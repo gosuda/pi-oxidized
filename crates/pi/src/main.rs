@@ -1,0 +1,3 @@
+//! `pi` executable.
+
+fn main() {}

@@ -1,0 +1,15 @@
+[package]
+name = "pi-rust-contract"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.97.1"
+publish = false
+
+[dependencies]
+pi = { path = "../../crates/pi" }
+pi-ai = { path = "../../crates/pi-ai" }
+pi-agent = { path = "../../crates/pi-agent" }
+pi-ext = { path = "../../crates/pi-ext" }
+pi-tui = { path = "../../crates/pi-tui" }
+
+[workspace]
