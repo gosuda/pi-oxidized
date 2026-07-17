@@ -2,7 +2,9 @@
 
 pub use pi::VERSION;
 
-pub use pi_ai::{AssistantMessageEvent, Context, Model, Provider, StreamOptions};
+pub use pi_ai::{
+    AssistantMessageEvent, Context, Message, Model, Provider, ProviderError, StreamOptions,
+};
 
 pub use pi_agent::{AgentEvent, AgentTool, AgentToolResult, QueueMode};
 

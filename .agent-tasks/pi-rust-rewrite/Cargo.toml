@@ -11,5 +11,6 @@ pi-ai = { path = "../../crates/pi-ai" }
 pi-agent = { path = "../../crates/pi-agent" }
 pi-ext = { path = "../../crates/pi-ext" }
 pi-tui = { path = "../../crates/pi-tui" }
+serde_json = "=1.0.150"
 
 [workspace]
