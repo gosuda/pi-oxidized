@@ -497,6 +497,7 @@ struct InteractiveRoot {
     post_editor: Vec<ComposedSection>,
     overlay: Option<Box<dyn Component>>,
     selector: Option<Box<dyn Component>>,
+    dialog_title: Option<Box<dyn Component>>,
     focus: FocusArea,
 }
 
@@ -519,6 +520,7 @@ impl InteractiveRoot {
             post_editor: sections,
             overlay: composed.overlay,
             selector,
+            dialog_title: None,
             focus: view.focus,
         }
     }
@@ -527,6 +529,7 @@ impl InteractiveRoot {
         view: &mut ViewState,
         editor: Editor,
         selector: Option<Box<dyn Component>>,
+        dialog_title: Option<Box<dyn Component>>,
         prefix: Box<dyn Component>,
         tail: Box<dyn Component>,
     ) -> Self {
@@ -566,6 +569,7 @@ impl InteractiveRoot {
             post_editor: sections,
             overlay,
             selector,
+            dialog_title,
             focus: view.focus,
         }
     }
@@ -641,13 +645,18 @@ impl Component for InteractiveRoot {
         let pre_height = self.pre_editor.iter_mut().fold(0_u16, |height, section| {
             height.saturating_add(section.component.measure(width))
         });
-        let middle_height = if self.focus == FocusArea::Selector {
+        let title_height = self
+            .dialog_title
+            .as_mut()
+            .map_or(0, |title| title.measure(width));
+        let body_height = if self.focus == FocusArea::Selector {
             self.selector
                 .as_mut()
                 .map_or(0, |selector| selector.measure(width))
         } else {
             self.editor.measure(width)
         };
+        let middle_height = title_height.saturating_add(body_height);
         self.post_editor.iter_mut().fold(
             pre_height.saturating_add(middle_height),
             |height, section| height.saturating_add(section.component.measure(width)),
@@ -660,13 +669,18 @@ impl Component for InteractiveRoot {
             .iter_mut()
             .map(|section| section.component.measure(area.width))
             .collect::<Vec<_>>();
-        let middle_height = if self.focus == FocusArea::Selector {
+        let title_height = self
+            .dialog_title
+            .as_mut()
+            .map_or(0, |title| title.measure(area.width));
+        let body_height = if self.focus == FocusArea::Selector {
             self.selector
                 .as_mut()
                 .map_or(0, |selector| selector.measure(area.width))
         } else {
             self.editor.measure(area.width)
         };
+        let middle_height = title_height.saturating_add(body_height);
         let post_heights = self
             .post_editor
             .iter_mut()
@@ -701,13 +715,30 @@ impl Component for InteractiveRoot {
 
         let height = middle_height.min(bottom.saturating_sub(y));
         if height > 0 {
-            let middle_area = Rect::new(area.x, y, area.width, height);
-            if self.focus == FocusArea::Selector {
-                if let Some(selector) = self.selector.as_mut() {
-                    selector.render(middle_area, buf);
+            let rendered_title_height = title_height.min(height);
+            if rendered_title_height > 0
+                && let Some(title) = self.dialog_title.as_mut()
+            {
+                title.render(
+                    Rect::new(area.x, y, area.width, rendered_title_height),
+                    buf,
+                );
+            }
+            let body_height = height.saturating_sub(rendered_title_height);
+            if body_height > 0 {
+                let body_area = Rect::new(
+                    area.x,
+                    y.saturating_add(rendered_title_height),
+                    area.width,
+                    body_height,
+                );
+                if self.focus == FocusArea::Selector {
+                    if let Some(selector) = self.selector.as_mut() {
+                        selector.render(body_area, buf);
+                    }
+                } else {
+                    self.editor.render(body_area, buf);
                 }
-            } else {
-                self.editor.render(middle_area, buf);
             }
             y = y.saturating_add(height);
         }
@@ -757,6 +788,9 @@ impl Component for InteractiveRoot {
         }
         if let Some(selector) = self.selector.as_mut() {
             selector.invalidate();
+        }
+        if let Some(title) = self.dialog_title.as_mut() {
+            title.invalidate();
         }
         if let Some(overlay) = self.overlay.as_mut() {
             overlay.invalidate();
@@ -2616,7 +2650,24 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             .chat_tail_cache
             .take()
             .unwrap_or_else(empty_chat_component);
-        InteractiveRoot::build_with_chat(&mut self.view, editor, selector, prefix, tail)
+        let dialog_title = self.pending_extension_dialog.as_ref().map(|dialog| {
+            Box::new(pi_tui::components::Text::with_padding(
+                super::theme::bold(&self.view.theme.fg(
+                    super::theme::ThemeColor::Accent,
+                    &extension_dialog_title(&dialog.request),
+                )),
+                1,
+                0,
+            )) as Box<dyn Component>
+        });
+        InteractiveRoot::build_with_chat(
+            &mut self.view,
+            editor,
+            selector,
+            dialog_title,
+            prefix,
+            tail,
+        )
     }
 
     fn recover_root(&mut self, mut root: InteractiveRoot) {
@@ -4425,6 +4476,17 @@ fn dialog_timeout(request: &HostUiRequest) -> Option<Duration> {
     Some(Duration::from_millis(timeout_ms))
 }
 
+fn extension_dialog_title(request: &HostUiRequest) -> String {
+    match request {
+        HostUiRequest::Select { request, .. } => request.title.clone(),
+        HostUiRequest::Confirm { request, .. } => {
+            format!("{}\n{}", request.title, request.message)
+        }
+        HostUiRequest::Input { request, .. } => request.title.clone(),
+        HostUiRequest::Editor { request, .. } => request.title.clone(),
+    }
+}
+
 const RESERVED_EXTENSION_SHORTCUTS: &[&str] = &[
     "escape",
     "ctrl+c",
@@ -6047,6 +6109,35 @@ mod tests {
         assert!(rt.pending_extension_dialog.is_none());
         assert_eq!(rt.editor.get_text(), "draft prompt");
         assert_eq!(rt.view.editor.placeholder, "Type a message…");
+    }
+
+    #[tokio::test]
+    async fn extension_confirmation_renders_title_and_message() {
+        let (mut rt, _log) = make_runtime();
+        rt.begin_extension_dialog(HostUiRequest::Confirm {
+            id: 19,
+            request: pi_ext::protocol::ConfirmRequest {
+                title: "Verification confirm prompt".to_owned(),
+                message: "Choose Yes".to_owned(),
+                options_meta: pi_ext::protocol::DialogOptions::default(),
+            },
+        })
+        .await;
+        let editor = std::mem::replace(&mut rt.editor, Editor::with_defaults());
+        let selector = rt.active_selector.take();
+        let mut root = rt.build_root(editor, selector);
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buffer = Buffer::empty(area);
+
+        root.render(area, &mut buffer);
+
+        let visible = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(visible.contains("Verification confirm prompt"));
+        assert!(visible.contains("Choose Yes"));
     }
 
     #[test]
