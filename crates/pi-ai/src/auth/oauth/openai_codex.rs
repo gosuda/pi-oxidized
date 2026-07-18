@@ -175,8 +175,9 @@ impl OpenAiCodexOAuth {
         })
         .await;
 
-        let manual_abort = CancellationToken::new();
-        link_parent_cancel(interaction.signal(), manual_abort.clone());
+        let manual_abort = interaction
+            .signal()
+            .map_or_else(CancellationToken::new, |parent| parent.child_token());
 
         interaction.notify(AuthEvent::AuthUrl {
             url: flow.url.clone(),
@@ -571,15 +572,6 @@ struct ParsedAuthorizationInput {
     state: Option<String>,
 }
 
-fn link_parent_cancel(parent: Option<CancellationToken>, child: CancellationToken) {
-    if let Some(parent) = parent {
-        tokio::spawn(async move {
-            parent.cancelled().await;
-            child.cancel();
-        });
-    }
-}
-
 async fn race_callback_and_manual_prompt(
     server: &OAuthCallbackServer,
     interaction: &dyn AuthInteraction,
@@ -640,6 +632,14 @@ async fn race_callback_and_manual_prompt(
                     }
                     Err(AuthError::Cancelled) => {
                         server.cancel_wait().await;
+                        if interaction
+                            .signal()
+                            .as_ref()
+                            .is_some_and(CancellationToken::is_cancelled)
+                        {
+                            result = BrowserRaceOutcome::Cancelled;
+                            break;
+                        }
                         if !waiting {
                             break;
                         }
@@ -1042,6 +1042,8 @@ mod tests {
         select_done: AtomicUsize,
         events: Mutex<Vec<AuthEvent>>,
         hang: CancellationToken,
+        prompt_signal: Mutex<Option<CancellationToken>>,
+        signal: Option<CancellationToken>,
     }
 
     impl AuthInteraction for HangManual {
@@ -1053,6 +1055,11 @@ mod tests {
                         Ok(OPENAI_CODEX_BROWSER_LOGIN_METHOD.into())
                     }
                     AuthPrompt::ManualCode { signal, .. } => {
+                        if let Some(signal) = &signal
+                            && let Ok(mut prompt_signal) = self.prompt_signal.lock()
+                        {
+                            *prompt_signal = Some(signal.clone());
+                        }
                         let cancel = signal.unwrap_or_else(|| self.hang.clone());
                         cancel.cancelled().await;
                         Err(AuthError::Cancelled)
@@ -1069,7 +1076,7 @@ mod tests {
         }
 
         fn signal(&self) -> Option<CancellationToken> {
-            None
+            self.signal.clone()
         }
     }
 
@@ -1610,10 +1617,13 @@ mod tests {
                     ..OpenAiCodexEndpoints::default()
                 });
         let hang = CancellationToken::new();
+        let parent_cancel = CancellationToken::new();
         let interaction = HangManual {
             select_done: AtomicUsize::new(0),
             events: Mutex::new(Vec::new()),
             hang: hang.clone(),
+            prompt_signal: Mutex::new(None),
+            signal: Some(parent_cancel.clone()),
         };
         let login = oauth.login(&interaction);
         let callback = hit_callback_when_ready(&interaction, port);
@@ -1630,7 +1640,76 @@ mod tests {
             .clone()
             .ok_or_else(|| err("missing token body"))?;
         assert!(body.contains("code=from-browser"));
+        let prompt_signal = interaction
+            .prompt_signal
+            .lock()
+            .map_err(|_| err("prompt signal lock"))?
+            .clone()
+            .ok_or_else(|| err("missing prompt signal"))?;
+        assert!(prompt_signal.is_cancelled());
+        assert!(
+            !parent_cancel.is_cancelled(),
+            "settling the prompt child must not cancel the parent"
+        );
         hang.cancel();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn browser_login_parent_cancel_propagates_to_prompt_child() -> TestResult {
+        let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| err(e.to_string()))?;
+        let port = listener
+            .local_addr()
+            .map_err(|e| err(e.to_string()))?
+            .port();
+        drop(listener);
+        let oauth =
+            OpenAiCodexOAuth::with_http(AuthHttpClient::new().map_err(|e| err(e.to_string()))?)
+                .with_endpoints(OpenAiCodexEndpoints {
+                    token_url: "http://127.0.0.1:1/unused".into(),
+                    callback_port: port,
+                    redirect_uri: format!("http://localhost:{port}/auth/callback"),
+                    ..OpenAiCodexEndpoints::default()
+                });
+        let parent_cancel = CancellationToken::new();
+        let interaction = HangManual {
+            select_done: AtomicUsize::new(0),
+            events: Mutex::new(Vec::new()),
+            hang: CancellationToken::new(),
+            prompt_signal: Mutex::new(None),
+            signal: Some(parent_cancel.clone()),
+        };
+
+        let cancel = async {
+            loop {
+                let prompt_signal = interaction
+                    .prompt_signal
+                    .lock()
+                    .ok()
+                    .and_then(|signal| signal.clone());
+                if let Some(prompt_signal) = prompt_signal {
+                    parent_cancel.cancel();
+                    assert!(
+                        prompt_signal.is_cancelled(),
+                        "parent cancellation must synchronously propagate to the active prompt child"
+                    );
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        };
+        let (login, ()) = tokio::join!(oauth.login(&interaction), cancel);
+        assert!(matches!(login, Err(AuthError::Cancelled)));
+        let prompt_signal = interaction
+            .prompt_signal
+            .lock()
+            .map_err(|_| err("prompt signal lock"))?
+            .clone()
+            .ok_or_else(|| err("missing prompt signal"))?;
+        assert!(
+            prompt_signal.is_cancelled(),
+            "parent cancellation must propagate to the prompt child"
+        );
         Ok(())
     }
 

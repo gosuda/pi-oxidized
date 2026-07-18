@@ -227,7 +227,9 @@ impl AnthropicOAuth {
         let pkce = generate_pkce()?;
         // Anthropic reuses the PKCE verifier as the OAuth state value.
         let server = self.start_login_callback(&pkce.verifier).await?;
-        let prompt_cancel = link_prompt_cancel(interaction.signal());
+        let prompt_cancel = interaction
+            .signal()
+            .map_or_else(CancellationToken::new, |parent| parent.child_token());
 
         interaction.notify(AuthEvent::AuthUrl {
             url: self.authorization_url(&pkce.challenge, &pkce.verifier),
@@ -276,18 +278,6 @@ impl AnthropicOAuth {
         .await
         .map_err(AuthError::from)
     }
-}
-
-fn link_prompt_cancel(parent: Option<CancellationToken>) -> CancellationToken {
-    let prompt_cancel = CancellationToken::new();
-    if let Some(parent) = parent {
-        let child = prompt_cancel.clone();
-        tokio::spawn(async move {
-            parent.cancelled().await;
-            child.cancel();
-        });
-    }
-    prompt_cancel
 }
 
 async fn race_login_sources(
@@ -757,6 +747,7 @@ mod tests {
         response: Arc<tokio::sync::Mutex<Option<String>>>,
         notify: Arc<tokio::sync::Notify>,
         prompt_signal: Mutex<Option<CancellationToken>>,
+        signal: Option<CancellationToken>,
     }
 
     impl DeferredManual {
@@ -766,6 +757,14 @@ mod tests {
                 response: Arc::new(tokio::sync::Mutex::new(None)),
                 notify: Arc::new(tokio::sync::Notify::new()),
                 prompt_signal: Mutex::new(None),
+                signal: None,
+            }
+        }
+
+        fn with_signal(signal: CancellationToken) -> Self {
+            Self {
+                signal: Some(signal),
+                ..Self::new()
             }
         }
 
@@ -828,7 +827,7 @@ mod tests {
         }
 
         fn signal(&self) -> Option<CancellationToken> {
-            None
+            self.signal.clone()
         }
     }
 
@@ -1112,7 +1111,8 @@ mod tests {
             .with_token_url(token_url)
             .with_callback_port(port);
 
-        let interaction = Arc::new(DeferredManual::new());
+        let parent_cancel = CancellationToken::new();
+        let interaction = Arc::new(DeferredManual::with_signal(parent_cancel.clone()));
         let login = {
             let interaction = interaction.clone();
             let oauth = oauth.clone();
@@ -1168,6 +1168,10 @@ mod tests {
         assert!(
             interaction.prompt_was_cancelled(),
             "manual prompt signal must be aborted after settle"
+        );
+        assert!(
+            !parent_cancel.is_cancelled(),
+            "settling the prompt child must not cancel the parent"
         );
         Ok(())
     }
@@ -1269,17 +1273,24 @@ mod tests {
             .with_callback_port(port);
         let signal = CancellationToken::new();
         let interaction = TestInteraction::with_signal(signal.clone());
-        let login = oauth.login(&interaction);
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            signal.cancel();
-        });
-        let err_value = expect_err(
-            tokio::time::timeout(Duration::from_secs(3), login)
-                .await
-                .map_err(|_| err("timeout"))?,
-            "cancelled",
-        )?;
+        let cancel = async {
+            loop {
+                let prompt_signal =
+                    lock_mutex(&interaction.prompt_signal_out, "prompt signal")?.clone();
+                if let Some(prompt_signal) = prompt_signal {
+                    signal.cancel();
+                    assert!(
+                        prompt_signal.is_cancelled(),
+                        "parent cancellation must synchronously propagate to the active prompt child"
+                    );
+                    return Ok::<(), String>(());
+                }
+                tokio::task::yield_now().await;
+            }
+        };
+        let (login, cancel) = tokio::join!(oauth.login(&interaction), cancel);
+        cancel?;
+        let err_value = expect_err(login, "cancelled")?;
         assert!(matches!(err_value, AuthError::Cancelled));
         Ok(())
     }
