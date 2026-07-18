@@ -417,9 +417,18 @@ mod tests {
                 restore_calls_for_hook.fetch_add(1, Ordering::SeqCst);
             }),
         );
+        let panic_trigger = AtomicBool::new(false);
 
         let assertions = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            assert!(std::panic::catch_unwind(|| std::panic::panic_any("first")).is_err());
+            assert!(
+                std::panic::catch_unwind(|| {
+                    assert!(
+                        panic_trigger.load(Ordering::Relaxed),
+                        "intentional first panic"
+                    );
+                })
+                .is_err()
+            );
             assert!(emergency.load(Ordering::SeqCst));
             assert_eq!(restore_calls.load(Ordering::SeqCst), 1);
             assert_eq!(previous_calls.load(Ordering::SeqCst), 1);
@@ -429,7 +438,15 @@ mod tests {
                 "the hook and guard must share the same once flag"
             );
 
-            assert!(std::panic::catch_unwind(|| std::panic::panic_any("second")).is_err());
+            assert!(
+                std::panic::catch_unwind(|| {
+                    assert!(
+                        panic_trigger.load(Ordering::Relaxed),
+                        "intentional second panic"
+                    );
+                })
+                .is_err()
+            );
             assert_eq!(restore_calls.load(Ordering::SeqCst), 1);
             assert_eq!(previous_calls.load(Ordering::SeqCst), 2);
         }));

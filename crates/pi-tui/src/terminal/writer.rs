@@ -1006,7 +1006,11 @@ mod tests {
             ..FailOnceWriter::default()
         };
 
-        let error = write_stage3_frame(&mut writer, &framed, true).unwrap_err();
+        let result = write_stage3_frame(&mut writer, &framed, true);
+        assert!(result.is_err());
+        let Err(error) = result else {
+            return;
+        };
 
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
         assert!(writer.bytes.starts_with(b"\x1b[?2026hpa"));
@@ -1025,7 +1029,11 @@ mod tests {
             ..FailOnceWriter::default()
         };
 
-        let error = write_stage3_frame(&mut writer, &framed, true).unwrap_err();
+        let result = write_stage3_frame(&mut writer, &framed, true);
+        assert!(result.is_err());
+        let Err(error) = result else {
+            return;
+        };
 
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
         assert_eq!(error.to_string(), "injected flush failure");

@@ -2491,14 +2491,14 @@ mod tests {
     }
 
     #[test]
-    fn backspace_deletes_marker_before_ten_to_nine_renumber() {
+    fn backspace_deletes_marker_before_ten_to_nine_renumber() -> Result<(), &'static str> {
         let (mut editor, payloads) = editor_with_ten_reverse_ordered_pastes();
         editor.set_cursor_col(editor.state.current_line().len());
         editor.insert_character("x");
         let marker_one = find_paste_markers(&editor.get_text())
             .into_iter()
             .find(|marker| marker.id == 1)
-            .expect("marker #1 should precede the suffix");
+            .ok_or("marker #1 should precede the suffix")?;
         editor.set_cursor_col(marker_one.end);
         let expected_shrink: usize = find_paste_markers(editor.state.current_line())
             .into_iter()
@@ -2522,17 +2522,18 @@ mod tests {
             payloads[1..].iter().rev().cloned().collect::<String>()
         );
         assert_eq!(editor.get_expanded_text(), expected);
+        Ok(())
     }
 
     #[test]
-    fn forward_delete_renumbers_marker_and_undo_restores_payload_state() {
+    fn forward_delete_renumbers_marker_and_undo_restores_payload_state() -> Result<(), &'static str> {
         let (mut editor, payloads) = editor_with_ten_reverse_ordered_pastes();
         editor.set_cursor_col(editor.state.current_line().len());
         editor.insert_character("x");
         let marker_one = find_paste_markers(&editor.get_text())
             .into_iter()
             .find(|marker| marker.id == 1)
-            .expect("marker #1 should precede the suffix");
+            .ok_or("marker #1 should precede the suffix")?;
         editor.set_cursor_col(marker_one.start);
         let before_text = editor.get_text();
         let before_expanded = editor.get_expanded_text();
@@ -2555,6 +2556,7 @@ mod tests {
         assert_eq!(editor.paste_counter, 10);
         assert_eq!(editor.pastes.len(), 10);
         assert!(editor.pastes.keys().all(|id| (1..=10).contains(id)));
+        Ok(())
     }
 
     #[test]
@@ -2576,7 +2578,7 @@ mod tests {
     }
 
     #[test]
-    fn history_and_non_character_moves_refresh_open_autocomplete() {
+    fn history_and_non_character_moves_refresh_open_autocomplete() -> Result<(), &'static str> {
         let mut editor = Editor::with_defaults();
         editor.add_to_history("history value");
         editor.set_text("draft");
@@ -2584,12 +2586,12 @@ mod tests {
         open_test_autocomplete(&mut editor);
 
         editor.navigate_history(-1);
-        let pending = editor.autocomplete_pending.as_ref().expect("history refresh");
+        let pending = editor.autocomplete_pending.as_ref().ok_or("history refresh")?;
         assert_eq!(pending.snapshot_text, "history value");
         assert_eq!(pending.snapshot_col, 0);
 
         editor.move_word_forwards();
-        let pending = editor.autocomplete_pending.as_ref().expect("word refresh");
+        let pending = editor.autocomplete_pending.as_ref().ok_or("word refresh")?;
         assert_eq!(pending.snapshot_col, "history".len());
 
         editor.set_text("zero\none\ntwo\nthree\nfour\nfive\nsix\nseven");
@@ -2597,8 +2599,9 @@ mod tests {
         open_test_autocomplete(&mut editor);
         let before = editor.get_cursor();
         editor.page_scroll(-1);
-        let pending = editor.autocomplete_pending.as_ref().expect("page refresh");
+        let pending = editor.autocomplete_pending.as_ref().ok_or("page refresh")?;
         assert_eq!((pending.snapshot_line, pending.snapshot_col), editor.get_cursor());
         assert_ne!(editor.get_cursor(), before);
+        Ok(())
     }
 }

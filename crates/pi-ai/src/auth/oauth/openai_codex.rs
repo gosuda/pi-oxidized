@@ -861,33 +861,29 @@ fn read_token_response(
         .filter(|s| !s.is_empty());
     let expires_in = response.body.get("expires_in").and_then(Value::as_f64);
 
-    match (access, refresh, expires_in) {
-        (Some(access), Some(refresh), Some(expires_in)) => {
-            let expires_ms = now_epoch_ms()?.saturating_add(seconds_f64_to_millis(expires_in)?);
-            Ok(OAuthToken {
-                access: access.to_owned(),
-                refresh: refresh.to_owned(),
-                expires: expires_ms,
-            })
+    let (Some(access), Some(refresh), Some(expires_in)) = (access, refresh, expires_in) else {
+        let mut fields = Vec::with_capacity(3);
+        if access.is_none() {
+            fields.push("access_token");
         }
-        _ => {
-            let mut fields = Vec::with_capacity(3);
-            if access.is_none() {
-                fields.push("access_token");
-            }
-            if refresh.is_none() {
-                fields.push("refresh_token");
-            }
-            if expires_in.is_none() {
-                fields.push("expires_in");
-            }
-            Err(AuthError::message(format!(
-                "OpenAI Codex token {} response missing or invalid fields: {}",
-                operation.as_str(),
-                fields.join(", "),
-            )))
+        if refresh.is_none() {
+            fields.push("refresh_token");
         }
-    }
+        if expires_in.is_none() {
+            fields.push("expires_in");
+        }
+        return Err(AuthError::message(format!(
+            "OpenAI Codex token {} response missing or invalid fields: {}",
+            operation.as_str(),
+            fields.join(", "),
+        )));
+    };
+    let expires_ms = now_epoch_ms()?.saturating_add(seconds_f64_to_millis(expires_in)?);
+    Ok(OAuthToken {
+        access: access.to_owned(),
+        refresh: refresh.to_owned(),
+        expires: expires_ms,
+    })
 }
 
 fn now_epoch_ms() -> Result<i64, AuthError> {

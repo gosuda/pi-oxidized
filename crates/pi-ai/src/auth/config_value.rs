@@ -18,6 +18,10 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as _;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt as _;
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -318,7 +322,6 @@ fn execute_with_default_shell(
         #[cfg(windows)]
         {
             let mut shell = Command::new("cmd");
-            use std::os::windows::process::CommandExt as _;
             const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             shell
@@ -330,7 +333,6 @@ fn execute_with_default_shell(
         #[cfg(not(windows))]
         {
             let mut shell = Command::new("/bin/sh");
-            use std::os::unix::process::CommandExt as _;
             shell.arg("-c").arg(command).process_group(0);
             shell
         }

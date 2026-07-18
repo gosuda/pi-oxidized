@@ -458,17 +458,12 @@ enum StringDestination {
     Value(Vec<JsonPathPart>),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 enum StringEscape {
+    #[default]
     None,
     Slash { base_len: usize },
     Unicode { base_len: usize, digits: String },
-}
-
-impl Default for StringEscape {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 impl IncrementalObjectParser {
@@ -489,11 +484,11 @@ impl IncrementalObjectParser {
     }
 
     fn consume(&mut self, character: char) {
-        if let Some(mut token) = self.token.take() {
-            if self.consume_token(&mut token, character) {
-                self.token = Some(token);
-                return;
-            }
+        if let Some(mut token) = self.token.take()
+            && self.consume_token(&mut token, character)
+        {
+            self.token = Some(token);
+            return;
         }
         self.consume_syntax(character);
     }
@@ -505,82 +500,13 @@ impl IncrementalObjectParser {
                 value,
                 pending_whitespace,
                 escape,
-            } => {
-                if character.is_whitespace() {
-                    pending_whitespace.push(character);
-                    return true;
-                }
-                value.push_str(pending_whitespace);
-                pending_whitespace.clear();
-                match escape {
-                    StringEscape::None if character == '"' => {
-                        if matches!(destination, StringDestination::Key)
-                            && let Some(JsonContainer::Object { state, key, .. }) =
-                                self.stack.last_mut()
-                        {
-                            *key = Some(value.clone());
-                            *state = ObjectState::Colon;
-                        }
-                        return false;
-                    }
-                    StringEscape::None if character == '\\' => {
-                        let base_len = value.len();
-                        value.push('\\');
-                        *escape = StringEscape::Slash { base_len };
-                    }
-                    StringEscape::Slash { base_len } if character == 'u' => {
-                        value.push('u');
-                        *escape = StringEscape::Unicode {
-                            base_len: *base_len,
-                            digits: String::new(),
-                        };
-                    }
-                    StringEscape::Slash { base_len } => {
-                        let replacement = match character {
-                            '"' => Some('"'),
-                            '\\' => Some('\\'),
-                            '/' => Some('/'),
-                            'b' => Some('\u{0008}'),
-                            'f' => Some('\u{000c}'),
-                            'n' => Some('\n'),
-                            'r' => Some('\r'),
-                            't' => Some('\t'),
-                            _ => None,
-                        };
-                        if let Some(replacement) = replacement {
-                            value.truncate(*base_len);
-                            value.push(replacement);
-                        } else {
-                            value.push(character);
-                        }
-                        *escape = StringEscape::None;
-                    }
-                    StringEscape::Unicode { base_len, digits }
-                        if character.is_ascii_hexdigit() =>
-                    {
-                        digits.push(character);
-                        value.push(character);
-                        if digits.len() == 4 {
-                            if let Ok(code) = u32::from_str_radix(digits, 16)
-                                && let Some(decoded) = char::from_u32(code)
-                            {
-                                value.truncate(*base_len);
-                                value.push(decoded);
-                            }
-                            *escape = StringEscape::None;
-                        }
-                    }
-                    StringEscape::Unicode { .. } => {
-                        value.push(character);
-                        *escape = StringEscape::None;
-                    }
-                    StringEscape::None => value.push(character),
-                }
-                if let StringDestination::Value(path) = destination {
-                    self.set_value(path, Value::String(value.clone()));
-                }
-                true
-            }
+            } => self.consume_string_token(
+                destination,
+                value,
+                pending_whitespace,
+                escape,
+                character,
+            ),
             JsonToken::Number { path, raw } => {
                 if matches!(character, '0'..='9' | '-' | '+' | '.' | 'e' | 'E') {
                     raw.push(character);
@@ -610,6 +536,87 @@ impl IncrementalObjectParser {
                 }
             }
         }
+    }
+
+    fn consume_string_token(
+        &mut self,
+        destination: &StringDestination,
+        value: &mut String,
+        pending_whitespace: &mut String,
+        escape: &mut StringEscape,
+        character: char,
+    ) -> bool {
+        if character.is_whitespace() {
+            pending_whitespace.push(character);
+            return true;
+        }
+        value.push_str(pending_whitespace);
+        pending_whitespace.clear();
+        match escape {
+            StringEscape::None if character == '"' => {
+                if matches!(destination, StringDestination::Key)
+                    && let Some(JsonContainer::Object { state, key, .. }) = self.stack.last_mut()
+                {
+                    *key = Some(value.clone());
+                    *state = ObjectState::Colon;
+                }
+                return false;
+            }
+            StringEscape::None if character == '\\' => {
+                let base_len = value.len();
+                value.push('\\');
+                *escape = StringEscape::Slash { base_len };
+            }
+            StringEscape::Slash { base_len } if character == 'u' => {
+                value.push('u');
+                *escape = StringEscape::Unicode {
+                    base_len: *base_len,
+                    digits: String::new(),
+                };
+            }
+            StringEscape::Slash { base_len } => {
+                let replacement = match character {
+                    '"' => Some('"'),
+                    '\\' => Some('\\'),
+                    '/' => Some('/'),
+                    'b' => Some('\u{0008}'),
+                    'f' => Some('\u{000c}'),
+                    'n' => Some('\n'),
+                    'r' => Some('\r'),
+                    't' => Some('\t'),
+                    _ => None,
+                };
+                if let Some(replacement) = replacement {
+                    value.truncate(*base_len);
+                    value.push(replacement);
+                } else {
+                    value.push(character);
+                }
+                *escape = StringEscape::None;
+            }
+            StringEscape::Unicode { base_len, digits } if character.is_ascii_hexdigit() => {
+                digits.push(character);
+                value.push(character);
+                if digits.len() == 4 {
+                    if let Ok(code) = u32::from_str_radix(digits, 16)
+                        && let Some(decoded) = char::from_u32(code)
+                    {
+                        value.truncate(*base_len);
+                        value.push(decoded);
+                    }
+                    *escape = StringEscape::None;
+                }
+            }
+            StringEscape::Unicode { .. } => {
+                value.push(character);
+                *escape = StringEscape::None;
+            }
+            StringEscape::None => value.push(character),
+        }
+        if let StringDestination::Value(path) = destination {
+            self.set_value(path, Value::String(value.clone()));
+        }
+        true
     }
 
     fn consume_syntax(&mut self, character: char) {
@@ -651,8 +658,15 @@ impl IncrementalObjectParser {
                     *state = ObjectState::Value;
                 }
             }
-            Some(JsonContainer::Object { state: ObjectState::Value, .. })
-            | Some(JsonContainer::Array { state: ArrayState::Value, .. }) => {
+            Some(
+                JsonContainer::Object {
+                    state: ObjectState::Value,
+                    ..
+                } | JsonContainer::Array {
+                    state: ArrayState::Value,
+                    ..
+                },
+            ) => {
                 self.start_value(character);
             }
             Some(JsonContainer::Object { state: ObjectState::Comma, .. }) => match character {

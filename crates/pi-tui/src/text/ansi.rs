@@ -390,11 +390,16 @@ mod tests {
     #[test]
     fn csi_accepts_every_standard_final_byte() {
         for final_byte in 0x40u8..=0x7e {
-            let sequence = String::from_utf8(vec![0x1b, b'[', final_byte]).unwrap();
-            let extracted = extract_ansi_code(&sequence, 0)
-                .unwrap_or_else(|| panic!("CSI final byte 0x{final_byte:02x} was rejected"));
-            assert_eq!(extracted.len, sequence.len());
-            assert_eq!(extracted.code, sequence);
+            let sequence = format!("\x1b[{}", char::from(final_byte));
+            let extracted = extract_ansi_code(&sequence, 0);
+            assert!(
+                extracted.is_some(),
+                "CSI final byte 0x{final_byte:02x} was rejected"
+            );
+            if let Some(extracted) = extracted {
+                assert_eq!(extracted.len, sequence.len());
+                assert_eq!(extracted.code, sequence);
+            }
         }
     }
 
