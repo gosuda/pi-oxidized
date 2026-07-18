@@ -63,6 +63,10 @@ async function collectEvents(provider: RegisteredProvider, context: Context): Pr
 function registerFixture(): RegisteredProvider {
 	let provider: RegisteredProvider | undefined;
 	const api = {
+		registerFlag() {},
+		on() {},
+		registerShortcut() {},
+		registerCommand() {},
 		registerProvider(name: string, config: RegisteredProvider) {
 			expect(name).toBe(VERIFICATION_PROVIDER);
 			provider = config;
