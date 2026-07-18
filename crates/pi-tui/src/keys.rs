@@ -342,6 +342,169 @@ pub fn normalize_event(event: &KeyEvent) -> Option<(String, KeyModifiers)> {
     }
 }
 
+/// Return the canonical [`KeyId`] identity for a structured terminal event.
+///
+/// Event kind is intentionally excluded: press, repeat, and release have the
+/// same binding identity and remain distinguishable on the event itself.
+#[must_use]
+pub fn canonical_key_id(event: &KeyEvent) -> Option<KeyId> {
+    let (key, modifiers) = normalize_event(event)?;
+    Some(ParsedKeyId { key, modifiers }.canonical_id())
+}
+
+/// Encode a structured key event as the canonical byte sequence delivered to
+/// terminal components such as extension `handleInput` implementations.
+///
+/// Conventional press events use their compact legacy representation whenever
+/// it preserves identity. Kitty enhanced CSI forms are used for repeat/release
+/// events and for modifier combinations that legacy input would erase.
+#[must_use]
+pub fn encode_key_event(event: &KeyEvent) -> Option<String> {
+    let (base, modifiers) = normalize_event(event)?;
+    if event.kind == KeyEventKind::Press
+        && let Some(legacy) = encode_legacy_key_event(event, &base, modifiers)
+    {
+        return Some(legacy);
+    }
+
+    let modifier_parameter = 1
+        + u8::from(modifiers.contains(KeyModifiers::SHIFT))
+        + 2 * u8::from(modifiers.contains(KeyModifiers::ALT))
+        + 4 * u8::from(modifiers.contains(KeyModifiers::CONTROL))
+        + 8 * u8::from(modifiers.contains(KeyModifiers::SUPER));
+    let event_type = match event.kind {
+        KeyEventKind::Press => 1,
+        KeyEventKind::Repeat => 2,
+        KeyEventKind::Release => 3,
+    };
+    encode_kitty_key_event(&base, modifier_parameter, event_type)
+}
+
+fn encode_legacy_key_event(
+    event: &KeyEvent,
+    base: &str,
+    modifiers: KeyModifiers,
+) -> Option<String> {
+    let without_alt = modifiers - KeyModifiers::ALT;
+    let mut data = match event.code {
+        KeyCode::Char(character) if without_alt == KeyModifiers::CONTROL => {
+            legacy_control_character(character).map(|character| character.to_string())?
+        }
+        KeyCode::Char(character) if without_alt.is_empty() => character.to_string(),
+        KeyCode::Char(character) if without_alt == KeyModifiers::SHIFT => {
+            let shift_is_embodied = character.is_ascii_uppercase()
+                || (is_symbol_char(character) && base == character.to_string());
+            shift_is_embodied.then(|| character.to_string())?
+        }
+        KeyCode::Enter if modifiers.is_empty() => "\r".to_owned(),
+        KeyCode::Tab if modifiers.is_empty() => "\t".to_owned(),
+        KeyCode::BackTab if modifiers == KeyModifiers::SHIFT => "\u{1b}[Z".to_owned(),
+        KeyCode::Backspace if modifiers.is_empty() => "\u{7f}".to_owned(),
+        KeyCode::Esc if modifiers.is_empty() => "\u{1b}".to_owned(),
+        KeyCode::Up if modifiers.is_empty() => "\u{1b}[A".to_owned(),
+        KeyCode::Down if modifiers.is_empty() => "\u{1b}[B".to_owned(),
+        KeyCode::Right if modifiers.is_empty() => "\u{1b}[C".to_owned(),
+        KeyCode::Left if modifiers.is_empty() => "\u{1b}[D".to_owned(),
+        KeyCode::Home if modifiers.is_empty() => "\u{1b}[H".to_owned(),
+        KeyCode::End if modifiers.is_empty() => "\u{1b}[F".to_owned(),
+        KeyCode::Insert if modifiers.is_empty() => "\u{1b}[2~".to_owned(),
+        KeyCode::Delete if modifiers.is_empty() => "\u{1b}[3~".to_owned(),
+        KeyCode::PageUp if modifiers.is_empty() => "\u{1b}[5~".to_owned(),
+        KeyCode::PageDown if modifiers.is_empty() => "\u{1b}[6~".to_owned(),
+        KeyCode::F(number @ 1..=4) if modifiers.is_empty() => {
+            format!("\u{1b}O{}", char::from(b'P' + number - 1))
+        }
+        KeyCode::F(number @ 5..=12) if modifiers.is_empty() => {
+            let suffix = [15, 17, 18, 19, 20, 21, 23, 24][usize::from(number - 5)];
+            format!("\u{1b}[{suffix}~")
+        }
+        KeyCode::KeypadBegin if modifiers.is_empty() => "\u{1b}[E".to_owned(),
+        _ => return None,
+    };
+    if modifiers.contains(KeyModifiers::ALT) {
+        data.insert(0, '\u{1b}');
+    }
+    Some(data)
+}
+
+fn legacy_control_character(character: char) -> Option<char> {
+    if character == ' ' {
+        return Some('\0');
+    }
+    character
+        .is_ascii()
+        .then(|| char::from((character.to_ascii_uppercase() as u8) & 0x1f))
+}
+
+fn encode_kitty_key_event(
+    base: &str,
+    modifier_parameter: u8,
+    event_type: u8,
+) -> Option<String> {
+    let sequence = match base {
+        "up" => format!("\u{1b}[1;{modifier_parameter}:{event_type}A"),
+        "down" => format!("\u{1b}[1;{modifier_parameter}:{event_type}B"),
+        "right" => format!("\u{1b}[1;{modifier_parameter}:{event_type}C"),
+        "left" => format!("\u{1b}[1;{modifier_parameter}:{event_type}D"),
+        "home" => format!("\u{1b}[1;{modifier_parameter}:{event_type}H"),
+        "end" => format!("\u{1b}[1;{modifier_parameter}:{event_type}F"),
+        "insert" => format!("\u{1b}[2;{modifier_parameter}:{event_type}~"),
+        "delete" => format!("\u{1b}[3;{modifier_parameter}:{event_type}~"),
+        "pageup" => format!("\u{1b}[5;{modifier_parameter}:{event_type}~"),
+        "pagedown" => format!("\u{1b}[6;{modifier_parameter}:{event_type}~"),
+        function if function.starts_with('f') => {
+            let number = function[1..].parse::<u8>().ok()?;
+            if (1..=4).contains(&number) {
+                let final_byte = char::from(b'P' + number - 1);
+                format!("\u{1b}[1;{modifier_parameter}:{event_type}{final_byte}")
+            } else {
+                let parameter = [15, 17, 18, 19, 20, 21, 23, 24]
+                    .get(usize::from(number.checked_sub(5)?))
+                    .copied()?;
+                format!("\u{1b}[{parameter};{modifier_parameter}:{event_type}~")
+            }
+        }
+        _ => {
+            let codepoint = kitty_codepoint(base)?;
+            format!("\u{1b}[{codepoint};{modifier_parameter}:{event_type}u")
+        }
+    };
+    Some(sequence)
+}
+
+fn kitty_codepoint(base: &str) -> Option<u32> {
+    let functional = match base {
+        "escape" => 27,
+        "enter" => 13,
+        "tab" => 9,
+        "backspace" => 127,
+        "insert" => 57_348,
+        "delete" => 57_349,
+        "pageup" => 57_350,
+        "pagedown" => 57_351,
+        "left" => 57_352,
+        "right" => 57_353,
+        "up" => 57_354,
+        "down" => 57_355,
+        "home" => 57_356,
+        "end" => 57_357,
+        "clear" => 57_427,
+        function if function.starts_with('f') => {
+            let number = function[1..].parse::<u32>().ok()?;
+            57_363 + number
+        }
+        "space" => u32::from(' '),
+        character => return single_character(character).map(u32::from),
+    };
+    Some(functional)
+}
+
+fn single_character(value: &str) -> Option<char> {
+    let mut characters = value.chars();
+    let character = characters.next()?;
+    characters.next().is_none().then_some(character)
+}
+
 fn normalize_char(ch: char, mut mods: KeyModifiers) -> Option<(String, KeyModifiers)> {
     // Shifted letter identity: 'A'..='Z' implies shift + lowercase base.
     if ch.is_ascii_uppercase() {
@@ -463,6 +626,8 @@ fn is_symbol_char(ch: char) -> bool {
 
 fn display_base_key(base: &str) -> String {
     match base {
+        "esc" => "escape".to_owned(),
+        "return" => "enter".to_owned(),
         "pageup" => "pageUp".to_owned(),
         "pagedown" => "pageDown".to_owned(),
         other => other.to_owned(),
@@ -1013,5 +1178,55 @@ mod tests {
             KeyEventState::CAPS_LOCK | KeyEventState::NUM_LOCK,
         );
         assert!(key_matches(&event, &id("ctrl+c")));
+    }
+
+    #[test]
+    fn canonical_identity_matches_for_press_repeat_and_release() {
+        for event in [
+            key_press(KeyCode::Char('p'), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+            key_repeat(KeyCode::Char('p'), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+            key_release(KeyCode::Char('p'), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+        ] {
+            let canonical = canonical_key_id(&event).expect("supported key");
+            assert_eq!(canonical.as_str(), "shift+ctrl+p");
+            assert!(key_matches(&event, &canonical));
+        }
+    }
+
+    #[test]
+    fn terminal_encoding_uses_legacy_only_when_identity_survives() {
+        assert_eq!(
+            encode_key_event(&key_press(KeyCode::Char('x'), KeyModifiers::ALT)).as_deref(),
+            Some("\u{1b}x")
+        );
+        assert_eq!(
+            encode_key_event(&key_press(KeyCode::Char('c'), KeyModifiers::CONTROL)).as_deref(),
+            Some("\u{3}")
+        );
+        assert_eq!(
+            encode_key_event(&key_press(KeyCode::PageDown, KeyModifiers::NONE)).as_deref(),
+            Some("\u{1b}[6~")
+        );
+        assert_eq!(
+            encode_key_event(&key_press(KeyCode::Enter, KeyModifiers::SHIFT)).as_deref(),
+            Some("\u{1b}[13;2:1u")
+        );
+        assert_eq!(
+            encode_key_event(&key_press(KeyCode::Up, KeyModifiers::CONTROL | KeyModifiers::ALT))
+                .as_deref(),
+            Some("\u{1b}[1;7:1A")
+        );
+    }
+
+    #[test]
+    fn terminal_encoding_preserves_kitty_event_kind() {
+        assert_eq!(
+            encode_key_event(&key_repeat(KeyCode::F(5), KeyModifiers::NONE)).as_deref(),
+            Some("\u{1b}[15;1:2~")
+        );
+        assert_eq!(
+            encode_key_event(&key_release(KeyCode::Char('a'), KeyModifiers::SUPER)).as_deref(),
+            Some("\u{1b}[97;9:3u")
+        );
     }
 }
