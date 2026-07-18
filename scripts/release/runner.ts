@@ -18,7 +18,7 @@ import {
 	stat,
 	writeFile,
 } from "node:fs/promises";
-import { isAbsolute, join, resolve } from "node:path";
+import { posix, win32 } from "node:path";
 
 /** Result of running one command via the runner. */
 export interface RunResult {
@@ -243,23 +243,31 @@ export class PathTraversalError extends Error {
 
 /**
  * Join `base` and `target`, then verify the result is still inside `base`.
- * Rejects absolute targets, `..` escape, null bytes, and backslashes.
+ * Uses the base path's POSIX or win32 semantics and rejects absolute targets,
+ * `..` escapes, null bytes, and POSIX backslashes.
  *
  * @throws {@link PathTraversalError} on any violation.
  */
 export function safeJoinPath(base: string, target: string): string {
-	if (isAbsolute(target)) {
-		throw new PathTraversalError(`absolute target path: ${target}`);
-	}
 	if (target.includes("\0")) {
 		throw new PathTraversalError(`null byte in path: ${target}`);
 	}
-	if (target.includes("\\")) {
+	const path = win32.isAbsolute(base) && !posix.isAbsolute(base) ? win32 : posix;
+	if (path.isAbsolute(target)) {
+		throw new PathTraversalError(`absolute target path: ${target}`);
+	}
+	if (path === posix && target.includes("\\")) {
 		throw new PathTraversalError(`backslash in path: ${target}`);
 	}
-	const resolved = resolve(join(base, target));
-	const normalizedBase = resolve(base);
-	if (resolved !== normalizedBase && !resolved.startsWith(`${normalizedBase}/`)) {
+
+	const normalizedBase = path.resolve(base);
+	const resolved = path.resolve(normalizedBase, target);
+	const relativePath = path.relative(normalizedBase, resolved);
+	if (
+		path.isAbsolute(relativePath) ||
+		relativePath === ".." ||
+		relativePath.startsWith(`..${path.sep}`)
+	) {
 		throw new PathTraversalError(`path escapes base: ${target} (base=${base})`);
 	}
 	return resolved;

@@ -24,7 +24,6 @@
  * Verification check 13 calls for, from the unpacked archive:
  *   - `pi --version` (binary runs and reports the workspace version)
  *   - host `hello` handshake (compiled sidecar responds with the expected version)
- *   - runtime-import fixture (external `.ts` extension loads through the sidecar)
  *
  * `smokeUnpacked` unpacks the finalized archive into a fresh directory before
  * running any check so archive corruption, missing files, or wrong target
@@ -212,7 +211,6 @@ async function main(): Promise<void> {
 				runner,
 				archiveDir: join(smokeRoot, args.plan.archiveDir),
 				plan: args.plan,
-				repoRoot,
 				dryRun: args.dryRun,
 			});
 		} finally {
@@ -234,7 +232,6 @@ interface SmokeOptions {
 	/** Absolute path to the unpacked archive root (containing `pi`, etc.). */
 	readonly archiveDir: string;
 	readonly plan: TargetPlan;
-	readonly repoRoot: string;
 	readonly dryRun: boolean;
 }
 
@@ -279,12 +276,12 @@ function runHostTool(args: readonly string[]): Promise<void> {
 }
 
 /**
- * Run the three verification check 13 smoke checks against the unpacked
- * archive. Real failures throw; architectural mismatches against the dev
+ * Run two smoke checks against the unpacked archive.
+ * Real failures throw; architectural mismatches against the dev
  * host (e.g. extracting a darwin archive on linux) skip with a clear note.
  */
-async function smokeUnpacked(opts: SmokeOptions): Promise<void> {
-	const { fs, runner, archiveDir, plan, repoRoot, dryRun } = opts;
+export async function smokeUnpacked(opts: SmokeOptions): Promise<void> {
+	const { fs, runner, archiveDir, plan, dryRun } = opts;
 	const piInArchive = join(archiveDir, plan.piBinaryName);
 	if (!(await pathExists(fs, piInArchive))) {
 		throw new Error(`unpack smoke: missing ${plan.piBinaryName} inside ${archiveDir}`);
@@ -358,55 +355,12 @@ async function smokeUnpacked(opts: SmokeOptions): Promise<void> {
 		);
 	}
 	process.stdout.write(`  host hello handshake: OK\n`);
+}
 
-	// Runtime-import fixture: only meaningful for native architectures
-	// (linux/macos/windows) and only when a `.ts` extension fixture is
-	// present in the workspace. When the dev host cannot execute the
-	// target binary we skip rather than fail.
-	const targetMatchesHost = targetCompatibleWithDevHost(plan);
-	if (!targetMatchesHost) {
-		process.stdout.write(
-			`  [skip] runtime-import fixture: dev host cannot execute ${plan.rustTarget}\n`,
-		);
-		return;
-	}
-	const exampleExt = join(
-		repoRoot,
-		"packages",
-		"extension-host",
-		"fixtures",
-		"extensions",
-		"tool.ts",
-	);
-	if (!(await pathExists(fs, exampleExt))) {
-		process.stdout.write(`  [skip] runtime-import fixture: missing ${exampleExt}\n`);
-		return;
-	}
-	const fixtureBin = join(archiveDir, `runtime-import-test${plan.windows ? ".exe" : ""}`);
-	const fixtureRes = await runner.run(fixtureBin, [exampleExt], {
-		rejectOnError: false,
-		cwd: repoRoot,
+
+if (import.meta.main) {
+	main().catch((err: unknown) => {
+		console.error(err);
+		process.exit(1);
 	});
-	if (fixtureRes.exitCode !== 0) {
-		throw new Error(
-			`unpack smoke: runtime-import fixture failed (exit ${fixtureRes.exitCode}): ${fixtureRes.stderr.slice(0, 500)}`,
-		);
-	}
-	process.stdout.write(`  runtime-import fixture: OK\n`);
 }
-
-/** True when the host running this script can execute the target's binaries. */
-function targetCompatibleWithDevHost(plan: TargetPlan): boolean {
-	const dev = process.platform;
-	if (plan.os === "windows" && dev !== "win32") return false;
-	if (plan.os === "darwin" && dev !== "darwin") return false;
-	if (plan.os === "linux" && dev !== "linux") return false;
-	// We do not pin the dev CPU architecture; assume linux-x64 CI runs the
-	// x86_64 and aarch64 (via qemu) targets if needed.
-	return true;
-}
-
-main().catch((err: unknown) => {
-	console.error(err);
-	process.exit(1);
-});

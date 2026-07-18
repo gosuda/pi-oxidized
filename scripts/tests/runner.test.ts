@@ -83,30 +83,35 @@ describe("SpawnRunner integration", () => {
 });
 
 describe("safeJoinPath", () => {
-	test("resolves a relative segment inside the base", () => {
+	test("accepts POSIX paths contained by the base", () => {
 		expect(safeJoinPath("/staging", "sub/file.txt")).toBe("/staging/sub/file.txt");
-	});
-	test("rejects absolute child path", () => {
-		expect(() => safeJoinPath("/staging", "/staging/sub")).toThrow(PathTraversalError);
+		expect(safeJoinPath("/staging", ".")).toBe("/staging");
 	});
 
-	test("rejects traversal via ..", () => {
+	test("rejects POSIX parent and absolute-target escapes", () => {
 		expect(() => safeJoinPath("/staging", "../escape")).toThrow(PathTraversalError);
-	});
-
-	test("rejects absolute paths outside the base", () => {
 		expect(() => safeJoinPath("/staging", "/etc/passwd")).toThrow(PathTraversalError);
-	});
-
-	test("rejects prefix-collision escape (e.g. /staging-evil)", () => {
 		expect(() => safeJoinPath("/staging", "/staging-evil/file")).toThrow(PathTraversalError);
 	});
 
-	test("rejects embedded null byte", () => {
-		expect(() => safeJoinPath("/staging", "x\0y")).toThrow(PathTraversalError);
+	test("accepts win32 paths contained by the base", () => {
+		expect(safeJoinPath("C:\\staging", "sub\\file.txt")).toBe(
+			"C:\\staging\\sub\\file.txt",
+		);
+		expect(safeJoinPath("C:\\staging", ".")).toBe("C:\\staging");
 	});
 
-	test("rejects backslashes (POSIX-only paths inside the archive)", () => {
+	test("rejects win32 parent and cross-drive escapes", () => {
+		expect(() => safeJoinPath("C:\\staging", "..\\escape")).toThrow(
+			PathTraversalError,
+		);
+		expect(() => safeJoinPath("C:\\staging", "D:escape")).toThrow(
+			PathTraversalError,
+		);
+	});
+
+	test("rejects embedded null bytes and POSIX backslashes", () => {
+		expect(() => safeJoinPath("/staging", "x\0y")).toThrow(PathTraversalError);
 		expect(() => safeJoinPath("/staging", "win\\path")).toThrow(PathTraversalError);
 	});
 });
