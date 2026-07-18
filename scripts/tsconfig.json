@@ -16,12 +16,30 @@
 		"resolveJsonModule": true,
 		"esModuleInterop": true,
 		"forceConsistentCasingInFileNames": true,
-		"isolatedModules": true
+		"isolatedModules": true,
+		"baseUrl": ".",
+		"paths": {
+			"@earendil-works/pi-tui-protocol": ["../packages/pi-tui-protocol/src/index.ts"],
+			"@earendil-works/pi-tui-protocol/*": ["../packages/pi-tui-protocol/src/*"],
+			"@earendil-works/pi-coding-agent": ["../packages/extension-host/src/refs.d.ts"],
+			"@earendil-works/pi-coding-agent/*": ["../packages/extension-host/src/refs.d.ts"],
+			"@earendil-works/pi-ai": ["../packages/extension-host/src/refs.d.ts"],
+			"@earendil-works/pi-ai/*": ["../packages/extension-host/src/refs.d.ts"]
+		}
 	},
 	"include": [
 		"release/**/*.ts",
 		"tests/**/*.ts",
+		"verification/**/*.ts",
+		"bench-extension-scaling.ts",
 		"build-extension-host.ts",
 		"package-release.ts"
+	],
+	"exclude": [
+		"verification/extension.ts",
+		"verification/foundation.test.ts",
+		"verification/performance.ts",
+		"verification/e2e-smoke.ts",
+		"verification/pty.ts"
 	]
 }

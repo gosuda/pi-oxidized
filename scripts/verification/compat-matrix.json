@@ -1,0 +1,441 @@
+{
+	"version": "0.1.0",
+	"rows": [
+		{
+			"id": "tui-protocol-check",
+			"surface": "tui-protocol",
+			"tier": "unit",
+			"required": true,
+			"commands": [
+				{
+					"cwd": "packages/pi-tui-protocol",
+					"argv": ["bun", "run", "check"],
+					"timeoutMs": 120000
+				}
+			],
+			"evidence": "tsc -p tsconfig.build.json --noEmit passes"
+		},
+		{
+			"id": "tui-protocol-test",
+			"surface": "tui-protocol",
+			"tier": "unit",
+			"required": true,
+			"commands": [
+				{
+					"cwd": "packages/pi-tui-protocol",
+					"argv": ["bun", "test", "tests"],
+					"timeoutMs": 120000
+				}
+			],
+			"evidence": "bun test tests passes (codec + client)"
+		},
+		{
+			"id": "tui-protocol-build",
+			"surface": "tui-protocol",
+			"tier": "unit",
+			"required": true,
+			"commands": [
+				{
+					"cwd": "packages/pi-tui-protocol",
+					"argv": ["bun", "run", "build"],
+					"timeoutMs": 120000
+				}
+			],
+			"evidence": "tsc -p tsconfig.build.json emits dist/"
+		},
+		{
+			"id": "extension-host-check",
+			"surface": "extension-host",
+			"tier": "unit",
+			"required": true,
+			"commands": [
+				{
+					"cwd": "packages/extension-host",
+					"argv": ["bun", "run", "check"],
+					"timeoutMs": 120000
+				}
+			],
+			"evidence": "tsc --noEmit -p tsconfig.check.json passes"
+		},
+		{
+			"id": "extension-host-test",
+			"surface": "extension-host",
+			"tier": "unit",
+			"required": true,
+			"commands": [
+				{
+					"cwd": "packages/extension-host",
+					"argv": ["bun", "test", "tests"],
+					"timeoutMs": 600000
+				}
+			],
+			"evidence": "host, acceptance, scaling and sanitize suites pass"
+		},
+		{
+			"id": "extension-host-build",
+			"surface": "extension-host",
+			"tier": "unit",
+			"required": true,
+			"commands": [
+				{
+					"cwd": "packages/extension-host",
+					"argv": ["bun", "run", "build"],
+					"timeoutMs": 300000
+				}
+			],
+			"evidence": "bun build compiles the host sidecar binary"
+		},
+		{
+			"id": "handshake",
+			"surface": "handshake",
+			"tier": "host",
+			"required": true,
+			"commands": [
+				{
+					"cwd": "packages/extension-host",
+					"argv": ["bun", "test", "tests"],
+					"timeoutMs": 600000
+				}
+			],
+			"evidence": "host: hello handshake / matching versions ack successfully"
+		},
+		{
+			"id": "registry",
+			"surface": "registry",
+			"tier": "host",
+			"required": true,
+			"commands": [
+				{
+					"cwd": "packages/extension-host",
+					"argv": ["bun", "test", "tests"],
+					"timeoutMs": 600000
+				}
+			],
+			"evidence": "acceptance: registry snapshot and tool/provider bridges / extensions.load returns full RegistrySnapshotWire"
+		},
+		{
+			"id": "tools",
+			"surface": "tools",
+			"tier": "host",
+			"required": true,
+			"commands": [
+				{
+					"cwd": "packages/extension-host",
+					"argv": ["bun", "test", "tests"],
+					"timeoutMs": 600000
+				}
+			],
+			"evidence": "acceptance: registry snapshot and tool/provider bridges / tool progress schema and argument preflight"
+		},
+		{
+			"id": "providers",
+			"surface": "providers",
+			"tier": "host",
+			"required": true,
+			"commands": [
+				{
+					"cwd": "packages/extension-host",
+					"argv": ["bun", "test", "tests"],
+					"timeoutMs": 600000
+				}
+			],
+			"evidence": "acceptance: registry snapshot and tool/provider bridges / provider stream api=custom"
+		},
+		{
+			"id": "lifecycle-33",
+			"surface": "33 lifecycle",
+			"tier": "host",
+			"required": true,
+			"commands": [
+				{
+					"cwd": "packages/extension-host",
+					"argv": ["bun", "test", "tests"],
+					"timeoutMs": 600000
+				}
+			],
+			"evidence": "acceptance: all 33 lifecycle events / runner recognizes handlers for all 33 event types"
+		},
+		{
+			"id": "widgets",
+			"surface": "widgets",
+			"tier": "host",
+			"required": true,
+			"commands": [
+				{
+					"cwd": "packages/extension-host",
+					"argv": ["bun", "test", "tests"],
+					"timeoutMs": 600000
+				}
+			],
+			"evidence": "acceptance: widget slot measure/render / host responds to measure with correct height"
+		},
+		{
+			"id": "terminal-input",
+			"surface": "terminalInput",
+			"tier": "host",
+			"required": true,
+			"commands": [
+				{
+					"cwd": "packages/extension-host",
+					"argv": ["bun", "test", "tests"],
+					"timeoutMs": 600000
+				}
+			],
+			"evidence": "scaling: terminal-input deadlines / fast onTerminalInput consume/rewrite stays under 5ms p99"
+		},
+		{
+			"id": "crash-isolation",
+			"surface": "crash",
+			"tier": "host",
+			"required": true,
+			"commands": [
+				{
+					"cwd": "packages/extension-host",
+					"argv": ["bun", "test", "tests"],
+					"timeoutMs": 600000
+				}
+			],
+			"evidence": "acceptance: crash isolation / handler throw emits extensionError, turn completes"
+		},
+		{
+			"id": "project-trusted",
+			"surface": "projectTrusted",
+			"tier": "host",
+			"required": true,
+			"commands": [
+				{
+					"cwd": "packages/extension-host",
+					"argv": ["bun", "test", "tests"],
+					"timeoutMs": 600000
+				}
+			],
+			"evidence": "acceptance: extension runtime / extensions.load parses projectTrusted and exposes it through hook context"
+		},
+		{
+			"id": "commands",
+			"surface": "commands",
+			"tier": "host",
+			"required": true,
+			"commands": [
+				{
+					"cwd": "packages/extension-host",
+					"argv": ["bun", "test", "tests"],
+					"timeoutMs": 600000
+				}
+			],
+			"evidence": "acceptance: registry snapshot and tool/provider bridges / command.execute invokes registered command and completes"
+		},
+		{
+			"id": "flags",
+			"surface": "flags",
+			"tier": "host",
+			"required": true,
+			"commands": [
+				{
+					"cwd": "packages/extension-host",
+					"argv": ["bun", "test", "tests"],
+					"timeoutMs": 600000
+				}
+			],
+			"evidence": "acceptance: control compatibility / flags.set values are observed through pi.getFlag during session_start and later updates"
+		},
+		{
+			"id": "shortcuts",
+			"surface": "shortcuts",
+			"tier": "host",
+			"required": true,
+			"commands": [
+				{
+					"cwd": "packages/extension-host",
+					"argv": ["bun", "test", "tests"],
+					"timeoutMs": 600000
+				}
+			],
+			"evidence": "acceptance: control compatibility / last registration wins, response precedes handler, and missing keys are unhandled"
+		},
+		{
+			"id": "shortcut-conflicts",
+			"surface": "shortcuts",
+			"tier": "product",
+			"required": true,
+			"commands": [
+				{
+					"cwd": ".",
+					"argv": ["cargo", "test", "-p", "pi", "--lib", "reserved_extension_conflict_falls_through_to_native_binding", "--locked"],
+					"timeoutMs": 600000
+				}
+			],
+			"evidence": "native interactive regression: upstream-reserved bindings suppress colliding extension shortcuts and fall through to the native action"
+		},
+		{
+			"id": "dialogs",
+			"surface": "dialogs",
+			"tier": "host",
+			"required": true,
+			"commands": [
+				{
+					"cwd": "packages/extension-host",
+					"argv": ["bun", "test", "tests"],
+					"timeoutMs": 600000
+				}
+			],
+			"evidence": "acceptance: control compatibility / select, confirm, input, and editor requests correlate real host responses"
+		},
+		{
+			"id": "ui-event",
+			"surface": "uiEvent",
+			"tier": "host",
+			"required": true,
+			"commands": [
+				{
+					"cwd": "packages/extension-host",
+					"argv": ["bun", "test", "tests"],
+					"timeoutMs": 600000
+				}
+			],
+			"evidence": "acceptance: control compatibility / keyed generation-gated input rerenders live custom UI and rejects stale generations"
+		},
+		{
+			"id": "session",
+			"surface": "session",
+			"tier": "host",
+			"required": true,
+			"commands": [
+				{
+					"cwd": "packages/extension-host",
+					"argv": ["bun", "test", "tests"],
+					"timeoutMs": 600000
+				}
+			],
+			"evidence": "acceptance: all 33 lifecycle events / cancellable session events round-trip cancellation through the host"
+		},
+		{
+			"id": "product-extension-tests",
+			"surface": "extension",
+			"tier": "product",
+			"required": true,
+			"commands": [
+				{
+					"cwd": ".",
+					"argv": ["cargo", "test", "-p", "pi-ext", "--locked"],
+					"timeoutMs": 600000
+				}
+			],
+			"evidence": "cargo pi-ext integration tests pass (scaling + extension invariants)"
+		},
+		{
+			"id": "session-interop",
+			"surface": "session interoperability",
+			"tier": "product",
+			"required": true,
+			"commands": [
+				{
+					"cwd": ".",
+					"argv": ["bun", "run", "scripts/verification/e2e-smoke.ts"],
+					"timeoutMs": 900000
+				}
+			],
+			"evidence": "e2e-smoke: rust-interactive-tools-steering-compaction, rust-fork, rust-resume-reload and typescript-real-session-reopen steps pass"
+		},
+		{
+			"id": "flicker",
+			"surface": "flicker",
+			"tier": "performance",
+			"required": true,
+			"commands": [
+				{
+					"cwd": ".",
+					"argv": ["cargo", "test", "--release", "-p", "pi-tui", "--test", "pty_no_flicker", "--locked"],
+					"timeoutMs": 600000
+				}
+			],
+			"evidence": "cargo pi-tui release PTY no-flicker tests pass (sync branches + cursor restore + snapshots)"
+		},
+		{
+			"id": "scaling",
+			"surface": "scaling",
+			"tier": "performance",
+			"required": true,
+			"commands": [
+				{
+					"cwd": ".",
+					"argv": ["bun", "run", "scripts/bench-extension-scaling.ts"],
+					"timeoutMs": 600000
+				}
+			],
+			"evidence": "bench-extension-scaling reports zero/idle/active widget medians and terminal-input p99 within thresholds"
+		},
+		{
+			"id": "performance",
+			"surface": "performance",
+			"tier": "performance",
+			"required": true,
+			"commands": [
+				{
+					"cwd": ".",
+					"argv": ["bun", "run", "scripts/verification/performance.ts"],
+					"timeoutMs": 1200000
+				}
+			],
+			"evidence": "scripts/verification/performance.ts produces target/bench/performance-comparison.json and meets speedup thresholds"
+		},
+		{
+			"id": "release-x86_64-linux",
+			"surface": "release",
+			"tier": "release",
+			"required": true,
+			"commands": [
+				{
+					"cwd": ".",
+					"argv": ["bun", "run", "scripts/package-release.ts", "--target", "x86_64-unknown-linux-gnu"],
+					"timeoutMs": 1800000
+				}
+			],
+			"evidence": "package-release assembles x86_64-unknown-linux-gnu archive and unpack smoke verifies pi --version + host hello handshake"
+		},
+		{
+			"id": "release-aarch64-linux",
+			"surface": "release",
+			"tier": "release",
+			"required": false,
+			"excluded": true,
+			"commands": [],
+			"evidence": "aarch64-linux release unpack smoke is not run on the x86_64 linux dev host",
+			"rationale": "Cross-compiling aarch64 binaries and running them on an x86_64 host is not supported by the local toolchain; CI uses a native runner.",
+			"citation": "scripts/release/targets.ts RUST_TARGETS includes aarch64-unknown-linux-gnu; package-release requires a matching native host for unpack smoke"
+		},
+		{
+			"id": "release-x86_64-darwin",
+			"surface": "release",
+			"tier": "release",
+			"required": false,
+			"excluded": true,
+			"commands": [],
+			"evidence": "x86_64-darwin release unpack smoke is not run on the linux dev host",
+			"rationale": "macOS binaries cannot be executed or fully validated on the linux development host; the target is built and smoke-tested on darwin CI runners.",
+			"citation": "scripts/release/targets.ts RUST_TARGETS includes x86_64-apple-darwin"
+		},
+		{
+			"id": "release-aarch64-darwin",
+			"surface": "release",
+			"tier": "release",
+			"required": false,
+			"excluded": true,
+			"commands": [],
+			"evidence": "aarch64-darwin release unpack smoke is not run on the linux dev host",
+			"rationale": "macOS ARM binaries cannot be executed or fully validated on the linux development host; the target is built and smoke-tested on darwin CI runners.",
+			"citation": "scripts/release/targets.ts RUST_TARGETS includes aarch64-apple-darwin"
+		},
+		{
+			"id": "release-x86_64-windows",
+			"surface": "release",
+			"tier": "release",
+			"required": false,
+			"excluded": true,
+			"commands": [],
+			"evidence": "x86_64-windows release unpack smoke is not run on the linux dev host",
+			"rationale": "Windows PE binaries cannot be executed or fully validated on the linux development host; the target is built and smoke-tested on windows CI runners.",
+			"citation": "scripts/release/targets.ts RUST_TARGETS includes x86_64-pc-windows-msvc"
+		}
+	]
+}
