@@ -357,8 +357,457 @@ enum OutputSlot {
     },
     ToolCall {
         content_index: u64,
-        partial_json: String,
+        arguments: StreamingArguments,
     },
+}
+
+#[derive(Clone, Debug, Default)]
+struct StreamingArguments {
+    raw: String,
+    parser: IncrementalObjectParser,
+}
+
+impl StreamingArguments {
+    fn from_initial(raw: &str) -> Self {
+        let mut arguments = Self::default();
+        arguments.push(raw);
+        arguments
+    }
+
+    fn push(&mut self, fragment: &str) {
+        self.raw.push_str(fragment);
+        self.parser.push(fragment);
+    }
+
+    fn current(&self) -> Map<String, Value> {
+        self.parser.object.clone()
+    }
+
+    fn replace_with_final(&mut self, final_json: String) -> Map<String, Value> {
+        self.raw = final_json;
+        let parsed = parse_streaming_json(&self.raw);
+        self.parser = IncrementalObjectParser::from_object(parsed.clone());
+        parsed
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct IncrementalObjectParser {
+    object: Map<String, Value>,
+    stack: Vec<JsonContainer>,
+    token: Option<JsonToken>,
+    started: bool,
+    rejected: bool,
+}
+
+#[derive(Clone, Debug)]
+enum JsonContainer {
+    Object {
+        path: Vec<JsonPathPart>,
+        state: ObjectState,
+        key: Option<String>,
+    },
+    Array {
+        path: Vec<JsonPathPart>,
+        state: ArrayState,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum JsonPathPart {
+    Key(String),
+    Index(usize),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ObjectState {
+    Key,
+    Colon,
+    Value,
+    Comma,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ArrayState {
+    Value,
+    Comma,
+}
+
+#[derive(Clone, Debug)]
+enum JsonToken {
+    String {
+        destination: StringDestination,
+        value: String,
+        pending_whitespace: String,
+        escape: StringEscape,
+    },
+    Number {
+        path: Vec<JsonPathPart>,
+        raw: String,
+    },
+    Literal {
+        path: Vec<JsonPathPart>,
+        expected: &'static str,
+        raw: String,
+    },
+}
+
+#[derive(Clone, Debug)]
+enum StringDestination {
+    Key,
+    Value(Vec<JsonPathPart>),
+}
+
+#[derive(Clone, Debug)]
+enum StringEscape {
+    None,
+    Slash { base_len: usize },
+    Unicode { base_len: usize, digits: String },
+}
+
+impl Default for StringEscape {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+impl IncrementalObjectParser {
+    fn from_object(object: Map<String, Value>) -> Self {
+        Self { object, started: true, ..Self::default() }
+    }
+
+    fn push(&mut self, fragment: &str) {
+        if self.rejected {
+            return;
+        }
+        for character in fragment.chars() {
+            self.consume(character);
+            if self.rejected {
+                break;
+            }
+        }
+    }
+
+    fn consume(&mut self, character: char) {
+        if let Some(mut token) = self.token.take() {
+            if self.consume_token(&mut token, character) {
+                self.token = Some(token);
+                return;
+            }
+        }
+        self.consume_syntax(character);
+    }
+
+    fn consume_token(&mut self, token: &mut JsonToken, character: char) -> bool {
+        match token {
+            JsonToken::String {
+                destination,
+                value,
+                pending_whitespace,
+                escape,
+            } => {
+                if character.is_whitespace() {
+                    pending_whitespace.push(character);
+                    return true;
+                }
+                value.push_str(pending_whitespace);
+                pending_whitespace.clear();
+                match escape {
+                    StringEscape::None if character == '"' => {
+                        if matches!(destination, StringDestination::Key)
+                            && let Some(JsonContainer::Object { state, key, .. }) =
+                                self.stack.last_mut()
+                        {
+                            *key = Some(value.clone());
+                            *state = ObjectState::Colon;
+                        }
+                        return false;
+                    }
+                    StringEscape::None if character == '\\' => {
+                        let base_len = value.len();
+                        value.push('\\');
+                        *escape = StringEscape::Slash { base_len };
+                    }
+                    StringEscape::Slash { base_len } if character == 'u' => {
+                        value.push('u');
+                        *escape = StringEscape::Unicode {
+                            base_len: *base_len,
+                            digits: String::new(),
+                        };
+                    }
+                    StringEscape::Slash { base_len } => {
+                        let replacement = match character {
+                            '"' => Some('"'),
+                            '\\' => Some('\\'),
+                            '/' => Some('/'),
+                            'b' => Some('\u{0008}'),
+                            'f' => Some('\u{000c}'),
+                            'n' => Some('\n'),
+                            'r' => Some('\r'),
+                            't' => Some('\t'),
+                            _ => None,
+                        };
+                        if let Some(replacement) = replacement {
+                            value.truncate(*base_len);
+                            value.push(replacement);
+                        } else {
+                            value.push(character);
+                        }
+                        *escape = StringEscape::None;
+                    }
+                    StringEscape::Unicode { base_len, digits }
+                        if character.is_ascii_hexdigit() =>
+                    {
+                        digits.push(character);
+                        value.push(character);
+                        if digits.len() == 4 {
+                            if let Ok(code) = u32::from_str_radix(digits, 16)
+                                && let Some(decoded) = char::from_u32(code)
+                            {
+                                value.truncate(*base_len);
+                                value.push(decoded);
+                            }
+                            *escape = StringEscape::None;
+                        }
+                    }
+                    StringEscape::Unicode { .. } => {
+                        value.push(character);
+                        *escape = StringEscape::None;
+                    }
+                    StringEscape::None => value.push(character),
+                }
+                if let StringDestination::Value(path) = destination {
+                    self.set_value(path, Value::String(value.clone()));
+                }
+                true
+            }
+            JsonToken::Number { path, raw } => {
+                if matches!(character, '0'..='9' | '-' | '+' | '.' | 'e' | 'E') {
+                    raw.push(character);
+                    if let Ok(value) = serde_json::from_str::<Value>(raw) {
+                        self.set_value(path, value);
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            JsonToken::Literal { path, expected, raw } => {
+                let next = expected.as_bytes().get(raw.len()).copied().map(char::from);
+                if next == Some(character) {
+                    raw.push(character);
+                    if raw == expected {
+                        let value = match *expected {
+                            "true" => Value::Bool(true),
+                            "false" => Value::Bool(false),
+                            _ => Value::Null,
+                        };
+                        self.set_value(path, value);
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    fn consume_syntax(&mut self, character: char) {
+        if !self.started {
+            if character == '{' {
+                self.started = true;
+                self.stack.push(JsonContainer::Object {
+                    path: Vec::new(),
+                    state: ObjectState::Key,
+                    key: None,
+                });
+            } else if !character.is_whitespace() {
+                self.rejected = true;
+            }
+            return;
+        }
+        if character.is_whitespace() {
+            return;
+        }
+        match self.stack.last() {
+            Some(JsonContainer::Object { state: ObjectState::Key, .. }) => match character {
+                '"' => {
+                    self.token = Some(JsonToken::String {
+                        destination: StringDestination::Key,
+                        value: String::new(),
+                        pending_whitespace: String::new(),
+                        escape: StringEscape::None,
+                    });
+                }
+                '}' => {
+                    let _closed = self.stack.pop();
+                }
+                _ => {}
+            },
+            Some(JsonContainer::Object { state: ObjectState::Colon, .. }) => {
+                if character == ':'
+                    && let Some(JsonContainer::Object { state, .. }) = self.stack.last_mut()
+                {
+                    *state = ObjectState::Value;
+                }
+            }
+            Some(JsonContainer::Object { state: ObjectState::Value, .. })
+            | Some(JsonContainer::Array { state: ArrayState::Value, .. }) => {
+                self.start_value(character);
+            }
+            Some(JsonContainer::Object { state: ObjectState::Comma, .. }) => match character {
+                ',' => {
+                    if let Some(JsonContainer::Object { state, key, .. }) = self.stack.last_mut() {
+                        *state = ObjectState::Key;
+                        *key = None;
+                    }
+                }
+                '}' => {
+                    let _closed = self.stack.pop();
+                }
+                _ => {}
+            },
+            Some(JsonContainer::Array { state: ArrayState::Comma, .. }) => match character {
+                ',' => {
+                    if let Some(JsonContainer::Array { state, .. }) = self.stack.last_mut() {
+                        *state = ArrayState::Value;
+                    }
+                }
+                ']' => {
+                    let _closed = self.stack.pop();
+                }
+                _ => {}
+            },
+            None => {}
+        }
+    }
+
+    fn start_value(&mut self, character: char) {
+        let Some(path) = self.next_value_path() else {
+            return;
+        };
+        match character {
+            '"' => {
+                self.set_value(&path, Value::String(String::new()));
+                self.token = Some(JsonToken::String {
+                    destination: StringDestination::Value(path),
+                    value: String::new(),
+                    pending_whitespace: String::new(),
+                    escape: StringEscape::None,
+                });
+            }
+            '{' => {
+                self.set_value(&path, Value::Object(Map::new()));
+                self.stack.push(JsonContainer::Object {
+                    path,
+                    state: ObjectState::Key,
+                    key: None,
+                });
+            }
+            '[' => {
+                self.set_value(&path, Value::Array(Vec::new()));
+                self.stack.push(JsonContainer::Array {
+                    path,
+                    state: ArrayState::Value,
+                });
+            }
+            't' => self.token = Some(JsonToken::Literal { path, expected: "true", raw: "t".into() }),
+            'f' => self.token = Some(JsonToken::Literal { path, expected: "false", raw: "f".into() }),
+            'n' => self.token = Some(JsonToken::Literal { path, expected: "null", raw: "n".into() }),
+            '-' | '0'..='9' => {
+                let raw = character.to_string();
+                if let Ok(value) = serde_json::from_str::<Value>(&raw) {
+                    self.set_value(&path, value);
+                }
+                self.token = Some(JsonToken::Number { path, raw });
+            }
+            ']' => {
+                let _closed = self.stack.pop();
+            }
+            _ => {}
+        }
+    }
+
+    fn next_value_path(&mut self) -> Option<Vec<JsonPathPart>> {
+        match self.stack.last_mut()? {
+            JsonContainer::Object { path, state, key } => {
+                let key = key.take()?;
+                *state = ObjectState::Comma;
+                let mut value_path = path.clone();
+                value_path.push(JsonPathPart::Key(key));
+                Some(value_path)
+            }
+            JsonContainer::Array { path, state } => {
+                *state = ArrayState::Comma;
+                let mut value_path = path.clone();
+                let index = value_at_path(&self.object, path)
+                    .and_then(Value::as_array)
+                    .map_or(0, Vec::len);
+                value_path.push(JsonPathPart::Index(index));
+                Some(value_path)
+            }
+        }
+    }
+
+    fn set_value(&mut self, path: &[JsonPathPart], value: Value) {
+        let Some((last, parents)) = path.split_last() else {
+            return;
+        };
+        if parents.is_empty() {
+            if let JsonPathPart::Key(key) = last {
+                self.object.insert(key.clone(), value);
+            }
+            return;
+        }
+        let Some(parent) = value_at_path_mut(&mut self.object, parents) else {
+            return;
+        };
+        match (parent, last) {
+            (Value::Object(object), JsonPathPart::Key(key)) => {
+                object.insert(key.clone(), value);
+            }
+            (Value::Array(array), JsonPathPart::Index(index)) if *index == array.len() => {
+                array.push(value);
+            }
+            (Value::Array(array), JsonPathPart::Index(index)) if *index < array.len() => {
+                array[*index] = value;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn value_at_path<'a>(object: &'a Map<String, Value>, path: &[JsonPathPart]) -> Option<&'a Value> {
+    let (first, rest) = path.split_first()?;
+    let JsonPathPart::Key(key) = first else {
+        return None;
+    };
+    let mut value = object.get(key)?;
+    for part in rest {
+        value = match part {
+            JsonPathPart::Key(key) => value.as_object()?.get(key)?,
+            JsonPathPart::Index(index) => value.as_array()?.get(*index)?,
+        };
+    }
+    Some(value)
+}
+
+fn value_at_path_mut<'a>(
+    object: &'a mut Map<String, Value>,
+    path: &[JsonPathPart],
+) -> Option<&'a mut Value> {
+    let (first, rest) = path.split_first()?;
+    let JsonPathPart::Key(key) = first else {
+        return None;
+    };
+    let mut value = object.get_mut(key)?;
+    for part in rest {
+        value = match part {
+            JsonPathPart::Key(key) => value.as_object_mut()?.get_mut(key)?,
+            JsonPathPart::Index(index) => value.as_array_mut()?.get_mut(*index)?,
+        };
+    }
+    Some(value)
 }
 
 impl ResponsesStreamProcessor {
@@ -421,14 +870,20 @@ impl ResponsesStreamProcessor {
             "response.function_call_arguments.delta" => self.tool_delta(&event).await?,
             "response.function_call_arguments.done" => self.tool_arguments_done(&event).await?,
             "response.output_item.done" => self.output_item_done(&event).await?,
-            "response.completed" | "response.incomplete" => {
+            "response.completed" | "response.incomplete" | "response.failed" => {
                 self.saw_terminal = true;
-                self.finalize_response(event.get("response").unwrap_or(&Value::Null));
-                let reason = done_reason(self.state.message().stop_reason);
-                self.sender
-                    .done(reason, self.state.snapshot())
-                    .await
-                    .map_err(|error| ResponsesError::new(error.to_string()))?;
+                let response = event.get("response").unwrap_or(&Value::Null);
+                match self.finalize_response(response, event_type) {
+                    Ok(reason) => {
+                        self.sender
+                            .done(reason, self.state.snapshot())
+                            .await
+                            .map_err(|error| ResponsesError::new(error.to_string()))?;
+                    }
+                    Err(failure) => {
+                        self.fail(failure.reason, failure.message).await?;
+                    }
+                }
                 return Ok(true);
             }
             "error" => {
@@ -443,18 +898,6 @@ impl ResponsesStreamProcessor {
                         .and_then(Value::as_str)
                         .unwrap_or("Unknown error")
                 )));
-            }
-            "response.failed" => {
-                self.saw_terminal = true;
-                let response = event.get("response").unwrap_or(&Value::Null);
-                let error = response.get("error").unwrap_or(&Value::Null);
-                let details = response.get("incomplete_details").unwrap_or(&Value::Null);
-                let message = error
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .or_else(|| details.get("reason").and_then(Value::as_str))
-                    .unwrap_or("Unknown error details in response");
-                return Err(ResponsesError::new(message));
             }
             _ => {}
         }
@@ -524,11 +967,9 @@ impl ResponsesStreamProcessor {
                 self.sender.event(semantic).await.map_err(send_error)?;
                 OutputSlot::ToolCall {
                     content_index,
-                    partial_json: item
-                        .get("arguments")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_owned(),
+                    arguments: StreamingArguments::from_initial(
+                        item.get("arguments").and_then(Value::as_str).unwrap_or(""),
+                    ),
                 }
             }
             _ => return Ok(()),
@@ -566,15 +1007,15 @@ impl ResponsesStreamProcessor {
         };
         let Some(OutputSlot::ToolCall {
             content_index,
-            partial_json,
+            arguments,
         }) = self.slots.get_mut(&output_index)
         else {
             return Ok(());
         };
-        partial_json.push_str(delta);
+        arguments.push(delta);
         let content_index = *content_index;
-        let arguments = parse_streaming_json(partial_json);
-        self.set_tool_arguments(content_index, arguments)?;
+        let parsed = arguments.current();
+        self.set_tool_arguments(content_index, parsed)?;
         let semantic = self
             .state
             .tool_call_delta(content_index, delta)
@@ -593,16 +1034,15 @@ impl ResponsesStreamProcessor {
             .to_owned();
         let Some(OutputSlot::ToolCall {
             content_index,
-            partial_json,
+            arguments,
         }) = self.slots.get_mut(&output_index)
         else {
             return Ok(());
         };
         let content_index = *content_index;
-        let previous = partial_json.clone();
-        *partial_json = final_arguments.clone();
-        let arguments = parse_streaming_json(&final_arguments);
-        self.set_tool_arguments(content_index, arguments)?;
+        let previous = arguments.raw.clone();
+        let parsed = arguments.replace_with_final(final_arguments.clone());
+        self.set_tool_arguments(content_index, parsed)?;
         if let Some(delta) = final_arguments
             .strip_prefix(&previous)
             .filter(|delta| !delta.is_empty())
@@ -669,15 +1109,15 @@ impl ResponsesStreamProcessor {
             }
             OutputSlot::ToolCall {
                 content_index,
-                partial_json,
+                arguments,
             } if item.get("type").and_then(Value::as_str) == Some("function_call") => {
-                let arguments = item
+                let final_json = item
                     .get("arguments")
                     .and_then(Value::as_str)
-                    .unwrap_or(&partial_json);
+                    .unwrap_or(&arguments.raw);
                 let semantic = self
                     .state
-                    .end_tool_call(content_index, parse_streaming_json(arguments))
+                    .end_tool_call(content_index, parse_streaming_json(final_json))
                     .map_err(state_error)?;
                 self.sender.event(semantic).await.map_err(send_error)?;
             }
@@ -686,7 +1126,11 @@ impl ResponsesStreamProcessor {
         Ok(())
     }
 
-    fn finalize_response(&mut self, response: &Value) {
+    fn finalize_response(
+        &mut self,
+        response: &Value,
+        event_type: &str,
+    ) -> Result<DoneReason, TerminalFailure> {
         self.backfill_reasoning(response);
         let usage = response.get("usage").unwrap_or(&Value::Null);
         let input_details = usage.get("input_tokens_details").unwrap_or(&Value::Null);
@@ -740,9 +1184,13 @@ impl ResponsesStreamProcessor {
             }
             message.usage = converted;
         });
+        if let Some(failure) = terminal_failure(response, event_type) {
+            return Err(failure);
+        }
         let reason = done_reason(stop_reason);
         let final_message = self.state.finish(reason);
         self.state = AssistantState::new(final_message);
+        Ok(reason)
     }
 
     fn backfill_reasoning(&mut self, response: &Value) {
@@ -827,6 +1275,36 @@ impl ResponsesStreamProcessor {
         update(&mut message);
         self.state = AssistantState::new(message);
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TerminalFailure {
+    reason: ErrorReason,
+    message: String,
+}
+
+fn terminal_failure(response: &Value, event_type: &str) -> Option<TerminalFailure> {
+    let status = response.get("status").and_then(Value::as_str);
+    let reason = match status {
+        Some("failed") => ErrorReason::Error,
+        Some("cancelled") => ErrorReason::Aborted,
+        None if event_type == "response.failed" => ErrorReason::Error,
+        _ => return None,
+    };
+    let error = response.get("error").unwrap_or(&Value::Null);
+    let details = response
+        .get("incomplete_details")
+        .unwrap_or(&Value::Null);
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| details.get("reason").and_then(Value::as_str))
+        .unwrap_or(match reason {
+            ErrorReason::Aborted => "Request was aborted",
+            ErrorReason::Error => "Unknown error details in response",
+        })
+        .to_owned();
+    Some(TerminalFailure { reason, message })
 }
 
 fn normalize_tool_call_id(
@@ -1057,6 +1535,54 @@ mod tests {
         assert!(tools[0].get("function").is_none());
     }
 
+    #[test]
+    fn incremental_argument_parser_preserves_partial_wire_state() {
+        for complete in [
+            r#"{"path":"src/lib.rs","line":12}"#,
+            r#"{"outer":{"items":[1,2,{"ok":true}]},"none":null}"#,
+            "{\"text\":\"line\nbreak\",\"bad\":\"x\\q\"}",
+            "{\"escaped_control\":\"x\\\ny\"}",
+            r#"{"unicode":"\u263a","fraction":-12.5e2}"#,
+            r#"{"name":"par"#,
+            r#"{"ok":1,"drop":"#,
+            r#"{"text":"tail\"#,
+            r#"{"outer":{"items":[1,2"#,
+            r#"[1,{"not":"an object root"}]"#,
+        ] {
+            let mut parser = StreamingArguments::default();
+            let mut prefix = String::new();
+            for character in complete.chars() {
+                let fragment = character.to_string();
+                prefix.push(character);
+                parser.push(&fragment);
+                assert_eq!(
+                    parser.current(),
+                    parse_streaming_json(&prefix),
+                    "partial argument state diverged at {prefix:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_argument_parser_consumes_many_tiny_fragments() {
+        const PAYLOAD_BYTES: usize = 256 * 1024;
+        let mut parser = StreamingArguments::default();
+        parser.push(r#"{"payload":""#);
+        for _ in 0..PAYLOAD_BYTES {
+            parser.push("x");
+        }
+        parser.push(r#""}"#);
+        assert_eq!(
+            parser
+                .current()
+                .get("payload")
+                .and_then(Value::as_str)
+                .map(str::len),
+            Some(PAYLOAD_BYTES)
+        );
+    }
+
     #[tokio::test]
     async fn partial_json_is_cleaned_and_terminal_usage_is_exact() -> Result<(), String> {
         let (sender, mut stream) = ProviderEventSender::channel(event_capacity(16));
@@ -1132,6 +1658,99 @@ mod tests {
 
     #[tokio::test]
     async fn failed_response_emits_exact_error_fields() -> Result<(), String> {
+        let events = terminal_events(
+            "response.completed",
+            json!({
+                "id":"resp_err",
+                "status":"failed",
+                "error":{"message":"provider rejected"},
+                "usage":{"input_tokens":7,"output_tokens":2,"total_tokens":9}
+            }),
+        )
+        .await?;
+
+        assert!(events.iter().all(|event| !matches!(
+            event,
+            crate::types::AssistantMessageEvent::Done { .. }
+        )));
+        let Some(crate::types::AssistantMessageEvent::Error { reason, error }) = events.last()
+        else {
+            return Err("expected terminal error event".into());
+        };
+        assert_eq!(*reason, ErrorReason::Error);
+        assert_eq!(error.stop_reason, StopReason::Error);
+        assert_eq!(error.error_message.as_deref(), Some("provider rejected"));
+        assert_eq!(error.response_id.as_deref(), Some("resp_err"));
+        assert_eq!(error.usage.input, 7);
+        assert_eq!(error.usage.output, 2);
+        assert!(matches!(
+            error.content.as_slice(),
+            [AssistantContent::Text(text)] if text.text == "partial"
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_response_emits_aborted_with_provider_details() -> Result<(), String> {
+        let events = terminal_events(
+            "response.incomplete",
+            json!({
+                "id":"resp_cancel",
+                "status":"cancelled",
+                "incomplete_details":{"reason":"cancelled by caller"},
+                "usage":{"input_tokens":5,"output_tokens":1,"total_tokens":6}
+            }),
+        )
+        .await?;
+
+        assert!(events.iter().all(|event| !matches!(
+            event,
+            crate::types::AssistantMessageEvent::Done { .. }
+        )));
+        let Some(crate::types::AssistantMessageEvent::Error { reason, error }) = events.last()
+        else {
+            return Err("expected terminal aborted event".into());
+        };
+        assert_eq!(*reason, ErrorReason::Aborted);
+        assert_eq!(error.stop_reason, StopReason::Aborted);
+        assert_eq!(error.error_message.as_deref(), Some("cancelled by caller"));
+        assert_eq!(error.response_id.as_deref(), Some("resp_cancel"));
+        assert_eq!(error.usage.total_tokens, 6);
+        assert!(matches!(
+            error.content.as_slice(),
+            [AssistantContent::Text(text)] if text.text == "partial"
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn incomplete_response_remains_a_successful_length_terminal() -> Result<(), String> {
+        let events = terminal_events(
+            "response.incomplete",
+            json!({
+                "id":"resp_length",
+                "status":"incomplete",
+                "incomplete_details":{"reason":"max_output_tokens"},
+                "usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}
+            }),
+        )
+        .await?;
+
+        let Some(crate::types::AssistantMessageEvent::Done { reason, message }) = events.last()
+        else {
+            return Err("expected terminal done event".into());
+        };
+        assert_eq!(*reason, DoneReason::Length);
+        assert_eq!(message.stop_reason, StopReason::Length);
+        assert_eq!(message.error_message, None);
+        assert_eq!(message.response_id.as_deref(), Some("resp_length"));
+        Ok(())
+    }
+
+    async fn terminal_events(
+        event_type: &str,
+        response: Value,
+    ) -> Result<Vec<crate::types::AssistantMessageEvent>, String> {
         let (sender, mut stream) = ProviderEventSender::channel(event_capacity(8));
         let mut processor = ResponsesStreamProcessor::new(
             model(),
@@ -1140,40 +1759,60 @@ mod tests {
             ProcessOptions::default(),
         );
         processor.start().await.map_err(|error| error.to_string())?;
-        let Err(error) = processor
+        processor
             .handle(json!({
-                "type":"response.failed",
-                "response":{
-                    "id":"resp_err",
-                    "status":"failed",
-                    "error":{"message":"provider rejected"}
-                }
+                "type":"response.output_item.added",
+                "output_index":0,
+                "item":{"type":"message","id":"msg_1","content":[]}
             }))
             .await
-        else {
-            return Err("failed response must error".into());
-        };
-        assert_eq!(error.to_string(), "provider rejected");
+            .map_err(|error| error.to_string())?;
         processor
-            .fail(ErrorReason::Error, format!("OpenAI API error: {error}"))
+            .handle(json!({
+                "type":"response.output_text.delta",
+                "output_index":0,
+                "delta":"partial"
+            }))
             .await
             .map_err(|error| error.to_string())?;
+        let terminal = processor
+            .handle(json!({"type":event_type,"response":response}))
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(terminal);
+        processor.finish().map_err(|error| error.to_string())?;
         drop(processor);
 
         let mut events = Vec::new();
         while let Some(event) = stream.next().await {
             events.push(event.map_err(|error| error.to_string())?);
         }
-        let Some(crate::types::AssistantMessageEvent::Error { reason, error }) = events.last()
+        let [
+            crate::types::AssistantMessageEvent::Start { partial: start },
+            crate::types::AssistantMessageEvent::TextStart {
+                content_index: 0,
+                partial: text_start,
+            },
+            crate::types::AssistantMessageEvent::TextDelta {
+                content_index: 0,
+                delta,
+                partial: text_delta,
+            },
+            _terminal,
+        ] = events.as_slice()
         else {
-            return Err("expected terminal error event".into());
+            return Err(format!("unexpected emitted event sequence: {events:?}"));
         };
-        assert_eq!(*reason, ErrorReason::Error);
-        assert_eq!(error.stop_reason, StopReason::Error);
-        assert_eq!(
-            error.error_message.as_deref(),
-            Some("OpenAI API error: provider rejected")
-        );
-        Ok(())
+        assert!(start.content.is_empty());
+        assert!(matches!(
+            text_start.content.as_slice(),
+            [AssistantContent::Text(text)] if text.text.is_empty()
+        ));
+        assert_eq!(delta, "partial");
+        assert!(matches!(
+            text_delta.content.as_slice(),
+            [AssistantContent::Text(text)] if text.text == "partial"
+        ));
+        Ok(events)
     }
 }

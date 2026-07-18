@@ -76,19 +76,12 @@ impl Provider for OpenAiResponses {
                 .run(&model, &context, &options, &mut processor)
                 .await
             {
-                let reason = if options
+                let cancelled = options
                     .signal
                     .as_ref()
-                    .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
-                    || failure.aborted
-                {
-                    ErrorReason::Aborted
-                } else {
-                    ErrorReason::Error
-                };
-                let _terminal = processor
-                    .fail(reason, format!("OpenAI API error: {}", failure.message))
-                    .await;
+                    .is_some_and(tokio_util::sync::CancellationToken::is_cancelled);
+                let (reason, message) = format_failure(&failure, cancelled);
+                let _terminal = processor.fail(reason, message).await;
             }
         });
         stream
@@ -563,6 +556,17 @@ impl AdapterFailure {
     }
 }
 
+fn format_failure(failure: &AdapterFailure, cancelled: bool) -> (ErrorReason, String) {
+    if cancelled || failure.aborted {
+        (ErrorReason::Aborted, failure.message.clone())
+    } else {
+        (
+            ErrorReason::Error,
+            format!("OpenAI API error: {}", failure.message),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -642,6 +646,25 @@ mod tests {
         assert_eq!(
             headers.get("x-client-request-id").map(String::as_str),
             Some("session")
+        );
+    }
+
+    #[test]
+    fn failure_formatting_preserves_abort_message_and_prefixes_errors() {
+        assert_eq!(
+            format_failure(&AdapterFailure::aborted("Request was aborted"), false),
+            (ErrorReason::Aborted, "Request was aborted".to_owned())
+        );
+        assert_eq!(
+            format_failure(&AdapterFailure::new("request cancelled"), true),
+            (ErrorReason::Aborted, "request cancelled".to_owned())
+        );
+        assert_eq!(
+            format_failure(&AdapterFailure::new("bad request"), false),
+            (
+                ErrorReason::Error,
+                "OpenAI API error: bad request".to_owned()
+            )
         );
     }
 
