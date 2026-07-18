@@ -30,7 +30,9 @@ use pi_ext::adapters::{
 use pi_ext::client::{HostClient, HostClientError, HostEvent, HostUiRequest, HostUiResponse};
 use pi_ext::host::{self, HostError, HostSpec};
 use pi_ext::protocol::{
-    self, DisposeSlot, ExtensionErrorEvent, NotifyRequest, ProviderEvent, ToolUpdate, UiSlot,
+    self, DisposeSlot, ExtensionErrorEvent, FlagValueWire, FlagsSetRequest, FlagsSetResponse,
+    NotifyRequest, ProviderEvent, ShortcutExecuteRequest, ShortcutExecuteResponse, ToolUpdate,
+    UiEventRequest, UiEventResponse, UiSlot,
 };
 use pi_ext::sanitize::{SanitizedSlot, sanitize_slot};
 use serde::{Deserialize, Serialize};
@@ -152,6 +154,9 @@ pub enum HostStartError {
     /// The registration snapshot could not be loaded or decoded.
     #[error("extension host load failed: {0}")]
     Load(String),
+    /// Validated flags could not be synchronized to the host.
+    #[error("extension host flag synchronization failed: {0}")]
+    FlagSync(String),
 }
 
 impl From<HostClientError> for HostStartError {
@@ -209,6 +214,8 @@ struct ShortcutWire {
     key: String,
     #[serde(default)]
     description: Option<String>,
+    #[serde(default)]
+    extension_path: Option<String>,
 }
 
 /// Wire form of [`FlagRegistration`] with its current resolved value.
@@ -225,6 +232,8 @@ struct FlagWire {
     /// Currently resolved value (from CLI / settings), if any.
     #[serde(default)]
     value: Option<Value>,
+    #[serde(default)]
+    extension_path: Option<String>,
 }
 
 /// Wire form of [`RendererRegistration`].
@@ -339,6 +348,8 @@ struct LoadErrorWire {
 struct RegistrySnapshot {
     /// Aggregate registrations (first-wins dedup applied on build).
     registry: Registry,
+    /// Ordered, undeduplicated shortcut registrations for product last-wins resolution.
+    raw_shortcuts: Vec<ShortcutRegistration>,
     /// Extension tool adapters keyed by tool name.
     tools: HashMap<String, Arc<dyn AgentTool>>,
     /// Lifecycle event types with at least one handler.
@@ -390,10 +401,13 @@ fn build_snapshot(wire: RegistrySnapshotWire, client: &Arc<HostClient>) -> Regis
     }
 
     for shortcut in wire.shortcuts {
-        let _ = snapshot.registry.register_shortcut(ShortcutRegistration {
+        let registration = ShortcutRegistration {
             key: shortcut.key,
             description: shortcut.description,
-        });
+            extension_path: shortcut.extension_path,
+        };
+        snapshot.raw_shortcuts.push(registration.clone());
+        let _ = snapshot.registry.register_shortcut(registration);
     }
 
     for flag in wire.flags {
@@ -405,6 +419,7 @@ fn build_snapshot(wire: RegistrySnapshotWire, client: &Arc<HostClient>) -> Regis
                 _ => adapters::FlagKind::String,
             },
             default: flag.default.clone(),
+            extension_path: flag.extension_path,
         }) {
             // First-wins: prefer the host-resolved value, fall back to default.
             let value = flag
@@ -1088,6 +1103,18 @@ impl HostExtensionRunner {
             .unwrap_or_default()
     }
 
+    /// Ordered, undeduplicated host shortcut registrations.
+    ///
+    /// Product code applies last-wins filtering after combining extension and native shortcuts.
+    #[must_use]
+    pub fn raw_shortcuts(&self) -> Vec<ShortcutRegistration> {
+        self.inner
+            .snapshot
+            .read()
+            .map(|guard| guard.raw_shortcuts.clone())
+            .unwrap_or_default()
+    }
+
     /// Current reload generation (starts at 1, bumps on each reload).
     #[must_use]
     pub fn reload_generation(&self) -> u64 {
@@ -1100,21 +1127,70 @@ impl HostExtensionRunner {
         self.inner.client.is_running() && !self.inner.disabled.load(Ordering::Relaxed)
     }
 
-    /// Set a flag value (CLI / settings source). Preserved across reload by
-    /// the caller re-applying values after [`HostExtensionRunner::reload`].
-    pub fn set_flag_value(&self, name: &str, value: Value) {
-        if let Ok(mut flags) = self.inner.flag_values.write() {
-            flags.insert(name.to_owned(), value);
+    /// Synchronize a complete validated flag overlay with the host.
+    ///
+    /// The local flag snapshot is updated only after the host acknowledges the request.
+    pub async fn apply_flag_values(
+        &self,
+        values: &BTreeMap<String, FlagValueWire>,
+    ) -> Result<(), HostClientError> {
+        let payload = protocol::to_payload(&FlagsSetRequest {
+            values: values.clone(),
+        })
+        .map_err(|error| HostClientError::Payload(format!("encode flags.set: {error}")))?;
+        let frame = self
+            .inner
+            .hook_request(protocol::FLAGS_SET_METHOD, payload)
+            .await?;
+        let response: FlagsSetResponse = protocol::from_payload(&frame.payload)
+            .map_err(|error| HostClientError::Payload(format!("decode flags.set: {error}")))?;
+        if !response.ok {
+            return Err(HostClientError::Payload(
+                "flags.set rejected by extension host".to_owned(),
+            ));
         }
-    }
-
-    /// Apply a batch of flag values (CLI / preserved-across-reload).
-    pub fn apply_flag_values(&self, values: &HashMap<String, Value>) {
         if let Ok(mut flags) = self.inner.flag_values.write() {
             for (name, value) in values {
-                flags.insert(name.clone(), value.clone());
+                let value = match value {
+                    FlagValueWire::Boolean(value) => Value::Bool(*value),
+                    FlagValueWire::String(value) => Value::String(value.clone()),
+                };
+                flags.insert(name.clone(), value);
             }
         }
+        Ok(())
+    }
+
+    /// Dispatch one effective extension shortcut.
+    pub async fn execute_shortcut(
+        &self,
+        key: impl Into<String>,
+    ) -> Result<ShortcutExecuteResponse, HostClientError> {
+        let payload = protocol::to_payload(&ShortcutExecuteRequest { key: key.into() }).map_err(
+            |error| HostClientError::Payload(format!("encode shortcut.execute: {error}")),
+        )?;
+        let frame = self
+            .inner
+            .hook_request(protocol::SHORTCUT_EXECUTE_METHOD, payload)
+            .await?;
+        protocol::from_payload(&frame.payload).map_err(|error| {
+            HostClientError::Payload(format!("decode shortcut.execute: {error}"))
+        })
+    }
+
+    /// Deliver one event to a keyed UI slot generation.
+    pub async fn send_ui_event(
+        &self,
+        request: UiEventRequest,
+    ) -> Result<UiEventResponse, HostClientError> {
+        let payload = protocol::to_payload(&request)
+            .map_err(|error| HostClientError::Payload(format!("encode uiEvent: {error}")))?;
+        let frame = self
+            .inner
+            .hook_request(protocol::Method::UiEvent.as_str(), payload)
+            .await?;
+        protocol::from_payload(&frame.payload)
+            .map_err(|error| HostClientError::Payload(format!("decode uiEvent: {error}")))
     }
 
     // -- Slot / tool-update / provider / error subscriptions ---------------
@@ -1359,10 +1435,28 @@ impl HostExtensionRunner {
             self.inner.project_trusted,
         )
         .await?;
-        // 4. Re-register providers (sibling isolation on individual failures).
+        // 4. Restore flags before any replacement-host hook can run.
+        let preserved_flags = preserved_flags
+            .into_iter()
+            .map(|(name, value)| {
+                let value = match value {
+                    Value::Bool(value) => FlagValueWire::Boolean(value),
+                    Value::String(value) => FlagValueWire::String(value),
+                    other => {
+                        return Err(HostStartError::FlagSync(format!(
+                            "flag {name:?} has unsupported value {other}"
+                        )));
+                    }
+                };
+                Ok((name, value))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        replacement
+            .apply_flag_values(&preserved_flags)
+            .await
+            .map_err(|error| HostStartError::FlagSync(error.to_string()))?;
+        // 5. Re-register providers (sibling isolation on individual failures).
         let _ = replacement.register_providers_on(runtime);
-        // 5. Restore flags.
-        replacement.apply_flag_values(&preserved_flags);
         Ok(replacement)
     }
 

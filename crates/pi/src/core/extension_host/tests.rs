@@ -7,7 +7,7 @@
 //! generation + stale-slot invalidation, the HTML renderer, and exactly-once
 //! shutdown.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -32,7 +32,8 @@ use pi_ext::client::HostClient;
 #[cfg(unix)]
 use pi_ext::host::{HostSource, HostSpec};
 use pi_ext::protocol::{
-    ExtensionErrorEvent, Frame, FrameKind, HelloAck, decode_frame_str, encode_frame,
+    ExtensionErrorEvent, FlagValueWire, Frame, FrameKind, HelloAck, KeyEventKindWire,
+    KeyModifiersWire, UiEventRequest, UiEventWire, decode_frame_str, encode_frame,
 };
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -59,7 +60,7 @@ enum FakeCmd {
     Close,
 }
 
-/// Handle to drive the fake host.
+#[derive(Clone)]
 struct FakeHost {
     cmd_tx: mpsc::Sender<FakeCmd>,
     responses: Arc<Mutex<HashMap<String, Value>>>,
@@ -230,12 +231,16 @@ fn dispatch(
         serde_json::to_value(HelloAck::local()).unwrap_or(Value::Null)
     } else if req.method == "extensions.load" {
         snapshot.clone()
+    } else if let Some(payload) = responses
+        .lock()
+        .ok()
+        .and_then(|map| map.get(&req.method).cloned())
+    {
+        payload
+    } else if req.method == pi_ext::protocol::FLAGS_SET_METHOD {
+        json!({"ok": true})
     } else {
-        responses
-            .lock()
-            .ok()
-            .and_then(|map| map.get(&req.method).cloned())
-            .unwrap_or_else(|| Value::Object(Map::new()))
+        Value::Object(Map::new())
     };
     Some(Frame {
         id: req.id,
@@ -578,6 +583,179 @@ async fn registry_first_registration_wins_for_duplicates() -> R {
     assert_eq!(registry.commands().len(), 1);
     assert_eq!(registry.providers().len(), 1);
     assert_eq!(runner.get_all_registered_tools().len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn shortcut_order_and_extension_metadata_are_preserved() -> R {
+    let snapshot = json!({
+        "shortcuts": [
+            {"key": "ctrl+x", "description": "first", "extensionPath": "/ext/a.ts"},
+            {"key": "ctrl+x", "description": "second", "extensionPath": "/ext/b.ts"}
+        ],
+        "flags": [{
+            "name": "mode",
+            "type": "string",
+            "extensionPath": "/ext/flags.ts"
+        }]
+    });
+    let (runner, _host) = make_runner(snapshot).await?;
+    let registry = runner.registry();
+    assert_eq!(registry.shortcuts().len(), 1, "legacy registry stays first-wins");
+    assert_eq!(
+        registry.shortcuts()[0].extension_path.as_deref(),
+        Some("/ext/a.ts")
+    );
+    assert_eq!(
+        registry.flags()[0].extension_path.as_deref(),
+        Some("/ext/flags.ts")
+    );
+    let raw = runner.raw_shortcuts();
+    assert_eq!(raw.len(), 2, "product projection needs every registration");
+    assert_eq!(raw[0].description.as_deref(), Some("first"));
+    assert_eq!(raw[1].description.as_deref(), Some("second"));
+    assert_eq!(raw[1].extension_path.as_deref(), Some("/ext/b.ts"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn flags_set_acks_before_updating_local_values_and_rejection_preserves_state() -> R {
+    let snapshot = json!({
+        "flags": [{
+            "name": "verbose",
+            "type": "boolean",
+            "value": false,
+            "extensionPath": "/ext/a.ts"
+        }]
+    });
+    let (runner, host) = make_runner(snapshot).await?;
+    let values = BTreeMap::from([("verbose".to_owned(), FlagValueWire::Boolean(true))]);
+    runner.apply_flag_values(&values).await?;
+    let request = host
+        .requests
+        .lock()
+        .map_err(|_| "request lock poisoned")?
+        .iter()
+        .find(|request| request.method == pi_ext::protocol::FLAGS_SET_METHOD)
+        .cloned()
+        .ok_or("missing flags.set request")?;
+    assert_eq!(request.payload, json!({"values": {"verbose": true}}));
+    assert_eq!(
+        runner.get_flag_values().get("verbose"),
+        Some(&Value::Bool(true))
+    );
+
+    host.set_response(pi_ext::protocol::FLAGS_SET_METHOD, json!({"ok": false}));
+    let rejected =
+        BTreeMap::from([("verbose".to_owned(), FlagValueWire::Boolean(false))]);
+    assert!(runner.apply_flag_values(&rejected).await.is_err());
+    assert_eq!(
+        runner.get_flag_values().get("verbose"),
+        Some(&Value::Bool(true)),
+        "rejected values must not leak into local state"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn flags_set_must_ack_before_startup_can_complete() -> R {
+    let snapshot = json!({
+        "flags": [{"name": "verbose", "type": "boolean", "value": false}]
+    });
+    let (runner, host) = make_runner(snapshot).await?;
+    host.drop_method(pi_ext::protocol::FLAGS_SET_METHOD);
+    let task_runner = Arc::clone(&runner);
+    let apply = tokio::spawn(async move {
+        task_runner
+            .apply_flag_values(&BTreeMap::from([(
+                "verbose".to_owned(),
+                FlagValueWire::Boolean(true),
+            )]))
+            .await
+    });
+    host.wait_for_request(pi_ext::protocol::FLAGS_SET_METHOD)
+        .await?;
+    assert!(!apply.is_finished(), "startup must wait for the host ACK");
+    assert_eq!(
+        runner.get_flag_values().get("verbose"),
+        Some(&Value::Bool(false)),
+        "local state must remain unchanged while flags.set is pending"
+    );
+    let request = host
+        .requests
+        .lock()
+        .map_err(|_| "request lock poisoned")?
+        .iter()
+        .find(|request| request.method == pi_ext::protocol::FLAGS_SET_METHOD)
+        .cloned()
+        .ok_or("missing pending flags.set")?;
+    host.emit(Frame {
+        id: request.id,
+        kind: FrameKind::Res,
+        method: request.method,
+        payload: json!({"ok": true}),
+    })
+    .await;
+    apply.await??;
+    assert_eq!(
+        runner.get_flag_values().get("verbose"),
+        Some(&Value::Bool(true))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn shortcut_and_ui_event_requests_use_typed_wire_payloads() -> R {
+    let (runner, host) = make_runner(full_snapshot()).await?;
+    host.set_response(
+        pi_ext::protocol::SHORTCUT_EXECUTE_METHOD,
+        json!({"handled": true}),
+    );
+    let shortcut = runner.execute_shortcut("ctrl+alt+p").await?;
+    assert!(shortcut.handled);
+
+    host.set_response("uiEvent", json!({"delivered": true}));
+    let delivered = runner
+        .send_ui_event(UiEventRequest {
+            key: "overlay.1".to_owned(),
+            generation: 7,
+            event: UiEventWire::Key {
+                code: "p".to_owned(),
+                modifiers: KeyModifiersWire {
+                    ctrl: Some(true),
+                    ..KeyModifiersWire::default()
+                },
+                kind: KeyEventKindWire::Press,
+            },
+            data: Some("\u{10}".to_owned()),
+        })
+        .await?;
+    assert!(delivered.delivered);
+
+    let requests = host.requests.lock().map_err(|_| "request lock poisoned")?;
+    let shortcut_request = requests
+        .iter()
+        .find(|request| request.method == pi_ext::protocol::SHORTCUT_EXECUTE_METHOD)
+        .ok_or("missing shortcut.execute request")?;
+    assert_eq!(shortcut_request.payload, json!({"key": "ctrl+alt+p"}));
+    let ui_request = requests
+        .iter()
+        .find(|request| request.method == "uiEvent")
+        .ok_or("missing uiEvent request")?;
+    assert_eq!(
+        ui_request.payload,
+        json!({
+            "key": "overlay.1",
+            "generation": 7,
+            "event": {
+                "type": "key",
+                "code": "p",
+                "modifiers": {"ctrl": true},
+                "kind": "press"
+            },
+            "data": "\u{10}"
+        })
+    );
     Ok(())
 }
 
@@ -1045,6 +1223,8 @@ async fn trusted_restart_sends_true_in_replacement_load_request() -> R {
     let runtime = ModelRuntime::create(CreateModelRuntimeOptions::default()).await?;
     let observed = Arc::new(Mutex::new(Vec::<Value>::new()));
     let observed_by_start = Arc::clone(&observed);
+    let replacement_host = Arc::new(Mutex::new(None::<FakeHost>));
+    let replacement_host_by_start = Arc::clone(&replacement_host);
 
     let replacement = runner
         .restart_and_rewire_with(
@@ -1069,6 +1249,10 @@ async fn trusted_restart_sends_true_in_replacement_load_request() -> R {
                     .lock()
                     .map_err(|_| HostStartError::Load("observed lock poisoned".to_owned()))?
                     .push(load.payload);
+                *replacement_host_by_start
+                    .lock()
+                    .map_err(|_| HostStartError::Load("host lock poisoned".to_owned()))? =
+                    Some(host);
                 Ok(replacement)
             },
         )
@@ -1079,6 +1263,35 @@ async fn trusted_restart_sends_true_in_replacement_load_request() -> R {
         assert_eq!(payloads.len(), 1);
         assert_eq!(payloads[0]["projectTrusted"], true);
     }
+    let replacement_fake = replacement_host
+        .lock()
+        .map_err(|_| "host lock poisoned")?
+        .as_ref()
+        .cloned()
+        .ok_or("replacement host missing")?;
+    replacement_fake.set_response("resources_discover", json!({"paths": []}));
+    let _ = replacement
+        .emit_resources_discover("/workspace", "reload")
+        .await?;
+    let methods = replacement_fake
+        .requests
+        .lock()
+        .map_err(|_| "request lock poisoned")?
+        .iter()
+        .map(|request| request.method.clone())
+        .collect::<Vec<_>>();
+    let flags_index = methods
+        .iter()
+        .position(|method| method == pi_ext::protocol::FLAGS_SET_METHOD)
+        .ok_or("missing replacement flags.set")?;
+    let hook_index = methods
+        .iter()
+        .position(|method| method == "resources_discover")
+        .ok_or("missing replacement resources_discover")?;
+    assert!(
+        flags_index < hook_index,
+        "replacement flags.set must precede reload resource hooks"
+    );
     replacement.shutdown_once().await;
     Ok(())
 }

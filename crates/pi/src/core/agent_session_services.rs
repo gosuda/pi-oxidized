@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use pi_ai::providers::KnownProvider;
 use pi_ai::types::{Model, ModelThinkingLevel};
+use pi_ext::protocol::FlagValueWire;
 use thiserror::Error;
 
 use super::agent_session::extension_runner::ExtensionRunner;
@@ -498,7 +499,7 @@ pub async fn create_agent_session_services_with_trust(
     .await?;
 
     let mut diagnostics = extension_discovery_diagnostics(&resource_loader);
-    let (extension_runner, host_registered_flags) = start_extension_phase(
+    let (mut extension_runner, host_registered_flags) = start_extension_phase(
         &resource_loader,
         discovery,
         &foundation.cwd,
@@ -507,6 +508,23 @@ pub async fn create_agent_session_services_with_trust(
         &mut diagnostics,
     )
     .await;
+
+    let mut registered_flags = registered_extension_flags;
+    registered_flags.extend(host_registered_flags);
+    let (flag_diagnostics, applied_flags) =
+        apply_extension_flag_values(extension_flag_values.unwrap_or_default(), &registered_flags);
+    diagnostics.extend(flag_diagnostics);
+    if let Some(runner) = extension_runner.as_deref()
+        && let Err(error) = apply_flags_to_runner(runner, &applied_flags).await
+    {
+        diagnostics.push(AgentSessionRuntimeDiagnostic::error(format!(
+            "Extension flags failed to apply: {error}"
+        )));
+        runner.unregister_providers_from(&foundation.model_runtime);
+        runner.shutdown_once().await;
+        extension_runner = None;
+    }
+
     let mut startup_resources_discovered = false;
     if let Some(runner) = extension_runner.as_deref()
         && runner.has_handlers("resources_discover")
@@ -543,13 +561,6 @@ pub async fn create_agent_session_services_with_trust(
             allow_network: Some(false),
         })
         .await;
-
-    let mut registered_flags = registered_extension_flags;
-    registered_flags.extend(host_registered_flags);
-    let (flag_diagnostics, applied_flags) =
-        apply_extension_flag_values(extension_flag_values.unwrap_or_default(), &registered_flags);
-    diagnostics.extend(flag_diagnostics);
-    apply_flags_to_runner(extension_runner.as_deref(), &applied_flags);
 
     Ok(AgentSessionServices {
         cwd: foundation.cwd,
@@ -715,24 +726,21 @@ async fn start_extension_phase(
     }
 }
 
-fn apply_flags_to_runner(
-    runner: Option<&HostExtensionRunner>,
+async fn apply_flags_to_runner(
+    runner: &HostExtensionRunner,
     applied_flags: &BTreeMap<String, ExtensionFlagValue>,
-) {
-    let Some(runner) = runner else {
-        return;
-    };
+) -> Result<(), pi_ext::client::HostClientError> {
     let values = applied_flags
         .iter()
         .map(|(name, value)| {
-            let json = match value {
-                ExtensionFlagValue::Bool(value) => serde_json::Value::Bool(*value),
-                ExtensionFlagValue::Str(value) => serde_json::Value::String(value.clone()),
+            let value = match value {
+                ExtensionFlagValue::Bool(value) => FlagValueWire::Boolean(*value),
+                ExtensionFlagValue::Str(value) => FlagValueWire::String(value.clone()),
             };
-            (name.clone(), json)
+            (name.clone(), value)
         })
         .collect();
-    runner.apply_flag_values(&values);
+    runner.apply_flag_values(&values).await
 }
 
 /// Validate and apply extension CLI flag values.
