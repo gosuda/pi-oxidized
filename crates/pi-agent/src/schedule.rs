@@ -435,8 +435,17 @@ impl ParallelBatch {
             tokio::select! {
                 biased;
                 () = self.cancel.cancelled() => {
+                    // Prefer the real outcome of any worker that already
+                    // finished (its side effects happened); only still-running
+                    // workers are aborted and synthesized as aborted.
                     self.workers.abort_all();
-                    while self.workers.join_next().await.is_some() {}
+                    while let Some(joined) = self.workers.join_next().await {
+                        if let Ok(worker) = joined {
+                            drain_parallel_updates(update_rx, slots, emit);
+                            settle_worker(slots, worker, emit);
+                        }
+                    }
+                    drain_parallel_updates(update_rx, slots, emit);
                     settle_all_pending(slots, "Operation aborted", emit);
                     return;
                 }
@@ -450,13 +459,20 @@ impl ParallelBatch {
                     if let Some(Ok(worker)) = joined {
                         settle_worker(slots, worker, emit);
                     }
-                    let _ = self.spawn_next();
+                    if !self.cancel.is_cancelled() {
+                        let _ = self.spawn_next();
+                    }
                 }
             }
         }
 
         drain_parallel_updates(update_rx, slots, emit);
-        settle_all_pending(slots, "Tool execution ended without a result", emit);
+        let message = if self.cancel.is_cancelled() {
+            "Operation aborted"
+        } else {
+            "Tool execution ended without a result"
+        };
+        settle_all_pending(slots, message, emit);
     }
 }
 
@@ -688,15 +704,22 @@ async fn execute_prepared_tool_call(
         tokio::select! {
             biased;
             () = cancel.cancelled() => {
+                // A worker that already finished keeps its real outcome; only
+                // a still-running tool is force-aborted and synthesized.
                 worker.abort_all();
-                while worker.join_next().await.is_some() {}
+                let mut ready = None;
+                while let Some(joined) = worker.join_next().await {
+                    if let Ok(outcome) = joined {
+                        ready = Some(outcome);
+                    }
+                }
                 while let Ok(partial) = update_rx.try_recv() {
                     emit_tool_execution_update(&tool_call, partial, emit);
                 }
-                return ExecutedOutcome {
+                return ready.unwrap_or_else(|| ExecutedOutcome {
                     result: error_tool_result("Operation aborted"),
                     is_error: true,
-                };
+                });
             }
             joined = worker.join_next() => {
                 while let Ok(partial) = update_rx.try_recv() {
@@ -968,6 +991,7 @@ mod tests {
         LateUpdate,
         PanicOnExecute,
         IgnoreCancel,
+        CancelThenSucceed,
         Progress(usize),
     }
 
@@ -1109,6 +1133,10 @@ mod tests {
                         added_tool_names: None,
                         terminate: None,
                     });
+                }
+
+                if behavior == ToolBehavior::CancelThenSucceed {
+                    cancel.cancel();
                 }
 
                 let mut content = vec![ToolResultContent::Text(TextContent::new(result_text))];
@@ -1613,6 +1641,144 @@ mod tests {
                     "expected one paired error end for {id}, got {ends}"
                 ));
             }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finished_sequential_work_keeps_real_outcome_over_cancel() -> TestResult {
+        // The tool cancels the run token, then completes successfully, so the
+        // worker result and the cancellation are ready together. The real
+        // outcome must win over a fabricated abort.
+        let tool = RecordingTool {
+            behavior: ToolBehavior::CancelThenSucceed,
+            ..RecordingTool::new("finish")
+        };
+        let late_tool = RecordingTool::new("never");
+        let late_executed = Arc::clone(&late_tool.executed);
+        let context = context_with(vec![Arc::new(tool), Arc::new(late_tool)]);
+        let assistant = assistant_with_calls(vec![
+            ToolCall::new("c1", "finish", Map::new()),
+            ToolCall::new("c2", "never", Map::new()),
+        ]);
+        let config = sample_config(ToolExecutionMode::Sequential);
+        let (_events, emit) = collect_emit();
+
+        let batch = execute_tool_calls(
+            &context,
+            &assistant,
+            &config,
+            &CancellationToken::new(),
+            &emit,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+        let first = batch.messages.first().ok_or("missing first result")?;
+        if first.is_error {
+            return Err(format!("finished work was fabricated as abort: {first:?}"));
+        }
+        if !first.content.iter().any(|content| {
+            matches!(
+                content,
+                ToolResultContent::Text(text) if text.text == "finish-ok"
+            )
+        }) {
+            return Err(format!("real outcome lost: {:?}", first.content));
+        }
+        let second = batch.messages.get(1).ok_or("missing second result")?;
+        if !second.is_error {
+            return Err("post-cancel call was not aborted".to_owned());
+        }
+        if late_executed.load(Ordering::SeqCst) {
+            return Err("post-cancel sequential tool still executed".to_owned());
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finished_parallel_work_keeps_real_outcome_and_blocks_post_cancel_spawn() -> TestResult
+    {
+        // One worker cancels the token inside its own poll and then completes,
+        // so its completion and the cancellation are ready together in the
+        // collector. Its real result must be kept, the still-running siblings
+        // must settle as aborted, and the queued job beyond the concurrency
+        // cap must never execute after cancellation.
+        let finish_tool = RecordingTool {
+            behavior: ToolBehavior::CancelThenSucceed,
+            ..RecordingTool::new("finish")
+        };
+        let hang_tool = RecordingTool {
+            behavior: ToolBehavior::IgnoreCancel,
+            ..RecordingTool::new("hang")
+        };
+        let queued_tool = RecordingTool::new("queued");
+        let queued_executed = Arc::clone(&queued_tool.executed);
+        let context = context_with(vec![
+            Arc::new(finish_tool),
+            Arc::new(hang_tool),
+            Arc::new(queued_tool),
+        ]);
+        let mut calls = vec![ToolCall::new("c0", "finish", Map::new())];
+        calls.extend(
+            (1..MAX_PARALLEL_TOOL_CALLS)
+                .map(|index| ToolCall::new(format!("c{index}"), "hang", Map::new())),
+        );
+        calls.push(ToolCall::new("queued", "queued", Map::new()));
+        let assistant = assistant_with_calls(calls);
+        let config = sample_config(ToolExecutionMode::Parallel);
+        let (_events, emit) = collect_emit();
+
+        let batch = timeout(
+            Duration::from_secs(2),
+            execute_tool_calls(
+                &context,
+                &assistant,
+                &config,
+                &CancellationToken::new(),
+                &emit,
+            ),
+        )
+        .await
+        .map_err(|_| "cancelled batch did not settle".to_owned())?
+        .map_err(|error| error.to_string())?;
+
+        if batch.messages.len() != MAX_PARALLEL_TOOL_CALLS + 1 {
+            return Err(format!("missing results: {}", batch.messages.len()));
+        }
+        let finished = batch.messages.first().ok_or("missing finished result")?;
+        if finished.is_error {
+            return Err(format!("finished worker fabricated as abort: {finished:?}"));
+        }
+        if !finished.content.iter().any(|content| {
+            matches!(
+                content,
+                ToolResultContent::Text(text) if text.text == "finish-ok"
+            )
+        }) {
+            return Err(format!("real outcome lost: {:?}", finished.content));
+        }
+        for message in batch.messages.iter().skip(1) {
+            if !message.is_error {
+                return Err(format!(
+                    "unfinished call {} was not aborted",
+                    message.tool_call_id
+                ));
+            }
+            if !message.content.iter().any(|content| {
+                matches!(
+                    content,
+                    ToolResultContent::Text(text) if text.text.contains("Operation aborted")
+                )
+            }) {
+                return Err(format!(
+                    "aborted content missing for {}: {:?}",
+                    message.tool_call_id, message.content
+                ));
+            }
+        }
+        if queued_executed.load(Ordering::SeqCst) {
+            return Err("post-cancel spawn executed the queued tool".to_owned());
         }
         Ok(())
     }
