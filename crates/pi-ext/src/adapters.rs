@@ -21,7 +21,7 @@ use std::time::Duration;
 use crossterm::event::{KeyCode, KeyModifiers};
 use futures::Stream;
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style as RatatuiStyle};
 use serde_json::{Map, Value};
 use tokio::sync::mpsc;
@@ -32,6 +32,9 @@ use pi_ai::provider::{Provider, ProviderError, StreamOptions};
 use pi_ai::types::{AssistantMessageEvent, Context, Model};
 use pi_tui::component::{Component, EventResult, UiEvent};
 use pi_tui::focus::{FocusId, Focusable};
+use pi_tui::frame::{RawRegion, push_raw_region, set_cursor};
+use pi_tui::link::{format_link_close, format_link_open};
+use pi_tui::text::slice_with_width;
 
 use crate::client::HostClient;
 use crate::protocol::{
@@ -546,12 +549,43 @@ impl Component for SlotComponent {
             let mut x = area.x;
             for run in line {
                 let style = wire_style_to_ratatui(&run.style);
-                let printed = paint_run(buf, x, y, area.right(), &run.text, style);
+                let remaining = usize::from(area.right().saturating_sub(x));
+                let rendered = slice_with_width(&run.text, 0, remaining, true);
+                if rendered.width == 0 {
+                    continue;
+                }
+                buf.set_stringn(x, y, &rendered.text, remaining, style);
+                let printed = u16::try_from(rendered.width).unwrap_or(u16::MAX);
+                if let Some(link) = &run.style.link
+                    && let Some(open) = format_link_open(&link.uri, link.id.as_deref())
+                {
+                    let mut bytes = Vec::new();
+                    bytes.extend_from_slice(open.as_bytes());
+                    bytes.extend_from_slice(sgr_open(&run.style).as_bytes());
+                    bytes.extend_from_slice(rendered.text.as_bytes());
+                    bytes.extend_from_slice(b"\x1b[0m");
+                    bytes.extend_from_slice(format_link_close().as_bytes());
+                    push_raw_region(RawRegion {
+                        area: Rect::new(x, y, printed, 1),
+                        bytes,
+                        kitty_id: None,
+                    });
+                }
                 x = x.saturating_add(printed);
                 if x >= area.right() {
                     break;
                 }
             }
+        }
+        if self.focused
+            && area.width > 0
+            && area.height > 0
+            && let Some(cursor) = self.slot.cursor
+        {
+            set_cursor(Position {
+                x: area.x.saturating_add(cursor.col.min(area.width.saturating_sub(1))),
+                y: area.y.saturating_add(cursor.row.min(area.height.saturating_sub(1))),
+            });
         }
     }
 
@@ -592,24 +626,6 @@ impl Focusable for SlotComponent {
     }
 }
 
-/// Paint one run's text into `buf` starting at `(x, y)`, clamped to `right`.
-/// Returns the number of cells advanced (ASCII width assumption).
-fn paint_run(buf: &mut Buffer, x: u16, y: u16, right: u16, text: &str, style: RatatuiStyle) -> u16 {
-    let mut advanced = 0u16;
-    for ch in text.chars() {
-        if x.saturating_add(advanced) >= right {
-            break;
-        }
-        buf.set_string(
-            x.saturating_add(advanced),
-            y,
-            ch.encode_utf8(&mut [0u8; 4]),
-            style,
-        );
-        advanced = advanced.saturating_add(1);
-    }
-    advanced
-}
 
 /// Convert a wire style into a Ratatui style.
 fn wire_style_to_ratatui(style: &crate::protocol::Style) -> RatatuiStyle {
@@ -640,6 +656,65 @@ fn wire_style_to_ratatui(style: &crate::protocol::Style) -> RatatuiStyle {
         out = out.bg(wire_color_to_ratatui(bg));
     }
     out
+}
+
+fn sgr_open(style: &crate::protocol::Style) -> String {
+    let mut codes = Vec::<String>::new();
+    for (enabled, code) in [
+        (style.bold, "1"),
+        (style.dim, "2"),
+        (style.italic, "3"),
+        (style.underline, "4"),
+        (style.reverse, "7"),
+        (style.strikethrough, "9"),
+    ] {
+        if enabled == Some(true) {
+            codes.push(code.to_owned());
+        }
+    }
+    if let Some(color) = &style.fg {
+        codes.push(sgr_color(color, false));
+    }
+    if let Some(color) = &style.bg {
+        codes.push(sgr_color(color, true));
+    }
+    if codes.is_empty() {
+        String::new()
+    } else {
+        format!("\x1b[{}m", codes.join(";"))
+    }
+}
+
+fn sgr_color(color: &WireColor, background: bool) -> String {
+    match color {
+        WireColor::Indexed { index } => {
+            format!("{};5;{index}", if background { 48 } else { 38 })
+        }
+        WireColor::Rgb { r, g, b } => {
+            format!("{};2;{r};{g};{b}", if background { 48 } else { 38 })
+        }
+        WireColor::Named { name } => {
+            let foreground = match name {
+                NamedColor::Black => 30,
+                NamedColor::Red => 31,
+                NamedColor::Green => 32,
+                NamedColor::Yellow => 33,
+                NamedColor::Blue => 34,
+                NamedColor::Magenta => 35,
+                NamedColor::Cyan => 36,
+                NamedColor::White => 37,
+                NamedColor::BrightBlack => 90,
+                NamedColor::BrightRed => 91,
+                NamedColor::BrightGreen => 92,
+                NamedColor::BrightYellow => 93,
+                NamedColor::BrightBlue => 94,
+                NamedColor::BrightMagenta => 95,
+                NamedColor::BrightCyan => 96,
+                NamedColor::BrightWhite => 97,
+            };
+            (if background { foreground + 10 } else { foreground }).to_string()
+        }
+    }
 }
 
 fn wire_color_to_ratatui(color: &WireColor) -> Color {
@@ -734,6 +809,50 @@ fn map_key_code(code: KeyCode) -> String {
         KeyCode::F(n) => format!("f{n}"),
         KeyCode::Null => "null".to_owned(),
         _ => "unknown".to_owned(),
+    }
+}
+
+/// Convert the wire overlay layout value into the product-agnostic TUI type.
+#[must_use]
+pub fn tui_overlay_spec(spec: &crate::protocol::OverlaySpec) -> pi_tui::layout::OverlaySpec {
+    use crate::protocol::{OverlayAnchor as WireAnchor, OverlayMarginWire, SizeValue as WireSize};
+    use pi_tui::layout::{OverlayAnchor, OverlayMargin, SizeValue};
+
+    let size = |value: crate::protocol::SizeValue| match value {
+        WireSize::Cells(cells) => SizeValue::Cells(cells),
+        WireSize::Percent(percent) => SizeValue::Percent(percent),
+    };
+    let anchor = spec.anchor.map(|anchor| match anchor {
+        WireAnchor::Center => OverlayAnchor::Center,
+        WireAnchor::TopLeft => OverlayAnchor::TopLeft,
+        WireAnchor::TopRight => OverlayAnchor::TopRight,
+        WireAnchor::BottomLeft => OverlayAnchor::BottomLeft,
+        WireAnchor::BottomRight => OverlayAnchor::BottomRight,
+        WireAnchor::TopCenter => OverlayAnchor::TopCenter,
+        WireAnchor::BottomCenter => OverlayAnchor::BottomCenter,
+        WireAnchor::LeftCenter => OverlayAnchor::LeftCenter,
+        WireAnchor::RightCenter => OverlayAnchor::RightCenter,
+    });
+    let margin = spec.margin.map(|margin| match margin {
+        OverlayMarginWire::Uniform(value) => OverlayMargin::uniform(value),
+        OverlayMarginWire::Sides(sides) => OverlayMargin {
+            top: sides.top,
+            right: sides.right,
+            bottom: sides.bottom,
+            left: sides.left,
+        },
+    });
+    pi_tui::layout::OverlaySpec {
+        width: spec.width.map(size),
+        min_width: spec.min_width,
+        max_height: spec.max_height.map(size),
+        anchor,
+        offset_x: spec.offset_x,
+        offset_y: spec.offset_y,
+        row: spec.row.map(size),
+        col: spec.col.map(size),
+        margin,
+        non_capturing: spec.non_capturing,
     }
 }
 
@@ -1484,6 +1603,70 @@ mod tests {
         );
         Ok(())
     }
+    #[test]
+    fn linked_styled_run_emits_balanced_safe_osc8_and_keeps_buffer_style() {
+        use std::cell::RefCell;
+
+        let slot = crate::protocol::UiSlot {
+            key: "links".to_owned(),
+            generation: 1,
+            placement: SlotPlacement::AboveEditor,
+            height: 1,
+            runs: vec![vec![
+                StyledRun {
+                    text: "safe".to_owned(),
+                    style: Style {
+                        bold: Some(true),
+                        fg: Some(WireColor::Named {
+                            name: NamedColor::Red,
+                        }),
+                        link: Some(crate::protocol::Hyperlink {
+                            id: Some("docs".to_owned()),
+                            uri: "https://safe.example/docs".to_owned(),
+                        }),
+                        ..Style::default()
+                    },
+                },
+                StyledRun {
+                    text: "bad\u{1b}]8;;https://evil.example".to_owned(),
+                    style: Style {
+                        link: Some(crate::protocol::Hyperlink {
+                            id: None,
+                            uri: "javascript:alert(1)\u{1b}".to_owned(),
+                        }),
+                        ..Style::default()
+                    },
+                },
+            ]],
+            focusable: false,
+            cursor: None,
+            overlay_options: None,
+        };
+        let mut component = SlotComponent::from_ui_slot(&slot);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 3, 1));
+        let annotations = RefCell::new(pi_tui::frame::FrameAnnotations::new());
+        pi_tui::frame::with_annotations(&annotations, || {
+            component.render(buffer.area, &mut buffer);
+        });
+
+        assert!(
+            buffer
+                .cell((0, 0))
+                .is_some_and(|cell| cell.modifier.contains(Modifier::BOLD))
+        );
+        let annotations = annotations.into_inner();
+        assert_eq!(annotations.raw_regions().len(), 1);
+        assert_eq!(annotations.raw_regions()[0].area.width, 3);
+        let raw = String::from_utf8_lossy(&annotations.raw_regions()[0].bytes);
+        let open = "\u{1b}]8;id=docs;https://safe.example/docs\u{1b}\\";
+        let close = "\u{1b}]8;;\u{1b}\\";
+        assert_eq!(raw.matches(open).count(), 1);
+        assert_eq!(raw.matches(close).count(), 1);
+        assert!(raw.contains("\u{1b}[1;31msaf\u{1b}[0m"));
+        assert!(!raw.contains("javascript:"));
+        assert!(!raw.contains("evil.example"));
+    }
+
 
     fn base_model_defaults() -> Model {
         Model {
@@ -1537,8 +1720,42 @@ mod tests {
             "escape leaked into buffer: {text:?}"
         );
         assert!(text.starts_with("Red"), "unexpected render: {text:?}");
+        assert!(
+            buf.cell((0, 0))
+                .is_some_and(|cell| cell.modifier.contains(Modifier::BOLD)),
+            "structured bold style must survive projection"
+        );
         let _ = &mut hostile;
         Ok(())
+    }
+
+    #[test]
+    fn focused_slot_component_publishes_clamped_hardware_cursor() {
+        use std::cell::RefCell;
+
+        let slot = crate::protocol::UiSlot {
+            key: "cursor".to_owned(),
+            generation: 1,
+            placement: SlotPlacement::AboveEditor,
+            height: 2,
+            runs: vec![vec![StyledRun {
+                text: "x".to_owned(),
+                style: Style::default(),
+            }]],
+            focusable: true,
+            cursor: Some(crate::protocol::SlotCursor { col: 99, row: 99 }),
+            overlay_options: None,
+        };
+        let mut component = SlotComponent::from_ui_slot(&slot);
+        component.set_focused(true);
+        let area = Rect::new(4, 6, 3, 2);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 10));
+        let annotations = RefCell::new(pi_tui::frame::FrameAnnotations::new());
+        pi_tui::frame::with_annotations(&annotations, || component.render(area, &mut buffer));
+        assert_eq!(
+            annotations.into_inner().cursor(),
+            Some(Position { x: 6, y: 7 })
+        );
     }
 
     #[tokio::test]

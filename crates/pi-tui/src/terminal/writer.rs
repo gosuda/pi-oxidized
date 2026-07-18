@@ -321,10 +321,12 @@ impl<W: Write> Tui<W> {
             payload.extend_from_slice(&kitty_delete_id(*id));
         }
         for region in raw_regions {
+            payload.extend_from_slice(b"\x1b7");
             let y = region.area.y.saturating_add(1);
             let x = region.area.x.saturating_add(1);
             payload.extend_from_slice(format!("\x1b[{y};{x}H").as_bytes());
             payload.extend_from_slice(&region.bytes);
+            payload.extend_from_slice(b"\x1b8");
         }
         self.state.live_kitty_ids = next_ids;
 
@@ -769,6 +771,30 @@ mod tests {
         }
     }
 
+    struct RawRegionRoot;
+
+    impl Component for RawRegionRoot {
+        fn measure(&mut self, _width: u16) -> u16 {
+            1
+        }
+
+        fn render(&mut self, area: Rect, buf: &mut Buffer) {
+            buf[(area.x, area.y)].set_char('R');
+            crate::frame::push_raw_region(crate::frame::RawRegion {
+                area: Rect::new(2, 1, 3, 1),
+                bytes: b"RAW".to_vec(),
+                kitty_id: None,
+            });
+        }
+
+        fn handle_event(&mut self, _event: &UiEvent) -> EventResult {
+            EventResult::Ignored
+        }
+
+        fn invalidate(&mut self) {}
+    }
+
+
     #[test]
     fn coalescer_arms_deadline_once() {
         let mut c = Coalescer::new();
@@ -925,6 +951,25 @@ mod tests {
         assert_eq!(report.sync_begin, 1);
         assert_eq!(report.sync_end, 1);
         assert!(report.is_clean());
+        Ok(())
+    }
+
+    #[test]
+    fn raw_region_transaction_saves_positions_and_restores_cursor() -> io::Result<()> {
+        let caps = TerminalCapabilities {
+            sync_output: true,
+            ..TerminalCapabilities::default()
+        };
+        let outer = Cursor::new(Vec::new());
+        let mut tui = Tui::new(outer, Size::new(20, 8), Position::ORIGIN, 3, caps)?;
+        tui.commit(Txn::Frame, &mut RawRegionRoot)?;
+        assert!(
+            tui.last_payload()
+                .windows(b"\x1b7\x1b[2;3HRAW\x1b8".len())
+                .any(|bytes| bytes == b"\x1b7\x1b[2;3HRAW\x1b8"),
+            "raw region must restore the cursor: {:?}",
+            String::from_utf8_lossy(tui.last_payload())
+        );
         Ok(())
     }
 
