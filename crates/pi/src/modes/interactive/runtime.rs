@@ -46,6 +46,7 @@ use std::time::{Duration, Instant};
 use futures::future::{BoxFuture, poll_fn};
 use pi_ai::AssistantMessage;
 use pi_tui::component::{Component, EventResult, UiEvent};
+use pi_tui::keys::{ParsedKeyId, encode_key_event, key_matches_parsed, parse_key_id};
 use pi_tui::components::editor::{Editor, EditorOptions};
 use pi_tui::terminal::caps::TerminalCapabilities;
 use pi_tui::terminal::input::TerminalInput;
@@ -58,11 +59,14 @@ use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::core::agent_session::events::AgentSessionEvent;
+use crate::core::agent_session::extension_runner::ExtensionRunner;
 use crate::core::agent_session::prompt::{PromptOptions, StreamingBehavior};
 use crate::core::extension_host::{ExtensionUiEvent, HostExtensionRunner};
 use crate::core::platform::external_editor::{EditOutcome, edit_text_in_external_editor};
 use pi_ext::client::{HostUiRequest, HostUiResponse};
-use pi_ext::protocol::{NotifyLevel, SlotPlacement};
+use pi_ext::protocol::{
+    KeyEventKindWire, KeyModifiersWire, NotifyLevel, SlotPlacement, UiEventRequest, UiEventWire,
+};
 use pi_ext::sanitize::SanitizedSlot;
 
 use super::input::{DoubleEscapeAction, InputMapper, InputState};
@@ -811,7 +815,11 @@ pub struct InteractiveRuntime<W: Write, S: SessionHost> {
     extension_runner: Option<Arc<HostExtensionRunner>>,
     extension_events: Option<tokio::sync::broadcast::Receiver<ExtensionUiEvent>>,
     extension_requests: Option<mpsc::Receiver<HostUiRequest>>,
-    extension_slots: std::collections::HashMap<String, SlotPlacement>,
+    extension_slots: std::collections::HashMap<String, ProjectedExtensionSlot>,
+    focused_extension_slot: Option<String>,
+    effective_extension_shortcuts: Vec<EffectiveExtensionShortcut>,
+    extension_action_rx: mpsc::UnboundedReceiver<Result<(), String>>,
+    extension_action_tx: mpsc::UnboundedSender<Result<(), String>>,
     pending_extension_dialog: Option<PendingExtensionDialog>,
     extension_select_rx: mpsc::UnboundedReceiver<String>,
     extension_select_tx: mpsc::UnboundedSender<String>,
@@ -866,7 +874,24 @@ struct PromptOperations {
 struct PendingExtensionDialog {
     request: HostUiRequest,
     saved_editor_text: Option<String>,
+    saved_editor_placeholder: String,
     deadline: Option<Instant>,
+}
+
+#[derive(Clone, Debug)]
+struct EffectiveExtensionShortcut {
+    key: String,
+    dispatch_key: String,
+    parsed: ParsedKeyId,
+    description: Option<String>,
+    source: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ProjectedExtensionSlot {
+    placement: SlotPlacement,
+    generation: u64,
+    focusable: bool,
 }
 
 impl PromptOperations {
@@ -924,12 +949,17 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         let initial_extension_slots = extension_runner
             .as_ref()
             .map_or_else(Vec::new, |runner| runner.current_slots());
+        let effective_extension_shortcuts = extension_runner
+            .as_ref()
+            .map_or_else(Vec::new, |runner| build_effective_extension_shortcuts(&runner.raw_shortcuts()));
+        view.extension_shortcuts = shortcut_hints(&effective_extension_shortcuts);
 
         let (submit_tx, submit_rx) = mpsc::unbounded_channel::<String>();
         let (select_tx, select_rx) =
             mpsc::unbounded_channel::<(super::state::SelectorKind, String)>();
         let (cancel_tx, cancel_rx) = mpsc::unbounded_channel::<()>();
         let (extension_select_tx, extension_select_rx) = mpsc::unbounded_channel::<String>();
+        let (extension_action_tx, extension_action_rx) = mpsc::unbounded_channel();
 
         let mut editor = Editor::new(
             &pi_tui::components::editor::EditorTheme::default(),
@@ -967,6 +997,10 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             extension_events,
             extension_requests,
             extension_slots: std::collections::HashMap::new(),
+            focused_extension_slot: None,
+            effective_extension_shortcuts,
+            extension_action_rx,
+            extension_action_tx,
             pending_extension_dialog: None,
             extension_select_rx,
             extension_select_tx,
@@ -1199,6 +1233,11 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                         }
                     }
                 }
+                extension_result = self.extension_action_rx.recv() => {
+                    if let Some(Err(error)) = extension_result {
+                        self.last_error = Some(error);
+                    }
+                }
             }
 
             // Run any pending settle as its own transaction.
@@ -1249,6 +1288,9 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         let Some(event) = self.intercept_terminal_input(event).await else {
             return Ok(());
         };
+        if self.route_extension_input(&event) {
+            return Ok(());
+        }
         // Swap the editor (and active selector) into a throwaway-built
         // InteractiveRoot so we can route the event, then recover both.
         let saved_editor = std::mem::replace(&mut self.editor, Editor::with_defaults());
@@ -1473,8 +1515,11 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             ViewAction::DequeueFollowUp => self.dequeue_follow_up(),
             ViewAction::CopyLastAssistant => self.copy_last_assistant().await,
             ViewAction::Reload => {
+                if self.pending_extension_dialog.is_some() {
+                    self.cancel_extension_dialog().await;
+                }
                 self.record_err(self.session.reload().await);
-                self.rebind_extension_channels();
+                self.rebind_extension_channels().await;
                 ActionOutcome::Repaint
             }
             ViewAction::SlashCommand { name, args } => self.submit_slash_command(name, args).await,
@@ -1503,6 +1548,26 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     }
 
     async fn submit_slash_command(&mut self, name: String, args: String) -> ActionOutcome {
+        if let Some(runner) = self.extension_runner.as_ref()
+            && runner
+                .registry()
+                .commands()
+                .iter()
+                .any(|command| command.name == name)
+        {
+            let runner = Arc::clone(runner);
+            let result_tx = self.extension_action_tx.clone();
+            tokio::spawn(async move {
+                let result = runner
+                    .execute_command(&name, &args)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string());
+                let _ = result_tx.send(result);
+            });
+            return ActionOutcome::Repaint;
+        }
+
         let command = if args.is_empty() {
             format!("/{name}")
         } else {
@@ -1551,8 +1616,10 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 lines: Vec::new(),
                 height: 1,
             });
+            self.view.extension_overlay_slot = None;
             self.view.focus = FocusArea::Overlay;
         }
+        self.view.extension_overlay_slot = None;
         self.input_state.reset_taps();
         ActionOutcome::Repaint
     }
@@ -1609,6 +1676,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
 
     fn dismiss_overlay(&mut self) -> ActionOutcome {
         self.view.overlay = None;
+        self.view.extension_overlay_slot = None;
         self.view.focus = FocusArea::Editor;
         self.input_state.reset_taps();
         ActionOutcome::Repaint
@@ -1616,13 +1684,16 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
 
     async fn replace_session(&mut self, replacement: SessionReplacement) -> ActionOutcome {
         self.quiesce_prompt_operations().await;
+        if self.pending_extension_dialog.is_some() {
+            self.cancel_extension_dialog().await;
+        }
         let result = match replacement {
             SessionReplacement::New => self.session.new_session().await,
             SessionReplacement::Fork => self.session.fork("").await,
             SessionReplacement::Clone => <S as SessionHost>::clone(&self.session).await,
         };
         self.record_err(result);
-        self.rebind_session_channels();
+        self.rebind_session_channels().await;
         self.refresh_footer().await;
         ActionOutcome::Repaint
     }
@@ -1875,16 +1946,22 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             }
             super::state::SelectorKind::Session => {
                 self.quiesce_prompt_operations().await;
+                if self.pending_extension_dialog.is_some() {
+                    self.cancel_extension_dialog().await;
+                }
                 self.record_err(self.session.switch_session(&value).await);
-                self.rebind_session_channels();
+                self.rebind_session_channels().await;
                 self.refresh_footer().await;
                 self.close_selector();
                 ActionOutcome::Repaint
             }
             super::state::SelectorKind::Fork => {
                 self.quiesce_prompt_operations().await;
+                if self.pending_extension_dialog.is_some() {
+                    self.cancel_extension_dialog().await;
+                }
                 self.record_err(self.session.fork(&value).await);
-                self.rebind_session_channels();
+                self.rebind_session_channels().await;
                 self.refresh_footer().await;
                 self.close_selector();
                 ActionOutcome::Repaint
@@ -1894,6 +1971,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
 
     fn close_selector(&mut self) {
         self.view.overlay = None;
+        self.view.extension_overlay_slot = None;
         self.active_selector = None;
         self.active_selector_kind = None;
         self.view.focus = FocusArea::Editor;
@@ -1939,6 +2017,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             lines: Vec::new(),
             height: 1,
         });
+        self.view.extension_overlay_slot = None;
         self.view.focus = FocusArea::Overlay;
         self.input_state.reset_taps();
         ActionOutcome::Repaint
@@ -1951,6 +2030,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 self.active_selector_kind = Some(kind);
                 self.view.focus = FocusArea::Selector;
                 self.view.overlay = None;
+                self.view.extension_overlay_slot = None;
                 self.input_state.reset_taps();
             }
             Err(error) => self.last_error = Some(error),
@@ -2120,6 +2200,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             self.cancel_extension_dialog().await;
         }
         let deadline = dialog_timeout(&request).map(|timeout| Instant::now() + timeout);
+        let saved_editor_placeholder = self.view.editor.placeholder.clone();
         let mut saved_editor_text = None;
         match &request {
             HostUiRequest::Select { request, .. } => {
@@ -2168,6 +2249,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         self.pending_extension_dialog = Some(PendingExtensionDialog {
             request,
             saved_editor_text,
+            saved_editor_placeholder,
             deadline,
         });
         self.input_state.reset_taps();
@@ -2207,11 +2289,13 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         {
             self.last_error = Some(error.to_string());
         }
-        if let Some(saved) = dialog.and_then(|dialog| dialog.saved_editor_text) {
-            self.editor.set_text(&saved);
-            self.view.editor.text = saved;
+        if let Some(dialog) = dialog {
+            if let Some(saved) = dialog.saved_editor_text {
+                self.editor.set_text(&saved);
+                self.view.editor.text = saved;
+            }
+            self.view.editor.placeholder = dialog.saved_editor_placeholder;
         }
-        self.view.editor.placeholder.clear();
         self.close_selector();
         self.arm_coalescer();
     }
@@ -2237,16 +2321,24 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
 
     fn project_extension_slot(&mut self, slot: SanitizedSlot) {
         self.dispose_extension_slot(&slot.key);
-        let lines = slot
-            .lines
-            .iter()
-            .map(|line| line.iter().map(|run| run.text.as_str()).collect::<String>())
-            .collect::<Vec<_>>();
+        let non_capturing = slot
+            .overlay_options
+            .as_ref()
+            .is_some_and(|options| options.non_capturing);
+        let captures_focus = slot.focusable && !non_capturing;
+        if captures_focus {
+            for widget in self
+                .view
+                .widgets_above
+                .iter_mut()
+                .chain(self.view.widgets_below.iter_mut())
+            {
+                widget.focused = false;
+            }
+        }
         let widget = WidgetSlot {
-            key: slot.key.clone(),
-            lines: lines.clone(),
-            height: slot.height,
-            focusable: slot.focusable,
+            slot: slot.clone(),
+            focused: captures_focus,
         };
         match slot.placement {
             SlotPlacement::Footer | SlotPlacement::BelowEditor => {
@@ -2256,27 +2348,38 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 self.view.overlay = Some(Overlay {
                     kind: OverlayKind::Extension,
                     height: slot.height,
-                    lines,
+                    lines: Vec::new(),
                 });
-                self.view.focus = if slot.focusable {
-                    FocusArea::Overlay
-                } else {
-                    FocusArea::Editor
-                };
+                self.view.extension_overlay_slot = Some(slot.clone());
             }
             SlotPlacement::Header
             | SlotPlacement::AboveEditor
             | SlotPlacement::Editor
             | SlotPlacement::MessageRenderer => self.view.widgets_above.push(widget),
         }
-        self.extension_slots.insert(slot.key, slot.placement);
+        if captures_focus {
+            self.focused_extension_slot = Some(slot.key.clone());
+            self.view.focus = if slot.placement == SlotPlacement::Overlay {
+                FocusArea::Overlay
+            } else {
+                FocusArea::Widget
+            };
+        }
+        self.extension_slots.insert(
+            slot.key,
+            ProjectedExtensionSlot {
+                placement: slot.placement,
+                generation: slot.generation,
+                focusable: captures_focus,
+            },
+        );
     }
 
     fn dispose_extension_slot(&mut self, key: &str) {
-        self.view.widgets_above.retain(|slot| slot.key != key);
-        self.view.widgets_below.retain(|slot| slot.key != key);
+        self.view.widgets_above.retain(|slot| slot.slot.key != key);
+        self.view.widgets_below.retain(|slot| slot.slot.key != key);
         if matches!(
-            self.extension_slots.remove(key),
+            self.extension_slots.remove(key).map(|slot| slot.placement),
             Some(SlotPlacement::Overlay)
         ) && self
             .view
@@ -2285,11 +2388,19 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             .is_some_and(|overlay| overlay.kind == OverlayKind::Extension)
         {
             self.view.overlay = None;
+            self.view.extension_overlay_slot = None;
+            self.view.focus = FocusArea::Editor;
+        }
+        if self.focused_extension_slot.as_deref() == Some(key) {
+            self.focused_extension_slot = None;
             self.view.focus = FocusArea::Editor;
         }
     }
 
-    fn rebind_extension_channels(&mut self) {
+    async fn rebind_extension_channels(&mut self) {
+        if self.pending_extension_dialog.is_some() {
+            self.cancel_extension_dialog().await;
+        }
         self.extension_runner = self.session.host_extension_runner();
         let current_slots = self
             .extension_runner
@@ -2305,6 +2416,13 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             .and_then(|runner| runner.take_ui_requests());
         self.pending_extension_dialog = None;
         self.extension_slots.clear();
+        self.focused_extension_slot = None;
+        self.view.extension_overlay_slot = None;
+        self.effective_extension_shortcuts = self.extension_runner.as_ref().map_or_else(
+            Vec::new,
+            |runner| build_effective_extension_shortcuts(&runner.raw_shortcuts()),
+        );
+        self.view.extension_shortcuts = shortcut_hints(&self.effective_extension_shortcuts);
         self.view.widgets_above.clear();
         self.view.widgets_below.clear();
         if self
@@ -2318,6 +2436,64 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         for slot in current_slots {
             self.project_extension_slot(slot);
         }
+    }
+
+    fn route_extension_input(&mut self, event: &UiEvent) -> bool {
+        if !matches!(event, UiEvent::Key(_) | UiEvent::Paste(_)) {
+            return false;
+        }
+        if let Some(key) = self.focused_extension_slot.clone()
+            && let Some(slot) = self.extension_slots.get(&key)
+            && slot.focusable
+            && let Some(runner) = self.extension_runner.as_ref()
+        {
+            let request = UiEventRequest {
+                key,
+                generation: slot.generation,
+                event: ui_event_wire(event),
+                data: encode_terminal_input(event),
+            };
+            let runner = Arc::clone(runner);
+            let result_tx = self.extension_action_tx.clone();
+            tokio::spawn(async move {
+                let result = runner
+                    .send_ui_event(request)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string());
+                let _ = result_tx.send(result);
+            });
+            return true;
+        }
+
+        let UiEvent::Key(key_event) = event else {
+            return false;
+        };
+        if key_event.kind == crossterm::event::KeyEventKind::Release {
+            return false;
+        }
+        let Some(shortcut) = self
+            .effective_extension_shortcuts
+            .iter()
+            .find(|shortcut| key_matches_parsed(key_event, &shortcut.parsed))
+        else {
+            return false;
+        };
+        let Some(runner) = self.extension_runner.as_ref() else {
+            return false;
+        };
+        let runner = Arc::clone(runner);
+        let key = shortcut.dispatch_key.clone();
+        let result_tx = self.extension_action_tx.clone();
+        tokio::spawn(async move {
+            let result = runner
+                .execute_shortcut(key)
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string());
+            let _ = result_tx.send(result);
+        });
+        true
     }
 
     async fn intercept_terminal_input(&mut self, event: UiEvent) -> Option<UiEvent> {
@@ -2353,7 +2529,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
 
     /// Rebind event/partial subscriptions and reload the transcript after a
     /// session replacement. Used by production rebind callback and tests.
-    pub fn rebind_session_channels(&mut self) {
+    pub async fn rebind_session_channels(&mut self) {
         self.events = self.session.subscribe();
         self.partial = self.session.partial_rx();
         let snapshot = self.session.snapshot();
@@ -2368,7 +2544,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         self.chat_prefix_len = usize::MAX;
         self.chat_tail_cache = None;
         self.chat_dirty = true;
-        self.rebind_extension_channels();
+        self.rebind_extension_channels().await;
     }
 
     async fn refresh_footer(&mut self) {
@@ -4077,7 +4253,7 @@ pub async fn run_interactive_mode(
                 // Rebind channels in case a replacement happened while we
                 // were suspended (defensive; replacement normally rebinds
                 // via the host callback + next action).
-                rt.rebind_session_channels();
+                rt.rebind_session_channels().await;
             }
             InteractiveExit::ExternalEditor => {
                 run_external_editor_handoff(&mut rt, &mut guard, enable_kitty).await?;
@@ -4227,6 +4403,105 @@ fn dialog_timeout(request: &HostUiRequest) -> Option<Duration> {
     Some(Duration::from_millis(timeout_ms))
 }
 
+const RESERVED_EXTENSION_SHORTCUTS: &[&str] = &[
+    "escape",
+    "ctrl+c",
+    "ctrl+d",
+    "ctrl+z",
+    "shift+tab",
+    "ctrl+p",
+    "shift+ctrl+p",
+    "ctrl+l",
+    "ctrl+o",
+    "ctrl+t",
+    "ctrl+g",
+    "ctrl+x",
+    "alt+enter",
+    "enter",
+    "ctrl+k",
+];
+
+fn build_effective_extension_shortcuts(
+    registrations: &[pi_ext::adapters::ShortcutRegistration],
+) -> Vec<EffectiveExtensionShortcut> {
+    let reserved = RESERVED_EXTENSION_SHORTCUTS
+        .iter()
+        .filter_map(|key| parse_key_id(key).ok())
+        .map(|key| key.canonical_id())
+        .collect::<Vec<_>>();
+    let mut effective = Vec::<EffectiveExtensionShortcut>::new();
+    for registration in registrations {
+        let Ok(parsed) = parse_key_id(&registration.key) else {
+            continue;
+        };
+        let key = parsed.canonical_id().as_str().to_owned();
+        if reserved.iter().any(|reserved| reserved.as_str() == key) {
+            continue;
+        }
+        effective.retain(|shortcut| shortcut.key != key);
+        effective.push(EffectiveExtensionShortcut {
+            key,
+            dispatch_key: registration.key.clone(),
+            parsed,
+            description: registration.description.clone(),
+            source: registration.extension_path.clone(),
+        });
+    }
+    effective
+}
+
+fn shortcut_hints(shortcuts: &[EffectiveExtensionShortcut]) -> Vec<super::state::ShortcutHint> {
+    shortcuts
+        .iter()
+        .map(|shortcut| super::state::ShortcutHint {
+            key: shortcut.key.clone(),
+            action: shortcut
+                .description
+                .clone()
+                .or_else(|| shortcut.source.clone())
+                .unwrap_or_else(|| "Extension shortcut".to_owned()),
+        })
+        .collect()
+}
+
+fn ui_event_wire(event: &UiEvent) -> UiEventWire {
+    match event {
+        UiEvent::Key(key) => {
+            let (code, modifiers) = pi_tui::keys::normalize_event(key)
+                .unwrap_or_else(|| (format!("{:?}", key.code), key.modifiers));
+            UiEventWire::Key {
+                code,
+                modifiers: KeyModifiersWire {
+                    shift: modifiers
+                        .contains(crossterm::event::KeyModifiers::SHIFT)
+                        .then_some(true),
+                    alt: modifiers
+                        .contains(crossterm::event::KeyModifiers::ALT)
+                        .then_some(true),
+                    ctrl: modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL)
+                        .then_some(true),
+                    super_key: modifiers
+                        .contains(crossterm::event::KeyModifiers::SUPER)
+                        .then_some(true),
+                },
+                kind: match key.kind {
+                    crossterm::event::KeyEventKind::Press => KeyEventKindWire::Press,
+                    crossterm::event::KeyEventKind::Repeat => KeyEventKindWire::Repeat,
+                    crossterm::event::KeyEventKind::Release => KeyEventKindWire::Release,
+                },
+            }
+        }
+        UiEvent::Paste(text) => UiEventWire::Paste { text: text.clone() },
+        UiEvent::FocusGained => UiEventWire::FocusGained,
+        UiEvent::FocusLost => UiEventWire::FocusLost,
+        UiEvent::Resize { width, height } => UiEventWire::Resize {
+            width: *width,
+            height: *height,
+        },
+    }
+}
+
 fn default_extension_dialog_response(request: &HostUiRequest) -> HostUiResponse {
     match request {
         HostUiRequest::Select { id, .. } => HostUiResponse::Select {
@@ -4251,38 +4526,7 @@ fn default_extension_dialog_response(request: &HostUiRequest) -> HostUiResponse 
 fn encode_terminal_input(event: &UiEvent) -> Option<String> {
     match event {
         UiEvent::Paste(text) => Some(text.clone()),
-        UiEvent::Key(key) => {
-            let prefix = if key.modifiers.contains(crossterm::event::KeyModifiers::ALT) {
-                "\u{1b}"
-            } else {
-                ""
-            };
-            let data = match key.code {
-                crossterm::event::KeyCode::Char(character)
-                    if key
-                        .modifiers
-                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
-                {
-                    let code = (character.to_ascii_uppercase() as u8) & 0x1f;
-                    char::from(code).to_string()
-                }
-                crossterm::event::KeyCode::Char(character) => character.to_string(),
-                crossterm::event::KeyCode::Enter => "\r".to_owned(),
-                crossterm::event::KeyCode::Tab => "\t".to_owned(),
-                crossterm::event::KeyCode::BackTab => "\u{1b}[Z".to_owned(),
-                crossterm::event::KeyCode::Backspace => "\u{7f}".to_owned(),
-                crossterm::event::KeyCode::Esc => "\u{1b}".to_owned(),
-                crossterm::event::KeyCode::Up => "\u{1b}[A".to_owned(),
-                crossterm::event::KeyCode::Down => "\u{1b}[B".to_owned(),
-                crossterm::event::KeyCode::Right => "\u{1b}[C".to_owned(),
-                crossterm::event::KeyCode::Left => "\u{1b}[D".to_owned(),
-                crossterm::event::KeyCode::Home => "\u{1b}[H".to_owned(),
-                crossterm::event::KeyCode::End => "\u{1b}[F".to_owned(),
-                crossterm::event::KeyCode::Delete => "\u{1b}[3~".to_owned(),
-                _ => return None,
-            };
-            Some(format!("{prefix}{data}"))
-        }
+        UiEvent::Key(key) => encode_key_event(key),
         UiEvent::FocusGained | UiEvent::FocusLost | UiEvent::Resize { .. } => None,
     }
 }
@@ -5464,7 +5708,7 @@ mod tests {
     async fn rebind_session_channels_reloads_snapshot() {
         let (mut rt, _log) = make_runtime();
         rt.view.streaming = true;
-        rt.rebind_session_channels();
+        rt.rebind_session_channels().await;
         assert!(!rt.view.streaming);
     }
 
@@ -5588,11 +5832,159 @@ mod tests {
         );
     }
 
+    #[test]
+    fn effective_extension_shortcuts_reject_invalid_reserved_and_use_last_registration() {
+        use pi_ext::adapters::ShortcutRegistration;
+
+        let shortcuts = build_effective_extension_shortcuts(&[
+            ShortcutRegistration {
+                key: "ctrl+not-a-key".to_owned(),
+                description: Some("invalid".to_owned()),
+                extension_path: Some("invalid.ts".to_owned()),
+            },
+            ShortcutRegistration {
+                key: "ctrl+c".to_owned(),
+                description: Some("reserved".to_owned()),
+                extension_path: Some("reserved.ts".to_owned()),
+            },
+            ShortcutRegistration {
+                key: "alt+ctrl+y".to_owned(),
+                description: Some("first".to_owned()),
+                extension_path: Some("first.ts".to_owned()),
+            },
+            ShortcutRegistration {
+                key: "CTRL+ALT+Y".to_owned(),
+                description: Some("last".to_owned()),
+                extension_path: Some("last.ts".to_owned()),
+            },
+        ]);
+
+        assert_eq!(shortcuts.len(), 1);
+        assert_eq!(shortcuts[0].key, "ctrl+alt+y");
+        assert_eq!(shortcuts[0].dispatch_key, "CTRL+ALT+Y");
+        assert_eq!(shortcuts[0].description.as_deref(), Some("last"));
+        assert_eq!(shortcuts[0].source.as_deref(), Some("last.ts"));
+        let non_reserved = KeyEvent::new(
+            KeyCode::Char('y'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+        assert!(key_matches_parsed(&non_reserved, &shortcuts[0].parsed));
+        let hints = shortcut_hints(&shortcuts);
+        assert_eq!(hints[0].action, "last");
+    }
+
+    #[tokio::test]
+    async fn reserved_extension_conflict_falls_through_to_native_binding() -> Result<(), String> {
+        let (mut rt, _log) = try_make_runtime()?;
+        rt.editor.set_text("draft");
+        rt.view.editor.text = "draft".to_owned();
+        rt.effective_extension_shortcuts = build_effective_extension_shortcuts(&[
+            pi_ext::adapters::ShortcutRegistration {
+                key: "ctrl+c".to_owned(),
+                description: Some("must not run".to_owned()),
+                extension_path: Some("extension.ts".to_owned()),
+            },
+        ]);
+        assert!(rt.effective_extension_shortcuts.is_empty());
+
+        rt.step_ui(key(KeyCode::Char('c'), KeyModifiers::CONTROL))
+            .await
+            .map_err(|error| format!("native fallthrough failed: {error}"))?;
+        assert!(rt.editor.get_text().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn focused_slot_projection_retains_generation_and_typed_key_payload() {
+        let (mut rt, _log) = make_runtime();
+        let slot = pi_ext::sanitize::sanitize_slot(&pi_ext::protocol::UiSlot {
+            key: "editor.status".to_owned(),
+            generation: 7,
+            placement: SlotPlacement::AboveEditor,
+            height: 1,
+            runs: vec![vec![pi_ext::protocol::StyledRun {
+                text: "focused".to_owned(),
+                style: pi_ext::protocol::Style::default(),
+            }]],
+            focusable: true,
+            cursor: None,
+            overlay_options: None,
+        });
+        rt.project_extension_slot(slot);
+        assert_eq!(rt.focused_extension_slot.as_deref(), Some("editor.status"));
+        assert_eq!(rt.view.focus, FocusArea::Widget);
+        assert_eq!(
+            rt.extension_slots.get("editor.status").map(|slot| slot.generation),
+            Some(7)
+        );
+
+        let event = UiEvent::Key(KeyEvent::new_with_kind(
+            KeyCode::Enter,
+            KeyModifiers::ALT,
+            crossterm::event::KeyEventKind::Repeat,
+        ));
+        assert_eq!(
+            ui_event_wire(&event),
+            UiEventWire::Key {
+                code: "enter".to_owned(),
+                modifiers: KeyModifiersWire {
+                    alt: Some(true),
+                    ..KeyModifiersWire::default()
+                },
+                kind: KeyEventKindWire::Repeat,
+            }
+        );
+        assert_eq!(
+            encode_terminal_input(&event).as_deref(),
+            Some("\u{1b}[13;3:2u")
+        );
+    }
+
+    #[test]
+    fn non_capturing_overlay_preserves_editor_focus_and_structured_metadata() {
+        let (mut rt, _log) = make_runtime();
+        let link = pi_ext::protocol::Hyperlink {
+            id: Some("docs".to_owned()),
+            uri: "https://example.com/docs".to_owned(),
+        };
+        let slot = pi_ext::sanitize::sanitize_slot(&pi_ext::protocol::UiSlot {
+            key: "overlay.help".to_owned(),
+            generation: 3,
+            placement: SlotPlacement::Overlay,
+            height: 1,
+            runs: vec![vec![pi_ext::protocol::StyledRun {
+                text: "help".to_owned(),
+                style: pi_ext::protocol::Style {
+                    bold: Some(true),
+                    link: Some(link.clone()),
+                    ..pi_ext::protocol::Style::default()
+                },
+            }]],
+            focusable: true,
+            cursor: None,
+            overlay_options: Some(pi_ext::protocol::OverlaySpec {
+                non_capturing: true,
+                ..pi_ext::protocol::OverlaySpec::default()
+            }),
+        });
+
+        rt.project_extension_slot(slot);
+        assert_eq!(rt.view.focus, FocusArea::Editor);
+        assert!(rt.focused_extension_slot.is_none());
+        let projected = rt
+            .view
+            .extension_overlay_slot
+            .as_ref()
+            .expect("structured overlay");
+        assert_eq!(projected.lines[0][0].style.link.as_ref(), Some(&link));
+    }
+
     #[tokio::test]
     async fn extension_input_dialog_temporarily_owns_then_restores_editor() {
         let (mut rt, _log) = make_runtime();
         rt.editor.set_text("draft prompt");
         rt.view.editor.text = "draft prompt".to_owned();
+        rt.view.editor.placeholder = "Type a message…".to_owned();
         rt.begin_extension_dialog(HostUiRequest::Input {
             id: 17,
             request: pi_ext::protocol::InputRequest {
@@ -5609,6 +6001,30 @@ mod tests {
         assert_eq!(outcome, ActionOutcome::Repaint);
         assert!(rt.pending_extension_dialog.is_none());
         assert_eq!(rt.editor.get_text(), "draft prompt");
+        assert_eq!(rt.view.editor.placeholder, "Type a message…");
+    }
+
+    #[tokio::test]
+    async fn reload_cancels_pending_extension_dialog_and_restores_editor() {
+        let (mut rt, _log) = make_runtime();
+        rt.editor.set_text("draft prompt");
+        rt.view.editor.text = "draft prompt".to_owned();
+        rt.view.editor.placeholder = "Type a message…".to_owned();
+        rt.begin_extension_dialog(HostUiRequest::Input {
+            id: 18,
+            request: pi_ext::protocol::InputRequest {
+                title: "Extension input".to_owned(),
+                placeholder: None,
+                options_meta: pi_ext::protocol::DialogOptions::default(),
+            },
+        })
+        .await;
+
+        let outcome = rt.dispatch_action(ViewAction::Reload).await;
+        assert_eq!(outcome, ActionOutcome::Repaint);
+        assert!(rt.pending_extension_dialog.is_none());
+        assert_eq!(rt.editor.get_text(), "draft prompt");
+        assert_eq!(rt.view.editor.placeholder, "Type a message…");
     }
 
     #[test]
@@ -5629,7 +6045,10 @@ mod tests {
         });
         rt.project_extension_slot(slot);
         assert_eq!(rt.view.widgets_above.len(), 1);
-        assert_eq!(rt.view.widgets_above[0].lines, vec!["extension ready"]);
+        assert_eq!(
+            rt.view.widgets_above[0].slot.lines[0][0].text,
+            "extension ready"
+        );
 
         rt.dispose_extension_slot("status");
         assert!(rt.view.widgets_above.is_empty());

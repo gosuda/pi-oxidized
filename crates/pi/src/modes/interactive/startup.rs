@@ -102,22 +102,43 @@ pub fn build_first_time_setup(
 
 /// Build the shortcut/help overlay component from hint rows.
 #[must_use]
-pub fn build_shortcut_overlay(hints: &[ShortcutHint], th: &ResolvedTheme) -> Box<dyn Component> {
+pub fn build_shortcut_overlay(
+    hints: &[ShortcutHint],
+    extension_hints: &[ShortcutHint],
+    th: &ResolvedTheme,
+) -> Box<dyn Component> {
     let mut stack = super::messages::ColumnStack::new();
     stack.push(Box::new(Text::with_padding(
         theme::bold(&th.fg(ThemeColor::Accent, "Keyboard shortcuts")),
         1,
         0,
     )));
-    for h in hints {
+    push_shortcut_hints(&mut stack, hints, th);
+    if !extension_hints.is_empty() {
+        stack.push(Box::new(Spacer::new(1)));
+        stack.push(Box::new(Text::with_padding(
+            theme::bold(&th.fg(ThemeColor::Accent, "Extensions")),
+            1,
+            0,
+        )));
+        push_shortcut_hints(&mut stack, extension_hints, th);
+    }
+    Box::new(stack)
+}
+
+fn push_shortcut_hints(
+    stack: &mut super::messages::ColumnStack,
+    hints: &[ShortcutHint],
+    th: &ResolvedTheme,
+) {
+    for hint in hints {
         let line = format!(
             "  {}  {}",
-            th.fg(ThemeColor::Accent, &h.key),
-            th.fg(ThemeColor::Muted, &h.action),
+            th.fg(ThemeColor::Accent, &hint.key),
+            th.fg(ThemeColor::Muted, &hint.action),
         );
         stack.push(Box::new(Text::with_padding(line, 0, 0)));
     }
-    Box::new(stack)
 }
 
 /// Default shortcut hint rows (ports the reference keybinding table).

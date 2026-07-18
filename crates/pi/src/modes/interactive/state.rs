@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use pi_ai::{AssistantMessage, ModelThinkingLevel};
+use pi_ext::sanitize::SanitizedSlot;
 use pi_tui::component::EventResult;
 
 use super::messages::MessageView;
@@ -51,6 +52,10 @@ pub struct ViewState {
     pub widgets_below: WidgetStack,
     /// Footer status-bar data.
     pub footer: FooterData,
+    /// Extension shortcut rows shown in the hotkeys overlay.
+    pub extension_shortcuts: Vec<ShortcutHint>,
+    /// Complete sanitized slot backing the current extension overlay.
+    pub extension_overlay_slot: Option<SanitizedSlot>,
     /// Optional overlay currently shown (shortcut help, selectors, etc.).
     pub overlay: Option<Overlay>,
     /// Which area currently holds focus.
@@ -276,14 +281,10 @@ pub enum StatusKind {
 /// Extension widget slot (above or below the editor).
 #[derive(Clone, Debug)]
 pub struct WidgetSlot {
-    /// Stable key for cache invalidation.
-    pub key: String,
-    /// Rendered text lines (already styled).
-    pub lines: Vec<String>,
-    /// Measured height.
-    pub height: u16,
-    /// Whether this widget captures focus.
-    pub focusable: bool,
+    /// Complete sanitized slot, including structured runs and link metadata.
+    pub slot: SanitizedSlot,
+    /// Whether this slot currently owns input focus.
+    pub focused: bool,
 }
 
 /// Ordered stack of widget slots.
@@ -532,6 +533,8 @@ impl ViewState {
             },
             widgets_below: Vec::new(),
             footer: FooterData::default(),
+            extension_shortcuts: Vec::new(),
+            extension_overlay_slot: None,
             overlay: None,
             focus: FocusArea::Editor,
             streaming: false,

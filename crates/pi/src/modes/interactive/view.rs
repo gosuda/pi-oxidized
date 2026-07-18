@@ -21,6 +21,8 @@ use ratatui::style::{Color, Modifier};
 
 use pi_tui::component::Component;
 use pi_tui::components::Text;
+use pi_tui::focus::Focusable;
+use pi_ext::adapters::{SlotComponent, tui_overlay_spec};
 
 use super::footer;
 use super::header;
@@ -46,6 +48,8 @@ pub struct ComposedView {
     pub sections: Vec<ComposedSection>,
     /// Optional overlay rendered on top (shortcut help / changelog / login / …).
     pub overlay: Option<Box<dyn Component>>,
+    /// Extension overlay layout specification, when the overlay is host-owned.
+    pub overlay_spec: Option<pi_tui::layout::OverlaySpec>,
 }
 
 /// Compose the full view-model into ordered sections for `state`.
@@ -124,8 +128,17 @@ fn compose_inner(state: &ViewState) -> ComposedView {
     });
 
     let overlay = build_overlay(state, &md_theme);
+    let overlay_spec = state
+        .extension_overlay_slot
+        .as_ref()
+        .and_then(|slot| slot.overlay_options.as_ref())
+        .map(tui_overlay_spec);
 
-    ComposedView { sections, overlay }
+    ComposedView {
+        sections,
+        overlay,
+        overlay_spec,
+    }
 }
 
 /// Build the chat container from all message view-models.
@@ -208,10 +221,10 @@ fn build_editor_section(state: &ViewState) -> Box<dyn Component> {
 /// Build a vertical widget stack from pre-rendered slot lines.
 fn build_widget_stack(slots: &[WidgetSlot], _th: &ResolvedTheme) -> Box<dyn Component> {
     let mut stack = messages::ColumnStack::new();
-    for slot in slots {
-        for line in &slot.lines {
-            stack.push(Box::new(Text::with_padding(line.clone(), 1, 0)));
-        }
+    for widget in slots {
+        let mut component = SlotComponent::new(widget.slot.clone());
+        component.set_focused(widget.focused);
+        stack.push(Box::new(component));
     }
     if stack.is_empty() {
         stack.push(Box::new(pi_tui::components::Spacer::new(0)));
@@ -224,21 +237,35 @@ fn build_widget_stack(slots: &[WidgetSlot], _th: &ResolvedTheme) -> Box<dyn Comp
 fn build_overlay(state: &ViewState, md_theme: &MarkdownTheme) -> Option<Box<dyn Component>> {
     let overlay = state.overlay.as_ref()?;
     let comp: Box<dyn Component> = match overlay.kind {
-        OverlayKind::ShortcutHelp => {
-            startup::build_shortcut_overlay(&startup::default_shortcut_hints(), &state.theme)
-        }
+        OverlayKind::ShortcutHelp => startup::build_shortcut_overlay(
+            &startup::default_shortcut_hints(),
+            &state.extension_shortcuts,
+            &state.theme,
+        ),
         OverlayKind::Changelog => {
             startup::build_changelog(&overlay.lines.join("\n"), md_theme.clone(), &state.theme)
         }
         OverlayKind::FirstTimeSetup => {
             startup::build_first_time_setup(0, md_theme.clone(), &state.theme)
         }
-        OverlayKind::Login | OverlayKind::Extension => {
+        OverlayKind::Login => {
             let mut stack = messages::ColumnStack::new();
             for line in &overlay.lines {
                 stack.push(Box::new(Text::with_padding(line.clone(), 1, 0)));
             }
             Box::new(stack)
+        }
+        OverlayKind::Extension => {
+            let slot = state.extension_overlay_slot.as_ref()?;
+            let mut component = SlotComponent::new(slot.clone());
+            component.set_focused(
+                state.focus == FocusArea::Overlay
+                    && !slot
+                        .overlay_options
+                        .as_ref()
+                        .is_some_and(|options| options.non_capturing),
+            );
+            Box::new(component)
         }
     };
     Some(comp)
@@ -287,9 +314,27 @@ pub fn render_view_with_height(state: &ViewState, width: u16, height: u16) -> Bu
         }
     }
     if let Some(mut overlay) = composed.overlay {
-        let oh = overlay.measure(width.max(1)).min(height);
-        if oh > 0 {
-            let rect = Rect::new(0, 0, width.max(1), oh);
+        let measured = overlay.measure(width.max(1)).min(height);
+        let rect = composed
+            .overlay_spec
+            .as_ref()
+            .map_or_else(
+                || Rect::new(0, 0, width.max(1), measured),
+                |spec| {
+                    let layout = pi_tui::layout::resolve_overlay_layout(
+                        spec,
+                        measured,
+                        width.max(1),
+                        height.max(1),
+                    );
+                    let overlay_height = layout
+                        .max_height
+                        .map_or(measured, |max_height| measured.min(max_height))
+                        .min(height.saturating_sub(layout.row));
+                    Rect::new(layout.col, layout.row, layout.width, overlay_height)
+                },
+            );
+        if rect.height > 0 {
             overlay.render(rect, &mut buf);
         }
     }

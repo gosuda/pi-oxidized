@@ -405,6 +405,71 @@ fn shortcut_overlay_snapshot() {
 }
 
 #[test]
+fn shortcut_overlay_shows_extensions_only_when_present() {
+    let mut state = base_state();
+    state.overlay = Some(Overlay {
+        kind: OverlayKind::ShortcutHelp,
+        lines: Vec::new(),
+        height: 20,
+    });
+    let plain =
+        snapshot_buffer_plain(&render_view(&state, 80, 40), 80, 40).join("\n");
+    assert!(!plain.contains("Extensions"));
+
+    state.extension_shortcuts.push(ShortcutHint {
+        key: "ctrl+y".to_owned(),
+        action: "Extension action".to_owned(),
+    });
+    let plain =
+        snapshot_buffer_plain(&render_view(&state, 80, 40), 80, 40).join("\n");
+    assert!(plain.contains("Extensions"));
+    assert!(plain.contains("ctrl+y"));
+    assert!(plain.contains("Extension action"));
+}
+
+#[test]
+fn extension_overlay_uses_resolved_anchor_width_and_margin() {
+    let mut state = base_state();
+    state.width = 40;
+    state.height = 12;
+    state.overlay = Some(Overlay {
+        kind: OverlayKind::Extension,
+        lines: Vec::new(),
+        height: 1,
+    });
+    state.extension_overlay_slot = Some(pi_ext::sanitize::sanitize_slot(
+        &pi_ext::protocol::UiSlot {
+            key: "geometry".to_owned(),
+            generation: 1,
+            placement: pi_ext::protocol::SlotPlacement::Overlay,
+            height: 1,
+            runs: vec![vec![pi_ext::protocol::StyledRun {
+                text: "GEOM".to_owned(),
+                style: pi_ext::protocol::Style::default(),
+            }]],
+            focusable: false,
+            cursor: None,
+            overlay_options: Some(pi_ext::protocol::OverlaySpec {
+                width: Some(pi_ext::protocol::SizeValue::Cells(12)),
+                anchor: Some(pi_ext::protocol::OverlayAnchor::BottomRight),
+                margin: Some(pi_ext::protocol::OverlayMarginWire::Uniform(2)),
+                ..pi_ext::protocol::OverlaySpec::default()
+            }),
+        },
+    ));
+
+    let buffer = render_view(&state, 40, 12);
+    assert_eq!(
+        buffer.cell((26, 9)).map(ratatui::buffer::Cell::symbol),
+        Some("G")
+    );
+    assert_ne!(
+        buffer.cell((0, 0)).map(ratatui::buffer::Cell::symbol),
+        Some("G")
+    );
+}
+
+#[test]
 fn changelog_overlay_snapshot() {
     let mut state = base_state();
     state.overlay = Some(Overlay {
@@ -755,18 +820,36 @@ fn resources_diagnostics_widgets_sections_present() {
         source: "themes".to_owned(),
         message: "custom theme 'foo' failed to load".to_owned(),
     });
-    state.widgets_above.push(WidgetSlot {
-        key: "ext1".to_owned(),
-        lines: vec!["[ext] widget above editor".to_owned()],
-        height: 1,
-        focusable: false,
-    });
-    state.widgets_below.push(WidgetSlot {
-        key: "ext2".to_owned(),
-        lines: vec!["[ext] widget below editor".to_owned()],
-        height: 1,
-        focusable: true,
-    });
+    let widget = |key: &str, text: &str, placement, focusable, focused| WidgetSlot {
+        slot: pi_ext::sanitize::sanitize_slot(&pi_ext::protocol::UiSlot {
+            key: key.to_owned(),
+            generation: 1,
+            placement,
+            height: 1,
+            runs: vec![vec![pi_ext::protocol::StyledRun {
+                text: text.to_owned(),
+                style: pi_ext::protocol::Style::default(),
+            }]],
+            focusable,
+            cursor: None,
+            overlay_options: None,
+        }),
+        focused,
+    };
+    state.widgets_above.push(widget(
+        "ext1",
+        "[ext] widget above editor",
+        pi_ext::protocol::SlotPlacement::AboveEditor,
+        false,
+        false,
+    ));
+    state.widgets_below.push(widget(
+        "ext2",
+        "[ext] widget below editor",
+        pi_ext::protocol::SlotPlacement::BelowEditor,
+        true,
+        false,
+    ));
     let buf = render_view(&state, 80, 40);
     let plain = snapshot_buffer_plain(&buf, 80, 40).join("\n");
     assert!(plain.contains("skill"), "resource must render");
