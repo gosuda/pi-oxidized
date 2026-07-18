@@ -6,11 +6,17 @@ rust-version = "1.97.1"
 publish = false
 
 [dependencies]
+base64 = "=0.22.1"
+futures = { version = "=0.3.32", default-features = false, features = ["alloc", "std"] }
 pi = { path = "../../crates/pi" }
 pi-ai = { path = "../../crates/pi-ai" }
 pi-agent = { path = "../../crates/pi-agent" }
 pi-ext = { path = "../../crates/pi-ext" }
 pi-tui = { path = "../../crates/pi-tui" }
+ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm_0_29"] }
 serde_json = "=1.0.150"
+tempfile = "=3.27.0"
+tokio = { version = "=1.52.4", default-features = false, features = ["io-util", "macros", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "=0.7.18", default-features = false, features = ["rt"] }
 
 [workspace]

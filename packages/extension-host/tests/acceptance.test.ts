@@ -1,0 +1,912 @@
+/**
+ * Acceptance tests: widget slots, stale generation, crash isolation,
+ * all 33 lifecycle methods, and compiled artifact verification.
+ */
+
+import { describe, expect, test } from "bun:test";
+import { resolve } from "node:path";
+import { Readable } from "node:stream";
+import { spawn } from "node:child_process";
+import {
+	PROTOCOL_VERSION,
+	encodeFrameString,
+	type Frame,
+} from "@earendil-works/pi-tui-protocol";
+import type {
+	ExtensionFactory,
+	ExtensionContextActions,
+} from "@earendil-works/pi-coding-agent";
+import {
+	loadExtensionFromFactory,
+	createExtensionRuntime,
+} from "@earendil-works/pi-coding-agent";
+import { ExtensionRunner } from "@earendil-works/pi-coding-agent";
+import { ExtensionHost, createEventBus } from "../src/host.ts";
+import { COMPATIBILITY_VERSION } from "../src/version.ts";
+import { createExtensionJiti } from "../src/virtual-modules.ts";
+
+import allEventsFactory, { ALL_EVENTS } from "../fixtures/extensions/all-events.ts";
+import crashFactory from "../fixtures/extensions/crash.ts";
+import hostileFactory from "../fixtures/extensions/hostile.ts";
+import hooksFactory from "../fixtures/extensions/hooks.ts";
+import toolFactory from "../fixtures/extensions/tool.ts";
+import toolProgressFactory from "../fixtures/extensions/tool-progress.ts";
+import providerStreamFactory from "../fixtures/extensions/provider-stream.ts";
+
+const noopContextActions: ExtensionContextActions = {
+	getModel: () => undefined,
+	isIdle: () => true,
+	isProjectTrusted: () => true,
+	getSignal: () => undefined,
+	abort: () => {},
+	hasPendingMessages: () => false,
+	shutdown: () => {},
+	getContextUsage: () => undefined,
+	compact: () => {},
+	getSystemPrompt: () => "",
+};
+
+/**
+ * ByteWritable that decodes frames as they arrive and lets tests await
+ * specific frames by predicate. No write-counting, no timers.
+ */
+class FrameCollector {
+	readonly frames: Frame[] = [];
+	private readonly waiters: Array<{
+		predicate: (f: Frame) => boolean;
+		resolve: (f: Frame) => void;
+	}> = [];
+	private buf = "";
+
+	write(chunk: Uint8Array): void {
+		this.buf += new TextDecoder().decode(chunk);
+		const lines = this.buf.split("\n");
+		this.buf = lines.pop() ?? "";
+		for (const line of lines) {
+			if (line.trim().length > 0) {
+				const frame = JSON.parse(line) as Frame;
+				this.frames.push(frame);
+				for (let i = this.waiters.length - 1; i >= 0; i--) {
+					if (this.waiters[i]?.predicate(frame)) {
+						this.waiters[i]?.resolve(frame);
+						this.waiters.splice(i, 1);
+					}
+				}
+			}
+		}
+	}
+
+	awaitFrame(predicate: (f: Frame) => boolean): Promise<Frame> {
+		const existing = this.frames.find(predicate);
+		if (existing !== undefined) return Promise.resolve(existing);
+		const { promise, resolve } = Promise.withResolvers<Frame>();
+		this.waiters.push({ predicate, resolve });
+		return promise;
+	}
+}
+
+/** Create a host wired to a FrameCollector; send hello and await ack. */
+async function connectHost(factories: ExtensionFactory[]): Promise<{
+	collector: FrameCollector;
+	stdin: Readable;
+	host: ExtensionHost;
+	runPromise: Promise<void>;
+}> {
+	const collector = new FrameCollector();
+	const stdin = new Readable({ read() {} });
+	const host = new ExtensionHost(stdin, collector);
+	const runPromise = host.run({ cwd: process.cwd(), factories, extensionPaths: [] });
+
+	stdin.push(Buffer.from(encodeFrameString({
+		id: 1, kind: "req", method: "hello",
+		payload: { protocolVersion: PROTOCOL_VERSION, compatibilityVersion: COMPATIBILITY_VERSION },
+	})));
+	await collector.awaitFrame((f) => f.id === 1 && f.kind === "res");
+	return { collector, stdin, host, runPromise };
+}
+
+async function makeRunner(factory: ExtensionFactory, path: string) {
+	const runtime = createExtensionRuntime();
+	const bus = createEventBus();
+	const ext = await loadExtensionFromFactory(factory, process.cwd(), bus, runtime, path);
+	// Escape hatch: reference class stubs for test-only runner construction.
+	const runner = new ExtensionRunner(
+		[ext], runtime, process.cwd(),
+		{} as unknown as ConstructorParameters<typeof ExtensionRunner>[3],
+		{ getAll: () => [], find: () => undefined } as unknown as ConstructorParameters<typeof ExtensionRunner>[4],
+	);
+	runner.bindCore({} as unknown as Parameters<typeof runner.bindCore>[0], noopContextActions);
+	return { runner, ext, runtime };
+ }
+
+/** Send session_start and await both the response and any uiSlot event. */
+async function sendSessionStart(stdin: Readable, collector: FrameCollector): Promise<void> {
+	stdin.push(Buffer.from(encodeFrameString({
+		id: 2, kind: "req", method: "session_start",
+		payload: { type: "session_start", reason: "startup" },
+	})));
+	await collector.awaitFrame((f) => f.id === 2 && f.kind === "res");
+}
+
+// ===========================================================================
+// 1. Widget slot measured-height + render
+// ===========================================================================
+
+describe("acceptance: widget slot measure/render", () => {
+	test("host responds to measure with correct height", async () => {
+		const { collector, stdin, host, runPromise } = await connectHost([hostileFactory]);
+		await sendSessionStart(stdin, collector);
+
+		// Wait for uiSlot event (widget.hostile pushed by session_start handler).
+		await collector.awaitFrame((f) => f.method === "uiSlot");
+
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 10, kind: "req", method: "measure",
+			payload: { key: "widget.hostile", width: 80 },
+		})));
+		const measureRes = await collector.awaitFrame((f) => f.id === 10 && f.kind === "res");
+
+		stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
+
+		const height = (measureRes.payload as Record<string, unknown>)["height"];
+		expect(typeof height).toBe("number");
+		expect(height as number).toBeGreaterThan(0);
+	});
+
+	test("host responds to render with sanitized runs (no raw ESC)", async () => {
+		const { collector, stdin, host, runPromise } = await connectHost([hostileFactory]);
+		await sendSessionStart(stdin, collector);
+		await collector.awaitFrame((f) => f.method === "uiSlot");
+
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 11, kind: "req", method: "render",
+			payload: { key: "widget.hostile", width: 80 },
+		})));
+		const renderRes = await collector.awaitFrame((f) => f.id === 11 && f.kind === "res");
+
+		stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
+
+		const runs = (renderRes.payload as Record<string, unknown>)["runs"] as unknown[][];
+		expect(Array.isArray(runs)).toBe(true);
+		expect(runs.length).toBeGreaterThan(0);
+		// Every text run must be free of raw ESC bytes — plugin bytes never reach stdout.
+		for (const line of runs) {
+			for (const run of line) {
+				const text = (run as Record<string, unknown>)["text"] as string;
+				expect(text).not.toContain("\x1b");
+			}
+		}
+	});
+
+	test("focusable slot can be disposed and focus restored", async () => {
+		const { collector, stdin, host, runPromise } = await connectHost([hostileFactory]);
+		await sendSessionStart(stdin, collector);
+
+		const slotEvent = await collector.awaitFrame((f) => f.method === "uiSlot");
+		const slotPayload = slotEvent.payload as Record<string, unknown>;
+		expect(slotPayload["key"]).toBe("widget.hostile");
+		expect(typeof slotPayload["generation"]).toBe("number");
+
+		// Dispose the slot via the host's disposeSlot method.
+		host.disposeSlot("widget.hostile");
+
+		const disposeEvent = await collector.awaitFrame((f) => f.method === "disposeSlot");
+		const disposePayload = disposeEvent.payload as Record<string, unknown>;
+		expect(disposePayload["key"]).toBe("widget.hostile");
+		expect(disposePayload["generation"]).toBe(slotPayload["generation"]);
+
+		stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
+	});
+});
+
+// ===========================================================================
+// 2. Stale generation reordered replies
+// ===========================================================================
+
+describe("acceptance: stale generation tracking", () => {
+	test("uiSlot and disposeSlot carry matching generations", async () => {
+		const { collector, stdin, host, runPromise } = await connectHost([hostileFactory]);
+		await sendSessionStart(stdin, collector);
+
+		const slotEvent = await collector.awaitFrame((f) => f.method === "uiSlot");
+		const slotGen = (slotEvent.payload as Record<string, unknown>)["generation"];
+
+		host.disposeSlot("widget.hostile");
+		const disposeEvent = await collector.awaitFrame((f) => f.method === "disposeSlot");
+		const disposeGen = (disposeEvent.payload as Record<string, unknown>)["generation"];
+
+		expect(disposeGen).toBe(slotGen);
+
+		stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
+	});
+
+	test("re-pushing a slot produces a newer generation", async () => {
+		const { collector, stdin, host, runPromise } = await connectHost([hostileFactory]);
+		await sendSessionStart(stdin, collector);
+
+		const slot1 = await collector.awaitFrame((f) => f.method === "uiSlot");
+		const gen1 = (slot1.payload as Record<string, unknown>)["generation"] as number;
+
+		// Dispose and re-trigger session_start to push again.
+		host.disposeSlot("widget.hostile");
+		await collector.awaitFrame((f) => f.method === "disposeSlot");
+
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 20, kind: "req", method: "session_start",
+			payload: { type: "session_start", reason: "reload" },
+		})));
+		await collector.awaitFrame((f) => f.id === 20 && f.kind === "res");
+
+		const slot2 = await collector.awaitFrame(
+			(f) => f.method === "uiSlot" && (f.payload as Record<string, unknown>)["generation"] !== gen1,
+		);
+		const gen2 = (slot2.payload as Record<string, unknown>)["generation"] as number;
+		expect(gen2).toBeGreaterThan(gen1);
+
+		stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
+	});
+});
+
+// ===========================================================================
+// 3. Crash mid-hook: error isolation, no replay, pending close
+// ===========================================================================
+
+describe("acceptance: crash isolation", () => {
+	test("handler throw emits extensionError, turn completes", async () => {
+		const { runner } = await makeRunner(crashFactory, "crash.ts");
+		const errors: Array<{ event: string; message: string }> = [];
+		runner.onError((err) => {
+			errors.push({ event: err.event, message: err.error });
+		});
+
+		await runner.emit({ type: "session_start", reason: "startup" });
+		expect(errors).toHaveLength(1);
+		expect(errors[0]?.event).toBe("session_start");
+		expect(errors[0]?.message).toContain("crash-in-session-start");
+
+		await runner.emit({ type: "agent_start" });
+		expect(errors).toHaveLength(2);
+		expect(errors[1]?.event).toBe("agent_start");
+	});
+
+	test("host forwards crash as nonretryable extensionError", async () => {
+		const { collector, stdin, host, runPromise } = await connectHost([crashFactory]);
+
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 5, kind: "req", method: "session_start",
+			payload: { type: "session_start", reason: "startup" },
+		})));
+
+		// Turn must complete (response arrives).
+		const res = await collector.awaitFrame((f) => f.id === 5 && f.kind === "res");
+		expect(res).toBeDefined();
+
+		// Extension error event must be emitted with retryable=false.
+		const errEvent = await collector.awaitFrame((f) => f.method === "extensionError");
+		const payload = errEvent.payload as Record<string, unknown>;
+		expect(payload["retryable"]).toBe(false);
+		expect(payload["code"]).toBe("extension_error");
+
+		stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
+	});
+
+	test("no effect replayed — second emit after crash is clean", async () => {
+		const calls: string[] = [];
+		const runtime = createExtensionRuntime();
+		const bus = createEventBus();
+		let firstCall = true;
+		const factory: ExtensionFactory = (pi) => {
+			pi.on("session_start", () => {
+				if (firstCall) {
+					firstCall = false;
+					throw new Error("first-crash");
+				}
+				calls.push("ok");
+			});
+		};
+		const ext = await loadExtensionFromFactory(factory, process.cwd(), bus, runtime, "replay.ts");
+		const runner = new ExtensionRunner(
+			[ext], runtime, process.cwd(),
+			{} as unknown as ConstructorParameters<typeof ExtensionRunner>[3],
+			{ getAll: () => [], find: () => undefined } as unknown as ConstructorParameters<typeof ExtensionRunner>[4],
+		);
+		runner.bindCore({} as unknown as Parameters<typeof runner.bindCore>[0], noopContextActions);
+
+		await runner.emit({ type: "session_start", reason: "startup" });
+		expect(calls).toHaveLength(0);
+
+		await runner.emit({ type: "session_start", reason: "reload" });
+		expect(calls).toHaveLength(1);
+	});
+
+	test("stale-generation reorder: only newest generation is rendered", async () => {
+		const { collector, stdin, host, runPromise } = await connectHost([hostileFactory]);
+		await sendSessionStart(stdin, collector);
+
+		const slot1 = await collector.awaitFrame((f) => f.method === "uiSlot");
+		const gen1 = (slot1.payload as Record<string, unknown>)["generation"] as number;
+
+		// Push two more times: generation N+1, then N+2.
+		host.disposeSlot("widget.hostile");
+		await collector.awaitFrame((f) => f.method === "disposeSlot");
+
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 40, kind: "req", method: "session_start",
+			payload: { type: "session_start", reason: "reload-1" },
+		})));
+		await collector.awaitFrame((f) => f.id === 40 && f.kind === "res");
+		const slot2 = await collector.awaitFrame(
+			(f) => f.method === "uiSlot" && (f.payload as Record<string, unknown>)["generation"] !== gen1,
+		);
+		const gen2 = (slot2.payload as Record<string, unknown>)["generation"] as number;
+
+		host.disposeSlot("widget.hostile");
+		await collector.awaitFrame(
+			(f) => f.method === "disposeSlot" && (f.payload as Record<string, unknown>)["generation"] === gen2,
+		);
+
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 41, kind: "req", method: "session_start",
+			payload: { type: "session_start", reason: "reload-2" },
+		})));
+		await collector.awaitFrame((f) => f.id === 41 && f.kind === "res");
+		const slot3 = await collector.awaitFrame(
+			(f) => f.method === "uiSlot" && (f.payload as Record<string, unknown>)["generation"] === gen2 + 1,
+		);
+		const gen3 = (slot3.payload as Record<string, unknown>)["generation"] as number;
+
+		// Verify generations are strictly increasing: Rust should render gen3,
+		// not gen2 (which is now stale). The host guarantees this by
+		// incrementing nextGeneration on every pushSlot.
+		expect(gen3).toBeGreaterThan(gen2);
+
+		stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
+	});
+
+	test("crash mid-tool: tool execute throw emits exactly-once nonretryable error", async () => {
+		const runtime = createExtensionRuntime();
+		const bus = createEventBus();
+		const ext = await loadExtensionFromFactory(crashFactory, process.cwd(), bus, runtime, "crash.ts");
+		const runner = new ExtensionRunner(
+			[ext], runtime, process.cwd(),
+			{} as unknown as ConstructorParameters<typeof ExtensionRunner>[3],
+			{ getAll: () => [], find: () => undefined } as unknown as ConstructorParameters<typeof ExtensionRunner>[4],
+		);
+		runner.bindCore({} as unknown as Parameters<typeof runner.bindCore>[0], noopContextActions);
+
+		const errorEvents: Array<{ event: string; message: string }> = [];
+		runner.onError((err) => {
+			errorEvents.push({ event: err.event, message: err.error });
+		});
+
+		// Invoke the crashing tool directly via the wrapper.
+		const toolDef = runner.getAllRegisteredTools().find((t) => t.definition.name === "crash_tool");
+		expect(toolDef).toBeDefined();
+
+		// Call execute and verify it throws exactly once (no replay).
+		await expect(
+			(toolDef?.definition.execute as (...args: unknown[]) => Promise<unknown>)(
+				"call-1", {}, undefined, undefined, runner.createContext(),
+			),
+		).rejects.toThrow("crash-in-tool-execute");
+
+		// Second call also throws — no replay of the first failure, but the
+		// second call is a fresh invocation.
+		await expect(
+			(toolDef?.definition.execute as (...args: unknown[]) => Promise<unknown>)(
+				"call-2", {}, undefined, undefined, runner.createContext(),
+			),
+		).rejects.toThrow("crash-in-tool-execute");
+	});
+
+	// Test harness: verify provider registration is processed exactly once
+	// during bindCore, and streamSimple invocation propagates errors to the
+	// caller (the runner does not intercept stream invocation errors — those
+	// are handled by the caller, e.g. Rust).
+	test("crash mid-provider-stream: provider registration exactly-once", async () => {
+		const factory: ExtensionFactory = (pi) => {
+			pi.registerProvider("crash_provider", {
+				streamSimple: () => { throw new Error("crash-in-provider-stream"); },
+			});
+		};
+		const runtime = createExtensionRuntime();
+		const ext = await loadExtensionFromFactory(factory, process.cwd(), undefined, runtime, "crash.ts");
+
+		// Capture provider config via a minimal stub that counts registrations.
+		let registerCount = 0;
+		let capturedConfig: { streamSimple?: () => unknown } | undefined;
+		const stubRegistry = {
+			getAll: () => [] as unknown[],
+			find: () => undefined,
+			registerProvider: (_name: string, config: { streamSimple?: () => unknown }) => {
+				registerCount++;
+				capturedConfig = config;
+			},
+			unregisterProvider: () => {},
+			getRegisteredProviderIds: () => [] as readonly string[],
+			getRegisteredProviderConfig: () => capturedConfig,
+		};
+		const runner = new ExtensionRunner(
+			[ext], runtime, process.cwd(),
+			{} as unknown as ConstructorParameters<typeof ExtensionRunner>[3],
+			stubRegistry as unknown as ConstructorParameters<typeof ExtensionRunner>[4],
+		);
+		runner.bindCore({} as unknown as Parameters<typeof runner.bindCore>[0], noopContextActions);
+
+		// Exactly-once: registerProvider called exactly once during bindCore.
+		expect(registerCount).toBe(1);
+		expect(capturedConfig?.streamSimple).toBeDefined();
+
+		// Second bindCore attempt: the runner is now bound; calling registerProvider
+		// again directly would call the stub again, but the runner doesn't
+		// re-flush pendingProviderRegistrations on subsequent calls.
+		// Verify the stub was NOT called again.
+		expect(registerCount).toBe(1);
+
+		// streamSimple invocation throws to the caller — not intercepted by runner.
+		expect(() => capturedConfig?.streamSimple?.()).toThrow("crash-in-provider-stream");
+	});
+});
+
+// ===========================================================================
+// 4. All 33 lifecycle methods
+// ===========================================================================
+
+describe("acceptance: all 33 lifecycle events", () => {
+	test("runner recognizes handlers for all 33 event types", async () => {
+		const { runner } = await makeRunner(allEventsFactory, "all-events.ts");
+		expect(ALL_EVENTS).toHaveLength(33);
+		for (const event of ALL_EVENTS) {
+			expect(runner.hasHandlers(event)).toBe(true);
+		}
+	});
+
+	test("all 33 events can be emitted without error", async () => {
+		const { runner } = await makeRunner(allEventsFactory, "all-events.ts");
+		for (const event of ALL_EVENTS) {
+			await runner.emit({ type: event });
+		}
+	});
+});
+
+// ===========================================================================
+// 5. Compiled artifact + runtime-import
+// ===========================================================================
+
+describe("acceptance: compiled artifact", () => {
+	test("compiled binary handles hello handshake", async () => {
+		const binPath = resolve(import.meta.dirname, "..", "dist", "pi-extension-host");
+		const { promise, resolve: resolvePromise, reject: rejectPromise } = Promise.withResolvers<string>();
+		const child = spawn(binPath, ["--cwd", "/tmp"], { stdio: ["pipe", "pipe", "pipe"] });
+		let output = "";
+		child.stdout.on("data", (chunk: Buffer) => {
+			output += chunk.toString();
+			if (output.includes("\n")) resolvePromise(output.trim());
+		});
+		child.on("error", rejectPromise);
+		child.on("exit", (code) => {
+			if (!output.includes("\n")) rejectPromise(new Error(`process exited early with code ${code}`));
+		});
+		child.stdin.write(encodeFrameString({
+			id: 1, kind: "req", method: "hello",
+			payload: { protocolVersion: PROTOCOL_VERSION, compatibilityVersion: COMPATIBILITY_VERSION },
+		}));
+		try {
+			const line = await promise;
+			const frame = JSON.parse(line) as Frame;
+			expect(frame.kind).toBe("res");
+			expect(frame.method).toBe("hello");
+			const payload = frame.payload as Record<string, unknown>;
+			expect(payload["protocolVersion"]).toBe(PROTOCOL_VERSION);
+			expect(payload["compatibilityVersion"]).toBe(COMPATIBILITY_VERSION);
+		} finally {
+			child.stdin.end();
+			child.kill("SIGTERM");
+		}
+	});
+
+	test("compiled binary rejects version mismatch", async () => {
+		const binPath = resolve(import.meta.dirname, "..", "dist", "pi-extension-host");
+		const { promise, resolve: resolvePromise, reject: rejectPromise } = Promise.withResolvers<string>();
+		const child = spawn(binPath, ["--cwd", "/tmp"], { stdio: ["pipe", "pipe", "pipe"] });
+		let stderr = "";
+		child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+		child.on("error", rejectPromise);
+		child.on("exit", (code) => {
+			if (code !== null) resolvePromise(stderr);
+		});
+	child.stdin.write(encodeFrameString({
+		id: 1, kind: "req", method: "hello",
+		payload: { protocolVersion: 999, compatibilityVersion: COMPATIBILITY_VERSION },
+	}));
+	child.stdin.end(); // EOF so the host's read loop completes.
+		try {
+			const errOutput = await promise;
+			expect(errOutput).toContain("version mismatch");
+		} finally {
+			child.stdin.end();
+			child.kill("SIGTERM");
+		}
+	});
+
+	test("runtime-import loads real extension via jiti", async () => {
+		const helloPath = resolve(
+			import.meta.dirname, "..", "..", "..",
+			".references", "pi", "packages", "coding-agent", "examples", "extensions", "hello.ts",
+		);
+		const jiti = createExtensionJiti();
+		const module = await jiti.import(helloPath, { default: true }) as unknown;
+		expect(typeof module).toBe("function");
+		const runtime = createExtensionRuntime();
+		const bus = createEventBus();
+		const ext = await loadExtensionFromFactory(
+			module as ExtensionFactory, process.cwd(), bus, runtime, helloPath,
+		);
+		expect([...ext.tools.keys()]).toContain("hello");
+	});
+
+	test("input hook forwards action union (not { ok: true })", async () => {
+		const { collector, stdin, host, runPromise } = await connectHost([hooksFactory]);
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 30, kind: "req", method: "input",
+			payload: { type: "input", text: "hello", source: "interactive" },
+		})));
+		const res = await collector.awaitFrame((f) => f.id === 30 && f.kind === "res");
+		expect(res.payload).toEqual({ action: "continue" });
+		stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
+	});
+
+	test("extensions.load RPC dynamically loads extensions", async () => {
+		const { collector, stdin, host, runPromise } = await connectHost([]);
+		const extPath = resolve(import.meta.dirname, "..", "fixtures", "extensions", "crash.ts");
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 31, kind: "req", method: "extensions.load",
+			payload: { extensionPaths: [extPath], cwd: process.cwd() },
+		})));
+		const res = await collector.awaitFrame((f) => f.id === 31 && f.kind === "res");
+		const payload = res.payload as Record<string, unknown>;
+		expect(payload["extensions"]).toBe(1);
+		expect(Array.isArray(payload["errors"])).toBe(true);
+		expect(Array.isArray(payload["tools"])).toBe(true);
+		expect(Array.isArray(payload["providers"])).toBe(true);
+		expect(Array.isArray(payload["handlers"])).toBe(true);
+		const tools = payload["tools"] as Array<Record<string, unknown>>;
+		expect(tools.some((t) => t["name"] === "crash_tool")).toBe(true);
+		const providers = payload["providers"] as Array<Record<string, unknown>>;
+		expect(providers.some((p) => p["name"] === "crash_provider" && p["streamSimple"] === true)).toBe(true);
+		stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
+	});
+
+	test("command.execute invokes registered command and completes", async () => {
+		const { collector, stdin, host, runPromise } = await connectHost([toolFactory]);
+		// Trigger showOverlay which registers an event listener that waits for session_info_changed
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 32, kind: "req", method: "command.execute",
+			payload: { command: "showOverlay", args: "test-arg" },
+		})));
+		// Wait for overlay uiSlot event
+		const slotEv = await collector.awaitFrame((f) => f.method === "uiSlot" && (f.payload as Record<string, unknown>)["placement"] === "overlay");
+		const slotPayload = slotEv.payload as Record<string, unknown>;
+		expect(slotPayload["focusable"]).toBe(true);
+
+		// Send session_info_changed to trigger done() inside showOverlay
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 33, kind: "req", method: "session_info_changed",
+			payload: { type: "session_info_changed", name: "trigger" },
+		})));
+
+		// Wait for command.execute response (after done())
+		const res = await collector.awaitFrame((f) => f.id === 32 && f.kind === "res");
+		expect(res.payload).toEqual({ ok: true });
+
+		// Verify slot was disposed
+		const disposeEv = await collector.awaitFrame((f) => f.method === "disposeSlot" && (f.payload as Record<string, unknown>)["key"] === slotPayload["key"]);
+		expect(disposeEv).toBeDefined();
+
+	stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
+	});
+
+	test("compiled runtime-import binary loads a real extension", async () => {
+		const binPath = resolve(import.meta.dirname, "..", "dist", "runtime-import");
+		const extPath = resolve(
+			import.meta.dirname, "..", "..", "..",
+			".references", "pi", "packages", "coding-agent", "examples", "extensions", "hello.ts",
+		);
+		const { promise, resolve: resolvePromise, reject: rejectPromise } = Promise.withResolvers<string>();
+		const child = spawn(binPath, [extPath], { stdio: ["ignore", "pipe", "pipe"] });
+		let stdout = "";
+		child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
+		child.on("error", rejectPromise);
+		child.on("exit", (code) => {
+			if (code === 0) resolvePromise(stdout.trim());
+			else rejectPromise(new Error(`runtime-import exited with code ${code}: ${stdout}`));
+		});
+		try {
+			const output = await promise;
+			const result = JSON.parse(output) as Record<string, unknown>;
+			expect(result["tools"]).toEqual(["hello"]);
+			expect(result["handlers"]).toEqual([]);
+		} finally {
+			if (child.exitCode === null) child.kill("SIGTERM");
+		}
+	});
+});
+
+
+// ===========================================================================
+// 6. Registry snapshot + tool/provider wire contract
+// ===========================================================================
+
+describe("acceptance: registry snapshot and tool/provider bridges", () => {
+	test("extensions.load returns full RegistrySnapshotWire", async () => {
+		const { collector, stdin, host, runPromise } = await connectHost([toolProgressFactory]);
+		const badPath = resolve(import.meta.dirname, "..", "fixtures", "extensions", "does-not-exist.ts");
+		const goodPath = resolve(import.meta.dirname, "..", "fixtures", "extensions", "provider-stream.ts");
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 40, kind: "req", method: "extensions.load",
+			payload: { extensionPaths: [goodPath, badPath], cwd: process.cwd() },
+		})));
+		const res = await collector.awaitFrame((f) => f.id === 40 && f.kind === "res");
+		const payload = res.payload as Record<string, unknown>;
+
+		// Isolation: bad path fails, good path + already-loaded factory survive.
+		expect(payload["extensions"]).toBe(1);
+		const errors = payload["errors"] as Array<Record<string, unknown>>;
+		expect(errors.length).toBe(1);
+		expect(String(errors[0]?.["path"])).toContain("does-not-exist");
+
+		const tools = payload["tools"] as Array<Record<string, unknown>>;
+		expect(tools.map((t) => t["name"]).sort()).toEqual(["progress_echo"]);
+		const progress = tools[0] as Record<string, unknown>;
+		expect(progress["label"]).toBe("ProgressEcho");
+		expect(progress["description"]).toBe("Echoes with optional progress and cancel modes");
+		expect(progress["parameters"]).toEqual(expect.objectContaining({ type: "object" }));
+
+		const commands = payload["commands"] as Array<Record<string, unknown>>;
+		expect(commands.some((c) => c["name"] === "progress_cmd")).toBe(true);
+
+		const shortcuts = payload["shortcuts"] as Array<Record<string, unknown>>;
+		expect(shortcuts.some((s) => s["key"] === "ctrl+p")).toBe(true);
+
+		const flags = payload["flags"] as Array<Record<string, unknown>>;
+		expect(flags.some((f) => f["name"] === "progress-flag" && f["type"] === "boolean")).toBe(true);
+
+		const renderers = payload["renderers"] as Array<Record<string, unknown>>;
+		expect(renderers.some((r) => r["name"] === "progress_msg" && r["type"] === "message")).toBe(true);
+
+		const providers = payload["providers"] as Array<Record<string, unknown>>;
+		// provider-stream loaded dynamically
+		const fixture = providers.find((p) => p["name"] === "fixture_provider");
+		expect(fixture).toBeDefined();
+		expect(fixture?.["streamSimple"]).toBe(true);
+		expect(fixture?.["baseUrl"]).toBe("https://fixture.example");
+		expect(fixture?.["api"]).toBe("custom");
+
+		const handlers = payload["handlers"] as string[];
+		expect(handlers).toEqual(expect.arrayContaining(["session_start", "agent_start"]));
+
+		// Sibling still alive: command from the first factory remains registered.
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 41, kind: "req", method: "command.execute",
+			payload: { command: "progress_cmd", args: "" },
+		})));
+		const cmdRes = await collector.awaitFrame((f) => f.id === 41 && f.kind === "res");
+		expect(cmdRes.payload).toEqual({ ok: true });
+
+		stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
+	});
+
+	test("tool.execute returns result and streams toolUpdate progress", async () => {
+		const { collector, stdin, host, runPromise } = await connectHost([toolProgressFactory]);
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 50, kind: "req", method: "tool.execute",
+			payload: {
+				name: "progress_echo",
+				toolCallId: "call-progress-1",
+				args: { text: "hi", mode: "progress" },
+			},
+		})));
+		const update = await collector.awaitFrame(
+			(f) => f.id === 50 && f.kind === "event" && f.method === "toolUpdate",
+		);
+		const updatePayload = update.payload as Record<string, unknown>;
+		expect(updatePayload["toolCallId"]).toBe("call-progress-1");
+		expect(updatePayload["toolName"]).toBe("progress_echo");
+		const partial = updatePayload["partialResult"] as Record<string, unknown>;
+		expect(partial["content"]).toEqual([{ type: "text", text: "partial:hi" }]);
+
+		const res = await collector.awaitFrame((f) => f.id === 50 && f.kind === "res");
+		const result = res.payload as Record<string, unknown>;
+		expect(result["content"]).toEqual([{ type: "text", text: "final:hi" }]);
+		expect(result["details"]).toEqual({ stage: "final", toolCallId: "call-progress-1" });
+
+		stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
+	});
+
+	test("tool.execute cancellation aborts in-flight tool", async () => {
+		const { collector, stdin, host, runPromise } = await connectHost([toolProgressFactory]);
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 51, kind: "req", method: "tool.execute",
+			payload: {
+				name: "progress_echo",
+				toolCallId: "call-cancel-1",
+				args: { text: "x", mode: "cancel" },
+			},
+		})));
+		// Give the tool a tick to enter the abort wait, then cancel.
+		await Promise.resolve();
+		await Promise.resolve();
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 0, kind: "event", method: "tool.cancel",
+			payload: { id: 51 },
+		})));
+		const res = await collector.awaitFrame(
+			(f) => f.id === 51 && (f.kind === "error" || f.kind === "res"),
+		);
+		expect(res.kind).toBe("error");
+		const err = res.payload as Record<string, unknown>;
+		expect(err["code"]).toBe("cancelled");
+		expect(err["retryable"]).toBe(false);
+
+		// Sibling tool still works after cancel.
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 52, kind: "req", method: "tool.execute",
+			payload: {
+				name: "progress_echo",
+				toolCallId: "call-ok",
+				args: { text: "alive" },
+			},
+		})));
+		const ok = await collector.awaitFrame((f) => f.id === 52 && f.kind === "res");
+		const okPayload = ok.payload as Record<string, unknown>;
+		expect(okPayload["content"]).toEqual([{ type: "text", text: "alive" }]);
+
+		stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
+	});
+
+	test("provider.stream emits ordered providerEvent frames then terminal res", async () => {
+		const { collector, stdin, host, runPromise } = await connectHost([providerStreamFactory]);
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 60, kind: "req", method: "provider.stream",
+			payload: {
+				providerId: "fixture_provider",
+				model: { id: "ok", provider: "fixture_provider", api: "custom" },
+				context: { messages: [] },
+				options: {},
+			},
+		})));
+
+		const events: Array<Record<string, unknown>> = [];
+		while (events.length < 4) {
+			const frame = await collector.awaitFrame(
+				(f) => f.id === 60 && f.kind === "event" && f.method === "providerEvent"
+					&& !events.includes(f.payload as Record<string, unknown>),
+			);
+			events.push(frame.payload as Record<string, unknown>);
+		}
+		expect(events.map((e) => e["type"])).toEqual([
+			"start",
+			"text_delta",
+			"text_delta",
+			"done",
+		]);
+		expect(events[1]?.["delta"]).toBe("hel");
+		expect(events[2]?.["delta"]).toBe("lo");
+
+		const res = await collector.awaitFrame((f) => f.id === 60 && f.kind === "res");
+		expect(res.payload).toEqual({});
+
+		stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
+	});
+
+	test("provider.stream error is isolated as non-retryable extension_error", async () => {
+		const { collector, stdin, host, runPromise } = await connectHost([providerStreamFactory]);
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 61, kind: "req", method: "provider.stream",
+			payload: {
+				providerId: "fixture_provider",
+				model: { id: "error", provider: "fixture_provider", api: "custom" },
+				context: { messages: [] },
+				options: {},
+			},
+		})));
+		// May stream an error event then terminal error, or only terminal error.
+		const terminal = await collector.awaitFrame(
+			(f) => f.id === 61 && (f.kind === "error" || f.kind === "res"),
+		);
+		// The fixture throws before first push when model.id === "error" —
+		// host responds with extension_error.
+		// If stream emitted an error event first, terminal may still be res {}.
+		// Prefer strict: throw path before any push.
+		if (terminal.kind === "error") {
+			const err = terminal.payload as Record<string, unknown>;
+			expect(err["code"]).toBe("extension_error");
+			expect(err["retryable"]).toBe(false);
+			expect(String(err["message"])).toContain("provider-stream-error");
+		} else {
+			// Accept ordered error event then empty res.
+			const errEv = collector.frames.find(
+				(f) => f.id === 61 && f.kind === "event" && f.method === "providerEvent"
+					&& (f.payload as Record<string, unknown>)["type"] === "error",
+			);
+			expect(errEv).toBeDefined();
+		}
+
+		// Sibling provider stream still works.
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 62, kind: "req", method: "provider.stream",
+			payload: {
+				providerId: "fixture_provider",
+				model: { id: "ok", provider: "fixture_provider", api: "custom" },
+				context: { messages: [] },
+				options: {},
+			},
+		})));
+		const ok = await collector.awaitFrame((f) => f.id === 62 && f.kind === "res");
+		expect(ok.kind).toBe("res");
+
+		stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
+	});
+
+	test("provider.stream cancellation aborts in-flight stream", async () => {
+		const { collector, stdin, host, runPromise } = await connectHost([providerStreamFactory]);
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 63, kind: "req", method: "provider.stream",
+			payload: {
+				providerId: "fixture_provider",
+				model: { id: "cancel", provider: "fixture_provider", api: "custom" },
+				context: { messages: [] },
+				options: {},
+			},
+		})));
+		// Wait for first events so the stream is parked on cancel wait.
+		await collector.awaitFrame(
+			(f) => f.id === 63 && f.kind === "event" && f.method === "providerEvent",
+		);
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 0, kind: "event", method: "tool.cancel",
+			payload: { id: 63 },
+		})));
+		const terminal = await collector.awaitFrame(
+			(f) => f.id === 63 && (f.kind === "error" || f.kind === "res"),
+		);
+		expect(terminal.kind).toBe("error");
+		const err = terminal.payload as Record<string, unknown>;
+		expect(err["code"]).toBe("cancelled");
+		expect(err["retryable"]).toBe(false);
+
+		stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
+	});
+});

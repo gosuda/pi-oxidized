@@ -277,14 +277,19 @@ impl ToolCall {
 #[serde(rename_all = "camelCase")]
 pub struct UsageCost {
     /// Input-token cost in US dollars.
+    #[serde(default)]
     pub input: f64,
     /// Output-token cost in US dollars.
+    #[serde(default)]
     pub output: f64,
     /// Cache-read cost in US dollars.
+    #[serde(default)]
     pub cache_read: f64,
     /// Cache-write cost in US dollars.
+    #[serde(default)]
     pub cache_write: f64,
     /// Total request cost in US dollars.
+    #[serde(default)]
     pub total: f64,
 }
 
@@ -293,22 +298,28 @@ pub struct UsageCost {
 #[serde(rename_all = "camelCase")]
 pub struct Usage {
     /// Input tokens consumed.
+    #[serde(default)]
     pub input: u64,
     /// Output tokens produced, including reasoning tokens.
+    #[serde(default)]
     pub output: u64,
     /// Cached input tokens read.
+    #[serde(default)]
     pub cache_read: u64,
     /// Input tokens written to cache.
+    #[serde(default)]
     pub cache_write: u64,
     /// Cache-write tokens stored with one-hour retention, when reported.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_write1h: Option<u64>,
     /// Reasoning tokens, as a subset of output tokens, when reported.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<u64>,
     /// Total tokens reported by the provider.
+    #[serde(default)]
     pub total_tokens: u64,
     /// Monetary cost for the request.
+    #[serde(default)]
     pub cost: UsageCost,
 }
 

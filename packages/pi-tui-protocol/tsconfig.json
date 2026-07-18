@@ -1,0 +1,9 @@
+{
+	"extends": "./tsconfig.build.json",
+	"compilerOptions": {
+		"types": ["bun"],
+		"noEmit": true,
+		"rootDir": "."
+	},
+	"include": ["src/**/*.ts", "tests/**/*.ts"]
+}

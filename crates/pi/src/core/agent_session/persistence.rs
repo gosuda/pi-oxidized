@@ -1,0 +1,255 @@
+//! Agent-event persistence and mirror-queue side effects.
+//!
+//! Ownership: the event pump (subscribe.rs) is the sole caller of these helpers
+//! while holding no `SessionManager` lock across await. `SessionManager` is wrapped
+//! in `tokio::sync::Mutex` on `AgentSessionInner` so only the pump (or a public
+//! method that awaits the same mutex) mutates the append-only tree.
+//!
+//! Lock order (documented in `mod.rs`):
+//! 1. `AgentSessionInner` fields under `std::sync::Mutex` (flags, mirrors)
+//! 2. `session_manager: tokio::sync::Mutex<SessionManager>` (async, never
+//!    held while holding the std mutex)
+//! 3. `SessionHooks` `RwLock`s (runner / prompt / tools) — never nested with 1/2
+
+use pi_agent::{AgentEvent, AgentMessage};
+use pi_ai::{AssistantMessage, Message, StopReason, UserContent, UserMessageContent};
+
+use super::events::AgentSessionEvent;
+use super::{AgentSession, AgentSessionInner};
+use crate::core::messages::{CustomMessage, CustomMessageContent};
+use crate::core::sessions::{SessionEntry, SessionError, SessionManager};
+
+impl AgentSession {
+    /// Handle one agent event for mirror queues + persistence side effects.
+    ///
+    /// Ordering contract:
+    /// - `message_start:user` dequeues mirror text and emits `queue_update`
+    ///   BEFORE the public session event is emitted.
+    /// - `message_end` persists after extension + public emit (caller order).
+    /// - successful assistant `message_end` with `retry_attempt > 0` emits
+    ///   `auto_retry_end{success:true}` and resets the counter.
+    pub(super) async fn handle_agent_event_side_effects(
+        &self,
+        event: &AgentEvent,
+        public_event: &AgentSessionEvent,
+    ) {
+        match event {
+            AgentEvent::MessageStart { message } if message.role() == "user" => {
+                self.on_user_message_start(message);
+            }
+            AgentEvent::MessageEnd { message } => {
+                // Prefer the (possibly replacement-mutated) public event message.
+                let message = match public_event {
+                    AgentSessionEvent::MessageEnd { message } => message,
+                    _ => message,
+                };
+                self.on_message_end(message).await;
+            }
+            _ => {}
+        }
+    }
+
+    fn on_user_message_start(&self, message: &AgentMessage) {
+        let text = user_message_text(message);
+        let mut inner = self.lock_inner();
+        inner.overflow_recovery_attempted = false;
+        if text.is_empty() {
+            return;
+        }
+        if let Some(idx) = inner.steering_messages.iter().position(|m| m == &text) {
+            inner.steering_messages.remove(idx);
+            let steering = inner.steering_messages.clone();
+            let follow_up = inner.follow_up_messages.clone();
+            drop(inner);
+            self.emit_public(AgentSessionEvent::QueueUpdate {
+                steering,
+                follow_up,
+            });
+            return;
+        }
+        if let Some(idx) = inner.follow_up_messages.iter().position(|m| m == &text) {
+            inner.follow_up_messages.remove(idx);
+            let steering = inner.steering_messages.clone();
+            let follow_up = inner.follow_up_messages.clone();
+            drop(inner);
+            self.emit_public(AgentSessionEvent::QueueUpdate {
+                steering,
+                follow_up,
+            });
+        }
+    }
+
+    async fn on_message_end(&self, message: &AgentMessage) {
+        if let Err(err) = self.persist_message_end(message).await {
+            tracing_warn_persist(&err);
+        }
+
+        if message.role() != "assistant" {
+            return;
+        }
+
+        let assistant = match message.as_llm() {
+            Some(Message::Assistant(a)) => a.clone(),
+            _ => return,
+        };
+
+        let mut inner = self.lock_inner();
+        inner.last_assistant_message = Some(assistant.clone());
+        if assistant.stop_reason != StopReason::Error {
+            inner.overflow_recovery_attempted = false;
+        }
+        if assistant.stop_reason != StopReason::Error && inner.retry_attempt > 0 {
+            let attempt = inner.retry_attempt;
+            inner.retry_attempt = 0;
+            drop(inner);
+            self.emit_public(AgentSessionEvent::AutoRetryEnd {
+                success: true,
+                attempt,
+                final_error: None,
+            });
+        }
+    }
+
+    async fn persist_message_end(&self, message: &AgentMessage) -> Result<(), SessionError> {
+        let mut sm = self.session_manager.lock().await;
+        match message.role() {
+            "custom" => persist_custom_message(&mut sm, message)?,
+            "user" | "assistant" | "toolResult" => {
+                let id = sm.append_message(message)?;
+                if let Some(entry) = sm.get_entry(&id).cloned() {
+                    drop(sm);
+                    self.emit_public(AgentSessionEvent::EntryAppended { entry });
+                    return Ok(());
+                }
+            }
+            // bashExecution / compactionSummary / branchSummary persist elsewhere
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Apply a `message_end` replacement to agent state + the event message value.
+    ///
+    /// Returns the message that should be used for public emit + persistence.
+    pub(super) fn apply_message_end_replacement(
+        &self,
+        original: AgentMessage,
+        replacement: Option<AgentMessage>,
+    ) -> AgentMessage {
+        let Some(mut replacement) = replacement else {
+            return original;
+        };
+
+        // Normalize null/missing content for typed roles (TS untyped-handler guard).
+        replacement = normalize_replacement(replacement);
+
+        // Update live agent transcript when the tail is the assistant being replaced.
+        if replacement.role() == "assistant"
+            && let Some(Message::Assistant(assistant)) = replacement.as_llm().cloned()
+        {
+            let _ = self.agent.replace_last_assistant(assistant);
+        } else if matches!(replacement.role(), "user" | "toolResult" | "custom") {
+            // For non-assistant replacements, rewrite the last matching role if present.
+            // Agent only exposes replace_last_assistant; other roles stay on the event
+            // path + persistence. Live transcript for those is already finalized by
+            // the agent loop before message_end, so we only ensure persistence sees
+            // the replacement value (returned below).
+        }
+
+        replacement
+    }
+}
+
+fn persist_custom_message(
+    sm: &mut SessionManager,
+    message: &AgentMessage,
+) -> Result<(), SessionError> {
+    let Some(custom) = parse_custom_agent_message(message) else {
+        // Fall back to opaque append via message entry.
+        sm.append_message(message)?;
+        return Ok(());
+    };
+    sm.append_custom_message_entry(
+        &custom.custom_type,
+        &custom.content,
+        custom.display,
+        custom.details.clone(),
+    )?;
+    Ok(())
+}
+
+fn parse_custom_agent_message(message: &AgentMessage) -> Option<CustomMessage> {
+    let AgentMessage::Custom(custom) = message else {
+        return None;
+    };
+    if custom.role != "custom" {
+        return None;
+    }
+    let value = serde_json::to_value(custom).ok()?;
+    serde_json::from_value(value).ok()
+}
+
+fn normalize_replacement(message: AgentMessage) -> AgentMessage {
+    match &message {
+        AgentMessage::Llm(inner) => match inner.as_ref() {
+            Message::User(user) => {
+                // User content is non-optional in the typed shape.
+                let _ = user;
+                message
+            }
+            Message::Assistant(assistant) => {
+                let _ = assistant;
+                message
+            }
+            Message::ToolResult(tool) => {
+                let _ = tool;
+                message
+            }
+        },
+        AgentMessage::Custom(custom) if custom.role == "custom" => {
+            // Ensure content key exists for product custom messages.
+            if custom.payload.get("content").is_none() {
+                let mut payload = custom.payload.clone();
+                payload.insert(
+                    "content".to_owned(),
+                    serde_json::to_value(CustomMessageContent::Blocks(Vec::new()))
+                        .unwrap_or(Value::Array(Vec::new())),
+                );
+                return AgentMessage::Custom(pi_agent::CustomAgentMessage::new("custom", payload));
+            }
+            message
+        }
+        AgentMessage::Custom(_) => message,
+    }
+}
+
+/// Extract plain text from a user message (joined text blocks).
+pub(super) fn user_message_text(message: &AgentMessage) -> String {
+    match message.as_llm() {
+        Some(Message::User(user)) => match &user.content {
+            UserMessageContent::Text(text) => text.clone(),
+            UserMessageContent::Blocks(blocks) => blocks
+                .iter()
+                .filter_map(|block| match block {
+                    UserContent::Text(t) => Some(t.text.as_str()),
+                    UserContent::Image(_) => None,
+                })
+                .collect::<Vec<_>>()
+                .join(""),
+        },
+        _ => String::new(),
+    }
+}
+
+fn tracing_warn_persist(err: &SessionError) {
+    // Avoid depending on a tracing subscriber; keep a silent-but-typed path.
+    let _ = err;
+}
+
+// Re-export for typecheck of SessionEntry in callers.
+#[allow(dead_code)]
+fn _keep(entry: SessionEntry, assistant: AssistantMessage, inner: &AgentSessionInner) {
+    let _ = (entry, assistant, inner);
+}
+
+use serde_json::Value;

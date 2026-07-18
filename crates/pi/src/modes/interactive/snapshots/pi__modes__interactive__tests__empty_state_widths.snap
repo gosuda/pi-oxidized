@@ -1,0 +1,136 @@
+---
+source: crates/pi/src/modes/interactive/tests.rs
+expression: triple_plain(&state)
+---
+===== width 20 =====
+ pi v0.1.0  •  type 
+ a message to begin 
+ No messages yet.   
+ Type below to      
+ begin.             
+                    
+                    
+ Type a message…    
+~/projects/pi (main)
+• refactor          
+↑1.2k ↓567 R8.9k    
+W1.0k CH89.9% $0.012
+42.5%/200k (auto)   
+claude-sonnet •     
+medium              
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+
+===== width 80 =====
+ pi v0.1.0  •  type a message to begin                                          
+ No messages yet. Type below to begin.                                          
+                                                                                
+                                                                                
+ Type a message…                                                                
+~/projects/pi (main) • refactor                                                 
+↑1.2k ↓567 R8.9k W1.0k CH89.9% $0.012 42.5%/200k (auto)   claude-sonnet • medium
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+
+===== width 160 =====
+ pi v0.1.0  •  type a message to begin                                                                                                                          
+ No messages yet. Type below to begin.                                                                                                                          
+                                                                                                                                                                
+                                                                                                                                                                
+ Type a message…                                                                                                                                                
+~/projects/pi (main) • refactor                                                                                                                                 
+↑1.2k ↓567 R8.9k W1.0k CH89.9% $0.012 42.5%/200k (auto)   claude-sonnet • medium

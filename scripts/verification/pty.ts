@@ -1,0 +1,314 @@
+export const PTY_KEYS = {
+	enter: "\r",
+	escape: "\x1b",
+	ctrlC: "\x03",
+	ctrlD: "\x04",
+	up: "\x1b[A",
+	down: "\x1b[B",
+	right: "\x1b[C",
+	left: "\x1b[D",
+} as const;
+
+
+export interface PtyCommand {
+	argv: readonly [string, ...string[]];
+	cwd: string;
+	env?: Readonly<Record<string, string | undefined>>;
+	stdin?: string | Uint8Array;
+	cursorPosition?: { readonly row: number; readonly column: number } | false;
+	size?: { readonly columns: number; readonly rows: number };
+}
+
+export interface PtyChunk {
+	readonly stream: "pty" | "driver";
+	readonly text: string;
+	readonly bytes: Uint8Array;
+	readonly elapsedMs: number;
+	readonly unixMs: number;
+}
+
+export interface PtySnapshot {
+	readonly rawText: string;
+	readonly applicationText: string;
+	readonly echoText: string;
+	readonly chunks: readonly PtyChunk[];
+	readonly elapsedMs: number;
+	readonly exited: boolean;
+	readonly exitCode: number | null;
+}
+
+export interface WaitForOptions {
+	deadlineMs: number;
+	source?: "application" | "raw" | "echo";
+}
+
+type SnapshotPredicate = (snapshot: PtySnapshot) => boolean;
+type ProcessSignal = "SIGINT" | "SIGTERM" | "SIGKILL";
+
+interface InputWrite {
+	readonly text: string;
+	readonly outputOffset: number;
+}
+
+function shellQuote(value: string): string {
+	if (value.includes("\0")) throw new Error("PTY argv cannot contain NUL bytes");
+	return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
+function commandString(
+	argv: readonly [string, ...string[]],
+	size: { readonly columns: number; readonly rows: number },
+): string {
+	if (
+		!Number.isSafeInteger(size.columns) ||
+		size.columns < 1 ||
+		size.columns > 10_000 ||
+		!Number.isSafeInteger(size.rows) ||
+		size.rows < 1 ||
+		size.rows > 10_000
+	) {
+		throw new Error("PTY size must use integer columns and rows between 1 and 10000");
+	}
+	return `stty cols ${size.columns} rows ${size.rows}; exec ${argv.map(shellQuote).join(" ")}`;
+}
+
+function mergedEnvironment(overrides: PtyCommand["env"]): Record<string, string> {
+	const result: Record<string, string> = {};
+	for (const [name, value] of Object.entries(process.env)) {
+		if (value !== undefined) result[name] = value;
+	}
+	for (const [name, value] of Object.entries(overrides ?? {})) {
+		if (value === undefined) delete result[name];
+		else result[name] = value;
+	}
+	result.TERM ??= "xterm-256color";
+	return result;
+}
+
+export class PtyProcess {
+	readonly #startedAt = performance.now();
+	readonly #chunks: PtyChunk[] = [];
+	readonly #writes: InputWrite[] = [];
+	readonly #process: Bun.Subprocess<"pipe", "pipe", "pipe">;
+	readonly #completed: Promise<number>;
+	readonly #stdin: Bun.FileSink;
+	readonly #cursorPosition: { readonly row: number; readonly column: number } | false;
+	#rawText = "";
+	#cursorScanOffset = 0;
+	#exitCode: number | null = null;
+	#version = 0;
+	#listeners = new Set<() => void>();
+
+	constructor(command: PtyCommand) {
+		this.#cursorPosition = command.cursorPosition ?? { row: 1, column: 1 };
+		this.#process = Bun.spawn(
+			[
+				"setsid",
+				"--wait",
+				"script",
+				"--quiet",
+				"--flush",
+				"--echo",
+				"always",
+				"--return",
+				"--command",
+				commandString(command.argv, command.size ?? { columns: 80, rows: 24 }),
+				"/dev/null",
+			],
+			{
+				cwd: command.cwd,
+				env: mergedEnvironment(command.env),
+				stdin: "pipe",
+				stdout: "pipe",
+				stderr: "pipe",
+			},
+		);
+		this.#stdin = this.#process.stdin;
+		const ptyDone = this.#consume(this.#process.stdout, "pty");
+		const driverDone = this.#consume(this.#process.stderr, "driver");
+		this.#completed = Promise.all([this.#process.exited, ptyDone, driverDone]).then(([code]) => {
+			this.#exitCode = code;
+			this.#notify();
+			return code;
+		});
+		if (command.stdin !== undefined) this.writeKeys(command.stdin);
+	}
+
+	get pid(): number {
+		return this.#process.pid;
+	}
+
+	get exited(): boolean {
+		return this.#exitCode !== null;
+	}
+
+	writeKeys(...keys: readonly (string | Uint8Array)[]): void {
+		if (this.exited) throw new Error(`PTY process ${this.pid} has exited`);
+		const outputOffset = this.#rawText.length;
+		let text = "";
+		for (const key of keys) {
+			const bytes = typeof key === "string" ? new TextEncoder().encode(key) : key;
+			text += new TextDecoder().decode(bytes);
+			this.#stdin.write(bytes);
+		}
+		this.#writes.push({ text, outputOffset });
+		this.#stdin.flush();
+	}
+
+
+	snapshot(): PtySnapshot {
+		const echoRanges: Array<readonly [number, number]> = [];
+		let searchOffset = 0;
+		for (const write of this.#writes) {
+			if (!/[\r\n]/.test(write.text) || !/[^\x00-\x1f\x7f]/.test(write.text)) continue;
+			const candidates = [write.text, write.text.replaceAll("\r", "\r\n"), write.text.replaceAll("\n", "\r\n")];
+			let bestStart = -1;
+			let bestText = "";
+			for (const candidate of candidates) {
+				const start = this.#rawText.indexOf(candidate, Math.max(searchOffset, write.outputOffset));
+				if (start >= 0 && (bestStart < 0 || start < bestStart || (start === bestStart && candidate.length > bestText.length))) {
+					bestStart = start;
+					bestText = candidate;
+				}
+			}
+			if (bestStart >= 0) {
+				echoRanges.push([bestStart, bestStart + bestText.length]);
+				searchOffset = bestStart + bestText.length;
+			}
+		}
+		let applicationText = "";
+		let echoText = "";
+		let offset = 0;
+		for (const [start, end] of echoRanges) {
+			applicationText += this.#rawText.slice(offset, start);
+			echoText += this.#rawText.slice(start, end);
+			offset = end;
+		}
+		applicationText += this.#rawText.slice(offset);
+		return {
+			rawText: this.#rawText,
+			applicationText,
+			echoText,
+			chunks: [...this.#chunks],
+			elapsedMs: performance.now() - this.#startedAt,
+			exited: this.exited,
+			exitCode: this.#exitCode,
+		};
+	}
+
+	async waitFor(pattern: RegExp | SnapshotPredicate, options: WaitForOptions): Promise<PtySnapshot> {
+		if (!(options.deadlineMs > 0)) throw new Error("PTY wait deadline must be positive");
+		const deadline = performance.now() + options.deadlineMs;
+		for (;;) {
+			const snapshot = this.snapshot();
+			let matched: boolean;
+			if (pattern instanceof RegExp) {
+				pattern.lastIndex = 0;
+				const text = options.source === "raw" ? snapshot.rawText : options.source === "echo" ? snapshot.echoText : snapshot.applicationText;
+				matched = pattern.test(text);
+			} else {
+				matched = pattern(snapshot);
+			}
+			if (matched) return snapshot;
+			if (snapshot.exited) throw new Error(`PTY process exited with code ${snapshot.exitCode} before expected output`);
+			const remaining = deadline - performance.now();
+			if (remaining <= 0) throw new Error(`PTY output deadline exceeded after ${options.deadlineMs}ms`);
+			const observedVersion = this.#version;
+			const changed = Promise.withResolvers<void>();
+			const listener = () => changed.resolve();
+			this.#listeners.add(listener);
+			if (this.#version !== observedVersion) listener();
+			const deadlineTimer = setTimeout(changed.resolve, remaining);
+			await changed.promise;
+			clearTimeout(deadlineTimer);
+			this.#listeners.delete(listener);
+		}
+	}
+
+	async waitForExit(deadlineMs: number): Promise<number> {
+		if (this.#exitCode !== null) return this.#exitCode;
+		const deadline = Promise.withResolvers<null>();
+		const deadlineTimer = setTimeout(() => deadline.resolve(null), deadlineMs);
+		const code = await Promise.race([this.#completed, deadline.promise]);
+		clearTimeout(deadlineTimer);
+		if (code === null) throw new Error(`PTY process did not exit within ${deadlineMs}ms`);
+		return code;
+	}
+
+	async terminate(graceMs = 1_000): Promise<number> {
+		if (this.#exitCode !== null) return this.#exitCode;
+		this.#signalTree("SIGTERM");
+		try {
+			return await this.waitForExit(graceMs);
+		} catch {
+			this.#signalTree("SIGKILL");
+			return await this.waitForExit(graceMs);
+		}
+	}
+
+	async #consume(stream: ReadableStream<Uint8Array>, source: PtyChunk["stream"]): Promise<void> {
+		const decoder = new TextDecoder();
+		for await (const bytes of stream) {
+			const copy = Uint8Array.from(bytes);
+			const text = decoder.decode(copy, { stream: true });
+			if (source === "pty") {
+				this.#rawText += text;
+				this.#answerCursorQueries();
+			}
+			this.#chunks.push({
+				stream: source,
+				text,
+				bytes: copy,
+				elapsedMs: performance.now() - this.#startedAt,
+				unixMs: Date.now(),
+			});
+			this.#notify();
+		}
+		const tail = decoder.decode();
+		if (tail) {
+			if (source === "pty") {
+				this.#rawText += tail;
+				this.#answerCursorQueries();
+			}
+			this.#chunks.push({
+				stream: source,
+				text: tail,
+				bytes: new Uint8Array(),
+				elapsedMs: performance.now() - this.#startedAt,
+				unixMs: Date.now(),
+			});
+			this.#notify();
+		}
+	}
+
+	#answerCursorQueries(): void {
+		if (this.#cursorPosition === false) return;
+		let query = this.#rawText.indexOf("\x1b[6n", this.#cursorScanOffset);
+		while (query >= 0) {
+			this.#stdin.write(`\x1b[${this.#cursorPosition.row};${this.#cursorPosition.column}R`);
+			this.#stdin.flush();
+			this.#cursorScanOffset = query + 4;
+			query = this.#rawText.indexOf("\x1b[6n", this.#cursorScanOffset);
+		}
+		this.#cursorScanOffset = Math.max(this.#cursorScanOffset, this.#rawText.length - 3);
+	}
+
+	#notify(): void {
+		this.#version += 1;
+		const listeners = [...this.#listeners];
+		this.#listeners.clear();
+		for (const listener of listeners) listener();
+	}
+
+	#signalTree(signal: ProcessSignal): void {
+		try {
+			process.kill(-this.#process.pid, signal);
+		} catch (error) {
+			if (!(error instanceof Error && "code" in error && error.code === "ESRCH")) throw error;
+		}
+	}
+}
+
+export function spawnPty(command: PtyCommand): PtyProcess {
+	return new PtyProcess(command);
+}

@@ -1,0 +1,8 @@
+/**
+ * Pure TypeScript protocol client for the pi extension-host / structured UI
+ * bridge. Speaks UTF-8 JSONL frames only; no terminal, ANSI, or native access.
+ */
+export { decodeFrameLine, decodeFrameStr, decodeFrameStrStrict, encodeFrame, encodeFrameString, errorFrame, eventFrame, FrameDecoder, ProtocolError, requestFrame, responseFrame, validateFrame, } from "./codec.js";
+export { type ByteReadable, type ByteWritable, type FrameHandler, ProtocolClient, type RequestOptions, } from "./client.js";
+export { COMPATIBILITY_VERSION, type ConfirmRequest, type ConfirmResponse, type DialogOptions, type DisposeSlot, type EditorRequest, type EditorResponse, type ErrorPayload, type ExtensionErrorEvent, type Frame, type FrameId, type FrameKind, type Hello, type HelloAck, type Hyperlink, type InputRequest, type InputResponse, isMethod, type KeyEventKindWire, type KeyModifiersWire, localHello, localHelloAck, MAX_FRAME_BYTES, type MeasureResponse, type Method, METHODS, type NamedColor, type NotifyLevel, type NotifyRequest, type OverlayAnchor, type OverlayMargin, type OverlayOptions, PROTOCOL_VERSION, type ProviderEvent, type SelectRequest, type SelectResponse, type SizeValue, type SlotCursor, type SlotPlacement, type SlotRenderRequest, type Style, type StyledRun, type TerminalInputResult, type ToolUpdate, type UiEventWire, type UiSlot, type WireColor, } from "./types.js";
+//# sourceMappingURL=index.d.ts.map

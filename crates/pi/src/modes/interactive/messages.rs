@@ -1,0 +1,640 @@
+//! Chat message view-models and component builders.
+//!
+//! Ports `.references/pi/packages/coding-agent/src/modes/interactive/components/`
+//! `assistant-message.ts`, `user-message.ts`, `tool-execution.ts`,
+//! `bash-execution.ts`, `custom-message.ts`, `compaction-summary-message.ts`,
+//! `branch-summary-message.ts`, and `skill-invocation-message.ts` into pure
+//! view-models that build pi-tui components for composition.
+
+use std::collections::BTreeMap;
+
+use pi_ai::{AssistantContent, AssistantMessage, StopReason};
+use pi_tui::component::Component;
+use pi_tui::components::{Markdown, Padded, Spacer, Text};
+
+use super::theme::{
+    self, MarkdownOptions, MarkdownTheme, ResolvedTheme, ThemeBg, ThemeColor, user_markdown_options,
+};
+use super::tool_renderer::{ToolPhase, ToolState};
+/// Default output padding for assistant/user content blocks (matches reference).
+pub const OUTPUT_PAD: u16 = 1;
+
+/// Collapsed bash/tool preview line count (ports `PREVIEW_LINES`).
+pub const BASH_PREVIEW_LINES: usize = 20;
+/// One chat message view-model.
+#[derive(Clone, Debug)]
+pub enum MessageView {
+    /// User-authored message.
+    User(UserMessageView),
+    /// Assistant message (text + thinking + stop-reason errors).
+    Assistant(AssistantMessageView),
+    /// Tool execution block.
+    Tool(ToolMessageView),
+    /// Bash execution (`!`/`!!`) block.
+    Bash(BashMessageView),
+    /// Extension-injected custom message.
+    Custom(CustomMessageView),
+    /// Compaction summary.
+    Compaction(CompactionSummaryView),
+    /// Branch summary.
+    Branch(BranchSummaryView),
+    /// Skill invocation block.
+    Skill(SkillInvocationView),
+}
+
+/// User message view-model.
+#[derive(Clone, Debug)]
+pub struct UserMessageView {
+    /// Markdown source.
+    pub text: String,
+}
+
+/// Assistant message view-model.
+#[derive(Clone, Debug)]
+pub struct AssistantMessageView {
+    /// The full assistant message (content + usage + stop reason).
+    pub message: AssistantMessage,
+    /// Whether thinking blocks are hidden behind a static label.
+    pub hide_thinking: bool,
+    /// Label shown for hidden thinking runs.
+    pub hidden_thinking_label: String,
+    /// Whether this is the live streaming tail.
+    pub streaming: bool,
+}
+
+/// Tool message view-model (wraps [`ToolState`] plus renderer key).
+#[derive(Clone, Debug)]
+pub struct ToolMessageView {
+    /// Aggregate tool state.
+    pub state: ToolState,
+    /// Renderer key (tool name) used to look up a [`super::tool_renderer::CustomToolRenderer`].
+    pub renderer: String,
+}
+
+/// Bash execution view-model.
+#[derive(Clone, Debug)]
+pub struct BashMessageView {
+    /// Shell command.
+    pub command: String,
+    /// Captured output (possibly truncated).
+    pub output: String,
+    /// Whether collapsed preview vs expanded.
+    pub expanded: bool,
+    /// Exit code when finished.
+    pub exit_code: Option<i32>,
+    /// Whether cancelled.
+    pub cancelled: bool,
+    /// Whether output is truncated.
+    pub truncated: bool,
+    /// Spill path when truncated.
+    pub full_output_path: Option<String>,
+}
+
+/// Extension custom message view-model.
+#[derive(Clone, Debug)]
+pub struct CustomMessageView {
+    /// Custom type label.
+    pub custom_type: String,
+    /// Text content.
+    pub text: String,
+}
+
+/// Compaction summary view-model.
+#[derive(Clone, Debug)]
+pub struct CompactionSummaryView {
+    /// Summary text.
+    pub summary: String,
+    /// Tokens before compaction.
+    pub tokens_before: i64,
+}
+
+/// Branch summary view-model.
+#[derive(Clone, Debug)]
+pub struct BranchSummaryView {
+    /// Summary text.
+    pub summary: String,
+    /// Entry id the branch forked from.
+    pub from_id: String,
+}
+
+/// Skill invocation view-model.
+#[derive(Clone, Debug)]
+pub struct SkillInvocationView {
+    /// Skill name.
+    pub name: String,
+    /// Invocation text.
+    pub text: String,
+}
+
+impl MessageView {
+    /// Build a streaming assistant tail view-model.
+    #[must_use]
+    pub fn streaming_assistant(message: AssistantMessage) -> Self {
+        Self::Assistant(AssistantMessageView {
+            message,
+            hide_thinking: false,
+            hidden_thinking_label: "Thinking…".to_owned(),
+            streaming: true,
+        })
+    }
+}
+
+/// Build the component stack for one assistant message.
+///
+/// Returns a `Vec<Box<dyn Component>>` so the caller can splice it into the
+/// chat container in order. Mirrors `AssistantMessageComponent.updateContent`.
+#[must_use]
+pub fn build_assistant(
+    view: &AssistantMessageView,
+    md_theme: &MarkdownTheme,
+    theme: &ResolvedTheme,
+) -> Vec<Box<dyn Component>> {
+    let mut out: Vec<Box<dyn Component>> = Vec::new();
+    let message = &view.message;
+
+    if message.content.iter().any(content_is_visible) {
+        out.push(Box::new(Spacer::new(1)));
+    }
+
+    push_assistant_content_blocks(&mut out, view, md_theme, theme);
+    push_assistant_stop_reason(&mut out, message, theme);
+    out
+}
+
+fn content_is_visible(content: &AssistantContent) -> bool {
+    match content {
+        AssistantContent::Text(t) => !t.text.trim().is_empty(),
+        AssistantContent::Thinking(t) => !t.thinking.trim().is_empty(),
+        AssistantContent::ToolCall(_) => false,
+    }
+}
+
+fn push_assistant_content_blocks(
+    out: &mut Vec<Box<dyn Component>>,
+    view: &AssistantMessageView,
+    md_theme: &MarkdownTheme,
+    theme: &ResolvedTheme,
+) {
+    let message = &view.message;
+    let mut iter = message.content.iter().enumerate().peekable();
+    while let Some((idx, content)) = iter.next() {
+        match content {
+            AssistantContent::Text(t) => {
+                if !t.text.trim().is_empty() {
+                    out.push(Box::new(Markdown::new(
+                        t.text.trim(),
+                        OUTPUT_PAD,
+                        0,
+                        md_theme.clone(),
+                        theme::default_text_style(),
+                        MarkdownOptions::default(),
+                    )));
+                }
+            }
+            AssistantContent::Thinking(tc) => {
+                // Preserve the first Thinking content in the run (thinking-current-block fix).
+                let mut blocks: Vec<String> = Vec::new();
+                if !tc.thinking.trim().is_empty() {
+                    blocks.push(tc.thinking.trim().to_owned());
+                }
+                while let Some(&(_, c)) = iter.peek() {
+                    if let AssistantContent::Thinking(next) = c {
+                        if !next.thinking.trim().is_empty() {
+                            blocks.push(next.thinking.trim().to_owned());
+                        }
+                        iter.next();
+                    } else {
+                        break;
+                    }
+                }
+                if blocks.is_empty() {
+                    continue;
+                }
+                push_thinking_components(out, view, md_theme, theme, &blocks, idx);
+            }
+            AssistantContent::ToolCall(_) => {
+                // Tool calls render as separate Tool message blocks, not inline.
+            }
+        }
+    }
+}
+
+fn push_thinking_components(
+    out: &mut Vec<Box<dyn Component>>,
+    view: &AssistantMessageView,
+    md_theme: &MarkdownTheme,
+    theme: &ResolvedTheme,
+    blocks: &[String],
+    idx: usize,
+) {
+    let has_after = view
+        .message
+        .content
+        .iter()
+        .skip(idx + 1)
+        .any(content_is_visible);
+    if view.hide_thinking {
+        out.push(Box::new(Text::with_padding(
+            theme.fg(
+                ThemeColor::ThinkingText,
+                &theme::italic(&view.hidden_thinking_label),
+            ),
+            OUTPUT_PAD,
+            0,
+        )));
+    } else {
+        out.push(Box::new(Markdown::new(
+            blocks.join("\n\n"),
+            OUTPUT_PAD,
+            0,
+            md_theme.clone(),
+            thinking_text_style(),
+            MarkdownOptions::default(),
+        )));
+    }
+    if has_after {
+        out.push(Box::new(Spacer::new(1)));
+    }
+}
+
+fn push_assistant_stop_reason(
+    out: &mut Vec<Box<dyn Component>>,
+    message: &AssistantMessage,
+    theme: &ResolvedTheme,
+) {
+    let has_tool_calls = message
+        .content
+        .iter()
+        .any(|c| matches!(c, AssistantContent::ToolCall(_)));
+    match message.stop_reason {
+        StopReason::Length => {
+            out.push(Box::new(Spacer::new(1)));
+            out.push(Box::new(Text::with_padding(
+                theme.fg(
+                    ThemeColor::Error,
+                    "Error: Model stopped because it reached the maximum output token limit. The response may be incomplete.",
+                ),
+                OUTPUT_PAD,
+                0,
+            )));
+        }
+        StopReason::Aborted if !has_tool_calls => {
+            let msg = match message.error_message.as_deref() {
+                Some(e) if e != "Request was aborted" => e.to_owned(),
+                _ => "Operation aborted".to_owned(),
+            };
+            out.push(Box::new(Spacer::new(1)));
+            out.push(Box::new(Text::with_padding(
+                theme.fg(ThemeColor::Error, &msg),
+                OUTPUT_PAD,
+                0,
+            )));
+        }
+        StopReason::Error if !has_tool_calls => {
+            let msg = message
+                .error_message
+                .clone()
+                .unwrap_or_else(|| "Unknown error".to_owned());
+            out.push(Box::new(Spacer::new(1)));
+            out.push(Box::new(Text::with_padding(
+                theme.fg(ThemeColor::Error, &format!("Error: {msg}")),
+                OUTPUT_PAD,
+                0,
+            )));
+        }
+        _ => {}
+    }
+}
+
+/// Build the component for a user message (Box + Markdown on userMessageBg).
+#[must_use]
+pub fn build_user(
+    view: &UserMessageView,
+    md_theme: &MarkdownTheme,
+    theme: &ResolvedTheme,
+) -> Box<dyn Component> {
+    let mut box_ = Padded::with_padding(OUTPUT_PAD, 1);
+    let bg = theme.bg_ansi(ThemeBg::UserMessageBg);
+    box_.set_bg(Some(move |line: &str| format!("{bg}{line}\x1b[49m")));
+    let md = Markdown::new(
+        view.text.as_str(),
+        0,
+        0,
+        md_theme.clone(),
+        user_text_style(),
+        user_markdown_options(),
+    );
+    box_.add_child(md);
+    Box::new(box_)
+}
+
+/// Build the component stack for a tool execution block.
+///
+/// Looks up `renderers` for the tool name; falls back to a JSON dump header.
+/// Call/result renderers return pre-styled lines, wrapped here in `Text`.
+#[must_use]
+pub fn build_tool(
+    view: &ToolMessageView,
+    renderers: &BTreeMap<String, Box<dyn super::tool_renderer::CustomToolRenderer>>,
+    theme: &ResolvedTheme,
+) -> Vec<Box<dyn Component>> {
+    let mut out: Vec<Box<dyn Component>> = Vec::new();
+    out.push(Box::new(Spacer::new(1)));
+    let phase_bg = match view.state.phase {
+        ToolPhase::Pending => ThemeBg::ToolPendingBg,
+        ToolPhase::Success => ThemeBg::ToolSuccessBg,
+        ToolPhase::Error => ThemeBg::ToolErrorBg,
+    };
+    let mut shell = Padded::with_padding(OUTPUT_PAD, 0);
+    let bg = theme.bg_ansi(phase_bg);
+    shell.set_bg(Some(move |line: &str| format!("{bg}{line}\x1b[49m")));
+    // Call header (renderer or JSON fallback).
+    let header_lines: Vec<String> = if let Some(renderer) = renderers.get(&view.renderer) {
+        renderer
+            .render_call_lines(&view.state.call, view.state.expanded)
+            .unwrap_or_default()
+    } else {
+        let title = theme.fg(
+            ThemeColor::ToolTitle,
+            &format!("▶ {}", view.state.call.name),
+        );
+        let args = serde_json::to_string_pretty(&view.state.call.raw_args).unwrap_or_default();
+        vec![title, theme.fg(ThemeColor::ToolOutput, &args)]
+    };
+    if !header_lines.is_empty() {
+        shell.add_child(Text::with_padding(header_lines.join("\n"), 0, 0));
+    }
+    // Result body.
+    if let Some(result) = view.state.result.as_ref() {
+        let body_lines = if let Some(renderer) = renderers.get(&view.renderer) {
+            renderer.render_result_lines(result, view.state.expanded)
+        } else {
+            super::tool_renderer::default_result_lines(result)
+        };
+        if !body_lines.is_empty() {
+            shell.add_child(Text::with_padding(
+                theme.fg(ThemeColor::ToolOutput, &body_lines.join("\n")),
+                0,
+                0,
+            ));
+        }
+    }
+    out.push(Box::new(shell));
+    out
+}
+
+/// Build the bash execution component (bordered run UI with preview/expand).
+#[must_use]
+pub fn build_bash(view: &BashMessageView, theme: &ResolvedTheme) -> Box<dyn Component> {
+    let mut out: Vec<Box<dyn Component>> = Vec::new();
+    let cmd_line = theme.fg(ThemeColor::BashMode, &format!("$ {}", view.command));
+    out.push(Box::new(Text::with_padding(cmd_line, OUTPUT_PAD, 0)));
+    let body = if view.expanded {
+        view.output.clone()
+    } else {
+        preview_lines(&view.output, BASH_PREVIEW_LINES)
+    };
+    if !body.is_empty() {
+        out.push(Box::new(Text::with_padding(
+            theme.fg(ThemeColor::ToolOutput, &body),
+            OUTPUT_PAD,
+            0,
+        )));
+    }
+    if view.truncated
+        && !view.expanded
+        && let Some(path) = view.full_output_path.as_deref()
+    {
+        out.push(Box::new(Text::with_padding(
+            theme.fg(
+                ThemeColor::Dim,
+                &format!("[truncated — full output: {path}]"),
+            ),
+            OUTPUT_PAD,
+            0,
+        )));
+    }
+    if view.cancelled {
+        out.push(Box::new(Text::with_padding(
+            theme.fg(ThemeColor::Warning, "(cancelled)"),
+            OUTPUT_PAD,
+            0,
+        )));
+    } else if let Some(code) = view.exit_code.filter(|&code| code != 0) {
+        out.push(Box::new(Text::with_padding(
+            theme.fg(ThemeColor::Error, &format!("exit {code}")),
+            OUTPUT_PAD,
+            0,
+        )));
+    }
+    let mut stack = ColumnStack::new();
+    for c in out {
+        stack.push(c);
+    }
+    let _ = theme;
+    Box::new(stack)
+}
+
+/// Build the custom-message component (purple label box).
+#[must_use]
+pub fn build_custom(
+    view: &CustomMessageView,
+    md_theme: &MarkdownTheme,
+    theme: &ResolvedTheme,
+) -> Box<dyn Component> {
+    let mut box_ = Padded::with_padding(OUTPUT_PAD, 1);
+    let bg = theme.bg_ansi(ThemeBg::CustomMessageBg);
+    box_.set_bg(Some(move |line: &str| format!("{bg}{line}\x1b[49m")));
+    let label = theme.fg(
+        ThemeColor::CustomMessageLabel,
+        &format!("[{}]", view.custom_type),
+    );
+    box_.add_child(Text::with_padding(label, 0, 0));
+    box_.add_child(Markdown::new(
+        view.text.as_str(),
+        0,
+        0,
+        md_theme.clone(),
+        custom_text_style(),
+        MarkdownOptions::default(),
+    ));
+    Box::new(box_)
+}
+
+/// Build the compaction-summary component (collapsible).
+#[must_use]
+pub fn build_compaction(
+    view: &CompactionSummaryView,
+    md_theme: &MarkdownTheme,
+    theme: &ResolvedTheme,
+) -> Box<dyn Component> {
+    let mut stack = ColumnStack::new();
+    let label = theme.fg(
+        ThemeColor::Accent,
+        &format!("⌁ Compacted context (was {} tokens)", view.tokens_before),
+    );
+    stack.push(Box::new(Text::with_padding(label, OUTPUT_PAD, 0)));
+    stack.push(Box::new(Markdown::new(
+        view.summary.as_str(),
+        OUTPUT_PAD,
+        0,
+        md_theme.clone(),
+        theme::default_text_style(),
+        MarkdownOptions::default(),
+    )));
+    Box::new(stack)
+}
+
+/// Build the branch-summary component.
+#[must_use]
+pub fn build_branch(
+    view: &BranchSummaryView,
+    md_theme: &MarkdownTheme,
+    theme: &ResolvedTheme,
+) -> Box<dyn Component> {
+    let mut stack = ColumnStack::new();
+    let label = theme.fg(
+        ThemeColor::Accent,
+        &format!("↶ Branch summary (from {})", view.from_id),
+    );
+    stack.push(Box::new(Text::with_padding(label, OUTPUT_PAD, 0)));
+    stack.push(Box::new(Markdown::new(
+        view.summary.as_str(),
+        OUTPUT_PAD,
+        0,
+        md_theme.clone(),
+        theme::default_text_style(),
+        MarkdownOptions::default(),
+    )));
+    Box::new(stack)
+}
+
+/// Build the skill-invocation component.
+#[must_use]
+pub fn build_skill(
+    view: &SkillInvocationView,
+    md_theme: &MarkdownTheme,
+    theme: &ResolvedTheme,
+) -> Box<dyn Component> {
+    let mut box_ = Padded::with_padding(OUTPUT_PAD, 1);
+    let bg = theme.bg_ansi(ThemeBg::CustomMessageBg);
+    box_.set_bg(Some(move |line: &str| format!("{bg}{line}\x1b[49m")));
+    let label = theme.fg(
+        ThemeColor::CustomMessageLabel,
+        &format!("[skill:{}]", view.name),
+    );
+    box_.add_child(Text::with_padding(label, 0, 0));
+    box_.add_child(Markdown::new(
+        view.text.as_str(),
+        0,
+        0,
+        md_theme.clone(),
+        custom_text_style(),
+        MarkdownOptions::default(),
+    ));
+    Box::new(box_)
+}
+
+/// Take the first `n` lines of `text` for a collapsed preview.
+fn preview_lines(text: &str, n: usize) -> String {
+    text.lines().take(n).collect::<Vec<_>>().join("\n")
+}
+
+/// User-message default text style (color applied via markdown theme hooks).
+fn user_text_style() -> pi_tui::components::DefaultTextStyle {
+    pi_tui::components::DefaultTextStyle::default()
+}
+
+/// Thinking text style (italic + thinkingText color applied via markdown theme).
+fn thinking_text_style() -> pi_tui::components::DefaultTextStyle {
+    pi_tui::components::DefaultTextStyle::with_style_flags(0)
+}
+
+/// Custom-message default text style.
+fn custom_text_style() -> pi_tui::components::DefaultTextStyle {
+    pi_tui::components::DefaultTextStyle::default()
+}
+
+// ---------------------------------------------------------------------------
+// ColumnStack: a minimal vertical stack component (no border).
+// ---------------------------------------------------------------------------
+
+/// Vertical stack of components; measure = sum of child heights, render stacks
+/// top-to-bottom. Used to assemble multi-block message bodies.
+pub struct ColumnStack {
+    children: Vec<Box<dyn Component>>,
+}
+
+impl ColumnStack {
+    /// Create an empty stack.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            children: Vec::new(),
+        }
+    }
+
+    /// Push a child.
+    pub fn push(&mut self, child: Box<dyn Component>) {
+        self.children.push(child);
+    }
+
+    /// Whether the stack has no children.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.children.is_empty()
+    }
+
+    /// Number of children.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.children.len()
+    }
+}
+
+impl Default for ColumnStack {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Component for ColumnStack {
+    fn measure(&mut self, width: u16) -> u16 {
+        self.children.iter_mut().map(|c| c.measure(width)).sum()
+    }
+
+    fn render(&mut self, area: ratatui::layout::Rect, buf: &mut ratatui::buffer::Buffer) {
+        let mut y = area.y;
+        for child in &mut self.children {
+            let h = child.measure(area.width);
+            if h == 0 {
+                continue;
+            }
+            let row = ratatui::layout::Rect {
+                x: area.x,
+                y,
+                width: area.width,
+                height: h,
+            };
+            child.render(row, buf);
+            y = y.saturating_add(h);
+            if y >= area.y.saturating_add(area.height) {
+                break;
+            }
+        }
+    }
+
+    fn handle_event(
+        &mut self,
+        event: &pi_tui::component::UiEvent,
+    ) -> pi_tui::component::EventResult {
+        let _ = event;
+        pi_tui::component::EventResult::Ignored
+    }
+
+    fn invalidate(&mut self) {
+        for c in &mut self.children {
+            c.invalidate();
+        }
+    }
+}

@@ -1,0 +1,41 @@
+{
+	"name": "@earendil-works/pi-tui-protocol",
+	"version": "0.1.0",
+	"description": "Versioned UTF-8 JSONL protocol client for the pi extension-host / structured UI bridge",
+	"type": "module",
+	"license": "MIT",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js",
+			"default": "./dist/index.js"
+		},
+		"./package.json": "./package.json"
+	},
+	"files": [
+		"dist/**/*",
+		"src/**/*",
+		"README.md"
+	],
+	"scripts": {
+		"build": "tsc -p tsconfig.build.json",
+		"test": "bun test tests",
+		"check": "tsc -p tsconfig.build.json --noEmit"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	},
+	"keywords": [
+		"pi",
+		"tui",
+		"protocol",
+		"jsonl",
+		"extension-host"
+	],
+	"devDependencies": {
+		"@types/bun": "1.3.9",
+		"typescript": "5.9.3"
+	}
+}

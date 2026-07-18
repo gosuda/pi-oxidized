@@ -8,6 +8,6 @@ pub use pi_ai::{
 
 pub use pi_agent::{AgentEvent, AgentTool, AgentToolResult, QueueMode};
 
-pub use pi_tui::{Component, EventResult, UiEvent};
+pub use pi_tui::component::{Component, EventResult, UiEvent};
 
 pub use pi_ext::protocol::{Frame, FrameKind, PROTOCOL_VERSION};

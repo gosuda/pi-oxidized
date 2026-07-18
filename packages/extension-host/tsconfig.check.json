@@ -1,0 +1,14 @@
+{
+	"extends": "./tsconfig.build.json",
+	"compilerOptions": {
+		"types": ["bun"],
+		"noEmit": true,
+		"paths": {
+			"@earendil-works/pi-tui-protocol": ["../pi-tui-protocol/src/index.ts"],
+			"@earendil-works/pi-tui-protocol/*": ["../pi-tui-protocol/src/*"],
+			"@earendil-works/pi-coding-agent": ["./src/refs.d.ts"],
+			"@earendil-works/pi-ai": ["./src/refs.d.ts"]
+		}
+	},
+	"include": ["src/**/*.ts", "src/**/*.d.ts", "fixtures/**/*.ts", "tests/**/*.ts"]
+}
