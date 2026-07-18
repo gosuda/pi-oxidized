@@ -13,10 +13,36 @@
 //! Listing credentials must never call into command execution.
 
 use std::collections::HashMap;
-use std::process::{Command, Stdio};
+use std::io::{Read, Seek, SeekFrom};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{LazyLock, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+#[derive(Debug, thiserror::Error)]
+enum CommandExecutionError {
+    #[error("failed to create command output file: {0}")]
+    CreateOutput(std::io::Error),
+    #[error("failed to clone command output file: {0}")]
+    CloneOutput(std::io::Error),
+    #[error("failed to spawn config command: {0}")]
+    Spawn(std::io::Error),
+    #[error("failed while waiting for config command: {0}")]
+    Wait(std::io::Error),
+    #[error("config command timed out")]
+    TimedOut,
+    #[error("failed to terminate config command: {0}")]
+    Terminate(std::io::Error),
+    #[error("config command exited with {0}")]
+    Exit(ExitStatus),
+    #[error("failed to read config command output: {0}")]
+    ReadOutput(std::io::Error),
+    #[error("config command produced no output")]
+    EmptyOutput,
+}
 
 /// Provider-scoped env overlay used during resolution.
 pub type ConfigEnv = std::collections::BTreeMap<String, String>;
@@ -241,49 +267,115 @@ pub fn is_config_value_configured(config: &str, env: Option<&ConfigEnv>) -> bool
     get_missing_config_value_env_var_names(config, env).is_empty()
 }
 
-fn execute_with_default_shell(command: &str) -> Option<String> {
-    let command = command.to_owned();
-    let handle = thread::spawn(move || {
-        #[cfg(windows)]
-        let output = Command::new("cmd")
-            .arg("/C")
-            .arg(&command)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output();
+fn terminate_process_group_and_reap(
+    child: &mut std::process::Child,
+) -> Result<(), CommandExecutionError> {
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::{Signal, killpg};
+        use nix::unistd::Pid;
 
-        #[cfg(not(windows))]
-        let output = Command::new("sh")
-            .arg("-c")
-            .arg(&command)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output();
-
-        match output {
-            Ok(output) if output.status.success() => {
-                let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-                if text.is_empty() { None } else { Some(text) }
-            }
-            _ => None,
+        let pid = i32::try_from(child.id()).map_err(|_| {
+            CommandExecutionError::Terminate(std::io::Error::other("child PID exceeds i32"))
+        })?;
+        if let Err(error) = killpg(Pid::from_raw(pid), Signal::SIGKILL) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(CommandExecutionError::Terminate(std::io::Error::other(
+                error,
+            )));
         }
-    });
+    }
+    #[cfg(windows)]
+    {
+        let status = Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if !matches!(status, Ok(status) if status.success()) {
+            child.kill().map_err(CommandExecutionError::Terminate)?;
+        }
+    }
 
-    handle.join().unwrap_or_default()
+    child
+        .wait()
+        .map(|_| ())
+        .map_err(CommandExecutionError::Wait)
+}
+
+fn execute_with_default_shell(
+    command: &str,
+    timeout: Duration,
+) -> Result<String, CommandExecutionError> {
+    let mut output_file = tempfile::tempfile().map_err(CommandExecutionError::CreateOutput)?;
+    let child_output = output_file
+        .try_clone()
+        .map_err(CommandExecutionError::CloneOutput)?;
+
+    let mut shell = {
+        #[cfg(windows)]
+        {
+            let mut shell = Command::new("cmd");
+            use std::os::windows::process::CommandExt as _;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            shell
+                .arg("/C")
+                .arg(command)
+                .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+            shell
+        }
+        #[cfg(not(windows))]
+        {
+            let mut shell = Command::new("/bin/sh");
+            use std::os::unix::process::CommandExt as _;
+            shell.arg("-c").arg(command).process_group(0);
+            shell
+        }
+    };
+    let mut child = shell
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(child_output))
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(CommandExecutionError::Spawn)?;
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(CommandExecutionError::Wait)? {
+            break status;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            terminate_process_group_and_reap(&mut child)?;
+            return Err(CommandExecutionError::TimedOut);
+        }
+        thread::sleep(remaining.min(COMMAND_POLL_INTERVAL));
+    };
+
+    if !status.success() {
+        return Err(CommandExecutionError::Exit(status));
+    }
+    output_file
+        .seek(SeekFrom::Start(0))
+        .map_err(CommandExecutionError::ReadOutput)?;
+    let mut bytes = Vec::new();
+    output_file
+        .read_to_end(&mut bytes)
+        .map_err(CommandExecutionError::ReadOutput)?;
+    let text = String::from_utf8_lossy(&bytes).trim().to_owned();
+    if text.is_empty() {
+        Err(CommandExecutionError::EmptyOutput)
+    } else {
+        Ok(text)
+    }
 }
 
 fn execute_command_uncached(command_config: &str) -> Option<String> {
     let command = command_config.get(1..).unwrap_or("");
-    // Bound runaway commands without depending on platform-specific kill APIs.
-    // The worker thread is detached on timeout; its result is ignored.
-    let (tx, rx) = std::sync::mpsc::channel();
-    let command_owned = command.to_owned();
-    thread::spawn(move || {
-        let _ = tx.send(execute_with_default_shell(&command_owned));
-    });
-    rx.recv_timeout(Duration::from_secs(10)).unwrap_or_default()
+    execute_with_default_shell(command, COMMAND_TIMEOUT).ok()
 }
 
 fn execute_command(command_config: &str) -> Option<String> {
@@ -477,5 +569,28 @@ mod tests {
         let resolved = resolve_config_value(&raw, Some(&env));
         assert_eq!(resolved.as_deref(), Some("abc"));
         assert_eq!(raw, "$TOKEN");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_terminates_descendants_and_reaps_shell() -> Result<(), String> {
+        let dir = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let marker = dir.path().join("descendant-survived");
+        let command = format!(
+            "(sleep 0.25; printf leaked > '{}') & wait",
+            marker.display()
+        );
+
+        let started = Instant::now();
+        let result = execute_with_default_shell(&command, Duration::from_millis(40));
+        assert!(matches!(result, Err(CommandExecutionError::TimedOut)));
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        thread::sleep(Duration::from_millis(350));
+        assert!(
+            !marker.exists(),
+            "the timed-out command's process group must not survive"
+        );
+        Ok(())
     }
 }

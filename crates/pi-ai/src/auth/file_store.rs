@@ -39,13 +39,39 @@ const LOCK_MAX_DELAY: Duration = Duration::from_secs(10);
 #[derive(Clone, Debug)]
 pub struct FileLockBackend {
     path: PathBuf,
+    #[cfg(test)]
+    lock_contention: Option<Arc<tokio::sync::Notify>>,
+    #[cfg(test)]
+    atomic_write_failure: Arc<Mutex<Option<std::io::ErrorKind>>>,
 }
 
 impl FileLockBackend {
     /// Create a backend for the given JSON data path.
     #[must_use]
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            #[cfg(test)]
+            lock_contention: None,
+            #[cfg(test)]
+            atomic_write_failure: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    #[cfg(test)]
+    fn notify_lock_contention(&self) {
+        if let Some(notify) = &self.lock_contention {
+            notify.notify_one();
+        }
+    }
+
+    #[cfg(test)]
+    fn fail_next_atomic_write(&self, kind: std::io::ErrorKind) {
+        let mut failure = self
+            .atomic_write_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *failure = Some(kind);
     }
 
     /// Path of the JSON data file.
@@ -75,7 +101,37 @@ impl FileLockBackend {
         F: FnOnce(Option<&str>) -> Result<(T, Option<String>), StoreError>,
     {
         self.ensure_parent_dir()?;
+        let lock_file = self.open_lock_file()?;
+        acquire_lock_sync(&lock_file)?;
+        let _guard = LockGuard { file: &lock_file };
+        self.check_lock_identity(&lock_file)?;
         self.ensure_data_file()?;
+        let current = self.read_data_file()?;
+        let (result, next) = f(current.as_deref())?;
+        self.check_lock_identity(&lock_file)?;
+        if let Some(next) = next {
+            self.atomic_write(&next)?;
+            self.check_lock_identity(&lock_file)?;
+        }
+        Ok(result)
+    }
+
+    /// Synchronous locked initialization or migration transaction.
+    ///
+    /// Unlike [`Self::with_lock_sync`], this method does not seed a missing
+    /// data file before invoking `f`. The callback can therefore distinguish a
+    /// missing destination from an existing one and install initial content
+    /// without racing normal readers or writers using the same sibling lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when directory/file setup, lock acquisition,
+    /// reading, callback execution, or atomic persistence fails.
+    pub fn with_lock_sync_unseeded<T, F>(&self, f: F) -> Result<T, StoreError>
+    where
+        F: FnOnce(Option<&str>) -> Result<(T, Option<String>), StoreError>,
+    {
+        self.ensure_parent_dir()?;
         let lock_file = self.open_lock_file()?;
         acquire_lock_sync(&lock_file)?;
         let _guard = LockGuard { file: &lock_file };
@@ -105,11 +161,15 @@ impl FileLockBackend {
         Fut: Future<Output = Result<(T, Option<String>), StoreError>>,
     {
         self.ensure_parent_dir()?;
-        self.ensure_data_file()?;
         let lock_file = self.open_lock_file()?;
-        acquire_lock_async(&lock_file).await?;
+        acquire_lock_async(&lock_file, || {
+            #[cfg(test)]
+            self.notify_lock_contention();
+        })
+        .await?;
         let _guard = LockGuard { file: &lock_file };
         self.check_lock_identity(&lock_file)?;
+        self.ensure_data_file()?;
         let current = self.read_data_file()?;
         let (result, next) = f(current).await?;
         self.check_lock_identity(&lock_file)?;
@@ -120,21 +180,53 @@ impl FileLockBackend {
         Ok(result)
     }
 
+    async fn with_lock_async_commit<T, C, F, Fut, Commit>(
+        &self,
+        f: F,
+        commit: Commit,
+    ) -> Result<T, StoreError>
+    where
+        F: FnOnce(Option<String>) -> Fut,
+        Fut: Future<Output = Result<(T, Option<String>, C), StoreError>>,
+        Commit: FnOnce(C) -> Result<(), StoreError>,
+    {
+        self.ensure_parent_dir()?;
+        let lock_file = self.open_lock_file()?;
+        acquire_lock_async(&lock_file, || {
+            #[cfg(test)]
+            self.notify_lock_contention();
+        })
+        .await?;
+        let _guard = LockGuard { file: &lock_file };
+        self.check_lock_identity(&lock_file)?;
+        self.ensure_data_file()?;
+        let current = self.read_data_file()?;
+        let (result, next, committed) = f(current).await?;
+        self.check_lock_identity(&lock_file)?;
+        if let Some(next) = next {
+            self.atomic_write(&next)?;
+            self.check_lock_identity(&lock_file)?;
+        }
+        commit(committed)?;
+        Ok(result)
+    }
+
     fn ensure_parent_dir(&self) -> Result<(), StoreError> {
         let Some(parent) = parent_dir(&self.path) else {
             return Ok(());
         };
-        if parent.exists() {
-            return Ok(());
+        if !parent.exists() {
+            create_dir_all_secure(parent)?;
         }
-        create_dir_all_secure(parent)
+        set_owner_dir_mode(parent)
     }
 
     fn ensure_data_file(&self) -> Result<(), StoreError> {
         if self.path.exists() {
             return Ok(());
         }
-        // First create races: atomic replace still leaves only valid `{}`.
+        // Callers hold the sibling lock here, so the missing-path recheck and
+        // seed commit are ordered with every normal read and write.
         self.atomic_write(EMPTY_JSON)
     }
 
@@ -173,6 +265,22 @@ impl FileLockBackend {
     }
 
     fn atomic_write(&self, content: &str) -> Result<(), StoreError> {
+        #[cfg(test)]
+        {
+            let failure = self
+                .atomic_write_failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(kind) = failure {
+                return Err(StoreError::message(format!(
+                    "Failed to persist auth storage {}: {}",
+                    self.path.display(),
+                    std::io::Error::from(kind)
+                )));
+            }
+        }
+
         let parent = parent_dir(&self.path).unwrap_or_else(|| Path::new("."));
         if !parent.exists() {
             create_dir_all_secure(parent)?;
@@ -339,27 +447,27 @@ impl CredentialStore for FileCredentialStore {
             let provider = provider_id.to_owned();
             let cache = Arc::clone(&self.cache);
             self.backend
-                .with_lock_async(move |content| {
-                    let f = f;
-                    async move {
-                        let mut data = parse_storage_data(content.as_deref())?;
-                        let current = data.get(&provider).cloned();
-                        let next = f(current.clone()).await?;
-                        match next {
-                            // None means no-op: leave the map and file bytes unchanged.
-                            None => {
-                                replace_cache_mutex(&cache, data.clone())?;
-                                Ok((current, None))
-                            }
-                            Some(credential) => {
-                                data.insert(provider, credential.clone());
-                                let serialized = serialize_storage_data(&data)?;
-                                replace_cache_mutex(&cache, data)?;
-                                Ok((Some(credential), Some(serialized)))
+                .with_lock_async_commit(
+                    move |content| {
+                        let f = f;
+                        async move {
+                            let mut data = parse_storage_data(content.as_deref())?;
+                            let current = data.get(&provider).cloned();
+                            let next = f(current.clone()).await?;
+                            match next {
+                                // None means no-op: leave file bytes unchanged,
+                                // then publish the authoritative locked snapshot.
+                                None => Ok((current, None, data)),
+                                Some(credential) => {
+                                    data.insert(provider, credential.clone());
+                                    let serialized = serialize_storage_data(&data)?;
+                                    Ok((Some(credential), Some(serialized), data))
+                                }
                             }
                         }
-                    }
-                })
+                    },
+                    move |data| replace_cache_mutex(&cache, data),
+                )
                 .await
         })
     }
@@ -369,13 +477,15 @@ impl CredentialStore for FileCredentialStore {
             let provider = provider_id.to_owned();
             let cache = Arc::clone(&self.cache);
             self.backend
-                .with_lock_async(move |content| async move {
-                    let mut data = parse_storage_data(content.as_deref())?;
-                    data.remove(&provider);
-                    let serialized = serialize_storage_data(&data)?;
-                    replace_cache_mutex(&cache, data)?;
-                    Ok(((), Some(serialized)))
-                })
+                .with_lock_async_commit(
+                    move |content| async move {
+                        let mut data = parse_storage_data(content.as_deref())?;
+                        data.remove(&provider);
+                        let serialized = serialize_storage_data(&data)?;
+                        Ok(((), Some(serialized), data))
+                    },
+                    move |data| replace_cache_mutex(&cache, data),
+                )
                 .await
         })
     }
@@ -520,12 +630,16 @@ fn acquire_lock_sync(file: &File) -> Result<(), StoreError> {
     Err(StoreError::message("Failed to acquire auth storage lock"))
 }
 
-async fn acquire_lock_async(file: &File) -> Result<(), StoreError> {
+async fn acquire_lock_async(
+    file: &File,
+    mut on_contention: impl FnMut(),
+) -> Result<(), StoreError> {
     let mut delay = LOCK_MIN_DELAY;
     for attempt in 1..=LOCK_ATTEMPTS {
         match FileExt::try_lock(file) {
             Ok(()) => return Ok(()),
             Err(TryLockError::WouldBlock) if attempt < LOCK_ATTEMPTS => {
+                on_contention();
                 // Light jitter from attempt count keeps retries desynchronized
                 // without introducing an extra RNG dependency here.
                 let jitter = Duration::from_millis(u64::from(attempt.saturating_mul(7) % 37));
@@ -932,6 +1046,90 @@ mod tests {
         assert_eq!(store.read("openai").await?, None);
         assert!(store.list().await?.is_empty());
         assert!(read_stored_credential("openai", &path).is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn missing_file_is_seeded_only_after_sibling_lock_is_acquired() -> TestResult {
+        let (dir, path) = temp_auth_path()?;
+        fs::create_dir_all(path.parent().ok_or("auth path must have a parent")?)?;
+        let mut backend = FileLockBackend::new(&path);
+        let contention = Arc::new(tokio::sync::Notify::new());
+        backend.lock_contention = Some(Arc::clone(&contention));
+        let lock_path = backend.lock_path();
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        FileExt::lock(&lock_file)?;
+
+        let task_backend = backend.clone();
+        let task = tokio::spawn(async move {
+            task_backend
+                .with_lock_async(|content| async move {
+                    Ok::<_, StoreError>((content, None))
+                })
+                .await
+        });
+        contention.notified().await;
+        assert!(
+            !path.exists(),
+            "a waiter must not seed before acquiring the sibling lock"
+        );
+
+        let durable = serialize_storage_data(&BTreeMap::from([(
+            "openai".to_owned(),
+            api_key("durable"),
+        )]))?;
+        fs::write(&path, &durable)?;
+        FileExt::unlock(&lock_file)?;
+
+        let observed = task.await??;
+        assert_eq!(observed.as_deref(), Some(durable.as_str()));
+        assert_eq!(fs::read_to_string(path)?, durable);
+        drop(dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_modify_does_not_publish_unpersisted_cache() -> TestResult {
+        let (_dir, path) = temp_auth_path()?;
+        let store = FileCredentialStore::new(&path);
+        store
+            .modify("openai", Box::new(|_| Box::pin(async { Ok(Some(api_key("old"))) })))
+            .await?;
+        let durable = fs::read_to_string(&path)?;
+
+        store
+            .backend
+            .fail_next_atomic_write(std::io::ErrorKind::PermissionDenied);
+        let result = store
+            .modify("openai", Box::new(|_| Box::pin(async { Ok(Some(api_key("new"))) })))
+            .await;
+        assert!(result.is_err(), "injected persistence failure must surface");
+        assert_eq!(fs::read_to_string(&path)?, durable);
+        assert_eq!(store.read("openai").await?, Some(api_key("old")));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_delete_does_not_evict_persisted_cache() -> TestResult {
+        let (_dir, path) = temp_auth_path()?;
+        let store = FileCredentialStore::new(&path);
+        store
+            .modify("openai", Box::new(|_| Box::pin(async { Ok(Some(api_key("old"))) })))
+            .await?;
+        let durable = fs::read_to_string(&path)?;
+
+        store
+            .backend
+            .fail_next_atomic_write(std::io::ErrorKind::PermissionDenied);
+        let result = store.delete("openai").await;
+        assert!(result.is_err(), "injected persistence failure must surface");
+        assert_eq!(fs::read_to_string(&path)?, durable);
+        assert_eq!(store.read("openai").await?, Some(api_key("old")));
         Ok(())
     }
 }

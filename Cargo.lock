@@ -2783,6 +2783,7 @@ dependencies = [
  "futures",
  "getrandom 0.4.3",
  "google-cloud-auth",
+ "nix 0.31.3",
  "reqwest",
  "serde",
  "serde_json",

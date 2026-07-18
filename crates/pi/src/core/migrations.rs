@@ -6,6 +6,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use pi_ai::auth::{FileLockBackend, StoreError};
 use serde_json::{Map, Value};
 
 use super::config::{CONFIG_DIR_NAME, get_agent_dir, get_bin_dir_with};
@@ -218,69 +219,87 @@ pub fn migrate_auth_to_auth_json() -> Vec<String> {
 #[must_use]
 pub fn migrate_auth_to_auth_json_in(agent_dir: &Path) -> Vec<String> {
     let auth_path = agent_dir.join("auth.json");
-    if entry_exists(&auth_path) {
-        return Vec::new();
-    }
-
     let oauth_path = agent_dir.join("oauth.json");
     let settings_path = agent_dir.join("settings.json");
-    let oauth = json_object(&oauth_path);
-    let settings = json_object(&settings_path);
-    let mut credentials = BTreeMap::<String, Value>::new();
-    let mut providers = Vec::new();
+    let backend = FileLockBackend::new(&auth_path);
 
-    if let Some(entries) = oauth.as_ref() {
-        for (provider, value) in entries {
-            if let Some(raw) = value.as_object() {
-                let mut credential = raw.clone();
-                credential.insert("type".to_owned(), Value::String("oauth".to_owned()));
-                credentials.insert(provider.clone(), Value::Object(credential));
-                providers.push(provider.clone());
+    let migration = backend.with_lock_sync_unseeded(|_| {
+        // Recheck under the same sibling lock used by every normal auth read
+        // and write. `entry_exists` intentionally treats broken symlinks as
+        // existing destinations, preserving the no-follow migration policy.
+        if entry_exists(&auth_path) {
+            return Ok((None, None));
+        }
+
+        let oauth = json_object(&oauth_path);
+        let settings = json_object(&settings_path);
+        let mut credentials = BTreeMap::<String, Value>::new();
+        let mut providers = Vec::new();
+
+        if let Some(entries) = oauth.as_ref() {
+            for (provider, value) in entries {
+                if let Some(raw) = value.as_object() {
+                    let mut credential = raw.clone();
+                    credential.insert("type".to_owned(), Value::String("oauth".to_owned()));
+                    credentials.insert(provider.clone(), Value::Object(credential));
+                    providers.push(provider.clone());
+                }
             }
         }
-    }
 
-    let mut settings_without_keys = settings.clone();
-    if let Some(document) = settings.as_ref()
-        && let Some(api_keys) = document.get("apiKeys").and_then(Value::as_object)
-    {
-        for (provider, value) in api_keys {
-            if credentials.contains_key(provider) {
-                continue;
+        let mut settings_without_keys = settings.clone();
+        let settings_had_keys = settings
+            .as_ref()
+            .is_some_and(|document| document.contains_key("apiKeys"));
+        if let Some(document) = settings.as_ref()
+            && let Some(api_keys) = document.get("apiKeys").and_then(Value::as_object)
+        {
+            for (provider, value) in api_keys {
+                if credentials.contains_key(provider) {
+                    continue;
+                }
+                if let Some(key) = value.as_str() {
+                    credentials.insert(
+                        provider.clone(),
+                        serde_json::json!({ "type": "api_key", "key": key }),
+                    );
+                    providers.push(provider.clone());
+                }
             }
-            if let Some(key) = value.as_str() {
-                credentials.insert(
-                    provider.clone(),
-                    serde_json::json!({ "type": "api_key", "key": key }),
-                );
-                providers.push(provider.clone());
+            if let Some(updated) = settings_without_keys.as_mut() {
+                updated.remove("apiKeys");
             }
         }
-        if let Some(updated) = settings_without_keys.as_mut() {
-            updated.remove("apiKeys");
-        }
-    }
 
-    if credentials.is_empty() {
-        return Vec::new();
-    }
-    let Ok(serialized) = serde_json::to_vec_pretty(&credentials) else {
+        if credentials.is_empty() {
+            return Ok((None, None));
+        }
+        let serialized = serde_json::to_string_pretty(&credentials).map_err(|error| {
+            StoreError::message(format!("Failed to serialize migrated auth storage: {error}"))
+        })?;
+        let outcome = (
+            providers,
+            settings_without_keys,
+            settings_had_keys,
+            oauth.is_some(),
+        );
+        Ok((Some(outcome), Some(serialized)))
+    });
+
+    let Ok(Some((providers, settings_without_keys, settings_had_keys, oauth_present))) = migration
+    else {
         return Vec::new();
     };
-    if atomic_write(&auth_path, &serialized, true).is_err() {
-        return Vec::new();
-    }
 
+    // Legacy sources remain untouched unless the auth commit succeeded.
     if let Some(updated) = settings_without_keys
-        && settings
-            .as_ref()
-            .is_some_and(|original| original.contains_key("apiKeys"))
+        && settings_had_keys
         && let Ok(bytes) = serde_json::to_vec_pretty(&Value::Object(updated))
     {
         let _ = atomic_write(&settings_path, &bytes, false);
     }
 
-    if oauth.is_some() {
+    if oauth_present {
         let migrated_path = agent_dir.join("oauth.json.migrated");
         if !entry_exists(&migrated_path) && fs::rename(&oauth_path, &migrated_path).is_ok() {
             let _ = sync_parent(&migrated_path);
@@ -497,6 +516,7 @@ pub fn run_migrations_in(
 #[cfg(test)]
 mod tests {
     use std::error::Error;
+    use std::time::Duration;
 
     use tempfile::TempDir;
 
@@ -723,6 +743,42 @@ mod tests {
             ]
         );
         assert!(migrate_auth_to_auth_json_in(&global).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn auth_migration_uses_auth_sibling_lock() -> TestResult {
+        let temp = TempDir::new()?;
+        let agent = temp.path();
+        write_json(
+            &agent.join("settings.json"),
+            &serde_json::json!({"apiKeys": {"openai": "sk-test"}}),
+        )?;
+
+        let backend = FileLockBackend::new(agent.join("auth.json"));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            backend.with_lock_sync_unseeded(|_| {
+                entered_tx.send(())
+                    .map_err(|error| StoreError::message(error.to_string()))?;
+                std::thread::sleep(Duration::from_millis(400));
+                Ok(((), None))
+            })
+        });
+        entered_rx.recv()?;
+
+        assert!(migrate_auth_to_auth_json_in(agent).is_empty());
+        assert!(
+            !agent.join("auth.json").exists(),
+            "migration must not write outside the held sibling lock"
+        );
+        holder.join().map_err(|_| "lock holder panicked")??;
+
+        assert_eq!(migrate_auth_to_auth_json_in(agent), ["openai"]);
+        assert_eq!(
+            read_json(&agent.join("auth.json"))?["openai"]["key"],
+            "sk-test"
+        );
         Ok(())
     }
 
