@@ -86,6 +86,7 @@ pub struct ModelsError {
     /// Stable error classification.
     pub code: ModelsErrorCode,
     message: String,
+    cancelled: bool,
 }
 
 impl ModelsError {
@@ -95,7 +96,25 @@ impl ModelsError {
         Self {
             code,
             message: message.into(),
+            cancelled: false,
         }
+    }
+
+    /// Create a request-cancellation error without expanding the stable
+    /// [`ModelsErrorCode`] wire contract.
+    #[must_use]
+    pub fn cancelled() -> Self {
+        Self {
+            code: ModelsErrorCode::Oauth,
+            message: "Login cancelled".to_owned(),
+            cancelled: true,
+        }
+    }
+
+    /// Whether auth resolution stopped because its request was cancelled.
+    #[must_use]
+    pub const fn is_cancelled(&self) -> bool {
+        self.cancelled
     }
 
     /// Human-readable error message.

@@ -953,6 +953,30 @@ mod tests {
         Ok(format!("http://{address}/v1/oauth/token"))
     }
 
+    fn spawn_hanging_token_server(
+    ) -> Result<(String, tokio::sync::oneshot::Receiver<()>), String> {
+        let listener = TcpListener::bind("127.0.0.1:0").map_err(|error| error.to_string())?;
+        let address = listener.local_addr().map_err(|error| error.to_string())?;
+        let (request_seen, request_started) = tokio::sync::oneshot::channel();
+        thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut request = [0_u8; 4096];
+            let Ok(size) = stream.read(&mut request) else {
+                return;
+            };
+            let request = String::from_utf8_lossy(&request[..size]);
+            if !request.starts_with("POST /token ") {
+                return;
+            }
+            let _ = request_seen.send(());
+            let mut remaining = [0_u8; 1024];
+            while stream.read(&mut remaining).is_ok_and(|size| size > 0) {}
+        });
+        Ok((format!("http://{address}/token"), request_started))
+    }
+
     #[test]
     fn client_id_matches_decoded_reference() {
         assert_eq!(CLIENT_ID, "9d1c250a-e61b-44d9-88ed-5944d1962f5e");
@@ -1292,6 +1316,54 @@ mod tests {
         cancel?;
         let err_value = expect_err(login, "cancelled")?;
         assert!(matches!(err_value, AuthError::Cancelled));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn parent_cancel_aborts_post_race_token_exchange() -> TestResult {
+        let (token_url, request_started) = spawn_hanging_token_server()?;
+        let oauth = AnthropicOAuth::with_http(
+            AuthHttpClient::from_client(reqwest::Client::new()),
+        )
+        .with_token_url(token_url)
+        .with_callback_port(free_port()?);
+        let parent_cancel = CancellationToken::new();
+        let interaction = Arc::new(DeferredManual::with_signal(parent_cancel.clone()));
+        let login = {
+            let interaction = Arc::clone(&interaction);
+            let oauth = oauth.clone();
+            tokio::spawn(async move { oauth.login(interaction.as_ref()).await })
+        };
+
+        let auth_url = loop {
+            if let Some(url) = interaction.auth_url() {
+                break url;
+            }
+            tokio::task::yield_now().await;
+        };
+        let parsed = reqwest::Url::parse(&auth_url).map_err(|error| error.to_string())?;
+        let state = parsed
+            .query_pairs()
+            .find(|(key, _)| key == "state")
+            .map(|(_, value)| value.into_owned())
+            .ok_or_else(|| err("missing state"))?;
+        interaction.complete_manual(format!(
+            "{REDIRECT_URI}?code=manual-code&state={state}#state={state}"
+        ));
+
+        tokio::time::timeout(Duration::from_secs(2), request_started)
+            .await
+            .map_err(|_| err("token exchange did not start"))?
+            .map_err(|_| err("token exchange signal dropped"))?;
+        assert!(interaction.prompt_was_cancelled());
+        assert!(!parent_cancel.is_cancelled());
+        parent_cancel.cancel();
+
+        let result = tokio::time::timeout(Duration::from_secs(2), login)
+            .await
+            .map_err(|_| err("cancelled token exchange did not return"))?
+            .map_err(|error| error.to_string())?;
+        assert!(matches!(result, Err(AuthError::Cancelled)));
         Ok(())
     }
 

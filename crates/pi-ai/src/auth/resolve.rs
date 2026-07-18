@@ -12,11 +12,12 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::config_value::{resolve_config_value, resolve_headers};
-use super::error::{ModelsError, ModelsErrorCode, StoreError};
+use super::error::{AuthError, ModelsError, ModelsErrorCode, StoreError};
 use super::types::{
     ApiKeyAuth, ApiKeyCredential, AuthContext, AuthResult, Credential, CredentialStore, OAuthAuth,
     OAuthCredential, ProviderAuth, ProviderEnv,
 };
+use tokio_util::sync::CancellationToken;
 
 /// Optional per-request auth overrides.
 #[derive(Clone, Debug, Default)]
@@ -48,6 +49,34 @@ pub async fn resolve_provider_auth(
     credentials: &dyn CredentialStore,
     auth_context: &dyn AuthContext,
     overrides: Option<&AuthResolutionOverrides>,
+) -> Result<Option<AuthResult>, ModelsError> {
+    resolve_provider_auth_with_signal(
+        provider_id,
+        auth,
+        credentials,
+        auth_context,
+        overrides,
+        None,
+    )
+    .await
+}
+
+/// Resolve provider auth while allowing an in-flight stored OAuth refresh to be cancelled.
+///
+/// This additive entry point keeps [`resolve_provider_auth`] source-compatible for callers
+/// without request-scoped cancellation.
+///
+/// # Errors
+///
+/// Returns [`ModelsErrorCode::Auth`] when the credential store fails, and
+/// [`ModelsErrorCode::Oauth`] when refresh, cancellation, or auth derivation fails.
+pub async fn resolve_provider_auth_with_signal(
+    provider_id: &str,
+    auth: &ProviderAuth,
+    credentials: &dyn CredentialStore,
+    auth_context: &dyn AuthContext,
+    overrides: Option<&AuthResolutionOverrides>,
+    signal: Option<CancellationToken>,
 ) -> Result<Option<AuthResult>, ModelsError> {
     let overlay_env = overrides.and_then(|value| value.env.as_ref());
     let request_context = EnvOverlayAuthContext {
@@ -81,6 +110,7 @@ pub async fn resolve_provider_auth(
                         provider_id,
                         Arc::clone(oauth_auth),
                         oauth_cred,
+                        signal,
                     )
                     .await;
                 }
@@ -183,6 +213,7 @@ async fn resolve_stored_oauth(
     provider_id: &str,
     oauth: Arc<dyn OAuthAuth>,
     stored: OAuthCredential,
+    signal: Option<CancellationToken>,
 ) -> Result<Option<AuthResult>, ModelsError> {
     let mut credential = stored;
 
@@ -190,6 +221,7 @@ async fn resolve_stored_oauth(
         // Optimistic check said expired; the authoritative check runs under the lock.
         let provider_id_owned = provider_id.to_owned();
         let oauth_for_refresh = Arc::clone(&oauth);
+        let refresh_signal = signal.clone();
         let post = match credentials
             .modify(
                 provider_id,
@@ -204,16 +236,19 @@ async fn resolve_stored_oauth(
                             // Another process/request refreshed — keep it.
                             return Ok(None);
                         }
-                        match oauth_for_refresh.refresh(&current_oauth, None).await {
-                            Ok(refreshed) => Ok(Some(Credential::Oauth(refreshed))),
-                            Err(err) => Err(err),
-                        }
+                        oauth_for_refresh
+                            .refresh(&current_oauth, refresh_signal)
+                            .await
+                            .map(|refreshed| Some(Credential::Oauth(refreshed)))
                     })
                 }),
             )
             .await
         {
             Ok(post) => post,
+            Err(StoreError::Auth(AuthError::Cancelled)) => {
+                return Err(ModelsError::cancelled());
+            }
             Err(StoreError::Auth(err)) => {
                 return Err(ModelsError::new(
                     ModelsErrorCode::Oauth,
@@ -388,14 +423,21 @@ mod tests {
         fn refresh<'a>(
             &'a self,
             credential: &'a OAuthCredential,
-            _signal: Option<CancellationToken>,
+            signal: Option<CancellationToken>,
         ) -> BoxFuture<'a, Result<OAuthCredential, AuthError>> {
             Box::pin(async move {
                 if self.fail_refresh {
                     return Err(AuthError::message("invalid_grant"));
                 }
                 self.refresh_count.fetch_add(1, Ordering::SeqCst);
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                if let Some(signal) = signal {
+                    tokio::select! {
+                        () = signal.cancelled() => return Err(AuthError::Cancelled),
+                        () = tokio::time::sleep(Duration::from_millis(10)) => {}
+                    }
+                } else {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
                 Ok(OAuthCredential {
                     refresh: format!("{}-rotated", credential.refresh),
                     access: format!("{}-new", credential.access),
@@ -575,6 +617,49 @@ mod tests {
         };
         assert!(stored.expires > now_ms());
         assert!(stored.refresh.ends_with("-rotated"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stored_refresh_honors_request_cancellation() -> TestResult {
+        let store = InMemoryCredentialStore::new();
+        put(
+            &store,
+            "anthropic",
+            oauth_credential("expired", now_ms() - 1),
+        )
+        .await?;
+        let oauth = Arc::new(MockOauth::working());
+        let auth = mixed_auth(oauth.clone());
+        let context = MapAuthContext::new();
+        let signal = CancellationToken::new();
+
+        let resolve = resolve_provider_auth_with_signal(
+            "anthropic",
+            &auth,
+            &store,
+            &context,
+            None,
+            Some(signal.clone()),
+        );
+        let cancel = async {
+            while oauth.refresh_count.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+            signal.cancel();
+        };
+        let (result, ()) = tokio::join!(resolve, cancel);
+        let error = result.err().ok_or_else(|| io::Error::other("cancelled refresh succeeded"))?;
+        assert_eq!(error.code, ModelsErrorCode::Oauth);
+        assert_eq!(error.message(), "Login cancelled");
+        assert!(error.is_cancelled());
+
+        let stored = store.read("anthropic").await?;
+        let Some(Credential::Oauth(stored)) = stored else {
+            return Err(io::Error::other("oauth credential missing").into());
+        };
+        assert_eq!(stored.access, "expired");
+        assert!(stored.expires <= now_ms());
         Ok(())
     }
 

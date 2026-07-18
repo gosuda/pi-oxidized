@@ -590,33 +590,54 @@ pub fn normalize_domain(input: &str) -> Option<String> {
 /// → `https://api.individual.githubcopilot.com`.
 #[must_use]
 pub fn get_base_url_from_token(token: &str) -> Option<String> {
+    get_base_url_from_token_for_provider(token, None)
+}
+
+fn get_base_url_from_token_for_provider(
+    token: &str,
+    enterprise_domain: Option<&str>,
+) -> Option<String> {
     const KEY: &str = "proxy-ep=";
     let start = token.find(KEY)? + KEY.len();
     let rest = &token[start..];
-    if rest.is_empty() {
-        return None;
-    }
     let end = rest.find(';').unwrap_or(rest.len());
     let proxy_host = rest[..end].trim();
-    if proxy_host.is_empty() {
+    let parsed = reqwest::Url::parse(&format!("https://{proxy_host}")).ok()?;
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.port().is_some()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
         return None;
     }
-    let api_host = match proxy_host.strip_prefix("proxy.") {
-        Some(rest) => format!("api.{rest}"),
-        None => proxy_host.to_owned(),
+    let proxy_host = parsed.host_str()?;
+    if proxy_host.parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+    let api_suffix = proxy_host.strip_prefix("proxy.")?;
+    let api_host = format!("api.{api_suffix}");
+
+    let allowed = if let Some(enterprise_domain) = enterprise_domain {
+        api_host.eq_ignore_ascii_case(&format!("api.{enterprise_domain}"))
+    } else {
+        api_host.ends_with(".githubcopilot.com")
     };
-    Some(format!("https://{api_host}"))
+    allowed.then(|| format!("https://{api_host}"))
 }
 
 /// Resolve the Copilot API base URL from a token and optional enterprise domain.
 #[must_use]
 pub fn get_github_copilot_base_url(token: Option<&str>, enterprise_domain: Option<&str>) -> String {
+    let enterprise_domain = enterprise_domain.and_then(normalize_domain);
     if let Some(token) = token
-        && let Some(url) = get_base_url_from_token(token)
+        && let Some(url) =
+            get_base_url_from_token_for_provider(token, enterprise_domain.as_deref())
     {
         return url;
     }
-    if let Some(domain) = enterprise_domain.filter(|value| !value.is_empty()) {
+    if let Some(domain) = enterprise_domain {
         return format!("https://copilot-api.{domain}");
     }
     DEFAULT_COPILOT_BASE_URL.to_owned()
@@ -1065,7 +1086,18 @@ mod tests {
             Some("https://api.individual.githubcopilot.com")
         );
         assert_eq!(
+            get_base_url_from_token(
+                "tid=1;proxy-ep=proxy.business.githubcopilot.com;sku=business"
+            )
+            .as_deref(),
+            Some("https://api.business.githubcopilot.com")
+        );
+        assert_eq!(
             get_github_copilot_base_url(None, Some("corp.ghe.com")),
+            "https://copilot-api.corp.ghe.com"
+        );
+        assert_eq!(
+            get_github_copilot_base_url(None, Some("https://corp.ghe.com/login")),
             "https://copilot-api.corp.ghe.com"
         );
         assert_eq!(
@@ -1075,6 +1107,34 @@ mod tests {
         assert_eq!(
             get_github_copilot_base_url(Some("no-proxy-ep"), Some("corp.ghe.com")),
             "https://copilot-api.corp.ghe.com"
+        );
+    }
+
+    #[test]
+    fn token_proxy_destination_is_bound_to_provider() {
+        for untrusted in [
+            "proxy.attacker.example",
+            "proxy.169.254.169.254",
+            "proxy.individual.githubcopilot.com:444",
+            "user@proxy.individual.githubcopilot.com",
+            "proxy.individual.githubcopilot.com/path",
+        ] {
+            let token = format!("tid=1;proxy-ep={untrusted};sku=free");
+            assert_eq!(get_base_url_from_token(&token), None, "accepted {untrusted}");
+            assert_eq!(
+                get_github_copilot_base_url(Some(&token), None),
+                DEFAULT_COPILOT_BASE_URL
+            );
+        }
+
+        let enterprise = "tid=1;proxy-ep=proxy.corp.ghe.com;sku=enterprise";
+        assert_eq!(
+            get_github_copilot_base_url(Some(enterprise), Some("corp.ghe.com")),
+            "https://api.corp.ghe.com"
+        );
+        assert_eq!(
+            get_github_copilot_base_url(Some(enterprise), Some("other.ghe.com")),
+            "https://copilot-api.other.ghe.com"
         );
     }
 

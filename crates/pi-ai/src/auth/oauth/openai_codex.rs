@@ -842,20 +842,10 @@ fn read_token_response(
     operation: TokenOperation,
 ) -> Result<OAuthToken, AuthError> {
     if !response.ok {
-        let text = if response.raw_body.is_empty() {
-            response.body.to_string()
-        } else {
-            response.raw_body.clone()
-        };
         return Err(AuthError::message(format!(
-            "OpenAI Codex token {} failed ({}): {}",
+            "OpenAI Codex token {} failed ({})",
             operation.as_str(),
             response.status,
-            if text.is_empty() {
-                "error".to_owned()
-            } else {
-                text
-            }
         )));
     }
 
@@ -880,11 +870,23 @@ fn read_token_response(
                 expires: expires_ms,
             })
         }
-        _ => Err(AuthError::message(format!(
-            "OpenAI Codex token {} response missing fields: {}",
-            operation.as_str(),
-            response.body
-        ))),
+        _ => {
+            let mut fields = Vec::with_capacity(3);
+            if access.is_none() {
+                fields.push("access_token");
+            }
+            if refresh.is_none() {
+                fields.push("refresh_token");
+            }
+            if expires_in.is_none() {
+                fields.push("expires_in");
+            }
+            Err(AuthError::message(format!(
+                "OpenAI Codex token {} response missing or invalid fields: {}",
+                operation.as_str(),
+                fields.join(", "),
+            )))
+        }
     }
 }
 
@@ -995,6 +997,13 @@ mod tests {
 
     fn err(msg: impl Into<String>) -> String {
         msg.into()
+    }
+
+    fn expect_err<T, E>(result: Result<T, E>, label: &str) -> Result<E, String> {
+        match result {
+            Ok(_) => Err(err(label)),
+            Err(error) => Ok(error),
+        }
     }
 
     struct ScriptedInteraction {
@@ -1176,6 +1185,31 @@ mod tests {
             }
         });
         Ok(format!("http://{address}/device-token"))
+    }
+
+    fn spawn_hanging_token_server(
+        path: &'static str,
+    ) -> Result<(String, tokio::sync::oneshot::Receiver<()>), String> {
+        let listener = TcpListener::bind("127.0.0.1:0").map_err(|error| error.to_string())?;
+        let address = listener.local_addr().map_err(|error| error.to_string())?;
+        let (request_seen, request_started) = tokio::sync::oneshot::channel();
+        thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut request = [0_u8; 4096];
+            let Ok(size) = stream.read(&mut request) else {
+                return;
+            };
+            let request = String::from_utf8_lossy(&request[..size]);
+            if !request.starts_with(&format!("POST {path} ")) {
+                return;
+            }
+            let _ = request_seen.send(());
+            let mut remaining = [0_u8; 1024];
+            while stream.read(&mut remaining).is_ok_and(|size| size > 0) {}
+        });
+        Ok((format!("http://{address}{path}"), request_started))
     }
 
     fn make_jwt(account_id: &str) -> String {
@@ -1714,6 +1748,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parent_cancel_aborts_post_race_token_exchange() -> TestResult {
+        let listener = TcpListener::bind("127.0.0.1:0").map_err(|error| error.to_string())?;
+        let port = listener
+            .local_addr()
+            .map_err(|error| error.to_string())?
+            .port();
+        drop(listener);
+        let (token_url, request_started) = spawn_hanging_token_server("/token")?;
+        let oauth = OpenAiCodexOAuth::with_http(
+            AuthHttpClient::new().map_err(|error| error.to_string())?,
+        )
+        .with_endpoints(OpenAiCodexEndpoints {
+            token_url,
+            callback_port: port,
+            redirect_uri: format!("http://localhost:{port}/auth/callback"),
+            ..OpenAiCodexEndpoints::default()
+        });
+        let parent_cancel = CancellationToken::new();
+        let interaction = HangManual {
+            select_done: AtomicUsize::new(0),
+            events: Mutex::new(Vec::new()),
+            hang: CancellationToken::new(),
+            prompt_signal: Mutex::new(None),
+            signal: Some(parent_cancel.clone()),
+        };
+
+        let exchange_cancel = async {
+            tokio::time::timeout(Duration::from_secs(2), request_started)
+                .await
+                .map_err(|_| err("token exchange did not start"))?
+                .map_err(|_| err("token exchange signal dropped"))?;
+            let prompt_signal = interaction
+                .prompt_signal
+                .lock()
+                .map_err(|_| err("prompt signal lock"))?
+                .clone()
+                .ok_or_else(|| err("missing prompt signal"))?;
+            assert!(prompt_signal.is_cancelled());
+            assert!(!parent_cancel.is_cancelled());
+            parent_cancel.cancel();
+            Ok::<(), String>(())
+        };
+        let (login, callback, cancel) = tokio::join!(
+            oauth.login(&interaction),
+            hit_callback_when_ready(&interaction, port),
+            exchange_cancel,
+        );
+        callback?;
+        cancel?;
+        assert!(matches!(login, Err(AuthError::Cancelled)));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn bad_state_on_manual_paste_is_rejected() -> TestResult {
         let blocker = TcpListener::bind("127.0.0.1:0").map_err(|e| err(e.to_string()))?;
         let port = blocker.local_addr().map_err(|e| err(e.to_string()))?.port();
@@ -1821,11 +1909,95 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn parent_cancel_aborts_in_flight_device_poll() -> TestResult {
+        let usercode = spawn_device_user_code_server()?;
+        let (device_token, request_started) =
+            spawn_hanging_token_server("/device-token")?;
+        let oauth = OpenAiCodexOAuth::with_http(
+            AuthHttpClient::new().map_err(|error| error.to_string())?,
+        )
+        .with_endpoints(OpenAiCodexEndpoints {
+            device_user_code_url: usercode,
+            device_token_url: device_token,
+            ..OpenAiCodexEndpoints::default()
+        });
+        let parent_cancel = CancellationToken::new();
+        let mut interaction =
+            ScriptedInteraction::new(vec![Ok(OPENAI_CODEX_DEVICE_CODE_LOGIN_METHOD.into())]);
+        interaction.signal = Some(parent_cancel.clone());
+
+        let cancel_poll = async {
+            tokio::time::timeout(Duration::from_secs(2), request_started)
+                .await
+                .map_err(|_| err("device poll did not start"))?
+                .map_err(|_| err("device poll signal dropped"))?;
+            parent_cancel.cancel();
+            Ok::<(), String>(())
+        };
+        let (login, cancel) = tokio::join!(oauth.login(&interaction), cancel_poll);
+        cancel?;
+        assert!(matches!(login, Err(AuthError::Cancelled)));
+        assert!(interaction
+            .events
+            .lock()
+            .map_err(|_| err("events lock"))?
+            .iter()
+            .any(|event| matches!(event, AuthEvent::DeviceCode { .. })));
+        Ok(())
+    }
+
     #[test]
     fn name_is_static_display_string() {
         let oauth = OpenAiCodexOAuth::default();
         assert_eq!(oauth.name(), OAUTH_DISPLAY_NAME);
         assert_eq!(oauth.login_label(), Some(OAUTH_DISPLAY_NAME));
+    }
+
+    #[test]
+    fn token_response_errors_never_include_secret_values() -> TestResult {
+        let access = "secret-access-token";
+        let refresh = "secret-refresh-token";
+        let malformed = super::super::super::http::AuthHttpResponse {
+            ok: true,
+            status: 200,
+            body: json!({
+                "access_token": access,
+                "refresh_token": refresh
+            }),
+            raw_body: format!("{{\"access_token\":\"{access}\",\"refresh_token\":\"{refresh}\"}}"),
+        };
+        let error = expect_err(
+            read_token_response(&malformed, TokenOperation::Exchange),
+            "malformed token response",
+        )?;
+        let message = error.to_string();
+        assert_eq!(
+            message,
+            "OpenAI Codex token exchange response missing or invalid fields: expires_in"
+        );
+        assert!(!message.contains(access));
+        assert!(!message.contains(refresh));
+
+        let failed = super::super::super::http::AuthHttpResponse {
+            ok: false,
+            status: 400,
+            body: json!({
+                "error": "invalid_grant",
+                "access_token": access,
+                "refresh_token": refresh
+            }),
+            raw_body: format!("provider details: {access} {refresh}"),
+        };
+        let error = expect_err(
+            read_token_response(&failed, TokenOperation::Refresh),
+            "failed token response",
+        )?;
+        let message = error.to_string();
+        assert_eq!(message, "OpenAI Codex token refresh failed (400)");
+        assert!(!message.contains(access));
+        assert!(!message.contains(refresh));
+        Ok(())
     }
 
     #[test]

@@ -19,8 +19,9 @@ use pi_ai::auth::{
     AMBIENT_AUTH_MARKER, AuthCheck, AuthContext, AuthResolutionOverrides, AuthResult, AuthType,
     Credential, CredentialInfo, CredentialStore, FileCredentialStore, InMemoryCredentialStore,
     ModelAuth, ModelsError, ModelsErrorCode, OAuthAuth, ProviderAuth, ProviderEnv, ProviderHeaders,
-    RuntimeCredentials, api_key_env_vars, env_api_key_auth, get_env_api_key, resolve_provider_auth,
+    RuntimeCredentials, api_key_env_vars, env_api_key_auth, get_env_api_key,
 };
+use pi_ai::auth::resolve::resolve_provider_auth_with_signal;
 use pi_ai::catalog::{BuiltinModels, ModelsStoreEntry, builtin_models};
 use pi_ai::models_store::{
     FileModelsStore, InMemoryModelsStore, ModelOverrides, ModelsStore, apply_model_overrides,
@@ -526,7 +527,7 @@ impl ModelRuntime {
         provider_id: &str,
         overrides: ModelRuntimeAuthOverrides,
     ) -> Result<Option<AuthResult>, ModelRuntimeError> {
-        self.resolve_auth(provider_id, None, overrides).await
+        self.resolve_auth(provider_id, None, overrides, None).await
     }
 
     /// Resolve request auth for a model (applies configured headers).
@@ -539,7 +540,7 @@ impl ModelRuntime {
         model: &Model,
         overrides: ModelRuntimeAuthOverrides,
     ) -> Result<Option<AuthResult>, ModelRuntimeError> {
-        self.resolve_auth(&model.provider, Some(model), overrides)
+        self.resolve_auth(&model.provider, Some(model), overrides, None)
             .await
     }
 
@@ -836,7 +837,12 @@ impl ModelRuntime {
             env: options.env.clone(),
         };
         let resolution = self
-            .get_auth_for_model(model, overrides)
+            .resolve_auth(
+                &model.provider,
+                Some(model),
+                overrides,
+                options.signal.clone(),
+            )
             .await?
             .ok_or_else(|| {
                 ModelsError::new(
@@ -874,6 +880,7 @@ impl ModelRuntime {
         provider_id: &str,
         model: Option<&Model>,
         overrides: ModelRuntimeAuthOverrides,
+        signal: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<Option<AuthResult>, ModelRuntimeError> {
         // Runtime API key is exposed through RuntimeCredentials::read, so the
         // shared resolver sees it as a stored api_key credential.
@@ -883,12 +890,13 @@ impl ModelRuntime {
             api_key: overrides.api_key.clone(),
             env: overrides.env.clone(),
         };
-        let mut result = resolve_provider_auth(
+        let mut result = resolve_provider_auth_with_signal(
             provider_id,
             &provider_auth,
             &self.inner.credentials,
             auth_context.as_ref(),
             Some(&resolution_overrides),
+            signal,
         )
         .await?;
 

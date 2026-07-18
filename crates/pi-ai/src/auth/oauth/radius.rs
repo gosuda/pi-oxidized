@@ -125,6 +125,39 @@ pub fn normalize_radius_gateway_url(value: &str) -> String {
     with_scheme.trim_end_matches('/').to_owned()
 }
 
+fn is_loopback_destination(url: &reqwest::Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+fn validate_radius_verification_uri(
+    value: &str,
+    gateway: &str,
+) -> Result<String, AuthError> {
+    let untrusted = || AuthError::message("Untrusted verification URI in Radius OAuth response");
+    let uri = reqwest::Url::parse(value).map_err(|_| untrusted())?;
+    if !uri.username().is_empty() || uri.password().is_some() || uri.host_str().is_none() {
+        return Err(untrusted());
+    }
+    if uri.scheme() == "https" {
+        return Ok(uri.to_string());
+    }
+    if uri.scheme() == "http" && is_loopback_destination(&uri) {
+        let configured_gateway = reqwest::Url::parse(gateway).map_err(|_| untrusted())?;
+        if configured_gateway.scheme() == "http"
+            && is_loopback_destination(&configured_gateway)
+        {
+            return Ok(uri.to_string());
+        }
+    }
+    Err(untrusted())
+}
+
 /// Build the fixed (or test-overridden) redirect URI for a callback port.
 #[must_use]
 pub fn radius_redirect_uri(port: u16) -> String {
@@ -280,8 +313,10 @@ impl RadiusOAuth {
 
         let verification_uri = device
             .verification_uri
-            .clone()
-            .unwrap_or_else(|| oauth.verification_endpoint.clone());
+            .as_deref()
+            .unwrap_or(oauth.verification_endpoint.as_str());
+        let verification_uri =
+            validate_radius_verification_uri(verification_uri, &self.gateway)?;
 
         interaction.notify(AuthEvent::DeviceCode {
             user_code: device.user_code.clone(),
@@ -1009,6 +1044,47 @@ mod tests {
     }
 
     #[test]
+    fn verification_destination_requires_https_except_loopback_development() -> TestResult {
+        assert_eq!(
+            validate_radius_verification_uri(
+                "https://identity.example/device",
+                "https://gateway.example",
+            )
+            .map_err(|error| error.to_string())?,
+            "https://identity.example/device"
+        );
+        assert_eq!(
+            validate_radius_verification_uri(
+                "http://127.0.0.1:9000/device",
+                "http://localhost:8000",
+            )
+            .map_err(|error| error.to_string())?,
+            "http://127.0.0.1:9000/device"
+        );
+        for value in [
+            "http://identity.example/device",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "https://user@identity.example/device",
+        ] {
+            let error = expect_err(
+                validate_radius_verification_uri(value, "https://gateway.example"),
+                "untrusted verification destination",
+            )?;
+            assert_eq!(
+                error.to_string(),
+                "Untrusted verification URI in Radius OAuth response"
+            );
+        }
+        assert!(validate_radius_verification_uri(
+            "http://localhost:9000/device",
+            "https://gateway.example",
+        )
+        .is_err());
+        Ok(())
+    }
+
+    #[test]
     fn redirect_uri_defaults_to_fixed_radius_callback() {
         assert_eq!(radius_redirect_uri(CALLBACK_PORT), REDIRECT_URI);
         assert_eq!(
@@ -1371,6 +1447,54 @@ mod tests {
                 expires_in_seconds: Some(600),
             } if user_code == "ABCD-EFGH" && verification_uri == "https://issuer.example/device"
         )));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn device_login_rejects_untrusted_verification_destination() -> TestResult {
+        let routes = Arc::new(Mutex::new(Vec::new()));
+        let gateway = spawn_json_server(routes.clone())?;
+        let issuer_routes = Arc::new(Mutex::new(vec![(
+            "POST /device".to_owned(),
+            200,
+            serde_json::json!({
+                "device_code": "dev-code",
+                "user_code": "ABCD-EFGH",
+                "verification_uri": "http://attacker.example/phish",
+                "expires_in": 600,
+                "interval": 1
+            })
+            .to_string(),
+            Some("client_id=radius-client".to_owned()),
+        )]));
+        let issuer = spawn_json_server(issuer_routes)?;
+        let device_url = format!("{issuer}/device");
+        {
+            let mut routes = lock_mutex(&routes, "routes")?;
+            routes.push((
+                "GET /v1/oauth".to_owned(),
+                200,
+                sample_config(
+                    "https://issuer.example/token",
+                    &device_url,
+                    "https://issuer.example/authorize",
+                )
+                .to_string(),
+                None,
+            ));
+        }
+
+        let oauth = radius_with(gateway, free_port()?)?;
+        let interaction = MockInteraction::device();
+        let error = expect_err(oauth.login(&interaction).await, "untrusted destination")?;
+        assert_eq!(
+            error.to_string(),
+            "Untrusted verification URI in Radius OAuth response"
+        );
+        assert!(!interaction
+            .events()?
+            .iter()
+            .any(|event| matches!(event, AuthEvent::DeviceCode { .. })));
         Ok(())
     }
 
