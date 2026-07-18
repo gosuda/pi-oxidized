@@ -1987,6 +1987,54 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn message_end_disk_failure_settles_only_after_agent_end() -> TestResult {
+        let dir = tempfile::tempdir().test_context("tempdir")?;
+        let provider = Arc::new(SeqProvider::new(two(
+            start_event(),
+            done_ok(assistant_text("answer")),
+        )));
+        let session = blocked_append_session(provider, &dir)?;
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let order_clone = Arc::clone(&order);
+        let _unsub = session.subscribe(move |event| {
+            mutex_value(&order_clone).push(event.type_name().to_owned());
+        });
+
+        let err = require_error(
+            session.prompt("question", PromptOptions::default()).await,
+            "disk-failure run",
+        )?;
+        assert!(matches!(err, PromptError::Session(_)), "{err}");
+
+        let observed = mutex_value(&order).clone();
+        let message_end = require_some(
+            observed.iter().position(|name| name == "message_end"),
+            "public message_end for the failed persistence",
+        )?;
+        let agent_end = require_some(
+            observed.iter().position(|name| name == "agent_end"),
+            "public agent_end after the persistence failure",
+        )?;
+        let settled = require_some(
+            observed.iter().position(|name| name == "agent_settled"),
+            "final agent_settled",
+        )?;
+        assert!(
+            message_end < agent_end && agent_end < settled,
+            "persistence failure must not settle before agent_end: {observed:?}"
+        );
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|name| *name == "agent_settled")
+                .count(),
+            1,
+            "exactly one settle per run: {observed:?}"
+        );
+        Ok(())
+    }
+
     #[allow(dead_code)]
     fn _ensure_null_runner_send_sync(_: NullExtensionRunner) {}
 

@@ -51,6 +51,7 @@ impl AgentSession {
         let wait_cancel = self.lock_inner().agent_end_wait_cancel.clone();
 
         let join = tokio::spawn(async move {
+            let mut lag_recorded = false;
             loop {
                 tokio::select! {
                     () = cancel_child.cancelled() => break,
@@ -58,7 +59,14 @@ impl AgentSession {
                         let Some(event) = event else {
                             break;
                         };
-                        if rx.is_lagged() {
+                        if rx.is_lagged() && !lag_recorded {
+                            // Record once and abort, but keep draining: the
+                            // bounded subscription retains the newest
+                            // message_end/agent_end, and only a processed
+                            // agent_end may drive the single settle. If the
+                            // subscription closes instead, the loop breaks and
+                            // wait_cancel unblocks the prompt barrier.
+                            lag_recorded = true;
                             session.record_session_error(
                                 crate::core::sessions::SessionError::Io {
                                     path: "agent event subscription".to_owned(),
@@ -68,8 +76,6 @@ impl AgentSession {
                                 },
                             );
                             session.agent.abort();
-                            session.emit_agent_settled().await;
-                            break;
                         }
                         session.process_agent_event(event).await;
                     }
@@ -115,9 +121,11 @@ impl AgentSession {
                 .handle_agent_event_side_effects(&event, &AgentSessionEvent::AgentStart)
                 .await
         {
+            // Record the typed failure and abort the run, but never settle
+            // here: the aborted run still emits `agent_end`, and the prompt
+            // lifecycle settles exactly once after processing it.
             self.record_session_error(error);
             self.agent.abort();
-            self.emit_agent_settled().await;
             return;
         }
 
@@ -185,8 +193,10 @@ impl AgentSession {
         if let Some(event) = persistence_event
             && let Err(error) = self.handle_agent_event_side_effects(&event, &public).await
         {
+            // Same invariant as the message_start path: record + abort, and
+            // let the eventual `agent_end` drive the single settle.
             self.record_session_error(error);
-            self.emit_agent_settled().await;
+            self.agent.abort();
         }
 
         if is_agent_end {
@@ -333,24 +343,107 @@ mod tests {
         }
     }
 
+    fn assistant_message() -> pi_agent::AgentMessage {
+        let mut assistant = pi_ai::AssistantMessage::new("test", "test", "model", 0);
+        assistant.stop_reason = pi_ai::StopReason::Stop;
+        pi_agent::AgentMessage::Llm(Box::new(pi_ai::Message::Assistant(assistant)))
+    }
+
+    fn update_event(index: i64) -> AgentEvent {
+        let partial = pi_ai::AssistantMessage::new("test", "test", "model", index);
+        AgentEvent::MessageUpdate {
+            message: assistant_message(),
+            assistant_message_event: Box::new(AssistantMessageEvent::Start { partial }),
+        }
+    }
+
     #[tokio::test]
-    async fn lagged_subscription_fails_and_unblocks_once() -> TestResult {
+    async fn lagged_subscription_drains_retained_terminals_before_settle() -> TestResult {
         let config =
             super::super::AgentSessionConfig::test_config(Arc::new(StubProvider), model())?;
         let session = super::super::AgentSession::new(config)?;
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_clone = Arc::clone(&observed);
+        let _unsub = session.subscribe(move |event| {
+            observed_clone
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(event.type_name().to_owned());
+        });
+
+        // Mirror the prompt lifecycle: the run flag gates the single settle.
+        session.mark_agent_run_active();
         let sink = AgentEventSink::new(Arc::new(std::sync::Mutex::new(AgentState::new())));
         let rx = sink.subscribe_with_capacity(2);
-        sink.emit(AgentEvent::AgentStart);
-        sink.emit(AgentEvent::TurnStart);
-        sink.emit(AgentEvent::AgentStart);
+        let ends_before = session.processed_agent_end_count();
+        // Overflow with streaming updates; the bounded subscription must keep
+        // the newest message_end and agent_end deliverable.
+        for index in 0..4 {
+            sink.emit(update_event(index));
+        }
+        sink.emit(AgentEvent::MessageEnd {
+            message: assistant_message(),
+        });
+        sink.emit(AgentEvent::AgentEnd {
+            messages: Vec::new(),
+        });
+        drop(sink);
 
         let pump = session.spawn_event_pump_with_subscription(rx);
         pump.join.await?;
+
         let error = session
             .take_session_error()
             .ok_or("lag must record a typed session error")?;
-        assert!(error.to_string().contains("subscription lagged"));
+        assert!(error.to_string().contains("subscription lagged"), "{error}");
         assert!(session.take_session_error().is_none(), "error is one-shot");
+        assert_eq!(
+            session.processed_agent_end_count(),
+            ends_before + 1,
+            "retained agent_end must still be processed after lag"
+        );
+
+        let snapshot = observed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(
+            snapshot.contains(&"message_end".to_owned()),
+            "retained message_end must be published: {snapshot:?}"
+        );
+        assert!(
+            snapshot.contains(&"agent_end".to_owned()),
+            "retained agent_end must be published: {snapshot:?}"
+        );
+        assert!(
+            !snapshot.contains(&"agent_settled".to_owned()),
+            "the pump must never settle on lag: {snapshot:?}"
+        );
+
+        // Settle exactly once, strictly after the processed agent_end —
+        // mirroring the prompt lifecycle that owns the settle.
+        session.emit_agent_settled().await;
+        let snapshot = observed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let end = snapshot
+            .iter()
+            .position(|name| name == "agent_end")
+            .ok_or("agent_end position")?;
+        let settled = snapshot
+            .iter()
+            .position(|name| name == "agent_settled")
+            .ok_or("agent_settled position")?;
+        assert!(end < settled, "AgentEnd must precede settle: {snapshot:?}");
+        assert_eq!(
+            snapshot
+                .iter()
+                .filter(|name| *name == "agent_settled")
+                .count(),
+            1,
+            "exactly one settle: {snapshot:?}"
+        );
         Ok(())
     }
 }
