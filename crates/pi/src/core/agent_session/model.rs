@@ -181,7 +181,7 @@ impl AgentSession {
     ///
     /// Returns [`ModelError::NoAuth`] when the runtime reports no configured
     /// credential for the model's provider, or [`ModelError::Session`] when
-    /// persistence fails.
+    /// persistence fails (live agent state is left unchanged in that case).
     pub async fn set_model(&self, model: Model) -> Result<(), ModelError> {
         if let Some(runtime) = self.model_runtime()
             && runtime.check_auth(&model.provider).await.is_none()
@@ -193,11 +193,13 @@ impl AgentSession {
             return Ok(());
         }
         let thinking = self.thinking_level_for_model_switch(None);
-        self.agent.set_model(model.clone());
+        // Durable append first: live state, settings, and events publish only
+        // model changes the session file actually holds.
         {
             let mut manager = self.session_manager.lock().await;
             manager.append_model_change(&model.provider, &model.id)?;
         }
+        self.agent.set_model(model.clone());
         self.lock_settings()
             .set_default_model_and_provider(&model.provider, &model.id);
         self.set_thinking_level(thinking).await;
@@ -237,11 +239,17 @@ impl AgentSession {
         };
         let next = &filtered[next_index];
         let thinking = self.thinking_level_for_model_switch(next.thinking_level);
-        self.agent.set_model(next.model.clone());
+        // Durable append first; a persistence failure cycles nothing.
         {
             let mut manager = self.session_manager.lock().await;
-            let _ = manager.append_model_change(&next.model.provider, &next.model.id);
+            if manager
+                .append_model_change(&next.model.provider, &next.model.id)
+                .is_err()
+            {
+                return None;
+            }
         }
+        self.agent.set_model(next.model.clone());
         self.lock_settings()
             .set_default_model_and_provider(&next.model.provider, &next.model.id);
         self.set_thinking_level(thinking).await;
@@ -272,11 +280,17 @@ impl AgentSession {
         };
         let next_model = available[next_index].clone();
         let thinking = self.thinking_level_for_model_switch(None);
-        self.agent.set_model(next_model.clone());
+        // Durable append first; a persistence failure cycles nothing.
         {
             let mut manager = self.session_manager.lock().await;
-            let _ = manager.append_model_change(&next_model.provider, &next_model.id);
+            if manager
+                .append_model_change(&next_model.provider, &next_model.id)
+                .is_err()
+            {
+                return None;
+            }
         }
+        self.agent.set_model(next_model.clone());
         self.lock_settings()
             .set_default_model_and_provider(&next_model.provider, &next_model.id);
         self.set_thinking_level(thinking).await;
@@ -322,11 +336,18 @@ impl AgentSession {
         if effective == previous {
             return;
         }
-        self.agent.set_thinking_level(effective);
+        // Durable append first: live level, settings, and events publish only
+        // changes the session file actually holds.
         {
             let mut manager = self.session_manager.lock().await;
-            let _ = manager.append_thinking_level_change(level_str(effective));
+            if manager
+                .append_thinking_level_change(level_str(effective))
+                .is_err()
+            {
+                return;
+            }
         }
+        self.agent.set_thinking_level(effective);
         // Persist as the default only when the model supports reasoning, or the
         // new level is not "off" (TypeScript `supportsThinking() ||
         // effectiveLevel !== "off"`).
@@ -562,5 +583,168 @@ mod tests {
         assert_eq!(level_str(ModelThinkingLevel::Medium), "medium");
         assert_eq!(level_str(ModelThinkingLevel::Xhigh), "xhigh");
         assert_eq!(level_str(ModelThinkingLevel::Max), "max");
+    }
+
+    mod append_failures {
+        use super::*;
+        use crate::core::agent_session::AgentSessionConfig;
+        use futures::stream::{self, BoxStream, StreamExt};
+        use pi_ai::{AssistantMessageEvent, Context, Provider, ProviderError, StreamOptions};
+        use std::sync::Mutex as StdMutex;
+
+        type TestResult<T = ()> = Result<T, String>;
+
+        #[derive(Clone)]
+        struct StubProvider;
+
+        impl Provider for StubProvider {
+            fn stream(
+                &self,
+                _model: &Model,
+                _context: Context,
+                _options: StreamOptions,
+            ) -> BoxStream<'static, Result<AssistantMessageEvent, ProviderError>> {
+                stream::empty().boxed()
+            }
+        }
+
+        fn context(error: impl std::fmt::Display, label: &str) -> String {
+            format!("{label}: {error}")
+        }
+
+        /// Session whose every subsequent append fails (file blocked by a dir).
+        fn blocked_append_session(
+            dir: &tempfile::TempDir,
+            session_model: Model,
+            scoped_models: Vec<ScopedModel>,
+        ) -> TestResult<Arc<AgentSession>> {
+            let mut manager = crate::core::sessions::SessionManager::create(
+                dir.path().to_string_lossy().as_ref(),
+                Some(dir.path().to_string_lossy().as_ref()),
+                None,
+            )
+            .map_err(|error| context(error, "session manager"))?;
+            manager
+                .append_message(&pi_agent::user_text("seed", std::iter::empty()))
+                .map_err(|error| context(error, "seed user append"))?;
+            // Persistence is lazy until an assistant entry exists; materialize
+            // the file so the directory blocker makes every later append fail.
+            let mut assistant =
+                pi_ai::AssistantMessage::new("test-api", "p", "m", pi_agent::now_millis());
+            assistant.stop_reason = pi_ai::StopReason::Stop;
+            manager
+                .append_message(&pi_agent::AgentMessage::Llm(Box::new(
+                    pi_ai::Message::Assistant(assistant),
+                )))
+                .map_err(|error| context(error, "seed assistant append"))?;
+            let session_file = std::path::PathBuf::from(
+                manager
+                    .get_session_file()
+                    .ok_or_else(|| "missing session file".to_owned())?,
+            );
+            std::fs::remove_file(&session_file)
+                .map_err(|error| context(error, "remove session file"))?;
+            std::fs::create_dir(&session_file)
+                .map_err(|error| context(error, "block append path"))?;
+            let mut config = AgentSessionConfig::test_config(Arc::new(StubProvider), session_model)
+                .map_err(|error| context(error, "test config"))?;
+            config.session_manager = manager;
+            config.scoped_models = scoped_models;
+            AgentSession::new(config).map_err(|error| context(error, "session"))
+        }
+
+        fn record_events(session: &Arc<AgentSession>) -> Arc<StdMutex<Vec<String>>> {
+            let events = Arc::new(StdMutex::new(Vec::new()));
+            let events_clone = Arc::clone(&events);
+            let _unsub = session.subscribe(move |event| {
+                events_clone
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(event.type_name().to_owned());
+            });
+            events
+        }
+
+        fn recorded(events: &Arc<StdMutex<Vec<String>>>) -> Vec<String> {
+            events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        #[tokio::test]
+        async fn set_model_append_failure_returns_error_without_live_drift() -> TestResult {
+            let dir = tempfile::tempdir().map_err(|error| context(error, "tempdir"))?;
+            let session = blocked_append_session(&dir, model("m", "p", false), Vec::new())?;
+            let events = record_events(&session);
+
+            let result = session.set_model(model("b", "p", false)).await;
+            assert!(
+                matches!(result, Err(ModelError::Session(_))),
+                "expected typed session error: {result:?}"
+            );
+            assert_eq!(session.model().id, "m", "live model must not change");
+            assert!(
+                recorded(&events).is_empty(),
+                "failed append must publish no events: {:?}",
+                recorded(&events)
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn scoped_cycle_append_failure_cycles_nothing() -> TestResult {
+            let dir = tempfile::tempdir().map_err(|error| context(error, "tempdir"))?;
+            let scoped = vec![
+                ScopedModel {
+                    model: model("m", "p", false),
+                    thinking_level: None,
+                },
+                ScopedModel {
+                    model: model("b", "p", false),
+                    thinking_level: None,
+                },
+            ];
+            let session = blocked_append_session(&dir, model("m", "p", false), scoped)?;
+            let events = record_events(&session);
+
+            let cycled = session.cycle_model(CycleDirection::Forward).await;
+            assert!(cycled.is_none(), "failed append must not report a cycle");
+            assert_eq!(session.model().id, "m", "live model must not change");
+            assert!(
+                recorded(&events).is_empty(),
+                "failed append must publish no events: {:?}",
+                recorded(&events)
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn thinking_level_append_failure_publishes_nothing() -> TestResult {
+            let dir = tempfile::tempdir().map_err(|error| context(error, "tempdir"))?;
+            let session = blocked_append_session(&dir, model("m", "p", true), Vec::new())?;
+            let before = session.thinking_level();
+            let next = if before == ModelThinkingLevel::High {
+                ModelThinkingLevel::Low
+            } else {
+                ModelThinkingLevel::High
+            };
+            let events = record_events(&session);
+
+            session.set_thinking_level(next).await;
+            assert_eq!(
+                session.thinking_level(),
+                before,
+                "live thinking level must not change"
+            );
+            assert!(
+                !recorded(&events)
+                    .iter()
+                    .any(|name| name == "thinking_level_changed"),
+                "failed append must not publish thinking_level_changed: {:?}",
+                recorded(&events)
+            );
+            Ok(())
+        }
     }
 }

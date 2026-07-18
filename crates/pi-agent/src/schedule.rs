@@ -654,13 +654,17 @@ async fn execute_prepared_tool_call(
     let args = prepared.args.clone();
     let tool_call_id = prepared.tool_call.id.clone();
     let cancel = cancel.clone();
+    let worker_cancel = cancel.clone();
 
-    let mut execute = Box::pin(async move {
+    // Owned task: a non-cooperative tool is force-aborted on cancellation (and
+    // on drop through JoinSet) instead of hanging the sequential batch.
+    let mut worker = JoinSet::new();
+    worker.spawn(async move {
         let updates = ToolUpdates::new(move |partial| {
             let _ = update_tx.send(partial);
         });
         match tool
-            .execute(&tool_call_id, args, cancel, updates.clone())
+            .execute(&tool_call_id, args, worker_cancel, updates.clone())
             .await
         {
             Ok(result) => {
@@ -683,21 +687,32 @@ async fn execute_prepared_tool_call(
     loop {
         tokio::select! {
             biased;
-            outcome = &mut execute => {
+            () = cancel.cancelled() => {
+                worker.abort_all();
+                while worker.join_next().await.is_some() {}
                 while let Ok(partial) = update_rx.try_recv() {
                     emit_tool_execution_update(&tool_call, partial, emit);
                 }
-                return outcome;
+                return ExecutedOutcome {
+                    result: error_tool_result("Operation aborted"),
+                    is_error: true,
+                };
+            }
+            joined = worker.join_next() => {
+                while let Ok(partial) = update_rx.try_recv() {
+                    emit_tool_execution_update(&tool_call, partial, emit);
+                }
+                return match joined {
+                    Some(Ok(outcome)) => outcome,
+                    Some(Err(_)) | None => ExecutedOutcome {
+                        result: error_tool_result("Tool execution panicked"),
+                        is_error: true,
+                    },
+                };
             }
             partial = update_rx.recv() => {
                 if let Some(partial) = partial {
                     emit_tool_execution_update(&tool_call, partial, emit);
-                } else {
-                    let outcome = execute.await;
-                    while let Ok(partial) = update_rx.try_recv() {
-                        emit_tool_execution_update(&tool_call, partial, emit);
-                    }
-                    return outcome;
                 }
             }
         }
@@ -1517,6 +1532,87 @@ mod tests {
             .count();
         if end_count != 1 {
             return Err(format!("expected one paired error end, got {end_count}"));
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn non_cooperative_sequential_tool_is_aborted_and_paired() -> TestResult {
+        let tool = RecordingTool {
+            behavior: ToolBehavior::IgnoreCancel,
+            ..RecordingTool::new("ignore-cancel")
+        };
+        let started = Arc::clone(&tool.executed);
+        let context = context_with(vec![Arc::new(tool)]);
+        let assistant = assistant_with_calls(vec![
+            ToolCall::new("c1", "ignore-cancel", Map::new()),
+            ToolCall::new("c2", "ignore-cancel", Map::new()),
+        ]);
+        let config = sample_config(ToolExecutionMode::Sequential);
+        let cancel = CancellationToken::new();
+        let run_cancel = cancel.clone();
+        let (events, emit) = collect_emit();
+
+        let run = tokio::spawn(async move {
+            execute_tool_calls(&context, &assistant, &config, &run_cancel, &emit).await
+        });
+        for _ in 0..100 {
+            if started.load(Ordering::SeqCst) {
+                break;
+            }
+            sleep(Duration::from_millis(2)).await;
+        }
+        if !started.load(Ordering::SeqCst) {
+            return Err("non-cooperative sequential tool never started".to_owned());
+        }
+
+        cancel.cancel();
+        let batch = timeout(Duration::from_secs(1), run)
+            .await
+            .map_err(|_| "cancelled sequential batch did not settle".to_owned())?
+            .map_err(|error| format!("join failed: {error}"))?
+            .map_err(|error| error.to_string())?;
+        let ids: Vec<&str> = batch
+            .messages
+            .iter()
+            .map(|message| message.tool_call_id.as_str())
+            .collect();
+        if ids != ["c1", "c2"] {
+            return Err(format!("sequential abort dropped results: {ids:?}"));
+        }
+        for message in &batch.messages {
+            if !message.is_error {
+                return Err(format!("result {} was not an error", message.tool_call_id));
+            }
+            if !message.content.iter().any(|content| {
+                matches!(
+                    content,
+                    ToolResultContent::Text(text) if text.text.contains("Operation aborted")
+                )
+            }) {
+                return Err(format!(
+                    "result {} lacked aborted content: {:?}",
+                    message.tool_call_id, message.content
+                ));
+            }
+        }
+        let events = snapshot_events(&events)?;
+        for id in ["c1", "c2"] {
+            let ends = events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        AgentEvent::ToolExecutionEnd { tool_call_id, is_error: true, .. }
+                            if tool_call_id == id
+                    )
+                })
+                .count();
+            if ends != 1 {
+                return Err(format!(
+                    "expected one paired error end for {id}, got {ends}"
+                ));
+            }
         }
         Ok(())
     }

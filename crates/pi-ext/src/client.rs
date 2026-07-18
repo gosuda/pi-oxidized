@@ -962,9 +962,10 @@ fn forward_event(shared: &Shared, frame: Frame) {
         }
     } else if method == Method::DisposeSlot.as_str() {
         match from_payload::<crate::protocol::DisposeSlot>(&frame.payload) {
-            Ok(d) => {
-                clear_generation(shared, &d.key);
-                let _ = shared.events.send(HostEvent::DisposeSlot(d));
+            Ok(dispose) => {
+                if accept_dispose(shared, &dispose.key, dispose.generation) {
+                    let _ = shared.events.send(HostEvent::DisposeSlot(dispose));
+                }
             }
             Err(_) => {
                 let _ = shared.events.send(HostEvent::Raw(frame));
@@ -1039,10 +1040,21 @@ fn accept_generation(shared: &Shared, key: &str, generation: u64) -> bool {
     }
 }
 
-fn clear_generation(shared: &Shared, key: &str) {
-    if let Ok(mut generations) = shared.slot_generations.lock() {
-        generations.remove(key);
+/// Accept a dispose unless it names a generation older than the accepted
+/// current one (a reordered stale dispose must not kill a live slot). An
+/// absent generation is an unconditional dispose. Accepted disposes clear the
+/// tracked generation so the key starts fresh.
+fn accept_dispose(shared: &Shared, key: &str, generation: Option<u64>) -> bool {
+    let Ok(mut generations) = shared.slot_generations.lock() else {
+        return false;
+    };
+    if let (Some(generation), Some(current)) = (generation, generations.get(key).copied())
+        && generation < current
+    {
+        return false;
     }
+    generations.remove(key);
+    true
 }
 
 fn remote_error(frame: &Frame) -> HostClientError {
@@ -1429,6 +1441,85 @@ mod tests {
         assert!(seen.contains(&2), "gen 2 must arrive: {seen:?}");
         assert!(!seen.contains(&1), "stale gen 1 must be dropped: {seen:?}");
         assert!(seen.contains(&3), "gen 3 must arrive: {seen:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reordered_stale_dispose_does_not_kill_live_slot() -> R {
+        let (client, mut host) = make_pair().await;
+        let mut sub = client.subscribe();
+        let client_task = tokio::spawn(async move {
+            client
+                .request(
+                    Method::Notify,
+                    serde_json::json!({}),
+                    Duration::from_secs(2),
+                )
+                .await
+        });
+        let req = host.read_frame().await.ok_or("no req")?;
+        let slot = |generation: u64| UiSlot {
+            key: "w".to_owned(),
+            generation,
+            placement: SlotPlacement::AboveEditor,
+            height: 1,
+            runs: vec![vec![StyledRun {
+                text: format!("g{generation}"),
+                style: crate::protocol::Style::default(),
+            }]],
+            focusable: false,
+            cursor: None,
+            overlay_options: None,
+        };
+        // Live slot at gen 2, then a REORDERED stale dispose for gen 1.
+        host.write_frame(&Frame::event(0, Method::UiSlot, to_payload(&slot(2))?))
+            .await?;
+        host.write_frame(&Frame::event(
+            0,
+            Method::DisposeSlot,
+            to_payload(&crate::protocol::DisposeSlot {
+                key: "w".to_owned(),
+                generation: Some(1),
+            })?,
+        ))
+        .await?;
+        // Old generation stays rejected after the ignored dispose.
+        host.write_frame(&Frame::event(0, Method::UiSlot, to_payload(&slot(1))?))
+            .await?;
+        // A current-generation dispose is honored.
+        host.write_frame(&Frame::event(
+            0,
+            Method::DisposeSlot,
+            to_payload(&crate::protocol::DisposeSlot {
+                key: "w".to_owned(),
+                generation: Some(2),
+            })?,
+        ))
+        .await?;
+        host.write_frame(&Frame::response(
+            req.id,
+            Method::Notify,
+            serde_json::json!({}),
+        ))
+        .await?;
+        let _ = client_task.await??;
+
+        let mut slots = Vec::new();
+        let mut disposes = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+        while let Ok(Ok(event)) = tokio::time::timeout_at(deadline, sub.recv()).await {
+            match event {
+                HostEvent::UiSlot(slot) => slots.push(slot.generation),
+                HostEvent::DisposeSlot(dispose) => disposes.push(dispose.generation),
+                _ => {}
+            }
+        }
+        assert_eq!(slots, vec![2], "live slot survives; stale push rejected");
+        assert_eq!(
+            disposes,
+            vec![Some(2)],
+            "stale dispose dropped, current dispose forwarded"
+        );
         Ok(())
     }
 

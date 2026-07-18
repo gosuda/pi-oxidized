@@ -23,6 +23,15 @@ use crate::core::model_runtime::ModelRuntime;
 use crate::core::resources::frontmatter::strip_frontmatter;
 use crate::core::resources::prompts::expand_prompt_template;
 
+/// Upper bound on waiting for a failed run's already-queued `agent_end`.
+///
+/// Ordinary failed runs never wait this long: their `agent_end` is queued
+/// before the run call returns, so the barrier resolves on the next pump
+/// iteration. This bound only fires for a future pre-start rejection that
+/// [`run_emits_agent_end`] does not classify, keeping worst-case added
+/// latency well under the interactive p95 budget.
+const FAILED_RUN_END_BARRIER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// How a streaming prompt is queued.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StreamingBehavior {
@@ -224,7 +233,9 @@ impl AgentSession {
     ///
     /// # Errors
     ///
-    /// Returns [`PromptError`] when starting a requested agent turn fails.
+    /// Returns [`PromptError`] when starting a requested agent turn fails or
+    /// when the idle-path durable session append fails (no live state or
+    /// public event is published in that case).
     pub async fn send_custom_message(
         self: &Arc<Self>,
         message: CustomMessageInput,
@@ -247,18 +258,19 @@ impl AgentSession {
                 self.run_agent_prompt(vec![app_message]).await?;
             }
             _ => {
-                self.agent.push_message(app_message.clone());
+                // Durable append first: live agent state and public events are
+                // published only for entries the session file actually holds.
                 {
                     let mut sm = self.session_manager.lock().await;
-                    if let Err(err) = sm.append_custom_message_entry(
+                    sm.append_custom_message_entry(
                         &message.custom_type,
                         &message.content,
                         message.display,
                         message.details.clone(),
-                    ) {
-                        let _ = err;
-                    }
+                    )
+                    .map_err(PromptError::Session)?;
                 }
+                self.agent.push_message(app_message.clone());
                 self.emit_public(AgentSessionEvent::MessageStart {
                     message: app_message.clone(),
                 });
@@ -528,15 +540,8 @@ impl AgentSession {
         let mut processed_count = self.assistant_count();
         let mut processed_agent_ends = self.processed_agent_end_count();
         let run = self.agent.prompt(messages).await;
-        if run.is_ok()
-            && !self
-                .wait_for_processed_agent_end(processed_agent_ends)
-                .await
-        {
-            return Err(PromptError::msg(
-                "Agent event pump disconnected before agent_end",
-            ));
-        }
+        self.observe_run_agent_end(&run, processed_agent_ends)
+            .await?;
         if let Some(error) = self.take_session_error() {
             return Err(PromptError::Session(error));
         }
@@ -555,20 +560,47 @@ impl AgentSession {
             // Re-baseline after pops from prepare_retry / overflow compaction.
             processed_count = self.assistant_count();
             let run = self.agent.continue_run().await;
-            if run.is_ok()
-                && !self
-                    .wait_for_processed_agent_end(processed_agent_ends)
-                    .await
-            {
-                return Err(PromptError::msg(
-                    "Agent event pump disconnected before agent_end",
-                ));
-            }
+            self.observe_run_agent_end(&run, processed_agent_ends)
+                .await?;
             if let Some(error) = self.take_session_error() {
                 return Err(PromptError::Session(error));
             }
             run?;
             processed_agent_ends = self.processed_agent_end_count();
+        }
+        Ok(())
+    }
+
+    /// Await the processed `agent_end` barrier for one run outcome.
+    ///
+    /// Successful runs require the barrier: a pump disconnect before the end
+    /// event is a hard prompt error. Failed runs that started a lifecycle have
+    /// already queued their synthesized `agent_end` before returning, so the
+    /// barrier resolves immediately; the bounded timeout guards against a
+    /// pre-start rejection this classifier does not know about, so a
+    /// misclassification can never hang the prompt lifecycle.
+    async fn observe_run_agent_end(
+        &self,
+        run: &Result<(), pi_agent::AgentLoopError>,
+        processed_agent_ends: u64,
+    ) -> Result<(), PromptError> {
+        if run.is_ok() {
+            if !self
+                .wait_for_processed_agent_end(processed_agent_ends)
+                .await
+            {
+                return Err(PromptError::msg(
+                    "Agent event pump disconnected before agent_end",
+                ));
+            }
+            return Ok(());
+        }
+        if run_emits_agent_end(run) {
+            let _ = tokio::time::timeout(
+                FAILED_RUN_END_BARRIER_TIMEOUT,
+                self.wait_for_processed_agent_end(processed_agent_ends),
+            )
+            .await;
         }
         Ok(())
     }
@@ -737,6 +769,24 @@ fn parse_slash_command(text: &str) -> Option<(&str, &str)> {
     match body.find(' ') {
         Some(idx) => Some((&body[..idx], &body[idx + 1..])),
         None => Some((body, "")),
+    }
+}
+
+/// Whether this run outcome is followed by an `agent_end` agent event.
+///
+/// `Agent::prompt` / `Agent::continue_run` emit `agent_end` for every run that
+/// actually starts — including failed runs, whose terminal sequence is
+/// synthesized by the agent before the error returns. Only the pre-start
+/// rejections below return without emitting anything; awaiting the processed
+/// `agent_end` barrier for them would hang forever.
+fn run_emits_agent_end(run: &Result<(), pi_agent::AgentLoopError>) -> bool {
+    match run {
+        Ok(()) => true,
+        Err(pi_agent::AgentLoopError::Message(message)) => {
+            message != "agent is already running"
+                && message != "No messages to continue from"
+                && !message.starts_with("Cannot continue from message role")
+        }
     }
 }
 
@@ -1827,6 +1877,113 @@ mod tests {
             .test_context("prompt")?;
         drain(&session).await;
         assert!(!session.agent.state().is_streaming);
+        Ok(())
+    }
+
+    /// Session whose next append fails (session file path blocked by a dir).
+    fn blocked_append_session(
+        provider: Arc<dyn Provider>,
+        dir: &tempfile::TempDir,
+    ) -> TestResult<Arc<AgentSession>> {
+        let mut manager = crate::core::sessions::SessionManager::create(
+            dir.path().to_string_lossy().as_ref(),
+            Some(dir.path().to_string_lossy().as_ref()),
+            None,
+        )
+        .test_context("session manager")?;
+        manager
+            .append_message(&pi_agent::user_text("seed", std::iter::empty()))
+            .test_context("seed user append")?;
+        // Persistence is lazy until an assistant entry exists; materialize the
+        // file so the directory blocker makes every later append fail.
+        manager
+            .append_message(&AgentMessage::Llm(Box::new(pi_ai::Message::Assistant(
+                assistant_text("seed answer"),
+            ))))
+            .test_context("seed assistant append")?;
+        let session_file = std::path::PathBuf::from(
+            manager
+                .get_session_file()
+                .ok_or_else(|| "missing session file".to_owned())?,
+        );
+        std::fs::remove_file(&session_file).test_context("remove session file")?;
+        std::fs::create_dir(&session_file).test_context("block append path")?;
+        let mut config =
+            AgentSessionConfig::test_config(provider, test_model()).test_context("test config")?;
+        config.session_manager = manager;
+        AgentSession::new(config).test_context("session")
+    }
+
+    #[tokio::test]
+    async fn provider_error_run_observes_agent_end_before_settled() -> TestResult {
+        let provider = Arc::new(SeqProvider::new(vec![vec![Err(
+            pi_ai::ProviderError::new("stream exploded"),
+        )]]));
+        let session = make_session(provider)?;
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let order_clone = Arc::clone(&order);
+        let _unsub = session.subscribe(move |event| {
+            mutex_value(&order_clone).push(event.type_name().to_owned());
+        });
+
+        // The provider failure surfaces as an error assistant terminal; the
+        // regression under test is event ordering, not the prompt result.
+        let _ = session.prompt("hi", PromptOptions::default()).await;
+
+        let observed = mutex_value(&order).clone();
+        let end = require_some(
+            observed.iter().position(|name| name == "agent_end"),
+            "public agent_end for the failed run",
+        )?;
+        let settled = require_some(
+            observed.iter().position(|name| name == "agent_settled"),
+            "agent_settled after the failed run",
+        )?;
+        assert!(
+            end < settled,
+            "agent_end must be observed before agent_settled: {observed:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn idle_custom_message_append_failure_publishes_nothing() -> TestResult {
+        let dir = tempfile::tempdir().test_context("tempdir")?;
+        let provider = Arc::new(SeqProvider::new(one(start_event())));
+        let session = blocked_append_session(provider, &dir)?;
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let events_clone = Arc::clone(&events);
+        let _unsub = session.subscribe(move |event| {
+            mutex_value(&events_clone).push(event.type_name().to_owned());
+        });
+        let transcript_before = session.messages().len();
+
+        let err = require_error(
+            session
+                .send_custom_message(
+                    CustomMessageInput {
+                        custom_type: "note".to_owned(),
+                        content: CustomMessageContent::Text("hello".to_owned()),
+                        display: true,
+                        details: None,
+                    },
+                    false,
+                    None,
+                )
+                .await,
+            "idle custom append",
+        )?;
+        assert!(matches!(err, PromptError::Session(_)), "{err}");
+        assert_eq!(
+            session.messages().len(),
+            transcript_before,
+            "failed durable append must not mutate live transcript"
+        );
+        assert!(
+            mutex_value(&events).is_empty(),
+            "failed durable append must not publish message events: {:?}",
+            mutex_value(&events)
+        );
         Ok(())
     }
 

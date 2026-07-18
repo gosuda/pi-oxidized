@@ -723,6 +723,8 @@ enum StartupBehavior {
     RejectHandshake,
     RejectLoad,
     Ready,
+    /// Answer hello + load, then exit immediately (stdout EOF mid-session).
+    ExitAfterLoad,
 }
 
 #[cfg(unix)]
@@ -737,7 +739,7 @@ fn write_startup_host(
         StartupBehavior::RejectHandshake => {
             r#"{"protocolVersion":999,"compatibilityVersion":"rejected"}"#
         }
-        StartupBehavior::RejectLoad | StartupBehavior::Ready => {
+        StartupBehavior::RejectLoad | StartupBehavior::Ready | StartupBehavior::ExitAfterLoad => {
             r#"{"protocolVersion":1,"compatibilityVersion":"0.80.10"}"#
         }
     };
@@ -762,6 +764,13 @@ fn write_startup_host(
             "IFS= read -r request || exit 11\n\
              printf '%s\\n' '{\"id\":2,\"kind\":\"res\",\"method\":\"extensions.load\",\"payload\":{\"handlers\":[\"session_shutdown\"]}}'\n",
         ),
+        StartupBehavior::ExitAfterLoad => {
+            script.push_str(
+                "IFS= read -r request || exit 11\n\
+                 printf '%s\\n' '{\"id\":2,\"kind\":\"res\",\"method\":\"extensions.load\",\"payload\":{\"handlers\":[\"session_shutdown\"]}}'\n\
+                 exit 0\n",
+            );
+        }
     }
     script.push_str(
         "while IFS= read -r request; do\n\
@@ -859,6 +868,54 @@ async fn explicit_process_shutdown_reaps_and_remains_idempotent() -> R {
     ExtensionRunner::shutdown(runner.as_ref(), "quit").await?;
     assert!(!runner.is_running());
     assert_host_shutdown_and_reaped(&pid_path, &shutdown_path)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn pump_eof_shuts_down_and_reaps_exactly_once() -> R {
+    let directory = tempfile::tempdir()?;
+    let (spec, pid_path, shutdown_path) =
+        write_startup_host(directory.path(), StartupBehavior::ExitAfterLoad)?;
+    let runner = HostExtensionRunner::spawn_from(&spec, Vec::new()).await?;
+    let mut errors = runner.subscribe_errors();
+
+    // The child exits right after load: the pump's EOF branch must publish
+    // extension_closed and shut down / reap the transport on its own.
+    let error = tokio::time::timeout(Duration::from_secs(2), errors.recv()).await??;
+    assert_eq!(error.code, "extension_closed");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while runner.is_running() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    // Reap is asynchronous relative to the error broadcast; poll kill -0.
+    let pid = fs::read_to_string(&pid_path)?.trim().to_owned();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let alive = std::process::Command::new("/bin/kill")
+                .args(["-0", &pid])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+            if !alive {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await?;
+
+    // Second shutdown is a no-op: the exactly-once latch already fired and
+    // the dead transport recorded no session_shutdown hook delivery.
+    runner.shutdown_once().await;
+    let recorded = std::fs::read_to_string(&shutdown_path).unwrap_or_default();
+    assert!(
+        !recorded.contains("session_shutdown"),
+        "dead transport must not record a shutdown hook: {recorded:?}"
+    );
+    Ok(())
 }
 
 #[tokio::test]

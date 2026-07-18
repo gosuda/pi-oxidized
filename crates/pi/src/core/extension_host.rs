@@ -1462,9 +1462,11 @@ fn spawn_event_pump(inner: Arc<Inner>) {
                     );
                 }
                 Ok(HostEvent::Eof) => {
-                    // Host stdout closed: fatal. Disable once, report, exit.
+                    // Host stdout closed: fatal. Disable once, report, then
+                    // shut down / reap the transport exactly once before exit.
                     inner.disabled.store(true, Ordering::Relaxed);
                     inner.publish_error("extension_closed", "extension host stream closed", None);
+                    HostExtensionRunner::shutdown_once_with_inner(&inner).await;
                     break;
                 }
                 Ok(HostEvent::ProtocolError(message)) => {
