@@ -232,7 +232,7 @@ async fn apply_edit(
     cancel: &CancellationToken,
 ) -> Result<AgentToolResult, ToolError> {
     let cancel_for_queue = cancel.clone();
-    let result = with_file_mutation_queue(&edit.absolute, || {
+    with_file_mutation_queue(&edit.absolute, || {
         let absolute = edit.absolute.clone();
         let path_for_message = edit.path_for_message.clone();
         let edits = edit.edits.clone();
@@ -240,10 +240,7 @@ async fn apply_edit(
         async move { apply_edit_mutation(&absolute, &path_for_message, &edits, &cancel).await }
     })
     .await
-    .map_err(|error| mutation_error(&error))??;
-
-    throw_if_cancelled(cancel)?;
-    Ok(result)
+    .map_err(|error| mutation_error(&error))?
 }
 
 async fn apply_edit_mutation(
@@ -252,6 +249,29 @@ async fn apply_edit_mutation(
     edits: &[Edit],
     cancel: &CancellationToken,
 ) -> Result<AgentToolResult, ToolError> {
+    apply_edit_mutation_with_commit_hooks(
+        absolute,
+        path_for_message,
+        edits,
+        cancel,
+        || {},
+        || {},
+    )
+    .await
+}
+
+async fn apply_edit_mutation_with_commit_hooks<BeforeCommit, AfterCommit>(
+    absolute: &Path,
+    path_for_message: &str,
+    edits: &[Edit],
+    cancel: &CancellationToken,
+    before_commit: BeforeCommit,
+    after_commit: AfterCommit,
+) -> Result<AgentToolResult, ToolError>
+where
+    BeforeCommit: FnOnce() + Send,
+    AfterCommit: FnOnce() + Send,
+{
     throw_if_cancelled(cancel)?;
 
     // access R_OK | W_OK
@@ -287,13 +307,6 @@ async fn apply_edit_mutation(
     throw_if_cancelled(cancel)?;
 
     let final_content = bom + &restore_line_endings(&applied.new_content, original_ending);
-    tokio::fs::write(absolute, final_content.as_bytes())
-        .await
-        .map_err(|error| {
-            ToolError::new(format!("Could not edit file: {path_for_message}. {error}."))
-        })?;
-    throw_if_cancelled(cancel)?;
-
     let diff_result = generate_diff_string(&applied.base_content, &applied.new_content, 4);
     let patch = generate_unified_patch(
         path_for_message,
@@ -308,15 +321,27 @@ async fn apply_edit_mutation(
     };
     let details_value = serde_json::to_value(details)
         .map_err(|error| ToolError::new(format!("Could not serialize edit details: {error}")))?;
-
-    Ok(AgentToolResult {
+    let result = AgentToolResult {
         content: vec![ToolResultContent::Text(TextContent::new(
             EditTool::success_text(path_for_message, edits.len()),
         ))],
         details: details_value,
         added_tool_names: None,
         terminate: None,
-    })
+    };
+
+    before_commit();
+    throw_if_cancelled(cancel)?;
+    tokio::fs::write(absolute, final_content.as_bytes())
+        .await
+        .map_err(|error| {
+            ToolError::new(format!("Could not edit file: {path_for_message}. {error}."))
+        })?;
+    after_commit();
+
+    // A successful write is the durable commit point. Cancellation observed
+    // after it must not turn the committed edit into a reported failure.
+    Ok(result)
 }
 
 fn edit_parameters_schema() -> Value {
@@ -734,6 +759,65 @@ mod tests {
             .err()
             .ok_or("cancelled edit succeeded")?;
         assert_eq!(err.message(), "Operation aborted");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_edit_commit_aborts_without_mutating() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        let path = dir.path().join("pre-commit.txt");
+        tokio::fs::write(&path, "before").await?;
+        let cancel = CancellationToken::new();
+        let cancel_at_boundary = cancel.clone();
+        let edits = [Edit {
+            old_text: "before".to_owned(),
+            new_text: "after".to_owned(),
+        }];
+
+        let error = apply_edit_mutation_with_commit_hooks(
+            &path,
+            "pre-commit.txt",
+            &edits,
+            &cancel,
+            move || cancel_at_boundary.cancel(),
+            || {},
+        )
+        .await
+        .expect_err("pre-commit cancellation unexpectedly succeeded");
+
+        assert_eq!(error.message(), "Operation aborted");
+        assert_eq!(tokio::fs::read_to_string(&path).await?, "before");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_edit_commit_reports_success() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        let path = dir.path().join("post-commit.txt");
+        tokio::fs::write(&path, "before").await?;
+        let cancel = CancellationToken::new();
+        let cancel_at_boundary = cancel.clone();
+        let edits = [Edit {
+            old_text: "before".to_owned(),
+            new_text: "after".to_owned(),
+        }];
+
+        let result = apply_edit_mutation_with_commit_hooks(
+            &path,
+            "post-commit.txt",
+            &edits,
+            &cancel,
+            || {},
+            move || cancel_at_boundary.cancel(),
+        )
+        .await?;
+
+        assert!(cancel.is_cancelled());
+        assert_eq!(
+            text_of(&result),
+            "Successfully replaced 1 block(s) in post-commit.txt."
+        );
+        assert_eq!(tokio::fs::read_to_string(&path).await?, "after");
         Ok(())
     }
 

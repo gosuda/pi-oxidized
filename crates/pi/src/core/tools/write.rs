@@ -149,50 +149,77 @@ impl AgentTool for WriteTool {
             let content = input.content;
             let cancel_for_queue = cancel.clone();
 
-            let result = with_file_mutation_queue(&absolute, || {
+            with_file_mutation_queue(&absolute, || {
                 let parent = parent.clone();
                 let absolute = absolute.clone();
                 let content = content.clone();
                 let cancel = cancel_for_queue.clone();
                 async move {
-                    throw_if_cancelled(&cancel)?;
-
-                    tokio::fs::create_dir_all(&parent).await.map_err(|error| {
-                        ToolError::new(format!(
-                            "Could not create parent directories for {}: {error}",
-                            absolute.display()
-                        ))
-                    })?;
-                    throw_if_cancelled(&cancel)?;
-
-                    tokio::fs::write(&absolute, content.as_bytes())
-                        .await
-                        .map_err(|error| {
-                            ToolError::new(format!(
-                                "Could not write file {}: {error}",
-                                absolute.display()
-                            ))
-                        })?;
-                    throw_if_cancelled(&cancel)?;
-
-                    Ok::<AgentToolResult, ToolError>(AgentToolResult {
-                        content: vec![ToolResultContent::Text(TextContent::new(
-                            WriteTool::success_text(&path_for_message, &content),
-                        ))],
-                        details: Value::Null,
-                        added_tool_names: None,
-                        terminate: None,
-                    })
+                    apply_write_mutation_with_commit_hooks(
+                        &parent,
+                        &absolute,
+                        &path_for_message,
+                        &content,
+                        &cancel,
+                        || {},
+                        || {},
+                    )
+                    .await
                 }
             })
             .await
-            .map_err(|error| mutation_error(&error))??;
-
-            throw_if_cancelled(&cancel)?;
-            Ok(result)
+            .map_err(|error| mutation_error(&error))?
         }
         .boxed()
     }
+}
+
+async fn apply_write_mutation_with_commit_hooks<BeforeCommit, AfterCommit>(
+    parent: &Path,
+    absolute: &Path,
+    path_for_message: &str,
+    content: &str,
+    cancel: &CancellationToken,
+    before_commit: BeforeCommit,
+    after_commit: AfterCommit,
+) -> Result<AgentToolResult, ToolError>
+where
+    BeforeCommit: FnOnce() + Send,
+    AfterCommit: FnOnce() + Send,
+{
+    throw_if_cancelled(cancel)?;
+
+    tokio::fs::create_dir_all(parent).await.map_err(|error| {
+        ToolError::new(format!(
+            "Could not create parent directories for {}: {error}",
+            absolute.display()
+        ))
+    })?;
+
+    let result = AgentToolResult {
+        content: vec![ToolResultContent::Text(TextContent::new(
+            WriteTool::success_text(path_for_message, content),
+        ))],
+        details: Value::Null,
+        added_tool_names: None,
+        terminate: None,
+    };
+
+    before_commit();
+    throw_if_cancelled(cancel)?;
+    tokio::fs::write(absolute, content.as_bytes())
+        .await
+        .map_err(|error| {
+            ToolError::new(format!(
+                "Could not write file {}: {error}",
+                absolute.display()
+            ))
+        })?;
+    after_commit();
+
+    // A successful write is the durable commit point. Cancellation observed
+    // after it must not turn the committed write into a reported failure.
+    Ok(result)
 }
 
 fn write_parameters_schema() -> Value {
@@ -347,6 +374,58 @@ mod tests {
             return Err("expected cancellation error".into());
         };
         assert_eq!(err.message(), "Operation aborted");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_write_commit_aborts_without_mutating() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        let path = dir.path().join("pre-commit.txt");
+        tokio::fs::write(&path, "before").await?;
+        let cancel = CancellationToken::new();
+        let cancel_at_boundary = cancel.clone();
+
+        let error = apply_write_mutation_with_commit_hooks(
+            dir.path(),
+            &path,
+            "pre-commit.txt",
+            "after",
+            &cancel,
+            move || cancel_at_boundary.cancel(),
+            || {},
+        )
+        .await
+        .expect_err("pre-commit cancellation unexpectedly succeeded");
+
+        assert_eq!(error.message(), "Operation aborted");
+        assert_eq!(tokio::fs::read_to_string(&path).await?, "before");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_write_commit_reports_success() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        let path = dir.path().join("post-commit.txt");
+        let cancel = CancellationToken::new();
+        let cancel_at_boundary = cancel.clone();
+
+        let result = apply_write_mutation_with_commit_hooks(
+            dir.path(),
+            &path,
+            "post-commit.txt",
+            "committed",
+            &cancel,
+            || {},
+            move || cancel_at_boundary.cancel(),
+        )
+        .await?;
+
+        assert!(cancel.is_cancelled());
+        assert_eq!(
+            text_of(&result),
+            "Successfully wrote 9 bytes to post-commit.txt"
+        );
+        assert_eq!(tokio::fs::read_to_string(&path).await?, "committed");
         Ok(())
     }
 

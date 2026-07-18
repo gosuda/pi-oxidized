@@ -97,10 +97,16 @@ impl QueueRegistration {
 
 impl Drop for QueueRegistration {
     fn drop(&mut self) {
-        // Strong count of 1 means only this registration holds the gate —
-        // no other waiter is registered — so reclaim the map entry.
-        if Arc::strong_count(&self.gate) == 1 {
-            let mut map = lock_registry();
+        let mut map = lock_registry();
+        let own_gate = Arc::downgrade(&self.gate);
+        let maps_to_this_gate = map
+            .get(&self.key)
+            .is_some_and(|mapped| Weak::ptr_eq(mapped, &own_gate));
+
+        // Identity verification, last-reference detection, and removal must
+        // be one registry-locked operation. Otherwise a concurrent registrar
+        // can install a replacement gate between the count check and remove.
+        if maps_to_this_gate && Arc::strong_count(&self.gate) == 1 {
             map.remove(&self.key);
         }
     }
@@ -333,6 +339,26 @@ mod tests {
         with_file_mutation_queue(&path, || async {}).await?;
         assert!(!registry_holds_key(&key));
         Ok(())
+    }
+
+    #[test]
+    fn stale_last_registration_cannot_remove_replacement_gate() {
+        let key = PathBuf::from("replacement-race-key");
+        let stale = QueueRegistration::register(key.clone());
+        let replacement_gate = Arc::new(Semaphore::new(1));
+
+        // Deterministically model the exact race state: a new registrar has
+        // installed a replacement after the stale registration observed
+        // itself as the final strong owner.
+        lock_registry().insert(key.clone(), Arc::downgrade(&replacement_gate));
+        drop(stale);
+
+        let mapped = lock_registry()
+            .get(&key)
+            .and_then(Weak::upgrade)
+            .expect("stale drop removed the replacement gate");
+        assert!(Arc::ptr_eq(&mapped, &replacement_gate));
+        lock_registry().remove(&key);
     }
 
     #[tokio::test]
