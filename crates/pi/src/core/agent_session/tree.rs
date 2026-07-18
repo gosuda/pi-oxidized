@@ -1199,9 +1199,13 @@ mod tests {
         let cwd = tmp.path().to_string_lossy().into_owned();
         let session = export_test_session(&cwd)?;
         append_export_messages(&session).await?;
+        let output_path = tmp.path().join("session.html");
+        let output_path = output_path
+            .to_str()
+            .ok_or_else(|| missing("temporary export path should be UTF-8"))?;
 
         let output = session
-            .export_to_html(None, Some(export_tool_renderer()))
+            .export_to_html(Some(output_path), Some(export_tool_renderer()))
             .await?;
         let html = std::fs::read_to_string(output)?;
         assert!(
