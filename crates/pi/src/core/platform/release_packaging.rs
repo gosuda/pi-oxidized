@@ -132,7 +132,10 @@ impl HostVariant {
         match self {
             Self::Compiled => vec![ReleaseAsset::host_compiled_for(target)],
             Self::RuntimeFallback => {
-                vec![ReleaseAsset::host_runtime_for(target), ReleaseAsset::host_script()]
+                vec![
+                    ReleaseAsset::host_runtime_for(target),
+                    ReleaseAsset::host_script(),
+                ]
             }
         }
     }
@@ -505,9 +508,8 @@ mod tests {
             ),
         ];
         for (target, bun_target, archive_dir, host_name, runtime_name) in expected {
-            let compiled =
-                plan_release(target, "1.0.0", HostVariant::Compiled, None)
-                    .map_err(io::Error::other)?;
+            let compiled = plan_release(target, "1.0.0", HostVariant::Compiled, None)
+                .map_err(io::Error::other)?;
             assert_eq!(compiled.target.bun_target(), bun_target);
             assert_eq!(compiled.target.archive_dir(), archive_dir);
             assert!(
@@ -516,9 +518,8 @@ mod tests {
                     .iter()
                     .any(|asset| asset.relative_path == host_name)
             );
-            let fallback =
-                plan_release(target, "1.0.0", HostVariant::RuntimeFallback, None)
-                    .map_err(io::Error::other)?;
+            let fallback = plan_release(target, "1.0.0", HostVariant::RuntimeFallback, None)
+                .map_err(io::Error::other)?;
             assert!(
                 fallback
                     .assets
@@ -584,10 +585,7 @@ mod tests {
                 .iter()
                 .any(|a| a.relative_path == "pi-extension-host.exe")
         );
-        assert_eq!(
-            archive_file_name(&plan),
-            "pi-0.1.0-pi-windows-x64-base.zip"
-        );
+        assert_eq!(archive_file_name(&plan), "pi-0.1.0-pi-windows-x64-base.zip");
         Ok(())
     }
 

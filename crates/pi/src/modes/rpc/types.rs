@@ -894,10 +894,8 @@ impl RpcCommand {
             id: None,
             message: "rpc command must be a JSON object".to_owned(),
         })?;
-        let id = optional_string(obj, "id").map_err(|message| RpcCommandParseError {
-            id: None,
-            message,
-        })?;
+        let id = optional_string(obj, "id")
+            .map_err(|message| RpcCommandParseError { id: None, message })?;
         let command_type = obj
             .get("type")
             .and_then(Value::as_str)
@@ -906,9 +904,8 @@ impl RpcCommand {
                 message: "rpc command missing type".to_owned(),
             })?
             .to_owned();
-        parse_known_command(obj, id.clone(), command_type).map_err(|message| {
-            RpcCommandParseError { id, message }
-        })
+        parse_known_command(obj, id.clone(), command_type)
+            .map_err(|message| RpcCommandParseError { id, message })
     }
 }
 
@@ -2243,7 +2240,9 @@ fn optional_u64(obj: &Map<String, Value>, key: &str) -> Result<Option<u64>, Stri
             .as_u64()
             .map(Some)
             .ok_or_else(|| format!("field {key} must be an unsigned integer, got {number}")),
-        Some(other) => Err(format!("field {key} must be an unsigned integer, got {other}")),
+        Some(other) => Err(format!(
+            "field {key} must be an unsigned integer, got {other}"
+        )),
     }
 }
 

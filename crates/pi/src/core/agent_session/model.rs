@@ -26,6 +26,7 @@ use pi_ai::{Model, ModelThinkingLevel, ThinkingLevelMap};
 use crate::core::model_runtime::ModelRuntime;
 use crate::core::sessions::SessionError;
 
+use super::events::{AgentSessionEvent, ModelSelectSource};
 use super::{AgentSession, ScopedModel};
 
 /// Result of [`AgentSession::cycle_model`].
@@ -47,33 +48,6 @@ pub enum CycleDirection {
     Forward,
     /// Step back to the previous entry.
     Backward,
-}
-
-/// Source attribute on the emitted `model_select` extension event.
-///
-/// Reserved for the typed extension seam; the variants and `as_str` helper
-/// are kept here so the future `model_select` dispatch has a single source
-/// of truth for the wire vocabulary.
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum ModelSelectSource {
-    /// `setModel` call.
-    Set,
-    /// `cycleModel` call.
-    Cycle,
-    /// Restoration after reload / runtime change.
-    Restore,
-}
-
-#[allow(dead_code)]
-impl ModelSelectSource {
-    pub(super) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Set => "set",
-            Self::Cycle => "cycle",
-            Self::Restore => "restore",
-        }
-    }
 }
 
 /// Errors returned by [`AgentSession::set_model`].
@@ -189,14 +163,12 @@ pub(super) fn clamp_thinking_level(model: &Model, level: ModelThinkingLevel) -> 
 }
 
 impl AgentSession {
-    /// Downcast the opaque model-runtime handle to the concrete runtime.
+    /// Clone the typed model-runtime handle when this session has one.
     ///
-    /// Returns `None` when no runtime was attached (tests, pre-runtime builds,
-    /// or pre-built-agent sessions that bypass `ModelRuntime`). Model set /
-    /// cycle methods treat `None` as "auth checks skipped".
+    /// Pre-built-agent tests may omit the runtime; model set / cycle methods
+    /// treat that as "auth checks skipped".
     pub(super) fn model_runtime(&self) -> Option<Arc<ModelRuntime>> {
-        self.model_runtime_any()
-            .and_then(|any| any.downcast::<ModelRuntime>().ok())
+        self.model_runtime_handle()
     }
 
     /// Set the current model.
@@ -229,7 +201,8 @@ impl AgentSession {
         self.lock_settings()
             .set_default_model_and_provider(&model.provider, &model.id);
         self.set_thinking_level(thinking).await;
-        Self::emit_model_select(&model, Some(&previous), ModelSelectSource::Set);
+        self.emit_model_select(&model, Some(&previous), ModelSelectSource::Set)
+            .await;
         Ok(())
     }
 
@@ -272,7 +245,8 @@ impl AgentSession {
         self.lock_settings()
             .set_default_model_and_provider(&next.model.provider, &next.model.id);
         self.set_thinking_level(thinking).await;
-        Self::emit_model_select(&next.model, Some(&current), ModelSelectSource::Cycle);
+        self.emit_model_select(&next.model, Some(&current), ModelSelectSource::Cycle)
+            .await;
         Some(ModelCycleResult {
             model: next.model.clone(),
             thinking_level: self.thinking_level(),
@@ -306,7 +280,8 @@ impl AgentSession {
         self.lock_settings()
             .set_default_model_and_provider(&next_model.provider, &next_model.id);
         self.set_thinking_level(thinking).await;
-        Self::emit_model_select(&next_model, Some(&current), ModelSelectSource::Cycle);
+        self.emit_model_select(&next_model, Some(&current), ModelSelectSource::Cycle)
+            .await;
         Some(ModelCycleResult {
             model: next_model,
             thinking_level: self.thinking_level(),
@@ -427,13 +402,8 @@ impl AgentSession {
     }
 
     /// Emit `model_select` to extensions when the model actually changed.
-    ///
-    /// The TypeScript reference routes this only to `_extensionRunner.emit`
-    /// (never the public `_emit`); until the Rust extension seam grows a
-    /// typed `model_select` method, this is a hook the host slice will wire
-    /// through. The no-op behavior is correct for `NullExtensionRunner` and
-    /// keeps the public event surface stable.
-    pub(super) fn emit_model_select(
+    async fn emit_model_select(
+        &self,
         next_model: &Model,
         previous_model: Option<&Model>,
         source: ModelSelectSource,
@@ -441,10 +411,20 @@ impl AgentSession {
         if matches!(previous_model, Some(prev) if models_are_equal(prev, next_model)) {
             return;
         }
-        // Reserved for the typed extension seam: `{ type: "model_select",
-        // model, previousModel, source }`. Calling sites above already
-        // validated a real change, so we only need the host hook to land.
-        let _ = (next_model, source);
+        let runner = self.hooks.runner();
+        if !runner.has_handlers("model_select") {
+            return;
+        }
+        if let Err(error) = runner
+            .emit(AgentSessionEvent::ModelSelect {
+                model: next_model.clone(),
+                previous_model: previous_model.cloned(),
+                source,
+            })
+            .await
+        {
+            runner.emit_error(error.to_string());
+        }
     }
 }
 

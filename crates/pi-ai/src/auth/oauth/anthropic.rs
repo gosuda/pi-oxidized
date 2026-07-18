@@ -953,8 +953,8 @@ mod tests {
         Ok(format!("http://{address}/v1/oauth/token"))
     }
 
-    fn spawn_hanging_token_server(
-    ) -> Result<(String, tokio::sync::oneshot::Receiver<()>), String> {
+    fn spawn_hanging_token_server() -> Result<(String, tokio::sync::oneshot::Receiver<()>), String>
+    {
         let listener = TcpListener::bind("127.0.0.1:0").map_err(|error| error.to_string())?;
         let address = listener.local_addr().map_err(|error| error.to_string())?;
         let (request_seen, request_started) = tokio::sync::oneshot::channel();
@@ -1322,11 +1322,9 @@ mod tests {
     #[tokio::test]
     async fn parent_cancel_aborts_post_race_token_exchange() -> TestResult {
         let (token_url, request_started) = spawn_hanging_token_server()?;
-        let oauth = AnthropicOAuth::with_http(
-            AuthHttpClient::from_client(reqwest::Client::new()),
-        )
-        .with_token_url(token_url)
-        .with_callback_port(free_port()?);
+        let oauth = AnthropicOAuth::with_http(AuthHttpClient::from_client(reqwest::Client::new()))
+            .with_token_url(token_url)
+            .with_callback_port(free_port()?);
         let parent_cancel = CancellationToken::new();
         let interaction = Arc::new(DeferredManual::with_signal(parent_cancel.clone()));
         let login = {

@@ -11,9 +11,10 @@ pub mod entries;
 pub mod list;
 
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use pi_agent::AgentMessage;
 use serde_json::Value;
@@ -414,23 +415,16 @@ impl SessionManager {
         let Some(ref path) = self.session_file else {
             return Ok(());
         };
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)
-            .map_err(|source| SessionError::Io {
-                path: path.clone(),
-                source,
-            })?;
-        for entry in &self.file_entries {
-            let line = file_entry_to_line(entry)?;
-            writeln!(file, "{line}").map_err(|source| SessionError::Io {
-                path: path.clone(),
-                source,
-            })?;
-        }
-        Ok(())
+        atomic_replace_file(Path::new(path), |file| {
+            for entry in &self.file_entries {
+                let line = file_entry_to_line(entry)?;
+                writeln!(file, "{line}").map_err(|source| SessionError::Io {
+                    path: path.clone(),
+                    source,
+                })?;
+            }
+            Ok(())
+        })
     }
 
     fn persist_entry_at(&mut self, idx: usize) -> Result<(), SessionError> {
@@ -462,7 +456,13 @@ impl SessionManager {
         {
             append_line(&path, entry)?;
         } else {
-            // Exclusive create (wx) + write ALL lines.
+            // Exclusive create (wx) + write ALL lines. Serialize before creating
+            // the destination so JSON failures cannot leave a partial file.
+            let mut contents = String::new();
+            for fe in &self.file_entries {
+                contents.push_str(&file_entry_to_line(fe)?);
+                contents.push('\n');
+            }
             let mut file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -471,12 +471,16 @@ impl SessionManager {
                     path: path.clone(),
                     source,
                 })?;
-            for fe in &self.file_entries {
-                let line = file_entry_to_line(fe)?;
-                writeln!(file, "{line}").map_err(|source| SessionError::Io {
+            if let Err(source) = file
+                .write_all(contents.as_bytes())
+                .and_then(|()| file.sync_all())
+            {
+                drop(file);
+                let _ = fs::remove_file(&path);
+                return Err(SessionError::Io {
                     path: path.clone(),
                     source,
-                })?;
+                });
             }
             self.flushed = true;
         }
@@ -485,15 +489,36 @@ impl SessionManager {
 
     fn append_entry(&mut self, entry: SessionEntry) -> Result<String, SessionError> {
         let id = entry.id().unwrap_or("").to_owned();
+        let previous_leaf = self.leaf.clone();
+        let previous_flushed = self.flushed;
+        let previous_index = if id.is_empty() {
+            None
+        } else {
+            self.by_id.insert(id.clone(), self.file_entries.len())
+        };
         self.file_entries.push(FileEntry::Entry(entry));
         let idx = self.file_entries.len() - 1;
-        if id.is_empty() {
-            self.leaf = Leaf::Tail;
+        self.leaf = if id.is_empty() {
+            Leaf::Tail
         } else {
-            self.by_id.insert(id.clone(), idx);
-            self.leaf = Leaf::Id(id.clone());
+            Leaf::Id(id.clone())
+        };
+        if let Err(err) = self.persist_entry_at(idx) {
+            self.file_entries.pop();
+            if !id.is_empty() {
+                match previous_index {
+                    Some(index) => {
+                        self.by_id.insert(id.clone(), index);
+                    }
+                    None => {
+                        self.by_id.remove(&id);
+                    }
+                }
+            }
+            self.leaf = previous_leaf;
+            self.flushed = previous_flushed;
+            return Err(err);
         }
-        self.persist_entry_at(idx)?;
         Ok(id)
     }
 
@@ -1451,6 +1476,10 @@ fn path_to_string(path: &Path) -> String {
 }
 
 fn append_line(path: &str, entry: &SessionEntry) -> Result<(), SessionError> {
+    let line = session_entry_to_line(entry)?;
+    let mut record = String::with_capacity(line.len() + 1);
+    record.push_str(&line);
+    record.push('\n');
     let mut file = OpenOptions::new()
         .append(true)
         .create(true)
@@ -1459,16 +1488,102 @@ fn append_line(path: &str, entry: &SessionEntry) -> Result<(), SessionError> {
             path: path.to_owned(),
             source,
         })?;
-    let line = session_entry_to_line(entry)?;
-    writeln!(file, "{line}").map_err(|source| SessionError::Io {
-        path: path.to_owned(),
-        source,
-    })?;
-    Ok(())
+    file.write_all(record.as_bytes())
+        .map_err(|source| SessionError::Io {
+            path: path.to_owned(),
+            source,
+        })
 }
 
 fn message_to_value(message: &AgentMessage) -> Result<Value, SessionError> {
     Ok(serde_json::to_value(message)?)
+}
+
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn atomic_replace_file(
+    path: &Path,
+    write_contents: impl FnOnce(&mut File) -> Result<(), SessionError>,
+) -> Result<(), SessionError> {
+    let path_text = path.to_string_lossy().into_owned();
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("session");
+    let mut temp_path = PathBuf::new();
+    let mut temp_file = None;
+    for _ in 0..100 {
+        let suffix = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        temp_path = parent.join(format!(".{file_name}.tmp-{}-{suffix}", std::process::id()));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => {
+                temp_file = Some(file);
+                break;
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(source) => {
+                return Err(SessionError::Io {
+                    path: temp_path.to_string_lossy().into_owned(),
+                    source,
+                });
+            }
+        }
+    }
+    let Some(mut file) = temp_file else {
+        return Err(SessionError::Io {
+            path: path_text,
+            source: io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "unable to allocate temporary session file",
+            ),
+        });
+    };
+
+    let result = write_contents(&mut file)
+        .and_then(|()| {
+            file.flush().map_err(|source| SessionError::Io {
+                path: temp_path.to_string_lossy().into_owned(),
+                source,
+            })
+        })
+        .and_then(|()| {
+            file.sync_all().map_err(|source| SessionError::Io {
+                path: temp_path.to_string_lossy().into_owned(),
+                source,
+            })
+        });
+    drop(file);
+    if let Err(err) = result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(err);
+    }
+
+    if let Err(source) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(SessionError::Io {
+            path: path_text,
+            source,
+        });
+    }
+    sync_parent_directory(parent).map_err(|source| SessionError::Io {
+        path: parent.to_string_lossy().into_owned(),
+        source,
+    })
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(parent: &Path) -> io::Result<()> {
+    File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_parent: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1483,6 +1598,34 @@ mod tests {
     use tempfile::tempdir;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn atomic_replace_failure_preserves_live_file() -> TestResult {
+        let dir = tempdir()?;
+        let file = dir.path().join("atomic.jsonl");
+        fs::write(&file, "original\n")?;
+
+        let result = atomic_replace_file(&file, |temp| {
+            temp.write_all(b"partial replacement\n")
+                .map_err(|source| SessionError::Io {
+                    path: file.to_string_lossy().into_owned(),
+                    source,
+                })?;
+            Err(SessionError::Io {
+                path: file.to_string_lossy().into_owned(),
+                source: io::Error::other("injected rewrite failure"),
+            })
+        });
+
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(&file)?, "original\n");
+        let leftovers: Vec<_> = fs::read_dir(dir.path())?
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "failed rewrite must remove temp file");
+        Ok(())
+    }
 
     fn path_str(path: &Path) -> Result<&str, Box<dyn std::error::Error>> {
         path.to_str()
@@ -1557,6 +1700,41 @@ mod tests {
             after.starts_with(original.as_bytes()),
             "original lines must be byte-stable on append"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_append_does_not_advance_tree_and_can_retry() -> TestResult {
+        let dir = tempdir()?;
+        let file = dir.path().join("retry.jsonl");
+        let original = concat!(
+            r#"{"type":"session","version":3,"id":"sess-1","timestamp":"2025-01-01T00:00:00.000Z","cwd":"/tmp"}"#,
+            "\n",
+            r#"{"type":"message","id":"aaaaaaaa","parentId":null,"timestamp":"2025-01-01T00:00:01.000Z","message":{"role":"user","content":"hi","timestamp":1}}"#,
+            "\n",
+            r#"{"type":"message","id":"bbbbbbbb","parentId":"aaaaaaaa","timestamp":"2025-01-01T00:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"yo"}],"api":"test","provider":"test","model":"test","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":2}}"#,
+            "\n",
+        );
+        fs::write(&file, original)?;
+        let mut sm = SessionManager::open(path_str(&file)?, Some(path_str(dir.path())?), None)?;
+        let before_count = sm.get_entries().len();
+        let before_leaf = sm.get_leaf_id().map(str::to_owned);
+
+        let backup = dir.path().join("retry.backup");
+        fs::rename(&file, &backup)?;
+        fs::create_dir(&file)?;
+        let result = sm.append_message(&user_agent("retry me", 3));
+        assert!(matches!(result, Err(SessionError::Io { .. })));
+        assert_eq!(sm.get_entries().len(), before_count);
+        assert_eq!(sm.get_leaf_id(), before_leaf.as_deref());
+
+        fs::remove_dir(&file)?;
+        fs::rename(&backup, &file)?;
+        let id = sm.append_message(&user_agent("retry me", 3))?;
+        assert_eq!(sm.get_entries().len(), before_count + 1);
+        assert_eq!(sm.get_leaf_id(), Some(id.as_str()));
+        let persisted = fs::read_to_string(&file)?;
+        assert_eq!(persisted.matches("retry me").count(), 1);
         Ok(())
     }
 

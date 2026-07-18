@@ -75,7 +75,8 @@ fn pty_cursor_restore_after_success_abort_provider_error_panic_and_sigint() {
         let report = drive_fixture(exit, true, false);
         if exit == "panic" {
             assert_eq!(
-                report.emergency_restore_count, 1,
+                report.emergency_restore_count,
+                1,
                 "exit=panic: expected exactly one complete emergency restore sequence; got {} in {} output bytes",
                 report.emergency_restore_count,
                 report.raw.len()

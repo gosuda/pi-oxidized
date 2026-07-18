@@ -4,7 +4,7 @@
 //! fields) for json/rpc parity. `agent_end` is rewritten with `willRetry`.
 
 use pi_agent::{AgentEvent, AgentMessage, AgentToolResult};
-use pi_ai::{AssistantMessageEvent, ModelThinkingLevel, ToolResultMessage};
+use pi_ai::{AssistantMessageEvent, Model, ModelThinkingLevel, ToolResultMessage};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -23,12 +23,78 @@ pub enum CompactionReason {
     Overflow,
 }
 
+/// Why a session replacement is about to occur.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionBeforeSwitchReason {
+    /// A new session is being created.
+    New,
+    /// An existing or imported session is being resumed.
+    Resume,
+}
+
+/// Position used for a session fork.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionBeforeForkPosition {
+    /// Fork from the selected user message's parent.
+    Before,
+    /// Fork at the selected entry.
+    At,
+}
+
+/// Source of a model selection.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelSelectSource {
+    /// Explicit model selection.
+    Set,
+    /// Model cycling.
+    Cycle,
+    /// Session/runtime restoration.
+    Restore,
+}
+
 /// Session-specific events that extend the core agent event surface.
 ///
 /// Wire tags and field names match TypeScript `AgentSessionEvent`.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentSessionEvent {
+    /// Extensions may cancel a pending session switch.
+    SessionBeforeSwitch {
+        /// Whether this creates a new session or resumes one.
+        reason: SessionBeforeSwitchReason,
+        /// Target session file for resume/import operations.
+        #[serde(
+            rename = "targetSessionFile",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        target_session_file: Option<String>,
+    },
+    /// Extensions may cancel a pending session fork.
+    SessionBeforeFork {
+        /// Selected session entry.
+        #[serde(rename = "entryId")]
+        entry_id: String,
+        /// Whether the fork starts before or at the selected entry.
+        position: SessionBeforeForkPosition,
+    },
+    /// A new model was selected.
+    ModelSelect {
+        /// Newly selected model.
+        model: Model,
+        /// Previously selected model, absent during initial restoration.
+        #[serde(
+            rename = "previousModel",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        previous_model: Option<Model>,
+        /// Selection source.
+        source: ModelSelectSource,
+    },
     /// A new agent run has started.
     AgentStart,
     /// The agent run finished; `will_retry` is true when auto-retry will continue.
@@ -253,6 +319,9 @@ impl AgentSessionEvent {
     #[must_use]
     pub fn type_name(&self) -> &'static str {
         match self {
+            Self::SessionBeforeSwitch { .. } => "session_before_switch",
+            Self::SessionBeforeFork { .. } => "session_before_fork",
+            Self::ModelSelect { .. } => "model_select",
             Self::AgentStart => "agent_start",
             Self::AgentEnd { .. } => "agent_end",
             Self::TurnStart => "turn_start",
@@ -310,6 +379,56 @@ mod tests {
         assert_eq!(value["type"], json!("queue_update"));
         assert_eq!(value["steering"], json!(["a"]));
         assert_eq!(value["followUp"], json!(["b"]));
+        Ok(())
+    }
+
+    #[test]
+    fn lifecycle_events_use_reference_wire_payloads() -> Result<(), serde_json::Error> {
+        let switch = serde_json::to_value(AgentSessionEvent::SessionBeforeSwitch {
+            reason: SessionBeforeSwitchReason::Resume,
+            target_session_file: Some("/tmp/session.jsonl".into()),
+        })?;
+        assert_eq!(
+            switch,
+            json!({
+                "type": "session_before_switch",
+                "reason": "resume",
+                "targetSessionFile": "/tmp/session.jsonl"
+            })
+        );
+
+        let fork = serde_json::to_value(AgentSessionEvent::SessionBeforeFork {
+            entry_id: "entry-1".into(),
+            position: SessionBeforeForkPosition::Before,
+        })?;
+        assert_eq!(
+            fork,
+            json!({
+                "type": "session_before_fork",
+                "entryId": "entry-1",
+                "position": "before"
+            })
+        );
+
+        let model = pi_agent::state::default_model();
+        let selected = serde_json::to_value(AgentSessionEvent::ModelSelect {
+            model: model.clone(),
+            previous_model: Some(model),
+            source: ModelSelectSource::Cycle,
+        })?;
+        assert_eq!(selected["type"], json!("model_select"));
+        assert_eq!(selected["source"], json!("cycle"));
+        assert!(selected.get("previousModel").is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn optional_lifecycle_fields_are_omitted() -> Result<(), serde_json::Error> {
+        let switch = serde_json::to_value(AgentSessionEvent::SessionBeforeSwitch {
+            reason: SessionBeforeSwitchReason::New,
+            target_session_file: None,
+        })?;
+        assert!(switch.get("targetSessionFile").is_none());
         Ok(())
     }
 

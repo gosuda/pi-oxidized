@@ -78,6 +78,17 @@ pub trait ExtensionRunner: Send + Sync {
         event: AgentSessionEvent,
     ) -> BoxFuture<'_, Result<Option<CancelResult>, ExtensionRunnerError>>;
 
+    /// Emit a compact streaming assistant delta.
+    ///
+    /// Product runners may override this to avoid serializing the full
+    /// assistant snapshot on every token. The default is a compatibility
+    fn emit_message_update_delta<'a>(
+        &'a self,
+        _event: &'a AssistantMessageEvent,
+    ) -> BoxFuture<'a, Result<Option<CancelResult>, ExtensionRunnerError>> {
+        Box::pin(async { Ok(None) })
+    }
+
     /// Emit `message_end` and optionally return a replacement message.
     fn emit_message_end(
         &self,

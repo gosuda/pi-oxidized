@@ -43,7 +43,9 @@ pub struct SessionInfo {
     pub message_count: usize,
     /// First user-message text, or [`NO_MESSAGES_PLACEHOLDER`].
     pub first_message: String,
-    /// All user/assistant text contents joined with spaces.
+    /// All user/assistant text contents joined with spaces. Populated by
+    /// [`build_session_info`]; directory listing APIs leave it empty to keep
+    /// listing memory proportional to session count.
     pub all_messages_text: String,
 }
 
@@ -65,7 +67,7 @@ fn find_most_recent_session_inner(
     let resolved_cwd = cwd.map(resolve_path);
 
     let entries = fs::read_dir(&resolved_session_dir).map_err(|_| ())?;
-    let mut candidates: Vec<(PathBuf, i64)> = Vec::new();
+    let mut candidates: Vec<PathBuf> = Vec::new();
 
     for entry in entries.flatten() {
         let path = entry.path();
@@ -81,13 +83,32 @@ fn find_most_recent_session_inner(
                 continue;
             }
         }
-        let meta = fs::metadata(&path).map_err(|_| ())?;
-        let mtime = mtime_millis(&meta).unwrap_or(0);
-        candidates.push((path, mtime));
+        candidates.push(path);
     }
+    Ok(most_recent_candidate(candidates, |path| {
+        fs::metadata(path)
+            .ok()
+            .map(|meta| mtime_millis(&meta).unwrap_or(0))
+    }))
+}
 
-    candidates.sort_by_key(|(_, mtime)| Reverse(*mtime));
-    Ok(candidates.into_iter().next().map(|(p, _)| p))
+fn most_recent_candidate(
+    candidates: Vec<PathBuf>,
+    mut modified: impl FnMut(&Path) -> Option<i64>,
+) -> Option<PathBuf> {
+    let mut best: Option<(PathBuf, i64)> = None;
+    for path in candidates {
+        let Some(mtime) = modified(&path) else {
+            continue;
+        };
+        if best
+            .as_ref()
+            .is_none_or(|(_, best_mtime)| mtime > *best_mtime)
+        {
+            best = Some((path, mtime));
+        }
+    }
+    best.map(|(path, _)| path)
 }
 
 /// True when `cwd` is non-empty and resolves equal to `resolved_cwd`.
@@ -102,7 +123,7 @@ pub fn session_cwd_matches(cwd: Option<&str>, resolved_cwd: &Path) -> bool {
 /// Build [`SessionInfo`] for one session file (sync, pure file IO).
 #[must_use]
 pub fn build_session_info(file_path: &Path) -> Option<SessionInfo> {
-    build_session_info_inner(file_path).ok().flatten()
+    build_session_info_inner(file_path, true).ok().flatten()
 }
 
 #[derive(Default)]
@@ -118,7 +139,7 @@ struct SessionScan {
 impl SessionScan {
     /// Ingest one JSONL entry. Returns `false` when the file is invalid
     /// (caller should yield `Ok(None)`).
-    fn ingest_entry(&mut self, entry: Value) -> bool {
+    fn ingest_entry(&mut self, entry: Value, include_all_messages: bool) -> bool {
         if self.header.is_none() {
             if entry.get("type").and_then(Value::as_str) != Some("session") {
                 return false;
@@ -141,10 +162,10 @@ impl SessionScan {
         if ty != Some("message") {
             return true;
         }
-        self.ingest_message_entry(&entry)
+        self.ingest_message_entry(&entry, include_all_messages)
     }
 
-    fn ingest_message_entry(&mut self, entry: &Value) -> bool {
+    fn ingest_message_entry(&mut self, entry: &Value, include_all_messages: bool) -> bool {
         self.message_count += 1;
 
         let Some(message) = entry.get("message") else {
@@ -173,7 +194,9 @@ impl SessionScan {
         if text.is_empty() {
             return true;
         }
-        self.all_messages.push(text.clone());
+        if include_all_messages {
+            self.all_messages.push(text.clone());
+        }
         if self.first_message.is_empty() && role == Some("user") {
             self.first_message = text;
         }
@@ -228,7 +251,10 @@ impl SessionScan {
     }
 }
 
-fn build_session_info_inner(file_path: &Path) -> Result<Option<SessionInfo>, ()> {
+fn build_session_info_inner(
+    file_path: &Path,
+    include_all_messages: bool,
+) -> Result<Option<SessionInfo>, ()> {
     let meta = fs::metadata(file_path).map_err(|_| ())?;
     let file_mtime = mtime_millis(&meta).unwrap_or(0);
 
@@ -245,7 +271,7 @@ fn build_session_info_inner(file_path: &Path) -> Result<Option<SessionInfo>, ()>
             Ok(v) => v,
             Err(_) => continue,
         };
-        if !scan.ingest_entry(entry) {
+        if !scan.ingest_entry(entry, include_all_messages) {
             return Ok(None);
         }
     }
@@ -346,7 +372,7 @@ async fn build_session_infos_with_concurrency(
         while next < n && set.len() < MAX_CONCURRENT_SESSION_INFO_LOADS {
             let i = next;
             let file = files[i].clone();
-            set.spawn_blocking(move || (i, build_session_info(&file)));
+            set.spawn_blocking(move || (i, build_session_info_inner(&file, false).ok().flatten()));
             next += 1;
         }
         if let Some(joined) = set.join_next().await {
@@ -479,6 +505,19 @@ mod tests {
     }
 
     #[test]
+    fn most_recent_skips_candidate_with_unreadable_metadata() {
+        let unreadable = PathBuf::from("unreadable.jsonl");
+        let valid = PathBuf::from("valid.jsonl");
+        let selected =
+            most_recent_candidate(vec![unreadable.clone(), valid.clone()], |path| match path {
+                p if p == unreadable => None,
+                p if p == valid => Some(42),
+                _ => None,
+            });
+        assert_eq!(selected, Some(valid));
+    }
+
+    #[test]
     fn find_most_recent_filters_by_cwd() -> TestResult {
         let dir = tempdir()?;
         let a = dir.path().join("a.jsonl");
@@ -555,6 +594,12 @@ mod tests {
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].id.as_deref(), Some("new"));
         assert_eq!(sessions[0].modified, 10000);
+        assert!(
+            sessions
+                .iter()
+                .all(|session| session.all_messages_text.is_empty()),
+            "directory listing must not retain transcript text"
+        );
         Ok(())
     }
 

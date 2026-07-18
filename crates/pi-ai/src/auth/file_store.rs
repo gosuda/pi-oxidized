@@ -1068,9 +1068,7 @@ mod tests {
         let task_backend = backend.clone();
         let task = tokio::spawn(async move {
             task_backend
-                .with_lock_async(|content| async move {
-                    Ok::<_, StoreError>((content, None))
-                })
+                .with_lock_async(|content| async move { Ok::<_, StoreError>((content, None)) })
                 .await
         });
         contention.notified().await;
@@ -1079,10 +1077,8 @@ mod tests {
             "a waiter must not seed before acquiring the sibling lock"
         );
 
-        let durable = serialize_storage_data(&BTreeMap::from([(
-            "openai".to_owned(),
-            api_key("durable"),
-        )]))?;
+        let durable =
+            serialize_storage_data(&BTreeMap::from([("openai".to_owned(), api_key("durable"))]))?;
         fs::write(&path, &durable)?;
         FileExt::unlock(&lock_file)?;
 
@@ -1098,7 +1094,10 @@ mod tests {
         let (_dir, path) = temp_auth_path()?;
         let store = FileCredentialStore::new(&path);
         store
-            .modify("openai", Box::new(|_| Box::pin(async { Ok(Some(api_key("old"))) })))
+            .modify(
+                "openai",
+                Box::new(|_| Box::pin(async { Ok(Some(api_key("old"))) })),
+            )
             .await?;
         let durable = fs::read_to_string(&path)?;
 
@@ -1106,7 +1105,10 @@ mod tests {
             .backend
             .fail_next_atomic_write(std::io::ErrorKind::PermissionDenied);
         let result = store
-            .modify("openai", Box::new(|_| Box::pin(async { Ok(Some(api_key("new"))) })))
+            .modify(
+                "openai",
+                Box::new(|_| Box::pin(async { Ok(Some(api_key("new"))) })),
+            )
             .await;
         assert!(result.is_err(), "injected persistence failure must surface");
         assert_eq!(fs::read_to_string(&path)?, durable);
@@ -1119,7 +1121,10 @@ mod tests {
         let (_dir, path) = temp_auth_path()?;
         let store = FileCredentialStore::new(&path);
         store
-            .modify("openai", Box::new(|_| Box::pin(async { Ok(Some(api_key("old"))) })))
+            .modify(
+                "openai",
+                Box::new(|_| Box::pin(async { Ok(Some(api_key("old"))) })),
+            )
             .await?;
         let durable = fs::read_to_string(&path)?;
 

@@ -23,6 +23,9 @@ use std::sync::{Arc, RwLock};
 use futures::future::BoxFuture;
 use tokio::sync::Mutex as AsyncMutex;
 
+use crate::core::agent_session::events::{
+    AgentSessionEvent, SessionBeforeForkPosition, SessionBeforeSwitchReason,
+};
 use crate::core::agent_session::extension::{SessionShutdownReason, SessionStartReason};
 use crate::core::agent_session::{AgentSession, ReplacedSessionContext};
 use crate::core::session_transfer::SessionImportFileNotFoundError;
@@ -307,7 +310,9 @@ impl AgentSessionRuntime {
         options: SwitchSessionOptions,
     ) -> Result<SwitchOutcome, AgentSessionRuntimeError> {
         let _guard = self.replacement_lock.lock().await;
-        let before = self.emit_before_switch(SessionStartReason::Resume, Some(session_path));
+        let before = self
+            .emit_before_switch(SessionStartReason::Resume, Some(session_path))
+            .await;
         if before.cancelled {
             return Ok(before);
         }
@@ -344,7 +349,9 @@ impl AgentSessionRuntime {
         options: NewSessionOptions,
     ) -> Result<SwitchOutcome, AgentSessionRuntimeError> {
         let _guard = self.replacement_lock.lock().await;
-        let before = self.emit_before_switch(SessionStartReason::Startup, None);
+        let before = self
+            .emit_before_switch(SessionStartReason::Startup, None)
+            .await;
         if before.cancelled {
             return Ok(before);
         }
@@ -414,7 +421,7 @@ impl AgentSessionRuntime {
         position: ForkPosition,
     ) -> Result<ForkOutcome, AgentSessionRuntimeError> {
         let _guard = self.replacement_lock.lock().await;
-        let before = self.emit_before_fork(entry_id, position);
+        let before = self.emit_before_fork(entry_id, position).await;
         if before.cancelled {
             return Ok(ForkOutcome {
                 cancelled: true,
@@ -559,7 +566,9 @@ impl AgentSessionRuntime {
             .to_string_lossy()
             .into_owned();
 
-        let before = self.emit_before_switch(SessionStartReason::Resume, Some(&destination));
+        let before = self
+            .emit_before_switch(SessionStartReason::Resume, Some(&destination))
+            .await;
         if before.cancelled {
             return Ok(before);
         }
@@ -619,27 +628,62 @@ impl AgentSessionRuntime {
     }
 
     /// Emit `session_before_switch` (cancellable) when handlers are registered.
-    fn emit_before_switch(
+    async fn emit_before_switch(
         &self,
-        _reason: SessionStartReason,
-        _target: Option<&str>,
+        reason: SessionStartReason,
+        target: Option<&str>,
     ) -> SwitchOutcome {
         let runner = self.read_session().extension_runner();
         if !runner.has_handlers("session_before_switch") {
             return SwitchOutcome { cancelled: false };
         }
-        // Reserved: once AgentSessionEvent::SessionBeforeSwitch lands, emit
-        // the typed event and honor CancelResult.
-        SwitchOutcome { cancelled: false }
+        let reason = if reason == SessionStartReason::Resume {
+            SessionBeforeSwitchReason::Resume
+        } else {
+            SessionBeforeSwitchReason::New
+        };
+        match runner
+            .emit(AgentSessionEvent::SessionBeforeSwitch {
+                reason,
+                target_session_file: target.map(str::to_owned),
+            })
+            .await
+        {
+            Ok(result) => SwitchOutcome {
+                cancelled: result.is_some_and(|result| result.cancel),
+            },
+            Err(error) => {
+                runner.emit_error(error.to_string());
+                SwitchOutcome { cancelled: false }
+            }
+        }
     }
 
     /// Emit `session_before_fork` (cancellable) when handlers are registered.
-    fn emit_before_fork(&self, _entry_id: &str, _position: ForkPosition) -> SwitchOutcome {
+    async fn emit_before_fork(&self, entry_id: &str, position: ForkPosition) -> SwitchOutcome {
         let runner = self.read_session().extension_runner();
         if !runner.has_handlers("session_before_fork") {
             return SwitchOutcome { cancelled: false };
         }
-        SwitchOutcome { cancelled: false }
+        let position = match position {
+            ForkPosition::Before => SessionBeforeForkPosition::Before,
+            ForkPosition::At => SessionBeforeForkPosition::At,
+        };
+        match runner
+            .emit(AgentSessionEvent::SessionBeforeFork {
+                entry_id: entry_id.to_owned(),
+                position,
+            })
+            .await
+        {
+            Ok(result) => SwitchOutcome {
+                cancelled: result.is_some_and(|result| result.cancel),
+            },
+            Err(error) => {
+                runner.emit_error(error.to_string());
+                SwitchOutcome { cancelled: false }
+            }
+        }
     }
 
     /// Tear down the current session: shutdown handlers → pre-invalidate → dispose.

@@ -13,9 +13,7 @@ use serde_json::Map;
 use tokio::sync::{Notify, watch};
 use tokio_util::sync::CancellationToken;
 
-use crate::bus::{
-    AgentEventSink, AgentEventSubscription, EventSink, ExtensionSubscription,
-};
+use crate::bus::{AgentEventSink, AgentEventSubscription, EventSink, ExtensionSubscription};
 use crate::config::{AgentContext, AgentLoopConfig, GetMessages};
 use crate::error::AgentLoopError;
 use crate::event::AgentEvent;
@@ -1096,8 +1094,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn abort_preserves_steering_and_follow_up_queues(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn abort_preserves_steering_and_follow_up_queues()
+    -> Result<(), Box<dyn std::error::Error>> {
         let provider = Arc::new(HangingProvider::after_start());
         let agent = Agent::new(agent_options(provider));
         let run = tokio::spawn({

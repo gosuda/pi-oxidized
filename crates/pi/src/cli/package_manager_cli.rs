@@ -172,6 +172,9 @@ pub trait PackageHandler {
     /// Implementation-defined.
     fn list(&self) -> Result<Vec<ListedPackage>, String>;
 
+    /// Supply the invocation-scoped project trust override before preflight.
+    fn set_project_trust_override(&self, _trust_override: Option<bool>) {}
+
     /// Whether the project is currently trusted (for the local-write gate).
     fn is_project_trusted(&self) -> bool;
 
@@ -599,6 +602,7 @@ pub fn handle_package_command(
     platform: DispatchPlatform,
 ) -> Option<PackageOutcome> {
     let options = parse_package_command(args)?;
+    handler.set_project_trust_override(options.project_trust_override);
     if let Some(outcome) = package_command_preflight(&options, handler, out) {
         return Some(outcome);
     }
@@ -913,6 +917,11 @@ mod tests {
         fn list(&self) -> Result<Vec<ListedPackage>, String> {
             self.borrow().list_result.clone()
         }
+        fn set_project_trust_override(&self, trust_override: Option<bool>) {
+            if let Some(trusted) = trust_override {
+                self.borrow_mut().trusted = trusted;
+            }
+        }
         fn is_project_trusted(&self) -> bool {
             self.borrow().trusted
         }
@@ -1150,6 +1159,45 @@ mod tests {
             out.borrow().error[0],
             "Project is not trusted. Use --approve to modify local package config."
         );
+        assert!(handler.borrow().calls.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn approve_override_unblocks_local_install() -> Result<(), String> {
+        let handler = Rc::new(RefCell::new(FakeHandler {
+            install_results: vec![Ok(())],
+            trusted: false,
+            ..FakeHandler::default()
+        }));
+        let out = Rc::new(RefCell::new(CapturedOutput::default()));
+        let outcome = handle_package_command(
+            &args(&["install", "npm:foo", "-l", "--approve"]),
+            &handler,
+            &out,
+            DispatchPlatform::Unix,
+        )
+        .ok_or_else(|| "expected dispatch outcome".to_owned())?;
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(handler.borrow().calls, ["install:npm:foo:true"]);
+        Ok(())
+    }
+
+    #[test]
+    fn no_approve_override_forces_local_denial() -> Result<(), String> {
+        let handler = Rc::new(RefCell::new(FakeHandler {
+            trusted: true,
+            ..FakeHandler::default()
+        }));
+        let out = Rc::new(RefCell::new(CapturedOutput::default()));
+        let outcome = handle_package_command(
+            &args(&["install", "npm:foo", "-l", "--no-approve"]),
+            &handler,
+            &out,
+            DispatchPlatform::Unix,
+        )
+        .ok_or_else(|| "expected dispatch outcome".to_owned())?;
+        assert_eq!(outcome.exit_code, 1);
         assert!(handler.borrow().calls.is_empty());
         Ok(())
     }

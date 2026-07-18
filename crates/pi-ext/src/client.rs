@@ -39,8 +39,10 @@ use tokio::task::JoinHandle;
 
 use crate::host::{HostError, HostSpec};
 use crate::protocol::{
-    COMPATIBILITY_VERSION, Frame, FrameDecoder, FrameId, FrameKind, Hello, HelloAck,
-    MeasureResponse, Method, PROTOCOL_VERSION, encode_frame, from_payload,
+    COMPATIBILITY_VERSION, ConfirmRequest, ConfirmResponse, EditorRequest, EditorResponse, Frame,
+    FrameDecoder, FrameId, FrameKind, Hello, HelloAck, InputRequest, InputResponse,
+    MeasureResponse, Method, NotifyRequest, PROTOCOL_VERSION, SelectRequest, SelectResponse,
+    encode_frame, from_payload,
 };
 
 /// Default bounded capacity for the outbound (client → host) frame channel.
@@ -70,6 +72,85 @@ struct PendingEntry {
     stream: Option<mpsc::Sender<Frame>>,
 }
 
+/// A typed, correlated UI request initiated by the TypeScript host.
+#[derive(Debug, Clone)]
+pub enum HostUiRequest {
+    /// Native select dialog.
+    Select {
+        /// Original host correlation id.
+        id: FrameId,
+        /// Dialog request payload.
+        request: SelectRequest,
+    },
+    /// Native confirmation dialog.
+    Confirm {
+        /// Original host correlation id.
+        id: FrameId,
+        /// Dialog request payload.
+        request: ConfirmRequest,
+    },
+    /// Native single-line input dialog.
+    Input {
+        /// Original host correlation id.
+        id: FrameId,
+        /// Dialog request payload.
+        request: InputRequest,
+    },
+    /// Native multi-line editor dialog.
+    Editor {
+        /// Original host correlation id.
+        id: FrameId,
+        /// Dialog request payload.
+        request: EditorRequest,
+    },
+}
+
+impl HostUiRequest {
+    /// Original host correlation id.
+    #[must_use]
+    pub const fn id(&self) -> FrameId {
+        match self {
+            Self::Select { id, .. }
+            | Self::Confirm { id, .. }
+            | Self::Input { id, .. }
+            | Self::Editor { id, .. } => *id,
+        }
+    }
+}
+
+/// Typed response to a host-initiated UI request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostUiResponse {
+    /// Selected value, or dismissal.
+    Select {
+        /// Original host correlation id.
+        id: FrameId,
+        /// Selected value, or `None` when dismissed.
+        value: Option<String>,
+    },
+    /// Confirmation result.
+    Confirm {
+        /// Original host correlation id.
+        id: FrameId,
+        /// Whether the user confirmed.
+        confirmed: bool,
+    },
+    /// Entered value, or dismissal.
+    Input {
+        /// Original host correlation id.
+        id: FrameId,
+        /// Entered value, or `None` when dismissed.
+        value: Option<String>,
+    },
+    /// Edited value, or dismissal.
+    Editor {
+        /// Original host correlation id.
+        id: FrameId,
+        /// Edited value, or `None` when dismissed.
+        value: Option<String>,
+    },
+}
+
 /// Cross-task shared state.
 struct Shared {
     /// id → pending call. `std::sync::Mutex` because critical sections never await.
@@ -89,6 +170,10 @@ struct Shared {
 /// Typed unsolicited event delivered to subscribers.
 #[derive(Debug, Clone)]
 pub enum HostEvent {
+    /// Host requested a correlated native UI interaction.
+    UiRequest(HostUiRequest),
+    /// Fire-and-forget host notification.
+    Notify(NotifyRequest),
     /// Host pushed a UI slot (generation-filtered).
     UiSlot(crate::protocol::UiSlot),
     /// Host disposed a slot.
@@ -356,10 +441,50 @@ impl HostClient {
                 stderr: self.stderr_tail(),
             }),
             Err(_) => {
+                if let Some(control_method) = cancel_method_for(method) {
+                    let _ = self.send_cancel(id, control_method).await;
+                }
                 Self::remove_pending(&self.shared, id);
                 Err(HostClientError::Timeout { id, timeout })
             }
         }
+    }
+
+    /// Answer a correlated host-initiated UI request.
+    ///
+    /// # Errors
+    ///
+    /// Returns a payload or transport error when the response cannot be encoded or sent.
+    pub async fn respond_ui(&self, response: HostUiResponse) -> HostResult<()> {
+        let (id, method, payload) = match response {
+            HostUiResponse::Select { id, value } => (
+                id,
+                Method::Select,
+                serde_json::to_value(SelectResponse { value }),
+            ),
+            HostUiResponse::Confirm { id, confirmed } => (
+                id,
+                Method::Confirm,
+                serde_json::to_value(ConfirmResponse { confirmed }),
+            ),
+            HostUiResponse::Input { id, value } => (
+                id,
+                Method::Input,
+                serde_json::to_value(InputResponse { value }),
+            ),
+            HostUiResponse::Editor { id, value } => (
+                id,
+                Method::Editor,
+                serde_json::to_value(EditorResponse { value }),
+            ),
+        };
+        let payload = payload
+            .map_err(|error| HostClientError::Payload(format!("encode UI response: {error}")))?;
+        self.send_frame(Frame::response(id, method, payload)).await
+    }
+
+    async fn send_cancel(&self, id: FrameId, control_method: &'static str) -> HostResult<()> {
+        self.send_frame(cancel_frame(id, control_method)).await
     }
 
     /// Open a streaming call: intermediate `event` frames with the request id
@@ -420,6 +545,8 @@ impl HostClient {
             terminal: Some(terminal_rx),
             shared: Arc::clone(&self.shared),
             cmd_tx: self.cmd_tx.lock().await.clone(),
+            cancel_method: cancel_method_for(method),
+            cancel_sent: false,
             consumed: false,
         })
     }
@@ -526,6 +653,8 @@ pub struct StreamHandle {
     terminal: Option<oneshot::Receiver<FrameResult>>,
     shared: Arc<Shared>,
     cmd_tx: Option<mpsc::Sender<Frame>>,
+    cancel_method: Option<&'static str>,
+    cancel_sent: bool,
     consumed: bool,
 }
 
@@ -549,18 +678,16 @@ impl StreamHandle {
     ///
     /// Returns [`HostClientError::Closed`] when the outbound pipe is broken.
     pub async fn cancel(&mut self, control_method: &str) -> HostResult<()> {
-        let payload = serde_json::json!({ "id": self.id });
-        let frame = Frame {
-            id: 0,
-            kind: FrameKind::Event,
-            method: control_method.to_owned(),
-            payload,
-        };
+        let frame = cancel_frame(self.id, control_method);
         match &self.cmd_tx {
-            Some(tx) => tx.send(frame).await.map_err(|e| HostClientError::Closed {
-                message: format!("cancel send failed: {e}"),
-                stderr: stderr_of(&self.shared),
-            }),
+            Some(tx) => {
+                tx.send(frame).await.map_err(|e| HostClientError::Closed {
+                    message: format!("cancel send failed: {e}"),
+                    stderr: stderr_of(&self.shared),
+                })?;
+                self.cancel_sent = true;
+                Ok(())
+            }
             None => Err(HostClientError::NotRunning),
         }
     }
@@ -580,6 +707,9 @@ impl StreamHandle {
                 stderr: stderr_of(&self.shared),
             }),
             Err(_) => {
+                if let Some(control_method) = self.cancel_method {
+                    let _ = self.cancel(control_method).await;
+                }
                 Self::remove_pending(&self.shared, self.id);
                 Err(HostClientError::Timeout {
                     id: self.id,
@@ -601,6 +731,11 @@ impl StreamHandle {
 impl Drop for StreamHandle {
     fn drop(&mut self) {
         if !self.consumed {
+            if !self.cancel_sent
+                && let (Some(control_method), Some(tx)) = (self.cancel_method, self.cmd_tx.as_ref())
+            {
+                let _ = tx.try_send(cancel_frame(self.id, control_method));
+            }
             Self::remove_pending(&self.shared, self.id);
         }
     }
@@ -801,9 +936,14 @@ fn dispatch(shared: &Shared, frame: Frame) {
                 forward_stream_event(shared, frame);
             }
         }
-        FrameKind::Req => {
-            let _ = shared.events.send(HostEvent::Raw(frame));
-        }
+        FrameKind::Req => match decode_ui_request(&frame) {
+            Some(request) => {
+                let _ = shared.events.send(HostEvent::UiRequest(request));
+            }
+            None => {
+                let _ = shared.events.send(HostEvent::Raw(frame));
+            }
+        },
     }
 }
 
@@ -852,6 +992,15 @@ fn forward_event(shared: &Shared, frame: Frame) {
         match from_payload::<crate::protocol::ExtensionErrorEvent>(&frame.payload) {
             Ok(e) => {
                 let _ = shared.events.send(HostEvent::ExtensionError(e));
+            }
+            Err(_) => {
+                let _ = shared.events.send(HostEvent::Raw(frame));
+            }
+        }
+    } else if method == Method::Notify.as_str() {
+        match from_payload::<NotifyRequest>(&frame.payload) {
+            Ok(notification) => {
+                let _ = shared.events.send(HostEvent::Notify(notification));
             }
             Err(_) => {
                 let _ = shared.events.send(HostEvent::Raw(frame));
@@ -906,6 +1055,38 @@ fn remote_error(frame: &Frame) -> HostClientError {
             code: "unknown".to_owned(),
             message: format!("unparseable error frame for method {}", frame.method),
         },
+    }
+}
+
+fn decode_ui_request(frame: &Frame) -> Option<HostUiRequest> {
+    match Method::parse(&frame.method)? {
+        Method::Select => from_payload(&frame.payload)
+            .ok()
+            .map(|request| HostUiRequest::Select {
+                id: frame.id,
+                request,
+            }),
+        Method::Confirm => {
+            from_payload(&frame.payload)
+                .ok()
+                .map(|request| HostUiRequest::Confirm {
+                    id: frame.id,
+                    request,
+                })
+        }
+        Method::Input => from_payload(&frame.payload)
+            .ok()
+            .map(|request| HostUiRequest::Input {
+                id: frame.id,
+                request,
+            }),
+        Method::Editor => from_payload(&frame.payload)
+            .ok()
+            .map(|request| HostUiRequest::Editor {
+                id: frame.id,
+                request,
+            }),
+        _ => None,
     }
 }
 
@@ -974,6 +1155,52 @@ mod tests {
         assert_eq!(frame.payload["ok"], true);
         Ok(())
     }
+    #[tokio::test]
+    async fn host_ui_requests_and_notifications_are_typed_and_correlated() -> R {
+        let (client, mut host) = make_pair().await;
+        let mut events = client.subscribe();
+        host.write_frame(&Frame {
+            id: 77,
+            kind: FrameKind::Req,
+            method: Method::Select.as_str().to_owned(),
+            payload: serde_json::json!({
+                "title": "Pick",
+                "options": ["a", "b"],
+                "timeoutMs": 50
+            }),
+        })
+        .await?;
+
+        let event = tokio::time::timeout(Duration::from_secs(1), events.recv()).await??;
+        let HostEvent::UiRequest(HostUiRequest::Select { id, request }) = event else {
+            return Err("expected typed select request".into());
+        };
+        assert_eq!(id, 77);
+        assert_eq!(request.options, ["a", "b"]);
+        client
+            .respond_ui(HostUiResponse::Select {
+                id,
+                value: Some("b".to_owned()),
+            })
+            .await?;
+        let response = host.read_frame().await.ok_or("no UI response")?;
+        assert_eq!(response.kind, FrameKind::Res);
+        assert_eq!(response.id, 77);
+        assert_eq!(response.payload["value"], "b");
+
+        host.write_frame(&Frame::event(
+            0,
+            Method::Notify,
+            serde_json::json!({"message":"hello","level":"warning"}),
+        ))
+        .await?;
+        let event = tokio::time::timeout(Duration::from_secs(1), events.recv()).await??;
+        let HostEvent::Notify(notification) = event else {
+            return Err("expected typed notification".into());
+        };
+        assert_eq!(notification.message, "hello");
+        Ok(())
+    }
 
     #[tokio::test]
     async fn concurrent_requests_all_resolve() -> R {
@@ -1018,6 +1245,26 @@ mod tests {
             matches!(result, Err(HostClientError::Timeout { .. })),
             "expected Timeout, got {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn timed_out_tool_request_sends_cancel_before_returning() -> R {
+        let (client, mut host) = make_pair().await;
+        let task = tokio::spawn(async move {
+            client
+                .request_raw(
+                    "tool.execute",
+                    serde_json::json!({}),
+                    Duration::from_millis(40),
+                )
+                .await
+        });
+        let request = host.read_frame().await.ok_or("no tool request")?;
+        let cancel = host.read_frame().await.ok_or("no timeout cancel")?;
+        assert_eq!(cancel.method, "tool.cancel");
+        assert_eq!(cancel.payload["id"], request.id);
+        assert!(matches!(task.await?, Err(HostClientError::Timeout { .. })));
+        Ok(())
     }
 
     #[tokio::test]
@@ -1068,6 +1315,23 @@ mod tests {
         let (events, terminal) = client_task.await??;
         assert_eq!(events.len(), 2);
         assert_eq!(terminal.payload["done"], true);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn timed_out_provider_stream_sends_cancel_before_returning() -> R {
+        let (client, mut host) = make_pair().await;
+        let task = tokio::spawn(async move {
+            let stream = client
+                .open_stream_raw("provider.stream", serde_json::json!({}), 2)
+                .await?;
+            stream.finish(Duration::from_millis(40)).await
+        });
+        let request = host.read_frame().await.ok_or("no provider request")?;
+        let cancel = host.read_frame().await.ok_or("no stream timeout cancel")?;
+        assert_eq!(cancel.method, "provider.cancel");
+        assert_eq!(cancel.payload["id"], request.id);
+        assert!(matches!(task.await?, Err(HostClientError::Timeout { .. })));
         Ok(())
     }
 
@@ -1279,5 +1543,22 @@ mod tests {
             .await;
         assert!(matches!(result, Err(HostClientError::NotRunning)));
         Ok(())
+    }
+}
+
+fn cancel_method_for(method: &str) -> Option<&'static str> {
+    match method {
+        "tool.execute" => Some("tool.cancel"),
+        "provider.stream" => Some("provider.cancel"),
+        _ => None,
+    }
+}
+
+fn cancel_frame(id: FrameId, control_method: &str) -> Frame {
+    Frame {
+        id: 0,
+        kind: FrameKind::Event,
+        method: control_method.to_owned(),
+        payload: serde_json::json!({ "id": id }),
     }
 }

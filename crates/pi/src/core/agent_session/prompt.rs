@@ -119,12 +119,22 @@ pub enum PromptError {
     /// Underlying agent run failure.
     #[error(transparent)]
     Agent(#[from] pi_agent::AgentLoopError),
+    /// Session persistence failure while preparing or settling the prompt.
+    #[error(transparent)]
+    Session(#[from] crate::core::sessions::SessionError),
 }
 
 impl PromptError {
     #[must_use]
     fn msg(s: impl Into<String>) -> Self {
         Self::Message(s.into())
+    }
+}
+
+fn map_bash_flush_error(err: super::bash::BashExecError) -> PromptError {
+    match err {
+        super::bash::BashExecError::Session(err) => PromptError::Session(err),
+        super::bash::BashExecError::Execution { message, .. } => PromptError::Message(message),
     }
 }
 
@@ -144,6 +154,7 @@ impl AgentSession {
     /// - [`PromptError::Message`] for no-model, no-auth, concurrent-streaming
     ///   guard, or queue slash-command rejection.
     /// - [`PromptError::Agent`] when the underlying agent run fails.
+    /// - [`PromptError::Session`] when transcript persistence fails.
     pub async fn prompt(
         self: &Arc<Self>,
         text: &str,
@@ -341,7 +352,9 @@ impl AgentSession {
         }
 
         // 5. Flush any pending bash messages before validation.
-        let _ = self.flush_pending_bash_messages().await;
+        self.flush_pending_bash_messages()
+            .await
+            .map_err(map_bash_flush_error)?;
 
         // 6. Validate model.
         let model = self.model();
@@ -480,9 +493,17 @@ impl AgentSession {
         self.mark_agent_run_active();
         let result = self.run_agent_prompt_inner(messages).await;
         // Flush any bash messages that arrived during the run before settle.
-        let _ = self.flush_pending_bash_messages().await;
+        let flush_result = self
+            .flush_pending_bash_messages()
+            .await
+            .map_err(map_bash_flush_error);
         self.hooks.set_system_prompt_override(None);
         self.emit_agent_settled().await;
+        let pending_session_error = self.take_session_error();
+        if let Some(error) = pending_session_error {
+            return Err(PromptError::Session(error));
+        }
+        flush_result?;
         result
     }
 
@@ -516,6 +537,9 @@ impl AgentSession {
                 "Agent event pump disconnected before agent_end",
             ));
         }
+        if let Some(error) = self.take_session_error() {
+            return Err(PromptError::Session(error));
+        }
         run?;
         processed_agent_ends = self.processed_agent_end_count();
         loop {
@@ -539,6 +563,9 @@ impl AgentSession {
                 return Err(PromptError::msg(
                     "Agent event pump disconnected before agent_end",
                 ));
+            }
+            if let Some(error) = self.take_session_error() {
+                return Err(PromptError::Session(error));
             }
             run?;
             processed_agent_ends = self.processed_agent_end_count();
@@ -694,8 +721,7 @@ impl AgentSession {
     }
 
     fn try_model_runtime(&self) -> Option<ModelRuntime> {
-        let any_arc = self.model_runtime.as_ref()?;
-        any_arc.as_ref().downcast_ref::<ModelRuntime>().cloned()
+        self.model_runtime.as_deref().cloned()
     }
 }
 
@@ -1249,6 +1275,142 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prompt_flush_failure_retains_bash_message_for_retry() -> TestResult {
+        let dir = tempfile::tempdir().test_context("tempdir")?;
+        let mut manager = crate::core::sessions::SessionManager::create(
+            dir.path().to_string_lossy().as_ref(),
+            Some(dir.path().to_string_lossy().as_ref()),
+            None,
+        )
+        .test_context("session manager")?;
+        manager
+            .append_message(&pi_agent::user_text("hi", std::iter::empty()))
+            .test_context("append user")?;
+        let assistant = AgentMessage::Llm(Box::new(pi_ai::Message::Assistant(assistant_text(
+            "answer",
+        ))));
+        manager
+            .append_message(&assistant)
+            .test_context("append assistant")?;
+        let session_file = std::path::PathBuf::from(
+            manager
+                .get_session_file()
+                .ok_or_else(|| "missing session file".to_owned())?,
+        );
+        let backup = dir.path().join("session-backup.jsonl");
+        std::fs::rename(&session_file, &backup).test_context("move session aside")?;
+        std::fs::create_dir(&session_file).test_context("block append path")?;
+
+        let provider = Arc::new(SeqProvider::new(one(start_event())));
+        let mut config =
+            AgentSessionConfig::test_config(provider, test_model()).test_context("test config")?;
+        config.model = None;
+        config.session_manager = manager;
+        let session = AgentSession::new(config).test_context("session")?;
+        let bash_message = |command: &str, timestamp: i64| {
+            crate::core::messages::BashExecutionMessage::from_fields(
+                crate::core::messages::BashExecutionFields {
+                    command: command.to_owned(),
+                    output: command.to_owned(),
+                    exit_code: Some(0),
+                    cancelled: false,
+                    truncated: false,
+                    full_output_path: None,
+                    timestamp,
+                    exclude_from_context: None,
+                },
+            )
+        };
+        session.lock_inner().pending_bash_messages.extend([
+            bash_message("printf first", 1),
+            bash_message("printf second", 2),
+        ]);
+
+        let err = require_error(
+            session.prompt("x", PromptOptions::default()).await,
+            "persistence failure",
+        )?;
+        assert!(matches!(err, PromptError::Session(_)));
+        assert_eq!(session.lock_inner().pending_bash_messages.len(), 2);
+
+        std::fs::remove_dir(&session_file).test_context("remove append blocker")?;
+        std::fs::rename(&backup, &session_file).test_context("restore session")?;
+        session
+            .flush_pending_bash_messages()
+            .await
+            .test_context("retry flush")?;
+        assert!(!session.has_pending_bash_messages());
+        let persisted =
+            std::fs::read_to_string(&session_file).test_context("read persisted session")?;
+        let first = persisted
+            .find("printf first")
+            .ok_or_else(|| "missing first bash".to_owned())?;
+        let second = persisted
+            .find("printf second")
+            .ok_or_else(|| "missing second bash".to_owned())?;
+        assert!(
+            first < second,
+            "retried bash messages must preserve queue order"
+        );
+        assert_eq!(persisted.matches("\"role\":\"bashExecution\"").count(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn message_end_disk_failure_returns_typed_prompt_error() -> TestResult {
+        let dir = tempfile::tempdir().test_context("tempdir")?;
+        let mut manager = crate::core::sessions::SessionManager::create(
+            dir.path().to_string_lossy().as_ref(),
+            Some(dir.path().to_string_lossy().as_ref()),
+            None,
+        )
+        .test_context("session manager")?;
+        manager
+            .append_message(&pi_agent::user_text("existing", std::iter::empty()))
+            .test_context("append existing user")?;
+        manager
+            .append_message(&AgentMessage::Llm(Box::new(pi_ai::Message::Assistant(
+                assistant_text("existing answer"),
+            ))))
+            .test_context("append existing assistant")?;
+        let before_count = manager.get_entries().len();
+        let session_file = std::path::PathBuf::from(
+            manager
+                .get_session_file()
+                .ok_or_else(|| "missing session file".to_owned())?,
+        );
+        let backup = dir.path().join("message-end-backup.jsonl");
+        std::fs::rename(&session_file, &backup).test_context("move session aside")?;
+        std::fs::create_dir(&session_file).test_context("block append path")?;
+
+        let provider = Arc::new(SeqProvider::new(two(
+            start_event(),
+            done_ok(assistant_text("new answer")),
+        )));
+        let mut config =
+            AgentSessionConfig::test_config(provider, test_model()).test_context("test config")?;
+        config.session_manager = manager;
+        let session = AgentSession::new(config).test_context("session")?;
+
+        let err = require_error(
+            session
+                .prompt("new question", PromptOptions::default())
+                .await,
+            "message-end persistence failure",
+        )?;
+        assert!(matches!(err, PromptError::Session(_)));
+        assert_eq!(
+            session.session_manager.lock().await.get_entries().len(),
+            before_count,
+            "failed append must not advance the in-memory tree"
+        );
+
+        std::fs::remove_dir(&session_file).test_context("remove append blocker")?;
+        std::fs::rename(&backup, &session_file).test_context("restore session")?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn handle_post_settles_after_retry_path_without_queue() -> TestResult {
         // Observable post-run contract: retry → (no queue) → exactly one settle.
         // A successful recovery leaves retry_attempt at 0 and no pending queue.
@@ -1351,8 +1513,9 @@ mod tests {
     }
 
     impl ExtensionRunner for TestRunner {
-        fn has_handlers(&self, _e: &str) -> bool {
-            false
+        fn has_handlers(&self, event: &str) -> bool {
+            event == "agent_end"
+                && (self.agent_end_gate.is_some() || self.agent_end_entered.is_some())
         }
         fn emit(
             &self,

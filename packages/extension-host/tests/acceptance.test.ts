@@ -26,6 +26,7 @@ import { ExtensionRunner } from "@earendil-works/pi-coding-agent";
 import { ExtensionHost, createEventBus } from "../src/host.ts";
 import { COMPATIBILITY_VERSION } from "../src/version.ts";
 import { createExtensionJiti } from "../src/virtual-modules.ts";
+import { Type } from "@earendil-works/pi-ai";
 
 import allEventsFactory, { ALL_EVENTS } from "../fixtures/extensions/all-events.ts";
 import crashFactory from "../fixtures/extensions/crash.ts";
@@ -511,11 +512,56 @@ describe("acceptance: all 33 lifecycle events", () => {
 		}
 	});
 
-	test("all 33 events can be emitted without error", async () => {
-		const { runner } = await makeRunner(allEventsFactory, "all-events.ts");
+	test("all 33 events can be emitted without error and exactly once", async () => {
+		const calls = new Map<string, number>();
+		const recordingFactory: ExtensionFactory = (pi) => {
+			for (const event of ALL_EVENTS) {
+				pi.on(event, () => {
+					calls.set(event, (calls.get(event) ?? 0) + 1);
+				});
+			}
+		};
+		const { runner } = await makeRunner(recordingFactory, "all-events-recording.ts");
+		const errors: string[] = [];
+		runner.onError((error) => errors.push(`${error.event}: ${error.error}`));
+
 		for (const event of ALL_EVENTS) {
-			await runner.emit({ type: event });
+			const result = await runner.emit({ type: event });
+			expect(result).not.toBeInstanceOf(Error);
 		}
+
+		expect(errors).toEqual([]);
+		for (const event of ALL_EVENTS) {
+			expect(calls.get(event)).toBe(1);
+		}
+	});
+
+	test("cancellable session events round-trip cancellation through the host", async () => {
+		const cancellationFactory: ExtensionFactory = (pi) => {
+			pi.on("session_before_switch", () => ({ cancel: true }));
+			pi.on("session_before_fork", () => ({ cancel: true }));
+			pi.on("session_before_compact", () => ({ cancel: true }));
+			pi.on("session_before_tree", () => ({ cancel: true }));
+		};
+		const { collector, stdin, host, runPromise } = await connectHost([cancellationFactory]);
+		const events = [
+			"session_before_switch",
+			"session_before_fork",
+			"session_before_compact",
+			"session_before_tree",
+		] as const;
+		for (const [index, event] of events.entries()) {
+			const id = 200 + index;
+			stdin.push(Buffer.from(encodeFrameString({
+				id, kind: "req", method: event, payload: {},
+			})));
+			const response = await collector.awaitFrame((frame) => frame.id === id);
+			expect(response.kind).toBe("res");
+			expect(response.payload).toEqual({ cancel: true });
+		}
+		stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
 	});
 });
 
@@ -653,8 +699,15 @@ describe("acceptance: extension runtime", () => {
 		);
 		const output = await runProcess(compiledRuntimeImport, [extensionPath], hostDir);
 		const result = JSON.parse(output.stdout.trim()) as Record<string, unknown>;
-		expect(result["tools"]).toEqual(["hello"]);
-		expect(result["handlers"]).toEqual([]);
+		expect(result).toEqual({
+			path: extensionPath,
+			tools: ["hello"],
+			handlers: [],
+			commands: [],
+			flags: [],
+			shortcuts: [],
+			messageRenderers: [],
+		});
 	});
 
 	test("input hook forwards action union (not { ok: true })", async () => {
@@ -680,17 +733,13 @@ describe("acceptance: extension runtime", () => {
 		const res = await collector.awaitFrame((f) => f.id === 31 && f.kind === "res");
 		const payload = res.payload as Record<string, unknown>;
 		expect(payload["extensions"]).toBe(1);
-		expect(Array.isArray(payload["errors"])).toBe(true);
-		expect(Array.isArray(payload["tools"])).toBe(true);
-		expect(Array.isArray(payload["providers"])).toBe(true);
-		expect(Array.isArray(payload["handlers"])).toBe(true);
+		expect(payload["errors"]).toEqual([]);
 		const tools = payload["tools"] as Array<Record<string, unknown>>;
-		expect(tools.some((t) => t["name"] === "crash_tool")).toBe(true);
+		expect(tools.map((tool) => tool["name"])).toEqual(["crash_tool"]);
 		const providers = payload["providers"] as Array<Record<string, unknown>>;
-		expect(providers.some((p) => p["name"] === "crash_provider" && p["streamSimple"] === true)).toBe(true);
-		stdin.push(null);
-		host.dispose("test");
-		await runPromise.catch(() => void 0);
+		expect(providers.map((provider) => provider["name"])).toEqual(["crash_provider"]);
+		expect(providers[0]?.["streamSimple"]).toBe(true);
+		expect(payload["handlers"]).toEqual(["session_start", "agent_start", "message_end"]);
 	});
 
 	test("extensions.load parses projectTrusted and exposes it through hook context", async () => {
@@ -1011,6 +1060,239 @@ describe("acceptance: registry snapshot and tool/provider bridges", () => {
 		const err = terminal.payload as Record<string, unknown>;
 		expect(err["code"]).toBe("cancelled");
 		expect(err["retryable"]).toBe(false);
+
+		stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
+	});
+});
+
+describe("compact message update reconstruction", () => {
+	test("reconstructs the public snapshot/event contract and clears terminal state", async () => {
+		const updates: Array<Record<string, unknown>> = [];
+		const factory: ExtensionFactory = (pi) => {
+			pi.on("message_update", (...args: unknown[]) => {
+				const event = args[0];
+				if (event !== null && typeof event === "object") {
+					updates.push(structuredClone(event as Record<string, unknown>));
+				}
+			});
+		};
+		const { collector, stdin, host, runPromise } = await connectHost([factory]);
+		let id = 200;
+		const sendDelta = async (event: Record<string, unknown>) => {
+			const requestId = id++;
+			stdin.push(Buffer.from(encodeFrameString({
+				id: requestId,
+				kind: "req",
+				method: "message_update_delta",
+				payload: { type: "message_update_delta", event },
+			})));
+			return await collector.awaitFrame((frame) => frame.id === requestId);
+		};
+		const meta = {
+			role: "assistant",
+			api: "test-api",
+			provider: "test-provider",
+			model: "test-model",
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: {} },
+			stopReason: "stop",
+			timestamp: 1,
+		};
+
+		expect((await sendDelta({ type: "start", meta })).kind).toBe("res");
+		await sendDelta({
+			type: "text_start",
+			meta,
+			contentIndex: 0,
+			block: { type: "text", text: "" },
+		});
+		await sendDelta({ type: "text_delta", meta, contentIndex: 0, delta: "hel" });
+		await sendDelta({ type: "text_delta", meta, contentIndex: 0, delta: "lo" });
+
+		const textUpdate = updates.at(-1);
+		const textMessage = textUpdate?.["message"] as Record<string, unknown>;
+		const textEvent = textUpdate?.["assistantMessageEvent"] as Record<string, unknown>;
+		expect((textMessage["content"] as Array<Record<string, unknown>>)[0]?.["text"]).toBe("hello");
+		expect(textEvent["partial"]).toEqual(textMessage);
+		expect(textEvent["delta"]).toBe("lo");
+
+		await sendDelta({
+			type: "toolcall_start",
+			meta,
+			contentIndex: 1,
+			block: { type: "toolCall", id: "call-1", name: "read", arguments: {} },
+		});
+		await sendDelta({
+			type: "toolcall_delta",
+			meta,
+			contentIndex: 1,
+			delta: "{\"path\":\"README",
+		});
+		const toolUpdate = updates.at(-1);
+		const toolMessage = toolUpdate?.["message"] as Record<string, unknown>;
+		expect(
+			((toolMessage["content"] as Array<Record<string, unknown>>)[1]?.["arguments"] as Record<string, unknown>)["path"],
+		).toBe("README");
+		await sendDelta({
+			type: "toolcall_end",
+			meta,
+			contentIndex: 1,
+			block: { type: "toolCall", id: "call-1", name: "read", arguments: { path: "README.md" } },
+		});
+		const toolEnd = updates.at(-1)?.["assistantMessageEvent"] as Record<string, unknown>;
+		expect((toolEnd["toolCall"] as Record<string, unknown>)["arguments"]).toEqual({ path: "README.md" });
+
+		const final = {
+			...meta,
+			content: [
+				{ type: "text", text: "hello" },
+				{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "README.md" } },
+			],
+		};
+		await sendDelta({ type: "done", reason: "stop", final });
+		const done = updates.at(-1);
+		expect(done?.["message"]).toEqual(final);
+		expect((done?.["assistantMessageEvent"] as Record<string, unknown>)["message"]).toEqual(final);
+
+		const afterTerminal = await sendDelta({ type: "text_delta", meta, contentIndex: 0, delta: "late" });
+		expect(afterTerminal.kind).toBe("error");
+		expect((afterTerminal.payload as Record<string, unknown>)["message"]).toContain("before assistant start");
+
+		stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
+	});
+});
+
+describe("tool rendering and argument preflight", () => {
+	test("tool.renderHtml renders calls/results at width 80 as inert HTML and isolates failures", async () => {
+		const renderFactory: ExtensionFactory = (pi) => {
+			pi.registerTool({
+				name: "render_fixture",
+				label: "RenderFixture",
+				description: "Renders acceptance output",
+				parameters: Type.Object({ text: Type.String() }),
+				async execute(_toolCallId, params) {
+					return { content: [{ type: "text", text: String(params.text) }], details: {} };
+				},
+				renderCall(args, theme, context) {
+					if (args.text === "boom") throw new Error("render-boom");
+					return {
+						render: (width) => [
+							theme.bold(`call width=${width} id=${context.toolCallId}`),
+							String(args.text),
+						],
+					};
+				},
+				renderResult(result, options, theme, context) {
+					return {
+						render: (width) => [
+							theme.italic(`result width=${width} expanded=${String(options.expanded)} cwd=${context.cwd}`),
+							String(result.content[0]?.type === "text" ? result.content[0].text : ""),
+						],
+					};
+				},
+			});
+		};
+		const { collector, stdin, host, runPromise } = await connectHost([renderFactory, toolProgressFactory]);
+
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 70, kind: "req", method: "tool.renderHtml",
+			payload: { phase: "call", toolName: "render_fixture", payload: { text: "<script>alert(1)</script>" } },
+		})));
+		const callResponse = await collector.awaitFrame((frame) => frame.id === 70);
+		expect(callResponse.kind).toBe("res");
+		const callHtml = String((callResponse.payload as Record<string, unknown>)["html"]);
+		expect(callHtml).toContain("call width=80 id=html-export:render_fixture");
+		expect(callHtml).toContain("&lt;script&gt;alert(1)&lt;/script&gt;");
+		expect(callHtml).not.toContain("\x1b");
+		expect(callHtml).not.toContain("<script>");
+
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 71, kind: "req", method: "tool.renderHtml",
+			payload: {
+				phase: "result", toolName: "render_fixture",
+				payload: { content: [{ type: "text", text: "result <b>bytes</b>" }], details: {} },
+			},
+		})));
+		const resultResponse = await collector.awaitFrame((frame) => frame.id === 71);
+		expect(resultResponse.kind).toBe("res");
+		const resultHtml = String((resultResponse.payload as Record<string, unknown>)["html"]);
+		expect(resultHtml).toContain("result width=80 expanded=true");
+		expect(resultHtml).toContain("result &lt;b&gt;bytes&lt;/b&gt;");
+
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 72, kind: "req", method: "tool.renderHtml",
+			payload: { phase: "call", toolName: "render_fixture", payload: { text: "boom" } },
+		})));
+		const failed = await collector.awaitFrame((frame) => frame.id === 72);
+		expect(failed.kind).toBe("error");
+		expect((failed.payload as Record<string, unknown>)["code"]).toBe("extension_error");
+
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 73, kind: "req", method: "tool.renderHtml",
+			payload: { phase: "call", toolName: "render_fixture", payload: { text: "still alive" } },
+		})));
+		expect((await collector.awaitFrame((frame) => frame.id === 73)).kind).toBe("res");
+
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 74, kind: "req", method: "tool.renderHtml",
+			payload: { phase: "call", toolName: "progress_echo", payload: {} },
+		})));
+		expect((await collector.awaitFrame((frame) => frame.id === 74)).payload).toEqual({});
+
+		stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
+	});
+
+	test("tool.prepare normalizes before canonical validation and malformed args are rejected", async () => {
+		let prepareCalls = 0;
+		const preflightFactory: ExtensionFactory = (pi) => {
+			pi.registerTool({
+				name: "preflight_fixture",
+				label: "PreflightFixture",
+				description: "Normalizes and validates arguments",
+				parameters: Type.Object({ text: Type.String(), count: Type.Number() }),
+				prepareArguments(args) {
+					prepareCalls++;
+					const raw = args as Record<string, unknown>;
+					return { text: String(raw["text"] ?? ""), count: Number(raw["count"]) };
+				},
+				async execute(_toolCallId, params) {
+					return { content: [{ type: "text", text: `${params.text}:${params.count}` }], details: {} };
+				},
+			});
+		};
+		const { collector, stdin, host, runPromise } = await connectHost([preflightFactory]);
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 80, kind: "req", method: "tool.prepare",
+			payload: { name: "preflight_fixture", args: { text: 42, count: "7" } },
+		})));
+		const prepared = await collector.awaitFrame((frame) => frame.id === 80);
+		expect(prepared.kind).toBe("res");
+		expect(prepared.payload).toEqual({ args: { text: "42", count: 7 } });
+
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 81, kind: "req", method: "tool.validate",
+			payload: { name: "preflight_fixture", args: { text: "42", count: 7 } },
+		})));
+		const valid = await collector.awaitFrame((frame) => frame.id === 81);
+		expect(valid.kind).toBe("res");
+		expect(valid.payload).toEqual({ args: { text: "42", count: 7 } });
+		expect(prepareCalls).toBe(1);
+
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 82, kind: "req", method: "tool.validate",
+			payload: { name: "preflight_fixture", args: { text: "missing count" } },
+		})));
+		const invalid = await collector.awaitFrame((frame) => frame.id === 82);
+		expect(invalid.kind).toBe("error");
+		const error = invalid.payload as Record<string, unknown>;
+		expect(error["code"]).toBe("invalid_arguments");
+		expect(String(error["message"])).toContain("Validation failed for tool \"preflight_fixture\"");
+		expect(prepareCalls).toBe(1);
 
 		stdin.push(null);
 		host.dispose("test");

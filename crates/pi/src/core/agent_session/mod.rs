@@ -39,7 +39,10 @@ pub mod subscribe;
 pub mod tools;
 pub mod tree;
 
-pub use events::{AgentSessionEvent, AgentSessionEventListener, CompactionReason};
+pub use events::{
+    AgentSessionEvent, AgentSessionEventListener, CompactionReason, ModelSelectSource,
+    SessionBeforeForkPosition, SessionBeforeSwitchReason,
+};
 pub use extension::{
     ExtensionBindError, ExtensionBindings, ExtensionMode, ExtensionUiContext,
     ReplacedSessionContext, SessionShutdownReason, SessionStartReason,
@@ -52,12 +55,14 @@ pub use extension_runner::{
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use futures::future::BoxFuture;
 use pi_agent::{Agent, AgentLoopConfig, AgentMessage, AgentOptions, AgentTool, QueueMode};
 use pi_ai::{AssistantMessage, Model, ModelThinkingLevel, Provider};
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio_util::sync::CancellationToken;
 
-use crate::core::sessions::SessionManager;
+use crate::core::model_runtime::ModelRuntime;
+use crate::core::sessions::{SessionError, SessionManager};
 use crate::core::settings::SettingsManager;
 use events::AgentSessionEvent as Event;
 use subscribe::EventPump;
@@ -74,8 +79,8 @@ pub struct ScopedModel {
 /// Construction inputs for [`AgentSession`].
 ///
 /// The services factory builds this and passes it to [`AgentSession::new`].
-/// `model_runtime` is intentionally opaque (`Arc<dyn std::any::Any + Send +
-/// Sync>`) until the concrete `ModelRuntime` type lands; accessors cast later.
+/// Product dependencies remain concrete: `model_runtime` is a typed handle,
+/// while compaction test overrides use their own typed seam.
 pub struct AgentSessionConfig {
     /// Pre-built agent. When `None`, [`AgentSession::new`] builds one from
     /// `provider` + defaults and installs `SessionHooks` closures.
@@ -110,8 +115,10 @@ pub struct AgentSessionConfig {
     pub extension_runner: Option<Arc<dyn ExtensionRunner>>,
     /// Concrete host runner retained for reload/restart (no trait downcast).
     pub host_extension_runner: Option<Arc<crate::core::extension_host::HostExtensionRunner>>,
-    /// Opaque model-runtime handle for later slices / services.
-    pub model_runtime: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    /// Typed model/auth runtime used by model selection and compaction.
+    pub model_runtime: Option<Arc<ModelRuntime>>,
+    /// Optional compaction stream override for tests and headless integrations.
+    pub compaction_stream_override: Option<compaction::CompactionStreamHandle>,
     /// Skills for `/skill:name` expansion (populated by resources slice).
     pub skills: Vec<crate::core::resources::skills::Skill>,
     /// Prompt templates for `/template` expansion.
@@ -164,6 +171,7 @@ impl AgentSessionConfig {
             extension_runner: None,
             host_extension_runner: None,
             model_runtime: None,
+            compaction_stream_override: None,
             skills: Vec::new(),
             prompt_templates: Vec::new(),
             resource_loader: None,
@@ -193,6 +201,12 @@ pub(super) struct AgentSessionInner {
     pub(super) listeners: Vec<(u64, AgentSessionEventListener)>,
     /// Monotonic listener id allocator.
     pub(super) next_listener_id: u64,
+    /// Awaited event backpressure hooks with stable ids.
+    pub(super) backpressure_hooks: Vec<(u64, EventBackpressureHook)>,
+    /// Monotonic backpressure-hook id allocator.
+    pub(super) next_backpressure_hook_id: u64,
+    /// Typed persistence failure awaiting prompt completion.
+    pub(super) pending_session_error: Option<SessionError>,
     /// Active event pump (at most one), encapsulated within this module.
     pump: Option<EventPump>,
     /// Idle waiters for session-level idle.
@@ -304,6 +318,9 @@ impl std::ops::DerefMut for AgentSessionInner {
 
 type ExtensionErrorListener = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// Awaited barrier invoked after a public event has reached synchronous listeners.
+pub type EventBackpressureHook = Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
+
 impl AgentSessionInner {
     fn new(scoped_models: Vec<ScopedModel>, base_system_prompt: String) -> Self {
         Self {
@@ -315,6 +332,9 @@ impl AgentSessionInner {
             last_assistant_message: None,
             listeners: Vec::new(),
             next_listener_id: 1,
+            backpressure_hooks: Vec::new(),
+            next_backpressure_hook_id: 1,
+            pending_session_error: None,
             pump: None,
             idle_notify: Arc::new(Notify::new()),
             processed_agent_ends: 0,
@@ -354,6 +374,8 @@ pub struct AgentSession {
     pub agent: Agent,
     /// Session tree (single-writer async mutex).
     pub(super) session_manager: Arc<AsyncMutex<SessionManager>>,
+    /// Serializes pending-bash flushes without owning queue data or nesting locks.
+    pub(super) bash_flush_lock: AsyncMutex<()>,
     /// Settings manager (interior-mutable so every accessor / mutator on
     /// `AgentSession` can operate through `&self`). Lock briefly and drop
     /// before any `.await` — see [`AgentSession::lock_settings`].
@@ -367,8 +389,10 @@ pub struct AgentSession {
     /// Concrete host runner for reload (optional; no trait downcast).
     pub(super) host_extension_runner:
         std::sync::RwLock<Option<Arc<crate::core::extension_host::HostExtensionRunner>>>,
-    /// Opaque model runtime for later slices.
-    pub(super) model_runtime: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    /// Typed model runtime shared across product-owned session boundaries.
+    pub(super) model_runtime: Option<Arc<ModelRuntime>>,
+    /// Optional compaction-only stream override.
+    pub(super) compaction_stream_override: Option<compaction::CompactionStreamHandle>,
     /// Skills for `/skill:name` expansion.
     pub(super) skills: Mutex<Vec<crate::core::resources::skills::Skill>>,
     /// Prompt templates for `/template` expansion.
@@ -472,12 +496,14 @@ impl AgentSession {
         let session = Arc::new(Self {
             agent,
             session_manager: Arc::new(AsyncMutex::new(config.session_manager)),
+            bash_flush_lock: AsyncMutex::new(()),
             settings_manager: std::sync::Mutex::new(config.settings_manager),
             cwd: config.cwd,
             hooks,
             inner: Mutex::new(inner),
             host_extension_runner: std::sync::RwLock::new(config.host_extension_runner),
             model_runtime: config.model_runtime,
+            compaction_stream_override: config.compaction_stream_override,
             skills: Mutex::new(config.skills),
             prompt_templates: Mutex::new(config.prompt_templates),
             resource_loader: config.resource_loader.map(AsyncMutex::new),
@@ -670,9 +696,9 @@ impl AgentSession {
         self.lock_inner().auto_retry_enabled
     }
 
-    /// Opaque model-runtime handle.
+    /// Typed model-runtime handle.
     #[must_use]
-    pub fn model_runtime_any(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+    pub fn model_runtime_handle(&self) -> Option<Arc<ModelRuntime>> {
         self.model_runtime.clone()
     }
 
@@ -706,6 +732,63 @@ impl AgentSession {
                 guard.listeners.retain(|(id, _)| *id != listener_id);
             }
         }
+    }
+
+    /// Register an awaited event-production barrier.
+    ///
+    /// The event pump and compaction paths invoke these hooks after synchronous
+    /// public listeners. The returned closure removes the hook by stable id.
+    pub fn register_event_backpressure_hook(
+        &self,
+        hook: EventBackpressureHook,
+    ) -> Box<dyn Fn() + Send + Sync> {
+        let hook_id = {
+            let mut inner = self.lock_inner();
+            let id = inner.next_backpressure_hook_id;
+            inner.next_backpressure_hook_id = inner.next_backpressure_hook_id.saturating_add(1);
+            inner.backpressure_hooks.push((id, hook));
+            id
+        };
+        let session_for_unsub = self.upgrade_self();
+        Box::new(move || {
+            if let Some(session) = session_for_unsub
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade)
+            {
+                session
+                    .lock_inner()
+                    .backpressure_hooks
+                    .retain(|(id, _)| *id != hook_id);
+            }
+        })
+    }
+
+    pub(super) async fn await_event_backpressure(&self) {
+        let hooks = self
+            .lock_inner()
+            .backpressure_hooks
+            .iter()
+            .map(|(_, hook)| Arc::clone(hook))
+            .collect::<Vec<_>>();
+        for hook in hooks {
+            hook().await;
+        }
+    }
+
+    pub(super) async fn emit_public_awaited(&self, event: &Event) {
+        self.emit_public(event);
+        self.await_event_backpressure().await;
+    }
+
+    pub(super) fn record_session_error(&self, error: SessionError) {
+        let mut inner = self.lock_inner();
+        if inner.pending_session_error.is_none() {
+            inner.pending_session_error = Some(error);
+        }
+    }
+
+    pub(super) fn take_session_error(&self) -> Option<SessionError> {
+        self.lock_inner().pending_session_error.take()
     }
 
     pub(super) fn emit_public<E>(&self, event: E)
@@ -989,8 +1072,11 @@ impl AgentSession {
     }
 
     /// Set auto-compaction enabled.
+    ///
+    /// Updates both the runtime cache and the persisted settings document.
     pub fn set_auto_compaction_enabled(&self, enabled: bool) {
         self.lock_inner().auto_compaction_enabled = enabled;
+        self.lock_settings().set_compaction_enabled(enabled);
     }
 
     /// Set steering mode on the agent.

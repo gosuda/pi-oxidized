@@ -736,7 +736,6 @@ mod tests {
         }
     }
 
-
     struct StubRoot {
         label: String,
         invalidated: u32,
@@ -1045,4 +1044,3 @@ mod tests {
         haystack.windows(needle.len()).position(|w| w == needle)
     }
 }
-

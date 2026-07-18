@@ -37,12 +37,17 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::io::AsyncRead;
 use tokio::sync::{Notify, mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
+
+use pi_ext::client::{HostUiRequest, HostUiResponse};
+use pi_ext::protocol::{NotifyLevel, SlotPlacement};
 
 use crate::core::agent_session::events::AgentSessionEvent;
 use crate::core::agent_session::extension::{ExtensionBindings, ExtensionMode};
 use crate::core::agent_session::prompt::PreflightCallback;
 use crate::core::agent_session_runtime::{ForkOutcome, ForkPosition};
 use crate::core::compaction::CompactionResult;
+use crate::core::extension_host::{ExtensionUiEvent, HostExtensionRunner};
 use crate::core::output_guard as output_guard_mod;
 use crate::core::sessions::SessionEntry;
 
@@ -363,6 +368,10 @@ pub trait RpcSessionHost: Send + Sync {
         &self,
         bindings: ExtensionBindings,
     ) -> BoxFuture<'static, Result<(), String>>;
+    /// Current concrete extension host, when this session uses one.
+    fn host_extension_runner(&self) -> Option<Arc<HostExtensionRunner>> {
+        None
+    }
 
     // ---- Lifecycle ----
     /// Dispose the current session and runtime.
@@ -454,6 +463,7 @@ pub(crate) struct ServerState {
     signal: Arc<Notify>,
     unsubscribe_events: UnsubSlot,
     unsubscribe_backpressure: UnsubSlot,
+    unsubscribe_extension_ui: UnsubSlot,
 }
 
 impl ServerState {
@@ -471,6 +481,7 @@ impl ServerState {
             signal: Arc::new(Notify::new()),
             unsubscribe_events: Mutex::new(None),
             unsubscribe_backpressure: Mutex::new(None),
+            unsubscribe_extension_ui: Mutex::new(None),
         }
     }
 
@@ -496,6 +507,7 @@ impl ServerState {
     {
         take_unsub(&self.unsubscribe_events);
         take_unsub(&self.unsubscribe_backpressure);
+        take_unsub(&self.unsubscribe_extension_ui);
 
         let shutdown_flag = Arc::clone(&self.shutdown_requested);
         let shutdown_signal = Arc::clone(&self.signal);
@@ -535,6 +547,29 @@ impl ServerState {
             })
         }));
         *lock_unsub(&self.unsubscribe_backpressure) = Some(unsub_bp);
+
+        if let Some(runner) = host.host_extension_runner() {
+            let cancel = CancellationToken::new();
+            let cancel_on_unbind = cancel.clone();
+            *lock_unsub(&self.unsubscribe_extension_ui) = Some(Box::new(move || {
+                cancel_on_unbind.cancel();
+            }));
+
+            if let Some(requests) = runner.take_ui_requests() {
+                tokio::spawn(run_extension_dialog_bridge(
+                    Arc::clone(&runner),
+                    requests,
+                    self.proxy.clone(),
+                    self.write_tx.clone(),
+                    cancel.clone(),
+                ));
+            }
+            tokio::spawn(run_extension_event_bridge(
+                runner,
+                self.write_tx.clone(),
+                cancel,
+            ));
+        }
     }
 
     /// Cleanup before exit: cancel UI, unsubscribe, dispose, flush.
@@ -545,11 +580,192 @@ impl ServerState {
         self.proxy.cancel_all();
         take_unsub(&self.unsubscribe_events);
         take_unsub(&self.unsubscribe_backpressure);
+        take_unsub(&self.unsubscribe_extension_ui);
         host.dispose().await;
         self.wait_for_output().await;
         if exit_code != 143 {
             let _ = self.sink.flush().await;
         }
+    }
+}
+
+async fn run_extension_dialog_bridge(
+    runner: Arc<HostExtensionRunner>,
+    mut requests: mpsc::Receiver<HostUiRequest>,
+    proxy: ExtensionUiProxy,
+    write_tx: mpsc::UnboundedSender<WriteMessage>,
+    cancel: CancellationToken,
+) {
+    loop {
+        let request = tokio::select! {
+            () = cancel.cancelled() => break,
+            request = requests.recv() => match request {
+                Some(request) => request,
+                None => break,
+            },
+        };
+        let runner = Arc::clone(&runner);
+        let proxy = proxy.clone();
+        let write_tx = write_tx.clone();
+        let request_cancel = cancel.child_token();
+        tokio::spawn(async move {
+            bridge_extension_dialog(runner, request, proxy, write_tx, request_cancel).await;
+        });
+    }
+}
+
+async fn bridge_extension_dialog(
+    runner: Arc<HostExtensionRunner>,
+    request: HostUiRequest,
+    proxy: ExtensionUiProxy,
+    write_tx: mpsc::UnboundedSender<WriteMessage>,
+    cancel: CancellationToken,
+) {
+    let timeout_ms = match &request {
+        HostUiRequest::Select { request, .. } => request.options_meta.timeout_ms,
+        HostUiRequest::Confirm { request, .. } => request.options_meta.timeout_ms,
+        HostUiRequest::Input { request, .. } => request.options_meta.timeout_ms,
+        HostUiRequest::Editor { .. } => None,
+    };
+    let (rpc_request, response_rx) = proxy.create_dialog(|id| match &request {
+        HostUiRequest::Select { request, .. } => RpcExtensionUiRequest::Select {
+            id: id.to_owned(),
+            title: request.title.clone(),
+            options: request.options.clone(),
+            timeout: request.options_meta.timeout_ms,
+        },
+        HostUiRequest::Confirm { request, .. } => RpcExtensionUiRequest::Confirm {
+            id: id.to_owned(),
+            title: request.title.clone(),
+            message: request.message.clone(),
+            timeout: request.options_meta.timeout_ms,
+        },
+        HostUiRequest::Input { request, .. } => RpcExtensionUiRequest::Input {
+            id: id.to_owned(),
+            title: request.title.clone(),
+            placeholder: request.placeholder.clone(),
+            timeout: request.options_meta.timeout_ms,
+        },
+        HostUiRequest::Editor { request, .. } => RpcExtensionUiRequest::Editor {
+            id: id.to_owned(),
+            title: request.title.clone(),
+            prefill: request.prefill.clone(),
+        },
+    });
+    let rpc_id = rpc_request.id().to_owned();
+    let _ = write_tx.send(WriteMessage::Line(to_jsonl(&ServerOutput::UiRequest(
+        rpc_request,
+    ))));
+
+    let response = match timeout_ms {
+        Some(timeout_ms) => tokio::select! {
+            () = cancel.cancelled() => None,
+            result = tokio::time::timeout(
+                std::time::Duration::from_millis(timeout_ms),
+                response_rx,
+            ) => result.ok().and_then(Result::ok),
+        },
+        None => tokio::select! {
+            () = cancel.cancelled() => None,
+            result = response_rx => result.ok(),
+        },
+    };
+    if response.is_none() {
+        let _ = proxy.route_response(RpcExtensionUiResponse::Cancelled { id: rpc_id });
+    }
+    let host_response = map_rpc_ui_response(&request, response);
+    let _ = runner.respond_ui(host_response).await;
+}
+
+fn map_rpc_ui_response(
+    request: &HostUiRequest,
+    response: Option<RpcExtensionUiResponse>,
+) -> HostUiResponse {
+    match request {
+        HostUiRequest::Select { id, .. } => HostUiResponse::Select {
+            id: *id,
+            value: match response {
+                Some(RpcExtensionUiResponse::Value { value, .. }) => Some(value),
+                _ => None,
+            },
+        },
+        HostUiRequest::Confirm { id, .. } => HostUiResponse::Confirm {
+            id: *id,
+            confirmed: match response {
+                Some(RpcExtensionUiResponse::Confirmed { confirmed, .. }) => confirmed,
+                _ => false,
+            },
+        },
+        HostUiRequest::Input { id, .. } => HostUiResponse::Input {
+            id: *id,
+            value: match response {
+                Some(RpcExtensionUiResponse::Value { value, .. }) => Some(value),
+                _ => None,
+            },
+        },
+        HostUiRequest::Editor { id, .. } => HostUiResponse::Editor {
+            id: *id,
+            value: match response {
+                Some(RpcExtensionUiResponse::Value { value, .. }) => Some(value),
+                _ => None,
+            },
+        },
+    }
+}
+
+async fn run_extension_event_bridge(
+    runner: Arc<HostExtensionRunner>,
+    write_tx: mpsc::UnboundedSender<WriteMessage>,
+    cancel: CancellationToken,
+) {
+    let mut events = runner.subscribe_ui();
+    for slot in runner.current_slots() {
+        let request = map_extension_ui_event(ExtensionUiEvent::Slot(slot));
+        let _ = write_tx.send(WriteMessage::Line(to_jsonl(&ServerOutput::UiRequest(
+            request,
+        ))));
+    }
+    loop {
+        let event = tokio::select! {
+            () = cancel.cancelled() => break,
+            event = events.recv() => match event {
+                Ok(event) => event,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            },
+        };
+        let request = map_extension_ui_event(event);
+        let _ = write_tx.send(WriteMessage::Line(to_jsonl(&ServerOutput::UiRequest(
+            request,
+        ))));
+    }
+}
+
+fn map_extension_ui_event(event: ExtensionUiEvent) -> RpcExtensionUiRequest {
+    match event {
+        ExtensionUiEvent::Notify(notification) => ExtensionUiProxy::notify(
+            &notification.message,
+            Some(match notification.level {
+                NotifyLevel::Info => super::types::NotifyType::Info,
+                NotifyLevel::Warning => super::types::NotifyType::Warning,
+                NotifyLevel::Error => super::types::NotifyType::Error,
+            }),
+        ),
+        ExtensionUiEvent::Slot(slot) => {
+            let lines = slot
+                .lines
+                .iter()
+                .map(|line| line.iter().map(|run| run.text.as_str()).collect::<String>())
+                .collect::<Vec<_>>();
+            let placement = match slot.placement {
+                SlotPlacement::Footer | SlotPlacement::BelowEditor => {
+                    Some(super::types::WidgetPlacement::BelowEditor)
+                }
+                _ => Some(super::types::WidgetPlacement::AboveEditor),
+            };
+            ExtensionUiProxy::set_widget(&slot.key, Some(&lines), placement)
+        }
+        ExtensionUiEvent::Dispose { key } => ExtensionUiProxy::set_widget(&key, None, None),
     }
 }
 
@@ -1185,7 +1401,6 @@ where
         }
     };
 
-
     state.cleanup(&host, exit_code).await;
     writer_task.abort();
     exit_code
@@ -1271,17 +1486,13 @@ where
         }
     };
 
-
     state.cleanup(&host, exit_code).await;
     writer_task.abort();
     output_guard_mod::restore_stdout();
     exit_code
 }
 
-async fn writer_actor(
-    mut write_rx: mpsc::UnboundedReceiver<WriteMessage>,
-    sink: Arc<dyn RpcSink>,
-) {
+async fn writer_actor(mut write_rx: mpsc::UnboundedReceiver<WriteMessage>, sink: Arc<dyn RpcSink>) {
     while let Some(message) = write_rx.recv().await {
         match message {
             WriteMessage::Line(line) => {
@@ -1342,8 +1553,11 @@ mod tests {
     };
     use pi_agent::QueueMode;
     use pi_ai::{ImageContent, Model, ModelThinkingLevel};
+    use pi_ext::client::HostClient;
+    use pi_ext::protocol::{Frame, FrameKind, HelloAck, Method, decode_frame_str, encode_frame};
     use std::task::{Context, Poll};
     use tokio::io::ReadBuf;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
 
     // -----------------------------------------------------------------------
     // FakeRpcHost
@@ -1442,6 +1656,7 @@ mod tests {
         disposed: Arc<AtomicBool>,
         events_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<AgentSessionEvent>>>>,
         bindings: Arc<Mutex<Option<ExtensionBindings>>>,
+        extension_runner: Arc<Mutex<Option<Arc<HostExtensionRunner>>>>,
     }
 
     impl FakeRpcHost {
@@ -1452,7 +1667,12 @@ mod tests {
                 disposed: Arc::new(AtomicBool::new(false)),
                 events_tx: Arc::new(Mutex::new(None)),
                 bindings: Arc::new(Mutex::new(None)),
+                extension_runner: Arc::new(Mutex::new(None)),
             }
+        }
+
+        fn set_extension_runner(&self, runner: Arc<HostExtensionRunner>) {
+            *self.extension_runner.lock().unwrap() = Some(runner);
         }
         fn rec(&self, name: &str) {
             self.calls.lock().unwrap().push(name.to_owned());
@@ -1675,6 +1895,9 @@ mod tests {
             *self.bindings.lock().unwrap() = Some(bindings);
             Box::pin(async { Ok(()) })
         }
+        fn host_extension_runner(&self) -> Option<Arc<HostExtensionRunner>> {
+            self.extension_runner.lock().unwrap().clone()
+        }
         fn dispose(&self) -> BoxFuture<'static, ()> {
             self.rec("dispose");
             self.disposed.store(true, Ordering::SeqCst);
@@ -1809,10 +2032,12 @@ mod tests {
         assert_eq!(response["id"], "req-17");
         assert_eq!(response["command"], "parse");
         assert_eq!(response["success"], false);
-        assert!(response["error"]
-            .as_str()
-            .unwrap()
-            .contains("excludeFromContext"));
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap()
+                .contains("excludeFromContext")
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2194,6 +2419,149 @@ mod tests {
     // Extension UI routing
     // -----------------------------------------------------------------------
 
+    struct RpcHostPeer {
+        read: BufReader<DuplexStream>,
+        write: DuplexStream,
+    }
+
+    impl RpcHostPeer {
+        async fn read_frame(&mut self) -> Result<Frame, Box<dyn std::error::Error>> {
+            let mut line = String::new();
+            self.read.read_line(&mut line).await?;
+            Ok(decode_frame_str(line.trim_end())?)
+        }
+
+        async fn write_frame(&mut self, frame: &Frame) -> Result<(), Box<dyn std::error::Error>> {
+            self.write.write_all(&encode_frame(frame)?).await?;
+            self.write.flush().await?;
+            Ok(())
+        }
+    }
+
+    async fn make_rpc_extension_runner()
+    -> Result<(Arc<HostExtensionRunner>, RpcHostPeer), Box<dyn std::error::Error>> {
+        let (client_stdout, host_stdout) = tokio::io::duplex(64 * 1024);
+        let (host_stdin, client_stdin) = tokio::io::duplex(64 * 1024);
+        let client = Arc::new(HostClient::connect_boxed(
+            Box::new(client_stdin),
+            Box::new(client_stdout),
+            Box::new(tokio::io::empty()),
+            None,
+        ));
+        let connect_client = Arc::clone(&client);
+        let connect = tokio::spawn(async move {
+            HostExtensionRunner::connect_with_cwd_and_trust(
+                connect_client,
+                Vec::new(),
+                "/workspace",
+                false,
+                std::time::Duration::from_secs(1),
+            )
+            .await
+        });
+        let mut peer = RpcHostPeer {
+            read: BufReader::new(host_stdin),
+            write: host_stdout,
+        };
+        let hello = peer.read_frame().await?;
+        peer.write_frame(&Frame::response(
+            hello.id,
+            Method::Hello,
+            serde_json::to_value(HelloAck::local())?,
+        ))
+        .await?;
+        let load = peer.read_frame().await?;
+        assert_eq!(load.method, "extensions.load");
+        peer.write_frame(&Frame::response(
+            load.id,
+            Method::Notify,
+            serde_json::json!({
+                "tools": [],
+                "commands": [],
+                "shortcuts": [],
+                "flags": [],
+                "renderers": [],
+                "providers": [],
+                "handlers": [],
+                "errors": [],
+                "terminalInput": false
+            }),
+        ))
+        .await?;
+        Ok((connect.await??, peer))
+    }
+
+    #[tokio::test]
+    async fn host_dialog_round_trips_through_rpc_stdout_and_stdin()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (runner, mut peer) = make_rpc_extension_runner().await?;
+        let host = FakeRpcHost::new(FakeConfig::default());
+        host.set_extension_runner(Arc::clone(&runner));
+        let sink = BufferSink::new();
+        let sink_arc = Arc::new(sink.clone()) as Arc<dyn RpcSink>;
+        let (write_tx, write_rx) = mpsc::unbounded_channel::<WriteMessage>();
+        let state = ServerState::new(sink_arc.clone(), write_tx, ExtensionUiProxy::new());
+        let writer = tokio::spawn(writer_actor(write_rx, sink_arc));
+        state.rebind(&host).await;
+
+        peer.write_frame(&Frame {
+            id: 901,
+            kind: FrameKind::Req,
+            method: Method::Select.as_str().to_owned(),
+            payload: serde_json::json!({
+                "title": "Pick",
+                "options": ["a", "b"],
+                "timeoutMs": 1000
+            }),
+        })
+        .await?;
+
+        let ui_request = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                state.wait_for_output().await;
+                if let Some(line) = sink.stdout_lines().last().cloned()
+                    && serde_json::from_str::<Value>(&line)
+                        .ok()
+                        .and_then(|value| {
+                            value.get("type").and_then(Value::as_str).map(str::to_owned)
+                        })
+                        .as_deref()
+                        == Some("extension_ui_request")
+                {
+                    break line;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        let request_json: Value = serde_json::from_str(&ui_request)?;
+        assert_eq!(request_json["method"], "select");
+        assert_eq!(request_json["title"], "Pick");
+        let rpc_id = request_json["id"].as_str().ok_or("missing RPC UI id")?;
+        let response = serde_json::json!({
+            "type": "extension_ui_response",
+            "id": rpc_id,
+            "value": "b"
+        })
+        .to_string();
+        assert_eq!(
+            process_input_line(&response, &host, &state).await,
+            LineOutcome::Done
+        );
+
+        let host_response =
+            tokio::time::timeout(std::time::Duration::from_secs(1), peer.read_frame()).await??;
+        assert_eq!(host_response.kind, FrameKind::Res);
+        assert_eq!(host_response.id, 901);
+        assert_eq!(host_response.method, "select");
+        assert_eq!(host_response.payload["value"], "b");
+
+        state.cleanup(&host, 0).await;
+        writer.abort();
+        runner.shutdown_once().await;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn ui_response_routes_to_proxy() {
         let host = FakeRpcHost::new(FakeConfig::default());
@@ -2381,10 +2749,12 @@ mod tests {
         assert_eq!(response["type"], "response");
         assert_eq!(response["command"], "transport");
         assert_eq!(response["success"], false);
-        assert!(response["error"]
-            .as_str()
-            .unwrap()
-            .contains("stdin transport failed"));
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap()
+                .contains("stdin transport failed")
+        );
     }
 
     #[tokio::test]
@@ -2404,7 +2774,9 @@ mod tests {
         let observer = host.clone();
         let gated = GatedSink::default();
         let sink = Arc::new(gated.clone()) as Arc<dyn RpcSink>;
-        let input = &b"{\"type\":\"get_state\",\"id\":\"one\"}\n{\"type\":\"get_state\",\"id\":\"two\"}\n"[..];
+        let input =
+            &b"{\"type\":\"get_state\",\"id\":\"one\"}\n{\"type\":\"get_state\",\"id\":\"two\"}\n"
+                [..];
         let loop_task = tokio::spawn(run_rpc_loop(host, sink, input));
 
         gated.wait_for_write(1).await;

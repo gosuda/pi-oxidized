@@ -462,13 +462,22 @@ enum StringDestination {
 enum StringEscape {
     #[default]
     None,
-    Slash { base_len: usize },
-    Unicode { base_len: usize, digits: String },
+    Slash {
+        base_len: usize,
+    },
+    Unicode {
+        base_len: usize,
+        digits: String,
+    },
 }
 
 impl IncrementalObjectParser {
     fn from_object(object: Map<String, Value>) -> Self {
-        Self { object, started: true, ..Self::default() }
+        Self {
+            object,
+            started: true,
+            ..Self::default()
+        }
     }
 
     fn push(&mut self, fragment: &str) {
@@ -500,13 +509,9 @@ impl IncrementalObjectParser {
                 value,
                 pending_whitespace,
                 escape,
-            } => self.consume_string_token(
-                destination,
-                value,
-                pending_whitespace,
-                escape,
-                character,
-            ),
+            } => {
+                self.consume_string_token(destination, value, pending_whitespace, escape, character)
+            }
             JsonToken::Number { path, raw } => {
                 if matches!(character, '0'..='9' | '-' | '+' | '.' | 'e' | 'E') {
                     raw.push(character);
@@ -518,7 +523,11 @@ impl IncrementalObjectParser {
                     false
                 }
             }
-            JsonToken::Literal { path, expected, raw } => {
+            JsonToken::Literal {
+                path,
+                expected,
+                raw,
+            } => {
                 let next = expected.as_bytes().get(raw.len()).copied().map(char::from);
                 if next == Some(character) {
                     raw.push(character);
@@ -637,7 +646,10 @@ impl IncrementalObjectParser {
             return;
         }
         match self.stack.last() {
-            Some(JsonContainer::Object { state: ObjectState::Key, .. }) => match character {
+            Some(JsonContainer::Object {
+                state: ObjectState::Key,
+                ..
+            }) => match character {
                 '"' => {
                     self.token = Some(JsonToken::String {
                         destination: StringDestination::Key,
@@ -651,7 +663,10 @@ impl IncrementalObjectParser {
                 }
                 _ => {}
             },
-            Some(JsonContainer::Object { state: ObjectState::Colon, .. }) => {
+            Some(JsonContainer::Object {
+                state: ObjectState::Colon,
+                ..
+            }) => {
                 if character == ':'
                     && let Some(JsonContainer::Object { state, .. }) = self.stack.last_mut()
                 {
@@ -662,14 +677,18 @@ impl IncrementalObjectParser {
                 JsonContainer::Object {
                     state: ObjectState::Value,
                     ..
-                } | JsonContainer::Array {
+                }
+                | JsonContainer::Array {
                     state: ArrayState::Value,
                     ..
                 },
             ) => {
                 self.start_value(character);
             }
-            Some(JsonContainer::Object { state: ObjectState::Comma, .. }) => match character {
+            Some(JsonContainer::Object {
+                state: ObjectState::Comma,
+                ..
+            }) => match character {
                 ',' => {
                     if let Some(JsonContainer::Object { state, key, .. }) = self.stack.last_mut() {
                         *state = ObjectState::Key;
@@ -681,7 +700,10 @@ impl IncrementalObjectParser {
                 }
                 _ => {}
             },
-            Some(JsonContainer::Array { state: ArrayState::Comma, .. }) => match character {
+            Some(JsonContainer::Array {
+                state: ArrayState::Comma,
+                ..
+            }) => match character {
                 ',' => {
                     if let Some(JsonContainer::Array { state, .. }) = self.stack.last_mut() {
                         *state = ArrayState::Value;
@@ -725,9 +747,27 @@ impl IncrementalObjectParser {
                     state: ArrayState::Value,
                 });
             }
-            't' => self.token = Some(JsonToken::Literal { path, expected: "true", raw: "t".into() }),
-            'f' => self.token = Some(JsonToken::Literal { path, expected: "false", raw: "f".into() }),
-            'n' => self.token = Some(JsonToken::Literal { path, expected: "null", raw: "n".into() }),
+            't' => {
+                self.token = Some(JsonToken::Literal {
+                    path,
+                    expected: "true",
+                    raw: "t".into(),
+                })
+            }
+            'f' => {
+                self.token = Some(JsonToken::Literal {
+                    path,
+                    expected: "false",
+                    raw: "f".into(),
+                })
+            }
+            'n' => {
+                self.token = Some(JsonToken::Literal {
+                    path,
+                    expected: "null",
+                    raw: "n".into(),
+                })
+            }
             '-' | '0'..='9' => {
                 let raw = character.to_string();
                 if let Ok(value) = serde_json::from_str::<Value>(&raw) {
@@ -1306,9 +1346,7 @@ fn terminal_failure(response: &Value, event_type: &str) -> Option<TerminalFailur
         _ => return None,
     };
     let error = response.get("error").unwrap_or(&Value::Null);
-    let details = response
-        .get("incomplete_details")
-        .unwrap_or(&Value::Null);
+    let details = response.get("incomplete_details").unwrap_or(&Value::Null);
     let message = error
         .get("message")
         .and_then(Value::as_str)
@@ -1683,10 +1721,11 @@ mod tests {
         )
         .await?;
 
-        assert!(events.iter().all(|event| !matches!(
-            event,
-            crate::types::AssistantMessageEvent::Done { .. }
-        )));
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, crate::types::AssistantMessageEvent::Done { .. }))
+        );
         let Some(crate::types::AssistantMessageEvent::Error { reason, error }) = events.last()
         else {
             return Err("expected terminal error event".into());
@@ -1717,10 +1756,11 @@ mod tests {
         )
         .await?;
 
-        assert!(events.iter().all(|event| !matches!(
-            event,
-            crate::types::AssistantMessageEvent::Done { .. }
-        )));
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, crate::types::AssistantMessageEvent::Done { .. }))
+        );
         let Some(crate::types::AssistantMessageEvent::Error { reason, error }) = events.last()
         else {
             return Err("expected terminal aborted event".into());

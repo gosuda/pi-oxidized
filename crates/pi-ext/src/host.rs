@@ -307,12 +307,7 @@ mod tests {
         let script = dir.path().join("pi-extension-host.js");
         fs::write(&runtime, b"runtime")?;
 
-        match resolve_with_fallback(
-            None,
-            None,
-            Some(runtime.as_path()),
-            Some(script.as_path()),
-        ) {
+        match resolve_with_fallback(None, None, Some(runtime.as_path()), Some(script.as_path())) {
             Err(HostError::NotAFile(path)) if path == script => Ok(()),
             other => Err(std::io::Error::other(format!(
                 "expected missing script error, got {other:?}"

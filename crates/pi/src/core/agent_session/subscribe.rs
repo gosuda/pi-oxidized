@@ -1,22 +1,22 @@
-//! Lossless agent-event pump.
+//! Bounded agent-event pump.
 //!
-//! Spawns exactly one task that drains `Agent::subscribe()` and for each event:
+//! Spawns exactly one task that drains `Agent::subscribe()`. Any observable
+//! subscription lag becomes a typed session failure and aborts/settles the run
+//! rather than persisting a partial lifecycle. For each retained event it:
 //! 1. runs pre-public side effects (`message_start` queue dequeue)
-//! 2. awaits the extension handler (extension-before-public)
+//! 2. awaits the extension handler (compact deltas for streaming updates)
 //! 3. applies `message_end` replacement to agent state when present
 //! 4. emits the public `AgentSessionEvent` (listeners called without holding locks)
 //! 5. persists `message_end` / emits auto-retry success
 //!
 //! Session-level `agent_settled` is emitted exactly once when the session run
-//! flag flips false (after retries / follow-ups / auto-compaction). The pump
-//! itself never emits settled; [`AgentSession::emit_agent_settled`] is the
-//! single entry point used by the prompt lifecycle.
+//! flag flips false (after retries / follow-ups / auto-compaction). The same
+//! guarded entry point also unblocks waiters after persistence or pump failure.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use pi_agent::AgentEvent;
-use tokio::sync::mpsc::UnboundedReceiver;
+use pi_agent::{AgentEvent, AgentEventSubscription};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -34,14 +34,20 @@ pub(super) struct EventPump {
 }
 
 impl AgentSession {
-    /// Spawn the single lossless event pump for this session.
+    /// Spawn the single bounded event pump for this session.
     pub(super) fn spawn_event_pump(self: &Arc<Self>) -> EventPump {
+        self.spawn_event_pump_with_subscription(self.agent.subscribe())
+    }
+
+    fn spawn_event_pump_with_subscription(
+        self: &Arc<Self>,
+        mut rx: AgentEventSubscription,
+    ) -> EventPump {
         let cancel = CancellationToken::new();
         let active = Arc::new(AtomicBool::new(true));
         let session = Arc::clone(self);
         let cancel_child = cancel.clone();
         let active_flag = Arc::clone(&active);
-        let mut rx: UnboundedReceiver<AgentEvent> = self.agent.subscribe();
         let wait_cancel = self.lock_inner().agent_end_wait_cancel.clone();
 
         let join = tokio::spawn(async move {
@@ -49,12 +55,23 @@ impl AgentSession {
                 tokio::select! {
                     () = cancel_child.cancelled() => break,
                     event = rx.recv() => {
-                        match event {
-                            Some(event) => {
-                                session.process_agent_event(event).await;
-                            }
-                            None => break,
+                        let Some(event) = event else {
+                            break;
+                        };
+                        if rx.is_lagged() {
+                            session.record_session_error(
+                                crate::core::sessions::SessionError::Io {
+                                    path: "agent event subscription".to_owned(),
+                                    source: std::io::Error::other(
+                                        "agent event subscription lagged; run lifecycle is incomplete",
+                                    ),
+                                },
+                            );
+                            session.agent.abort();
+                            session.emit_agent_settled().await;
+                            break;
                         }
+                        session.process_agent_event(event).await;
                     }
                 }
             }
@@ -93,39 +110,83 @@ impl AgentSession {
     /// Process one agent event through extension → public → persistence.
     async fn process_agent_event(self: &Arc<Self>, event: AgentEvent) {
         let is_agent_end = matches!(&event, AgentEvent::AgentEnd { .. });
-        // 1. Pre-public side effects for message_start:user (queue dequeue).
-        if matches!(&event, AgentEvent::MessageStart { message } if message.role() == "user") {
-            self.handle_agent_event_side_effects(&event, &AgentSessionEvent::AgentStart)
-                .await;
+        if matches!(&event, AgentEvent::MessageStart { message } if message.role() == "user")
+            && let Err(error) = self
+                .handle_agent_event_side_effects(&event, &AgentSessionEvent::AgentStart)
+                .await
+        {
+            self.record_session_error(error);
+            self.agent.abort();
+            self.emit_agent_settled().await;
+            return;
         }
 
-        // 2. Extension handler BEFORE public listeners.
-        let mut public = self.map_agent_event_for_public(event.clone());
-        if let AgentEvent::MessageEnd { message } = &event {
-            let runner = self.hooks.runner();
-            match runner.emit_message_end(message.clone()).await {
-                Ok(replacement) => {
-                    let replaced = self.apply_message_end_replacement(message.clone(), replacement);
-                    public = AgentSessionEvent::MessageEnd { message: replaced };
+        let (public, persistence_event) = match event {
+            AgentEvent::MessageUpdate {
+                message,
+                assistant_message_event,
+            } => {
+                let runner = self.hooks.runner();
+                if runner.has_handlers("message_update")
+                    && let Err(error) = runner
+                        .emit_message_update_delta(assistant_message_event.as_ref())
+                        .await
+                {
+                    runner.emit_error(error.to_string());
                 }
-                Err(err) => {
-                    runner.emit_error(err.to_string());
+                (
+                    AgentSessionEvent::MessageUpdate {
+                        message,
+                        assistant_message_event,
+                    },
+                    None,
+                )
+            }
+            AgentEvent::MessageEnd { message } => {
+                let runner = self.hooks.runner();
+                let replacement = if runner.has_handlers("message_end") {
+                    match runner.emit_message_end(message.clone()).await {
+                        Ok(replacement) => replacement,
+                        Err(error) => {
+                            runner.emit_error(error.to_string());
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                let public_message = replacement.map_or_else(
+                    || message.clone(),
+                    |replacement| {
+                        self.apply_message_end_replacement(message.clone(), Some(replacement))
+                    },
+                );
+                (
+                    AgentSessionEvent::MessageEnd {
+                        message: public_message,
+                    },
+                    Some(AgentEvent::MessageEnd { message }),
+                )
+            }
+            event => {
+                let public = self.map_agent_event_for_public(event);
+                let runner = self.hooks.runner();
+                if runner.has_handlers(public.type_name())
+                    && let Err(error) = runner.emit(public.clone()).await
+                {
+                    runner.emit_error(error.to_string());
                 }
+                (public, None)
             }
-        } else {
-            let runner = self.hooks.runner();
-            let ext_event = public.clone();
-            if let Err(err) = runner.emit(ext_event).await {
-                runner.emit_error(err.to_string());
-            }
-        }
+        };
 
-        // 3. Public listeners (no locks held).
-        self.emit_public(public.clone());
+        self.emit_public_awaited(&public).await;
 
-        // 4. Persistence half for message_end (and other post-public effects).
-        if matches!(&event, AgentEvent::MessageEnd { .. }) {
-            self.handle_agent_event_side_effects(&event, &public).await;
+        if let Some(event) = persistence_event
+            && let Err(error) = self.handle_agent_event_side_effects(&event, &public).await
+        {
+            self.record_session_error(error);
+            self.emit_agent_settled().await;
         }
 
         if is_agent_end {
@@ -172,9 +233,8 @@ impl AgentSession {
 
     /// Whether auto-retry will continue after this `agent_end`.
     ///
-    /// Full retry policy lives in `retry.rs` (sibling). Foundation uses a
-    /// conservative default: never claim `will_retry` until retry module wires
-    /// settings. Sibling modules replace this via the shared inner state.
+    /// Uses the same retry.rs classifier and runtime attempt/settings gates as
+    /// actual retry execution so public prediction cannot drift.
     pub(super) fn will_retry_after_agent_end(&self, messages: &[pi_agent::AgentMessage]) -> bool {
         let inner = self.lock_inner();
         if !inner.auto_retry_enabled || inner.retry_attempt >= inner.max_retries {
@@ -183,7 +243,7 @@ impl AgentSession {
         for message in messages.iter().rev() {
             if message.role() == "assistant" {
                 if let Some(pi_ai::Message::Assistant(assistant)) = message.as_llm() {
-                    return is_retryable_assistant(assistant);
+                    return Self::is_retryable_error(assistant);
                 }
                 return false;
             }
@@ -207,7 +267,8 @@ impl AgentSession {
 
         let runner = self.hooks.runner();
         let _ = runner.emit(AgentSessionEvent::AgentSettled).await;
-        self.emit_public(AgentSessionEvent::AgentSettled);
+        self.emit_public_awaited(&AgentSessionEvent::AgentSettled)
+            .await;
         self.resolve_idle_waiters();
     }
 
@@ -227,32 +288,69 @@ impl AgentSession {
     }
 }
 
-fn is_retryable_assistant(message: &pi_ai::AssistantMessage) -> bool {
-    if message.stop_reason != pi_ai::StopReason::Error {
-        return false;
-    }
-    let Some(err) = message.error_message.as_deref() else {
-        return false;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::stream::{self, BoxStream, StreamExt};
+    use pi_agent::{AgentEventSink, AgentState, EventSink};
+    use pi_ai::{
+        AssistantMessageEvent, Context, Model, ModelCost, ModelInput, Provider, ProviderError,
+        StreamOptions,
     };
-    let lower = err.to_ascii_lowercase();
-    if lower.contains("invalid_api_key")
-        || lower.contains("invalid api key")
-        || lower.contains("context overflow")
-        || lower.contains("context length")
-        || lower.contains("maximum context")
-    {
-        return false;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[derive(Clone)]
+    struct StubProvider;
+
+    impl Provider for StubProvider {
+        fn stream(
+            &self,
+            _model: &Model,
+            _context: Context,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, Result<AssistantMessageEvent, ProviderError>> {
+            stream::empty().boxed()
+        }
     }
-    lower.contains("overloaded")
-        || lower.contains("rate_limit")
-        || lower.contains("rate limit")
-        || lower.contains("network")
-        || lower.contains("timeout")
-        || lower.contains("server error")
-        || lower.contains("503")
-        || lower.contains("502")
-        || lower.contains("500")
-        || lower.contains("retry your request")
-        || lower.contains("try your request again")
-        || lower.contains("network connection lost")
+
+    fn model() -> Model {
+        Model {
+            id: "model".into(),
+            name: "model".into(),
+            api: "test".into(),
+            provider: "test".into(),
+            base_url: String::new(),
+            reasoning: false,
+            thinking_level_map: None,
+            input: vec![ModelInput::Text],
+            cost: ModelCost::default(),
+            context_window: 8_192,
+            max_tokens: 1_024,
+            headers: None,
+            compat: None,
+            extra: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn lagged_subscription_fails_and_unblocks_once() -> TestResult {
+        let config =
+            super::super::AgentSessionConfig::test_config(Arc::new(StubProvider), model())?;
+        let session = super::super::AgentSession::new(config)?;
+        let sink = AgentEventSink::new(Arc::new(std::sync::Mutex::new(AgentState::new())));
+        let rx = sink.subscribe_with_capacity(2);
+        sink.emit(AgentEvent::AgentStart);
+        sink.emit(AgentEvent::TurnStart);
+        sink.emit(AgentEvent::AgentStart);
+
+        let pump = session.spawn_event_pump_with_subscription(rx);
+        pump.join.await?;
+        let error = session
+            .take_session_error()
+            .ok_or("lag must record a typed session error")?;
+        assert!(error.to_string().contains("subscription lagged"));
+        assert!(session.take_session_error().is_none(), "error is one-shot");
+        Ok(())
+    }
 }

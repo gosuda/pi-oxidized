@@ -54,7 +54,7 @@ pub enum EditorExit {
 }
 
 /// Injectable asynchronous editor process boundary.
-pub trait EditorRunner {
+pub trait EditorRunner: Send {
     /// Run one editor command until exit or cancellation.
     fn run<'a>(
         &'a mut self,

@@ -214,15 +214,32 @@ pub const ALL_BG: [ThemeBg; 6] = [
 
 /// One resolved color: an 8-bit-per-channel RGB triple.
 ///
-/// Empty theme values (`""`) resolve to [`Self::none`] which emits a reset.
+/// [`Self::none`] is retained as the reset sentinel for [`ResolvedTheme::from_slots`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Rgb(pub u8, pub u8, pub u8);
 
 impl Rgb {
-    /// The empty/reset sentinel — black with the empty flag set by the theme.
+    /// The reset sentinel used by the compatibility [`ResolvedTheme::from_slots`] constructor.
     #[must_use]
     pub const fn none() -> Self {
         Self(0, 0, 0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResolvedColor {
+    Default,
+    Indexed(u8),
+    Rgb(Rgb),
+}
+
+impl ResolvedColor {
+    const fn rgb(self) -> Rgb {
+        match self {
+            Self::Default => Rgb::none(),
+            Self::Indexed(index) => Rgb(index, index, index),
+            Self::Rgb(rgb) => rgb,
+        }
     }
 }
 
@@ -232,12 +249,8 @@ impl Rgb {
 /// inside the `fn`-pointer color hooks.
 #[derive(Clone, Debug)]
 pub struct ResolvedTheme {
-    fg: [Rgb; ALL_FG.len()],
-    bg: [Rgb; ALL_BG.len()],
-    /// Bitmask of empty foreground slots (emit reset instead of color).
-    fg_empty: u64,
-    /// Bitmask of empty background slots.
-    bg_empty: u8,
+    fg: [ResolvedColor; ALL_FG.len()],
+    bg: [ResolvedColor; ALL_BG.len()],
     mode: ColorMode,
     /// Theme display name.
     pub name: Cow<'static, str>,
@@ -260,29 +273,59 @@ impl ResolvedTheme {
         mode: ColorMode,
         name: impl Into<Cow<'static, str>>,
     ) -> Self {
-        let mut fg_arr = [Rgb(0, 0, 0); ALL_FG.len()];
-        let mut fg_empty = 0u64;
-        for (color, rgb) in fg {
-            let i = Self::fg_index(color);
-            fg_arr[i] = rgb;
-            if rgb == Rgb::none() {
-                fg_empty |= 1 << i;
-            }
+        Self::from_resolved_slots(
+            fg.into_iter().map(|(slot, rgb)| {
+                let color = if rgb == Rgb::none() {
+                    ResolvedColor::Default
+                } else {
+                    ResolvedColor::Rgb(rgb)
+                };
+                (slot, color)
+            }),
+            bg.into_iter().map(|(slot, rgb)| {
+                let color = if rgb == Rgb::none() {
+                    ResolvedColor::Default
+                } else {
+                    ResolvedColor::Rgb(rgb)
+                };
+                (slot, color)
+            }),
+            mode,
+            name,
+        )
+    }
+
+    fn from_resolved_slots(
+        fg: impl IntoIterator<Item = (ThemeColor, ResolvedColor)>,
+        bg: impl IntoIterator<Item = (ThemeBg, ResolvedColor)>,
+        mode: ColorMode,
+        name: impl Into<Cow<'static, str>>,
+    ) -> Self {
+        let mut fg_arr = [ResolvedColor::Default; ALL_FG.len()];
+        for (color, resolved) in fg {
+            fg_arr[Self::fg_index(color)] = resolved;
         }
-        let mut bg_arr = [Rgb(0, 0, 0); ALL_BG.len()];
-        let mut bg_empty = 0u8;
-        for (b, rgb) in bg {
-            let i = Self::bg_index(b);
-            bg_arr[i] = rgb;
-            if rgb == Rgb::none() {
-                bg_empty |= 1 << i;
-            }
+        let mut bg_arr = [ResolvedColor::Default; ALL_BG.len()];
+        for (bg, resolved) in bg {
+            bg_arr[Self::bg_index(bg)] = resolved;
         }
         Self {
             fg: fg_arr,
             bg: bg_arr,
-            fg_empty,
-            bg_empty,
+            mode,
+            name: name.into(),
+        }
+    }
+
+    fn from_rgb_arrays(
+        fg: [Rgb; ALL_FG.len()],
+        bg: [Rgb; ALL_BG.len()],
+        mode: ColorMode,
+        name: impl Into<Cow<'static, str>>,
+    ) -> Self {
+        Self {
+            fg: fg.map(ResolvedColor::Rgb),
+            bg: bg.map(ResolvedColor::Rgb),
             mode,
             name: name.into(),
         }
@@ -297,25 +340,25 @@ impl ResolvedTheme {
     /// Raw RGB for a foreground slot (empty slots return black; check [`Self::is_fg_empty`]).
     #[must_use]
     pub fn fg_rgb(&self, color: ThemeColor) -> Rgb {
-        self.fg[Self::fg_index(color)]
+        self.fg[Self::fg_index(color)].rgb()
     }
 
     /// Raw RGB for a background slot.
     #[must_use]
     pub fn bg_rgb(&self, bg: ThemeBg) -> Rgb {
-        self.bg[Self::bg_index(bg)]
+        self.bg[Self::bg_index(bg)].rgb()
     }
 
     /// Whether a foreground slot is empty (resets color).
     #[must_use]
     pub fn is_fg_empty(&self, color: ThemeColor) -> bool {
-        (self.fg_empty & (1 << Self::fg_index(color))) != 0
+        self.fg[Self::fg_index(color)] == ResolvedColor::Default
     }
 
     /// Whether a background slot is empty.
     #[must_use]
     pub fn is_bg_empty(&self, bg: ThemeBg) -> bool {
-        (self.bg_empty & (1 << Self::bg_index(bg))) != 0
+        self.bg[Self::bg_index(bg)] == ResolvedColor::Default
     }
 
     /// Style `text` with a foreground color, resetting foreground after.
@@ -323,13 +366,8 @@ impl ResolvedTheme {
     /// Mirrors reference `Theme.fg`: `\x1b[38..m{text}\x1b[39m`.
     #[must_use]
     pub fn fg(&self, color: ThemeColor, text: &str) -> String {
-        let i = Self::fg_index(color);
         let mut out = String::with_capacity(text.len() + 24);
-        if (self.fg_empty & (1 << i)) != 0 {
-            out.push_str("\x1b[39m");
-        } else {
-            self.push_fg(&mut out, self.fg[i]);
-        }
+        self.push_fg(&mut out, self.fg[Self::fg_index(color)]);
         out.push_str(text);
         out.push_str("\x1b[39m");
         out
@@ -338,45 +376,56 @@ impl ResolvedTheme {
     /// Style `text` with a background color, resetting background after.
     #[must_use]
     pub fn bg(&self, bg: ThemeBg, text: &str) -> String {
-        let i = Self::bg_index(bg);
         let mut out = String::with_capacity(text.len() + 24);
-        if (self.bg_empty & (1 << i)) != 0 {
-            out.push_str("\x1b[49m");
-        } else {
-            self.push_bg(&mut out, self.bg[i]);
-        }
+        self.push_bg(&mut out, self.bg[Self::bg_index(bg)]);
         out.push_str(text);
         out.push_str("\x1b[49m");
         out
     }
 
-    fn push_fg(&self, out: &mut String, rgb: Rgb) {
-        match self.mode {
-            ColorMode::Truecolor => {
-                out.push_str("\x1b[38;2;");
-                push_rgb(out, rgb);
-                out.push('m');
-            }
-            ColorMode::Palette256 => {
+    fn push_fg(&self, out: &mut String, color: ResolvedColor) {
+        match color {
+            ResolvedColor::Default => out.push_str("\x1b[39m"),
+            ResolvedColor::Indexed(index) => {
                 out.push_str("\x1b[38;5;");
-                out.push_str(rgb_to_256(rgb).to_string().as_str());
+                out.push_str(index.to_string().as_str());
                 out.push('m');
             }
+            ResolvedColor::Rgb(rgb) => match self.mode {
+                ColorMode::Truecolor => {
+                    out.push_str("\x1b[38;2;");
+                    push_rgb(out, rgb);
+                    out.push('m');
+                }
+                ColorMode::Palette256 => {
+                    out.push_str("\x1b[38;5;");
+                    out.push_str(rgb_to_256(rgb).to_string().as_str());
+                    out.push('m');
+                }
+            },
         }
     }
 
-    fn push_bg(&self, out: &mut String, rgb: Rgb) {
-        match self.mode {
-            ColorMode::Truecolor => {
-                out.push_str("\x1b[48;2;");
-                push_rgb(out, rgb);
-                out.push('m');
-            }
-            ColorMode::Palette256 => {
+    fn push_bg(&self, out: &mut String, color: ResolvedColor) {
+        match color {
+            ResolvedColor::Default => out.push_str("\x1b[49m"),
+            ResolvedColor::Indexed(index) => {
                 out.push_str("\x1b[48;5;");
-                out.push_str(rgb_to_256(rgb).to_string().as_str());
+                out.push_str(index.to_string().as_str());
                 out.push('m');
             }
+            ResolvedColor::Rgb(rgb) => match self.mode {
+                ColorMode::Truecolor => {
+                    out.push_str("\x1b[48;2;");
+                    push_rgb(out, rgb);
+                    out.push('m');
+                }
+                ColorMode::Palette256 => {
+                    out.push_str("\x1b[48;5;");
+                    out.push_str(rgb_to_256(rgb).to_string().as_str());
+                    out.push('m');
+                }
+            },
         }
     }
 
@@ -387,11 +436,7 @@ impl ResolvedTheme {
     #[must_use]
     pub fn bg_ansi(&self, bg: ThemeBg) -> String {
         let mut out = String::new();
-        if self.is_bg_empty(bg) {
-            out.push_str("\x1b[49m");
-        } else {
-            self.push_bg(&mut out, self.bg[Self::bg_index(bg)]);
-        }
+        self.push_bg(&mut out, self.bg[Self::bg_index(bg)]);
         out
     }
 
@@ -399,11 +444,7 @@ impl ResolvedTheme {
     #[must_use]
     pub fn fg_ansi(&self, color: ThemeColor) -> String {
         let mut out = String::new();
-        if self.is_fg_empty(color) {
-            out.push_str("\x1b[39m");
-        } else {
-            self.push_fg(&mut out, self.fg[Self::fg_index(color)]);
-        }
+        self.push_fg(&mut out, self.fg[Self::fg_index(color)]);
         out
     }
 }
@@ -737,25 +778,21 @@ pub fn light() -> Arc<ResolvedTheme> {
 }
 
 static DARK_CLONE: LazyLock<Arc<ResolvedTheme>> = LazyLock::new(|| {
-    Arc::new(ResolvedTheme {
-        fg: dark_fg(),
-        bg: dark_bg(),
-        fg_empty: 0,
-        bg_empty: 0,
-        mode: ColorMode::Truecolor,
-        name: Cow::Borrowed("dark"),
-    })
+    Arc::new(ResolvedTheme::from_rgb_arrays(
+        dark_fg(),
+        dark_bg(),
+        ColorMode::Truecolor,
+        Cow::Borrowed("dark"),
+    ))
 });
 
 static LIGHT_INTERN: LazyLock<Arc<ResolvedTheme>> = LazyLock::new(|| {
-    Arc::new(ResolvedTheme {
-        fg: light_fg(),
-        bg: light_bg(),
-        fg_empty: 0,
-        bg_empty: 0,
-        mode: ColorMode::Truecolor,
-        name: Cow::Borrowed("light"),
-    })
+    Arc::new(ResolvedTheme::from_rgb_arrays(
+        light_fg(),
+        light_bg(),
+        ColorMode::Truecolor,
+        Cow::Borrowed("light"),
+    ))
 });
 
 // ---------------------------------------------------------------------------
@@ -896,7 +933,7 @@ impl ThemeJson {
     ///
     /// Returns [`ThemeError`] on resolution failure.
     pub fn resolve_owned(&self, mode: ColorMode) -> Result<ResolvedTheme, ThemeError> {
-        let mut fg = [(ThemeColor::Accent, Rgb::none()); ALL_FG.len()];
+        let mut fg = [(ThemeColor::Accent, ResolvedColor::Default); ALL_FG.len()];
         for (i, (slot_enum, slot_name)) in ALL_FG_SLOTS.iter().enumerate() {
             let value = self
                 .colors
@@ -904,10 +941,10 @@ impl ThemeJson {
                 .find(|(k, _)| k == *slot_name)
                 .map(|(_, v)| v.clone())
                 .ok_or_else(|| ThemeError::MissingColor((*slot_name).to_owned()))?;
-            let rgb = resolve_value(&value, &self.vars, slot_name)?;
-            fg[i] = (*slot_enum, rgb);
+            let resolved = resolve_value(&value, &self.vars, slot_name)?;
+            fg[i] = (*slot_enum, resolved);
         }
-        let mut bg = [(ThemeBg::SelectedBg, Rgb::none()); ALL_BG.len()];
+        let mut bg = [(ThemeBg::SelectedBg, ResolvedColor::Default); ALL_BG.len()];
         for (i, (slot_enum, slot_name)) in ALL_BG_SLOTS.iter().enumerate() {
             let value = self
                 .colors
@@ -915,10 +952,15 @@ impl ThemeJson {
                 .find(|(k, _)| k == *slot_name)
                 .map(|(_, v)| v.clone())
                 .ok_or_else(|| ThemeError::MissingColor((*slot_name).to_owned()))?;
-            let rgb = resolve_value(&value, &self.vars, slot_name)?;
-            bg[i] = (*slot_enum, rgb);
+            let resolved = resolve_value(&value, &self.vars, slot_name)?;
+            bg[i] = (*slot_enum, resolved);
         }
-        Ok(ResolvedTheme::from_slots(fg, bg, mode, self.name.clone()))
+        Ok(ResolvedTheme::from_resolved_slots(
+            fg,
+            bg,
+            mode,
+            self.name.clone(),
+        ))
     }
 }
 
@@ -960,19 +1002,21 @@ fn resolve_value(
     value: &ColorValue,
     vars: &[(String, ColorValue)],
     slot: &str,
-) -> Result<Rgb, ThemeError> {
+) -> Result<ResolvedColor, ThemeError> {
     let mut visited: Vec<String> = Vec::new();
     let mut current = value.clone();
     loop {
         match current {
-            ColorValue::Empty => return Ok(Rgb::none()),
+            ColorValue::Empty => return Ok(ResolvedColor::Default),
             ColorValue::Hex(s) => {
-                return hex_to_rgb(&s).ok_or_else(|| ThemeError::InvalidColor {
-                    slot: slot.to_owned(),
-                    value: s.clone(),
+                return hex_to_rgb(&s).map(ResolvedColor::Rgb).ok_or_else(|| {
+                    ThemeError::InvalidColor {
+                        slot: slot.to_owned(),
+                        value: s.clone(),
+                    }
                 });
             }
-            ColorValue::Indexed(i) => return Ok(Rgb(i, i, i)),
+            ColorValue::Indexed(index) => return Ok(ResolvedColor::Indexed(index)),
             ColorValue::Var(name) => {
                 if visited.iter().any(|v| v == &name) {
                     return Err(ThemeError::CircularVar(name));
@@ -1279,9 +1323,76 @@ const fn light_bg() -> [Rgb; 6] {
 mod tests {
     use super::*;
 
+    fn parsed_theme(overrides: &[(&str, serde_json::Value)]) -> ThemeJson {
+        let mut colors = serde_json::Map::new();
+        for slot in REQUIRED_COLORS {
+            colors.insert((*slot).to_owned(), serde_json::json!("#010203"));
+        }
+        for (slot, value) in overrides {
+            colors.insert((*slot).to_owned(), value.clone());
+        }
+        ThemeJson::from_value(&serde_json::json!({
+            "name": "test",
+            "colors": colors,
+        }))
+        .expect("test theme should parse")
+    }
+
     #[test]
     fn dark_accent_resolves() {
         let th = dark();
         assert_eq!(th.fg_rgb(ThemeColor::Accent), Rgb(138, 190, 183));
+    }
+
+    #[test]
+    fn builtin_literal_black_remains_a_color() {
+        let theme = light();
+        assert!(!theme.is_fg_empty(ThemeColor::SyntaxOperator));
+        assert_eq!(
+            theme.fg_ansi(ThemeColor::SyntaxOperator),
+            "\x1b[38;2;0;0;0m"
+        );
+    }
+
+    #[test]
+    fn json_black_is_distinct_from_default() {
+        let theme = parsed_theme(&[
+            ("accent", serde_json::json!("#000000")),
+            ("muted", serde_json::json!("")),
+            ("selectedBg", serde_json::json!("#000000")),
+            ("toolErrorBg", serde_json::json!("")),
+        ])
+        .resolve_owned(ColorMode::Truecolor)
+        .expect("test theme should resolve");
+
+        assert_eq!(theme.fg_rgb(ThemeColor::Accent), Rgb(0, 0, 0));
+        assert!(!theme.is_fg_empty(ThemeColor::Accent));
+        assert_eq!(theme.fg_ansi(ThemeColor::Accent), "\x1b[38;2;0;0;0m");
+        assert!(theme.is_fg_empty(ThemeColor::Muted));
+        assert_eq!(theme.fg_ansi(ThemeColor::Muted), "\x1b[39m");
+
+        assert_eq!(theme.bg_rgb(ThemeBg::SelectedBg), Rgb(0, 0, 0));
+        assert!(!theme.is_bg_empty(ThemeBg::SelectedBg));
+        assert_eq!(theme.bg_ansi(ThemeBg::SelectedBg), "\x1b[48;2;0;0;0m");
+        assert!(theme.is_bg_empty(ThemeBg::ToolErrorBg));
+        assert_eq!(theme.bg_ansi(ThemeBg::ToolErrorBg), "\x1b[49m");
+    }
+
+    #[test]
+    fn json_indexed_colors_emit_exact_sequences_in_every_mode() {
+        let parsed = parsed_theme(&[
+            ("accent", serde_json::json!(17)),
+            ("selectedBg", serde_json::json!(231)),
+        ]);
+
+        for mode in [ColorMode::Truecolor, ColorMode::Palette256] {
+            let theme = parsed
+                .resolve_owned(mode)
+                .expect("test theme should resolve");
+            assert_eq!(theme.fg_ansi(ThemeColor::Accent), "\x1b[38;5;17m");
+            assert_eq!(theme.bg_ansi(ThemeBg::SelectedBg), "\x1b[48;5;231m");
+            assert_eq!(theme.fg_rgb(ThemeColor::Accent), Rgb(17, 17, 17));
+            assert_eq!(theme.bg_rgb(ThemeBg::SelectedBg), Rgb(231, 231, 231));
+        }
     }
 }

@@ -158,6 +158,35 @@ impl AgentTool for ExtensionAgentTool {
         Ok(args.clone())
     }
 
+    fn prepare_and_validate_arguments(
+        &self,
+        raw: Map<String, Value>,
+    ) -> futures::future::BoxFuture<'_, Result<Map<String, Value>, ToolError>> {
+        let client = Arc::clone(&self.client);
+        let name = self.meta.name.clone();
+        let timeout = self.timeout;
+        Box::pin(async move {
+            let prepared = client
+                .request_raw(
+                    methods::TOOL_PREPARE,
+                    serde_json::json!({ "name": &name, "args": raw }),
+                    timeout,
+                )
+                .await
+                .map_err(tool_error)?;
+            let prepared_args = decode_tool_args(&prepared, "prepare")?;
+            let validated = client
+                .request_raw(
+                    methods::TOOL_VALIDATE,
+                    serde_json::json!({ "name": &name, "args": prepared_args }),
+                    timeout,
+                )
+                .await
+                .map_err(tool_error)?;
+            decode_tool_args(&validated, "validate")
+        })
+    }
+
     fn execute(
         &self,
         tool_call_id: &str,
@@ -174,6 +203,7 @@ impl AgentTool for ExtensionAgentTool {
                 "name": name,
                 "toolCallId": tool_call_id,
                 "args": args,
+                "prepared": true,
             });
             let mut stream = client
                 .open_stream_raw(methods::TOOL_EXECUTE, payload, 64)
@@ -196,6 +226,15 @@ impl AgentTool for ExtensionAgentTool {
             parse_tool_result(&terminal)
         })
     }
+}
+
+fn decode_tool_args(frame: &Frame, phase: &str) -> Result<Map<String, Value>, ToolError> {
+    frame
+        .payload
+        .get("args")
+        .and_then(Value::as_object)
+        .cloned()
+        .ok_or_else(|| ToolError::new(format!("extension tool {phase} returned invalid args")))
 }
 
 fn forward_tool_update(frame: &Frame, updates: &ToolUpdates) {
@@ -914,6 +953,52 @@ mod tests {
             parameters: serde_json::json!({}),
             execution_mode: None,
         }
+    }
+
+    #[tokio::test]
+    async fn extension_tool_preflight_prepares_then_validates_on_host() -> R {
+        let (client, mut host) = make_pair().await;
+        let tool = Arc::new(ExtensionAgentTool::new(
+            reg_tool("ext.echo"),
+            Arc::new(client),
+        ));
+        let driver = {
+            let tool = Arc::clone(&tool);
+            tokio::spawn(async move {
+                tool.prepare_and_validate_arguments(
+                    serde_json::json!({"raw": "7"})
+                        .as_object()
+                        .cloned()
+                        .unwrap_or_default(),
+                )
+                .await
+            })
+        };
+
+        let prepare = host.require_frame(methods::TOOL_PREPARE).await?;
+        assert_eq!(prepare.payload["name"], "ext.echo");
+        assert_eq!(prepare.payload["args"]["raw"], "7");
+        host.write_frame(&Frame::response(
+            prepare.id,
+            Method::Notify,
+            serde_json::json!({"args":{"value":7}}),
+        ))
+        .await?;
+
+        let validate = host.require_frame(methods::TOOL_VALIDATE).await?;
+        assert_eq!(validate.payload["name"], "ext.echo");
+        assert_eq!(validate.payload["args"]["value"], 7);
+        host.write_frame(&Frame::response(
+            validate.id,
+            Method::Notify,
+            serde_json::json!({"args":{"value":7,"valid":true}}),
+        ))
+        .await?;
+
+        let result = driver.await??;
+        assert_eq!(result["value"], 7);
+        assert_eq!(result["valid"], true);
+        Ok(())
     }
 
     #[tokio::test]

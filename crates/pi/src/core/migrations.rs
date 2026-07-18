@@ -275,7 +275,9 @@ pub fn migrate_auth_to_auth_json_in(agent_dir: &Path) -> Vec<String> {
             return Ok((None, None));
         }
         let serialized = serde_json::to_string_pretty(&credentials).map_err(|error| {
-            StoreError::message(format!("Failed to serialize migrated auth storage: {error}"))
+            StoreError::message(format!(
+                "Failed to serialize migrated auth storage: {error}"
+            ))
         })?;
         let outcome = (
             providers,
@@ -759,7 +761,8 @@ mod tests {
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let holder = std::thread::spawn(move || {
             backend.with_lock_sync_unseeded(|_| {
-                entered_tx.send(())
+                entered_tx
+                    .send(())
                     .map_err(|error| StoreError::message(error.to_string()))?;
                 std::thread::sleep(Duration::from_millis(400));
                 Ok(((), None))

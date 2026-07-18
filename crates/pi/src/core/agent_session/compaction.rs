@@ -8,12 +8,13 @@
 //!   overflow vs threshold, honours the sameModel + stale pre-compaction guards,
 //!   and drives the one-shot overflow-recovery latch.
 //! - Extension `session_before_compact` (cancellable) and `session_compact`
-//!   notifications, routed through [`ExtensionRunner`] using the public
-//!   [`AgentSessionEvent::CompactionStart`] / [`AgentSessionEvent::CompactionEnd`]
-//!   carriers (best-effort: dedicated runner methods are a later pi-ext concern).
+//!   notifications each dispatch exactly once through their dedicated core paths.
 //!
-//! All events follow the extension-before-public ordering established by the
-//! event pump (see [`AgentSession::emit_session_event`]).
+//! Public compaction notifications are emitted separately so the host mapping
+//! cannot duplicate either extension lifecycle hook.
+//!
+//! Public compaction events await event-consumer backpressure after synchronous
+//! listeners; extension lifecycle dispatch remains explicit and single-shot.
 //!
 //! # Lock order
 //!
@@ -37,7 +38,7 @@ use crate::core::compaction::{
     CompactionSettings, SummarizeStreamFn, preparation_none_error, prepare_compaction,
     should_compact,
 };
-use crate::core::model_runtime::{ModelRuntime, ModelRuntimeAuthOverrides};
+use crate::core::model_runtime::ModelRuntimeAuthOverrides;
 use crate::core::sessions::{CompactionEntry, SessionEntry, get_latest_compaction_entry};
 use crate::core::settings::ResolvedCompactionSettings;
 
@@ -123,7 +124,7 @@ impl AgentSession {
         self.abort().await;
 
         let abort_token = self.begin_compaction_abort();
-        self.emit_session_event(AgentSessionEvent::CompactionStart {
+        self.emit_public_awaited(&AgentSessionEvent::CompactionStart {
             reason: CompactionReason::Manual,
         })
         .await;
@@ -144,7 +145,7 @@ impl AgentSession {
 
         let outcome = match result {
             Ok(Some(compaction_result)) => {
-                self.emit_session_event(AgentSessionEvent::CompactionEnd {
+                self.emit_public_awaited(&AgentSessionEvent::CompactionEnd {
                     reason: CompactionReason::Manual,
                     result: Some(compaction_result.clone()),
                     aborted: false,
@@ -161,7 +162,7 @@ impl AgentSession {
                 let path_refs: Vec<&SessionEntry> = path_entries.iter().collect();
                 let err = preparation_none_error(&path_refs);
                 let message = err.to_string();
-                self.emit_session_event(AgentSessionEvent::CompactionEnd {
+                self.emit_public_awaited(&AgentSessionEvent::CompactionEnd {
                     reason: CompactionReason::Manual,
                     result: None,
                     aborted: false,
@@ -178,7 +179,7 @@ impl AgentSession {
                 } else {
                     Some(format!("Compaction failed: {err}"))
                 };
-                self.emit_session_event(AgentSessionEvent::CompactionEnd {
+                self.emit_public_awaited(&AgentSessionEvent::CompactionEnd {
                     reason: CompactionReason::Manual,
                     result: None,
                     aborted,
@@ -272,15 +273,13 @@ impl AgentSession {
             if already_attempted {
                 // Second overflow after one recovery: terminal error, no
                 // preceding compaction_start (never started).
-                self.emit_session_event(AgentSessionEvent::CompactionEnd {
+                self.emit_public_awaited(&AgentSessionEvent::CompactionEnd {
                     reason: CompactionReason::Overflow,
                     result: None,
                     aborted: false,
                     will_retry: false,
                     error_message: Some(
-                        "Context overflow recovery failed after one \
-                         compact-and-retry attempt. Try reducing context or \
-                         switching to a larger-context model."
+                        "Context overflow recovery failed after one compact-and-retry attempt"
                             .to_owned(),
                     ),
                 })
@@ -321,9 +320,8 @@ impl AgentSession {
     /// or queued-message delivery), `false` otherwise.
     async fn run_auto_compaction(&self, reason: CompactionReason, will_retry: bool) -> bool {
         let abort_token = self.begin_auto_compaction_abort();
-        let started_emitted = !abort_token.is_cancelled();
 
-        self.emit_session_event(AgentSessionEvent::CompactionStart { reason })
+        self.emit_public_awaited(&AgentSessionEvent::CompactionStart { reason })
             .await;
 
         let result = self
@@ -332,7 +330,7 @@ impl AgentSession {
 
         let should_continue = match result {
             Ok(Some(compaction_result)) => {
-                self.emit_session_event(AgentSessionEvent::CompactionEnd {
+                self.emit_public_awaited(&AgentSessionEvent::CompactionEnd {
                     reason,
                     result: Some(compaction_result),
                     aborted: false,
@@ -358,7 +356,7 @@ impl AgentSession {
                 // compaction_end (TS only emits end when started; the None
                 // path exits early before compaction_start is emitted there,
                 // but here we already emitted start — emit a clean end).
-                self.emit_session_event(AgentSessionEvent::CompactionEnd {
+                self.emit_public_awaited(&AgentSessionEvent::CompactionEnd {
                     reason,
                     result: None,
                     aborted: false,
@@ -369,7 +367,7 @@ impl AgentSession {
                 false
             }
             Err(CompactionError::Cancelled) => {
-                self.emit_session_event(AgentSessionEvent::CompactionEnd {
+                self.emit_public_awaited(&AgentSessionEvent::CompactionEnd {
                     reason,
                     result: None,
                     aborted: true,
@@ -385,7 +383,7 @@ impl AgentSession {
                 } else {
                     format!("Auto-compaction failed: {err}")
                 };
-                self.emit_session_event(AgentSessionEvent::CompactionEnd {
+                self.emit_public_awaited(&AgentSessionEvent::CompactionEnd {
                     reason,
                     result: None,
                     aborted: false,
@@ -397,7 +395,6 @@ impl AgentSession {
             }
         };
 
-        let _ = started_emitted;
         self.clear_auto_compaction_abort();
         should_continue
     }
@@ -564,15 +561,7 @@ impl AgentSession {
     /// Returns [`CompactionError::SummarizationFailed`] when no model runtime
     /// is configured or auth resolution fails.
     async fn resolve_compaction_inputs(&self) -> Result<CompactionInputs, CompactionError> {
-        let Some(any) = self.model_runtime_any() else {
-            return Err(CompactionError::SummarizationFailed(
-                "No model runtime configured for compaction".to_owned(),
-            ));
-        };
-
-        // Production: ModelRuntime.
-        if let Some(runtime) = any.downcast_ref::<ModelRuntime>() {
-            let runtime = runtime.clone();
+        if let Some(runtime) = self.model_runtime_handle() {
             let model = self.model();
 
             let auth = runtime
@@ -620,8 +609,7 @@ impl AgentSession {
             });
         }
 
-        // Test / SDK override: CompactionStreamHandle.
-        if let Some(handle) = any.downcast_ref::<CompactionStreamHandle>() {
+        if let Some(handle) = &self.compaction_stream_override {
             return Ok(CompactionInputs {
                 stream_fn: handle.stream_fn.clone(),
                 api_key: handle.api_key.clone(),
@@ -631,7 +619,7 @@ impl AgentSession {
         }
 
         Err(CompactionError::SummarizationFailed(
-            "Unsupported model runtime for compaction".to_owned(),
+            "No model runtime configured for compaction".to_owned(),
         ))
     }
 
@@ -687,21 +675,6 @@ impl AgentSession {
         if let Err(err) = runner.emit(event).await {
             runner.emit_error(err.to_string());
         }
-    }
-
-    // -- event helper -----------------------------------------------------
-
-    /// Emit a session event through extension-before-public ordering.
-    ///
-    /// Compaction events are emitted from this module (not the event pump),
-    /// so we replicate the pump's ordering: extension handler first, then
-    /// public listeners.
-    pub(super) async fn emit_session_event(&self, event: AgentSessionEvent) {
-        let runner = self.hooks.runner();
-        if let Err(err) = runner.emit(event.clone()).await {
-            runner.emit_error(err.to_string());
-        }
-        self.emit_public(event);
     }
 
     // -- auto-compaction abort -------------------------------------------
@@ -1089,7 +1062,7 @@ mod tests {
         let mut config = AgentSessionConfig::test_config(provider, test_model(context_window))?;
         config.system_prompt = "sys".into();
         config.messages = messages;
-        config.model_runtime = Some(Arc::new(CompactionStreamHandle::new(stream_fn)));
+        config.compaction_stream_override = Some(CompactionStreamHandle::new(stream_fn));
         Ok(AgentSession::new(config)?)
     }
 
@@ -1678,12 +1651,11 @@ mod tests {
     #[tokio::test]
     async fn check_compaction_disabled_returns_false() -> TestResult {
         let session = session_with_history(8_192, summary_stream_fn("disabled")).await?;
-        // Disable auto-compaction via the inner flag (set_auto_compaction_enabled
-        // requires &mut self which Arc<AgentSession> cannot provide).
-        {
-            let mut inner = session.lock_inner();
-            inner.auto_compaction_enabled = false;
-        }
+        session.set_auto_compaction_enabled(false);
+        assert!(
+            !session.lock_settings().get_compaction_settings().enabled,
+            "runtime toggle must update persisted settings state"
+        );
 
         let last_assistant = session
             .agent

@@ -444,7 +444,10 @@ fn spawn_parallel_tool(
         };
         ParallelWorkerResult {
             index,
-            finalized: AssertUnwindSafe(worker).catch_unwind().await.map_err(|_| ()),
+            finalized: AssertUnwindSafe(worker)
+                .catch_unwind()
+                .await
+                .map_err(|_| ()),
         }
     });
 }
@@ -496,11 +499,7 @@ async fn collect_parallel_completions(
     }
 
     drain_parallel_updates(update_rx, slots, emit);
-    settle_all_pending(
-        slots,
-        "Tool execution ended without a result",
-        emit,
-    );
+    settle_all_pending(slots, "Tool execution ended without a result", emit);
 }
 
 fn drain_parallel_updates(
@@ -539,12 +538,7 @@ fn settle_worker(
                 *slot = ParallelSlot::Ready(finalized);
             }
         }
-        Err(()) => settle_pending(
-            slots,
-            worker.index,
-            "Tool execution panicked",
-            emit,
-        ),
+        Err(()) => settle_pending(slots, worker.index, "Tool execution panicked", emit),
     }
 }
 
@@ -569,11 +563,7 @@ fn settle_pending(
     *slot = ParallelSlot::Ready(finalized);
 }
 
-fn settle_all_pending(
-    slots: &mut [ParallelSlot],
-    message: &str,
-    emit: &impl EmitAgentEvent,
-) {
+fn settle_all_pending(slots: &mut [ParallelSlot], message: &str, emit: &impl EmitAgentEvent) {
     for index in 0..slots.len() {
         settle_pending(slots, index, message, emit);
     }

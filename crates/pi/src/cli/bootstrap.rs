@@ -667,10 +667,8 @@ async fn handle_runtime_metadata(
         ListModels::Search(search) => Some(search.to_lowercase()),
         ListModels::All | ListModels::None => None,
     };
-    let any_model_runtime = handle.runtime.session().model_runtime_any();
-    if let Some(model_runtime) = any_model_runtime
-        && let Ok(model_runtime) =
-            model_runtime.downcast::<crate::core::model_runtime::ModelRuntime>()
+    let model_runtime = handle.runtime.session().model_runtime_handle();
+    if let Some(model_runtime) = model_runtime
         && let Ok(models) = model_runtime.get_available(None).await
     {
         let mut rows: Vec<(String, String, String)> = Vec::new();

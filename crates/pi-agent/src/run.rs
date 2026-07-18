@@ -320,12 +320,7 @@ async fn consume_drain_items(
                     io.sink.emit(AgentEvent::MessageStart { message });
                 }
                 AssistantMessageEvent::Done { message, .. } => {
-                    return Ok(finalize_assistant(
-                        context,
-                        io,
-                        message,
-                        added_partial,
-                    ));
+                    return Ok(finalize_assistant(context, io, message, added_partial));
                 }
                 AssistantMessageEvent::Error { error, .. } => {
                     return Ok(finalize_assistant(context, io, error, added_partial));

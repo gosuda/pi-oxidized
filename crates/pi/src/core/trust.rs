@@ -7,8 +7,10 @@
 
 use std::collections::BTreeMap;
 use std::env;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value};
 use thiserror::Error;
@@ -633,10 +635,51 @@ fn write_trust_file(path: &Path, data: &TrustFile) -> Result<(), TrustError> {
     })?;
     let mut bytes = body.into_bytes();
     bytes.push(b'\n');
-    fs::write(path, bytes).map_err(|error| TrustError::Write {
+    atomic_write_trust_file(path, &bytes).map_err(|error| TrustError::Write {
         path: path_to_string(path),
         message: error.to_string(),
     })
+}
+
+fn atomic_write_trust_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "trust path has no parent"))?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let file_name = path.file_name().map_or_else(
+        || "trust.json".to_owned(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let temporary = parent.join(format!(".{file_name}.tmp.{}.{nonce}", std::process::id()));
+
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, path)?;
+        sync_parent_directory(parent)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(parent: &Path) -> io::Result<()> {
+    File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_parent: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 fn find_nearest_trust_entry(data: &TrustFile, cwd: &Path) -> Option<ProjectTrustStoreEntry> {
@@ -887,6 +930,17 @@ mod tests {
         assert!(
             !lock_path.exists(),
             "lock directory must not remain after write"
+        );
+
+        let entries = fs::read_dir(&agent_dir)
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        assert!(
+            entries
+                .iter()
+                .all(|entry| !entry.file_name().to_string_lossy().contains(".tmp.")),
+            "atomic writer left a temporary file"
         );
 
         let _ = expected; // keep construction for readability of expected shape

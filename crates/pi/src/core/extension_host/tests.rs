@@ -27,7 +27,7 @@ use pi_agent::{
     AfterToolCallContext, AgentContext, AgentMessage, AgentToolResult, BeforeToolCallContext,
     CustomAgentMessage,
 };
-use pi_ai::{AssistantMessage, ToolCall};
+use pi_ai::{AssistantContent, AssistantMessage, AssistantMessageEvent, TextContent, ToolCall};
 use pi_ext::client::HostClient;
 #[cfg(unix)]
 use pi_ext::host::{HostSource, HostSpec};
@@ -40,7 +40,11 @@ use tokio::sync::mpsc;
 
 use super::super::agent_session::events::AgentSessionEvent;
 use super::super::agent_session::extension_runner::{ExtensionRunner, SessionHooks};
-use super::{ALL_EVENT_TYPES, HostExtensionRunner, HostStartError, ToolRenderPhase, sanitize_html};
+use super::super::model_runtime::{CreateModelRuntimeOptions, ModelRuntime};
+use super::{
+    ALL_EVENT_TYPES, HostExtensionRunner, HostStartError, ToolRenderPhase,
+    compact_message_update_event, sanitize_html,
+};
 
 type BoxErr = Box<dyn Error>;
 type R = Result<(), BoxErr>;
@@ -611,6 +615,9 @@ async fn reload_bumps_generation_and_disposes_slots() -> R {
         "slot pushed"
     );
     assert!(slot.borrow().is_some(), "slot received content");
+    let retained = runner.current_slots();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].key, "widget");
 
     let generation = runner.reload().await;
     assert_eq!(generation, 2);
@@ -855,22 +862,118 @@ async fn explicit_process_shutdown_reaps_and_remains_idempotent() -> R {
 }
 
 #[tokio::test]
-async fn load_request_carries_project_trust() -> R {
-    let (runner, host) = make_runner_with_trust(full_snapshot(), true).await?;
-    let request = host
-        .requests
-        .lock()
-        .ok()
-        .and_then(|requests| {
-            requests
-                .iter()
-                .find(|request| request.method == "extensions.load")
-                .cloned()
-        })
-        .ok_or("missing extensions.load request")?;
-    assert_eq!(request.payload["cwd"], "/workspace");
-    assert_eq!(request.payload["projectTrusted"], true);
-    runner.shutdown_once().await;
+async fn load_request_carries_both_project_trust_values() -> R {
+    for project_trusted in [false, true] {
+        let (runner, host) = make_runner_with_trust(full_snapshot(), project_trusted).await?;
+        let request = host
+            .requests
+            .lock()
+            .ok()
+            .and_then(|requests| {
+                requests
+                    .iter()
+                    .find(|request| request.method == "extensions.load")
+                    .cloned()
+            })
+            .ok_or("missing extensions.load request")?;
+        assert_eq!(request.payload["cwd"], "/workspace");
+        assert_eq!(request.payload["projectTrusted"], project_trusted);
+        runner.shutdown_once().await;
+    }
+    Ok(())
+}
+#[test]
+fn compact_message_updates_omit_growing_snapshot_content() {
+    let mut partial = AssistantMessage::new("test-api", "test-provider", "m", 1);
+    partial
+        .content
+        .push(AssistantContent::Text(TextContent::new("hello")));
+
+    let delta = compact_message_update_event(&AssistantMessageEvent::TextDelta {
+        content_index: 0,
+        delta: "lo".to_owned(),
+        partial: partial.clone(),
+    });
+    assert_eq!(delta["type"], "text_delta");
+    assert_eq!(delta["delta"], "lo");
+    assert!(delta.get("partial").is_none());
+    assert!(delta.get("block").is_none());
+    assert!(delta["meta"].get("content").is_none());
+
+    let end = compact_message_update_event(&AssistantMessageEvent::TextEnd {
+        content_index: 0,
+        content: "hello".to_owned(),
+        partial,
+    });
+    assert_eq!(end["block"]["type"], "text");
+    assert_eq!(end["block"]["text"], "hello");
+    assert!(end["meta"].get("content").is_none());
+}
+
+#[tokio::test]
+async fn trusted_restart_sends_true_in_replacement_load_request() -> R {
+    let (runner, _host) = make_runner_with_trust(full_snapshot(), true).await?;
+    let runtime = ModelRuntime::create(CreateModelRuntimeOptions::default()).await?;
+    let observed = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let observed_by_start = Arc::clone(&observed);
+
+    let replacement = runner
+        .restart_and_rewire_with(
+            &runtime,
+            HashMap::new(),
+            move |_paths, _cwd, project_trusted| async move {
+                let (replacement, host) = make_runner_with_trust(full_snapshot(), project_trusted)
+                    .await
+                    .map_err(|error| HostStartError::Load(error.to_string()))?;
+                let load = host
+                    .requests
+                    .lock()
+                    .ok()
+                    .and_then(|requests| {
+                        requests
+                            .iter()
+                            .find(|request| request.method == "extensions.load")
+                            .cloned()
+                    })
+                    .ok_or_else(|| HostStartError::Load("missing replacement load".to_owned()))?;
+                observed_by_start
+                    .lock()
+                    .map_err(|_| HostStartError::Load("observed lock poisoned".to_owned()))?
+                    .push(load.payload);
+                Ok(replacement)
+            },
+        )
+        .await?;
+
+    let payloads = observed.lock().map_err(|_| "observed lock poisoned")?;
+    assert_eq!(payloads.len(), 1);
+    assert_eq!(payloads[0]["projectTrusted"], true);
+    drop(payloads);
+    replacement.shutdown_once().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn protocol_fatal_stops_event_pump_and_host_transport() -> R {
+    let (runner, host) = make_runner(full_snapshot()).await?;
+    let mut errors = runner.subscribe_errors();
+    host.emit(Frame {
+        id: 0,
+        kind: FrameKind::Event,
+        method: "rogue.method".to_owned(),
+        payload: json!({}),
+    })
+    .await;
+
+    let error = tokio::time::timeout(Duration::from_secs(1), errors.recv()).await??;
+    assert_eq!(error.code, "extension_protocol");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while runner.is_running() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    assert!(!runner.is_running());
     Ok(())
 }
 

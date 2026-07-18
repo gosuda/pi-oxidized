@@ -649,7 +649,9 @@ mod tests {
             signal.cancel();
         };
         let (result, ()) = tokio::join!(resolve, cancel);
-        let error = result.err().ok_or_else(|| io::Error::other("cancelled refresh succeeded"))?;
+        let error = result
+            .err()
+            .ok_or_else(|| io::Error::other("cancelled refresh succeeded"))?;
         assert_eq!(error.code, ModelsErrorCode::Oauth);
         assert_eq!(error.message(), "Login cancelled");
         assert!(error.is_cancelled());

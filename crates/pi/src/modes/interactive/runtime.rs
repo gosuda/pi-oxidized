@@ -55,18 +55,24 @@ use ratatui::layout::Rect;
 use ratatui::text::Line;
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::task::{JoinError, JoinSet};
+use tokio_util::sync::CancellationToken;
 
 use crate::core::agent_session::events::AgentSessionEvent;
 use crate::core::agent_session::prompt::{PromptOptions, StreamingBehavior};
-use crate::core::model_runtime::ModelRuntime;
+use crate::core::extension_host::{ExtensionUiEvent, HostExtensionRunner};
+use crate::core::platform::external_editor::{EditOutcome, edit_text_in_external_editor};
+use pi_ext::client::{HostUiRequest, HostUiResponse};
+use pi_ext::protocol::{NotifyLevel, SlotPlacement};
+use pi_ext::sanitize::SanitizedSlot;
 
 use super::input::{DoubleEscapeAction, InputMapper, InputState};
 use super::messages::{AssistantMessageView, MessageView};
 #[cfg(test)]
 use super::state;
 use super::state::{
-    BillingMode, EditorBorder, FocusArea, Overlay, OverlayKind, PendingKind, PendingMessage,
-    SessionStatus, StatusKind, ViewAction, ViewState,
+    BillingMode, DiagnosticSeverity, EditorBorder, FocusArea, Overlay, OverlayKind, PendingKind,
+    PendingMessage, SessionStatus, StartupDiagnostic, StatusKind, ViewAction, ViewState,
+    WidgetSlot,
 };
 use super::theme::ResolvedTheme;
 use super::view::{ComposedSection, compose};
@@ -261,6 +267,30 @@ pub trait SessionHost: Send + Sync + 'static {
     /// Returns the full transcript for the current session (used on rebind).
     fn messages(&self) -> Vec<pi_agent::AgentMessage>;
 
+    /// Concrete extension host for interactive UI bridging, when enabled.
+    fn host_extension_runner(&self) -> Option<Arc<HostExtensionRunner>> {
+        None
+    }
+
+    /// Initial persisted thinking-block visibility.
+    fn hide_thinking_block(&self) -> bool {
+        false
+    }
+
+    /// Persist thinking-block visibility.
+    fn set_hide_thinking_block(&self, _hide: bool) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Configured external editor command.
+    fn external_editor_command(&self) -> String {
+        if cfg!(windows) {
+            "notepad".to_owned()
+        } else {
+            "nano".to_owned()
+        }
+    }
+
     /// Fetch the model list for the model selector.
     fn get_model_entries(
         &self,
@@ -372,6 +402,8 @@ pub enum InteractiveExit {
     /// drives the actual SIGTSTP via the [`pi_tui::terminal::guard::TerminalGuard`]
     /// then loops `run()` to resume.
     Suspend,
+    /// Temporarily restore the terminal and run the configured external editor.
+    ExternalEditor,
 }
 
 /// Outcome of dispatching one [`ViewAction`].
@@ -403,6 +435,8 @@ pub(crate) enum ActionOutcome {
     Exit,
     /// The process should suspend after restoring terminal state.
     Suspend,
+    /// Pause the runtime while the outer terminal owner runs an editor child.
+    ExternalEditor,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -459,6 +493,7 @@ struct InteractiveRoot {
 }
 
 impl InteractiveRoot {
+    #[cfg(test)]
     fn build(view: &ViewState, editor: Editor, selector: Option<Box<dyn Component>>) -> Self {
         let composed = compose(view);
         let mut sections = composed.sections;
@@ -478,6 +513,64 @@ impl InteractiveRoot {
             selector,
             focus: view.focus,
         }
+    }
+
+    fn build_with_chat(
+        view: &mut ViewState,
+        editor: Editor,
+        selector: Option<Box<dyn Component>>,
+        prefix: Box<dyn Component>,
+        tail: Box<dyn Component>,
+    ) -> Self {
+        let messages = std::mem::take(&mut view.messages);
+        let mut composed = compose(view);
+        view.messages = messages;
+        if let Some(index) = composed
+            .sections
+            .iter()
+            .position(|section| section.label == "chat")
+        {
+            composed.sections[index] = ComposedSection {
+                label: "chat-prefix",
+                component: prefix,
+            };
+            composed.sections.insert(
+                index + 1,
+                ComposedSection {
+                    label: "chat-tail",
+                    component: tail,
+                },
+            );
+        }
+        let mut sections = composed.sections;
+        let editor_idx = sections
+            .iter()
+            .position(|section| section.label == "editor")
+            .unwrap_or(sections.len().saturating_sub(1));
+        let pre_editor: Vec<_> = sections.drain(..editor_idx).collect();
+        let overlay = composed.overlay;
+        if !sections.is_empty() {
+            sections.remove(0);
+        }
+        Self {
+            pre_editor,
+            editor,
+            post_editor: sections,
+            overlay,
+            selector,
+            focus: view.focus,
+        }
+    }
+
+    fn take_section(&mut self, label: &'static str) -> Option<Box<dyn Component>> {
+        let section = self
+            .pre_editor
+            .iter_mut()
+            .find(|section| section.label == label)?;
+        Some(std::mem::replace(
+            &mut section.component,
+            Box::new(pi_tui::components::Text::new(String::new())),
+        ))
     }
 
     fn editor_mut(&mut self) -> &mut Editor {
@@ -702,6 +795,19 @@ pub struct InteractiveRuntime<W: Write, S: SessionHost> {
     last_error: Option<String>,
     shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
     pending_ui_reinject: Vec<UiEvent>,
+    extension_runner: Option<Arc<HostExtensionRunner>>,
+    extension_events: Option<tokio::sync::broadcast::Receiver<ExtensionUiEvent>>,
+    extension_requests: Option<mpsc::Receiver<HostUiRequest>>,
+    extension_slots: std::collections::HashMap<String, SlotPlacement>,
+    pending_extension_dialog: Option<PendingExtensionDialog>,
+    extension_select_rx: mpsc::UnboundedReceiver<String>,
+    extension_select_tx: mpsc::UnboundedSender<String>,
+    tools_expanded: bool,
+    hide_thinking: bool,
+    chat_prefix_cache: Option<Box<dyn Component>>,
+    chat_prefix_len: usize,
+    chat_tail_cache: Option<Box<dyn Component>>,
+    chat_dirty: bool,
     /// Live selector component (replaces the editor while focused).
     active_selector: Option<Box<dyn Component>>,
     /// Kind of the active selector for confirm/cancel routing.
@@ -742,6 +848,13 @@ struct PromptOperations {
     tasks: JoinSet<PromptCompletion>,
     aborts: std::collections::BTreeMap<u64, oneshot::Sender<()>>,
     bash_operation: Option<u64>,
+}
+
+#[derive(Debug)]
+struct PendingExtensionDialog {
+    request: HostUiRequest,
+    saved_editor_text: Option<String>,
+    deadline: Option<Instant>,
 }
 
 impl PromptOperations {
@@ -786,11 +899,25 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         let partial = session.partial_rx();
         let snapshot = session.snapshot();
         project_snapshot(&mut view, &snapshot, None);
+        view.messages = project_messages(&session.messages());
+        let hide_thinking = session.hide_thinking_block();
+        apply_display_preferences(&mut view.messages, false, hide_thinking);
+        let extension_runner = session.host_extension_runner();
+        let extension_events = extension_runner
+            .as_ref()
+            .map(|runner| runner.subscribe_ui());
+        let extension_requests = extension_runner
+            .as_ref()
+            .and_then(|runner| runner.take_ui_requests());
+        let initial_extension_slots = extension_runner
+            .as_ref()
+            .map_or_else(Vec::new, |runner| runner.current_slots());
 
         let (submit_tx, submit_rx) = mpsc::unbounded_channel::<String>();
         let (select_tx, select_rx) =
             mpsc::unbounded_channel::<(super::state::SelectorKind, String)>();
         let (cancel_tx, cancel_rx) = mpsc::unbounded_channel::<()>();
+        let (extension_select_tx, extension_select_rx) = mpsc::unbounded_channel::<String>();
 
         let mut editor = Editor::new(
             &pi_tui::components::editor::EditorTheme::default(),
@@ -805,7 +932,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             let _ = submit_tx_cb.send(text);
         }));
 
-        Self {
+        let mut runtime = Self {
             tui,
             input,
             session,
@@ -824,6 +951,19 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             last_error: None,
             shutdown_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_ui_reinject: Vec::new(),
+            extension_runner,
+            extension_events,
+            extension_requests,
+            extension_slots: std::collections::HashMap::new(),
+            pending_extension_dialog: None,
+            extension_select_rx,
+            extension_select_tx,
+            tools_expanded: false,
+            hide_thinking,
+            chat_prefix_cache: None,
+            chat_prefix_len: usize::MAX,
+            chat_tail_cache: None,
+            chat_dirty: true,
             active_selector: None,
             active_selector_kind: None,
             submit_rx,
@@ -832,7 +972,11 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             select_tx,
             cancel_rx,
             cancel_tx,
+        };
+        for slot in initial_extension_slots {
+            runtime.project_extension_slot(slot);
         }
+        runtime
     }
 
     // ----- Public accessors (driver seam) -----
@@ -1004,6 +1148,25 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                         self.exited = true;
                     }
                 }
+                extension_event = recv_extension_event(&mut self.extension_events) => {
+                    if let Some(extension_event) = extension_event {
+                        self.handle_extension_event(extension_event);
+                    } else {
+                        self.extension_events = None;
+                    }
+                }
+                extension_request = recv_extension_request(&mut self.extension_requests) => {
+                    if let Some(extension_request) = extension_request {
+                        self.begin_extension_dialog(extension_request).await;
+                    } else {
+                        self.extension_requests = None;
+                    }
+                }
+                () = wait_extension_deadline(
+                    self.pending_extension_dialog.as_ref().and_then(|dialog| dialog.deadline),
+                ), if self.pending_extension_dialog.as_ref().and_then(|dialog| dialog.deadline).is_some() => {
+                    self.cancel_extension_dialog().await;
+                }
                 changed = self.partial.changed() => {
                     if changed.is_ok() {
                         self.handle_partial_update();
@@ -1061,15 +1224,16 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     // -----------------------------------------------------------------------
 
     async fn handle_ui_event(&mut self, event: UiEvent) -> io::Result<()> {
+        let Some(event) = self.intercept_terminal_input(event).await else {
+            return Ok(());
+        };
         // Swap the editor (and active selector) into a throwaway-built
         // InteractiveRoot so we can route the event, then recover both.
         let saved_editor = std::mem::replace(&mut self.editor, Editor::with_defaults());
         let saved_selector = self.active_selector.take();
-        let mut root = InteractiveRoot::build(&self.view, saved_editor, saved_selector);
+        let mut root = self.build_root(saved_editor, saved_selector);
         let editor_result = root.handle_event(&event);
-        let recovered = std::mem::replace(root.editor_mut(), Editor::with_defaults());
-        self.editor = recovered;
-        self.active_selector = root.selector.take();
+        self.recover_root(root);
         // Re-attach on_submit after the swap (Editor does not preserve it
         // through with_defaults temporary).
         self.ensure_editor_on_submit();
@@ -1085,13 +1249,22 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         let mut actions: Vec<ViewAction> = Vec::new();
         while let Ok(text) = self.submit_rx.try_recv() {
             actions.push(ViewAction::Submit { text });
-            actions.push(ViewAction::ClearEditor);
+            if self.pending_extension_dialog.is_none() {
+                actions.push(ViewAction::ClearEditor);
+            }
         }
         while let Ok((selector, value)) = self.select_rx.try_recv() {
             actions.push(ViewAction::SelectConfirmed { selector, value });
         }
+        while let Ok(value) = self.extension_select_rx.try_recv() {
+            self.finish_extension_selection(value).await;
+        }
         while self.cancel_rx.try_recv().is_ok() {
-            actions.push(ViewAction::SelectCancelled);
+            if self.pending_extension_dialog.is_some() {
+                self.cancel_extension_dialog().await;
+            } else {
+                actions.push(ViewAction::SelectCancelled);
+            }
         }
 
         // Map app-level keys (skipped when the focused component already
@@ -1118,6 +1291,10 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 self.exited = true;
                 self.exit_kind = InteractiveExit::Suspend;
             }
+            if matches!(outcome, ActionOutcome::ExternalEditor) {
+                self.exited = true;
+                self.exit_kind = InteractiveExit::ExternalEditor;
+            }
         }
 
         if needs_immediate_repaint {
@@ -1129,6 +1306,18 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
 
     fn handle_session_event(&mut self, event: &AgentSessionEvent) {
         project_event(&mut self.view, event);
+        apply_display_preferences(
+            &mut self.view.messages,
+            self.tools_expanded,
+            self.hide_thinking,
+        );
+        if matches!(event, AgentSessionEvent::MessageUpdate { .. }) {
+            self.chat_dirty = true;
+        } else {
+            self.chat_prefix_cache = None;
+            self.chat_prefix_len = usize::MAX;
+            self.chat_dirty = true;
+        }
         self.arm_coalescer();
     }
 
@@ -1152,6 +1341,12 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                     .push(MessageView::streaming_assistant((*message).clone()));
             }
             self.view.streaming = true;
+            apply_display_preferences(
+                &mut self.view.messages,
+                self.tools_expanded,
+                self.hide_thinking,
+            );
+            self.chat_dirty = true;
             self.arm_coalescer();
         } else {
             // Stream ended; the next MessageEnd event will finalize the tail.
@@ -1165,13 +1360,32 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
 
     async fn dispatch_action(&mut self, action: ViewAction) -> ActionOutcome {
         match action {
-            ViewAction::None | ViewAction::Consumed | ViewAction::ExternalEditor => {
-                ActionOutcome::None
+            ViewAction::None | ViewAction::Consumed => ActionOutcome::None,
+            ViewAction::ExternalEditor => ActionOutcome::ExternalEditor,
+            ViewAction::Render | ViewAction::OpenSettingsSubmenu { .. } => ActionOutcome::Repaint,
+            ViewAction::ToggleThinking => {
+                self.hide_thinking = !self.hide_thinking;
+                if let Err(error) = self.session.set_hide_thinking_block(self.hide_thinking) {
+                    self.last_error = Some(error);
+                }
+                apply_display_preferences(
+                    &mut self.view.messages,
+                    self.tools_expanded,
+                    self.hide_thinking,
+                );
+                self.chat_dirty = true;
+                ActionOutcome::Repaint
             }
-            ViewAction::Render
-            | ViewAction::ToggleThinking
-            | ViewAction::ToggleToolExpand
-            | ViewAction::OpenSettingsSubmenu { .. } => ActionOutcome::Repaint,
+            ViewAction::ToggleToolExpand => {
+                self.tools_expanded = !self.tools_expanded;
+                apply_display_preferences(
+                    &mut self.view.messages,
+                    self.tools_expanded,
+                    self.hide_thinking,
+                );
+                self.chat_dirty = true;
+                ActionOutcome::Repaint
+            }
             ViewAction::Submit { text } => self.submit_text(text, false).await,
             ViewAction::SubmitBash {
                 command,
@@ -1231,6 +1445,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             ViewAction::CopyLastAssistant => self.copy_last_assistant().await,
             ViewAction::Reload => {
                 self.record_err(self.session.reload().await);
+                self.rebind_extension_channels();
                 ActionOutcome::Repaint
             }
             ViewAction::SlashCommand { name, args } => self.submit_slash_command(name, args).await,
@@ -1384,6 +1599,27 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     }
 
     async fn submit_text(&mut self, text: String, force_follow_up: bool) -> ActionOutcome {
+        if let Some(dialog) = self.pending_extension_dialog.as_ref() {
+            match &dialog.request {
+                HostUiRequest::Input { id, .. } => {
+                    let response = HostUiResponse::Input {
+                        id: *id,
+                        value: Some(text),
+                    };
+                    self.finish_extension_dialog(response).await;
+                    return ActionOutcome::Repaint;
+                }
+                HostUiRequest::Editor { id, .. } => {
+                    let response = HostUiResponse::Editor {
+                        id: *id,
+                        value: Some(text),
+                    };
+                    self.finish_extension_dialog(response).await;
+                    return ActionOutcome::Repaint;
+                }
+                HostUiRequest::Select { .. } | HostUiRequest::Confirm { .. } => {}
+            }
+        }
         let trimmed = text.trim().to_owned();
         if trimmed.is_empty() {
             return ActionOutcome::None;
@@ -1802,8 +2038,8 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         let items = entries
             .into_iter()
             .map(|entry| {
-                let indent = "  ".repeat(entry.depth);
-                pi_tui::components::SelectItem::new(entry.value, format!("{indent}{}", entry.label))
+                let label = format!("{}{}", "  ".repeat(entry.depth), entry.label);
+                pi_tui::components::SelectItem::new(entry.value, label)
             })
             .collect();
         self.build_select_list(kind, items)
@@ -1816,30 +2052,265 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     ) -> Box<dyn Component> {
         let items = rows
             .into_iter()
-            .map(|row| pi_tui::components::SettingItem {
-                id: row.id,
-                label: row.label,
-                description: row.description,
-                current_value: row.current_value,
-                values: row.values,
-                submenu: None,
+            .map(|row| {
+                pi_tui::components::SelectItem::new(
+                    row.id,
+                    format!("{}  {}", row.label, row.current_value),
+                )
+                .with_description(row.description.unwrap_or_default())
             })
             .collect();
-        let options = pi_tui::components::SettingsListOptions::default();
-        let select_tx = self.select_tx.clone();
-        let cancel_tx = self.cancel_tx.clone();
-        Box::new(pi_tui::components::SettingsList::new(
+        self.build_select_list(kind, items)
+    }
+
+    fn build_extension_select_list(
+        &mut self,
+        title: &str,
+        items: Vec<pi_tui::components::SelectItem>,
+    ) -> Box<dyn Component> {
+        let mut list = pi_tui::components::SelectList::new(
             items,
             super::selectors::SELECTOR_MAX_VISIBLE,
-            super::theme::settings_list_theme(),
-            move |id, value| {
-                let _ = select_tx.send((kind, format!("{id}={value}")));
+            super::theme::select_list_theme(),
+        );
+        list.set_selected_index(0);
+        let select_tx = self.extension_select_tx.clone();
+        list.on_select = Some(Box::new(move |item| {
+            let _ = select_tx.send(item.value.clone());
+        }));
+        let cancel_tx = self.cancel_tx.clone();
+        list.on_cancel = Some(Box::new(move || {
+            let _ = cancel_tx.send(());
+        }));
+        self.view.editor.placeholder = title.to_owned();
+        Box::new(list)
+    }
+
+    async fn begin_extension_dialog(&mut self, request: HostUiRequest) {
+        if self.pending_extension_dialog.is_some() {
+            self.cancel_extension_dialog().await;
+        }
+        let deadline = dialog_timeout(&request).map(|timeout| Instant::now() + timeout);
+        let mut saved_editor_text = None;
+        match &request {
+            HostUiRequest::Select { request, .. } => {
+                let items = request
+                    .options
+                    .iter()
+                    .map(|option| {
+                        pi_tui::components::SelectItem::new(option.clone(), option.clone())
+                    })
+                    .collect();
+                self.active_selector =
+                    Some(self.build_extension_select_list(&request.title, items));
+                self.active_selector_kind = None;
+                self.view.focus = FocusArea::Selector;
+            }
+            HostUiRequest::Confirm { request, .. } => {
+                let items = vec![
+                    pi_tui::components::SelectItem::new("true", "Yes")
+                        .with_description(request.message.clone()),
+                    pi_tui::components::SelectItem::new("false", "No"),
+                ];
+                self.active_selector =
+                    Some(self.build_extension_select_list(&request.title, items));
+                self.active_selector_kind = None;
+                self.view.focus = FocusArea::Selector;
+            }
+            HostUiRequest::Input { request, .. } => {
+                saved_editor_text = Some(self.editor.get_text());
+                self.editor.set_text("");
+                self.view.editor.text.clear();
+                self.view.editor.placeholder = request
+                    .placeholder
+                    .clone()
+                    .unwrap_or_else(|| request.title.clone());
+                self.view.focus = FocusArea::Editor;
+            }
+            HostUiRequest::Editor { request, .. } => {
+                saved_editor_text = Some(self.editor.get_text());
+                let prefill = request.prefill.clone().unwrap_or_default();
+                self.editor.set_text(&prefill);
+                self.view.editor.text = prefill;
+                self.view.editor.placeholder = request.title.clone();
+                self.view.focus = FocusArea::Editor;
+            }
+        }
+        self.pending_extension_dialog = Some(PendingExtensionDialog {
+            request,
+            saved_editor_text,
+            deadline,
+        });
+        self.input_state.reset_taps();
+        self.arm_coalescer();
+    }
+
+    async fn finish_extension_selection(&mut self, value: String) {
+        let Some(dialog) = self.pending_extension_dialog.as_ref() else {
+            return;
+        };
+        let response = match &dialog.request {
+            HostUiRequest::Select { id, .. } => HostUiResponse::Select {
+                id: *id,
+                value: Some(value),
             },
-            move || {
-                let _ = cancel_tx.send(());
+            HostUiRequest::Confirm { id, .. } => HostUiResponse::Confirm {
+                id: *id,
+                confirmed: value == "true",
             },
-            &options,
-        ))
+            HostUiRequest::Input { .. } | HostUiRequest::Editor { .. } => return,
+        };
+        self.finish_extension_dialog(response).await;
+    }
+
+    async fn cancel_extension_dialog(&mut self) {
+        let Some(dialog) = self.pending_extension_dialog.as_ref() else {
+            return;
+        };
+        let response = default_extension_dialog_response(&dialog.request);
+        self.finish_extension_dialog(response).await;
+    }
+
+    async fn finish_extension_dialog(&mut self, response: HostUiResponse) {
+        let dialog = self.pending_extension_dialog.take();
+        if let Some(runner) = &self.extension_runner
+            && let Err(error) = runner.respond_ui(response).await
+        {
+            self.last_error = Some(error.to_string());
+        }
+        if let Some(saved) = dialog.and_then(|dialog| dialog.saved_editor_text) {
+            self.editor.set_text(&saved);
+            self.view.editor.text = saved;
+        }
+        self.view.editor.placeholder.clear();
+        self.close_selector();
+        self.arm_coalescer();
+    }
+
+    fn handle_extension_event(&mut self, event: ExtensionUiEvent) {
+        match event {
+            ExtensionUiEvent::Notify(notification) => {
+                let severity = match notification.level {
+                    NotifyLevel::Info | NotifyLevel::Warning => DiagnosticSeverity::Warning,
+                    NotifyLevel::Error => DiagnosticSeverity::Error,
+                };
+                self.view.diagnostics.entries.push(StartupDiagnostic {
+                    severity,
+                    source: "extension".to_owned(),
+                    message: notification.message,
+                });
+            }
+            ExtensionUiEvent::Slot(slot) => self.project_extension_slot(slot),
+            ExtensionUiEvent::Dispose { key } => self.dispose_extension_slot(&key),
+        }
+        self.arm_coalescer();
+    }
+
+    fn project_extension_slot(&mut self, slot: SanitizedSlot) {
+        self.dispose_extension_slot(&slot.key);
+        let lines = slot
+            .lines
+            .iter()
+            .map(|line| line.iter().map(|run| run.text.as_str()).collect::<String>())
+            .collect::<Vec<_>>();
+        let widget = WidgetSlot {
+            key: slot.key.clone(),
+            lines: lines.clone(),
+            height: slot.height,
+            focusable: slot.focusable,
+        };
+        match slot.placement {
+            SlotPlacement::Footer | SlotPlacement::BelowEditor => {
+                self.view.widgets_below.push(widget)
+            }
+            SlotPlacement::Overlay => {
+                self.view.overlay = Some(Overlay {
+                    kind: OverlayKind::Extension,
+                    height: slot.height,
+                    lines,
+                });
+                self.view.focus = if slot.focusable {
+                    FocusArea::Overlay
+                } else {
+                    FocusArea::Editor
+                };
+            }
+            SlotPlacement::Header
+            | SlotPlacement::AboveEditor
+            | SlotPlacement::Editor
+            | SlotPlacement::MessageRenderer => self.view.widgets_above.push(widget),
+        }
+        self.extension_slots.insert(slot.key, slot.placement);
+    }
+
+    fn dispose_extension_slot(&mut self, key: &str) {
+        self.view.widgets_above.retain(|slot| slot.key != key);
+        self.view.widgets_below.retain(|slot| slot.key != key);
+        if matches!(
+            self.extension_slots.remove(key),
+            Some(SlotPlacement::Overlay)
+        ) && self
+            .view
+            .overlay
+            .as_ref()
+            .is_some_and(|overlay| overlay.kind == OverlayKind::Extension)
+        {
+            self.view.overlay = None;
+            self.view.focus = FocusArea::Editor;
+        }
+    }
+
+    fn rebind_extension_channels(&mut self) {
+        self.extension_runner = self.session.host_extension_runner();
+        let current_slots = self
+            .extension_runner
+            .as_ref()
+            .map_or_else(Vec::new, |runner| runner.current_slots());
+        self.extension_events = self
+            .extension_runner
+            .as_ref()
+            .map(|runner| runner.subscribe_ui());
+        self.extension_requests = self
+            .extension_runner
+            .as_ref()
+            .and_then(|runner| runner.take_ui_requests());
+        self.pending_extension_dialog = None;
+        self.extension_slots.clear();
+        self.view.widgets_above.clear();
+        self.view.widgets_below.clear();
+        if self
+            .view
+            .overlay
+            .as_ref()
+            .is_some_and(|overlay| overlay.kind == OverlayKind::Extension)
+        {
+            self.view.overlay = None;
+        }
+        for slot in current_slots {
+            self.project_extension_slot(slot);
+        }
+    }
+
+    async fn intercept_terminal_input(&mut self, event: UiEvent) -> Option<UiEvent> {
+        let Some(runner) = &self.extension_runner else {
+            return Some(event);
+        };
+        if !runner.has_terminal_input_handlers() {
+            return Some(event);
+        }
+        let Some(data) = encode_terminal_input(&event) else {
+            return Some(event);
+        };
+        match runner.terminal_input(&data).await {
+            Ok(result) if result.consume => None,
+            Ok(result) => result
+                .data
+                .filter(|rewritten| rewritten != &data)
+                .map_or(Some(event), |rewritten| {
+                    Some(decode_terminal_input(rewritten))
+                }),
+            Err(_) => Some(event),
+        }
     }
 
     fn ensure_editor_on_submit(&mut self) {
@@ -1859,6 +2330,16 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         let snapshot = self.session.snapshot();
         project_snapshot(&mut self.view, &snapshot, None);
         self.view.messages = project_messages(&self.session.messages());
+        apply_display_preferences(
+            &mut self.view.messages,
+            self.tools_expanded,
+            self.hide_thinking,
+        );
+        self.chat_prefix_cache = None;
+        self.chat_prefix_len = usize::MAX;
+        self.chat_tail_cache = None;
+        self.chat_dirty = true;
+        self.rebind_extension_channels();
     }
 
     async fn refresh_footer(&mut self) {
@@ -1888,6 +2369,58 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     // Painting
     // -----------------------------------------------------------------------
 
+    fn refresh_chat_caches(&mut self) {
+        let prefix_len = self.view.messages.len().saturating_sub(1);
+        if self.chat_prefix_cache.is_none() || self.chat_prefix_len != prefix_len {
+            let mut messages = std::mem::take(&mut self.view.messages);
+            let tail = messages.split_off(prefix_len);
+            self.view.messages = messages;
+            self.chat_prefix_cache = Some(extract_chat_component(&self.view));
+            let mut messages = std::mem::take(&mut self.view.messages);
+            messages.extend(tail);
+            self.view.messages = messages;
+            self.chat_prefix_len = prefix_len;
+            self.chat_dirty = true;
+        }
+
+        if self.chat_tail_cache.is_none() || self.chat_dirty {
+            let mut messages = std::mem::take(&mut self.view.messages);
+            let tail = messages.split_off(prefix_len);
+            let prefix = messages;
+            self.view.messages = tail;
+            self.chat_tail_cache = Some(extract_chat_component(&self.view));
+            let mut tail = std::mem::take(&mut self.view.messages);
+            let mut all = prefix;
+            all.append(&mut tail);
+            self.view.messages = all;
+            self.chat_dirty = false;
+        }
+    }
+
+    fn build_root(
+        &mut self,
+        editor: Editor,
+        selector: Option<Box<dyn Component>>,
+    ) -> InteractiveRoot {
+        self.refresh_chat_caches();
+        let prefix = self
+            .chat_prefix_cache
+            .take()
+            .unwrap_or_else(empty_chat_component);
+        let tail = self
+            .chat_tail_cache
+            .take()
+            .unwrap_or_else(empty_chat_component);
+        InteractiveRoot::build_with_chat(&mut self.view, editor, selector, prefix, tail)
+    }
+
+    fn recover_root(&mut self, mut root: InteractiveRoot) {
+        self.chat_prefix_cache = root.take_section("chat-prefix");
+        self.chat_tail_cache = root.take_section("chat-tail");
+        self.editor = std::mem::replace(root.editor_mut(), Editor::with_defaults());
+        self.active_selector = root.selector.take();
+    }
+
     fn arm_coalescer(&mut self) {
         if self.coalesce_deadline.is_none() {
             self.coalesce_deadline = Some(Instant::now() + BACKGROUND_COALESCE_WINDOW);
@@ -1897,10 +2430,9 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     fn paint_frame(&mut self) -> io::Result<()> {
         let saved_editor = std::mem::replace(&mut self.editor, Editor::with_defaults());
         let saved_selector = self.active_selector.take();
-        let mut root = InteractiveRoot::build(&self.view, saved_editor, saved_selector);
+        let mut root = self.build_root(saved_editor, saved_selector);
         let result = self.tui.commit(Txn::Frame, &mut root);
-        self.editor = std::mem::replace(root.editor_mut(), Editor::with_defaults());
-        self.active_selector = root.selector.take();
+        self.recover_root(root);
         self.ensure_editor_on_submit();
         result
     }
@@ -1908,10 +2440,9 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     fn commit_settle(&mut self, blocks: Vec<SettledBlock>) -> io::Result<()> {
         let saved_editor = std::mem::replace(&mut self.editor, Editor::with_defaults());
         let saved_selector = self.active_selector.take();
-        let mut root = InteractiveRoot::build(&self.view, saved_editor, saved_selector);
+        let mut root = self.build_root(saved_editor, saved_selector);
         let result = self.tui.commit(Txn::Settle(blocks), &mut root);
-        self.editor = std::mem::replace(root.editor_mut(), Editor::with_defaults());
-        self.active_selector = root.selector.take();
+        self.recover_root(root);
         self.ensure_editor_on_submit();
         result
     }
@@ -1919,12 +2450,11 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     fn commit_reanchor(&mut self) -> io::Result<()> {
         let saved_editor = std::mem::replace(&mut self.editor, Editor::with_defaults());
         let saved_selector = self.active_selector.take();
-        let mut root = InteractiveRoot::build(&self.view, saved_editor, saved_selector);
+        let mut root = self.build_root(saved_editor, saved_selector);
         let result = self
             .tui
             .commit(Txn::Reanchor(ReanchorCause::Resize), &mut root);
-        self.editor = std::mem::replace(root.editor_mut(), Editor::with_defaults());
-        self.active_selector = root.selector.take();
+        self.recover_root(root);
         self.ensure_editor_on_submit();
         result
     }
@@ -2169,6 +2699,9 @@ fn project_event(view: &mut ViewState, event: &AgentSessionEvent) {
                 ),
             });
         }
+        AgentSessionEvent::SessionBeforeSwitch { .. }
+        | AgentSessionEvent::SessionBeforeFork { .. }
+        | AgentSessionEvent::ModelSelect { .. } => {}
     }
 }
 
@@ -2331,6 +2864,37 @@ fn project_messages(messages: &[pi_agent::AgentMessage]) -> Vec<MessageView> {
         .iter()
         .filter_map(message_view_from_agent)
         .collect()
+}
+
+fn extract_chat_component(view: &ViewState) -> Box<dyn Component> {
+    compose(view)
+        .sections
+        .into_iter()
+        .find(|section| section.label == "chat")
+        .map_or_else(empty_chat_component, |section| section.component)
+}
+
+fn empty_chat_component() -> Box<dyn Component> {
+    Box::new(pi_tui::components::Text::new(String::new()))
+}
+
+fn apply_display_preferences(
+    messages: &mut [MessageView],
+    tools_expanded: bool,
+    hide_thinking: bool,
+) {
+    for message in messages {
+        match message {
+            MessageView::Assistant(view) => view.hide_thinking = hide_thinking,
+            MessageView::Tool(view) => view.state.expanded = tools_expanded,
+            MessageView::Bash(view) => view.expanded = tools_expanded,
+            MessageView::User(_)
+            | MessageView::Custom(_)
+            | MessageView::Compaction(_)
+            | MessageView::Branch(_)
+            | MessageView::Skill(_) => {}
+        }
+    }
 }
 
 fn message_view_from_agent(message: &pi_agent::AgentMessage) -> Option<MessageView> {
@@ -2760,9 +3324,7 @@ impl SessionHost for AgentSessionHost {
             let model = session.model();
             let stats = session.get_session_stats().await;
             let context = stats.context_usage;
-            let runtime = session
-                .model_runtime_any()
-                .and_then(|runtime| runtime.downcast::<ModelRuntime>().ok());
+            let runtime = session.model_runtime_handle();
             let subscription = runtime
                 .as_ref()
                 .is_some_and(|runtime| runtime.is_using_oauth(&model.provider));
@@ -2888,22 +3450,37 @@ impl SessionHost for AgentSessionHost {
         self.read_session().messages()
     }
 
+    fn host_extension_runner(&self) -> Option<Arc<HostExtensionRunner>> {
+        self.read_session().host_extension_runner()
+    }
+
+    fn hide_thinking_block(&self) -> bool {
+        self.read_session()
+            .lock_settings()
+            .get_hide_thinking_block()
+    }
+
+    fn set_hide_thinking_block(&self, hide: bool) -> Result<(), String> {
+        self.read_session()
+            .lock_settings()
+            .set_hide_thinking_block(hide);
+        Ok(())
+    }
+
+    fn external_editor_command(&self) -> String {
+        self.read_session()
+            .lock_settings()
+            .get_external_editor_command()
+    }
+
     fn get_model_entries(
         &self,
     ) -> BoxFuture<'_, Result<Vec<super::state::ModelSelectorEntry>, String>> {
         let session = self.read_session();
         Box::pin(async move {
-            let models = if let Some(any) = session.model_runtime_any() {
-                if let Some(runtime) =
-                    any.downcast_ref::<crate::core::model_runtime::ModelRuntime>()
-                {
-                    runtime.get_models(None)
-                } else {
-                    vec![session.model()]
-                }
-            } else {
-                vec![session.model()]
-            };
+            let models = session
+                .model_runtime_handle()
+                .map_or_else(|| vec![session.model()], |runtime| runtime.get_models(None));
             Ok(models
                 .into_iter()
                 .map(|m| super::state::ModelSelectorEntry {
@@ -3012,10 +3589,7 @@ impl SessionHost for AgentSessionHost {
         let session = self.read_session();
         Box::pin(async move {
             let mut out = Vec::new();
-            if let Some(any) = session.model_runtime_any()
-                && let Some(runtime) =
-                    any.downcast_ref::<crate::core::model_runtime::ModelRuntime>()
-            {
+            if let Some(runtime) = session.model_runtime_handle() {
                 for provider in runtime.get_registered_provider_ids() {
                     let configured = runtime.has_configured_auth(&provider);
                     out.push(super::state::AuthSelectorEntry {
@@ -3475,6 +4049,54 @@ pub async fn run_interactive_mode(
                 // via the host callback + next action).
                 rt.rebind_session_channels();
             }
+            InteractiveExit::ExternalEditor => {
+                let initial = rt.editor.get_text();
+                let editor_command = rt.session.external_editor_command();
+                rt.input
+                    .pause()
+                    .await
+                    .map_err(|e| format!("pause terminal input for editor: {e}"))?;
+                guard.restore();
+
+                let cancel = CancellationToken::new();
+                let cancel_on_shutdown = cancel.clone();
+                let shutdown = Arc::clone(&rt.shutdown);
+                let watcher = tokio::spawn(async move {
+                    shutdown.notified().await;
+                    cancel_on_shutdown.cancel();
+                });
+                let edited = edit_text_in_external_editor(&editor_command, &initial, &cancel)
+                    .await
+                    .map_err(|error| error.to_string());
+                watcher.abort();
+
+                guard
+                    .resume(enable_kitty)
+                    .map_err(|e| format!("terminal resume after editor failed: {e}"))?;
+                rt.input
+                    .resume(Vec::new())
+                    .await
+                    .map_err(|e| format!("resume terminal input after editor: {e}"))?;
+                rt.exited = false;
+                rt.exit_kind = InteractiveExit::Clean;
+                match edited {
+                    Ok(EditOutcome::Changed(text)) => {
+                        rt.editor.set_text(&text);
+                        rt.view.editor.text = text;
+                    }
+                    Ok(EditOutcome::Unchanged | EditOutcome::Aborted) => {}
+                    Err(error) => rt.last_error = Some(error),
+                }
+                let size = initial_terminal_size();
+                guard.set_viewport_bottom_row(size.1.saturating_sub(1));
+                let _ = rt
+                    .step_ui(UiEvent::Resize {
+                        width: size.0,
+                        height: size.1,
+                    })
+                    .await;
+                guard.set_viewport_bottom_row(rt.viewport_bottom_row());
+            }
             other => break other,
         }
     };
@@ -3485,7 +4107,10 @@ pub async fn run_interactive_mode(
 
     // 7. Guard restores on Drop. Convert exit kind to a process exit code.
     let code = match exit {
-        InteractiveExit::Clean | InteractiveExit::SessionEnded | InteractiveExit::Suspend => 0u8,
+        InteractiveExit::Clean
+        | InteractiveExit::SessionEnded
+        | InteractiveExit::Suspend
+        | InteractiveExit::ExternalEditor => 0u8,
         InteractiveExit::IoFailure | InteractiveExit::DrawDeadlock => 1u8,
     };
 
@@ -4464,21 +5089,85 @@ mod tests {
         assert_eq!(rt.viewport_bottom_row(), 40);
         Ok(())
     }
+    #[test]
+    fn editor_only_repaint_reuses_long_transcript_chat_components() -> io::Result<()> {
+        let (mut rt, _log) = make_runtime();
+        rt.view.messages = (0..1_000)
+            .map(|index| {
+                MessageView::User(crate::modes::interactive::messages::UserMessageView {
+                    text: format!("message {index} with **markdown**"),
+                })
+            })
+            .collect();
+        rt.chat_prefix_cache = None;
+        rt.chat_prefix_len = usize::MAX;
+        rt.chat_tail_cache = None;
+        rt.chat_dirty = true;
+        rt.paint_frame()?;
+
+        let prefix_before = rt
+            .chat_prefix_cache
+            .as_deref()
+            .map(|component| std::ptr::from_ref(component).cast::<()>())
+            .ok_or_else(|| io::Error::other("missing prefix cache"))?;
+        let tail_before = rt
+            .chat_tail_cache
+            .as_deref()
+            .map(|component| std::ptr::from_ref(component).cast::<()>())
+            .ok_or_else(|| io::Error::other("missing tail cache"))?;
+
+        rt.editor.set_text("editor-only change");
+        rt.view.editor.text = "editor-only change".to_owned();
+        rt.paint_frame()?;
+
+        assert_eq!(rt.chat_prefix_len, 999);
+        assert_eq!(
+            rt.chat_prefix_cache
+                .as_deref()
+                .map(|component| std::ptr::from_ref(component).cast::<()>()),
+            Some(prefix_before)
+        );
+        assert_eq!(
+            rt.chat_tail_cache
+                .as_deref()
+                .map(|component| std::ptr::from_ref(component).cast::<()>()),
+            Some(tail_before)
+        );
+        Ok(())
+    }
 
     #[test]
-    fn product_panic_setup_uses_emergency_restore_bytes_without_panicking() {
-        let writer = SharedWriter::new();
-        let captured = writer.clone();
-        // Keep unrelated parallel-test panics from invoking this global hook.
-        let emergency = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let restore = install_product_panic_emergency_hook(emergency, writer);
+    fn installed_product_panic_hook_emits_complete_restore_sequence() -> io::Result<()> {
+        const CHILD_ENV: &str = "PI_TEST_PRODUCT_PANIC_HOOK_PATH";
+        if let Some(path) = std::env::var_os(CHILD_ENV) {
+            let writer = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)?;
+            let emergency = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let _restore = install_product_panic_emergency_hook(emergency, writer);
+            panic!("intentional product panic-hook fixture");
+        }
 
-        restore();
-
+        let directory = tempfile::tempdir()?;
+        let capture = directory.path().join("panic-restore.bin");
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "modes::interactive::runtime::tests::installed_product_panic_hook_emits_complete_restore_sequence",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, &capture)
+            .output()?;
+        assert!(
+            !output.status.success(),
+            "panic fixture unexpectedly succeeded"
+        );
         assert_eq!(
-            captured.snapshot(),
+            std::fs::read(capture)?,
             b"\x1b[?2026l\x1b[<u\x1b[?2004l\x1b[?1004l\x1b[?2031l\x1b[?25h\x1b[0m"
         );
+        Ok(())
     }
 
     #[tokio::test]
@@ -4658,6 +5347,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn external_editor_action_requests_outer_terminal_handoff() {
+        let (mut rt, _log) = make_runtime();
+        let outcome = rt.dispatch_action(ViewAction::ExternalEditor).await;
+        assert_eq!(outcome, ActionOutcome::ExternalEditor);
+    }
+
+    #[tokio::test]
+    async fn display_toggles_update_existing_assistant_and_tool_messages() {
+        let (mut rt, _log) = make_runtime();
+        rt.view
+            .messages
+            .push(MessageView::Assistant(AssistantMessageView {
+                message: AssistantMessage::new(
+                    "test-api",
+                    "test-provider",
+                    "test-model",
+                    pi_agent::now_millis(),
+                ),
+                hide_thinking: false,
+                hidden_thinking_label: "Thinking hidden".to_owned(),
+                streaming: false,
+            }));
+        project_event(
+            &mut rt.view,
+            &AgentSessionEvent::ToolExecutionStart {
+                tool_call_id: "tool-1".to_owned(),
+                tool_name: "read".to_owned(),
+                args: serde_json::Map::new(),
+            },
+        );
+
+        assert_eq!(
+            rt.dispatch_action(ViewAction::ToggleThinking).await,
+            ActionOutcome::Repaint
+        );
+        assert_eq!(
+            rt.dispatch_action(ViewAction::ToggleToolExpand).await,
+            ActionOutcome::Repaint
+        );
+        assert!(
+            rt.view.messages.iter().any(
+                |message| matches!(message, MessageView::Assistant(view) if view.hide_thinking)
+            )
+        );
+        assert!(
+            rt.view
+                .messages
+                .iter()
+                .any(|message| matches!(message, MessageView::Tool(view) if view.state.expanded))
+        );
+    }
+
+    #[tokio::test]
+    async fn extension_input_dialog_temporarily_owns_then_restores_editor() {
+        let (mut rt, _log) = make_runtime();
+        rt.editor.set_text("draft prompt");
+        rt.view.editor.text = "draft prompt".to_owned();
+        rt.begin_extension_dialog(HostUiRequest::Input {
+            id: 17,
+            request: pi_ext::protocol::InputRequest {
+                title: "Extension input".to_owned(),
+                placeholder: Some("value".to_owned()),
+                options_meta: pi_ext::protocol::DialogOptions::default(),
+            },
+        })
+        .await;
+        assert_eq!(rt.editor.get_text(), "");
+        assert_eq!(rt.view.editor.placeholder, "value");
+
+        let outcome = rt.submit_text("answer".to_owned(), false).await;
+        assert_eq!(outcome, ActionOutcome::Repaint);
+        assert!(rt.pending_extension_dialog.is_none());
+        assert_eq!(rt.editor.get_text(), "draft prompt");
+    }
+
+    #[test]
+    fn extension_slot_update_and_dispose_projects_live_widgets() {
+        let (mut rt, _log) = make_runtime();
+        let slot = pi_ext::sanitize::sanitize_slot(&pi_ext::protocol::UiSlot {
+            key: "status".to_owned(),
+            generation: 1,
+            placement: SlotPlacement::AboveEditor,
+            height: 1,
+            runs: vec![vec![pi_ext::protocol::StyledRun {
+                text: "extension ready".to_owned(),
+                style: pi_ext::protocol::Style::default(),
+            }]],
+            focusable: false,
+            cursor: None,
+            overlay_options: None,
+        });
+        rt.project_extension_slot(slot);
+        assert_eq!(rt.view.widgets_above.len(), 1);
+        assert_eq!(rt.view.widgets_above[0].lines, vec!["extension ready"]);
+
+        rt.dispose_extension_slot("status");
+        assert!(rt.view.widgets_above.is_empty());
+    }
+
+    #[test]
+    fn terminal_input_codec_covers_extension_rewrite_keyspace() {
+        let events = [
+            UiEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            UiEvent::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT)),
+            UiEvent::Key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)),
+            UiEvent::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)),
+            UiEvent::Key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE)),
+            UiEvent::Key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE)),
+        ];
+        for event in events {
+            let encoded = encode_terminal_input(&event).expect("supported event");
+            assert_eq!(decode_terminal_input(encoded), event);
+        }
+    }
+
+    #[tokio::test]
     async fn copy_last_assistant_produces_feedback() {
         let (mut rt, log) = make_runtime();
         *log.last_text.lock().await = Some("assistant says hi".to_owned());
@@ -4823,4 +5628,141 @@ mod tests {
             vec!["/foo custom args".to_owned()]
         );
     }
+}
+
+async fn recv_extension_event(
+    receiver: &mut Option<tokio::sync::broadcast::Receiver<ExtensionUiEvent>>,
+) -> Option<ExtensionUiEvent> {
+    match receiver {
+        Some(receiver) => loop {
+            match receiver.recv().await {
+                Ok(event) => return Some(event),
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            }
+        },
+        None => std::future::pending().await,
+    }
+}
+
+async fn recv_extension_request(
+    receiver: &mut Option<mpsc::Receiver<HostUiRequest>>,
+) -> Option<HostUiRequest> {
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn wait_extension_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await,
+        None => std::future::pending().await,
+    }
+}
+
+fn dialog_timeout(request: &HostUiRequest) -> Option<Duration> {
+    let timeout_ms = match request {
+        HostUiRequest::Select { request, .. } => request.options_meta.timeout_ms,
+        HostUiRequest::Confirm { request, .. } => request.options_meta.timeout_ms,
+        HostUiRequest::Input { request, .. } => request.options_meta.timeout_ms,
+        HostUiRequest::Editor { .. } => None,
+    }?;
+    Some(Duration::from_millis(timeout_ms))
+}
+
+fn default_extension_dialog_response(request: &HostUiRequest) -> HostUiResponse {
+    match request {
+        HostUiRequest::Select { id, .. } => HostUiResponse::Select {
+            id: *id,
+            value: None,
+        },
+        HostUiRequest::Confirm { id, .. } => HostUiResponse::Confirm {
+            id: *id,
+            confirmed: false,
+        },
+        HostUiRequest::Input { id, .. } => HostUiResponse::Input {
+            id: *id,
+            value: None,
+        },
+        HostUiRequest::Editor { id, .. } => HostUiResponse::Editor {
+            id: *id,
+            value: None,
+        },
+    }
+}
+
+fn encode_terminal_input(event: &UiEvent) -> Option<String> {
+    match event {
+        UiEvent::Paste(text) => Some(text.clone()),
+        UiEvent::Key(key) => {
+            let prefix = if key.modifiers.contains(crossterm::event::KeyModifiers::ALT) {
+                "\u{1b}"
+            } else {
+                ""
+            };
+            let data = match key.code {
+                crossterm::event::KeyCode::Char(character)
+                    if key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                {
+                    let code = (character.to_ascii_uppercase() as u8) & 0x1f;
+                    char::from(code).to_string()
+                }
+                crossterm::event::KeyCode::Char(character) => character.to_string(),
+                crossterm::event::KeyCode::Enter => "\r".to_owned(),
+                crossterm::event::KeyCode::Tab => "\t".to_owned(),
+                crossterm::event::KeyCode::BackTab => "\u{1b}[Z".to_owned(),
+                crossterm::event::KeyCode::Backspace => "\u{7f}".to_owned(),
+                crossterm::event::KeyCode::Esc => "\u{1b}".to_owned(),
+                crossterm::event::KeyCode::Up => "\u{1b}[A".to_owned(),
+                crossterm::event::KeyCode::Down => "\u{1b}[B".to_owned(),
+                crossterm::event::KeyCode::Right => "\u{1b}[C".to_owned(),
+                crossterm::event::KeyCode::Left => "\u{1b}[D".to_owned(),
+                crossterm::event::KeyCode::Home => "\u{1b}[H".to_owned(),
+                crossterm::event::KeyCode::End => "\u{1b}[F".to_owned(),
+                crossterm::event::KeyCode::Delete => "\u{1b}[3~".to_owned(),
+                _ => return None,
+            };
+            Some(format!("{prefix}{data}"))
+        }
+        UiEvent::FocusGained | UiEvent::FocusLost | UiEvent::Resize { .. } => None,
+    }
+}
+
+fn decode_terminal_input(data: String) -> UiEvent {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let key = match data.as_str() {
+        "\r" | "\n" => Some(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        "\t" => Some(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+        "\u{7f}" | "\u{8}" => Some(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+        "\u{1b}" => Some(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        "\u{1b}[A" => Some(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+        "\u{1b}[B" => Some(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+        "\u{1b}[C" => Some(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+        "\u{1b}[D" => Some(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+        "\u{1b}[H" => Some(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)),
+        "\u{1b}[F" => Some(KeyEvent::new(KeyCode::End, KeyModifiers::NONE)),
+        "\u{1b}[3~" => Some(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE)),
+        "\u{1b}[Z" => Some(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)),
+        _ if data.starts_with('\u{1b}') && data.chars().count() == 2 => data
+            .chars()
+            .nth(1)
+            .map(|character| KeyEvent::new(KeyCode::Char(character), KeyModifiers::ALT)),
+        _ => {
+            let mut characters = data.chars();
+            match (characters.next(), characters.next()) {
+                (Some(character), None) if (character as u32) < 0x20 => {
+                    let letter = char::from((character as u8) | 0x60);
+                    Some(KeyEvent::new(KeyCode::Char(letter), KeyModifiers::CONTROL))
+                }
+                (Some(character), None) => {
+                    Some(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+                }
+                _ => None,
+            }
+        }
+    };
+    key.map_or(UiEvent::Paste(data), UiEvent::Key)
 }

@@ -24,7 +24,7 @@ use crate::core::agent_session_runtime::{
     SwitchSessionOptions,
 };
 use crate::core::compaction::CompactionResult;
-use crate::core::model_runtime::ModelRuntime;
+use crate::core::extension_host::HostExtensionRunner;
 use crate::core::resources::{SlashCommandInfo, SlashCommandSource};
 use crate::core::sessions::{SessionEntry, SessionTreeNode};
 
@@ -182,10 +182,7 @@ impl RpcSessionHost for Arc<AgentSessionRuntime> {
     fn get_available_models(&self) -> BoxFuture<'static, Vec<Model>> {
         let session = self.session();
         Box::pin(async move {
-            if let Some(mr) = session
-                .model_runtime_any()
-                .and_then(|any| Arc::downcast::<ModelRuntime>(any).ok())
-            {
+            if let Some(mr) = session.model_runtime_handle() {
                 return mr.get_available(None).await.unwrap_or_default();
             }
             Vec::new()
@@ -413,6 +410,10 @@ impl RpcSessionHost for Arc<AgentSessionRuntime> {
                 .map(convert_slash_command)
                 .collect()
         })
+    }
+
+    fn host_extension_runner(&self) -> Option<Arc<HostExtensionRunner>> {
+        self.session().host_extension_runner()
     }
 
     fn subscribe(

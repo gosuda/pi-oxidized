@@ -135,10 +135,7 @@ fn is_loopback_destination(url: &reqwest::Url) -> bool {
             .is_ok_and(|address| address.is_loopback())
 }
 
-fn validate_radius_verification_uri(
-    value: &str,
-    gateway: &str,
-) -> Result<String, AuthError> {
+fn validate_radius_verification_uri(value: &str, gateway: &str) -> Result<String, AuthError> {
     let untrusted = || AuthError::message("Untrusted verification URI in Radius OAuth response");
     let uri = reqwest::Url::parse(value).map_err(|_| untrusted())?;
     if !uri.username().is_empty() || uri.password().is_some() || uri.host_str().is_none() {
@@ -149,9 +146,7 @@ fn validate_radius_verification_uri(
     }
     if uri.scheme() == "http" && is_loopback_destination(&uri) {
         let configured_gateway = reqwest::Url::parse(gateway).map_err(|_| untrusted())?;
-        if configured_gateway.scheme() == "http"
-            && is_loopback_destination(&configured_gateway)
-        {
+        if configured_gateway.scheme() == "http" && is_loopback_destination(&configured_gateway) {
             return Ok(uri.to_string());
         }
     }
@@ -315,8 +310,7 @@ impl RadiusOAuth {
             .verification_uri
             .as_deref()
             .unwrap_or(oauth.verification_endpoint.as_str());
-        let verification_uri =
-            validate_radius_verification_uri(verification_uri, &self.gateway)?;
+        let verification_uri = validate_radius_verification_uri(verification_uri, &self.gateway)?;
 
         interaction.notify(AuthEvent::DeviceCode {
             user_code: device.user_code.clone(),
@@ -1076,11 +1070,13 @@ mod tests {
                 "Untrusted verification URI in Radius OAuth response"
             );
         }
-        assert!(validate_radius_verification_uri(
-            "http://localhost:9000/device",
-            "https://gateway.example",
-        )
-        .is_err());
+        assert!(
+            validate_radius_verification_uri(
+                "http://localhost:9000/device",
+                "https://gateway.example",
+            )
+            .is_err()
+        );
         Ok(())
     }
 
@@ -1491,10 +1487,12 @@ mod tests {
             error.to_string(),
             "Untrusted verification URI in Radius OAuth response"
         );
-        assert!(!interaction
-            .events()?
-            .iter()
-            .any(|event| matches!(event, AuthEvent::DeviceCode { .. })));
+        assert!(
+            !interaction
+                .events()?
+                .iter()
+                .any(|event| matches!(event, AuthEvent::DeviceCode { .. }))
+        );
         Ok(())
     }
 

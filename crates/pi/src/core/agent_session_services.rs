@@ -21,6 +21,7 @@ use super::model_runtime::{
 };
 use super::resources::{DefaultResourceLoader, DefaultResourceLoaderOptions, ResourceLoader};
 use super::settings::{SettingsManager, SettingsManagerCreateOptions};
+use super::trust::{ProjectTrustStore, ResolveProjectTrustedOptions, resolve_project_trusted};
 
 /// Default thinking level when none is configured (`medium`).
 pub const DEFAULT_THINKING_LEVEL: ModelThinkingLevel = ModelThinkingLevel::Medium;
@@ -380,6 +381,9 @@ pub enum AgentSessionServicesError {
     /// Model runtime construction failed.
     #[error(transparent)]
     ModelRuntime(#[from] ModelRuntimeError),
+    /// Project trust resolution failed before resource loading.
+    #[error("{0}")]
+    Trust(String),
     /// Resource loader reload failed.
     #[error("{0}")]
     ResourceLoader(String),
@@ -433,23 +437,27 @@ pub fn format_oauth_auth_failed_message(provider: &str) -> String {
     )
 }
 
-/// Create cwd-bound runtime services.
-///
-/// Creation order matches TypeScript:
-/// 1. resolve cwd / agentDir
-/// 2. [`ModelRuntime`] (`auth.json` + `models.json` under `agent_dir`)
-/// 3. [`SettingsManager`]
-/// 4. [`ResourceLoader`] + reload
-/// 5. apply pending provider registrations
-/// 6. modelRuntime.refresh(allowNetwork: false)
-/// 7. validate extension flags
+/// Create all cwd-bound session services with trust resolved from saved/global state.
 ///
 /// # Errors
 ///
-/// Returns [`AgentSessionServicesError`] when the model runtime cannot be
-/// constructed or the resource loader reload fails hard.
+/// Returns service construction, trust resolution, or resource loading errors.
 pub async fn create_agent_session_services(
     options: CreateAgentSessionServicesOptions,
+) -> Result<AgentSessionServices, AgentSessionServicesError> {
+    create_agent_session_services_with_trust(options, None).await
+}
+
+/// Create all cwd-bound session services with an invocation-scoped trust override.
+///
+/// The override is resolved before project settings, packages, or extensions load.
+///
+/// # Errors
+///
+/// Returns service construction, trust resolution, or resource loading errors.
+pub async fn create_agent_session_services_with_trust(
+    options: CreateAgentSessionServicesOptions,
+    project_trust_override: Option<bool>,
 ) -> Result<AgentSessionServices, AgentSessionServicesError> {
     let CreateAgentSessionServicesOptions {
         cwd,
@@ -461,9 +469,26 @@ pub async fn create_agent_session_services(
         pending_provider_registrations,
         registered_extension_flags,
     } = options;
-    let foundation =
+    let settings_manager_was_supplied = settings_manager.is_some();
+    let mut foundation =
         create_service_foundation(cwd, agent_dir, settings_manager, model_runtime).await?;
-    let project_trusted = foundation.settings_manager.is_project_trusted();
+    let project_trusted = if settings_manager_was_supplied && project_trust_override.is_none() {
+        foundation.settings_manager.is_project_trusted()
+    } else {
+        resolve_project_trusted(ResolveProjectTrustedOptions {
+            cwd: foundation.cwd.clone(),
+            trust_store: &ProjectTrustStore::new(&foundation.agent_dir),
+            trust_override: project_trust_override,
+            default_project_trust: foundation.settings_manager.get_default_project_trust(),
+            extension_hook: None,
+            ui: None,
+            on_extension_error: None,
+        })
+        .map_err(|error| AgentSessionServicesError::Trust(error.to_string()))?
+    };
+    foundation
+        .settings_manager
+        .set_project_trusted(project_trusted);
     let (mut resource_loader, discovery) = create_service_resource_loader(
         &foundation.cwd,
         &foundation.agent_dir,
@@ -572,7 +597,7 @@ async fn create_service_foundation(
         SettingsManager::create(
             &cwd,
             Some(&agent_dir),
-            SettingsManagerCreateOptions::default(),
+            SettingsManagerCreateOptions::default().project_trusted(false),
         )
     });
     Ok(ServiceFoundation {
@@ -1504,6 +1529,47 @@ mod tests {
         .await?;
         assert!(builtin.allowed_tool_names.is_none());
         assert!(builtin.initial_active_tool_names.is_empty());
+        Ok(())
+    }
+    #[tokio::test]
+    async fn trust_override_precedes_project_settings_load() -> TestResult {
+        for (trust_override, trusted) in [(None, false), (Some(false), false), (Some(true), true)] {
+            let dir = tempfile::tempdir()?;
+            let cwd = dir.path().join("project");
+            let agent = dir.path().join("agent");
+            std::fs::create_dir_all(cwd.join(".pi"))?;
+            std::fs::create_dir_all(&agent)?;
+            std::fs::write(agent.join("settings.json"), r#"{"theme":"global"}"#)?;
+            std::fs::write(
+                cwd.join(".pi").join("settings.json"),
+                r#"{"theme":"project"}"#,
+            )?;
+
+            let services = create_agent_session_services_with_trust(
+                CreateAgentSessionServicesOptions {
+                    cwd,
+                    agent_dir: Some(agent),
+                    model_runtime: Some(ModelRuntime::create_in_memory().await?),
+                    resource_loader_options: Some(ResourceLoaderServiceOptions {
+                        no_extensions: true,
+                        no_skills: true,
+                        no_prompt_templates: true,
+                        no_themes: true,
+                        no_context_files: true,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                trust_override,
+            )
+            .await?;
+
+            assert_eq!(services.settings_manager().is_project_trusted(), trusted);
+            assert_eq!(
+                services.settings_manager().get_theme().as_deref(),
+                Some(if trusted { "project" } else { "global" })
+            );
+        }
         Ok(())
     }
 }

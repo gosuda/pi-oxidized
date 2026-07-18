@@ -24,10 +24,14 @@
 //! The `has_handlers("session_start"|"session_shutdown")` gates still run so
 //! pi-ext can observe handler presence.
 
-use crate::core::resources::ResourceLoader;
+use crate::core::resources::{
+    ResourceLoader, SlashCommandInfo, SlashCommandSource, SyntheticSourceInfoOptions,
+    create_synthetic_source_info,
+};
 use std::sync::{Arc, Mutex};
 
 use super::AgentSession;
+#[cfg(test)]
 use super::events::AgentSessionEvent;
 
 /// Reason passed to `session_start`.
@@ -422,17 +426,92 @@ impl AgentSession {
         }
     }
 
-    /// Report an extension error to the registered listener (isolation:
-    /// errors never propagate to the caller).
+    /// Build the current extension/prompt/skill slash-command catalog.
+    #[must_use]
+    pub fn slash_commands(&self) -> Vec<SlashCommandInfo> {
+        let mut commands = Vec::new();
+        let mut extension_names = std::collections::HashSet::new();
+
+        if let Some(host) = self.host_extension_runner() {
+            for command in host.registry().commands() {
+                extension_names.insert(command.name.clone());
+                let path = command
+                    .source
+                    .clone()
+                    .unwrap_or_else(|| "<extension>".to_owned());
+                commands.push(SlashCommandInfo {
+                    name: command.name.clone(),
+                    description: command.description.clone(),
+                    source: SlashCommandSource::Extension,
+                    source_info: create_synthetic_source_info(
+                        path,
+                        SyntheticSourceInfoOptions {
+                            source: "extension".to_owned(),
+                            scope: None,
+                            origin: None,
+                            base_dir: None,
+                        },
+                    ),
+                });
+            }
+        }
+
+        for name in self.hooks.runner().get_registered_commands() {
+            if extension_names.insert(name.clone()) {
+                commands.push(SlashCommandInfo {
+                    name,
+                    description: None,
+                    source: SlashCommandSource::Extension,
+                    source_info: create_synthetic_source_info(
+                        "<extension>",
+                        SyntheticSourceInfoOptions {
+                            source: "extension".to_owned(),
+                            scope: None,
+                            origin: None,
+                            base_dir: None,
+                        },
+                    ),
+                });
+            }
+        }
+
+        commands.extend(
+            self.prompt_templates
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .map(|template| SlashCommandInfo {
+                    name: template.name.clone(),
+                    description: Some(template.description.clone()),
+                    source: SlashCommandSource::Prompt,
+                    source_info: template.source_info.clone(),
+                }),
+        );
+        commands.extend(
+            self.skills
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .map(|skill| SlashCommandInfo {
+                    name: format!("skill:{}", skill.name),
+                    description: Some(skill.description.clone()),
+                    source: SlashCommandSource::Skill,
+                    source_info: skill.source_info.clone(),
+                }),
+        );
+        commands
+    }
+
+    /// Report an extension error to the registered listener (isolation boundary).
     pub fn report_extension_error(&self, message: impl Into<String>) {
-        let msg = message.into();
+        let message = message.into();
         let listener = self.lock_inner().extension_error_listener.clone();
         if let Some(listener) = listener {
-            listener(&msg);
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| listener(&message)));
         }
     }
 
-    /// Invoke the shutdown handler if one is bound.
+    /// Invoke the shutdown handler, if one is bound.
     pub fn invoke_extension_shutdown_handler(&self) {
         let handler = self.lock_inner().extension_shutdown_handler.clone();
         if let Some(handler) = handler {
@@ -473,11 +552,6 @@ impl AgentSession {
         }
     }
 }
-
-// Silence unused-import warning while the typed SessionStart variant is
-// pending.
-#[allow(dead_code)]
-fn _keep_event_type(_e: AgentSessionEvent) {}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -1125,12 +1199,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn extension_error_isolation_does_not_propagate() -> TestResult {
-        let runner = Arc::new(TestRunner::new());
-        let mut config = AgentSessionConfig::test_config(Arc::new(StubProvider), test_model())?;
-        config.extension_runner = Some(runner.clone() as Arc<dyn ExtensionRunner>);
-        let session = AgentSession::new(config)?;
+    async fn extension_error_listener_receives_exact_message_and_is_isolated() -> TestResult {
+        let session = make_session()?;
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let received_clone = Arc::clone(&received);
+        session
+            .bind_extensions(ExtensionBindings {
+                on_error: Some(Arc::new(move |message| {
+                    received_clone
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(message.to_owned());
+                })),
+                ..Default::default()
+            })
+            .await?;
         session.report_extension_error("host crashed");
+        assert_eq!(
+            received
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_slice(),
+            ["host crashed"]
+        );
+
+        session
+            .bind_extensions(ExtensionBindings {
+                on_error: Some(Arc::new(|_| panic!("listener panic"))),
+                ..Default::default()
+            })
+            .await?;
+        session.report_extension_error("boom");
         assert!(!session.session_id().await.is_empty());
         Ok(())
     }

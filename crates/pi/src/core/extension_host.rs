@@ -17,23 +17,25 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::Duration;
 
 use futures::future::BoxFuture;
 use pi_agent::{AfterToolCallResult, AgentMessage, AgentTool, BeforeToolCallResult};
-use pi_ai::ToolResultContent;
+use pi_ai::{AssistantMessage, AssistantMessageEvent, ToolResultContent};
 use pi_ext::adapters::{
     self, CommandRegistration, ExtensionAgentTool, ExtensionProvider, FlagRegistration,
     ProviderRegistration, Registry, RendererRegistration, ShortcutRegistration, ToolRegistration,
 };
-use pi_ext::client::{HostClient, HostClientError, HostEvent};
+use pi_ext::client::{HostClient, HostClientError, HostEvent, HostUiRequest, HostUiResponse};
 use pi_ext::host::{self, HostError, HostSpec};
-use pi_ext::protocol::{self, DisposeSlot, ExtensionErrorEvent, ProviderEvent, ToolUpdate, UiSlot};
+use pi_ext::protocol::{
+    self, DisposeSlot, ExtensionErrorEvent, NotifyRequest, ProviderEvent, ToolUpdate, UiSlot,
+};
 use pi_ext::sanitize::{SanitizedSlot, sanitize_slot};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 
 use super::agent_session::events::AgentSessionEvent;
 use super::agent_session::extension_runner::{
@@ -58,6 +60,8 @@ pub const LOAD_METHOD: &str = "extensions.load";
 
 /// Open method string: dispatch a registered slash command.
 pub const COMMAND_EXECUTE_METHOD: &str = "command.execute";
+/// Private compact streaming update request. Extensions still observe `message_update`.
+pub const MESSAGE_UPDATE_DELTA_METHOD: &str = "message_update_delta";
 
 /// Open method string: render an extension tool call/result as HTML (export).
 pub const TOOL_RENDER_HTML_METHOD: &str = "tool.renderHtml";
@@ -117,6 +121,20 @@ impl ToolRenderPhase {
             Self::Result => "result",
         }
     }
+}
+
+/// Sanitized extension UI activity delivered to an active product mode.
+#[derive(Debug, Clone)]
+pub enum ExtensionUiEvent {
+    /// Fire-and-forget notification.
+    Notify(NotifyRequest),
+    /// Sanitized keyed slot update.
+    Slot(SanitizedSlot),
+    /// Keyed slot disposal.
+    Dispose {
+        /// Stable extension widget key to remove.
+        key: String,
+    },
 }
 
 /// Failure while starting the extension host.
@@ -292,6 +310,9 @@ pub struct RegistrySnapshotWire {
     /// Lifecycle event types with at least one handler installed.
     #[serde(default)]
     handlers: Vec<String>,
+    /// Whether `ui.onTerminalInput` has at least one active handler.
+    #[serde(default)]
+    terminal_input: bool,
     /// Number of extensions successfully loaded (host diagnostic field).
     #[serde(default)]
     extensions: Option<u64>,
@@ -322,6 +343,8 @@ struct RegistrySnapshot {
     tools: HashMap<String, Arc<dyn AgentTool>>,
     /// Lifecycle event types with at least one handler.
     handlers: HashSet<String>,
+    /// Whether terminal input must be offered to the host before native dispatch.
+    terminal_input: bool,
     /// Resolved flag values (host value if present, else default).
     flag_values: HashMap<String, Value>,
     /// Provider config inputs keyed by provider id (for `ModelRuntime` registration).
@@ -335,7 +358,10 @@ struct RegistrySnapshot {
 }
 
 fn build_snapshot(wire: RegistrySnapshotWire, client: &Arc<HostClient>) -> RegistrySnapshot {
-    let mut snapshot = RegistrySnapshot::default();
+    let mut snapshot = RegistrySnapshot {
+        terminal_input: wire.terminal_input,
+        ..RegistrySnapshot::default()
+    };
 
     for tool in wire.tools {
         let meta = ToolRegistration {
@@ -542,6 +568,10 @@ struct Inner {
     tool_updates_tx: broadcast::Sender<ToolUpdate>,
     provider_events_tx: broadcast::Sender<ProviderEvent>,
     errors_tx: broadcast::Sender<ExtensionErrorEvent>,
+    ui_tx: broadcast::Sender<ExtensionUiEvent>,
+    ui_requests_tx: mpsc::Sender<HostUiRequest>,
+    ui_requests_rx: StdMutex<Option<mpsc::Receiver<HostUiRequest>>>,
+    ui_requests_claimed: AtomicBool,
     /// Paths passed to `extensions.load` (restart reuses them).
     extension_paths: Vec<String>,
     /// Cwd passed to `extensions.load`.
@@ -576,6 +606,8 @@ impl Inner {
         let (tool_updates_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let (provider_events_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let (errors_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let (ui_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let (ui_requests_tx, ui_requests_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let flag_values = snapshot.flag_values.clone();
         Self {
             client,
@@ -585,6 +617,10 @@ impl Inner {
             tool_updates_tx,
             provider_events_tx,
             errors_tx,
+            ui_tx,
+            ui_requests_tx,
+            ui_requests_rx: StdMutex::new(Some(ui_requests_rx)),
+            ui_requests_claimed: AtomicBool::new(false),
             extension_paths,
             load_cwd,
             project_trusted,
@@ -676,8 +712,9 @@ impl Inner {
         if let Ok(mut slots) = self.slots.write() {
             let key = slot.key.clone();
             let sender = slots.entry(key).or_insert_with(|| watch::channel(None).0);
-            let _ = sender.send(Some(slot));
+            let _ = sender.send(Some(slot.clone()));
         }
+        let _ = self.ui_tx.send(ExtensionUiEvent::Slot(slot));
     }
 
     fn slot_dispose(&self, key: &str) {
@@ -687,13 +724,24 @@ impl Inner {
             }
             slots.remove(key);
         }
+        let _ = self.ui_tx.send(ExtensionUiEvent::Dispose {
+            key: key.to_owned(),
+        });
     }
 
     fn dispose_all_slots(&self) {
-        if let Ok(mut slots) = self.slots.write() {
-            for (_key, sender) in slots.drain() {
+        let keys = if let Ok(mut slots) = self.slots.write() {
+            let keys = slots.keys().cloned().collect::<Vec<_>>();
+            for sender in slots.values() {
                 let _ = sender.send(None);
             }
+            slots.clear();
+            keys
+        } else {
+            Vec::new()
+        };
+        for key in keys {
+            let _ = self.ui_tx.send(ExtensionUiEvent::Dispose { key });
         }
     }
 }
@@ -1068,6 +1116,27 @@ impl HostExtensionRunner {
             .unwrap_or_default()
     }
 
+    /// Snapshot all currently live sanitized slots.
+    ///
+    /// This lets a mode attach after `session_start` without losing widgets
+    /// already published before its broadcast subscription existed.
+    #[must_use]
+    pub fn current_slots(&self) -> Vec<SanitizedSlot> {
+        let mut slots = self
+            .inner
+            .slots
+            .read()
+            .map(|guard| {
+                guard
+                    .values()
+                    .filter_map(|sender| sender.borrow().clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        slots.sort_by(|left, right| left.key.cmp(&right.key));
+        slots
+    }
+
     /// Subscribe to unsolicited partial tool updates from extension tools.
     #[must_use]
     pub fn subscribe_tool_updates(&self) -> broadcast::Receiver<ToolUpdate> {
@@ -1085,6 +1154,68 @@ impl HostExtensionRunner {
     #[must_use]
     pub fn subscribe_errors(&self) -> broadcast::Receiver<ExtensionErrorEvent> {
         self.inner.errors_tx.subscribe()
+    }
+
+    /// Whether the loaded host has an active `ui.onTerminalInput` handler.
+    #[must_use]
+    pub fn has_terminal_input_handlers(&self) -> bool {
+        self.inner
+            .snapshot
+            .read()
+            .is_ok_and(|snapshot| snapshot.terminal_input)
+    }
+
+    /// Offer canonical terminal input to the host's sequential 4 ms actor.
+    pub async fn terminal_input(
+        &self,
+        data: &str,
+    ) -> Result<protocol::TerminalInputResult, HostClientError> {
+        let frame = self
+            .inner
+            .client
+            .request(
+                protocol::Method::TerminalInput,
+                serde_json::json!({ "data": data }),
+                Duration::from_millis(4),
+            )
+            .await?;
+        protocol::from_payload(&frame.payload)
+            .map_err(|error| HostClientError::Payload(format!("decode terminalInput: {error}")))
+    }
+
+    /// Subscribe to host notifications and sanitized slot lifecycle.
+    #[must_use]
+    pub fn subscribe_ui(&self) -> broadcast::Receiver<ExtensionUiEvent> {
+        self.inner.ui_tx.subscribe()
+    }
+
+    /// Claim the sole lossless receiver for correlated host dialog requests.
+    ///
+    /// A product mode calls this exactly once when it binds. Subsequent callers
+    /// receive `None`, preventing two modes from racing responses.
+    #[must_use]
+    pub fn take_ui_requests(&self) -> Option<mpsc::Receiver<HostUiRequest>> {
+        let receiver = self
+            .inner
+            .ui_requests_rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if receiver.is_some() {
+            self.inner
+                .ui_requests_claimed
+                .store(true, Ordering::Release);
+        }
+        receiver
+    }
+
+    /// Answer a correlated host-initiated dialog request.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport error if the host has already exited.
+    pub async fn respond_ui(&self, response: HostUiResponse) -> Result<(), HostClientError> {
+        self.inner.client.respond_ui(response).await
     }
 
     // -- Custom tool HTML rendering (session export) ----------------------
@@ -1162,15 +1293,37 @@ impl HostExtensionRunner {
         runtime: &ModelRuntime,
         preserved_flags: HashMap<String, Value>,
     ) -> Result<Arc<Self>, HostStartError> {
+        self.restart_and_rewire_with(
+            runtime,
+            preserved_flags,
+            |paths, cwd, project_trusted| async move {
+                Self::start_with_cwd_and_trust(paths, cwd, project_trusted).await
+            },
+        )
+        .await
+    }
+
+    async fn restart_and_rewire_with<F, Fut>(
+        &self,
+        runtime: &ModelRuntime,
+        preserved_flags: HashMap<String, Value>,
+        start: F,
+    ) -> Result<Arc<Self>, HostStartError>
+    where
+        F: FnOnce(Vec<String>, String, bool) -> Fut,
+        Fut: std::future::Future<Output = Result<Arc<Self>, HostStartError>>,
+    {
         // 1. Drop old provider registrations before the new host binds.
         self.unregister_providers_from(runtime);
         // 2. Await old transport shutdown / process reap exactly once.
         let _ = self.reload().await;
-        // 3. Spawn replacement host with the same paths + cwd.
-        let paths = self.inner.extension_paths.clone();
-        let cwd = self.inner.load_cwd.clone();
-        let project_trusted = self.inner.project_trusted;
-        let replacement = Self::start_with_cwd_and_trust(paths, cwd, project_trusted).await?;
+        // 3. Spawn replacement host with the same paths + cwd + trust bit.
+        let replacement = start(
+            self.inner.extension_paths.clone(),
+            self.inner.load_cwd.clone(),
+            self.inner.project_trusted,
+        )
+        .await?;
         // 4. Re-register providers (sibling isolation on individual failures).
         let _ = replacement.register_providers_on(runtime);
         // 5. Restore flags.
@@ -1261,6 +1414,16 @@ fn spawn_event_pump(inner: Arc<Inner>) {
     tokio::spawn(async move {
         loop {
             match rx.recv().await {
+                Ok(HostEvent::UiRequest(request)) => {
+                    if !inner.ui_requests_claimed.load(Ordering::Acquire) {
+                        let _ = inner.client.respond_ui(default_ui_response(&request)).await;
+                    } else if let Err(error) = inner.ui_requests_tx.send(request).await {
+                        let _ = inner.client.respond_ui(default_ui_response(&error.0)).await;
+                    }
+                }
+                Ok(HostEvent::Notify(notification)) => {
+                    let _ = inner.ui_tx.send(ExtensionUiEvent::Notify(notification));
+                }
                 Ok(HostEvent::UiSlot(slot)) => {
                     forward_slot(&inner, &slot);
                 }
@@ -1276,8 +1439,22 @@ fn spawn_event_pump(inner: Arc<Inner>) {
                 Ok(HostEvent::ExtensionError(event)) => {
                     let _ = inner.errors_tx.send(event);
                 }
-                Ok(HostEvent::Raw(_)) | Err(broadcast::error::RecvError::Lagged(_)) => {
-                    // Untyped / unexpected frame: ignore, host stays trusted.
+                Ok(HostEvent::Raw(frame)) => {
+                    inner.disabled.store(true, Ordering::Relaxed);
+                    inner.publish_error(
+                        "extension_protocol",
+                        &format!("unhandled host frame: {} {}", frame.kind, frame.method),
+                        None,
+                    );
+                    HostExtensionRunner::shutdown_once_with_inner(&inner).await;
+                    break;
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    inner.publish_error(
+                        "extension_event_lagged",
+                        &format!("dropped {skipped} extension host events"),
+                        None,
+                    );
                 }
                 Ok(HostEvent::Eof) => {
                     // Host stdout closed: fatal. Disable once, report, exit.
@@ -1288,11 +1465,34 @@ fn spawn_event_pump(inner: Arc<Inner>) {
                 Ok(HostEvent::ProtocolError(message)) => {
                     inner.disabled.store(true, Ordering::Relaxed);
                     inner.publish_error("extension_protocol", &message, None);
+                    HostExtensionRunner::shutdown_once_with_inner(&inner).await;
+                    break;
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             }
         }
     });
+}
+
+fn default_ui_response(request: &HostUiRequest) -> HostUiResponse {
+    match request {
+        HostUiRequest::Select { id, .. } => HostUiResponse::Select {
+            id: *id,
+            value: None,
+        },
+        HostUiRequest::Confirm { id, .. } => HostUiResponse::Confirm {
+            id: *id,
+            confirmed: false,
+        },
+        HostUiRequest::Input { id, .. } => HostUiResponse::Input {
+            id: *id,
+            value: None,
+        },
+        HostUiRequest::Editor { id, .. } => HostUiResponse::Editor {
+            id: *id,
+            value: None,
+        },
+    }
 }
 
 fn forward_slot(inner: &Arc<Inner>, slot: &UiSlot) {
@@ -1360,6 +1560,128 @@ fn sanitize_html(html: &str) -> String {
         .replace('>', "&gt;")
 }
 
+fn compact_message_update_event(event: &AssistantMessageEvent) -> Value {
+    fn meta(message: &AssistantMessage) -> Value {
+        let mut value = serde_json::to_value(message).unwrap_or_else(|_| Value::Object(Map::new()));
+        if let Value::Object(object) = &mut value {
+            object.remove("content");
+        }
+        value
+    }
+
+    fn block(message: &AssistantMessage, content_index: u64) -> Value {
+        message
+            .content
+            .get(content_index as usize)
+            .and_then(|content| serde_json::to_value(content).ok())
+            .unwrap_or(Value::Null)
+    }
+
+    match event {
+        AssistantMessageEvent::Start { partial } => serde_json::json!({
+            "type": "start",
+            "meta": meta(&partial),
+        }),
+        AssistantMessageEvent::TextStart {
+            content_index,
+            partial,
+        } => serde_json::json!({
+            "type": "text_start",
+            "meta": meta(&partial),
+            "contentIndex": content_index,
+            "block": block(partial, *content_index),
+        }),
+        AssistantMessageEvent::TextDelta {
+            content_index,
+            delta,
+            partial,
+        } => serde_json::json!({
+            "type": "text_delta",
+            "meta": meta(&partial),
+            "contentIndex": content_index,
+            "delta": delta,
+        }),
+        AssistantMessageEvent::TextEnd {
+            content_index,
+            partial,
+            ..
+        } => serde_json::json!({
+            "type": "text_end",
+            "meta": meta(&partial),
+            "contentIndex": content_index,
+            "block": block(partial, *content_index),
+        }),
+        AssistantMessageEvent::ThinkingStart {
+            content_index,
+            partial,
+        } => serde_json::json!({
+            "type": "thinking_start",
+            "meta": meta(&partial),
+            "contentIndex": content_index,
+            "block": block(partial, *content_index),
+        }),
+        AssistantMessageEvent::ThinkingDelta {
+            content_index,
+            delta,
+            partial,
+        } => serde_json::json!({
+            "type": "thinking_delta",
+            "meta": meta(&partial),
+            "contentIndex": content_index,
+            "delta": delta,
+        }),
+        AssistantMessageEvent::ThinkingEnd {
+            content_index,
+            partial,
+            ..
+        } => serde_json::json!({
+            "type": "thinking_end",
+            "meta": meta(&partial),
+            "contentIndex": content_index,
+            "block": block(partial, *content_index),
+        }),
+        AssistantMessageEvent::ToolCallStart {
+            content_index,
+            partial,
+        } => serde_json::json!({
+            "type": "toolcall_start",
+            "meta": meta(&partial),
+            "contentIndex": content_index,
+            "block": block(partial, *content_index),
+        }),
+        AssistantMessageEvent::ToolCallDelta {
+            content_index,
+            delta,
+            partial,
+        } => serde_json::json!({
+            "type": "toolcall_delta",
+            "meta": meta(&partial),
+            "contentIndex": content_index,
+            "delta": delta,
+        }),
+        AssistantMessageEvent::ToolCallEnd {
+            content_index,
+            partial,
+            ..
+        } => serde_json::json!({
+            "type": "toolcall_end",
+            "meta": meta(&partial),
+            "contentIndex": content_index,
+            "block": block(partial, *content_index),
+        }),
+        AssistantMessageEvent::Done { reason, message } => serde_json::json!({
+            "type": "done",
+            "reason": reason,
+            "final": message,
+        }),
+        AssistantMessageEvent::Error { reason, error } => serde_json::json!({
+            "type": "error",
+            "reason": reason,
+            "final": error,
+        }),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ExtensionRunner trait impl
 // ---------------------------------------------------------------------------
@@ -1402,6 +1724,44 @@ impl ExtensionRunner for HostExtensionRunner {
                 }
                 Err(err) => {
                     inner.report_host_error(&err);
+                    Ok(None)
+                }
+            }
+        })
+    }
+
+    fn emit_message_update_delta<'a>(
+        &'a self,
+        event: &'a AssistantMessageEvent,
+    ) -> BoxFuture<
+        'a,
+        Result<Option<CancelResult>, super::agent_session::extension_runner::ExtensionRunnerError>,
+    > {
+        let inner = Arc::clone(&self.inner);
+        let payload = serde_json::json!({
+            "type": MESSAGE_UPDATE_DELTA_METHOD,
+            "event": compact_message_update_event(event),
+        });
+        Box::pin(async move {
+            if !inner.has_handlers("message_update") {
+                return Ok(None);
+            }
+            match inner
+                .hook_request(MESSAGE_UPDATE_DELTA_METHOD, payload)
+                .await
+            {
+                Ok(frame) => {
+                    let result = serde_json::from_value::<Option<CancelWire>>(frame.payload)
+                        .ok()
+                        .flatten()
+                        .map(|wire| CancelResult {
+                            cancel: wire.cancel,
+                            reason: wire.reason,
+                        });
+                    Ok(result)
+                }
+                Err(error) => {
+                    inner.report_host_error(&error);
                     Ok(None)
                 }
             }

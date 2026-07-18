@@ -39,6 +39,47 @@ declare module "@earendil-works/pi-coding-agent" {
 		isError?: boolean;
 	}
 
+	export interface Component {
+		render(width: number): string[];
+		dispose?(): void;
+	}
+
+	export interface Theme {
+		name?: string;
+		fg(color: string, text: string): string;
+		bg(color: string, text: string): string;
+		bold(text: string): string;
+		italic(text: string): string;
+		underline(text: string): string;
+		inverse(text: string): string;
+		strikethrough(text: string): string;
+		getFgAnsi(color: string): string;
+		getBgAnsi(color: string): string;
+		getColorMode(): string;
+		getThinkingBorderColor(level: string): (text: string) => string;
+		getBashModeBorderColor(): (text: string) => string;
+	}
+
+	export interface ToolRenderContext<TState = unknown, TArgs = unknown> {
+		args: TArgs;
+		toolCallId: string;
+		invalidate(): void;
+		lastComponent: Component | undefined;
+		state: TState;
+		cwd: string;
+		executionStarted: boolean;
+		argsComplete: boolean;
+		isPartial: boolean;
+		expanded: boolean;
+		showImages: boolean;
+		isError: boolean;
+	}
+
+	export interface ToolRenderResultOptions {
+		expanded: boolean;
+		isPartial: boolean;
+	}
+
 	export interface ToolDefinition<TParams = Record<string, unknown>, TDetails = unknown> {
 		name: string;
 		label: string;
@@ -53,6 +94,17 @@ declare module "@earendil-works/pi-coding-agent" {
 			onUpdate: ((partial: AgentToolResult<TDetails>) => void) | undefined,
 			ctx: ExtensionContext,
 		): Promise<AgentToolResult<TDetails>>;
+		renderCall?: (
+			args: TParams,
+			theme: Theme,
+			context: ToolRenderContext<unknown, TParams>,
+		) => Component;
+		renderResult?: (
+			result: AgentToolResult<TDetails>,
+			options: ToolRenderResultOptions,
+			theme: Theme,
+			context: ToolRenderContext<unknown, TParams>,
+		) => Component;
 	}
 
 	export function defineTool<T extends ToolDefinition>(tool: T): T;
@@ -269,4 +321,17 @@ declare module "@earendil-works/pi-ai" {
 	}
 
 	export function createAssistantMessageEventStream(): AssistantMessageEventStream;
+}
+
+declare module "@earendil-works/pi-ai/compat" {
+	export function validateToolArguments(
+		tool: { name: string; parameters: unknown },
+		call: { name: string; arguments: unknown },
+	): Record<string, unknown>;
+}
+
+declare module "@earendil-works/pi-ai/utils/json-parse.ts" {
+	export function parseStreamingJson<T = Record<string, unknown>>(
+		partialJson: string | undefined,
+	): T;
 }

@@ -1752,15 +1752,14 @@ mod tests {
             .port();
         drop(listener);
         let (token_url, request_started) = spawn_hanging_token_server("/token")?;
-        let oauth = OpenAiCodexOAuth::with_http(
-            AuthHttpClient::new().map_err(|error| error.to_string())?,
-        )
-        .with_endpoints(OpenAiCodexEndpoints {
-            token_url,
-            callback_port: port,
-            redirect_uri: format!("http://localhost:{port}/auth/callback"),
-            ..OpenAiCodexEndpoints::default()
-        });
+        let oauth =
+            OpenAiCodexOAuth::with_http(AuthHttpClient::new().map_err(|error| error.to_string())?)
+                .with_endpoints(OpenAiCodexEndpoints {
+                    token_url,
+                    callback_port: port,
+                    redirect_uri: format!("http://localhost:{port}/auth/callback"),
+                    ..OpenAiCodexEndpoints::default()
+                });
         let parent_cancel = CancellationToken::new();
         let interaction = HangManual {
             select_done: AtomicUsize::new(0),
@@ -1908,16 +1907,14 @@ mod tests {
     #[tokio::test]
     async fn parent_cancel_aborts_in_flight_device_poll() -> TestResult {
         let usercode = spawn_device_user_code_server()?;
-        let (device_token, request_started) =
-            spawn_hanging_token_server("/device-token")?;
-        let oauth = OpenAiCodexOAuth::with_http(
-            AuthHttpClient::new().map_err(|error| error.to_string())?,
-        )
-        .with_endpoints(OpenAiCodexEndpoints {
-            device_user_code_url: usercode,
-            device_token_url: device_token,
-            ..OpenAiCodexEndpoints::default()
-        });
+        let (device_token, request_started) = spawn_hanging_token_server("/device-token")?;
+        let oauth =
+            OpenAiCodexOAuth::with_http(AuthHttpClient::new().map_err(|error| error.to_string())?)
+                .with_endpoints(OpenAiCodexEndpoints {
+                    device_user_code_url: usercode,
+                    device_token_url: device_token,
+                    ..OpenAiCodexEndpoints::default()
+                });
         let parent_cancel = CancellationToken::new();
         let mut interaction =
             ScriptedInteraction::new(vec![Ok(OPENAI_CODEX_DEVICE_CODE_LOGIN_METHOD.into())]);
@@ -1934,12 +1931,14 @@ mod tests {
         let (login, cancel) = tokio::join!(oauth.login(&interaction), cancel_poll);
         cancel?;
         assert!(matches!(login, Err(AuthError::Cancelled)));
-        assert!(interaction
-            .events
-            .lock()
-            .map_err(|_| err("events lock"))?
-            .iter()
-            .any(|event| matches!(event, AuthEvent::DeviceCode { .. })));
+        assert!(
+            interaction
+                .events
+                .lock()
+                .map_err(|_| err("events lock"))?
+                .iter()
+                .any(|event| matches!(event, AuthEvent::DeviceCode { .. }))
+        );
         Ok(())
     }
 

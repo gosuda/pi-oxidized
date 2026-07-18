@@ -249,15 +249,8 @@ async fn apply_edit_mutation(
     edits: &[Edit],
     cancel: &CancellationToken,
 ) -> Result<AgentToolResult, ToolError> {
-    apply_edit_mutation_with_commit_hooks(
-        absolute,
-        path_for_message,
-        edits,
-        cancel,
-        || {},
-        || {},
-    )
-    .await
+    apply_edit_mutation_with_commit_hooks(absolute, path_for_message, edits, cancel, || {}, || {})
+        .await
 }
 
 async fn apply_edit_mutation_with_commit_hooks<BeforeCommit, AfterCommit>(
@@ -763,7 +756,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_before_edit_commit_aborts_without_mutating() -> Result<(), Box<dyn std::error::Error>> {
+    async fn cancellation_before_edit_commit_aborts_without_mutating()
+    -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempdir()?;
         let path = dir.path().join("pre-commit.txt");
         tokio::fs::write(&path, "before").await?;
@@ -791,7 +785,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_after_edit_commit_reports_success() -> Result<(), Box<dyn std::error::Error>> {
+    async fn cancellation_after_edit_commit_reports_success()
+    -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempdir()?;
         let path = dir.path().join("post-commit.txt");
         tokio::fs::write(&path, "before").await?;

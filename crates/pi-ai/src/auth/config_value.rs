@@ -14,14 +14,14 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
-use std::process::{Command, ExitStatus, Stdio};
-use std::sync::{LazyLock, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt as _;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt as _;
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::{LazyLock, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);

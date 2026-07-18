@@ -45,7 +45,7 @@ use crate::core::agent_session_runtime::{
 use crate::core::agent_session_services::{
     AgentSessionRuntimeDiagnostic, AgentSessionServices, AgentSessionServicesError,
     CreateAgentSessionResult, CreateAgentSessionServicesOptions, ExtensionFlagValue,
-    create_agent_session_from_services, create_agent_session_services,
+    create_agent_session_from_services, create_agent_session_services_with_trust,
 };
 use crate::core::config::get_agent_dir;
 use crate::core::model_resolver::{
@@ -57,6 +57,9 @@ use crate::core::package_manager::{PackageManager, PackageManagerOptions, Scope}
 use crate::core::resources::ResourceLoader;
 use crate::core::settings::{SettingsManager, SettingsManagerCreateOptions};
 use crate::core::system_prompt::{BuildSystemPromptOptions, build_system_prompt};
+use crate::core::trust::{
+    ProjectTrustStore, ResolveProjectTrustedOptions, resolve_project_trusted,
+};
 use crate::modes::interactive::runtime::{InteractiveRuntimeOptions, run_interactive_mode};
 use crate::modes::rpc::server::run_rpc_mode;
 use crate::modes::run::{DefaultDispatcher, run_mode_default};
@@ -379,9 +382,8 @@ fn build_session(options: SessionBuildOptions) -> Result<BuiltSession, String> {
         messages: options.messages,
         extension_runner: trait_runner,
         host_extension_runner: host_runner,
-        model_runtime: Some(
-            Arc::new(session_result.model_runtime) as Arc<dyn std::any::Any + Send + Sync>
-        ),
+        model_runtime: Some(Arc::new(session_result.model_runtime)),
+        compaction_stream_override: None,
         skills: options.skills,
         prompt_templates: options.prompt_templates,
         resource_loader: Some(session_result.resource_loader),
@@ -462,26 +464,29 @@ async fn create_runtime_services(
     agent_dir: &str,
     args: &crate::cli::args::Args,
 ) -> Result<AgentSessionServices, String> {
-    create_agent_session_services(CreateAgentSessionServicesOptions {
-        cwd: PathBuf::from(cwd),
-        agent_dir: Some(PathBuf::from(agent_dir)),
-        extension_flag_values: Some(extension_flag_values(args)),
-        resource_loader_options: Some(
-            crate::core::agent_session_services::ResourceLoaderServiceOptions {
-                no_extensions: args.no_extensions,
-                no_skills: args.no_skills,
-                no_prompt_templates: args.no_prompt_templates,
-                no_themes: args.no_themes,
-                no_context_files: args.no_context_files,
-                system_prompt: args.system_prompt.clone(),
-                append_system_prompt: (!args.append_system_prompt.is_empty())
-                    .then(|| args.append_system_prompt.clone()),
-                additional_extension_paths: args.extensions.clone(),
-                ..Default::default()
-            },
-        ),
-        ..Default::default()
-    })
+    create_agent_session_services_with_trust(
+        CreateAgentSessionServicesOptions {
+            cwd: PathBuf::from(cwd),
+            agent_dir: Some(PathBuf::from(agent_dir)),
+            extension_flag_values: Some(extension_flag_values(args)),
+            resource_loader_options: Some(
+                crate::core::agent_session_services::ResourceLoaderServiceOptions {
+                    no_extensions: args.no_extensions,
+                    no_skills: args.no_skills,
+                    no_prompt_templates: args.no_prompt_templates,
+                    no_themes: args.no_themes,
+                    no_context_files: args.no_context_files,
+                    system_prompt: args.system_prompt.clone(),
+                    append_system_prompt: (!args.append_system_prompt.is_empty())
+                        .then(|| args.append_system_prompt.clone()),
+                    additional_extension_paths: args.extensions.clone(),
+                    ..Default::default()
+                },
+            ),
+            ..Default::default()
+        },
+        args.project_trust_override,
+    )
     .await
     .map_err(|error| error.to_string())
 }
@@ -552,6 +557,7 @@ async fn apply_cli_api_key(
 fn build_session_inputs(
     cwd: &str,
     agent_dir: &str,
+    project_trusted: bool,
     model: Option<Model>,
     initial_active_tool_names: Vec<String>,
     resources: &SessionResources,
@@ -559,7 +565,7 @@ fn build_session_inputs(
     let settings_manager = SettingsManager::create(
         cwd,
         Some(agent_dir),
-        SettingsManagerCreateOptions::default(),
+        SettingsManagerCreateOptions::default().project_trusted(project_trusted),
     );
     let tools = build_builtin_tools(Path::new(cwd), &settings_manager, model);
     let system_prompt = build_system_prompt(&BuildSystemPromptOptions {
@@ -598,6 +604,7 @@ impl RuntimeFactory for RealRuntimeFactory {
             } = restore_session(session_context);
 
             let services = create_runtime_services(&cwd, &agent_dir, &parsed).await?;
+            let project_trusted = services.settings_manager().is_project_trusted();
 
             // Services refresh registers extension providers before model resolution.
             let ResolvedModels {
@@ -653,6 +660,7 @@ impl RuntimeFactory for RealRuntimeFactory {
             let (settings_manager, tools, system_prompt) = build_session_inputs(
                 &cwd,
                 &agent_dir,
+                project_trusted,
                 session_result.model.clone(),
                 session_result.initial_active_tool_names.clone(),
                 &resources,
@@ -675,7 +683,9 @@ impl RuntimeFactory for RealRuntimeFactory {
                     cwd: PathBuf::from(&cwd),
                     agent_dir: PathBuf::from(&agent_dir),
                 },
-                Arc::new(RealReplacementFactory),
+                Arc::new(RealReplacementFactory {
+                    project_trust_override: parsed.project_trust_override,
+                }),
                 built.diagnostics,
                 built.model_fallback_message,
             );
@@ -693,7 +703,9 @@ impl RuntimeFactory for RealRuntimeFactory {
 
 /// Replacement factory for runtime swap operations (new/switch/fork).
 #[derive(Clone)]
-struct RealReplacementFactory;
+struct RealReplacementFactory {
+    project_trust_override: Option<bool>,
+}
 
 impl CreateAgentSessionRuntimeFactory for RealReplacementFactory {
     fn create(
@@ -724,17 +736,21 @@ impl CreateAgentSessionRuntimeFactory for RealReplacementFactory {
                 saved_thinking_level: thinking_level,
                 messages: existing_messages,
             } = restore_session(session_context);
-            let services = create_agent_session_services(CreateAgentSessionServicesOptions {
-                cwd: PathBuf::from(&cwd),
-                agent_dir: Some(PathBuf::from(&agent_dir)),
-                ..Default::default()
-            })
+            let services = create_agent_session_services_with_trust(
+                CreateAgentSessionServicesOptions {
+                    cwd: PathBuf::from(&cwd),
+                    agent_dir: Some(PathBuf::from(&agent_dir)),
+                    ..Default::default()
+                },
+                self.project_trust_override,
+            )
             .await
             .map_err(|e| {
                 crate::core::agent_session_runtime::AgentSessionRuntimeError::Factory(format!(
                     "{e}"
                 ))
             })?;
+            let project_trusted = services.settings_manager().is_project_trusted();
             let SessionResources {
                 skills,
                 prompt_templates,
@@ -767,7 +783,7 @@ impl CreateAgentSessionRuntimeFactory for RealReplacementFactory {
             let settings_manager = SettingsManager::create(
                 &cwd,
                 Some(&agent_dir),
-                SettingsManagerCreateOptions::default(),
+                SettingsManagerCreateOptions::default().project_trusted(project_trusted),
             );
             let tools = build_builtin_tools(
                 Path::new(&cwd),
@@ -819,6 +835,7 @@ struct RealPackageHandler {
     cwd: PathBuf,
     agent_dir: PathBuf,
     offline: bool,
+    project_trust_override: std::sync::Mutex<Option<bool>>,
 }
 
 impl RealPackageHandler {
@@ -829,6 +846,7 @@ impl RealPackageHandler {
             cwd,
             agent_dir,
             offline,
+            project_trust_override: std::sync::Mutex::new(None),
         }
     }
 
@@ -838,6 +856,24 @@ impl RealPackageHandler {
             Some(&self.agent_dir),
             SettingsManagerCreateOptions::default().project_trusted(trusted),
         )
+    }
+
+    fn resolved_project_trusted(&self) -> bool {
+        let global_settings = self.build_settings(false);
+        let trust_override = *self
+            .project_trust_override
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        resolve_project_trusted(ResolveProjectTrustedOptions {
+            cwd: self.cwd.clone(),
+            trust_store: &ProjectTrustStore::new(&self.agent_dir),
+            trust_override,
+            default_project_trust: global_settings.get_default_project_trust(),
+            extension_hook: None,
+            ui: None,
+            on_extension_error: None,
+        })
+        .unwrap_or(false)
     }
 
     fn build_package_manager(&self) -> PackageManager {
@@ -853,25 +889,29 @@ impl RealPackageHandler {
 }
 
 impl PackageHandler for RealPackageHandler {
+    fn set_project_trust_override(&self, trust_override: Option<bool>) {
+        *self
+            .project_trust_override
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = trust_override;
+    }
+
     fn install(&self, source: &str, local: bool) -> Result<(), String> {
-        let trusted = self.build_settings(false).is_project_trusted();
-        let mut settings = self.build_settings(trusted);
+        let mut settings = self.build_settings(local && self.resolved_project_trusted());
         let pm = self.build_package_manager();
         pm.install_and_persist(&mut settings, source, Self::scope(local))
             .map_err(|e| format!("{e}"))
     }
 
     fn remove(&self, source: &str, local: bool) -> Result<bool, String> {
-        let trusted = self.build_settings(false).is_project_trusted();
-        let mut settings = self.build_settings(trusted);
+        let mut settings = self.build_settings(local && self.resolved_project_trusted());
         let pm = self.build_package_manager();
         pm.remove_and_persist(&mut settings, source, Self::scope(local))
             .map_err(|e| format!("{e}"))
     }
 
     fn list(&self) -> Result<Vec<ListedPackage>, String> {
-        let trusted = self.build_settings(false).is_project_trusted();
-        let settings = self.build_settings(trusted);
+        let settings = self.build_settings(self.resolved_project_trusted());
         let pm = self.build_package_manager();
         let configured = pm
             .list_configured_packages(&settings)
@@ -894,29 +934,56 @@ impl PackageHandler for RealPackageHandler {
     }
 
     fn is_project_trusted(&self) -> bool {
-        self.build_settings(false).is_project_trusted()
+        self.resolved_project_trusted()
     }
 
     fn refresh_models(&self) -> Result<(), String> {
-        // Model catalog refresh uses ModelRuntime; the concrete refresh is a
-        // product concern wired by the model-runtime slice. Here we accept the
-        // request without error since offline builds skip remote refresh.
-        Ok(())
+        if self.offline {
+            return Err("Cannot refresh model catalogs while offline".to_owned());
+        }
+        let agent_dir = self.agent_dir.clone();
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| format!("Failed to start model refresh runtime: {error}"))?
+                .block_on(async move {
+                    let runtime = ModelRuntime::create(
+                        crate::core::model_runtime::CreateModelRuntimeOptions {
+                            auth_path: Some(agent_dir.join("auth.json")),
+                            models_path: Some(agent_dir.join("models.json")),
+                            models_store_path: Some(agent_dir.join("models-store.json")),
+                            allow_model_network: Some(true),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                    runtime
+                        .refresh(crate::core::model_runtime::ModelsRefreshOptions {
+                            allow_network: Some(true),
+                        })
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                })
+        })
+        .join()
+        .map_err(|_| "Model refresh worker panicked".to_owned())?
     }
 
     fn update_extensions(&self, source: Option<&str>) -> Result<(), String> {
-        let trusted = self.build_settings(false).is_project_trusted();
-        let settings = self.build_settings(trusted);
+        let settings = self.build_settings(self.resolved_project_trusted());
         let pm = self.build_package_manager();
         pm.update_extensions(&settings, source)
             .map_err(|e| format!("{e}"))
     }
 
     fn update_self(&self, _force: bool) -> Result<bool, String> {
-        // Self-update is handled by the update engine; the bootstrap calls
-        // `pi update --self` which routes here. Return Ok(false) (already latest)
-        // when the update engine reports no newer version.
-        Ok(false)
+        Err(
+            "Self-update is not supported by this build; install the new release with your package manager"
+                .to_owned(),
+        )
     }
 }
 
@@ -1099,6 +1166,19 @@ mod tests {
         let io = Io::custom(io_state, factory, handler, output, dispatcher);
         let result = run_pipeline(vec!["-Z".to_owned()], &io).await;
         assert_eq!(result, ExitCode::from(1));
+    }
+
+    #[test]
+    fn unavailable_real_updates_fail_honestly() {
+        let handler = RealPackageHandler::new(true);
+        assert_eq!(
+            handler.refresh_models(),
+            Err("Cannot refresh model catalogs while offline".to_owned())
+        );
+        let error = handler
+            .update_self(false)
+            .expect_err("self-update must not report already-latest without an engine");
+        assert!(error.contains("not supported by this build"));
     }
 
     // Fake factory that errors with a stable string.

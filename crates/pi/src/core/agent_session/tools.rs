@@ -213,8 +213,8 @@ impl AgentSession {
 
     /// Set the active tool set by name.
     ///
-    /// Unknown names are ignored. Order is preserved. The agent tool list is
-    /// rebuilt from the registry; the cached `active_tool_names` mirror is
+    /// Unknown names are ignored. Order is preserved. The agent tool list,
+    /// the prepare-next-turn hook snapshot, and the cached active names are
     /// refreshed in lockstep.
     ///
     /// **System-prompt rebuild boundary**: the TypeScript reference also calls
@@ -238,7 +238,9 @@ impl AgentSession {
                 seen.insert(name);
             }
         }
-        // Update agent state first; then cache the active names.
+        // Keep the hook snapshot synchronized so prepare_next_turn cannot
+        // reinstall stale construction-time tools.
+        self.hooks.set_tools(tools.clone());
         self.agent.set_tools(tools);
         {
             let mut inner = self.lock_inner();

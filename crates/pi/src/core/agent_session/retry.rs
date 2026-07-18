@@ -215,6 +215,22 @@ fn is_context_overflow(message: &AssistantMessage) -> bool {
         || lower.contains("input length")
 }
 
+/// Whether `text` contains `status` as a standalone decimal status token.
+fn contains_status_code(text: &str, status: &str) -> bool {
+    text.match_indices(status).any(|(index, _)| {
+        let before_is_digit = text[..index]
+            .chars()
+            .next_back()
+            .is_some_and(|ch| ch.is_ascii_digit());
+        let after = index.saturating_add(status.len());
+        let after_is_digit = text[after..]
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_digit());
+        !before_is_digit && !after_is_digit
+    })
+}
+
 /// Whether the assistant message is a retryable transient error.
 ///
 /// Non-retryable: auth failures and context overflow (overflow is caught by
@@ -247,9 +263,10 @@ fn is_retryable_assistant_error(message: &AssistantMessage) -> bool {
         || lower.contains("timeout")
         || lower.contains("server error")
         || lower.contains("internal error")
-        || lower.contains("503")
-        || lower.contains("502")
-        || lower.contains("500")
+        || contains_status_code(&lower, "429")
+        || contains_status_code(&lower, "503")
+        || contains_status_code(&lower, "502")
+        || contains_status_code(&lower, "500")
         || lower.contains("retry your request")
         || lower.contains("try your request again")
         || lower.contains("network connection lost")
@@ -304,6 +321,25 @@ mod tests {
         msg.error_message = Some("rate_limit exceeded".to_owned());
         assert!(is_retryable_assistant_error(&msg));
         assert!(!is_context_overflow(&msg));
+    }
+
+    #[test]
+    fn status_first_429_is_retryable() {
+        for error in [
+            "OpenAI API error: 429: {}",
+            "HTTP 429: ",
+            "provider failed with status 429",
+        ] {
+            let mut msg = AssistantMessage::new("api", "provider", "m", 0);
+            msg.stop_reason = StopReason::Error;
+            msg.error_message = Some(error.to_owned());
+            assert!(is_retryable_assistant_error(&msg), "{error}");
+        }
+
+        let mut msg = AssistantMessage::new("api", "provider", "m", 0);
+        msg.stop_reason = StopReason::Error;
+        msg.error_message = Some("internal code 14290".to_owned());
+        assert!(!is_retryable_assistant_error(&msg));
     }
 
     #[test]

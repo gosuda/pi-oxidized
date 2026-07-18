@@ -15,13 +15,13 @@ use pi_ai::auth::config_value::{
     is_config_value_configured, resolve_config_value, resolve_headers,
 };
 use pi_ai::auth::context::MapAuthContext;
+use pi_ai::auth::resolve::resolve_provider_auth_with_signal;
 use pi_ai::auth::{
     AMBIENT_AUTH_MARKER, AuthCheck, AuthContext, AuthResolutionOverrides, AuthResult, AuthType,
     Credential, CredentialInfo, CredentialStore, FileCredentialStore, InMemoryCredentialStore,
     ModelAuth, ModelsError, ModelsErrorCode, OAuthAuth, ProviderAuth, ProviderEnv, ProviderHeaders,
     RuntimeCredentials, api_key_env_vars, env_api_key_auth, get_env_api_key,
 };
-use pi_ai::auth::resolve::resolve_provider_auth_with_signal;
 use pi_ai::catalog::{BuiltinModels, ModelsStoreEntry, builtin_models};
 use pi_ai::models_store::{
     FileModelsStore, InMemoryModelsStore, ModelOverrides, ModelsStore, apply_model_overrides,

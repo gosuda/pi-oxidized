@@ -958,9 +958,7 @@ impl Editor {
         let preceding_id_shrink: usize = find_paste_markers(&self.state.lines[line_index])
             .into_iter()
             .filter(|marker| marker.end <= cursor_after_removal && marker.id > id)
-            .map(|marker| {
-                marker.id.to_string().len() - (marker.id - 1).to_string().len()
-            })
+            .map(|marker| marker.id.to_string().len() - (marker.id - 1).to_string().len())
             .sum();
 
         renumber_after_delete(&mut self.state.lines, &mut self.pastes, id);
@@ -1228,12 +1226,14 @@ impl Editor {
         let mut segments = Vec::new();
         let mut last = 0;
         for marker in markers {
-            segments.extend(default_word_segments(&text[last..marker.start]).into_iter().map(
-                |mut segment| {
-                    segment.index += last;
-                    segment
-                },
-            ));
+            segments.extend(
+                default_word_segments(&text[last..marker.start])
+                    .into_iter()
+                    .map(|mut segment| {
+                        segment.index += last;
+                        segment
+                    }),
+            );
             segments.push(WordSegment {
                 segment: text[marker.start..marker.end].to_owned(),
                 index: marker.start,
@@ -1241,10 +1241,14 @@ impl Editor {
             });
             last = marker.end;
         }
-        segments.extend(default_word_segments(&text[last..]).into_iter().map(|mut segment| {
-            segment.index += last;
-            segment
-        }));
+        segments.extend(
+            default_word_segments(&text[last..])
+                .into_iter()
+                .map(|mut segment| {
+                    segment.index += last;
+                    segment
+                }),
+        );
         segments
     }
 
@@ -2503,9 +2507,7 @@ mod tests {
         let expected_shrink: usize = find_paste_markers(editor.state.current_line())
             .into_iter()
             .filter(|marker| marker.end <= marker_one.start && marker.id > marker_one.id)
-            .map(|marker| {
-                marker.id.to_string().len() - (marker.id - 1).to_string().len()
-            })
+            .map(|marker| marker.id.to_string().len() - (marker.id - 1).to_string().len())
             .sum();
         assert_eq!(expected_shrink, 1);
 
@@ -2513,7 +2515,7 @@ mod tests {
 
         let text = editor.get_text();
         assert_eq!(editor.get_cursor(), (0, marker_one.start - 1));
-        assert!(!text.contains("[paste #10 ") );
+        assert!(!text.contains("[paste #10 "));
         assert_eq!(find_paste_markers(&text).len(), 9);
         assert_eq!(editor.paste_counter, 9);
         assert_eq!(editor.pastes.len(), 9);
@@ -2526,7 +2528,8 @@ mod tests {
     }
 
     #[test]
-    fn forward_delete_renumbers_marker_and_undo_restores_payload_state() -> Result<(), &'static str> {
+    fn forward_delete_renumbers_marker_and_undo_restores_payload_state() -> Result<(), &'static str>
+    {
         let (mut editor, payloads) = editor_with_ten_reverse_ordered_pastes();
         editor.set_cursor_col(editor.state.current_line().len());
         editor.insert_character("x");
@@ -2541,7 +2544,7 @@ mod tests {
         editor.handle_forward_delete();
 
         assert_eq!(editor.get_cursor(), (0, marker_one.start - 1));
-        assert!(!editor.get_text().contains("[paste #10 ") );
+        assert!(!editor.get_text().contains("[paste #10 "));
         assert_eq!(editor.paste_counter, 9);
         assert_eq!(editor.pastes.len(), 9);
         let expected = format!(
@@ -2570,11 +2573,21 @@ mod tests {
         editor.set_cursor_col("α".len());
         editor.move_word_forwards();
         assert_eq!(editor.get_cursor(), (0, marker.end));
-        assert!(editor.state.current_line().is_char_boundary(editor.state.cursor_col));
+        assert!(
+            editor
+                .state
+                .current_line()
+                .is_char_boundary(editor.state.cursor_col)
+        );
 
         editor.move_word_backwards();
         assert_eq!(editor.get_cursor(), (0, marker.start));
-        assert!(editor.state.current_line().is_char_boundary(editor.state.cursor_col));
+        assert!(
+            editor
+                .state
+                .current_line()
+                .is_char_boundary(editor.state.cursor_col)
+        );
     }
 
     #[test]
@@ -2586,7 +2599,10 @@ mod tests {
         open_test_autocomplete(&mut editor);
 
         editor.navigate_history(-1);
-        let pending = editor.autocomplete_pending.as_ref().ok_or("history refresh")?;
+        let pending = editor
+            .autocomplete_pending
+            .as_ref()
+            .ok_or("history refresh")?;
         assert_eq!(pending.snapshot_text, "history value");
         assert_eq!(pending.snapshot_col, 0);
 
@@ -2600,7 +2616,10 @@ mod tests {
         let before = editor.get_cursor();
         editor.page_scroll(-1);
         let pending = editor.autocomplete_pending.as_ref().ok_or("page refresh")?;
-        assert_eq!((pending.snapshot_line, pending.snapshot_col), editor.get_cursor());
+        assert_eq!(
+            (pending.snapshot_line, pending.snapshot_col),
+            editor.get_cursor()
+        );
         assert_ne!(editor.get_cursor(), before);
         Ok(())
     }

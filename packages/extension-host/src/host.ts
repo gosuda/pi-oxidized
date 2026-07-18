@@ -39,8 +39,11 @@ import type {
 	ExtensionUIContext,
 	ProviderConfig,
 	ToolDefinition,
+	Theme,
 } from "@earendil-works/pi-coding-agent";
 import { EventEmitter } from "node:events";
+import { validateToolArguments } from "@earendil-works/pi-ai/compat";
+import { parseStreamingJson } from "@earendil-works/pi-ai/utils/json-parse.ts";
 
 /** Minimal event bus for extension-to-extension communication. */
 export function createEventBus() {
@@ -161,6 +164,46 @@ function parseExtensionsLoadRequest(
 	};
 }
 
+const TOOL_RENDER_WIDTH = 80;
+const TOOL_RENDER_THEME = {
+	name: "extension-host-reference",
+	fg: (_color: string, text: string) => text,
+	bg: (_color: string, text: string) => text,
+	bold: (text: string) => `\x1b[1m${text}\x1b[22m`,
+	italic: (text: string) => `\x1b[3m${text}\x1b[23m`,
+	underline: (text: string) => `\x1b[4m${text}\x1b[24m`,
+	inverse: (text: string) => `\x1b[7m${text}\x1b[27m`,
+	strikethrough: (text: string) => `\x1b[9m${text}\x1b[29m`,
+	getFgAnsi: (_color: string) => "",
+	getBgAnsi: (_color: string) => "",
+	getColorMode: () => "truecolor",
+	getThinkingBorderColor: (_level: string) => (text: string) => text,
+	getBashModeBorderColor: () => (text: string) => text,
+} as Theme;
+
+function escapeHtml(text: string): string {
+	return text
+		.replaceAll("&", "&amp;")
+		.replaceAll("<", "&lt;")
+		.replaceAll(">", "&gt;")
+		.replaceAll('\"', "&quot;")
+		.replaceAll("'", "&#39;");
+}
+
+function ansiToInertHtml(lines: string[]): string {
+	const rendered = parseAnsiLines(lines.join("\n"))
+		.map((line) => line.map((run) => {
+			let text = escapeHtml(run.text);
+			if (run.style?.strikethrough) text = `<s>${text}</s>`;
+			if (run.style?.underline) text = `<u>${text}</u>`;
+			if (run.style?.italic) text = `<em>${text}</em>`;
+			if (run.style?.bold) text = `<strong>${text}</strong>`;
+			return text;
+		}).join(""))
+		.join("\n");
+	return `<pre class="pi-tool-render">${rendered}</pre>`;
+}
+
 /**
  * Extension host process. Owns the ExtensionRunner and bridges it to Rust over
  * a single JSONL byte transport. One stdout writer; all writes are ordered
@@ -190,6 +233,10 @@ export class ExtensionHost {
 	/** Capacity-64 sequential queue of terminal-input jobs. */
 	private readonly terminalInputQueue: Array<() => Promise<void>> = [];
 	private terminalInputDraining = false;
+	/** Active assistant snapshot reconstructed from compact Rust updates. */
+	private activeAssistant: Record<string, unknown> | undefined;
+	/** Raw streamed tool-argument fragments keyed by assistant content index. */
+	private readonly activeToolArguments = new Map<number, string>();
 
 	constructor(stdin: ByteReadable, stdout: ByteWritable) {
 		const onFrame: FrameHandler = (frame) => this.onInbound(frame);
@@ -376,6 +423,12 @@ export class ExtensionHost {
 			case "tool.validate":
 				await this.handleToolValidate(id, p);
 				return;
+			case "tool.renderHtml":
+				await this.handleToolRenderHtml(id, p);
+				return;
+			case "message_update_delta":
+				await this.handleMessageUpdateDelta(id, p);
+				return;
 			case "provider.stream":
 				await this.handleProviderStream(id, p);
 				return;
@@ -403,9 +456,16 @@ export class ExtensionHost {
 			return;
 		}
 		try {
+			if (eventType === "message_start") {
+				const message = payload["message"];
+				if (isRecord(message) && message["role"] === "assistant") {
+					this.seedActiveAssistant(message);
+				}
+			}
 			let result: unknown;
 			switch (eventType) {
 				case "message_end":
+                    this.clearActiveAssistant();
 					result = await runner.emitMessageEnd({ type: eventType, ...payload });
 					await this.client.respond(id, eventType as Method, { message: result ?? undefined });
 					return;
@@ -432,6 +492,9 @@ export class ExtensionHost {
 					await this.client.respond(id, eventType as Method, result ?? {});
 					return;
 				default:
+                    if (eventType === "agent_end" || eventType === "session_shutdown") {
+                        this.clearActiveAssistant();
+                    }
 					result = await runner.emit({ type: eventType, ...payload } as Parameters<typeof runner.emit>[0]);
 					await this.client.respond(id, eventType as Method, result ?? { ok: true });
 					return;
@@ -445,7 +508,134 @@ export class ExtensionHost {
 		}
 	}
 
+	private async handleMessageUpdateDelta(
+		id: number, payload: Record<string, unknown>,
+	): Promise<void> {
+		const runner = this.runner;
+		if (runner === undefined) {
+			await this.client.respondError(id, "message_update_delta" as Method, {
+				code: "extension_error", message: "runner not initialized", retryable: false,
+			});
+			return;
+		}
+		const event = payload["event"];
+		if (!isRecord(event) || typeof event["type"] !== "string") {
+			await this.client.respondError(id, "message_update_delta" as Method, {
+				code: "invalid_request", message: "message_update_delta.event is required", retryable: false,
+			});
+			return;
+		}
+
+		try {
+			const type = event["type"] as string;
+			const final = event["final"];
+			if ((type === "done" || type === "error") && isRecord(final)) {
+				const message = structuredClone(final);
+				const assistantMessageEvent = type === "done"
+					? { type, reason: event["reason"], message }
+					: { type, reason: event["reason"], error: message };
+                this.clearActiveAssistant();
+				const result = await runner.emit({
+					type: "message_update",
+					message,
+					assistantMessageEvent,
+				} as Parameters<typeof runner.emit>[0]);
+				await this.client.respond(id, "message_update_delta" as Method, result ?? { ok: true });
+				return;
+			}
+
+			this.applyAssistantDelta(event);
+			if (this.activeAssistant === undefined) {
+				throw new Error("message update arrived before assistant start");
+			}
+			const message = structuredClone(this.activeAssistant);
+			const assistantMessageEvent = this.expandAssistantEvent(event, message);
+			const result = await runner.emit({
+				type: "message_update",
+				message,
+				assistantMessageEvent,
+			} as Parameters<typeof runner.emit>[0]);
+			await this.client.respond(id, "message_update_delta" as Method, result ?? { ok: true });
+		} catch (error) {
+			await this.client.respondError(id, "message_update_delta" as Method, {
+				code: "extension_error",
+				message: error instanceof Error ? error.message : String(error),
+				retryable: false,
+			});
+		}
+	}
+
+	private seedActiveAssistant(message: Record<string, unknown>): void {
+		this.activeAssistant = structuredClone(message);
+		this.activeToolArguments.clear();
+	}
+
+	private clearActiveAssistant(): void {
+		this.activeAssistant = undefined;
+		this.activeToolArguments.clear();
+	}
+
+	private applyAssistantDelta(event: Record<string, unknown>): void {
+		const meta = isRecord(event["meta"]) ? event["meta"] : {};
+		if (this.activeAssistant === undefined) {
+			if (event["type"] !== "start") {
+				throw new Error("message update arrived before assistant start");
+			}
+			this.activeAssistant = { ...meta, content: [] };
+		} else if (event["type"] === "start") {
+			this.activeAssistant = { ...meta, content: [] };
+			this.activeToolArguments.clear();
+		} else {
+			const content = this.activeAssistant["content"];
+			this.activeAssistant = { ...this.activeAssistant, ...meta, content };
+		}
+		const content = this.activeAssistant["content"];
+		if (!Array.isArray(content)) {
+			throw new Error("active assistant content is not an array");
+		}
+		const index = event["contentIndex"];
+		if (typeof index !== "number") return;
+		const type = event["type"];
+		if ((type === "text_start" || type === "thinking_start" || type === "toolcall_start"
+			|| type === "text_end" || type === "thinking_end" || type === "toolcall_end")
+			&& isRecord(event["block"])) {
+			content[index] = structuredClone(event["block"]);
+			if (type === "toolcall_start") this.activeToolArguments.set(index, "");
+			if (type === "toolcall_end") this.activeToolArguments.delete(index);
+			return;
+		}
+		const delta = event["delta"];
+		const block = content[index];
+		if (typeof delta !== "string" || !isRecord(block)) return;
+		if (type === "text_delta") {
+			block["text"] = `${typeof block["text"] === "string" ? block["text"] : ""}${delta}`;
+		} else if (type === "thinking_delta") {
+			block["thinking"] = `${typeof block["thinking"] === "string" ? block["thinking"] : ""}${delta}`;
+		} else if (type === "toolcall_delta") {
+			const fragments = `${this.activeToolArguments.get(index) ?? ""}${delta}`;
+			this.activeToolArguments.set(index, fragments);
+			block["arguments"] = parseStreamingJson(fragments);
+		}
+	}
+
+	private expandAssistantEvent(
+		event: Record<string, unknown>, partial: Record<string, unknown>,
+	): Record<string, unknown> {
+		const type = event["type"] as string;
+		const expanded: Record<string, unknown> = { type, partial };
+		const index = event["contentIndex"];
+		if (typeof index === "number") expanded["contentIndex"] = index;
+		if (typeof event["delta"] === "string") expanded["delta"] = event["delta"];
+		const content = partial["content"];
+		const block = Array.isArray(content) && typeof index === "number" ? content[index] : undefined;
+		if (type === "text_end" && isRecord(block)) expanded["content"] = block["text"];
+		if (type === "thinking_end" && isRecord(block)) expanded["content"] = block["thinking"];
+		if (type === "toolcall_end" && isRecord(block)) expanded["toolCall"] = block;
+		return expanded;
+	}
+
 	private async handleExtensionsLoad(id: number, p: Record<string, unknown>): Promise<void> {
+		this.clearActiveAssistant();
 		const request = parseExtensionsLoadRequest(
 			p,
 			this.loadOptions?.cwd ?? process.cwd(),
@@ -1009,7 +1199,10 @@ export class ExtensionHost {
 
 		const handlers = ALL_EVENT_TYPES.filter((eventType) => runner.hasHandlers(eventType));
 
-		return { tools, commands, shortcuts, flags, renderers, providers, handlers };
+		return {
+			tools, commands, shortcuts, flags, renderers, providers, handlers,
+			terminalInput: this.activeTerminalHandlerCount > 0,
+		};
 	}
 
 	private handleControlEvent(frame: Frame): void {
@@ -1061,9 +1254,82 @@ export class ExtensionHost {
 			});
 			return;
 		}
-		// Schema validation lives in the TypeScript tool definition; pass through.
-		void def;
-		await this.client.respond(id, "tool.validate" as Method, { args });
+		try {
+			const validated = validateToolArguments(
+				def as Parameters<typeof validateToolArguments>[0],
+				{
+					type: "toolCall",
+					id: String(p["toolCallId"] ?? `validate-${id}`),
+					name,
+					arguments: args,
+				} as Parameters<typeof validateToolArguments>[1],
+			);
+			await this.client.respond(id, "tool.validate" as Method, { args: validated });
+		} catch (err) {
+			await this.client.respondError(id, "tool.validate" as Method, {
+				code: "invalid_arguments",
+				message: err instanceof Error ? err.message : String(err),
+				retryable: false,
+			});
+		}
+	}
+
+	private async handleToolRenderHtml(id: number, p: Record<string, unknown>): Promise<void> {
+		const name = String(p["toolName"] ?? "");
+		const phase = p["phase"];
+		const payload = p["payload"];
+		const def = this.runner?.getToolDefinition(name);
+		if (def === undefined) {
+			await this.client.respond(id, "tool.renderHtml" as Method, {});
+			return;
+		}
+
+		const renderer = phase === "call" ? def.renderCall : phase === "result" ? def.renderResult : undefined;
+		if (renderer === undefined) {
+			await this.client.respond(id, "tool.renderHtml" as Method, {});
+			return;
+		}
+
+		const context: Parameters<NonNullable<ToolDefinition["renderCall"]>>[2] = {
+			args: phase === "call" && isRecord(payload) ? payload : {},
+			toolCallId: `html-export:${name}`,
+			invalidate: () => {},
+			lastComponent: undefined,
+			state: {},
+			cwd: this.loadOptions?.cwd ?? process.cwd(),
+			executionStarted: phase === "result",
+			argsComplete: true,
+			isPartial: false,
+			expanded: true,
+			showImages: false,
+			isError: false,
+		};
+
+		let component: ReturnType<NonNullable<ToolDefinition["renderCall"]>> | undefined;
+		try {
+			component = phase === "call"
+				? def.renderCall?.(payload as never, TOOL_RENDER_THEME, context)
+				: def.renderResult?.(
+					payload as never,
+					{ expanded: true, isPartial: false },
+					TOOL_RENDER_THEME,
+					context,
+				);
+			if (component === undefined) {
+				await this.client.respond(id, "tool.renderHtml" as Method, {});
+				return;
+			}
+			const html = ansiToInertHtml(component.render(TOOL_RENDER_WIDTH));
+			await this.client.respond(id, "tool.renderHtml" as Method, { html });
+		} catch (err) {
+			await this.client.respondError(id, "tool.renderHtml" as Method, {
+				code: "extension_error",
+				message: err instanceof Error ? err.message : String(err),
+				retryable: false,
+			});
+		} finally {
+			component?.dispose?.();
+		}
 	}
 
 	private async handleToolExecute(id: number, p: Record<string, unknown>): Promise<void> {
@@ -1084,9 +1350,11 @@ export class ExtensionHost {
 		const controller = new AbortController();
 		this.inFlightTools.set(id, controller);
 		try {
-			const prepared = def.prepareArguments !== undefined
-				? def.prepareArguments(args)
-				: (args as ToolDefinition["parameters"]);
+			const prepared = p["prepared"] === true
+				? (args as ToolDefinition["parameters"])
+				: def.prepareArguments !== undefined
+					? def.prepareArguments(args)
+					: (args as ToolDefinition["parameters"]);
 			const result = await def.execute(
 				toolCallId,
 				prepared,
@@ -1245,9 +1513,10 @@ export class ExtensionHost {
 		}).catch(() => void 0);
 	}
 
-	private terminate(message: string): void {
-		console.error(`[host] fatal: ${message}`);
-		this.dispose(message);
+	private terminate(reason: string): void {
+		this.clearActiveAssistant();
+		console.error(`[host] fatal: ${reason}`);
+		this.dispose(reason);
 	}
 
 	dispose(reason = "host disposed"): void {
@@ -1268,4 +1537,8 @@ export class ExtensionHost {
 	get extensionCount(): number { return this.extensions.length; }
 	getExtensions(): Extension[] { return [...this.extensions]; }
 	getRunner(): ExtensionRunner | undefined { return this.runner; }
+}
+
+function isRecord<T extends Record<string, unknown>>(value: unknown): value is T {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
 }

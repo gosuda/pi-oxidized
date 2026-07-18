@@ -76,6 +76,9 @@ impl TextRenderer {
             }
             // Lifecycle / tool / session events update no text state.
             AgentSessionEvent::AgentStart
+            | AgentSessionEvent::SessionBeforeSwitch { .. }
+            | AgentSessionEvent::SessionBeforeFork { .. }
+            | AgentSessionEvent::ModelSelect { .. }
             | AgentSessionEvent::TurnStart
             | AgentSessionEvent::ToolExecutionStart { .. }
             | AgentSessionEvent::ToolExecutionUpdate { .. }

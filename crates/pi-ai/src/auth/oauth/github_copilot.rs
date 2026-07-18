@@ -632,8 +632,7 @@ fn get_base_url_from_token_for_provider(
 pub fn get_github_copilot_base_url(token: Option<&str>, enterprise_domain: Option<&str>) -> String {
     let enterprise_domain = enterprise_domain.and_then(normalize_domain);
     if let Some(token) = token
-        && let Some(url) =
-            get_base_url_from_token_for_provider(token, enterprise_domain.as_deref())
+        && let Some(url) = get_base_url_from_token_for_provider(token, enterprise_domain.as_deref())
     {
         return url;
     }
@@ -1086,10 +1085,8 @@ mod tests {
             Some("https://api.individual.githubcopilot.com")
         );
         assert_eq!(
-            get_base_url_from_token(
-                "tid=1;proxy-ep=proxy.business.githubcopilot.com;sku=business"
-            )
-            .as_deref(),
+            get_base_url_from_token("tid=1;proxy-ep=proxy.business.githubcopilot.com;sku=business")
+                .as_deref(),
             Some("https://api.business.githubcopilot.com")
         );
         assert_eq!(
@@ -1120,7 +1117,11 @@ mod tests {
             "proxy.individual.githubcopilot.com/path",
         ] {
             let token = format!("tid=1;proxy-ep={untrusted};sku=free");
-            assert_eq!(get_base_url_from_token(&token), None, "accepted {untrusted}");
+            assert_eq!(
+                get_base_url_from_token(&token),
+                None,
+                "accepted {untrusted}"
+            );
             assert_eq!(
                 get_github_copilot_base_url(Some(&token), None),
                 DEFAULT_COPILOT_BASE_URL

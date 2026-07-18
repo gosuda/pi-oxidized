@@ -378,7 +378,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_before_write_commit_aborts_without_mutating() -> Result<(), Box<dyn std::error::Error>> {
+    async fn cancellation_before_write_commit_aborts_without_mutating()
+    -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempdir()?;
         let path = dir.path().join("pre-commit.txt");
         tokio::fs::write(&path, "before").await?;
@@ -403,7 +404,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_after_write_commit_reports_success() -> Result<(), Box<dyn std::error::Error>> {
+    async fn cancellation_after_write_commit_reports_success()
+    -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempdir()?;
         let path = dir.path().join("post-commit.txt");
         let cancel = CancellationToken::new();

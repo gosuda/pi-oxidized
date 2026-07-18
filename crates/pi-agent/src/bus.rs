@@ -437,8 +437,7 @@ mod tests {
     }
 
     fn update(n: usize) -> AgentEvent {
-        let assistant =
-            pi_ai::AssistantMessage::new("api", "provider", format!("m{n}"), n as i64);
+        let assistant = pi_ai::AssistantMessage::new("api", "provider", format!("m{n}"), n as i64);
         AgentEvent::MessageUpdate {
             message: crate::message::AgentMessage::Llm(Box::new(pi_ai::Message::Assistant(
                 assistant.clone(),
@@ -591,10 +590,7 @@ mod tests {
             retained.get(retained.len().saturating_sub(2)),
             Some(AgentEvent::MessageEnd { .. })
         ));
-        assert!(matches!(
-            retained.last(),
-            Some(AgentEvent::AgentEnd { .. })
-        ));
+        assert!(matches!(retained.last(), Some(AgentEvent::AgentEnd { .. })));
         Ok(())
     }
 

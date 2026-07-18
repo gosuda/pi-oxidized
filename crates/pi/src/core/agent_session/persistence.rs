@@ -11,6 +11,9 @@
 //!    held while holding the std mutex)
 //! 3. `SessionHooks` `RwLock`s (runner / prompt / tools) — never nested with 1/2
 
+use std::io;
+use std::sync::Arc;
+
 use pi_agent::{AgentEvent, AgentMessage};
 use pi_ai::{AssistantMessage, Message, StopReason, UserContent, UserMessageContent};
 
@@ -32,7 +35,7 @@ impl AgentSession {
         &self,
         event: &AgentEvent,
         public_event: &AgentSessionEvent,
-    ) {
+    ) -> Result<(), SessionError> {
         match event {
             AgentEvent::MessageStart { message } if message.role() == "user" => {
                 self.on_user_message_start(message);
@@ -43,10 +46,11 @@ impl AgentSession {
                     AgentSessionEvent::MessageEnd { message } => message,
                     _ => message,
                 };
-                self.on_message_end(message).await;
+                self.on_message_end(message).await?;
             }
             _ => {}
         }
+        Ok(())
     }
 
     fn on_user_message_start(&self, message: &AgentMessage) {
@@ -79,18 +83,16 @@ impl AgentSession {
         }
     }
 
-    async fn on_message_end(&self, message: &AgentMessage) {
-        if let Err(err) = self.persist_message_end(message).await {
-            tracing_warn_persist(&err);
-        }
+    async fn on_message_end(&self, message: &AgentMessage) -> Result<(), SessionError> {
+        self.persist_message_end(message).await?;
 
         if message.role() != "assistant" {
-            return;
+            return Ok(());
         }
 
         let assistant = match message.as_llm() {
             Some(Message::Assistant(a)) => a.clone(),
-            _ => return,
+            _ => return Ok(()),
         };
 
         let mut inner = self.lock_inner();
@@ -108,22 +110,38 @@ impl AgentSession {
                 final_error: None,
             });
         }
+        Ok(())
     }
 
     async fn persist_message_end(&self, message: &AgentMessage) -> Result<(), SessionError> {
-        let mut sm = self.session_manager.lock().await;
-        match message.role() {
-            "custom" => persist_custom_message(&mut sm, message)?,
-            "user" | "assistant" | "toolResult" => {
-                let id = sm.append_message(message)?;
-                if let Some(entry) = sm.get_entry(&id).cloned() {
-                    drop(sm);
-                    self.emit_public(AgentSessionEvent::EntryAppended { entry });
-                    return Ok(());
-                }
-            }
-            // bashExecution / compactionSummary / branchSummary persist elsewhere
-            _ => {}
+        if self.lock_inner().pending_session_error.is_some() {
+            return Err(SessionError::Io {
+                path: "session persistence".to_owned(),
+                source: io::Error::other("session persistence is blocked by an earlier failure"),
+            });
+        }
+        // Reserve the manager in event order before handing the synchronous
+        // filesystem work to the blocking pool. The owned guard preserves the
+        // append linearization point while keeping blocking I/O off Tokio workers.
+        let mut sm = Arc::clone(&self.session_manager).lock_owned().await;
+        let message = message.clone();
+        let persisted_entry = tokio::task::spawn_blocking(move || {
+            let id = match message.role() {
+                "custom" => Some(persist_custom_message(&mut sm, &message)?),
+                "user" | "assistant" | "toolResult" => Some(sm.append_message(&message)?),
+                // bashExecution / compactionSummary / branchSummary persist elsewhere
+                _ => None,
+            };
+            Ok::<_, SessionError>(id.and_then(|id| sm.get_entry(&id).cloned()))
+        })
+        .await
+        .map_err(|err| SessionError::Io {
+            path: "session persistence worker".to_owned(),
+            source: io::Error::other(err),
+        })??;
+
+        if let Some(entry) = persisted_entry {
+            self.emit_public(AgentSessionEvent::EntryAppended { entry });
         }
         Ok(())
     }
@@ -163,19 +181,17 @@ impl AgentSession {
 fn persist_custom_message(
     sm: &mut SessionManager,
     message: &AgentMessage,
-) -> Result<(), SessionError> {
+) -> Result<String, SessionError> {
     let Some(custom) = parse_custom_agent_message(message) else {
         // Fall back to opaque append via message entry.
-        sm.append_message(message)?;
-        return Ok(());
+        return sm.append_message(message);
     };
     sm.append_custom_message_entry(
         &custom.custom_type,
         &custom.content,
         custom.display,
         custom.details.clone(),
-    )?;
-    Ok(())
+    )
 }
 
 fn parse_custom_agent_message(message: &AgentMessage) -> Option<CustomMessage> {
@@ -239,11 +255,6 @@ pub(super) fn user_message_text(message: &AgentMessage) -> String {
         },
         _ => String::new(),
     }
-}
-
-fn tracing_warn_persist(err: &SessionError) {
-    // Avoid depending on a tracing subscriber; keep a silent-but-typed path.
-    let _ = err;
 }
 
 // Re-export for typecheck of SessionEntry in callers.

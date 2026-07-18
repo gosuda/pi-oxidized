@@ -213,31 +213,48 @@ impl AgentSession {
         !self.lock_inner().pending_bash_messages.is_empty()
     }
 
-    /// Drain the pending bash queue, appending each to agent state + session.
+    /// Append pending bash messages in order, removing each only after its
+    /// session append succeeds.
     ///
     /// Called by the pump after `agent_end` (TypeScript `_flushPendingBashMessages`).
     ///
     /// # Errors
     ///
-    /// Returns [`BashExecError::Session`] when persistence fails.
+    /// Returns [`BashExecError::Session`] on the first persistence failure.
+    /// The failed message and every unattempted message remain queued in their
+    /// original order so a later flush can retry without loss.
     pub async fn flush_pending_bash_messages(&self) -> Result<(), BashExecError> {
-        let drained: Vec<BashExecutionMessage> = {
-            let mut inner = self.lock_inner();
-            std::mem::take(&mut inner.pending_bash_messages)
-        };
-        if drained.is_empty() {
-            return Ok(());
-        }
-        let mut manager = self.session_manager.lock().await;
-        for message in drained {
+        // Serialize flush attempts without using the session-manager lock as the
+        // serializer: lock order forbids taking `inner` while manager is held.
+        let _flush_guard = self.bash_flush_lock.lock().await;
+        loop {
+            let message = {
+                let inner = self.lock_inner();
+                inner.pending_bash_messages.first().cloned()
+            };
+            let Some(message) = message else {
+                return Ok(());
+            };
             let agent_message: AgentMessage =
                 AgentMessage::Custom(pi_agent::CustomAgentMessage::new(
                     "bashExecution",
                     bash_execution_payload(&message),
                 ));
-            let _ = manager.append_message(&agent_message);
+            let entry = {
+                let mut manager = self.session_manager.lock().await;
+                let id = manager.append_message(&agent_message)?;
+                manager.get_entry(&id).cloned()
+            };
+            {
+                let mut inner = self.lock_inner();
+                if inner.pending_bash_messages.first() == Some(&message) {
+                    inner.pending_bash_messages.remove(0);
+                }
+            }
+            if let Some(entry) = entry {
+                self.emit_public(super::events::AgentSessionEvent::EntryAppended { entry });
+            }
         }
-        Ok(())
     }
 }
 
