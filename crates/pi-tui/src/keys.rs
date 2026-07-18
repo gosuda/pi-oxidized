@@ -436,11 +436,7 @@ fn legacy_control_character(character: char) -> Option<char> {
         .then(|| char::from((character.to_ascii_uppercase() as u8) & 0x1f))
 }
 
-fn encode_kitty_key_event(
-    base: &str,
-    modifier_parameter: u8,
-    event_type: u8,
-) -> Option<String> {
+fn encode_kitty_key_event(base: &str, modifier_parameter: u8, event_type: u8) -> Option<String> {
     let sequence = match base {
         "up" => format!("\u{1b}[1;{modifier_parameter}:{event_type}A"),
         "down" => format!("\u{1b}[1;{modifier_parameter}:{event_type}B"),
@@ -1181,16 +1177,27 @@ mod tests {
     }
 
     #[test]
-    fn canonical_identity_matches_for_press_repeat_and_release() {
+    fn canonical_identity_matches_for_press_repeat_and_release() -> Result<(), String> {
         for event in [
-            key_press(KeyCode::Char('p'), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
-            key_repeat(KeyCode::Char('p'), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
-            key_release(KeyCode::Char('p'), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+            key_press(
+                KeyCode::Char('p'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+            key_repeat(
+                KeyCode::Char('p'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+            key_release(
+                KeyCode::Char('p'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
         ] {
-            let canonical = canonical_key_id(&event).expect("supported key");
+            let canonical = canonical_key_id(&event)
+                .ok_or_else(|| format!("unsupported key event: {event:?}"))?;
             assert_eq!(canonical.as_str(), "shift+ctrl+p");
             assert!(key_matches(&event, &canonical));
         }
+        Ok(())
     }
 
     #[test]
@@ -1212,8 +1219,11 @@ mod tests {
             Some("\u{1b}[13;2:1u")
         );
         assert_eq!(
-            encode_key_event(&key_press(KeyCode::Up, KeyModifiers::CONTROL | KeyModifiers::ALT))
-                .as_deref(),
+            encode_key_event(&key_press(
+                KeyCode::Up,
+                KeyModifiers::CONTROL | KeyModifiers::ALT
+            ))
+            .as_deref(),
             Some("\u{1b}[1;7:1A")
         );
     }

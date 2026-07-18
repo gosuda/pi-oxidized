@@ -27,8 +27,8 @@ use futures::future::BoxFuture;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::core::agent_session::events::{
-    AgentSessionEvent, SessionBeforeForkPosition, SessionBeforeSwitchReason,
-    SessionShutdownReason, SessionStartReason,
+    AgentSessionEvent, SessionBeforeForkPosition, SessionBeforeSwitchReason, SessionShutdownReason,
+    SessionStartReason,
 };
 use crate::core::agent_session::{AgentSession, ReplacedSessionContext};
 use crate::core::session_transfer::SessionImportFileNotFoundError;
@@ -336,8 +336,11 @@ impl AgentSessionRuntime {
                 previous_session_file,
             })
             .await?;
-        self.teardown_current(SessionShutdownReason::Resume, target_session_file.as_deref())
-            .await;
+        self.teardown_current(
+            SessionShutdownReason::Resume,
+            target_session_file.as_deref(),
+        )
+        .await;
         self.apply(result);
         self.finish_session_replacement(None).await;
         Ok(SwitchOutcome { cancelled: false })
@@ -353,9 +356,7 @@ impl AgentSessionRuntime {
         options: NewSessionOptions,
     ) -> Result<SwitchOutcome, AgentSessionRuntimeError> {
         let _guard = self.replacement_lock.lock().await;
-        let before = self
-            .emit_before_switch(SessionStartReason::New, None)
-            .await;
+        let before = self.emit_before_switch(SessionStartReason::New, None).await;
         if before.cancelled {
             return Ok(before);
         }
@@ -607,8 +608,11 @@ impl AgentSessionRuntime {
                 previous_session_file,
             })
             .await?;
-        self.teardown_current(SessionShutdownReason::Resume, target_session_file.as_deref())
-            .await;
+        self.teardown_current(
+            SessionShutdownReason::Resume,
+            target_session_file.as_deref(),
+        )
+        .await;
         self.apply(result);
         self.finish_session_replacement(None).await;
         Ok(SwitchOutcome { cancelled: false })
@@ -837,8 +841,8 @@ mod tests {
         StreamOptions,
     };
     use std::io;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -933,8 +937,7 @@ mod tests {
         fn log_clone(&self) -> Vec<String> {
             self.log
                 .lock()
-                .map(|g| g.clone())
-                .unwrap_or_else(|p| p.into_inner().clone())
+                .map_or_else(|p| p.into_inner().clone(), |g| g.clone())
         }
     }
 
@@ -1076,8 +1079,7 @@ mod tests {
             &'a self,
             _name: &'a str,
             _args: &'a str,
-        ) -> BoxFuture<'a, Result<bool, crate::core::agent_session::ExtensionRunnerError>>
-        {
+        ) -> BoxFuture<'a, Result<bool, crate::core::agent_session::ExtensionRunnerError>> {
             Box::pin(async { Ok(false) })
         }
 
@@ -1114,8 +1116,7 @@ mod tests {
         fn reasons_clone(&self) -> Vec<SessionStartReason> {
             self.reasons
                 .lock()
-                .map(|g| g.clone())
-                .unwrap_or_else(|p| p.into_inner().clone())
+                .map_or_else(|p| p.into_inner().clone(), |g| g.clone())
         }
     }
 
@@ -1133,9 +1134,8 @@ mod tests {
                     AgentSessionConfig::test_config(Arc::new(StubProvider), test_model())
                         .map_err(|e| AgentSessionRuntimeError::Factory(e.to_string()))?;
                 config.session_manager = options.session_manager;
-                config.extension_runner = Some(
-                    Arc::clone(&self.runner) as Arc<dyn crate::core::agent_session::ExtensionRunner>
-                );
+                config.extension_runner = Some(Arc::clone(&self.runner)
+                    as Arc<dyn crate::core::agent_session::ExtensionRunner>);
                 let session = AgentSession::new(config)
                     .map_err(|e| AgentSessionRuntimeError::Factory(e.to_string()))?;
                 Ok(CreateAgentSessionRuntimeResult {
@@ -1507,8 +1507,11 @@ mod tests {
         Ok(())
     }
 
-    async fn make_recording_runtime()
-    -> TestResult<(AgentSessionRuntime, Arc<RecordingFactory>, Arc<EmitRecordingRunner>)> {
+    async fn make_recording_runtime() -> TestResult<(
+        AgentSessionRuntime,
+        Arc<RecordingFactory>,
+        Arc<EmitRecordingRunner>,
+    )> {
         let runner = Arc::new(EmitRecordingRunner::new());
         let factory = Arc::new(RecordingFactory::new(Arc::clone(&runner)));
         let session_manager = SessionManager::in_memory(Some("."), None)?;

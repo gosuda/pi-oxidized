@@ -603,7 +603,11 @@ async fn shortcut_order_and_extension_metadata_are_preserved() -> R {
     });
     let (runner, _host) = make_runner(snapshot).await?;
     let registry = runner.registry();
-    assert_eq!(registry.shortcuts().len(), 1, "legacy registry stays first-wins");
+    assert_eq!(
+        registry.shortcuts().len(),
+        1,
+        "legacy registry stays first-wins"
+    );
     assert_eq!(
         registry.shortcuts()[0].extension_path.as_deref(),
         Some("/ext/a.ts")
@@ -648,8 +652,7 @@ async fn flags_set_acks_before_updating_local_values_and_rejection_preserves_sta
     );
 
     host.set_response(pi_ext::protocol::FLAGS_SET_METHOD, json!({"ok": false}));
-    let rejected =
-        BTreeMap::from([("verbose".to_owned(), FlagValueWire::Boolean(false))]);
+    let rejected = BTreeMap::from([("verbose".to_owned(), FlagValueWire::Boolean(false))]);
     assert!(runner.apply_flag_values(&rejected).await.is_err());
     assert_eq!(
         runner.get_flag_values().get("verbose"),
@@ -1972,11 +1975,9 @@ export default function flagObserver(pi) {{
         program: host_path,
         args: Vec::new(),
     };
-    let runner = HostExtensionRunner::spawn_from(
-        &spec,
-        vec![extension_path.to_string_lossy().into_owned()],
-    )
-    .await?;
+    let runner =
+        HostExtensionRunner::spawn_from(&spec, vec![extension_path.to_string_lossy().into_owned()])
+            .await?;
 
     // CLI flag application (flags.set) happens before any bind.
     runner

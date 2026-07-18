@@ -19,10 +19,10 @@ use ratatui::layout::Rect;
 #[cfg(test)]
 use ratatui::style::{Color, Modifier};
 
+use pi_ext::adapters::{SlotComponent, tui_overlay_spec};
 use pi_tui::component::Component;
 use pi_tui::components::Text;
 use pi_tui::focus::Focusable;
-use pi_ext::adapters::{SlotComponent, tui_overlay_spec};
 
 use super::footer;
 use super::header;
@@ -315,25 +315,22 @@ pub fn render_view_with_height(state: &ViewState, width: u16, height: u16) -> Bu
     }
     if let Some(mut overlay) = composed.overlay {
         let measured = overlay.measure(width.max(1)).min(height);
-        let rect = composed
-            .overlay_spec
-            .as_ref()
-            .map_or_else(
-                || Rect::new(0, 0, width.max(1), measured),
-                |spec| {
-                    let layout = pi_tui::layout::resolve_overlay_layout(
-                        spec,
-                        measured,
-                        width.max(1),
-                        height.max(1),
-                    );
-                    let overlay_height = layout
-                        .max_height
-                        .map_or(measured, |max_height| measured.min(max_height))
-                        .min(height.saturating_sub(layout.row));
-                    Rect::new(layout.col, layout.row, layout.width, overlay_height)
-                },
-            );
+        let rect = composed.overlay_spec.as_ref().map_or_else(
+            || Rect::new(0, 0, width.max(1), measured),
+            |spec| {
+                let layout = pi_tui::layout::resolve_overlay_layout(
+                    spec,
+                    measured,
+                    width.max(1),
+                    height.max(1),
+                );
+                let overlay_height = layout
+                    .max_height
+                    .map_or(measured, |max_height| measured.min(max_height))
+                    .min(height.saturating_sub(layout.row));
+                Rect::new(layout.col, layout.row, layout.width, overlay_height)
+            },
+        );
         if rect.height > 0 {
             overlay.render(rect, &mut buf);
         }

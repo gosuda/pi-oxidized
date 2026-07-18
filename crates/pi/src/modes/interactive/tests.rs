@@ -412,16 +412,14 @@ fn shortcut_overlay_shows_extensions_only_when_present() {
         lines: Vec::new(),
         height: 20,
     });
-    let plain =
-        snapshot_buffer_plain(&render_view(&state, 80, 40), 80, 40).join("\n");
+    let plain = snapshot_buffer_plain(&render_view(&state, 80, 40), 80, 40).join("\n");
     assert!(!plain.contains("Extensions"));
 
     state.extension_shortcuts.push(ShortcutHint {
         key: "ctrl+y".to_owned(),
         action: "Extension action".to_owned(),
     });
-    let plain =
-        snapshot_buffer_plain(&render_view(&state, 80, 40), 80, 40).join("\n");
+    let plain = snapshot_buffer_plain(&render_view(&state, 80, 40), 80, 40).join("\n");
     assert!(plain.contains("Extensions"));
     assert!(plain.contains("ctrl+y"));
     assert!(plain.contains("Extension action"));
@@ -437,8 +435,8 @@ fn extension_overlay_uses_resolved_anchor_width_and_margin() {
         lines: Vec::new(),
         height: 1,
     });
-    state.extension_overlay_slot = Some(pi_ext::sanitize::sanitize_slot(
-        &pi_ext::protocol::UiSlot {
+    state.extension_overlay_slot =
+        Some(pi_ext::sanitize::sanitize_slot(&pi_ext::protocol::UiSlot {
             key: "geometry".to_owned(),
             generation: 1,
             placement: pi_ext::protocol::SlotPlacement::Overlay,
@@ -455,8 +453,7 @@ fn extension_overlay_uses_resolved_anchor_width_and_margin() {
                 margin: Some(pi_ext::protocol::OverlayMarginWire::Uniform(2)),
                 ..pi_ext::protocol::OverlaySpec::default()
             }),
-        },
-    ));
+        }));
 
     let buffer = render_view(&state, 40, 12);
     assert_eq!(

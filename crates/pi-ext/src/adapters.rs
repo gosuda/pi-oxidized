@@ -583,8 +583,12 @@ impl Component for SlotComponent {
             && let Some(cursor) = self.slot.cursor
         {
             set_cursor(Position {
-                x: area.x.saturating_add(cursor.col.min(area.width.saturating_sub(1))),
-                y: area.y.saturating_add(cursor.row.min(area.height.saturating_sub(1))),
+                x: area
+                    .x
+                    .saturating_add(cursor.col.min(area.width.saturating_sub(1))),
+                y: area
+                    .y
+                    .saturating_add(cursor.row.min(area.height.saturating_sub(1))),
             });
         }
     }
@@ -625,7 +629,6 @@ impl Focusable for SlotComponent {
         self
     }
 }
-
 
 /// Convert a wire style into a Ratatui style.
 fn wire_style_to_ratatui(style: &crate::protocol::Style) -> RatatuiStyle {
@@ -712,7 +715,12 @@ fn sgr_color(color: &WireColor, background: bool) -> String {
                 NamedColor::BrightCyan => 96,
                 NamedColor::BrightWhite => 97,
             };
-            (if background { foreground + 10 } else { foreground }).to_string()
+            (if background {
+                foreground + 10
+            } else {
+                foreground
+            })
+            .to_string()
         }
     }
 }
@@ -1666,7 +1674,6 @@ mod tests {
         assert!(!raw.contains("javascript:"));
         assert!(!raw.contains("evil.example"));
     }
-
 
     fn base_model_defaults() -> Model {
         Model {

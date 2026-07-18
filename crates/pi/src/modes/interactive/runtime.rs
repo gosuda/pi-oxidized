@@ -46,8 +46,8 @@ use std::time::{Duration, Instant};
 use futures::future::{BoxFuture, poll_fn};
 use pi_ai::AssistantMessage;
 use pi_tui::component::{Component, EventResult, UiEvent};
-use pi_tui::keys::{ParsedKeyId, encode_key_event, key_matches_parsed, parse_key_id};
 use pi_tui::components::editor::{Editor, EditorOptions};
+use pi_tui::keys::{ParsedKeyId, encode_key_event, key_matches_parsed, parse_key_id};
 use pi_tui::terminal::caps::TerminalCapabilities;
 use pi_tui::terminal::input::TerminalInput;
 use pi_tui::terminal::writer::{ReanchorCause, SettledBlock, Tui, Txn};
@@ -719,10 +719,7 @@ impl Component for InteractiveRoot {
             if rendered_title_height > 0
                 && let Some(title) = self.dialog_title.as_mut()
             {
-                title.render(
-                    Rect::new(area.x, y, area.width, rendered_title_height),
-                    buf,
-                );
+                title.render(Rect::new(area.x, y, area.width, rendered_title_height), buf);
             }
             let body_height = height.saturating_sub(rendered_title_height);
             if body_height > 0 {
@@ -983,9 +980,10 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         let initial_extension_slots = extension_runner
             .as_ref()
             .map_or_else(Vec::new, |runner| runner.current_slots());
-        let effective_extension_shortcuts = extension_runner
-            .as_ref()
-            .map_or_else(Vec::new, |runner| build_effective_extension_shortcuts(&runner.raw_shortcuts()));
+        let effective_extension_shortcuts =
+            extension_runner.as_ref().map_or_else(Vec::new, |runner| {
+                build_effective_extension_shortcuts(&runner.raw_shortcuts())
+            });
         view.extension_shortcuts = shortcut_hints(&effective_extension_shortcuts);
 
         let (submit_tx, submit_rx) = mpsc::unbounded_channel::<String>();
@@ -2452,10 +2450,12 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         self.extension_slots.clear();
         self.focused_extension_slot = None;
         self.view.extension_overlay_slot = None;
-        self.effective_extension_shortcuts = self.extension_runner.as_ref().map_or_else(
-            Vec::new,
-            |runner| build_effective_extension_shortcuts(&runner.raw_shortcuts()),
-        );
+        self.effective_extension_shortcuts = self
+            .extension_runner
+            .as_ref()
+            .map_or_else(Vec::new, |runner| {
+                build_effective_extension_shortcuts(&runner.raw_shortcuts())
+            });
         self.view.extension_shortcuts = shortcut_hints(&self.effective_extension_shortcuts);
         self.view.widgets_above.clear();
         self.view.widgets_below.clear();
@@ -5962,13 +5962,12 @@ mod tests {
         let (mut rt, _log) = try_make_runtime()?;
         rt.editor.set_text("draft");
         rt.view.editor.text = "draft".to_owned();
-        rt.effective_extension_shortcuts = build_effective_extension_shortcuts(&[
-            pi_ext::adapters::ShortcutRegistration {
+        rt.effective_extension_shortcuts =
+            build_effective_extension_shortcuts(&[pi_ext::adapters::ShortcutRegistration {
                 key: "ctrl+c".to_owned(),
                 description: Some("must not run".to_owned()),
                 extension_path: Some("extension.ts".to_owned()),
-            },
-        ]);
+            }]);
         assert!(rt.effective_extension_shortcuts.is_empty());
 
         rt.step_ui(key(KeyCode::Char('c'), KeyModifiers::CONTROL))
@@ -5998,7 +5997,9 @@ mod tests {
         assert_eq!(rt.focused_extension_slot.as_deref(), Some("editor.status"));
         assert_eq!(rt.view.focus, FocusArea::Widget);
         assert_eq!(
-            rt.extension_slots.get("editor.status").map(|slot| slot.generation),
+            rt.extension_slots
+                .get("editor.status")
+                .map(|slot| slot.generation),
             Some(7)
         );
 
@@ -6025,7 +6026,8 @@ mod tests {
     }
 
     #[test]
-    fn non_capturing_overlay_preserves_editor_focus_and_structured_metadata() {
+    fn non_capturing_overlay_preserves_editor_focus_and_structured_metadata() -> Result<(), String>
+    {
         let (mut rt, _log) = make_runtime();
         let link = pi_ext::protocol::Hyperlink {
             id: Some("docs".to_owned()),
@@ -6059,8 +6061,9 @@ mod tests {
             .view
             .extension_overlay_slot
             .as_ref()
-            .expect("structured overlay");
+            .ok_or_else(|| "structured overlay was not projected".to_owned())?;
         assert_eq!(projected.lines[0][0].style.link.as_ref(), Some(&link));
+        Ok(())
     }
 
     #[tokio::test]

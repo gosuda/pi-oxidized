@@ -794,7 +794,6 @@ mod tests {
         fn invalidate(&mut self) {}
     }
 
-
     #[test]
     fn coalescer_arms_deadline_once() {
         let mut c = Coalescer::new();

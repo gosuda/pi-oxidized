@@ -1742,32 +1742,9 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_collect_extension_flags() {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-
-        // 1. Prove no-runner returns empty list
-        let config = crate::core::agent_session::AgentSessionConfig::test_config(
-            Arc::new(StubProvider),
-            fake_runtime_model(),
-        )
-        .unwrap();
-        let session = crate::core::agent_session::AgentSession::new(config).unwrap();
-        let runtime = Arc::new(AgentSessionRuntime::new(
-            session,
-            crate::core::agent_session_runtime::AgentSessionRuntimeServices {
-                cwd: std::env::current_dir().unwrap(),
-                agent_dir: std::env::current_dir().unwrap(),
-            },
-            Arc::new(StubRuntimeFactory),
-            Vec::new(),
-            None,
-        ));
-        let flags = collect_extension_flags(&runtime);
-        assert!(flags.is_empty(), "expected empty flags when no runner is present");
-
-        // 2. Setup a mock host runner with boolean/string flags, description fallback source
-        let snapshot = serde_json::json!({
+    /// Flag snapshot the fake host serves for `extensions.load`.
+    fn fake_flag_snapshot() -> serde_json::Value {
+        serde_json::json!({
             "flags": [
                 {
                     "name": "verbose-log",
@@ -1791,111 +1768,187 @@ mod tests {
                     "type": "string"
                 }
             ]
-        });
+        })
+    }
 
-        let (client_to_host, host_from_client) = tokio::io::duplex(64 * 1024);
-        let (host_to_client, client_from_host) = tokio::io::duplex(64 * 1024);
-        let (client_err, _host_err) = tokio::io::duplex(4096);
-        let client = pi_ext::client::HostClient::connect_boxed(
-            Box::new(client_to_host),
-            Box::new(client_from_host),
-            Box::new(client_err),
-            None,
-        );
-        let client = Arc::new(client);
-
-        let snapshot_clone = snapshot.clone();
-        tokio::spawn(async move {
-            let mut reader = tokio::io::BufReader::new(host_from_client);
-            let mut writer = host_to_client;
-            let mut line = String::new();
-            while reader.read_line(&mut line).await.is_ok() {
-                if line.is_empty() {
-                    break;
-                }
-                if let Ok(req) = pi_ext::protocol::decode_frame_str(&line) {
-                    let payload = if req.method == "hello" {
-                        serde_json::to_value(pi_ext::protocol::HelloAck::local()).unwrap()
-                    } else if req.method == "extensions.load" {
-                        snapshot_clone.clone()
-                    } else {
-                        serde_json::Value::Object(serde_json::Map::new())
-                    };
-                    let resp = pi_ext::protocol::Frame {
-                        id: req.id,
-                        kind: pi_ext::protocol::FrameKind::Res,
-                        method: req.method,
-                        payload,
-                    };
-                    let bytes = pi_ext::protocol::encode_frame(&resp).unwrap();
-                    let _ = writer.write_all(&bytes).await;
-                    let _ = writer.flush().await;
-                }
-                line.clear();
-            }
-        });
-
-        let runner = crate::core::extension_host::HostExtensionRunner::connect(
-            client,
-            vec![],
-        )
-        .await
-        .unwrap();
-
-        let mut config_with_runner = crate::core::agent_session::AgentSessionConfig::test_config(
+    /// Build a test runtime, optionally binding a host extension runner.
+    /// Propagates typed construction errors instead of panicking.
+    fn build_test_runtime(
+        runner: Option<Arc<crate::core::extension_host::HostExtensionRunner>>,
+    ) -> Result<Arc<AgentSessionRuntime>, String> {
+        let cwd = std::env::current_dir().map_err(|e| format!("current_dir: {e}"))?;
+        let mut config = crate::core::agent_session::AgentSessionConfig::test_config(
             Arc::new(StubProvider),
             fake_runtime_model(),
         )
-        .unwrap();
-        config_with_runner.host_extension_runner = Some(runner);
-        let session_with_runner = crate::core::agent_session::AgentSession::new(config_with_runner).unwrap();
-        let runtime_with_runner = Arc::new(AgentSessionRuntime::new(
-            session_with_runner,
+        .map_err(|e| format!("test_config: {e}"))?;
+        config.host_extension_runner = runner;
+        let session = crate::core::agent_session::AgentSession::new(config)
+            .map_err(|e| format!("AgentSession::new: {e}"))?;
+        Ok(Arc::new(AgentSessionRuntime::new(
+            session,
             crate::core::agent_session_runtime::AgentSessionRuntimeServices {
-                cwd: std::env::current_dir().unwrap(),
-                agent_dir: std::env::current_dir().unwrap(),
+                cwd: cwd.clone(),
+                agent_dir: cwd,
             },
             Arc::new(StubRuntimeFactory),
             Vec::new(),
             None,
+        )))
+    }
+
+    /// Answer one fake-host request line, propagating encode/serialization
+    /// errors instead of unwrapping.
+    async fn serve_fake_host_line(
+        line: &str,
+        snapshot: &serde_json::Value,
+        writer: &mut tokio::io::DuplexStream,
+    ) -> Result<(), String> {
+        use tokio::io::AsyncWriteExt;
+        let req =
+            pi_ext::protocol::decode_frame_str(line).map_err(|e| format!("decode request: {e}"))?;
+        let payload = if req.method == "hello" {
+            serde_json::to_value(pi_ext::protocol::HelloAck::local())
+                .map_err(|e| format!("encode hello: {e}"))?
+        } else if req.method == "extensions.load" {
+            snapshot.clone()
+        } else {
+            serde_json::Value::Object(serde_json::Map::new())
+        };
+        let resp = pi_ext::protocol::Frame {
+            id: req.id,
+            kind: pi_ext::protocol::FrameKind::Res,
+            method: req.method,
+            payload,
+        };
+        let bytes =
+            pi_ext::protocol::encode_frame(&resp).map_err(|e| format!("encode frame: {e}"))?;
+        writer
+            .write_all(&bytes)
+            .await
+            .map_err(|e| format!("write frame: {e}"))?;
+        writer
+            .flush()
+            .await
+            .map_err(|e| format!("flush frame: {e}"))?;
+        Ok(())
+    }
+
+    /// Spawn a fake extension host over a duplex pair. Encode/serialization
+    /// failures are recorded into `errors` (never silently swallowed) and the
+    /// task exits so the client observes EOF.
+    fn spawn_fake_extension_host(
+        host_from_client: tokio::io::DuplexStream,
+        host_to_client: tokio::io::DuplexStream,
+        snapshot: serde_json::Value,
+        errors: Arc<Mutex<Vec<String>>>,
+    ) -> tokio::task::JoinHandle<()> {
+        use tokio::io::AsyncBufReadExt;
+        tokio::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(host_from_client);
+            let mut writer = host_to_client;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+                if let Err(message) = serve_fake_host_line(&line, &snapshot, &mut writer).await {
+                    lock_recover(&errors).push(message);
+                    break;
+                }
+            }
+        })
+    }
+
+    fn assert_extension_flag(
+        flag: &crate::cli::help::ExtensionFlagHelp,
+        name: &str,
+        takes_value: bool,
+        description: Option<&str>,
+        extension_path: &str,
+    ) {
+        assert_eq!(flag.name, name);
+        assert_eq!(flag.takes_value, takes_value);
+        assert_eq!(flag.description.as_deref(), description);
+        assert_eq!(flag.extension_path, extension_path);
+    }
+
+    #[tokio::test]
+    async fn test_collect_extension_flags() -> Result<(), String> {
+        // 1. No runner → empty flag list.
+        let runtime = build_test_runtime(None)?;
+        assert!(
+            collect_extension_flags(&runtime).is_empty(),
+            "expected empty flags when no runner is present"
+        );
+
+        // 2. Wire a fake host serving boolean/string flags with varied metadata.
+        let (client_to_host, host_from_client) = tokio::io::duplex(64 * 1024);
+        let (host_to_client, client_from_host) = tokio::io::duplex(64 * 1024);
+        let (client_err, _host_err) = tokio::io::duplex(4096);
+        let client = Arc::new(pi_ext::client::HostClient::connect_boxed(
+            Box::new(client_to_host),
+            Box::new(client_from_host),
+            Box::new(client_err),
+            None,
         ));
+        let host_errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let _host = spawn_fake_extension_host(
+            host_from_client,
+            host_to_client,
+            fake_flag_snapshot(),
+            Arc::clone(&host_errors),
+        );
 
+        let runner = crate::core::extension_host::HostExtensionRunner::connect(client, vec![])
+            .await
+            .map_err(|e| format!("HostExtensionRunner::connect: {e}"))?;
+
+        let runtime_with_runner = build_test_runtime(Some(runner))?;
         let flags = collect_extension_flags(&runtime_with_runner);
-        assert_eq!(flags.len(), 4);
+        assert_eq!(flags.len(), 4, "expected four registered flags");
 
-        // Prove order, description, takes_value, and extension_path mapping:
-        // Flag 0: verbose-log (boolean)
-        assert_eq!(flags[0].name, "verbose-log");
-        assert_eq!(flags[0].takes_value, false);
-        assert_eq!(flags[0].description, Some("Enable verbose logging".to_owned()));
-        assert_eq!(flags[0].extension_path, "/plugins/logger");
+        // Order, description, takes_value, and extension_path mapping.
+        assert_extension_flag(
+            &flags[0],
+            "verbose-log",
+            false,
+            Some("Enable verbose logging"),
+            "/plugins/logger",
+        );
+        assert_extension_flag(
+            &flags[1],
+            "api-url",
+            true,
+            Some("Custom API URL"),
+            "/plugins/api",
+        );
+        // No description → falls back to extension_path in help rendering.
+        assert_extension_flag(&flags[2], "fallback-flag", false, None, "/plugins/fallback");
+        // No description and no extensionPath → maps to "<extension>".
+        assert_extension_flag(&flags[3], "legacy-flag", true, None, "<extension>");
 
-        // Flag 1: api-url (string)
-        assert_eq!(flags[1].name, "api-url");
-        assert_eq!(flags[1].takes_value, true);
-        assert_eq!(flags[1].description, Some("Custom API URL".to_owned()));
-        assert_eq!(flags[1].extension_path, "/plugins/api");
-
-        // Flag 2: fallback-flag (boolean, no description -> falls back to extension_path)
-        assert_eq!(flags[2].name, "fallback-flag");
-        assert_eq!(flags[2].takes_value, false);
-        assert_eq!(flags[2].description, None);
-        assert_eq!(flags[2].extension_path, "/plugins/fallback");
-
-        // Flag 3: legacy-flag (string, no description, lacks extensionPath -> maps to "<extension>")
-        assert_eq!(flags[3].name, "legacy-flag");
-        assert_eq!(flags[3].takes_value, true);
-        assert_eq!(flags[3].description, None);
-        assert_eq!(flags[3].extension_path, "<extension>");
-
-        // Prove description fallback source: when formatting the help,
-        // fallback-flag should print "Registered by /plugins/fallback"
-        // and legacy-flag should print "Registered by <extension>"
+        // Help rendering surfaces the description-fallback source.
         let help_text = crate::cli::help::format_help(
             Some(&flags),
             crate::cli::help::HelpStyle { styled: false },
         );
-        assert!(help_text.contains("Registered by /plugins/fallback"));
-        assert!(help_text.contains("Registered by <extension>"));
+        assert!(
+            help_text.contains("Registered by /plugins/fallback"),
+            "help missing fallback-path registration line"
+        );
+        assert!(
+            help_text.contains("Registered by <extension>"),
+            "help missing generic-extension registration line"
+        );
+        // The fake host must not have silently hidden any encode/serialization failure.
+        assert!(
+            lock_recover(&host_errors).is_empty(),
+            "fake host reported errors: {:?}",
+            lock_recover(&host_errors).clone()
+        );
+        Ok(())
     }
 }

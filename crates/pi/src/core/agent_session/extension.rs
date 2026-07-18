@@ -30,9 +30,8 @@ use std::sync::{Arc, Mutex};
 
 use super::AgentSession;
 use super::events::{
-    AgentSessionEvent, SessionStartEvent, SessionStartReason, SessionShutdownReason,
+    AgentSessionEvent, SessionShutdownReason, SessionStartEvent, SessionStartReason,
 };
-
 
 /// Mode the session is bound to (mirrors `AppMode` minus `Interactive`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -803,7 +802,6 @@ mod tests {
         fn invalidate(&self) {}
 
         fn emit_error(&self, _message: String) {}
-
     }
 
     #[tokio::test]

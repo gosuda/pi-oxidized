@@ -1130,6 +1130,16 @@ impl HostExtensionRunner {
     /// Synchronize a complete validated flag overlay with the host.
     ///
     /// The local flag snapshot is updated only after the host acknowledges the request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostClientError::Payload`] when the request or response payload
+    /// cannot be (de)serialized, or when the host rejects the overlay
+    /// (`ok == false`). Propagates the transport-level error from
+    /// [`hook_request`](HostClientInner::hook_request) otherwise:
+    /// [`HostClientError::NotRunning`] when the host is down, and
+    /// [`HostClientError::Timeout`], [`HostClientError::Closed`], or
+    /// [`HostClientError::Remote`] on transport failure.
     pub async fn apply_flag_values(
         &self,
         values: &BTreeMap<String, FlagValueWire>,
@@ -1162,23 +1172,41 @@ impl HostExtensionRunner {
     }
 
     /// Dispatch one effective extension shortcut.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostClientError::Payload`] when the request or response payload
+    /// cannot be (de)serialized. Propagates the transport-level error from
+    /// [`hook_request`](HostClientInner::hook_request) otherwise:
+    /// [`HostClientError::NotRunning`] when the host is down, and
+    /// [`HostClientError::Timeout`], [`HostClientError::Closed`], or
+    /// [`HostClientError::Remote`] on transport failure.
     pub async fn execute_shortcut(
         &self,
         key: impl Into<String>,
     ) -> Result<ShortcutExecuteResponse, HostClientError> {
-        let payload = protocol::to_payload(&ShortcutExecuteRequest { key: key.into() }).map_err(
-            |error| HostClientError::Payload(format!("encode shortcut.execute: {error}")),
-        )?;
+        let payload =
+            protocol::to_payload(&ShortcutExecuteRequest { key: key.into() }).map_err(|error| {
+                HostClientError::Payload(format!("encode shortcut.execute: {error}"))
+            })?;
         let frame = self
             .inner
             .hook_request(protocol::SHORTCUT_EXECUTE_METHOD, payload)
             .await?;
-        protocol::from_payload(&frame.payload).map_err(|error| {
-            HostClientError::Payload(format!("decode shortcut.execute: {error}"))
-        })
+        protocol::from_payload(&frame.payload)
+            .map_err(|error| HostClientError::Payload(format!("decode shortcut.execute: {error}")))
     }
 
     /// Deliver one event to a keyed UI slot generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostClientError::Payload`] when the request or response payload
+    /// cannot be (de)serialized. Propagates the transport-level error from
+    /// [`hook_request`](HostClientInner::hook_request) otherwise:
+    /// [`HostClientError::NotRunning`] when the host is down, and
+    /// [`HostClientError::Timeout`], [`HostClientError::Closed`], or
+    /// [`HostClientError::Remote`] on transport failure.
     pub async fn send_ui_event(
         &self,
         request: UiEventRequest,

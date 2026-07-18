@@ -1323,7 +1323,6 @@ mod tests {
         fn invalidate(&self) {}
 
         fn emit_error(&self, _message: String) {}
-
     }
 
     async fn collect_types(rx: &mut mpsc::UnboundedReceiver<String>, n: usize) -> Vec<String> {
