@@ -131,10 +131,11 @@ type HostState = (typeof HostState)[keyof typeof HostState];
 /** State tracked for a keyed UI slot (widget/header/footer/editor/overlay). */
 interface SlotEntry {
 	generation: number;
-	component: { render(width: number): string[]; dispose?(): void } | null;
+	component: { render(width: number): string[]; handleInput?(data: string): void; dispose?(): void } | null;
 	placement: SlotPlacement;
 	focusable: boolean;
 	overlayOptions: OverlayOptions | undefined;
+	width: number;
 }
 
 /** Pending load options captured during the hello handshake. */
@@ -396,6 +397,12 @@ export class ExtensionHost {
 		const p = payload as Record<string, unknown>;
 
 		switch (method) {
+			case "flags.set":
+				await this.handleFlagsSet(id, p);
+				return;
+			case "shortcut.execute":
+				await this.handleShortcutExecute(id, p);
+				return;
 			case "measure":
 				await this.handleMeasure(id, p);
 				return;
@@ -439,6 +446,74 @@ export class ExtensionHost {
 				}
 				this.respondError(frame, `unknown method: ${method}`);
 		}
+	}
+
+	private async handleFlagsSet(id: number, p: Record<string, unknown>): Promise<void> {
+		const runner = this.runner;
+		const values = p["values"];
+		if (runner === undefined) {
+			await this.client.respondError(id, "flags.set", {
+				code: "extension_error", message: "runner not initialized", retryable: false,
+			});
+			return;
+		}
+		if (!isRecord(values)) {
+			await this.client.respondError(id, "flags.set", {
+				code: "invalid_arguments", message: "flags.set values must be an object", retryable: false,
+			});
+			return;
+		}
+
+		const entries: Array<readonly [string, boolean | string]> = [];
+		for (const [name, value] of Object.entries(values)) {
+			if (typeof value !== "boolean" && typeof value !== "string") {
+				await this.client.respondError(id, "flags.set", {
+					code: "invalid_arguments",
+					message: `flags.set value for "${name}" must be boolean or string`,
+					retryable: false,
+				});
+				return;
+			}
+			entries.push([name, value]);
+		}
+
+		for (const [name, value] of entries) {
+			runner.setFlagValue(name, value);
+		}
+		await this.client.respond(id, "flags.set", { ok: true });
+	}
+
+	private async handleShortcutExecute(id: number, p: Record<string, unknown>): Promise<void> {
+		const key = p["key"];
+		const runner = this.runner;
+		if (typeof key !== "string" || runner === undefined) {
+			await this.client.respond(id, "shortcut.execute", { handled: false });
+			return;
+		}
+		let shortcut: (Extension["shortcuts"] extends Map<string, infer T> ? T : never) | undefined;
+		for (let index = this.extensions.length - 1; index >= 0; index--) {
+			const candidate = this.extensions[index]?.shortcuts.get(key);
+			if (candidate !== undefined) {
+				shortcut = candidate;
+				break;
+			}
+		}
+
+		if (shortcut === undefined) {
+			await this.client.respond(id, "shortcut.execute", { handled: false });
+			return;
+		}
+
+		await this.client.respond(id, "shortcut.execute", { handled: true });
+		Promise.resolve()
+			.then(() => shortcut.handler(runner.createContext()))
+			.catch((error) => {
+				this.emitExtensionError(
+					shortcut.extensionPath,
+					"shortcut.execute",
+					error instanceof Error ? error.message : String(error),
+				);
+			});
 	}
 
 	/**
@@ -718,6 +793,7 @@ export class ExtensionHost {
 		const key = p["key"] as string;
 		const width = p["width"] as number;
 		const entry = this.slots.get(key);
+		if (entry !== undefined && Number.isFinite(width)) entry.width = width;
 		const height = entry?.component?.render(width)?.length ?? 0;
 		await this.client.respond(id, "measure", { height });
 	}
@@ -726,6 +802,7 @@ export class ExtensionHost {
 		const key = p["key"] as string;
 		const width = p["width"] as number;
 		const entry = this.slots.get(key);
+		if (entry !== undefined && Number.isFinite(width)) entry.width = width;
 		const lines = entry?.component?.render(width) ?? [];
 		const runs = lines.map((line) => parseAnsiLines(line)[0] ?? []) as StyledRun[][];
 		await this.client.respond(id, "render", { runs });
@@ -895,8 +972,31 @@ export class ExtensionHost {
 		}
 	}
 
-	private async handleUiEvent(id: number, _p: Record<string, unknown>): Promise<void> {
-		await this.client.respond(id, "uiEvent", { ok: true });
+	private async handleUiEvent(id: number, p: Record<string, unknown>): Promise<void> {
+		const key = p["key"];
+		const generation = p["generation"];
+		const event = p["event"];
+		const entry = typeof key === "string" ? this.slots.get(key) : undefined;
+		if (entry === undefined || entry.generation !== generation || !isRecord(event)) {
+			await this.client.respond(id, "uiEvent", { delivered: false });
+			return;
+		}
+
+		const type = event["type"];
+		if (type === "key" || type === "paste") {
+			const data = p["data"];
+			if (typeof data === "string") entry.component?.handleInput?.(data);
+			if (this.slots.get(key as string) === entry) this.pushSlot(key as string, entry, entry.width);
+		} else if (type === "resize") {
+			const width = event["width"];
+			if (typeof width === "number" && Number.isFinite(width)) entry.width = width;
+			this.pushSlot(key as string, entry, entry.width);
+		} else if (type !== "focusGained" && type !== "focusLost") {
+			await this.client.respond(id, "uiEvent", { delivered: false });
+			return;
+		}
+
+		await this.client.respond(id, "uiEvent", { delivered: true });
 	}
 
 	// -----------------------------------------------------------------------
@@ -983,6 +1083,7 @@ export class ExtensionHost {
 						placement: "aboveEditor",
 						focusable: false,
 						overlayOptions: undefined,
+						width: 80,
 					};
 					self.slots.set(key, entry);
 					self.pushSlot(key, entry, 80);
@@ -1001,7 +1102,13 @@ export class ExtensionHost {
 					self.disposeSlot(key);
 					resolve(result);
 				};
-				Promise.resolve(factory({}, {}, {}, done)).then((component: any) => {
+				const tui = {
+					requestRender: () => {
+						const entry = self.slots.get(key);
+						if (entry !== undefined) self.pushSlot(key, entry, entry.width);
+					},
+				};
+				Promise.resolve(factory(tui, {}, {}, done)).then((component: any) => {
 					if (resolved) {
 						component?.dispose?.();
 						return;
@@ -1012,6 +1119,7 @@ export class ExtensionHost {
 						placement: "overlay",
 						focusable: true,
 						overlayOptions: (typeof options?.overlayOptions === "function" ? options.overlayOptions() : options?.overlayOptions) ?? {},
+						width: 80,
 					};
 					self.slots.set(key, entry);
 					self.pushSlot(key, entry, 80);
@@ -1133,14 +1241,12 @@ export class ExtensionHost {
 		}));
 
 		const shortcuts: Array<Record<string, unknown>> = [];
-		const seenShortcuts = new Set<string>();
 		for (const ext of this.extensions) {
 			for (const [key, shortcut] of ext.shortcuts) {
-				if (seenShortcuts.has(key)) continue;
-				seenShortcuts.add(key);
 				shortcuts.push({
 					key,
 					description: shortcut.description,
+					extensionPath: shortcut.extensionPath,
 				});
 			}
 		}
@@ -1152,9 +1258,10 @@ export class ExtensionHost {
 				name,
 				description: flag.description,
 				type: flag.type,
+				extensionPath: flag.extensionPath,
 			};
 			if (flag.default !== undefined) {
-				entry["default"] = String(flag.default);
+				entry["default"] = flag.default;
 			}
 			if (flagValues.has(name)) {
 				entry["value"] = flagValues.get(name);

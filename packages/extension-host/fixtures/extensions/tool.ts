@@ -44,6 +44,23 @@ export default function toolExtension(pi: ExtensionAPI): void {
 		},
 	});
 
+	pi.registerCommand("interactiveOverlay", {
+		description: "Exercise custom overlay input and rerendering",
+		async handler(_args, ctx) {
+			await ctx.ui.custom((tui, _theme, _keybindings, done) => {
+				let value = "initial";
+				return {
+					handleInput(data: string) {
+						value = `${value}|${data}`;
+						if (data === "finish") done(value);
+						else (tui as { requestRender(): void }).requestRender();
+					},
+					render: () => [`overlay:${value}`],
+				};
+			});
+		},
+	});
+
 	pi.on("session_start", (_event, ctx) => {
 		if (!ctx.hasUI) return;
 		ctx.ui.setWidget("widget.status", [

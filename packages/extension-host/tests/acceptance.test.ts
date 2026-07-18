@@ -806,6 +806,78 @@ describe("acceptance: extension runtime", () => {
 		await runPromise.catch(() => void 0);
 	});
 
+	test("custom overlay routes input by generation and rerenders through the TUI proxy", async () => {
+		const { collector, stdin, host, runPromise } = await connectHost([toolFactory]);
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 110, kind: "req", method: "command.execute",
+			payload: { command: "interactiveOverlay", args: "" },
+		})));
+		const initial = await collector.awaitFrame((frame) =>
+			frame.method === "uiSlot"
+			&& String((frame.payload as Record<string, unknown>)["key"]).startsWith("overlay.")
+			&& JSON.stringify(frame.payload).includes("overlay:initial")
+		);
+		const slot = initial.payload as Record<string, unknown>;
+		const key = slot["key"] as string;
+		const generation = slot["generation"] as number;
+
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 111, kind: "req", method: "uiEvent",
+			payload: { key, generation: generation + 1, event: { type: "key", code: "x", modifiers: {}, kind: "press" }, data: "stale" },
+		})));
+		const stale = await collector.awaitFrame((frame) => frame.id === 111);
+		expect(stale.payload).toEqual({ delivered: false });
+
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 112, kind: "req", method: "uiEvent",
+			payload: { key, generation, event: { type: "key", code: "x", modifiers: {}, kind: "press" }, data: "x" },
+		})));
+		const rerender = await collector.awaitFrame((frame) =>
+			frame.method === "uiSlot"
+			&& (frame.payload as Record<string, unknown>)["key"] === key
+			&& JSON.stringify(frame.payload).includes("overlay:initial|x")
+		);
+		const delivered = await collector.awaitFrame((frame) => frame.id === 112);
+		expect(delivered.payload).toEqual({ delivered: true });
+		expect(rerender).toBeDefined();
+
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 113, kind: "req", method: "uiEvent",
+			payload: { key, generation, event: { type: "resize", width: 41, height: 20 } },
+		})));
+		expect((await collector.awaitFrame((frame) => frame.id === 113)).payload).toEqual({ delivered: true });
+
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 114, kind: "req", method: "uiEvent",
+			payload: { key, generation, event: { type: "focusGained" } },
+		})));
+		expect((await collector.awaitFrame((frame) => frame.id === 114)).payload).toEqual({ delivered: true });
+
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 115, kind: "req", method: "uiEvent",
+			payload: { key, generation, event: { type: "paste", text: "finish" }, data: "finish" },
+		})));
+		expect((await collector.awaitFrame((frame) => frame.id === 115)).payload).toEqual({ delivered: true });
+		const disposed = await collector.awaitFrame((frame) =>
+			frame.method === "disposeSlot"
+			&& (frame.payload as Record<string, unknown>)["key"] === key
+		);
+		expect((disposed.payload as Record<string, unknown>)["generation"]).toBe(generation);
+		expect((await collector.awaitFrame((frame) => frame.id === 110)).payload).toEqual({ ok: true });
+		const slotFrames = collector.frames.filter((frame) =>
+			frame.method === "uiSlot"
+			&& (frame.payload as Record<string, unknown>)["key"] === key
+		);
+		const lastSlot = slotFrames.at(-1);
+		expect(lastSlot).toBeDefined();
+		expect(collector.frames.indexOf(lastSlot as Frame)).toBeLessThan(
+			collector.frames.indexOf(disposed),
+		);
+
+		stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
+	});
 });
 
 
@@ -1060,6 +1132,131 @@ describe("acceptance: registry snapshot and tool/provider bridges", () => {
 		const err = terminal.payload as Record<string, unknown>;
 		expect(err["code"]).toBe("cancelled");
 		expect(err["retryable"]).toBe(false);
+
+		stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
+	});
+
+	test("flags.set updates getFlag atomically and preserves values across sets", async () => {
+		const { collector, stdin, host, runPromise } = await connectHost([]);
+		const extensionPath = resolve(import.meta.dirname, "..", "fixtures", "extensions", "control-compat.ts");
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 90, kind: "req", method: "extensions.load",
+			payload: { extensionPaths: [extensionPath], cwd: process.cwd() },
+		})));
+		const loaded = await collector.awaitFrame((frame) => frame.id === 90);
+		const flags = (loaded.payload as Record<string, unknown>)["flags"] as Array<Record<string, unknown>>;
+		expect(flags).toEqual(expect.arrayContaining([
+			expect.objectContaining({ name: "compat-enabled", default: false, extensionPath }),
+			expect.objectContaining({ name: "compat-label", default: "default", extensionPath }),
+		]));
+
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 91, kind: "req", method: "flags.set",
+			payload: { values: { "compat-enabled": true, "compat-label": "first" } },
+		})));
+		expect((await collector.awaitFrame((frame) => frame.id === 91)).payload).toEqual({ ok: true });
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 92, kind: "req", method: "session_start",
+			payload: { type: "session_start", reason: "startup" },
+		})));
+		const first = await collector.awaitFrame((frame) =>
+			frame.method === "notify" && String((frame.payload as Record<string, unknown>)["message"]).includes('"label":"first"')
+		);
+		expect(JSON.parse((first.payload as Record<string, unknown>)["message"] as string)).toEqual({ enabled: true, label: "first" });
+
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 93, kind: "req", method: "flags.set",
+			payload: { values: { "compat-label": "second" } },
+		})));
+		expect((await collector.awaitFrame((frame) => frame.id === 93)).payload).toEqual({ ok: true });
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 94, kind: "req", method: "session_start",
+			payload: { type: "session_start", reason: "reload" },
+		})));
+		const second = await collector.awaitFrame((frame) =>
+			frame.method === "notify" && String((frame.payload as Record<string, unknown>)["message"]).includes('"label":"second"')
+		);
+		expect(JSON.parse((second.payload as Record<string, unknown>)["message"] as string)).toEqual({ enabled: true, label: "second" });
+
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 95, kind: "req", method: "flags.set",
+			payload: { values: { "compat-enabled": false, "compat-label": 7 } },
+		})));
+		const invalid = await collector.awaitFrame((frame) => frame.id === 95);
+		expect(invalid.kind).toBe("error");
+		expect((invalid.payload as Record<string, unknown>)["code"]).toBe("invalid_arguments");
+		expect(host.getRunner()?.getFlagValues()).toEqual(new Map<string, boolean | string>([
+			["compat-enabled", true], ["compat-label", "second"],
+		]));
+
+		stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
+	});
+
+	test("shortcut.execute ACKs before real dialogs and resolves the last registration", async () => {
+		const { collector, stdin, host, runPromise } = await connectHost([]);
+		const firstPath = resolve(import.meta.dirname, "..", "fixtures", "extensions", "control-compat.ts");
+		const lastPath = resolve(import.meta.dirname, "..", "fixtures", "extensions", "control-compat-shadow.ts");
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 100, kind: "req", method: "extensions.load",
+			payload: { extensionPaths: [firstPath, lastPath], cwd: process.cwd() },
+		})));
+		const loaded = await collector.awaitFrame((frame) => frame.id === 100);
+		const shortcuts = ((loaded.payload as Record<string, unknown>)["shortcuts"] as Array<Record<string, unknown>>)
+			.filter((entry) => entry["key"] === "ctrl+k");
+		expect(shortcuts).toEqual([
+			expect.objectContaining({ description: "First duplicate shortcut", extensionPath: firstPath }),
+			expect.objectContaining({ description: "Last duplicate shortcut", extensionPath: lastPath }),
+		]);
+
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 101, kind: "req", method: "shortcut.execute", payload: { key: "ctrl+k" },
+		})));
+		const ack = await collector.awaitFrame((frame) => frame.id === 101);
+		const select = await collector.awaitFrame((frame) => frame.kind === "req" && frame.method === "select");
+		expect(ack.payload).toEqual({ handled: true });
+		expect((select.payload as Record<string, unknown>)["title"]).toBe("compat select");
+		expect(collector.frames.indexOf(ack)).toBeLessThan(collector.frames.indexOf(select));
+
+		const reply = (request: Frame, payload: Record<string, unknown>) => {
+			stdin.push(Buffer.from(encodeFrameString({
+				id: request.id, kind: "res", method: request.method, payload,
+			})));
+		};
+		reply(select, { value: "beta" });
+		const confirm = await collector.awaitFrame((frame) => frame.kind === "req" && frame.method === "confirm");
+		expect(confirm.payload).toEqual(expect.objectContaining({ title: "compat confirm", message: "continue?" }));
+		reply(confirm, { confirmed: true });
+		const input = await collector.awaitFrame((frame) => frame.kind === "req" && frame.method === "input");
+		expect(input.payload).toEqual(expect.objectContaining({ title: "compat input", placeholder: "type here" }));
+		reply(input, { value: "typed" });
+		const editor = await collector.awaitFrame((frame) => frame.kind === "req" && frame.method === "editor");
+		expect(editor.payload).toEqual({ title: "compat editor", prefill: "draft" });
+		reply(editor, { value: "edited" });
+		const completed = await collector.awaitFrame((frame) =>
+			frame.method === "notify" && String((frame.payload as Record<string, unknown>)["message"]).includes('"edited":"edited"')
+		);
+		expect(JSON.parse((completed.payload as Record<string, unknown>)["message"] as string)).toEqual({
+			selected: "beta", confirmed: true, input: "typed", edited: "edited",
+		});
+
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 102, kind: "req", method: "shortcut.execute", payload: { key: "ctrl+missing" },
+		})));
+		expect((await collector.awaitFrame((frame) => frame.id === 102)).payload).toEqual({ handled: false });
+
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 103, kind: "req", method: "shortcut.execute", payload: { key: "ctrl+e" },
+		})));
+		expect((await collector.awaitFrame((frame) => frame.id === 103)).payload).toEqual({ handled: true });
+		const failure = await collector.awaitFrame((frame) =>
+			frame.method === "extensionError"
+			&& String((frame.payload as Record<string, unknown>)["message"]).includes("shortcut fixture failure")
+		);
+		expect((failure.payload as Record<string, unknown>)["retryable"]).toBe(false);
 
 		stdin.push(null);
 		host.dispose("test");

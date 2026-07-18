@@ -18,6 +18,7 @@ declare module "@earendil-works/pi-coding-agent" {
 		select(title: string, options: string[], opts?: { timeout?: number }): Promise<string | undefined>;
 		confirm(title: string, message: string, opts?: { timeout?: number }): Promise<boolean>;
 		input(title: string, placeholder?: string, opts?: { timeout?: number }): Promise<string | undefined>;
+		editor(title: string, prefill?: string): Promise<string | undefined>;
 		notify(message: string, type?: string): void;
 		onTerminalInput(handler: (data: string) => unknown): () => void;
 		setWidget(key: string, content: string[] | undefined, options?: Record<string, unknown>): void;
@@ -41,6 +42,7 @@ declare module "@earendil-works/pi-coding-agent" {
 
 	export interface Component {
 		render(width: number): string[];
+		handleInput?(data: string): void;
 		dispose?(): void;
 	}
 
@@ -220,6 +222,7 @@ declare module "@earendil-works/pi-coding-agent" {
 		registerMessageRenderer(customType: string, renderer: unknown): void;
 		registerProvider(name: string, config: ProviderConfig): void;
 		unregisterProvider(name: string): void;
+		getFlag(name: string): boolean | string | undefined;
 	}
 
 	export interface ExtensionActions {
@@ -287,6 +290,7 @@ declare module "@earendil-works/pi-coding-agent" {
 		getToolDefinition(toolName: string): ToolDefinition | undefined;
 		getAllRegisteredTools(): RegisteredTool[];
 		getFlags(): Map<string, ExtensionFlag>;
+		setFlagValue(name: string, value: boolean | string): void;
 		getFlagValues(): Map<string, boolean | string>;
 		hasHandlers(eventType: string): boolean;
 		invalidate(message?: string): void;
