@@ -842,6 +842,12 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         &self.view
     }
 
+    /// Last row occupied by the current terminal viewport.
+    #[must_use]
+    pub fn viewport_bottom_row(&self) -> u16 {
+        self.view.height.saturating_sub(1)
+    }
+
     /// Mutably borrow the view state (tests / driver seam).
     pub fn view_mut(&mut self) -> &mut ViewState {
         &mut self.view
@@ -2666,7 +2672,9 @@ use crate::core::agent_session_runtime::{
     AgentSessionRuntime, AgentSessionRuntimeError, ForkPosition, NewSessionOptions,
     SwitchSessionOptions,
 };
-use pi_tui::terminal::guard::TerminalGuard;
+use pi_tui::terminal::{
+    TerminalGuard, install_panic_emergency_hook, write_emergency_restore_bytes,
+};
 
 /// Production [`SessionHost`] over a live `Arc<AgentSession>` and the
 /// owning `Arc<AgentSessionRuntime>`.
@@ -3340,17 +3348,32 @@ fn initial_terminal_size() -> (u16, u16) {
     }
 }
 
+fn install_product_panic_emergency_hook<W>(
+    emergency: Arc<std::sync::atomic::AtomicBool>,
+    writer: W,
+) -> Arc<dyn Fn() + Send + Sync>
+where
+    W: Write + Send + 'static,
+{
+    let writer = std::sync::Mutex::new(writer);
+    let restore: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        if let Ok(mut writer) = writer.lock() {
+            let _ = write_emergency_restore_bytes(&mut *writer);
+        }
+    });
+    install_panic_emergency_hook(emergency, Arc::clone(&restore));
+    restore
+}
+
 /// Run interactive mode end-to-end against a real [`AgentSessionRuntime`].
 ///
 /// Wires (in order):
 /// 1. `io::stdout()` handle + initial ioctl size.
-/// 2. [`TerminalGuard`] activation (raw mode + bracketed paste + Kitty flags
-///    when supported + cursor hide).
-/// 3. Initial capability probe (skipped on Windows).
-/// 4. [`Tui<Stdout>`] construction with the cached caps + size.
-/// 5. [`TerminalInput::spawn`] (sole `EventStream` owner).
-/// 6. [`AgentSessionHost`] wrapping the runtime.
-/// 7. [`InteractiveRuntime::run`] to completion.
+/// 2. Panic emergency-restore hook and [`TerminalGuard`] viewport/activation.
+/// 3. [`Tui<Stdout>`] construction with the cached capabilities + size.
+/// 4. [`TerminalInput::spawn`] (sole `EventStream` owner).
+/// 5. [`AgentSessionHost`] wrapping the runtime.
+/// 6. [`InteractiveRuntime::run`] to completion.
 ///
 /// On exit the runtime is dropped, then the guard (which writes the restore
 /// bytes via its `Drop` impl). Returns the process exit code.
@@ -3368,8 +3391,12 @@ pub async fn run_interactive_mode(
         return Err("interactive mode requires a tty".to_owned());
     }
 
-    // 1. Terminal guard activates raw mode + modes on its own stdout handle.
+    // 1. Capture the real terminal size before enabling raw mode. The guard
+    // parks the cursor below this viewport on every normal restore.
+    let size = initial_terminal_size();
     let mut guard = TerminalGuard::new(stdout());
+    guard.set_viewport_bottom_row(size.1.saturating_sub(1));
+    let _panic_restore = install_product_panic_emergency_hook(guard.emergency_flag(), stdout());
     let enable_kitty = !cfg!(windows);
     guard
         .activate(enable_kitty)
@@ -3380,7 +3407,6 @@ pub async fn run_interactive_mode(
     //    process's stdout fd — both handles write to the OS stream, but Tui
     //    is the sole writer of paint bytes (guard only wrote mode setup).
     let stdout_writer = stdout();
-    let size = initial_terminal_size();
     let viewport_height = options.viewport_height.max(1).min(size.1);
     let tui = Tui::new(
         stdout_writer,
@@ -3414,28 +3440,36 @@ pub async fn run_interactive_mode(
     let mut rt = InteractiveRuntime::new(tui, input, host_arc, &options);
 
     // 5. Drive the loop. Suspend restores the terminal, raises SIGTSTP on
-    //    Unix, then resumes/reprobes and re-enters run() without exiting.
+    //    Unix, then resumes/resizes and re-enters run() without exiting.
     let exit = loop {
-        let exit = rt.run().await.map_err(|e| format!("runtime loop: {e}"))?;
+        let exit = rt.run().await;
+        // Resize events update the runtime view while the guard remains owned
+        // here. Synchronize before every path that can restore terminal modes.
+        guard.set_viewport_bottom_row(rt.viewport_bottom_row());
+        let exit = exit.map_err(|e| format!("runtime loop: {e}"))?;
         match exit {
             InteractiveExit::Suspend => {
                 // Drop active selector focus so resume returns to the editor.
                 rt.close_selector_for_suspend();
-                // Restore modes, suspend the process, then re-activate.
+                // Restore modes, suspend the process, then re-activate using
+                // the terminal dimensions observed after SIGCONT.
                 guard
                     .suspend()
                     .map_err(|e| format!("terminal suspend failed: {e}"))?;
+                let size = initial_terminal_size();
+                guard.set_viewport_bottom_row(size.1.saturating_sub(1));
                 guard
                     .resume(enable_kitty)
                     .map_err(|e| format!("terminal resume failed: {e}"))?;
-                // Reprobe size after resume and reanchor without a clear.
-                let size = initial_terminal_size();
+                // Reanchor without a clear and retain the runtime's clamped
+                // view row as the source for the next normal restore.
                 let _ = rt
                     .step_ui(UiEvent::Resize {
                         width: size.0,
                         height: size.1,
                     })
                     .await;
+                guard.set_viewport_bottom_row(rt.viewport_bottom_row());
                 // Rebind channels in case a replacement happened while we
                 // were suspended (defensive; replacement normally rebinds
                 // via the host callback + next action).
@@ -4413,6 +4447,38 @@ mod tests {
         assert!(rt.prompt_operations.tasks.is_empty());
         assert!(rt.prompt_operations.aborts.is_empty());
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn viewport_bottom_row_tracks_terminal_resize() -> Result<(), String> {
+        let (mut rt, _log) = try_make_runtime()?;
+        assert_eq!(rt.viewport_bottom_row(), 23);
+
+        rt.step_ui(UiEvent::Resize {
+            width: 100,
+            height: 41,
+        })
+        .await
+        .map_err(|error| format!("resize step failed: {error}"))?;
+
+        assert_eq!(rt.viewport_bottom_row(), 40);
+        Ok(())
+    }
+
+    #[test]
+    fn product_panic_setup_uses_emergency_restore_bytes_without_panicking() {
+        let writer = SharedWriter::new();
+        let captured = writer.clone();
+        // Keep unrelated parallel-test panics from invoking this global hook.
+        let emergency = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let restore = install_product_panic_emergency_hook(emergency, writer);
+
+        restore();
+
+        assert_eq!(
+            captured.snapshot(),
+            b"\x1b[?2026l\x1b[<u\x1b[?2004l\x1b[?1004l\x1b[?2031l\x1b[?25h\x1b[0m"
+        );
     }
 
     #[tokio::test]

@@ -362,6 +362,17 @@ mod tests {
     }
 
     #[test]
+    fn updated_viewport_row_controls_normal_restore_cursor_park() {
+        let mut guard = TerminalGuard::new(Cursor::new(Vec::new()));
+        guard.applied.push(RestoreStep::CursorHidden);
+        guard.set_viewport_bottom_row(6);
+
+        guard.restore_modes(false);
+
+        assert_eq!(guard.writer().get_ref(), b"\x1b[8;1H\r\n\x1b[?25h");
+    }
+
+    #[test]
     fn activate_queues_modes_on_writer() -> io::Result<()> {
         let mut guard = TerminalGuard::new(Cursor::new(Vec::new()));
         if guard.activate(true).is_ok() {
