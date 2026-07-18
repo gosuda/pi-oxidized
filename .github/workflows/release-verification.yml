@@ -70,11 +70,15 @@ jobs:
       - name: Build and Package (First Pass)
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
         run: bun run scripts/package-release.ts --target ${{ matrix.target }} --out dist/pass1
 
       - name: Build and Package (Second Pass)
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
         run: bun run scripts/package-release.ts --target ${{ matrix.target }} --out dist/pass2
 
       - name: Verify Determinism
