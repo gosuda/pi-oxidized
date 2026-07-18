@@ -335,7 +335,7 @@
 					"timeoutMs": 900000
 				}
 			],
-			"evidence": "e2e-smoke: rust-interactive-tools-steering-compaction, rust-fork, rust-resume-reload and typescript-real-session-reopen steps pass"
+			"evidence": "e2e-smoke: real Rust host flag, shortcut, dialogs, custom UI input/rerender, reload preservation, tools/steering/compaction/fork/resume, and upstream TypeScript session reopen steps pass"
 		},
 		{
 			"id": "flicker",

@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import type {
 	AssistantMessage,
@@ -21,7 +21,33 @@ const ENV = {
 	finalMarker: "PI_VERIFICATION_FINAL_MARKER",
 	loadCountPath: "PI_VERIFICATION_LOAD_COUNT_PATH",
 	toolPath: "PI_VERIFICATION_TOOL_PATH",
+	compatibilityPath: "PI_VERIFICATION_COMPATIBILITY_PATH",
 } as const;
+
+export const VERIFICATION_PROFILE_FLAG = "verification-profile";
+export const VERIFICATION_SHORTCUT = "ctrl+shift+x";
+export const VERIFICATION_DIALOG_COMMAND = "verification-dialogs";
+export const VERIFICATION_CUSTOM_UI_COMMAND = "verification-custom-ui";
+export const VERIFICATION_FLAG_COMMAND = "verification-observe-flag";
+
+const COMPATIBILITY_INSTANCE = `${process.pid}:${Date.now()}`;
+let compatibilitySequence = 0;
+
+function recordCompatibility(stage: string, value: unknown): void {
+	const path = process.env[ENV.compatibilityPath];
+	if (!path) return;
+	mkdirSync(dirname(path), { recursive: true });
+	appendFileSync(
+		path,
+		`${JSON.stringify({
+			stage,
+			instance: COMPATIBILITY_INSTANCE,
+			sequence: ++compatibilitySequence,
+			value: value ?? null,
+		})}\n`,
+		"utf8",
+	);
+}
 
 type VerificationMode = "auto" | "text" | "tools" | "compaction";
 
@@ -197,6 +223,102 @@ function streamVerification(model: Model<any>, context: Context, options?: Simpl
 
 export default function verificationExtension(pi: ExtensionAPI): void {
 	recordLoadGeneration();
+
+	pi.registerFlag(VERIFICATION_PROFILE_FLAG, {
+		description: "Run-local compatibility verification profile",
+		type: "string",
+	});
+
+	pi.on("session_start", () => {
+		recordCompatibility("session_start.before", { flag: VERIFICATION_PROFILE_FLAG });
+		recordCompatibility("session_start.after", { value: pi.getFlag(VERIFICATION_PROFILE_FLAG) ?? null });
+	});
+
+	pi.registerShortcut(VERIFICATION_SHORTCUT, {
+		description: "Record compatibility shortcut dispatch",
+		handler: () => {
+			recordCompatibility("shortcut.before", { shortcut: VERIFICATION_SHORTCUT });
+			recordCompatibility("shortcut.after", { shortcut: VERIFICATION_SHORTCUT, dispatched: true });
+		},
+	});
+
+	pi.registerCommand(VERIFICATION_FLAG_COMMAND, {
+		description: "Record the current verification profile flag",
+		handler: async () => {
+			recordCompatibility("flag_observation.before", { flag: VERIFICATION_PROFILE_FLAG });
+			recordCompatibility("flag_observation.after", { value: pi.getFlag(VERIFICATION_PROFILE_FLAG) ?? null });
+		},
+	});
+
+	pi.registerCommand(VERIFICATION_DIALOG_COMMAND, {
+		description: "Exercise real extension dialogs",
+		handler: async (_args, ctx) => {
+			const operationId = "verification-dialogs-v1";
+			recordCompatibility("dialogs.command.before", { operationId });
+
+			recordCompatibility("dialogs.select.before", { operationId, options: ["alpha", "beta"] });
+			const select = await ctx.ui.select("Verification select prompt", ["alpha", "beta"]);
+			recordCompatibility("dialogs.select.after", { operationId, value: select ?? null });
+
+			recordCompatibility("dialogs.confirm.before", { operationId });
+			const confirm = await ctx.ui.confirm("Verification confirm prompt", "Choose Yes");
+			recordCompatibility("dialogs.confirm.after", { operationId, value: confirm });
+
+			recordCompatibility("dialogs.input.before", { operationId });
+			const input = await ctx.ui.input("Verification input prompt", "dialog input");
+			recordCompatibility("dialogs.input.after", { operationId, value: input ?? null });
+
+			recordCompatibility("dialogs.editor.before", { operationId });
+			const editor = await ctx.ui.editor("Verification editor prompt");
+			recordCompatibility("dialogs.editor.after", { operationId, value: editor ?? null });
+
+			const results = { operationId, select: select ?? null, confirm, input: input ?? null, editor: editor ?? null };
+			recordCompatibility("dialogs.results", results);
+			recordCompatibility("dialogs.command.after", results);
+		},
+	});
+
+	pi.registerCommand(VERIFICATION_CUSTOM_UI_COMMAND, {
+		description: "Exercise real focusable custom extension UI",
+		handler: async (_args, ctx) => {
+			recordCompatibility("custom.command.before", { state: "initial" });
+			const result = await ctx.ui.custom<string>((tui, _theme, _keybindings, done) => {
+				let state = "initial";
+				let initialRendered = false;
+				let updatedRendered = false;
+				let completionTimer: ReturnType<typeof setTimeout> | undefined;
+				return {
+					focused: false,
+					invalidate() {},
+					render(): string[] {
+						if (state === "initial" && !initialRendered) {
+							initialRendered = true;
+							recordCompatibility("custom.render.initial", { state });
+						}
+						if (state === "updated" && !updatedRendered) {
+							updatedRendered = true;
+							recordCompatibility("custom.render.updated", { state });
+							completionTimer = setTimeout(() => done(state), 200);
+						}
+						return [`Verification custom state=${state}`];
+					},
+					handleInput(data: string): void {
+						if (data !== "x" || state !== "initial") return;
+						recordCompatibility("custom.input.before", { input: data, state });
+						state = "updated";
+						recordCompatibility("custom.input.after", { input: data, state });
+						tui.requestRender();
+					},
+					dispose(): void {
+						if (completionTimer !== undefined) clearTimeout(completionTimer);
+						recordCompatibility("custom.dispose", { state });
+					},
+				};
+			});
+			recordCompatibility("custom.command.after", { state: result });
+		},
+	});
+
 	pi.registerProvider(VERIFICATION_PROVIDER, {
 		name: "Verification",
 		baseUrl: "https://verification.invalid",

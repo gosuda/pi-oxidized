@@ -12,7 +12,11 @@ import { createHash } from "node:crypto";
 import { basename, join, relative, resolve } from "node:path";
 import {
 	DEFAULT_FINAL_MARKER,
+	VERIFICATION_CUSTOM_UI_COMMAND,
+	VERIFICATION_DIALOG_COMMAND,
+	VERIFICATION_FLAG_COMMAND,
 	VERIFICATION_MODEL,
+	VERIFICATION_PROFILE_FLAG,
 	VERIFICATION_PROVIDER,
 } from "./extension.ts";
 import { PTY_KEYS, type PtyProcess, spawnPty } from "./pty.ts";
@@ -36,6 +40,11 @@ const TURN_DEADLINE_MS = 180_000;
 const COMMAND_DEADLINE_MS = 60_000;
 const EXIT_DEADLINE_MS = 15_000;
 const POLL_INTERVAL_MS = 25;
+const RUST_VERIFICATION_PROFILE = "rust-compatibility-profile";
+const TYPESCRIPT_VERIFICATION_PROFILE = "typescript-compatibility-profile";
+const KITTY_CTRL_SHIFT_X = "\x1b[120;6u";
+const DIALOG_INPUT_VALUE = "dialog-input-value";
+const DIALOG_EDITOR_VALUE = "dialog-editor-value";
 
 interface JsonObject {
 	[key: string]: JsonValue;
@@ -60,6 +69,13 @@ interface NamedProcess {
 	readonly process: PtyProcess;
 }
 
+interface CompatibilityMarker {
+	readonly stage: string;
+	readonly instance: string;
+	readonly sequence: number;
+	readonly value: JsonValue;
+}
+
 interface WorkflowState {
 	readonly runRoot: string;
 	readonly homeDir: string;
@@ -67,12 +83,16 @@ interface WorkflowState {
 	readonly sessionDir: string;
 	readonly workDir: string;
 	readonly loadCountPath: string;
+	readonly compatibilityPath: string;
 	readonly toolPath: string;
 	readonly steps: StepEvidence[];
 	readonly processes: NamedProcess[];
 	originalSessionPath?: string;
 	forkSessionPath?: string;
 	loadGeneration?: number;
+	rustInitialCompatibilityInstance?: string;
+	rustReloadCompatibilityInstance?: string;
+	typescriptCompatibilityInstance?: string;
 }
 
 function errorText(error: unknown): string {
@@ -143,6 +163,7 @@ function createState(): WorkflowState {
 		sessionDir: join(runRoot, "sessions"),
 		workDir: join(runRoot, "work"),
 		loadCountPath: join(runRoot, "extension-load-generation.txt"),
+		compatibilityPath: join(runRoot, "compatibility.jsonl"),
 		toolPath: join(runRoot, "work", TOOL_FILE),
 		steps: [],
 		processes: [],
@@ -168,11 +189,12 @@ function processEnvironment(state: WorkflowState): Record<string, string> {
 		PI_VERIFICATION_CHUNK_DELAY_MS: "1",
 		PI_VERIFICATION_FINAL_MARKER: FINAL_MARKER,
 		PI_VERIFICATION_LOAD_COUNT_PATH: state.loadCountPath,
+		PI_VERIFICATION_COMPATIBILITY_PATH: state.compatibilityPath,
 		PI_VERIFICATION_TOOL_PATH: TOOL_FILE,
 	};
 }
 
-function commonArguments(): string[] {
+function commonArguments(profile = RUST_VERIFICATION_PROFILE): string[] {
 	return [
 		"--provider",
 		VERIFICATION_PROVIDER,
@@ -182,6 +204,8 @@ function commonArguments(): string[] {
 		"verification-key",
 		"--extension",
 		EXTENSION_PATH,
+		`--${VERIFICATION_PROFILE_FLAG}`,
+		profile,
 		"--offline",
 		"--no-context-files",
 		"--no-skills",
@@ -284,6 +308,51 @@ function readSession(path: string): SessionDocument {
 	return { path, bytes, lines };
 }
 
+function readCompatibilityMarkers(state: WorkflowState): CompatibilityMarker[] {
+	if (!existsSync(state.compatibilityPath)) return [];
+	const text = readFileSync(state.compatibilityPath, "utf8");
+	const markers: CompatibilityMarker[] = [];
+	const nextSequenceByInstance = new Map<string, number>();
+	for (const [index, rawLine] of text.split(/\r?\n/).entries()) {
+		const line = rawLine.trim();
+		if (line.length === 0) continue;
+		let parsed: JsonValue;
+		try {
+			parsed = JSON.parse(line) as JsonValue;
+		} catch (error) {
+			fail(`invalid compatibility JSONL ${state.compatibilityPath}:${index + 1}: ${errorText(error)}`);
+		}
+		const object = asObject(parsed, `${state.compatibilityPath}:${index + 1}`);
+		const keys = Object.keys(object).sort();
+		assert(
+			keys.join(",") === "instance,sequence,stage,value",
+			`compatibility marker ${index + 1} has invalid keys: ${keys.join(",")}`,
+		);
+		const stage = asString(object.stage, `compatibility marker ${index + 1} stage`);
+		const instance = asString(object.instance, `compatibility marker ${index + 1} instance`);
+		assert(stage.length > 0, `compatibility marker ${index + 1} stage must not be empty`);
+		assert(instance.length > 0, `compatibility marker ${index + 1} instance must not be empty`);
+		const sequence = object.sequence;
+		assert(
+			typeof sequence === "number" && Number.isSafeInteger(sequence) && sequence > 0,
+			`compatibility marker ${index + 1} sequence must be a positive safe integer`,
+		);
+		const expectedSequence = nextSequenceByInstance.get(instance) ?? 1;
+		assert(
+			sequence === expectedSequence,
+			`compatibility marker ${index + 1} sequence for ${instance} must be ${expectedSequence}, got ${sequence}`,
+		);
+		nextSequenceByInstance.set(instance, sequence + 1);
+		assert(Object.hasOwn(object, "value"), `compatibility marker ${index + 1} is missing value`);
+		markers.push({ stage, instance, sequence, value: object.value ?? null });
+	}
+	return markers;
+}
+
+function markerValue(marker: CompatibilityMarker, label = marker.stage): JsonObject {
+	return asObject(marker.value, `${label} value`);
+}
+
 function entryType(entry: JsonObject): string {
 	return typeof entry.type === "string" ? entry.type : "";
 }
@@ -350,6 +419,45 @@ async function waitUntil<T>(
 		if (process?.exited === true) throw processBlocker(label, process, "process exited while awaiting state");
 		if (performance.now() >= deadline) fail(`product blocker: ${label} exceeded ${deadlineMs}ms`);
 		await Bun.sleep(POLL_INTERVAL_MS);
+	}
+}
+
+async function waitForCompatibilityMarker(
+	state: WorkflowState,
+	label: string,
+	process: PtyProcess,
+	startIndex: number,
+	stage: string,
+	predicate: (marker: CompatibilityMarker) => boolean = () => true,
+): Promise<{ marker: CompatibilityMarker; index: number }> {
+	return waitUntil(
+		label,
+		COMMAND_DEADLINE_MS,
+		() => {
+			const markers = readCompatibilityMarkers(state);
+			const relativeIndex = markers.slice(startIndex).findIndex((marker) => marker.stage === stage && predicate(marker));
+			if (relativeIndex < 0) return undefined;
+			const index = startIndex + relativeIndex;
+			const marker = markers[index];
+			return marker === undefined ? undefined : { marker, index };
+		},
+		process,
+	);
+}
+
+async function waitForScreen(
+	process: PtyProcess,
+	label: string,
+	text: string,
+	startOffset = 0,
+): Promise<void> {
+	try {
+		await process.waitFor((snapshot) => snapshot.rawText.slice(startOffset).includes(text), {
+			deadlineMs: COMMAND_DEADLINE_MS,
+			source: "raw",
+		});
+	} catch (error) {
+		throw processBlocker(label, process, error);
 	}
 }
 
@@ -446,8 +554,147 @@ function assertCompaction(entry: JsonObject): void {
 	assert(typeof entry.tokensBefore === "number", "manual compaction entry is missing tokensBefore");
 }
 
+async function assertInitialFlagCompatibility(
+	state: WorkflowState,
+	rust: PtyProcess,
+	startIndex: number,
+): Promise<void> {
+	const step = beginStep(state, "rust-extension-flag-session-start");
+	const { marker, index } = await waitForCompatibilityMarker(
+		state,
+		"Rust extension session_start flag marker",
+		rust,
+		startIndex,
+		"session_start.after",
+		(candidate) => markerValue(candidate).value === RUST_VERIFICATION_PROFILE,
+	);
+	state.rustInitialCompatibilityInstance = marker.instance;
+	finishStep(step, {
+		profile: RUST_VERIFICATION_PROFILE,
+		instance: marker.instance,
+		markerIndex: index,
+	});
+}
+
+async function assertShortcutCompatibility(state: WorkflowState, rust: PtyProcess): Promise<void> {
+	const step = beginStep(state, "rust-extension-shortcut-dispatch");
+	const startIndex = readCompatibilityMarkers(state).length;
+	rust.writeKeys(KITTY_CTRL_SHIFT_X);
+	const { marker, index } = await waitForCompatibilityMarker(
+		state,
+		"canonical Kitty ctrl+shift+x shortcut dispatch",
+		rust,
+		startIndex,
+		"shortcut.after",
+		(candidate) => {
+			const value = markerValue(candidate);
+			return value.shortcut === "ctrl+shift+x" && value.dispatched === true;
+		},
+	);
+	assert(
+		marker.instance === state.rustInitialCompatibilityInstance,
+		"shortcut dispatched in a different extension instance than session_start",
+	);
+	finishStep(step, { sequence: "CSI 120;6u", instance: marker.instance, markerIndex: index });
+}
+
+async function assertDialogCompatibility(state: WorkflowState, rust: PtyProcess): Promise<void> {
+	const step = beginStep(state, "rust-extension-dialogs");
+	const startIndex = readCompatibilityMarkers(state).length;
+	sendLine(rust, `/${VERIFICATION_DIALOG_COMMAND}`);
+
+	await waitForCompatibilityMarker(state, "select before marker", rust, startIndex, "dialogs.select.before");
+	await waitForScreen(rust, "real select prompt", "Verification select prompt");
+	rust.writeKeys(PTY_KEYS.down, PTY_KEYS.enter);
+	await waitForCompatibilityMarker(
+		state, "select result marker", rust, startIndex, "dialogs.select.after",
+		(marker) => markerValue(marker).value === "beta",
+	);
+
+	await waitForCompatibilityMarker(state, "confirm before marker", rust, startIndex, "dialogs.confirm.before");
+	await waitForScreen(rust, "real confirm prompt", "confirm prompt");
+	rust.writeKeys(PTY_KEYS.enter);
+	await waitForCompatibilityMarker(
+		state, "confirm result marker", rust, startIndex, "dialogs.confirm.after",
+		(marker) => markerValue(marker).value === true,
+	);
+
+	await waitForCompatibilityMarker(state, "input before marker", rust, startIndex, "dialogs.input.before");
+	await waitForScreen(rust, "real input prompt", "input prompt");
+	rust.writeKeys(DIALOG_INPUT_VALUE, PTY_KEYS.enter);
+	await waitForCompatibilityMarker(
+		state, "input result marker", rust, startIndex, "dialogs.input.after",
+		(marker) => markerValue(marker).value === DIALOG_INPUT_VALUE,
+	);
+
+	await waitForCompatibilityMarker(state, "editor before marker", rust, startIndex, "dialogs.editor.before");
+	await waitForScreen(rust, "real editor prompt", "editor prompt");
+	rust.writeKeys(DIALOG_EDITOR_VALUE, PTY_KEYS.enter);
+	const { marker: results, index } = await waitForCompatibilityMarker(
+		state,
+		"exact correlated dialog results",
+		rust,
+		startIndex,
+		"dialogs.results",
+		(marker) => {
+			const value = markerValue(marker);
+			return value.operationId === "verification-dialogs-v1"
+				&& value.select === "beta"
+				&& value.confirm === true
+				&& value.input === DIALOG_INPUT_VALUE
+				&& value.editor === DIALOG_EDITOR_VALUE;
+		},
+	);
+	await waitForCompatibilityMarker(state, "dialog command after marker", rust, startIndex, "dialogs.command.after");
+	finishStep(step, { instance: results.instance, markerIndex: index, operationId: "verification-dialogs-v1" });
+}
+
+async function assertCustomUiCompatibility(state: WorkflowState, rust: PtyProcess): Promise<void> {
+	const step = beginStep(state, "rust-extension-custom-ui");
+	const startIndex = readCompatibilityMarkers(state).length;
+	sendLine(rust, `/${VERIFICATION_CUSTOM_UI_COMMAND}`);
+	await waitForCompatibilityMarker(state, "custom initial render marker", rust, startIndex, "custom.render.initial");
+	await waitForScreen(rust, "custom UI initial render", "state=initial");
+	// Ratatui updates only the changed `initial` cells, so the raw PTY receives
+	// `updated` rather than a repeated full line. Markers are file-only; this
+	// post-input offset proves that the native terminal emitted the rerender.
+	const updateOutputOffset = rust.snapshot().rawText.length;
+	rust.writeKeys("x");
+	await waitForCompatibilityMarker(
+		state, "custom input mutation marker", rust, startIndex, "custom.input.after",
+		(marker) => {
+			const value = markerValue(marker);
+			return value.input === "x" && value.state === "updated";
+		},
+	);
+	await waitForCompatibilityMarker(state, "custom updated render marker", rust, startIndex, "custom.render.updated");
+	await waitForScreen(rust, "custom UI updated rerender", "updated", updateOutputOffset);
+	const { marker: completed, index } = await waitForCompatibilityMarker(
+		state, "custom command completion after rerender", rust, startIndex, "custom.command.after",
+		(marker) => markerValue(marker).state === "updated",
+	);
+	const disposed = await waitForCompatibilityMarker(
+		state, "custom component disposal after rerender", rust, startIndex, "custom.dispose",
+		(marker) => markerValue(marker).state === "updated",
+	);
+	assert(disposed.index < index, "custom command completed before the updated component was disposed");
+	finishStep(step, { instance: completed.instance, markerIndex: index, state: "updated" });
+}
+
+async function runExtensionCompatibility(
+	state: WorkflowState,
+	rust: PtyProcess,
+	startIndex: number,
+): Promise<void> {
+	await assertInitialFlagCompatibility(state, rust, startIndex);
+	await assertShortcutCompatibility(state, rust);
+	await assertDialogCompatibility(state, rust);
+	await assertCustomUiCompatibility(state, rust);
+}
+
 async function runInitialSession(state: WorkflowState): Promise<SessionDocument> {
 	const step = beginStep(state, "rust-interactive-tools-steering-compaction");
+	const compatibilityStartIndex = readCompatibilityMarkers(state).length;
 	const rust = launch(state, "rust-initial", [
 		RUST_BINARY,
 		...commonArguments(),
@@ -456,6 +703,7 @@ async function runInitialSession(state: WorkflowState): Promise<SessionDocument>
 	]);
 	await waitForReady("Rust initial interactive startup", rust);
 	state.loadGeneration = await waitForLoadGeneration(state, 1, rust);
+	await runExtensionCompatibility(state, rust, compatibilityStartIndex);
 	sendLine(rust, "verification:tools execute real read edit bash stages");
 
 	const toolsSession = await waitForSession(
@@ -573,6 +821,7 @@ async function runFork(state: WorkflowState, original: SessionDocument): Promise
 async function runResumeAndReload(state: WorkflowState, fork: SessionDocument): Promise<SessionDocument> {
 	const step = beginStep(state, "rust-resume-reload");
 	const beforeResume = fork.bytes;
+	const compatibilityStartupIndex = readCompatibilityMarkers(state).length;
 	const expectedStartupLoad = (state.loadGeneration ?? 0) + 1;
 	const rust = launch(state, "rust-resume", [
 		RUST_BINARY,
@@ -584,17 +833,68 @@ async function runResumeAndReload(state: WorkflowState, fork: SessionDocument): 
 	]);
 	await waitForReady("Rust resumed interactive startup", rust);
 	state.loadGeneration = await waitForLoadGeneration(state, expectedStartupLoad, rust);
+	const resumedStartup = await waitForCompatibilityMarker(
+		state,
+		"resumed Rust session_start flag marker",
+		rust,
+		compatibilityStartupIndex,
+		"session_start.after",
+		(marker) => markerValue(marker).value === RUST_VERIFICATION_PROFILE,
+	);
 	assert(
 		Buffer.compare(Buffer.from(beforeResume), readFileSync(fork.path)) === 0,
 		"resuming the Rust session rewrote historical JSONL before any action",
 	);
 
+	const reloadStep = beginStep(state, "rust-extension-reload-flag-preservation");
 	const beforeReload = state.loadGeneration;
-	// Ctrl+R is the public interactive reload action and cannot be mistaken for a
-	// provider prompt. The load-generation file is written by the shared source
-	// extension factory each time a fresh host registration pass occurs.
-	rust.writeKeys("\x12");
+	const compatibilityReloadIndex = readCompatibilityMarkers(state).length;
+	// Exercise the public slash-command path, then require the replacement host's
+	// session_start hook to observe the original dynamic flag before any command.
+	sendLine(rust, "/reload");
 	state.loadGeneration = await waitForLoadGeneration(state, beforeReload + 1, rust);
+	const replacementStart = await waitForCompatibilityMarker(
+		state,
+		"replacement host session_start preserved flag",
+		rust,
+		compatibilityReloadIndex,
+		"session_start.after",
+		(marker) => markerValue(marker).value === RUST_VERIFICATION_PROFILE,
+	);
+	assert(
+		replacementStart.marker.instance !== resumedStartup.marker.instance,
+		"/reload reused the prior extension instance instead of starting a replacement host registration",
+	);
+	state.rustReloadCompatibilityInstance = replacementStart.marker.instance;
+	const observationStartIndex = readCompatibilityMarkers(state).length;
+	sendLine(rust, `/${VERIFICATION_FLAG_COMMAND}`);
+	const observationBefore = await waitForCompatibilityMarker(
+		state, "replacement flag observation before marker", rust, observationStartIndex, "flag_observation.before",
+	);
+	const observationAfter = await waitForCompatibilityMarker(
+		state,
+		"replacement flag observation after marker",
+		rust,
+		observationStartIndex,
+		"flag_observation.after",
+		(marker) => markerValue(marker).value === RUST_VERIFICATION_PROFILE,
+	);
+	assert(
+		observationBefore.marker.instance === replacementStart.marker.instance
+			&& observationAfter.marker.instance === replacementStart.marker.instance,
+		"flag observation command did not execute in the replacement extension instance",
+	);
+	assert(
+		replacementStart.index < observationBefore.index && observationBefore.index < observationAfter.index,
+		"replacement session_start did not observe the flag before command dispatch",
+	);
+	finishStep(reloadStep, {
+		profile: RUST_VERIFICATION_PROFILE,
+		previousInstance: resumedStartup.marker.instance,
+		replacementInstance: replacementStart.marker.instance,
+		sessionStartMarkerIndex: replacementStart.index,
+		observationMarkerIndex: observationAfter.index,
+	});
 	await cleanQuit("Rust resumed session", rust);
 	const resumed = readSession(fork.path);
 	assert(
@@ -617,13 +917,15 @@ async function reopenWithTypescript(
 	rustSession: SessionDocument,
 ): Promise<void> {
 	const step = beginStep(state, "typescript-real-session-reopen");
+	const flagStep = beginStep(state, "typescript-extension-flag-session-start");
+	const compatibilityStartIndex = readCompatibilityMarkers(state).length;
 	const before = readFileSync(rustSession.path);
 	copyFileSync(rustSession.path, join(state.runRoot, "session-before-typescript.jsonl"));
 	const expectedLoad = (state.loadGeneration ?? 0) + 1;
 	const typescript = launch(state, "typescript-reopen", [
 		bun,
 		TYPESCRIPT_CLI,
-		...commonArguments(),
+		...commonArguments(TYPESCRIPT_VERIFICATION_PROFILE),
 		"--session-dir",
 		state.sessionDir,
 		"--session",
@@ -631,6 +933,20 @@ async function reopenWithTypescript(
 	]);
 	await waitForReady("TypeScript pi real --session reopen", typescript);
 	state.loadGeneration = await waitForLoadGeneration(state, expectedLoad, typescript);
+	const typescriptStart = await waitForCompatibilityMarker(
+		state,
+		"TypeScript extension session_start distinct flag marker",
+		typescript,
+		compatibilityStartIndex,
+		"session_start.after",
+		(marker) => markerValue(marker).value === TYPESCRIPT_VERIFICATION_PROFILE,
+	);
+	state.typescriptCompatibilityInstance = typescriptStart.marker.instance;
+	finishStep(flagStep, {
+		profile: TYPESCRIPT_VERIFICATION_PROFILE,
+		instance: typescriptStart.marker.instance,
+		markerIndex: typescriptStart.index,
+	});
 	await cleanQuit("TypeScript reopened session", typescript);
 	const after = readFileSync(rustSession.path);
 	copyFileSync(rustSession.path, join(state.runRoot, "session-after-typescript.jsonl"));
@@ -751,6 +1067,15 @@ async function main(): Promise<void> {
 				forkSession: state.forkSessionPath ?? null,
 			},
 			loadGeneration: state.loadGeneration ?? loadGeneration(state.loadCountPath),
+			compatibility: {
+				path: relative(state.runRoot, state.compatibilityPath),
+				markerCount: readCompatibilityMarkers(state).length,
+				rustProfile: RUST_VERIFICATION_PROFILE,
+				typescriptProfile: TYPESCRIPT_VERIFICATION_PROFILE,
+				rustInitialInstance: state.rustInitialCompatibilityInstance ?? null,
+				rustReloadInstance: state.rustReloadCompatibilityInstance ?? null,
+				typescriptInstance: state.typescriptCompatibilityInstance ?? null,
+			},
 			steps: state.steps,
 			sessions: captureSessions(state),
 			failure: failure?.message ?? null,
