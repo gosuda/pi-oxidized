@@ -417,8 +417,8 @@ impl AgentSession {
         }
         if let Err(error) = runner
             .emit(AgentSessionEvent::ModelSelect {
-                model: next_model.clone(),
-                previous_model: previous_model.cloned(),
+                model: Box::new(next_model.clone()),
+                previous_model: previous_model.map(|model| Box::new(model.clone())),
                 source,
             })
             .await

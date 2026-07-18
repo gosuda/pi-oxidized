@@ -1166,6 +1166,11 @@ impl HostExtensionRunner {
     }
 
     /// Offer canonical terminal input to the host's sequential 4 ms actor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostClientError`] when the host transport is down, the 4 ms
+    /// deadline elapses, or the response payload cannot be decoded.
     pub async fn terminal_input(
         &self,
         data: &str,
@@ -1560,126 +1565,121 @@ fn sanitize_html(html: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// Assistant metadata without the growing `content` array.
+fn compact_assistant_meta(message: &AssistantMessage) -> Value {
+    let mut value = serde_json::to_value(message).unwrap_or_else(|_| Value::Object(Map::new()));
+    if let Value::Object(object) = &mut value {
+        object.remove("content");
+    }
+    value
+}
+
+/// The single content block addressed by a streaming event, if any.
+fn compact_assistant_block(message: &AssistantMessage, content_index: u64) -> Value {
+    usize::try_from(content_index)
+        .ok()
+        .and_then(|index| message.content.get(index))
+        .and_then(|content| serde_json::to_value(content).ok())
+        .unwrap_or(Value::Null)
+}
+
 fn compact_message_update_event(event: &AssistantMessageEvent) -> Value {
-    fn meta(message: &AssistantMessage) -> Value {
-        let mut value = serde_json::to_value(message).unwrap_or_else(|_| Value::Object(Map::new()));
-        if let Value::Object(object) = &mut value {
-            object.remove("content");
+    use AssistantMessageEvent as Ev;
+    // (type name, partial, contentIndex, delta text, include block)
+    let (kind, partial, content_index, delta, with_block) = match event {
+        Ev::Start { partial } => ("start", partial, None, None, false),
+        Ev::TextStart {
+            content_index,
+            partial,
+        } => ("text_start", partial, Some(*content_index), None, true),
+        Ev::TextDelta {
+            content_index,
+            delta,
+            partial,
+        } => (
+            "text_delta",
+            partial,
+            Some(*content_index),
+            Some(delta),
+            false,
+        ),
+        Ev::TextEnd {
+            content_index,
+            partial,
+            ..
+        } => ("text_end", partial, Some(*content_index), None, true),
+        Ev::ThinkingStart {
+            content_index,
+            partial,
+        } => ("thinking_start", partial, Some(*content_index), None, true),
+        Ev::ThinkingDelta {
+            content_index,
+            delta,
+            partial,
+        } => (
+            "thinking_delta",
+            partial,
+            Some(*content_index),
+            Some(delta),
+            false,
+        ),
+        Ev::ThinkingEnd {
+            content_index,
+            partial,
+            ..
+        } => ("thinking_end", partial, Some(*content_index), None, true),
+        Ev::ToolCallStart {
+            content_index,
+            partial,
+        } => ("toolcall_start", partial, Some(*content_index), None, true),
+        Ev::ToolCallDelta {
+            content_index,
+            delta,
+            partial,
+        } => (
+            "toolcall_delta",
+            partial,
+            Some(*content_index),
+            Some(delta),
+            false,
+        ),
+        Ev::ToolCallEnd {
+            content_index,
+            partial,
+            ..
+        } => ("toolcall_end", partial, Some(*content_index), None, true),
+        Ev::Done { reason, message } => {
+            return serde_json::json!({
+                "type": "done",
+                "reason": reason,
+                "final": message,
+            });
         }
-        value
-    }
+        Ev::Error { reason, error } => {
+            return serde_json::json!({
+                "type": "error",
+                "reason": reason,
+                "final": error,
+            });
+        }
+    };
 
-    fn block(message: &AssistantMessage, content_index: u64) -> Value {
-        message
-            .content
-            .get(content_index as usize)
-            .and_then(|content| serde_json::to_value(content).ok())
-            .unwrap_or(Value::Null)
+    let mut object = Map::new();
+    object.insert("type".to_owned(), Value::String(kind.to_owned()));
+    object.insert("meta".to_owned(), compact_assistant_meta(partial));
+    if let Some(content_index) = content_index {
+        object.insert("contentIndex".to_owned(), Value::from(content_index));
+        if with_block {
+            object.insert(
+                "block".to_owned(),
+                compact_assistant_block(partial, content_index),
+            );
+        }
     }
-
-    match event {
-        AssistantMessageEvent::Start { partial } => serde_json::json!({
-            "type": "start",
-            "meta": meta(&partial),
-        }),
-        AssistantMessageEvent::TextStart {
-            content_index,
-            partial,
-        } => serde_json::json!({
-            "type": "text_start",
-            "meta": meta(&partial),
-            "contentIndex": content_index,
-            "block": block(partial, *content_index),
-        }),
-        AssistantMessageEvent::TextDelta {
-            content_index,
-            delta,
-            partial,
-        } => serde_json::json!({
-            "type": "text_delta",
-            "meta": meta(&partial),
-            "contentIndex": content_index,
-            "delta": delta,
-        }),
-        AssistantMessageEvent::TextEnd {
-            content_index,
-            partial,
-            ..
-        } => serde_json::json!({
-            "type": "text_end",
-            "meta": meta(&partial),
-            "contentIndex": content_index,
-            "block": block(partial, *content_index),
-        }),
-        AssistantMessageEvent::ThinkingStart {
-            content_index,
-            partial,
-        } => serde_json::json!({
-            "type": "thinking_start",
-            "meta": meta(&partial),
-            "contentIndex": content_index,
-            "block": block(partial, *content_index),
-        }),
-        AssistantMessageEvent::ThinkingDelta {
-            content_index,
-            delta,
-            partial,
-        } => serde_json::json!({
-            "type": "thinking_delta",
-            "meta": meta(&partial),
-            "contentIndex": content_index,
-            "delta": delta,
-        }),
-        AssistantMessageEvent::ThinkingEnd {
-            content_index,
-            partial,
-            ..
-        } => serde_json::json!({
-            "type": "thinking_end",
-            "meta": meta(&partial),
-            "contentIndex": content_index,
-            "block": block(partial, *content_index),
-        }),
-        AssistantMessageEvent::ToolCallStart {
-            content_index,
-            partial,
-        } => serde_json::json!({
-            "type": "toolcall_start",
-            "meta": meta(&partial),
-            "contentIndex": content_index,
-            "block": block(partial, *content_index),
-        }),
-        AssistantMessageEvent::ToolCallDelta {
-            content_index,
-            delta,
-            partial,
-        } => serde_json::json!({
-            "type": "toolcall_delta",
-            "meta": meta(&partial),
-            "contentIndex": content_index,
-            "delta": delta,
-        }),
-        AssistantMessageEvent::ToolCallEnd {
-            content_index,
-            partial,
-            ..
-        } => serde_json::json!({
-            "type": "toolcall_end",
-            "meta": meta(&partial),
-            "contentIndex": content_index,
-            "block": block(partial, *content_index),
-        }),
-        AssistantMessageEvent::Done { reason, message } => serde_json::json!({
-            "type": "done",
-            "reason": reason,
-            "final": message,
-        }),
-        AssistantMessageEvent::Error { reason, error } => serde_json::json!({
-            "type": "error",
-            "reason": reason,
-            "final": error,
-        }),
+    if let Some(delta) = delta {
+        object.insert("delta".to_owned(), Value::String(delta.clone()));
     }
+    Value::Object(object)
 }
 
 // ---------------------------------------------------------------------------

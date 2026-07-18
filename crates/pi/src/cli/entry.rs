@@ -751,13 +751,7 @@ impl CreateAgentSessionRuntimeFactory for RealReplacementFactory {
                 ))
             })?;
             let project_trusted = services.settings_manager().is_project_trusted();
-            let SessionResources {
-                skills,
-                prompt_templates,
-                context_files,
-                custom_prompt,
-                append_prompt,
-            } = session_resources(&services.resource_loader);
+            let resources = session_resources(&services.resource_loader);
 
             let session_result = create_agent_session_from_services(
                 crate::core::agent_session_services::CreateAgentSessionFromServicesOptions {
@@ -780,37 +774,15 @@ impl CreateAgentSessionRuntimeFactory for RealReplacementFactory {
                 ))
             })?;
 
-            let settings_manager = SettingsManager::create(
+            let built = assemble_replacement_session(
                 &cwd,
-                Some(&agent_dir),
-                SettingsManagerCreateOptions::default().project_trusted(project_trusted),
-            );
-            let tools = build_builtin_tools(
-                Path::new(&cwd),
-                &settings_manager,
-                session_result.model.clone(),
-            );
-            let system_prompt = build_system_prompt(&BuildSystemPromptOptions {
-                custom_prompt,
-                selected_tools: Some(session_result.initial_active_tool_names.clone()),
-                tool_snippets: None,
-                prompt_guidelines: None,
-                append: append_prompt,
-                cwd: cwd.clone(),
-                context_files: Some(context_files),
-                skills: Some(skills.clone()),
-            });
-            let built = build_session(SessionBuildOptions {
-                cwd: cwd.clone(),
-                session_manager: options.session_manager,
-                settings_manager,
+                &agent_dir,
+                project_trusted,
+                options.session_manager,
                 session_result,
-                tools,
-                messages: existing_messages,
-                system_prompt,
-                skills,
-                prompt_templates,
-            })
+                resources,
+                existing_messages,
+            )
             .map_err(crate::core::agent_session_runtime::AgentSessionRuntimeError::Factory)?;
 
             Ok(CreateAgentSessionRuntimeResult {
@@ -824,6 +796,58 @@ impl CreateAgentSessionRuntimeFactory for RealReplacementFactory {
             })
         })
     }
+}
+
+/// Assemble the replacement session inputs (settings, tools, system prompt)
+/// and build the session. Pulled out of [`RealReplacementFactory::create`] to
+/// keep it under the strict `too_many_lines` ceiling.
+fn assemble_replacement_session(
+    cwd: &str,
+    agent_dir: &str,
+    project_trusted: bool,
+    session_manager: crate::core::sessions::SessionManager,
+    session_result: CreateAgentSessionResult,
+    resources: SessionResources,
+    existing_messages: Vec<pi_agent::AgentMessage>,
+) -> Result<BuiltSession, String> {
+    let SessionResources {
+        skills,
+        prompt_templates,
+        context_files,
+        custom_prompt,
+        append_prompt,
+    } = resources;
+    let settings_manager = SettingsManager::create(
+        cwd,
+        Some(agent_dir),
+        SettingsManagerCreateOptions::default().project_trusted(project_trusted),
+    );
+    let tools = build_builtin_tools(
+        Path::new(cwd),
+        &settings_manager,
+        session_result.model.clone(),
+    );
+    let system_prompt = build_system_prompt(&BuildSystemPromptOptions {
+        custom_prompt,
+        selected_tools: Some(session_result.initial_active_tool_names.clone()),
+        tool_snippets: None,
+        prompt_guidelines: None,
+        append: append_prompt,
+        cwd: cwd.to_owned(),
+        context_files: Some(context_files),
+        skills: Some(skills.clone()),
+    });
+    build_session(SessionBuildOptions {
+        cwd: cwd.to_owned(),
+        session_manager,
+        settings_manager,
+        session_result,
+        tools,
+        messages: existing_messages,
+        system_prompt,
+        skills,
+        prompt_templates,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1175,10 +1199,13 @@ mod tests {
             handler.refresh_models(),
             Err("Cannot refresh model catalogs while offline".to_owned())
         );
-        let error = handler
-            .update_self(false)
-            .expect_err("self-update must not report already-latest without an engine");
-        assert!(error.contains("not supported by this build"));
+        let error = handler.update_self(false).err();
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|error| error.contains("not supported by this build")),
+            "self-update must fail honestly without an engine: {error:?}"
+        );
     }
 
     // Fake factory that errors with a stable string.

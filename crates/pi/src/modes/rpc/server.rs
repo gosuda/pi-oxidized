@@ -419,7 +419,7 @@ pub enum ServerOutput {
     /// Command response.
     Response(RpcResponse),
     /// Raw agent event.
-    Event(AgentSessionEvent),
+    Event(Box<AgentSessionEvent>),
     /// Extension UI request.
     UiRequest(RpcExtensionUiRequest),
     /// Extension error notification.
@@ -657,18 +657,19 @@ async fn bridge_extension_dialog(
         rpc_request,
     ))));
 
-    let response = match timeout_ms {
-        Some(timeout_ms) => tokio::select! {
+    let response = if let Some(timeout_ms) = timeout_ms {
+        tokio::select! {
             () = cancel.cancelled() => None,
             result = tokio::time::timeout(
                 std::time::Duration::from_millis(timeout_ms),
                 response_rx,
             ) => result.ok().and_then(Result::ok),
-        },
-        None => tokio::select! {
+        }
+    } else {
+        tokio::select! {
             () = cancel.cancelled() => None,
             result = response_rx => result.ok(),
-        },
+        }
     };
     if response.is_none() {
         let _ = proxy.route_response(RpcExtensionUiResponse::Cancelled { id: rpc_id });
@@ -1269,7 +1270,7 @@ where
         return LineOutcome::Done;
     }
 
-    let command = match RpcCommand::parse_value(parsed) {
+    let command = match RpcCommand::parse_value(&parsed) {
         Ok(command) => command,
         Err(error) => {
             let response = RpcResponse::err(

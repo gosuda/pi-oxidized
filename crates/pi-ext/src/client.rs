@@ -1090,6 +1090,23 @@ fn decode_ui_request(frame: &Frame) -> Option<HostUiRequest> {
     }
 }
 
+fn cancel_method_for(method: &str) -> Option<&'static str> {
+    match method {
+        "tool.execute" => Some("tool.cancel"),
+        "provider.stream" => Some("provider.cancel"),
+        _ => None,
+    }
+}
+
+fn cancel_frame(id: FrameId, control_method: &str) -> Frame {
+    Frame {
+        id: 0,
+        kind: FrameKind::Event,
+        method: control_method.to_owned(),
+        payload: serde_json::json!({ "id": id }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1543,22 +1560,5 @@ mod tests {
             .await;
         assert!(matches!(result, Err(HostClientError::NotRunning)));
         Ok(())
-    }
-}
-
-fn cancel_method_for(method: &str) -> Option<&'static str> {
-    match method {
-        "tool.execute" => Some("tool.cancel"),
-        "provider.stream" => Some("provider.cancel"),
-        _ => None,
-    }
-}
-
-fn cancel_frame(id: FrameId, control_method: &str) -> Frame {
-    Frame {
-        id: 0,
-        kind: FrameKind::Event,
-        method: control_method.to_owned(),
-        payload: serde_json::json!({ "id": id }),
     }
 }

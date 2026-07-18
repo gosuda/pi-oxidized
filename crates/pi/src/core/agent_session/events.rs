@@ -83,15 +83,15 @@ pub enum AgentSessionEvent {
     },
     /// A new model was selected.
     ModelSelect {
-        /// Newly selected model.
-        model: Model,
+        /// Newly selected model (boxed to keep the enum small; wire unchanged).
+        model: Box<Model>,
         /// Previously selected model, absent during initial restoration.
         #[serde(
             rename = "previousModel",
             default,
             skip_serializing_if = "Option::is_none"
         )]
-        previous_model: Option<Model>,
+        previous_model: Option<Box<Model>>,
         /// Selection source.
         source: ModelSelectSource,
     },
@@ -412,8 +412,8 @@ mod tests {
 
         let model = pi_agent::state::default_model();
         let selected = serde_json::to_value(AgentSessionEvent::ModelSelect {
-            model: model.clone(),
-            previous_model: Some(model),
+            model: Box::new(model.clone()),
+            previous_model: Some(Box::new(model)),
             source: ModelSelectSource::Cycle,
         })?;
         assert_eq!(selected["type"], json!("model_select"));

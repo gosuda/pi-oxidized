@@ -278,6 +278,10 @@ pub trait SessionHost: Send + Sync + 'static {
     }
 
     /// Persist thinking-block visibility.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable message when persisting the preference fails.
     fn set_hide_thinking_block(&self, _hide: bool) -> Result<(), String> {
         Ok(())
     }
@@ -760,6 +764,15 @@ impl Component for InteractiveRoot {
 // InteractiveRuntime
 // ---------------------------------------------------------------------------
 
+/// Persistent transcript display preferences applied to every projection.
+#[derive(Clone, Copy, Default)]
+struct DisplayPreferences {
+    /// Whether tool blocks render expanded.
+    tools_expanded: bool,
+    /// Whether thinking blocks are hidden behind a static label.
+    hide_thinking: bool,
+}
+
 /// Live interactive runtime.
 ///
 /// Owns:
@@ -802,8 +815,7 @@ pub struct InteractiveRuntime<W: Write, S: SessionHost> {
     pending_extension_dialog: Option<PendingExtensionDialog>,
     extension_select_rx: mpsc::UnboundedReceiver<String>,
     extension_select_tx: mpsc::UnboundedSender<String>,
-    tools_expanded: bool,
-    hide_thinking: bool,
+    display: DisplayPreferences,
     chat_prefix_cache: Option<Box<dyn Component>>,
     chat_prefix_len: usize,
     chat_tail_cache: Option<Box<dyn Component>>,
@@ -958,8 +970,10 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             pending_extension_dialog: None,
             extension_select_rx,
             extension_select_tx,
-            tools_expanded: false,
-            hide_thinking,
+            display: DisplayPreferences {
+                tools_expanded: false,
+                hide_thinking,
+            },
             chat_prefix_cache: None,
             chat_prefix_len: usize::MAX,
             chat_tail_cache: None,
@@ -1061,6 +1075,24 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         true
     }
 
+    /// Latched shutdown check catches notifications fired before the select
+    /// arm was awaiting (Ctrl+Z, signal handler, etc.). Only forces Clean when
+    /// no more-specific exit was already set (Suspend sets `exit_kind` + exited
+    /// without using this flag). Returns true when the loop must stop.
+    fn take_latched_shutdown(&mut self) -> bool {
+        if !self
+            .shutdown_flag
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return false;
+        }
+        if !self.exited {
+            self.exit_kind = InteractiveExit::Clean;
+            self.exited = true;
+        }
+        true
+    }
+
     /// Run the main event loop until shutdown is requested or stdin closes.
     ///
     /// Returns the exit reason; the caller drops the runtime and the
@@ -1075,18 +1107,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         }
 
         while !self.exited {
-            // Latched shutdown check catches notifications fired before the
-            // select arm was awaiting (Ctrl+Z, signal handler, etc.).
-            if self
-                .shutdown_flag
-                .swap(false, std::sync::atomic::Ordering::SeqCst)
-            {
-                // Only force Clean when no more-specific exit was already set
-                // (Suspend sets exit_kind + exited without using this flag).
-                if !self.exited {
-                    self.exit_kind = InteractiveExit::Clean;
-                    self.exited = true;
-                }
+            if self.take_latched_shutdown() {
                 break;
             }
 
@@ -1094,17 +1115,10 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             // new ones, so ordering across the storm is preserved.
             if let Some(event) = self.pending_ui_reinject.pop() {
                 if let Err(err) = self.handle_ui_event(event).await {
-                    self.exit_kind = InteractiveExit::IoFailure;
-                    self.last_error = Some(err.to_string());
-                    self.exited = true;
+                    self.fail_io(&err);
                     break;
                 }
-                if let Some(blocks) = self.pending_settle.take()
-                    && let Err(err) = self.commit_settle(blocks)
-                {
-                    self.exit_kind = InteractiveExit::IoFailure;
-                    self.last_error = Some(err.to_string());
-                    self.exited = true;
+                if !self.settle_pending() {
                     break;
                 }
                 continue;
@@ -1127,9 +1141,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 ui = self.input.recv() => {
                     if let Some(event) = ui {
                         if let Err(err) = self.handle_ui_event(event).await {
-                            self.exit_kind = InteractiveExit::IoFailure;
-                            self.last_error = Some(err.to_string());
-                            self.exited = true;
+                            self.fail_io(&err);
                         }
                     } else {
                         // stdin EOF: clean exit.
@@ -1183,25 +1195,35 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                     if self.coalesce_deadline.is_some() {
                         self.coalesce_deadline = None;
                         if let Err(err) = self.paint_frame() {
-                            self.exit_kind = InteractiveExit::IoFailure;
-                            self.last_error = Some(err.to_string());
-                            self.exited = true;
+                            self.fail_io(&err);
                         }
                     }
                 }
             }
 
             // Run any pending settle as its own transaction.
-            if let Some(blocks) = self.pending_settle.take()
-                && let Err(err) = self.commit_settle(blocks)
-            {
-                self.exit_kind = InteractiveExit::IoFailure;
-                self.last_error = Some(err.to_string());
-                self.exited = true;
-            }
+            self.settle_pending();
         }
 
         Ok(self.finish_run().await)
+    }
+
+    /// Record an unrecoverable terminal I/O failure and request exit.
+    fn fail_io(&mut self, err: &io::Error) {
+        self.exit_kind = InteractiveExit::IoFailure;
+        self.last_error = Some(err.to_string());
+        self.exited = true;
+    }
+
+    /// Commit any pending settle transaction; returns `false` on I/O failure.
+    fn settle_pending(&mut self) -> bool {
+        if let Some(blocks) = self.pending_settle.take()
+            && let Err(err) = self.commit_settle(blocks)
+        {
+            self.fail_io(&err);
+            return false;
+        }
+        true
     }
 
     async fn finish_run(&mut self) -> InteractiveExit {
@@ -1308,8 +1330,8 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         project_event(&mut self.view, event);
         apply_display_preferences(
             &mut self.view.messages,
-            self.tools_expanded,
-            self.hide_thinking,
+            self.display.tools_expanded,
+            self.display.hide_thinking,
         );
         if matches!(event, AgentSessionEvent::MessageUpdate { .. }) {
             self.chat_dirty = true;
@@ -1343,8 +1365,8 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             self.view.streaming = true;
             apply_display_preferences(
                 &mut self.view.messages,
-                self.tools_expanded,
-                self.hide_thinking,
+                self.display.tools_expanded,
+                self.display.hide_thinking,
             );
             self.chat_dirty = true;
             self.arm_coalescer();
@@ -1358,34 +1380,41 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     // Action dispatch
     // -----------------------------------------------------------------------
 
+    /// Flip thinking-block visibility, persist it, and reproject messages.
+    fn toggle_thinking(&mut self) -> ActionOutcome {
+        self.display.hide_thinking = !self.display.hide_thinking;
+        if let Err(error) = self
+            .session
+            .set_hide_thinking_block(self.display.hide_thinking)
+        {
+            self.last_error = Some(error);
+        }
+        self.reapply_display_preferences()
+    }
+
+    /// Flip tool/bash expansion and reproject messages.
+    fn toggle_tool_expand(&mut self) -> ActionOutcome {
+        self.display.tools_expanded = !self.display.tools_expanded;
+        self.reapply_display_preferences()
+    }
+
+    fn reapply_display_preferences(&mut self) -> ActionOutcome {
+        apply_display_preferences(
+            &mut self.view.messages,
+            self.display.tools_expanded,
+            self.display.hide_thinking,
+        );
+        self.chat_dirty = true;
+        ActionOutcome::Repaint
+    }
+
     async fn dispatch_action(&mut self, action: ViewAction) -> ActionOutcome {
         match action {
             ViewAction::None | ViewAction::Consumed => ActionOutcome::None,
             ViewAction::ExternalEditor => ActionOutcome::ExternalEditor,
             ViewAction::Render | ViewAction::OpenSettingsSubmenu { .. } => ActionOutcome::Repaint,
-            ViewAction::ToggleThinking => {
-                self.hide_thinking = !self.hide_thinking;
-                if let Err(error) = self.session.set_hide_thinking_block(self.hide_thinking) {
-                    self.last_error = Some(error);
-                }
-                apply_display_preferences(
-                    &mut self.view.messages,
-                    self.tools_expanded,
-                    self.hide_thinking,
-                );
-                self.chat_dirty = true;
-                ActionOutcome::Repaint
-            }
-            ViewAction::ToggleToolExpand => {
-                self.tools_expanded = !self.tools_expanded;
-                apply_display_preferences(
-                    &mut self.view.messages,
-                    self.tools_expanded,
-                    self.hide_thinking,
-                );
-                self.chat_dirty = true;
-                ActionOutcome::Repaint
-            }
+            ViewAction::ToggleThinking => self.toggle_thinking(),
+            ViewAction::ToggleToolExpand => self.toggle_tool_expand(),
             ViewAction::Submit { text } => self.submit_text(text, false).await,
             ViewAction::SubmitBash {
                 command,
@@ -2082,7 +2111,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         list.on_cancel = Some(Box::new(move || {
             let _ = cancel_tx.send(());
         }));
-        self.view.editor.placeholder = title.to_owned();
+        title.clone_into(&mut self.view.editor.placeholder);
         Box::new(list)
     }
 
@@ -2132,7 +2161,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 let prefill = request.prefill.clone().unwrap_or_default();
                 self.editor.set_text(&prefill);
                 self.view.editor.text = prefill;
-                self.view.editor.placeholder = request.title.clone();
+                self.view.editor.placeholder.clone_from(&request.title);
                 self.view.focus = FocusArea::Editor;
             }
         }
@@ -2221,7 +2250,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         };
         match slot.placement {
             SlotPlacement::Footer | SlotPlacement::BelowEditor => {
-                self.view.widgets_below.push(widget)
+                self.view.widgets_below.push(widget);
             }
             SlotPlacement::Overlay => {
                 self.view.overlay = Some(Overlay {
@@ -2332,8 +2361,8 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         self.view.messages = project_messages(&self.session.messages());
         apply_display_preferences(
             &mut self.view.messages,
-            self.tools_expanded,
-            self.hide_thinking,
+            self.display.tools_expanded,
+            self.display.hide_thinking,
         );
         self.chat_prefix_cache = None;
         self.chat_prefix_len = usize::MAX;
@@ -2643,7 +2672,11 @@ fn project_event(view: &mut ViewState, event: &AgentSessionEvent) {
             view.streaming = false;
             view.status = None;
         }
-        Event::TurnStart | Event::TurnEnd { .. } => {}
+        Event::TurnStart
+        | Event::TurnEnd { .. }
+        | Event::SessionBeforeSwitch { .. }
+        | Event::SessionBeforeFork { .. }
+        | Event::ModelSelect { .. } => {}
         Event::MessageStart { message } => project_message_start(view, message),
         Event::MessageUpdate { message, .. } => {
             project_assistant_message(view, message, false);
@@ -2699,9 +2732,6 @@ fn project_event(view: &mut ViewState, event: &AgentSessionEvent) {
                 ),
             });
         }
-        AgentSessionEvent::SessionBeforeSwitch { .. }
-        | AgentSessionEvent::SessionBeforeFork { .. }
-        | AgentSessionEvent::ModelSelect { .. } => {}
     }
 }
 
@@ -4050,52 +4080,7 @@ pub async fn run_interactive_mode(
                 rt.rebind_session_channels();
             }
             InteractiveExit::ExternalEditor => {
-                let initial = rt.editor.get_text();
-                let editor_command = rt.session.external_editor_command();
-                rt.input
-                    .pause()
-                    .await
-                    .map_err(|e| format!("pause terminal input for editor: {e}"))?;
-                guard.restore();
-
-                let cancel = CancellationToken::new();
-                let cancel_on_shutdown = cancel.clone();
-                let shutdown = Arc::clone(&rt.shutdown);
-                let watcher = tokio::spawn(async move {
-                    shutdown.notified().await;
-                    cancel_on_shutdown.cancel();
-                });
-                let edited = edit_text_in_external_editor(&editor_command, &initial, &cancel)
-                    .await
-                    .map_err(|error| error.to_string());
-                watcher.abort();
-
-                guard
-                    .resume(enable_kitty)
-                    .map_err(|e| format!("terminal resume after editor failed: {e}"))?;
-                rt.input
-                    .resume(Vec::new())
-                    .await
-                    .map_err(|e| format!("resume terminal input after editor: {e}"))?;
-                rt.exited = false;
-                rt.exit_kind = InteractiveExit::Clean;
-                match edited {
-                    Ok(EditOutcome::Changed(text)) => {
-                        rt.editor.set_text(&text);
-                        rt.view.editor.text = text;
-                    }
-                    Ok(EditOutcome::Unchanged | EditOutcome::Aborted) => {}
-                    Err(error) => rt.last_error = Some(error),
-                }
-                let size = initial_terminal_size();
-                guard.set_viewport_bottom_row(size.1.saturating_sub(1));
-                let _ = rt
-                    .step_ui(UiEvent::Resize {
-                        width: size.0,
-                        height: size.1,
-                    })
-                    .await;
-                guard.set_viewport_bottom_row(rt.viewport_bottom_row());
+                run_external_editor_handoff(&mut rt, &mut guard, enable_kitty).await?;
             }
             other => break other,
         }
@@ -4118,6 +4103,67 @@ pub async fn run_interactive_mode(
     Ok(code)
 }
 
+/// Hand the terminal to the configured external editor, then restore the
+/// interactive session and apply the edited prompt text.
+async fn run_external_editor_handoff<W, G, S>(
+    rt: &mut InteractiveRuntime<W, S>,
+    guard: &mut TerminalGuard<G>,
+    enable_kitty: bool,
+) -> Result<(), String>
+where
+    W: Write,
+    G: Write,
+    S: SessionHost,
+{
+    let initial = rt.editor.get_text();
+    let editor_command = rt.session.external_editor_command();
+    rt.input
+        .pause()
+        .await
+        .map_err(|e| format!("pause terminal input for editor: {e}"))?;
+    guard.restore();
+
+    let cancel = CancellationToken::new();
+    let cancel_on_shutdown = cancel.clone();
+    let shutdown = Arc::clone(&rt.shutdown);
+    let watcher = tokio::spawn(async move {
+        shutdown.notified().await;
+        cancel_on_shutdown.cancel();
+    });
+    let edited = edit_text_in_external_editor(&editor_command, &initial, &cancel)
+        .await
+        .map_err(|error| error.to_string());
+    watcher.abort();
+
+    guard
+        .resume(enable_kitty)
+        .map_err(|e| format!("terminal resume after editor failed: {e}"))?;
+    rt.input
+        .resume(Vec::new())
+        .await
+        .map_err(|e| format!("resume terminal input after editor: {e}"))?;
+    rt.exited = false;
+    rt.exit_kind = InteractiveExit::Clean;
+    match edited {
+        Ok(EditOutcome::Changed(text)) => {
+            rt.editor.set_text(&text);
+            rt.view.editor.text = text;
+        }
+        Ok(EditOutcome::Unchanged | EditOutcome::Aborted) => {}
+        Err(error) => rt.last_error = Some(error),
+    }
+    let size = initial_terminal_size();
+    guard.set_viewport_bottom_row(size.1.saturating_sub(1));
+    let _ = rt
+        .step_ui(UiEvent::Resize {
+            width: size.0,
+            height: size.1,
+        })
+        .await;
+    guard.set_viewport_bottom_row(rt.viewport_bottom_row());
+    Ok(())
+}
+
 /// Extension trait so the host can subscribe with an [`Arc<EventListener>`].
 /// [`AgentSession::subscribe`] takes `Fn(&Event)` (not `Arc`) and returns an
 /// unsubscribe closure. We adapt by cloning the Arc into a wrapped fn.
@@ -4138,6 +4184,143 @@ impl AgentSessionSubscribeExt for AgentSession {
         });
         Box::new(unsubscribe)
     }
+}
+
+async fn recv_extension_event(
+    receiver: &mut Option<tokio::sync::broadcast::Receiver<ExtensionUiEvent>>,
+) -> Option<ExtensionUiEvent> {
+    match receiver {
+        Some(receiver) => loop {
+            match receiver.recv().await {
+                Ok(event) => return Some(event),
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            }
+        },
+        None => std::future::pending().await,
+    }
+}
+
+async fn recv_extension_request(
+    receiver: &mut Option<mpsc::Receiver<HostUiRequest>>,
+) -> Option<HostUiRequest> {
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn wait_extension_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await,
+        None => std::future::pending().await,
+    }
+}
+
+fn dialog_timeout(request: &HostUiRequest) -> Option<Duration> {
+    let timeout_ms = match request {
+        HostUiRequest::Select { request, .. } => request.options_meta.timeout_ms,
+        HostUiRequest::Confirm { request, .. } => request.options_meta.timeout_ms,
+        HostUiRequest::Input { request, .. } => request.options_meta.timeout_ms,
+        HostUiRequest::Editor { .. } => None,
+    }?;
+    Some(Duration::from_millis(timeout_ms))
+}
+
+fn default_extension_dialog_response(request: &HostUiRequest) -> HostUiResponse {
+    match request {
+        HostUiRequest::Select { id, .. } => HostUiResponse::Select {
+            id: *id,
+            value: None,
+        },
+        HostUiRequest::Confirm { id, .. } => HostUiResponse::Confirm {
+            id: *id,
+            confirmed: false,
+        },
+        HostUiRequest::Input { id, .. } => HostUiResponse::Input {
+            id: *id,
+            value: None,
+        },
+        HostUiRequest::Editor { id, .. } => HostUiResponse::Editor {
+            id: *id,
+            value: None,
+        },
+    }
+}
+
+fn encode_terminal_input(event: &UiEvent) -> Option<String> {
+    match event {
+        UiEvent::Paste(text) => Some(text.clone()),
+        UiEvent::Key(key) => {
+            let prefix = if key.modifiers.contains(crossterm::event::KeyModifiers::ALT) {
+                "\u{1b}"
+            } else {
+                ""
+            };
+            let data = match key.code {
+                crossterm::event::KeyCode::Char(character)
+                    if key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                {
+                    let code = (character.to_ascii_uppercase() as u8) & 0x1f;
+                    char::from(code).to_string()
+                }
+                crossterm::event::KeyCode::Char(character) => character.to_string(),
+                crossterm::event::KeyCode::Enter => "\r".to_owned(),
+                crossterm::event::KeyCode::Tab => "\t".to_owned(),
+                crossterm::event::KeyCode::BackTab => "\u{1b}[Z".to_owned(),
+                crossterm::event::KeyCode::Backspace => "\u{7f}".to_owned(),
+                crossterm::event::KeyCode::Esc => "\u{1b}".to_owned(),
+                crossterm::event::KeyCode::Up => "\u{1b}[A".to_owned(),
+                crossterm::event::KeyCode::Down => "\u{1b}[B".to_owned(),
+                crossterm::event::KeyCode::Right => "\u{1b}[C".to_owned(),
+                crossterm::event::KeyCode::Left => "\u{1b}[D".to_owned(),
+                crossterm::event::KeyCode::Home => "\u{1b}[H".to_owned(),
+                crossterm::event::KeyCode::End => "\u{1b}[F".to_owned(),
+                crossterm::event::KeyCode::Delete => "\u{1b}[3~".to_owned(),
+                _ => return None,
+            };
+            Some(format!("{prefix}{data}"))
+        }
+        UiEvent::FocusGained | UiEvent::FocusLost | UiEvent::Resize { .. } => None,
+    }
+}
+
+fn decode_terminal_input(data: String) -> UiEvent {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let key = match data.as_str() {
+        "\r" | "\n" => Some(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        "\t" => Some(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+        "\u{7f}" | "\u{8}" => Some(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+        "\u{1b}" => Some(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        "\u{1b}[A" => Some(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+        "\u{1b}[B" => Some(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+        "\u{1b}[C" => Some(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+        "\u{1b}[D" => Some(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+        "\u{1b}[H" => Some(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)),
+        "\u{1b}[F" => Some(KeyEvent::new(KeyCode::End, KeyModifiers::NONE)),
+        "\u{1b}[3~" => Some(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE)),
+        "\u{1b}[Z" => Some(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)),
+        _ if data.starts_with('\u{1b}') && data.chars().count() == 2 => data
+            .chars()
+            .nth(1)
+            .map(|character| KeyEvent::new(KeyCode::Char(character), KeyModifiers::ALT)),
+        _ => {
+            let mut characters = data.chars();
+            match (characters.next(), characters.next()) {
+                (Some(character), None) if (character as u32) < 0x20 => {
+                    let letter = char::from((character as u8) | 0x60);
+                    Some(KeyEvent::new(KeyCode::Char(letter), KeyModifiers::CONTROL))
+                }
+                (Some(character), None) => {
+                    Some(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+                }
+                _ => None,
+            }
+        }
+    };
+    key.map_or(UiEvent::Paste(data), UiEvent::Key)
 }
 
 #[cfg(test)]
@@ -5146,7 +5329,13 @@ mod tests {
                 .open(path)?;
             let emergency = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let _restore = install_product_panic_emergency_hook(emergency, writer);
-            panic!("intentional product panic-hook fixture");
+            // The fixture MUST execute the installed panic hook;
+            // `resume_unwind` deliberately bypasses hooks, so an explicit
+            // panic is the only honest trigger. Test-only lint exception.
+            #[allow(clippy::panic)]
+            {
+                panic!("intentional product panic-hook fixture");
+            }
         }
 
         let directory = tempfile::tempdir()?;
@@ -5447,7 +5636,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_input_codec_covers_extension_rewrite_keyspace() {
+    fn terminal_input_codec_covers_extension_rewrite_keyspace() -> Result<(), String> {
         let events = [
             UiEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             UiEvent::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT)),
@@ -5457,9 +5646,11 @@ mod tests {
             UiEvent::Key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE)),
         ];
         for event in events {
-            let encoded = encode_terminal_input(&event).expect("supported event");
+            let encoded = encode_terminal_input(&event)
+                .ok_or_else(|| format!("unsupported event: {event:?}"))?;
             assert_eq!(decode_terminal_input(encoded), event);
         }
+        Ok(())
     }
 
     #[tokio::test]
@@ -5628,141 +5819,4 @@ mod tests {
             vec!["/foo custom args".to_owned()]
         );
     }
-}
-
-async fn recv_extension_event(
-    receiver: &mut Option<tokio::sync::broadcast::Receiver<ExtensionUiEvent>>,
-) -> Option<ExtensionUiEvent> {
-    match receiver {
-        Some(receiver) => loop {
-            match receiver.recv().await {
-                Ok(event) => return Some(event),
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
-            }
-        },
-        None => std::future::pending().await,
-    }
-}
-
-async fn recv_extension_request(
-    receiver: &mut Option<mpsc::Receiver<HostUiRequest>>,
-) -> Option<HostUiRequest> {
-    match receiver {
-        Some(receiver) => receiver.recv().await,
-        None => std::future::pending().await,
-    }
-}
-
-async fn wait_extension_deadline(deadline: Option<Instant>) {
-    match deadline {
-        Some(deadline) => tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await,
-        None => std::future::pending().await,
-    }
-}
-
-fn dialog_timeout(request: &HostUiRequest) -> Option<Duration> {
-    let timeout_ms = match request {
-        HostUiRequest::Select { request, .. } => request.options_meta.timeout_ms,
-        HostUiRequest::Confirm { request, .. } => request.options_meta.timeout_ms,
-        HostUiRequest::Input { request, .. } => request.options_meta.timeout_ms,
-        HostUiRequest::Editor { .. } => None,
-    }?;
-    Some(Duration::from_millis(timeout_ms))
-}
-
-fn default_extension_dialog_response(request: &HostUiRequest) -> HostUiResponse {
-    match request {
-        HostUiRequest::Select { id, .. } => HostUiResponse::Select {
-            id: *id,
-            value: None,
-        },
-        HostUiRequest::Confirm { id, .. } => HostUiResponse::Confirm {
-            id: *id,
-            confirmed: false,
-        },
-        HostUiRequest::Input { id, .. } => HostUiResponse::Input {
-            id: *id,
-            value: None,
-        },
-        HostUiRequest::Editor { id, .. } => HostUiResponse::Editor {
-            id: *id,
-            value: None,
-        },
-    }
-}
-
-fn encode_terminal_input(event: &UiEvent) -> Option<String> {
-    match event {
-        UiEvent::Paste(text) => Some(text.clone()),
-        UiEvent::Key(key) => {
-            let prefix = if key.modifiers.contains(crossterm::event::KeyModifiers::ALT) {
-                "\u{1b}"
-            } else {
-                ""
-            };
-            let data = match key.code {
-                crossterm::event::KeyCode::Char(character)
-                    if key
-                        .modifiers
-                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
-                {
-                    let code = (character.to_ascii_uppercase() as u8) & 0x1f;
-                    char::from(code).to_string()
-                }
-                crossterm::event::KeyCode::Char(character) => character.to_string(),
-                crossterm::event::KeyCode::Enter => "\r".to_owned(),
-                crossterm::event::KeyCode::Tab => "\t".to_owned(),
-                crossterm::event::KeyCode::BackTab => "\u{1b}[Z".to_owned(),
-                crossterm::event::KeyCode::Backspace => "\u{7f}".to_owned(),
-                crossterm::event::KeyCode::Esc => "\u{1b}".to_owned(),
-                crossterm::event::KeyCode::Up => "\u{1b}[A".to_owned(),
-                crossterm::event::KeyCode::Down => "\u{1b}[B".to_owned(),
-                crossterm::event::KeyCode::Right => "\u{1b}[C".to_owned(),
-                crossterm::event::KeyCode::Left => "\u{1b}[D".to_owned(),
-                crossterm::event::KeyCode::Home => "\u{1b}[H".to_owned(),
-                crossterm::event::KeyCode::End => "\u{1b}[F".to_owned(),
-                crossterm::event::KeyCode::Delete => "\u{1b}[3~".to_owned(),
-                _ => return None,
-            };
-            Some(format!("{prefix}{data}"))
-        }
-        UiEvent::FocusGained | UiEvent::FocusLost | UiEvent::Resize { .. } => None,
-    }
-}
-
-fn decode_terminal_input(data: String) -> UiEvent {
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    let key = match data.as_str() {
-        "\r" | "\n" => Some(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-        "\t" => Some(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
-        "\u{7f}" | "\u{8}" => Some(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
-        "\u{1b}" => Some(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-        "\u{1b}[A" => Some(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
-        "\u{1b}[B" => Some(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
-        "\u{1b}[C" => Some(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
-        "\u{1b}[D" => Some(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
-        "\u{1b}[H" => Some(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)),
-        "\u{1b}[F" => Some(KeyEvent::new(KeyCode::End, KeyModifiers::NONE)),
-        "\u{1b}[3~" => Some(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE)),
-        "\u{1b}[Z" => Some(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)),
-        _ if data.starts_with('\u{1b}') && data.chars().count() == 2 => data
-            .chars()
-            .nth(1)
-            .map(|character| KeyEvent::new(KeyCode::Char(character), KeyModifiers::ALT)),
-        _ => {
-            let mut characters = data.chars();
-            match (characters.next(), characters.next()) {
-                (Some(character), None) if (character as u32) < 0x20 => {
-                    let letter = char::from((character as u8) | 0x60);
-                    Some(KeyEvent::new(KeyCode::Char(letter), KeyModifiers::CONTROL))
-                }
-                (Some(character), None) => {
-                    Some(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
-                }
-                _ => None,
-            }
-        }
-    };
-    key.map_or(UiEvent::Paste(data), UiEvent::Key)
 }

@@ -878,7 +878,7 @@ impl<'de> Deserialize<'de> for RpcCommand {
         D: Deserializer<'de>,
     {
         let value = Value::deserialize(deserializer)?;
-        Self::parse_value(value).map_err(|error| de::Error::custom(error.message))
+        Self::parse_value(&value).map_err(|error| de::Error::custom(error.message))
     }
 }
 
@@ -889,7 +889,7 @@ pub(crate) struct RpcCommandParseError {
 }
 
 impl RpcCommand {
-    pub(crate) fn parse_value(value: Value) -> Result<Self, RpcCommandParseError> {
+    pub(crate) fn parse_value(value: &Value) -> Result<Self, RpcCommandParseError> {
         let obj = value.as_object().ok_or_else(|| RpcCommandParseError {
             id: None,
             message: "rpc command must be a JSON object".to_owned(),

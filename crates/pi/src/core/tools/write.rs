@@ -386,7 +386,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let cancel_at_boundary = cancel.clone();
 
-        let error = apply_write_mutation_with_commit_hooks(
+        let result = apply_write_mutation_with_commit_hooks(
             dir.path(),
             &path,
             "pre-commit.txt",
@@ -395,8 +395,10 @@ mod tests {
             move || cancel_at_boundary.cancel(),
             || {},
         )
-        .await
-        .expect_err("pre-commit cancellation unexpectedly succeeded");
+        .await;
+        let Err(error) = result else {
+            return Err("pre-commit cancellation unexpectedly succeeded".into());
+        };
 
         assert_eq!(error.message(), "Operation aborted");
         assert_eq!(tokio::fs::read_to_string(&path).await?, "before");

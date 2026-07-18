@@ -329,7 +329,7 @@ mod tests {
             max_tokens: 1_024,
             headers: None,
             compat: None,
-            extra: Default::default(),
+            extra: std::collections::BTreeMap::new(),
         }
     }
 

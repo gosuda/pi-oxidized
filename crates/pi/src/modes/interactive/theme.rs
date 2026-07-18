@@ -1323,7 +1323,9 @@ const fn light_bg() -> [Rgb; 6] {
 mod tests {
     use super::*;
 
-    fn parsed_theme(overrides: &[(&str, serde_json::Value)]) -> ThemeJson {
+    type TestResult = Result<(), String>;
+
+    fn parsed_theme(overrides: &[(&str, serde_json::Value)]) -> Result<ThemeJson, String> {
         let mut colors = serde_json::Map::new();
         for slot in REQUIRED_COLORS {
             colors.insert((*slot).to_owned(), serde_json::json!("#010203"));
@@ -1335,7 +1337,7 @@ mod tests {
             "name": "test",
             "colors": colors,
         }))
-        .expect("test theme should parse")
+        .map_err(|error| format!("test theme should parse: {error}"))
     }
 
     #[test]
@@ -1355,15 +1357,15 @@ mod tests {
     }
 
     #[test]
-    fn json_black_is_distinct_from_default() {
+    fn json_black_is_distinct_from_default() -> TestResult {
         let theme = parsed_theme(&[
             ("accent", serde_json::json!("#000000")),
             ("muted", serde_json::json!("")),
             ("selectedBg", serde_json::json!("#000000")),
             ("toolErrorBg", serde_json::json!("")),
-        ])
+        ])?
         .resolve_owned(ColorMode::Truecolor)
-        .expect("test theme should resolve");
+        .map_err(|error| format!("test theme should resolve: {error}"))?;
 
         assert_eq!(theme.fg_rgb(ThemeColor::Accent), Rgb(0, 0, 0));
         assert!(!theme.is_fg_empty(ThemeColor::Accent));
@@ -1376,23 +1378,25 @@ mod tests {
         assert_eq!(theme.bg_ansi(ThemeBg::SelectedBg), "\x1b[48;2;0;0;0m");
         assert!(theme.is_bg_empty(ThemeBg::ToolErrorBg));
         assert_eq!(theme.bg_ansi(ThemeBg::ToolErrorBg), "\x1b[49m");
+        Ok(())
     }
 
     #[test]
-    fn json_indexed_colors_emit_exact_sequences_in_every_mode() {
+    fn json_indexed_colors_emit_exact_sequences_in_every_mode() -> TestResult {
         let parsed = parsed_theme(&[
             ("accent", serde_json::json!(17)),
             ("selectedBg", serde_json::json!(231)),
-        ]);
+        ])?;
 
         for mode in [ColorMode::Truecolor, ColorMode::Palette256] {
             let theme = parsed
                 .resolve_owned(mode)
-                .expect("test theme should resolve");
+                .map_err(|error| format!("test theme should resolve: {error}"))?;
             assert_eq!(theme.fg_ansi(ThemeColor::Accent), "\x1b[38;5;17m");
             assert_eq!(theme.bg_ansi(ThemeBg::SelectedBg), "\x1b[48;5;231m");
             assert_eq!(theme.fg_rgb(ThemeColor::Accent), Rgb(17, 17, 17));
             assert_eq!(theme.bg_rgb(ThemeBg::SelectedBg), Rgb(231, 231, 231));
         }
+        Ok(())
     }
 }

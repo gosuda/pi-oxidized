@@ -1225,7 +1225,10 @@ mod tests {
 
         session
             .bind_extensions(ExtensionBindings {
-                on_error: Some(Arc::new(|_| panic!("listener panic"))),
+                on_error: Some(Arc::new(|_| {
+                    // Deliberate unwind: proves listener panics are isolated.
+                    std::panic::resume_unwind(Box::new("listener panic"));
+                })),
                 ..Default::default()
             })
             .await?;

@@ -752,21 +752,21 @@ impl IncrementalObjectParser {
                     path,
                     expected: "true",
                     raw: "t".into(),
-                })
+                });
             }
             'f' => {
                 self.token = Some(JsonToken::Literal {
                     path,
                     expected: "false",
                     raw: "f".into(),
-                })
+                });
             }
             'n' => {
                 self.token = Some(JsonToken::Literal {
                     path,
                     expected: "null",
                     raw: "n".into(),
-                })
+                });
             }
             '-' | '0'..='9' => {
                 let raw = character.to_string();

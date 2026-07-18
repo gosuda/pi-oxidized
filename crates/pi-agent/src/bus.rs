@@ -317,6 +317,12 @@ impl AgentEventSubscription {
     }
 
     /// Attempts to receive a retained event without waiting.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`mpsc::error::TryRecvError::Empty`] when no event is buffered,
+    /// or [`mpsc::error::TryRecvError::Disconnected`] once the sink has closed
+    /// this subscription and the buffer is drained.
     pub fn try_recv(&mut self) -> Result<AgentEvent, mpsc::error::TryRecvError> {
         let mut state = self
             .inner
@@ -437,7 +443,8 @@ mod tests {
     }
 
     fn update(n: usize) -> AgentEvent {
-        let assistant = pi_ai::AssistantMessage::new("api", "provider", format!("m{n}"), n as i64);
+        let timestamp = i64::try_from(n).unwrap_or(i64::MAX);
+        let assistant = pi_ai::AssistantMessage::new("api", "provider", format!("m{n}"), timestamp);
         AgentEvent::MessageUpdate {
             message: crate::message::AgentMessage::Llm(Box::new(pi_ai::Message::Assistant(
                 assistant.clone(),

@@ -342,7 +342,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_last_registration_cannot_remove_replacement_gate() {
+    fn stale_last_registration_cannot_remove_replacement_gate() -> TestResult {
         let key = PathBuf::from("replacement-race-key");
         let stale = QueueRegistration::register(key.clone());
         let replacement_gate = Arc::new(Semaphore::new(1));
@@ -353,12 +353,12 @@ mod tests {
         lock_registry().insert(key.clone(), Arc::downgrade(&replacement_gate));
         drop(stale);
 
-        let mapped = lock_registry()
-            .get(&key)
-            .and_then(Weak::upgrade)
-            .expect("stale drop removed the replacement gate");
+        let Some(mapped) = lock_registry().get(&key).and_then(Weak::upgrade) else {
+            return Err("stale drop removed the replacement gate".into());
+        };
         assert!(Arc::ptr_eq(&mapped, &replacement_gate));
         lock_registry().remove(&key);
+        Ok(())
     }
 
     #[tokio::test]

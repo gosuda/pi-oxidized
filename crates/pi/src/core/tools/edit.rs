@@ -768,7 +768,7 @@ mod tests {
             new_text: "after".to_owned(),
         }];
 
-        let error = apply_edit_mutation_with_commit_hooks(
+        let result = apply_edit_mutation_with_commit_hooks(
             &path,
             "pre-commit.txt",
             &edits,
@@ -776,8 +776,10 @@ mod tests {
             move || cancel_at_boundary.cancel(),
             || {},
         )
-        .await
-        .expect_err("pre-commit cancellation unexpectedly succeeded");
+        .await;
+        let Err(error) = result else {
+            return Err("pre-commit cancellation unexpectedly succeeded".into());
+        };
 
         assert_eq!(error.message(), "Operation aborted");
         assert_eq!(tokio::fs::read_to_string(&path).await?, "before");

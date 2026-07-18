@@ -945,10 +945,11 @@ async fn trusted_restart_sends_true_in_replacement_load_request() -> R {
         )
         .await?;
 
-    let payloads = observed.lock().map_err(|_| "observed lock poisoned")?;
-    assert_eq!(payloads.len(), 1);
-    assert_eq!(payloads[0]["projectTrusted"], true);
-    drop(payloads);
+    {
+        let payloads = observed.lock().map_err(|_| "observed lock poisoned")?;
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0]["projectTrusted"], true);
+    }
     replacement.shutdown_once().await;
     Ok(())
 }
