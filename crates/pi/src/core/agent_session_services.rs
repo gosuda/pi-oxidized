@@ -463,6 +463,7 @@ pub async fn create_agent_session_services(
     } = options;
     let foundation =
         create_service_foundation(cwd, agent_dir, settings_manager, model_runtime).await?;
+    let project_trusted = foundation.settings_manager.is_project_trusted();
     let (mut resource_loader, discovery) = create_service_resource_loader(
         &foundation.cwd,
         &foundation.agent_dir,
@@ -477,6 +478,7 @@ pub async fn create_agent_session_services(
         discovery,
         &foundation.cwd,
         &foundation.model_runtime,
+        project_trusted,
         &mut diagnostics,
     )
     .await;
@@ -632,6 +634,7 @@ async fn start_extension_phase(
     discovery: ResourceDiscoveryPolicy,
     cwd: &Path,
     model_runtime: &ModelRuntime,
+    project_trusted: bool,
     diagnostics: &mut Vec<AgentSessionRuntimeDiagnostic>,
 ) -> (
     Option<Arc<HostExtensionRunner>>,
@@ -655,7 +658,13 @@ async fn start_extension_phase(
     if paths.is_empty() {
         return (None, BTreeMap::new());
     }
-    match HostExtensionRunner::start_with_cwd(paths, cwd.to_string_lossy().into_owned()).await {
+    match HostExtensionRunner::start_with_cwd_and_trust(
+        paths,
+        cwd.to_string_lossy().into_owned(),
+        project_trusted,
+    )
+    .await
+    {
         Ok(runner) => {
             for (path, message) in runner.load_errors() {
                 diagnostics.push(AgentSessionRuntimeDiagnostic::error(format!(

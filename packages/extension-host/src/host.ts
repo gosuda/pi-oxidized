@@ -141,6 +141,26 @@ interface LoadOptions {
 	factories: ExtensionFactory[];
 }
 
+interface ExtensionsLoadRequest {
+	extensionPaths: string[];
+	cwd: string;
+	projectTrusted: boolean;
+}
+
+function parseExtensionsLoadRequest(
+	payload: Record<string, unknown>,
+	fallbackCwd: string,
+): ExtensionsLoadRequest {
+	const paths = payload["extensionPaths"] ?? payload["paths"];
+	return {
+		extensionPaths: Array.isArray(paths)
+			? paths.filter((path): path is string => typeof path === "string")
+			: [],
+		cwd: typeof payload["cwd"] === "string" ? payload["cwd"] : fallbackCwd,
+		projectTrusted: payload["projectTrusted"] === true,
+	};
+}
+
 /**
  * Extension host process. Owns the ExtensionRunner and bridges it to Rust over
  * a single JSONL byte transport. One stdout writer; all writes are ordered
@@ -161,6 +181,7 @@ export class ExtensionHost {
 	/** In-flight provider.stream AbortControllers keyed by request id. */
 	private readonly inFlightProviders = new Map<number, AbortController>();
 	private loadOptions: LoadOptions | undefined;
+	private projectTrusted = false;
 	/** Frames buffered while extensions are loading. */
 	private readonly pendingFrames: Frame[] = [];
 	/** Registered terminal-input handlers (sequential actor). */
@@ -425,10 +446,11 @@ export class ExtensionHost {
 	}
 
 	private async handleExtensionsLoad(id: number, p: Record<string, unknown>): Promise<void> {
-		const paths = (p["extensionPaths"] ?? p["paths"] ?? []) as string[];
-		const cwd = (typeof p["cwd"] === "string" ? p["cwd"] : undefined)
-			?? this.loadOptions?.cwd
-			?? process.cwd();
+		const request = parseExtensionsLoadRequest(
+			p,
+			this.loadOptions?.cwd ?? process.cwd(),
+		);
+		const { extensionPaths: paths, cwd, projectTrusted } = request;
 		const errors: Array<{ path: string; error: string }> = [];
 		let loadedCount = 0;
 
@@ -440,6 +462,8 @@ export class ExtensionHost {
 			});
 			return;
 		}
+		this.projectTrusted = projectTrusted;
+
 		const eventBus = createEventBus();
 
 		for (const extPath of paths) {
@@ -1176,7 +1200,8 @@ export class ExtensionHost {
 	// Escape hatch: ExtensionContextActions is an 11-method reference interface.
 	private createContextActions(): ExtensionContextActions {
 		return {
-			getModel: () => undefined, isIdle: () => true, isProjectTrusted: () => true,
+			getModel: () => undefined, isIdle: () => true,
+			isProjectTrusted: () => this.projectTrusted,
 			getSignal: () => undefined, abort: () => {}, hasPendingMessages: () => false,
 			shutdown: () => {}, getContextUsage: () => undefined, compact: () => {},
 			getSystemPrompt: () => "",

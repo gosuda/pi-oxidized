@@ -23,7 +23,11 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::Stdio;
 
-use pi_agent::{AgentMessage, CustomAgentMessage};
+use pi_agent::{
+    AfterToolCallContext, AgentContext, AgentMessage, AgentToolResult, BeforeToolCallContext,
+    CustomAgentMessage,
+};
+use pi_ai::{AssistantMessage, ToolCall};
 use pi_ext::client::HostClient;
 #[cfg(unix)]
 use pi_ext::host::{HostSource, HostSpec};
@@ -35,7 +39,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
 use super::super::agent_session::events::AgentSessionEvent;
-use super::super::agent_session::extension_runner::ExtensionRunner;
+use super::super::agent_session::extension_runner::{ExtensionRunner, SessionHooks};
 use super::{ALL_EVENT_TYPES, HostExtensionRunner, HostStartError, ToolRenderPhase, sanitize_html};
 
 type BoxErr = Box<dyn Error>;
@@ -56,6 +60,7 @@ struct FakeHost {
     cmd_tx: mpsc::Sender<FakeCmd>,
     responses: Arc<Mutex<HashMap<String, Value>>>,
     drop_methods: Arc<Mutex<HashSet<String>>>,
+    requests: Arc<Mutex<Vec<Frame>>>,
 }
 
 impl FakeHost {
@@ -78,10 +83,35 @@ impl FakeHost {
     async fn close(&self) {
         let _ = self.cmd_tx.send(FakeCmd::Close).await;
     }
+
+    async fn wait_for_request(&self, method: &str) -> R {
+        tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                if self
+                    .requests
+                    .lock()
+                    .is_ok_and(|requests| requests.iter().any(|request| request.method == method))
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| format!("fake host did not receive {method}"))?;
+        Ok(())
+    }
 }
 
 /// Build a client + fake host pair and a ready runner loaded with `snapshot`.
 async fn make_runner(snapshot: Value) -> Result<(Arc<HostExtensionRunner>, FakeHost), BoxErr> {
+    make_runner_with_trust(snapshot, false).await
+}
+
+async fn make_runner_with_trust(
+    snapshot: Value,
+    project_trusted: bool,
+) -> Result<(Arc<HostExtensionRunner>, FakeHost), BoxErr> {
     let (client_to_host, host_read) = tokio::io::duplex(64 * 1024);
     let (host_write, client_read) = tokio::io::duplex(64 * 1024);
     let (err_write, _err_read) = tokio::io::duplex(4096);
@@ -93,37 +123,51 @@ async fn make_runner(snapshot: Value) -> Result<(Arc<HostExtensionRunner>, FakeH
     );
     let client = Arc::new(client);
 
-    let responses: Arc<Mutex<HashMap<String, Value>>> = Arc::new(Mutex::new(HashMap::new()));
-    let drop_methods: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    let responses = Arc::new(Mutex::new(HashMap::new()));
+    let drop_methods = Arc::new(Mutex::new(HashSet::new()));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let (cmd_tx, cmd_rx) = mpsc::channel(64);
     let resp_clone = Arc::clone(&responses);
     let drop_clone = Arc::clone(&drop_methods);
-    let (cmd_tx, cmd_rx) = mpsc::channel::<FakeCmd>(32);
+    let requests_clone = Arc::clone(&requests);
     tokio::spawn(fake_host_task(
-        host_read, host_write, snapshot, resp_clone, drop_clone, cmd_rx,
+        host_read,
+        host_write,
+        snapshot,
+        resp_clone,
+        drop_clone,
+        requests_clone,
+        cmd_rx,
     ));
-    let runner =
-        HostExtensionRunner::connect_with_timeout(Arc::clone(&client), vec![], FAST_TIMEOUT)
-            .await?;
+    let runner = HostExtensionRunner::connect_with_cwd_and_trust(
+        Arc::clone(&client),
+        vec![],
+        "/workspace",
+        project_trusted,
+        FAST_TIMEOUT,
+    )
+    .await?;
     Ok((
         runner,
         FakeHost {
             cmd_tx,
             responses,
             drop_methods,
+            requests,
         },
     ))
 }
 
 async fn fake_host_task(
     read: tokio::io::DuplexStream,
-    write: tokio::io::DuplexStream,
+    mut write: tokio::io::DuplexStream,
     snapshot: Value,
     responses: Arc<Mutex<HashMap<String, Value>>>,
     drop_methods: Arc<Mutex<HashSet<String>>>,
+    requests: Arc<Mutex<Vec<Frame>>>,
     mut cmd_rx: mpsc::Receiver<FakeCmd>,
 ) {
     let mut reader = BufReader::new(read);
-    let mut writer = write;
     let mut buf = String::new();
     loop {
         tokio::select! {
@@ -133,12 +177,12 @@ async fn fake_host_task(
                     Some(FakeCmd::Emit(frame)) => {
                         let bytes = encode_frame(&frame).unwrap_or_default();
                         if !bytes.is_empty() {
-                            let _ = writer.write_all(&bytes).await;
-                            let _ = writer.flush().await;
+                            let _ = write.write_all(&bytes).await;
+                            let _ = write.flush().await;
                         }
                     }
                     Some(FakeCmd::Close) => {
-                        let _ = writer.shutdown().await;
+                        let _ = write.shutdown().await;
                         return;
                     }
                     None => return,
@@ -148,13 +192,15 @@ async fn fake_host_task(
                 match n {
                     Ok(0) | Err(_) => return,
                     Ok(_) => {
-                        if let Ok(req) = decode_frame_str(buf.trim_end())
-                            && let Some(resp) =
-                                dispatch(&req, &snapshot, &responses, &drop_methods)
-                        {
-                            let bytes = encode_frame(&resp).unwrap_or_default();
-                            let _ = writer.write_all(&bytes).await;
-                            let _ = writer.flush().await;
+                        if let Ok(req) = decode_frame_str(&buf) {
+                            if let Ok(mut recorded) = requests.lock() {
+                                recorded.push(req.clone());
+                            }
+                            if let Some(resp) = dispatch(&req, &snapshot, &responses, &drop_methods) {
+                                let bytes = encode_frame(&resp).unwrap_or_default();
+                                let _ = write.write_all(&bytes).await;
+                                let _ = write.flush().await;
+                            }
                         }
                         buf.clear();
                     }
@@ -707,12 +753,19 @@ fn write_startup_host(
         ),
         StartupBehavior::Ready => script.push_str(
             "IFS= read -r request || exit 11\n\
-             printf '%s\\n' '{\"id\":2,\"kind\":\"res\",\"method\":\"extensions.load\",\"payload\":{}}'\n",
+             printf '%s\\n' '{\"id\":2,\"kind\":\"res\",\"method\":\"extensions.load\",\"payload\":{\"handlers\":[\"session_shutdown\"]}}'\n",
         ),
     }
     script.push_str(
-        "while IFS= read -r request; do :; done\n\
-         printf '%s\\n' shutdown > \"$shutdown_file\"\n",
+        "while IFS= read -r request; do\n\
+           case \"$request\" in\n\
+             *'\"method\":\"session_shutdown\"'*)\n\
+               printf '%s\\n' \"$request\" >> \"$shutdown_file\"\n\
+               printf '%s\\n' '{\"id\":3,\"kind\":\"res\",\"method\":\"session_shutdown\",\"payload\":{}}'\n\
+               ;;\n\
+           esac\n\
+         done\n\
+         printf '%s\\n' shutdown >> \"$shutdown_file\"\n",
     );
     fs::write(&script_path, script)?;
     let mut permissions = fs::metadata(&script_path)?.permissions();
@@ -732,6 +785,11 @@ fn write_startup_host(
 #[cfg(unix)]
 fn assert_host_shutdown_and_reaped(pid_path: &Path, shutdown_path: &Path) -> R {
     assert_eq!(fs::read_to_string(shutdown_path)?, "shutdown\n");
+    assert_host_reaped(pid_path)
+}
+
+#[cfg(unix)]
+fn assert_host_reaped(pid_path: &Path) -> R {
     let pid = fs::read_to_string(pid_path)?;
     let status = std::process::Command::new("/bin/kill")
         .args(["-0", pid.trim()])
@@ -797,20 +855,130 @@ async fn explicit_process_shutdown_reaps_and_remains_idempotent() -> R {
 }
 
 #[tokio::test]
-async fn invalidate_short_circuits_hooks_and_disposes_slots() -> R {
-    let (runner, host) = make_runner(full_snapshot()).await?;
-    let mut slot = runner.subscribe_slot("h");
-    host.emit(ui_slot_frame("h", 1, "x")).await;
-    let _ = tokio::time::timeout(Duration::from_millis(500), slot.changed()).await;
+async fn load_request_carries_project_trust() -> R {
+    let (runner, host) = make_runner_with_trust(full_snapshot(), true).await?;
+    let request = host
+        .requests
+        .lock()
+        .ok()
+        .and_then(|requests| {
+            requests
+                .iter()
+                .find(|request| request.method == "extensions.load")
+                .cloned()
+        })
+        .ok_or("missing extensions.load request")?;
+    assert_eq!(request.payload["cwd"], "/workspace");
+    assert_eq!(request.payload["projectTrusted"], true);
+    runner.shutdown_once().await;
+    Ok(())
+}
 
-    ExtensionRunner::invalidate(runner.as_ref());
-    assert!(
-        !runner.has_handlers("tool_call"),
-        "stale runner has no handlers"
+#[tokio::test]
+async fn cancelled_before_tool_hook_returns_without_waiting_for_host_timeout() -> R {
+    let (runner, host) = make_runner(full_snapshot()).await?;
+    host.drop_method("tool_call");
+    let hooks = Arc::new(SessionHooks::new(
+        Arc::clone(&runner) as Arc<dyn ExtensionRunner>
+    ));
+    let hook = hooks.before_tool_call_hook();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let call_cancel = cancel.clone();
+    let task = tokio::spawn(async move {
+        hook(
+            BeforeToolCallContext {
+                assistant_message: AssistantMessage::new("test-api", "test-provider", "m", 1),
+                tool_call: ToolCall::new("tc1", "read", Map::new()),
+                args: Map::new(),
+                context: AgentContext {
+                    system_prompt: String::new(),
+                    messages: Vec::<AgentMessage>::new(),
+                    tools: Vec::new(),
+                },
+            },
+            call_cancel,
+        )
+        .await
+    });
+    host.wait_for_request("tool_call").await?;
+    cancel.cancel();
+    let result = tokio::time::timeout(Duration::from_millis(50), task).await??;
+    assert!(result?.is_none());
+    runner.shutdown_once().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_after_tool_hook_returns_without_waiting_for_host_timeout() -> R {
+    let (runner, host) = make_runner(full_snapshot()).await?;
+    host.drop_method("tool_result");
+    let hooks = Arc::new(SessionHooks::new(
+        Arc::clone(&runner) as Arc<dyn ExtensionRunner>
+    ));
+    let hook = hooks.after_tool_call_hook();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let call_cancel = cancel.clone();
+    let task = tokio::spawn(async move {
+        hook(
+            AfterToolCallContext {
+                assistant_message: AssistantMessage::new("test-api", "test-provider", "m", 1),
+                tool_call: ToolCall::new("tc2", "read", Map::new()),
+                args: Map::new(),
+                result: AgentToolResult::default(),
+                is_error: false,
+                context: AgentContext {
+                    system_prompt: String::new(),
+                    messages: Vec::<AgentMessage>::new(),
+                    tools: Vec::new(),
+                },
+            },
+            call_cancel,
+        )
+        .await
+    });
+    host.wait_for_request("tool_result").await?;
+    cancel.cancel();
+    let result = tokio::time::timeout(Duration::from_millis(50), task).await??;
+    assert!(result?.is_none());
+    runner.shutdown_once().await;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shutdown_hook_runs_once_before_transport_reap() -> R {
+    let directory = tempfile::tempdir()?;
+    let (spec, pid_path, shutdown_path) =
+        write_startup_host(directory.path(), StartupBehavior::Ready)?;
+    let runner = HostExtensionRunner::spawn_from(&spec, Vec::new()).await?;
+    let (first, repeated) = tokio::join!(
+        ExtensionRunner::shutdown(runner.as_ref(), "quit"),
+        ExtensionRunner::shutdown(runner.as_ref(), "quit"),
     );
-    let result = runner.emit_tool_call("read", "tc1", Map::new()).await?;
-    assert!(result.is_none());
-    assert!(slot.borrow().is_none(), "slot disposed on invalidate");
+    first?;
+    repeated?;
+    runner.shutdown_once().await;
+
+    let sequence = fs::read_to_string(&shutdown_path)?;
+    let lines = sequence.lines().collect::<Vec<_>>();
+    assert_eq!(
+        lines.len(),
+        2,
+        "expected one hook request followed by one reap"
+    );
+    let request: Frame = serde_json::from_str(lines[0])?;
+    assert_eq!(request.method, "session_shutdown");
+    assert_eq!(request.payload["reason"], "quit");
+    assert_eq!(lines[1], "shutdown");
+    assert_host_reaped(&pid_path)
+}
+
+#[tokio::test]
+async fn shutdown_reaps_transport_when_hook_times_out() -> R {
+    let (runner, host) = make_runner(full_snapshot()).await?;
+    host.drop_method("session_shutdown");
+    ExtensionRunner::shutdown(runner.as_ref(), "quit").await?;
+    assert!(!runner.is_running());
     Ok(())
 }
 

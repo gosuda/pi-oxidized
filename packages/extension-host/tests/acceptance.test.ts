@@ -1,12 +1,14 @@
 /**
  * Acceptance tests: widget slots, stale generation, crash isolation,
- * all 33 lifecycle methods, and compiled artifact verification.
+ * all 33 lifecycle methods, runtime extension loading, and compiled artifacts.
  */
 
-import { describe, expect, test } from "bun:test";
-import { resolve } from "node:path";
-import { Readable } from "node:stream";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { Readable } from "node:stream";
 import {
 	PROTOCOL_VERSION,
 	encodeFrameString,
@@ -45,6 +47,40 @@ const noopContextActions: ExtensionContextActions = {
 	compact: () => {},
 	getSystemPrompt: () => "",
 };
+
+const projectTrustFactory: ExtensionFactory = (pi) => {
+	pi.on("input", (_event, ctx) => {
+		const trustAwareContext = ctx as typeof ctx & { isProjectTrusted(): boolean };
+		return {
+			action: trustAwareContext.isProjectTrusted() ? "handled" : "continue",
+		};
+	});
+};
+
+async function runProcess(
+	command: string,
+	args: readonly string[],
+	cwd: string,
+): Promise<{ readonly stdout: string; readonly stderr: string }> {
+	const { promise, resolve: resolvePromise, reject: rejectPromise } =
+		Promise.withResolvers<{ readonly stdout: string; readonly stderr: string }>();
+	const child = spawn(command, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+	let stdout = "";
+	let stderr = "";
+	child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
+	child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+	child.once("error", rejectPromise);
+	child.once("exit", (code, signal) => {
+		if (code === 0) {
+			resolvePromise({ stdout, stderr });
+			return;
+		}
+		rejectPromise(new Error(
+			`${command} exited with code ${String(code)} signal ${String(signal)}: ${stderr || stdout}`,
+		));
+	});
+	return await promise;
+}
 
 /**
  * ByteWritable that decodes frames as they arrive and lets tests await
@@ -484,30 +520,69 @@ describe("acceptance: all 33 lifecycle events", () => {
 });
 
 // ===========================================================================
-// 5. Compiled artifact + runtime-import
+// 5. Runtime import and compiled extension protocol
 // ===========================================================================
 
-describe("acceptance: compiled artifact", () => {
+describe("acceptance: extension runtime", () => {
+	const hostDir = resolve(import.meta.dirname, "..");
+	const executableSuffix = process.platform === "win32" ? ".exe" : "";
+	let artifactDir: string;
+	let compiledHost: string;
+	let compiledRuntimeImport: string;
+
+	beforeAll(async () => {
+		artifactDir = await mkdtemp(join(tmpdir(), "pi-extension-host-acceptance-"));
+		compiledHost = join(artifactDir, `pi-extension-host${executableSuffix}`);
+		compiledRuntimeImport = join(artifactDir, `runtime-import${executableSuffix}`);
+		await runProcess(process.execPath, [
+			"build",
+			"./src/main.ts",
+			"--compile",
+			"--outfile",
+			compiledHost,
+		], hostDir);
+		await runProcess(process.execPath, [
+			"build",
+			"./fixtures/runtime-import.ts",
+			"--compile",
+			"--outfile",
+			compiledRuntimeImport,
+		], hostDir);
+	});
+
+	afterAll(async () => {
+		await rm(artifactDir, { force: true, recursive: true });
+	});
+
 	test("compiled binary handles hello handshake", async () => {
-		const binPath = resolve(import.meta.dirname, "..", "dist", "pi-extension-host");
-		const { promise, resolve: resolvePromise, reject: rejectPromise } = Promise.withResolvers<string>();
-		const child = spawn(binPath, ["--cwd", "/tmp"], { stdio: ["pipe", "pipe", "pipe"] });
+		const { promise, resolve: resolvePromise, reject: rejectPromise } =
+			Promise.withResolvers<string>();
+		const child = spawn(compiledHost, ["--cwd", artifactDir], {
+			cwd: hostDir,
+			stdio: ["pipe", "pipe", "pipe"],
+		});
 		let output = "";
 		child.stdout.on("data", (chunk: Buffer) => {
 			output += chunk.toString();
 			if (output.includes("\n")) resolvePromise(output.trim());
 		});
-		child.on("error", rejectPromise);
-		child.on("exit", (code) => {
-			if (!output.includes("\n")) rejectPromise(new Error(`process exited early with code ${code}`));
+		child.once("error", rejectPromise);
+		child.once("exit", (code) => {
+			if (!output.includes("\n")) {
+				rejectPromise(new Error(`process exited early with code ${String(code)}`));
+			}
 		});
 		child.stdin.write(encodeFrameString({
-			id: 1, kind: "req", method: "hello",
-			payload: { protocolVersion: PROTOCOL_VERSION, compatibilityVersion: COMPATIBILITY_VERSION },
+			id: 1,
+			kind: "req",
+			method: "hello",
+			payload: {
+				protocolVersion: PROTOCOL_VERSION,
+				compatibilityVersion: COMPATIBILITY_VERSION,
+			},
 		}));
 		try {
-			const line = await promise;
-			const frame = JSON.parse(line) as Frame;
+			const frame = JSON.parse(await promise) as Frame;
 			expect(frame.kind).toBe("res");
 			expect(frame.method).toBe("hello");
 			const payload = frame.payload as Record<string, unknown>;
@@ -520,29 +595,32 @@ describe("acceptance: compiled artifact", () => {
 	});
 
 	test("compiled binary rejects version mismatch", async () => {
-		const binPath = resolve(import.meta.dirname, "..", "dist", "pi-extension-host");
-		const { promise, resolve: resolvePromise, reject: rejectPromise } = Promise.withResolvers<string>();
-		const child = spawn(binPath, ["--cwd", "/tmp"], { stdio: ["pipe", "pipe", "pipe"] });
+		const { promise, resolve: resolvePromise, reject: rejectPromise } =
+			Promise.withResolvers<string>();
+		const child = spawn(compiledHost, ["--cwd", artifactDir], {
+			cwd: hostDir,
+			stdio: ["pipe", "ignore", "pipe"],
+		});
 		let stderr = "";
 		child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
-		child.on("error", rejectPromise);
-		child.on("exit", (code) => {
-			if (code !== null) resolvePromise(stderr);
-		});
-	child.stdin.write(encodeFrameString({
-		id: 1, kind: "req", method: "hello",
-		payload: { protocolVersion: 999, compatibilityVersion: COMPATIBILITY_VERSION },
-	}));
-	child.stdin.end(); // EOF so the host's read loop completes.
+		child.once("error", rejectPromise);
+		child.once("exit", () => resolvePromise(stderr));
+		child.stdin.write(encodeFrameString({
+			id: 1,
+			kind: "req",
+			method: "hello",
+			payload: {
+				protocolVersion: 999,
+				compatibilityVersion: COMPATIBILITY_VERSION,
+			},
+		}));
+		child.stdin.end();
 		try {
-			const errOutput = await promise;
-			expect(errOutput).toContain("version mismatch");
+			expect(await promise).toContain("version mismatch");
 		} finally {
-			child.stdin.end();
 			child.kill("SIGTERM");
 		}
 	});
-
 	test("runtime-import loads real extension via jiti", async () => {
 		const helloPath = resolve(
 			import.meta.dirname, "..", "..", "..",
@@ -557,6 +635,26 @@ describe("acceptance: compiled artifact", () => {
 			module as ExtensionFactory, process.cwd(), bus, runtime, helloPath,
 		);
 		expect([...ext.tools.keys()]).toContain("hello");
+	});
+
+	test("compiled runtime-import binary loads a real extension", async () => {
+		const extensionPath = resolve(
+			import.meta.dirname,
+			"..",
+			"..",
+			"..",
+			".references",
+			"pi",
+			"packages",
+			"coding-agent",
+			"examples",
+			"extensions",
+			"hello.ts",
+		);
+		const output = await runProcess(compiledRuntimeImport, [extensionPath], hostDir);
+		const result = JSON.parse(output.stdout.trim()) as Record<string, unknown>;
+		expect(result["tools"]).toEqual(["hello"]);
+		expect(result["handlers"]).toEqual([]);
 	});
 
 	test("input hook forwards action union (not { ok: true })", async () => {
@@ -595,6 +693,39 @@ describe("acceptance: compiled artifact", () => {
 		await runPromise.catch(() => void 0);
 	});
 
+	test("extensions.load parses projectTrusted and exposes it through hook context", async () => {
+		const { collector, stdin, host, runPromise } = await connectHost([projectTrustFactory]);
+		let id = 100;
+		const observeTrust = async (projectTrusted: unknown, includeField = true): Promise<string | undefined> => {
+			const loadId = id++;
+			const payload: Record<string, unknown> = { extensionPaths: [], cwd: process.cwd() };
+			if (includeField) payload["projectTrusted"] = projectTrusted;
+			stdin.push(Buffer.from(encodeFrameString({
+				id: loadId, kind: "req", method: "extensions.load", payload,
+			})));
+			await collector.awaitFrame((frame) => frame.id === loadId && frame.kind === "res");
+
+			const hookId = id++;
+			stdin.push(Buffer.from(encodeFrameString({
+				id: hookId, kind: "req", method: "input",
+				payload: { text: "trust?", source: "interactive" },
+			})));
+			const response = await collector.awaitFrame(
+				(frame) => frame.id === hookId && frame.kind === "res",
+			);
+			return (response.payload as Record<string, unknown>)["action"] as string | undefined;
+		};
+
+		expect(await observeTrust(false)).toBe("continue");
+		expect(await observeTrust(true)).toBe("handled");
+		expect(await observeTrust("true")).toBe("continue");
+		expect(await observeTrust(undefined, false)).toBe("continue");
+
+		stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
+	});
+
 	test("command.execute invokes registered command and completes", async () => {
 		const { collector, stdin, host, runPromise } = await connectHost([toolFactory]);
 		// Trigger showOverlay which registers an event listener that waits for session_info_changed
@@ -626,30 +757,6 @@ describe("acceptance: compiled artifact", () => {
 		await runPromise.catch(() => void 0);
 	});
 
-	test("compiled runtime-import binary loads a real extension", async () => {
-		const binPath = resolve(import.meta.dirname, "..", "dist", "runtime-import");
-		const extPath = resolve(
-			import.meta.dirname, "..", "..", "..",
-			".references", "pi", "packages", "coding-agent", "examples", "extensions", "hello.ts",
-		);
-		const { promise, resolve: resolvePromise, reject: rejectPromise } = Promise.withResolvers<string>();
-		const child = spawn(binPath, [extPath], { stdio: ["ignore", "pipe", "pipe"] });
-		let stdout = "";
-		child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
-		child.on("error", rejectPromise);
-		child.on("exit", (code) => {
-			if (code === 0) resolvePromise(stdout.trim());
-			else rejectPromise(new Error(`runtime-import exited with code ${code}: ${stdout}`));
-		});
-		try {
-			const output = await promise;
-			const result = JSON.parse(output) as Record<string, unknown>;
-			expect(result["tools"]).toEqual(["hello"]);
-			expect(result["handlers"]).toEqual([]);
-		} finally {
-			if (child.exitCode === null) child.kill("SIGTERM");
-		}
-	});
 });
 
 

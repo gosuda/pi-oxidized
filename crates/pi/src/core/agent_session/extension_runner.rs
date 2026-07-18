@@ -371,7 +371,7 @@ impl SessionHooks {
     pub fn before_tool_call_hook(self: &Arc<Self>) -> pi_agent::BeforeToolCall {
         let hooks = Arc::clone(self);
         Arc::new(
-            move |ctx: BeforeToolCallContext, _cancel: CancellationToken| {
+            move |ctx: BeforeToolCallContext, cancel: CancellationToken| {
                 let hooks = Arc::clone(&hooks);
                 Box::pin(async move {
                     let runner = hooks.runner();
@@ -380,10 +380,12 @@ impl SessionHooks {
                     }
                     let tool_name = ctx.tool_call.name.clone();
                     let tool_call_id = ctx.tool_call.id.clone();
-                    match runner
-                        .emit_tool_call(&tool_name, &tool_call_id, ctx.args)
-                        .await
-                    {
+                    let hook_result = tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => return Ok(None),
+                        result = runner.emit_tool_call(&tool_name, &tool_call_id, ctx.args) => result,
+                    };
+                    match hook_result {
                         Ok(result) => Ok(result),
                         Err(err) => Err(AgentLoopError::message(err.to_string())),
                     }
@@ -397,7 +399,7 @@ impl SessionHooks {
     pub fn after_tool_call_hook(self: &Arc<Self>) -> pi_agent::AfterToolCall {
         let hooks = Arc::clone(self);
         Arc::new(
-            move |ctx: AfterToolCallContext, _cancel: CancellationToken| {
+            move |ctx: AfterToolCallContext, cancel: CancellationToken| {
                 let hooks = Arc::clone(&hooks);
                 Box::pin(async move {
                     let runner = hooks.runner();
@@ -408,17 +410,19 @@ impl SessionHooks {
                     let tool_call_id = ctx.tool_call.id.clone();
                     let content = ctx.result.content.clone();
                     let details = ctx.result.details.clone();
-                    match runner
-                        .emit_tool_result(
+                    let hook_result = tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => return Ok(None),
+                        result = runner.emit_tool_result(
                             &tool_name,
                             &tool_call_id,
                             ctx.args,
                             content,
                             details,
                             ctx.is_error,
-                        )
-                        .await
-                    {
+                        ) => result,
+                    };
+                    match hook_result {
                         Ok(result) => Ok(result),
                         Err(err) => Err(AgentLoopError::message(err.to_string())),
                     }

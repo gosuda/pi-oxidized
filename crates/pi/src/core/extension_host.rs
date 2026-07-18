@@ -31,7 +31,7 @@ use pi_ext::client::{HostClient, HostClientError, HostEvent};
 use pi_ext::host::{self, HostError, HostSpec};
 use pi_ext::protocol::{self, DisposeSlot, ExtensionErrorEvent, ProviderEvent, ToolUpdate, UiSlot};
 use pi_ext::sanitize::{SanitizedSlot, sanitize_slot};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::sync::{broadcast, watch};
 
@@ -149,6 +149,14 @@ impl From<HostClientError> for HostStartError {
 // ---------------------------------------------------------------------------
 // Registration snapshot wire types (host → Rust load response)
 // ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtensionsLoadRequest<'a> {
+    extension_paths: &'a [String],
+    cwd: &'a str,
+    project_trusted: bool,
+}
 
 /// Wire form of [`ToolRegistration`] received from the host load response.
 #[derive(Debug, Clone, Deserialize)]
@@ -538,6 +546,8 @@ struct Inner {
     extension_paths: Vec<String>,
     /// Cwd passed to `extensions.load`.
     load_cwd: String,
+    /// Project trust passed to `extensions.load` and preserved across restart.
+    project_trusted: bool,
     /// Monotonic reload generation; bumps invalidate every active slot.
     reload_generation: AtomicU64,
     /// Host transport is gone (EOF / crash / protocol error). All hooks and
@@ -547,6 +557,8 @@ struct Inner {
     stale: AtomicBool,
     /// `shutdown` has completed at least once.
     shutdown_done: AtomicBool,
+    /// Serializes shutdown so concurrent callers await the same completed reap.
+    shutdown_lock: tokio::sync::Mutex<()>,
     /// Per-hook control-RPC deadline (`HOOK_TIMEOUT` in production; shorter in
     /// tests to exercise the timeout path quickly).
     hook_timeout: Duration,
@@ -558,6 +570,7 @@ impl Inner {
         snapshot: RegistrySnapshot,
         extension_paths: Vec<String>,
         load_cwd: String,
+        project_trusted: bool,
         hook_timeout: Duration,
     ) -> Self {
         let (tool_updates_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
@@ -574,10 +587,12 @@ impl Inner {
             errors_tx,
             extension_paths,
             load_cwd,
+            project_trusted,
             reload_generation: AtomicU64::new(1),
             disabled: AtomicBool::new(false),
             stale: AtomicBool::new(false),
             shutdown_done: AtomicBool::new(false),
+            shutdown_lock: tokio::sync::Mutex::new(()),
             hook_timeout,
         }
     }
@@ -763,23 +778,11 @@ impl HostExtensionRunner {
         extension_paths: Vec<String>,
         hook_timeout: Duration,
     ) -> Result<Arc<Self>, HostStartError> {
-        client.handshake().await?;
         let load_cwd = std::env::current_dir()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let snapshot = Self::load(&client, &extension_paths, &load_cwd).await?;
-        let inner = Arc::new(Inner::new(
-            Arc::clone(&client),
-            snapshot,
-            extension_paths,
-            load_cwd,
-            hook_timeout,
-        ));
-        let runner = Arc::new(Self {
-            inner: Arc::clone(&inner),
-        });
-        spawn_event_pump(inner);
-        Ok(runner)
+        Self::connect_with_cwd_and_trust(client, extension_paths, load_cwd, false, hook_timeout)
+            .await
     }
 
     /// Bind a runner with an explicit load cwd (services factory / tests).
@@ -793,14 +796,31 @@ impl HostExtensionRunner {
         load_cwd: impl Into<String>,
         hook_timeout: Duration,
     ) -> Result<Arc<Self>, HostStartError> {
+        Self::connect_with_cwd_and_trust(client, extension_paths, load_cwd, false, hook_timeout)
+            .await
+    }
+
+    /// Bind a runner with an explicit load cwd and project-trust value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostStartError::Handshake`] or [`HostStartError::Load`].
+    pub async fn connect_with_cwd_and_trust(
+        client: Arc<HostClient>,
+        extension_paths: Vec<String>,
+        load_cwd: impl Into<String>,
+        project_trusted: bool,
+        hook_timeout: Duration,
+    ) -> Result<Arc<Self>, HostStartError> {
         client.handshake().await?;
         let load_cwd = load_cwd.into();
-        let snapshot = Self::load(&client, &extension_paths, &load_cwd).await?;
+        let snapshot = Self::load(&client, &extension_paths, &load_cwd, project_trusted).await?;
         let inner = Arc::new(Inner::new(
             Arc::clone(&client),
             snapshot,
             extension_paths,
             load_cwd,
+            project_trusted,
             hook_timeout,
         ));
         let runner = Arc::new(Self {
@@ -824,11 +844,14 @@ impl HostExtensionRunner {
         client: &Arc<HostClient>,
         extension_paths: &[String],
         cwd: &str,
+        project_trusted: bool,
     ) -> Result<RegistrySnapshot, HostStartError> {
-        let payload = serde_json::json!({
-            "extensionPaths": extension_paths,
-            "cwd": cwd,
-        });
+        let payload = serde_json::to_value(ExtensionsLoadRequest {
+            extension_paths,
+            cwd,
+            project_trusted,
+        })
+        .map_err(|error| HostStartError::Load(error.to_string()))?;
         let frame = client
             .request_raw(LOAD_METHOD, payload, START_TIMEOUT)
             .await?;
@@ -1121,12 +1144,8 @@ impl HostExtensionRunner {
             .reload_generation
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
-        self.inner.dispose_all_slots();
+        Self::shutdown_with_reason_once(&self.inner, "reload").await;
         self.inner.stale.store(true, Ordering::Relaxed);
-        // Mark shutdown done so a later dispose path does not double-reap.
-        self.inner.shutdown_done.store(true, Ordering::Relaxed);
-        let _ = self.inner.client.shutdown().await;
-        self.inner.disabled.store(true, Ordering::Relaxed);
         generation
     }
 
@@ -1150,7 +1169,8 @@ impl HostExtensionRunner {
         // 3. Spawn replacement host with the same paths + cwd.
         let paths = self.inner.extension_paths.clone();
         let cwd = self.inner.load_cwd.clone();
-        let replacement = Self::start_with_cwd(paths, cwd).await?;
+        let project_trusted = self.inner.project_trusted;
+        let replacement = Self::start_with_cwd_and_trust(paths, cwd, project_trusted).await?;
         // 4. Re-register providers (sibling isolation on individual failures).
         let _ = replacement.register_providers_on(runtime);
         // 5. Restore flags.
@@ -1167,12 +1187,30 @@ impl HostExtensionRunner {
         extension_paths: Vec<String>,
         load_cwd: impl Into<String>,
     ) -> Result<Arc<Self>, HostStartError> {
+        Self::start_with_cwd_and_trust(extension_paths, load_cwd, false).await
+    }
+
+    /// Resolve + spawn with an explicit load cwd and project-trust value.
+    ///
+    /// # Errors
+    ///
+    /// See [`HostExtensionRunner::start`].
+    pub async fn start_with_cwd_and_trust(
+        extension_paths: Vec<String>,
+        load_cwd: impl Into<String>,
+        project_trusted: bool,
+    ) -> Result<Arc<Self>, HostStartError> {
         let spec = host::resolve_host()?;
         let client =
             Arc::new(HostClient::spawn(&spec).map_err(|e| HostStartError::Spawn(e.to_string()))?);
-        let startup =
-            Self::connect_with_cwd(Arc::clone(&client), extension_paths, load_cwd, HOOK_TIMEOUT)
-                .await;
+        let startup = Self::connect_with_cwd_and_trust(
+            Arc::clone(&client),
+            extension_paths,
+            load_cwd,
+            project_trusted,
+            HOOK_TIMEOUT,
+        )
+        .await;
         Self::finish_startup(&client, startup).await
     }
 
@@ -1188,12 +1226,7 @@ impl HostExtensionRunner {
     /// no-ops. Slot subscriptions are disposed and the runner is marked
     /// disabled.
     pub async fn shutdown_once(&self) {
-        if self.inner.shutdown_done.swap(true, Ordering::Relaxed) {
-            return;
-        }
-        self.inner.dispose_all_slots();
-        self.inner.disabled.store(true, Ordering::Relaxed);
-        let _ = self.inner.client.shutdown().await;
+        Self::shutdown_once_with_inner(&self.inner).await;
     }
 }
 
@@ -1730,20 +1763,38 @@ impl ExtensionRunner for HostExtensionRunner {
         let inner = Arc::clone(&self.inner);
         let reason = reason.to_owned();
         Box::pin(async move {
-            if reason == "reload" {
-                inner.reload_generation.fetch_add(1, Ordering::Relaxed);
-            }
-            HostExtensionRunner::shutdown_once_with_inner(&inner).await;
+            HostExtensionRunner::shutdown_with_reason_once(&inner, &reason).await;
             Ok(())
         })
     }
 }
 
 impl HostExtensionRunner {
-    async fn shutdown_once_with_inner(inner: &Arc<Inner>) {
-        if inner.shutdown_done.swap(true, Ordering::Relaxed) {
+    async fn shutdown_with_reason_once(inner: &Arc<Inner>, reason: &str) {
+        let _guard = inner.shutdown_lock.lock().await;
+        if inner.shutdown_done.load(Ordering::Relaxed) {
             return;
         }
+        if inner.has_handlers("session_shutdown") {
+            let payload = serde_json::json!({ "reason": reason });
+            if let Err(error) = inner.hook_request("session_shutdown", payload).await {
+                inner.report_host_error(&error);
+            }
+        }
+        Self::reap_inner(inner).await;
+        inner.shutdown_done.store(true, Ordering::Relaxed);
+    }
+
+    async fn shutdown_once_with_inner(inner: &Arc<Inner>) {
+        let _guard = inner.shutdown_lock.lock().await;
+        if inner.shutdown_done.load(Ordering::Relaxed) {
+            return;
+        }
+        Self::reap_inner(inner).await;
+        inner.shutdown_done.store(true, Ordering::Relaxed);
+    }
+
+    async fn reap_inner(inner: &Arc<Inner>) {
         inner.dispose_all_slots();
         inner.disabled.store(true, Ordering::Relaxed);
         let _ = inner.client.shutdown().await;
