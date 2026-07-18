@@ -274,8 +274,9 @@ pub trait RpcSessionHost: Send + Sync {
     fn set_model(&self, model: Model) -> BoxFuture<'static, Result<(), String>>;
     /// Cycle to the next model (scoped or all-available).
     fn cycle_model(&self) -> BoxFuture<'static, Option<ModelCycleResult>>;
-    /// Set the thinking level.
-    fn set_thinking_level(&self, level: ModelThinkingLevel) -> BoxFuture<'static, ()>;
+    /// Set the thinking level. Resolves `true` only when the level change was
+    /// durably committed (or was already effective).
+    fn set_thinking_level(&self, level: ModelThinkingLevel) -> BoxFuture<'static, bool>;
     /// Cycle to the next thinking level.
     fn cycle_thinking_level(&self) -> BoxFuture<'static, Option<ModelThinkingLevel>>;
 
@@ -910,8 +911,15 @@ where
         }
 
         RpcCommand::SetThinkingLevel { level, .. } => {
-            host.set_thinking_level(*level).await;
-            Some(RpcResponse::ok(id, "set_thinking_level"))
+            if host.set_thinking_level(*level).await {
+                Some(RpcResponse::ok(id, "set_thinking_level"))
+            } else {
+                Some(RpcResponse::err(
+                    id,
+                    "set_thinking_level",
+                    "Failed to persist thinking level change",
+                ))
+            }
         }
 
         RpcCommand::CycleThinkingLevel { .. } => {
@@ -1571,6 +1579,7 @@ mod tests {
         commands: Vec<RpcSlashCommand>,
         cycle_model_result: Option<ModelCycleResult>,
         cycle_thinking_result: Option<ModelThinkingLevel>,
+        set_thinking_result: bool,
         compact_result: Option<Result<CompactionResult, String>>,
         bash_result: Option<Result<BashResult, String>>,
         fork_outcome: Result<ForkOutcome, String>,
@@ -1587,6 +1596,7 @@ mod tests {
                 commands: vec![],
                 cycle_model_result: None,
                 cycle_thinking_result: None,
+                set_thinking_result: true,
                 compact_result: None,
                 bash_result: None,
                 fork_outcome: Ok(ForkOutcome::default()),
@@ -1744,9 +1754,10 @@ mod tests {
             let cfg = Arc::clone(&self.cfg);
             Box::pin(async move { cfg.lock().unwrap().cycle_model_result.clone() })
         }
-        fn set_thinking_level(&self, _l: ModelThinkingLevel) -> BoxFuture<'static, ()> {
+        fn set_thinking_level(&self, _l: ModelThinkingLevel) -> BoxFuture<'static, bool> {
             self.rec("set_thinking_level");
-            Box::pin(async {})
+            let cfg = Arc::clone(&self.cfg);
+            Box::pin(async move { cfg.lock().unwrap().set_thinking_result })
         }
         fn cycle_thinking_level(&self) -> BoxFuture<'static, Option<ModelThinkingLevel>> {
             self.rec("cycle_thinking_level");
@@ -2117,6 +2128,22 @@ mod tests {
         )
         .await;
         assert_eq!(r["command"], "set_thinking_level");
+        assert_eq!(r["success"], true);
+    }
+
+    #[tokio::test]
+    async fn set_thinking_level_uncommitted_returns_error() {
+        let (r, _) = dispatch(
+            r#"{"type":"set_thinking_level","id":"t2","level":"high"}"#,
+            FakeConfig {
+                set_thinking_result: false,
+                ..FakeConfig::default()
+            },
+        )
+        .await;
+        assert_eq!(r["command"], "set_thinking_level");
+        assert_eq!(r["success"], false);
+        assert_eq!(r["error"], "Failed to persist thinking level change");
     }
 
     #[tokio::test]

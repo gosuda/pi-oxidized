@@ -208,11 +208,9 @@ impl RpcSessionHost for Arc<AgentSessionRuntime> {
         })
     }
 
-    fn set_thinking_level(&self, level: ModelThinkingLevel) -> BoxFuture<'static, ()> {
+    fn set_thinking_level(&self, level: ModelThinkingLevel) -> BoxFuture<'static, bool> {
         let session = self.session();
-        Box::pin(async move {
-            session.set_thinking_level(level).await;
-        })
+        Box::pin(async move { session.set_thinking_level(level).await })
     }
 
     fn cycle_thinking_level(&self) -> BoxFuture<'static, Option<ModelThinkingLevel>> {

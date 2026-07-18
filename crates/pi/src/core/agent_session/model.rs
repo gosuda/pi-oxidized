@@ -202,7 +202,9 @@ impl AgentSession {
         self.agent.set_model(model.clone());
         self.lock_settings()
             .set_default_model_and_provider(&model.provider, &model.id);
-        self.set_thinking_level(thinking).await;
+        // Model-switch path: the thinking append may fail independently; the
+        // live level (reported by callers via `thinking_level()`) stays honest.
+        let _committed = self.set_thinking_level(thinking).await;
         self.emit_model_select(&model, Some(&previous), ModelSelectSource::Set)
             .await;
         Ok(())
@@ -252,7 +254,8 @@ impl AgentSession {
         self.agent.set_model(next.model.clone());
         self.lock_settings()
             .set_default_model_and_provider(&next.model.provider, &next.model.id);
-        self.set_thinking_level(thinking).await;
+        // Cycle result reports the actual live level below; bind-and-ignore.
+        let _committed = self.set_thinking_level(thinking).await;
         self.emit_model_select(&next.model, Some(&current), ModelSelectSource::Cycle)
             .await;
         Some(ModelCycleResult {
@@ -293,7 +296,8 @@ impl AgentSession {
         self.agent.set_model(next_model.clone());
         self.lock_settings()
             .set_default_model_and_provider(&next_model.provider, &next_model.id);
-        self.set_thinking_level(thinking).await;
+        // Cycle result reports the actual live level below; bind-and-ignore.
+        let _committed = self.set_thinking_level(thinking).await;
         self.emit_model_select(&next_model, Some(&current), ModelSelectSource::Cycle)
             .await;
         Some(ModelCycleResult {
@@ -325,7 +329,12 @@ impl AgentSession {
     /// because JavaScript is single-threaded; this Rust port is `async` so it
     /// can append to the session manager (held under a `tokio::Mutex`) and
     /// await extension emits without spawning.
-    pub async fn set_thinking_level(&self, level: ModelThinkingLevel) {
+    ///
+    /// Returns whether the live level now equals the requested effective
+    /// level: `true` on commit or when no change was needed, `false` when the
+    /// durable append failed (nothing was mutated or published).
+    #[must_use = "a false return means the level change was not durably committed"]
+    pub async fn set_thinking_level(&self, level: ModelThinkingLevel) -> bool {
         let available = self.available_thinking_levels();
         let effective = if available.contains(&level) {
             level
@@ -334,7 +343,7 @@ impl AgentSession {
         };
         let previous = self.thinking_level();
         if effective == previous {
-            return;
+            return true;
         }
         // Durable append first: live level, settings, and events publish only
         // changes the session file actually holds.
@@ -344,7 +353,7 @@ impl AgentSession {
                 .append_thinking_level_change(level_str(effective))
                 .is_err()
             {
-                return;
+                return false;
             }
         }
         self.agent.set_thinking_level(effective);
@@ -361,12 +370,13 @@ impl AgentSession {
         let _ = runner
             .emit(super::events::AgentSessionEvent::ThinkingLevelChanged { level: effective })
             .await;
+        true
     }
 
     /// Cycle to the next supported thinking level.
     ///
-    /// Returns the new level, or `None` when the current model does not
-    /// support reasoning.
+    /// Returns the new level, `None` when the current model does not support
+    /// reasoning, or `None` when the durable level-change append failed.
     pub async fn cycle_thinking_level(&self) -> Option<ModelThinkingLevel> {
         if !self.supports_thinking() {
             return None;
@@ -383,8 +393,11 @@ impl AgentSession {
         let len = levels.len();
         let next_index = (current_index + 1) % len;
         let next_level = levels[next_index];
-        self.set_thinking_level(next_level).await;
-        Some(next_level)
+        if self.set_thinking_level(next_level).await {
+            Some(next_level)
+        } else {
+            None
+        }
     }
 
     /// Supported thinking levels for the current model.
@@ -731,11 +744,23 @@ mod tests {
             };
             let events = record_events(&session);
 
-            session.set_thinking_level(next).await;
+            assert!(
+                !session.set_thinking_level(next).await,
+                "failed append must report an uncommitted level change"
+            );
             assert_eq!(
                 session.thinking_level(),
                 before,
                 "live thinking level must not change"
+            );
+            assert!(
+                session.cycle_thinking_level().await.is_none(),
+                "failed append must not report a successful cycle"
+            );
+            assert_eq!(
+                session.thinking_level(),
+                before,
+                "failed cycle must not change the live level"
             );
             assert!(
                 !recorded(&events)
