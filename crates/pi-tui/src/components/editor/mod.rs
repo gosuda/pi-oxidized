@@ -31,8 +31,8 @@ use ratatui::style::{Modifier, Style};
 use unicode_segmentation::UnicodeSegmentation;
 
 use self::paste::{
-    expand_paste_markers, format_paste_marker, is_large_paste, is_paste_marker, normalize_text,
-    paste_marker_id, prepare_paste_text, renumber_after_delete,
+    expand_paste_markers, find_paste_markers, format_paste_marker, is_large_paste, is_paste_marker,
+    normalize_text, paste_marker_id, prepare_paste_text, renumber_after_delete,
 };
 use self::state::{
     EditorState, LastAction, compute_vertical_move_column, next_grapheme_len, prev_grapheme_len,
@@ -103,6 +103,13 @@ struct AutocompleteRequest {
     explicit_tab: bool,
 }
 
+#[derive(Clone)]
+struct EditorSnapshot {
+    state: EditorState,
+    pastes: HashMap<u32, Arc<str>>,
+    paste_counter: u32,
+}
+
 /// Multiline editor implementing [`Component`].
 pub struct Editor {
     state: EditorState,
@@ -115,7 +122,7 @@ pub struct Editor {
     /// Dynamic border color (product may reassign).
     pub border_color: fn(&str) -> String,
 
-    pastes: HashMap<u32, String>,
+    pastes: HashMap<u32, Arc<str>>,
     paste_counter: u32,
 
     history: History,
@@ -123,7 +130,7 @@ pub struct Editor {
     last_action: Option<LastAction>,
     jump_mode: Option<JumpDir>,
     preferred_visual_col: Option<usize>,
-    undo_stack: UndoStack<EditorState>,
+    undo_stack: UndoStack<EditorSnapshot>,
 
     autocomplete_provider: Option<Arc<dyn AutocompleteProvider>>,
     autocomplete_trigger_characters: Vec<String>,
@@ -414,7 +421,12 @@ impl Editor {
     }
 
     fn push_undo_snapshot(&mut self) {
-        self.undo_stack.push(&self.state);
+        let snapshot = EditorSnapshot {
+            state: self.state.clone(),
+            pastes: self.pastes.clone(),
+            paste_counter: self.paste_counter,
+        };
+        self.undo_stack.push(&snapshot);
     }
 
     fn set_cursor_col(&mut self, col: usize) {
@@ -519,6 +531,7 @@ impl Editor {
             self.push_undo_snapshot();
         }
         self.set_text_internal(&result.text, result.cursor_placement);
+        self.refresh_autocomplete_after_navigation();
     }
 
     fn insert_character(&mut self, ch: &str) {
@@ -830,8 +843,8 @@ impl Editor {
         if is_large_paste(&filtered) {
             self.paste_counter = self.paste_counter.saturating_add(1);
             let id = self.paste_counter;
-            self.pastes.insert(id, filtered.clone());
             let marker = format_paste_marker(id, &filtered);
+            self.pastes.insert(id, Arc::<str>::from(filtered));
             self.insert_text_at_cursor_internal(&marker);
             return;
         }
@@ -877,27 +890,22 @@ impl Editor {
     fn handle_backspace(&mut self) {
         self.history.exit_browsing();
         self.last_action = None;
-        let ids = valid_paste_ids(&self.pastes);
-
         if self.state.cursor_col > 0 {
-            self.push_undo_snapshot();
             let line = self.state.current_line().to_owned();
             let col = self.state.cursor_col.min(line.len());
-            let glen = prev_grapheme_len(&line, col, &ids);
-            let deleted = &line[col - glen..col];
-            if let Some(id) = paste_marker_id(deleted) {
-                // Renumber other markers first; then delete this marker span
-                // using the pre-renumber grapheme length (ids after renumber
-                // no longer treat this marker as atomic).
-                renumber_after_delete(&mut self.state.lines, &mut self.pastes, id);
-                self.paste_counter = self.paste_counter.saturating_sub(1);
+            if let Some(marker) = find_paste_markers(&line)
+                .into_iter()
+                .find(|marker| marker.end == col && self.pastes.contains_key(&marker.id))
+            {
+                self.delete_paste_marker(marker.start, marker.end, marker.id);
+            } else {
+                self.push_undo_snapshot();
+                let ids = valid_paste_ids(&self.pastes);
+                let glen = prev_grapheme_len(&line, col, &ids);
+                self.state.lines[self.state.cursor_line] =
+                    format!("{}{}", &line[..col - glen], &line[col..]);
+                self.set_cursor_col(col - glen);
             }
-            let line = self.state.current_line().to_owned();
-            let col = self.state.cursor_col.min(line.len());
-            let delete_len = glen.min(col);
-            self.state.lines[self.state.cursor_line] =
-                format!("{}{}", &line[..col - delete_len], &line[col..]);
-            self.set_cursor_col(col - delete_len);
         } else if self.state.cursor_line > 0 {
             self.push_undo_snapshot();
             let current = self.state.lines.remove(self.state.cursor_line);
@@ -913,14 +921,21 @@ impl Editor {
     fn handle_forward_delete(&mut self) {
         self.history.exit_browsing();
         self.last_action = None;
-        let ids = valid_paste_ids(&self.pastes);
         let current = self.state.current_line().to_owned();
         if self.state.cursor_col < current.len() {
-            self.push_undo_snapshot();
-            let glen = next_grapheme_len(&current, self.state.cursor_col, &ids);
             let col = self.state.cursor_col;
-            self.state.lines[self.state.cursor_line] =
-                format!("{}{}", &current[..col], &current[col + glen..]);
+            if let Some(marker) = find_paste_markers(&current)
+                .into_iter()
+                .find(|marker| marker.start == col && self.pastes.contains_key(&marker.id))
+            {
+                self.delete_paste_marker(marker.start, marker.end, marker.id);
+            } else {
+                self.push_undo_snapshot();
+                let ids = valid_paste_ids(&self.pastes);
+                let glen = next_grapheme_len(&current, col, &ids);
+                self.state.lines[self.state.cursor_line] =
+                    format!("{}{}", &current[..col], &current[col + glen..]);
+            }
         } else if self.state.cursor_line + 1 < self.state.lines.len() {
             self.push_undo_snapshot();
             let next = self.state.lines.remove(self.state.cursor_line + 1);
@@ -928,6 +943,35 @@ impl Editor {
         }
         self.emit_change();
         self.refresh_autocomplete_after_edit();
+    }
+
+    fn delete_paste_marker(&mut self, start: usize, end: usize, id: u32) {
+        debug_assert_eq!(
+            paste_marker_id(&self.state.current_line()[start..end]),
+            Some(id)
+        );
+        self.push_undo_snapshot();
+        let line_index = self.state.cursor_line;
+        self.state.lines[line_index].replace_range(start..end, "");
+
+        let cursor_after_removal = start;
+        let preceding_id_shrink: usize = find_paste_markers(&self.state.lines[line_index])
+            .into_iter()
+            .filter(|marker| marker.end <= cursor_after_removal && marker.id > id)
+            .map(|marker| {
+                marker.id.to_string().len() - (marker.id - 1).to_string().len()
+            })
+            .sum();
+
+        renumber_after_delete(&mut self.state.lines, &mut self.pastes, id);
+        self.paste_counter = self.paste_counter.saturating_sub(1);
+        self.set_cursor_col(cursor_after_removal.saturating_sub(preceding_id_shrink));
+    }
+
+    fn refresh_autocomplete_after_navigation(&mut self) {
+        if self.autocomplete_state.is_some() {
+            self.update_autocomplete();
+        }
     }
 
     fn refresh_autocomplete_after_edit(&mut self) {
@@ -1034,9 +1078,7 @@ impl Editor {
             self.push_undo_snapshot();
             let was_kill = self.last_action == Some(LastAction::Kill);
             let old = self.state.cursor_col;
-            self.move_word_backwards();
-            let from = self.state.cursor_col;
-            self.set_cursor_col(old);
+            let from = self.word_backward_col(&current, old);
             let deleted = current[from..old].to_owned();
             self.kill_ring.push(
                 &deleted,
@@ -1074,9 +1116,7 @@ impl Editor {
             self.push_undo_snapshot();
             let was_kill = self.last_action == Some(LastAction::Kill);
             let old = self.state.cursor_col;
-            self.move_word_forwards();
-            let to = self.state.cursor_col;
-            self.set_cursor_col(old);
+            let to = self.word_forward_col(&current, old);
             let deleted = current[old..to].to_owned();
             self.kill_ring.push(
                 &deleted,
@@ -1166,10 +1206,70 @@ impl Editor {
         let Some(snapshot) = self.undo_stack.pop() else {
             return;
         };
-        self.state = snapshot;
+        self.state = snapshot.state;
+        self.pastes = snapshot.pastes;
+        self.paste_counter = snapshot.paste_counter;
         self.last_action = None;
         self.preferred_visual_col = None;
         self.emit_change();
+        self.refresh_autocomplete_after_edit();
+    }
+
+    fn marker_aware_word_segments(&self, text: &str) -> Vec<WordSegment> {
+        let ids = valid_paste_ids(&self.pastes);
+        let markers: Vec<_> = find_paste_markers(text)
+            .into_iter()
+            .filter(|marker| ids.contains(&marker.id))
+            .collect();
+        if markers.is_empty() {
+            return default_word_segments(text);
+        }
+
+        let mut segments = Vec::new();
+        let mut last = 0;
+        for marker in markers {
+            segments.extend(default_word_segments(&text[last..marker.start]).into_iter().map(
+                |mut segment| {
+                    segment.index += last;
+                    segment
+                },
+            ));
+            segments.push(WordSegment {
+                segment: text[marker.start..marker.end].to_owned(),
+                index: marker.start,
+                is_word_like: true,
+            });
+            last = marker.end;
+        }
+        segments.extend(default_word_segments(&text[last..]).into_iter().map(|mut segment| {
+            segment.index += last;
+            segment
+        }));
+        segments
+    }
+
+    fn word_backward_col(&self, text: &str, cursor_col: usize) -> usize {
+        let segmenter = |value: &str| self.marker_aware_word_segments(value);
+        find_word_backward(
+            text,
+            cursor_col,
+            &WordNavigationOptions {
+                segment: Some(&segmenter),
+                is_atomic_segment: Some(&is_paste_marker),
+            },
+        )
+    }
+
+    fn word_forward_col(&self, text: &str, cursor_col: usize) -> usize {
+        let segmenter = |value: &str| self.marker_aware_word_segments(value);
+        find_word_forward(
+            text,
+            cursor_col,
+            &WordNavigationOptions {
+                segment: Some(&segmenter),
+                is_atomic_segment: Some(&is_paste_marker),
+            },
+        )
     }
 
     fn move_word_backwards(&mut self) {
@@ -1181,40 +1281,12 @@ impl Editor {
                 let len = self.state.lines[self.state.cursor_line].len();
                 self.set_cursor_col(len);
             }
+            self.refresh_autocomplete_after_navigation();
             return;
         }
-        let ids = valid_paste_ids(&self.pastes);
-        let segs_for = |text: &str| -> Vec<WordSegment> {
-            // Use unicode word bounds; atomic paste markers merged at grapheme
-            // layer are not re-split here for word mode — custom segmenter
-            // merges markers when present.
-            use unicode_segmentation::UnicodeSegmentation;
-            if ids.is_empty() || !text.contains("[paste #") {
-                return text
-                    .split_word_bound_indices()
-                    .map(|(index, segment)| WordSegment {
-                        is_word_like: !segment.chars().all(char::is_whitespace)
-                            && !crate::text::is_punctuation_char(
-                                &segment
-                                    .chars()
-                                    .next()
-                                    .map(|c| c.to_string())
-                                    .unwrap_or_default(),
-                            ),
-                        segment: segment.to_owned(),
-                        index,
-                    })
-                    .collect();
-            }
-            // Fall back to default; atomic handling via is_atomic_segment.
-            default_word_segments(text)
-        };
-        let opts = WordNavigationOptions {
-            segment: Some(&segs_for),
-            is_atomic_segment: Some(&is_paste_marker),
-        };
-        let col = find_word_backward(&current, self.state.cursor_col, &opts);
+        let col = self.word_backward_col(&current, self.state.cursor_col);
         self.set_cursor_col(col);
+        self.refresh_autocomplete_after_navigation();
     }
 
     fn move_word_forwards(&mut self) {
@@ -1225,14 +1297,12 @@ impl Editor {
                 self.state.cursor_line += 1;
                 self.set_cursor_col(0);
             }
+            self.refresh_autocomplete_after_navigation();
             return;
         }
-        let opts = WordNavigationOptions {
-            segment: None,
-            is_atomic_segment: Some(&is_paste_marker),
-        };
-        let col = find_word_forward(&current, self.state.cursor_col, &opts);
+        let col = self.word_forward_col(&current, self.state.cursor_col);
         self.set_cursor_col(col);
+        self.refresh_autocomplete_after_navigation();
     }
 
     fn move_cursor(&mut self, delta_line: isize, delta_col: isize) {
@@ -1275,9 +1345,7 @@ impl Editor {
             }
         }
 
-        if self.autocomplete_state.is_some() {
-            self.update_autocomplete();
-        }
+        self.refresh_autocomplete_after_navigation();
     }
 
     fn move_to_visual_line(
@@ -1342,6 +1410,7 @@ impl Editor {
             (signed_current + isize::from(direction) * signed_page).clamp(0, signed_max);
         let target = usize::try_from(signed_target).unwrap_or(0);
         self.move_to_visual_line(&visual_lines, current, target);
+        self.refresh_autocomplete_after_navigation();
     }
 
     fn jump_to_char(&mut self, ch: &str, direction: JumpDir) {
@@ -1385,6 +1454,7 @@ impl Editor {
             if let Some(idx) = idx {
                 self.state.cursor_line = line_idx.cast_unsigned();
                 self.set_cursor_col(idx);
+                self.refresh_autocomplete_after_navigation();
                 return;
             }
             line_idx += step;
@@ -1583,12 +1653,14 @@ impl Editor {
         if kb.matches(event, "tui.editor.cursorLineStart") {
             self.last_action = None;
             self.set_cursor_col(0);
+            self.refresh_autocomplete_after_navigation();
             return Some(EventResult::Render);
         }
         if kb.matches(event, "tui.editor.cursorLineEnd") {
             self.last_action = None;
             let len = self.state.current_line().len();
             self.set_cursor_col(len);
+            self.refresh_autocomplete_after_navigation();
             return Some(EventResult::Render);
         }
         if kb.matches(event, "tui.editor.cursorWordLeft") {
@@ -1609,6 +1681,7 @@ impl Editor {
             } else if self.is_on_first_visual_line() {
                 self.last_action = None;
                 self.set_cursor_col(0);
+                self.refresh_autocomplete_after_navigation();
             } else {
                 self.move_cursor(-1, 0);
             }
@@ -1621,6 +1694,7 @@ impl Editor {
                 self.last_action = None;
                 let len = self.state.current_line().len();
                 self.set_cursor_col(len);
+                self.refresh_autocomplete_after_navigation();
             } else {
                 self.move_cursor(1, 0);
             }
@@ -2078,9 +2152,74 @@ fn paint_plain(buf: &mut Buffer, x: u16, y: u16, width: u16, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::editor_support::ApplyCompletionResult;
     use crate::keys::key_press;
     use crossterm::event::{KeyCode, KeyModifiers};
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::Mutex;
+
+    struct TestAutocompleteProvider;
+
+    impl AutocompleteProvider for TestAutocompleteProvider {
+        fn get_suggestions(
+            &self,
+            _lines: &[String],
+            _cursor_line: usize,
+            _cursor_col: usize,
+            _options: SuggestionOptions,
+        ) -> Pin<Box<dyn Future<Output = Option<AutocompleteSuggestions>> + Send + '_>> {
+            Box::pin(async { None })
+        }
+
+        fn apply_completion(
+            &self,
+            lines: &[String],
+            cursor_line: usize,
+            cursor_col: usize,
+            _item: &AutocompleteItem,
+            _prefix: &str,
+        ) -> ApplyCompletionResult {
+            ApplyCompletionResult {
+                lines: lines.to_vec(),
+                cursor_line,
+                cursor_col,
+            }
+        }
+    }
+
+    fn large_paste(label: usize) -> String {
+        (0..11)
+            .map(|line| format!("paste-{label}-line-{line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn editor_with_ten_reverse_ordered_pastes() -> (Editor, Vec<String>) {
+        let mut editor = Editor::with_defaults();
+        let payloads: Vec<_> = (1..=10).map(large_paste).collect();
+        editor.handle_paste(&payloads[0]);
+        for payload in &payloads[1..] {
+            editor.set_cursor_col(0);
+            editor.handle_paste(payload);
+        }
+        (editor, payloads)
+    }
+
+    fn open_test_autocomplete(editor: &mut Editor) {
+        editor.set_autocomplete_provider(Some(Arc::new(TestAutocompleteProvider)));
+        editor.apply_autocomplete_suggestions(
+            AutocompleteSuggestions {
+                items: vec![AutocompleteItem {
+                    value: "stale".to_owned(),
+                    label: "stale".to_owned(),
+                    description: None,
+                }],
+                prefix: "stale".to_owned(),
+            },
+            AutocompleteUiState::Regular,
+        );
+    }
 
     fn press(code: KeyCode) -> KeyEvent {
         key_press(code, KeyModifiers::empty())
@@ -2349,5 +2488,117 @@ mod tests {
         assert_eq!(editor.state.cursor_line, 1);
         assert_eq!(editor.state.cursor_col, last.len());
         assert!(last.is_char_boundary(editor.state.cursor_col));
+    }
+
+    #[test]
+    fn backspace_deletes_marker_before_ten_to_nine_renumber() {
+        let (mut editor, payloads) = editor_with_ten_reverse_ordered_pastes();
+        editor.set_cursor_col(editor.state.current_line().len());
+        editor.insert_character("x");
+        let marker_one = find_paste_markers(&editor.get_text())
+            .into_iter()
+            .find(|marker| marker.id == 1)
+            .expect("marker #1 should precede the suffix");
+        editor.set_cursor_col(marker_one.end);
+        let expected_shrink: usize = find_paste_markers(editor.state.current_line())
+            .into_iter()
+            .filter(|marker| marker.end <= marker_one.start && marker.id > marker_one.id)
+            .map(|marker| {
+                marker.id.to_string().len() - (marker.id - 1).to_string().len()
+            })
+            .sum();
+        assert_eq!(expected_shrink, 1);
+
+        editor.handle_backspace();
+
+        let text = editor.get_text();
+        assert_eq!(editor.get_cursor(), (0, marker_one.start - 1));
+        assert!(!text.contains("[paste #10 ") );
+        assert_eq!(find_paste_markers(&text).len(), 9);
+        assert_eq!(editor.paste_counter, 9);
+        assert_eq!(editor.pastes.len(), 9);
+        let expected = format!(
+            "{}x",
+            payloads[1..].iter().rev().cloned().collect::<String>()
+        );
+        assert_eq!(editor.get_expanded_text(), expected);
+    }
+
+    #[test]
+    fn forward_delete_renumbers_marker_and_undo_restores_payload_state() {
+        let (mut editor, payloads) = editor_with_ten_reverse_ordered_pastes();
+        editor.set_cursor_col(editor.state.current_line().len());
+        editor.insert_character("x");
+        let marker_one = find_paste_markers(&editor.get_text())
+            .into_iter()
+            .find(|marker| marker.id == 1)
+            .expect("marker #1 should precede the suffix");
+        editor.set_cursor_col(marker_one.start);
+        let before_text = editor.get_text();
+        let before_expanded = editor.get_expanded_text();
+
+        editor.handle_forward_delete();
+
+        assert_eq!(editor.get_cursor(), (0, marker_one.start - 1));
+        assert!(!editor.get_text().contains("[paste #10 ") );
+        assert_eq!(editor.paste_counter, 9);
+        assert_eq!(editor.pastes.len(), 9);
+        let expected = format!(
+            "{}x",
+            payloads[1..].iter().rev().cloned().collect::<String>()
+        );
+        assert_eq!(editor.get_expanded_text(), expected);
+
+        editor.undo();
+        assert_eq!(editor.get_text(), before_text);
+        assert_eq!(editor.get_expanded_text(), before_expanded);
+        assert_eq!(editor.paste_counter, 10);
+        assert_eq!(editor.pastes.len(), 10);
+        assert!(editor.pastes.keys().all(|id| (1..=10).contains(id)));
+    }
+
+    #[test]
+    fn word_motion_treats_unicode_adjacent_marker_as_atomic() {
+        let mut editor = Editor::with_defaults();
+        editor.insert_character("α");
+        editor.handle_paste(&large_paste(1));
+        editor.insert_character("β");
+        let marker = find_paste_markers(&editor.get_text())[0];
+
+        editor.set_cursor_col("α".len());
+        editor.move_word_forwards();
+        assert_eq!(editor.get_cursor(), (0, marker.end));
+        assert!(editor.state.current_line().is_char_boundary(editor.state.cursor_col));
+
+        editor.move_word_backwards();
+        assert_eq!(editor.get_cursor(), (0, marker.start));
+        assert!(editor.state.current_line().is_char_boundary(editor.state.cursor_col));
+    }
+
+    #[test]
+    fn history_and_non_character_moves_refresh_open_autocomplete() {
+        let mut editor = Editor::with_defaults();
+        editor.add_to_history("history value");
+        editor.set_text("draft");
+        editor.set_cursor_col(0);
+        open_test_autocomplete(&mut editor);
+
+        editor.navigate_history(-1);
+        let pending = editor.autocomplete_pending.as_ref().expect("history refresh");
+        assert_eq!(pending.snapshot_text, "history value");
+        assert_eq!(pending.snapshot_col, 0);
+
+        editor.move_word_forwards();
+        let pending = editor.autocomplete_pending.as_ref().expect("word refresh");
+        assert_eq!(pending.snapshot_col, "history".len());
+
+        editor.set_text("zero\none\ntwo\nthree\nfour\nfive\nsix\nseven");
+        editor.set_terminal_rows(1);
+        open_test_autocomplete(&mut editor);
+        let before = editor.get_cursor();
+        editor.page_scroll(-1);
+        let pending = editor.autocomplete_pending.as_ref().expect("page refresh");
+        assert_eq!((pending.snapshot_line, pending.snapshot_col), editor.get_cursor());
+        assert_ne!(editor.get_cursor(), before);
     }
 }

@@ -140,7 +140,7 @@ pub fn default_grapheme_segs(text: &str) -> Vec<GraphemeSeg> {
 
 /// Valid paste ids from the paste store.
 #[must_use]
-pub fn valid_paste_ids<S: BuildHasher>(pastes: &HashMap<u32, String, S>) -> HashSet<u32> {
+pub fn valid_paste_ids<S: BuildHasher, V>(pastes: &HashMap<u32, V, S>) -> HashSet<u32> {
     pastes.keys().copied().collect()
 }
 
@@ -225,7 +225,7 @@ mod tests {
 
     #[test]
     fn paste_marker_atomic_segment() -> Result<(), &'static str> {
-        let mut pastes = HashMap::new();
+        let mut pastes: HashMap<u32, String> = HashMap::new();
         pastes.insert(1, "big".into());
         let ids = valid_paste_ids(&pastes);
         let line = "hi [paste #1 3 chars] there";

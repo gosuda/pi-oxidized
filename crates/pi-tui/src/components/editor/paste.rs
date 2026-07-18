@@ -252,9 +252,9 @@ pub fn maybe_prepend_path_space(paste: &str, char_before_cursor: Option<char>) -
 
 /// Expand all stored paste markers in `text`.
 #[must_use]
-pub fn expand_paste_markers<S: BuildHasher>(
+pub fn expand_paste_markers<S: BuildHasher, V: AsRef<str>>(
     text: &str,
-    pastes: &HashMap<u32, String, S>,
+    pastes: &HashMap<u32, V, S>,
 ) -> String {
     let markers = find_paste_markers(text);
     if markers.is_empty() {
@@ -265,7 +265,7 @@ pub fn expand_paste_markers<S: BuildHasher>(
     for m in markers {
         result.push_str(&text[last..m.start]);
         if let Some(content) = pastes.get(&m.id) {
-            result.push_str(content);
+            result.push_str(content.as_ref());
         } else {
             result.push_str(&text[m.start..m.end]);
         }
@@ -276,9 +276,9 @@ pub fn expand_paste_markers<S: BuildHasher>(
 }
 
 /// After deleting paste `target_id`, renumber higher markers and remap the store.
-pub fn renumber_after_delete(
+pub fn renumber_after_delete<V>(
     lines: &mut [String],
-    pastes: &mut HashMap<u32, String>,
+    pastes: &mut HashMap<u32, V>,
     target_id: u32,
 ) {
     pastes.remove(&target_id);
