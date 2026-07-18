@@ -39,7 +39,9 @@ use serde_json::{Map, Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
-use super::super::agent_session::events::AgentSessionEvent;
+use super::super::agent_session::events::{
+    AgentSessionEvent, SessionShutdownReason as ShutdownReason,
+};
 use super::super::agent_session::extension_runner::{ExtensionRunner, SessionHooks};
 use super::super::model_runtime::{CreateModelRuntimeOptions, ModelRuntime};
 use super::{
@@ -1115,7 +1117,15 @@ async fn explicit_process_shutdown_reaps_and_remains_idempotent() -> R {
     let runner = HostExtensionRunner::spawn_from(&spec, Vec::new()).await?;
     runner.shutdown_once().await;
     runner.shutdown_once().await;
-    ExtensionRunner::shutdown(runner.as_ref(), "quit").await?;
+    // Post-reap lifecycle emit is a no-op on the dead transport.
+    let _ = ExtensionRunner::emit(
+        runner.as_ref(),
+        AgentSessionEvent::SessionShutdown {
+            reason: ShutdownReason::Quit,
+            target_session_file: None,
+        },
+    )
+    .await?;
     assert!(!runner.is_running());
     assert_host_shutdown_and_reaped(&pid_path, &shutdown_path)
 }
@@ -1397,12 +1407,14 @@ async fn shutdown_hook_runs_once_before_transport_reap() -> R {
     let (spec, pid_path, shutdown_path) =
         write_startup_host(directory.path(), StartupBehavior::Ready)?;
     let runner = HostExtensionRunner::spawn_from(&spec, Vec::new()).await?;
-    let (first, repeated) = tokio::join!(
-        ExtensionRunner::shutdown(runner.as_ref(), "quit"),
-        ExtensionRunner::shutdown(runner.as_ref(), "quit"),
-    );
-    first?;
-    repeated?;
+    ExtensionRunner::emit(
+        runner.as_ref(),
+        AgentSessionEvent::SessionShutdown {
+            reason: ShutdownReason::Quit,
+            target_session_file: Some("/tmp/next.jsonl".to_owned()),
+        },
+    )
+    .await?;
     runner.shutdown_once().await;
 
     let sequence = fs::read_to_string(&shutdown_path)?;
@@ -1414,7 +1426,9 @@ async fn shutdown_hook_runs_once_before_transport_reap() -> R {
     );
     let request: Frame = serde_json::from_str(lines[0])?;
     assert_eq!(request.method, "session_shutdown");
+    assert_eq!(request.payload["type"], "session_shutdown");
     assert_eq!(request.payload["reason"], "quit");
+    assert_eq!(request.payload["targetSessionFile"], "/tmp/next.jsonl");
     assert_eq!(lines[1], "shutdown");
     assert_host_reaped(&pid_path)
 }
@@ -1423,7 +1437,16 @@ async fn shutdown_hook_runs_once_before_transport_reap() -> R {
 async fn shutdown_reaps_transport_when_hook_times_out() -> R {
     let (runner, host) = make_runner(full_snapshot()).await?;
     host.drop_method("session_shutdown");
-    ExtensionRunner::shutdown(runner.as_ref(), "quit").await?;
+    // Hook failure is isolated inside emit; reap still succeeds.
+    let _ = ExtensionRunner::emit(
+        runner.as_ref(),
+        AgentSessionEvent::SessionShutdown {
+            reason: ShutdownReason::Quit,
+            target_session_file: None,
+        },
+    )
+    .await?;
+    runner.shutdown_once().await;
     assert!(!runner.is_running());
     Ok(())
 }
@@ -1435,7 +1458,14 @@ async fn shutdown_is_idempotent() -> R {
     assert!(!runner.is_running());
     runner.shutdown_once().await;
     assert!(!runner.is_running());
-    ExtensionRunner::shutdown(runner.as_ref(), "quit").await?;
+    let _ = ExtensionRunner::emit(
+        runner.as_ref(),
+        AgentSessionEvent::SessionShutdown {
+            reason: ShutdownReason::Quit,
+            target_session_file: None,
+        },
+    )
+    .await?;
     assert!(!runner.is_running());
     Ok(())
 }
@@ -1872,5 +1902,112 @@ async fn real_host_lifecycle_and_dispatch() -> R {
     // Teardown.
     guard.teardown().await;
 
+    Ok(())
+}
+
+/// Minimal in-repo reproduction of the E2E `rust-extension-flag-session-start`
+/// marker bug: a real extension must observe the CLI-applied flag value inside
+/// its `session_start` handler, and `resources_discover` must follow it.
+///
+/// Fails on pre-lifecycle HEAD with an empty log (no emission at bind time).
+#[tokio::test]
+async fn real_host_bind_emits_session_start_with_cli_flag_before_discovery() -> R {
+    use futures::stream::StreamExt;
+
+    #[derive(Clone)]
+    struct StubProvider;
+
+    impl pi_ai::Provider for StubProvider {
+        fn stream(
+            &self,
+            _model: &pi_ai::Model,
+            _context: pi_ai::Context,
+            _options: pi_ai::StreamOptions,
+        ) -> futures::stream::BoxStream<
+            'static,
+            std::result::Result<AssistantMessageEvent, pi_ai::ProviderError>,
+        > {
+            futures::stream::empty().boxed()
+        }
+    }
+
+    let host_path = real_host_path()?;
+    assert!(
+        host_path.is_file(),
+        "compiled host artifact missing: {}",
+        host_path.display()
+    );
+
+    let directory = tempfile::tempdir()?;
+    let log_path = directory.path().join("lifecycle.log");
+    let extension_path = directory.path().join("flag-observer.ts");
+    std::fs::write(
+        &extension_path,
+        format!(
+            r#"import {{ appendFileSync }} from "node:fs";
+
+const LOG = {log:?};
+
+export default function flagObserver(pi) {{
+	pi.registerFlag("marker", {{
+		description: "Lifecycle marker flag",
+		type: "string",
+		default: "unset",
+	}});
+	pi.on("session_start", (event) => {{
+		appendFileSync(LOG, `session_start:${{pi.getFlag("marker")}}:${{event.reason}}\n`);
+	}});
+	pi.on("resources_discover", (event) => {{
+		appendFileSync(LOG, `resources_discover:${{event.reason}}\n`);
+		return {{ skillPaths: [], promptPaths: [], themePaths: [] }};
+	}});
+}}
+"#,
+            log = log_path.to_string_lossy()
+        ),
+    )?;
+
+    let spec = pi_ext::host::HostSpec {
+        source: pi_ext::host::HostSource::Env(host_path.clone()),
+        program: host_path,
+        args: Vec::new(),
+    };
+    let runner = HostExtensionRunner::spawn_from(
+        &spec,
+        vec![extension_path.to_string_lossy().into_owned()],
+    )
+    .await?;
+
+    // CLI flag application (flags.set) happens before any bind.
+    runner
+        .apply_flag_values(&BTreeMap::from([(
+            "marker".to_owned(),
+            FlagValueWire::String("cli-value".to_owned()),
+        )]))
+        .await?;
+
+    let mut config = crate::core::agent_session::AgentSessionConfig::test_config(
+        Arc::new(StubProvider),
+        pi_agent::state::default_model(),
+    )?;
+    config.extension_runner = Some(Arc::clone(&runner) as Arc<dyn ExtensionRunner>);
+    let session = crate::core::agent_session::AgentSession::new(config)?;
+
+    session
+        .bind_extensions(crate::core::agent_session::ExtensionBindings::default())
+        .await?;
+
+    let log = std::fs::read_to_string(&log_path)?;
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(
+        lines,
+        vec![
+            "session_start:cli-value:startup",
+            "resources_discover:startup"
+        ],
+        "flags.set → session_start → resources_discover order must hold"
+    );
+
+    runner.shutdown_once().await;
     Ok(())
 }

@@ -14,7 +14,6 @@ use pi_ai::types::{Model, ModelThinkingLevel};
 use pi_ext::protocol::FlagValueWire;
 use thiserror::Error;
 
-use super::agent_session::extension_runner::ExtensionRunner;
 use super::config::{get_agent_dir, get_docs_path, resolve_path};
 use super::extension_host::HostExtensionRunner;
 use super::model_runtime::{
@@ -263,8 +262,6 @@ pub struct AgentSessionServices {
     pub diagnostics: Vec<AgentSessionRuntimeDiagnostic>,
     /// Validated extension flag values applied during creation.
     pub extension_flag_values: BTreeMap<String, ExtensionFlagValue>,
-    /// Whether startup resource discovery completed successfully.
-    pub startup_resources_discovered: bool,
     /// Concrete host runner when extensions were discovered and loaded.
     ///
     /// `None` when no extension paths were discovered, discovery was disabled,
@@ -301,8 +298,9 @@ pub struct CreateAgentSessionFromServicesOptions {
     pub exclude_tools: Option<Vec<String>>,
     /// Default tool suppression mode when no allowlist is provided.
     pub no_tools: Option<NoToolsMode>,
-    /// Session-start metadata for extensions (opaque for now).
-    pub session_start_event: Option<String>,
+    /// Session-start metadata carried into the session (reason + previous
+    /// session file for replacements).
+    pub session_start_event: Option<crate::core::agent_session::SessionStartEvent>,
     /// Saved session model to restore (provider, model id).
     pub saved_session_model: Option<(String, String)>,
     /// Whether the session already has messages (affects restore vs initial).
@@ -370,8 +368,8 @@ pub struct CreateAgentSessionResult {
     pub model_runtime: ModelRuntime,
     /// Resource loader retained for extension-driven reloads.
     pub resource_loader: DefaultResourceLoader,
-    /// Whether startup resource discovery completed successfully.
-    pub startup_resources_discovered: bool,
+    /// Session-start metadata forwarded from the creation options.
+    pub session_start_event: Option<crate::core::agent_session::SessionStartEvent>,
     /// Concrete host runner moved out of services (if any).
     pub extension_runner: Option<Arc<HostExtensionRunner>>,
 }
@@ -490,7 +488,7 @@ pub async fn create_agent_session_services_with_trust(
     foundation
         .settings_manager
         .set_project_trusted(project_trusted);
-    let (mut resource_loader, discovery) = create_service_resource_loader(
+    let (resource_loader, discovery) = create_service_resource_loader(
         &foundation.cwd,
         &foundation.agent_dir,
         foundation.settings_manager,
@@ -525,24 +523,6 @@ pub async fn create_agent_session_services_with_trust(
         extension_runner = None;
     }
 
-    let mut startup_resources_discovered = false;
-    if let Some(runner) = extension_runner.as_deref()
-        && runner.has_handlers("resources_discover")
-    {
-        match runner
-            .emit_resources_discover(foundation.cwd.to_string_lossy().as_ref(), "startup")
-            .await
-        {
-            Ok(paths) => {
-                resource_loader.extend_resources(paths);
-                startup_resources_discovered = true;
-            }
-            Err(error) => diagnostics.push(AgentSessionRuntimeDiagnostic::error(format!(
-                "Extension resource discovery failed: {error}"
-            ))),
-        }
-    }
-
     for registration in pending_provider_registrations {
         if let Err(error) = foundation
             .model_runtime
@@ -569,7 +549,6 @@ pub async fn create_agent_session_services_with_trust(
         resource_loader,
         diagnostics,
         extension_flag_values: applied_flags,
-        startup_resources_discovered,
         extension_runner,
     })
 }
@@ -947,7 +926,7 @@ pub async fn create_agent_session_from_services(
         tools,
         exclude_tools,
         no_tools,
-        session_start_event: _,
+        session_start_event,
         saved_session_model,
         has_existing_session,
     } = options;
@@ -987,7 +966,7 @@ pub async fn create_agent_session_from_services(
         model_runtime: services.model_runtime,
         resource_loader: services.resource_loader,
         extension_runner: services.extension_runner,
-        startup_resources_discovered: services.startup_resources_discovered,
+        session_start_event,
     })
 }
 
@@ -1461,6 +1440,57 @@ mod tests {
         );
         assert_eq!(result.thinking_level, ModelThinkingLevel::Off);
         assert!(result.allowed_tool_names.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn from_services_forwards_session_start_event() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let cwd = dir.path().join("project");
+        let agent = dir.path().join("agent");
+        std::fs::create_dir_all(&cwd)?;
+        std::fs::create_dir_all(&agent)?;
+
+        let runtime = ModelRuntime::create_in_memory().await?;
+        let services = create_agent_session_services(CreateAgentSessionServicesOptions {
+            cwd,
+            agent_dir: Some(agent),
+            model_runtime: Some(runtime),
+            resource_loader_options: Some(ResourceLoaderServiceOptions {
+                no_extensions: true,
+                no_skills: true,
+                no_prompt_templates: true,
+                no_themes: true,
+                no_context_files: true,
+                ..ResourceLoaderServiceOptions::default()
+            }),
+            ..CreateAgentSessionServicesOptions::default()
+        })
+        .await?;
+
+        let event = crate::core::agent_session::SessionStartEvent {
+            reason: crate::core::agent_session::SessionStartReason::New,
+            previous_session_file: Some("prev.jsonl".to_owned()),
+        };
+        let result = create_agent_session_from_services(CreateAgentSessionFromServicesOptions {
+            services,
+            model: None,
+            thinking_level: None,
+            scoped_models: Vec::new(),
+            tools: None,
+            exclude_tools: None,
+            no_tools: None,
+            session_start_event: Some(event.clone()),
+            saved_session_model: None,
+            has_existing_session: false,
+        })
+        .await?;
+
+        assert_eq!(
+            result.session_start_event,
+            Some(event),
+            "replacement session-start metadata must survive services resolution"
+        );
         Ok(())
     }
 

@@ -1671,9 +1671,6 @@ mod tests {
         }
         fn invalidate(&self) {}
         fn emit_error(&self, _: String) {}
-        fn shutdown(&self, _: &str) -> BoxFuture<'_, Result<(), ExtensionRunnerError>> {
-            Box::pin(async { Ok(()) })
-        }
     }
 
     #[tokio::test]

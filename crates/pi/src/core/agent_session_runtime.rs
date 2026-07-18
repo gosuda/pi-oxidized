@@ -11,11 +11,14 @@
 //! 1. `emit_before_switch` / `emit_before_fork` (cancellable).
 //! 2. Build the new session manager.
 //! 3. Call the factory → new session + services + diagnostics.
-//! 4. `teardown_current`: `session_shutdown{reason}`, then
-//!    `before_session_invalidate`, then `session.dispose()`.
+//! 4. `teardown_current`: typed `session_shutdown{reason, targetSessionFile}`
+//!    emit, then `before_session_invalidate`, then `session.dispose()`.
 //! 5. `apply(result)`: swap session + services + diagnostics.
 //! 6. `finish_session_replacement`: `rebind_session(new_session)` then
-//!    optional `with_session(ctx)`.
+//!    optional `with_session(ctx)`. The mode's rebind calls `bind_extensions`
+//!    on the new session, which emits the stored
+//!    `session_start{new|resume|fork}` after the old host received its
+//!    `session_shutdown` in step 4.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -25,8 +28,8 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::core::agent_session::events::{
     AgentSessionEvent, SessionBeforeForkPosition, SessionBeforeSwitchReason,
+    SessionShutdownReason, SessionStartReason,
 };
-use crate::core::agent_session::extension::{SessionShutdownReason, SessionStartReason};
 use crate::core::agent_session::{AgentSession, ReplacedSessionContext};
 use crate::core::session_transfer::SessionImportFileNotFoundError;
 use crate::core::sessions::{
@@ -322,6 +325,7 @@ impl AgentSessionRuntime {
             SessionManager::open(session_path, None, options.cwd_override.as_deref())?;
         self.assert_cwd(&session_manager)?;
         let new_cwd = session_manager.get_cwd().to_owned();
+        let target_session_file = session_manager.get_session_file().map(str::to_owned);
         let result = self
             .factory
             .create(CreateAgentSessionRuntimeOptions {
@@ -332,7 +336,7 @@ impl AgentSessionRuntime {
                 previous_session_file,
             })
             .await?;
-        self.teardown_current(SessionShutdownReason::Resume, None)
+        self.teardown_current(SessionShutdownReason::Resume, target_session_file.as_deref())
             .await;
         self.apply(result);
         self.finish_session_replacement(None).await;
@@ -350,7 +354,7 @@ impl AgentSessionRuntime {
     ) -> Result<SwitchOutcome, AgentSessionRuntimeError> {
         let _guard = self.replacement_lock.lock().await;
         let before = self
-            .emit_before_switch(SessionStartReason::Startup, None)
+            .emit_before_switch(SessionStartReason::New, None)
             .await;
         if before.cancelled {
             return Ok(before);
@@ -382,17 +386,18 @@ impl AgentSessionRuntime {
                 SessionManager::in_memory(Some(&cwd), opts)?
             }
         };
+        let target_session_file = session_manager.get_session_file().map(str::to_owned);
         let result = self
             .factory
             .create(CreateAgentSessionRuntimeOptions {
                 cwd: cwd.clone(),
                 agent_dir: self.agent_dir(),
                 session_manager,
-                start_reason: SessionStartReason::Startup,
+                start_reason: SessionStartReason::New,
                 previous_session_file,
             })
             .await?;
-        self.teardown_current(SessionShutdownReason::New, None)
+        self.teardown_current(SessionShutdownReason::New, target_session_file.as_deref())
             .await;
         self.apply(result);
         self.finish_session_replacement(None).await;
@@ -502,6 +507,7 @@ impl AgentSessionRuntime {
             SessionManager::in_memory(Some(&cwd), opts)?
         };
         let new_cwd = session_manager.get_cwd().to_owned();
+        let target_session_file = session_manager.get_session_file().map(str::to_owned);
         drop(sm_guard);
         drop(session);
 
@@ -511,11 +517,11 @@ impl AgentSessionRuntime {
                 cwd: new_cwd,
                 agent_dir,
                 session_manager,
-                start_reason: SessionStartReason::Startup,
+                start_reason: SessionStartReason::Fork,
                 previous_session_file,
             })
             .await?;
-        self.teardown_current(SessionShutdownReason::Fork, None)
+        self.teardown_current(SessionShutdownReason::Fork, target_session_file.as_deref())
             .await;
         self.apply(result);
         self.finish_session_replacement(None).await;
@@ -590,6 +596,7 @@ impl AgentSessionRuntime {
         let session_manager = SessionManager::open(&destination, Some(&session_dir), cwd_override)?;
         self.assert_cwd(&session_manager)?;
         let new_cwd = session_manager.get_cwd().to_owned();
+        let target_session_file = session_manager.get_session_file().map(str::to_owned);
         let result = self
             .factory
             .create(CreateAgentSessionRuntimeOptions {
@@ -600,7 +607,7 @@ impl AgentSessionRuntime {
                 previous_session_file,
             })
             .await?;
-        self.teardown_current(SessionShutdownReason::Resume, None)
+        self.teardown_current(SessionShutdownReason::Resume, target_session_file.as_deref())
             .await;
         self.apply(result);
         self.finish_session_replacement(None).await;
@@ -686,21 +693,26 @@ impl AgentSessionRuntime {
         }
     }
 
-    /// Tear down the current session: shutdown handlers → pre-invalidate → dispose.
+    /// Tear down the current session: typed `session_shutdown` emit →
+    /// pre-invalidate → dispose.
     ///
-    /// `session_shutdown` is optional (lifecycle event). Host process reap is
-    /// always performed exactly once inside [`AgentSession::dispose`] when a
-    /// concrete host is present, even without `session_shutdown` handlers.
+    /// The emit self-gates on `session_shutdown` handler presence and host
+    /// errors are isolated. Host process reap is always performed exactly
+    /// once inside [`AgentSession::dispose`] when a concrete host is present,
+    /// even without `session_shutdown` handlers.
     async fn teardown_current(
         &self,
         reason: SessionShutdownReason,
-        _target_session_file: Option<&str>,
+        target_session_file: Option<&str>,
     ) {
         let session = self.read_session();
         let runner = session.extension_runner();
-        if runner.has_handlers("session_shutdown") {
-            let _ = runner.shutdown(reason.as_str()).await;
-        }
+        let _ = runner
+            .emit(AgentSessionEvent::SessionShutdown {
+                reason,
+                target_session_file: target_session_file.map(str::to_owned),
+            })
+            .await;
         // Pre-invalidate callback (host UI teardown, sync). Falls back to the
         // session-bound shutdown handler when no runtime-level callback exists.
         let runtime_cb = self
@@ -826,6 +838,7 @@ mod tests {
     };
     use std::io;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -889,6 +902,240 @@ mod tests {
             Box::pin(async move {
                 let config = AgentSessionConfig::test_config(Arc::new(StubProvider), test_model())
                     .map_err(|e| AgentSessionRuntimeError::Factory(e.to_string()))?;
+                let session = AgentSession::new(config)
+                    .map_err(|e| AgentSessionRuntimeError::Factory(e.to_string()))?;
+                Ok(CreateAgentSessionRuntimeResult {
+                    session,
+                    services: AgentSessionRuntimeServices {
+                        cwd: PathBuf::from(&options.cwd),
+                        agent_dir: PathBuf::from(&options.agent_dir),
+                    },
+                    diagnostics: Vec::new(),
+                    model_fallback_message: None,
+                })
+            })
+        }
+    }
+
+    /// Extension runner recording lifecycle `emit` calls (shared across the
+    /// sessions a recording factory creates).
+    struct EmitRecordingRunner {
+        log: Mutex<Vec<String>>,
+    }
+
+    impl EmitRecordingRunner {
+        fn new() -> Self {
+            Self {
+                log: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn log_clone(&self) -> Vec<String> {
+            self.log
+                .lock()
+                .map(|g| g.clone())
+                .unwrap_or_else(|p| p.into_inner().clone())
+        }
+    }
+
+    impl crate::core::agent_session::ExtensionRunner for EmitRecordingRunner {
+        fn has_handlers(&self, _event: &str) -> bool {
+            true
+        }
+
+        fn emit(
+            &self,
+            event: AgentSessionEvent,
+        ) -> BoxFuture<
+            '_,
+            Result<
+                Option<crate::core::agent_session::CancelResult>,
+                crate::core::agent_session::ExtensionRunnerError,
+            >,
+        > {
+            let entry = match &event {
+                AgentSessionEvent::SessionStart {
+                    reason,
+                    previous_session_file,
+                } => format!(
+                    "session_start:{}:{}",
+                    reason.as_str(),
+                    previous_session_file.as_deref().unwrap_or("-")
+                ),
+                AgentSessionEvent::SessionShutdown {
+                    reason,
+                    target_session_file,
+                } => format!(
+                    "session_shutdown:{}:{}",
+                    reason.as_str(),
+                    target_session_file.as_deref().unwrap_or("-")
+                ),
+                other => other.type_name().to_owned(),
+            };
+            if let Ok(mut g) = self.log.lock() {
+                g.push(entry);
+            }
+            Box::pin(async { Ok(None) })
+        }
+
+        fn emit_message_end(
+            &self,
+            message: pi_agent::AgentMessage,
+        ) -> BoxFuture<
+            '_,
+            Result<
+                Option<pi_agent::AgentMessage>,
+                crate::core::agent_session::ExtensionRunnerError,
+            >,
+        > {
+            Box::pin(async move { Ok(Some(message)) })
+        }
+
+        fn emit_tool_call(
+            &self,
+            _tool_name: &str,
+            _tool_call_id: &str,
+            _input: serde_json::Map<String, serde_json::Value>,
+        ) -> BoxFuture<
+            '_,
+            Result<
+                Option<pi_agent::BeforeToolCallResult>,
+                crate::core::agent_session::ExtensionRunnerError,
+            >,
+        > {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn emit_tool_result(
+            &self,
+            _tool_name: &str,
+            _tool_call_id: &str,
+            _input: serde_json::Map<String, serde_json::Value>,
+            _content: Vec<pi_ai::ToolResultContent>,
+            _details: serde_json::Value,
+            _is_error: bool,
+        ) -> BoxFuture<
+            '_,
+            Result<
+                Option<pi_agent::AfterToolCallResult>,
+                crate::core::agent_session::ExtensionRunnerError,
+            >,
+        > {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn emit_input(
+            &self,
+            _text: &str,
+            _images: Option<serde_json::Value>,
+            _source: &str,
+            _streaming_behavior: Option<&str>,
+        ) -> BoxFuture<
+            '_,
+            Result<
+                crate::core::agent_session::InputTransformResult,
+                crate::core::agent_session::ExtensionRunnerError,
+            >,
+        > {
+            Box::pin(async { Ok(crate::core::agent_session::InputTransformResult::default()) })
+        }
+
+        fn emit_before_agent_start(
+            &self,
+            _prompt: &str,
+            _images: Option<serde_json::Value>,
+        ) -> BoxFuture<
+            '_,
+            Result<
+                Option<crate::core::agent_session::BeforeAgentStartResult>,
+                crate::core::agent_session::ExtensionRunnerError,
+            >,
+        > {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn emit_resources_discover(
+            &self,
+            _cwd: &str,
+            _reason: &str,
+        ) -> BoxFuture<
+            '_,
+            Result<
+                crate::core::resources::ResourceExtensionPaths,
+                crate::core::agent_session::ExtensionRunnerError,
+            >,
+        > {
+            Box::pin(async { Ok(crate::core::resources::ResourceExtensionPaths::default()) })
+        }
+
+        fn get_registered_commands(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn execute_command<'a>(
+            &'a self,
+            _name: &'a str,
+            _args: &'a str,
+        ) -> BoxFuture<'a, Result<bool, crate::core::agent_session::ExtensionRunnerError>>
+        {
+            Box::pin(async { Ok(false) })
+        }
+
+        fn get_all_registered_tools(
+            &self,
+        ) -> std::collections::HashMap<String, Arc<dyn pi_agent::AgentTool>> {
+            std::collections::HashMap::new()
+        }
+
+        fn get_flag_values(&self) -> std::collections::HashMap<String, serde_json::Value> {
+            std::collections::HashMap::new()
+        }
+
+        fn invalidate(&self) {}
+
+        fn emit_error(&self, _message: String) {}
+    }
+
+    /// Factory recording every `start_reason` and installing a shared
+    /// recording runner on each created session.
+    struct RecordingFactory {
+        reasons: Mutex<Vec<SessionStartReason>>,
+        runner: Arc<EmitRecordingRunner>,
+    }
+
+    impl RecordingFactory {
+        fn new(runner: Arc<EmitRecordingRunner>) -> Self {
+            Self {
+                reasons: Mutex::new(Vec::new()),
+                runner,
+            }
+        }
+
+        fn reasons_clone(&self) -> Vec<SessionStartReason> {
+            self.reasons
+                .lock()
+                .map(|g| g.clone())
+                .unwrap_or_else(|p| p.into_inner().clone())
+        }
+    }
+
+    impl CreateAgentSessionRuntimeFactory for RecordingFactory {
+        fn create(
+            &self,
+            options: CreateAgentSessionRuntimeOptions,
+        ) -> BoxFuture<'_, Result<CreateAgentSessionRuntimeResult, AgentSessionRuntimeError>>
+        {
+            if let Ok(mut g) = self.reasons.lock() {
+                g.push(options.start_reason);
+            }
+            Box::pin(async move {
+                let mut config =
+                    AgentSessionConfig::test_config(Arc::new(StubProvider), test_model())
+                        .map_err(|e| AgentSessionRuntimeError::Factory(e.to_string()))?;
+                config.session_manager = options.session_manager;
+                config.extension_runner = Some(
+                    Arc::clone(&self.runner) as Arc<dyn crate::core::agent_session::ExtensionRunner>
+                );
                 let session = AgentSession::new(config)
                     .map_err(|e| AgentSessionRuntimeError::Factory(e.to_string()))?;
                 Ok(CreateAgentSessionRuntimeResult {
@@ -1257,6 +1504,106 @@ mod tests {
             .map_err(|_| io::Error::other("timed out joining second new-session task"))??;
         first_result?;
         second_result?;
+        Ok(())
+    }
+
+    async fn make_recording_runtime()
+    -> TestResult<(AgentSessionRuntime, Arc<RecordingFactory>, Arc<EmitRecordingRunner>)> {
+        let runner = Arc::new(EmitRecordingRunner::new());
+        let factory = Arc::new(RecordingFactory::new(Arc::clone(&runner)));
+        let session_manager = SessionManager::in_memory(Some("."), None)?;
+        let runtime = create_agent_session_runtime(
+            Arc::clone(&factory) as Arc<dyn CreateAgentSessionRuntimeFactory>,
+            ".".into(),
+            ".".into(),
+            session_manager,
+        )
+        .await?;
+        Ok((runtime, factory, runner))
+    }
+
+    #[tokio::test]
+    async fn new_session_passes_new_reason_and_emits_typed_shutdown() -> TestResult {
+        let (runtime, factory, runner) = make_recording_runtime().await?;
+        runtime.new_session(NewSessionOptions::default()).await?;
+        assert_eq!(
+            factory.reasons_clone(),
+            vec![SessionStartReason::Startup, SessionStartReason::New],
+            "replacement factory must receive start_reason = New"
+        );
+        let log = runner.log_clone();
+        assert!(
+            log.iter().any(|e| e == "session_shutdown:new:-"),
+            "old session must receive typed session_shutdown{{new}} (in-memory: no target), got {log:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fork_passes_fork_reason_and_emits_typed_shutdown() -> TestResult {
+        let (runtime, factory, runner) = make_recording_runtime().await?;
+        let entry_id = {
+            let session = runtime.session();
+            let sm = session.session_manager();
+            let mut sm = sm.lock().await;
+            sm.append_message(&pi_agent::AgentMessage::Llm(Box::new(
+                pi_ai::Message::Assistant({
+                    let mut a = pi_ai::AssistantMessage::new(
+                        "test-api",
+                        "test-provider",
+                        "m",
+                        pi_agent::now_millis(),
+                    );
+                    a.stop_reason = pi_ai::StopReason::Stop;
+                    a
+                }),
+            )))?
+        };
+        runtime.fork(&entry_id, ForkPosition::At).await?;
+        assert_eq!(
+            factory.reasons_clone(),
+            vec![SessionStartReason::Startup, SessionStartReason::Fork],
+            "fork factory must receive start_reason = Fork"
+        );
+        let log = runner.log_clone();
+        assert!(
+            log.iter().any(|e| e == "session_shutdown:fork:-"),
+            "old session must receive typed session_shutdown{{fork}}, got {log:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn switch_session_emits_shutdown_with_target_session_file() -> TestResult {
+        let (runtime, factory, runner) = make_recording_runtime().await?;
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().join("switch-target.jsonl");
+        let path_str = path.to_string_lossy().into_owned();
+        runtime
+            .switch_session(&path_str, SwitchSessionOptions::default())
+            .await?;
+        assert_eq!(
+            factory.reasons_clone(),
+            vec![SessionStartReason::Startup, SessionStartReason::Resume],
+        );
+        let expected = format!("session_shutdown:resume:{path_str}");
+        let log = runner.log_clone();
+        assert!(
+            log.contains(&expected),
+            "switch must carry the new session file as targetSessionFile: want {expected}, got {log:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dispose_emits_quit_shutdown_without_target() -> TestResult {
+        let (runtime, _factory, runner) = make_recording_runtime().await?;
+        runtime.dispose().await;
+        let log = runner.log_clone();
+        assert!(
+            log.iter().any(|e| e == "session_shutdown:quit:-"),
+            "dispose must emit typed session_shutdown{{quit}} with no target, got {log:?}"
+        );
         Ok(())
     }
 }

@@ -78,6 +78,8 @@ impl TextRenderer {
             AgentSessionEvent::AgentStart
             | AgentSessionEvent::SessionBeforeSwitch { .. }
             | AgentSessionEvent::SessionBeforeFork { .. }
+            | AgentSessionEvent::SessionStart { .. }
+            | AgentSessionEvent::SessionShutdown { .. }
             | AgentSessionEvent::ModelSelect { .. }
             | AgentSessionEvent::TurnStart
             | AgentSessionEvent::ToolExecutionStart { .. }
@@ -394,6 +396,14 @@ mod tests {
             success: true,
             attempt: 1,
             final_error: None,
+        });
+        renderer.handle(&AgentSessionEvent::SessionStart {
+            reason: crate::core::agent_session::SessionStartReason::Startup,
+            previous_session_file: None,
+        });
+        renderer.handle(&AgentSessionEvent::SessionShutdown {
+            reason: crate::core::agent_session::SessionShutdownReason::Quit,
+            target_session_file: None,
         });
         assert!(renderer.last_assistant.is_some());
         Ok(())

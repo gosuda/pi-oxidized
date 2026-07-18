@@ -8,21 +8,19 @@
 //! (defined in `extension_runner.rs`). This module owns:
 //! - binding UI/mode/command/error listeners (recorded locally; pushed to the
 //!   runner once the trait gains `set_ui_context` / `bind_command_context`)
+//! - emitting the stored `session_start` event exactly once per session
+//!   instance on the first `bind_extensions` call (under `bind_lock`)
 //! - extension-driven resource discovery (skills/prompts/themes)
-//! - reload (preserves flag values, reloads settings, re-discovers resources,
-//!   and re-emits `session_start{reload}` only when bindings exist)
+//! - reload (emits `session_shutdown{reload}` on the old host, preserves flag
+//!   values, restarts the host, re-emits `session_start{reload}` on the new
+//!   host, then re-discovers resources)
 //! - the replaced-session context handed to `withSession` after runtime swap
 //! - extension error isolation (host errors never abort the session)
 //!
-//! ## Pending foundation work
-//!
-//! `AgentSessionEvent::SessionStart { reason, previous_session_file }` and
-//! `AgentSessionEvent::SessionShutdown { reason, target_session_file }` are
-//! not yet on the event enum (owned by the foundation slice). Until they
-//! land, `bind_extensions` and `reload` record state + drive resource
-//! discovery + `runner.shutdown()` but do not emit a typed lifecycle event.
-//! The `has_handlers("session_start"|"session_shutdown")` gates still run so
-//! pi-ext can observe handler presence.
+//! Divergence from upstream: reload emission is not gated on recorded
+//! bindings (`hasBindings` in `agent-session.ts`). All Rust modes bind, and
+//! `emit` self-gates on handler presence, so the gate would only suppress
+//! correct emissions.
 
 use crate::core::resources::{
     ResourceLoader, SlashCommandInfo, SlashCommandSource, SyntheticSourceInfoOptions,
@@ -31,60 +29,10 @@ use crate::core::resources::{
 use std::sync::{Arc, Mutex};
 
 use super::AgentSession;
-#[cfg(test)]
-use super::events::AgentSessionEvent;
+use super::events::{
+    AgentSessionEvent, SessionStartEvent, SessionStartReason, SessionShutdownReason,
+};
 
-/// Reason passed to `session_start`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SessionStartReason {
-    /// First bind for this session.
-    Startup,
-    /// Bind after `/reload`.
-    Reload,
-    /// Bind after new/switch/fork/import.
-    Resume,
-}
-
-impl SessionStartReason {
-    /// Wire discriminant matching TS.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Startup => "startup",
-            Self::Reload => "reload",
-            Self::Resume => "resume",
-        }
-    }
-}
-
-/// Reason passed to `session_shutdown`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SessionShutdownReason {
-    /// New session replacing this one.
-    New,
-    /// Resume/switch/import replacing this one.
-    Resume,
-    /// Fork replacing this one.
-    Fork,
-    /// `/reload`.
-    Reload,
-    /// Runtime disposal.
-    Quit,
-}
-
-impl SessionShutdownReason {
-    /// Wire discriminant matching TS.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::New => "new",
-            Self::Resume => "resume",
-            Self::Fork => "fork",
-            Self::Reload => "reload",
-            Self::Quit => "quit",
-        }
-    }
-}
 
 /// Mode the session is bound to (mirrors `AppMode` minus `Interactive`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -138,10 +86,6 @@ pub struct ExtensionBindings {
     pub shutdown_handler: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Optional error listener invoked when the host reports an extension error.
     pub on_error: Option<ExtensionErrorListener>,
-    /// Override `session_start` reason (defaults to `Startup`).
-    pub start_reason: Option<SessionStartReason>,
-    /// Optional previous session file (carried into `session_start`).
-    pub previous_session_file: Option<String>,
 }
 
 /// Context handed to `withSession` after a runtime replacement.
@@ -179,9 +123,6 @@ impl ReplacedSessionContext {
 /// Errors raised by extension binding / reload.
 #[derive(Debug, thiserror::Error)]
 pub enum ExtensionBindError {
-    /// `session_shutdown` runner call failed.
-    #[error("extension shutdown failed: {0}")]
-    Shutdown(super::extension_runner::ExtensionRunnerError),
     /// `resources_discover` failed.
     #[error("extension resource discovery failed: {0}")]
     ResourceDiscover(super::extension_runner::ExtensionRunnerError),
@@ -202,13 +143,14 @@ impl AgentSession {
         self.hooks.runner().has_handlers(event_type)
     }
 
-    /// Bind extension UI/mode/error/shutdown listeners and drive resource
-    /// discovery.
+    /// Bind extension UI/mode/error/shutdown listeners, emit the stored
+    /// `session_start` event (first bind only), and drive resource discovery.
     ///
-    /// Stores the bindings locally (forwarded to the runner once
-    /// `set_ui_context` / `bind_command_context` join the trait) and invokes
-    /// [`AgentSession::extend_resources_from_extensions`] with the bind
-    /// reason.
+    /// The whole lifecycle runs under the session `bind_lock`, so concurrent
+    /// binds are serialized: the losing bind waits for the winner's full
+    /// session_start-then-discovery sequence. The stored event is consumed
+    /// with `Option::take`, so repeated binds on the same session instance
+    /// never re-emit.
     ///
     /// # Errors
     ///
@@ -218,7 +160,7 @@ impl AgentSession {
         &self,
         bindings: ExtensionBindings,
     ) -> Result<(), ExtensionBindError> {
-        let reason = bindings.start_reason.unwrap_or(SessionStartReason::Startup);
+        let _bind_guard = self.bind_lock.lock().await;
         // Persist bindings on the inner state.
         {
             let mut inner = self.lock_inner();
@@ -233,17 +175,31 @@ impl AgentSession {
             inner
                 .extension_command_context
                 .clone_from(&bindings.command_context_actions);
-            inner
-                .previous_session_file
-                .clone_from(&bindings.previous_session_file);
         }
 
-        // Reserved: emit SessionStart { reason, previous_session_file } once
-        // AgentSessionEvent gains the typed variant. Until then, resource
-        // discovery is the observable side effect.
-        let _ = reason;
-
-        self.extend_resources_from_extensions(reason.as_str())
+        let pending = self.lock_inner().pending_session_start.take();
+        if let Some(event) = &pending {
+            // emit self-gates on has_handlers("session_start"); host errors
+            // are isolated (reported via the host error listener).
+            let _ = self
+                .hooks
+                .runner()
+                .emit(AgentSessionEvent::SessionStart {
+                    reason: event.reason,
+                    previous_session_file: event.previous_session_file.clone(),
+                })
+                .await;
+        }
+        // Non-reload start reasons map to "startup" for resources_discover
+        // (its wire contract only allows startup|reload).
+        let discover_reason = match pending {
+            Some(SessionStartEvent {
+                reason: SessionStartReason::Reload,
+                ..
+            }) => "reload",
+            _ => "startup",
+        };
+        self.extend_resources_from_extensions(discover_reason)
             .await?;
         Ok(())
     }
@@ -352,29 +308,30 @@ impl AgentSession {
     ///
     /// Mirrors TS `reload`:
     /// 1. Capture previous flag values (preserved across the swap).
-    /// 2. Emit `session_shutdown{reload}` when handlers exist.
+    /// 2. Emit `session_shutdown{reload}` on the old runner (self-gated on
+    ///    handler presence; host errors isolated).
     /// 3. When a concrete host is present: sequential restart-and-rewire
     ///    (await old transport reap exactly once, re-register providers,
     ///    restore flags, swap runner, refresh tools).
-    /// 4. Reload base resources regardless of bindings.
-    /// 5. Re-discover extension resources when the hook exists.
+    /// 4. Emit `session_start{reload}` on the post-swap runner.
+    /// 5. Reload base resources and re-discover extension resources.
     ///
     /// # Errors
     ///
-    /// Returns [`ExtensionBindError`] on shutdown, host restart, or
-    /// resource-discovery failure.
+    /// Returns [`ExtensionBindError`] on host restart or resource-discovery
+    /// failure.
     pub async fn reload(&self) -> Result<(), ExtensionBindError> {
         let runner = self.hooks.runner();
         let previous_flag_values = runner.get_flag_values();
 
-        // Lifecycle event when handlers are registered. Host transport reaping
-        // is handled below even when no session_shutdown handlers exist.
-        if runner.has_handlers("session_shutdown") {
-            runner
-                .shutdown(SessionShutdownReason::Reload.as_str())
-                .await
-                .map_err(ExtensionBindError::Shutdown)?;
-        }
+        // Lifecycle event on the old host. Emit self-gates on handler
+        // presence; host transport reaping is handled below regardless.
+        let _ = runner
+            .emit(AgentSessionEvent::SessionShutdown {
+                reason: SessionShutdownReason::Reload,
+                target_session_file: None,
+            })
+            .await;
 
         if let Some(host) = self.host_extension_runner() {
             let Some(runtime) = self.model_runtime() else {
@@ -384,6 +341,7 @@ impl AgentSession {
                 self.set_host_extension_runner(None);
                 self.hooks
                     .set_runner(Arc::new(super::extension_runner::NullExtensionRunner));
+                self.emit_session_start_reload().await;
                 self.extend_resources_from_extensions(SessionStartReason::Reload.as_str())
                     .await?;
                 return Ok(());
@@ -402,15 +360,29 @@ impl AgentSession {
                 active_tool_names: None,
                 include_all_extension_tools: true,
             });
+            self.emit_session_start_reload().await;
             self.extend_resources_from_extensions(SessionStartReason::Reload.as_str())
                 .await?;
             return Ok(());
         }
 
         // Trait-only / test path (no concrete host).
+        self.emit_session_start_reload().await;
         self.extend_resources_from_extensions(SessionStartReason::Reload.as_str())
             .await?;
         Ok(())
+    }
+
+    /// Emit `session_start{reload}` on the current (post-swap) runner.
+    async fn emit_session_start_reload(&self) {
+        let _ = self
+            .hooks
+            .runner()
+            .emit(AgentSessionEvent::SessionStart {
+                reason: SessionStartReason::Reload,
+                previous_session_file: None,
+            })
+            .await;
     }
 
     /// Build the [`ReplacedSessionContext`] for `withSession` callbacks.
@@ -525,12 +497,6 @@ impl AgentSession {
         self.lock_inner().extension_mode
     }
 
-    /// Snapshot of the previous session file (if any).
-    #[must_use]
-    pub fn previous_session_file(&self) -> Option<String> {
-        self.lock_inner().previous_session_file.clone()
-    }
-
     /// Concrete host runner handle (no trait downcast).
     #[must_use]
     pub fn host_extension_runner(
@@ -620,13 +586,17 @@ mod tests {
             .map_err(|_| io::Error::other(format!("{label} mutex poisoned")).into())
     }
 
-    /// Runner that records calls and supports toggling handler presence.
+    /// Runner that records an ordered lifecycle log and supports toggling
+    /// handler presence plus an optional emit delay (concurrency tests).
     struct TestRunner {
         has_start: AtomicBool,
         has_shutdown: AtomicBool,
         has_resources: AtomicBool,
-        shutdown_calls: Arc<Mutex<Vec<String>>>,
-        resource_calls: Arc<Mutex<Vec<String>>>,
+        /// Unified ordered call log: `session_start:{reason}:{prev|-}`,
+        /// `session_shutdown:{reason}:{target|-}`,
+        /// `resources_discover:{reason}`.
+        calls: Arc<Mutex<Vec<String>>>,
+        emit_delay: Mutex<Option<std::time::Duration>>,
         flag_values: Arc<Mutex<HashMap<String, serde_json::Value>>>,
         resource_paths: Arc<Mutex<crate::core::resources::ResourceExtensionPaths>>,
     }
@@ -637,12 +607,40 @@ mod tests {
                 has_start: AtomicBool::new(false),
                 has_shutdown: AtomicBool::new(false),
                 has_resources: AtomicBool::new(false),
-                shutdown_calls: Arc::new(Mutex::new(Vec::new())),
-                resource_calls: Arc::new(Mutex::new(Vec::new())),
+                calls: Arc::new(Mutex::new(Vec::new())),
+                emit_delay: Mutex::new(None),
                 flag_values: Arc::new(Mutex::new(HashMap::new())),
                 resource_paths: Arc::new(Mutex::new(
                     crate::core::resources::ResourceExtensionPaths::default(),
                 )),
+            }
+        }
+
+        fn record(&self, entry: String) {
+            if let Ok(mut g) = self.calls.lock() {
+                g.push(entry);
+            }
+        }
+
+        fn lifecycle_label(event: &AgentSessionEvent) -> String {
+            match event {
+                AgentSessionEvent::SessionStart {
+                    reason,
+                    previous_session_file,
+                } => format!(
+                    "session_start:{}:{}",
+                    reason.as_str(),
+                    previous_session_file.as_deref().unwrap_or("-")
+                ),
+                AgentSessionEvent::SessionShutdown {
+                    reason,
+                    target_session_file,
+                } => format!(
+                    "session_shutdown:{}:{}",
+                    reason.as_str(),
+                    target_session_file.as_deref().unwrap_or("-")
+                ),
+                other => other.type_name().to_owned(),
             }
         }
     }
@@ -659,7 +657,7 @@ mod tests {
 
         fn emit(
             &self,
-            _event: AgentSessionEvent,
+            event: AgentSessionEvent,
         ) -> BoxFuture<
             '_,
             Result<
@@ -667,7 +665,19 @@ mod tests {
                 super::super::extension_runner::ExtensionRunnerError,
             >,
         > {
-            Box::pin(async { Ok(None) })
+            let delay = self
+                .emit_delay
+                .lock()
+                .map(|guard| *guard)
+                .unwrap_or_default();
+            let label = Self::lifecycle_label(&event);
+            Box::pin(async move {
+                if let Some(delay) = delay {
+                    tokio::time::sleep(delay).await;
+                }
+                self.record(label);
+                Ok(None)
+            })
         }
 
         fn emit_message_end(
@@ -757,10 +767,8 @@ mod tests {
                 super::super::extension_runner::ExtensionRunnerError,
             >,
         > {
-            let entry = format!("{cwd}:{reason}");
-            if let Ok(mut g) = self.resource_calls.lock() {
-                g.push(entry);
-            }
+            self.record(format!("resources_discover:{reason}"));
+            let _ = cwd;
             let paths = self
                 .resource_paths
                 .lock()
@@ -796,16 +804,6 @@ mod tests {
 
         fn emit_error(&self, _message: String) {}
 
-        fn shutdown(
-            &self,
-            reason: &str,
-        ) -> BoxFuture<'_, Result<(), super::super::extension_runner::ExtensionRunnerError>>
-        {
-            if let Ok(mut g) = self.shutdown_calls.lock() {
-                g.push(reason.to_owned());
-            }
-            Box::pin(async { Ok(()) })
-        }
     }
 
     #[tokio::test]
@@ -835,25 +833,120 @@ mod tests {
             on_error: Some(Arc::new(move |_msg: &str| {
                 error_hit_clone.store(true, Ordering::SeqCst);
             })),
-            previous_session_file: Some("/old/path".into()),
             ..Default::default()
         };
         session.bind_extensions(bindings).await?;
 
         // Resource discovery invoked with "startup".
-        let resource_calls = locked_clone(&runner.resource_calls, "resource calls")?;
-        assert!(resource_calls.iter().any(|c| c.ends_with(":startup")));
+        let calls = locked_clone(&runner.calls, "calls")?;
+        assert!(calls.iter().any(|c| c == "resources_discover:startup"));
 
         // Bindings recorded.
         assert_eq!(session.extension_mode(), Some(ExtensionMode::Rpc));
-        assert_eq!(
-            session.previous_session_file().as_deref(),
-            Some("/old/path")
-        );
 
         // Error listener is routed.
         session.report_extension_error("boom");
         assert!(error_hit.load(Ordering::SeqCst));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bind_emits_stored_session_start_before_discovery() -> TestResult {
+        let runner = Arc::new(TestRunner::new());
+        runner.has_start.store(true, Ordering::SeqCst);
+        runner.has_resources.store(true, Ordering::SeqCst);
+        let mut config = AgentSessionConfig::test_config(Arc::new(StubProvider), test_model())?;
+        config.extension_runner = Some(runner.clone() as Arc<dyn ExtensionRunner>);
+        let session = AgentSession::new(config)?;
+
+        session
+            .bind_extensions(ExtensionBindings::default())
+            .await?;
+        let calls = locked_clone(&runner.calls, "calls")?;
+        assert_eq!(
+            calls,
+            vec![
+                "session_start:startup:-".to_owned(),
+                "resources_discover:startup".to_owned(),
+            ],
+            "first bind must emit session_start exactly once, before discovery"
+        );
+
+        // Second bind: no re-emission (take-guard), no second discovery.
+        session
+            .bind_extensions(ExtensionBindings::default())
+            .await?;
+        let calls = locked_clone(&runner.calls, "calls")?;
+        assert_eq!(
+            calls,
+            vec![
+                "session_start:startup:-".to_owned(),
+                "resources_discover:startup".to_owned(),
+            ],
+            "second bind must not re-emit or rediscover"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_binds_emit_start_once_before_any_discovery() -> TestResult {
+        let runner = Arc::new(TestRunner::new());
+        runner.has_start.store(true, Ordering::SeqCst);
+        runner.has_resources.store(true, Ordering::SeqCst);
+        *runner
+            .emit_delay
+            .lock()
+            .map_err(|_| io::Error::other("emit delay mutex poisoned"))? =
+            Some(std::time::Duration::from_millis(25));
+        let mut config = AgentSessionConfig::test_config(Arc::new(StubProvider), test_model())?;
+        config.extension_runner = Some(runner.clone() as Arc<dyn ExtensionRunner>);
+        let session = AgentSession::new(config)?;
+
+        let (first, second) = tokio::join!(
+            session.bind_extensions(ExtensionBindings::default()),
+            session.bind_extensions(ExtensionBindings::default()),
+        );
+        first?;
+        second?;
+
+        let calls = locked_clone(&runner.calls, "calls")?;
+        assert_eq!(
+            calls,
+            vec![
+                "session_start:startup:-".to_owned(),
+                "resources_discover:startup".to_owned(),
+            ],
+            "concurrent binds must serialize: one start strictly before one discovery"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bind_emits_replacement_reason_and_previous_file() -> TestResult {
+        let runner = Arc::new(TestRunner::new());
+        runner.has_start.store(true, Ordering::SeqCst);
+        runner.has_resources.store(true, Ordering::SeqCst);
+        let mut config = AgentSessionConfig::test_config(Arc::new(StubProvider), test_model())?;
+        config.extension_runner = Some(runner.clone() as Arc<dyn ExtensionRunner>);
+        config.session_start_event = Some(SessionStartEvent {
+            reason: SessionStartReason::New,
+            previous_session_file: Some("prev.jsonl".into()),
+        });
+        let session = AgentSession::new(config)?;
+
+        session
+            .bind_extensions(ExtensionBindings::default())
+            .await?;
+        let calls = locked_clone(&runner.calls, "calls")?;
+        assert_eq!(
+            calls,
+            vec![
+                "session_start:new:prev.jsonl".to_owned(),
+                // Non-reload replacement reasons map to "startup" for
+                // resources_discover (wire contract: startup|reload only).
+                "resources_discover:startup".to_owned(),
+            ]
+        );
         Ok(())
     }
 
@@ -955,9 +1048,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reload_emits_shutdown_and_rediscover_resources_when_bound() -> TestResult {
+    async fn reload_emits_shutdown_start_discovery_in_order() -> TestResult {
         let runner = Arc::new(TestRunner::new());
         runner.has_shutdown.store(true, Ordering::SeqCst);
+        runner.has_start.store(true, Ordering::SeqCst);
         runner.has_resources.store(true, Ordering::SeqCst);
         let mut config = AgentSessionConfig::test_config(Arc::new(StubProvider), test_model())?;
         config.extension_runner = Some(runner.clone() as Arc<dyn ExtensionRunner>);
@@ -970,18 +1064,23 @@ mod tests {
             })
             .await?;
         runner
-            .resource_calls
+            .calls
             .lock()
-            .map_err(|_| io::Error::other("resource calls mutex poisoned"))?
+            .map_err(|_| io::Error::other("calls mutex poisoned"))?
             .clear();
 
         session.reload().await?;
 
-        let shutdown_calls = locked_clone(&runner.shutdown_calls, "shutdown calls")?;
-        assert_eq!(shutdown_calls, vec!["reload".to_owned()]);
-
-        let resource_calls = locked_clone(&runner.resource_calls, "resource calls")?;
-        assert!(resource_calls.iter().any(|c| c.ends_with(":reload")));
+        let calls = locked_clone(&runner.calls, "calls")?;
+        assert_eq!(
+            calls,
+            vec![
+                "session_shutdown:reload:-".to_owned(),
+                "session_start:reload:-".to_owned(),
+                "resources_discover:reload".to_owned(),
+            ],
+            "reload must emit shutdown, then start, then rediscover"
+        );
         Ok(())
     }
 
@@ -994,16 +1093,16 @@ mod tests {
         config.extension_runner = Some(runner.clone() as Arc<dyn ExtensionRunner>);
         let session = AgentSession::new(config)?;
         session.reload().await?;
-        let shutdown_calls = locked_clone(&runner.shutdown_calls, "shutdown calls")?;
-        assert_eq!(shutdown_calls, vec!["reload".to_owned()]);
-        let resource_calls = locked_clone(&runner.resource_calls, "resource calls")?;
+        let calls = locked_clone(&runner.calls, "calls")?;
+        assert!(calls.iter().any(|c| c == "session_shutdown:reload:-"));
         assert!(
-            resource_calls.iter().any(|call| call.ends_with(":reload")),
-            "reload must refresh resources even without bindings, got {resource_calls:?}"
+            calls.iter().any(|c| c == "resources_discover:reload"),
+            "reload must refresh resources even without bindings, got {calls:?}"
         );
         Ok(())
     }
 
+    /// Runner whose lifecycle `emit` fails (dead host simulation).
     struct FailingRunner;
 
     impl ExtensionRunner for FailingRunner {
@@ -1011,21 +1110,8 @@ mod tests {
             true
         }
 
-        fn shutdown(
-            &self,
-            _reason: &str,
-        ) -> BoxFuture<'_, Result<(), super::super::extension_runner::ExtensionRunnerError>>
-        {
-            Box::pin(async {
-                Err(
-                    super::super::extension_runner::ExtensionRunnerError::Failed(
-                        "host gone".into(),
-                    ),
-                )
-            })
-        }
-
-        // All other methods default to null-runner behavior.
+        // Lifecycle emit fails; all other methods default to null-runner
+        // behavior.
         fn emit(
             &self,
             _event: AgentSessionEvent,
@@ -1036,7 +1122,13 @@ mod tests {
                 super::super::extension_runner::ExtensionRunnerError,
             >,
         > {
-            Box::pin(async { Ok(None) })
+            Box::pin(async {
+                Err(
+                    super::super::extension_runner::ExtensionRunnerError::Failed(
+                        "host gone".into(),
+                    ),
+                )
+            })
         }
 
         fn emit_message_end(
@@ -1155,15 +1247,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reload_propagates_shutdown_error() -> TestResult {
+    async fn reload_survives_lifecycle_emit_error() -> TestResult {
+        // Lifecycle emit failures are isolated (host error reporting), never
+        // fatal: reload must still complete resource rediscovery.
         let mut config = AgentSessionConfig::test_config(Arc::new(StubProvider), test_model())?;
         config.extension_runner = Some(Arc::new(FailingRunner) as Arc<dyn ExtensionRunner>);
         let session = AgentSession::new(config)?;
-        let err = match session.reload().await {
-            Ok(()) => return Err(io::Error::other("reload unexpectedly succeeded").into()),
-            Err(err) => err,
-        };
-        assert!(matches!(err, ExtensionBindError::Shutdown(_)));
+        session.reload().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bind_survives_lifecycle_emit_error() -> TestResult {
+        let mut config = AgentSessionConfig::test_config(Arc::new(StubProvider), test_model())?;
+        config.extension_runner = Some(Arc::new(FailingRunner) as Arc<dyn ExtensionRunner>);
+        let session = AgentSession::new(config)?;
+        session
+            .bind_extensions(ExtensionBindings::default())
+            .await?;
         Ok(())
     }
 

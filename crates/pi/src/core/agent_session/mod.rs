@@ -15,6 +15,9 @@
 //!
 //! Never hold a sync lock across `.await`. Never nest locks out of order:
 //!
+//! 0. `bind_lock` (`tokio::sync::Mutex`) — serializes the entire
+//!    `bind_extensions` lifecycle; held across `.await`. Acquire before any
+//!    `lock_inner()`.
 //! 1. `AgentSessionInner` (`std::sync::Mutex`) — flags, mirror queues, retry
 //!    counters, listener list, pump handle, cancellation slots.
 //! 2. `session_manager` (`tokio::sync::Mutex<SessionManager>`) — single-writer
@@ -41,11 +44,12 @@ pub mod tree;
 
 pub use events::{
     AgentSessionEvent, AgentSessionEventListener, CompactionReason, ModelSelectSource,
-    SessionBeforeForkPosition, SessionBeforeSwitchReason,
+    SessionBeforeForkPosition, SessionBeforeSwitchReason, SessionShutdownReason, SessionStartEvent,
+    SessionStartReason,
 };
 pub use extension::{
     ExtensionBindError, ExtensionBindings, ExtensionMode, ExtensionUiContext,
-    ReplacedSessionContext, SessionShutdownReason, SessionStartReason,
+    ReplacedSessionContext,
 };
 pub use extension_runner::{
     BeforeAgentStartResult, CancelResult, ExtensionRunner, ExtensionRunnerError,
@@ -125,8 +129,9 @@ pub struct AgentSessionConfig {
     pub prompt_templates: Vec<crate::core::resources::prompts::PromptTemplate>,
     /// Resource loader retained for extension-driven resource refreshes.
     pub resource_loader: Option<crate::core::resources::DefaultResourceLoader>,
-    /// Whether service construction already completed startup resource discovery.
-    pub startup_resources_discovered: bool,
+    /// Session-start metadata emitted to extensions on first bind
+    /// (`None` = default startup).
+    pub session_start_event: Option<SessionStartEvent>,
     /// Base agent loop config overrides (hooks are always installed by session).
     pub base_config: Option<AgentLoopConfig>,
 }
@@ -175,7 +180,7 @@ impl AgentSessionConfig {
             skills: Vec::new(),
             prompt_templates: Vec::new(),
             resource_loader: None,
-            startup_resources_discovered: false,
+            session_start_event: None,
             base_config: None,
         })
     }
@@ -245,9 +250,11 @@ pub(super) struct AgentSessionInner {
     pub(super) extension_error_listener: Option<ExtensionErrorListener>,
     /// Bound extension command-context actions (opaque JSON).
     pub(super) extension_command_context: Option<serde_json::Value>,
-    /// Previous session file (carried into `session_start` for resume/fork).
-    pub(super) previous_session_file: Option<String>,
-    /// Whether service construction already applied startup resource discovery.
+    /// Session-start event stored at construction, consumed by the first
+    /// `bind_extensions` call (take-guard against duplicate emission).
+    pub(super) pending_session_start: Option<SessionStartEvent>,
+    /// Whether bind-time startup resource discovery already ran
+    /// (same-session rediscovery guard).
     pub(super) initial_resources_discovered: bool,
     /// Base built-in tool definitions (insertion-ordered, first-wins on dupes).
     pub(super) base_tool_definitions: Vec<std::sync::Arc<dyn AgentTool>>,
@@ -354,7 +361,7 @@ impl AgentSessionInner {
             extension_shutdown_handler: None,
             extension_error_listener: None,
             extension_command_context: None,
-            previous_session_file: None,
+            pending_session_start: None,
             initial_resources_discovered: false,
             base_tool_definitions: Vec::new(),
             tool_registry: Vec::new(),
@@ -401,6 +408,11 @@ pub struct AgentSession {
     pub(super) resource_loader: Option<AsyncMutex<crate::core::resources::DefaultResourceLoader>>,
     /// Self handle for pump (set after construction).
     pub(super) self_handle: Mutex<Option<std::sync::Weak<AgentSession>>>,
+    /// Serializes the whole `bind_extensions` lifecycle (record → emit →
+    /// discover). Lives on the session (not `AgentSessionInner`) because it
+    /// is held across `.await`; acquire it before any `lock_inner()`, never
+    /// hold `lock_inner` across an await.
+    pub(super) bind_lock: AsyncMutex<()>,
 }
 
 /// Errors from [`AgentSession::new`].
@@ -483,9 +495,8 @@ impl AgentSession {
         let retry = config.settings_manager.get_retry_settings();
         let compaction = config.settings_manager.get_compaction_settings();
 
-        let initial_resources_discovered = config.startup_resources_discovered;
         let mut inner = AgentSessionInner::new(config.scoped_models, config.system_prompt.clone());
-        inner.initial_resources_discovered = initial_resources_discovered;
+        inner.pending_session_start = Some(config.session_start_event.unwrap_or_default());
         inner.auto_retry_enabled = retry.enabled;
         inner.max_retries = u32::try_from(retry.max_retries).unwrap_or(u32::MAX);
         inner.auto_compaction_enabled = compaction.enabled;
@@ -508,6 +519,7 @@ impl AgentSession {
             prompt_templates: Mutex::new(config.prompt_templates),
             resource_loader: config.resource_loader.map(AsyncMutex::new),
             self_handle: Mutex::new(None),
+            bind_lock: AsyncMutex::new(()),
         });
 
         // Build the initial tool registry from configured base tools and active
@@ -1312,15 +1324,6 @@ mod tests {
 
         fn emit_error(&self, _message: String) {}
 
-        fn shutdown<'a>(
-            &'a self,
-            reason: &'a str,
-        ) -> futures::future::BoxFuture<'a, Result<(), ExtensionRunnerError>> {
-            Box::pin(async move {
-                self.order.lock().await.push(format!("shutdown:{reason}"));
-                Ok(())
-            })
-        }
     }
 
     async fn collect_types(rx: &mut mpsc::UnboundedReceiver<String>, n: usize) -> Vec<String> {

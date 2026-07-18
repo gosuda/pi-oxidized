@@ -338,6 +338,20 @@ pub async fn run_print_session(
     };
     let session = runtime.session();
 
+    // Bind extensions before subscribing/prompting: emits the stored
+    // session_start{startup} and runs bind-time resource discovery
+    // (upstream print-mode parity). Bind errors are non-fatal.
+    let _ = session
+        .bind_extensions(crate::core::agent_session::ExtensionBindings {
+            mode: Some(if print_output.is_json() {
+                crate::core::agent_session::ExtensionMode::Json
+            } else {
+                crate::core::agent_session::ExtensionMode::Print
+            }),
+            ..Default::default()
+        })
+        .await;
+
     // Session header (JSON mode only).
     let header = if print_output.is_json() {
         let sm = session.session_manager();

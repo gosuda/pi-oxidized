@@ -387,7 +387,7 @@ fn build_session(options: SessionBuildOptions) -> Result<BuiltSession, String> {
         skills: options.skills,
         prompt_templates: options.prompt_templates,
         resource_loader: Some(session_result.resource_loader),
-        startup_resources_discovered: session_result.startup_resources_discovered,
+        session_start_event: session_result.session_start_event,
         base_config: None,
     };
     let session =
@@ -762,7 +762,10 @@ impl CreateAgentSessionRuntimeFactory for RealReplacementFactory {
                     tools: None,
                     exclude_tools: None,
                     no_tools: None,
-                    session_start_event: None,
+                    session_start_event: Some(crate::core::agent_session::SessionStartEvent {
+                        reason: options.start_reason,
+                        previous_session_file: options.previous_session_file.clone(),
+                    }),
                     saved_session_model,
                     has_existing_session,
                 },

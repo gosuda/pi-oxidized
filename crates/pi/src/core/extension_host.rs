@@ -1376,17 +1376,19 @@ impl HostExtensionRunner {
 
     // -- Reload / invalidate / shutdown -----------------------------------
 
-    /// Bump the reload generation, dispose every active slot, and shut down
-    /// the current host exactly once. The caller re-creates the runner (via
-    /// [`HostExtensionRunner::start`] / [`connect`](Self::connect)) for the
-    /// clean registration pass. Returns the new generation.
+    /// Bump the reload generation, dispose every active slot, and reap the
+    /// current host exactly once (reap-only; the session layer owns the
+    /// typed `session_shutdown{reload}` emission before calling this). The
+    /// caller re-creates the runner (via [`HostExtensionRunner::start`] /
+    /// [`connect`](Self::connect)) for the clean registration pass. Returns
+    /// the new generation.
     pub async fn reload(&self) -> u64 {
         let generation = self
             .inner
             .reload_generation
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
-        Self::shutdown_with_reason_once(&self.inner, "reload").await;
+        Self::shutdown_once_with_inner(&self.inner).await;
         self.inner.stale.store(true, Ordering::Relaxed);
         generation
     }
@@ -2240,37 +2242,9 @@ impl ExtensionRunner for HostExtensionRunner {
     fn emit_error(&self, message: String) {
         self.inner.publish_error("extension_error", &message, None);
     }
-
-    fn shutdown(
-        &self,
-        reason: &str,
-    ) -> BoxFuture<'_, Result<(), super::agent_session::extension_runner::ExtensionRunnerError>>
-    {
-        let inner = Arc::clone(&self.inner);
-        let reason = reason.to_owned();
-        Box::pin(async move {
-            HostExtensionRunner::shutdown_with_reason_once(&inner, &reason).await;
-            Ok(())
-        })
-    }
 }
 
 impl HostExtensionRunner {
-    async fn shutdown_with_reason_once(inner: &Arc<Inner>, reason: &str) {
-        let _guard = inner.shutdown_lock.lock().await;
-        if inner.shutdown_done.load(Ordering::Relaxed) {
-            return;
-        }
-        if inner.has_handlers("session_shutdown") {
-            let payload = serde_json::json!({ "reason": reason });
-            if let Err(error) = inner.hook_request("session_shutdown", payload).await {
-                inner.report_host_error(&error);
-            }
-        }
-        Self::reap_inner(inner).await;
-        inner.shutdown_done.store(true, Ordering::Relaxed);
-    }
-
     async fn shutdown_once_with_inner(inner: &Arc<Inner>) {
         let _guard = inner.shutdown_lock.lock().await;
         if inner.shutdown_done.load(Ordering::Relaxed) {

@@ -168,9 +168,6 @@ pub trait ExtensionRunner: Send + Sync {
 
     /// Report an extension error to the host error listener.
     fn emit_error(&self, message: String);
-
-    /// Shut down extension UI / handlers for this session.
-    fn shutdown<'a>(&'a self, reason: &'a str) -> BoxFuture<'a, Result<(), ExtensionRunnerError>>;
 }
 
 /// No-op extension runner used before `pi-ext` lands and in unit tests.
@@ -266,10 +263,6 @@ impl ExtensionRunner for NullExtensionRunner {
     fn invalidate(&self) {}
 
     fn emit_error(&self, _message: String) {}
-
-    fn shutdown(&self, _reason: &str) -> BoxFuture<'_, Result<(), ExtensionRunnerError>> {
-        Box::pin(async { Ok(()) })
-    }
 }
 
 /// System-prompt snapshot shared with the agent `prepare_next_turn` closure.

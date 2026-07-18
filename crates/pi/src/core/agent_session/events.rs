@@ -33,6 +33,76 @@ pub enum SessionBeforeSwitchReason {
     Resume,
 }
 
+/// Reason passed to `session_start`.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStartReason {
+    /// First bind for this session.
+    #[default]
+    Startup,
+    /// Bind after `/reload`.
+    Reload,
+    /// Bind after a new-session replacement.
+    New,
+    /// Bind after resume/switch/import.
+    Resume,
+    /// Bind after a fork replacement.
+    Fork,
+}
+
+impl SessionStartReason {
+    /// Wire discriminant matching TS.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::Reload => "reload",
+            Self::New => "new",
+            Self::Resume => "resume",
+            Self::Fork => "fork",
+        }
+    }
+}
+
+/// Reason passed to `session_shutdown`.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionShutdownReason {
+    /// New session replacing this one.
+    New,
+    /// Resume/switch/import replacing this one.
+    Resume,
+    /// Fork replacing this one.
+    Fork,
+    /// `/reload`.
+    Reload,
+    /// Runtime disposal.
+    Quit,
+}
+
+impl SessionShutdownReason {
+    /// Wire discriminant matching TS.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::New => "new",
+            Self::Resume => "resume",
+            Self::Fork => "fork",
+            Self::Reload => "reload",
+            Self::Quit => "quit",
+        }
+    }
+}
+
+/// Session-start metadata stored at construction and emitted on first bind.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SessionStartEvent {
+    /// Why this session started.
+    pub reason: SessionStartReason,
+    /// Previously active session file (new/resume/fork).
+    pub previous_session_file: Option<String>,
+}
+
 /// Position used for a session fork.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -80,6 +150,32 @@ pub enum AgentSessionEvent {
         entry_id: String,
         /// Whether the fork starts before or at the selected entry.
         position: SessionBeforeForkPosition,
+    },
+    /// Extension-host-facing session start (never routed through
+    /// `emit_public`; the public event stream excludes it, matching TS).
+    SessionStart {
+        /// Why this session started.
+        reason: SessionStartReason,
+        /// Previously active session file (new/resume/fork).
+        #[serde(
+            rename = "previousSessionFile",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        previous_session_file: Option<String>,
+    },
+    /// Extension-host-facing session shutdown (never routed through
+    /// `emit_public`).
+    SessionShutdown {
+        /// Why this session is shutting down.
+        reason: SessionShutdownReason,
+        /// Session file replacing this one (new/resume/fork).
+        #[serde(
+            rename = "targetSessionFile",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        target_session_file: Option<String>,
     },
     /// A new model was selected.
     ModelSelect {
@@ -321,6 +417,8 @@ impl AgentSessionEvent {
         match self {
             Self::SessionBeforeSwitch { .. } => "session_before_switch",
             Self::SessionBeforeFork { .. } => "session_before_fork",
+            Self::SessionStart { .. } => "session_start",
+            Self::SessionShutdown { .. } => "session_shutdown",
             Self::ModelSelect { .. } => "model_select",
             Self::AgentStart => "agent_start",
             Self::AgentEnd { .. } => "agent_end",
@@ -438,5 +536,86 @@ mod tests {
         let value = serde_json::to_value(&event)?;
         assert_eq!(value, json!({"type": "agent_settled"}));
         Ok(())
+    }
+
+    #[test]
+    fn session_start_wire_shape_and_round_trip() -> Result<(), serde_json::Error> {
+        let startup = AgentSessionEvent::SessionStart {
+            reason: SessionStartReason::Startup,
+            previous_session_file: None,
+        };
+        let value = serde_json::to_value(&startup)?;
+        assert_eq!(value, json!({"type": "session_start", "reason": "startup"}));
+        assert!(value.get("previousSessionFile").is_none());
+        assert_eq!(serde_json::from_value::<AgentSessionEvent>(value)?, startup);
+
+        let resume = AgentSessionEvent::SessionStart {
+            reason: SessionStartReason::Resume,
+            previous_session_file: Some("/tmp/prev.jsonl".into()),
+        };
+        let value = serde_json::to_value(&resume)?;
+        assert_eq!(
+            value,
+            json!({
+                "type": "session_start",
+                "reason": "resume",
+                "previousSessionFile": "/tmp/prev.jsonl"
+            })
+        );
+        assert_eq!(serde_json::from_value::<AgentSessionEvent>(value)?, resume);
+        Ok(())
+    }
+
+    #[test]
+    fn session_shutdown_wire_shape_and_round_trip() -> Result<(), serde_json::Error> {
+        let quit = AgentSessionEvent::SessionShutdown {
+            reason: SessionShutdownReason::Quit,
+            target_session_file: None,
+        };
+        let value = serde_json::to_value(&quit)?;
+        assert_eq!(value, json!({"type": "session_shutdown", "reason": "quit"}));
+        assert!(value.get("targetSessionFile").is_none());
+        assert_eq!(serde_json::from_value::<AgentSessionEvent>(value)?, quit);
+
+        let new = AgentSessionEvent::SessionShutdown {
+            reason: SessionShutdownReason::New,
+            target_session_file: Some("/tmp/next.jsonl".into()),
+        };
+        let value = serde_json::to_value(&new)?;
+        assert_eq!(
+            value,
+            json!({
+                "type": "session_shutdown",
+                "reason": "new",
+                "targetSessionFile": "/tmp/next.jsonl"
+            })
+        );
+        assert_eq!(serde_json::from_value::<AgentSessionEvent>(value)?, new);
+        Ok(())
+    }
+
+    #[test]
+    fn lifecycle_reason_strings_match_wire_contract() {
+        assert_eq!(
+            [
+                SessionStartReason::Startup.as_str(),
+                SessionStartReason::Reload.as_str(),
+                SessionStartReason::New.as_str(),
+                SessionStartReason::Resume.as_str(),
+                SessionStartReason::Fork.as_str(),
+            ],
+            ["startup", "reload", "new", "resume", "fork"]
+        );
+        assert_eq!(
+            [
+                SessionShutdownReason::Quit.as_str(),
+                SessionShutdownReason::Reload.as_str(),
+                SessionShutdownReason::New.as_str(),
+                SessionShutdownReason::Resume.as_str(),
+                SessionShutdownReason::Fork.as_str(),
+            ],
+            ["quit", "reload", "new", "resume", "fork"]
+        );
+        assert_eq!(SessionStartReason::default(), SessionStartReason::Startup);
     }
 }

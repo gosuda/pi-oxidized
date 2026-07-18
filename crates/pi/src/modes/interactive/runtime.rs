@@ -2852,6 +2852,8 @@ fn project_event(view: &mut ViewState, event: &AgentSessionEvent) {
         | Event::TurnEnd { .. }
         | Event::SessionBeforeSwitch { .. }
         | Event::SessionBeforeFork { .. }
+        | Event::SessionStart { .. }
+        | Event::SessionShutdown { .. }
         | Event::ModelSelect { .. } => {}
         Event::MessageStart { message } => project_message_start(view, message),
         Event::MessageUpdate { message, .. } => {
@@ -4206,13 +4208,33 @@ pub async fn run_interactive_mode(
     let host = AgentSessionHost::new(Arc::clone(&runtime));
     let host_arc = Arc::new(host);
 
-    // Rebind callback keeps AgentSessionHost's cached session Arc current.
+    // Initial bind: emits the stored session_start{startup} to extensions
+    // and runs bind-time resource discovery. Bind errors are non-fatal
+    // extension errors (the session survives with base resources).
+    let _ = host_arc
+        .session()
+        .bind_extensions(crate::core::agent_session::ExtensionBindings {
+            mode: Some(crate::core::agent_session::ExtensionMode::Tui),
+            ..Default::default()
+        })
+        .await;
+
+    // Rebind callback keeps AgentSessionHost's cached session Arc current and
+    // binds the replacement session (emitting its stored
+    // session_start{new|resume|fork}).
     {
         let host_for_rebind = Arc::clone(&host_arc);
         runtime.set_rebind_session(Some(Arc::new(move |_session| {
             let host_for_rebind = Arc::clone(&host_for_rebind);
             Box::pin(async move {
                 host_for_rebind.refresh();
+                let _ = host_for_rebind
+                    .session()
+                    .bind_extensions(crate::core::agent_session::ExtensionBindings {
+                        mode: Some(crate::core::agent_session::ExtensionMode::Tui),
+                        ..Default::default()
+                    })
+                    .await;
             })
         })));
     }
