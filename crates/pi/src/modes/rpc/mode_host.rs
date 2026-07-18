@@ -25,12 +25,13 @@ use crate::core::agent_session_runtime::{
 };
 use crate::core::compaction::CompactionResult;
 use crate::core::model_runtime::ModelRuntime;
+use crate::core::resources::{SlashCommandInfo, SlashCommandSource};
 use crate::core::sessions::{SessionEntry, SessionTreeNode};
 
 use super::server::{ModelCycleResult, RebindCallback, RpcSessionHost};
 use super::types::{
-    BashResult, ForkMessage, RpcSessionState, RpcSessionTreeNode, RpcSlashCommand, SessionStats,
-    StreamingBehavior,
+    BashResult, ForkMessage, RpcSessionState, RpcSessionTreeNode, RpcSlashCommand,
+    RpcSlashCommandSource, SessionStats, StreamingBehavior,
 };
 
 // ---------------------------------------------------------------------------
@@ -82,6 +83,18 @@ fn convert_stats(s: crate::core::agent_session::stats::SessionStats) -> SessionS
             context_window: c.context_window,
             percent: c.percent,
         }),
+    }
+}
+fn convert_slash_command(command: SlashCommandInfo) -> RpcSlashCommand {
+    RpcSlashCommand {
+        name: command.name,
+        description: command.description,
+        source: match command.source {
+            SlashCommandSource::Extension => RpcSlashCommandSource::Extension,
+            SlashCommandSource::Prompt => RpcSlashCommandSource::Prompt,
+            SlashCommandSource::Skill => RpcSlashCommandSource::Skill,
+        },
+        source_info: command.source_info.into(),
     }
 }
 
@@ -392,7 +405,14 @@ impl RpcSessionHost for Arc<AgentSessionRuntime> {
     }
 
     fn get_commands(&self) -> BoxFuture<'static, Vec<RpcSlashCommand>> {
-        Box::pin(async { Vec::new() })
+        let session = self.session();
+        Box::pin(async move {
+            session
+                .slash_commands()
+                .into_iter()
+                .map(convert_slash_command)
+                .collect()
+        })
     }
 
     fn subscribe(
@@ -408,9 +428,9 @@ impl RpcSessionHost for Arc<AgentSessionRuntime> {
 
     fn register_backpressure_hook(
         &self,
-        _hook: Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>,
+        hook: Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>,
     ) -> Box<dyn Fn() + Send + Sync> {
-        Box::new(|| {})
+        self.session().register_event_backpressure_hook(hook)
     }
 
     fn bind_extensions_rpc(

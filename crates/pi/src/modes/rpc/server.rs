@@ -36,7 +36,7 @@ use pi_ai::{ImageContent, Model, ModelThinkingLevel};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::io::AsyncRead;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::core::agent_session::events::AgentSessionEvent;
 use crate::core::agent_session::extension::{ExtensionBindings, ExtensionMode};
@@ -155,6 +155,53 @@ impl RpcSink for BufferSink {
     fn backpressure(&self) -> SinkFut {
         Box::pin(async { Ok(()) })
     }
+    fn flush(&self) -> SinkFut {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct GatedSink {
+    stdout: Arc<Mutex<Vec<u8>>>,
+    writes_started: Arc<std::sync::atomic::AtomicUsize>,
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[cfg(test)]
+impl GatedSink {
+    async fn wait_for_write(&self, target: usize) {
+        loop {
+            let started = self.started.notified();
+            if self.writes_started.load(Ordering::SeqCst) >= target {
+                return;
+            }
+            started.await;
+        }
+    }
+}
+
+#[cfg(test)]
+impl RpcSink for GatedSink {
+    fn write_stdout(&self, text: String) -> SinkFut {
+        let sink = self.clone();
+        Box::pin(async move {
+            sink.writes_started.fetch_add(1, Ordering::SeqCst);
+            sink.started.notify_waiters();
+            sink.release.notified().await;
+            sink.stdout
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(text.as_bytes());
+            Ok(())
+        })
+    }
+
+    fn backpressure(&self) -> SinkFut {
+        Box::pin(async { Ok(()) })
+    }
+
     fn flush(&self) -> SinkFut {
         Box::pin(async { Ok(()) })
     }
@@ -390,15 +437,17 @@ fn take_unsub(slot: &UnsubSlot) {
 /// Mutable server state shared between the event loop, event subscriber, and
 /// rebind callback.
 ///
-/// All stdout writes go through `write_tx` — an unbounded FIFO channel. The
-/// event loop owns the receiver and drains it as the **first** biased
-/// `select!` branch, guaranteeing response-before-events ordering: the prompt
-/// preflight callback enqueues the success line synchronously before the
-/// spawned prompt task starts the agent run, so the response is ahead of any
-/// event lines in the channel.
+/// All stdout writes go through `write_tx`. A dedicated writer actor consumes
+/// line and drain-barrier messages in FIFO order, preserving prompt-response
+/// ordering while allowing producers to await the actual server queue.
+enum WriteMessage {
+    Line(String),
+    Drain(oneshot::Sender<()>),
+}
+
 pub(crate) struct ServerState {
     sink: Arc<dyn RpcSink>,
-    write_tx: mpsc::UnboundedSender<String>,
+    write_tx: mpsc::UnboundedSender<WriteMessage>,
     proxy: ExtensionUiProxy,
     shutdown_requested: Arc<AtomicBool>,
     needs_rebind: Arc<AtomicBool>,
@@ -410,7 +459,7 @@ pub(crate) struct ServerState {
 impl ServerState {
     fn new(
         sink: Arc<dyn RpcSink>,
-        write_tx: mpsc::UnboundedSender<String>,
+        write_tx: mpsc::UnboundedSender<WriteMessage>,
         proxy: ExtensionUiProxy,
     ) -> Self {
         Self {
@@ -427,7 +476,14 @@ impl ServerState {
 
     /// Enqueue a JSONL line for ordered stdout emission (synchronous, FIFO).
     fn enqueue(&self, line: String) {
-        let _ = self.write_tx.send(line);
+        let _ = self.write_tx.send(WriteMessage::Line(line));
+    }
+
+    async fn wait_for_output(&self) {
+        let (done_tx, done_rx) = oneshot::channel();
+        if self.write_tx.send(WriteMessage::Drain(done_tx)).is_ok() {
+            let _ = done_rx.await;
+        }
     }
 
     /// Rebind extensions + subscriptions on the current session.
@@ -442,15 +498,17 @@ impl ServerState {
         take_unsub(&self.unsubscribe_backpressure);
 
         let shutdown_flag = Arc::clone(&self.shutdown_requested);
+        let shutdown_signal = Arc::clone(&self.signal);
         let error_tx = self.write_tx.clone();
         let bindings = ExtensionBindings {
             mode: Some(ExtensionMode::Rpc),
             shutdown_handler: Some(Arc::new(move || {
                 shutdown_flag.store(true, Ordering::SeqCst);
+                shutdown_signal.notify_one();
             })),
             on_error: Some(Arc::new(move |err: &str| {
                 let output = ExtensionErrorOutput::new(err, "", err);
-                let _ = error_tx.send(to_jsonl(&output));
+                let _ = error_tx.send(WriteMessage::Line(to_jsonl(&output)));
             })),
             ..Default::default()
         };
@@ -459,18 +517,21 @@ impl ServerState {
         let event_tx = self.write_tx.clone();
         let signal = Arc::clone(&self.signal);
         let unsub = host.subscribe(Arc::new(move |event: &AgentSessionEvent| {
-            let _ = event_tx.send(to_jsonl(event));
+            let _ = event_tx.send(WriteMessage::Line(to_jsonl(event)));
             if matches!(event, AgentSessionEvent::AgentSettled) {
                 signal.notify_one();
             }
         }));
         *lock_unsub(&self.unsubscribe_events) = Some(unsub);
 
-        let bp_sink = Arc::clone(&self.sink);
+        let backpressure_tx = self.write_tx.clone();
         let unsub_bp = host.register_backpressure_hook(Arc::new(move || {
-            let sink = Arc::clone(&bp_sink);
+            let write_tx = backpressure_tx.clone();
             Box::pin(async move {
-                let _ = sink.backpressure().await;
+                let (done_tx, done_rx) = oneshot::channel();
+                if write_tx.send(WriteMessage::Drain(done_tx)).is_ok() {
+                    let _ = done_rx.await;
+                }
             })
         }));
         *lock_unsub(&self.unsubscribe_backpressure) = Some(unsub_bp);
@@ -485,6 +546,7 @@ impl ServerState {
         take_unsub(&self.unsubscribe_events);
         take_unsub(&self.unsubscribe_backpressure);
         host.dispose().await;
+        self.wait_for_output().await;
         if exit_code != 143 {
             let _ = self.sink.flush().await;
         }
@@ -896,7 +958,7 @@ async fn spawn_prompt<H>(
     images: Vec<ImageContent>,
     streaming_behavior: Option<StreamingBehavior>,
     host: &H,
-    write_tx: mpsc::UnboundedSender<String>,
+    write_tx: mpsc::UnboundedSender<WriteMessage>,
 ) where
     H: RpcSessionHost + ?Sized,
 {
@@ -915,7 +977,7 @@ async fn spawn_prompt<H>(
                 .is_ok()
         {
             let response = RpcResponse::ok(success_id.clone(), "prompt");
-            let _ = success_tx.send(to_jsonl(&response));
+            let _ = success_tx.send(WriteMessage::Line(to_jsonl(&response)));
         }
         // Unblock the dispatcher after preflight so later commands cannot
         // enqueue ahead of the prompt response.
@@ -940,7 +1002,7 @@ async fn spawn_prompt<H>(
             && !error_flag.load(Ordering::SeqCst)
         {
             let response = RpcResponse::err(error_id, "prompt", msg);
-            let _ = error_tx.send(to_jsonl(&response));
+            let _ = error_tx.send(WriteMessage::Line(to_jsonl(&response)));
         }
         // If preflight never fired (host bug / panic path), still release the
         // dispatcher so the command loop cannot hang forever.
@@ -991,10 +1053,14 @@ where
         return LineOutcome::Done;
     }
 
-    let command: RpcCommand = match serde_json::from_value(parsed) {
-        Ok(cmd) => cmd,
-        Err(e) => {
-            let response = RpcResponse::err(None, "parse", format!("Failed to parse command: {e}"));
+    let command = match RpcCommand::parse_value(parsed) {
+        Ok(command) => command,
+        Err(error) => {
+            let response = RpcResponse::err(
+                error.id,
+                "parse",
+                format!("Failed to parse command: {}", error.message),
+            );
             state.enqueue(to_jsonl(&response));
             return LineOutcome::Done;
         }
@@ -1016,6 +1082,7 @@ where
 
 enum LineMsg {
     Line(String),
+    ReadError(String),
     Eof,
 }
 
@@ -1025,13 +1092,20 @@ where
 {
     let mut reader = JsonlLineReader::new(input);
     loop {
-        if let Ok(Some(line)) = reader.next_line().await {
-            if tx.send(LineMsg::Line(line)).await.is_err() {
+        match reader.next_line().await {
+            Ok(Some(line)) => {
+                if tx.send(LineMsg::Line(line)).await.is_err() {
+                    break;
+                }
+            }
+            Ok(None) => {
+                let _ = tx.send(LineMsg::Eof).await;
                 break;
             }
-        } else {
-            let _ = tx.send(LineMsg::Eof).await;
-            break;
+            Err(error) => {
+                let _ = tx.send(LineMsg::ReadError(error.to_string())).await;
+                break;
+            }
         }
     }
 }
@@ -1045,20 +1119,20 @@ where
 /// Returns the process exit code.
 ///
 /// All stdout frames (responses, events, extension errors, prompt preflight)
-/// flow through a single FIFO write channel. The `select!` drains it as the
-/// first biased branch so the event loop always flushes pending frames before
-/// processing new input — guaranteeing response-before-events ordering.
+/// flow through one writer actor. Ordered drain barriers provide backpressure
+/// without making the input/signal loop responsible for stdout progress.
 pub async fn run_rpc_loop<H, R>(host: H, sink: Arc<dyn RpcSink>, input: R) -> i32
 where
     H: RpcSessionHost,
     R: AsyncRead + Unpin + Send + 'static,
 {
-    let (write_tx, mut write_rx) = mpsc::unbounded_channel::<String>();
+    let (write_tx, write_rx) = mpsc::unbounded_channel::<WriteMessage>();
     let state = Arc::new(ServerState::new(
         Arc::clone(&sink),
         write_tx,
         ExtensionUiProxy::new(),
     ));
+    let writer_task = tokio::spawn(writer_actor(write_rx, Arc::clone(&sink)));
 
     let rebind_signal = Arc::clone(&state.signal);
     let rebind_flag = Arc::clone(&state.needs_rebind);
@@ -1079,12 +1153,6 @@ where
     let exit_code = loop {
         tokio::select! {
             biased;
-            // Drain write queue first — guarantees FIFO response-before-events.
-            line = write_rx.recv() => {
-                if let Some(line) = line {
-                    let _ = sink.write_stdout(line).await;
-                }
-            }
             () = state.signal.notified() => {
                 if state.shutdown_requested.load(Ordering::SeqCst) {
                     break 0;
@@ -1097,22 +1165,29 @@ where
                 match msg {
                     Some(LineMsg::Line(line)) => {
                         let outcome = process_input_line(&line, &host, &state).await;
+                        state.wait_for_output().await;
                         if outcome == LineOutcome::Shutdown {
                             break 0;
                         }
                     }
-                    _ => break 0,
+                    Some(LineMsg::ReadError(error)) => {
+                        let response = RpcResponse::err(
+                            None,
+                            "transport",
+                            format!("Failed to read stdin: {error}"),
+                        );
+                        state.enqueue(to_jsonl(&response));
+                        break 1;
+                    }
+                    Some(LineMsg::Eof) | None => break 0,
                 }
             }
         }
     };
 
-    // Drain remaining queued frames before cleanup.
-    while let Ok(line) = write_rx.try_recv() {
-        let _ = sink.write_stdout(line).await;
-    }
 
     state.cleanup(&host, exit_code).await;
+    writer_task.abort();
     exit_code
 }
 
@@ -1131,12 +1206,13 @@ where
     let _ = output_guard_mod::take_over_stdout();
     let sink: Arc<dyn RpcSink> = Arc::new(OutputGuardSink);
 
-    let (write_tx, mut write_rx) = mpsc::unbounded_channel::<String>();
+    let (write_tx, write_rx) = mpsc::unbounded_channel::<WriteMessage>();
     let state = Arc::new(ServerState::new(
         Arc::clone(&sink),
         write_tx,
         ExtensionUiProxy::new(),
     ));
+    let writer_task = tokio::spawn(writer_actor(write_rx, Arc::clone(&sink)));
 
     let rs = Arc::clone(&state.signal);
     let rf = Arc::clone(&state.needs_rebind);
@@ -1160,11 +1236,6 @@ where
     let exit_code = loop {
         tokio::select! {
             biased;
-            line = write_rx.recv() => {
-                if let Some(line) = line {
-                    let _ = sink.write_stdout(line).await;
-                }
-            }
             code = signal_rx.recv() => {
                 break code.unwrap_or(0);
             }
@@ -1180,23 +1251,48 @@ where
                 match msg {
                     Some(LineMsg::Line(line)) => {
                         let outcome = process_input_line(&line, &host, &state).await;
+                        state.wait_for_output().await;
                         if outcome == LineOutcome::Shutdown {
                             break 0;
                         }
                     }
-                    _ => break 0,
+                    Some(LineMsg::ReadError(error)) => {
+                        let response = RpcResponse::err(
+                            None,
+                            "transport",
+                            format!("Failed to read stdin: {error}"),
+                        );
+                        state.enqueue(to_jsonl(&response));
+                        break 1;
+                    }
+                    Some(LineMsg::Eof) | None => break 0,
                 }
             }
         }
     };
 
-    while let Ok(line) = write_rx.try_recv() {
-        let _ = sink.write_stdout(line).await;
-    }
 
     state.cleanup(&host, exit_code).await;
+    writer_task.abort();
     output_guard_mod::restore_stdout();
     exit_code
+}
+
+async fn writer_actor(
+    mut write_rx: mpsc::UnboundedReceiver<WriteMessage>,
+    sink: Arc<dyn RpcSink>,
+) {
+    while let Some(message) = write_rx.recv().await {
+        match message {
+            WriteMessage::Line(line) => {
+                let _ = sink.write_stdout(line).await;
+            }
+            WriteMessage::Drain(done) => {
+                let _ = sink.backpressure().await;
+                let _ = done.send(());
+            }
+        }
+    }
 }
 
 /// Spawn SIGTERM (→143) and SIGHUP (→129, unix-only) handlers.
@@ -1241,10 +1337,13 @@ mod tests {
     use crate::core::compaction::CompactionResult;
     use crate::core::sessions::SessionEntry;
     use crate::modes::rpc::types::{
-        RpcSessionState, RpcSessionTreeNode, RpcSlashCommand, SessionStats, SessionStatsTokens,
+        RpcSessionState, RpcSessionTreeNode, RpcSlashCommand, RpcSlashCommandSource, RpcSourceInfo,
+        RpcSourceOrigin, RpcSourceScope, SessionStats, SessionStatsTokens,
     };
     use pi_agent::QueueMode;
     use pi_ai::{ImageContent, Model, ModelThinkingLevel};
+    use std::task::{Context, Poll};
+    use tokio::io::ReadBuf;
 
     // -----------------------------------------------------------------------
     // FakeRpcHost
@@ -1254,6 +1353,7 @@ mod tests {
     struct FakeConfig {
         state: RpcSessionState,
         models: Vec<Model>,
+        commands: Vec<RpcSlashCommand>,
         cycle_model_result: Option<ModelCycleResult>,
         cycle_thinking_result: Option<ModelThinkingLevel>,
         compact_result: Option<Result<CompactionResult, String>>,
@@ -1269,6 +1369,7 @@ mod tests {
             Self {
                 state: test_state(),
                 models: vec![],
+                commands: vec![],
                 cycle_model_result: None,
                 cycle_thinking_result: None,
                 compact_result: None,
@@ -1319,11 +1420,28 @@ mod tests {
         }
     }
 
+    struct FailingInput;
+
+    impl AsyncRead for FailingInput {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "stdin transport failed",
+            )))
+        }
+    }
+
+    #[derive(Clone)]
     struct FakeRpcHost {
         cfg: Arc<Mutex<FakeConfig>>,
         calls: Arc<Mutex<Vec<String>>>,
         disposed: Arc<AtomicBool>,
         events_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<AgentSessionEvent>>>>,
+        bindings: Arc<Mutex<Option<ExtensionBindings>>>,
     }
 
     impl FakeRpcHost {
@@ -1333,6 +1451,7 @@ mod tests {
                 calls: Arc::new(Mutex::new(Vec::new())),
                 disposed: Arc::new(AtomicBool::new(false)),
                 events_tx: Arc::new(Mutex::new(None)),
+                bindings: Arc::new(Mutex::new(None)),
             }
         }
         fn rec(&self, name: &str) {
@@ -1524,7 +1643,8 @@ mod tests {
         }
         fn get_commands(&self) -> BoxFuture<'static, Vec<RpcSlashCommand>> {
             self.rec("get_commands");
-            Box::pin(async { vec![] })
+            let cfg = Arc::clone(&self.cfg);
+            Box::pin(async move { cfg.lock().unwrap().commands.clone() })
         }
         fn subscribe(
             &self,
@@ -1549,9 +1669,10 @@ mod tests {
         }
         fn bind_extensions_rpc(
             &self,
-            _bindings: ExtensionBindings,
+            bindings: ExtensionBindings,
         ) -> BoxFuture<'static, Result<(), String>> {
             self.rec("bind_extensions_rpc");
+            *self.bindings.lock().unwrap() = Some(bindings);
             Box::pin(async { Ok(()) })
         }
         fn dispose(&self) -> BoxFuture<'static, ()> {
@@ -1591,10 +1712,10 @@ mod tests {
     ) -> (
         Arc<ServerState>,
         BufferSink,
-        mpsc::UnboundedReceiver<String>,
+        mpsc::UnboundedReceiver<WriteMessage>,
     ) {
         let s = sink.clone();
-        let (write_tx, write_rx) = mpsc::unbounded_channel::<String>();
+        let (write_tx, write_rx) = mpsc::unbounded_channel::<WriteMessage>();
         let state = Arc::new(ServerState::new(
             Arc::new(sink) as Arc<dyn RpcSink>,
             write_tx,
@@ -1604,9 +1725,17 @@ mod tests {
     }
 
     /// Drain all pending write-channel frames into the sink.
-    async fn drain(sink: &BufferSink, write_rx: &mut mpsc::UnboundedReceiver<String>) {
-        while let Ok(line) = write_rx.try_recv() {
-            let _ = sink.write_stdout(line).await;
+    async fn drain(sink: &BufferSink, write_rx: &mut mpsc::UnboundedReceiver<WriteMessage>) {
+        while let Ok(message) = write_rx.try_recv() {
+            match message {
+                WriteMessage::Line(line) => {
+                    let _ = sink.write_stdout(line).await;
+                }
+                WriteMessage::Drain(done) => {
+                    let _ = sink.backpressure().await;
+                    let _ = done.send(());
+                }
+            }
         }
     }
 
@@ -1625,7 +1754,7 @@ mod tests {
     async fn dispatch_no_response(
         cmd_json: &str,
         cfg: FakeConfig,
-    ) -> (BufferSink, mpsc::UnboundedReceiver<String>) {
+    ) -> (BufferSink, mpsc::UnboundedReceiver<WriteMessage>) {
         let host = FakeRpcHost::new(cfg);
         let sink = BufferSink::new();
         let (state, sink_clone, mut write_rx) = make_state(sink);
@@ -1668,6 +1797,22 @@ mod tests {
                 .unwrap()
                 .starts_with("Failed to parse")
         );
+    }
+
+    #[tokio::test]
+    async fn field_validation_error_echoes_valid_id() {
+        let (response, _) = dispatch(
+            r#"{"type":"bash","id":"req-17","command":"true","excludeFromContext":"yes"}"#,
+            FakeConfig::default(),
+        )
+        .await;
+        assert_eq!(response["id"], "req-17");
+        assert_eq!(response["command"], "parse");
+        assert_eq!(response["success"], false);
+        assert!(response["error"]
+            .as_str()
+            .unwrap()
+            .contains("excludeFromContext"));
     }
 
     // -----------------------------------------------------------------------
@@ -1856,13 +2001,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_commands_empty() {
-        let (r, _) = dispatch(
+    async fn get_commands_returns_complete_catalog() {
+        let source_info = RpcSourceInfo {
+            path: "/tmp/resource".into(),
+            source: "test".into(),
+            scope: RpcSourceScope::Temporary,
+            origin: RpcSourceOrigin::TopLevel,
+            base_dir: None,
+        };
+        let commands = [
+            ("ext-command", RpcSlashCommandSource::Extension),
+            ("deploy", RpcSlashCommandSource::Prompt),
+            ("skill:review", RpcSlashCommandSource::Skill),
+        ]
+        .into_iter()
+        .map(|(name, source)| RpcSlashCommand {
+            name: name.into(),
+            description: Some(format!("{name} description")),
+            source,
+            source_info: source_info.clone(),
+        })
+        .collect();
+        let (response, _) = dispatch(
             r#"{"type":"get_commands","id":"gc1"}"#,
-            FakeConfig::default(),
+            FakeConfig {
+                commands,
+                ..FakeConfig::default()
+            },
         )
         .await;
-        assert!(r["data"]["commands"].is_array());
+        let catalog = response["data"]["commands"].as_array().unwrap();
+        assert_eq!(catalog.len(), 3);
+        assert_eq!(catalog[0]["source"], "extension");
+        assert_eq!(catalog[1]["source"], "prompt");
+        assert_eq!(catalog[2]["name"], "skill:review");
+        assert_eq!(catalog[2]["source"], "skill");
     }
 
     #[tokio::test]
@@ -2033,7 +2206,7 @@ mod tests {
             timeout: None,
         });
         let pending_id = req.id().to_owned();
-        let (write_tx, _write_rx) = mpsc::unbounded_channel::<String>();
+        let (write_tx, _write_rx) = mpsc::unbounded_channel::<WriteMessage>();
         let state = ServerState::new(Arc::new(sink.clone()) as Arc<dyn RpcSink>, write_tx, proxy);
         let resp_json =
             format!(r#"{{"type":"extension_ui_response","id":"{pending_id}","value":"picked"}}"#);
@@ -2100,7 +2273,7 @@ mod tests {
         // This ensures the host's emitted events go into the same write_tx queue.
         let event_tx = state.write_tx.clone();
         let unsub = host.subscribe(Arc::new(move |event: &AgentSessionEvent| {
-            let _ = event_tx.send(to_jsonl(event));
+            let _ = event_tx.send(WriteMessage::Line(to_jsonl(event)));
         }));
         *state.unsubscribe_events.lock().unwrap() = Some(unsub);
 
@@ -2149,6 +2322,39 @@ mod tests {
         assert_eq!(outcome, LineOutcome::Shutdown);
     }
 
+    #[tokio::test]
+    async fn extension_shutdown_wakes_idle_loop() {
+        let host = FakeRpcHost::new(FakeConfig::default());
+        let observer = host.clone();
+        let sink = Arc::new(BufferSink::new()) as Arc<dyn RpcSink>;
+        let (_input_writer, input_reader) = tokio::io::duplex(64);
+        let loop_task = tokio::spawn(run_rpc_loop(host, sink, input_reader));
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let handler = observer
+                    .bindings
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|bindings| bindings.shutdown_handler.clone());
+                if let Some(handler) = handler {
+                    handler();
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("extension bindings were not installed");
+
+        let code = tokio::time::timeout(std::time::Duration::from_secs(1), loop_task)
+            .await
+            .expect("idle RPC loop did not wake")
+            .expect("RPC loop task panicked");
+        assert_eq!(code, 0);
+    }
+
     // -----------------------------------------------------------------------
     // Event loop with EOF
     // -----------------------------------------------------------------------
@@ -2163,6 +2369,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn loop_stdin_read_error_is_protocol_visible_and_nonzero() {
+        let host = FakeRpcHost::new(FakeConfig::default());
+        let buffer = Arc::new(BufferSink::new());
+        let sink = Arc::clone(&buffer) as Arc<dyn RpcSink>;
+        let code = run_rpc_loop(host, sink, FailingInput).await;
+        assert_eq!(code, 1);
+        let lines = buffer.stdout_lines();
+        assert_eq!(lines.len(), 1);
+        let response: Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(response["type"], "response");
+        assert_eq!(response["command"], "transport");
+        assert_eq!(response["success"], false);
+        assert!(response["error"]
+            .as_str()
+            .unwrap()
+            .contains("stdin transport failed"));
+    }
+
+    #[tokio::test]
     async fn loop_command_then_eof() {
         let host = FakeRpcHost::new(FakeConfig::default());
         let buf = BufferSink::new();
@@ -2171,6 +2396,48 @@ mod tests {
         let code = run_rpc_loop(host, Arc::clone(&sink), input).await;
         assert_eq!(code, 0);
         assert_eq!(buf.stdout_lines().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn command_dispatch_waits_for_writer_drain() {
+        let host = FakeRpcHost::new(FakeConfig::default());
+        let observer = host.clone();
+        let gated = GatedSink::default();
+        let sink = Arc::new(gated.clone()) as Arc<dyn RpcSink>;
+        let input = &b"{\"type\":\"get_state\",\"id\":\"one\"}\n{\"type\":\"get_state\",\"id\":\"two\"}\n"[..];
+        let loop_task = tokio::spawn(run_rpc_loop(host, sink, input));
+
+        gated.wait_for_write(1).await;
+        assert_eq!(
+            observer
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| call.as_str() == "get_state")
+                .count(),
+            1,
+            "second request dispatched before first response drained"
+        );
+        gated.release.notify_one();
+
+        gated.wait_for_write(2).await;
+        gated.release.notify_one();
+        let code = tokio::time::timeout(std::time::Duration::from_secs(1), loop_task)
+            .await
+            .expect("RPC loop did not finish")
+            .expect("RPC loop task panicked");
+        assert_eq!(code, 0);
+        assert_eq!(
+            observer
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| call.as_str() == "get_state")
+                .count(),
+            2
+        );
     }
 
     #[tokio::test]
@@ -2192,7 +2459,7 @@ mod tests {
             // takes H: RpcSessionHost by value. Instead, test rebind+dispose
             // via direct calls.
             let sink = Arc::new(BufferSink::new()) as Arc<dyn RpcSink>;
-            let (write_tx, _) = mpsc::unbounded_channel::<String>();
+            let (write_tx, _) = mpsc::unbounded_channel::<WriteMessage>();
             let state = ServerState::new(sink, write_tx, ExtensionUiProxy::new());
             state.rebind(&*h).await;
             state.cleanup(&*h, 0).await;
@@ -2232,7 +2499,7 @@ mod tests {
     async fn rebind_binds_and_subscribes() {
         let host = FakeRpcHost::new(FakeConfig::default());
         let sink = Arc::new(BufferSink::new()) as Arc<dyn RpcSink>;
-        let (write_tx, _) = mpsc::unbounded_channel::<String>();
+        let (write_tx, _) = mpsc::unbounded_channel::<WriteMessage>();
         let state = ServerState::new(sink, write_tx, ExtensionUiProxy::new());
         state.rebind(&host).await;
         let calls = host.calls.lock().unwrap();

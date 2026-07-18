@@ -878,16 +878,37 @@ impl<'de> Deserialize<'de> for RpcCommand {
         D: Deserializer<'de>,
     {
         let value = Value::deserialize(deserializer)?;
-        let obj = value
-            .as_object()
-            .ok_or_else(|| de::Error::custom("rpc command must be a JSON object"))?;
+        Self::parse_value(value).map_err(|error| de::Error::custom(error.message))
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct RpcCommandParseError {
+    pub(crate) id: Option<String>,
+    pub(crate) message: String,
+}
+
+impl RpcCommand {
+    pub(crate) fn parse_value(value: Value) -> Result<Self, RpcCommandParseError> {
+        let obj = value.as_object().ok_or_else(|| RpcCommandParseError {
+            id: None,
+            message: "rpc command must be a JSON object".to_owned(),
+        })?;
+        let id = optional_string(obj, "id").map_err(|message| RpcCommandParseError {
+            id: None,
+            message,
+        })?;
         let command_type = obj
             .get("type")
             .and_then(Value::as_str)
-            .ok_or_else(|| de::Error::custom("rpc command missing type"))?
+            .ok_or_else(|| RpcCommandParseError {
+                id: id.clone(),
+                message: "rpc command missing type".to_owned(),
+            })?
             .to_owned();
-        let id = optional_string(obj, "id");
-        parse_known_command(obj, id, command_type).map_err(de::Error::custom)
+        parse_known_command(obj, id.clone(), command_type).map_err(|message| {
+            RpcCommandParseError { id, message }
+        })
     }
 }
 
@@ -903,7 +924,7 @@ fn parse_known_command(
         "abort" => Ok(RpcCommand::Abort { id }),
         "new_session" => Ok(RpcCommand::NewSession {
             id,
-            parent_session: optional_string(obj, "parentSession"),
+            parent_session: optional_string(obj, "parentSession")?,
         }),
         "get_state" => Ok(RpcCommand::GetState { id }),
         "set_model" => Ok(RpcCommand::SetModel {
@@ -919,7 +940,7 @@ fn parse_known_command(
         "set_follow_up_mode" => parse_queue_mode_cmd(obj, id, false),
         "compact" => Ok(RpcCommand::Compact {
             id,
-            custom_instructions: optional_string(obj, "customInstructions"),
+            custom_instructions: optional_string(obj, "customInstructions")?,
         }),
         "set_auto_compaction" => Ok(RpcCommand::SetAutoCompaction {
             id,
@@ -933,13 +954,13 @@ fn parse_known_command(
         "bash" => Ok(RpcCommand::Bash {
             id,
             command: required_string_owned(obj, "command")?,
-            exclude_from_context: optional_bool(obj, "excludeFromContext"),
+            exclude_from_context: optional_bool(obj, "excludeFromContext")?,
         }),
         "abort_bash" => Ok(RpcCommand::AbortBash { id }),
         "get_session_stats" => Ok(RpcCommand::GetSessionStats { id }),
         "export_html" => Ok(RpcCommand::ExportHtml {
             id,
-            output_path: optional_string(obj, "outputPath"),
+            output_path: optional_string(obj, "outputPath")?,
         }),
         "switch_session" => Ok(RpcCommand::SwitchSession {
             id,
@@ -953,7 +974,7 @@ fn parse_known_command(
         "get_fork_messages" => Ok(RpcCommand::GetForkMessages { id }),
         "get_entries" => Ok(RpcCommand::GetEntries {
             id,
-            since: optional_string(obj, "since"),
+            since: optional_string(obj, "since")?,
         }),
         "get_tree" => Ok(RpcCommand::GetTree { id }),
         "get_last_assistant_text" => Ok(RpcCommand::GetLastAssistantText { id }),
@@ -1535,7 +1556,7 @@ impl<'de> Deserialize<'de> for RpcResponse {
             )));
         }
 
-        let id = optional_string(obj, "id");
+        let id = optional_string(obj, "id").map_err(de::Error::custom)?;
         let command = required_string(obj, "command")?;
         let success = obj
             .get("success")
@@ -1958,18 +1979,18 @@ fn parse_ui_request(
             id,
             title: required_string_owned(obj, "title")?,
             message: required_string_owned(obj, "message")?,
-            timeout: optional_u64(obj, "timeout"),
+            timeout: optional_u64(obj, "timeout")?,
         }),
         "input" => Ok(RpcExtensionUiRequest::Input {
             id,
             title: required_string_owned(obj, "title")?,
-            placeholder: optional_string(obj, "placeholder"),
-            timeout: optional_u64(obj, "timeout"),
+            placeholder: optional_string(obj, "placeholder")?,
+            timeout: optional_u64(obj, "timeout")?,
         }),
         "editor" => Ok(RpcExtensionUiRequest::Editor {
             id,
             title: required_string_owned(obj, "title")?,
-            prefill: optional_string(obj, "prefill"),
+            prefill: optional_string(obj, "prefill")?,
         }),
         "notify" => parse_ui_notify(obj, id),
         "setStatus" => parse_ui_set_status(obj, id),
@@ -1996,7 +2017,7 @@ fn parse_ui_select(obj: &Map<String, Value>, id: String) -> Result<RpcExtensionU
         id,
         title,
         options,
-        timeout: optional_u64(obj, "timeout"),
+        timeout: optional_u64(obj, "timeout")?,
     })
 }
 
@@ -2189,10 +2210,11 @@ where
     map.end()
 }
 
-fn optional_string(obj: &Map<String, Value>, key: &str) -> Option<String> {
+fn optional_string(obj: &Map<String, Value>, key: &str) -> Result<Option<String>, String> {
     match obj.get(key) {
-        Some(Value::String(s)) => Some(s.clone()),
-        _ => None,
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(other) => Err(format!("field {key} must be a string, got {other}")),
     }
 }
 
@@ -2206,17 +2228,22 @@ fn required_string<E: de::Error>(obj: &Map<String, Value>, key: &str) -> Result<
     }
 }
 
-fn optional_bool(obj: &Map<String, Value>, key: &str) -> Option<bool> {
+fn optional_bool(obj: &Map<String, Value>, key: &str) -> Result<Option<bool>, String> {
     match obj.get(key) {
-        Some(Value::Bool(b)) => Some(*b),
-        _ => None,
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(other) => Err(format!("field {key} must be a boolean, got {other}")),
     }
 }
 
-fn optional_u64(obj: &Map<String, Value>, key: &str) -> Option<u64> {
+fn optional_u64(obj: &Map<String, Value>, key: &str) -> Result<Option<u64>, String> {
     match obj.get(key) {
-        Some(Value::Number(n)) => n.as_u64(),
-        _ => None,
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(number)) => number
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| format!("field {key} must be an unsigned integer, got {number}")),
+        Some(other) => Err(format!("field {key} must be an unsigned integer, got {other}")),
     }
 }
 
@@ -2539,6 +2566,44 @@ mod tests {
         if re["id"] != "42" || re["type"] != "future_command" || re["foo"] != 1 || re["bar"] != "x"
         {
             return Err(fail(format!("reserialized unknown: {re}")));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn known_optional_command_fields_reject_wrong_types() -> TestResult {
+        for raw in [
+            json!({"type": "get_state", "id": 123}),
+            json!({"type": "new_session", "parentSession": false}),
+            json!({"type": "compact", "customInstructions": 7}),
+            json!({"type": "bash", "command": "true", "excludeFromContext": "true"}),
+            json!({"type": "export_html", "outputPath": []}),
+            json!({"type": "get_entries", "since": {}}),
+        ] {
+            if from_value::<RpcCommand>(raw.clone()).is_ok() {
+                return Err(fail(format!("wrongly accepted optional field: {raw}")));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn known_optional_command_fields_accept_null() -> TestResult {
+        let command = from_value::<RpcCommand>(json!({
+            "type": "bash",
+            "id": null,
+            "command": "true",
+            "excludeFromContext": null
+        }))?;
+        if !matches!(
+            command,
+            RpcCommand::Bash {
+                id: None,
+                exclude_from_context: None,
+                ..
+            }
+        ) {
+            return Err(fail(format!("unexpected parsed command: {command:?}")));
         }
         Ok(())
     }
