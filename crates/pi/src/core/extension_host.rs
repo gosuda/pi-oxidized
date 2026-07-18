@@ -709,40 +709,70 @@ impl Inner {
     }
 
     fn slot_send(&self, slot: SanitizedSlot) {
-        if let Ok(mut slots) = self.slots.write() {
-            let key = slot.key.clone();
-            let sender = slots.entry(key).or_insert_with(|| watch::channel(None).0);
-            let _ = sender.send(Some(slot.clone()));
+        // Teardown must not be reanimated: after invalidate/shutdown a
+        // delayed in-flight slot would otherwise re-insert a watch entry.
+        // Both the active check AND the synchronous ui_tx publish run UNDER
+        // the slots lock, so they serialize against dispose_all_slots and a
+        // Slot event can never be published after the teardown Dispose.
+        let Ok(mut slots) = self.slots.write() else {
+            return;
+        };
+        if !self.active() {
+            return;
         }
+        let sender = slots
+            .entry(slot.key.clone())
+            .or_insert_with(|| watch::channel(None).0);
+        let _ = sender.send(Some(slot.clone()));
         let _ = self.ui_tx.send(ExtensionUiEvent::Slot(slot));
     }
 
     fn slot_dispose(&self, key: &str) {
-        if let Ok(mut slots) = self.slots.write() {
-            if let Some(sender) = slots.get(key) {
-                let _ = sender.send(None);
-            }
-            slots.remove(key);
+        // Same lock discipline as slot_send: watch update and public publish
+        // are one atomic step relative to teardown.
+        let Ok(mut slots) = self.slots.write() else {
+            return;
+        };
+        if !self.active() {
+            return;
         }
+        if let Some(sender) = slots.get(key) {
+            let _ = sender.send(None);
+        }
+        slots.remove(key);
         let _ = self.ui_tx.send(ExtensionUiEvent::Dispose {
             key: key.to_owned(),
         });
     }
 
-    fn dispose_all_slots(&self) {
-        let keys = if let Ok(mut slots) = self.slots.write() {
-            let keys = slots.keys().cloned().collect::<Vec<_>>();
-            for sender in slots.values() {
-                let _ = sender.send(None);
-            }
-            slots.clear();
-            keys
-        } else {
-            Vec::new()
+    fn notify_send(&self, notification: NotifyRequest) {
+        // Same lock discipline as slot_send/slot_dispose: the active check
+        // and the synchronous publish serialize against teardown so a Notify
+        // can never land after the teardown Dispose.
+        let Ok(_slots) = self.slots.write() else {
+            return;
         };
-        for key in keys {
-            let _ = self.ui_tx.send(ExtensionUiEvent::Dispose { key });
+        if !self.active() {
+            return;
         }
+        let _ = self.ui_tx.send(ExtensionUiEvent::Notify(notification));
+    }
+
+    fn dispose_all_slots(&self) {
+        // Publishing the Dispose events while still holding the lock keeps
+        // Slot-before-teardown-Dispose ordering: any concurrent slot_send
+        // either published before we acquired the lock or is dropped by the
+        // inactive gate afterwards. `broadcast::Sender::send` never blocks.
+        let Ok(mut slots) = self.slots.write() else {
+            return;
+        };
+        for (key, sender) in slots.iter() {
+            let _ = sender.send(None);
+            let _ = self
+                .ui_tx
+                .send(ExtensionUiEvent::Dispose { key: key.clone() });
+        }
+        slots.clear();
     }
 }
 
@@ -1420,14 +1450,14 @@ fn spawn_event_pump(inner: Arc<Inner>) {
         loop {
             match rx.recv().await {
                 Ok(HostEvent::UiRequest(request)) => {
-                    if !inner.ui_requests_claimed.load(Ordering::Acquire) {
+                    if !inner.active() || !inner.ui_requests_claimed.load(Ordering::Acquire) {
                         let _ = inner.client.respond_ui(default_ui_response(&request)).await;
                     } else if let Err(error) = inner.ui_requests_tx.send(request).await {
                         let _ = inner.client.respond_ui(default_ui_response(&error.0)).await;
                     }
                 }
                 Ok(HostEvent::Notify(notification)) => {
-                    let _ = inner.ui_tx.send(ExtensionUiEvent::Notify(notification));
+                    inner.notify_send(notification);
                 }
                 Ok(HostEvent::UiSlot(slot)) => {
                     forward_slot(&inner, &slot);
@@ -2157,8 +2187,10 @@ impl HostExtensionRunner {
     }
 
     async fn reap_inner(inner: &Arc<Inner>) {
-        inner.dispose_all_slots();
+        // Order matters for the slot_send/slot_dispose teardown gate: the
+        // flag must be set before dispose_all_slots takes the slots lock.
         inner.disabled.store(true, Ordering::Relaxed);
+        inner.dispose_all_slots();
         let _ = inner.client.shutdown().await;
     }
 }

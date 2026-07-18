@@ -646,6 +646,78 @@ async fn stale_slot_generation_is_dropped() -> R {
     Ok(())
 }
 
+#[tokio::test]
+async fn invalidate_drops_delayed_slot_and_notify_with_single_dispose() -> R {
+    use crate::core::extension_host::ExtensionUiEvent;
+
+    let (runner, host) = make_runner(full_snapshot()).await?;
+    let mut ui = runner.subscribe_ui();
+
+    // Barrier 1: the slot is fully inserted (public Slot event observed)
+    // before teardown starts.
+    host.emit(ui_slot_frame("w", 1, "live")).await;
+    let first = tokio::time::timeout(Duration::from_millis(500), ui.recv()).await??;
+    assert!(
+        matches!(&first, ExtensionUiEvent::Slot(slot) if slot.key == "w"),
+        "expected live slot first: {first:?}"
+    );
+
+    // Keep a burst of newer slot pushes AND notifies in flight while
+    // invalidating, so the pump's Notify path races teardown for the slots
+    // lock exactly like Slot does.
+    for generation in 2..12u64 {
+        host.emit(ui_slot_frame("w", generation, "delayed")).await;
+        host.emit(Frame {
+            id: 0,
+            kind: FrameKind::Event,
+            method: "notify".to_owned(),
+            payload: json!({"message": format!("racing {generation}"), "type": "info"}),
+        })
+        .await;
+    }
+    runner.invalidate();
+    host.emit(ui_slot_frame("w", 99, "post-teardown")).await;
+    host.emit(Frame {
+        id: 0,
+        kind: FrameKind::Event,
+        method: "notify".to_owned(),
+        payload: json!({"message": "late", "type": "info"}),
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Barrier 2: drain the ORDERED public stream and verify the lock-enforced
+    // contract: exactly one Dispose, and never a Slot/Notify after it.
+    let mut disposals = 0;
+    let mut late_events = Vec::new();
+    while let Ok(event) = ui.try_recv() {
+        match event {
+            ExtensionUiEvent::Dispose { key } => {
+                assert_eq!(key, "w");
+                disposals += 1;
+            }
+            ExtensionUiEvent::Slot(slot) if disposals == 0 => {
+                // Racing pre-teardown pushes may legally land before the
+                // Dispose; they must still be for the live key.
+                assert_eq!(slot.key, "w");
+            }
+            ExtensionUiEvent::Notify(notification) if disposals == 0 => {
+                // Racing pre-teardown notifies are legal before the Dispose.
+                assert!(notification.message.starts_with("racing"));
+            }
+            other => late_events.push(format!("{other:?}")),
+        }
+    }
+    assert_eq!(disposals, 1, "disposal must be exactly once");
+    assert!(
+        late_events.is_empty(),
+        "no slot/notify may follow the teardown dispose: {late_events:?}"
+    );
+    assert!(runner.slot_keys().is_empty(), "slot map must stay empty");
+    runner.shutdown_once().await;
+    Ok(())
+}
+
 // ===========================================================================
 // HTML renderer (strips script/style, escapes markup)
 // ===========================================================================
