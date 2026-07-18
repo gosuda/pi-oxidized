@@ -180,6 +180,11 @@ async fn run_loop(
                 tool_results: tool_results.clone(),
             });
 
+            if cancel.is_cancelled() {
+                emit_agent_end(io.sink, new_messages);
+                return Ok(());
+            }
+
             apply_prepare_next_turn(
                 current_context,
                 &mut config,
@@ -1121,6 +1126,98 @@ mod tests {
         );
         assert_eq!(count_type(&events, "agent_end"), 1);
         assert_eq!(provider.call_count(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_tools_ends_without_another_turn_or_hooks() -> TestResult {
+        let tool = Arc::new(RecordingTool::new("cancel-me"));
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                Ok(start("")),
+                Ok(done_tool(vec![
+                    ToolCall::new("c1", "cancel-me", Map::new()),
+                    ToolCall::new("c2", "cancel-me", Map::new()),
+                    ToolCall::new("c3", "cancel-me", Map::new()),
+                ])),
+            ],
+            text_script("must-not-start"),
+        ]);
+        let prepare_calls = Arc::new(AtomicUsize::new(0));
+        let stop_calls = Arc::new(AtomicUsize::new(0));
+        let steering_polls = Arc::new(AtomicUsize::new(0));
+        let follow_up_polls = Arc::new(AtomicUsize::new(0));
+        let mut config = sample_config();
+        config.tool_execution = ToolExecutionMode::Sequential;
+        config.before_tool_call = Some(Arc::new(|context, cancel| {
+            Box::pin(async move {
+                if context.tool_call.id == "c1" {
+                    cancel.cancel();
+                }
+                Ok(None)
+            })
+        }));
+        let prepare_calls_hook = Arc::clone(&prepare_calls);
+        config.prepare_next_turn = Some(Arc::new(move |_| {
+            let prepare_calls_hook = Arc::clone(&prepare_calls_hook);
+            Box::pin(async move {
+                prepare_calls_hook.fetch_add(1, Ordering::SeqCst);
+                Ok(None)
+            })
+        }));
+        let stop_calls_hook = Arc::clone(&stop_calls);
+        config.should_stop_after_turn = Some(Arc::new(move |_| {
+            let stop_calls_hook = Arc::clone(&stop_calls_hook);
+            Box::pin(async move {
+                stop_calls_hook.fetch_add(1, Ordering::SeqCst);
+                Ok(false)
+            })
+        }));
+        let steering_polls_hook = Arc::clone(&steering_polls);
+        config.get_steering_messages = Some(Arc::new(move || {
+            let steering_polls_hook = Arc::clone(&steering_polls_hook);
+            Box::pin(async move {
+                steering_polls_hook.fetch_add(1, Ordering::SeqCst);
+                Ok(Vec::new())
+            })
+        }));
+        let follow_up_polls_hook = Arc::clone(&follow_up_polls);
+        config.get_follow_up_messages = Some(Arc::new(move || {
+            let follow_up_polls_hook = Arc::clone(&follow_up_polls_hook);
+            Box::pin(async move {
+                follow_up_polls_hook.fetch_add(1, Ordering::SeqCst);
+                Ok(Vec::new())
+            })
+        }));
+
+        let (_messages, events, _) = run_prompt(
+            vec![text_user_message("cancel tools")],
+            base_context(vec![tool]),
+            config,
+            &provider,
+            CancellationToken::new(),
+        )
+        .await?;
+
+        let result_ids = events.iter().find_map(|event| match event {
+            AgentEvent::TurnEnd { tool_results, .. } if !tool_results.is_empty() => Some(
+                tool_results
+                    .iter()
+                    .map(|result| result.tool_call_id.as_str())
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        });
+        assert_eq!(result_ids, Some(vec!["c1", "c2", "c3"]));
+        assert_eq!(provider.call_count(), 1);
+        assert_eq!(prepare_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(stop_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(steering_polls.load(Ordering::SeqCst), 1);
+        assert_eq!(follow_up_polls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            &event_types(&events)[events.len() - 2..],
+            ["turn_end", "agent_end"]
+        );
         Ok(())
     }
 

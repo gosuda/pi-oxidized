@@ -236,10 +236,6 @@ async fn execute_tool_calls_sequential(
         emit_tool_result_message(&message, emit);
         finalized_calls.push(finalized);
         messages.push(message);
-
-        if cancel.is_cancelled() {
-            break;
-        }
     }
 
     Ok(ExecutedToolCallBatch {
@@ -324,9 +320,6 @@ async fn preflight_parallel_tools<E: EmitAgentEvent>(preflight: ParallelPrefligh
                 };
                 emit_tool_execution_end(&finalized, emit);
                 slots.push(ParallelSlot::Ready(finalized));
-                if cancel.is_cancelled() {
-                    break;
-                }
             }
             Preparation::Prepared(prepared) => {
                 let index = slots.len();
@@ -341,9 +334,6 @@ async fn preflight_parallel_tools<E: EmitAgentEvent>(preflight: ParallelPrefligh
                     cancel.clone(),
                     event_tx.clone(),
                 );
-                if cancel.is_cancelled() {
-                    break;
-                }
             }
         }
     }
@@ -1255,6 +1245,54 @@ mod tests {
             return Err(format!("late update not ignored: {updates:?}"));
         }
         Ok(())
+    }
+
+    async fn cancellation_preserves_all_tool_result_ids(mode: ToolExecutionMode) -> TestResult {
+        let context = context_with(vec![Arc::new(RecordingTool::new("cancel-me"))]);
+        let assistant = assistant_with_calls(vec![
+            ToolCall::new("c1", "cancel-me", Map::new()),
+            ToolCall::new("c2", "cancel-me", Map::new()),
+            ToolCall::new("c3", "cancel-me", Map::new()),
+        ]);
+        let mut config = sample_config(mode);
+        config.before_tool_call = Some(Arc::new(|context, cancel| {
+            Box::pin(async move {
+                if context.tool_call.id == "c1" {
+                    cancel.cancel();
+                }
+                Ok(None)
+            })
+        }));
+        let (_events, emit) = collect_emit();
+
+        let batch = execute_tool_calls(
+            &context,
+            &assistant,
+            &config,
+            &CancellationToken::new(),
+            &emit,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let ids: Vec<&str> = batch
+            .messages
+            .iter()
+            .map(|message| message.tool_call_id.as_str())
+            .collect();
+        if ids != ["c1", "c2", "c3"] {
+            return Err(format!("cancelled result ids were not preserved: {ids:?}"));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sequential_cancellation_preserves_all_tool_result_ids() -> TestResult {
+        cancellation_preserves_all_tool_result_ids(ToolExecutionMode::Sequential).await
+    }
+
+    #[tokio::test]
+    async fn parallel_cancellation_preserves_all_tool_result_ids() -> TestResult {
+        cancellation_preserves_all_tool_result_ids(ToolExecutionMode::Parallel).await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
