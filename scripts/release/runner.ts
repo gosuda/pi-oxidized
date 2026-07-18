@@ -40,6 +40,8 @@ export interface RunOptions {
 	readonly stdin?: string;
 	/** Throw on nonzero exit instead of returning. */
 	readonly rejectOnError?: boolean;
+	/** Positive deadline in milliseconds. On expiry the process tree is killed. */
+	readonly timeoutMs?: number;
 }
 
 /**
@@ -69,6 +71,61 @@ export class CommandFailedError extends Error {
 	}
 }
 
+/** Raised after a command exceeds its configured deadline and is terminated. */
+export class CommandTimeoutError extends Error {
+	readonly command: string;
+	readonly args: readonly string[];
+	readonly timeoutMs: number;
+	readonly stdout: string;
+	readonly stderr: string;
+
+	constructor(
+		command: string,
+		args: readonly string[],
+		timeoutMs: number,
+		stdout: string,
+		stderr: string,
+	) {
+		super(`Command "${command}" timed out after ${timeoutMs}ms`);
+		this.name = "CommandTimeoutError";
+		this.command = command;
+		this.args = args;
+		this.timeoutMs = timeoutMs;
+		this.stdout = stdout;
+		this.stderr = stderr;
+	}
+}
+
+/** Kill a spawned process and its descendants without invoking a shell. */
+async function terminateProcessTree(
+	child: ReturnType<typeof spawn>,
+): Promise<void> {
+	const pid = child.pid;
+	if (pid === undefined) {
+		child.kill("SIGKILL");
+		return;
+	}
+	if (process.platform !== "win32") {
+		try {
+			process.kill(-pid, "SIGKILL");
+		} catch {
+			child.kill("SIGKILL");
+		}
+		return;
+	}
+
+	await new Promise<void>((resolve) => {
+		const killer = spawn("taskkill", ["/pid", String(pid), "/t", "/f"], {
+			stdio: "ignore",
+		});
+		killer.once("error", () => {
+			child.kill("SIGKILL");
+			resolve();
+		});
+		killer.once("close", () => resolve());
+	});
+}
+
 /**
  * Default `CommandRunner`: spawn `command` with `args` and capture combined
  * stdout/stderr. Honors `options.stdin`, `options.cwd`, `options.env`.
@@ -79,10 +136,17 @@ export class SpawnRunner implements CommandRunner {
 		args: readonly string[],
 		options: RunOptions = {},
 	): Promise<RunResult> {
+		if (
+			options.timeoutMs !== undefined &&
+			(!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0)
+		) {
+			throw new RangeError(`timeoutMs must be positive, got ${options.timeoutMs}`);
+		}
 		const env = options.env ? { ...process.env, ...options.env } : { ...process.env };
 		const child = spawn(command, [...args], {
 			cwd: options.cwd,
 			env,
+			detached: process.platform !== "win32",
 			stdio: [options.stdin !== undefined ? "pipe" : "ignore", "pipe", "pipe"],
 		});
 		// Attach close/error listeners BEFORE consuming stdio so a spawn
@@ -106,8 +170,20 @@ export class SpawnRunner implements CommandRunner {
 			if (!child.stderr) return;
 			for await (const chunk of child.stderr) stderr += chunk.toString("utf8");
 		})();
+		let timedOut = false;
+		const timeout = options.timeoutMs === undefined
+			? undefined
+			: setTimeout(() => {
+				timedOut = true;
+				void terminateProcessTree(child);
+			}, options.timeoutMs);
+		timeout?.unref();
 		const exitCode = await exit.promise;
+		if (timeout !== undefined) clearTimeout(timeout);
 		await Promise.all([drainStdout, drainStderr]);
+		if (timedOut && options.timeoutMs !== undefined) {
+			throw new CommandTimeoutError(command, args, options.timeoutMs, stdout, stderr);
+		}
 		const result: RunResult = { exitCode, stdout, stderr };
 		if (options.rejectOnError && exitCode !== 0) {
 			throw new CommandFailedError(result, command, args);

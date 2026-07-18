@@ -30,23 +30,28 @@
  * fail the release.
  */
 
-import { spawn } from "node:child_process";
 import { mkdir, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 
-import { checksumLine, sha256Bytes, writeTarGz, writeZip } from "./release/archive.ts";
+import { checksumLine, extractZip, sha256Bytes, writeTarGz, writeZip } from "./release/archive.ts";
 import { parseReleaseArgs } from "./release/args.ts";
-import { buildHost } from "./release/host.ts";
+import {
+	buildHost,
+	helloRequestLine,
+	HOST_COMPATIBILITY_VERSION,
+	HOST_PROTOCOL_VERSION,
+	isHelloAckLine,
+} from "./release/host.ts";
 import { realFs, SpawnRunner, type CommandRunner, type Fs } from "./release/runner.ts";
 import { pathExists } from "./release/runner.ts";
+import { provisionBunRuntime } from "./release/runtime.ts";
 import { assembleRelease } from "./release/stage.ts";
-import type { TargetPlan } from "./release/targets.ts";
+import { archiveName, type TargetPlan } from "./release/targets.ts";
 
-/** Compatibility version stamped into the manifest and host hello payload. */
-const COMPATIBILITY_VERSION = "0.80.10";
+const CARGO_BUILD_TIMEOUT_MS = 30 * 60_000;
+const ARCHIVE_TOOL_TIMEOUT_MS = 2 * 60_000;
+const SMOKE_TIMEOUT_MS = 30_000;
 
-/** Protocol version stamped into the manifest and host hello payload. */
-const PROTOCOL_VERSION = 1;
 
 async function main(): Promise<void> {
 	const args = parseReleaseArgs(process.argv.slice(2));
@@ -89,7 +94,7 @@ async function main(): Promise<void> {
 			const cargoRes = await runner.run(
 				"cargo",
 				["build", "-p", "pi", "--release", "--locked", "--target", args.plan.rustTarget],
-				{ cwd: repoRoot },
+				{ cwd: repoRoot, timeoutMs: CARGO_BUILD_TIMEOUT_MS },
 			);
 			if (cargoRes.exitCode !== 0) {
 				throw new Error(`Cargo build failed: ${cargoRes.stderr.slice(0, 2000)}`);
@@ -120,17 +125,20 @@ async function main(): Promise<void> {
 			);
 		}
 
-		// Optional runtime for the runtime-bundle fallback path. In dry-run we
-		// write a mock so assembly completes; otherwise the caller is
-		// responsible for placing the official Bun runtime alongside the host.
-		const bunRuntimePath = host.kind === "runtime-bundle"
-			? join(stagingRoot, args.plan.bunRuntimeName)
-			: undefined;
-		if (args.dryRun && bunRuntimePath !== undefined) {
-			await fs.writeFile(
-				bunRuntimePath,
-				`mock-bun-runtime ${args.plan.bunTarget} source-date-epoch=${args.sourceDateEpoch}\n`,
-			);
+		// A runtime-bundle is self-contained: provision the exact pinned Bun
+		// executable at the path returned by the host builder.
+		let bunRuntimePath: string | undefined;
+		if (host.kind === "runtime-bundle") {
+			bunRuntimePath = host.runtimePath;
+			if (args.dryRun) {
+				await fs.writeFile(
+					bunRuntimePath,
+					`mock-bun-runtime ${args.plan.bunTarget} source-date-epoch=${args.sourceDateEpoch}\n`,
+				);
+			} else {
+				process.stdout.write(`  Provisioning checksum-verified Bun runtime ${args.plan.bunTarget}...\n`);
+				await provisionBunRuntime({ plan: args.plan, destination: bunRuntimePath, fs });
+			}
 		}
 
 		// 3. Assembly & verification.
@@ -148,8 +156,8 @@ async function main(): Promise<void> {
 			bunRuntimePath,
 			fs,
 			sourceDateEpoch: parseInt(args.sourceDateEpoch, 10),
-			compatibilityVersion: COMPATIBILITY_VERSION,
-			protocolVersion: PROTOCOL_VERSION,
+			compatibilityVersion: HOST_COMPATIBILITY_VERSION,
+			protocolVersion: HOST_PROTOCOL_VERSION,
 			createdAt: new Date(parseInt(args.sourceDateEpoch, 10) * 1000).toISOString(),
 			docsSource: join(repoRoot, "crates", "pi", "docs"),
 			examplesSource: join(
@@ -165,7 +173,7 @@ async function main(): Promise<void> {
 
 		// 4. Deterministic archive.
 		process.stdout.write(`[4/6] Creating deterministic archive...\n`);
-		const archiveBase = `pi-${pkgJson.version}-${args.plan.archiveDir}.${args.plan.archive}`;
+		const archiveBase = archiveName(pkgJson.version, args.plan);
 		const archivePath = join(stagingRoot, archiveBase);
 		const entries: { path: string; data: Uint8Array; mode: number }[] = [];
 		for (const file of assembly.manifest.files) {
@@ -176,6 +184,11 @@ async function main(): Promise<void> {
 				mode: file.executable ? 0o755 : 0o644,
 			});
 		}
+		entries.push({
+			path: `${args.plan.archiveDir}/release.json`,
+			data: await fs.readFile(join(assembly.stagingDir, "release.json")),
+			mode: 0o644,
+		});
 		const archiveOpts = { sourceDateEpoch: parseInt(args.sourceDateEpoch, 10) };
 		if (args.plan.archive === "zip") {
 			await writeZip(entries, archivePath, archiveOpts);
@@ -205,7 +218,7 @@ async function main(): Promise<void> {
 		await rm(smokeRoot, { recursive: true, force: true });
 		await mkdir(smokeRoot, { recursive: true });
 		try {
-			await unpackArchive(archivePath, args.plan, smokeRoot);
+			await unpackArchive(archivePath, args.plan, smokeRoot, runner);
 			await smokeUnpacked({
 				fs,
 				runner,
@@ -235,45 +248,26 @@ interface SmokeOptions {
 	readonly dryRun: boolean;
 }
 
-/**
- * Extract the finalized archive using the host's `tar` / `unzip`. The
- * archive layout is always `<archiveDir>/<file>`; the smoke step expects
- * `archiveDir` to point at that inner directory after extraction.
- */
+/** Extract the finalized archive into the smoke directory. */
 async function unpackArchive(
 	archivePath: string,
 	plan: TargetPlan,
 	smokeRoot: string,
+	runner: CommandRunner,
 ): Promise<void> {
 	if (plan.archive === "zip") {
-		await runHostTool(["unzip", "-q", archivePath, "-d", smokeRoot]);
-	} else {
-		await runHostTool(["tar", "-xzf", archivePath, "-C", smokeRoot]);
+		await extractZip(archivePath, smokeRoot);
+		return;
+	}
+	const result = await runner.run("tar", ["-xzf", archivePath, "-C", smokeRoot], {
+		rejectOnError: false,
+		timeoutMs: ARCHIVE_TOOL_TIMEOUT_MS,
+	});
+	if (result.exitCode !== 0) {
+		throw new Error(`tar exited ${result.exitCode}: ${result.stderr.slice(0, 500)}`);
 	}
 }
 
-/**
- * Invoke a host shell tool (`tar`, `unzip`) via `node:child_process`. These
- * are POSIX utilities available on the dev host and CI runners, so we don't
- * pull in another zip/tar implementation just for the smoke step.
- */
-function runHostTool(args: readonly string[]): Promise<void> {
-	const { promise, resolve, reject } = Promise.withResolvers<void>();
-	const child = spawn(args[0] ?? "", args.slice(1), { stdio: ["ignore", "pipe", "pipe"] });
-	let stderr = "";
-	child.stderr?.on("data", (chunk: Buffer) => {
-		stderr += chunk.toString("utf8");
-	});
-	child.on("error", (err: Error) => reject(err));
-	child.on("close", (code: number | null) => {
-		if (code === 0) {
-			resolve();
-		} else {
-			reject(new Error(`${args[0]} exited ${code}: ${stderr.slice(0, 500)}`));
-		}
-	});
-	return promise;
-}
 
 /**
  * Run two smoke checks against the unpacked archive.
@@ -302,8 +296,15 @@ export async function smokeUnpacked(opts: SmokeOptions): Promise<void> {
 				`  [dry-run] ${plan.hostBinaryName}: present (${hstat.size} bytes) — handshake skipped\n`,
 			);
 		} else {
+			const runtime = join(archiveDir, plan.bunRuntimeName);
+			const script = join(archiveDir, plan.hostBundleName);
+			if (!(await pathExists(fs, runtime)) || !(await pathExists(fs, script))) {
+				throw new Error(
+					`unpack smoke: missing ${plan.hostBinaryName} and incomplete runtime-bundle fallback`,
+				);
+			}
 			process.stdout.write(
-				`  [dry-run] ${plan.hostBinaryName}: absent (runtime-bundle fallback)\n`,
+				`  [dry-run] ${plan.bunRuntimeName} + ${plan.hostBundleName}: present — handshake skipped\n`,
 			);
 		}
 		return;
@@ -312,6 +313,7 @@ export async function smokeUnpacked(opts: SmokeOptions): Promise<void> {
 	const versionRes = await runner.run(piInArchive, ["--version"], {
 		rejectOnError: false,
 		cwd: archiveDir,
+		timeoutMs: SMOKE_TIMEOUT_MS,
 	});
 	if (versionRes.exitCode !== 0) {
 		throw new Error(
@@ -319,42 +321,39 @@ export async function smokeUnpacked(opts: SmokeOptions): Promise<void> {
 		);
 	}
 	process.stdout.write(`  pi --version: ${versionRes.stdout.trim() || "(no output)"}\n`);
-	// Handshake against the compiled sidecar only (runtime-bundle has no
-	// standalone binary). The handshake is the strongest proof the host is
-	// both binary-buildable and protocol-compatible.
+	// Prefer the compiled sibling, then exercise the shipped Bun+JS fallback.
 	const hostBin = join(archiveDir, plan.hostBinaryName);
+	let hostProgram = hostBin;
+	let hostArgs: readonly string[] = [];
 	if (!(await pathExists(fs, hostBin))) {
-		process.stdout.write(
-			`  [skip] host hello handshake: ${plan.hostBinaryName} not in archive (runtime-bundle target)\n`,
-		);
-		return;
+		const runtime = join(archiveDir, plan.bunRuntimeName);
+		const script = join(archiveDir, plan.hostBundleName);
+		if (!(await pathExists(fs, runtime))) {
+			throw new Error(`unpack smoke: missing ${plan.hostBinaryName} and ${plan.bunRuntimeName}`);
+		}
+		if (!(await pathExists(fs, script))) {
+			throw new Error(`unpack smoke: missing ${plan.hostBinaryName} and ${plan.hostBundleName}`);
+		}
+		hostProgram = runtime;
+		hostArgs = [script];
 	}
-	const helloLine =
-		JSON.stringify({
-			id: 1,
-			kind: "req",
-			method: "hello",
-			payload: {
-				protocolVersion: PROTOCOL_VERSION,
-				compatibilityVersion: COMPATIBILITY_VERSION,
-			},
-		}) + "\n";
-	const hostRes = await runner.run(hostBin, [], {
-		stdin: helloLine,
+	const hostRes = await runner.run(hostProgram, hostArgs, {
+		stdin: helloRequestLine(),
 		rejectOnError: false,
 		cwd: archiveDir,
+		timeoutMs: SMOKE_TIMEOUT_MS,
 	});
 	const firstLine = hostRes.stdout.split("\n", 1)[0] ?? "";
-	const ok =
-		firstLine.includes('"method":"hello"') &&
-		firstLine.includes('"kind":"res"') &&
-		firstLine.includes(`"protocolVersion":${PROTOCOL_VERSION}`);
-	if (!ok) {
+	if (hostRes.exitCode !== 0 || !isHelloAckLine(firstLine)) {
 		throw new Error(
-			`unpack smoke: host hello handshake failed (exit ${hostRes.exitCode}): ${firstLine.slice(0, 500)}`,
+			`unpack smoke: host hello handshake failed (exit ${hostRes.exitCode}): ${firstLine.slice(0, 500)}; stderr=${hostRes.stderr.slice(0, 500)}`,
 		);
 	}
-	process.stdout.write(`  host hello handshake: OK\n`);
+	process.stdout.write(
+		hostProgram === hostBin
+			? `  host hello handshake: OK\n`
+			: `  runtime-bundle host hello handshake: OK\n`,
+	);
 }
 
 

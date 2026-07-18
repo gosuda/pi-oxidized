@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { buildHost } from "../release/host.ts";
+import { buildHost, isHelloAckLine } from "../release/host.ts";
 import { OK_RUN, RecordingRunner, type RunResult } from "../release/runner.ts";
 import { planFor } from "../release/targets.ts";
 
@@ -69,5 +69,70 @@ describe("buildHost", () => {
 
 		const fixtureCall = runner.calls.find((c) => c.command.includes("runtime-import-test"));
 		expect(fixtureCall).toBeUndefined();
+		expect(runner.calls.every((call) => (call.options?.timeoutMs ?? 0) > 0)).toBe(true);
+	});
+
+	test("falls back to consistently named Bun and JavaScript assets", async () => {
+		const plan = planFor("x86_64-unknown-linux-gnu");
+		let buildCount = 0;
+		const runner = new RecordingRunner((call): RunResult => {
+			if (call.command === "bun" && call.args[0] === "build") {
+				buildCount++;
+				if (call.args.includes("--compile")) {
+					return { exitCode: 1, stdout: "", stderr: "compile unsupported" };
+				}
+				const outIndex = call.args.indexOf("--outfile");
+				const scriptPath = call.args[outIndex + 1];
+				if (scriptPath !== undefined) writeFileSync(scriptPath, "bundled-host");
+			}
+			return OK_RUN;
+		});
+
+		const host = await buildHost({
+			repoRoot: "/workspace",
+			stagingRoot: work,
+			plan,
+			skipTests: true,
+			skipRuntimeImport: true,
+			skipHandshake: true,
+			runner,
+		});
+
+		expect(host).toEqual({
+			kind: "runtime-bundle",
+			runtimePath: join(work, "host", plan.rustTarget, plan.bunRuntimeName),
+			scriptPath: join(work, "host", plan.rustTarget, plan.hostBundleName),
+		});
+		expect(buildCount).toBe(2);
+		const bundleCall = runner.calls.find(
+			(call) => call.args[0] === "build" && !call.args.includes("--compile"),
+		);
+		expect(bundleCall?.args).not.toContain("--outdir");
+		expect(bundleCall?.args.at(-2)).toBe("--outfile");
+		expect(bundleCall?.args.at(-1)).toBe(
+			join(work, "host", plan.rustTarget, plan.hostBundleName),
+		);
+		expect(runner.calls.every((call) => (call.options?.timeoutMs ?? 0) > 0)).toBe(true);
+	});
+});
+
+describe("isHelloAckLine", () => {
+	test("accepts only strict protocol and compatibility acknowledgements", () => {
+		const canonical = JSON.stringify({
+			kind: "res",
+			method: "hello",
+			payload: { protocolVersion: 1, compatibilityVersion: "0.80.10" },
+		});
+		expect(isHelloAckLine(canonical)).toBe(true);
+		expect(isHelloAckLine(`prefix ${canonical}`)).toBe(false);
+		expect(
+			isHelloAckLine(
+				JSON.stringify({
+					kind: "res",
+					method: "hello",
+					payload: { protocolVersion: 1, compatibilityVersion: "wrong" },
+				}),
+			),
+		).toBe(false);
 	});
 });

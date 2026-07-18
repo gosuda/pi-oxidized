@@ -13,8 +13,8 @@
  */
 
 import { createHash } from "node:crypto";
-import { mkdir, writeFile, readFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { chmod, mkdir, writeFile, readFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 
 /** A single byte stream to pack into an archive, with its in-archive path. */
 export interface ArchiveEntry {
@@ -110,6 +110,9 @@ export function safeRelativePath(input: string): string {
 	if (input.length === 0) {
 		throw new TraversalError("archive path is empty");
 	}
+	if (input.includes("\0")) {
+		throw new TraversalError(`archive path contains a null byte: ${input}`);
+	}
 	if (input.includes("\\")) {
 		throw new TraversalError(`archive path contains backslash: ${input}`);
 	}
@@ -123,6 +126,9 @@ export function safeRelativePath(input: string): string {
 		}
 		if (seg === "." || seg === "..") {
 			throw new TraversalError(`archive path escapes root: ${input}`);
+		}
+		if (seg.includes(":")) {
+			throw new TraversalError(`archive path contains a drive separator: ${input}`);
 		}
 	}
 	return input;
@@ -332,6 +338,172 @@ function encodeZipArchive(entries: readonly ArchiveEntry[], mtimeSeconds: number
 
 	return concatBytes([...fileRecords, centralBytes, eocd]);
 }
+
+const ZIP_LOCAL_SIGNATURE = 0x04034b50;
+const ZIP_CENTRAL_SIGNATURE = 0x02014b50;
+const ZIP_EOCD_SIGNATURE = 0x06054b50;
+const ZIP_MAX_ENTRIES = 10_000;
+const ZIP_MAX_UNCOMPRESSED_BYTES = 512 * 1024 * 1024;
+
+/** Decode regular files from a standard, non-encrypted ZIP archive. */
+export function decodeZipArchive(bytes: Uint8Array): ArchiveEntry[] {
+	const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+	const eocdOffset = findZipEocd(view);
+	const disk = view.getUint16(eocdOffset + 4, true);
+	const centralDisk = view.getUint16(eocdOffset + 6, true);
+	const entriesOnDisk = view.getUint16(eocdOffset + 8, true);
+	const entryCount = view.getUint16(eocdOffset + 10, true);
+	const centralSize = view.getUint32(eocdOffset + 12, true);
+	const centralOffset = view.getUint32(eocdOffset + 16, true);
+	if (disk !== 0 || centralDisk !== 0 || entriesOnDisk !== entryCount) {
+		throw new Error("multi-disk ZIP archives are not supported");
+	}
+	if (entryCount === 0xffff || centralSize === 0xffffffff || centralOffset === 0xffffffff) {
+		throw new Error("ZIP64 archives are not supported");
+	}
+	if (entryCount > ZIP_MAX_ENTRIES) {
+		throw new Error(`ZIP archive has too many entries: ${entryCount}`);
+	}
+	requireZipRange(bytes, centralOffset, centralSize, "central directory");
+
+	const decoded: ArchiveEntry[] = [];
+	const seen = new Set<string>();
+	let totalSize = 0;
+	let offset = centralOffset;
+	for (let index = 0; index < entryCount; index++) {
+		requireZipRange(bytes, offset, 46, `central entry ${index}`);
+		if (view.getUint32(offset, true) !== ZIP_CENTRAL_SIGNATURE) {
+			throw new Error(`invalid ZIP central entry signature at ${offset}`);
+		}
+		const flags = view.getUint16(offset + 8, true);
+		const method = view.getUint16(offset + 10, true);
+		const expectedCrc = view.getUint32(offset + 16, true);
+		const compressedSize = view.getUint32(offset + 20, true);
+		const uncompressedSize = view.getUint32(offset + 24, true);
+		const nameLength = view.getUint16(offset + 28, true);
+		const extraLength = view.getUint16(offset + 30, true);
+		const commentLength = view.getUint16(offset + 32, true);
+		const externalAttrs = view.getUint32(offset + 38, true);
+		const localOffset = view.getUint32(offset + 42, true);
+		const recordLength = 46 + nameLength + extraLength + commentLength;
+		requireZipRange(bytes, offset, recordLength, `central entry ${index}`);
+		if ((flags & 1) !== 0) throw new Error("encrypted ZIP entries are not supported");
+		if (method !== 0 && method !== 8) {
+			throw new Error(`unsupported ZIP compression method ${method}`);
+		}
+		const rawName = new TextDecoder("utf-8", { fatal: true }).decode(
+			bytes.subarray(offset + 46, offset + 46 + nameLength),
+		);
+		const isDirectory = rawName.endsWith("/");
+		const path = safeRelativePath(isDirectory ? rawName.slice(0, -1) : rawName);
+		if (seen.has(path)) throw new Error(`duplicate ZIP entry: ${path}`);
+		seen.add(path);
+		offset += recordLength;
+		if (isDirectory) continue;
+
+		totalSize += uncompressedSize;
+		if (totalSize > ZIP_MAX_UNCOMPRESSED_BYTES) {
+			throw new Error("ZIP archive exceeds the uncompressed size limit");
+		}
+		requireZipRange(bytes, localOffset, 30, `local entry ${path}`);
+		if (view.getUint32(localOffset, true) !== ZIP_LOCAL_SIGNATURE) {
+			throw new Error(`invalid ZIP local entry signature for ${path}`);
+		}
+		const localNameLength = view.getUint16(localOffset + 26, true);
+		const localExtraLength = view.getUint16(localOffset + 28, true);
+		const payloadOffset = localOffset + 30 + localNameLength + localExtraLength;
+		requireZipRange(bytes, payloadOffset, compressedSize, `payload for ${path}`);
+		const payload = bytes.subarray(payloadOffset, payloadOffset + compressedSize);
+		const inflatedRaw = method === 0 ? payload : Bun.inflateSync(Buffer.from(payload));
+		const inflated = new Uint8Array(
+			inflatedRaw.buffer,
+			inflatedRaw.byteOffset,
+			inflatedRaw.byteLength,
+		);
+		if (inflated.length !== uncompressedSize) {
+			throw new Error(`ZIP size mismatch for ${path}`);
+		}
+		if (crc32(inflated) !== expectedCrc) {
+			throw new Error(`ZIP checksum mismatch for ${path}`);
+		}
+		const unixMode = (externalAttrs >>> 16) & 0xffff;
+		decoded.push({ path, data: inflated, mode: unixMode === 0 ? 0o644 : unixMode & 0o777 });
+	}
+	if (offset !== centralOffset + centralSize) {
+		throw new Error("ZIP central directory size mismatch");
+	}
+	return decoded;
+}
+
+/** Extract a ZIP archive without relying on a host `unzip` executable. */
+export async function extractZip(archivePath: string, outDir: string): Promise<void> {
+	const entries = decodeZipArchive(await readBytes(archivePath));
+	for (const entry of entries) {
+		const destination = join(outDir, ...entry.path.split("/"));
+		await mkdir(dirname(destination), { recursive: true });
+		await writeFile(destination, entry.data);
+		if (process.platform !== "win32") await chmod(destination, entry.mode);
+	}
+}
+
+/** List regular-file members from a gzip-compressed USTAR archive. */
+export function listTarGzEntries(bytes: Uint8Array): string[] {
+	const tarRaw = Bun.gunzipSync(Buffer.from(bytes));
+	const tar = new Uint8Array(tarRaw.buffer, tarRaw.byteOffset, tarRaw.byteLength);
+	const paths: string[] = [];
+	let offset = 0;
+	while (offset + TAR_BLOCK_SIZE <= tar.length) {
+		const header = tar.subarray(offset, offset + TAR_BLOCK_SIZE);
+		if (header.every((byte) => byte === 0)) break;
+		const name = readTarString(header, 0, 100);
+		const prefix = readTarString(header, 345, 155);
+		const path = safeRelativePath(prefix.length === 0 ? name : `${prefix}/${name}`);
+		const sizeRaw = readTarString(header, 124, 12).trim();
+		const size = sizeRaw.length === 0 ? 0 : Number.parseInt(sizeRaw, 8);
+		if (!Number.isSafeInteger(size) || size < 0) {
+			throw new Error(`invalid tar size for ${path}`);
+		}
+		const payloadEnd = offset + TAR_BLOCK_SIZE + size;
+		if (payloadEnd > tar.length) throw new Error(`truncated tar entry: ${path}`);
+		const type = header[156] ?? 0;
+		if (type === 0 || type === 0x30) paths.push(path);
+		offset = offset + TAR_BLOCK_SIZE + Math.ceil(size / TAR_BLOCK_SIZE) * TAR_BLOCK_SIZE;
+	}
+	return paths;
+}
+
+function findZipEocd(view: DataView): number {
+	const minimum = 22;
+	if (view.byteLength < minimum) throw new Error("truncated ZIP archive");
+	const lower = Math.max(0, view.byteLength - minimum - 0xffff);
+	for (let offset = view.byteLength - minimum; offset >= lower; offset--) {
+		if (
+			view.getUint32(offset, true) === ZIP_EOCD_SIGNATURE &&
+			offset + minimum + view.getUint16(offset + 20, true) === view.byteLength
+		) {
+			return offset;
+		}
+	}
+	throw new Error("ZIP end-of-central-directory record not found");
+}
+
+function requireZipRange(
+	bytes: Uint8Array,
+	offset: number,
+	length: number,
+	label: string,
+): void {
+	if (offset < 0 || length < 0 || offset > bytes.length - length) {
+		throw new Error(`truncated ZIP ${label}`);
+	}
+}
+
+function readTarString(bytes: Uint8Array, offset: number, length: number): string {
+	const field = bytes.subarray(offset, offset + length);
+	const end = field.indexOf(0);
+	return Buffer.from(end === -1 ? field : field.subarray(0, end)).toString("ascii");
+}
+
 
 /** DOS date/time encoding (seconds granularity, UTC).
  *

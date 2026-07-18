@@ -82,13 +82,37 @@ impl ReleaseTarget {
     pub const fn archive_extension(self) -> &'static str {
         if self.is_windows() { "zip" } else { "tar.gz" }
     }
+
+    /// Bun compile target used by the TypeScript host builder.
+    #[must_use]
+    pub const fn bun_target(self) -> &'static str {
+        match self {
+            Self::LinuxX64 => "bun-linux-x64-baseline",
+            Self::LinuxArm64 => "bun-linux-arm64",
+            Self::MacosX64 => "bun-darwin-x64-baseline",
+            Self::MacosArm64 => "bun-darwin-arm64",
+            Self::WindowsX64 => "bun-windows-x64-baseline",
+        }
+    }
+
+    /// Directory prefix inside the archive.
+    #[must_use]
+    pub const fn archive_dir(self) -> &'static str {
+        match self {
+            Self::LinuxX64 => "pi-linux-x64-base",
+            Self::LinuxArm64 => "pi-linux-arm64",
+            Self::MacosX64 => "pi-darwin-x64-base",
+            Self::MacosArm64 => "pi-darwin-arm64",
+            Self::WindowsX64 => "pi-windows-x64-base",
+        }
+    }
 }
 
 /// Which host build ships beside `pi`.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum HostVariant {
-    /// Compiled standalone host binary (`pi-host`). Preferred when the
-    /// runtime-import fixture passes for the target.
+    /// Compiled standalone host binary (`pi-extension-host[.exe]`). Preferred
+    /// when the runtime-import fixture passes for the target.
     Compiled,
     /// Official Bun runtime plus the host JavaScript bundle. Fallback when the
     /// compiled host cannot run on the target.
@@ -96,13 +120,19 @@ pub enum HostVariant {
 }
 
 impl HostVariant {
-    /// The host-side assets this variant contributes (excluding `pi`).
+    /// The host-side assets this variant contributes for a Unix target.
     #[must_use]
     pub fn assets(self) -> Vec<ReleaseAsset> {
+        self.assets_for(ReleaseTarget::LinuxX64)
+    }
+
+    /// The target-specific host assets this variant contributes (excluding `pi`).
+    #[must_use]
+    pub fn assets_for(self, target: ReleaseTarget) -> Vec<ReleaseAsset> {
         match self {
-            Self::Compiled => vec![ReleaseAsset::host_compiled()],
+            Self::Compiled => vec![ReleaseAsset::host_compiled_for(target)],
             Self::RuntimeFallback => {
-                vec![ReleaseAsset::host_runtime(), ReleaseAsset::host_script()]
+                vec![ReleaseAsset::host_runtime_for(target), ReleaseAsset::host_script()]
             }
         }
     }
@@ -128,20 +158,40 @@ impl ReleaseAsset {
         }
     }
 
-    /// The compiled standalone host binary asset.
+    /// The compiled standalone host binary asset for a Unix target.
     #[must_use]
     pub fn host_compiled() -> Self {
+        Self::host_compiled_for(ReleaseTarget::LinuxX64)
+    }
+
+    /// The compiled standalone host binary asset for `target`.
+    #[must_use]
+    pub fn host_compiled_for(target: ReleaseTarget) -> Self {
         Self {
-            relative_path: "pi-host".to_owned(),
+            relative_path: if target.is_windows() {
+                "pi-extension-host.exe".to_owned()
+            } else {
+                "pi-extension-host".to_owned()
+            },
             executable: true,
         }
     }
 
-    /// The Bun runtime asset used by the runtime-plus-JavaScript fallback.
+    /// The Bun runtime asset used by the runtime-plus-JavaScript fallback on Unix.
     #[must_use]
     pub fn host_runtime() -> Self {
+        Self::host_runtime_for(ReleaseTarget::LinuxX64)
+    }
+
+    /// The target-specific Bun runtime asset used by the fallback.
+    #[must_use]
+    pub fn host_runtime_for(target: ReleaseTarget) -> Self {
         Self {
-            relative_path: "bun".to_owned(),
+            relative_path: if target.is_windows() {
+                "bun.exe".to_owned()
+            } else {
+                "bun".to_owned()
+            },
             executable: true,
         }
     }
@@ -150,7 +200,7 @@ impl ReleaseAsset {
     #[must_use]
     pub fn host_script() -> Self {
         Self {
-            relative_path: "host.js".to_owned(),
+            relative_path: "pi-extension-host.js".to_owned(),
             executable: false,
         }
     }
@@ -169,7 +219,7 @@ pub struct ReleasePlan {
     pub cargo_build: CommandSpec,
     /// Host branch to build alongside the binary.
     pub host_branch: &'static str,
-    /// Archive base name without extension (`pi-<version>-<triple>`).
+    /// Archive base name without extension (`pi-<version>-<archive-dir>`).
     pub archive_base: String,
     /// Archive extension (`tar.gz` or `zip`).
     pub archive_extension: &'static str,
@@ -249,13 +299,13 @@ pub fn plan_release(
         ],
     );
     let mut assets = vec![ReleaseAsset::pi_binary(target)];
-    assets.extend(host_variant.assets());
+    assets.extend(host_variant.assets_for(target));
     assets.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
     for asset in &assets {
         validate_asset_name(&asset.relative_path)?;
     }
     let sorted_members = assets.clone();
-    let archive_base = format!("pi-{version}-{triple}");
+    let archive_base = format!("pi-{version}-{}", target.archive_dir());
     Ok(ReleasePlan {
         target,
         version: version.to_owned(),
@@ -416,6 +466,76 @@ mod tests {
     }
 
     #[test]
+    fn target_plans_match_the_typescript_release_contract() -> TestResult {
+        let expected = [
+            (
+                ReleaseTarget::LinuxX64,
+                "bun-linux-x64-baseline",
+                "pi-linux-x64-base",
+                "pi-extension-host",
+                "bun",
+            ),
+            (
+                ReleaseTarget::LinuxArm64,
+                "bun-linux-arm64",
+                "pi-linux-arm64",
+                "pi-extension-host",
+                "bun",
+            ),
+            (
+                ReleaseTarget::MacosX64,
+                "bun-darwin-x64-baseline",
+                "pi-darwin-x64-base",
+                "pi-extension-host",
+                "bun",
+            ),
+            (
+                ReleaseTarget::MacosArm64,
+                "bun-darwin-arm64",
+                "pi-darwin-arm64",
+                "pi-extension-host",
+                "bun",
+            ),
+            (
+                ReleaseTarget::WindowsX64,
+                "bun-windows-x64-baseline",
+                "pi-windows-x64-base",
+                "pi-extension-host.exe",
+                "bun.exe",
+            ),
+        ];
+        for (target, bun_target, archive_dir, host_name, runtime_name) in expected {
+            let compiled =
+                plan_release(target, "1.0.0", HostVariant::Compiled, None)
+                    .map_err(io::Error::other)?;
+            assert_eq!(compiled.target.bun_target(), bun_target);
+            assert_eq!(compiled.target.archive_dir(), archive_dir);
+            assert!(
+                compiled
+                    .assets
+                    .iter()
+                    .any(|asset| asset.relative_path == host_name)
+            );
+            let fallback =
+                plan_release(target, "1.0.0", HostVariant::RuntimeFallback, None)
+                    .map_err(io::Error::other)?;
+            assert!(
+                fallback
+                    .assets
+                    .iter()
+                    .any(|asset| asset.relative_path == runtime_name)
+            );
+            assert!(
+                fallback
+                    .assets
+                    .iter()
+                    .any(|asset| asset.relative_path == "pi-extension-host.js")
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn plan_cargo_invocation_matches_contract() -> TestResult {
         let plan = plan_release(
             ReleaseTarget::LinuxX64,
@@ -439,11 +559,11 @@ mod tests {
         );
         assert_eq!(plan.host_variant, HostVariant::Compiled);
         assert_eq!(plan.host_branch, "baseline-x64");
-        assert_eq!(plan.archive_base, "pi-1.2.3-x86_64-unknown-linux-gnu");
+        assert_eq!(plan.archive_base, "pi-1.2.3-pi-linux-x64-base");
         assert_eq!(plan.archive_extension, "tar.gz");
         assert_eq!(
             archive_file_name(&plan),
-            "pi-1.2.3-x86_64-unknown-linux-gnu.tar.gz"
+            "pi-1.2.3-pi-linux-x64-base.tar.gz"
         );
         Ok(())
     }
@@ -459,9 +579,14 @@ mod tests {
         .map_err(io::Error::other)?;
         assert_eq!(plan.archive_extension, "zip");
         assert!(plan.assets.iter().any(|a| a.relative_path == "pi.exe"));
+        assert!(
+            plan.assets
+                .iter()
+                .any(|a| a.relative_path == "pi-extension-host.exe")
+        );
         assert_eq!(
             archive_file_name(&plan),
-            "pi-0.1.0-x86_64-pc-windows-msvc.zip"
+            "pi-0.1.0-pi-windows-x64-base.zip"
         );
         Ok(())
     }
@@ -495,8 +620,8 @@ mod tests {
             .map(|a| a.relative_path.as_str())
             .collect();
         assert!(names.contains(&"bun"));
-        assert!(names.contains(&"host.js"));
-        assert!(!names.contains(&"pi-host"));
+        assert!(names.contains(&"pi-extension-host.js"));
+        assert!(!names.contains(&"pi-extension-host"));
         // manifest mirrors the asset list exactly.
         assert_eq!(plan.manifest.sorted_members, plan.assets);
         Ok(())
@@ -565,8 +690,8 @@ mod tests {
     fn validate_asset_name_rejects_traversal() {
         assert!(validate_asset_name("pi").is_ok());
         assert!(validate_asset_name("pi.exe").is_ok());
-        assert!(validate_asset_name("host.js").is_ok());
-        assert!(validate_asset_name("pi-host").is_ok());
+        assert!(validate_asset_name("pi-extension-host.js").is_ok());
+        assert!(validate_asset_name("pi-extension-host").is_ok());
         assert!(validate_asset_name("").is_err());
         assert!(validate_asset_name("../pi").is_err());
         assert!(validate_asset_name("a/b").is_err());
@@ -656,7 +781,7 @@ mod tests {
         let staging = Path::new("/stage");
         let asset = ReleaseAsset::host_script();
         let path = asset_staging_path(staging, &asset);
-        assert_eq!(path, Path::new("/stage/host.js"));
+        assert_eq!(path, Path::new("/stage/pi-extension-host.js"));
         assert!(is_within_staging(&path, staging));
     }
 }

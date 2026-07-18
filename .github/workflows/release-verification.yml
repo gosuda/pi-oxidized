@@ -34,6 +34,7 @@ jobs:
 
       - name: Set up QEMU for aarch64 Linux
         if: matrix.target == 'aarch64-unknown-linux-gnu'
+        id: qemu
         uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130  # v3
         with:
           platforms: arm64
@@ -43,6 +44,19 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Verify aarch64 smoke execution support
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
+        env:
+          QEMU_PLATFORMS: ${{ steps.qemu.outputs.platforms }}
+        run: |
+          case ",${QEMU_PLATFORMS}," in
+            *,linux/arm64,*) ;;
+            *) echo "setup-qemu did not register linux/arm64: ${QEMU_PLATFORMS}" >&2; exit 1 ;;
+          esac
+          test -r /proc/sys/fs/binfmt_misc/qemu-aarch64
+          grep -q '^enabled' /proc/sys/fs/binfmt_misc/qemu-aarch64
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable

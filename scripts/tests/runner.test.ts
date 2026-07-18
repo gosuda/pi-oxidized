@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import {
 	CommandFailedError,
+	CommandTimeoutError,
 	OK_RUN,
 	PathTraversalError,
 	pathExists,
@@ -79,6 +80,31 @@ describe("SpawnRunner integration", () => {
 		const runner = new SpawnRunner();
 		const res = await runner.run("cat", [], { stdin: "from-stdin" });
 		expect(res.stdout).toBe("from-stdin");
+	});
+
+	test("terminates a hung child at the configured deadline", async () => {
+		const runner = new SpawnRunner();
+		const started = Date.now();
+		let caught: unknown;
+		try {
+			await runner.run("sh", ["-c", "printf started; sleep 30"], { timeoutMs: 100 });
+		} catch (err) {
+			caught = err;
+		}
+		expect(caught).toBeInstanceOf(CommandTimeoutError);
+		if (caught instanceof CommandTimeoutError) {
+			expect(caught.command).toBe("sh");
+			expect(caught.timeoutMs).toBe(100);
+			expect(caught.stdout).toBe("started");
+		}
+		expect(Date.now() - started).toBeLessThan(5_000);
+	});
+
+	test("rejects non-positive deadlines before spawning", async () => {
+		const runner = new SpawnRunner();
+		await expect(
+			runner.run("sh", ["-c", "exit 0"], { timeoutMs: 0 }),
+		).rejects.toThrow(RangeError);
 	});
 });
 

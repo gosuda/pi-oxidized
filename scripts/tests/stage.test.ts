@@ -159,4 +159,74 @@ describe("assembleRelease", () => {
 		// Ensure no chmod calls were made because it's Windows.
 		expect(fs.chmodCalls).toHaveLength(0);
 	});
+
+	test("assembles the provisioned Bun runtime and JavaScript fallback", async () => {
+		const fs = new MemoryFs();
+		const plan = planFor("x86_64-unknown-linux-gnu");
+		const piPath = "/workspace/target/x86_64-unknown-linux-gnu/release/pi";
+		const scriptPath = "/staging/host/pi-extension-host.js";
+		const runtimePath = "/staging/host/bun";
+		fs.files.set(piPath, new Uint8Array([1]));
+		fs.files.set(scriptPath, new Uint8Array([2]));
+		fs.files.set(runtimePath, new Uint8Array([3]));
+		fs.modes.set(piPath, 0o755);
+		fs.modes.set(runtimePath, 0o755);
+
+		const assembly = await assembleRelease("/staging", {
+			plan,
+			version: "1.0.0",
+			piBinaryPath: piPath,
+			repoRoot: "/workspace",
+			host: { kind: "runtime-bundle", runtimePath, scriptPath },
+			bunRuntimePath: runtimePath,
+			fs,
+			sourceDateEpoch: 1000,
+			compatibilityVersion: "0.80.10",
+			protocolVersion: 1,
+			createdAt: "2024-01-01T00:00:00Z",
+		});
+
+		expect(assembly.manifest.hostKind).toBe("runtime-bundle");
+		expect(assembly.manifest.files.map((file) => file.path)).toEqual([
+			"bun",
+			"pi",
+			"pi-extension-host.js",
+		]);
+		expect(assembly.manifest.files.find((file) => file.path === "bun")?.executable).toBe(
+			true,
+		);
+		expect(
+			assembly.manifest.files.find((file) => file.path === "pi-extension-host.js")
+				?.executable,
+		).toBe(false);
+	});
+
+	test("rejects a runtime bundle without a provisioned Bun path", async () => {
+		const fs = new MemoryFs();
+		const plan = planFor("x86_64-unknown-linux-gnu");
+		const piPath = "/workspace/target/x86_64-unknown-linux-gnu/release/pi";
+		const scriptPath = "/staging/host/pi-extension-host.js";
+		fs.files.set(piPath, new Uint8Array([1]));
+		fs.files.set(scriptPath, new Uint8Array([2]));
+		fs.modes.set(piPath, 0o755);
+
+		const inputs = {
+			plan,
+			version: "1.0.0",
+			piBinaryPath: piPath,
+			repoRoot: "/workspace",
+			host: { kind: "runtime-bundle" as const, runtimePath: "/missing/bun", scriptPath },
+			fs,
+			sourceDateEpoch: 1000,
+			compatibilityVersion: "0.80.10",
+			protocolVersion: 1,
+			createdAt: "2024-01-01T00:00:00Z",
+		};
+		await expect(
+			assembleRelease("/staging", { ...inputs, bunRuntimePath: undefined }),
+		).rejects.toThrow("requires bunRuntimePath");
+		await expect(
+			assembleRelease("/staging", { ...inputs, bunRuntimePath: "/missing/bun" }),
+		).rejects.toThrow("ENOENT: /missing/bun");
+	});
 });

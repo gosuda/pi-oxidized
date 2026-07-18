@@ -20,6 +20,12 @@ pub const ENV_HOST: &str = "PI_EXTENSION_HOST";
 /// Default sibling host executable name (without platform extension).
 pub const DEFAULT_HOST_NAME: &str = "pi-extension-host";
 
+/// Default sibling Bun runtime name (without platform extension).
+pub const DEFAULT_BUN_RUNTIME_NAME: &str = "bun";
+
+/// Default sibling JavaScript host bundle name.
+pub const DEFAULT_HOST_BUNDLE_NAME: &str = "pi-extension-host.js";
+
 /// Windows host executable suffix.
 #[cfg(windows)]
 const HOST_EXE_SUFFIX: &str = ".exe";
@@ -76,8 +82,20 @@ pub fn resolve_host() -> Result<HostSpec, HostError> {
         .as_ref()
         .map(|os| os.to_string_lossy().into_owned());
     let asset = default_asset_path();
-    let asset_ref = asset.as_deref();
-    resolve_with(env_str.as_deref(), asset_ref)
+    let Some(asset_path) = asset.as_deref() else {
+        return resolve_with(env_str.as_deref(), None);
+    };
+    let Some(dir) = asset_path.parent() else {
+        return resolve_with(env_str.as_deref(), Some(asset_path));
+    };
+    let runtime = dir.join(format!("{DEFAULT_BUN_RUNTIME_NAME}{HOST_EXE_SUFFIX}"));
+    let script = dir.join(DEFAULT_HOST_BUNDLE_NAME);
+    resolve_with_fallback(
+        env_str.as_deref(),
+        Some(asset_path),
+        Some(runtime.as_path()),
+        Some(script.as_path()),
+    )
 }
 
 /// Resolve a host from an explicit env override and an optional asset path.
@@ -89,6 +107,15 @@ pub fn resolve_host() -> Result<HostSpec, HostError> {
 /// Returns [`HostError::NotConfigured`] when neither yields a file, or
 /// [`HostError::NotAFile`] / [`HostError::NonUtf8`] for malformed inputs.
 pub fn resolve_with(env: Option<&str>, asset: Option<&Path>) -> Result<HostSpec, HostError> {
+    resolve_with_fallback(env, asset, None, None)
+}
+
+fn resolve_with_fallback(
+    env: Option<&str>,
+    compiled: Option<&Path>,
+    runtime: Option<&Path>,
+    script: Option<&Path>,
+) -> Result<HostSpec, HostError> {
     if let Some(raw) = env {
         let trimmed = raw.trim();
         if !trimmed.is_empty() {
@@ -101,7 +128,7 @@ pub fn resolve_with(env: Option<&str>, asset: Option<&Path>) -> Result<HostSpec,
             });
         }
     }
-    if let Some(path) = asset
+    if let Some(path) = compiled
         && path.is_file()
     {
         check_utf8(path)?;
@@ -109,6 +136,21 @@ pub fn resolve_with(env: Option<&str>, asset: Option<&Path>) -> Result<HostSpec,
             source: HostSource::InstalledAsset(path.to_path_buf()),
             program: path.to_path_buf(),
             args: Vec::new(),
+        });
+    }
+    if let (Some(runtime), Some(script)) = (runtime, script)
+        && (runtime.exists() || script.exists())
+    {
+        check_file(runtime)?;
+        check_file(script)?;
+        let script_arg = script
+            .to_str()
+            .ok_or_else(|| HostError::NonUtf8(script.to_path_buf()))?
+            .to_owned();
+        return Ok(HostSpec {
+            source: HostSource::InstalledAsset(runtime.to_path_buf()),
+            program: runtime.to_path_buf(),
+            args: vec![script_arg],
         });
     }
     Err(HostError::NotConfigured { env: ENV_HOST })
@@ -214,5 +256,68 @@ mod tests {
             "unexpected asset name: {name}"
         );
         Ok(())
+    }
+
+    #[test]
+    fn compiled_sibling_wins_over_runtime_bundle() -> R {
+        let dir = tempdir()?;
+        let compiled = dir.path().join("pi-extension-host");
+        let runtime = dir.path().join("bun");
+        let script = dir.path().join("pi-extension-host.js");
+        fs::write(&compiled, b"compiled")?;
+        fs::write(&runtime, b"runtime")?;
+        fs::write(&script, b"script")?;
+
+        let spec = resolve_with_fallback(
+            None,
+            Some(compiled.as_path()),
+            Some(runtime.as_path()),
+            Some(script.as_path()),
+        )?;
+        assert_eq!(spec.program, compiled);
+        assert!(spec.args.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_bundle_uses_bun_with_script_argument() -> R {
+        let dir = tempdir()?;
+        let compiled = dir.path().join("pi-extension-host");
+        let runtime = dir.path().join("bun");
+        let script = dir.path().join("pi-extension-host.js");
+        fs::write(&runtime, b"runtime")?;
+        fs::write(&script, b"script")?;
+
+        let spec = resolve_with_fallback(
+            None,
+            Some(compiled.as_path()),
+            Some(runtime.as_path()),
+            Some(script.as_path()),
+        )?;
+        assert_eq!(spec.source, HostSource::InstalledAsset(runtime.clone()));
+        assert_eq!(spec.program, runtime);
+        assert_eq!(spec.args, vec![script.to_string_lossy().into_owned()]);
+        Ok(())
+    }
+
+    #[test]
+    fn incomplete_runtime_bundle_reports_missing_sibling() -> R {
+        let dir = tempdir()?;
+        let runtime = dir.path().join("bun");
+        let script = dir.path().join("pi-extension-host.js");
+        fs::write(&runtime, b"runtime")?;
+
+        match resolve_with_fallback(
+            None,
+            None,
+            Some(runtime.as_path()),
+            Some(script.as_path()),
+        ) {
+            Err(HostError::NotAFile(path)) if path == script => Ok(()),
+            other => Err(std::io::Error::other(format!(
+                "expected missing script error, got {other:?}"
+            ))
+            .into()),
+        }
     }
 }

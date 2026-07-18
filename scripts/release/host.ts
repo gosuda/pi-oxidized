@@ -23,13 +23,17 @@ import { SpawnRunner } from "./runner.ts";
 import type { TargetPlan } from "./targets.ts";
 
 /** Wire protocol version negotiated in `hello` (mirrors pi-tui-protocol). */
-const PROTOCOL_VERSION = 1;
+export const HOST_PROTOCOL_VERSION = 1;
 
 /** Compatibility target version (mirrors host COMPATIBILITY_VERSION). */
-const COMPATIBILITY_VERSION = "0.80.10";
+export const HOST_COMPATIBILITY_VERSION = "0.80.10";
 
 /** Maximum bytes of one JSONL frame line. Mirrors the protocol constant. */
 const FRAME_MAX_BYTES = 8 * 1024 * 1024;
+
+const HOST_SETUP_TIMEOUT_MS = 5 * 60_000;
+const HOST_BUILD_TIMEOUT_MS = 10 * 60_000;
+const HOST_PROBE_TIMEOUT_MS = 30_000;
 
 /**
  * The artifact set the release script must place beside `pi`. The Rust
@@ -127,6 +131,7 @@ async function installHostDeps(hostDir: string, runner: CommandRunner): Promise<
 	const res = await runner.run("bun", ["install", "--frozen-lockfile"], {
 		cwd: hostDir,
 		rejectOnError: false,
+		timeoutMs: HOST_SETUP_TIMEOUT_MS,
 	});
 	if (res.exitCode !== 0) {
 		throw new HostBuildError(
@@ -141,6 +146,7 @@ async function typecheckHost(hostDir: string, runner: CommandRunner): Promise<vo
 	const res = await runner.run("bun", ["run", "check"], {
 		cwd: hostDir,
 		rejectOnError: false,
+		timeoutMs: HOST_SETUP_TIMEOUT_MS,
 	});
 	if (res.exitCode !== 0) {
 		throw new HostBuildError(
@@ -155,6 +161,7 @@ async function testHost(hostDir: string, runner: CommandRunner): Promise<void> {
 	const res = await runner.run("bun", ["run", "test"], {
 		cwd: hostDir,
 		rejectOnError: false,
+		timeoutMs: HOST_BUILD_TIMEOUT_MS,
 	});
 	if (res.exitCode !== 0) {
 		throw new HostBuildError(
@@ -185,7 +192,7 @@ async function compileSidecar(
 			"--outfile",
 			outPath,
 		],
-		{ cwd: hostDir, rejectOnError: false },
+		{ cwd: hostDir, rejectOnError: false, timeoutMs: HOST_BUILD_TIMEOUT_MS },
 	);
 }
 
@@ -210,7 +217,7 @@ async function tryCompiledPath(
 		if (!ok) return undefined;
 	}
 	if (!options.skipHandshake) {
-		const ok = await runHelloHandshake(options, sidecarPath, runner);
+		const ok = await runHelloHandshake(sidecarPath, runner);
 		if (!ok) return undefined;
 	}
 	return { kind: "compiled", binaryPath: sidecarPath };
@@ -248,7 +255,7 @@ async function runRuntimeImportFixture(
 			"--outfile",
 			fixtureBin,
 		],
-		{ cwd: hostDir, rejectOnError: false },
+		{ cwd: hostDir, rejectOnError: false, timeoutMs: HOST_BUILD_TIMEOUT_MS },
 	);
 	if (compile.exitCode !== 0 || !existsSync(fixtureBin)) return false;
 
@@ -266,6 +273,7 @@ async function runRuntimeImportFixture(
 	const run = await runner.run(fixtureBin, [exampleExt], {
 		cwd: hostDir,
 		rejectOnError: false,
+		timeoutMs: HOST_PROBE_TIMEOUT_MS,
 	});
 	if (run.exitCode !== 0) return false;
 	// Fixture prints one JSON line of registration summary; accept any nonempty
@@ -279,51 +287,54 @@ async function runRuntimeImportFixture(
  * protocol + compatibility versions, then closes stdin.
  */
 async function runHelloHandshake(
-	options: BuildHostOptions,
 	sidecarPath: string,
 	runner: CommandRunner,
 ): Promise<boolean> {
-	const helloLine =
-		JSON.stringify({
-			id: 1,
-			kind: "req",
-			method: "hello",
-			payload: {
-				protocolVersion: PROTOCOL_VERSION,
-				compatibilityVersion: COMPATIBILITY_VERSION,
-			},
-		}) + "\n";
 	const res = await runner.run(sidecarPath, [], {
 		cwd: dirname(sidecarPath),
-		stdin: helloLine,
+		stdin: helloRequestLine(),
 		rejectOnError: false,
+		timeoutMs: HOST_PROBE_TIMEOUT_MS,
 	});
-	// Host returns nonzero when stdin closes (normal shutdown); inspect stdout.
-	const firstLine = res.stdout.split("\n", 1)[0];
-	if (firstLine === undefined || firstLine.length === 0) return false;
-	if (firstLine.length > FRAME_MAX_BYTES) return false;
+	const firstLine = res.stdout.split("\n", 1)[0] ?? "";
+	return res.exitCode === 0 && isHelloAckLine(firstLine);
+}
+
+/** Canonical JSONL request used by build-time and unpacked-archive probes. */
+export function helloRequestLine(): string {
+	return `${JSON.stringify({
+		id: 1,
+		kind: "req",
+		method: "hello",
+		payload: {
+			protocolVersion: HOST_PROTOCOL_VERSION,
+			compatibilityVersion: HOST_COMPATIBILITY_VERSION,
+		},
+	})}\n`;
+}
+
+/** Parse one line and validate the complete hello acknowledgement contract. */
+export function isHelloAckLine(line: string): boolean {
+	if (line.length === 0 || line.length > FRAME_MAX_BYTES) return false;
 	let frame: unknown;
 	try {
-		frame = JSON.parse(firstLine) as unknown;
+		frame = JSON.parse(line) as unknown;
 	} catch {
 		return false;
 	}
-	return isHelloAck(frame, options.plan);
+	return isHelloAck(frame);
 }
 
 /** Narrow a parsed frame into a hello-ack with the expected versions. */
-function isHelloAck(frame: unknown, plan: TargetPlan): boolean {
+export function isHelloAck(frame: unknown): boolean {
 	if (typeof frame !== "object" || frame === null) return false;
 	const f = frame as { kind?: unknown; method?: unknown; payload?: unknown };
 	if (f.kind !== "res" || f.method !== "hello") return false;
 	if (typeof f.payload !== "object" || f.payload === null) return false;
 	const p = f.payload as { protocolVersion?: unknown; compatibilityVersion?: unknown };
 	return (
-		p.protocolVersion === PROTOCOL_VERSION &&
-		p.compatibilityVersion === COMPATIBILITY_VERSION &&
-		// Reference the plan so unused-parameter lints stay quiet and future
-		// target-specific handshake variants can hook here.
-		plan.rustTarget.length > 0
+		p.protocolVersion === HOST_PROTOCOL_VERSION &&
+		p.compatibilityVersion === HOST_COMPATIBILITY_VERSION
 	);
 }
 
@@ -347,15 +358,13 @@ async function tryRuntimeBundlePath(
 		[
 			"build",
 			"./src/main.ts",
-			"--outdir",
-			outDir,
 			"--target",
 			"bun",
 			"--minify",
 			"--outfile",
 			scriptPath,
 		],
-		{ cwd: hostDir, rejectOnError: false },
+		{ cwd: hostDir, rejectOnError: false, timeoutMs: HOST_BUILD_TIMEOUT_MS },
 	);
 	if (res.exitCode !== 0 || !existsSync(scriptPath)) return undefined;
 	const runtimePath = join(outDir, options.plan.bunRuntimeName);
