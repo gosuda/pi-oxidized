@@ -16,7 +16,7 @@ export type FrameId = number;
 /** Frame kind discriminant on the wire. */
 export type FrameKind = "req" | "res" | "event" | "error";
 /** Allowlisted bridge and host-control methods. */
-export type Method = "hello" | "toolUpdate" | "providerEvent" | "uiSlot" | "disposeSlot" | "extensionError" | "select" | "confirm" | "input" | "editor" | "notify" | "terminalInput" | "uiEvent" | "measure" | "render";
+export type Method = "hello" | "toolUpdate" | "providerEvent" | "uiSlot" | "disposeSlot" | "extensionError" | "select" | "confirm" | "input" | "editor" | "notify" | "terminalInput" | "flags.set" | "shortcut.execute" | "uiEvent" | "measure" | "render";
 /** All allowlisted methods in stable order. */
 export declare const METHODS: readonly Method[];
 /** Returns true when `raw` is an allowlisted method. */

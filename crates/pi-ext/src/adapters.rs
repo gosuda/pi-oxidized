@@ -672,7 +672,8 @@ fn named_color_to_ratatui(name: NamedColor) -> Color {
 }
 
 /// Map a native [`UiEvent`] onto the protocol wire event type.
-fn map_ui_event(event: &UiEvent) -> UiEventWire {
+#[must_use]
+pub fn map_ui_event(event: &UiEvent) -> UiEventWire {
     match event {
         UiEvent::Key(key) => UiEventWire::Key {
             code: map_key_code(key.code),
@@ -758,6 +759,8 @@ pub struct ShortcutRegistration {
     pub key: String,
     /// Human-readable description.
     pub description: Option<String>,
+    /// Owning extension path.
+    pub extension_path: Option<String>,
 }
 
 /// A registered CLI flag.
@@ -771,6 +774,8 @@ pub struct FlagRegistration {
     pub kind: FlagKind,
     /// Default value (string form).
     pub default: Option<String>,
+    /// Owning extension path.
+    pub extension_path: Option<String>,
 }
 
 /// CLI flag value type.

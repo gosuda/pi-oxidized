@@ -13,8 +13,10 @@ import {
 } from "../src/codec.ts";
 import {
 	COMPATIBILITY_VERSION,
+	isMethod,
 	localHello,
 	MAX_FRAME_BYTES,
+	METHODS,
 	PROTOCOL_VERSION,
 } from "../src/types.ts";
 
@@ -29,6 +31,15 @@ describe("constants", () => {
 		expect(PROTOCOL_VERSION).toBe(1);
 		expect(COMPATIBILITY_VERSION).toBe("0.80.10");
 		expect(MAX_FRAME_BYTES).toBe(8 * 1024 * 1024);
+	});
+
+	test("extension control methods are allowlisted", () => {
+		for (const method of ["flags.set", "shortcut.execute"] as const) {
+			expect(METHODS).toContain(method);
+			expect(isMethod(method)).toBe(true);
+			const frame = requestFrame(2, method, {});
+			expect(decodeFrameStrStrict(encodeFrameString(frame).trimEnd())).toEqual(frame);
+		}
 	});
 });
 

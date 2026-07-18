@@ -11,12 +11,18 @@
 //! `packages/pi-tui-protocol` and share golden JSONL fixtures under that
 //! package's tests.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::str;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
+/// Open host-control method that synchronizes validated extension flag values.
+pub const FLAGS_SET_METHOD: &str = "flags.set";
+
+/// Open host-control method that dispatches one effective extension shortcut.
+pub const SHORTCUT_EXECUTE_METHOD: &str = "shortcut.execute";
 
 // Local wire copies of overlay layout value types (camelCase). Kept here so
 // the protocol module does not depend on pi-tui compile health for validation.
@@ -983,6 +989,71 @@ pub enum UiEventWire {
     },
 }
 
+/// Validated extension flag value sent to the TypeScript runtime.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum FlagValueWire {
+    /// Boolean CLI flag.
+    Boolean(bool),
+    /// String CLI flag.
+    String(String),
+}
+
+/// Payload for [`FLAGS_SET_METHOD`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FlagsSetRequest {
+    /// Complete validated flag-value overlay.
+    pub values: BTreeMap<String, FlagValueWire>,
+}
+
+/// Acknowledgement for [`FLAGS_SET_METHOD`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FlagsSetResponse {
+    /// True when the host applied every supplied value.
+    pub ok: bool,
+}
+
+/// Payload for [`SHORTCUT_EXECUTE_METHOD`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShortcutExecuteRequest {
+    /// Canonical lower-case key identifier.
+    pub key: String,
+}
+
+/// Immediate dispatch acknowledgement for [`SHORTCUT_EXECUTE_METHOD`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShortcutExecuteResponse {
+    /// Whether a live extension shortcut owned this key.
+    pub handled: bool,
+}
+
+/// Keyed UI event request for [`Method::UiEvent`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UiEventRequest {
+    /// UI slot key.
+    pub key: String,
+    /// Slot generation observed by the native product.
+    pub generation: u64,
+    /// Structured event for cross-language inspection.
+    pub event: UiEventWire,
+    /// Raw terminal input bytes for component `handleInput`, when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+}
+
+/// Host delivery result for [`Method::UiEvent`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UiEventResponse {
+    /// True only when the key and generation matched a live component.
+    pub delivered: bool,
+}
+
 /// Terminal-input rewrite / consume result for `terminalInput`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -1757,6 +1828,40 @@ mod tests {
             .validate()
             .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn extension_control_payloads_roundtrip() -> TestResult {
+        let flags = FlagsSetRequest {
+            values: BTreeMap::from([
+                ("plan".to_owned(), FlagValueWire::Boolean(true)),
+                (
+                    "profile".to_owned(),
+                    FlagValueWire::String("fast".to_owned()),
+                ),
+            ]),
+        };
+        let payload = to_payload(&flags)?;
+        assert_eq!(from_payload::<FlagsSetRequest>(&payload)?, flags);
+
+        let shortcut = ShortcutExecuteRequest {
+            key: "ctrl+alt+p".to_owned(),
+        };
+        let payload = to_payload(&shortcut)?;
+        assert_eq!(from_payload::<ShortcutExecuteRequest>(&payload)?, shortcut);
+
+        let ui = UiEventRequest {
+            key: "overlay.1".to_owned(),
+            generation: 2,
+            event: UiEventWire::Paste {
+                text: "hello".to_owned(),
+            },
+            data: Some("hello".to_owned()),
+        };
+        let frame = Frame::request(9, Method::UiEvent, to_payload(&ui)?);
+        let decoded = decode_frame_str(encode_frame_string(&frame)?.trim_end())?;
+        assert_eq!(from_payload::<UiEventRequest>(&decoded.payload)?, ui);
         Ok(())
     }
 }

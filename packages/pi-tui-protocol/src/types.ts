@@ -35,6 +35,8 @@ export type Method =
 	| "editor"
 	| "notify"
 	| "terminalInput"
+	| "flags.set"
+	| "shortcut.execute"
 	| "uiEvent"
 	| "measure"
 	| "render";
@@ -53,6 +55,8 @@ export const METHODS: readonly Method[] = [
 	"editor",
 	"notify",
 	"terminalInput",
+	"flags.set",
+	"shortcut.execute",
 	"uiEvent",
 	"measure",
 	"render",

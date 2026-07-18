@@ -25,6 +25,8 @@ export const METHODS = [
     "editor",
     "notify",
     "terminalInput",
+    "flags.set",
+    "shortcut.execute",
     "uiEvent",
     "measure",
     "render",
