@@ -21,6 +21,8 @@ use crate::terminal::backend::{
 use crate::terminal::caps::{TerminalCapabilities, kitty_delete_id};
 use crate::terminal::sink::FrameSink;
 
+const SYNC_OUTPUT_END: &[u8] = b"\x1b[?2026l";
+
 /// Maximum background coalescing window.
 pub const COALESCE_WINDOW: Duration = Duration::from_millis(16);
 
@@ -518,13 +520,41 @@ impl<W: Write> Tui<W> {
                 "unbalanced synchronized output markers",
             ));
         }
-        self.outer.write_all(&framed)?;
-        self.outer.flush()?;
+        write_stage3_frame(
+            &mut self.outer,
+            &framed,
+            self.caps.sync_output && !payload.is_empty(),
+        )?;
         self.write_count = self.write_count.saturating_add(1);
         self.last_payload = framed;
         let _ = self.take_composition_bytes();
         Ok(())
     }
+}
+
+fn write_stage3_frame<W: Write>(
+    writer: &mut W,
+    framed: &[u8],
+    synchronized: bool,
+) -> io::Result<()> {
+    if let Err(error) = writer.write_all(framed) {
+        if synchronized {
+            best_effort_sync_close(writer);
+        }
+        return Err(error);
+    }
+    if let Err(error) = writer.flush() {
+        if synchronized {
+            best_effort_sync_close(writer);
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn best_effort_sync_close<W: Write>(writer: &mut W) {
+    let _ = writer.write_all(SYNC_OUTPUT_END);
+    let _ = writer.flush();
 }
 
 fn render_lines(buf: &mut Buffer, lines: &[Line<'static>]) {
@@ -665,6 +695,47 @@ mod tests {
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
     use std::io::Cursor;
+    #[derive(Default)]
+    struct FailOnceWriter {
+        bytes: Vec<u8>,
+        fail_after: usize,
+        failed: bool,
+        fail_flush: bool,
+    }
+
+    impl Write for FailOnceWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if !self.failed && self.bytes.len() >= self.fail_after {
+                self.failed = true;
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "injected write failure",
+                ));
+            }
+            let limit = if self.failed {
+                buf.len()
+            } else {
+                self.fail_after
+                    .saturating_sub(self.bytes.len())
+                    .min(buf.len())
+            };
+            self.bytes.extend_from_slice(&buf[..limit]);
+            Ok(limit)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if self.fail_flush {
+                self.fail_flush = false;
+                self.failed = true;
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "injected flush failure",
+                ));
+            }
+            Ok(())
+        }
+    }
+
 
     struct StubRoot {
         label: String,
@@ -927,7 +998,43 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn stage3_partial_write_best_effort_closes_sync() {
+        let framed = wrap_synchronized(b"payload", true);
+        let mut writer = FailOnceWriter {
+            fail_after: b"\x1b[?2026hpa".len(),
+            ..FailOnceWriter::default()
+        };
+
+        let error = write_stage3_frame(&mut writer, &framed, true).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert!(writer.bytes.starts_with(b"\x1b[?2026hpa"));
+        assert!(writer.bytes.ends_with(SYNC_OUTPUT_END));
+        let audit = audit_bytes(&writer.bytes);
+        assert_eq!(audit.sync_begin, 1);
+        assert_eq!(audit.sync_end, 1);
+    }
+
+    #[test]
+    fn stage3_flush_error_best_effort_closes_sync_and_returns_original_error() {
+        let framed = wrap_synchronized(b"payload", true);
+        let mut writer = FailOnceWriter {
+            fail_after: usize::MAX,
+            fail_flush: true,
+            ..FailOnceWriter::default()
+        };
+
+        let error = write_stage3_frame(&mut writer, &framed, true).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(error.to_string(), "injected flush failure");
+        assert!(writer.bytes.starts_with(&framed));
+        assert!(writer.bytes.ends_with(SYNC_OUTPUT_END));
+    }
+
     fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         haystack.windows(needle.len()).position(|w| w == needle)
     }
 }
+

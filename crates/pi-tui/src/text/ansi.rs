@@ -51,18 +51,25 @@ pub fn extract_ansi_code(s: &str, pos: usize) -> Option<ExtractedAnsi<'_>> {
     }
     let next = *bytes.get(pos + 1)?;
 
-    // CSI: ESC [ ... final in {m,G,K,H,J}
+    // CSI: ESC [ parameters (0x30-0x3f), intermediates (0x20-0x2f),
+    // then exactly one final byte (0x40-0x7e).
     if next == b'[' {
         let mut j = pos + 2;
+        let mut in_intermediates = false;
         while j < bytes.len() {
             match bytes[j] {
-                b'm' | b'G' | b'K' | b'H' | b'J' => {
+                0x30..=0x3f if !in_intermediates => j += 1,
+                0x20..=0x2f => {
+                    in_intermediates = true;
+                    j += 1;
+                }
+                0x40..=0x7e => {
                     return Some(ExtractedAnsi {
                         code: &s[pos..=j],
                         len: j + 1 - pos,
                     });
                 }
-                _ => j += 1,
+                _ => return None,
             }
         }
         return None;
@@ -372,5 +379,32 @@ pub fn update_tracker_from_text(text: &str, tracker: &mut AnsiCodeTracker) {
         } else {
             i += text[i..].chars().next().map_or(1, char::len_utf8);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_ansi_code;
+    use crate::text::visible_width;
+
+    #[test]
+    fn csi_accepts_every_standard_final_byte() {
+        for final_byte in 0x40u8..=0x7e {
+            let sequence = String::from_utf8(vec![0x1b, b'[', final_byte]).unwrap();
+            let extracted = extract_ansi_code(&sequence, 0)
+                .unwrap_or_else(|| panic!("CSI final byte 0x{final_byte:02x} was rejected"));
+            assert_eq!(extracted.len, sequence.len());
+            assert_eq!(extracted.code, sequence);
+        }
+    }
+
+    #[test]
+    fn private_mode_csi_has_zero_visible_width() {
+        assert_eq!(visible_width("\x1b[?25lhello\x1b[?25h"), 5);
+    }
+
+    #[test]
+    fn csi_rejects_parameter_bytes_after_intermediates() {
+        assert!(extract_ansi_code("\x1b[ 1m", 0).is_none());
     }
 }

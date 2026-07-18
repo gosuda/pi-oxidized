@@ -219,6 +219,11 @@ impl OverlayStackInner {
             return;
         };
         let entry = self.entries.remove(index);
+        for remaining in &mut self.entries {
+            if remaining.pre_focus == Some(id) {
+                remaining.pre_focus = entry.pre_focus;
+            }
+        }
         self.focus.clear_overlay_focus_restore_for(id);
         self.focus.retarget_overlay_pre_focus(id, entry.pre_focus);
         self.focus.unregister_overlay(id);
@@ -867,5 +872,24 @@ mod tests {
         assert!(!stack.has_overlay());
         stack.set_terminal_size(120, 24);
         assert!(stack.has_overlay());
+    }
+
+    #[test]
+    fn removing_middle_overlay_retargets_nested_pre_focus() {
+        let stack = OverlayStack::new();
+        stack.set_terminal_size(80, 24);
+        let editor = FocusId::new();
+        let parent = FocusId::new();
+        let child = FocusId::new();
+        stack.set_base_focus(Some(editor));
+        let parent_handle = stack.show(parent, OverlayOptions::default());
+        let child_handle = stack.show(child, OverlayOptions::default());
+
+        assert_eq!(stack.focused(), Some(child));
+        parent_handle.hide();
+        assert_eq!(stack.focused(), Some(child));
+        child_handle.hide();
+        assert_eq!(stack.focused(), Some(editor));
+        assert!(!stack.has_overlay());
     }
 }

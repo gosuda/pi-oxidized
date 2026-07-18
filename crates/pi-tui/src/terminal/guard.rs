@@ -14,11 +14,15 @@ use crossterm::queue;
 use crossterm::style::ResetColor;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
-/// Desired Kitty keyboard flags: disambiguate | event types | alternate keys (== 7).
+/// Desired Kitty keyboard flags: disambiguate | event types | alternate keys (= 7).
 pub const KITTY_KEYBOARD_FLAGS: KeyboardEnhancementFlags =
     KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
         .union(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
         .union(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS);
+
+/// Exact signal-safe terminal recovery sequence used by panic/signal handlers.
+pub const EMERGENCY_RESTORE_BYTES: &[u8] =
+    b"\x1b[?2026l\x1b[<u\x1b[?2004l\x1b[?1004l\x1b[?2031l\x1b[?25h\x1b[0m";
 
 /// Ordered restore stack entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -306,7 +310,7 @@ pub fn install_panic_emergency_hook(
 ///
 /// Returns an I/O error if writing or flushing the restore sequence fails.
 pub fn write_emergency_restore_bytes<W: Write>(writer: &mut W) -> io::Result<()> {
-    writer.write_all(b"\x1b[?2026l\x1b[<u\x1b[?2004l\x1b[?1004l\x1b[?2031l\x1b[?25h\x1b[0m")?;
+    writer.write_all(EMERGENCY_RESTORE_BYTES)?;
     writer.flush()
 }
 
@@ -314,6 +318,10 @@ pub fn write_emergency_restore_bytes<W: Write>(writer: &mut W) -> io::Result<()>
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
+
+    static PANIC_HOOK_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn guard_script_restores_in_reverse() {
@@ -384,5 +392,68 @@ mod tests {
             write_emergency_restore_bytes(&mut out)?;
         }
         Ok(())
+    }
+
+    #[test]
+    fn installed_panic_hook_restores_once_shares_cas_and_chains_previous() {
+        let _lock = PANIC_HOOK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let original = std::panic::take_hook();
+        let previous_calls = Arc::new(AtomicUsize::new(0));
+        let previous_calls_for_hook = Arc::clone(&previous_calls);
+        std::panic::set_hook(Box::new(move |_| {
+            previous_calls_for_hook.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        let mut guard = TerminalGuard::new(Cursor::new(Vec::new()));
+        guard.applied.push(RestoreStep::ColorSchemeNotify);
+        let emergency = guard.emergency_flag();
+        let restore_calls = Arc::new(AtomicUsize::new(0));
+        let restore_calls_for_hook = Arc::clone(&restore_calls);
+        install_panic_emergency_hook(
+            Arc::clone(&emergency),
+            Arc::new(move || {
+                restore_calls_for_hook.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+
+        let assertions = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert!(std::panic::catch_unwind(|| std::panic::panic_any("first")).is_err());
+            assert!(emergency.load(Ordering::SeqCst));
+            assert_eq!(restore_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(previous_calls.load(Ordering::SeqCst), 1);
+            guard.emergency_restore();
+            assert!(
+                guard.writer().get_ref().is_empty(),
+                "the hook and guard must share the same once flag"
+            );
+
+            assert!(std::panic::catch_unwind(|| std::panic::panic_any("second")).is_err());
+            assert_eq!(restore_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(previous_calls.load(Ordering::SeqCst), 2);
+        }));
+
+        drop(std::panic::take_hook());
+        std::panic::set_hook(original);
+        if let Err(payload) = assertions {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[test]
+    fn terminal_guard_emergency_restore_is_mode_only_and_idempotent() {
+        let mut guard = TerminalGuard::new(Cursor::new(Vec::new()));
+        guard.applied.push(RestoreStep::ColorSchemeNotify);
+        let emergency = guard.emergency_flag();
+
+        guard.emergency_restore();
+        let first = guard.writer().get_ref().clone();
+        guard.emergency_restore();
+
+        assert!(emergency.load(Ordering::SeqCst));
+        assert_eq!(guard.writer().get_ref(), &first);
+        assert_eq!(first, b"\x1b[?2031l");
+        assert!(!first.windows(8).any(|window| window == b"\x1b[?2026l"));
     }
 }

@@ -35,6 +35,7 @@ use pi_tui::keys::{
     KeyId, MODIFY_OTHER_KEYS_OMISSION, is_kitty_protocol_active, key_matches, key_press,
     key_press_state, set_kitty_protocol_active,
 };
+use pi_tui::terminal::guard::EMERGENCY_RESTORE_BYTES;
 use pi_tui::terminal::{audit_bytes, probe_query_batch};
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 
@@ -72,11 +73,20 @@ fn pty_no_flicker_sync_ignored_branch_single_write_no_clear() {
 fn pty_cursor_restore_after_success_abort_provider_error_panic_and_sigint() {
     for exit in ["success", "abort", "provider-error", "panic", "sigint"] {
         let report = drive_fixture(exit, true, false);
-        assert!(
-            report.saw_cursor_show || report.saw_emergency_restore,
-            "exit={exit}: expected cursor restoration bytes; got {} output bytes",
-            report.raw.len()
-        );
+        if exit == "panic" {
+            assert_eq!(
+                report.emergency_restore_count, 1,
+                "exit=panic: expected exactly one complete emergency restore sequence; got {} in {} output bytes",
+                report.emergency_restore_count,
+                report.raw.len()
+            );
+        } else {
+            assert!(
+                report.saw_cursor_show || report.emergency_restore_count > 0,
+                "exit={exit}: expected cursor restoration bytes; got {} output bytes",
+                report.raw.len()
+            );
+        }
         let audit = audit_bytes(&report.raw);
         assert_eq!(audit.clear_2j, 0, "exit={exit}: CSI 2J must never appear");
         assert_eq!(audit.clear_3j, 0, "exit={exit}: CSI 3J must never appear");
@@ -366,7 +376,7 @@ struct DriveReport {
     finished_within_timeout: bool,
     sole_stdout_owner: bool,
     saw_cursor_show: bool,
-    saw_emergency_restore: bool,
+    emergency_restore_count: usize,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -659,10 +669,10 @@ fn drive_fixture(exit: &str, sync: bool, capture_width_snapshots: bool) -> Drive
         && !txns.is_empty();
 
     let saw_cursor_show = find_subslice(&raw, b"\x1b[?25h").is_some();
-    let saw_emergency_restore = find_subslice(&raw, b"\x1b[?2026l").is_some()
-        && (find_subslice(&raw, b"\x1b[?25h").is_some()
-            || find_subslice(&raw, b"\x1b[0m").is_some()
-            || find_subslice(&raw, b"\x1b[<u").is_some());
+    let emergency_restore_count = raw
+        .windows(EMERGENCY_RESTORE_BYTES.len())
+        .filter(|window| *window == EMERGENCY_RESTORE_BYTES)
+        .count();
 
     if !saw_stream_and_tools {
         saw_stream_and_tools =
@@ -719,7 +729,7 @@ fn drive_fixture(exit: &str, sync: bool, capture_width_snapshots: bool) -> Drive
         finished_within_timeout,
         sole_stdout_owner,
         saw_cursor_show,
-        saw_emergency_restore,
+        emergency_restore_count,
     }
 }
 

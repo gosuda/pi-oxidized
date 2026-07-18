@@ -338,7 +338,7 @@ impl FocusManager {
         match (focused, event) {
             (Some(component), UiEvent::Key(key)) => {
                 if self.filter_key(*key).is_none() {
-                    return EventResult::Ignored;
+                    return EventResult::Consumed;
                 }
                 component.handle_event(event)
             }
@@ -403,6 +403,27 @@ fn restore_state_overlay(state: OverlayFocusRestoreState) -> Option<FocusId> {
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEventState, KeyModifiers};
+    use ratatui::{buffer::Buffer, layout::Rect};
+
+    #[derive(Default)]
+    struct RecordingComponent {
+        events: usize,
+    }
+
+    impl Component for RecordingComponent {
+        fn measure(&mut self, _width: u16) -> u16 {
+            0
+        }
+
+        fn render(&mut self, _area: Rect, _buf: &mut Buffer) {}
+
+        fn handle_event(&mut self, _event: &UiEvent) -> EventResult {
+            self.events += 1;
+            EventResult::Render
+        }
+
+        fn invalidate(&mut self) {}
+    }
 
     fn key(kind: KeyEventKind) -> KeyEvent {
         KeyEvent {
@@ -524,5 +545,20 @@ mod tests {
             OverlayFocusRestoreState::Inactive
         );
         assert!(!fm.is_overlay(overlay));
+    }
+
+    #[test]
+    fn filtered_release_is_consumed_without_component_dispatch() {
+        let mut fm = FocusManager::new();
+        let id = FocusId::new();
+        fm.set_focus(Some(id));
+        let mut component = RecordingComponent::default();
+        let event = UiEvent::Key(key(KeyEventKind::Release));
+
+        assert_eq!(
+            fm.dispatch_to_focused(Some(&mut component), &event),
+            EventResult::Consumed
+        );
+        assert_eq!(component.events, 0);
     }
 }
