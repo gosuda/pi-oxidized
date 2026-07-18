@@ -18,7 +18,8 @@ pub mod tool;
 
 pub use agent::{Agent, AgentOptions};
 pub use bus::{
-    AgentEventSink, EXTENSION_EVENT_CAPACITY, EventSink, ExtensionEvent, ExtensionSubscription,
+    AGENT_EVENT_CAPACITY, AgentEventSink, AgentEventSubscription, EXTENSION_EVENT_CAPACITY,
+    EventSink, ExtensionEvent, ExtensionSubscription,
 };
 pub use config::{
     AfterToolCall, AfterToolCallContext, AfterToolCallResult, AgentContext, AgentLoopConfig,
@@ -36,8 +37,9 @@ pub use message::{
 pub use queue::{PendingMessageQueue, QueueMode};
 pub use run::{RunIo, run_agent_loop, run_agent_loop_continue};
 pub use schedule::{
-    EmitAgentEvent, ExecutedToolCallBatch, execute_tool_calls,
-    fail_tool_calls_from_truncated_message, should_terminate_tool_batch,
+    EmitAgentEvent, ExecutedToolCallBatch, MAX_PARALLEL_TOOL_CALLS,
+    PARALLEL_TOOL_UPDATE_CAPACITY, execute_tool_calls, fail_tool_calls_from_truncated_message,
+    should_terminate_tool_batch,
 };
 pub use state::{AgentState, AgentStateSnapshot};
 pub use tool::{

@@ -1,19 +1,22 @@
 //! Synchronous non-blocking agent event fan-out.
 //!
 //! The agent loop and provider drain never await presentation or extension
-//! consumers. Lossless subscribers (session, RPC, interactive) receive every
-//! event. Each extension gets a bounded queue of capacity
-//! [`EXTENSION_EVENT_CAPACITY`]; overflow disconnects only that extension with
+//! consumers. Agent subscribers have bounded queues with observable lag and
+//! terminal retention; extension overflow disconnects only that extension with
 //! exactly one [`ExtensionEvent::Lagged`].
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
-use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{Notify, mpsc};
 
 use crate::event::AgentEvent;
 use crate::state::AgentState;
+
+/// Default per-subscriber event queue capacity.
+pub const AGENT_EVENT_CAPACITY: usize = 256;
 
 /// Per-extension event queue capacity.
 ///
@@ -42,19 +45,98 @@ pub enum ExtensionEvent {
 }
 
 struct ExtensionSlot {
-    tx: Option<mpsc::Sender<AgentEvent>>,
+    tx: Option<mpsc::Sender<Arc<AgentEvent>>>,
     lagged: Arc<AtomicBool>,
 }
 
+struct SubscriberState {
+    queue: VecDeque<Arc<AgentEvent>>,
+    closed: bool,
+    lagged: bool,
+}
+
+struct SubscriberInner {
+    capacity: usize,
+    state: Mutex<SubscriberState>,
+    notify: Notify,
+}
+
+impl SubscriberInner {
+    fn push(&self, event: Arc<AgentEvent>) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.closed {
+            return false;
+        }
+
+        if state.queue.len() == self.capacity {
+            state.lagged = true;
+            if let Some(index) = state
+                .queue
+                .iter()
+                .position(|queued| matches!(queued.as_ref(), AgentEvent::MessageUpdate { .. }))
+            {
+                state.queue.remove(index);
+            } else if is_run_terminal(event.as_ref()) {
+                // At the hard bound, the newest terminal snapshot is more
+                // useful than an older buffered event for rebuilding state.
+                state.queue.pop_front();
+            } else {
+                return true;
+            }
+        }
+
+        state.queue.push_back(event);
+        drop(state);
+        self.notify.notify_one();
+        true
+    }
+
+    fn close_sender(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.closed = true;
+        drop(state);
+        self.notify.notify_one();
+    }
+
+    fn close_receiver(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.closed = true;
+        state.queue.clear();
+        drop(state);
+        self.notify.notify_one();
+    }
+}
+
+fn is_run_terminal(event: &AgentEvent) -> bool {
+    matches!(
+        event,
+        AgentEvent::MessageEnd { .. } | AgentEvent::AgentEnd { .. }
+    )
+}
+
+fn unwrap_event(event: Arc<AgentEvent>) -> AgentEvent {
+    Arc::try_unwrap(event).unwrap_or_else(|shared| shared.as_ref().clone())
+}
+
 struct AgentEventSinkInner {
-    lossless: Vec<mpsc::UnboundedSender<AgentEvent>>,
+    subscribers: Vec<Weak<SubscriberInner>>,
     extensions: Vec<ExtensionSlot>,
 }
 
-/// Fan-out sink with lossless unbounded subscribers and bounded extension queues.
+/// Fan-out sink with bounded subscribers and bounded extension queues.
 ///
-/// `emit` reduces agent state first, then publishes:
-/// - lossless: `UnboundedSender` (never drops while the receiver is alive)
+/// `emit` reduces agent state first, then publishes one shared event allocation:
+/// - subscribers: bounded queues; streaming updates are coalesced under lag and
+///   the newest assistant/agent terminal is always retained
 /// - extensions: bounded `try_send`; on `Full`, that slot is disconnected and
 ///   flagged lagged without affecting other subscribers
 pub struct AgentEventSink {
@@ -69,7 +151,7 @@ impl AgentEventSink {
         Self {
             state,
             inner: Mutex::new(AgentEventSinkInner {
-                lossless: Vec::new(),
+                subscribers: Vec::new(),
                 extensions: Vec::new(),
             }),
         }
@@ -81,18 +163,39 @@ impl AgentEventSink {
         Arc::clone(&self.state)
     }
 
-    /// Subscribes a lossless consumer that never drops events.
+    /// Subscribes a bounded consumer with [`AGENT_EVENT_CAPACITY`].
     ///
-    /// Used by session persistence, RPC, and interactive transcript paths.
+    /// Ordered delivery is lossless while the receiver keeps pace. On overflow,
+    /// streaming updates are coalesced and non-terminal events may be dropped;
+    /// [`AgentEventSubscription::is_lagged`] reports that condition. The newest
+    /// assistant and agent terminal events remain deliverable.
     #[must_use]
-    pub fn subscribe(&self) -> mpsc::UnboundedReceiver<AgentEvent> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let mut inner = self
+    pub fn subscribe(&self) -> AgentEventSubscription {
+        self.subscribe_with_capacity(AGENT_EVENT_CAPACITY)
+    }
+
+    /// Subscribes a consumer with an explicit queue capacity.
+    ///
+    /// Capacity is clamped to at least 2 so both `message_end` and `agent_end`
+    /// can remain buffered for a stalled consumer.
+    #[must_use]
+    pub fn subscribe_with_capacity(&self, capacity: usize) -> AgentEventSubscription {
+        let capacity = capacity.max(2);
+        let inner = Arc::new(SubscriberInner {
+            capacity,
+            state: Mutex::new(SubscriberState {
+                queue: VecDeque::with_capacity(capacity),
+                closed: false,
+                lagged: false,
+            }),
+            notify: Notify::new(),
+        });
+        let mut sink = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        inner.lossless.push(tx);
-        rx
+        sink.subscribers.push(Arc::downgrade(&inner));
+        AgentEventSubscription { inner }
     }
 
     /// Subscribes an extension with the default capacity of
@@ -128,12 +231,13 @@ impl AgentEventSink {
 
 impl EventSink for AgentEventSink {
     fn emit(&self, event: AgentEvent) {
+        let event = Arc::new(event);
         {
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state.reduce(&event);
+            state.reduce(event.as_ref());
         }
 
         let mut inner = self
@@ -141,14 +245,17 @@ impl EventSink for AgentEventSink {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        // Drop closed lossless senders and deliver to the rest.
-        inner.lossless.retain(|tx| tx.send(event.clone()).is_ok());
+        inner.subscribers.retain(|subscriber| {
+            subscriber
+                .upgrade()
+                .is_some_and(|subscriber| subscriber.push(Arc::clone(&event)))
+        });
 
         for slot in &mut inner.extensions {
             let Some(tx) = slot.tx.as_ref() else {
                 continue;
             };
-            match tx.try_send(event.clone()) {
+            match tx.try_send(Arc::clone(&event)) {
                 Ok(()) => {}
                 Err(TrySendError::Full(_)) => {
                     // Overflow: disconnect only this extension. Buffered items
@@ -164,6 +271,96 @@ impl EventSink for AgentEventSink {
     }
 }
 
+impl Drop for AgentEventSink {
+    fn drop(&mut self) {
+        let inner = self
+            .inner
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for subscriber in &inner.subscribers {
+            if let Some(subscriber) = subscriber.upgrade() {
+                subscriber.close_sender();
+            }
+        }
+    }
+}
+
+/// Bounded agent event subscription.
+///
+/// The queue remains at its configured hard bound. A stalled consumer may miss
+/// intermediate updates, detectable through [`Self::is_lagged`], while the
+/// newest `message_end` and `agent_end` remain deliverable.
+pub struct AgentEventSubscription {
+    inner: Arc<SubscriberInner>,
+}
+
+impl AgentEventSubscription {
+    /// Receives the next retained event in source order.
+    pub async fn recv(&mut self) -> Option<AgentEvent> {
+        loop {
+            let notified = self.inner.notify.notified();
+            {
+                let mut state = self
+                    .inner
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(event) = state.queue.pop_front() {
+                    return Some(unwrap_event(event));
+                }
+                if state.closed {
+                    return None;
+                }
+            }
+            notified.await;
+        }
+    }
+
+    /// Attempts to receive a retained event without waiting.
+    pub fn try_recv(&mut self) -> Result<AgentEvent, mpsc::error::TryRecvError> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(event) = state.queue.pop_front() {
+            return Ok(unwrap_event(event));
+        }
+        if state.closed {
+            Err(mpsc::error::TryRecvError::Disconnected)
+        } else {
+            Err(mpsc::error::TryRecvError::Empty)
+        }
+    }
+
+    /// Returns true after any event was coalesced or dropped under backpressure.
+    #[must_use]
+    pub fn is_lagged(&self) -> bool {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lagged
+    }
+
+    /// Returns the current number of buffered events.
+    #[must_use]
+    pub fn queued_len(&self) -> usize {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .queue
+            .len()
+    }
+}
+
+impl Drop for AgentEventSubscription {
+    fn drop(&mut self) {
+        self.inner.close_receiver();
+    }
+}
+
 /// Bounded extension event subscription.
 ///
 /// `recv` yields buffered [`ExtensionEvent::Event`] values until the sender is
@@ -171,7 +368,7 @@ impl EventSink for AgentEventSink {
 /// the buffer is empty returns exactly one [`ExtensionEvent::Lagged`], then
 /// `None` forever.
 pub struct ExtensionSubscription {
-    rx: mpsc::Receiver<AgentEvent>,
+    rx: mpsc::Receiver<Arc<AgentEvent>>,
     lagged: Arc<AtomicBool>,
     emitted_lag: bool,
 }
@@ -183,7 +380,7 @@ impl ExtensionSubscription {
     /// the single lag signal when applicable).
     pub async fn recv(&mut self) -> Option<ExtensionEvent> {
         match self.rx.recv().await {
-            Some(event) => Some(ExtensionEvent::Event(Box::new(event))),
+            Some(event) => Some(ExtensionEvent::Event(Box::new(unwrap_event(event)))),
             None => {
                 if !self.emitted_lag && self.lagged.load(Ordering::SeqCst) {
                     self.emitted_lag = true;
@@ -204,7 +401,7 @@ impl ExtensionSubscription {
     /// (and after the single lag signal has already been delivered).
     pub fn try_recv(&mut self) -> Result<ExtensionEvent, mpsc::error::TryRecvError> {
         match self.rx.try_recv() {
-            Ok(event) => Ok(ExtensionEvent::Event(Box::new(event))),
+            Ok(event) => Ok(ExtensionEvent::Event(Box::new(unwrap_event(event)))),
             Err(mpsc::error::TryRecvError::Empty) => Err(mpsc::error::TryRecvError::Empty),
             Err(mpsc::error::TryRecvError::Disconnected) => {
                 if !self.emitted_lag && self.lagged.load(Ordering::SeqCst) {
@@ -236,6 +433,19 @@ mod tests {
     fn msg(n: usize) -> AgentEvent {
         AgentEvent::MessageEnd {
             message: user_text(format!("m{n}"), std::iter::empty()),
+        }
+    }
+
+    fn update(n: usize) -> AgentEvent {
+        let assistant =
+            pi_ai::AssistantMessage::new("api", "provider", format!("m{n}"), n as i64);
+        AgentEvent::MessageUpdate {
+            message: crate::message::AgentMessage::Llm(Box::new(pi_ai::Message::Assistant(
+                assistant.clone(),
+            ))),
+            assistant_message_event: Box::new(pi_ai::AssistantMessageEvent::Start {
+                partial: assistant,
+            }),
         }
     }
 
@@ -351,6 +561,40 @@ mod tests {
             }
         }
         assert_eq!(count, 200);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lagging_subscriber_stays_bounded_and_receives_terminals() -> TestResult {
+        const CAPACITY: usize = 4;
+        let state = Arc::new(Mutex::new(AgentState::new()));
+        let sink = AgentEventSink::new(state);
+        let mut rx = sink.subscribe_with_capacity(CAPACITY);
+
+        for index in 0..100_000 {
+            sink.emit(update(index));
+            assert!(rx.queued_len() <= CAPACITY);
+        }
+        assert!(rx.is_lagged());
+
+        sink.emit(msg(100_000));
+        sink.emit(AgentEvent::AgentEnd {
+            messages: Vec::new(),
+        });
+        assert_eq!(rx.queued_len(), CAPACITY);
+
+        let mut retained = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            retained.push(event);
+        }
+        assert!(matches!(
+            retained.get(retained.len().saturating_sub(2)),
+            Some(AgentEvent::MessageEnd { .. })
+        ));
+        assert!(matches!(
+            retained.last(),
+            Some(AgentEvent::AgentEnd { .. })
+        ));
         Ok(())
     }
 

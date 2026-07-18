@@ -227,6 +227,20 @@ pub trait AgentTool: Send + Sync {
         args: &Map<String, Value>,
     ) -> Result<Map<String, Value>, ToolError>;
 
+    /// Prepares and validates raw arguments before lifecycle hooks and execution.
+    ///
+    /// The default preserves the synchronous compatibility shims. Host-backed
+    /// tools may override this method to perform an asynchronous preflight.
+    fn prepare_and_validate_arguments(
+        &self,
+        raw: Map<String, Value>,
+    ) -> BoxFuture<'_, Result<Map<String, Value>, ToolError>> {
+        Box::pin(async move {
+            let prepared = self.prepare_arguments(&raw)?;
+            self.validate_arguments(&prepared)
+        })
+    }
+
     /// Executes the tool call.
     ///
     /// Failures must be returned as [`ToolError`]; the loop converts them into

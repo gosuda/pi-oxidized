@@ -4,11 +4,14 @@
 //! sequential force for any sequential tool, source-order preflights, parallel
 //! completion-order ends, and source-order tool-result messages.
 
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
+use futures::FutureExt;
 use pi_ai::{AssistantContent, AssistantMessage, Message, ToolCall, ToolResultMessage};
 use serde_json::{Map, Value};
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{
@@ -18,6 +21,12 @@ use crate::error::AgentLoopError;
 use crate::event::AgentEvent;
 use crate::message::{AgentMessage, now_millis};
 use crate::tool::{AgentTool, AgentToolResult, ToolExecutionMode, ToolUpdates, error_tool_result};
+
+/// Maximum number of tool calls executing concurrently in a parallel batch.
+pub const MAX_PARALLEL_TOOL_CALLS: usize = 8;
+
+/// Maximum number of queued parallel tool progress updates.
+pub const PARALLEL_TOOL_UPDATE_CAPACITY: usize = 64;
 
 /// Outcome of scheduling every tool call from one assistant message.
 #[derive(Clone, Debug, PartialEq)]
@@ -56,15 +65,14 @@ enum Preparation {
     Immediate(ImmediateOutcome),
 }
 
-enum ParallelEvent {
-    Update {
-        tool_call: ToolCall,
-        partial: AgentToolResult,
-    },
-    Done {
-        index: usize,
-        finalized: FinalizedOutcome,
-    },
+struct ParallelUpdate {
+    index: usize,
+    partial: AgentToolResult,
+}
+
+struct ParallelWorkerResult {
+    index: usize,
+    finalized: Result<FinalizedOutcome, ()>,
 }
 
 /// Synchronous, non-blocking event fan-out used by the scheduler.
@@ -222,10 +230,10 @@ async fn execute_tool_calls_sequential(
                 finalize_executed_tool_call(
                     current_context,
                     assistant_message,
-                    &prepared,
+                    prepared,
                     executed,
-                    config,
-                    cancel,
+                    config.after_tool_call.clone(),
+                    cancel.clone(),
                 )
                 .await
             }
@@ -252,9 +260,9 @@ async fn execute_tool_calls_parallel(
     cancel: &CancellationToken,
     emit: &impl EmitAgentEvent,
 ) -> Result<ExecutedToolCallBatch, AgentLoopError> {
-    let mut slots: Vec<ParallelSlot> = Vec::with_capacity(tool_calls.len());
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<ParallelEvent>();
-    let pending_count = preflight_parallel_tools(ParallelPreflight {
+    let mut slots = Vec::with_capacity(tool_calls.len());
+    let mut jobs = Vec::with_capacity(tool_calls.len());
+    preflight_parallel_tools(ParallelPreflight {
         current_context,
         assistant_message,
         tool_calls,
@@ -262,18 +270,46 @@ async fn execute_tool_calls_parallel(
         cancel,
         emit,
         slots: &mut slots,
-        event_tx: &event_tx,
+        jobs: &mut jobs,
     })
     .await;
-    drop(event_tx);
 
-    collect_parallel_completions(&mut event_rx, pending_count, &mut slots, emit).await;
+    let context = Arc::new(current_context.clone());
+    let assistant = Arc::new(assistant_message.clone());
+    let (update_tx, mut update_rx) = mpsc::channel(PARALLEL_TOOL_UPDATE_CAPACITY);
+    let mut workers = JoinSet::new();
+    let mut jobs = jobs.into_iter();
+    while workers.len() < MAX_PARALLEL_TOOL_CALLS
+        && spawn_next_parallel_worker(
+            &mut workers,
+            &mut jobs,
+            &context,
+            &assistant,
+            config.after_tool_call.as_ref(),
+            cancel,
+            &update_tx,
+        )
+    {}
+
+    collect_parallel_completions(
+        &mut workers,
+        &mut jobs,
+        &context,
+        &assistant,
+        config.after_tool_call.as_ref(),
+        cancel,
+        &update_tx,
+        &mut update_rx,
+        &mut slots,
+        emit,
+    )
+    .await;
     Ok(emit_source_ordered_results(slots, emit))
 }
 
 enum ParallelSlot {
     Ready(FinalizedOutcome),
-    Pending,
+    Pending(ToolCall),
 }
 
 struct ParallelPreflight<'a, E: EmitAgentEvent> {
@@ -284,10 +320,10 @@ struct ParallelPreflight<'a, E: EmitAgentEvent> {
     cancel: &'a CancellationToken,
     emit: &'a E,
     slots: &'a mut Vec<ParallelSlot>,
-    event_tx: &'a mpsc::UnboundedSender<ParallelEvent>,
+    jobs: &'a mut Vec<(usize, PreparedToolCall)>,
 }
 
-async fn preflight_parallel_tools<E: EmitAgentEvent>(preflight: ParallelPreflight<'_, E>) -> usize {
+async fn preflight_parallel_tools<E: EmitAgentEvent>(preflight: ParallelPreflight<'_, E>) {
     let ParallelPreflight {
         current_context,
         assistant_message,
@@ -296,22 +332,21 @@ async fn preflight_parallel_tools<E: EmitAgentEvent>(preflight: ParallelPrefligh
         cancel,
         emit,
         slots,
-        event_tx,
+        jobs,
     } = preflight;
-    let mut pending_count = 0usize;
 
     for tool_call in tool_calls {
         emit_tool_execution_start(tool_call, &tool_call.arguments, emit);
 
-        let preparation = prepare_tool_call(
+        match prepare_tool_call(
             current_context,
             assistant_message,
             tool_call,
             config,
             cancel,
         )
-        .await;
-        match preparation {
+        .await
+        {
             Preparation::Immediate(immediate) => {
                 let finalized = FinalizedOutcome {
                     tool_call: tool_call.clone(),
@@ -323,119 +358,224 @@ async fn preflight_parallel_tools<E: EmitAgentEvent>(preflight: ParallelPrefligh
             }
             Preparation::Prepared(prepared) => {
                 let index = slots.len();
-                slots.push(ParallelSlot::Pending);
-                pending_count = pending_count.saturating_add(1);
-                spawn_parallel_tool(
-                    index,
-                    prepared,
-                    current_context.clone(),
-                    assistant_message.clone(),
-                    config.after_tool_call.clone(),
+                slots.push(ParallelSlot::Pending(prepared.tool_call.clone()));
+                jobs.push((index, prepared));
+            }
+        }
+    }
+}
+
+fn spawn_next_parallel_worker(
+    workers: &mut JoinSet<ParallelWorkerResult>,
+    jobs: &mut std::vec::IntoIter<(usize, PreparedToolCall)>,
+    context: &Arc<AgentContext>,
+    assistant: &Arc<AssistantMessage>,
+    after_tool_call: Option<&AfterToolCall>,
+    cancel: &CancellationToken,
+    update_tx: &mpsc::Sender<ParallelUpdate>,
+) -> bool {
+    let Some((index, prepared)) = jobs.next() else {
+        return false;
+    };
+    spawn_parallel_tool(
+        workers,
+        index,
+        prepared,
+        Arc::clone(context),
+        Arc::clone(assistant),
+        after_tool_call.cloned(),
+        cancel.clone(),
+        update_tx.clone(),
+    );
+    true
+}
+
+fn spawn_parallel_tool(
+    workers: &mut JoinSet<ParallelWorkerResult>,
+    index: usize,
+    prepared: PreparedToolCall,
+    context: Arc<AgentContext>,
+    assistant: Arc<AssistantMessage>,
+    after_tool_call: Option<AfterToolCall>,
+    cancel: CancellationToken,
+    update_tx: mpsc::Sender<ParallelUpdate>,
+) {
+    workers.spawn(async move {
+        let worker = async move {
+            let updates = ToolUpdates::new(move |partial| {
+                let _ = update_tx.try_send(ParallelUpdate { index, partial });
+            });
+
+            let executed = match prepared
+                .tool
+                .execute(
+                    &prepared.tool_call.id,
+                    prepared.args.clone(),
                     cancel.clone(),
-                    event_tx.clone(),
+                    updates.clone(),
+                )
+                .await
+            {
+                Ok(result) => {
+                    updates.stop_accepting();
+                    ExecutedOutcome {
+                        result,
+                        is_error: false,
+                    }
+                }
+                Err(error) => {
+                    updates.stop_accepting();
+                    ExecutedOutcome {
+                        result: AgentToolResult::from(error),
+                        is_error: true,
+                    }
+                }
+            };
+
+            finalize_executed_tool_call(
+                context.as_ref(),
+                assistant.as_ref(),
+                prepared,
+                executed,
+                after_tool_call,
+                cancel,
+            )
+            .await
+        };
+        ParallelWorkerResult {
+            index,
+            finalized: AssertUnwindSafe(worker).catch_unwind().await.map_err(|_| ()),
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn collect_parallel_completions(
+    workers: &mut JoinSet<ParallelWorkerResult>,
+    jobs: &mut std::vec::IntoIter<(usize, PreparedToolCall)>,
+    context: &Arc<AgentContext>,
+    assistant: &Arc<AssistantMessage>,
+    after_tool_call: Option<&AfterToolCall>,
+    cancel: &CancellationToken,
+    update_tx: &mpsc::Sender<ParallelUpdate>,
+    update_rx: &mut mpsc::Receiver<ParallelUpdate>,
+    slots: &mut [ParallelSlot],
+    emit: &impl EmitAgentEvent,
+) {
+    while !workers.is_empty() {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                workers.abort_all();
+                while workers.join_next().await.is_some() {}
+                settle_all_pending(slots, "Operation aborted", emit);
+                return;
+            }
+            update = update_rx.recv() => {
+                if let Some(update) = update {
+                    emit_parallel_update(slots, update, emit);
+                }
+            }
+            joined = workers.join_next() => {
+                drain_parallel_updates(update_rx, slots, emit);
+                match joined {
+                    Some(Ok(worker)) => settle_worker(slots, worker, emit),
+                    Some(Err(_)) | None => {}
+                }
+                let _ = spawn_next_parallel_worker(
+                    workers,
+                    jobs,
+                    context,
+                    assistant,
+                    after_tool_call,
+                    cancel,
+                    update_tx,
                 );
             }
         }
     }
 
-    pending_count
+    drain_parallel_updates(update_rx, slots, emit);
+    settle_all_pending(
+        slots,
+        "Tool execution ended without a result",
+        emit,
+    );
 }
 
-fn spawn_parallel_tool(
-    index: usize,
-    prepared: PreparedToolCall,
-    context: AgentContext,
-    assistant: AssistantMessage,
-    after_tool_call: Option<AfterToolCall>,
-    cancel_token: CancellationToken,
-    event_tx: mpsc::UnboundedSender<ParallelEvent>,
-) {
-    let tool_call_for_updates = prepared.tool_call.clone();
-    tokio::spawn(async move {
-        let update_tx = event_tx.clone();
-        let tool_call = tool_call_for_updates;
-        let updates = ToolUpdates::new(move |partial| {
-            let _ = update_tx.send(ParallelEvent::Update {
-                tool_call: tool_call.clone(),
-                partial,
-            });
-        });
-
-        let executed = match prepared
-            .tool
-            .execute(
-                &prepared.tool_call.id,
-                prepared.args.clone(),
-                cancel_token.clone(),
-                updates.clone(),
-            )
-            .await
-        {
-            Ok(result) => {
-                updates.stop_accepting();
-                ExecutedOutcome {
-                    result,
-                    is_error: false,
-                }
-            }
-            Err(error) => {
-                updates.stop_accepting();
-                ExecutedOutcome {
-                    result: AgentToolResult::from(error),
-                    is_error: true,
-                }
-            }
-        };
-
-        let finalized = finalize_executed_tool_call_owned(
-            context,
-            assistant,
-            prepared,
-            executed,
-            after_tool_call,
-            cancel_token,
-        )
-        .await;
-        let _ = event_tx.send(ParallelEvent::Done { index, finalized });
-    });
-}
-
-async fn collect_parallel_completions(
-    event_rx: &mut mpsc::UnboundedReceiver<ParallelEvent>,
-    mut pending_count: usize,
-    slots: &mut [ParallelSlot],
+fn drain_parallel_updates(
+    update_rx: &mut mpsc::Receiver<ParallelUpdate>,
+    slots: &[ParallelSlot],
     emit: &impl EmitAgentEvent,
 ) {
-    while pending_count > 0 {
-        match event_rx.recv().await {
-            Some(ParallelEvent::Update { tool_call, partial }) => {
-                emit.emit(AgentEvent::ToolExecutionUpdate {
-                    tool_call_id: tool_call.id,
-                    tool_name: tool_call.name,
-                    args: tool_call.arguments,
-                    partial_result: partial,
-                });
-            }
-            Some(ParallelEvent::Done { index, finalized }) => {
-                emit_tool_execution_end(&finalized, emit);
-                if let Some(slot) = slots.get_mut(index) {
-                    *slot = ParallelSlot::Ready(finalized);
-                }
-                pending_count = pending_count.saturating_sub(1);
-            }
-            None => break,
-        }
+    while let Ok(update) = update_rx.try_recv() {
+        emit_parallel_update(slots, update, emit);
     }
+}
 
-    while let Ok(event) = event_rx.try_recv() {
-        if let ParallelEvent::Update { tool_call, partial } = event {
-            emit.emit(AgentEvent::ToolExecutionUpdate {
-                tool_call_id: tool_call.id,
-                tool_name: tool_call.name,
-                args: tool_call.arguments,
-                partial_result: partial,
-            });
+fn emit_parallel_update(
+    slots: &[ParallelSlot],
+    update: ParallelUpdate,
+    emit: &impl EmitAgentEvent,
+) {
+    let Some(tool_call) = slots.get(update.index).map(|slot| match slot {
+        ParallelSlot::Ready(finalized) => &finalized.tool_call,
+        ParallelSlot::Pending(tool_call) => tool_call,
+    }) else {
+        return;
+    };
+    emit_tool_execution_update(tool_call, update.partial, emit);
+}
+
+fn settle_worker(
+    slots: &mut [ParallelSlot],
+    worker: ParallelWorkerResult,
+    emit: &impl EmitAgentEvent,
+) {
+    match worker.finalized {
+        Ok(finalized) => {
+            emit_tool_execution_end(&finalized, emit);
+            if let Some(slot) = slots.get_mut(worker.index) {
+                *slot = ParallelSlot::Ready(finalized);
+            }
         }
+        Err(()) => settle_pending(
+            slots,
+            worker.index,
+            "Tool execution panicked",
+            emit,
+        ),
+    }
+}
+
+fn settle_pending(
+    slots: &mut [ParallelSlot],
+    index: usize,
+    message: &str,
+    emit: &impl EmitAgentEvent,
+) {
+    let Some(slot) = slots.get_mut(index) else {
+        return;
+    };
+    let ParallelSlot::Pending(tool_call) = slot else {
+        return;
+    };
+    let finalized = FinalizedOutcome {
+        tool_call: tool_call.clone(),
+        result: error_tool_result(message),
+        is_error: true,
+    };
+    emit_tool_execution_end(&finalized, emit);
+    *slot = ParallelSlot::Ready(finalized);
+}
+
+fn settle_all_pending(
+    slots: &mut [ParallelSlot],
+    message: &str,
+    emit: &impl EmitAgentEvent,
+) {
+    for index in 0..slots.len() {
+        settle_pending(slots, index, message, emit);
     }
 }
 
@@ -446,12 +586,22 @@ fn emit_source_ordered_results(
     let mut finalized_calls = Vec::with_capacity(slots.len());
     let mut messages = Vec::with_capacity(slots.len());
     for slot in slots {
-        if let ParallelSlot::Ready(finalized) = slot {
-            let message = tool_result_message(&finalized);
-            emit_tool_result_message(&message, emit);
-            finalized_calls.push(finalized);
-            messages.push(message);
-        }
+        let finalized = match slot {
+            ParallelSlot::Ready(finalized) => finalized,
+            ParallelSlot::Pending(tool_call) => {
+                let finalized = FinalizedOutcome {
+                    tool_call,
+                    result: error_tool_result("Tool execution ended without a result"),
+                    is_error: true,
+                };
+                emit_tool_execution_end(&finalized, emit);
+                finalized
+            }
+        };
+        let message = tool_result_message(&finalized);
+        emit_tool_result_message(&message, emit);
+        messages.push(message);
+        finalized_calls.push(finalized);
     }
 
     ExecutedToolCallBatch {
@@ -479,17 +629,10 @@ async fn prepare_tool_call(
         });
     };
 
-    let prepared_args = match tool.prepare_arguments(&tool_call.arguments) {
-        Ok(args) => args,
-        Err(error) => {
-            return Preparation::Immediate(ImmediateOutcome {
-                result: AgentToolResult::from(error),
-                is_error: true,
-            });
-        }
-    };
-
-    let validated_args = match tool.validate_arguments(&prepared_args) {
+    let validated_args = match tool
+        .prepare_and_validate_arguments(tool_call.arguments.clone())
+        .await
+    {
         Ok(args) => args,
         Err(error) => {
             return Preparation::Immediate(ImmediateOutcome {
@@ -616,29 +759,6 @@ async fn execute_prepared_tool_call(
 async fn finalize_executed_tool_call(
     current_context: &AgentContext,
     assistant_message: &AssistantMessage,
-    prepared: &PreparedToolCall,
-    executed: ExecutedOutcome,
-    config: &AgentLoopConfig,
-    cancel: &CancellationToken,
-) -> FinalizedOutcome {
-    finalize_executed_tool_call_owned(
-        current_context.clone(),
-        assistant_message.clone(),
-        PreparedToolCall {
-            tool_call: prepared.tool_call.clone(),
-            tool: Arc::clone(&prepared.tool),
-            args: prepared.args.clone(),
-        },
-        executed,
-        config.after_tool_call.clone(),
-        cancel.clone(),
-    )
-    .await
-}
-
-async fn finalize_executed_tool_call_owned(
-    current_context: AgentContext,
-    assistant_message: AssistantMessage,
     prepared: PreparedToolCall,
     executed: ExecutedOutcome,
     after_tool_call: Option<AfterToolCall>,
@@ -650,12 +770,12 @@ async fn finalize_executed_tool_call_owned(
     if let Some(after_tool_call) = after_tool_call {
         match after_tool_call(
             AfterToolCallContext {
-                assistant_message,
+                assistant_message: assistant_message.clone(),
                 tool_call: prepared.tool_call.clone(),
                 args: prepared.args.clone(),
                 result: result.clone(),
                 is_error,
-                context: current_context,
+                context: current_context.clone(),
             },
             cancel,
         )
@@ -762,7 +882,7 @@ mod tests {
     use futures::future::BoxFuture;
     use pi_ai::{ImageContent, Model, ModelCost, ModelInput, TextContent, ToolResultContent};
     use serde_json::json;
-    use tokio::time::sleep;
+    use tokio::time::{sleep, timeout};
 
     use crate::config::{AfterToolCallResult, BeforeToolCallResult, default_convert_to_llm_hook};
     use crate::error::ToolError;
@@ -867,6 +987,9 @@ mod tests {
             executed: Arc::new(AtomicBool::new(false)),
             fail_validate: false,
             send_late_update: false,
+            panic_on_execute: false,
+            ignore_cancel: false,
+            progress_updates: 0,
             cancel_seen: Arc::new(AtomicBool::new(false)),
             result_text: format!("{name}-ok"),
             image: false,
@@ -884,6 +1007,9 @@ mod tests {
         executed: Arc<AtomicBool>,
         fail_validate: bool,
         send_late_update: bool,
+        panic_on_execute: bool,
+        ignore_cancel: bool,
+        progress_updates: usize,
         cancel_seen: Arc<AtomicBool>,
         result_text: String,
         image: bool,
@@ -902,6 +1028,9 @@ mod tests {
                 executed: Arc::new(AtomicBool::new(false)),
                 fail_validate: false,
                 send_late_update: false,
+                panic_on_execute: false,
+                ignore_cancel: false,
+                progress_updates: 0,
                 cancel_seen: Arc::new(AtomicBool::new(false)),
                 result_text: format!("{name}-ok"),
                 image: false,
@@ -958,11 +1087,16 @@ mod tests {
             let image = self.image;
             let terminate = self.terminate;
             let send_late_update = self.send_late_update;
+            let panic_on_execute = self.panic_on_execute;
+            let ignore_cancel = self.ignore_cancel;
+            let progress_updates = self.progress_updates;
 
             Box::pin(async move {
                 executed.store(true, Ordering::SeqCst);
                 let current = active.fetch_add(1, Ordering::SeqCst) + 1;
                 max_active.fetch_max(current, Ordering::SeqCst);
+
+                assert!(!panic_on_execute, "intentional tool panic");
 
                 updates.send(AgentToolResult {
                     content: vec![ToolResultContent::Text(TextContent::new("partial"))],
@@ -970,6 +1104,20 @@ mod tests {
                     added_tool_names: None,
                     terminate: None,
                 });
+                for index in 0..progress_updates {
+                    updates.send(AgentToolResult {
+                        content: vec![ToolResultContent::Text(TextContent::new(format!(
+                            "progress-{index}"
+                        )))],
+                        details: json!({"stage":"progress"}),
+                        added_tool_names: None,
+                        terminate: None,
+                    });
+                }
+
+                if ignore_cancel {
+                    std::future::pending::<()>().await;
+                }
 
                 if delay.is_zero() {
                     if cancel.is_cancelled() {
@@ -1248,7 +1396,9 @@ mod tests {
     }
 
     async fn cancellation_preserves_all_tool_result_ids(mode: ToolExecutionMode) -> TestResult {
-        let context = context_with(vec![Arc::new(RecordingTool::new("cancel-me"))]);
+        let tool = RecordingTool::new("cancel-me");
+        let executed = Arc::clone(&tool.executed);
+        let context = context_with(vec![Arc::new(tool)]);
         let assistant = assistant_with_calls(vec![
             ToolCall::new("c1", "cancel-me", Map::new()),
             ToolCall::new("c2", "cancel-me", Map::new()),
@@ -1281,6 +1431,29 @@ mod tests {
             .collect();
         if ids != ["c1", "c2", "c3"] {
             return Err(format!("cancelled result ids were not preserved: {ids:?}"));
+        }
+        for message in &batch.messages {
+            if !message.is_error {
+                return Err(format!(
+                    "cancelled result {} was not an error",
+                    message.tool_call_id
+                ));
+            }
+            let contains_aborted = message.content.iter().any(|content| {
+                matches!(
+                    content,
+                    ToolResultContent::Text(text) if text.text.contains("Operation aborted")
+                )
+            });
+            if !contains_aborted {
+                return Err(format!(
+                    "cancelled result {} lacked aborted content: {:?}",
+                    message.tool_call_id, message.content
+                ));
+            }
+        }
+        if executed.load(Ordering::SeqCst) {
+            return Err("pre-cancelled batch executed a tool".to_owned());
         }
         Ok(())
     }
@@ -1328,6 +1501,197 @@ mod tests {
         }
         if !cancel_seen.load(Ordering::SeqCst) {
             return Err("tool did not observe cancellation".to_owned());
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn non_cooperative_parallel_tool_is_aborted_and_paired() -> TestResult {
+        let tool = RecordingTool {
+            ignore_cancel: true,
+            ..RecordingTool::new("ignore-cancel")
+        };
+        let started = Arc::clone(&tool.executed);
+        let context = context_with(vec![Arc::new(tool)]);
+        let assistant =
+            assistant_with_calls(vec![ToolCall::new("c1", "ignore-cancel", Map::new())]);
+        let config = sample_config(ToolExecutionMode::Parallel);
+        let cancel = CancellationToken::new();
+        let run_cancel = cancel.clone();
+        let (events, emit) = collect_emit();
+
+        let run = tokio::spawn(async move {
+            execute_tool_calls(&context, &assistant, &config, &run_cancel, &emit).await
+        });
+        for _ in 0..100 {
+            if started.load(Ordering::SeqCst) {
+                break;
+            }
+            sleep(Duration::from_millis(2)).await;
+        }
+        if !started.load(Ordering::SeqCst) {
+            return Err("non-cooperative tool never started".to_owned());
+        }
+
+        cancel.cancel();
+        let batch = timeout(Duration::from_secs(1), run)
+            .await
+            .map_err(|_| "cancelled batch did not settle".to_owned())?
+            .map_err(|error| format!("join failed: {error}"))?
+            .map_err(|error| error.to_string())?;
+        if batch.messages.len() != 1 || !batch.messages[0].is_error {
+            return Err(format!("unexpected cancelled batch: {:?}", batch.messages));
+        }
+        if !batch.messages[0].content.iter().any(|content| {
+            matches!(
+                content,
+                ToolResultContent::Text(text) if text.text.contains("Operation aborted")
+            )
+        }) {
+            return Err(format!(
+                "missing aborted result content: {:?}",
+                batch.messages[0].content
+            ));
+        }
+        let end_count = snapshot_events(&events)?
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    AgentEvent::ToolExecutionEnd { tool_call_id, is_error: true, .. }
+                        if tool_call_id == "c1"
+                )
+            })
+            .count();
+        if end_count != 1 {
+            return Err(format!("expected one paired error end, got {end_count}"));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn panicking_parallel_tool_emits_paired_error_result() -> TestResult {
+        let tool = RecordingTool {
+            panic_on_execute: true,
+            ..RecordingTool::new("panic")
+        };
+        let context = context_with(vec![Arc::new(tool)]);
+        let assistant = assistant_with_calls(vec![ToolCall::new("panic-1", "panic", Map::new())]);
+        let config = sample_config(ToolExecutionMode::Parallel);
+        let (events, emit) = collect_emit();
+
+        let batch = execute_tool_calls(
+            &context,
+            &assistant,
+            &config,
+            &CancellationToken::new(),
+            &emit,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        if batch.messages.len() != 1 || !batch.messages[0].is_error {
+            return Err(format!("panic was not paired: {:?}", batch.messages));
+        }
+        if !batch.messages[0].content.iter().any(|content| {
+            matches!(
+                content,
+                ToolResultContent::Text(text) if text.text.contains("Tool execution panicked")
+            )
+        }) {
+            return Err(format!(
+                "panic result lacked diagnostic: {:?}",
+                batch.messages[0].content
+            ));
+        }
+        let events = snapshot_events(&events)?;
+        let ends = events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::ToolExecutionEnd { .. }))
+            .count();
+        let result_ends = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    AgentEvent::MessageEnd { message }
+                        if matches!(message.as_llm(), Some(Message::ToolResult(_)))
+                )
+            })
+            .count();
+        if ends != 1 || result_ends != 1 {
+            return Err(format!(
+                "panic lifecycle was not paired: ends={ends}, result_ends={result_ends}"
+            ));
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parallel_tool_concurrency_is_capped() -> TestResult {
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let tool = shared_tool(
+            "bounded",
+            None,
+            Duration::from_millis(20),
+            &active,
+            &max_active,
+        );
+        let context = context_with(vec![Arc::new(tool)]);
+        let assistant = assistant_with_calls(
+            (0..(MAX_PARALLEL_TOOL_CALLS * 3))
+                .map(|index| ToolCall::new(format!("c{index}"), "bounded", Map::new()))
+                .collect(),
+        );
+        let config = sample_config(ToolExecutionMode::Parallel);
+        let (_events, emit) = collect_emit();
+
+        let batch = execute_tool_calls(
+            &context,
+            &assistant,
+            &config,
+            &CancellationToken::new(),
+            &emit,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        if batch.messages.len() != MAX_PARALLEL_TOOL_CALLS * 3 {
+            return Err(format!("missing bounded results: {}", batch.messages.len()));
+        }
+        let observed = max_active.load(Ordering::SeqCst);
+        if observed == 0 || observed > MAX_PARALLEL_TOOL_CALLS {
+            return Err(format!("parallel concurrency exceeded cap: {observed}"));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn parallel_progress_queue_is_bounded() -> TestResult {
+        let tool = RecordingTool {
+            progress_updates: 10_000,
+            ..RecordingTool::new("progress")
+        };
+        let context = context_with(vec![Arc::new(tool)]);
+        let assistant =
+            assistant_with_calls(vec![ToolCall::new("progress-1", "progress", Map::new())]);
+        let config = sample_config(ToolExecutionMode::Parallel);
+        let (events, emit) = collect_emit();
+
+        execute_tool_calls(
+            &context,
+            &assistant,
+            &config,
+            &CancellationToken::new(),
+            &emit,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let updates = snapshot_events(&events)?
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::ToolExecutionUpdate { .. }))
+            .count();
+        if updates == 0 || updates > PARALLEL_TOOL_UPDATE_CAPACITY {
+            return Err(format!("progress queue was not bounded: {updates}"));
         }
         Ok(())
     }

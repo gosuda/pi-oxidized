@@ -10,10 +10,12 @@ use std::sync::{Arc, Mutex};
 
 use pi_ai::{AssistantMessage, Message, Model, ModelThinkingLevel, Provider, StopReason};
 use serde_json::Map;
-use tokio::sync::{Notify, mpsc, watch};
+use tokio::sync::{Notify, watch};
 use tokio_util::sync::CancellationToken;
 
-use crate::bus::{AgentEventSink, EventSink, ExtensionSubscription};
+use crate::bus::{
+    AgentEventSink, AgentEventSubscription, EventSink, ExtensionSubscription,
+};
 use crate::config::{AgentContext, AgentLoopConfig, GetMessages};
 use crate::error::AgentLoopError;
 use crate::event::AgentEvent;
@@ -148,9 +150,9 @@ impl Agent {
         Self { inner }
     }
 
-    /// Returns a lossless event subscription.
+    /// Returns a bounded event subscription.
     #[must_use]
-    pub fn subscribe(&self) -> mpsc::UnboundedReceiver<AgentEvent> {
+    pub fn subscribe(&self) -> AgentEventSubscription {
         self.inner.sink.subscribe()
     }
 
@@ -702,7 +704,6 @@ mod tests {
         ModelInput, Provider, ProviderError, StopReason, StreamOptions, TextContent,
         UserMessageContent,
     };
-    use tokio::sync::mpsc::UnboundedReceiver;
     use tokio::time::{sleep, timeout};
 
     use super::*;
@@ -822,7 +823,7 @@ mod tests {
         }
     }
 
-    async fn drain_events(rx: &mut UnboundedReceiver<AgentEvent>) -> Vec<AgentEvent> {
+    async fn drain_events(rx: &mut AgentEventSubscription) -> Vec<AgentEvent> {
         let mut events = Vec::new();
         while let Ok(Some(event)) = timeout(Duration::from_millis(50), rx.recv()).await {
             events.push(event);
@@ -1046,9 +1047,9 @@ mod tests {
         let run = tokio::spawn({
             let agent = agent.clone();
             async move {
-                let _ = agent
+                agent
                     .prompt(vec![user_text("go", std::iter::empty())])
-                    .await;
+                    .await
             }
         });
 
@@ -1059,7 +1060,11 @@ mod tests {
         }
         assert!(agent.state().is_streaming, "run never started");
         agent.abort();
-        run.await?;
+        let prompt_result = run.await?;
+        assert!(
+            prompt_result.is_ok(),
+            "normal abort must resolve the prompt successfully: {prompt_result:?}"
+        );
         agent.wait_for_idle().await;
 
         let events = drain_events(&mut rx).await;
@@ -1087,6 +1092,46 @@ mod tests {
             _ => false,
         };
         assert!(aborted, "expected an aborted assistant terminal");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn abort_preserves_steering_and_follow_up_queues(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let provider = Arc::new(HangingProvider::after_start());
+        let agent = Agent::new(agent_options(provider));
+        let run = tokio::spawn({
+            let agent = agent.clone();
+            async move {
+                agent
+                    .prompt(vec![user_text("go", std::iter::empty())])
+                    .await
+            }
+        });
+
+        let mut waited = 0;
+        while agent.state().streaming_message.is_none() && waited < 200 {
+            sleep(Duration::from_millis(5)).await;
+            waited += 1;
+        }
+        assert!(
+            agent.state().streaming_message.is_some(),
+            "provider start was never reduced"
+        );
+
+        agent.steer(user_text("steer-after-abort", std::iter::empty()));
+        agent.follow_up(user_text("follow-after-abort", std::iter::empty()));
+        agent.abort();
+        let prompt_result = run.await?;
+        assert!(prompt_result.is_ok(), "abort returned {prompt_result:?}");
+        agent.wait_for_idle().await;
+
+        let steering = lock(&agent.inner.steering).drain();
+        let follow_up = lock(&agent.inner.follow_up).drain();
+        assert_eq!(steering.len(), 1, "abort cleared the steering queue");
+        assert_eq!(follow_up.len(), 1, "abort cleared the follow-up queue");
+        assert_eq!(user_text_of(&steering[0]), Some("steer-after-abort"));
+        assert_eq!(user_text_of(&follow_up[0]), Some("follow-after-abort"));
         Ok(())
     }
 

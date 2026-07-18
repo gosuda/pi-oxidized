@@ -312,48 +312,46 @@ async fn consume_drain_items(
         };
 
         match item {
-            DrainItem::Event(event) => match event.as_ref() {
+            DrainItem::Event(event) => match *event {
                 AssistantMessageEvent::Start { partial } => {
-                    context
-                        .messages
-                        .push(assistant_agent_message(partial.clone()));
+                    let message = assistant_agent_message(partial);
+                    context.messages.push(message.clone());
                     added_partial = true;
-                    io.sink.emit(AgentEvent::MessageStart {
-                        message: assistant_agent_message(partial.clone()),
-                    });
-                }
-                AssistantMessageEvent::TextStart { partial, .. }
-                | AssistantMessageEvent::TextDelta { partial, .. }
-                | AssistantMessageEvent::TextEnd { partial, .. }
-                | AssistantMessageEvent::ThinkingStart { partial, .. }
-                | AssistantMessageEvent::ThinkingDelta { partial, .. }
-                | AssistantMessageEvent::ThinkingEnd { partial, .. }
-                | AssistantMessageEvent::ToolCallStart { partial, .. }
-                | AssistantMessageEvent::ToolCallDelta { partial, .. }
-                | AssistantMessageEvent::ToolCallEnd { partial, .. } => {
-                    if added_partial {
-                        replace_last_assistant(context, partial.clone());
-                        io.sink.emit(AgentEvent::MessageUpdate {
-                            message: assistant_agent_message(partial.clone()),
-                            assistant_message_event: event.clone(),
-                        });
-                    }
+                    io.sink.emit(AgentEvent::MessageStart { message });
                 }
                 AssistantMessageEvent::Done { message, .. } => {
                     return Ok(finalize_assistant(
                         context,
                         io,
-                        message.clone(),
+                        message,
                         added_partial,
                     ));
                 }
                 AssistantMessageEvent::Error { error, .. } => {
-                    return Ok(finalize_assistant(
-                        context,
-                        io,
-                        error.clone(),
-                        added_partial,
-                    ));
+                    return Ok(finalize_assistant(context, io, error, added_partial));
+                }
+                event => {
+                    let partial = match &event {
+                        AssistantMessageEvent::TextStart { partial, .. }
+                        | AssistantMessageEvent::TextDelta { partial, .. }
+                        | AssistantMessageEvent::TextEnd { partial, .. }
+                        | AssistantMessageEvent::ThinkingStart { partial, .. }
+                        | AssistantMessageEvent::ThinkingDelta { partial, .. }
+                        | AssistantMessageEvent::ThinkingEnd { partial, .. }
+                        | AssistantMessageEvent::ToolCallStart { partial, .. }
+                        | AssistantMessageEvent::ToolCallDelta { partial, .. }
+                        | AssistantMessageEvent::ToolCallEnd { partial, .. } => partial,
+                        AssistantMessageEvent::Start { .. }
+                        | AssistantMessageEvent::Done { .. }
+                        | AssistantMessageEvent::Error { .. } => unreachable!(),
+                    };
+                    if added_partial {
+                        let message = assistant_agent_message(partial.clone());
+                        io.sink.emit(AgentEvent::MessageUpdate {
+                            message,
+                            assistant_message_event: Box::new(event),
+                        });
+                    }
                 }
             },
             DrainItem::Infra(error) => {
@@ -1436,7 +1434,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn infra_error_synthesizes_error_or_aborted() -> TestResult {
+    async fn infra_error_synthesizes_error() -> TestResult {
         let provider = ScriptedProvider::new(vec![vec![
             Ok(start("")),
             Err(ProviderError::new("transport down")),
@@ -1461,6 +1459,20 @@ mod tests {
         assert_eq!(last.stop_reason, StopReason::Error);
         assert_eq!(last.error_message.as_deref(), Some("transport down"));
         Ok(())
+    }
+
+    #[test]
+    fn cancelled_provider_error_synthesizes_aborted() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let assistant = synthesize_from_provider_error(
+            &sample_config(),
+            &cancel,
+            &ProviderError::new("transport down"),
+        );
+
+        assert_eq!(assistant.stop_reason, StopReason::Aborted);
+        assert_eq!(assistant.error_message.as_deref(), Some("transport down"));
     }
 
     #[tokio::test]
@@ -1676,12 +1688,34 @@ mod tests {
             }
             sleep(Duration::from_millis(5)).await;
         }
+        assert!(
+            provider.delivered.load(Ordering::SeqCst) >= 1,
+            "provider did not deliver the event required to establish the cancellation race"
+        );
         cancel.cancel();
-        let _ = join.await.map_err(|err| err.to_string())?;
+        join.await
+            .map_err(|err| err.to_string())?
+            .map_err(|err| err.to_string())?;
         let events = snapshot(&events)?;
 
         assert_eq!(count_type(&events, "agent_end"), 1, "events={events:?}");
         assert_eq!(count_assistant_message_end(&events), 1, "events={events:?}");
+        let final_assistant = events.iter().find_map(|event| match event {
+            AgentEvent::MessageEnd { message } => match message.as_llm() {
+                Some(Message::Assistant(assistant)) => Some(assistant),
+                _ => None,
+            },
+            _ => None,
+        });
+        let final_assistant = final_assistant.ok_or("missing assistant terminal")?;
+        assert_eq!(final_assistant.stop_reason, StopReason::Aborted);
+        assert!(
+            final_assistant
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("cancel")),
+            "unexpected cancellation terminal: {final_assistant:?}"
+        );
         assert!(partial_rx.borrow().is_none());
         Ok(())
     }
