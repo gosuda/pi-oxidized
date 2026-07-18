@@ -839,6 +839,11 @@ async fn reader_task(stdout: Box<dyn AsyncRead + Unpin + Send>, shared: Arc<Shar
                         stderr: stderr_of(&shared),
                     },
                 );
+                // Typed fatal event so the product pump tears the host down
+                // exactly like EOF / protocol death.
+                let _ = shared
+                    .events
+                    .send(HostEvent::ProtocolError(format!("stdout read error: {e}")));
                 shared.running.store(false, Ordering::Relaxed);
                 break;
             }
@@ -1523,6 +1528,44 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn stdout_read_error_emits_fatal_protocol_event() -> R {
+        struct FailingReader;
+        impl tokio::io::AsyncRead for FailingReader {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Err(std::io::Error::other("injected stdout failure")))
+            }
+        }
+
+        let (client_to_host, _host_from_client) = tokio::io::duplex(4096);
+        let (client_err, _host_err) = tokio::io::duplex(4096);
+        let client = HostClient::connect_boxed(
+            Box::new(client_to_host),
+            Box::new(FailingReader),
+            Box::new(client_err),
+            None,
+        );
+        let mut events = client.subscribe();
+        let event = tokio::time::timeout(Duration::from_secs(1), events.recv()).await??;
+        let HostEvent::ProtocolError(message) = event else {
+            return Err(format!("expected ProtocolError, got {event:?}").into());
+        };
+        assert!(
+            message.contains("stdout read error"),
+            "unexpected message: {message}"
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while client.is_running() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        Ok(())
+    }
     #[tokio::test]
     async fn crash_eof_fails_pending_with_closed() -> R {
         let (client, mut host) = make_pair().await;
