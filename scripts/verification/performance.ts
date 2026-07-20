@@ -1183,10 +1183,62 @@ async function buildProducts(): Promise<void> {
 		cwd: resolve(REPOSITORY_ROOT, ".references/pi"),
 		argv: [npm, "ci", "--ignore-scripts"],
 	});
+	// Offline replacement for the upstream `build:binary` chain: the ai
+	// package's build starts with `npm run generate-models`, which fetches
+	// live provider catalogs (forbidden here) and mutates the reference tree.
+	// main() already provisioned the gitignored provider data (with the
+	// inversion proof) before fingerprinting; run the same compile steps the
+	// upstream chain would, minus the generator.
+	const refRoot = resolve(REPOSITORY_ROOT, ".references/pi");
+	const tsgo = resolve(refRoot, "node_modules/.bin/tsgo");
+	const shx = resolve(refRoot, "node_modules/.bin/shx");
 	await runCheckedCommand({
-		label: "TypeScript pi official package binary build",
-		cwd: REPOSITORY_ROOT,
-		argv: [npm, "--prefix", ".references/pi/packages/coding-agent", "run", "build:binary"],
+		label: "TypeScript pi tui build",
+		cwd: resolve(refRoot, "packages/tui"),
+		argv: [tsgo, "-p", "tsconfig.build.json"],
+	});
+	await runCheckedCommand({
+		label: "TypeScript pi ai build (generate-models skipped)",
+		cwd: resolve(refRoot, "packages/ai"),
+		argv: [tsgo, "-p", "tsconfig.build.json"],
+	});
+	await runCheckedCommand({
+		label: "TypeScript pi ai data staging",
+		cwd: resolve(refRoot, "packages/ai"),
+		argv: [shx, "rm", "-rf", "dist/providers/data"],
+	});
+	await runCheckedCommand({
+		label: "TypeScript pi ai data copy",
+		cwd: resolve(refRoot, "packages/ai"),
+		argv: [shx, "cp", "-r", "src/providers/data", "dist/providers/data"],
+	});
+	await runCheckedCommand({
+		label: "TypeScript pi agent build",
+		cwd: resolve(refRoot, "packages/agent"),
+		argv: [tsgo, "-p", "tsconfig.build.json"],
+	});
+	await runCheckedCommand({
+		label: "TypeScript pi coding-agent build",
+		cwd: resolve(refRoot, "packages/coding-agent"),
+		argv: [npm, "run", "build"],
+	});
+	await runCheckedCommand({
+		label: "TypeScript pi binary compile",
+		cwd: resolve(refRoot, "packages/coding-agent"),
+		argv: [
+			bun,
+			"build",
+			"--compile",
+			"./dist/bun/cli.js",
+			"./src/utils/image-resize-worker.ts",
+			"--outfile",
+			"dist/pi",
+		],
+	});
+	await runCheckedCommand({
+		label: "TypeScript pi binary assets",
+		cwd: resolve(refRoot, "packages/coding-agent"),
+		argv: [npm, "run", "copy-binary-assets"],
 	});
 	artifact.build.artifacts = {
 		rustPi: fileRecord(RUST_BINARY),
@@ -1201,6 +1253,14 @@ async function main(): Promise<void> {
 	artifact.machine = machineMetadata();
 	const ticksPerSecond = clockTicksPerSecond();
 	const python = requiredExecutable("python3");
+	// Provision the gitignored reference provider data BEFORE fingerprinting:
+	// reconstruction is deterministic, and the fingerprint must cover the
+	// exact data the benchmark builds against (a fresh clone has none).
+	await runCheckedCommand({
+		label: "Provider data reconstruction (offline, proof-checked)",
+		cwd: REPOSITORY_ROOT,
+		argv: [requiredExecutable("bun"), "run", "scripts/reconstruct-provider-data.ts"],
+	});
 	const sourceBefore = {
 		rust: sourceFingerprint(RUST_SOURCE_ROOTS),
 		typescript: sourceFingerprint(TYPESCRIPT_SOURCE_ROOTS),

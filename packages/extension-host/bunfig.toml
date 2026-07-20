@@ -2,28 +2,29 @@
 # extension loading and host bridge. tsc uses local .d.ts declarations
 # instead (see src/refs.d.ts) for compiler isolation.
 #
-# Absolute paths ensure compiled binaries resolve correctly regardless
-# of runtime working directory.
+# Paths are relative to this bunfig.toml, so any checkout location works
+# (CI clones the reference beside the repo root). Compiled binaries do not
+# read this file; they resolve via the bundled virtual modules.
 
 [resolver.paths]
-"@earendil-works/pi-coding-agent" = "/home/alpha/exp/pi-oxidized/.references/pi/packages/coding-agent/src/core/extensions/index.ts"
-"@earendil-works/pi-coding-agent/builtins" = "/home/alpha/exp/pi-oxidized/.references/pi/packages/coding-agent/src/extensions/index.ts"
-"@mariozechner/pi-coding-agent/builtins" = "/home/alpha/exp/pi-oxidized/.references/pi/packages/coding-agent/src/extensions/index.ts"
-"pi-coding-agent-full" = "/home/alpha/exp/pi-oxidized/.references/pi/packages/coding-agent/src/index.ts"
-"@earendil-works/pi-coding-agent/*" = "/home/alpha/exp/pi-oxidized/.references/pi/packages/coding-agent/src/core/extensions/*"
-"@earendil-works/pi-agent-core" = "/home/alpha/exp/pi-oxidized/.references/pi/packages/agent/src/index.ts"
-"@earendil-works/pi-agent-core/*" = "/home/alpha/exp/pi-oxidized/.references/pi/packages/agent/src/*"
-"@earendil-works/pi-tui" = "/home/alpha/exp/pi-oxidized/.references/pi/packages/tui/src/index.ts"
-"@earendil-works/pi-tui/*" = "/home/alpha/exp/pi-oxidized/.references/pi/packages/tui/src/*"
-"@earendil-works/pi-ai" = "/home/alpha/exp/pi-oxidized/.references/pi/packages/ai/src/compat.ts"
-"@earendil-works/pi-ai/compat" = "/home/alpha/exp/pi-oxidized/.references/pi/packages/ai/src/compat.ts"
-"@earendil-works/pi-ai/oauth" = "/home/alpha/exp/pi-oxidized/.references/pi/packages/ai/src/oauth.ts"
-"@earendil-works/pi-ai/providers/all" = "/home/alpha/exp/pi-oxidized/.references/pi/packages/ai/src/providers/all.ts"
-"@earendil-works/pi-ai/*" = "/home/alpha/exp/pi-oxidized/.references/pi/packages/ai/src/*"
-"@mariozechner/pi-coding-agent" = "/home/alpha/exp/pi-oxidized/.references/pi/packages/coding-agent/src/core/extensions/index.ts"
-"@mariozechner/pi-agent-core" = "/home/alpha/exp/pi-oxidized/.references/pi/packages/agent/src/index.ts"
-"@mariozechner/pi-tui" = "/home/alpha/exp/pi-oxidized/.references/pi/packages/tui/src/index.ts"
-"@mariozechner/pi-ai" = "/home/alpha/exp/pi-oxidized/.references/pi/packages/ai/src/compat.ts"
-"@mariozechner/pi-ai/compat" = "/home/alpha/exp/pi-oxidized/.references/pi/packages/ai/src/compat.ts"
-"@mariozechner/pi-ai/oauth" = "/home/alpha/exp/pi-oxidized/.references/pi/packages/ai/src/oauth.ts"
-"@mariozechner/pi-ai/providers/all" = "/home/alpha/exp/pi-oxidized/.references/pi/packages/ai/src/providers/all.ts"
+"@earendil-works/pi-coding-agent" = "../../.references/pi/packages/coding-agent/src/core/extensions/index.ts"
+"@earendil-works/pi-coding-agent/builtins" = "../../.references/pi/packages/coding-agent/src/extensions/index.ts"
+"@mariozechner/pi-coding-agent/builtins" = "../../.references/pi/packages/coding-agent/src/extensions/index.ts"
+"pi-coding-agent-full" = "../../.references/pi/packages/coding-agent/src/index.ts"
+"@earendil-works/pi-coding-agent/*" = "../../.references/pi/packages/coding-agent/src/core/extensions/*"
+"@earendil-works/pi-agent-core" = "../../.references/pi/packages/agent/src/index.ts"
+"@earendil-works/pi-agent-core/*" = "../../.references/pi/packages/agent/src/*"
+"@earendil-works/pi-tui" = "../../.references/pi/packages/tui/src/index.ts"
+"@earendil-works/pi-tui/*" = "../../.references/pi/packages/tui/src/*"
+"@earendil-works/pi-ai" = "../../.references/pi/packages/ai/src/compat.ts"
+"@earendil-works/pi-ai/compat" = "../../.references/pi/packages/ai/src/compat.ts"
+"@earendil-works/pi-ai/oauth" = "../../.references/pi/packages/ai/src/oauth.ts"
+"@earendil-works/pi-ai/providers/all" = "../../.references/pi/packages/ai/src/providers/all.ts"
+"@earendil-works/pi-ai/*" = "../../.references/pi/packages/ai/src/*"
+"@mariozechner/pi-coding-agent" = "../../.references/pi/packages/coding-agent/src/core/extensions/index.ts"
+"@mariozechner/pi-agent-core" = "../../.references/pi/packages/agent/src/index.ts"
+"@mariozechner/pi-tui" = "../../.references/pi/packages/tui/src/index.ts"
+"@mariozechner/pi-ai" = "../../.references/pi/packages/ai/src/compat.ts"
+"@mariozechner/pi-ai/compat" = "../../.references/pi/packages/ai/src/compat.ts"
+"@mariozechner/pi-ai/oauth" = "../../.references/pi/packages/ai/src/oauth.ts"
+"@mariozechner/pi-ai/providers/all" = "../../.references/pi/packages/ai/src/providers/all.ts"
