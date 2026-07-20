@@ -143,11 +143,10 @@ describe("host: REAL ExtensionRunner hooks", () => {
 
 	test("runner dispatches session_start without error", async () => {
 		const { ext, runtime } = await loadFactory(hooksFactory, "hooks.ts");
-		// Escape hatch: reference class stubs.
 		const runner = new ExtensionRunner(
 			[ext], runtime, process.cwd(),
-			{} as unknown as ConstructorParameters<typeof ExtensionRunner>[3],
-			{ getAll: () => [], find: () => undefined } as unknown as ConstructorParameters<typeof ExtensionRunner>[4],
+			{} as ConstructorParameters<typeof ExtensionRunner>[3],
+			{ getAll: () => [], find: () => undefined } as ConstructorParameters<typeof ExtensionRunner>[4],
 		);
 		runner.bindCore({} as never, noopContextActions);
 		await runner.emit({ type: "session_start", reason: "startup" });
@@ -158,8 +157,8 @@ describe("host: REAL ExtensionRunner hooks", () => {
 		const { ext, runtime } = await loadFactory(hooksFactory, "hooks.ts");
 		const runner = new ExtensionRunner(
 			[ext], runtime, process.cwd(),
-			{} as unknown as ConstructorParameters<typeof ExtensionRunner>[3],
-			{ getAll: () => [], find: () => undefined } as unknown as ConstructorParameters<typeof ExtensionRunner>[4],
+			{} as ConstructorParameters<typeof ExtensionRunner>[3],
+			{ getAll: () => [], find: () => undefined } as ConstructorParameters<typeof ExtensionRunner>[4],
 		);
 		runner.bindCore({} as never, noopContextActions);
 		const messages = [{ role: "user", content: [{ type: "text", text: "hi" }] }] as never;
@@ -171,14 +170,13 @@ describe("host: REAL ExtensionRunner hooks", () => {
 		const { ext, runtime } = await loadFactory(hooksFactory, "hooks.ts");
 		const runner = new ExtensionRunner(
 			[ext], runtime, process.cwd(),
-			{} as unknown as ConstructorParameters<typeof ExtensionRunner>[3],
-			{ getAll: () => [], find: () => undefined } as unknown as ConstructorParameters<typeof ExtensionRunner>[4],
+			{} as ConstructorParameters<typeof ExtensionRunner>[3],
+			{ getAll: () => [], find: () => undefined } as ConstructorParameters<typeof ExtensionRunner>[4],
 		);
 		runner.bindCore({} as never, noopContextActions);
 		const result = await runner.emitInput("hello", undefined, "interactive");
 		expect(result.action).toBe("continue");
 	});
-
 	test("first registration wins for duplicate tool names", async () => {
 		const runtime = createExtensionRuntime();
 		const bus = createEventBus();

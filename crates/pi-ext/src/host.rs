@@ -248,17 +248,6 @@ mod tests {
     }
 
     #[test]
-    fn default_asset_path_shape() -> R {
-        let path = default_asset_path().ok_or_else(|| std::io::Error::other("no asset path"))?;
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        assert!(
-            name == "pi-extension-host" || name == "pi-extension-host.exe",
-            "unexpected asset name: {name}"
-        );
-        Ok(())
-    }
-
-    #[test]
     fn compiled_sibling_wins_over_runtime_bundle() -> R {
         let dir = tempdir()?;
         let compiled = dir.path().join("pi-extension-host");

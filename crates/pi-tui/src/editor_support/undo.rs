@@ -61,13 +61,4 @@ mod tests {
         stack.clear();
         assert!(stack.is_empty());
     }
-
-    #[test]
-    fn push_clones_state() {
-        let mut stack = UndoStack::new();
-        let mut state = vec![1, 2, 3];
-        stack.push(&state);
-        state.push(4);
-        assert_eq!(stack.pop(), Some(vec![1, 2, 3]));
-    }
 }

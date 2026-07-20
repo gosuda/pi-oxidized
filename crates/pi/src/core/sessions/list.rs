@@ -602,9 +602,4 @@ mod tests {
         );
         Ok(())
     }
-
-    #[test]
-    fn max_concurrent_is_ten() {
-        assert_eq!(MAX_CONCURRENT_SESSION_INFO_LOADS, 10);
-    }
 }

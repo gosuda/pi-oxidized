@@ -802,6 +802,8 @@ mod tests {
 
     type TestResult = Result<(), String>;
 
+    static CALLBACK_PORT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn err(msg: impl Into<String>) -> String {
         msg.into()
     }
@@ -1202,6 +1204,7 @@ mod tests {
 
     #[tokio::test]
     async fn browser_callback_rejects_wrong_state() -> TestResult {
+        let _port_guard = CALLBACK_PORT_TEST_LOCK.lock().await;
         let port = free_port()?;
         let routes = Arc::new(Mutex::new(Vec::new()));
         let gateway = spawn_json_server(routes.clone())?;
@@ -1244,6 +1247,7 @@ mod tests {
 
     #[tokio::test]
     async fn browser_callback_exchanges_code_and_to_auth() -> TestResult {
+        let _port_guard = CALLBACK_PORT_TEST_LOCK.lock().await;
         let port = free_port()?;
         let routes = Arc::new(Mutex::new(Vec::new()));
         let gateway = spawn_json_server(routes.clone())?;
@@ -1312,6 +1316,7 @@ mod tests {
 
     #[tokio::test]
     async fn browser_state_mismatch_does_not_settle_callback() -> TestResult {
+        let _port_guard = CALLBACK_PORT_TEST_LOCK.lock().await;
         let port = free_port()?;
         let server = OAuthCallbackServer::start(OAuthCallbackConfig {
             port,

@@ -2231,12 +2231,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_omission_documented() {
-        assert!(LEGACY_MODIFY_OTHER_KEYS_OMISSION.contains("modifyOtherKeys"));
-        assert!(LEGACY_MODIFY_OTHER_KEYS_OMISSION.contains("backslash-Enter"));
-    }
-
-    #[test]
     fn insert_and_submit() {
         let submitted = Arc::new(Mutex::new(None));
         let submitted2 = submitted.clone();

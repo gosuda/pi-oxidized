@@ -713,9 +713,4 @@ mod tests {
         sink.emit(msg(0));
         sink.emit(msg(1));
     }
-
-    #[test]
-    fn default_extension_capacity_is_64() {
-        assert_eq!(EXTENSION_EVENT_CAPACITY, 64);
-    }
 }

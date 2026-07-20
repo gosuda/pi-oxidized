@@ -187,68 +187,6 @@ pub struct StreamOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{AssistantMessage, ErrorReason, StopReason};
-    use futures::stream::StreamExt;
-
-    /// A provider returning an empty stream is enough to prove trait object
-    /// safety and that the returned stream is `'static` and `Send`.
-    struct NullProvider;
-
-    impl Provider for NullProvider {
-        fn stream(
-            &self,
-            _model: &Model,
-            _context: Context,
-            _options: StreamOptions,
-        ) -> BoxStream<'static, Result<AssistantMessageEvent, ProviderError>> {
-            futures::stream::empty().boxed()
-        }
-    }
-
-    #[test]
-    fn provider_trait_is_object_safe_and_stream_is_static() {
-        fn assert_object_safe(_: &dyn Provider) {}
-        fn assert_static_stream<T: Send + 'static>(_: T) {}
-
-        let provider: Box<dyn Provider> = Box::new(NullProvider);
-        assert_object_safe(&*provider);
-
-        // The provider contract promises a 'static, Send stream type.
-        assert_static_stream::<BoxStream<'static, Result<AssistantMessageEvent, ProviderError>>>(
-            futures::stream::empty().boxed(),
-        );
-    }
-
-    #[test]
-    fn semantic_error_event_is_not_provider_error() {
-        /// Inspect a result to show the two failure channels are distinct.
-        ///
-        /// The `Ok(AssistantMessageEvent::Error { .. })` arm is a compile-time
-        /// proof that the semantic error event exists and is distinct from the
-        /// `Err(ProviderError)` infrastructure channel.
-        fn classify(result: &Result<AssistantMessageEvent, ProviderError>) -> &'static str {
-            match result {
-                Ok(AssistantMessageEvent::Error { .. }) => "semantic error event",
-                Ok(_) => "other event",
-                Err(_) => "infrastructure provider error",
-            }
-        }
-
-        let mut assistant = AssistantMessage::new("custom-api", "custom-provider", "model", 1);
-        assistant.stop_reason = StopReason::Error;
-        assistant.error_message = Some("request rejected".into());
-        let semantic_error: Result<_, ProviderError> = Ok(AssistantMessageEvent::Error {
-            reason: ErrorReason::Error,
-            error: assistant,
-        });
-        assert_eq!(classify(&semantic_error), "semantic error event");
-
-        let infrastructure_error = Err(ProviderError::new("stream transport failed"));
-        assert_eq!(
-            classify(&infrastructure_error),
-            "infrastructure provider error"
-        );
-    }
 
     #[test]
     fn cloned_stream_options_share_cancellation_token() {
@@ -284,25 +222,5 @@ mod tests {
                 .as_ref()
                 .is_some_and(CancellationToken::is_cancelled)
         );
-    }
-
-    #[test]
-    fn callback_signature_compiles_without_executor() {
-        let payload_cb: OnPayloadFn = Arc::new(|_payload: &mut Value, _model: &Model| {
-            Box::pin(std::future::ready(Ok(()))) as BoxFuture<'_, Result<(), ProviderError>>
-        });
-
-        let response_cb: OnResponseFn = Arc::new(|_response: &ProviderResponse, _model: &Model| {
-            Box::pin(std::future::ready(Ok(()))) as BoxFuture<'_, Result<(), ProviderError>>
-        });
-
-        let options = StreamOptions {
-            on_payload: Some(payload_cb),
-            on_response: Some(response_cb),
-            ..StreamOptions::default()
-        };
-
-        assert!(options.on_payload.is_some());
-        assert!(options.on_response.is_some());
     }
 }

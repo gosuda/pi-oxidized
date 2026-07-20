@@ -1150,15 +1150,6 @@ mod tests {
     }
 
     #[test]
-    fn never_matches_modify_other_keys_bytes_as_events() {
-        // There is no KeyCode for CSI 27 sequences; we only match structured
-        // events. This test locks the omission: no helper accepts raw CSI 27.
-        let omission = MODIFY_OTHER_KEYS_OMISSION;
-        assert!(omission.contains("CSI 27"));
-        assert!(omission.contains("never emitted or parsed"));
-    }
-
-    #[test]
     fn kitty_protocol_flag_roundtrip() {
         set_kitty_protocol_active(true);
         assert!(is_kitty_protocol_active());

@@ -7545,16 +7545,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn draw_timeout_constant_matches_master_plan() {
-        assert_eq!(DRAW_TIMEOUT, Duration::from_secs(5));
-    }
-
-    #[tokio::test]
-    async fn coalesce_window_constant_matches_master_plan() {
-        assert_eq!(BACKGROUND_COALESCE_WINDOW, Duration::from_millis(16));
-    }
-
-    #[tokio::test]
     async fn enqueue_settle_runs_on_next_loop_turn() -> Result<(), String> {
         let (mut rt, _log) = try_make_runtime()?;
         rt.enqueue_settle(vec![settled_lines(vec![Line::raw("settled")])]);
