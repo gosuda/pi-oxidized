@@ -6,6 +6,7 @@
 use crate::estimate::estimate_context_tokens;
 use crate::provider::StreamOptions;
 use crate::types::{Context, Model, ThinkingLevel};
+use serde::Deserialize;
 
 /// Safety margin reserved between context usage and the output budget.
 pub const CONTEXT_SAFETY_TOKENS: u64 = 4_096;
@@ -40,7 +41,7 @@ pub const DEFAULT_CACHE_RETENTION: crate::types::CacheRetention =
 ///
 /// Mirrors TypeScript `ThinkingBudgets`. Missing fields fall back to the
 /// defaults in [`default_thinking_budgets`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct ThinkingBudgets {
     /// Budget for [`ThinkingLevel::Minimal`].
     pub minimal: Option<u64>,

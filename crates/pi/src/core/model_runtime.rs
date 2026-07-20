@@ -34,7 +34,7 @@ use pi_ai::providers::{
     OpenAiCompletions, OpenAiResponses, PiMessages, ProviderRegistry,
 };
 use pi_ai::types::{
-    AssistantMessageEvent, Context, Model, ModelCost, ModelInput, ModelThinkingLevel,
+    AssistantMessageEvent, Context, Model, ModelCost, ModelInput, ModelThinkingLevel, ThinkingLevel,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -856,10 +856,13 @@ impl ModelRuntime {
             options.api_key.clone_from(&resolution.auth.api_key);
         }
         if let Some(headers) = resolution.auth.headers.clone() {
-            let mut merged = options.headers.take().unwrap_or_default();
-            for (name, value) in headers {
-                // Auth values are Option<String>: None suppresses a default.
-                merged.insert(name, value);
+            // Precedence matches upstream applyAuth: options.headers override
+            // auth/model/config headers; None values suppress defaults.
+            let mut merged = headers;
+            if let Some(option_headers) = options.headers.take() {
+                for (name, value) in option_headers {
+                    merged.insert(name, value);
+                }
             }
             options.headers = Some(merged);
         }
@@ -874,8 +877,46 @@ impl ModelRuntime {
         if let Some(base_url) = resolution.auth.base_url {
             model.base_url = base_url;
         }
-        // TS streamSimple / buildBaseOptions clamp path.
-        options = pi_ai::apply_simple_max_tokens_clamp(&model, context, options);
+        // TS streamSimple / buildBaseOptions clamp path, with thinking-budget
+        // adjustment when a reasoning model carries a non-off level in extra.
+        let reasoning_level = if model.reasoning {
+            options
+                .extra
+                .get("reasoning")
+                .and_then(|value| value.as_str())
+                .and_then(|level| {
+                    if level == "off" {
+                        None
+                    } else {
+                        serde_json::from_value::<ThinkingLevel>(Value::String(level.to_owned()))
+                            .ok()
+                    }
+                })
+        } else {
+            None
+        };
+        let custom_budgets = options
+            .extra
+            .get("thinkingBudgets")
+            .and_then(|value| serde_json::from_value(value.clone()).ok());
+        if let Some(level) = reasoning_level {
+            let (adjusted, thinking_budget) = pi_ai::apply_thinking_and_context_clamp(
+                &model,
+                context,
+                options,
+                level,
+                custom_budgets,
+            );
+            options = adjusted;
+            if thinking_budget > 0 {
+                options.extra.insert(
+                    "thinkingBudgetTokens".to_owned(),
+                    Value::Number(serde_json::Number::from(thinking_budget)),
+                );
+            }
+        } else {
+            options = pi_ai::apply_simple_max_tokens_clamp(&model, context, options);
+        }
         // Shared retry-delay default when product paths leave it unset.
         if options.max_retry_delay_ms.is_none() {
             options.max_retry_delay_ms = Some(pi_ai::DEFAULT_MAX_RETRY_DELAY_MS);
@@ -1921,6 +1962,9 @@ mod tests {
         api: String,
         base_url: String,
         api_key: Option<String>,
+        headers: Option<BTreeMap<String, Option<String>>>,
+        max_tokens: Option<u64>,
+        extra: serde_json::Map<String, Value>,
     }
 
     impl RecordingExtensionProvider {
@@ -1949,6 +1993,9 @@ mod tests {
                 api: model.api.clone(),
                 base_url: model.base_url.clone(),
                 api_key: options.api_key.clone(),
+                headers: options.headers.clone(),
+                max_tokens: options.max_tokens,
+                extra: options.extra.clone(),
             });
             if let Some(runtime) = lock(&self.reenter_runtime).clone() {
                 // Would deadlock if stream selection still held the map lock.
@@ -2648,6 +2695,207 @@ mod tests {
             auth.auth.base_url.as_deref(),
             Some("https://oauth-endpoint.example"),
             "OAuth to_auth baseUrl must be preserved"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prepare_request_options_headers_override_auth_and_model_headers()
+    -> Result<(), ModelRuntimeError> {
+        let runtime = ModelRuntime::create_in_memory().await?;
+        let mut model_headers = BTreeMap::new();
+        model_headers.insert("X-Shared".to_owned(), "model".to_owned());
+        model_headers.insert("X-Model-Only".to_owned(), "model".to_owned());
+        let mut option_headers = BTreeMap::<String, Option<String>>::new();
+        option_headers.insert("X-Shared".to_owned(), Some("options".to_owned()));
+        option_headers.insert("X-Options-Only".to_owned(), Some("options".to_owned()));
+        option_headers.insert(
+            "Authorization".to_owned(),
+            Some("Bearer options".to_owned()),
+        );
+
+        runtime.register_provider(
+            "precedence",
+            &ProviderConfigInput {
+                base_url: Some("https://precedence.test/v1".to_owned()),
+                api: Some("openai-completions".to_owned()),
+                api_key: Some("sk-lit".to_owned()),
+                auth_header: Some(true),
+                models: Some(vec![ProviderModelDefinition {
+                    id: "m".to_owned(),
+                    name: Some("m".to_owned()),
+                    api: Some("openai-completions".to_owned()),
+                    base_url: Some("https://precedence.test/v1".to_owned()),
+                    reasoning: false,
+                    thinking_level_map: None,
+                    input: Some(vec![ModelInput::Text]),
+                    cost: Some(ModelCost::default()),
+                    context_window: Some(32_000),
+                    max_tokens: Some(4_096),
+                    headers: Some(model_headers.clone()),
+                    compat: None,
+                }]),
+                ..ProviderConfigInput::default()
+            },
+        )?;
+        let extension = Arc::new(RecordingExtensionProvider::new());
+        runtime.register_extension_stream_provider("precedence", extension.clone());
+
+        let mut model = required(runtime.get_model("precedence", "m"), "model")?;
+        model.headers = Some(model_headers.clone());
+        let options = StreamOptions {
+            headers: Some(option_headers),
+            ..StreamOptions::default()
+        };
+        let mut stream = runtime.stream_simple(model, Context::default(), options);
+        let first = futures::StreamExt::next(&mut stream).await;
+        assert!(
+            matches!(&first, Some(Err(error)) if error.message() == "extension-stream-hit"),
+            "expected extension stream hit, got {first:?}"
+        );
+
+        let calls = extension.calls();
+        assert_eq!(calls.len(), 1);
+        let headers = required(calls[0].headers.clone(), "headers")?;
+        assert_eq!(
+            headers.get("Authorization").and_then(|v| v.as_deref()),
+            Some("Bearer options"),
+            "options.headers must override auth Authorization"
+        );
+        assert_eq!(
+            headers.get("X-Shared").and_then(|v| v.as_deref()),
+            Some("options"),
+            "options.headers must override model/config headers"
+        );
+        assert_eq!(
+            headers.get("X-Model-Only").and_then(|v| v.as_deref()),
+            Some("model")
+        );
+        assert_eq!(
+            headers.get("X-Options-Only").and_then(|v| v.as_deref()),
+            Some("options")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prepare_request_applies_thinking_budget_for_reasoning_model()
+    -> Result<(), ModelRuntimeError> {
+        let runtime = ModelRuntime::create_in_memory().await?;
+        let mut extra = serde_json::Map::new();
+        extra.insert("reasoning".to_owned(), Value::String("high".to_owned()));
+        runtime.register_provider(
+            "reasoning-provider",
+            &ProviderConfigInput {
+                base_url: Some("https://reasoning.test/v1".to_owned()),
+                api: Some("anthropic-messages".to_owned()),
+                api_key: Some("sk-reasoning".to_owned()),
+                auth_header: Some(true),
+                models: Some(vec![ProviderModelDefinition {
+                    id: "m".to_owned(),
+                    name: Some("m".to_owned()),
+                    api: Some("anthropic-messages".to_owned()),
+                    base_url: Some("https://reasoning.test/v1".to_owned()),
+                    reasoning: true,
+                    thinking_level_map: None,
+                    input: Some(vec![ModelInput::Text]),
+                    cost: Some(ModelCost::default()),
+                    context_window: Some(32_000),
+                    max_tokens: Some(4_096),
+                    headers: None,
+                    compat: None,
+                }]),
+                ..ProviderConfigInput::default()
+            },
+        )?;
+        let extension = Arc::new(RecordingExtensionProvider::new());
+        runtime.register_extension_stream_provider("reasoning-provider", extension.clone());
+
+        let model = required(runtime.get_model("reasoning-provider", "m"), "model")?;
+        let options = StreamOptions {
+            max_tokens: Some(1_024),
+            extra,
+            ..StreamOptions::default()
+        };
+        let mut stream = runtime.stream_simple(model, Context::default(), options);
+        let first = futures::StreamExt::next(&mut stream).await;
+        assert!(
+            matches!(&first, Some(Err(error)) if error.message() == "extension-stream-hit"),
+            "expected extension stream hit, got {first:?}"
+        );
+
+        let calls = extension.calls();
+        assert_eq!(calls.len(), 1);
+        let max_tokens = required(calls[0].max_tokens, "max_tokens")?;
+        assert_eq!(
+            max_tokens, 4_096,
+            "thinking budget should expand max_tokens up to model cap"
+        );
+        let extra = &calls[0].extra;
+        assert_eq!(
+            extra.get("thinkingBudgetTokens"),
+            Some(&Value::Number(3_072.into())),
+            "thinking budget should be exposed for adapter use"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prepare_request_ignores_reasoning_for_non_reasoning_model()
+    -> Result<(), ModelRuntimeError> {
+        let runtime = ModelRuntime::create_in_memory().await?;
+        let mut extra = serde_json::Map::new();
+        extra.insert("reasoning".to_owned(), Value::String("high".to_owned()));
+        runtime.register_provider(
+            "non-reasoning-provider",
+            &ProviderConfigInput {
+                base_url: Some("https://non-reasoning.test/v1".to_owned()),
+                api: Some("openai-completions".to_owned()),
+                api_key: Some("sk-non-reasoning".to_owned()),
+                auth_header: Some(true),
+                models: Some(vec![ProviderModelDefinition {
+                    id: "m".to_owned(),
+                    name: Some("m".to_owned()),
+                    api: Some("openai-completions".to_owned()),
+                    base_url: Some("https://non-reasoning.test/v1".to_owned()),
+                    reasoning: false,
+                    thinking_level_map: None,
+                    input: Some(vec![ModelInput::Text]),
+                    cost: Some(ModelCost::default()),
+                    context_window: Some(32_000),
+                    max_tokens: Some(4_096),
+                    headers: None,
+                    compat: None,
+                }]),
+                ..ProviderConfigInput::default()
+            },
+        )?;
+        let extension = Arc::new(RecordingExtensionProvider::new());
+        runtime.register_extension_stream_provider("non-reasoning-provider", extension.clone());
+
+        let model = required(runtime.get_model("non-reasoning-provider", "m"), "model")?;
+        let options = StreamOptions {
+            max_tokens: Some(1_024),
+            extra,
+            ..StreamOptions::default()
+        };
+        let mut stream = runtime.stream_simple(model, Context::default(), options);
+        let first = futures::StreamExt::next(&mut stream).await;
+        assert!(
+            matches!(&first, Some(Err(error)) if error.message() == "extension-stream-hit"),
+            "expected extension stream hit, got {first:?}"
+        );
+
+        let calls = extension.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].max_tokens,
+            Some(1_024),
+            "non-reasoning model must not apply thinking budget"
+        );
+        assert!(
+            calls[0].extra.get("thinkingBudgetTokens").is_none(),
+            "non-reasoning model must not emit thinking budget"
         );
         Ok(())
     }
