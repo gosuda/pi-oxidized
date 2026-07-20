@@ -667,8 +667,10 @@ async fn handle_runtime_metadata(
     if state.should_take_over_stdout {
         output_guard::restore_stdout();
     }
+    // Pass the original token: fuzzy matching lowercases internally and the
+    // no-match message must echo the user's input verbatim (upstream parity).
     let pattern = match &state.parsed.list_models {
-        ListModels::Search(search) => Some(search.to_lowercase()),
+        ListModels::Search(search) => Some(search.clone()),
         ListModels::All | ListModels::None => None,
     };
     let model_runtime = handle.runtime.session().model_runtime_handle()?;
@@ -2302,7 +2304,7 @@ mod tests {
         let pkg_out = CapturedOutput::default();
         let pkg = FakePackageHandler::default();
         let outcome = run_bootstrap(BootstrapInputs {
-            args: args_vec(&["--list-models", "nomatch"]),
+            args: args_vec(&["--list-models", "NoMatch"]),
             io: &io,
             factory: &factory,
             package_handler: &pkg,
@@ -2314,8 +2316,8 @@ mod tests {
         assert!(
             stdout
                 .iter()
-                .any(|line| line.contains(r#"No models matching "nomatch""#)),
-            "expected no-match message in stdout: {stdout:?}"
+                .any(|line| line.contains(r#"No models matching "NoMatch""#)),
+            "no-match message must echo the user's token verbatim: {stdout:?}"
         );
         Ok(())
     }
