@@ -253,7 +253,7 @@ impl AgentSession {
         for message in messages.iter().rev() {
             if message.role() == "assistant" {
                 if let Some(pi_ai::Message::Assistant(assistant)) = message.as_llm() {
-                    return Self::is_retryable_error(assistant);
+                    return self.is_retryable_error(assistant);
                 }
                 return false;
             }

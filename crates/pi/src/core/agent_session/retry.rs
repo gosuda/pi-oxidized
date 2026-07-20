@@ -30,6 +30,7 @@ use std::time::Duration;
 use pi_ai::{AssistantMessage, StopReason};
 
 use super::AgentSession;
+use super::compaction::is_context_overflow;
 use super::events::AgentSessionEvent;
 
 impl AgentSession {
@@ -51,8 +52,9 @@ impl AgentSession {
     ///
     /// Context overflow and auth errors are NOT retryable: overflow is owned by
     /// compaction, and auth errors require user action.
-    pub(super) fn is_retryable_error(message: &AssistantMessage) -> bool {
-        if is_context_overflow(message) {
+    pub(super) fn is_retryable_error(&self, message: &AssistantMessage) -> bool {
+        let context_window = self.model().context_window;
+        if is_context_overflow(message, context_window) {
             return false;
         }
         is_retryable_assistant_error(message)
@@ -175,46 +177,6 @@ fn backoff_delay_ms(base_delay_ms: u64, attempt: u32) -> u64 {
     base_delay_ms.saturating_mul(2u64.saturating_pow(exp))
 }
 
-/// Whether the assistant message is a context-overflow error.
-///
-/// Context overflow is handled by compaction, not retry. The detection is
-/// conservative: it only fires for `stop_reason == Error` messages whose error
-/// text matches overflow patterns, while excluding rate-limit and throttling
-/// messages that mention tokens but are transient.
-fn is_context_overflow(message: &AssistantMessage) -> bool {
-    if message.stop_reason != StopReason::Error {
-        return false;
-    }
-    let Some(err) = message.error_message.as_deref() else {
-        return false;
-    };
-    let lower = err.to_ascii_lowercase();
-
-    // Exclude transient errors that may mention "tokens" or "limit".
-    let is_non_overflow = lower.contains("rate_limit")
-        || lower.contains("rate limit")
-        || lower.contains("too many requests")
-        || lower.contains("throttling")
-        || lower.contains("service unavailable")
-        || lower.contains("overloaded");
-
-    if is_non_overflow {
-        return false;
-    }
-
-    lower.contains("context overflow")
-        || lower.contains("context length")
-        || lower.contains("maximum context")
-        || lower.contains("too long")
-        || lower.contains("exceeds the limit")
-        || lower.contains("exceeds the context")
-        || lower.contains("exceeds model")
-        || lower.contains("prompt has")
-        || lower.contains("token count")
-        || lower.contains("input is too long")
-        || lower.contains("input length")
-}
-
 /// Whether `text` contains `status` as a standalone decimal status token.
 fn contains_status_code(text: &str, status: &str) -> bool {
     text.match_indices(status).any(|(index, _)| {
@@ -294,7 +256,7 @@ mod tests {
         msg.stop_reason = StopReason::Error;
         msg.error_message = Some("overloaded_error".to_owned());
         assert!(is_retryable_assistant_error(&msg));
-        assert!(!is_context_overflow(&msg));
+        assert!(!is_context_overflow(&msg, 0));
     }
 
     #[test]
@@ -311,7 +273,7 @@ mod tests {
         msg.stop_reason = StopReason::Error;
         msg.error_message = Some("This model's maximum context length is 8192 tokens.".to_owned());
         assert!(!is_retryable_assistant_error(&msg));
-        assert!(is_context_overflow(&msg));
+        assert!(is_context_overflow(&msg, 0));
     }
 
     #[test]
@@ -320,7 +282,7 @@ mod tests {
         msg.stop_reason = StopReason::Error;
         msg.error_message = Some("rate_limit exceeded".to_owned());
         assert!(is_retryable_assistant_error(&msg));
-        assert!(!is_context_overflow(&msg));
+        assert!(!is_context_overflow(&msg, 0));
     }
 
     #[test]
@@ -371,12 +333,78 @@ mod tests {
         let mut msg = AssistantMessage::new("api", "provider", "m", 0);
         msg.stop_reason = StopReason::Error;
         msg.error_message = Some("Throttling error: Too many tokens, please wait.".to_owned());
-        assert!(!is_context_overflow(&msg));
+        assert!(!is_context_overflow(&msg, 0));
     }
 
     #[test]
     fn stop_reason_non_error_not_retryable() {
         let msg = AssistantMessage::new("api", "provider", "m", 0);
         assert!(!is_retryable_assistant_error(&msg));
+    }
+
+    #[tokio::test]
+    async fn usage_exceeds_window_is_overflow_not_retryable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::super::AgentSessionConfig;
+        use futures::stream::{self, BoxStream};
+        use pi_ai::{
+            AssistantMessageEvent, Context, Model, Provider, ProviderError, StreamOptions,
+        };
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        struct NoopProvider;
+        impl Provider for NoopProvider {
+            fn stream(
+                &self,
+                _model: &Model,
+                _ctx: Context,
+                _opts: StreamOptions,
+            ) -> BoxStream<'static, Result<AssistantMessageEvent, ProviderError>> {
+                Box::pin(stream::iter(Vec::new()))
+            }
+        }
+
+        let model = Model {
+            id: "m".to_owned(),
+            name: "m".to_owned(),
+            api: "test-api".to_owned(),
+            provider: "test-provider".to_owned(),
+            base_url: "url".to_owned(),
+            reasoning: false,
+            thinking_level_map: None,
+            input: vec![pi_ai::ModelInput::Text],
+            cost: pi_ai::ModelCost::default(),
+            context_window: 8192,
+            max_tokens: 1024,
+            headers: None,
+            compat: None,
+            extra: BTreeMap::new(),
+        };
+
+        let config = AgentSessionConfig::test_config(Arc::new(NoopProvider), model)?;
+        let session = AgentSession::new(config)?;
+
+        // 1. Silent overflow (stop reason: Stop, input usage > window)
+        let mut msg_silent = AssistantMessage::new("test-api", "test-provider", "m", 0);
+        msg_silent.stop_reason = StopReason::Stop;
+        msg_silent.usage.input = 10000;
+        assert!(!session.is_retryable_error(&msg_silent));
+
+        // 2. Length overflow (stop reason: Length, output: 0, input exceeds window)
+        let mut msg_length = AssistantMessage::new("test-api", "test-provider", "m", 0);
+        msg_length.stop_reason = StopReason::Length;
+        msg_length.usage.input = 8192;
+        msg_length.usage.output = 0;
+        assert!(!session.is_retryable_error(&msg_length));
+
+        // 3. Normal transient error (stop reason: Error, under window) -> should be retryable
+        let mut msg_normal = AssistantMessage::new("test-api", "test-provider", "m", 0);
+        msg_normal.stop_reason = StopReason::Error;
+        msg_normal.error_message = Some("overloaded".to_owned());
+        msg_normal.usage.input = 1000;
+        assert!(session.is_retryable_error(&msg_normal));
+
+        Ok(())
     }
 }

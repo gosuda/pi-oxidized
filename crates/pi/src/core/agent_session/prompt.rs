@@ -616,7 +616,7 @@ impl AgentSession {
             return Ok(false);
         };
 
-        if Self::is_retryable_error(&msg) && self.prepare_retry(&msg).await {
+        if self.is_retryable_error(&msg) && self.prepare_retry(&msg).await {
             return Ok(true);
         }
 
