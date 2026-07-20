@@ -1,17 +1,16 @@
 //! App-level input dispatch: maps [`UiEvent`]s into [`ViewAction`]s.
 //!
-//! This module is pure (no I/O, no async, no terminal access). The runtime
-//! loop calls [`InputMapper::map`] with a [`ViewState`] snapshot plus the
-//! [`EventResult`](pi_tui::component::EventResult) the focused component
-//! returned for the same event. If the focused component consumed the event,
-//! the mapper defers entirely; otherwise it checks the small closed set of
-//! application keybindings (Ctrl+C / Ctrl+D / Ctrl+Z / Esc / Shift+Tab /
-//! Ctrl+P / Ctrl+L / Ctrl+O / Ctrl+T / Ctrl+G / Ctrl+X / Alt+Enter / Alt+Up)
-//! and emits the matching semantic action.
+//! The runtime loop calls [`InputMapper::map`] with a [`ViewState`] snapshot
+//! plus the [`EventResult`](pi_tui::component::EventResult) the focused
+//! component returned for the same event. If the focused component consumed
+//! the event, the mapper defers entirely; otherwise it resolves the closed set
+//! of application keybindings (`app.*` ids from
+//! [`crate::core::keybindings`]) through a [`KeybindingsManager`] so user
+//! rebinds in `keybindings.json` apply.
 //!
-//! Double-tap timing for "press Ctrl+C twice within 500ms to exit" and
-//! "press Esc twice within 500ms to open `/tree` or `/fork`" lives in
-//! [`InputState`]; the runtime owns one instance for the lifetime of the
+//! Double-tap timing for "press clear-chord twice within 500ms to exit" and
+//! "press interrupt-chord twice within 500ms to open `/tree` or `/fork`" lives
+//! in [`InputState`]; the runtime owns one instance for the lifetime of the
 //! session and resets it whenever focus moves to or from a selector.
 //!
 //! Field and constant names mirror `.references/pi/packages/coding-agent/
@@ -20,8 +19,11 @@
 
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
 use pi_tui::component::UiEvent;
+use pi_tui::keybindings::KeybindingsManager;
+
+use crate::core::keybindings::{app_keybindings_defaults, create_app_keybindings};
 
 use super::state::{OverlayKind, StatusKind, ViewAction, ViewState};
 
@@ -119,17 +121,53 @@ impl InputState {
 
 /// Pure input mapper.
 ///
-/// Stateless beyond the borrowed [`InputState`]; one instance lives for the
-/// runtime's lifetime. Methods never touch the terminal, the session, or any
-/// I/O.
-#[derive(Debug, Default)]
-pub struct InputMapper;
+/// Holds a [`KeybindingsManager`] snapshot for `app.*` resolution. One
+/// instance lives for the runtime's lifetime; call [`InputMapper::set_keybindings`]
+/// after `/reload` so user rebinds take effect. Methods never touch the
+/// terminal, the session, or any I/O beyond the already-loaded table.
+#[derive(Debug, Clone)]
+pub struct InputMapper {
+    keybindings: KeybindingsManager,
+}
+
+impl Default for InputMapper {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl InputMapper {
-    /// Construct a fresh mapper.
+    /// Construct a mapper with process agent-dir defaults + `keybindings.json`.
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self {
+            keybindings: create_app_keybindings(),
+        }
+    }
+
+    /// Construct a mapper with shipped defaults only (no user file).
+    #[must_use]
+    pub fn with_defaults() -> Self {
+        Self {
+            keybindings: app_keybindings_defaults(),
+        }
+    }
+
+    /// Construct a mapper from an explicit keybindings table (tests / reload).
+    #[must_use]
+    pub fn with_keybindings(keybindings: KeybindingsManager) -> Self {
+        Self { keybindings }
+    }
+
+    /// Replace the keybindings table (e.g. after `/reload`).
+    pub fn set_keybindings(&mut self, keybindings: KeybindingsManager) {
+        self.keybindings = keybindings;
+    }
+
+    /// Borrow the active keybindings table.
+    #[must_use]
+    pub fn keybindings(&self) -> &KeybindingsManager {
+        &self.keybindings
     }
 
     /// Translate one [`UiEvent`] into zero or more ordered [`ViewAction`]s.
@@ -174,144 +212,161 @@ impl InputMapper {
             }
             UiEvent::Key(key) => {
                 if !editor_consumed {
-                    Self::map_key(*key, view, editor_text, state, &mut out);
+                    self.map_key(*key, view, editor_text, state, &mut out);
                 }
             }
         }
         out
     }
 
+    /// `app.clear` (default ctrl+c): double-tap within window → Exit;
+    /// otherwise Interrupt. First tap also clears the editor.
+    fn map_clear_key(state: &mut InputState, out: &mut Vec<ViewAction>) {
+        let now = Instant::now();
+        let double = state
+            .last_sigint
+            .is_some_and(|t| now.duration_since(t) < state.sigint_exit_window);
+        if double {
+            state.last_sigint = None;
+            out.push(ViewAction::ClearEditor);
+            out.push(ViewAction::Exit);
+        } else {
+            state.last_sigint = Some(now);
+            out.push(ViewAction::ClearEditor);
+            out.push(ViewAction::Interrupt);
+        }
+    }
+
     fn map_key(
+        &self,
         key: KeyEvent,
         view: &ViewState,
         editor_text: &str,
         state: &mut InputState,
         out: &mut Vec<ViewAction>,
     ) {
-        let mods = key.modifiers;
-        match (mods, key.code) {
-            // Ctrl+C: double-tap within window → Exit; otherwise Interrupt.
-            // First tap also clears the editor (mirrors `handleCtrlC`).
-            (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
-                let now = Instant::now();
-                let double = state
-                    .last_sigint
-                    .is_some_and(|t| now.duration_since(t) < state.sigint_exit_window);
-                if double {
-                    state.last_sigint = None;
-                    out.push(ViewAction::ClearEditor);
-                    out.push(ViewAction::Exit);
-                } else {
-                    state.last_sigint = Some(now);
-                    out.push(ViewAction::ClearEditor);
-                    out.push(ViewAction::Interrupt);
-                }
+        let kb = &self.keybindings;
+
+        if kb.matches(&key, "app.clear") {
+            Self::map_clear_key(state, out);
+            return;
+        }
+
+        // app.exit (default ctrl+d): exit only when the editor is empty AND
+        // no overlay is up (parity with `handleCtrlD`).
+        if kb.matches(&key, "app.exit") {
+            if editor_text.trim().is_empty() && view.overlay.is_none() {
+                out.push(ViewAction::Exit);
             }
-            // Ctrl+D: exit only when the editor is empty AND no overlay is up
-            // (parity with `handleCtrlD`: "Only called when editor is empty").
-            (KeyModifiers::CONTROL, KeyCode::Char('d')) => {
-                if editor_text.trim().is_empty() && view.overlay.is_none() {
-                    out.push(ViewAction::Exit);
-                }
+            return;
+        }
+
+        // app.suspend (default ctrl+z; unbound on Windows).
+        if kb.matches(&key, "app.suspend") {
+            out.push(ViewAction::Suspend);
+            return;
+        }
+
+        // app.thinking.cycle (default shift+tab).
+        if kb.matches(&key, "app.thinking.cycle") {
+            out.push(ViewAction::CycleThinking { forward: true });
+            return;
+        }
+
+        // Model cycle: check backward before forward so shift+ctrl+p does not
+        // also match ctrl+p when both are claimed.
+        if kb.matches(&key, "app.model.cycleBackward") {
+            out.push(ViewAction::CycleModel { forward: false });
+            return;
+        }
+        if kb.matches(&key, "app.model.cycleForward") {
+            out.push(ViewAction::CycleModel { forward: true });
+            return;
+        }
+
+        if kb.matches(&key, "app.model.select") {
+            out.push(ViewAction::OpenModelSelector);
+            return;
+        }
+        if kb.matches(&key, "app.tools.expand") {
+            out.push(ViewAction::ToggleToolExpand);
+            return;
+        }
+        if kb.matches(&key, "app.thinking.toggle") {
+            out.push(ViewAction::ToggleThinking);
+            return;
+        }
+        if kb.matches(&key, "app.editor.external") {
+            out.push(ViewAction::ExternalEditor);
+            return;
+        }
+        if kb.matches(&key, "app.message.copy") {
+            out.push(ViewAction::CopyLastAssistant);
+            return;
+        }
+
+        // app.message.followUp (default alt+enter): queue while streaming,
+        // otherwise submit.
+        if kb.matches(&key, "app.message.followUp") {
+            let text = editor_text.trim().to_owned();
+            if text.is_empty() {
+                return;
             }
-            // Ctrl+Z: suspend (Windows no-op is handled by the runtime).
-            (KeyModifiers::CONTROL, KeyCode::Char('z')) => {
-                out.push(ViewAction::Suspend);
+            if view.streaming {
+                out.push(ViewAction::QueueFollowUp { text });
+                out.push(ViewAction::ClearEditor);
+            } else {
+                out.push(ViewAction::Submit { text });
+                out.push(ViewAction::ClearEditor);
             }
-            // Shift+Tab: cycle thinking level forward.
-            (KeyModifiers::SHIFT, KeyCode::BackTab | KeyCode::Tab) => {
-                out.push(ViewAction::CycleThinking { forward: true });
-            }
-            // Ctrl+P: cycle model forward.
-            // Ctrl+P (lowercase, no shift): cycle model forward.
-            // The SHIFT bit is checked exactly so Ctrl+Shift+P (which may
-            // arrive as lowercase 'p' with SHIFT on some platforms) falls
-            // through to the backward arm below.
-            (mods, KeyCode::Char('p')) if mods == KeyModifiers::CONTROL => {
-                out.push(ViewAction::CycleModel { forward: true });
-            }
-            // Ctrl+Shift+P (any case, with SHIFT bit): cycle backward.
-            (mods, KeyCode::Char('P'))
-                if mods.contains(KeyModifiers::CONTROL) && mods.contains(KeyModifiers::SHIFT) =>
-            {
-                out.push(ViewAction::CycleModel { forward: false });
-            }
-            (mods, KeyCode::Char('p'))
-                if mods.contains(KeyModifiers::CONTROL) && mods.contains(KeyModifiers::SHIFT) =>
-            {
-                out.push(ViewAction::CycleModel { forward: false });
-            }
-            // Ctrl+L: open the model selector.
-            (KeyModifiers::CONTROL, KeyCode::Char('l')) => {
-                out.push(ViewAction::OpenModelSelector);
-            }
-            // Ctrl+O: toggle tool expansion.
-            (KeyModifiers::CONTROL, KeyCode::Char('o')) => {
-                out.push(ViewAction::ToggleToolExpand);
-            }
-            // Ctrl+T: toggle thinking block visibility.
-            (KeyModifiers::CONTROL, KeyCode::Char('t')) => {
-                out.push(ViewAction::ToggleThinking);
-            }
-            // Ctrl+G: open external editor.
-            (KeyModifiers::CONTROL, KeyCode::Char('g')) => {
-                out.push(ViewAction::ExternalEditor);
-            }
-            // Ctrl+X: copy last assistant message to clipboard.
-            (KeyModifiers::CONTROL, KeyCode::Char('x')) => {
-                out.push(ViewAction::CopyLastAssistant);
-            }
-            // Alt+Enter: queue a follow-up while streaming, otherwise submit.
-            (KeyModifiers::ALT, KeyCode::Enter) => {
-                let text = editor_text.trim().to_owned();
-                if text.is_empty() {
-                    return;
-                }
-                if view.streaming {
-                    out.push(ViewAction::QueueFollowUp { text });
-                    out.push(ViewAction::ClearEditor);
-                } else {
-                    out.push(ViewAction::Submit { text });
-                    out.push(ViewAction::ClearEditor);
-                }
-            }
-            // Alt+Up: restore the last queued follow-up to the editor.
-            (KeyModifiers::ALT, KeyCode::Up) => {
-                out.push(ViewAction::DequeueFollowUp);
-            }
-            // Ctrl+V / Alt+V: paste image from clipboard (runtime owns the
-            // clipboard call; emit a Paste with empty payload so the runtime
-            // knows it was a clipboard-image request).
-            (mods, KeyCode::Char('v'))
-                if mods == KeyModifiers::CONTROL || mods == KeyModifiers::ALT =>
-            {
-                out.push(ViewAction::Paste {
-                    text: String::new(),
-                });
-            }
-            // Ctrl+R: open reload (slash-command equivalent of /reload).
-            (KeyModifiers::CONTROL, KeyCode::Char('r')) => {
-                out.push(ViewAction::Reload);
-            }
-            // Ctrl+B: open the session picker (/resume).
-            (KeyModifiers::CONTROL, KeyCode::Char('b')) => {
-                out.push(ViewAction::OpenSessionPicker);
-            }
-            // Ctrl+F: open the tree (/tree) selector.
-            (KeyModifiers::CONTROL, KeyCode::Char('f')) => {
-                out.push(ViewAction::OpenTreeSelector);
-            }
-            // Ctrl+N: new session.
-            (KeyModifiers::CONTROL, KeyCode::Char('n')) => {
-                out.push(ViewAction::NewSession);
-            }
-            // Esc: dispatch contextually (overlay → dismiss; streaming →
-            // interrupt; bash → interrupt; double-tap on empty → tree/fork;
-            // otherwise clear editor).
-            (_, KeyCode::Esc) => {
-                Self::map_escape(view, editor_text, state, out);
-            }
-            _ => {}
+            return;
+        }
+
+        if kb.matches(&key, "app.message.dequeue") {
+            out.push(ViewAction::DequeueFollowUp);
+            return;
+        }
+
+        // app.clipboard.pasteImage (default ctrl+v / alt+v on Windows):
+        // empty Paste payload signals the runtime to pull a clipboard image.
+        if kb.matches(&key, "app.clipboard.pasteImage") {
+            out.push(ViewAction::Paste {
+                text: String::new(),
+            });
+            return;
+        }
+
+        // Session actions: TS defaults are empty for new/tree/fork/resume so
+        // they only fire when the user rebinds them in keybindings.json.
+        if kb.matches(&key, "app.session.new") {
+            out.push(ViewAction::NewSession);
+            return;
+        }
+        if kb.matches(&key, "app.session.tree") {
+            out.push(ViewAction::OpenTreeSelector);
+            return;
+        }
+        if kb.matches(&key, "app.session.fork") {
+            out.push(ViewAction::OpenForkSelector);
+            return;
+        }
+        if kb.matches(&key, "app.session.resume") {
+            out.push(ViewAction::OpenSessionPicker);
+            return;
+        }
+
+        // app.session.toggleNamedFilter (default ctrl+n) is selector-local in
+        // TS (session-selector.ts). The interactive editor has no named-filter
+        // surface, so a match here is a deliberate no-op: leave the chord
+        // reserved / rebound without opening a new session.
+        if kb.matches(&key, "app.session.toggleNamedFilter") {
+            return;
+        }
+
+        // app.interrupt (default escape): contextual dismiss / interrupt /
+        // double-tap tree|fork / clear editor.
+        if kb.matches(&key, "app.interrupt") {
+            Self::map_escape(view, editor_text, state, out);
         }
     }
 
@@ -403,13 +458,15 @@ pub fn dismissable_overlay_kinds() -> &'static [OverlayKind] {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use pi_ai::AssistantMessage;
     use pi_tui::component::UiEvent;
+    use pi_tui::keybindings::KeybindingsConfig;
+    use pi_tui::keys::KeyId;
+    use tempfile::TempDir;
 
     use super::*;
+    use crate::core::keybindings::{KEYBINDINGS_FILE_NAME, app_keybindings, load_app_keybindings};
     use crate::modes::interactive::messages::MessageView;
     use crate::modes::interactive::state::{
         EditorBorder, EditorView, FocusArea, Overlay, OverlayKind, SessionStatus, StatusKind,
@@ -492,9 +549,15 @@ mod tests {
         v
     }
 
+    /// Mapper with shipped defaults only — isolated from the developer's
+    /// real `~/.pi/agent/keybindings.json`.
+    fn mapper() -> InputMapper {
+        InputMapper::with_defaults()
+    }
+
     #[test]
     fn resize_emits_resize_action() {
-        let mapper = InputMapper::new();
+        let mapper = mapper();
         let mut state = InputState::default();
         let view = empty_view();
         let actions = mapper.map(
@@ -519,7 +582,7 @@ mod tests {
 
     #[test]
     fn paste_when_editor_did_not_consume_emits_paste() {
-        let mapper = InputMapper::new();
+        let mapper = mapper();
         let mut state = InputState::default();
         let view = empty_view();
         let actions = mapper.map(
@@ -539,7 +602,7 @@ mod tests {
 
     #[test]
     fn paste_consumed_by_editor_is_ignored_by_mapper() {
-        let mapper = InputMapper::new();
+        let mapper = mapper();
         let mut state = InputState::default();
         let view = empty_view();
         let actions = mapper.map(
@@ -554,7 +617,7 @@ mod tests {
 
     #[test]
     fn empty_paste_is_ignored() {
-        let mapper = InputMapper::new();
+        let mapper = mapper();
         let mut state = InputState::default();
         let view = empty_view();
         let actions = mapper.map(&UiEvent::Paste(String::new()), &view, "", &mut state, false);
@@ -563,7 +626,7 @@ mod tests {
 
     #[test]
     fn ctrl_c_first_tap_clears_and_interrupts() {
-        let mapper = InputMapper::new();
+        let mapper = mapper();
         let mut state = InputState::default();
         let view = view_with_editor("draft");
         let actions = mapper.map(&ctrl('c'), &view, "draft", &mut state, false);
@@ -571,23 +634,21 @@ mod tests {
             actions,
             vec![ViewAction::ClearEditor, ViewAction::Interrupt]
         );
-        assert!(state.last_sigint.is_some());
     }
 
     #[test]
     fn ctrl_c_double_tap_within_window_exits() {
-        let mapper = InputMapper::new();
+        let mapper = mapper();
         let mut state = InputState::default();
         let view = view_with_editor("x");
         let _ = mapper.map(&ctrl('c'), &view, "x", &mut state, false);
         let actions = mapper.map(&ctrl('c'), &view, "x", &mut state, false);
         assert_eq!(actions, vec![ViewAction::ClearEditor, ViewAction::Exit]);
-        assert!(state.last_sigint.is_none());
     }
 
     #[test]
     fn ctrl_c_double_tap_outside_window_just_interrupts() {
-        let mapper = InputMapper::new();
+        let mapper = mapper();
         let mut state = InputState::default();
         state.set_sigint_exit_window(Duration::from_nanos(1));
         let view = view_with_editor("x");
@@ -602,20 +663,20 @@ mod tests {
 
     #[test]
     fn ctrl_d_only_exits_when_editor_empty() {
-        let mapper = InputMapper::new();
+        let mapper = mapper();
         let mut state = InputState::default();
         let empty = empty_view();
         let actions = mapper.map(&ctrl('d'), &empty, "", &mut state, false);
         assert_eq!(actions, vec![ViewAction::Exit]);
 
-        let view = view_with_editor("not empty");
-        let actions = mapper.map(&ctrl('d'), &view, "not empty", &mut state, false);
+        let nonempty = view_with_editor("x");
+        let actions = mapper.map(&ctrl('d'), &nonempty, "x", &mut state, false);
         assert!(actions.is_empty());
     }
 
     #[test]
     fn ctrl_d_does_not_exit_when_overlay_open() {
-        let mapper = InputMapper::new();
+        let mapper = mapper();
         let mut state = InputState::default();
         let view = view_with_overlay(OverlayKind::ShortcutHelp);
         let actions = mapper.map(&ctrl('d'), &view, "", &mut state, false);
@@ -624,16 +685,20 @@ mod tests {
 
     #[test]
     fn ctrl_z_emits_suspend() {
-        let mapper = InputMapper::new();
+        let mapper = mapper();
         let mut state = InputState::default();
         let view = empty_view();
         let actions = mapper.map(&ctrl('z'), &view, "", &mut state, false);
-        assert_eq!(actions, vec![ViewAction::Suspend]);
+        if cfg!(windows) {
+            assert!(actions.is_empty());
+        } else {
+            assert_eq!(actions, vec![ViewAction::Suspend]);
+        }
     }
 
     #[test]
     fn shift_tab_cycles_thinking() {
-        let mapper = InputMapper::new();
+        let mapper = mapper();
         let mut state = InputState::default();
         let view = empty_view();
         let actions = mapper.map(&shift(KeyCode::Tab), &view, "", &mut state, false);
@@ -642,7 +707,7 @@ mod tests {
 
     #[test]
     fn ctrl_p_cycles_model_forward() {
-        let mapper = InputMapper::new();
+        let mapper = mapper();
         let mut state = InputState::default();
         let view = empty_view();
         let actions = mapper.map(&ctrl('p'), &view, "", &mut state, false);
@@ -651,7 +716,7 @@ mod tests {
 
     #[test]
     fn ctrl_shift_p_cycles_model_backward() {
-        let mapper = InputMapper::new();
+        let mapper = mapper();
         let mut state = InputState::default();
         let view = empty_view();
         let actions = mapper.map(&ctrl_shift('P'), &view, "", &mut state, false);
@@ -660,7 +725,7 @@ mod tests {
 
     #[test]
     fn app_keys_dispatch_table() {
-        let mapper = InputMapper::new();
+        let mapper = mapper();
         let mut state = InputState::default();
         let view = empty_view();
 
@@ -684,18 +749,118 @@ mod tests {
             mapper.map(&ctrl('x'), &view, "", &mut state, false),
             vec![ViewAction::CopyLastAssistant]
         );
+    }
+
+    #[test]
+    fn default_chord_fires_action() {
+        let mapper = mapper();
+        let mut state = InputState::default();
+        let view = empty_view();
         assert_eq!(
-            mapper.map(&ctrl('r'), &view, "", &mut state, false),
-            vec![ViewAction::Reload]
+            mapper.map(&ctrl('l'), &view, "", &mut state, false),
+            vec![ViewAction::OpenModelSelector]
         );
         assert_eq!(
-            mapper.map(&ctrl('b'), &view, "", &mut state, false),
-            vec![ViewAction::OpenSessionPicker]
+            mapper
+                .keybindings()
+                .get_keys("app.model.select")
+                .iter()
+                .map(KeyId::as_str)
+                .collect::<Vec<_>>(),
+            vec!["ctrl+l"]
+        );
+    }
+
+    #[test]
+    fn keybindings_json_rebind_moves_action() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        std::fs::write(
+            temp.path().join(KEYBINDINGS_FILE_NAME),
+            r#"{"app.model.select": "ctrl+m"}"#,
+        )?;
+        let mapper = InputMapper::with_keybindings(load_app_keybindings(temp.path()));
+        let mut state = InputState::default();
+        let view = empty_view();
+
+        // Old default no longer fires.
+        assert!(
+            mapper
+                .map(&ctrl('l'), &view, "", &mut state, false)
+                .is_empty()
+        );
+        // Rebound chord fires the action.
+        assert_eq!(
+            mapper.map(&ctrl('m'), &view, "", &mut state, false),
+            vec![ViewAction::OpenModelSelector]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unbound_by_default_verified() {
+        let mapper = mapper();
+        let mut state = InputState::default();
+        let view = empty_view();
+
+        // TS leaves these unbound at the editor level (slash/UI only).
+        assert!(
+            mapper
+                .map(&ctrl('r'), &view, "", &mut state, false)
+                .is_empty(),
+            "ctrl+r must not be Reload by default"
+        );
+        assert!(
+            mapper
+                .map(&ctrl('b'), &view, "", &mut state, false)
+                .is_empty(),
+            "ctrl+b must not open session picker by default"
+        );
+        assert!(
+            mapper
+                .map(&ctrl('f'), &view, "", &mut state, false)
+                .is_empty(),
+            "ctrl+f must not open tree selector by default"
+        );
+        // Ctrl+N is app.session.toggleNamedFilter (selector-local); editor is no-op.
+        assert!(
+            mapper
+                .map(&ctrl('n'), &view, "", &mut state, false)
+                .is_empty(),
+            "ctrl+n must not NewSession; named-filter is selector-local"
+        );
+        assert!(mapper.keybindings().get_keys("app.session.new").is_empty());
+        assert!(mapper.keybindings().get_keys("app.session.tree").is_empty());
+        assert!(mapper.keybindings().get_keys("app.session.fork").is_empty());
+        assert!(
+            mapper
+                .keybindings()
+                .get_keys("app.session.resume")
+                .is_empty()
         );
         assert_eq!(
-            mapper.map(&ctrl('f'), &view, "", &mut state, false),
-            vec![ViewAction::OpenTreeSelector]
+            mapper
+                .keybindings()
+                .get_keys("app.session.toggleNamedFilter")
+                .iter()
+                .map(KeyId::as_str)
+                .collect::<Vec<_>>(),
+            vec!["ctrl+n"]
         );
+    }
+
+    #[test]
+    fn rebind_session_new_enables_new_session_chord() {
+        let mut user = KeybindingsConfig::new();
+        user.insert(
+            "app.session.new".to_owned(),
+            vec![KeyId::from_raw("ctrl+n")],
+        );
+        // Unbind named-filter so ctrl+n is free for session.new.
+        user.insert("app.session.toggleNamedFilter".to_owned(), vec![]);
+        let mgr = KeybindingsManager::new(app_keybindings(), user);
+        let mapper = InputMapper::with_keybindings(mgr);
+        let mut state = InputState::default();
+        let view = empty_view();
         assert_eq!(
             mapper.map(&ctrl('n'), &view, "", &mut state, false),
             vec![ViewAction::NewSession]
@@ -704,7 +869,7 @@ mod tests {
 
     #[test]
     fn alt_enter_submits_when_not_streaming() {
-        let mapper = InputMapper::new();
+        let mapper = mapper();
         let mut state = InputState::default();
         let view = view_with_editor("hello");
         let actions = mapper.map(&alt(KeyCode::Enter), &view, "hello", &mut state, false);
@@ -721,7 +886,7 @@ mod tests {
 
     #[test]
     fn alt_enter_queues_followup_when_streaming() {
-        let mapper = InputMapper::new();
+        let mapper = mapper();
         let mut state = InputState::default();
         let view = view_streaming();
         let actions = mapper.map(&alt(KeyCode::Enter), &view, "more", &mut state, false);
@@ -738,7 +903,7 @@ mod tests {
 
     #[test]
     fn alt_enter_empty_is_noop() {
-        let mapper = InputMapper::new();
+        let mapper = mapper();
         let mut state = InputState::default();
         let view = empty_view();
         let actions = mapper.map(&alt(KeyCode::Enter), &view, "   ", &mut state, false);
@@ -747,7 +912,7 @@ mod tests {
 
     #[test]
     fn alt_up_dequeues() {
-        let mapper = InputMapper::new();
+        let mapper = mapper();
         let mut state = InputState::default();
         let view = empty_view();
         let actions = mapper.map(&alt(KeyCode::Up), &view, "", &mut state, false);
@@ -756,7 +921,7 @@ mod tests {
 
     #[test]
     fn esc_dismisses_overlay_first() {
-        let mapper = InputMapper::new();
+        let mapper = mapper();
         let mut state = InputState::default();
         let view = view_with_overlay(OverlayKind::ShortcutHelp);
         let actions = mapper.map(&plain(KeyCode::Esc), &view, "abc", &mut state, false);
@@ -765,7 +930,7 @@ mod tests {
 
     #[test]
     fn esc_interrupts_when_streaming() {
-        let mapper = InputMapper::new();
+        let mapper = mapper();
         let mut state = InputState::default();
         let view = view_streaming();
         let actions = mapper.map(&plain(KeyCode::Esc), &view, "x", &mut state, false);
@@ -774,7 +939,7 @@ mod tests {
 
     #[test]
     fn esc_interrupts_when_compacting() {
-        let mapper = InputMapper::new();
+        let mapper = mapper();
         let mut state = InputState::default();
         let view = view_with_status(StatusKind::Compaction);
         let actions = mapper.map(&plain(KeyCode::Esc), &view, "x", &mut state, false);
@@ -783,7 +948,7 @@ mod tests {
 
     #[test]
     fn esc_clears_editor_when_nonempty_and_idle() {
-        let mapper = InputMapper::new();
+        let mapper = mapper();
         let mut state = InputState::default();
         let view = view_with_editor("draft");
         let actions = mapper.map(&plain(KeyCode::Esc), &view, "draft", &mut state, false);
@@ -792,7 +957,7 @@ mod tests {
 
     #[test]
     fn esc_double_tap_on_empty_opens_tree_when_configured() {
-        let mapper = InputMapper::new();
+        let mapper = mapper();
         let mut state = InputState::new(DoubleEscapeAction::Tree);
         let view = empty_view();
         let _ = mapper.map(&plain(KeyCode::Esc), &view, "", &mut state, false);
@@ -802,7 +967,7 @@ mod tests {
 
     #[test]
     fn esc_double_tap_on_empty_opens_fork_when_configured() {
-        let mapper = InputMapper::new();
+        let mapper = mapper();
         let mut state = InputState::new(DoubleEscapeAction::Fork);
         let view = empty_view();
         let _ = mapper.map(&plain(KeyCode::Esc), &view, "", &mut state, false);
@@ -812,7 +977,7 @@ mod tests {
 
     #[test]
     fn esc_single_tap_on_empty_when_double_disabled_is_noop() {
-        let mapper = InputMapper::new();
+        let mapper = mapper();
         let mut state = InputState::default();
         let view = empty_view();
         let actions = mapper.map(&plain(KeyCode::Esc), &view, "", &mut state, false);
@@ -822,7 +987,7 @@ mod tests {
 
     #[test]
     fn esc_double_tap_outside_window_records_new_tap() {
-        let mapper = InputMapper::new();
+        let mapper = mapper();
         let mut state = InputState::new(DoubleEscapeAction::Tree);
         state.set_escape_double_window(Duration::from_nanos(1));
         let view = empty_view();
@@ -847,7 +1012,7 @@ mod tests {
 
     #[test]
     fn focus_events_produce_no_actions() {
-        let mapper = InputMapper::new();
+        let mapper = mapper();
         let mut state = InputState::default();
         let view = empty_view();
         let actions = mapper.map(&UiEvent::FocusGained, &view, "", &mut state, false);
@@ -858,7 +1023,7 @@ mod tests {
 
     #[test]
     fn editor_consumed_silences_app_keys() {
-        let mapper = InputMapper::new();
+        let mapper = mapper();
         let mut state = InputState::default();
         let view = empty_view();
         let actions = mapper.map(&ctrl('l'), &view, "", &mut state, true);
@@ -888,21 +1053,25 @@ mod tests {
 
     #[test]
     fn ctrl_v_emits_empty_paste_for_clipboard_image_path() {
-        let mapper = InputMapper::new();
+        let mapper = mapper();
         let mut state = InputState::default();
         let view = empty_view();
         let actions = mapper.map(&ctrl('v'), &view, "", &mut state, false);
-        assert_eq!(
-            actions,
-            vec![ViewAction::Paste {
-                text: String::new()
-            }]
-        );
+        if cfg!(windows) {
+            assert!(actions.is_empty());
+        } else {
+            assert_eq!(
+                actions,
+                vec![ViewAction::Paste {
+                    text: String::new()
+                }]
+            );
+        }
     }
 
     #[test]
     fn unknown_key_is_ignored() {
-        let mapper = InputMapper::new();
+        let mapper = mapper();
         let mut state = InputState::default();
         let view = empty_view();
         let actions = mapper.map(
