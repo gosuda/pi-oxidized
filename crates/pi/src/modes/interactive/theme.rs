@@ -247,7 +247,7 @@ impl ResolvedColor {
 ///
 /// Cheap to clone via [`Arc`]; the view-model reads it through [`current()`]
 /// inside the `fn`-pointer color hooks.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedTheme {
     fg: [ResolvedColor; ALL_FG.len()],
     bg: [ResolvedColor; ALL_BG.len()],
@@ -312,20 +312,6 @@ impl ResolvedTheme {
         Self {
             fg: fg_arr,
             bg: bg_arr,
-            mode,
-            name: name.into(),
-        }
-    }
-
-    fn from_rgb_arrays(
-        fg: [Rgb; ALL_FG.len()],
-        bg: [Rgb; ALL_BG.len()],
-        mode: ColorMode,
-        name: impl Into<Cow<'static, str>>,
-    ) -> Self {
-        Self {
-            fg: fg.map(ResolvedColor::Rgb),
-            bg: bg.map(ResolvedColor::Rgb),
             mode,
             name: name.into(),
         }
@@ -758,42 +744,45 @@ fn closest_gray(gray: u8) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// Built-in dark / light themes (resolved interns)
+// Built-in themes (resolved interns)
 // ---------------------------------------------------------------------------
 
-const fn rgb(r: u8, g: u8, b: u8) -> Rgb {
-    Rgb(r, g, b)
-}
-
-/// Built-in dark theme (interned). Mirrors `dark.json` with vars resolved.
+/// Built-in dark theme (interned).
 #[must_use]
 pub fn dark() -> Arc<ResolvedTheme> {
-    DARK_CLONE.clone()
+    DARK_INTERN.clone()
 }
 
-/// Built-in light theme (interned). Mirrors `light.json` with vars resolved.
+/// Built-in light theme (interned).
 #[must_use]
 pub fn light() -> Arc<ResolvedTheme> {
     LIGHT_INTERN.clone()
 }
 
-static DARK_CLONE: LazyLock<Arc<ResolvedTheme>> = LazyLock::new(|| {
-    Arc::new(ResolvedTheme::from_rgb_arrays(
-        dark_fg(),
-        dark_bg(),
-        ColorMode::Truecolor,
-        Cow::Borrowed("dark"),
-    ))
-});
+macro_rules! built_in_theme {
+    ($static_name:ident, $file:literal) => {
+        static $static_name: LazyLock<Arc<ResolvedTheme>> = LazyLock::new(|| {
+            ThemeJson::parse(include_str!(concat!(
+                "../../../assets/theme/",
+                $file,
+                ".json"
+            )))
+            .and_then(|theme| theme.resolve(ColorMode::Truecolor))
+            .expect("built-in theme JSON is valid")
+        });
+    };
+}
 
-static LIGHT_INTERN: LazyLock<Arc<ResolvedTheme>> = LazyLock::new(|| {
-    Arc::new(ResolvedTheme::from_rgb_arrays(
-        light_fg(),
-        light_bg(),
-        ColorMode::Truecolor,
-        Cow::Borrowed("light"),
-    ))
-});
+built_in_theme!(DARK_INTERN, "dark");
+built_in_theme!(LIGHT_INTERN, "light");
+built_in_theme!(CLASSIC_DARK_INTERN, "classic-dark");
+built_in_theme!(CLASSIC_LIGHT_INTERN, "classic-light");
+built_in_theme!(MOTION_DARK_INTERN, "motion-dark");
+built_in_theme!(MOTION_LIGHT_INTERN, "motion-light");
+built_in_theme!(M3_DARK_INTERN, "m3-dark");
+built_in_theme!(M3_LIGHT_INTERN, "m3-light");
+built_in_theme!(ANTD_DARK_INTERN, "antd-dark");
+built_in_theme!(ANTD_LIGHT_INTERN, "antd-light");
 
 // ---------------------------------------------------------------------------
 // JSON loading + validation
@@ -904,9 +893,13 @@ impl ThemeJson {
             colors.push(((*slot).to_owned(), cv));
         }
         // thinkingMax is optional → falls back to thinkingXhigh.
-        if !colors.iter().any(|(k, _)| k == "thinkingMax")
-            && let Some((_, x)) = colors.iter().find(|(k, _)| k == "thinkingXhigh")
-        {
+        if let Some(value) = colors_obj.get("thinkingMax") {
+            let color = parse_color_value(value).ok_or_else(|| ThemeError::InvalidColor {
+                slot: "thinkingMax".to_owned(),
+                value: value.to_string(),
+            })?;
+            colors.push(("thinkingMax".to_owned(), color));
+        } else if let Some((_, x)) = colors.iter().find(|(k, _)| k == "thinkingXhigh") {
             colors.push(("thinkingMax".to_owned(), x.clone()));
         }
         Ok(Self { name, vars, colors })
@@ -1031,6 +1024,40 @@ fn resolve_value(
     }
 }
 
+fn built_in_theme(name: &str) -> Option<Arc<ResolvedTheme>> {
+    match name {
+        "dark" => Some(dark()),
+        "light" => Some(light()),
+        "classic-dark" => Some(CLASSIC_DARK_INTERN.clone()),
+        "classic-light" => Some(CLASSIC_LIGHT_INTERN.clone()),
+        "motion-dark" => Some(MOTION_DARK_INTERN.clone()),
+        "motion-light" => Some(MOTION_LIGHT_INTERN.clone()),
+        "m3-dark" => Some(M3_DARK_INTERN.clone()),
+        "m3-light" => Some(M3_LIGHT_INTERN.clone()),
+        "antd-dark" => Some(ANTD_DARK_INTERN.clone()),
+        "antd-light" => Some(ANTD_LIGHT_INTERN.clone()),
+        _ => None,
+    }
+}
+
+/// Other-variant theme name for light/dark switching; `None` when the name has no convention pair.
+#[must_use]
+pub fn paired_name(name: &str, want_dark: bool) -> Option<String> {
+    match name {
+        "dark" => Some(if want_dark { "dark" } else { "light" }.to_owned()),
+        "light" => Some(if want_dark { "dark" } else { "light" }.to_owned()),
+        _ => {
+            let stem = name
+                .strip_suffix("-dark")
+                .or_else(|| name.strip_suffix("-light"))?;
+            Some(format!(
+                "{stem}-{}",
+                if want_dark { "dark" } else { "light" }
+            ))
+        }
+    }
+}
+
 fn hex_to_rgb(hex: &str) -> Option<Rgb> {
     let rest = hex.strip_prefix('#')?;
     if rest.len() != 6 {
@@ -1045,17 +1072,14 @@ fn hex_to_rgb(hex: &str) -> Option<Rgb> {
 /// Load a theme by name from the configured theme directories.
 ///
 /// Searches built-in (`get_themes_dir`) then custom (`get_custom_themes_dir`).
-/// `"dark"` and `"light"` resolve to the built-in interns without disk access.
+/// Built-in names resolve to interned themes without disk access.
 ///
 /// # Errors
 ///
 /// See [`ThemeError`] variants.
 pub fn load_by_name(name: &str, mode: ColorMode) -> Result<Arc<ResolvedTheme>, ThemeError> {
-    if name == "dark" {
-        return Ok(dark());
-    }
-    if name == "light" {
-        return Ok(light());
+    if let Some(theme) = built_in_theme(name) {
+        return Ok(theme);
     }
     let builtin_path = config::get_themes_dir().join(format!("{name}.json"));
     let custom_path = config::get_custom_themes_dir().join(format!("{name}.json"));
@@ -1193,132 +1217,6 @@ const ALL_BG_SLOTS: &[(ThemeBg, &str)] = &[
     (ThemeBg::ToolErrorBg, "toolErrorBg"),
 ];
 
-// --- built-in resolved color tables ----------------------------------------
-
-const fn dark_fg() -> [Rgb; 46] {
-    [
-        rgb(138, 190, 183), // accent
-        rgb(95, 135, 255),  // border
-        rgb(0, 215, 255),   // borderAccent
-        rgb(80, 80, 80),    // borderMuted
-        rgb(181, 189, 104), // success
-        rgb(204, 102, 102), // error
-        rgb(255, 255, 0),   // warning
-        rgb(128, 128, 128), // muted
-        rgb(102, 102, 102), // dim
-        rgb(212, 212, 212), // text
-        rgb(128, 128, 128), // thinkingText
-        rgb(212, 212, 212), // userMessageText
-        rgb(212, 212, 212), // customMessageText
-        rgb(149, 117, 205), // customMessageLabel
-        rgb(212, 212, 212), // toolTitle
-        rgb(128, 128, 128), // toolOutput
-        rgb(240, 198, 116), // mdHeading
-        rgb(129, 162, 190), // mdLink
-        rgb(102, 102, 102), // mdLinkUrl
-        rgb(138, 190, 183), // mdCode
-        rgb(181, 189, 104), // mdCodeBlock
-        rgb(128, 128, 128), // mdCodeBlockBorder
-        rgb(128, 128, 128), // mdQuote
-        rgb(128, 128, 128), // mdQuoteBorder
-        rgb(128, 128, 128), // mdHr
-        rgb(138, 190, 183), // mdListBullet
-        rgb(181, 189, 104), // toolDiffAdded
-        rgb(204, 102, 102), // toolDiffRemoved
-        rgb(128, 128, 128), // toolDiffContext
-        rgb(106, 153, 85),  // syntaxComment
-        rgb(86, 156, 214),  // syntaxKeyword
-        rgb(220, 220, 170), // syntaxFunction
-        rgb(156, 220, 254), // syntaxVariable
-        rgb(206, 145, 120), // syntaxString
-        rgb(181, 206, 168), // syntaxNumber
-        rgb(78, 201, 176),  // syntaxType
-        rgb(212, 212, 212), // syntaxOperator
-        rgb(212, 212, 212), // syntaxPunctuation
-        rgb(80, 80, 80),    // thinkingOff
-        rgb(110, 110, 110), // thinkingMinimal
-        rgb(95, 135, 175),  // thinkingLow
-        rgb(129, 162, 190), // thinkingMedium
-        rgb(178, 148, 187), // thinkingHigh
-        rgb(209, 131, 232), // thinkingXhigh
-        rgb(255, 95, 255),  // thinkingMax
-        rgb(181, 189, 104), // bashMode
-    ]
-}
-
-const fn dark_bg() -> [Rgb; 6] {
-    [
-        rgb(58, 58, 74), // selectedBg
-        rgb(52, 53, 65), // userMessageBg
-        rgb(45, 40, 56), // customMessageBg
-        rgb(40, 40, 50), // toolPendingBg
-        rgb(40, 50, 40), // toolSuccessBg
-        rgb(60, 40, 40), // toolErrorBg
-    ]
-}
-
-const fn light_fg() -> [Rgb; 46] {
-    [
-        rgb(90, 128, 128),  // accent
-        rgb(84, 125, 167),  // border
-        rgb(90, 128, 128),  // borderAccent
-        rgb(176, 176, 176), // borderMuted
-        rgb(88, 132, 88),   // success
-        rgb(170, 85, 85),   // error
-        rgb(154, 115, 38),  // warning
-        rgb(108, 108, 108), // muted
-        rgb(118, 118, 118), // dim
-        rgb(31, 35, 40),    // text
-        rgb(108, 108, 108), // thinkingText
-        rgb(31, 35, 40),    // userMessageText
-        rgb(31, 35, 40),    // customMessageText
-        rgb(126, 87, 194),  // customMessageLabel
-        rgb(31, 35, 40),    // toolTitle
-        rgb(108, 108, 108), // toolOutput
-        rgb(154, 115, 38),  // mdHeading
-        rgb(84, 125, 167),  // mdLink
-        rgb(118, 118, 118), // mdLinkUrl
-        rgb(90, 128, 128),  // mdCode
-        rgb(88, 132, 88),   // mdCodeBlock
-        rgb(108, 108, 108), // mdCodeBlockBorder
-        rgb(108, 108, 108), // mdQuote
-        rgb(108, 108, 108), // mdQuoteBorder
-        rgb(108, 108, 108), // mdHr
-        rgb(88, 132, 88),   // mdListBullet
-        rgb(88, 132, 88),   // toolDiffAdded
-        rgb(170, 85, 85),   // toolDiffRemoved
-        rgb(108, 108, 108), // toolDiffContext
-        rgb(0, 128, 0),     // syntaxComment
-        rgb(0, 0, 255),     // syntaxKeyword
-        rgb(121, 94, 38),   // syntaxFunction
-        rgb(0, 16, 128),    // syntaxVariable
-        rgb(163, 21, 21),   // syntaxString
-        rgb(9, 134, 88),    // syntaxNumber
-        rgb(38, 127, 153),  // syntaxType
-        rgb(0, 0, 0),       // syntaxOperator
-        rgb(0, 0, 0),       // syntaxPunctuation
-        rgb(176, 176, 176), // thinkingOff
-        rgb(118, 118, 118), // thinkingMinimal
-        rgb(84, 125, 167),  // thinkingLow
-        rgb(90, 128, 128),  // thinkingMedium
-        rgb(135, 95, 135),  // thinkingHigh
-        rgb(139, 0, 139),   // thinkingXhigh
-        rgb(175, 0, 95),    // thinkingMax
-        rgb(88, 132, 88),   // bashMode
-    ]
-}
-
-const fn light_bg() -> [Rgb; 6] {
-    [
-        rgb(208, 208, 224), // selectedBg
-        rgb(232, 232, 232), // userMessageBg
-        rgb(237, 231, 246), // customMessageBg
-        rgb(232, 232, 240), // toolPendingBg
-        rgb(232, 240, 232), // toolSuccessBg
-        rgb(240, 232, 232), // toolErrorBg
-    ]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1340,15 +1238,109 @@ mod tests {
         .map_err(|error| format!("test theme should parse: {error}"))
     }
 
+    const BUILTIN_JSONS: &[(&str, &str)] = &[
+        ("dark", include_str!("../../../assets/theme/dark.json")),
+        ("light", include_str!("../../../assets/theme/light.json")),
+        (
+            "classic-dark",
+            include_str!("../../../assets/theme/classic-dark.json"),
+        ),
+        (
+            "classic-light",
+            include_str!("../../../assets/theme/classic-light.json"),
+        ),
+        (
+            "motion-dark",
+            include_str!("../../../assets/theme/motion-dark.json"),
+        ),
+        (
+            "motion-light",
+            include_str!("../../../assets/theme/motion-light.json"),
+        ),
+        (
+            "m3-dark",
+            include_str!("../../../assets/theme/m3-dark.json"),
+        ),
+        (
+            "m3-light",
+            include_str!("../../../assets/theme/m3-light.json"),
+        ),
+        (
+            "antd-dark",
+            include_str!("../../../assets/theme/antd-dark.json"),
+        ),
+        (
+            "antd-light",
+            include_str!("../../../assets/theme/antd-light.json"),
+        ),
+    ];
+
     #[test]
-    fn dark_accent_resolves() {
-        let th = dark();
-        assert_eq!(th.fg_rgb(ThemeColor::Accent), Rgb(138, 190, 183));
+    fn built_in_jsons_parse_and_resolve() {
+        for (name, json) in BUILTIN_JSONS {
+            let theme = ThemeJson::parse(json)
+                .unwrap_or_else(|error| panic!("{name} should parse: {error}"))
+                .resolve(ColorMode::Truecolor)
+                .unwrap_or_else(|error| panic!("{name} should resolve: {error}"));
+            assert_eq!(theme.name, *name);
+        }
     }
 
     #[test]
-    fn builtin_literal_black_remains_a_color() {
-        let theme = light();
+    fn built_in_jsons_are_the_intern_authority() {
+        for (name, json) in BUILTIN_JSONS {
+            let resolved = ThemeJson::parse(json)
+                .unwrap_or_else(|error| panic!("{name} should parse: {error}"))
+                .resolve(ColorMode::Truecolor)
+                .unwrap_or_else(|error| panic!("{name} should resolve: {error}"));
+            assert_eq!(
+                resolved,
+                built_in_theme(name).expect("built-in intern should exist")
+            );
+        }
+    }
+
+    #[test]
+    fn paired_names_follow_dark_light_convention() {
+        assert_eq!(paired_name("dark", true).as_deref(), Some("dark"));
+        assert_eq!(paired_name("dark", false).as_deref(), Some("light"));
+        assert_eq!(paired_name("m3-light", true).as_deref(), Some("m3-dark"));
+        assert_eq!(paired_name("mytheme", true), None);
+        assert_eq!(paired_name("mytheme", false), None);
+    }
+
+    #[test]
+    fn built_in_palette_spot_checks() {
+        assert_eq!(dark().fg_rgb(ThemeColor::Text), Rgb(237, 237, 237));
+        assert_eq!(
+            built_in_theme("m3-dark")
+                .expect("m3-dark intern should exist")
+                .fg_rgb(ThemeColor::SyntaxKeyword),
+            Rgb(158, 202, 255)
+        );
+        assert_eq!(
+            built_in_theme("antd-light")
+                .expect("antd-light intern should exist")
+                .fg_rgb(ThemeColor::Accent),
+            Rgb(22, 119, 255)
+        );
+        assert_eq!(
+            built_in_theme("classic-light")
+                .expect("classic-light intern should exist")
+                .fg_rgb(ThemeColor::ThinkingMax),
+            Rgb(175, 0, 95)
+        );
+    }
+
+    #[test]
+    fn dark_accent_resolves() {
+        let th = dark();
+        assert_eq!(th.fg_rgb(ThemeColor::Accent), Rgb(82, 168, 255));
+    }
+
+    #[test]
+    fn classic_light_literal_black_remains_a_color() {
+        let theme = built_in_theme("classic-light").expect("classic-light intern should exist");
         assert!(!theme.is_fg_empty(ThemeColor::SyntaxOperator));
         assert_eq!(
             theme.fg_ansi(ThemeColor::SyntaxOperator),

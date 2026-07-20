@@ -204,6 +204,15 @@ export async function assembleRelease(
 	for (const f of await copyTreeOptional(fs, inputs.assetsSource, archiveDir, "assets", used)) {
 		copied.push(f);
 	}
+	for (const f of await copyTreeOptional(
+		fs,
+		`${inputs.repoRoot}/crates/pi/assets/theme`,
+		archiveDir,
+		"theme",
+		used,
+	)) {
+		copied.push(f);
+	}
 
 	// 5. Caller-supplied extras (tests use this for deterministic content).
 	if (inputs.extraFiles) {
@@ -355,6 +364,7 @@ async function copyTreeOptional(
 		} catch {
 			continue;
 		}
+		entries.sort();
 		for (const name of entries) {
 			const childAbs = `${dir}/${name}`;
 			const s = await fs.stat(childAbs);
