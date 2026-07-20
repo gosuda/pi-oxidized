@@ -38,16 +38,17 @@ const REF_ROOT = (() => {
 
 /** Map every extension-importable specifier to reference source. */
 export function getExtensionAliases(): Record<string, string> {
-	const codingAgent = `${REF_ROOT}/coding-agent/src/core/extensions/index.ts`;
+	const codingAgent = `${REF_ROOT}/coding-agent/src/index.ts`;
 	const agent = `${REF_ROOT}/agent/src/index.ts`;
 	const tui = `${REF_ROOT}/tui/src/index.ts`;
 	const aiCompat = `${REF_ROOT}/ai/src/compat.ts`;
 	const aiOauth = `${REF_ROOT}/ai/src/oauth.ts`;
 	const aiProviders = `${REF_ROOT}/ai/src/providers/all.ts`;
 	// The reference loader resolves typebox via require.resolve from the
-	// coding-agent package; mirror that exact copy so extension schemas share
-	// one typebox instance with the reference extension machinery.
-	const typeboxRoot = `${REF_ROOT}/coding-agent/node_modules/typebox/build`;
+	// coding-agent package; bun hoists that copy to the workspace root, so
+	// mirror the hoisted path and share one typebox instance with the
+	// reference extension machinery.
+	const typeboxRoot = `${REF_ROOT}/../node_modules/typebox/build`;
 	const typebox = `${typeboxRoot}/index.mjs`;
 	const typeboxCompile = `${typeboxRoot}/compile/index.mjs`;
 	const typeboxValue = `${typeboxRoot}/value/index.mjs`;
