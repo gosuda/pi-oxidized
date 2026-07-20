@@ -323,7 +323,6 @@ function encodeZipArchive(entries: readonly ArchiveEntry[], mtimeSeconds: number
 
 	const centralStart = offset;
 	const centralBytes = concatBytes(centralRecords);
-	const centralEnd = centralStart + centralBytes.length;
 
 	const eocd = new Uint8Array(22);
 	const ev = new DataView(eocd.buffer);

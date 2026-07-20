@@ -45,18 +45,6 @@ impl PendingMessageQueue {
         self.messages.push(message);
     }
 
-    /// Returns true when at least one message is queued.
-    #[must_use]
-    pub fn has_items(&self) -> bool {
-        !self.messages.is_empty()
-    }
-
-    /// Returns the number of queued messages.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.messages.len()
-    }
-
     /// Returns true when the queue is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -144,7 +132,7 @@ mod tests {
         let drained = queue.drain();
         assert_eq!(drained.len(), 3);
         assert_eq!(drained[0].role(), "user");
-        assert!(!queue.has_items());
+        assert!(queue.is_empty());
         assert!(queue.drain().is_empty());
     }
 
@@ -157,15 +145,13 @@ mod tests {
 
         let first = queue.drain();
         assert_eq!(first.len(), 1);
-        assert_eq!(queue.len(), 2);
 
         let second = queue.drain();
         assert_eq!(second.len(), 1);
-        assert_eq!(queue.len(), 1);
 
         let third = queue.drain();
         assert_eq!(third.len(), 1);
-        assert!(!queue.has_items());
+        assert!(queue.is_empty());
     }
 
     #[test]
@@ -179,13 +165,12 @@ mod tests {
         queue.set_mode(QueueMode::OneAtATime);
         let one = queue.drain();
         assert_eq!(one.len(), 1);
-        assert_eq!(queue.len(), 2);
 
         // Switch back to all: remaining messages drain together.
         queue.mode = QueueMode::All;
         let rest = queue.drain();
         assert_eq!(rest.len(), 2);
-        assert!(!queue.has_items());
+        assert!(queue.is_empty());
     }
 
     #[test]
@@ -208,7 +193,7 @@ mod tests {
         queue.enqueue(msg("x"));
         queue.enqueue(msg("y"));
         queue.clear();
-        assert!(!queue.has_items());
+        assert!(queue.is_empty());
         assert!(queue.drain().is_empty());
     }
 

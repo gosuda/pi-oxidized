@@ -8,7 +8,6 @@ import { Readable } from "node:stream";
 import {
 	PROTOCOL_VERSION,
 	encodeFrameString,
-	type Frame,
 } from "@earendil-works/pi-tui-protocol";
 import type {
 	ExtensionFactory,
@@ -54,19 +53,6 @@ class PipeWritable {
 	}
 }
 
-/** Decode collected stdout chunks into Frame[]. */
-function decodeChunks(chunks: Uint8Array[]): Frame[] {
-	const text = new TextDecoder().decode(
-		Buffer.concat(chunks.map((c) => Buffer.from(c))),
-	);
-	const frames: Frame[] = [];
-	for (const line of text.split("\n")) {
-		if (line.trim().length > 0) {
-			frames.push(JSON.parse(line) as Frame);
-		}
-	}
-	return frames;
-}
 
 /** Minimal context-actions stub for runner construction in tests. */
 const noopContextActions: ExtensionContextActions = {

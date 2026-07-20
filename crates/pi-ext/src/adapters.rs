@@ -38,8 +38,8 @@ use pi_tui::text::slice_with_width;
 
 use crate::client::HostClient;
 use crate::protocol::{
-    Frame, KeyEventKindWire, KeyModifiersWire, NamedColor, SlotPlacement, ToolUpdate, UiEventWire,
-    WireColor, from_payload,
+    Frame, KeyEventKindWire, KeyModifiersWire, NamedColor, ToolUpdate, UiEventWire, WireColor,
+    from_payload,
 };
 use crate::sanitize::{SanitizedSlot, sanitize_slot};
 
@@ -109,19 +109,6 @@ impl ExtensionAgentTool {
             client,
             timeout: DEFAULT_CALL_TIMEOUT,
         }
-    }
-
-    /// Override the per-call deadline.
-    #[must_use]
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
-        self
-    }
-
-    /// Borrowed registration metadata.
-    #[must_use]
-    pub fn registration(&self) -> &ToolRegistration {
-        &self.meta
     }
 }
 
@@ -278,13 +265,6 @@ impl ExtensionProvider {
             client,
             timeout: DEFAULT_CALL_TIMEOUT,
         }
-    }
-
-    /// Override the per-call deadline.
-    #[must_use]
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
-        self
     }
 }
 
@@ -480,7 +460,6 @@ impl Stream for ProviderStream {
 pub struct SlotComponent {
     slot: SanitizedSlot,
     focused: bool,
-    dirty: bool,
     focus_id: FocusId,
     event_tx: Option<mpsc::UnboundedSender<UiEventWire>>,
 }
@@ -492,7 +471,6 @@ impl SlotComponent {
         Self {
             slot,
             focused: false,
-            dirty: true,
             focus_id: FocusId::new(),
             event_tx: None,
         }
@@ -512,18 +490,6 @@ impl SlotComponent {
         self
     }
 
-    /// Replace the rendered slot with a freshly sanitized one.
-    pub fn set_slot(&mut self, slot: SanitizedSlot) {
-        self.slot = slot;
-        self.dirty = true;
-    }
-
-    /// Current placement.
-    #[must_use]
-    pub fn placement(&self) -> SlotPlacement {
-        self.slot.placement
-    }
-
     fn forward_event(&self, event: &UiEvent) {
         if let Some(tx) = &self.event_tx {
             let _ = tx.send(map_ui_event(event));
@@ -537,7 +503,6 @@ impl Component for SlotComponent {
     }
 
     fn render(&mut self, area: Rect, buf: &mut Buffer) {
-        self.dirty = false;
         let max_rows = area.height as usize;
         for (row, line) in self.slot.lines.iter().take(max_rows).enumerate() {
             let y = area
@@ -602,9 +567,7 @@ impl Component for SlotComponent {
         }
     }
 
-    fn invalidate(&mut self) {
-        self.dirty = true;
-    }
+    fn invalidate(&mut self) {}
 }
 
 impl Focusable for SlotComponent {
@@ -618,7 +581,6 @@ impl Focusable for SlotComponent {
 
     fn set_focused(&mut self, focused: bool) {
         self.focused = focused;
-        self.dirty = true;
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -1068,8 +1030,7 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::Style;
-    use crate::protocol::StyledRun;
+    use crate::protocol::{SlotPlacement, Style, StyledRun};
     use crate::test_support::make_pair;
     use futures::StreamExt;
     use pi_ai::types::ModelCost;

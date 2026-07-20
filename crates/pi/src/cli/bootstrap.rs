@@ -455,8 +455,6 @@ fn initialize_bootstrap(inputs: &BootstrapInputs<'_>) -> BootstrapStep<Args> {
         return Err(stop(outcome.exit_code, outcome.drain_quirk));
     }
 
-    let mut parsed = crate::cli::args::parse_args(&inputs.args);
-    parsed.offline = offline_mode;
     report_diagnostics(&parsed, inputs.io);
     if parsed
         .diagnostics

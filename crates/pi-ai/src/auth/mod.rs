@@ -19,7 +19,7 @@ pub use env_keys::{
     is_ambient_auth_marker,
 };
 pub use error::{AuthError, ModelsError, ModelsErrorCode, StoreError};
-pub use file_store::{FileCredentialStore, FileLockBackend, read_stored_credential};
+pub use file_store::{FileCredentialStore, FileLockBackend};
 pub use resolve::{AuthResolutionOverrides, resolve_provider_auth};
 pub use runtime_credentials::RuntimeCredentials;
 pub use types::{

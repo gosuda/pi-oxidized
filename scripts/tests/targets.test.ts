@@ -1,7 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
 	RUST_TARGETS,
-	TARGET_PLANS,
 	archiveName,
 	checksumName,
 	isSupportedTarget,

@@ -1,7 +1,7 @@
 //! Environment and ambient API-key detection.
 //!
 //! Ports `.references/pi/packages/ai/src/env-api-keys.ts` and the
-//! `envApiKeyAuth` / `lazyOAuth` helpers from `auth/helpers.ts`.
+//! `envApiKeyAuth` helper from `auth/helpers.ts`.
 //!
 //! Ambient Vertex/Bedrock detection returns the [`AMBIENT_AUTH_MARKER`]
 //! sentinel for status only. That value is never bearer material and must not
@@ -11,14 +11,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use futures::future::BoxFuture;
-use tokio::sync::OnceCell;
-use tokio_util::sync::CancellationToken;
 
 use super::config_value::resolve_config_value;
 use super::error::AuthError;
 use super::types::{
     ApiKeyAuth, ApiKeyCredential, AuthCheck, AuthContext, AuthInteraction, AuthPrompt, AuthResult,
-    AuthType, ModelAuth, OAuthAuth, OAuthCredential, ProviderEnv,
+    ModelAuth, ProviderEnv,
 };
 
 /// Status-only marker returned when Vertex ADC or Bedrock ambient credentials
@@ -320,88 +318,13 @@ impl ApiKeyAuth for EnvApiKeyAuth {
     }
 }
 
-/// Lazily load an [`OAuthAuth`] implementation on first use.
-#[must_use]
-pub fn lazy_oauth(
-    name: impl Into<String>,
-    login_label: Option<String>,
-    load: impl Fn() -> BoxFuture<'static, Arc<dyn OAuthAuth>> + Send + Sync + 'static,
-) -> Arc<dyn OAuthAuth> {
-    Arc::new(LazyOAuthAuth {
-        name: name.into(),
-        login_label,
-        load: Box::new(load),
-        cached: OnceCell::new(),
-    })
-}
-
-struct LazyOAuthAuth {
-    name: String,
-    login_label: Option<String>,
-    load: Box<dyn Fn() -> BoxFuture<'static, Arc<dyn OAuthAuth>> + Send + Sync>,
-    cached: OnceCell<Arc<dyn OAuthAuth>>,
-}
-
-impl LazyOAuthAuth {
-    async fn loaded(&self) -> Arc<dyn OAuthAuth> {
-        self.cached.get_or_init(|| (self.load)()).await.clone()
-    }
-}
-
-impl OAuthAuth for LazyOAuthAuth {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn login_label(&self) -> Option<&str> {
-        self.login_label.as_deref()
-    }
-
-    fn login<'a>(
-        &'a self,
-        interaction: &'a dyn AuthInteraction,
-    ) -> BoxFuture<'a, Result<OAuthCredential, AuthError>> {
-        Box::pin(async move { self.loaded().await.login(interaction).await })
-    }
-
-    fn refresh<'a>(
-        &'a self,
-        credential: &'a OAuthCredential,
-        signal: Option<CancellationToken>,
-    ) -> BoxFuture<'a, Result<OAuthCredential, AuthError>> {
-        Box::pin(async move { self.loaded().await.refresh(credential, signal).await })
-    }
-
-    fn to_auth<'a>(
-        &'a self,
-        credential: &'a OAuthCredential,
-    ) -> BoxFuture<'a, Result<ModelAuth, AuthError>> {
-        Box::pin(async move { self.loaded().await.to_auth(credential).await })
-    }
-}
-
-/// Side-effect-free availability probe matching `envApiKeyAuth` resolve rules.
-#[must_use]
-pub fn env_api_key_check(source: Option<String>, configured: bool) -> Option<AuthCheck> {
-    if configured {
-        Some(AuthCheck {
-            source,
-            kind: AuthType::ApiKey,
-        })
-    } else {
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::auth::context::MapAuthContext;
-    use std::collections::BTreeMap;
     use std::error::Error;
     use std::fs;
     use std::io;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -570,78 +493,6 @@ mod tests {
             "sentinel status",
         )?;
         assert!(result.auth.api_key.is_none());
-        Ok(())
-    }
-
-    struct StaticOauth;
-
-    impl OAuthAuth for StaticOauth {
-        fn name(&self) -> &'static str {
-            "static"
-        }
-
-        fn login_label(&self) -> Option<&str> {
-            Some("Static")
-        }
-
-        fn login<'a>(
-            &'a self,
-            _interaction: &'a dyn AuthInteraction,
-        ) -> BoxFuture<'a, Result<OAuthCredential, AuthError>> {
-            Box::pin(async {
-                Ok(OAuthCredential {
-                    refresh: "refresh".to_owned(),
-                    access: "access".to_owned(),
-                    expires: i64::MAX,
-                    extra: BTreeMap::new(),
-                })
-            })
-        }
-
-        fn refresh<'a>(
-            &'a self,
-            credential: &'a OAuthCredential,
-            _signal: Option<CancellationToken>,
-        ) -> BoxFuture<'a, Result<OAuthCredential, AuthError>> {
-            Box::pin(async move { Ok(credential.clone()) })
-        }
-
-        fn to_auth<'a>(
-            &'a self,
-            credential: &'a OAuthCredential,
-        ) -> BoxFuture<'a, Result<ModelAuth, AuthError>> {
-            Box::pin(async move {
-                Ok(ModelAuth {
-                    api_key: Some(credential.access.clone()),
-                    headers: None,
-                    base_url: None,
-                })
-            })
-        }
-    }
-
-    #[tokio::test]
-    async fn lazy_oauth_loads_once_concurrently() -> TestResult {
-        let loads = Arc::new(AtomicUsize::new(0));
-        let counter = Arc::clone(&loads);
-        let oauth = lazy_oauth("Lazy", Some("Login".to_owned()), move || {
-            let counter = Arc::clone(&counter);
-            Box::pin(async move {
-                counter.fetch_add(1, Ordering::SeqCst);
-                tokio::task::yield_now().await;
-                Arc::new(StaticOauth) as Arc<dyn OAuthAuth>
-            })
-        });
-        let credential = OAuthCredential {
-            refresh: "refresh".to_owned(),
-            access: "access".to_owned(),
-            expires: i64::MAX,
-            extra: BTreeMap::new(),
-        };
-        let (first, second) = tokio::join!(oauth.to_auth(&credential), oauth.to_auth(&credential));
-        assert_eq!(first?.api_key.as_deref(), Some("access"));
-        assert_eq!(second?.api_key.as_deref(), Some("access"));
-        assert_eq!(loads.load(Ordering::SeqCst), 1);
         Ok(())
     }
 }

@@ -132,26 +132,11 @@ impl AgentMessage {
         }
     }
 
-    /// Returns true when this message is an LLM-compatible variant.
-    #[must_use]
-    pub const fn is_llm(&self) -> bool {
-        matches!(self, Self::Llm(_))
-    }
-
     /// Borrows the inner LLM message when present.
     #[must_use]
     pub fn as_llm(&self) -> Option<&Message> {
         match self {
             Self::Llm(message) => Some(message.as_ref()),
-            Self::Custom(_) => None,
-        }
-    }
-
-    /// Consumes the value and returns the inner LLM message when present.
-    #[must_use]
-    pub fn into_llm(self) -> Option<Message> {
-        match self {
-            Self::Llm(message) => Some(*message),
             Self::Custom(_) => None,
         }
     }
@@ -265,7 +250,6 @@ mod tests {
         assert_eq!(converted.len(), 1);
         assert!(matches!(converted[0], Message::User(_)));
         assert_eq!(user.role(), "user");
-        assert!(user.is_llm());
         assert!(user.as_llm().is_some());
     }
 
@@ -277,7 +261,7 @@ mod tests {
             "timestamp": 42
         });
         let message: AgentMessage = serde_json::from_value(raw.clone())?;
-        assert!(message.is_llm());
+        assert!(message.as_llm().is_some());
         assert_eq!(message.role(), "user");
         let encoded = serde_json::to_value(&message)?;
         assert_eq!(encoded, raw);

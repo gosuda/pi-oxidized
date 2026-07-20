@@ -423,36 +423,6 @@ pub fn resolve_config_value_uncached(config: &str, env: Option<&ConfigEnv>) -> O
     }
 }
 
-/// Resolve a required config value or return a descriptive error message.
-///
-/// # Errors
-///
-/// Returns an error message when a `!command` fails or when one or more
-/// referenced environment variables are unset.
-pub fn resolve_config_value_or_error(
-    config: &str,
-    description: &str,
-    env: Option<&ConfigEnv>,
-) -> Result<String, String> {
-    match resolve_config_value(config, env) {
-        Some(value) => Ok(value),
-        None if is_command_config_value(config) => {
-            Err(format!("Failed to resolve {description} from command"))
-        }
-        None => {
-            let missing = get_missing_config_value_env_var_names(config, env);
-            if missing.is_empty() {
-                Err(format!("Failed to resolve {description}"))
-            } else {
-                Err(format!(
-                    "Failed to resolve {description}: missing {}",
-                    missing.join(", ")
-                ))
-            }
-        }
-    }
-}
-
 /// Resolve all header values with the same rules as API keys.
 ///
 /// Present `None` values are suppression markers and pass through without

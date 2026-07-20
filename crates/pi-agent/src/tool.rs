@@ -169,16 +169,6 @@ impl ToolUpdates {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
     }
-
-    /// Returns whether this handle still accepts updates.
-    #[must_use]
-    pub fn is_accepting(&self) -> bool {
-        let (lock, _) = &*self.state;
-        let guard = lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.accepting
-    }
 }
 
 /// Tool definition used by the agent runtime.
@@ -455,7 +445,5 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(values.as_slice(), &[Some("one".to_owned())]);
-        assert!(!updates.is_accepting());
-        assert!(ToolUpdates::default().is_accepting());
     }
 }

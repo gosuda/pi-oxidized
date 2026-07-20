@@ -40,8 +40,6 @@ pub const MAX_RUN_TEXT_BYTES: usize = 64 * 1024;
 pub const TAB_WIDTH: usize = 4;
 /// Maximum accepted [`Hyperlink`] id length in bytes.
 pub const MAX_LINK_ID_BYTES: usize = Hyperlink::MAX_ID_BYTES;
-/// Maximum accepted [`Hyperlink`] uri length in bytes.
-pub const MAX_LINK_URI_BYTES: usize = Hyperlink::MAX_URI_BYTES;
 
 /// A single sanitized styled run (text + validated style).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -171,8 +169,9 @@ impl Perform for StripPerformer {
 ///
 /// Returns the cleaned text and whether any control byte was seen. The parser
 /// is consumed (ground state for the next caller).
+#[cfg(test)]
 #[must_use]
-pub fn sanitize_text(text: &str) -> (String, bool) {
+fn sanitize_text(text: &str) -> (String, bool) {
     let mut performer = StripPerformer::new(MAX_RUN_TEXT_BYTES);
     // Any ESC byte flags hostile input even when silently consumed (APC/PM/SOS).
     if text.as_bytes().contains(&0x1b) {
@@ -292,8 +291,9 @@ fn sanitize_run(
 /// Returns `true` when `bytes` contains any byte that is not a printable
 /// grapheme, tab, or newline. Useful for assertions that plugin text never
 /// reached a raw output channel.
+#[cfg(test)]
 #[must_use]
-pub fn contains_control_bytes(bytes: &[u8]) -> bool {
+fn contains_control_bytes(bytes: &[u8]) -> bool {
     let mut saw_control = false;
     let mut detector = ControlDetector {
         saw: &mut saw_control,
@@ -305,10 +305,12 @@ pub fn contains_control_bytes(bytes: &[u8]) -> bool {
     saw_control
 }
 
+#[cfg(test)]
 struct ControlDetector<'a> {
     saw: &'a mut bool,
 }
 
+#[cfg(test)]
 impl Perform for ControlDetector<'_> {
     fn print(&mut self, _c: char) {}
     fn execute(&mut self, _byte: u8) {

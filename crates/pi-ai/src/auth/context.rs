@@ -24,16 +24,6 @@ impl DefaultAuthContext {
         Self { home_dir }
     }
 
-    /// Create a context using the current process home directory when available.
-    #[must_use]
-    pub fn from_process() -> Self {
-        Self {
-            home_dir: std::env::var_os("HOME")
-                .or_else(|| std::env::var_os("USERPROFILE"))
-                .map(PathBuf::from),
-        }
-    }
-
     fn expand_path(&self, path: &str) -> PathBuf {
         if let Some(rest) = path.strip_prefix('~')
             && let Some(home) = &self.home_dir

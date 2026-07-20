@@ -7,12 +7,12 @@ use futures::future::BoxFuture;
 use pi_ai::provider::{OnPayloadFn, OnResponseFn};
 use pi_ai::{
     AssistantMessage, CacheRetention, ImageContent, Model, ModelThinkingLevel, StreamOptions,
-    TextContent, ToolCall, ToolResultMessage, Transport,
+    ToolCall, ToolResultMessage, Transport,
 };
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
-use crate::error::{AgentLoopError, ToolError};
+use crate::error::AgentLoopError;
 use crate::message::AgentMessage;
 use crate::tool::{AgentTool, AgentToolResult, ToolExecutionMode};
 
@@ -314,18 +314,6 @@ pub fn default_convert_to_llm_hook() -> ConvertToLlm {
 #[must_use]
 pub fn text_user_message(text: impl Into<String>) -> AgentMessage {
     crate::message::user_text(text, std::iter::empty::<ImageContent>())
-}
-
-/// Convenience constructor for a text tool-result content block.
-#[must_use]
-pub fn text_tool_content(text: impl Into<String>) -> pi_ai::ToolResultContent {
-    pi_ai::ToolResultContent::Text(TextContent::new(text))
-}
-
-/// Maps a [`ToolError`] into an [`AgentToolResult`].
-#[must_use]
-pub fn tool_error_result(error: ToolError) -> AgentToolResult {
-    AgentToolResult::from(error)
 }
 
 #[cfg(test)]

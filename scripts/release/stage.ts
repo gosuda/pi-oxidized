@@ -440,8 +440,3 @@ function manifestEntryFromData(data: Uint8Array, relPath: string, executable: bo
 	return { path: relPath, size: data.length, sha256: hash, executable };
 }
 
-/** Render an unknown error as a short string for diagnostic messages. */
-function errMessage(err: unknown): string {
-	if (err instanceof Error) return err.message;
-	return String(err);
-}

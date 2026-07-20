@@ -98,7 +98,7 @@ describe("assembleRelease", () => {
 		const assembly1 = await assembleRelease("/staging", inputs);
 		const m1Bytes = new Uint8Array(await fs.readFile("/staging/pi-linux-arm64/release.json"));
 		
-		const assembly2 = await assembleRelease("/staging", inputs);
+		await assembleRelease("/staging", inputs);
 		const m2Bytes = new Uint8Array(await fs.readFile("/staging/pi-linux-arm64/release.json"));
 		
 		expect(assembly1.stagingDir).toBe("/staging/pi-linux-arm64");

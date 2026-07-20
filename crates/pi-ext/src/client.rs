@@ -40,9 +40,8 @@ use tokio::task::JoinHandle;
 use crate::host::{HostError, HostSpec};
 use crate::protocol::{
     COMPATIBILITY_VERSION, ConfirmRequest, ConfirmResponse, EditorRequest, EditorResponse, Frame,
-    FrameDecoder, FrameId, FrameKind, Hello, HelloAck, InputRequest, InputResponse,
-    MeasureResponse, Method, NotifyRequest, PROTOCOL_VERSION, SelectRequest, SelectResponse,
-    encode_frame, from_payload,
+    FrameDecoder, FrameId, FrameKind, Hello, HelloAck, InputRequest, InputResponse, Method,
+    NotifyRequest, PROTOCOL_VERSION, SelectRequest, SelectResponse, encode_frame, from_payload,
 };
 
 /// Default bounded capacity for the outbound (client → host) frame channel.
@@ -103,19 +102,6 @@ pub enum HostUiRequest {
         /// Dialog request payload.
         request: EditorRequest,
     },
-}
-
-impl HostUiRequest {
-    /// Original host correlation id.
-    #[must_use]
-    pub const fn id(&self) -> FrameId {
-        match self {
-            Self::Select { id, .. }
-            | Self::Confirm { id, .. }
-            | Self::Input { id, .. }
-            | Self::Editor { id, .. } => *id,
-        }
-    }
 }
 
 /// Typed response to a host-initiated UI request.
@@ -592,21 +578,6 @@ impl HostClient {
     /// # Errors
     ///
     /// Returns [`HostClientError::NotRunning`] or [`HostClientError::Closed`].
-    pub async fn open_stream(
-        &self,
-        method: Method,
-        payload: serde_json::Value,
-        event_bound: usize,
-    ) -> HostResult<StreamHandle> {
-        self.open_stream_raw(method.as_str(), payload, event_bound)
-            .await
-    }
-
-    /// Streaming variant using an open lifecycle method string.
-    ///
-    /// # Errors
-    ///
-    /// See [`HostClient::open_stream`].
     pub async fn open_stream_raw(
         &self,
         method: &str,
@@ -682,37 +653,6 @@ impl HostClient {
         Ok(())
     }
 
-    /// Request a slot measure for `width` / `theme_generation`.
-    ///
-    /// # Errors
-    ///
-    /// Returns transport or remote errors.
-    pub async fn measure(
-        &self,
-        key: &str,
-        width: u16,
-        theme_generation: u64,
-        timeout: Duration,
-    ) -> HostResult<u16> {
-        #[derive(serde::Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Req<'a> {
-            key: &'a str,
-            width: u16,
-            theme_generation: u64,
-        }
-        let payload = serde_json::to_value(Req {
-            key,
-            width,
-            theme_generation,
-        })
-        .map_err(|e| HostClientError::Payload(format!("encode measure: {e}")))?;
-        let frame = self.request(Method::Measure, payload, timeout).await?;
-        let resp: MeasureResponse = from_payload(&frame.payload)
-            .map_err(|e| HostClientError::Payload(format!("decode measure: {e}")))?;
-        Ok(resp.height)
-    }
-
     fn insert_pending(&self, id: FrameId, entry: PendingEntry) {
         if let Ok(mut pending) = self.shared.pending.lock() {
             pending.insert(id, entry);
@@ -757,12 +697,6 @@ pub struct StreamHandle {
 }
 
 impl StreamHandle {
-    /// Request id of this call.
-    #[must_use]
-    pub fn id(&self) -> FrameId {
-        self.id
-    }
-
     /// Receive the next intermediate event frame, if any.
     ///
     /// Returns `None` when the stream closed (terminal resolved or host gone).

@@ -11,8 +11,7 @@ pub mod types;
 
 pub use estimate::{
     ContextUsageEstimate, calculate_context_tokens, estimate_context_tokens,
-    estimate_message_tokens, estimate_messages_tokens, estimate_text_and_image_content_tokens,
-    estimate_text_tokens,
+    estimate_message_tokens, estimate_text_and_image_content_tokens, estimate_text_tokens,
 };
 pub use provider::{Provider, ProviderError, ProviderResponse, StreamOptions};
 pub use simple_options::{

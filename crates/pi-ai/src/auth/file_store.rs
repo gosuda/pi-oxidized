@@ -502,17 +502,6 @@ fn replace_cache_mutex(
     Ok(())
 }
 
-/// One-off synchronous read of a stored credential without resolving templates.
-///
-/// Returns `None` when the file is missing, unreadable, malformed, or lacks the
-/// provider entry. Never acquires the store lock.
-#[must_use]
-pub fn read_stored_credential(provider_id: &str, auth_path: &Path) -> Option<Credential> {
-    let content = fs::read_to_string(auth_path).ok()?;
-    let data: BTreeMap<String, Credential> = serde_json::from_str(&content).ok()?;
-    data.get(provider_id).cloned()
-}
-
 fn lock_path_for(path: &Path) -> PathBuf {
     let mut os = path.as_os_str().to_owned();
     os.push(".lock");
@@ -882,7 +871,6 @@ mod tests {
         };
         assert!(error.to_string().contains("JSON"));
         assert_eq!(fs::read(&path)?, garbage);
-        assert!(read_stored_credential("openai", &path).is_none());
         Ok(())
     }
 
@@ -936,11 +924,6 @@ mod tests {
                 .map(String::as_str),
             Some("acct")
         );
-        assert!(matches!(
-            read_stored_credential("openai", &path),
-            Some(Credential::ApiKey(ApiKeyCredential { key: Some(key), .. }))
-                if key == "$OPENAI_API_KEY"
-        ));
         Ok(())
     }
 
@@ -1045,7 +1028,6 @@ mod tests {
         store.delete("openai").await?;
         assert_eq!(store.read("openai").await?, None);
         assert!(store.list().await?.is_empty());
-        assert!(read_stored_credential("openai", &path).is_none());
         Ok(())
     }
 

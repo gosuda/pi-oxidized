@@ -255,7 +255,7 @@ async function measureFrameCpu(
 	return latencies;
 }
 
-function assertWithinTenPercent(label: string, baseline: number, candidate: number): void {
+function assertWithinTenPercent(baseline: number, candidate: number): void {
 	// Allow absolute floor so near-zero baselines don't fail on noise.
 	const limit = Math.max(baseline * 1.1, baseline + 1.0, 2.0);
 	expect(candidate).toBeLessThanOrEqual(limit);
@@ -313,8 +313,8 @@ describe("scaling: zero / idle / active widgets", () => {
 		idle.host.dispose("test");
 		await idle.runPromise.catch(() => void 0);
 
-		assertWithinTenPercent("keypress-to-paint p99", p99(zeroKey), p99(idleKey));
-		assertWithinTenPercent("frame CPU p99", p99(zeroFrame), p99(idleFrame));
+		assertWithinTenPercent(p99(zeroKey), p99(idleKey));
+		assertWithinTenPercent(p99(zeroFrame), p99(idleFrame));
 	}, 60_000);
 
 	test("20 active widgets stay bounded and drop stale generations", async () => {

@@ -348,17 +348,6 @@ impl AgentEventSubscription {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .lagged
     }
-
-    /// Returns the current number of buffered events.
-    #[must_use]
-    pub fn queued_len(&self) -> usize {
-        self.inner
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .queue
-            .len()
-    }
 }
 
 impl Drop for AgentEventSubscription {
@@ -579,7 +568,6 @@ mod tests {
 
         for index in 0..100_000 {
             sink.emit(update(index));
-            assert!(rx.queued_len() <= CAPACITY);
         }
         assert!(rx.is_lagged());
 
@@ -587,8 +575,6 @@ mod tests {
         sink.emit(AgentEvent::AgentEnd {
             messages: Vec::new(),
         });
-        assert_eq!(rx.queued_len(), CAPACITY);
-
         let mut retained = Vec::new();
         while let Ok(event) = rx.try_recv() {
             retained.push(event);

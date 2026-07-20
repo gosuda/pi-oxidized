@@ -56,6 +56,7 @@ use pi_tui::terminal::probe::{TerminalTheme, detect_terminal_theme, probe_termin
 use pi_tui::terminal::writer::{ReanchorCause, SettledBlock, Tui, Txn};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+#[cfg(test)]
 use ratatui::text::Line;
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::task::{JoinError, JoinSet};
@@ -4786,16 +4787,6 @@ fn update_tool_message(
 #[cfg(test)]
 fn settled_lines(lines: Vec<Line<'static>>) -> SettledBlock {
     SettledBlock::Lines(lines)
-}
-
-#[allow(dead_code)]
-fn settled_raw(rows: u16, bytes: Vec<u8>, fallback: Vec<Line<'static>>) -> SettledBlock {
-    SettledBlock::Raw {
-        rows,
-        bytes,
-        kitty_id: None,
-        fallback,
-    }
 }
 
 /// Shared-buffer writer for tests so the [`pi_tui::terminal::guard::TerminalGuard`]

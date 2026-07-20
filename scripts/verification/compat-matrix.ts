@@ -8,7 +8,7 @@
 
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { arch, cpus, hostname, platform, release } from "node:os";
-import { dirname, resolve } from "node:path";
+import { resolve } from "node:path";
 
 const TIER_VALUES = ["unit", "host", "product", "performance", "release"] as const;
 type Tier = (typeof TIER_VALUES)[number];
@@ -113,19 +113,6 @@ function isStringArray(value: unknown): value is string[] {
 	return Array.isArray(value) && value.every(isString);
 }
 
-function isCommandSpec(value: unknown): value is CommandSpec {
-	if (!isPlainObject(value)) return false;
-	const cwd = value.cwd;
-	const argv = value.argv;
-	const timeoutMs = value.timeoutMs;
-	return (
-		isString(cwd) &&
-		isStringArray(argv) &&
-		argv.length > 0 &&
-		isNumber(timeoutMs) &&
-		timeoutMs > 0
-	);
-}
 
 function assertCommandSpec(value: unknown, path: string): asserts value is CommandSpec {
 	if (!isPlainObject(value)) {

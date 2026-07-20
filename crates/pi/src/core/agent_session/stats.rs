@@ -49,7 +49,6 @@ pub struct SessionStats {
     /// Context-usage snapshot, when computable.
     pub context_usage: Option<ContextUsage>,
 }
-
 /// Token totals (TypeScript `SessionStats['tokens']`).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct SessionTokenTotals {

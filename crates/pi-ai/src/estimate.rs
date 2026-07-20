@@ -241,12 +241,6 @@ pub fn estimate_context_tokens(context: &Context) -> ContextUsageEstimate {
     }
 }
 
-/// Estimate context tokens for a bare message list (no system prompt / tools).
-#[must_use]
-pub fn estimate_messages_tokens(messages: &[Message]) -> ContextUsageEstimate {
-    estimate_messages(messages)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

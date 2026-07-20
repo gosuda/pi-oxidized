@@ -727,7 +727,7 @@ describe("acceptance: extension runtime", () => {
 	});
 
 	test("extensions.load RPC dynamically loads extensions", async () => {
-		const { collector, stdin, host, runPromise } = await connectHost([]);
+		const { collector, stdin } = await connectHost([]);
 		const extPath = resolve(import.meta.dirname, "..", "fixtures", "extensions", "crash.ts");
 		stdin.push(Buffer.from(encodeFrameString({
 			id: 31, kind: "req", method: "extensions.load",
