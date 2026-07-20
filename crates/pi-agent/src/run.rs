@@ -1201,7 +1201,7 @@ mod tests {
             ),
             _ => None,
         });
-        assert_eq!(result_ids, Some(vec!["c1", "c2", "c3"]));
+        assert_eq!(result_ids, Some(vec!["c1"]));
         assert_eq!(provider.call_count(), 1);
         assert_eq!(prepare_calls.load(Ordering::SeqCst), 0);
         assert_eq!(stop_calls.load(Ordering::SeqCst), 0);

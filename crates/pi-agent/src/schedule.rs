@@ -244,6 +244,10 @@ async fn execute_tool_calls_sequential(
         emit_tool_result_message(&message, emit);
         finalized_calls.push(finalized);
         messages.push(message);
+
+        if cancel.is_cancelled() {
+            break;
+        }
     }
 
     Ok(ExecutedToolCallBatch {
@@ -1408,7 +1412,7 @@ mod tests {
                 Ok(None)
             })
         }));
-        let (_events, emit) = collect_emit();
+        let (events, emit) = collect_emit();
 
         let batch = execute_tool_calls(
             &context,
@@ -1419,13 +1423,20 @@ mod tests {
         )
         .await
         .map_err(|error| error.to_string())?;
+        let expected_ids: &[&str] = if mode == ToolExecutionMode::Sequential {
+            &["c1"]
+        } else {
+            &["c1", "c2", "c3"]
+        };
         let ids: Vec<&str> = batch
             .messages
             .iter()
             .map(|message| message.tool_call_id.as_str())
             .collect();
-        if ids != ["c1", "c2", "c3"] {
-            return Err(format!("cancelled result ids were not preserved: {ids:?}"));
+        if ids.as_slice() != expected_ids {
+            return Err(format!(
+                "cancelled result ids were not preserved: {ids:?} (expected {expected_ids:?})"
+            ));
         }
         for message in &batch.messages {
             if !message.is_error {
@@ -1447,6 +1458,23 @@ mod tests {
                 ));
             }
         }
+        if mode == ToolExecutionMode::Sequential {
+            let events = snapshot_events(&events)?;
+            for id in ["c2", "c3"] {
+                let started = events.iter().any(|event| {
+                    matches!(
+                        event,
+                        AgentEvent::ToolExecutionStart { tool_call_id, .. }
+                            if tool_call_id == id
+                    )
+                });
+                if started {
+                    return Err(format!(
+                        "post-cancel sequential call {id} was still started"
+                    ));
+                }
+            }
+        }
         if executed.load(Ordering::SeqCst) {
             return Err("pre-cancelled batch executed a tool".to_owned());
         }
@@ -1454,7 +1482,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sequential_cancellation_preserves_all_tool_result_ids() -> TestResult {
+    async fn sequential_cancellation_pairs_first_call_and_breaks() -> TestResult {
         cancellation_preserves_all_tool_result_ids(ToolExecutionMode::Sequential).await
     }
 
@@ -1605,8 +1633,10 @@ mod tests {
             .iter()
             .map(|message| message.tool_call_id.as_str())
             .collect();
-        if ids != ["c1", "c2"] {
-            return Err(format!("sequential abort dropped results: {ids:?}"));
+        if ids != ["c1"] {
+            return Err(format!(
+                "sequential abort should only pair c1, got: {ids:?}"
+            ));
         }
         for message in &batch.messages {
             if !message.is_error {
@@ -1625,22 +1655,30 @@ mod tests {
             }
         }
         let events = snapshot_events(&events)?;
-        for id in ["c1", "c2"] {
-            let ends = events
-                .iter()
-                .filter(|event| {
-                    matches!(
-                        event,
-                        AgentEvent::ToolExecutionEnd { tool_call_id, is_error: true, .. }
-                            if tool_call_id == id
-                    )
-                })
-                .count();
-            if ends != 1 {
-                return Err(format!(
-                    "expected one paired error end for {id}, got {ends}"
-                ));
-            }
+        let c1_ends = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    AgentEvent::ToolExecutionEnd { tool_call_id, is_error: true, .. }
+                        if tool_call_id == "c1"
+                )
+            })
+            .count();
+        if c1_ends != 1 {
+            return Err(format!(
+                "expected one paired error end for c1, got {c1_ends}"
+            ));
+        }
+        let c2_started = events.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::ToolExecutionStart { tool_call_id, .. }
+                    if tool_call_id == "c2"
+            )
+        });
+        if c2_started {
+            return Err("post-abort sequential call c2 was still started".to_owned());
         }
         Ok(())
     }
@@ -1662,7 +1700,7 @@ mod tests {
             ToolCall::new("c2", "never", Map::new()),
         ]);
         let config = sample_config(ToolExecutionMode::Sequential);
-        let (_events, emit) = collect_emit();
+        let (events, emit) = collect_emit();
 
         let batch = execute_tool_calls(
             &context,
@@ -1674,7 +1712,13 @@ mod tests {
         .await
         .map_err(|error| error.to_string())?;
 
-        let first = batch.messages.first().ok_or("missing first result")?;
+        if batch.messages.len() != 1 {
+            return Err(format!(
+                "expected exactly one finalized sequential call, got {}",
+                batch.messages.len()
+            ));
+        }
+        let first = &batch.messages[0];
         if first.is_error {
             return Err(format!("finished work was fabricated as abort: {first:?}"));
         }
@@ -1686,9 +1730,16 @@ mod tests {
         }) {
             return Err(format!("real outcome lost: {:?}", first.content));
         }
-        let second = batch.messages.get(1).ok_or("missing second result")?;
-        if !second.is_error {
-            return Err("post-cancel call was not aborted".to_owned());
+        let events = snapshot_events(&events)?;
+        let c2_started = events.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::ToolExecutionStart { tool_call_id, .. }
+                    if tool_call_id == "c2"
+            )
+        });
+        if c2_started {
+            return Err("post-cancel sequential call c2 was still started".to_owned());
         }
         if late_executed.load(Ordering::SeqCst) {
             return Err("post-cancel sequential tool still executed".to_owned());
