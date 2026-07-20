@@ -1,6 +1,9 @@
 //! Capability / cursor probe session with fragmented-reply handling.
 
-use std::time::Duration;
+#[cfg(unix)]
+use std::io::Read;
+use std::io::{self, IsTerminal, Write};
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -9,6 +12,15 @@ use crate::terminal::caps::{CellDimensions, TerminalCapabilities};
 
 /// Fragment timeout for split capability replies (TS: 150 ms).
 pub const PROBE_FRAGMENT_TIMEOUT: Duration = Duration::from_millis(150);
+
+/// Terminal background polarity used by automatic theme selection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalTheme {
+    /// A dark terminal background.
+    Dark,
+    /// A light terminal background.
+    Light,
+}
 
 /// Probe batch written outside synchronized output before `EventStream` starts.
 #[must_use]
@@ -25,6 +37,64 @@ pub fn probe_query_batch(include_cell_size: bool) -> Vec<u8> {
     // Cursor position report.
     out.extend_from_slice(b"\x1b[6n");
     out
+}
+
+/// Select terminal polarity from an OSC 11 classification, `COLORFGBG`, or the
+/// conservative dark fallback, in that order.
+#[must_use]
+pub fn detect_terminal_theme(osc_dark: Option<bool>, colorfgbg: Option<&str>) -> TerminalTheme {
+    if let Some(dark) = osc_dark {
+        return if dark {
+            TerminalTheme::Dark
+        } else {
+            TerminalTheme::Light
+        };
+    }
+
+    colorfgbg
+        .and_then(colorfgbg_background_index)
+        .map_or(TerminalTheme::Dark, |index| {
+            if ansi256_luminance(index) >= 128 {
+                TerminalTheme::Light
+            } else {
+                TerminalTheme::Dark
+            }
+        })
+}
+
+/// Write the startup probe batch and merge bounded replies into `caps`.
+///
+/// This runs before [`crate::terminal::TerminalInput`] takes ownership of
+/// stdin, preserving early keystrokes as UI events for its caller to re-inject.
+pub fn probe_terminal<W: Write>(
+    output: &mut W,
+    caps: &mut TerminalCapabilities,
+) -> io::Result<Vec<UiEvent>> {
+    if !io::stdin().is_terminal() {
+        return Ok(Vec::new());
+    }
+
+    output.write_all(&probe_query_batch(true))?;
+    output.flush()?;
+
+    let mut session = ProbeSession::new();
+    let mut pending = Vec::new();
+    let deadline = Instant::now() + PROBE_FRAGMENT_TIMEOUT;
+    while Instant::now() < deadline && !session.is_complete() {
+        if let Some(bytes) = read_stdin_nonblocking()? {
+            if bytes.is_empty() {
+                break;
+            }
+            if let ProbeFeed::PendingInput(bytes) = session.feed(&bytes) {
+                pending.extend(bytes);
+            }
+        } else {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    pending.extend(session.flush_timeout());
+    session.apply_to(caps);
+    Ok(reinject_bytes_as_events(&pending))
 }
 
 /// Outcome of feeding bytes into a [`ProbeSession`].
@@ -331,6 +401,55 @@ pub fn classify_background(payload: &str) -> Option<bool> {
     Some(luminance < 128)
 }
 
+fn colorfgbg_background_index(colorfgbg: &str) -> Option<u8> {
+    colorfgbg
+        .split(';')
+        .rev()
+        .find_map(|part| part.trim().parse::<u8>().ok())
+}
+
+fn ansi256_luminance(index: u8) -> u8 {
+    let [red, green, blue] = ansi256_rgb(index);
+    ((u32::from(red) * 299 + u32::from(green) * 587 + u32::from(blue) * 114) / 1000) as u8
+}
+
+fn ansi256_rgb(index: u8) -> [u8; 3] {
+    const ANSI16: [[u8; 3]; 16] = [
+        [0, 0, 0],
+        [128, 0, 0],
+        [0, 128, 0],
+        [128, 128, 0],
+        [0, 0, 128],
+        [128, 0, 128],
+        [0, 128, 128],
+        [192, 192, 192],
+        [128, 128, 128],
+        [255, 0, 0],
+        [0, 255, 0],
+        [255, 255, 0],
+        [0, 0, 255],
+        [255, 0, 255],
+        [0, 255, 255],
+        [255, 255, 255],
+    ];
+    match index {
+        0..=15 => ANSI16[usize::from(index)],
+        16..=231 => {
+            let offset = index - 16;
+            let channel = |value| if value == 0 { 0 } else { value * 40 + 55 };
+            [
+                channel(offset / 36),
+                channel((offset / 6) % 6),
+                channel(offset % 6),
+            ]
+        }
+        232..=255 => {
+            let gray = (u16::from(index - 232) * 10 + 8) as u8;
+            [gray, gray, gray]
+        }
+    }
+}
+
 fn parse_background_rgb(payload: &str) -> Option<[u8; 3]> {
     let payload = payload.trim();
     if let Some(rest) = payload.strip_prefix("rgb:") {
@@ -427,6 +546,35 @@ pub fn reinject_bytes_as_events(bytes: &[u8]) -> Vec<UiEvent> {
     events
 }
 
+/// Read pending probe bytes without waiting for terminal input.
+fn read_stdin_nonblocking() -> io::Result<Option<Vec<u8>>> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsFd;
+
+        let stdin = io::stdin();
+        let fd = stdin.as_fd();
+        let mut fds = [nix::poll::PollFd::new(fd, nix::poll::PollFlags::POLLIN)];
+        if nix::poll::poll(&mut fds, 0u8)
+            .map_err(|error| io::Error::other(format!("poll stdin: {error}")))?
+            == 0
+        {
+            return Ok(None);
+        }
+        let mut buffer = [0_u8; 512];
+        match stdin.lock().read(&mut buffer) {
+            Ok(0) => Ok(Some(Vec::new())),
+            Ok(len) => Ok(Some(buffer[..len].to_vec())),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(None)
+    }
+}
+
 /// Seed cell dimensions into caps when a probe reply provided them.
 #[must_use]
 pub fn cell_from_caps(caps: &TerminalCapabilities) -> CellDimensions {
@@ -485,6 +633,23 @@ mod tests {
         assert_eq!(caps.cell.height, 18);
         assert_eq!(caps.dark_background, Some(true));
         assert_eq!(cursor, Some((3, 2)));
+    }
+
+    #[test]
+    fn terminal_theme_detection_prefers_osc_then_colorfgbg_then_dark() {
+        assert_eq!(
+            detect_terminal_theme(Some(false), Some("15;0")),
+            TerminalTheme::Light
+        );
+        assert_eq!(
+            detect_terminal_theme(None, Some("15;0")),
+            TerminalTheme::Dark
+        );
+        assert_eq!(
+            detect_terminal_theme(None, Some("0;15")),
+            TerminalTheme::Light
+        );
+        assert_eq!(detect_terminal_theme(None, None), TerminalTheme::Dark);
     }
 
     #[test]

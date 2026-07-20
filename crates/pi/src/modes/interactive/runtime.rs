@@ -47,9 +47,12 @@ use futures::future::{BoxFuture, poll_fn};
 use pi_ai::AssistantMessage;
 use pi_tui::component::{Component, EventResult, UiEvent};
 use pi_tui::components::editor::{Editor, EditorOptions};
-use pi_tui::keys::{ParsedKeyId, encode_key_event, key_matches_parsed, parse_key_id};
+use pi_tui::keys::{
+    ParsedKeyId, encode_key_event, key_matches_parsed, parse_key_id, set_kitty_protocol_active,
+};
 use pi_tui::terminal::caps::TerminalCapabilities;
 use pi_tui::terminal::input::TerminalInput;
+use pi_tui::terminal::probe::{TerminalTheme, detect_terminal_theme, probe_terminal};
 use pi_tui::terminal::writer::{ReanchorCause, SettledBlock, Tui, Txn};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -420,6 +423,8 @@ pub struct InteractiveRuntimeOptions {
     pub theme: Arc<ResolvedTheme>,
     /// Terminal capabilities (sync output, image protocol, hyperlinks, …).
     pub caps: TerminalCapabilities,
+    /// Detected terminal background polarity for automatic theme selection.
+    pub terminal_theme: TerminalTheme,
     /// Initial terminal size.
     pub size: (u16, u16),
     /// Initial inline viewport height.
@@ -430,6 +435,7 @@ pub struct InteractiveRuntimeOptions {
     pub double_escape: DoubleEscapeAction,
     /// Show hardware cursor (debug / accessibility).
     pub hardware_cursor: bool,
+    pending_ui_events: Vec<UiEvent>,
 }
 
 /// Outcome of dispatching one [`ViewAction`].
@@ -481,11 +487,27 @@ impl Default for InteractiveRuntimeOptions {
         Self {
             theme: super::theme::dark(),
             caps: TerminalCapabilities::default(),
+            terminal_theme: TerminalTheme::Dark,
             size: (80, 24),
             viewport_height: 24,
             quiet: false,
             double_escape: DoubleEscapeAction::None,
             hardware_cursor: false,
+            pending_ui_events: Vec::new(),
+        }
+    }
+}
+
+impl InteractiveRuntimeOptions {
+    /// Build production startup options from environment capabilities.
+    #[must_use]
+    pub fn detect() -> Self {
+        let caps = TerminalCapabilities::detect();
+        let colorfgbg = std::env::var("COLORFGBG").ok();
+        Self {
+            caps: caps.clone(),
+            terminal_theme: detect_terminal_theme(caps.dark_background, colorfgbg.as_deref()),
+            ..Self::default()
         }
     }
 }
@@ -842,6 +864,7 @@ pub struct InteractiveRuntime<W: Write, S: SessionHost> {
     exit_kind: InteractiveExit,
     last_error: Option<String>,
     shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+    terminal_theme: TerminalTheme,
     pending_ui_reinject: Vec<UiEvent>,
     extension_runner: Option<Arc<HostExtensionRunner>>,
     extension_events: Option<tokio::sync::broadcast::Receiver<ExtensionUiEvent>>,
@@ -1024,7 +1047,8 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             exit_kind: InteractiveExit::Clean,
             last_error: None,
             shutdown_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            pending_ui_reinject: Vec::new(),
+            terminal_theme: options.terminal_theme,
+            pending_ui_reinject: options.pending_ui_events.iter().rev().cloned().collect(),
             extension_runner,
             extension_events,
             extension_requests,
@@ -1095,6 +1119,20 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     /// Last recorded session error message, if any.
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
+    }
+
+    /// Current terminal background polarity used by automatic theme selection.
+    #[must_use]
+    pub fn terminal_theme(&self) -> TerminalTheme {
+        self.terminal_theme
+    }
+
+    fn requery_terminal_theme(&mut self) {
+        let colorfgbg = std::env::var("COLORFGBG").ok();
+        self.terminal_theme = detect_terminal_theme(
+            self.tui.capabilities().dark_background,
+            colorfgbg.as_deref(),
+        );
     }
 
     /// Signal the runtime to exit at the next loop turn (signal handler hook).
@@ -1552,6 +1590,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 }
                 self.record_err(self.session.reload().await);
                 self.rebind_extension_channels().await;
+                self.requery_terminal_theme();
                 ActionOutcome::Repaint
             }
             ViewAction::SlashCommand { name, args } => self.submit_slash_command(name, args).await,
@@ -1772,6 +1811,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 }
                 TypedBuiltin::Reload => {
                     self.record_err(self.session.reload().await);
+                    self.requery_terminal_theme();
                     ActionOutcome::Repaint
                 }
             };
@@ -4217,7 +4257,7 @@ where
 /// should surface it on stderr and exit nonzero.
 pub async fn run_interactive_mode(
     runtime: Arc<AgentSessionRuntime>,
-    options: InteractiveRuntimeOptions,
+    mut options: InteractiveRuntimeOptions,
 ) -> Result<u8, String> {
     use std::io::stdout;
     if !stdout().is_terminal() {
@@ -4234,6 +4274,13 @@ pub async fn run_interactive_mode(
     guard
         .activate(enable_kitty)
         .map_err(|e| format!("terminal activation failed: {e}"))?;
+
+    options.pending_ui_events = probe_terminal(guard.writer_mut(), &mut options.caps)
+        .map_err(|error| format!("terminal probe failed: {error}"))?;
+    let colorfgbg = std::env::var("COLORFGBG").ok();
+    options.terminal_theme =
+        detect_terminal_theme(options.caps.dark_background, colorfgbg.as_deref());
+    set_kitty_protocol_active(options.caps.kitty_keyboard());
 
     // 2. Tui takes a separate stdout handle (Stdout is a cheap cloneable
     //    handle to the same underlying stream). No stdout clone of the

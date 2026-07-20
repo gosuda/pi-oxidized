@@ -96,7 +96,7 @@ impl Io {
             .with_interactive(|dispatched, runtime| {
                 Box::pin(async move {
                     let _ = dispatched;
-                    run_interactive_mode(runtime, InteractiveRuntimeOptions::default())
+                    run_interactive_mode(runtime, InteractiveRuntimeOptions::detect())
                         .await
                         .map_err(|e| format!("interactive: {e}"))
                 })
