@@ -1786,9 +1786,19 @@ fn clone_registry(source: &Registry) -> Registry {
 /// Spawn the unsolicited-event pump. Routes typed host events into the bounded
 /// subscribers; on fatal host conditions marks the runner disabled and emits a
 /// single non-retryable `extension_error`.
+///
+/// Subscribe-then-check: a fast-exiting host can broadcast `Eof` (then clear
+/// `running`) before this pump subscribes, so the flag is probed after
+/// subscribing — state catches an early EOF, the broadcast catches a late one.
 fn spawn_event_pump(inner: Arc<Inner>) {
     let mut rx = inner.client.subscribe();
     tokio::spawn(async move {
+        if !inner.client.is_running() {
+            inner.disabled.store(true, Ordering::Relaxed);
+            inner.publish_error("extension_closed", "extension host stream closed", None);
+            HostExtensionRunner::shutdown_once_with_inner(&inner).await;
+            return;
+        }
         loop {
             match rx.recv().await {
                 Ok(HostEvent::UiRequest(request)) => {

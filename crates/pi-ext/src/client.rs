@@ -906,8 +906,10 @@ async fn reader_task(stdout: Box<dyn AsyncRead + Unpin + Send>, shared: Arc<Shar
                         stderr: stderr_of(&shared),
                     },
                 );
-                let _ = shared.events.send(HostEvent::Eof);
+                // Clear `running` BEFORE broadcasting: a subscriber that
+                // misses this send must observe the flag when it probes.
                 shared.running.store(false, Ordering::Relaxed);
+                let _ = shared.events.send(HostEvent::Eof);
                 break;
             }
             Ok(n) => match decoder.push(&buf[..n]) {
@@ -924,8 +926,8 @@ async fn reader_task(stdout: Box<dyn AsyncRead + Unpin + Send>, shared: Arc<Shar
                             stderr: stderr_of(&shared),
                         },
                     );
-                    let _ = shared.events.send(HostEvent::ProtocolError(e.to_string()));
                     shared.running.store(false, Ordering::Relaxed);
+                    let _ = shared.events.send(HostEvent::ProtocolError(e.to_string()));
                     break;
                 }
             },
@@ -939,10 +941,10 @@ async fn reader_task(stdout: Box<dyn AsyncRead + Unpin + Send>, shared: Arc<Shar
                 );
                 // Typed fatal event so the product pump tears the host down
                 // exactly like EOF / protocol death.
+                shared.running.store(false, Ordering::Relaxed);
                 let _ = shared
                     .events
                     .send(HostEvent::ProtocolError(format!("stdout read error: {e}")));
-                shared.running.store(false, Ordering::Relaxed);
                 break;
             }
         }
