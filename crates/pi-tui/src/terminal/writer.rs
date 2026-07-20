@@ -226,6 +226,14 @@ impl<W: Write> Tui<W> {
         &mut self.caps
     }
 
+    /// Borrow the outer writer for mid-session probes (OSC 11 re-query).
+    ///
+    /// Writes must stay outside synchronized-output frames; the caller is
+    /// responsible for not interleaving with an in-flight commit.
+    pub fn outer_mut(&mut self) -> &mut W {
+        &mut self.outer
+    }
+
     /// Current terminal size cache.
     #[must_use]
     pub fn size(&self) -> Size {

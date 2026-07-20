@@ -1,12 +1,13 @@
 //! Sole owner of the Crossterm `EventStream`.
 
-use std::io;
+use std::io::{self, Write};
 
 use crossterm::event::{Event, EventStream};
 use futures::{Stream, StreamExt};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::component::UiEvent;
+use crate::terminal::probe::probe_background;
 
 /// Handle used by the UI loop to receive mapped terminal events.
 #[derive(Debug)]
@@ -101,6 +102,31 @@ impl TerminalInput {
         received
             .await
             .map_err(|_| io::Error::other("terminal input resume was not acknowledged"))
+    }
+
+    /// Pause the event stream, emit OSC 11, classify the background, resume.
+    ///
+    /// Returns `Ok(Some(dark))` when OSC 11 classified a polarity, or `Ok(None)`
+    /// on timeout / no-TTY / unparseable reply (caller keeps its prior value).
+    /// Interleaved keystrokes are reinjected through the resume path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if pause/resume fails or writing the query fails.
+    /// On write failure the stream is still resumed (best-effort empty reinject)
+    /// so the input task is never left paused.
+    pub async fn requery_background<W: Write>(&self, output: &mut W) -> io::Result<Option<bool>> {
+        self.pause().await?;
+        match probe_background(output) {
+            Ok((dark, reinject)) => {
+                self.resume(reinject).await?;
+                Ok(dark)
+            }
+            Err(error) => {
+                let _ = self.resume(Vec::new()).await;
+                Err(error)
+            }
+        }
     }
 
     /// Request task shutdown.
@@ -260,6 +286,35 @@ mod tests {
         input.pause().await?;
         input.resume(vec![UiEvent::FocusGained]).await?;
         assert_eq!(input.recv().await, Some(UiEvent::FocusGained));
+        input.shutdown();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn requery_background_resume_reinjects_from_chunks() -> io::Result<()> {
+        // Exercise the pause → reinject → resume control path that requery_background
+        // uses; classification itself is unit-tested via probe_background_from_chunks.
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        tokio::spawn(input_task_with_factory(events_tx, control_rx, || {
+            futures::stream::pending::<io::Result<Event>>()
+        }));
+        let mut input = TerminalInput {
+            rx: events_rx,
+            control_tx,
+        };
+
+        input.pause().await?;
+        let (dark, reinject) = crate::terminal::probe::probe_background_from_chunks([
+            b"z".as_slice(),
+            b"\x1b]11;#ffffff\x07".as_slice(),
+        ]);
+        assert_eq!(dark, Some(false));
+        input.resume(reinject).await?;
+        assert!(matches!(
+            input.recv().await,
+            Some(UiEvent::Key(k)) if k.code == KeyCode::Char('z')
+        ));
         input.shutdown();
         Ok(())
     }

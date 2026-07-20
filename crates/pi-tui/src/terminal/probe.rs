@@ -39,6 +39,21 @@ pub fn probe_query_batch(include_cell_size: bool) -> Vec<u8> {
     out
 }
 
+/// OSC 11 background query only (mid-session re-probe; no DA1/cursor batch).
+#[must_use]
+pub fn osc_11_query() -> &'static [u8] {
+    b"\x1b]11;?\x07"
+}
+
+/// Classify dark-background from collected probe replies, if any OSC 11 landed.
+#[must_use]
+pub fn background_from_replies(replies: &[ProbeReply]) -> Option<bool> {
+    replies.iter().find_map(|reply| match reply {
+        ProbeReply::Background(payload) => classify_background(payload),
+        _ => None,
+    })
+}
+
 /// Select terminal polarity from an OSC 11 classification, `COLORFGBG`, or the
 /// conservative dark fallback, in that order.
 #[must_use]
@@ -99,6 +114,64 @@ pub fn probe_terminal<W: Write>(
     pending.extend(session.flush_timeout());
     session.apply_to(caps);
     Ok(reinject_bytes_as_events(&pending))
+}
+
+/// Mid-session OSC 11 re-probe: emit only the background query and parse a
+/// bounded reply. Non-probe stdin bytes are returned for re-injection.
+///
+/// Call only while the sole [`crate::terminal::TerminalInput`] `EventStream`
+/// is paused so this path owns stdin. `None` means timeout / no-TTY / unparseable
+/// — the caller keeps its prior classification.
+///
+/// # Errors
+///
+/// Returns [`io::Error`] when writing or flushing the query fails.
+pub fn probe_background<W: Write>(output: &mut W) -> io::Result<(Option<bool>, Vec<UiEvent>)> {
+    if !io::stdin().is_terminal() {
+        return Ok((None, Vec::new()));
+    }
+
+    output.write_all(osc_11_query())?;
+    output.flush()?;
+
+    let mut session = ProbeSession::new();
+    let mut pending = Vec::new();
+    let deadline = Instant::now() + PROBE_FRAGMENT_TIMEOUT;
+    while Instant::now() < deadline && background_from_replies(session.replies()).is_none() {
+        if let Some(bytes) = read_stdin_nonblocking()? {
+            if bytes.is_empty() {
+                break;
+            }
+            if let ProbeFeed::PendingInput(bytes) = session.feed(&bytes) {
+                pending.extend(bytes);
+            }
+        } else {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    pending.extend(session.flush_timeout());
+    let dark = background_from_replies(session.replies());
+    Ok((dark, reinject_bytes_as_events(&pending)))
+}
+
+/// Drive a mid-session OSC 11 classification from canned stdin chunks.
+///
+/// Processes every chunk, then treats any incomplete fragment as user input
+/// (timeout path). Used by unit tests and fakes that cannot touch real stdin.
+#[must_use]
+pub fn probe_background_from_chunks(
+    chunks: impl IntoIterator<Item = impl AsRef<[u8]>>,
+) -> (Option<bool>, Vec<UiEvent>) {
+    let mut session = ProbeSession::new();
+    let mut pending = Vec::new();
+    for chunk in chunks {
+        if let ProbeFeed::PendingInput(bytes) = session.feed(chunk.as_ref()) {
+            pending.extend(bytes);
+        }
+    }
+    let dark = background_from_replies(session.replies());
+    pending.extend(session.flush_timeout());
+    (dark, reinject_bytes_as_events(&pending))
 }
 
 /// Outcome of feeding bytes into a [`ProbeSession`].
@@ -665,5 +738,59 @@ mod tests {
         assert!(batch.windows(4).any(|w| w == b"\x1b[?u"));
         assert!(batch.windows(3).any(|w| w == b"\x1b[c"));
         assert!(batch.windows(4).any(|w| w == b"\x1b[6n"));
+    }
+
+    #[test]
+    fn osc_11_query_is_background_only() {
+        let query = osc_11_query();
+        assert_eq!(query, b"\x1b]11;?\x07");
+        assert!(!query.windows(3).any(|w| w == b"\x1b[c"));
+        assert!(!query.windows(4).any(|w| w == b"\x1b[6n"));
+    }
+
+    #[test]
+    fn probe_background_from_chunks_classifies_reply() {
+        let (dark, events) =
+            probe_background_from_chunks([b"\x1b]11;rgb:ffff/ffff/ffff\x07".as_slice()]);
+        assert_eq!(dark, Some(false));
+        assert!(events.is_empty());
+
+        let (dark, events) = probe_background_from_chunks([b"\x1b]11;rgb:00/00/00\x07".as_slice()]);
+        assert_eq!(dark, Some(true));
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn probe_background_from_chunks_timeout_is_none() {
+        // Incomplete OSC 11 prefix — flush_timeout treats it as user input.
+        let (dark, events) = probe_background_from_chunks([b"\x1b]11;rgb:".as_slice()]);
+        assert_eq!(dark, None);
+        assert!(!events.is_empty());
+    }
+
+    #[test]
+    fn probe_background_from_chunks_preserves_interleaved_keys() {
+        let (dark, events) = probe_background_from_chunks([
+            b"a".as_slice(),
+            b"\x1b]11;rgb:00/00/00\x07".as_slice(),
+            b"b".as_slice(),
+        ]);
+        assert_eq!(dark, Some(true));
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0],
+            UiEvent::Key(k) if k.code == KeyCode::Char('a')
+        ));
+        assert!(matches!(
+            &events[1],
+            UiEvent::Key(k) if k.code == KeyCode::Char('b')
+        ));
+    }
+
+    #[test]
+    fn probe_background_from_chunks_empty_is_none() {
+        let (dark, events) = probe_background_from_chunks(std::iter::empty::<&[u8]>());
+        assert_eq!(dark, None);
+        assert!(events.is_empty());
     }
 }
