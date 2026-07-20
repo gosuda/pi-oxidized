@@ -1300,7 +1300,6 @@ mod tests {
         let debug = format!("{provider:?}");
         assert!(debug.contains("DefaultVertexTokenProvider"));
         assert!(!debug.to_lowercase().contains("secret"));
-        let _production = DefaultVertexTokenProvider::new();
     }
 
     #[tokio::test]

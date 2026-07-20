@@ -121,11 +121,9 @@ async fn run_loop(
     let mut first_turn = true;
     let mut pending_messages = poll_messages(config.get_steering_messages.as_ref()).await?;
 
-    // Outer loop: re-enters when follow-up messages arrive after tools finish.
     loop {
         let mut has_more_tool_calls = true;
 
-        // Inner loop: stream, tools, steering.
         while has_more_tool_calls || !pending_messages.is_empty() {
             if first_turn {
                 first_turn = false;

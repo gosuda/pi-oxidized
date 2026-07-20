@@ -1269,11 +1269,6 @@ mod tests {
 
     #[tokio::test]
     async fn length_fails_all_without_execute() -> TestResult {
-        let executed = Arc::new(AtomicBool::new(false));
-        let tool = RecordingTool {
-            executed: Arc::clone(&executed),
-            ..RecordingTool::new("t")
-        };
         let mut assistant = assistant_with_calls(vec![
             ToolCall::new("a", "t", Map::new()),
             ToolCall::new("b", "t", Map::new()),
@@ -1282,9 +1277,6 @@ mod tests {
         let (events, emit) = collect_emit();
 
         let batch = fail_tool_calls_from_truncated_message(&assistant, &emit);
-        if executed.load(Ordering::SeqCst) {
-            return Err("length path executed a tool".to_owned());
-        }
         if batch.messages.len() != 2 || batch.terminate {
             return Err("length batch shape wrong".to_owned());
         }
@@ -1298,7 +1290,6 @@ mod tests {
         if ends != 2 {
             return Err(format!("expected 2 error ends, got {ends}"));
         }
-        let _ = tool;
         Ok(())
     }
 

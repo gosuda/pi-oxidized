@@ -555,10 +555,6 @@ fn custom_text_style() -> pi_tui::components::DefaultTextStyle {
     pi_tui::components::DefaultTextStyle::default()
 }
 
-// ---------------------------------------------------------------------------
-// ColumnStack: a minimal vertical stack component (no border).
-// ---------------------------------------------------------------------------
-
 /// Vertical stack of components; measure = sum of child heights, render stacks
 /// top-to-bottom. Used to assemble multi-block message bodies.
 pub struct ColumnStack {

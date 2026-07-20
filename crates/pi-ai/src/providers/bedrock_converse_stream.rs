@@ -310,7 +310,7 @@ impl Provider for BedrockConverseStream {
                 Ok((reason, message)) => {
                     let _result = sender.done(reason, message).await;
                 }
-                Err(AdapterFailure::Undeliverable(_)) => {}
+                Err(AdapterFailure::Undeliverable(_)) => drop(sender),
                 Err(AdapterFailure::Aborted) => {
                     let message = assembly.fail(ErrorReason::Aborted, ABORTED_MESSAGE, &model);
                     let _result = sender.error(ErrorReason::Aborted, message).await;

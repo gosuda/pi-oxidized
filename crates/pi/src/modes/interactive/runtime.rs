@@ -105,10 +105,6 @@ pub const BACKGROUND_COALESCE_WINDOW: Duration = Duration::from_millis(16);
 /// extension-queue capacity so a lagging consumer surfaces backpressure early.
 pub const EVENT_CHANNEL_CAPACITY: usize = 256;
 
-// ---------------------------------------------------------------------------
-// SessionHost trait
-// ---------------------------------------------------------------------------
-
 /// Mutually exclusive foreground activity reported by a session snapshot.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SessionActivity {
@@ -516,9 +512,6 @@ impl Drop for EventSubscription {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Runtime options / exit / outcome
-// ---------------------------------------------------------------------------
 /// Why the runtime exited.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InteractiveExit {
@@ -977,10 +970,6 @@ impl Component for InteractiveRoot {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// InteractiveRuntime
-// ---------------------------------------------------------------------------
 
 /// Persistent transcript display preferences applied to every projection.
 #[derive(Clone, Copy, Default)]
@@ -3993,10 +3982,6 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Pure projection helpers
-// ---------------------------------------------------------------------------
-
 /// Default working-indicator text when no extension override is set.
 const DEFAULT_WORKING_MESSAGE: &str = "Working…";
 
@@ -4347,10 +4332,6 @@ fn project_entry(view: &mut ViewState, entry: &crate::core::sessions::SessionEnt
         | MessageView::Skill(_) => view.messages.push(view_message),
     }
 }
-
-// ---------------------------------------------------------------------------
-// Message projection helpers
-// ---------------------------------------------------------------------------
 
 fn project_messages(messages: &[pi_agent::AgentMessage]) -> Vec<MessageView> {
     messages
@@ -4801,10 +4782,6 @@ fn update_tool_message(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Settle policy helpers
-// ---------------------------------------------------------------------------
-
 /// Build a [`SettledBlock::Lines`] from a slice of styled lines.
 #[cfg(test)]
 fn settled_lines(lines: Vec<Line<'static>>) -> SettledBlock {
@@ -4820,10 +4797,6 @@ fn settled_raw(rows: u16, bytes: Vec<u8>, fallback: Vec<Line<'static>>) -> Settl
         fallback,
     }
 }
-
-// ---------------------------------------------------------------------------
-// Test driver seam: SharedWriter + helpers
-// ---------------------------------------------------------------------------
 
 /// Shared-buffer writer for tests so the [`pi_tui::terminal::guard::TerminalGuard`]
 /// and [`Tui`] can write to the same in-memory sink without owning the same
@@ -4873,10 +4846,6 @@ impl Debug for SharedWriter {
 pub fn mock_input(rx: mpsc::UnboundedReceiver<UiEvent>) -> TerminalInput {
     TerminalInput::mock(rx)
 }
-
-// ---------------------------------------------------------------------------
-// Production adapter: AgentSessionHost + run_interactive_mode
-// ---------------------------------------------------------------------------
 
 use std::io::IsTerminal;
 

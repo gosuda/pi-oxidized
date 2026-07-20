@@ -15,12 +15,12 @@ use std::io;
 use std::sync::Arc;
 
 use pi_agent::{AgentEvent, AgentMessage};
-use pi_ai::{AssistantMessage, Message, StopReason, UserContent, UserMessageContent};
+use pi_ai::{Message, StopReason, UserContent, UserMessageContent};
 
+use super::AgentSession;
 use super::events::AgentSessionEvent;
-use super::{AgentSession, AgentSessionInner};
 use crate::core::messages::{CustomMessage, CustomMessageContent};
-use crate::core::sessions::{SessionEntry, SessionError, SessionManager};
+use crate::core::sessions::{SessionError, SessionManager};
 
 impl AgentSession {
     /// Handle one agent event for mirror queues + persistence side effects.
@@ -206,37 +206,20 @@ fn parse_custom_agent_message(message: &AgentMessage) -> Option<CustomMessage> {
 }
 
 fn normalize_replacement(message: AgentMessage) -> AgentMessage {
-    match &message {
-        AgentMessage::Llm(inner) => match inner.as_ref() {
-            Message::User(user) => {
-                // User content is non-optional in the typed shape.
-                let _ = user;
-                message
-            }
-            Message::Assistant(assistant) => {
-                let _ = assistant;
-                message
-            }
-            Message::ToolResult(tool) => {
-                let _ = tool;
-                message
-            }
-        },
-        AgentMessage::Custom(custom) if custom.role == "custom" => {
-            // Ensure content key exists for product custom messages.
-            if custom.payload.get("content").is_none() {
-                let mut payload = custom.payload.clone();
-                payload.insert(
-                    "content".to_owned(),
-                    serde_json::to_value(CustomMessageContent::Blocks(Vec::new()))
-                        .unwrap_or(Value::Array(Vec::new())),
-                );
-                return AgentMessage::Custom(pi_agent::CustomAgentMessage::new("custom", payload));
-            }
-            message
-        }
-        AgentMessage::Custom(_) => message,
+    // Product custom messages must carry a content key (upstream contract).
+    let AgentMessage::Custom(custom) = &message else {
+        return message;
+    };
+    if custom.role != "custom" || custom.payload.get("content").is_some() {
+        return message;
     }
+    let mut payload = custom.payload.clone();
+    payload.insert(
+        "content".to_owned(),
+        serde_json::to_value(CustomMessageContent::Blocks(Vec::new()))
+            .unwrap_or(Value::Array(Vec::new())),
+    );
+    AgentMessage::Custom(pi_agent::CustomAgentMessage::new("custom", payload))
 }
 
 /// Extract plain text from a user message (joined text blocks).
@@ -255,12 +238,6 @@ pub(super) fn user_message_text(message: &AgentMessage) -> String {
         },
         _ => String::new(),
     }
-}
-
-// Re-export for typecheck of SessionEntry in callers.
-#[allow(dead_code)]
-fn _keep(entry: SessionEntry, assistant: AssistantMessage, inner: &AgentSessionInner) {
-    let _ = (entry, assistant, inner);
 }
 
 use serde_json::Value;

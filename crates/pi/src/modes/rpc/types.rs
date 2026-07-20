@@ -18,10 +18,6 @@ use crate::core::compaction::CompactionResult;
 use crate::core::resources::{SourceInfo, SourceOrigin, SourceScope};
 use crate::core::sessions::SessionEntry;
 
-// ---------------------------------------------------------------------------
-// Local payload types not yet owned by product-core modules
-// ---------------------------------------------------------------------------
-
 /// Bash execution result returned by the `bash` RPC command.
 ///
 /// Matches `.references/pi/packages/coding-agent/src/core/bash-executor.ts`
@@ -211,10 +207,6 @@ pub enum StreamingBehavior {
     /// Queue as a follow-up after the current turn.
     FollowUp,
 }
-
-// ---------------------------------------------------------------------------
-// RpcCommand (stdin)
-// ---------------------------------------------------------------------------
 
 /// All 31 known RPC commands, plus an unknown catch-all.
 ///
@@ -1093,10 +1085,6 @@ fn optional_images_owned(obj: &Map<String, Value>) -> Result<Option<Vec<ImageCon
     }
 }
 
-// ---------------------------------------------------------------------------
-// RpcSessionState / RpcSlashCommand
-// ---------------------------------------------------------------------------
-
 /// Snapshot returned by `get_state`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1156,10 +1144,6 @@ pub struct RpcSlashCommand {
     /// Source metadata for the owning resource.
     pub source_info: RpcSourceInfo,
 }
-
-// ---------------------------------------------------------------------------
-// RpcResponse (stdout)
-// ---------------------------------------------------------------------------
 
 /// Typed success payload for each command that returns `data`.
 ///
@@ -1575,10 +1559,6 @@ impl<'de> Deserialize<'de> for RpcResponse {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Extension UI request / response
-// ---------------------------------------------------------------------------
 
 /// Notify severity for [`RpcExtensionUiRequest::Notify`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2179,10 +2159,6 @@ impl<'de> Deserialize<'de> for RpcExtensionUiResponse {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Serde helpers
-// ---------------------------------------------------------------------------
-
 fn serialize_id<S>(map: &mut S, id: Option<&str>) -> Result<(), S::Error>
 where
     S: SerializeMap,
@@ -2245,10 +2221,6 @@ fn optional_u64(obj: &Map<String, Value>, key: &str) -> Result<Option<u64>, Stri
         )),
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

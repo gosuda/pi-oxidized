@@ -388,8 +388,6 @@ fn access_error(path: &str, error: &std::io::Error) -> ToolError {
     let message = match error.raw_os_error() {
         Some(_) => {
             let code = error.kind();
-            // Prefer errno-style names when available via Display of ErrorKind is not ENOENT.
-            // Use io::Error::to_string and map common kinds.
             let code_str = match code {
                 std::io::ErrorKind::NotFound => "ENOENT",
                 std::io::ErrorKind::PermissionDenied => "EACCES",

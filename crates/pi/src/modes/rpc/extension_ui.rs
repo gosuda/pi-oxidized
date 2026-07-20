@@ -31,10 +31,6 @@ use uuid::Uuid;
 
 use super::types::{NotifyType, RpcExtensionUiRequest, RpcExtensionUiResponse, WidgetPlacement};
 
-// ---------------------------------------------------------------------------
-// Pending request map
-// ---------------------------------------------------------------------------
-
 type Resolver = oneshot::Sender<RpcExtensionUiResponse>;
 
 fn lock_pending(
@@ -44,10 +40,6 @@ fn lock_pending(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
-
-// ---------------------------------------------------------------------------
-// ExtensionUiProxy
-// ---------------------------------------------------------------------------
 
 /// Manages pending extension UI requests and provides helpers for creating
 /// dialog promises and constructing fire-and-forget request frames.
@@ -202,10 +194,6 @@ impl std::fmt::Debug for ExtensionUiProxy {
             .finish()
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]

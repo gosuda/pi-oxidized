@@ -303,10 +303,6 @@ fn fire(relay: &Arc<SignalRelay>, code: u8) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Concrete print-mode binding (live AgentSessionRuntime)
-// ---------------------------------------------------------------------------
-
 use crate::core::agent_session::AgentSessionEvent;
 use crate::core::agent_session::prompt::PromptOptions;
 use crate::modes::print::{OutputGuardSink, PrintModeOptions, PrintOutput, run_print_mode};

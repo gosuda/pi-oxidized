@@ -219,10 +219,6 @@ pub async fn run_pipeline(args: Vec<String>, io: &Io) -> ExitCode {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Real process I/O
-// ---------------------------------------------------------------------------
-
 struct RealBootstrapIo;
 
 impl BootstrapIo for RealBootstrapIo {
@@ -272,10 +268,6 @@ impl BootstrapIo for RealBootstrapIo {
         let _ = stderr.write_all(b"\n");
     }
 }
-
-// ---------------------------------------------------------------------------
-// Real runtime factory
-// ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 struct RuntimeProvider(ModelRuntime);
@@ -853,10 +845,6 @@ fn assemble_replacement_session(
     })
 }
 
-// ---------------------------------------------------------------------------
-// Real package handler
-// ---------------------------------------------------------------------------
-
 /// Package handler backed by real [`PackageManager`] + [`SettingsManager`].
 struct RealPackageHandler {
     cwd: PathBuf,
@@ -1048,10 +1036,6 @@ impl PackageHandler for RealPackageHandler {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Real package output
-// ---------------------------------------------------------------------------
-
 struct ProductOutputSink;
 
 impl PackageOutput for ProductOutputSink {
@@ -1071,10 +1055,6 @@ impl PackageOutput for ProductOutputSink {
         let _ = stderr.write_all(b"\n");
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

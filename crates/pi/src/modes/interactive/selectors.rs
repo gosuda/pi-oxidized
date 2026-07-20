@@ -22,10 +22,6 @@ use super::theme;
 /// Maximum visible rows for any selector (ports reference default).
 pub const SELECTOR_MAX_VISIBLE: usize = 12;
 
-// ---------------------------------------------------------------------------
-// Select-list selectors (model / session / tree / auth / scoped)
-// ---------------------------------------------------------------------------
-
 /// Build the model selector. Reads the thread-local current theme.
 #[must_use]
 pub fn build_model_selector(entries: &[ModelSelectorEntry], selected: usize) -> Box<dyn Component> {
@@ -103,10 +99,6 @@ fn auth_item(e: &AuthSelectorEntry) -> SelectItem {
     SelectItem::new(e.value.clone(), e.label.clone())
         .with_description(e.description.clone().unwrap_or_default())
 }
-
-// ---------------------------------------------------------------------------
-// Settings-list selectors (settings / config)
-// ---------------------------------------------------------------------------
 
 /// Build the settings selector (cycleable settings rows).
 #[must_use]

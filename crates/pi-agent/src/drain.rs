@@ -1,19 +1,6 @@
 //! Dedicated provider-stream drain task.
 //!
-//! [`ProviderDrain`] continuously consumes a `pi-ai` provider stream and fans
-//! items into two independent channels:
-//!
-//! - a lossless, capacity-64 [`tokio::sync::mpsc`] of [`DrainItem`]s for the
-//!   agent loop (semantic events plus distinct infrastructure errors)
-//! - a lossy [`tokio::sync::watch`] of the latest partial
-//!   [`pi_ai::AssistantMessage`] for native UI
-//!
-//! The drain never emits [`crate::AgentEvent`] values. Terminal
-//! `message_end` / `agent_end` ownership stays with the agent loop. Exactly one
-//! final item is delivered: the first `Done`/`Error` event, or the first
-//! infrastructure `Err`. Duplicate provider terminals after that final are
-//! ignored under an explicit contract (the drain exits after the first final,
-//! so later stream items are dropped with the task).
+//! See [`ProviderDrain::spawn`] for channel wiring and the final-item contract.
 
 use std::sync::Arc;
 

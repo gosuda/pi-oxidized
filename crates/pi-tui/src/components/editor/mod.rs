@@ -589,7 +589,6 @@ impl Editor {
         if triggers.is_empty() {
             return false;
         }
-        let bytes = text_before.as_bytes();
         // Find last trigger char at token boundary
         for (i, ch) in text_before.char_indices().rev() {
             let s = ch.to_string();
@@ -610,7 +609,6 @@ impl Editor {
             if ch.is_whitespace() {
                 break;
             }
-            let _ = bytes;
         }
         false
     }
@@ -740,7 +738,6 @@ impl Editor {
             pending.explicit_tab = explicit_tab;
         }
         // Product drives complete_autocomplete_request after awaiting the provider.
-        let _ = (force, explicit_tab);
     }
 
     /// Synchronously fetch suggestions from the provider (for tests / simple providers).

@@ -169,27 +169,10 @@ function percentile(sorted: number[], p: number): number {
 	return sorted[idx] ?? 0;
 }
 
-function stats(samples: number[]): {
-	median: number;
-	p95: number;
-	p99: number;
-	mean: number;
-} {
-	const sorted = [...samples].sort((a, b) => a - b);
-	const mean =
-		sorted.length === 0
-			? 0
-			: sorted.reduce((acc, v) => acc + v, 0) / sorted.length;
-	return {
-		median: percentile(sorted, 50),
-		p95: percentile(sorted, 95),
-		p99: percentile(sorted, 99),
-		mean,
-	};
-}
+const p99 = (samples: number[]): number =>
+	percentile([...samples].sort((a, b) => a - b), 99);
 
 async function measureKeypressToPaint(
-	host: ExtensionHost,
 	stdin: Readable,
 	collector: FrameCollector,
 	samples: number,
@@ -218,8 +201,6 @@ async function measureKeypressToPaint(
 		expect(payload["consume"]).toBe(false);
 		id += 1;
 	}
-	// Touch host so the parameter is used (frame CPU measured separately).
-	expect(host.extensionCount).toBeGreaterThanOrEqual(0);
 	return latencies;
 }
 
@@ -289,9 +270,8 @@ describe("scaling: zero / idle / active widgets", () => {
 		const zero = await connectHost([]);
 		await waitUntilReady(zero.stdin, zero.collector, 2);
 		// Warmup.
-		await measureKeypressToPaint(zero.host, zero.stdin, zero.collector, warmups, 100);
+		await measureKeypressToPaint(zero.stdin, zero.collector, warmups, 100);
 		const zeroKey = await measureKeypressToPaint(
-			zero.host,
 			zero.stdin,
 			zero.collector,
 			samples,
@@ -314,9 +294,8 @@ describe("scaling: zero / idle / active widgets", () => {
 		const idle = await connectHost(idleFactories);
 		await waitUntilReady(idle.stdin, idle.collector, 2);
 		expect(idle.host.extensionCount).toBe(100);
-		await measureKeypressToPaint(idle.host, idle.stdin, idle.collector, warmups, 100);
+		await measureKeypressToPaint(idle.stdin, idle.collector, warmups, 100);
 		const idleKey = await measureKeypressToPaint(
-			idle.host,
 			idle.stdin,
 			idle.collector,
 			samples,
@@ -334,24 +313,8 @@ describe("scaling: zero / idle / active widgets", () => {
 		idle.host.dispose("test");
 		await idle.runPromise.catch(() => void 0);
 
-		const zeroKeyStats = stats(zeroKey);
-		const idleKeyStats = stats(idleKey);
-		const zeroFrameStats = stats(zeroFrame);
-		const idleFrameStats = stats(idleFrame);
-
-		assertWithinTenPercent("keypress-to-paint p99", zeroKeyStats.p99, idleKeyStats.p99);
-		assertWithinTenPercent("frame CPU p99", zeroFrameStats.p99, idleFrameStats.p99);
-
-		// Surface numbers for the report / artifact.
-		console.warn(
-			JSON.stringify({
-				check: "idle-vs-zero",
-				warmups,
-				samples,
-				zero: { keypress: zeroKeyStats, frame: zeroFrameStats },
-				idle100: { keypress: idleKeyStats, frame: idleFrameStats },
-			}),
-		);
+		assertWithinTenPercent("keypress-to-paint p99", p99(zeroKey), p99(idleKey));
+		assertWithinTenPercent("frame CPU p99", p99(zeroFrame), p99(idleFrame));
 	}, 60_000);
 
 	test("20 active widgets stay bounded and drop stale generations", async () => {
@@ -519,18 +482,7 @@ describe("scaling: terminal-input deadlines", () => {
 			}
 		}
 
-		const s = stats(latencies);
-		expect(s.p99).toBeLessThan(5);
-		console.warn(
-			JSON.stringify({
-				check: "fast-terminal-input",
-				warmups,
-				samples,
-				timeoutMs: EXTENSION_INPUT_TIMEOUT_MS,
-				queueCapacity: EXTENSION_INPUT_QUEUE_CAPACITY,
-				stats: s,
-			}),
-		);
+		expect(p99(latencies)).toBeLessThan(5);
 
 		stdin.push(null);
 		host.dispose("test");

@@ -91,13 +91,7 @@ pub async fn resolve_provider_auth_with_signal(
             key: Some(api_key_override.clone()),
             env: overrides.and_then(|value| value.env.clone()),
         };
-        return resolve_api_key(
-            &request_context,
-            api_key_auth.as_ref(),
-            provider_id,
-            Some(&credential),
-        )
-        .await;
+        return resolve_api_key(&request_context, api_key_auth.as_ref(), Some(&credential)).await;
     }
 
     let stored = read_credential(credentials, provider_id).await?;
@@ -127,7 +121,6 @@ pub async fn resolve_provider_auth_with_signal(
                     return resolve_api_key(
                         &request_context,
                         api_key_auth.as_ref(),
-                        provider_id,
                         Some(&credential),
                     )
                     .await;
@@ -140,7 +133,7 @@ pub async fn resolve_provider_auth_with_signal(
 
     // Ambient (env vars, AWS profiles, ADC files).
     if let Some(api_key_auth) = auth.api_key.as_ref() {
-        return resolve_api_key(&request_context, api_key_auth.as_ref(), provider_id, None).await;
+        return resolve_api_key(&request_context, api_key_auth.as_ref(), None).await;
     }
     Ok(None)
 }
@@ -286,7 +279,6 @@ async fn resolve_stored_oauth(
 async fn resolve_api_key(
     auth_context: &dyn AuthContext,
     api_key: &dyn ApiKeyAuth,
-    provider_id: &str,
     credential: Option<&ApiKeyCredential>,
 ) -> Result<Option<AuthResult>, ModelsError> {
     // Expand templates/commands on a copy so disk/store retain raw forms.
@@ -298,7 +290,6 @@ async fn resolve_api_key(
         .resolve(auth_context, expanded.as_ref())
         .await
         .map(expand_auth_result);
-    let _ = provider_id;
     Ok(result)
 }
 

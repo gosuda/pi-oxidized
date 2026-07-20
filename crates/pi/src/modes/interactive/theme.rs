@@ -557,10 +557,6 @@ pub fn current() -> Arc<ResolvedTheme> {
     CURRENT.with(|c| c.borrow().clone()).unwrap_or_else(dark)
 }
 
-// ---------------------------------------------------------------------------
-// fn-pointer color hooks (read the thread-local current theme)
-// ---------------------------------------------------------------------------
-
 /// Build a foreground `fn(&str) -> String` for `color` that resolves against
 /// [`current()`] at call time.
 ///
@@ -645,10 +641,6 @@ pub fn markdown_theme() -> MarkdownTheme {
         code_block_indent: "  ".to_owned(),
     }
 }
-
-// ---------------------------------------------------------------------------
-// Syntax highlighting (ports `highlightCode`/`getLanguageFromPath` from theme.ts)
-// ---------------------------------------------------------------------------
 
 /// Curated `.sublime-syntax` grammars embedded at compile time. Provenance,
 /// upstream pins, and the hand-authored stubs are documented in
@@ -1089,10 +1081,6 @@ pub fn truncate_line(text: &str, width: usize, ellipsis: &str) -> String {
     truncate_to_width(text, width, ellipsis, false)
 }
 
-// ---------------------------------------------------------------------------
-// 256-color downsampling (ports rgbTo256 from theme.ts)
-// ---------------------------------------------------------------------------
-
 const CUBE_VALUES: [u8; 6] = [0, 95, 135, 175, 215, 255];
 
 fn closest_cube(value: u8) -> usize {
@@ -1172,10 +1160,6 @@ fn closest_gray(gray: u8) -> usize {
     best
 }
 
-// ---------------------------------------------------------------------------
-// Built-in themes (resolved interns)
-// ---------------------------------------------------------------------------
-
 /// Built-in dark theme (interned).
 #[must_use]
 pub fn dark() -> Arc<ResolvedTheme> {
@@ -1212,10 +1196,6 @@ built_in_theme!(M3_DARK_INTERN, "m3-dark");
 built_in_theme!(M3_LIGHT_INTERN, "m3-light");
 built_in_theme!(ANTD_DARK_INTERN, "antd-dark");
 built_in_theme!(ANTD_LIGHT_INTERN, "antd-light");
-
-// ---------------------------------------------------------------------------
-// JSON loading + validation
-// ---------------------------------------------------------------------------
 
 /// Errors produced while loading or validating a theme JSON document.
 #[derive(Debug, thiserror::Error)]

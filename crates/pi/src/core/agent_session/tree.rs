@@ -358,9 +358,6 @@ impl AgentSession {
         };
         self.agent.replace_messages(session_context.messages);
 
-        // Signal session_tree handler presence.
-        let _ = self.has_extension_handlers("session_tree");
-
         Ok(NavigateTreeResult {
             editor_text,
             cancelled: false,

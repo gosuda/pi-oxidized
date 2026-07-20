@@ -274,7 +274,6 @@ impl Input {
         if cursor == 0 {
             return 0;
         }
-        let bytes = text.as_bytes();
         let mut i = cursor;
         // Skip whitespace left.
         while i > 0 {
@@ -305,7 +304,6 @@ impl Input {
                 break;
             }
             i = prev;
-            let _ = bytes;
         }
         i
     }
@@ -499,10 +497,8 @@ impl Component for Input {
         let (line, cursor_byte) = self.render_line(area.width);
         // Paint base text without reverse cursor, then overlay reverse on cursor grapheme.
         let prompt = "> ";
-        let prompt_len = prompt.len();
         let y = area.y;
         let mut col = 0usize;
-        // prompt
         for (i, ch) in prompt.chars().enumerate() {
             let s = ch.to_string();
             if let Some(cell) = buf.cell_mut((
@@ -513,7 +509,6 @@ impl Component for Input {
             }
             col += 1;
         }
-        let _ = prompt_len;
         let visible = line.get(prompt.len()..).unwrap_or("");
         let mut byte_i = 0usize;
         let max_w = usize::from(area.width);

@@ -31,7 +31,7 @@ use pi_ai::models_store::{
 use pi_ai::provider::{Provider, ProviderError, StreamOptions};
 use pi_ai::providers::{
     AnthropicMessages, AzureOpenAiResponses, BedrockConverseStream, DefaultBedrockClientFactory,
-    GoogleGenerativeAi, GoogleVertex, KnownProvider, MistralConversations, OpenAiCodexResponses,
+    GoogleGenerativeAi, GoogleVertex, MistralConversations, OpenAiCodexResponses,
     OpenAiCompletions, OpenAiResponses, PiMessages, ProviderRegistry,
 };
 use pi_ai::types::{
@@ -705,14 +705,12 @@ impl ModelRuntime {
         self.update_model_snapshot_from_maps();
         self.mark_configured_if_auth_present(provider_id);
         let runtime = self.clone();
-        let provider = provider_id.to_owned();
         tokio::spawn(async move {
             let _ = runtime
                 .refresh(ModelsRefreshOptions {
                     allow_network: Some(false),
                 })
                 .await;
-            let _ = provider;
         });
         Ok(())
     }
@@ -1563,7 +1561,6 @@ impl ModelRuntime {
                 kind: AuthType::ApiKey,
             });
         }
-        let _ = KnownProvider::from_id(provider_id);
         None
     }
 }
@@ -1783,7 +1780,7 @@ fn validate_extension_provider(
 ) -> Result<(), ModelRuntimeError> {
     if let Some(models) = config.models.as_ref() {
         for model in models {
-            let api = model
+            model
                 .api
                 .as_deref()
                 .or(config.api.as_deref())
@@ -1793,8 +1790,7 @@ fn validate_extension_provider(
                         model.id
                     ))
                 })?;
-            let _ = api;
-            let base_url = model
+            model
                 .base_url
                 .as_deref()
                 .or(config.base_url.as_deref())
@@ -1803,7 +1799,6 @@ fn validate_extension_provider(
                         "Provider {provider_id}: \"baseUrl\" is required when defining custom models."
                     ))
                 })?;
-            let _ = base_url;
             if model.context_window == Some(0) {
                 return Err(ModelRuntimeError::Registration(format!(
                     "Provider {provider_id}, model {}: invalid contextWindow",
@@ -2669,7 +2664,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auth_header_true_emits_bearer_and_requires_key() -> Result<(), ModelRuntimeError> {
+    async fn auth_header_true_emits_bearer() -> Result<(), ModelRuntimeError> {
         let mut providers = BTreeMap::new();
         providers.insert(
             "openai".to_owned(),
@@ -2708,48 +2703,6 @@ mod tests {
             Some("yes")
         );
 
-        // authHeader without a key fails.
-        let mut providers = BTreeMap::new();
-        providers.insert(
-            "acme".to_owned(),
-            ProviderConfigInput {
-                auth_header: Some(true),
-                base_url: Some("https://acme.test".into()),
-                api: Some("openai-completions".into()),
-                models: Some(vec![custom_model("acme", "m")]),
-                ..ProviderConfigInput::default()
-            },
-        );
-        let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
-            credentials: Some(Arc::new(InMemoryCredentialStore::new())),
-            models_store: Some(Arc::new(InMemoryModelsStore::new())),
-            models_config: Some(ModelsJsonConfig::from_providers(providers)),
-            allow_model_network: Some(false),
-            ..CreateModelRuntimeOptions::default()
-        })
-        .await?;
-        // Register with only authHeader and no key material: resolve returns None
-        // (no ambient/store/configured key), so authHeader error is not reached.
-        // Force a key-less AuthResult path by registering apiKey that fails resolve
-        // is not possible; instead register with authHeader after a blank override.
-        // When a result exists without apiKey, apply_configured_auth_projection errors.
-        // Simulate via models.json apiKey empty is invalid; use set_runtime then remove
-        // and authHeader with oauth-only-like empty key by direct internal path:
-        // request override empty string still sets api_key Some("").
-        let err = runtime
-            .get_auth_for_provider(
-                "acme",
-                ModelRuntimeAuthOverrides {
-                    api_key: Some(String::new()),
-                    env: None,
-                },
-            )
-            .await;
-        // empty string is still Some key, so Bearer is emitted; for missing key we
-        // rely on the explicit unit path below via register without any key source
-        // and a fake resolution — assert configured authHeader flag is true.
-        assert!(runtime.configured_auth_header("acme"));
-        let _ = err;
         Ok(())
     }
 

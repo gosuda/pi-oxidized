@@ -791,7 +791,7 @@ export class ExtensionHost {
 			let result: unknown;
 			switch (eventType) {
 				case "message_end":
-                    this.clearActiveAssistant();
+					this.clearActiveAssistant();
 					result = await runner.emitMessageEnd({ type: eventType, ...payload });
 					await this.client.respond(id, eventType as Method, { message: result ?? undefined });
 					return;
@@ -818,9 +818,9 @@ export class ExtensionHost {
 					await this.client.respond(id, eventType as Method, result ?? {});
 					return;
 				default:
-                    if (eventType === "agent_end" || eventType === "session_shutdown") {
-                        this.clearActiveAssistant();
-                    }
+					if (eventType === "agent_end" || eventType === "session_shutdown") {
+						this.clearActiveAssistant();
+					}
 					result = await runner.emit({ type: eventType, ...payload } as Parameters<typeof runner.emit>[0]);
 					await this.client.respond(id, eventType as Method, result ?? { ok: true });
 					return;
@@ -860,7 +860,7 @@ export class ExtensionHost {
 				const assistantMessageEvent = type === "done"
 					? { type, reason: event["reason"], message }
 					: { type, reason: event["reason"], error: message };
-                this.clearActiveAssistant();
+				this.clearActiveAssistant();
 				const result = await runner.emit({
 					type: "message_update",
 					message,

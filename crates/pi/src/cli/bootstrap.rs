@@ -230,10 +230,6 @@ pub fn is_truthy_env_flag(value: Option<&str>) -> bool {
     }
 }
 
-// ---------------------------------------------------------------------------
-// I/O injection
-// ---------------------------------------------------------------------------
-
 /// Process-level I/O surface the bootstrap needs.
 ///
 /// All methods are sync except [`Self::read_piped_stdin`]. Implementations are
@@ -259,10 +255,6 @@ pub trait BootstrapIo: Send + Sync {
     /// Write a line to product stderr (newline appended).
     fn write_stderr(&self, line: &str);
 }
-
-// ---------------------------------------------------------------------------
-// Runtime factory injection
-// ---------------------------------------------------------------------------
 
 /// Inputs to [`RuntimeFactory::create`].
 pub struct RuntimeFactoryOptions {
@@ -317,10 +309,6 @@ pub trait RuntimeFactory: Send + Sync {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Outcome
-// ---------------------------------------------------------------------------
-
 /// Result of running the bootstrap pipeline.
 #[derive(Debug)]
 pub enum BootstrapOutcome {
@@ -351,10 +339,6 @@ pub struct Dispatched {
     /// Migration result (carried into interactive mode for changelog display).
     pub migrations: MigrationResult,
 }
-
-// ---------------------------------------------------------------------------
-// Bootstrap driver
-// ---------------------------------------------------------------------------
 
 /// Inputs to [`run_bootstrap`].
 pub struct BootstrapInputs<'a> {

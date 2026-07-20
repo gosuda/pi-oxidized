@@ -373,10 +373,6 @@ pub enum DiagnosticSeverity {
     Error,
 }
 
-// ---------------------------------------------------------------------------
-// Selector view-models
-// ---------------------------------------------------------------------------
-
 /// Model selector entry.
 #[derive(Clone, Debug)]
 pub struct ModelSelectorEntry {
@@ -611,10 +607,6 @@ impl Default for ViewState {
         Self::empty()
     }
 }
-
-// ---------------------------------------------------------------------------
-// Pure action enum
-// ---------------------------------------------------------------------------
 
 /// Pure, allocation-light actions emitted by the presentation layer for the
 /// runtime event loop to consume.

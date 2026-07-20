@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use pulldown_cmark::{CodeBlockKind, CowStr, Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
@@ -423,7 +423,7 @@ impl<'a> MarkdownRenderer<'a> {
             Event::Start(Tag::Table(_) | Tag::TableHead | Tag::TableRow | Tag::TableCell)
             | Event::End(
                 TagEnd::Table | TagEnd::TableHead | TagEnd::TableRow | TagEnd::TableCell,
-            ) => self.consume_table(event),
+            ) => self.consume_table(&event),
             Event::Text(_)
             | Event::Code(_)
             | Event::SoftBreak
@@ -589,7 +589,6 @@ impl<'a> MarkdownRenderer<'a> {
                 ordered: start.is_some(),
                 next_index: start.unwrap_or(1),
                 task: None,
-                loose: true,
             }),
             Event::Start(Tag::Item) => self.inline.clear(),
             Event::End(TagEnd::List(_)) => {
@@ -633,11 +632,10 @@ impl<'a> MarkdownRenderer<'a> {
         }
     }
 
-    fn consume_table(&mut self, event: Event<'_>) {
+    fn consume_table(&mut self, event: &Event<'_>) {
         match event {
-            Event::Start(Tag::Table(alignments)) => {
+            Event::Start(Tag::Table(_)) => {
                 self.table = Some(TableBuilder {
-                    alignments: alignments.len(),
                     headers: Vec::new(),
                     rows: Vec::new(),
                     current_row: Vec::new(),
@@ -734,7 +732,6 @@ impl<'a> MarkdownRenderer<'a> {
         while self.lines.last().is_some_and(String::is_empty) {
             self.lines.pop();
         }
-        let _ = CowStr::from("");
         self.lines
     }
 }
@@ -753,8 +750,6 @@ struct ListState {
     ordered: bool,
     next_index: u64,
     task: Option<String>,
-    #[allow(dead_code)]
-    loose: bool,
 }
 
 impl ListState {
@@ -806,8 +801,6 @@ fn rewrite_quote_borders(lines: &mut Vec<String>, theme: &MarkdownTheme, width: 
 }
 
 struct TableBuilder {
-    #[allow(dead_code)]
-    alignments: usize,
     headers: Vec<String>,
     rows: Vec<Vec<String>>,
     current_row: Vec<String>,

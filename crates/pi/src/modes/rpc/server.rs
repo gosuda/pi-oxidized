@@ -65,10 +65,6 @@ fn to_jsonl<T: Serialize>(value: &T) -> String {
     serialize_json_line(value).unwrap_or_default()
 }
 
-// ---------------------------------------------------------------------------
-// RpcSink — output abstraction
-// ---------------------------------------------------------------------------
-
 /// Future returned by [`RpcSink`] methods.
 type SinkFut = Pin<Box<dyn Future<Output = io::Result<()>> + Send>>;
 
@@ -211,10 +207,6 @@ impl RpcSink for GatedSink {
         Box::pin(async { Ok(()) })
     }
 }
-
-// ---------------------------------------------------------------------------
-// RpcSessionHost — session + runtime abstraction
-// ---------------------------------------------------------------------------
 
 /// Callback the host invokes after a session replacement.
 pub type RebindCallback = Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
@@ -381,10 +373,6 @@ pub trait RpcSessionHost: Send + Sync {
     fn set_rebind(&self, callback: Option<RebindCallback>);
 }
 
-// ---------------------------------------------------------------------------
-// ServerOutput types
-// ---------------------------------------------------------------------------
-
 /// Extension error notification (`type: "extension_error"`).
 #[derive(Clone, Debug, Serialize)]
 pub struct ExtensionErrorOutput {
@@ -426,10 +414,6 @@ pub enum ServerOutput {
     /// Extension error notification.
     ExtensionError(ExtensionErrorOutput),
 }
-
-// ---------------------------------------------------------------------------
-// ServerState
-// ---------------------------------------------------------------------------
 
 type UnsubSlot = Mutex<Option<Box<dyn Fn() + Send + Sync>>>;
 
@@ -792,10 +776,6 @@ fn map_extension_ui_event(event: ExtensionUiEvent) -> Option<RpcExtensionUiReque
         },
     })
 }
-
-// ---------------------------------------------------------------------------
-// handle_command — dispatch one RpcCommand
-// ---------------------------------------------------------------------------
 
 /// Dispatch a single [`RpcCommand`].
 ///
@@ -1265,10 +1245,6 @@ async fn spawn_prompt<H>(
     let _ = preflight_rx.await;
 }
 
-// ---------------------------------------------------------------------------
-// Input line processing
-// ---------------------------------------------------------------------------
-
 /// Outcome of processing one input line.
 #[derive(Debug, PartialEq, Eq)]
 pub enum LineOutcome {
@@ -1323,10 +1299,6 @@ where
     LineOutcome::Done
 }
 
-// ---------------------------------------------------------------------------
-// stdin reader task
-// ---------------------------------------------------------------------------
-
 enum LineMsg {
     Line(String),
     ReadError(String),
@@ -1356,10 +1328,6 @@ where
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Event loop (testable)
-// ---------------------------------------------------------------------------
 
 /// Run the RPC event loop until a shutdown condition is reached.
 ///
@@ -1436,10 +1404,6 @@ where
     writer_task.abort();
     exit_code
 }
-
-// ---------------------------------------------------------------------------
-// Production entry point
-// ---------------------------------------------------------------------------
 
 /// Production entry point. Takes over stdout, reads stdin, dispatches
 /// commands, handles signals/EOF, and returns the exit code.
@@ -1565,10 +1529,6 @@ fn spawn_signal_handlers(tx: mpsc::Sender<i32>) {
         let _ = tx;
     }
 }
-
-// ===========================================================================
-// Tests
-// ===========================================================================
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]

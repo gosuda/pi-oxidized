@@ -394,7 +394,7 @@ impl AgentSession {
         // 8. Pre-prompt compaction check (no agent.continue — sibling compaction
         //    slice owns this; here we trigger only the pre-prompt pass).
         if let Some(last_msg) = self.agent.last_assistant() {
-            self.check_compaction(&last_msg, false).await;
+            self.check_compaction(&last_msg).await;
         }
 
         // 9. Build messages: user message + pending nextTurn.
@@ -622,10 +622,7 @@ impl AgentSession {
 
         self.emit_retry_exhausted(&msg);
 
-        // Compaction check after retry handling. skip_aborted_check is `true`
-        // here because we only run after a real agent message_end, not an
-        // aborted user prompt.
-        if self.check_compaction(&msg, true).await {
+        if self.check_compaction(&msg).await {
             return Ok(true);
         }
 
@@ -827,7 +824,6 @@ mod tests {
     use super::*;
     use crate::core::agent_session::{
         AgentSessionConfig, AgentSessionEvent, ExtensionRunner, ExtensionRunnerError,
-        NullExtensionRunner,
     };
     use futures::future::BoxFuture;
     use futures::stream::{self, BoxStream, StreamExt};
@@ -2030,13 +2026,5 @@ mod tests {
             "exactly one settle per run: {observed:?}"
         );
         Ok(())
-    }
-
-    #[allow(dead_code)]
-    fn _ensure_null_runner_send_sync(_: NullExtensionRunner) {}
-
-    #[allow(dead_code)]
-    fn _ensure_ok_event_ok(e: AssistantMessageEvent) {
-        let _ = ok_event(e);
     }
 }

@@ -12,10 +12,6 @@ use super::state::{LoadedResource, ShortcutHint, StartupDiagnostics};
 use super::theme::{self, MarkdownOptions, MarkdownTheme, ResolvedTheme, ThemeColor};
 use crate::core::settings::ThemeMode;
 
-// ---------------------------------------------------------------------------
-// Loaded resources
-// ---------------------------------------------------------------------------
-
 /// Build the loaded-resources summary (one line per skill/prompt/theme/context).
 #[must_use]
 pub fn build_resources(resources: &[LoadedResource], th: &ResolvedTheme) -> Box<dyn Component> {
@@ -33,10 +29,6 @@ pub fn build_resources(resources: &[LoadedResource], th: &ResolvedTheme) -> Box<
     }
     Box::new(stack)
 }
-
-// ---------------------------------------------------------------------------
-// Startup diagnostics
-// ---------------------------------------------------------------------------
 
 /// Build the startup diagnostics block (warnings/errors from resource load).
 #[must_use]
@@ -63,10 +55,6 @@ pub fn build_diagnostics(
     }
     Box::new(stack)
 }
-
-// ---------------------------------------------------------------------------
-// First-time setup
-// ---------------------------------------------------------------------------
 
 /// First-run wizard steps: family → mode → analytics.
 pub const FIRST_RUN_STEP_FAMILY: usize = 0;
@@ -181,10 +169,6 @@ pub fn build_first_time_setup_with_selection(
     Box::new(stack)
 }
 
-// ---------------------------------------------------------------------------
-// Shortcut overlay
-// ---------------------------------------------------------------------------
-
 /// Build the shortcut/help overlay component from hint rows.
 #[must_use]
 pub fn build_shortcut_overlay(
@@ -254,10 +238,6 @@ pub fn default_shortcut_hints() -> Vec<ShortcutHint> {
     })
     .collect()
 }
-
-// ---------------------------------------------------------------------------
-// Release notes / changelog
-// ---------------------------------------------------------------------------
 
 /// Build the changelog/release-notes component from markdown source.
 #[must_use]

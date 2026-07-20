@@ -14,10 +14,6 @@ use super::state::{
 };
 use super::theme::{self, ResolvedTheme, ThemeColor};
 
-// ---------------------------------------------------------------------------
-// Pending queue
-// ---------------------------------------------------------------------------
-
 /// Build the pending-messages component (steering + follow-up queue).
 ///
 /// Renders one styled line per queued message, prefixed by kind.
@@ -66,10 +62,6 @@ fn pending_line(kind: PendingKind, text: &str, th: &ResolvedTheme) -> String {
         th.fg(ThemeColor::Muted, &format!("{label}: ")),
     ) + text
 }
-
-// ---------------------------------------------------------------------------
-// OAuth / auth progress
-// ---------------------------------------------------------------------------
 
 /// Build the auth-progress component (login dialog status line + spinner).
 #[must_use]
@@ -122,10 +114,6 @@ pub fn auth_stage_message(progress: &AuthProgress, th: &ResolvedTheme) -> String
         OAuthStage::Failed => format!("Failed to log in to {}.", progress.provider),
     }
 }
-
-// ---------------------------------------------------------------------------
-// Compaction / retry / bash progress
-// ---------------------------------------------------------------------------
 
 /// Build the compaction-progress component (a working status with reason text).
 #[must_use]

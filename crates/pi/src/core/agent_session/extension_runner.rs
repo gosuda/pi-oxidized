@@ -15,10 +15,9 @@ use crate::core::resources::ResourceExtensionPaths;
 use futures::future::BoxFuture;
 use pi_agent::{
     AfterToolCallContext, AfterToolCallResult, AgentLoopError, AgentLoopTurnUpdate, AgentMessage,
-    AgentTool, AgentToolResult, BeforeToolCallContext, BeforeToolCallResult,
-    PrepareNextTurnContext,
+    AgentTool, BeforeToolCallContext, BeforeToolCallResult, PrepareNextTurnContext,
 };
-use pi_ai::{AssistantMessageEvent, Model, ModelThinkingLevel, ToolCall, ToolResultContent};
+use pi_ai::{AssistantMessageEvent, ToolResultContent};
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
@@ -457,15 +456,4 @@ impl SessionHooks {
             })
         })
     }
-}
-
-/// Helper: unused imports kept for sibling modules via re-exports.
-#[allow(dead_code)]
-fn _keep_types(
-    _: ToolCall,
-    _: AssistantMessageEvent,
-    _: Model,
-    _: ModelThinkingLevel,
-    _: AgentToolResult,
-) {
 }

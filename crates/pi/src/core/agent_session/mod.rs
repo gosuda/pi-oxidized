@@ -57,7 +57,6 @@ pub use extension_runner::{
 };
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use futures::future::BoxFuture;
 use pi_agent::{Agent, AgentLoopConfig, AgentMessage, AgentOptions, AgentTool, QueueMode};
@@ -1106,12 +1105,6 @@ impl AgentSession {
     pub fn set_follow_up_mode(&self, mode: QueueMode) {
         self.agent.set_follow_up_mode(mode);
     }
-}
-
-// Silence unused Duration until retry sleep lands.
-#[allow(dead_code)]
-fn _duration_keep() -> Duration {
-    Duration::from_millis(0)
 }
 
 #[cfg(test)]

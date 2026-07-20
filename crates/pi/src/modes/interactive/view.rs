@@ -65,7 +65,6 @@ fn compose_inner(state: &ViewState) -> ComposedView {
     let md_theme = markdown_theme();
     let mut sections: Vec<ComposedSection> = Vec::new();
 
-    // 1. Header
     if !state.quiet {
         sections.push(ComposedSection {
             label: "header",
@@ -73,55 +72,46 @@ fn compose_inner(state: &ViewState) -> ComposedView {
         });
     }
 
-    // 2. Loaded resources
     sections.push(ComposedSection {
         label: "resources",
         component: startup::build_resources(&state.resources, &state.theme),
     });
 
-    // 3. Startup diagnostics (rendered with resources, above chat)
     sections.push(ComposedSection {
         label: "diagnostics",
         component: startup::build_diagnostics(&state.diagnostics, &state.theme),
     });
 
-    // 4. Chat messages
     sections.push(ComposedSection {
         label: "chat",
         component: build_chat(state, &md_theme),
     });
 
-    // 5. Pending queue
     sections.push(ComposedSection {
         label: "pending",
         component: progress::build_pending(&state.pending, &state.theme),
     });
 
-    // 6. Status indicator
     sections.push(ComposedSection {
         label: "status",
         component: build_status_section(state),
     });
 
-    // 7. Widgets above editor
     sections.push(ComposedSection {
         label: "widgets-above",
         component: build_widget_stack(&state.widgets_above, &state.theme),
     });
 
-    // 8. Editor (or active selector / overlay replacement)
     sections.push(ComposedSection {
         label: "editor",
         component: build_editor_section(state),
     });
 
-    // 9. Widgets below editor
     sections.push(ComposedSection {
         label: "widgets-below",
         component: build_widget_stack(&state.widgets_below, &state.theme),
     });
 
-    // 10. Footer
     sections.push(ComposedSection {
         label: "footer",
         component: footer::build_footer(&state.footer, &state.theme, state.width),
@@ -277,10 +267,6 @@ fn build_overlay(state: &ViewState, md_theme: &MarkdownTheme) -> Option<Box<dyn 
     };
     Some(comp)
 }
-
-// ---------------------------------------------------------------------------
-// Buffer rendering
-// ---------------------------------------------------------------------------
 
 /// Render the composed view into a fresh buffer of `width` × `height`.
 ///

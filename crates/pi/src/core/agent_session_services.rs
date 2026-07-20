@@ -9,7 +9,6 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use pi_ai::providers::KnownProvider;
 use pi_ai::types::{Model, ModelThinkingLevel};
 use pi_ext::protocol::FlagValueWire;
 use thiserror::Error;
@@ -1055,8 +1054,6 @@ fn pick_default_available(available: &[Model]) -> Option<Model> {
         {
             return Some(match_model.clone());
         }
-        // Keep KnownProvider parse reachable so renames fail tests.
-        let _ = KnownProvider::from_id(provider);
     }
     available.first().cloned()
 }

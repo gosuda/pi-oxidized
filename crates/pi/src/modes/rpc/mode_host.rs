@@ -34,10 +34,6 @@ use super::types::{
     RpcSlashCommandSource, SessionStats, StreamingBehavior,
 };
 
-// ---------------------------------------------------------------------------
-// Conversion helpers
-// ---------------------------------------------------------------------------
-
 fn convert_tree(nodes: Vec<SessionTreeNode>) -> Vec<RpcSessionTreeNode> {
     nodes
         .into_iter()
@@ -97,10 +93,6 @@ fn convert_slash_command(command: SlashCommandInfo) -> RpcSlashCommand {
         source_info: command.source_info.into(),
     }
 }
-
-// ---------------------------------------------------------------------------
-// RpcSessionHost for Arc<AgentSessionRuntime>
-// ---------------------------------------------------------------------------
 
 impl RpcSessionHost for Arc<AgentSessionRuntime> {
     fn prompt(

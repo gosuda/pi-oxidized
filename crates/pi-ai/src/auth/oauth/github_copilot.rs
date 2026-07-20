@@ -413,10 +413,10 @@ impl GitHubCopilotOAuth {
                     enterprise.as_deref(),
                     cancel.as_ref(),
                 )
-                .await
+                .await;
             });
         }
-        let _ = futures::future::join_all(tasks).await;
+        futures::future::join_all(tasks).await;
     }
 }
 

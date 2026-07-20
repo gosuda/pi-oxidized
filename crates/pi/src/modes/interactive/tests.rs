@@ -26,10 +26,6 @@ use crate::modes::interactive::view::{
     compose, render_component, render_view, snapshot_buffer_ansi, snapshot_buffer_plain,
 };
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 /// Render `state` at three widths and return the joined plain snapshots.
 fn triple_plain(state: &ViewState) -> String {
     let mut out = String::new();
@@ -102,10 +98,6 @@ fn base_state() -> ViewState {
     s
 }
 
-// ---------------------------------------------------------------------------
-// Composition order
-// ---------------------------------------------------------------------------
-
 #[test]
 fn empty_state_renders_canonical_section_order() {
     let state = base_state();
@@ -128,10 +120,6 @@ fn empty_state_renders_canonical_section_order() {
         "section order must match the reference composition"
     );
 }
-
-// ---------------------------------------------------------------------------
-// State snapshots at 20/80/160
-// ---------------------------------------------------------------------------
 
 #[test]
 fn empty_state_snapshot_widths() {
@@ -254,10 +242,6 @@ fn queue_state_snapshot() {
     };
     insta::assert_snapshot!("queue_state_widths", triple_plain(&state));
 }
-
-// ---------------------------------------------------------------------------
-// Message + tool content
-// ---------------------------------------------------------------------------
 
 #[test]
 fn user_and_assistant_messages_snapshot() {
@@ -382,10 +366,6 @@ fn tool_message_renders_call_and_result() {
         "tool result body must render: {plain}"
     );
 }
-
-// ---------------------------------------------------------------------------
-// Focus / overlay / selector
-// ---------------------------------------------------------------------------
 
 #[test]
 fn shortcut_overlay_snapshot() {
@@ -614,10 +594,6 @@ fn scoped_models_selector_marks_enabled() {
     assert!(plain.contains("[x]"), "enabled model shows [x]: {plain}");
 }
 
-// ---------------------------------------------------------------------------
-// Resize + theme fallback
-// ---------------------------------------------------------------------------
-
 #[test]
 fn resize_updates_dimensions_and_renders() {
     let mut state = base_state();
@@ -688,10 +664,6 @@ fn custom_theme_round_trips() -> Result<(), String> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// ANSI emission (colors reconstructed from buffer styles)
-// ---------------------------------------------------------------------------
-
 #[test]
 fn ansi_snapshot_emits_truecolor() {
     let state = base_state();
@@ -715,10 +687,6 @@ fn ansi_snapshot_emits_palette256() {
         "256-color SGR expected: {joined}"
     );
 }
-
-// ---------------------------------------------------------------------------
-// Footer + progress unit checks
-// ---------------------------------------------------------------------------
 
 #[test]
 fn format_tokens_thresholds() {
@@ -779,10 +747,6 @@ fn compaction_and_retry_messages_match_reference() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Theme-scoped rendering (with_theme restores prior)
-// ---------------------------------------------------------------------------
-
 #[test]
 fn with_theme_restores_prior() {
     let dark = theme::dark();
@@ -799,10 +763,6 @@ fn with_theme_restores_prior() {
         );
     });
 }
-
-// ---------------------------------------------------------------------------
-// Resources / diagnostics / widgets appear in composed output
-// ---------------------------------------------------------------------------
 
 #[test]
 fn resources_diagnostics_widgets_sections_present() {

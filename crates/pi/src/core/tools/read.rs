@@ -806,9 +806,6 @@ fn resize_image(input_bytes: &[u8], mime_type: &str) -> Option<ResizedImage> {
     target_width = target_width.max(1);
     target_height = target_height.max(1);
 
-    let mut quality_steps = vec![IMAGE_JPEG_QUALITY, 85, 70, 55, 40];
-    quality_steps.sort_unstable();
-    quality_steps.dedup();
     // Preserve first-try order: preferred quality first, then the rest descending-ish.
     let mut ordered = vec![IMAGE_JPEG_QUALITY];
     for q in [85_u8, 70, 55, 40] {

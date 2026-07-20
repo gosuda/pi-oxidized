@@ -784,16 +784,8 @@ fn resolve_scoped_fuzzy_query(
     } else {
         base_path.join(&display_base)
     };
-    // Existence check is best-effort via empty list.
-    let _ = base_dir;
     Some(ScopedFuzzy {
-        base_dir: if display_base.starts_with("~/") {
-            lister.expand_home(&display_base)
-        } else if display_base.starts_with('/') {
-            PathBuf::from(&display_base)
-        } else {
-            base_path.join(&display_base)
-        },
+        base_dir,
         query,
         display_base,
     })

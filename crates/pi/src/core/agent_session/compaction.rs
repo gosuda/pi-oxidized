@@ -218,14 +218,7 @@ impl AgentSession {
     ///    retries once (`overflow_recovery_attempted` latch).
     /// 2. **Threshold** — context is over the configured threshold. Compacts
     ///    without retry (user continues manually).
-    pub(super) async fn check_compaction(
-        &self,
-        assistant_message: &AssistantMessage,
-        skip_aborted_check: bool,
-    ) -> bool {
-        let _ = skip_aborted_check; // retained for TS parity; behaviour below
-        // already treats aborted as non-overflow.
-
+    pub(super) async fn check_compaction(&self, assistant_message: &AssistantMessage) -> bool {
         let settings = self.compaction_settings();
         // The inner `auto_compaction_enabled` flag is the runtime source of
         // truth (set by `set_auto_compaction_enabled`); `settings.enabled` is
@@ -1485,7 +1478,7 @@ mod tests {
             .last_assistant()
             .ok_or("threshold fixture has a last assistant")?;
         let _context_tokens = compaction::calculate_context_tokens(&last_assistant.usage);
-        let should_continue = session.check_compaction(&last_assistant, true).await;
+        let should_continue = session.check_compaction(&last_assistant).await;
         assert!(!should_continue, "threshold should not continue");
         assert!(!session.is_compacting(), "should clear compaction latch");
         let messages = session.agent.transcript();
@@ -1505,7 +1498,7 @@ mod tests {
             .last_assistant()
             .ok_or("below-threshold fixture has a last assistant")?;
         let messages_before = session.agent.transcript().len();
-        let should_continue = session.check_compaction(&last_assistant, true).await;
+        let should_continue = session.check_compaction(&last_assistant).await;
         assert!(!should_continue);
         assert_eq!(
             session.agent.transcript().len(),
@@ -1532,7 +1525,7 @@ mod tests {
             cost: UsageCost::default(),
         };
         overflow_assistant.content = vec![AssistantContent::Text(TextContent::new("overflow"))];
-        let should_continue = session.check_compaction(&overflow_assistant, true).await;
+        let should_continue = session.check_compaction(&overflow_assistant).await;
         assert!(!should_continue, "successful overflow should not retry");
         assert!(!session.is_compacting(), "should clear compaction latch");
         let messages = session.agent.transcript();
@@ -1556,7 +1549,7 @@ mod tests {
             let mut sm = session.session_manager.lock().await;
             sm.append_message(&overflow_msg)?;
         }
-        let should_continue = session.check_compaction(&overflow_assistant, true).await;
+        let should_continue = session.check_compaction(&overflow_assistant).await;
         assert!(should_continue, "error overflow should signal continuation");
         Ok(())
     }
@@ -1573,7 +1566,7 @@ mod tests {
         let _unsub = session.subscribe(move |event| {
             let _ = tx.send(event.clone());
         });
-        let should_continue = session.check_compaction(&overflow_assistant, true).await;
+        let should_continue = session.check_compaction(&overflow_assistant).await;
         assert!(!should_continue, "second overflow should not continue");
         sleep(std::time::Duration::from_millis(50)).await;
         let mut ends = Vec::new();
@@ -1617,7 +1610,7 @@ mod tests {
         other_model_msg.error_message = Some("prompt is too long".into());
 
         let messages_before = session.agent.transcript().len();
-        let should_continue = session.check_compaction(&other_model_msg, true).await;
+        let should_continue = session.check_compaction(&other_model_msg).await;
 
         assert!(!should_continue, "different model should not compact");
         assert_eq!(
@@ -1639,7 +1632,7 @@ mod tests {
             output: 500,
             ..Usage::default()
         };
-        let should_continue = session.check_compaction(&old_msg, true).await;
+        let should_continue = session.check_compaction(&old_msg).await;
         assert!(
             !should_continue,
             "stale pre-compaction message should not trigger compaction"
@@ -1662,7 +1655,7 @@ mod tests {
             .ok_or("disabled fixture has a last assistant")?;
         let messages_before = session.agent.transcript().len();
 
-        let should_continue = session.check_compaction(&last_assistant, true).await;
+        let should_continue = session.check_compaction(&last_assistant).await;
 
         assert!(!should_continue);
         assert_eq!(
@@ -1729,7 +1722,7 @@ mod tests {
             .agent
             .last_assistant()
             .ok_or("queued fixture has a last assistant")?;
-        let should_continue = session.check_compaction(&last_assistant, true).await;
+        let should_continue = session.check_compaction(&last_assistant).await;
         assert!(
             should_continue,
             "should continue when queued messages exist after auto-compaction"

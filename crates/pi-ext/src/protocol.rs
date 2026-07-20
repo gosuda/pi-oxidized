@@ -433,17 +433,6 @@ pub const fn extension_error_method() -> &'static str {
     "extensionError"
 }
 
-/// Compatibility validation message helper used by the host client.
-pub struct FrameValidationError;
-
-impl FrameValidationError {
-    /// Generic validation message for a rejected frame.
-    #[must_use]
-    pub const fn message_for(_frame: &Frame) -> &'static str {
-        "invalid protocol frame"
-    }
-}
-
 /// One protocol frame.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
