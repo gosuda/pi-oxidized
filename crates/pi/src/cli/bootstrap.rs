@@ -675,25 +675,193 @@ async fn handle_runtime_metadata(
     if let Some(model_runtime) = model_runtime
         && let Ok(models) = model_runtime.get_available(None).await
     {
-        let mut rows: Vec<(String, String, String)> = Vec::new();
-        for model in &models {
-            if let Some(search) = &pattern
-                && !model.provider.to_lowercase().contains(search)
-                && !model.id.to_lowercase().contains(search)
-            {
-                continue;
-            }
-            rows.push((model.provider.clone(), model.id.clone(), model.name.clone()));
+        let load_error = model_runtime.get_error();
+        if let Some(message) = load_error.as_deref() {
+            io.write_stderr(&format!("Warning: errors loading models.json:\n{message}"));
         }
-        rows.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
-        for (provider, id, name) in &rows {
-            io.write_stdout(&format!("{provider}/{id} {name}"));
-        }
-        if let Some(message) = model_runtime.get_error() {
-            io.write_stderr(&format!("Warning: {message}"));
-        }
+        let mut filtered: Vec<&pi_ai::Model> = models
+            .iter()
+            .filter(|model| match &pattern {
+                Some(search) => {
+                    model.provider.to_lowercase().contains(search)
+                        || model.id.to_lowercase().contains(search)
+                }
+                None => true,
+            })
+            .collect();
+        filtered.sort_by(|left, right| {
+            left.provider
+                .cmp(&right.provider)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        let header = ListModelsRow {
+            provider: "provider".to_owned(),
+            model: "model".to_owned(),
+            context: "context".to_owned(),
+            max_out: "max-out".to_owned(),
+            thinking: "thinking".to_owned(),
+            images: "images".to_owned(),
+        };
+        let rows: Vec<ListModelsRow> = filtered
+            .iter()
+            .map(|model| ListModelsRow {
+                provider: model.provider.clone(),
+                model: model.id.clone(),
+                context: format_token_count(model.context_window),
+                max_out: format_token_count(model.max_tokens),
+                thinking: if model.reasoning { "yes" } else { "no" }.to_owned(),
+                images: if model
+                    .input
+                    .iter()
+                    .any(|m| matches!(m, pi_ai::ModelInput::Image))
+                {
+                    "yes"
+                } else {
+                    "no"
+                }
+                .to_owned(),
+            })
+            .collect();
+        emit_list_models_table(io, &header, &rows);
     }
     Some(exit(0, false))
+}
+
+/// One row of the `--list-models` table.
+///
+/// Mirrors the upstream `listModels` row shape (provider/model/context/max-out
+/// /thinking/images) so column widths are computed from the rendered strings.
+struct ListModelsRow {
+    provider: String,
+    model: String,
+    context: String,
+    max_out: String,
+    thinking: String,
+    images: String,
+}
+
+/// Format a token count using the upstream-friendly `K` / `M` style.
+///
+/// Mirrors `.references/pi/packages/coding-agent/src/cli/list-models.ts`
+/// `formatTokenCount`: integer buckets use a bare count; sub-integer are kept
+/// at one decimal; values under 1k render as the raw number.
+fn format_token_count(count: u64) -> String {
+    const ONE_MILLION: u64 = 1_000_000;
+    const ONE_THOUSAND: u64 = 1_000;
+    if count >= ONE_MILLION {
+        let millions = count / ONE_THOUSAND;
+        let whole = millions.is_multiple_of(ONE_THOUSAND);
+        let value = f64::from(u32::try_from(millions).unwrap_or(u32::MAX)) / 1000.0;
+        if whole {
+            format!("{value:.0}M")
+        } else {
+            format!("{value:.1}M")
+        }
+    } else if count >= ONE_THOUSAND {
+        let thousands = count / 10;
+        let whole = thousands.is_multiple_of(100);
+        let value = f64::from(u32::try_from(thousands).unwrap_or(u32::MAX)) / 100.0;
+        if whole {
+            format!("{value:.0}K")
+        } else {
+            format!("{value:.1}K")
+        }
+    } else {
+        count.to_string()
+    }
+}
+
+/// Emit the `--list-models` table with header + data rows.
+///
+/// Column widths use the max of the header label and every rendered cell, then
+/// pad with a two-space gutter (matching upstream `padEnd` + `"  "`).
+fn emit_list_models_table(io: &dyn BootstrapIo, header: &ListModelsRow, rows: &[ListModelsRow]) {
+    let width = |label: &str, key: fn(&ListModelsRow) -> &str| -> usize {
+        label
+            .len()
+            .max(rows.iter().map(|row| key(row).len()).max().unwrap_or(0))
+    };
+    let w_provider = width(&header.provider, |row| &row.provider);
+    let w_model = width(&header.model, |row| &row.model);
+    let w_context = width(&header.context, |row| &row.context);
+    let w_max_out = width(&header.max_out, |row| &row.max_out);
+    let w_thinking = width(&header.thinking, |row| &row.thinking);
+    let w_images = width(&header.images, |row| &row.images);
+    io.write_stdout(&format_list_models_row(
+        &header.provider,
+        &header.model,
+        &header.context,
+        &header.max_out,
+        &header.thinking,
+        &header.images,
+        w_provider,
+        w_model,
+        w_context,
+        w_max_out,
+        w_thinking,
+        w_images,
+    ));
+    for row in rows {
+        io.write_stdout(&format_list_models_row(
+            &row.provider,
+            &row.model,
+            &row.context,
+            &row.max_out,
+            &row.thinking,
+            &row.images,
+            w_provider,
+            w_model,
+            w_context,
+            w_max_out,
+            w_thinking,
+            w_images,
+        ));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn format_list_models_row(
+    provider: &str,
+    model: &str,
+    context: &str,
+    max_out: &str,
+    thinking: &str,
+    images: &str,
+    w_provider: usize,
+    w_model: usize,
+    w_context: usize,
+    w_max_out: usize,
+    w_thinking: usize,
+    w_images: usize,
+) -> String {
+    [
+        provider.pad_to(w_provider),
+        model.pad_to(w_model),
+        context.pad_to(w_context),
+        max_out.pad_to(w_max_out),
+        thinking.pad_to(w_thinking),
+        images.pad_to(w_images),
+    ]
+    .join("  ")
+}
+
+trait PadTo {
+    fn pad_to(&self, width: usize) -> String;
+}
+
+impl PadTo for str {
+    fn pad_to(&self, width: usize) -> String {
+        if width <= self.len() {
+            self.to_owned()
+        } else {
+            let mut out = String::with_capacity(width);
+            out.push_str(self);
+            for _ in 0..(width - self.len()) {
+                out.push(' ');
+            }
+            out
+        }
+    }
 }
 
 async fn finish_bootstrap(
