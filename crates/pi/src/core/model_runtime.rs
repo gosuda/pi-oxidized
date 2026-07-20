@@ -989,6 +989,13 @@ impl ModelRuntime {
             None
         };
         let Some(level) = reasoning_level else {
+            // Upstream anthropic streamSimple always sends the activation flag,
+            // so off/absent reaches the adapter as an explicit disable.
+            if model.api == "anthropic-messages" && model.reasoning {
+                options
+                    .extra
+                    .insert("thinkingEnabled".to_owned(), Value::Bool(false));
+            }
             return pi_ai::apply_simple_max_tokens_clamp(model, context, options);
         };
         let custom_budgets = options
@@ -1042,14 +1049,44 @@ impl ModelRuntime {
             );
             options = adjusted;
             if thinking_budget > 0 {
-                options.extra.insert(
-                    "thinkingBudgetTokens".to_owned(),
-                    Value::Number(serde_json::Number::from(thinking_budget)),
-                );
+                Self::record_thinking_budget(&mut options, model, level, thinking_budget);
             }
             options
         } else {
             pi_ai::apply_simple_max_tokens_clamp(model, context, options)
+        }
+    }
+
+    /// Expose the clamped thinking budget on the key each adapter reads:
+    /// bedrock consumes the `thinkingBudgets` map (upstream writes the clamped
+    /// value into it), anthropic consumes the scalar `thinkingBudgetTokens`.
+    fn record_thinking_budget(
+        options: &mut StreamOptions,
+        model: &Model,
+        level: pi_ai::ThinkingLevel,
+        thinking_budget: u64,
+    ) {
+        let budget = Value::Number(serde_json::Number::from(thinking_budget));
+        if model.api == "bedrock-converse-stream" {
+            let key = match level {
+                pi_ai::ThinkingLevel::Minimal => "minimal",
+                pi_ai::ThinkingLevel::Low => "low",
+                pi_ai::ThinkingLevel::Medium => "medium",
+                pi_ai::ThinkingLevel::High
+                | pi_ai::ThinkingLevel::Xhigh
+                | pi_ai::ThinkingLevel::Max => "high",
+            };
+            let budgets = options
+                .extra
+                .entry("thinkingBudgets".to_owned())
+                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+            if let Some(map) = budgets.as_object_mut() {
+                map.insert(key.to_owned(), budget);
+            }
+        } else {
+            options
+                .extra
+                .insert("thinkingBudgetTokens".to_owned(), budget);
         }
     }
 
@@ -3033,6 +3070,84 @@ mod tests {
         assert_eq!(bedrock.max_tokens, Some(1_024));
         assert_eq!(bedrock.extra.get("reasoning"), Some(&json!("high")));
         assert!(bedrock.extra.get("thinkingBudgetTokens").is_none());
+    }
+
+    #[test]
+    fn shape_reasoning_options_disables_anthropic_thinking_when_off() {
+        let model = Model {
+            id: "claude-3-9".to_owned(),
+            name: "Claude".to_owned(),
+            api: "anthropic-messages".to_owned(),
+            provider: "test".to_owned(),
+            base_url: "https://example.test".to_owned(),
+            reasoning: true,
+            thinking_level_map: None,
+            input: vec![ModelInput::Text],
+            cost: ModelCost::default(),
+            context_window: 32_000,
+            max_tokens: 4_096,
+            headers: None,
+            compat: None,
+            extra: BTreeMap::new(),
+        };
+        let off = StreamOptions {
+            extra: serde_json::Map::from_iter([("reasoning".to_owned(), json!("off"))]),
+            ..StreamOptions::default()
+        };
+        let shaped = ModelRuntime::shape_reasoning_options(&model, &Context::default(), off);
+        assert_eq!(
+            shaped.extra.get("thinkingEnabled"),
+            Some(&json!(false)),
+            "upstream streamSimple always sends the explicit disable"
+        );
+
+        let absent = ModelRuntime::shape_reasoning_options(
+            &model,
+            &Context::default(),
+            StreamOptions::default(),
+        );
+        assert_eq!(absent.extra.get("thinkingEnabled"), Some(&json!(false)));
+    }
+
+    #[test]
+    fn shape_reasoning_options_writes_bedrock_budget_into_map() {
+        let model = Model {
+            id: "anthropic.claude-3-9-v1:0".to_owned(),
+            name: "Claude 3.9".to_owned(),
+            api: "bedrock-converse-stream".to_owned(),
+            provider: "test".to_owned(),
+            base_url: "https://example.test".to_owned(),
+            reasoning: true,
+            thinking_level_map: None,
+            input: vec![ModelInput::Text],
+            cost: ModelCost::default(),
+            context_window: 64_000,
+            max_tokens: 32_000,
+            headers: None,
+            compat: None,
+            extra: BTreeMap::new(),
+        };
+        let options = StreamOptions {
+            max_tokens: Some(2_048),
+            extra: serde_json::Map::from_iter([("reasoning".to_owned(), json!("high"))]),
+            ..StreamOptions::default()
+        };
+        let shaped = ModelRuntime::shape_reasoning_options(&model, &Context::default(), options);
+        let budget = shaped
+            .extra
+            .get("thinkingBudgets")
+            .and_then(|budgets| budgets.get("high"))
+            .and_then(Value::as_u64);
+        assert_eq!(
+            budget,
+            Some(16_384),
+            "bedrock adapter reads the clamped budget from the map: {:?}",
+            shaped.extra
+        );
+        assert!(
+            shaped.extra.get("thinkingBudgetTokens").is_none(),
+            "the scalar key is the anthropic contract, not bedrock's"
+        );
     }
 
     #[tokio::test]
