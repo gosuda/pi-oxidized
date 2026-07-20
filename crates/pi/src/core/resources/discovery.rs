@@ -1546,6 +1546,13 @@ fn parse_git_url(source: &str) -> Option<ParsedSource> {
     } else {
         trimmed
     };
+
+    // hosted-git shorthand pass for github:owner/repo and gitlab:owner/repo
+    // (with optional #committish). Other hosts fall through to the generic
+    // parser, matching hostedGitInfo's narrow shorthand support.
+    let expanded = expand_hosted_git_shorthand(url);
+    let url = expanded.as_deref().unwrap_or(url);
+
     if !has_git_prefix
         && !url.starts_with("https://")
         && !url.starts_with("http://")
@@ -1555,6 +1562,23 @@ fn parse_git_url(source: &str) -> Option<ParsedSource> {
         return None;
     }
     parse_generic_git_url(url)
+}
+
+fn expand_hosted_git_shorthand(url: &str) -> Option<String> {
+    let (domain, after) = if let Some(after) = url.strip_prefix("github:") {
+        ("github.com", after)
+    } else {
+        let after = url.strip_prefix("gitlab:")?;
+        ("gitlab.com", after)
+    };
+    if after.is_empty() {
+        return None;
+    }
+    // The generic parser splits refs with '@' for URLs, so map the shorthand's
+    // '#committish' marker to '@' so split_ref / parse_generic_git_url pick
+    // it up and produce a clean clone URL without the fragment.
+    let after = after.replacen('#', "@", 1);
+    Some(format!("https://{domain}/{after}"))
 }
 
 fn parse_generic_git_url(url: &str) -> Option<ParsedSource> {
@@ -2474,6 +2498,54 @@ mod tests {
             temporary_dir_hash("npm", ""),
             temporary_dir_hash("npm", "x")
         );
+    }
+
+    #[test]
+    fn parse_git_url_github_shorthand() {
+        assert_eq!(
+            parse_git_url("github:owner/repo"),
+            Some(ParsedSource::Git {
+                repo: "https://github.com/owner/repo".into(),
+                host: "github.com".into(),
+                path: "owner/repo".into(),
+                ref_name: None,
+                pinned: false,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_git_url_gitlab_shorthand_with_ref() {
+        assert_eq!(
+            parse_git_url("gitlab:owner/repo#feature/x"),
+            Some(ParsedSource::Git {
+                repo: "https://gitlab.com/owner/repo".into(),
+                host: "gitlab.com".into(),
+                path: "owner/repo".into(),
+                ref_name: Some("feature/x".into()),
+                pinned: true,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_git_url_git_prefix_around_shorthand() {
+        assert_eq!(
+            parse_git_url("git:github:owner/repo"),
+            Some(ParsedSource::Git {
+                repo: "https://github.com/owner/repo".into(),
+                host: "github.com".into(),
+                path: "owner/repo".into(),
+                ref_name: None,
+                pinned: false,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_git_url_other_shorthand_falls_through() {
+        // Only github: and gitlab: are supported by hostedGitInfo.
+        assert!(parse_git_url("bitbucket:owner/repo").is_none());
     }
 
     #[test]

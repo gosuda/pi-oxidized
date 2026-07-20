@@ -25,6 +25,25 @@ use super::truncate::{
 /// (TypeScript `pi-output`; the bash tool passes `pi-bash`).
 pub const DEFAULT_TEMP_FILE_PREFIX: &str = "pi-output";
 
+/// Sanitize decoded tool output for storage and display.
+///
+/// Ports `sanitizeBinaryOutput` from `.references/pi/utils/shell.ts`:
+/// - keeps tab, newline, and carriage return
+/// - drops other C0 control characters (0x00-0x1F)
+/// - drops Unicode format characters U+FFF9..U+FFFB
+/// - lone surrogates cannot exist in a Rust `String`; the decoder already
+///   emits U+FFFD for invalid UTF-8 sequences, which this filter keeps.
+#[must_use]
+pub(crate) fn sanitize_binary_output(text: &str) -> String {
+    text.chars()
+        .filter(|ch| {
+            let code = *ch as u32;
+            matches!(code, 0x09 | 0x0a | 0x0d)
+                || (code > 0x1f && !(0xfff9..=0xfffb).contains(&code))
+        })
+        .collect()
+}
+
 /// Options for [`OutputAccumulator`] (TypeScript `OutputAccumulatorOptions`).
 #[derive(Clone, Debug)]
 pub struct OutputAccumulatorOptions {
@@ -218,7 +237,7 @@ impl OutputAccumulator {
         }
 
         self.total_raw_bytes += data.len();
-        let text = self.decoder.decode(data, true);
+        let text = sanitize_binary_output(&self.decoder.decode(data, true));
         self.append_decoded_text(&text);
 
         if self.temp_file.is_some() || self.should_use_temp_file() {
@@ -249,7 +268,7 @@ impl OutputAccumulator {
             return Ok(());
         }
         self.finished = true;
-        let text = self.decoder.finish();
+        let text = sanitize_binary_output(&self.decoder.finish());
         self.append_decoded_text(&text);
         if self.should_use_temp_file() {
             self.ensure_temp_file()?;
@@ -685,5 +704,36 @@ mod tests {
         // The path is still reported after the handle closes.
         assert!(snapshot.full_output_path.is_some());
         cleanup(snapshot.full_output_path.as_deref())
+    }
+
+    #[test]
+    fn sanitize_binary_output_keeps_text_and_whitelist() {
+        assert_eq!(
+            sanitize_binary_output("hello\tworld\n\r"),
+            "hello\tworld\n\r"
+        );
+    }
+
+    #[test]
+    fn sanitize_binary_output_drops_c0_except_whitelist() {
+        let input = "a\x00b\x01c\x08d\t e\n f\r g";
+        assert_eq!(sanitize_binary_output(input), "abcd\t e\n f\r g");
+    }
+
+    #[test]
+    fn sanitize_binary_output_drops_interlinear_annotations() {
+        // U+FFF9, U+FFFA, U+FFFB are explicitly removed by the reference.
+        let input = "a\u{fff9}\u{fffa}\u{fffb}b";
+        assert_eq!(sanitize_binary_output(input), "ab");
+    }
+
+    #[test]
+    fn accumulator_applies_sanitize_to_snapshot() -> TestResult {
+        let mut acc = OutputAccumulator::new(OutputAccumulatorOptions::default());
+        acc.append("hello\x00\x01world\u{fff9}\n".as_bytes())?;
+        acc.finish()?;
+        let snapshot = acc.snapshot(false)?;
+        assert_eq!(snapshot.content, "helloworld\n");
+        Ok(())
     }
 }

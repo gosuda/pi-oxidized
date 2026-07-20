@@ -14,11 +14,13 @@
 //! Image support reuses [`super::image::process_image`] so no external image
 //! binaries are spawned.
 
+use std::fs;
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use base64::Engine;
+use uuid::Uuid;
 
 use super::image::{convert_to_png, detect_supported_image_mime, extension_for_image_mime};
 
@@ -416,8 +418,9 @@ fn base_mime(mime: &str) -> String {
 /// Read an image from the clipboard, converting unsupported formats to PNG.
 ///
 /// The argv selection mirrors `readClipboardImage`: Wayland/WSL → `wl-paste`
-/// then `xclip`. Termux yields no image. Unsupported MIME is converted via
-/// [`maybe_convert_to_png`].
+/// then `xclip`; WSL also tries PowerShell (Windows clipboard); plain X11
+/// falls back to `xclip` directly. Termux yields no image. Unsupported MIME is
+/// converted via [`maybe_convert_to_png`].
 #[must_use]
 pub fn read_clipboard_image() -> Option<ClipboardImage> {
     read_clipboard_image_with(ClipboardPlatform::host(), &HostEnv)
@@ -445,10 +448,24 @@ fn read_clipboard_image_raw(
     }
     let wayland = is_wayland_session(env);
     let wsl = is_wsl(env);
+
+    // Mirrors readClipboardImage from the TypeScript reference:
+    //  - on Wayland or WSL, try wl-paste first, then xclip
+    //  - on WSL, also fall back to PowerShell (Windows clipboard)
+    //  - on plain X11 (or any non-Wayland Linux) fall back to xclip.
+    // The reference tries nativeClipboard before xclip, but this port has no
+    // native addon, so xclip is the plain-X11 fallback.
+    let mut image = None;
     if wayland || wsl {
-        return wl_paste_image().or_else(xclip_image);
+        image = wl_paste_image().or_else(xclip_image);
     }
-    None
+    if image.is_none() && wsl {
+        image = read_clipboard_image_via_powershell();
+    }
+    if image.is_none() && !wayland {
+        image = xclip_image();
+    }
+    image
 }
 
 fn wl_paste_image() -> Option<ClipboardImage> {
@@ -496,6 +513,68 @@ fn xclip_image() -> Option<ClipboardImage> {
         }
     }
     None
+}
+
+/// On WSL, the Linux clipboard often does not receive image data copied in
+/// Windows (e.g. Win+Shift+S). PowerShell can reach the Windows clipboard
+/// directly, so save a PNG to a temporary file and read it back.
+fn read_clipboard_image_via_powershell() -> Option<ClipboardImage> {
+    let tmp_file = std::env::temp_dir().join(format!("pi-wsl-clip-{}.png", Uuid::new_v4()));
+
+    let win_path = {
+        let output = Command::new("wslpath")
+            .args(["-w", tmp_file.to_str()?])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    };
+
+    if win_path.is_empty() {
+        return None;
+    }
+
+    let quoted = win_path.replace('\'', "''");
+    let script = format!(
+        "Add-Type -AssemblyName System.Windows.Forms; \
+         Add-Type -AssemblyName System.Drawing; \
+         $path = '{quoted}'; \
+         $img = [System.Windows.Forms.Clipboard]::GetImage(); \
+         if ($img) {{ $img.Save($path, [System.Drawing.Imaging.ImageFormat]::Png); Write-Output 'ok' }} else {{ Write-Output 'empty' }}"
+    );
+
+    let result = Command::new("powershell.exe")
+        .args(["-NoProfile", "-Command", &script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+
+    let image = result.ok().and_then(|output| {
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if text != "ok" {
+            return None;
+        }
+        let bytes = fs::read(&tmp_file).ok()?;
+        if bytes.is_empty() {
+            return None;
+        }
+        Some(ClipboardImage {
+            bytes,
+            mime: "image/png".to_owned(),
+        })
+    });
+
+    let _ = fs::remove_file(&tmp_file);
+    image
 }
 
 fn select_preferred_image_mime(types_output: &str) -> Option<String> {
@@ -698,5 +777,25 @@ mod tests {
             select_preferred_image_mime(types).as_deref(),
             Some("image/png")
         );
+    }
+
+    #[test]
+    fn read_image_returns_none_on_non_unix() {
+        let env = MapEnv::default();
+        assert!(read_clipboard_image_with(ClipboardPlatform::Darwin, &env).is_none());
+        assert!(read_clipboard_image_with(ClipboardPlatform::Windows, &env).is_none());
+    }
+
+    #[test]
+    fn read_image_returns_none_for_termux() {
+        let env = MapEnv::default().set("TERMUX_VERSION", "1.0");
+        assert!(read_clipboard_image_with(ClipboardPlatform::Unix, &env).is_none());
+    }
+
+    #[test]
+    fn is_wsl_detects_env_vars() {
+        assert!(is_wsl(&MapEnv::default().set("WSL_DISTRO_NAME", "Ubuntu")));
+        assert!(is_wsl(&MapEnv::default().set("WSLENV", "x")));
+        assert!(!is_wsl(&MapEnv::default()));
     }
 }
