@@ -850,7 +850,7 @@ static OVERFLOW_REGEXES: std::sync::LazyLock<Vec<Regex>> = std::sync::LazyLock::
         r"(?i)request_too_large",
         r"(?i)input is too long for requested model",
         r"(?i)exceeds the context window",
-        r"(?i)exceeds (?:the )?(?:model'?s )?maximum context length(?: of [\d,]+ tokens?|\s*\([\d,]+\))?",
+        r"(?i)exceeds (?:the )?(?:model'?s )?maximum context length(?: of [\d,]+ tokens?|\s*\([\d,]+\))",
         r"(?i)input token count.*exceeds the maximum",
         r"(?i)maximum prompt length is \d+",
         r"(?i)reduce the length of the messages",
@@ -1156,6 +1156,14 @@ mod tests {
         msg.stop_reason = StopReason::Error;
         msg.error_message = Some("prompt is too long: 213462 tokens > 200000 maximum".into());
         assert!(is_context_overflow(&msg, 0));
+    }
+
+    #[test]
+    fn bare_maximum_context_length_is_not_overflow() {
+        let mut msg = AssistantMessage::new("a", "openai-compatible", "m", 1);
+        msg.stop_reason = StopReason::Error;
+        msg.error_message = Some("exceeds the maximum context length".into());
+        assert!(!is_context_overflow(&msg, 0));
     }
 
     #[test]

@@ -25,9 +25,11 @@
 //! persistence half (pump task) resets it on success; the prompt half (caller
 //! task) increments and reads it. Never hold the inner mutex across `.await`.
 
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use pi_ai::{AssistantMessage, StopReason};
+use regex::Regex;
 
 use super::AgentSession;
 use super::compaction::is_context_overflow;
@@ -193,11 +195,81 @@ fn contains_status_code(text: &str, status: &str) -> bool {
     })
 }
 
+/// Non-retryable quota/billing/subscription provider error patterns.
+///
+/// Port of `pi-ai/utils/retry.ts::NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN`.
+/// These defeat retry even when the message also contains a transient-looking
+/// status code such as 429.
+static NON_RETRYABLE_PROVIDER_LIMIT_PATTERN: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    let patterns = [
+        "GoUsageLimitError",
+        "FreeUsageLimitError",
+        "Monthly usage limit reached",
+        "available balance",
+        "insufficient_quota",
+        "out of budget",
+        "quota exceeded",
+        "billing",
+    ];
+    Regex::new(&format!("(?i)(?:{})", patterns.join("|"))).ok()
+});
+
+/// Retryable provider/transient error patterns.
+///
+/// Port of `pi-ai/utils/retry.ts::RETRYABLE_PROVIDER_ERROR_PATTERN`. Numeric
+/// HTTP status codes are handled separately by [`contains_status_code`] so they
+/// are recognised only as standalone tokens (e.g. "429" but not "14290").
+static RETRYABLE_PROVIDER_ERROR_PATTERN: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    let patterns = [
+        // Generic provider load, HTTP status, and server-side transient failures.
+        "overloaded",
+        "rate.?limit",
+        "too many requests",
+        "service.?unavailable",
+        "server.?error",
+        "internal.?error",
+        // Wrapper/provider text for transient upstream failures.
+        "provider.?returned.?error",
+        // Network, proxy, and fetch transport failures.
+        "network.?error",
+        "connection.?error",
+        "connection.?refused",
+        "connection.?lost",
+        "other side closed",
+        "fetch failed",
+        "upstream.?connect",
+        "reset before headers",
+        "socket hang up",
+        "socket connection was closed",
+        "timed? out",
+        "timeout",
+        "terminated",
+        // WebSocket transports.
+        "websocket.?closed",
+        "websocket.?error",
+        // Premature stream endings.
+        "ended without",
+        "stream ended before message_stop",
+        "stream ended before a terminal response event",
+        "http2 request did not get a response",
+        // Provider-requested retry delay / guidance.
+        "retry delay",
+        "you can retry your request",
+        "try your request again",
+        "please retry your request",
+        // gRPC based providers (e.g. NVIDIA NIM).
+        "ResourceExhausted",
+    ];
+    Regex::new(&format!("(?i)(?:{})", patterns.join("|"))).ok()
+});
+
+const RETRYABLE_STATUS_CODES: &[&str] = &["429", "500", "502", "503", "504", "524"];
+
 /// Whether the assistant message is a retryable transient error.
 ///
-/// Non-retryable: auth failures and context overflow (overflow is caught by
-/// [`is_context_overflow`] first, but this function is also safe to call
-/// directly).
+/// Non-retryable: auth failures, context overflow, and provider limit/billing
+/// errors (overflow is caught by [`is_context_overflow`] first, but this
+/// function is also safe to call directly).
 fn is_retryable_assistant_error(message: &AssistantMessage) -> bool {
     if message.stop_reason != StopReason::Error {
         return false;
@@ -207,7 +279,15 @@ fn is_retryable_assistant_error(message: &AssistantMessage) -> bool {
     };
     let lower = err.to_ascii_lowercase();
 
-    // Explicitly non-retryable.
+    // Provider quota/billing/subscription limits defeat retry first.
+    if NON_RETRYABLE_PROVIDER_LIMIT_PATTERN
+        .as_ref()
+        .is_some_and(|re| re.is_match(&lower))
+    {
+        return false;
+    }
+
+    // Auth failures and context-overflow wording are not transient.
     if lower.contains("invalid_api_key")
         || lower.contains("invalid api key")
         || lower.contains("context overflow")
@@ -218,22 +298,20 @@ fn is_retryable_assistant_error(message: &AssistantMessage) -> bool {
     }
 
     // Transient / retryable patterns.
-    lower.contains("overloaded")
-        || lower.contains("rate_limit")
-        || lower.contains("rate limit")
-        || lower.contains("network")
-        || lower.contains("timeout")
-        || lower.contains("server error")
-        || lower.contains("internal error")
-        || contains_status_code(&lower, "429")
-        || contains_status_code(&lower, "503")
-        || contains_status_code(&lower, "502")
-        || contains_status_code(&lower, "500")
-        || lower.contains("retry your request")
-        || lower.contains("try your request again")
-        || lower.contains("network connection lost")
-        || lower.contains("temporarily unavailable")
-        || lower.contains("service_unavailable")
+    if RETRYABLE_PROVIDER_ERROR_PATTERN
+        .as_ref()
+        .is_some_and(|re| re.is_match(&lower))
+    {
+        return true;
+    }
+
+    for status in RETRYABLE_STATUS_CODES {
+        if contains_status_code(&lower, status) {
+            return true;
+        }
+    }
+
+    false
 }
 
 #[cfg(test)]
@@ -326,6 +404,40 @@ mod tests {
         msg.stop_reason = StopReason::Error;
         msg.error_message = Some("The server had an error while processing your request. Sorry about that! Please retry your request.".to_owned());
         assert!(is_retryable_assistant_error(&msg));
+    }
+
+    #[test]
+    fn quota_429_not_retryable() {
+        let mut msg = AssistantMessage::new("api", "provider", "m", 0);
+        msg.stop_reason = StopReason::Error;
+        msg.error_message = Some("429 insufficient_quota billing error".to_owned());
+        assert!(!is_retryable_assistant_error(&msg));
+    }
+
+    #[test]
+    fn socket_hang_up_retryable() {
+        let mut msg = AssistantMessage::new("api", "provider", "m", 0);
+        msg.stop_reason = StopReason::Error;
+        msg.error_message = Some("provider fetch failed: socket hang up".to_owned());
+        assert!(is_retryable_assistant_error(&msg));
+    }
+
+    #[test]
+    fn existing_classifications_unchanged() {
+        let mut overloaded = AssistantMessage::new("api", "provider", "m", 0);
+        overloaded.stop_reason = StopReason::Error;
+        overloaded.error_message = Some("overloaded_error".to_owned());
+        assert!(is_retryable_assistant_error(&overloaded));
+
+        let mut invalid = AssistantMessage::new("api", "provider", "m", 0);
+        invalid.stop_reason = StopReason::Error;
+        invalid.error_message = Some("invalid_api_key".to_owned());
+        assert!(!is_retryable_assistant_error(&invalid));
+
+        let mut embedded = AssistantMessage::new("api", "provider", "m", 0);
+        embedded.stop_reason = StopReason::Error;
+        embedded.error_message = Some("internal code 14290".to_owned());
+        assert!(!is_retryable_assistant_error(&embedded));
     }
 
     #[test]
