@@ -10,12 +10,18 @@ use base64::Engine as _;
 use indexmap::IndexMap;
 use pi_agent::{AgentState, AgentStateSnapshot};
 use pi_ai::{AssistantContent, Message, ToolResultContent};
+use pi_tui::terminal::probe::TerminalTheme;
 use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
 
 use crate::core::config::{APP_NAME, PathInputOptions, normalize_path, resolve_path};
 use crate::core::sessions::{SessionEntry, SessionError, SessionHeader, SessionManager};
+use crate::core::settings::ThemeMode;
+use crate::modes::interactive::theme::{
+    BUILT_IN_THEME_NAMES, ColorMode, ResolvedTheme, Rgb, ThemeSlotValue, bg_slot_names, dark,
+    fg_slot_names, load_or_dark, resolve_active_theme,
+};
 
 const TEMPLATE_HTML: &str = include_str!("../../../assets/export-html/template.html");
 const TEMPLATE_CSS: &str = include_str!("../../../assets/export-html/template.css");
@@ -202,19 +208,100 @@ impl ExportTheme {
         })
     }
 
-    fn built_in(name: Option<&str>) -> Self {
-        let (source, light) = if name == Some("light") {
-            (LIGHT_THEME, true)
+    /// Build export colors from a fully resolved interactive theme.
+    ///
+    /// Slot values come from the resolved fg/bg tables (same CSS variable
+    /// names as the theme schema). Page/card/info backgrounds are left unset
+    /// so [`generate_html`] can derive them from `userMessageBg`, matching
+    /// themes that omit an `export` block.
+    #[must_use]
+    pub fn from_resolved(theme: &ResolvedTheme) -> Self {
+        let default_text = if is_light_theme_name(theme.name.as_ref()) {
+            "#000000"
         } else {
-            (DARK_THEME, false)
+            "#e5e5e7"
         };
-        Self::from_json(source, light).unwrap_or_else(|_| Self {
-            colors: vec![("userMessageBg".to_owned(), "#343541".to_owned())],
-            page_background: Some("#18181e".to_owned()),
-            card_background: Some("#1e1e24".to_owned()),
-            info_background: Some("#3c3728".to_owned()),
-        })
+        let mut colors = Vec::with_capacity(fg_slot_names().len() + bg_slot_names().len());
+        for (slot, name) in fg_slot_names() {
+            let value = if theme.is_fg_empty(*slot) {
+                default_text.to_owned()
+            } else {
+                slot_color_to_hex(theme.fg_value(*slot), default_text)
+            };
+            colors.push(((*name).to_owned(), value));
+        }
+        for (slot, name) in bg_slot_names() {
+            let value = if theme.is_bg_empty(*slot) {
+                String::new()
+            } else {
+                slot_color_to_hex(theme.bg_value(*slot), "")
+            };
+            colors.push(((*name).to_owned(), value));
+        }
+        Self {
+            colors,
+            page_background: None,
+            card_background: None,
+            info_background: None,
+        }
     }
+
+    /// Resolve a built-in theme name through the interactive theme interns.
+    ///
+    /// Unknown or missing names fall back to the default dark theme. For the
+    /// `dark`/`light` family, vendor export page/card/info colors are overlaid
+    /// so HTML export keeps the explicit backgrounds shipped for those two.
+    #[must_use]
+    pub fn built_in(name: Option<&str>) -> Self {
+        let resolved = match name {
+            Some(name) if BUILT_IN_THEME_NAMES.contains(&name) => {
+                load_or_dark(name, ColorMode::Truecolor)
+            }
+            _ => dark(),
+        };
+        let mut theme = Self::from_resolved(&resolved);
+        overlay_vendor_export_backgrounds(&mut theme, resolved.name.as_ref());
+        theme
+    }
+}
+
+fn is_light_theme_name(name: &str) -> bool {
+    name == "light" || name.ends_with("-light")
+}
+
+fn rgb_to_hex(Rgb(red, green, blue): Rgb) -> String {
+    format!("#{red:02x}{green:02x}{blue:02x}")
+}
+
+fn slot_color_to_hex(value: ThemeSlotValue, default_text: &str) -> String {
+    match value {
+        ThemeSlotValue::Empty => default_text.to_owned(),
+        ThemeSlotValue::Indexed(index) => ansi_256_to_hex(u16::from(index)),
+        ThemeSlotValue::Rgb(rgb) => rgb_to_hex(rgb),
+    }
+}
+
+fn overlay_vendor_export_backgrounds(theme: &mut ExportTheme, name: &str) {
+    let (source, light) = match name {
+        "light" => (LIGHT_THEME, true),
+        "dark" => (DARK_THEME, false),
+        _ => return,
+    };
+    let Ok(vendor) = ExportTheme::from_json(source, light) else {
+        return;
+    };
+    theme.page_background = vendor.page_background;
+    theme.card_background = vendor.card_background;
+    theme.info_background = vendor.info_background;
+}
+
+/// Headless export resolution: Auto/pair settings pick the dark member.
+#[must_use]
+pub fn resolve_export_theme(raw: Option<&str>, mode: ThemeMode) -> ExportTheme {
+    let resolved = resolve_active_theme(raw, mode, TerminalTheme::Dark);
+    let mut theme = ExportTheme::from_resolved(&resolved);
+    overlay_vendor_export_backgrounds(&mut theme, resolved.name.as_ref());
+    theme
 }
 
 fn resolve_theme_color(
@@ -267,7 +354,7 @@ fn ansi_256_to_hex(index: u16) -> String {
 pub struct ExportOptions<'a> {
     /// Output path; a pi-compatible basename is generated when absent.
     pub output_path: Option<PathBuf>,
-    /// Built-in theme name (`dark` or `light`). Unknown names use `dark`.
+    /// Built-in theme name (any of the ten built-in themes). Unknown names use `dark`.
     pub theme_name: Option<String>,
     /// Resolved custom theme, taking precedence over `theme_name`.
     pub theme: Option<ExportTheme>,
@@ -782,6 +869,91 @@ mod tests {
             json!("&lt;custom:custom-id&gt;")
         );
         assert!(data["renderedTools"].get("read-id").is_none());
+        Ok(())
+    }
+
+    fn css_var(theme: &ExportTheme, name: &str) -> Option<String> {
+        theme
+            .colors
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.clone())
+    }
+
+    #[test]
+    fn built_in_resolves_all_ten_themes_distinctly() -> Result<(), String> {
+        let dark = ExportTheme::built_in(Some("dark"));
+        let m3_light = ExportTheme::built_in(Some("m3-light"));
+        assert_eq!(css_var(&dark, "accent").as_deref(), Some("#52a8ff"));
+        assert_eq!(css_var(&m3_light, "accent").as_deref(), Some("#6750a4"));
+        assert_ne!(
+            css_var(&dark, "accent"),
+            css_var(&m3_light, "accent"),
+            "m3-light must differ from dark"
+        );
+
+        let mut accents = std::collections::BTreeSet::new();
+        for name in BUILT_IN_THEME_NAMES {
+            let theme = ExportTheme::built_in(Some(name));
+            let accent = css_var(&theme, "accent").ok_or_else(|| format!("{name}: accent slot"))?;
+            accents.insert((name, accent));
+        }
+        assert_eq!(accents.len(), 10, "each built-in should resolve distinctly");
+
+        let unknown = ExportTheme::built_in(Some("not-a-theme"));
+        assert_eq!(css_var(&unknown, "accent").as_deref(), Some("#52a8ff"));
+        assert_eq!(unknown.page_background.as_deref(), Some("#18181e"));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_export_theme_honors_m3_light_and_auto_dark() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let m3 = resolve_export_theme(Some("m3-light"), ThemeMode::Light);
+        assert_eq!(css_var(&m3, "accent").as_deref(), Some("#6750a4"));
+        assert_eq!(css_var(&m3, "text").as_deref(), Some("#1d1b20"));
+
+        let auto_dark = resolve_export_theme(Some("dark"), ThemeMode::Auto);
+        assert_eq!(css_var(&auto_dark, "accent").as_deref(), Some("#52a8ff"));
+        assert_eq!(css_var(&auto_dark, "text").as_deref(), Some("#ededed"));
+        assert_eq!(auto_dark.page_background.as_deref(), Some("#18181e"));
+
+        let root = tempdir()?;
+        let input = fixture(root.path())?;
+        let output = root.path().join("m3.html");
+        export_from_file(
+            &input.to_string_lossy(),
+            ExportOptions {
+                output_path: Some(output.clone()),
+                theme: Some(resolve_export_theme(Some("m3-light"), ThemeMode::Light)),
+                ..ExportOptions::default()
+            },
+        )?;
+        let html = fs::read_to_string(output)?;
+        assert!(
+            html.contains("--accent: #6750a4;"),
+            "m3-light CSS variables should be embedded"
+        );
+        assert!(
+            html.contains("--text: #1d1b20;"),
+            "m3-light text slot should be embedded"
+        );
+
+        let output = root.path().join("auto-dark.html");
+        export_from_file(
+            &input.to_string_lossy(),
+            ExportOptions {
+                output_path: Some(output.clone()),
+                theme: Some(resolve_export_theme(Some("dark"), ThemeMode::Auto)),
+                ..ExportOptions::default()
+            },
+        )?;
+        let html = fs::read_to_string(output)?;
+        assert!(
+            html.contains("--accent: #52a8ff;"),
+            "auto+dark headless should export default dark"
+        );
+        assert!(html.contains("--exportPageBg: #18181e;"));
         Ok(())
     }
 }

@@ -24,7 +24,7 @@ use crate::core::compaction::{
 };
 use crate::core::export_html::{
     ExportError, ExportOptions, RenderedResult, RenderedToolHtml, SessionExportState,
-    ToolHtmlRenderer, export_session_to_html,
+    ToolHtmlRenderer, export_session_to_html, resolve_export_theme,
 };
 use crate::core::session_transfer::{SessionTransferError, export_branch_to_jsonl};
 use crate::core::sessions::{SessionEntry, SessionError};
@@ -438,8 +438,11 @@ impl AgentSession {
         let snapshot = self.agent.state();
         let state = SessionExportState::from_agent_snapshot(&snapshot);
 
-        // Resolve theme from settings.
-        let theme_name = self.lock_settings().get_theme();
+        // Headless resolution: Auto/pairs pick the dark member (TerminalTheme::Dark).
+        let theme = {
+            let settings = self.lock_settings();
+            resolve_export_theme(settings.get_theme().as_deref(), settings.get_theme_mode())
+        };
 
         // Pre-render extension tool HTML (async → sync bridge).
         let map_renderer = if let Some(renderer) = tool_pre_renderer {
@@ -487,8 +490,8 @@ impl AgentSession {
         let sm = self.session_manager.lock().await;
         let opts = ExportOptions {
             output_path: output_path.map(std::path::PathBuf::from),
-            theme_name,
-            theme: None,
+            theme_name: None,
+            theme: Some(theme),
             tool_renderer: map_renderer.as_ref().map(|r| r as &dyn ToolHtmlRenderer),
         };
         export_session_to_html(&sm, Some(&state), opts)
@@ -1214,6 +1217,62 @@ mod tests {
         );
         let data = decode_export_data(&html)?;
         assert_export_data(&data)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn export_to_html_uses_m3_light_and_auto_dark_settings() -> TestResult {
+        use crate::core::settings::ThemeMode;
+
+        let tmp = tempfile::tempdir()?;
+        let cwd = tmp.path().to_string_lossy().into_owned();
+
+        // m3-light pin
+        {
+            let session = export_test_session(&cwd)?;
+            {
+                let mut settings = session.lock_settings();
+                settings.set_theme("m3-light");
+                settings.set_theme_mode(ThemeMode::Light);
+            }
+            append_export_messages(&session).await?;
+            let output_path = tmp.path().join("m3.html");
+            let output_path = output_path
+                .to_str()
+                .ok_or_else(|| missing("temporary export path should be UTF-8"))?;
+            let output = session.export_to_html(Some(output_path), None).await?;
+            let html = std::fs::read_to_string(output)?;
+            assert!(
+                html.contains("--accent: #6750a4;"),
+                "settings theme m3-light should export m3-light CSS vars"
+            );
+        }
+
+        // dark + auto headless → default dark
+        {
+            let session = export_test_session(&cwd)?;
+            {
+                let mut settings = session.lock_settings();
+                settings.set_theme("dark");
+                settings.set_theme_mode(ThemeMode::Auto);
+            }
+            append_export_messages(&session).await?;
+            let output_path = tmp.path().join("auto-dark.html");
+            let output_path = output_path
+                .to_str()
+                .ok_or_else(|| missing("temporary export path should be UTF-8"))?;
+            let output = session.export_to_html(Some(output_path), None).await?;
+            let html = std::fs::read_to_string(output)?;
+            assert!(
+                html.contains("--accent: #52a8ff;"),
+                "theme=dark themeMode=auto headless should export default dark"
+            );
+            assert!(
+                html.contains("--exportPageBg: #18181e;"),
+                "default dark export page background should remain explicit"
+            );
+        }
+
         Ok(())
     }
 }
