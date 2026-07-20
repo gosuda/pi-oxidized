@@ -285,10 +285,11 @@ mod tests {
     #[test]
     fn estimate_text_tokens_counts_utf16_units_like_upstream() {
         // "中" = 3 UTF-8 bytes but 1 UTF-16 unit; "😀" = 4 bytes but 2 units.
-        // Upstream .length counts units, so 4 CJK chars = 4 units = 1 token
-        // and two emoji = 4 units = 1 token; byte counting would give 3 and 2.
+        // Upstream .length counts units: 4 CJK chars = 4 units = 1 token
+        // (bytes would give 3), and three emoji = 6 units = 2 tokens
+        // (bytes would give 3, scalar chars would give 1).
         assert_eq!(estimate_text_tokens("中中中中"), 1);
-        assert_eq!(estimate_text_tokens("😀😀"), 1);
+        assert_eq!(estimate_text_tokens("😀😀😀"), 2);
         assert_eq!(estimate_text_tokens("中中中中中"), 2);
     }
 
