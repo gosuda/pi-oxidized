@@ -64,6 +64,7 @@ use tokio_util::sync::CancellationToken;
 use crate::core::agent_session::events::AgentSessionEvent;
 use crate::core::agent_session::extension_runner::ExtensionRunner;
 use crate::core::agent_session::prompt::{PromptOptions, StreamingBehavior};
+use crate::core::agent_session_runtime::{ForkOutcome, SwitchOutcome};
 use crate::core::extension_host::{ExtensionUiEvent, HostExtensionRunner};
 use crate::core::platform::external_editor::{EditOutcome, edit_text_in_external_editor};
 use pi_ext::client::{HostUiRequest, HostUiResponse};
@@ -432,18 +433,21 @@ pub trait SessionHost: Send + Sync + 'static {
         exclude_from_context: bool,
     ) -> BoxFuture<'_, Result<(), String>>;
 
-    /// Start a new session (replacement pipeline).
-    fn new_session(&self) -> BoxFuture<'_, Result<(), String>>;
+    /// Start a new session (replacement pipeline). `Ok(Cancelled)` when a
+    /// `before_switch` extension hook cancels the replacement.
+    fn new_session(&self) -> BoxFuture<'_, Result<SwitchOutcome, String>>;
 
     /// Open the fork selector's confirmation; runtime supplies the entry id.
-    fn fork(&self, entry_id: &str) -> BoxFuture<'_, Result<(), String>>;
+    /// `Ok(Cancelled)` when a `before_fork` extension hook cancels the fork.
+    fn fork(&self, entry_id: &str) -> BoxFuture<'_, Result<ForkOutcome, String>>;
 
     /// Clone the session at the current leaf. `Ok(NothingToClone)` when there is
     /// no leaf yet; `Ok(Cancelled)` when a before-switch hook cancels the fork.
     fn clone(&self) -> BoxFuture<'_, Result<CloneOutcome, String>>;
 
-    /// Switch to a different session file (resume).
-    fn switch_session(&self, path: &str) -> BoxFuture<'_, Result<(), String>>;
+    /// Switch to a different session file (resume). `Ok(Cancelled)` when a
+    /// `before_switch` extension hook cancels the switch.
+    fn switch_session(&self, path: &str) -> BoxFuture<'_, Result<SwitchOutcome, String>>;
 
     /// Export the current session to HTML; runtime passes an optional path.
     fn export_html(&self, path: Option<&str>) -> BoxFuture<'_, Result<String, String>>;
@@ -2444,18 +2448,23 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         }
         match replacement {
             SessionReplacement::New => match self.session.new_session().await {
-                Ok(()) => {
+                Ok(outcome) if !outcome.cancelled => {
                     self.rebind_session_channels().await;
                     self.refresh_footer().await;
                     self.push_notice("new", "✓ New session started".to_owned());
                 }
+                Ok(_) => {}
                 Err(error) => self.record_err(Err(error)),
             },
-            SessionReplacement::Fork => {
-                self.record_err(self.session.fork("").await);
-                self.rebind_session_channels().await;
-                self.refresh_footer().await;
-            }
+            SessionReplacement::Fork => match self.session.fork("").await {
+                Ok(outcome) if !outcome.cancelled => {
+                    self.rebind_session_channels().await;
+                    self.refresh_footer().await;
+                    self.push_notice("fork", "Forked to new session".to_owned());
+                }
+                Ok(_) => {}
+                Err(error) => self.record_err(Err(error)),
+            },
             SessionReplacement::Clone => match <S as SessionHost>::clone(&self.session).await {
                 Ok(CloneOutcome::Cloned) => {
                     self.rebind_session_channels().await;
@@ -2718,9 +2727,15 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 if self.pending_extension_dialog.is_some() {
                     self.cancel_extension_dialog().await;
                 }
-                self.record_err(self.session.switch_session(&value).await);
-                self.rebind_session_channels().await;
-                self.refresh_footer().await;
+                match self.session.switch_session(&value).await {
+                    Ok(outcome) if !outcome.cancelled => {
+                        self.rebind_session_channels().await;
+                        self.refresh_footer().await;
+                        self.push_notice("resume", "Resumed session".to_owned());
+                    }
+                    Ok(_) => {}
+                    Err(error) => self.record_err(Err(error)),
+                }
                 self.close_selector();
                 ActionOutcome::Repaint
             }
@@ -2729,9 +2744,19 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 if self.pending_extension_dialog.is_some() {
                     self.cancel_extension_dialog().await;
                 }
-                self.record_err(self.session.fork(&value).await);
-                self.rebind_session_channels().await;
-                self.refresh_footer().await;
+                match self.session.fork(&value).await {
+                    Ok(outcome) if !outcome.cancelled => {
+                        if let Some(text) = outcome.selected_text {
+                            self.editor.set_text(&text);
+                            self.view.editor.text = self.editor.get_text();
+                        }
+                        self.rebind_session_channels().await;
+                        self.refresh_footer().await;
+                        self.push_notice("fork", "Forked to new session".to_owned());
+                    }
+                    Ok(_) => {}
+                    Err(error) => self.record_err(Err(error)),
+                }
                 self.close_selector();
                 ActionOutcome::Repaint
             }
@@ -5435,36 +5460,38 @@ impl SessionHost for AgentSessionHost {
         })
     }
 
-    fn new_session(&self) -> BoxFuture<'_, Result<(), String>> {
+    fn new_session(&self) -> BoxFuture<'_, Result<SwitchOutcome, String>> {
         let runtime = Arc::clone(&self.runtime);
         let host_session = Arc::clone(&self.session);
         Box::pin(async move {
-            runtime
+            let outcome = runtime
                 .new_session(NewSessionOptions::default())
                 .await
-                .map(|_| ())
                 .map_err(|err| runtime_err_to_string(&err))?;
-            if let Ok(mut guard) = host_session.write() {
+            if !outcome.cancelled
+                && let Ok(mut guard) = host_session.write()
+            {
                 *guard = runtime.session();
             }
-            Ok(())
+            Ok(outcome)
         })
     }
 
-    fn fork(&self, entry_id: &str) -> BoxFuture<'_, Result<(), String>> {
+    fn fork(&self, entry_id: &str) -> BoxFuture<'_, Result<ForkOutcome, String>> {
         let runtime = Arc::clone(&self.runtime);
         let host_session = Arc::clone(&self.session);
         let entry_id = entry_id.to_owned();
         Box::pin(async move {
-            runtime
+            let outcome = runtime
                 .fork(&entry_id, ForkPosition::Before)
                 .await
-                .map(|_| ())
                 .map_err(|err| runtime_err_to_string(&err))?;
-            if let Ok(mut guard) = host_session.write() {
+            if !outcome.cancelled
+                && let Ok(mut guard) = host_session.write()
+            {
                 *guard = runtime.session();
             }
-            Ok(())
+            Ok(outcome)
         })
     }
 
@@ -5498,20 +5525,21 @@ impl SessionHost for AgentSessionHost {
         })
     }
 
-    fn switch_session(&self, path: &str) -> BoxFuture<'_, Result<(), String>> {
+    fn switch_session(&self, path: &str) -> BoxFuture<'_, Result<SwitchOutcome, String>> {
         let runtime = Arc::clone(&self.runtime);
         let host_session = Arc::clone(&self.session);
         let path = path.to_owned();
         Box::pin(async move {
-            runtime
+            let outcome = runtime
                 .switch_session(&path, SwitchSessionOptions::default())
                 .await
-                .map(|_| ())
                 .map_err(|err| runtime_err_to_string(&err))?;
-            if let Ok(mut guard) = host_session.write() {
+            if !outcome.cancelled
+                && let Ok(mut guard) = host_session.write()
+            {
                 *guard = runtime.session();
             }
-            Ok(())
+            Ok(outcome)
         })
     }
 
@@ -6282,6 +6310,10 @@ mod tests {
         stream_chunks: Arc<AtomicUsize>,
         logout_options: Arc<std::sync::Mutex<Vec<super::state::LogoutOption>>>,
         clone_nothing: Arc<std::sync::atomic::AtomicBool>,
+        cancel_new: Arc<std::sync::atomic::AtomicBool>,
+        cancel_fork: Arc<std::sync::atomic::AtomicBool>,
+        cancel_switch: Arc<std::sync::atomic::AtomicBool>,
+        fork_selected_text: Arc<std::sync::Mutex<Option<String>>>,
     }
 
     impl FakeHost {
@@ -6296,6 +6328,10 @@ mod tests {
                 stream_chunks: Arc::new(AtomicUsize::new(0)),
                 logout_options: Arc::new(std::sync::Mutex::new(Vec::new())),
                 clone_nothing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                cancel_new: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                cancel_fork: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                cancel_switch: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                fork_selected_text: Arc::new(std::sync::Mutex::new(None)),
             };
             (host, log)
         }
@@ -6313,6 +6349,25 @@ mod tests {
 
         fn set_clone_nothing(&self, nothing: bool) {
             self.clone_nothing.store(nothing, Ordering::SeqCst);
+        }
+
+        fn set_cancel_new(&self, cancel: bool) {
+            self.cancel_new.store(cancel, Ordering::SeqCst);
+        }
+
+        fn set_cancel_fork(&self, cancel: bool) {
+            self.cancel_fork.store(cancel, Ordering::SeqCst);
+        }
+
+        fn set_cancel_switch(&self, cancel: bool) {
+            self.cancel_switch.store(cancel, Ordering::SeqCst);
+        }
+
+        fn set_fork_selected_text(&self, text: Option<String>) {
+            *self
+                .fork_selected_text
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = text;
         }
     }
 
@@ -6509,20 +6564,30 @@ mod tests {
             })
         }
 
-        fn new_session(&self) -> BoxFuture<'_, Result<(), String>> {
+        fn new_session(&self) -> BoxFuture<'_, Result<SwitchOutcome, String>> {
             let log = Arc::clone(&self.log);
+            let cancel = self.cancel_new.load(Ordering::SeqCst);
             Box::pin(async move {
                 *log.new_sessions.lock().await += 1;
-                Ok(())
+                Ok(SwitchOutcome { cancelled: cancel })
             })
         }
 
-        fn fork(&self, entry_id: &str) -> BoxFuture<'_, Result<(), String>> {
+        fn fork(&self, entry_id: &str) -> BoxFuture<'_, Result<ForkOutcome, String>> {
             let log = Arc::clone(&self.log);
             let owned = entry_id.to_owned();
+            let cancel = self.cancel_fork.load(Ordering::SeqCst);
+            let selected_text = self
+                .fork_selected_text
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             Box::pin(async move {
                 log.forks.lock().await.push(owned);
-                Ok(())
+                Ok(ForkOutcome {
+                    cancelled: cancel,
+                    selected_text,
+                })
             })
         }
 
@@ -6537,12 +6602,13 @@ mod tests {
             })
         }
 
-        fn switch_session(&self, path: &str) -> BoxFuture<'_, Result<(), String>> {
+        fn switch_session(&self, path: &str) -> BoxFuture<'_, Result<SwitchOutcome, String>> {
             let log = Arc::clone(&self.log);
             let owned = path.to_owned();
+            let cancel = self.cancel_switch.load(Ordering::SeqCst);
             Box::pin(async move {
                 log.switches.lock().await.push(owned);
-                Ok(())
+                Ok(SwitchOutcome { cancelled: cancel })
             })
         }
 
@@ -8652,6 +8718,12 @@ mod tests {
     #[tokio::test]
     async fn new_session_success_shows_notice() -> TestResult {
         let (mut rt, log) = try_make_runtime()?;
+        let before = rt
+            .session
+            .event_senders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
         let _ = rt.submit_text("/new".to_owned(), false).await;
         assert_eq!(*log.new_sessions.lock().await, 1);
         assert!(matches!(
@@ -8659,6 +8731,196 @@ mod tests {
             Some(MessageView::Custom(custom))
                 if custom.custom_type == "new" && custom.text.contains("New session started")
         ));
+        let after = rt
+            .session
+            .event_senders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        assert_eq!(after, before + 1, "success rebinds subscriptions");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn new_session_cancelled_suppresses_notice_and_rebind() -> TestResult {
+        let (mut rt, log) = try_make_runtime()?;
+        rt.session.set_cancel_new(true);
+        let before = rt
+            .session
+            .event_senders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        let _ = rt.submit_text("/new".to_owned(), false).await;
+        assert_eq!(*log.new_sessions.lock().await, 1);
+        assert!(
+            !rt.view.messages.iter().any(|message| matches!(
+                message,
+                MessageView::Custom(custom)
+                    if custom.custom_type == "new" && custom.text.contains("New session started")
+            )),
+            "cancelled new session must not show success notice"
+        );
+        let after = rt
+            .session
+            .event_senders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        assert_eq!(after, before, "cancelled new session must not rebind");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fork_success_shows_notice() -> TestResult {
+        let (mut rt, log) = try_make_runtime()?;
+        let before = rt
+            .session
+            .event_senders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        let _ = rt
+            .dispatch_action(ViewAction::SelectConfirmed {
+                selector: SelectorKind::Fork,
+                value: "entry-1".to_owned(),
+            })
+            .await;
+        assert_eq!(log.forks.lock().await.as_slice(), &["entry-1".to_owned()]);
+        assert!(matches!(
+            rt.view.messages.last(),
+            Some(MessageView::Custom(custom))
+                if custom.custom_type == "fork" && custom.text.contains("Forked to new session")
+        ));
+        let after = rt
+            .session
+            .event_senders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        assert_eq!(after, before + 1, "success rebinds subscriptions");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fork_success_prefills_selected_text() -> TestResult {
+        let (mut rt, _log) = try_make_runtime()?;
+        rt.session
+            .set_fork_selected_text(Some("prefill text".to_owned()));
+        let _ = rt
+            .dispatch_action(ViewAction::SelectConfirmed {
+                selector: SelectorKind::Fork,
+                value: "entry-1".to_owned(),
+            })
+            .await;
+        assert_eq!(rt.view.editor.text, "prefill text");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fork_cancelled_suppresses_notice_and_rebind() -> TestResult {
+        let (mut rt, log) = try_make_runtime()?;
+        rt.session.set_cancel_fork(true);
+        let before = rt
+            .session
+            .event_senders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        let _ = rt
+            .dispatch_action(ViewAction::SelectConfirmed {
+                selector: SelectorKind::Fork,
+                value: "entry-1".to_owned(),
+            })
+            .await;
+        assert_eq!(log.forks.lock().await.as_slice(), &["entry-1".to_owned()]);
+        assert!(
+            !rt.view.messages.iter().any(|message| matches!(
+                message,
+                MessageView::Custom(custom)
+                    if custom.custom_type == "fork" && custom.text.contains("Forked to new session")
+            )),
+            "cancelled fork must not show success notice"
+        );
+        let after = rt
+            .session
+            .event_senders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        assert_eq!(after, before, "cancelled fork must not rebind");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resume_success_shows_notice() -> TestResult {
+        let (mut rt, log) = try_make_runtime()?;
+        let before = rt
+            .session
+            .event_senders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        let _ = rt
+            .dispatch_action(ViewAction::SelectConfirmed {
+                selector: SelectorKind::Session,
+                value: "/tmp/sess.json".to_owned(),
+            })
+            .await;
+        assert_eq!(
+            log.switches.lock().await.as_slice(),
+            &["/tmp/sess.json".to_owned()]
+        );
+        assert!(matches!(
+            rt.view.messages.last(),
+            Some(MessageView::Custom(custom))
+                if custom.custom_type == "resume" && custom.text.contains("Resumed session")
+        ));
+        let after = rt
+            .session
+            .event_senders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        assert_eq!(after, before + 1, "success rebinds subscriptions");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resume_cancelled_suppresses_notice_and_rebind() -> TestResult {
+        let (mut rt, log) = try_make_runtime()?;
+        rt.session.set_cancel_switch(true);
+        let before = rt
+            .session
+            .event_senders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        let _ = rt
+            .dispatch_action(ViewAction::SelectConfirmed {
+                selector: SelectorKind::Session,
+                value: "/tmp/sess.json".to_owned(),
+            })
+            .await;
+        assert_eq!(
+            log.switches.lock().await.as_slice(),
+            &["/tmp/sess.json".to_owned()]
+        );
+        assert!(
+            !rt.view.messages.iter().any(|message| matches!(
+                message,
+                MessageView::Custom(custom)
+                    if custom.custom_type == "resume" && custom.text.contains("Resumed session")
+            )),
+            "cancelled resume must not show success notice"
+        );
+        let after = rt
+            .session
+            .event_senders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        assert_eq!(after, before, "cancelled resume must not rebind");
         Ok(())
     }
 
