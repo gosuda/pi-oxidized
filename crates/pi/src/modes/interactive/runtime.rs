@@ -399,6 +399,19 @@ pub trait SessionHost: Send + Sync + 'static {
     /// Export the current session to HTML; runtime passes an optional path.
     fn export_html(&self, path: Option<&str>) -> BoxFuture<'_, Result<String, String>>;
 
+    /// Export the current session to JSONL; runtime passes an optional path.
+    fn export_jsonl(&self, path: Option<&str>) -> BoxFuture<'_, Result<String, String>>;
+
+    /// Import and replace the current session from a JSONL file.
+    fn import_jsonl(&self, path: &str) -> BoxFuture<'_, Result<(), String>>;
+
+    /// Export to a temp HTML and upload it as a secret gist; returns
+    /// `(viewer_url, gist_url)`.
+    fn share(&self) -> BoxFuture<'_, Result<(String, String), String>>;
+
+    /// Aggregate session statistics for `/session`.
+    fn session_stats(&self) -> BoxFuture<'_, crate::core::agent_session::stats::SessionStats>;
+
     /// Set the session display name.
     fn set_session_name(&self, name: &str) -> BoxFuture<'_, Result<(), String>>;
 
@@ -493,12 +506,66 @@ pub(crate) enum ActionOutcome {
     ExternalEditor,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TypedBuiltin<'a> {
-    Compact(Option<&'a str>),
-    Fork,
-    Resume,
-    Reload,
+/// Split a `/command args` string into `(name, args)`; `None` when `text` is not
+/// a slash command. `args` has leading whitespace trimmed.
+fn parse_slash_command(text: &str) -> Option<(&str, &str)> {
+    let rest = text.strip_prefix('/')?;
+    match rest.split_once(char::is_whitespace) {
+        Some((name, args)) => Some((name, args.trim_start())),
+        None => Some((rest, "")),
+    }
+}
+
+/// Extract the first path argument (`getPathCommandArgument` semantics): the
+/// first whitespace-delimited token, honoring a single/double-quoted span.
+/// `None` when `args` is empty or holds an unterminated quote.
+fn parse_path_argument(args: &str) -> Option<String> {
+    let args = args.trim_start();
+    let first = args.chars().next()?;
+    if first == '"' || first == '\'' {
+        let rest = &args[1..];
+        return rest.find(first).map(|idx| rest[..idx].to_owned());
+    }
+    let end = args.find(char::is_whitespace).unwrap_or(args.len());
+    Some(args[..end].to_owned())
+}
+
+/// Render `/session` stats as a markdown block (ports `handleSessionCommand`;
+/// per-model and cache-waste breakdown omitted — see divergence ledger).
+fn format_session_info(
+    stats: &crate::core::agent_session::stats::SessionStats,
+    name: Option<&str>,
+) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::from("**Session Info**\n\n");
+    if let Some(name) = name {
+        let _ = writeln!(out, "Name: {name}");
+    }
+    let file = stats.session_file.as_deref().unwrap_or("In-memory");
+    let _ = writeln!(out, "File: {file}");
+    let _ = writeln!(out, "ID: {}\n", stats.session_id);
+    let _ = writeln!(out, "**Messages**");
+    let _ = writeln!(out, "Total: {}", stats.total_messages);
+    let _ = writeln!(out, "User: {}", stats.user_messages);
+    let _ = writeln!(out, "Assistant: {}", stats.assistant_messages);
+    let _ = writeln!(
+        out,
+        "Tools: {} calls, {} results\n",
+        stats.tool_calls, stats.tool_results
+    );
+    let tokens = &stats.tokens;
+    let prompt_tokens = tokens
+        .input
+        .saturating_add(tokens.cache_read)
+        .saturating_add(tokens.cache_write);
+    let _ = writeln!(out, "**Tokens**");
+    let _ = writeln!(out, "Input: {prompt_tokens}");
+    let _ = writeln!(out, "Output: {}", tokens.output);
+    let _ = writeln!(out, "Total: {}", tokens.total);
+    if stats.cost > 0.0 {
+        let _ = write!(out, "\n**Cost**\nTotal: ${:.3}", stats.cost);
+    }
+    out
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -506,20 +573,6 @@ enum SessionReplacement {
     New,
     Fork,
     Clone,
-}
-
-fn parse_typed_builtin(text: &str) -> Option<TypedBuiltin<'_>> {
-    match text {
-        "/compact" => Some(TypedBuiltin::Compact(None)),
-        "/fork" => Some(TypedBuiltin::Fork),
-        "/resume" => Some(TypedBuiltin::Resume),
-        "/reload" => Some(TypedBuiltin::Reload),
-        _ => text
-            .strip_prefix("/compact ")
-            .map(str::trim)
-            .map(Some)
-            .map(TypedBuiltin::Compact),
-    }
 }
 
 impl Default for InteractiveRuntimeOptions {
@@ -1506,6 +1559,9 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         // Refresh view.editor.text from the live buffer so the mapper sees
         // the freshest value.
         let live_text = self.editor.get_text();
+        // Expanded form (paste markers resolved) feeds submission paths so
+        // followUp/submit carry real content, not the collapsed marker.
+        let expanded_text = self.editor.get_expanded_text();
         self.view.editor.text.clone_from(&live_text);
         let (_line, col) = self.editor.get_cursor();
         self.view.editor.cursor = col;
@@ -1547,6 +1603,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             &event,
             &self.view,
             &live_text,
+            &expanded_text,
             &mut self.input_state,
             editor_result.is_handled(),
         ));
@@ -1770,12 +1827,182 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         ActionOutcome::Repaint
     }
 
-    async fn submit_slash_command(&mut self, name: String, args: String) -> ActionOutcome {
-        if name == "debug" {
-            return self.handle_debug_command();
+    /// Route a built-in slash command by `name` + `args`. Returns `Some` when
+    /// `name` is a recognized built-in (fully handled here) so the command never
+    /// reaches the LLM; `None` lets the caller fall through to extension dispatch
+    /// or the prompt path.
+    async fn dispatch_builtin_command(&mut self, name: &str, args: &str) -> Option<ActionOutcome> {
+        use super::state::SelectorKind;
+        let outcome = match name {
+            "quit" => ActionOutcome::Exit,
+            "debug" => self.handle_debug_command(),
+            "theme" => self.open_selector(SelectorKind::Theme).await,
+            "settings" => self.open_selector(SelectorKind::Settings).await,
+            "model" => self.open_selector(SelectorKind::Model).await,
+            "scoped-models" => self.open_selector(SelectorKind::ScopedModels).await,
+            "export" => self.handle_export_command(args).await,
+            "import" => self.handle_import_command(args).await,
+            "share" => self.handle_share_command().await,
+            "copy" => self.copy_last_assistant().await,
+            "name" => self.handle_name_command(args).await,
+            "session" => self.handle_session_command().await,
+            "changelog" => self.handle_changelog_command(),
+            "hotkeys" => self.handle_hotkeys_command(),
+            "fork" => self.open_selector(SelectorKind::Fork).await,
+            "clone" => {
+                self.record_err(<S as SessionHost>::clone(&self.session).await);
+                ActionOutcome::None
+            }
+            "tree" => self.open_selector(SelectorKind::Tree).await,
+            "trust" => self.open_selector(SelectorKind::Trust).await,
+            "login" => self.open_selector(SelectorKind::Auth).await,
+            "logout" => {
+                self.record_err(self.session.logout().await);
+                ActionOutcome::None
+            }
+            "new" => {
+                self.record_err(self.session.new_session().await);
+                ActionOutcome::None
+            }
+            "compact" => {
+                let instructions = (!args.is_empty()).then_some(args);
+                self.record_err(self.session.compact(instructions).await);
+                ActionOutcome::None
+            }
+            "resume" => self.open_selector(SelectorKind::Session).await,
+            "reload" => self.handle_reload_action().await,
+            _ => return None,
+        };
+        Some(outcome)
+    }
+
+    /// `/export [path]`: JSONL when the path ends in `.jsonl`, else HTML.
+    async fn handle_export_command(&mut self, args: &str) -> ActionOutcome {
+        let path = parse_path_argument(args);
+        let is_jsonl = path.as_deref().is_some_and(|value| {
+            std::path::Path::new(value)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
+        });
+        let result = if is_jsonl {
+            self.session.export_jsonl(path.as_deref()).await
+        } else {
+            self.session.export_html(path.as_deref()).await
+        };
+        match result {
+            Ok(written) => self.push_notice("export", format!("Session exported to: {written}")),
+            Err(error) => {
+                self.push_notice("export", format!("Failed to export session: {error}"));
+            }
         }
-        if name == "theme" {
-            return self.open_selector(super::state::SelectorKind::Theme).await;
+        ActionOutcome::Repaint
+    }
+
+    /// `/import <path>`: replace the current session from a JSONL file.
+    async fn handle_import_command(&mut self, args: &str) -> ActionOutcome {
+        let Some(path) = parse_path_argument(args) else {
+            self.push_notice("import", "Usage: /import <path.jsonl>".to_owned());
+            return ActionOutcome::Repaint;
+        };
+        match self.session.import_jsonl(&path).await {
+            Ok(()) => {
+                self.rebind_session_channels().await;
+                self.refresh_footer().await;
+                self.push_notice("import", format!("Session imported from: {path}"));
+            }
+            Err(error) => {
+                self.push_notice("import", format!("Failed to import session: {error}"));
+            }
+        }
+        ActionOutcome::Repaint
+    }
+
+    /// `/share`: export to a temp HTML and upload it as a secret gist.
+    async fn handle_share_command(&mut self) -> ActionOutcome {
+        match self.session.share().await {
+            Ok((viewer_url, gist_url)) => {
+                self.push_notice(
+                    "share",
+                    format!("Share URL: {viewer_url}\nGist: {gist_url}"),
+                );
+            }
+            Err(error) => self.push_notice("share", format!("Failed to create gist: {error}")),
+        }
+        ActionOutcome::Repaint
+    }
+
+    /// `/name [text]`: set the session display name, or show the current one.
+    async fn handle_name_command(&mut self, args: &str) -> ActionOutcome {
+        let name = args.trim();
+        if name.is_empty() {
+            match self.view.footer.session_name.clone() {
+                Some(current) => self.push_notice("name", format!("Session name: {current}")),
+                None => self.push_notice("name", "Usage: /name <name>".to_owned()),
+            }
+            return ActionOutcome::Repaint;
+        }
+        match self.session.set_session_name(name).await {
+            Ok(()) => self.push_notice("name", format!("Session name set: {name}")),
+            Err(error) => {
+                self.push_notice("name", format!("Failed to set session name: {error}"));
+            }
+        }
+        ActionOutcome::Repaint
+    }
+
+    /// `/session`: show session info and stats.
+    async fn handle_session_command(&mut self) -> ActionOutcome {
+        let stats = self.session.session_stats().await;
+        let name = self.view.footer.session_name.clone();
+        self.push_notice("session", format_session_info(&stats, name.as_deref()));
+        ActionOutcome::Repaint
+    }
+
+    /// `/changelog`: open the release-notes overlay from `CHANGELOG.md`.
+    fn handle_changelog_command(&mut self) -> ActionOutcome {
+        use crate::core::config::get_changelog_path;
+        use crate::core::update::changelog::{normalize_changelog_links, parse_changelog};
+        let entries = parse_changelog(&get_changelog_path());
+        let markdown = if entries.is_empty() {
+            "No changelog entries found.".to_owned()
+        } else {
+            entries
+                .iter()
+                .rev()
+                .map(|entry| normalize_changelog_links(&entry.content, &entry.version()))
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        };
+        self.view.overlay = Some(Overlay {
+            kind: OverlayKind::Changelog,
+            lines: markdown.lines().map(str::to_owned).collect(),
+            height: 1,
+        });
+        self.view.extension_overlay_slot = None;
+        self.view.focus = FocusArea::Overlay;
+        self.input_state.reset_taps();
+        ActionOutcome::Repaint
+    }
+
+    /// `/hotkeys`: open the keyboard-shortcut overlay.
+    fn handle_hotkeys_command(&mut self) -> ActionOutcome {
+        self.open_overlay(OverlayKind::ShortcutHelp)
+    }
+
+    /// Append a local command-result message to the transcript.
+    fn push_notice(&mut self, label: &str, text: String) {
+        self.view
+            .messages
+            .push(MessageView::Custom(super::messages::CustomMessageView {
+                custom_type: label.to_owned(),
+                text,
+            }));
+        self.chat_dirty = true;
+    }
+
+    async fn submit_slash_command(&mut self, name: String, args: String) -> ActionOutcome {
+        if let Some(outcome) = self.dispatch_builtin_command(&name, &args).await {
+            return outcome;
         }
         if let Some(runner) = self.extension_runner.as_ref()
             && runner
@@ -1953,28 +2180,10 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         if trimmed.is_empty() {
             return ActionOutcome::None;
         }
-        if trimmed == "/quit" {
-            return ActionOutcome::Exit;
-        }
-        if trimmed == "/debug" {
-            return self.handle_debug_command();
-        }
-        if trimmed == "/theme" {
-            return self.open_selector(super::state::SelectorKind::Theme).await;
-        }
-        if let Some(command) = parse_typed_builtin(&trimmed) {
-            return match command {
-                TypedBuiltin::Compact(instructions) => {
-                    self.record_err(self.session.compact(instructions).await);
-                    ActionOutcome::None
-                }
-                TypedBuiltin::Fork => self.open_selector(super::state::SelectorKind::Fork).await,
-                TypedBuiltin::Resume => {
-                    self.open_selector(super::state::SelectorKind::Session)
-                        .await
-                }
-                TypedBuiltin::Reload => self.handle_reload_action().await,
-            };
+        if let Some((name, args)) = parse_slash_command(&trimmed)
+            && let Some(outcome) = self.dispatch_builtin_command(name, args).await
+        {
+            return outcome;
         }
 
         // `!`/`!!` bash prefix routes directly to execute_bash.
@@ -2617,28 +2826,33 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 }
             },
             UiControl::SetWorkingMessage { message } => {
-                if let Some(message) = message {
-                    self.set_status(SessionStatus {
-                        kind: StatusKind::Working,
-                        frame: 0,
-                        message,
-                    });
-                } else if self
-                    .view
-                    .status
-                    .as_ref()
-                    .is_some_and(|status| status.kind == StatusKind::Working)
+                self.view.working_message.clone_from(&message);
+                if let Some(status) = self.view.status.as_mut()
+                    && status.kind == StatusKind::Working
                 {
-                    self.view.status = None;
+                    status.message = message.unwrap_or_else(|| DEFAULT_WORKING_MESSAGE.to_owned());
                 }
             }
             UiControl::SetWorkingVisible { visible } => {
+                self.view.working_visible = visible;
                 if visible {
-                    if self.view.status.is_none() {
+                    // Surface only while streaming; never spuriously while idle.
+                    if self.view.streaming
+                        && !self
+                            .view
+                            .status
+                            .as_ref()
+                            .is_some_and(|status| status.kind == StatusKind::Working)
+                    {
+                        let message = self
+                            .view
+                            .working_message
+                            .clone()
+                            .unwrap_or_else(|| DEFAULT_WORKING_MESSAGE.to_owned());
                         self.set_status(SessionStatus {
                             kind: StatusKind::Working,
                             frame: 0,
-                            message: "Working…".to_owned(),
+                            message,
                         });
                     }
                 } else if self
@@ -2703,7 +2917,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             return;
         };
         let state = UiStateWire {
-            editor_text: self.editor.get_text(),
+            editor_text: self.editor.get_expanded_text(),
             tools_expanded: self.display.tools_expanded,
         };
         Arc::clone(runner).push_ui_state(&state).await;
@@ -3419,6 +3633,25 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
 // Pure projection helpers
 // ---------------------------------------------------------------------------
 
+/// Default working-indicator text when no extension override is set.
+const DEFAULT_WORKING_MESSAGE: &str = "Working…";
+
+/// Working-indicator status for agent-start / streaming projection, honoring the
+/// extension `workingVisible` toggle and `workingMessage` override.
+fn working_start_status(view: &ViewState) -> Option<SessionStatus> {
+    if !view.working_visible {
+        return None;
+    }
+    Some(SessionStatus {
+        kind: StatusKind::Working,
+        frame: 0,
+        message: view
+            .working_message
+            .clone()
+            .unwrap_or_else(|| DEFAULT_WORKING_MESSAGE.to_owned()),
+    })
+}
+
 /// Apply a [`SessionSnapshot`] to [`ViewState`]. `partial` may overwrite the
 /// streaming tail when present.
 fn project_snapshot(
@@ -3427,12 +3660,9 @@ fn project_snapshot(
     partial: Option<&Arc<AssistantMessage>>,
 ) {
     view.streaming = snapshot.is_streaming();
+    let streaming_status = working_start_status(view);
     view.status = match snapshot.activity {
-        SessionActivity::Streaming => Some(SessionStatus {
-            kind: StatusKind::Working,
-            frame: 0,
-            message: "Working…".to_owned(),
-        }),
+        SessionActivity::Streaming => streaming_status,
         SessionActivity::Compacting => Some(SessionStatus {
             kind: StatusKind::Compaction,
             frame: 0,
@@ -3527,11 +3757,7 @@ fn project_event(view: &mut ViewState, event: &AgentSessionEvent) {
     match event {
         Event::AgentStart => {
             view.streaming = true;
-            view.status = Some(SessionStatus {
-                kind: StatusKind::Working,
-                frame: 0,
-                message: "Working…".to_owned(),
-            });
+            view.status = working_start_status(view);
         }
         Event::AgentEnd { will_retry, .. } => {
             if !will_retry {
@@ -4974,6 +5200,66 @@ impl SessionHost for AgentSessionHost {
         let session = self.read_session();
         Box::pin(async move { Ok(session.get_last_assistant_text()) })
     }
+
+    fn export_jsonl(&self, path: Option<&str>) -> BoxFuture<'_, Result<String, String>> {
+        let session = self.read_session();
+        let path = path.map(str::to_owned);
+        Box::pin(async move {
+            session
+                .export_to_jsonl(path.as_deref())
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    fn import_jsonl(&self, path: &str) -> BoxFuture<'_, Result<(), String>> {
+        let runtime = Arc::clone(&self.runtime);
+        let host_session = Arc::clone(&self.session);
+        let path = path.to_owned();
+        Box::pin(async move {
+            runtime
+                .import_from_jsonl(&path, None)
+                .await
+                .map(|_| ())
+                .map_err(|err| runtime_err_to_string(&err))?;
+            if let Ok(mut guard) = host_session.write() {
+                *guard = runtime.session();
+            }
+            Ok(())
+        })
+    }
+
+    fn share(&self) -> BoxFuture<'_, Result<(String, String), String>> {
+        let session = self.read_session();
+        Box::pin(async move {
+            // Unique, unpredictable temp dir per call (mirrors share.rs
+            // `TemporaryShareFile`): avoids collisions between concurrent shares
+            // and pre-created-symlink races on a guessable path.
+            let directory = std::env::temp_dir().join(format!("pi-share-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&directory).map_err(|error| error.to_string())?;
+            let html_path = directory.join("session.html");
+            let path_str = html_path.to_string_lossy().into_owned();
+            // Export via the live session so shared HTML carries system prompt
+            // and tools, matching the `/export` path.
+            let exported = session.export_to_html(Some(&path_str), None).await;
+            let cancel = CancellationToken::new();
+            let shared = match exported {
+                Ok(_) => crate::core::share::share_html_file(&html_path, &cancel)
+                    .await
+                    .map_err(|error| error.to_string()),
+                Err(error) => Err(error.to_string()),
+            };
+            let _ = std::fs::remove_file(&html_path);
+            let _ = std::fs::remove_dir(&directory);
+            let shared = shared?;
+            Ok((shared.viewer_url, shared.gist_url))
+        })
+    }
+
+    fn session_stats(&self) -> BoxFuture<'_, crate::core::agent_session::stats::SessionStats> {
+        let session = self.read_session();
+        Box::pin(async move { session.get_session_stats().await })
+    }
 }
 
 /// Map a runtime error into a `String` for [`SessionHost`] consumers.
@@ -5242,7 +5528,7 @@ where
     G: Write,
     S: SessionHost,
 {
-    let initial = rt.editor.get_text();
+    let initial = rt.editor.get_expanded_text();
     let editor_command = rt.session.external_editor_command();
     rt.input
         .pause()
@@ -5565,6 +5851,8 @@ mod tests {
         clones: Mutex<u32>,
         switches: Mutex<Vec<String>>,
         logouts: Mutex<u32>,
+        imports: Mutex<Vec<String>>,
+        shares: Mutex<u32>,
         follows: Mutex<Vec<String>>,
         steers: Mutex<Vec<String>>,
         last_text: Mutex<Option<String>>,
@@ -5829,6 +6117,48 @@ mod tests {
 
         fn export_html(&self, _path: Option<&str>) -> BoxFuture<'_, Result<String, String>> {
             Box::pin(async { Ok("<html></html>".to_owned()) })
+        }
+
+        fn export_jsonl(&self, path: Option<&str>) -> BoxFuture<'_, Result<String, String>> {
+            let owned = path.map(str::to_owned);
+            Box::pin(async move { Ok(owned.unwrap_or_else(|| "session.jsonl".to_owned())) })
+        }
+
+        fn import_jsonl(&self, path: &str) -> BoxFuture<'_, Result<(), String>> {
+            let log = Arc::clone(&self.log);
+            let owned = path.to_owned();
+            Box::pin(async move {
+                log.imports.lock().await.push(owned);
+                Ok(())
+            })
+        }
+
+        fn share(&self) -> BoxFuture<'_, Result<(String, String), String>> {
+            let log = Arc::clone(&self.log);
+            Box::pin(async move {
+                *log.shares.lock().await += 1;
+                Ok((
+                    "https://viewer.example/abc".to_owned(),
+                    "https://gist.github.com/u/abc".to_owned(),
+                ))
+            })
+        }
+
+        fn session_stats(&self) -> BoxFuture<'_, crate::core::agent_session::stats::SessionStats> {
+            Box::pin(async {
+                crate::core::agent_session::stats::SessionStats {
+                    session_file: None,
+                    session_id: "test-session".to_owned(),
+                    user_messages: 0,
+                    assistant_messages: 0,
+                    tool_calls: 0,
+                    tool_results: 0,
+                    total_messages: 0,
+                    tokens: crate::core::agent_session::stats::SessionTokenTotals::default(),
+                    cost: 0.0,
+                    context_usage: None,
+                }
+            })
         }
 
         fn set_session_name(&self, _name: &str) -> BoxFuture<'_, Result<(), String>> {
@@ -6175,12 +6505,14 @@ mod tests {
         let (mut rt, log) = make_runtime();
         let _ = rt
             .dispatch_action(ViewAction::SlashCommand {
-                name: "name".to_owned(),
-                args: "my session".to_owned(),
+                // Non-builtin command: falls through to the prompt path, which
+                // reconstructs `/{name} {args}` for extension/LLM dispatch.
+                name: "explain".to_owned(),
+                args: "this diff".to_owned(),
             })
             .await;
         let prompts = log.prompts.lock().await.clone();
-        assert_eq!(prompts, vec!["/name my session".to_owned()]);
+        assert_eq!(prompts, vec!["/explain this diff".to_owned()]);
     }
 
     #[tokio::test]
@@ -7502,5 +7834,174 @@ mod tests {
         assert!(rt.first_run.is_none());
         assert!(rt.view.overlay.is_none());
         assert!(lock_plain(&log.first_runs).is_empty());
+    }
+
+    #[tokio::test]
+    async fn all_registered_builtins_are_intercepted() {
+        use crate::core::resources::slash::builtin_slash_commands;
+        for command in builtin_slash_commands() {
+            let (mut rt, log) = make_runtime();
+            let input = format!("/{}", command.name);
+            let _ = rt.submit_text(input, false).await;
+            assert!(
+                log.prompts.lock().await.is_empty(),
+                "/{} leaked to the LLM prompt path instead of being intercepted",
+                command.name
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn slash_settings_opens_settings_selector() {
+        let (mut rt, log) = make_runtime();
+        let _ = rt.submit_text("/settings".to_owned(), false).await;
+        assert_eq!(rt.active_selector_kind, Some(SelectorKind::Settings));
+        assert!(log.prompts.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn slash_session_pushes_info_notice() {
+        let (mut rt, _log) = make_runtime();
+        let _ = rt.submit_text("/session".to_owned(), false).await;
+        assert!(matches!(
+            rt.view.messages.last(),
+            Some(MessageView::Custom(custom)) if custom.custom_type == "session"
+        ));
+    }
+
+    #[tokio::test]
+    async fn slash_changelog_opens_changelog_overlay() {
+        let (mut rt, _log) = make_runtime();
+        let _ = rt.submit_text("/changelog".to_owned(), false).await;
+        assert!(matches!(
+            rt.view.overlay.as_ref().map(|overlay| overlay.kind),
+            Some(OverlayKind::Changelog)
+        ));
+        assert_eq!(rt.view.focus, FocusArea::Overlay);
+    }
+
+    #[tokio::test]
+    async fn slash_hotkeys_opens_shortcut_overlay() {
+        let (mut rt, _log) = make_runtime();
+        let _ = rt.submit_text("/hotkeys".to_owned(), false).await;
+        assert!(matches!(
+            rt.view.overlay.as_ref().map(|overlay| overlay.kind),
+            Some(OverlayKind::ShortcutHelp)
+        ));
+    }
+
+    #[tokio::test]
+    async fn slash_clone_invokes_clone_backend() {
+        let (mut rt, log) = make_runtime();
+        let _ = rt.submit_text("/clone".to_owned(), false).await;
+        assert_eq!(*log.clones.lock().await, 1);
+        assert!(log.prompts.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn slash_new_invokes_new_session() {
+        let (mut rt, log) = make_runtime();
+        let _ = rt.submit_text("/new".to_owned(), false).await;
+        assert_eq!(*log.new_sessions.lock().await, 1);
+    }
+
+    #[tokio::test]
+    async fn slash_export_jsonl_routes_to_jsonl_backend() {
+        let (mut rt, _log) = make_runtime();
+        let _ = rt.submit_text("/export out.jsonl".to_owned(), false).await;
+        assert!(matches!(
+            rt.view.messages.last(),
+            Some(MessageView::Custom(custom))
+                if custom.custom_type == "export" && custom.text.contains("out.jsonl")
+        ));
+    }
+
+    #[tokio::test]
+    async fn slash_import_without_path_shows_usage() {
+        let (mut rt, log) = make_runtime();
+        let _ = rt.submit_text("/import".to_owned(), false).await;
+        assert!(matches!(
+            rt.view.messages.last(),
+            Some(MessageView::Custom(custom))
+                if custom.custom_type == "import" && custom.text.contains("Usage")
+        ));
+        assert!(log.imports.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn slash_name_with_arg_sets_and_confirms() {
+        let (mut rt, _log) = make_runtime();
+        let _ = rt.submit_text("/name my-session".to_owned(), false).await;
+        assert!(matches!(
+            rt.view.messages.last(),
+            Some(MessageView::Custom(custom))
+                if custom.custom_type == "name" && custom.text.contains("my-session")
+        ));
+    }
+
+    #[tokio::test]
+    async fn working_visible_false_suppresses_agent_start_status() {
+        let mut view = ViewState::empty();
+        view.working_visible = false;
+        project_event(&mut view, &AgentSessionEvent::AgentStart);
+        assert!(view.streaming);
+        assert!(
+            view.status.is_none(),
+            "workingVisible=false must suppress the status at AgentStart"
+        );
+    }
+
+    #[tokio::test]
+    async fn working_message_override_applies_at_agent_start() -> Result<(), String> {
+        let mut view = ViewState::empty();
+        view.working_message = Some("Custom…".to_owned());
+        project_event(&mut view, &AgentSessionEvent::AgentStart);
+        let status = view
+            .status
+            .ok_or_else(|| "status present at AgentStart".to_owned())?;
+        assert_eq!(status.kind, StatusKind::Working);
+        assert_eq!(status.message, "Custom…");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn set_working_visible_false_persists_and_clears_status() {
+        let (mut rt, _log) = make_runtime();
+        rt.view.streaming = true;
+        rt.view.status = Some(SessionStatus {
+            kind: StatusKind::Working,
+            frame: 0,
+            message: "Working…".to_owned(),
+        });
+        rt.handle_extension_ui_control(UiControl::SetWorkingVisible { visible: false })
+            .await;
+        assert!(!rt.view.working_visible);
+        assert!(rt.view.status.is_none());
+        // Persisted flag is honored at the next AgentStart projection.
+        project_event(&mut rt.view, &AgentSessionEvent::AgentStart);
+        assert!(rt.view.status.is_none());
+    }
+
+    #[tokio::test]
+    async fn set_working_message_does_not_spawn_idle_status() {
+        let (mut rt, _log) = make_runtime();
+        rt.handle_extension_ui_control(UiControl::SetWorkingMessage {
+            message: Some("Deploying…".to_owned()),
+        })
+        .await;
+        assert!(
+            rt.view.status.is_none(),
+            "setWorkingMessage must not spawn a status while idle"
+        );
+        assert_eq!(rt.view.working_message.as_deref(), Some("Deploying…"));
+        // The stored override is applied when the agent actually starts.
+        project_event(&mut rt.view, &AgentSessionEvent::AgentStart);
+        assert_eq!(
+            rt.view
+                .status
+                .as_ref()
+                .map(|status| status.message.as_str()),
+            Some("Deploying…")
+        );
     }
 }

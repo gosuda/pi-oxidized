@@ -74,6 +74,12 @@ pub struct ViewState {
     pub first_run_family: Option<String>,
     /// Mode chosen on the first-run mode step.
     pub first_run_mode: Option<ThemeMode>,
+    /// Extension-set working-indicator message override. `None` means the
+    /// default text (`Working…`) is used while streaming.
+    pub working_message: Option<String>,
+    /// Whether the working indicator is shown at agent start. Persisted across
+    /// turns so `ui.setWorkingVisible(false)` is honored at `AgentStart`.
+    pub working_visible: bool,
 }
 
 /// Header view-model data.
@@ -553,6 +559,8 @@ impl ViewState {
             first_run_selected: 0,
             first_run_family: None,
             first_run_mode: None,
+            working_message: None,
+            working_visible: true,
         }
     }
 

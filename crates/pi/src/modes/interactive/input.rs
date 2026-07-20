@@ -181,12 +181,15 @@ impl InputMapper {
     /// received — the snapshot in `view.editor.text` may lag by one paint.
     /// Callers should pass the editor's current `get_text()` so submit /
     /// bash-detection see the same string the user typed.
+    /// `expanded_text` is the same buffer with paste markers resolved; use it
+    /// for submission paths so followUp/submit carry the real pasted content.
     #[must_use]
     pub fn map(
         &self,
         event: &UiEvent,
         view: &ViewState,
         editor_text: &str,
+        expanded_text: &str,
         state: &mut InputState,
         editor_consumed: bool,
     ) -> Vec<ViewAction> {
@@ -212,7 +215,7 @@ impl InputMapper {
             }
             UiEvent::Key(key) => {
                 if !editor_consumed {
-                    self.map_key(*key, view, editor_text, state, &mut out);
+                    self.map_key(*key, view, editor_text, expanded_text, state, &mut out);
                 }
             }
         }
@@ -242,6 +245,7 @@ impl InputMapper {
         key: KeyEvent,
         view: &ViewState,
         editor_text: &str,
+        expanded_text: &str,
         state: &mut InputState,
         out: &mut Vec<ViewAction>,
     ) {
@@ -308,7 +312,7 @@ impl InputMapper {
         // app.message.followUp (default alt+enter): queue while streaming,
         // otherwise submit.
         if kb.matches(&key, "app.message.followUp") {
-            let text = editor_text.trim().to_owned();
+            let text = expanded_text.trim().to_owned();
             if text.is_empty() {
                 return;
             }
@@ -567,6 +571,7 @@ mod tests {
             },
             &view,
             "",
+            "",
             &mut state,
             false,
         );
@@ -589,6 +594,7 @@ mod tests {
             &UiEvent::Paste("hello".to_owned()),
             &view,
             "",
+            "",
             &mut state,
             false,
         );
@@ -609,6 +615,7 @@ mod tests {
             &UiEvent::Paste("hello".to_owned()),
             &view,
             "",
+            "",
             &mut state,
             true,
         );
@@ -620,7 +627,14 @@ mod tests {
         let mapper = mapper();
         let mut state = InputState::default();
         let view = empty_view();
-        let actions = mapper.map(&UiEvent::Paste(String::new()), &view, "", &mut state, false);
+        let actions = mapper.map(
+            &UiEvent::Paste(String::new()),
+            &view,
+            "",
+            "",
+            &mut state,
+            false,
+        );
         assert!(actions.is_empty());
     }
 
@@ -629,7 +643,7 @@ mod tests {
         let mapper = mapper();
         let mut state = InputState::default();
         let view = view_with_editor("draft");
-        let actions = mapper.map(&ctrl('c'), &view, "draft", &mut state, false);
+        let actions = mapper.map(&ctrl('c'), &view, "draft", "draft", &mut state, false);
         assert_eq!(
             actions,
             vec![ViewAction::ClearEditor, ViewAction::Interrupt]
@@ -641,8 +655,8 @@ mod tests {
         let mapper = mapper();
         let mut state = InputState::default();
         let view = view_with_editor("x");
-        let _ = mapper.map(&ctrl('c'), &view, "x", &mut state, false);
-        let actions = mapper.map(&ctrl('c'), &view, "x", &mut state, false);
+        let _ = mapper.map(&ctrl('c'), &view, "x", "x", &mut state, false);
+        let actions = mapper.map(&ctrl('c'), &view, "x", "x", &mut state, false);
         assert_eq!(actions, vec![ViewAction::ClearEditor, ViewAction::Exit]);
     }
 
@@ -652,9 +666,9 @@ mod tests {
         let mut state = InputState::default();
         state.set_sigint_exit_window(Duration::from_nanos(1));
         let view = view_with_editor("x");
-        let _ = mapper.map(&ctrl('c'), &view, "x", &mut state, false);
+        let _ = mapper.map(&ctrl('c'), &view, "x", "x", &mut state, false);
         std::thread::sleep(Duration::from_millis(2));
-        let actions = mapper.map(&ctrl('c'), &view, "x", &mut state, false);
+        let actions = mapper.map(&ctrl('c'), &view, "x", "x", &mut state, false);
         assert_eq!(
             actions,
             vec![ViewAction::ClearEditor, ViewAction::Interrupt]
@@ -666,11 +680,11 @@ mod tests {
         let mapper = mapper();
         let mut state = InputState::default();
         let empty = empty_view();
-        let actions = mapper.map(&ctrl('d'), &empty, "", &mut state, false);
+        let actions = mapper.map(&ctrl('d'), &empty, "", "", &mut state, false);
         assert_eq!(actions, vec![ViewAction::Exit]);
 
         let nonempty = view_with_editor("x");
-        let actions = mapper.map(&ctrl('d'), &nonempty, "x", &mut state, false);
+        let actions = mapper.map(&ctrl('d'), &nonempty, "x", "x", &mut state, false);
         assert!(actions.is_empty());
     }
 
@@ -679,7 +693,7 @@ mod tests {
         let mapper = mapper();
         let mut state = InputState::default();
         let view = view_with_overlay(OverlayKind::ShortcutHelp);
-        let actions = mapper.map(&ctrl('d'), &view, "", &mut state, false);
+        let actions = mapper.map(&ctrl('d'), &view, "", "", &mut state, false);
         assert!(actions.is_empty());
     }
 
@@ -688,7 +702,7 @@ mod tests {
         let mapper = mapper();
         let mut state = InputState::default();
         let view = empty_view();
-        let actions = mapper.map(&ctrl('z'), &view, "", &mut state, false);
+        let actions = mapper.map(&ctrl('z'), &view, "", "", &mut state, false);
         if cfg!(windows) {
             assert!(actions.is_empty());
         } else {
@@ -701,7 +715,7 @@ mod tests {
         let mapper = mapper();
         let mut state = InputState::default();
         let view = empty_view();
-        let actions = mapper.map(&shift(KeyCode::Tab), &view, "", &mut state, false);
+        let actions = mapper.map(&shift(KeyCode::Tab), &view, "", "", &mut state, false);
         assert_eq!(actions, vec![ViewAction::CycleThinking { forward: true }]);
     }
 
@@ -710,7 +724,7 @@ mod tests {
         let mapper = mapper();
         let mut state = InputState::default();
         let view = empty_view();
-        let actions = mapper.map(&ctrl('p'), &view, "", &mut state, false);
+        let actions = mapper.map(&ctrl('p'), &view, "", "", &mut state, false);
         assert_eq!(actions, vec![ViewAction::CycleModel { forward: true }]);
     }
 
@@ -719,7 +733,7 @@ mod tests {
         let mapper = mapper();
         let mut state = InputState::default();
         let view = empty_view();
-        let actions = mapper.map(&ctrl_shift('P'), &view, "", &mut state, false);
+        let actions = mapper.map(&ctrl_shift('P'), &view, "", "", &mut state, false);
         assert_eq!(actions, vec![ViewAction::CycleModel { forward: false }]);
     }
 
@@ -730,23 +744,23 @@ mod tests {
         let view = empty_view();
 
         assert_eq!(
-            mapper.map(&ctrl('l'), &view, "", &mut state, false),
+            mapper.map(&ctrl('l'), &view, "", "", &mut state, false),
             vec![ViewAction::OpenModelSelector]
         );
         assert_eq!(
-            mapper.map(&ctrl('o'), &view, "", &mut state, false),
+            mapper.map(&ctrl('o'), &view, "", "", &mut state, false),
             vec![ViewAction::ToggleToolExpand]
         );
         assert_eq!(
-            mapper.map(&ctrl('t'), &view, "", &mut state, false),
+            mapper.map(&ctrl('t'), &view, "", "", &mut state, false),
             vec![ViewAction::ToggleThinking]
         );
         assert_eq!(
-            mapper.map(&ctrl('g'), &view, "", &mut state, false),
+            mapper.map(&ctrl('g'), &view, "", "", &mut state, false),
             vec![ViewAction::ExternalEditor]
         );
         assert_eq!(
-            mapper.map(&ctrl('x'), &view, "", &mut state, false),
+            mapper.map(&ctrl('x'), &view, "", "", &mut state, false),
             vec![ViewAction::CopyLastAssistant]
         );
     }
@@ -757,7 +771,7 @@ mod tests {
         let mut state = InputState::default();
         let view = empty_view();
         assert_eq!(
-            mapper.map(&ctrl('l'), &view, "", &mut state, false),
+            mapper.map(&ctrl('l'), &view, "", "", &mut state, false),
             vec![ViewAction::OpenModelSelector]
         );
         assert_eq!(
@@ -785,12 +799,12 @@ mod tests {
         // Old default no longer fires.
         assert!(
             mapper
-                .map(&ctrl('l'), &view, "", &mut state, false)
+                .map(&ctrl('l'), &view, "", "", &mut state, false)
                 .is_empty()
         );
         // Rebound chord fires the action.
         assert_eq!(
-            mapper.map(&ctrl('m'), &view, "", &mut state, false),
+            mapper.map(&ctrl('m'), &view, "", "", &mut state, false),
             vec![ViewAction::OpenModelSelector]
         );
         Ok(())
@@ -805,26 +819,26 @@ mod tests {
         // TS leaves these unbound at the editor level (slash/UI only).
         assert!(
             mapper
-                .map(&ctrl('r'), &view, "", &mut state, false)
+                .map(&ctrl('r'), &view, "", "", &mut state, false)
                 .is_empty(),
             "ctrl+r must not be Reload by default"
         );
         assert!(
             mapper
-                .map(&ctrl('b'), &view, "", &mut state, false)
+                .map(&ctrl('b'), &view, "", "", &mut state, false)
                 .is_empty(),
             "ctrl+b must not open session picker by default"
         );
         assert!(
             mapper
-                .map(&ctrl('f'), &view, "", &mut state, false)
+                .map(&ctrl('f'), &view, "", "", &mut state, false)
                 .is_empty(),
             "ctrl+f must not open tree selector by default"
         );
         // Ctrl+N is app.session.toggleNamedFilter (selector-local); editor is no-op.
         assert!(
             mapper
-                .map(&ctrl('n'), &view, "", &mut state, false)
+                .map(&ctrl('n'), &view, "", "", &mut state, false)
                 .is_empty(),
             "ctrl+n must not NewSession; named-filter is selector-local"
         );
@@ -862,7 +876,7 @@ mod tests {
         let mut state = InputState::default();
         let view = empty_view();
         assert_eq!(
-            mapper.map(&ctrl('n'), &view, "", &mut state, false),
+            mapper.map(&ctrl('n'), &view, "", "", &mut state, false),
             vec![ViewAction::NewSession]
         );
     }
@@ -872,7 +886,14 @@ mod tests {
         let mapper = mapper();
         let mut state = InputState::default();
         let view = view_with_editor("hello");
-        let actions = mapper.map(&alt(KeyCode::Enter), &view, "hello", &mut state, false);
+        let actions = mapper.map(
+            &alt(KeyCode::Enter),
+            &view,
+            "hello",
+            "hello",
+            &mut state,
+            false,
+        );
         assert_eq!(
             actions,
             vec![
@@ -889,7 +910,14 @@ mod tests {
         let mapper = mapper();
         let mut state = InputState::default();
         let view = view_streaming();
-        let actions = mapper.map(&alt(KeyCode::Enter), &view, "more", &mut state, false);
+        let actions = mapper.map(
+            &alt(KeyCode::Enter),
+            &view,
+            "more",
+            "more",
+            &mut state,
+            false,
+        );
         assert_eq!(
             actions,
             vec![
@@ -902,11 +930,61 @@ mod tests {
     }
 
     #[test]
+    fn alt_enter_submits_expanded_paste_text() {
+        // Collapsed buffer shows the paste marker; submission must carry the
+        // expanded content, not the marker.
+        let mapper = mapper();
+        let mut state = InputState::default();
+        let view = view_with_editor("[paste #1 +5 lines]");
+        let actions = mapper.map(
+            &alt(KeyCode::Enter),
+            &view,
+            "[paste #1 +5 lines]",
+            "the real pasted body",
+            &mut state,
+            false,
+        );
+        assert_eq!(
+            actions,
+            vec![
+                ViewAction::Submit {
+                    text: "the real pasted body".to_owned()
+                },
+                ViewAction::ClearEditor,
+            ]
+        );
+    }
+
+    #[test]
+    fn alt_enter_queues_expanded_paste_text_when_streaming() {
+        let mapper = mapper();
+        let mut state = InputState::default();
+        let view = view_streaming();
+        let actions = mapper.map(
+            &alt(KeyCode::Enter),
+            &view,
+            "[paste #2 +9 lines]",
+            "expanded queued content",
+            &mut state,
+            false,
+        );
+        assert_eq!(
+            actions,
+            vec![
+                ViewAction::QueueFollowUp {
+                    text: "expanded queued content".to_owned()
+                },
+                ViewAction::ClearEditor,
+            ]
+        );
+    }
+
+    #[test]
     fn alt_enter_empty_is_noop() {
         let mapper = mapper();
         let mut state = InputState::default();
         let view = empty_view();
-        let actions = mapper.map(&alt(KeyCode::Enter), &view, "   ", &mut state, false);
+        let actions = mapper.map(&alt(KeyCode::Enter), &view, "   ", "   ", &mut state, false);
         assert!(actions.is_empty());
     }
 
@@ -915,7 +993,7 @@ mod tests {
         let mapper = mapper();
         let mut state = InputState::default();
         let view = empty_view();
-        let actions = mapper.map(&alt(KeyCode::Up), &view, "", &mut state, false);
+        let actions = mapper.map(&alt(KeyCode::Up), &view, "", "", &mut state, false);
         assert_eq!(actions, vec![ViewAction::DequeueFollowUp]);
     }
 
@@ -924,7 +1002,7 @@ mod tests {
         let mapper = mapper();
         let mut state = InputState::default();
         let view = view_with_overlay(OverlayKind::ShortcutHelp);
-        let actions = mapper.map(&plain(KeyCode::Esc), &view, "abc", &mut state, false);
+        let actions = mapper.map(&plain(KeyCode::Esc), &view, "abc", "abc", &mut state, false);
         assert_eq!(actions, vec![ViewAction::DismissOverlay]);
     }
 
@@ -933,7 +1011,7 @@ mod tests {
         let mapper = mapper();
         let mut state = InputState::default();
         let view = view_streaming();
-        let actions = mapper.map(&plain(KeyCode::Esc), &view, "x", &mut state, false);
+        let actions = mapper.map(&plain(KeyCode::Esc), &view, "x", "x", &mut state, false);
         assert_eq!(actions, vec![ViewAction::Interrupt]);
     }
 
@@ -942,7 +1020,7 @@ mod tests {
         let mapper = mapper();
         let mut state = InputState::default();
         let view = view_with_status(StatusKind::Compaction);
-        let actions = mapper.map(&plain(KeyCode::Esc), &view, "x", &mut state, false);
+        let actions = mapper.map(&plain(KeyCode::Esc), &view, "x", "x", &mut state, false);
         assert_eq!(actions, vec![ViewAction::Interrupt]);
     }
 
@@ -951,7 +1029,14 @@ mod tests {
         let mapper = mapper();
         let mut state = InputState::default();
         let view = view_with_editor("draft");
-        let actions = mapper.map(&plain(KeyCode::Esc), &view, "draft", &mut state, false);
+        let actions = mapper.map(
+            &plain(KeyCode::Esc),
+            &view,
+            "draft",
+            "draft",
+            &mut state,
+            false,
+        );
         assert_eq!(actions, vec![ViewAction::ClearEditor]);
     }
 
@@ -960,8 +1045,8 @@ mod tests {
         let mapper = mapper();
         let mut state = InputState::new(DoubleEscapeAction::Tree);
         let view = empty_view();
-        let _ = mapper.map(&plain(KeyCode::Esc), &view, "", &mut state, false);
-        let actions = mapper.map(&plain(KeyCode::Esc), &view, "", &mut state, false);
+        let _ = mapper.map(&plain(KeyCode::Esc), &view, "", "", &mut state, false);
+        let actions = mapper.map(&plain(KeyCode::Esc), &view, "", "", &mut state, false);
         assert_eq!(actions, vec![ViewAction::OpenTreeSelector]);
     }
 
@@ -970,8 +1055,8 @@ mod tests {
         let mapper = mapper();
         let mut state = InputState::new(DoubleEscapeAction::Fork);
         let view = empty_view();
-        let _ = mapper.map(&plain(KeyCode::Esc), &view, "", &mut state, false);
-        let actions = mapper.map(&plain(KeyCode::Esc), &view, "", &mut state, false);
+        let _ = mapper.map(&plain(KeyCode::Esc), &view, "", "", &mut state, false);
+        let actions = mapper.map(&plain(KeyCode::Esc), &view, "", "", &mut state, false);
         assert_eq!(actions, vec![ViewAction::OpenForkSelector]);
     }
 
@@ -980,7 +1065,7 @@ mod tests {
         let mapper = mapper();
         let mut state = InputState::default();
         let view = empty_view();
-        let actions = mapper.map(&plain(KeyCode::Esc), &view, "", &mut state, false);
+        let actions = mapper.map(&plain(KeyCode::Esc), &view, "", "", &mut state, false);
         assert!(actions.is_empty());
         assert!(state.last_escape.is_none());
     }
@@ -991,9 +1076,9 @@ mod tests {
         let mut state = InputState::new(DoubleEscapeAction::Tree);
         state.set_escape_double_window(Duration::from_nanos(1));
         let view = empty_view();
-        let _ = mapper.map(&plain(KeyCode::Esc), &view, "", &mut state, false);
+        let _ = mapper.map(&plain(KeyCode::Esc), &view, "", "", &mut state, false);
         std::thread::sleep(Duration::from_millis(2));
-        let actions = mapper.map(&plain(KeyCode::Esc), &view, "", &mut state, false);
+        let actions = mapper.map(&plain(KeyCode::Esc), &view, "", "", &mut state, false);
         assert!(actions.is_empty(), "{actions:?}");
         assert!(state.last_escape.is_some());
     }
@@ -1015,9 +1100,9 @@ mod tests {
         let mapper = mapper();
         let mut state = InputState::default();
         let view = empty_view();
-        let actions = mapper.map(&UiEvent::FocusGained, &view, "", &mut state, false);
+        let actions = mapper.map(&UiEvent::FocusGained, &view, "", "", &mut state, false);
         assert!(actions.is_empty());
-        let actions = mapper.map(&UiEvent::FocusLost, &view, "", &mut state, false);
+        let actions = mapper.map(&UiEvent::FocusLost, &view, "", "", &mut state, false);
         assert!(actions.is_empty());
     }
 
@@ -1026,7 +1111,7 @@ mod tests {
         let mapper = mapper();
         let mut state = InputState::default();
         let view = empty_view();
-        let actions = mapper.map(&ctrl('l'), &view, "", &mut state, true);
+        let actions = mapper.map(&ctrl('l'), &view, "", "", &mut state, true);
         assert!(actions.is_empty());
     }
 
@@ -1056,7 +1141,7 @@ mod tests {
         let mapper = mapper();
         let mut state = InputState::default();
         let view = empty_view();
-        let actions = mapper.map(&ctrl('v'), &view, "", &mut state, false);
+        let actions = mapper.map(&ctrl('v'), &view, "", "", &mut state, false);
         if cfg!(windows) {
             assert!(actions.is_empty());
         } else {
@@ -1077,6 +1162,7 @@ mod tests {
         let actions = mapper.map(
             &key(KeyCode::Char('a'), KeyModifiers::NONE),
             &view,
+            "",
             "",
             &mut state,
             false,
