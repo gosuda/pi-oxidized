@@ -384,7 +384,7 @@ fn toggle_package(
         return Ok(());
     };
 
-    let pattern = package_relative_pattern(resource);
+    let pattern = relative_pattern(resource);
     let disable = format!("-{pattern}");
     let enable = format!("+{pattern}");
 
@@ -441,14 +441,7 @@ fn package_filter_patterns_mut(
     filter: &mut PackageSourceFilter,
     kind: ResourceType,
 ) -> &mut Vec<String> {
-    let slot = package_filter_patterns_opt_mut(filter, kind);
-    if slot.is_none() {
-        *slot = Some(Vec::new());
-    }
-    match slot {
-        Some(patterns) => patterns,
-        None => unreachable!("package filter pattern vec inserted above"),
-    }
+    package_filter_patterns_opt_mut(filter, kind).get_or_insert_with(Vec::new)
 }
 
 fn package_filter_patterns_opt_mut(
@@ -530,10 +523,6 @@ fn relative_pattern(resource: &ResourceEntry) -> String {
         || resource.path.clone(),
         |name| name.to_string_lossy().into_owned(),
     )
-}
-
-fn package_relative_pattern(resource: &ResourceEntry) -> String {
-    relative_pattern(resource)
 }
 
 fn strip_pattern_prefix(entry: &str) -> &str {

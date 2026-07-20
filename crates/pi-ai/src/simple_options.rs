@@ -142,25 +142,10 @@ pub fn build_base_options(
     let empty = StreamOptions::default();
     let options = options.unwrap_or(&empty);
     let requested_max = options.max_tokens.unwrap_or(model.max_tokens);
-    StreamOptions {
-        temperature: options.temperature,
-        max_tokens: Some(clamp_max_tokens_to_context(model, context, requested_max)),
-        signal: options.signal.clone(),
-        api_key: api_key.or_else(|| options.api_key.clone()),
-        transport: options.transport,
-        cache_retention: options.cache_retention,
-        session_id: options.session_id.clone(),
-        headers: options.headers.clone(),
-        on_payload: options.on_payload.clone(),
-        on_response: options.on_response.clone(),
-        timeout_ms: options.timeout_ms,
-        websocket_connect_timeout_ms: options.websocket_connect_timeout_ms,
-        max_retries: options.max_retries,
-        max_retry_delay_ms: options.max_retry_delay_ms,
-        metadata: options.metadata.clone(),
-        env: options.env.clone(),
-        extra: options.extra.clone(),
-    }
+    let mut built = options.clone();
+    built.max_tokens = Some(clamp_max_tokens_to_context(model, context, requested_max));
+    built.api_key = api_key.or_else(|| options.api_key.clone());
+    built
 }
 
 /// Collapse `xhigh` / `max` to `high` for token-budget tables.

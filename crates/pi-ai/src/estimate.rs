@@ -200,7 +200,9 @@ fn estimate_tools_tokens(tools: Option<&[Tool]>) -> u64 {
 #[must_use]
 pub fn estimate_context_tokens(context: &Context) -> ContextUsageEstimate {
     let estimate = estimate_messages(&context.messages);
-    if let Some(last_usage_index) = estimate.last_usage_index {
+    // Tokens on top of the usage anchor: tools added after the anchor when
+    // one exists, otherwise the full system-prompt + tools prefix.
+    let extra_tokens = if let Some(last_usage_index) = estimate.last_usage_index {
         let added_names: std::collections::BTreeSet<&str> = context
             .messages
             .iter()
@@ -223,25 +225,19 @@ pub fn estimate_context_tokens(context: &Context) -> ContextUsageEstimate {
                     .collect()
             })
             .unwrap_or_default();
-        let added_tool_tokens = estimate_tools_tokens(Some(added_tools.as_slice()));
-        return ContextUsageEstimate {
-            tokens: estimate.tokens.saturating_add(added_tool_tokens),
-            usage_tokens: estimate.usage_tokens,
-            trailing_tokens: estimate.trailing_tokens.saturating_add(added_tool_tokens),
-            last_usage_index: estimate.last_usage_index,
-        };
-    }
-
-    let prefix_tokens = context
-        .system_prompt
-        .as_deref()
-        .map_or(0, estimate_text_tokens)
-        .saturating_add(estimate_tools_tokens(context.tools.as_deref()));
+        estimate_tools_tokens(Some(added_tools.as_slice()))
+    } else {
+        context
+            .system_prompt
+            .as_deref()
+            .map_or(0, estimate_text_tokens)
+            .saturating_add(estimate_tools_tokens(context.tools.as_deref()))
+    };
 
     ContextUsageEstimate {
-        tokens: estimate.tokens.saturating_add(prefix_tokens),
+        tokens: estimate.tokens.saturating_add(extra_tokens),
         usage_tokens: estimate.usage_tokens,
-        trailing_tokens: estimate.trailing_tokens.saturating_add(prefix_tokens),
+        trailing_tokens: estimate.trailing_tokens.saturating_add(extra_tokens),
         last_usage_index: estimate.last_usage_index,
     }
 }
