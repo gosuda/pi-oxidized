@@ -253,7 +253,11 @@ pub fn build_stream_options(
 ) -> StreamOptions {
     let mut extra = config.stream_extra.clone();
     if let Some(level) = config.reasoning
-        && level != ModelThinkingLevel::Off
+        && (level != ModelThinkingLevel::Off
+            || matches!(
+                config.model.api.as_str(),
+                "google-generative-ai" | "google-vertex"
+            ))
     {
         extra
             .entry("reasoning".to_owned())
@@ -412,17 +416,22 @@ mod tests {
     }
 
     #[test]
-    fn build_stream_options_skips_reasoning_when_off_or_absent() {
-        let off = build_stream_options(
-            &sample_config(Some(ModelThinkingLevel::Off), None),
-            None,
-            None,
-        );
-        assert!(off.extra.get("reasoning").is_none());
+    fn build_stream_options_preserves_off_for_google_and_omits_it_elsewhere() {
+        let mut google = sample_config(Some(ModelThinkingLevel::Off), None);
+        google.model.api = "google-generative-ai".to_owned();
+        let off = build_stream_options(&google, None, None);
+        assert_eq!(off.extra.get("reasoning"), Some(&json!("off")));
         assert!(off.extra.get("thinkingBudgets").is_none());
 
         let absent = build_stream_options(&sample_config(None, None), None, None);
         assert!(absent.extra.get("reasoning").is_none());
+
+        let non_google = build_stream_options(
+            &sample_config(Some(ModelThinkingLevel::Off), None),
+            None,
+            None,
+        );
+        assert!(non_google.extra.get("reasoning").is_none());
     }
 
     #[test]

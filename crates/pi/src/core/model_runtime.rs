@@ -34,7 +34,7 @@ use pi_ai::providers::{
     OpenAiCompletions, OpenAiResponses, PiMessages, ProviderRegistry,
 };
 use pi_ai::types::{
-    AssistantMessageEvent, Context, Model, ModelCost, ModelInput, ModelThinkingLevel,
+    AssistantMessageEvent, Context, Model, ModelCost, ModelInput, ModelThinkingLevel, ThinkingLevel,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -910,6 +910,62 @@ impl ModelRuntime {
         Ok(PreparedRequest { model, options })
     }
 
+    fn adaptive_effort(model: &Model, level: ThinkingLevel) -> String {
+        let mapped_level = match level {
+            ThinkingLevel::Minimal => ModelThinkingLevel::Minimal,
+            ThinkingLevel::Low => ModelThinkingLevel::Low,
+            ThinkingLevel::Medium => ModelThinkingLevel::Medium,
+            ThinkingLevel::High => ModelThinkingLevel::High,
+            ThinkingLevel::Xhigh => ModelThinkingLevel::Xhigh,
+            ThinkingLevel::Max => ModelThinkingLevel::Max,
+        };
+        model
+            .thinking_level_map
+            .as_ref()
+            .and_then(|mapping| mapping.get(&mapped_level))
+            .and_then(Clone::clone)
+            .unwrap_or_else(|| {
+                match level {
+                    ThinkingLevel::Minimal | ThinkingLevel::Low => "low",
+                    ThinkingLevel::Medium => "medium",
+                    ThinkingLevel::High | ThinkingLevel::Xhigh | ThinkingLevel::Max => "high",
+                }
+                .to_owned()
+            })
+    }
+
+    fn uses_adaptive_thinking(model: &Model) -> bool {
+        match model.api.as_str() {
+            "anthropic-messages" => model
+                .compat
+                .as_ref()
+                .and_then(|compat| compat.get("forceAdaptiveThinking"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            "bedrock-converse-stream" => [&model.id, &model.name].into_iter().any(|value| {
+                let normalized = value
+                    .to_ascii_lowercase()
+                    .split(|character: char| {
+                        character.is_ascii_whitespace() || "_.:".contains(character)
+                    })
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("-");
+                [
+                    "opus-4-6",
+                    "opus-4-7",
+                    "opus-4-8",
+                    "sonnet-4-6",
+                    "sonnet-5",
+                    "fable-5",
+                ]
+                .iter()
+                .any(|family| normalized.contains(family))
+            }),
+            _ => false,
+        }
+    }
+
     /// Map the generic `extra["reasoning"]` onto per-API activation keys and
     /// apply the upstream max-token clamps (thinking-budget inflation for the
     /// anthropic/bedrock family, plain context clamp otherwise), mirroring
@@ -944,6 +1000,13 @@ impl ModelRuntime {
                 options
                     .extra
                     .insert("thinkingEnabled".to_owned(), Value::Bool(true));
+                if Self::uses_adaptive_thinking(model) {
+                    options.extra.insert(
+                        "effort".to_owned(),
+                        Value::String(Self::adaptive_effort(model, level)),
+                    );
+                    return pi_ai::apply_simple_max_tokens_clamp(model, context, options);
+                }
             }
             "openai-responses"
             | "azure-openai-responses"
@@ -958,6 +1021,13 @@ impl ModelRuntime {
                 );
             }
             _ => {}
+        }
+        if matches!(
+            model.api.as_str(),
+            "anthropic-messages" | "bedrock-converse-stream"
+        ) && Self::uses_adaptive_thinking(model)
+        {
+            return pi_ai::apply_simple_max_tokens_clamp(model, context, options);
         }
         if matches!(
             model.api.as_str(),
@@ -2906,6 +2976,63 @@ mod tests {
             "anthropic-messages must not receive the openai activation key"
         );
         Ok(())
+    }
+
+    #[test]
+    fn shape_reasoning_options_uses_plain_options_for_adaptive_claude() {
+        let adaptive_model = |api: &str, id: &str, name: &str, compat: Option<Value>| Model {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            api: api.to_owned(),
+            provider: "test".to_owned(),
+            base_url: "https://example.test".to_owned(),
+            reasoning: true,
+            thinking_level_map: Some(BTreeMap::from([(
+                ModelThinkingLevel::High,
+                Some("max".to_owned()),
+            )])),
+            input: vec![ModelInput::Text],
+            cost: ModelCost::default(),
+            context_window: 32_000,
+            max_tokens: 4_096,
+            headers: None,
+            compat,
+            extra: BTreeMap::new(),
+        };
+        let options = StreamOptions {
+            max_tokens: Some(1_024),
+            extra: serde_json::Map::from_iter([("reasoning".to_owned(), json!("high"))]),
+            ..StreamOptions::default()
+        };
+
+        let anthropic = ModelRuntime::shape_reasoning_options(
+            &adaptive_model(
+                "anthropic-messages",
+                "claude-opus-4-6",
+                "Claude Opus 4.6",
+                Some(json!({"forceAdaptiveThinking": true})),
+            ),
+            &Context::default(),
+            options.clone(),
+        );
+        assert_eq!(anthropic.max_tokens, Some(1_024));
+        assert_eq!(anthropic.extra.get("thinkingEnabled"), Some(&json!(true)));
+        assert_eq!(anthropic.extra.get("effort"), Some(&json!("max")));
+        assert!(anthropic.extra.get("thinkingBudgetTokens").is_none());
+
+        let bedrock = ModelRuntime::shape_reasoning_options(
+            &adaptive_model(
+                "bedrock-converse-stream",
+                "anthropic.claude-opus-4-6-v1:0",
+                "Claude Opus 4.6",
+                None,
+            ),
+            &Context::default(),
+            options,
+        );
+        assert_eq!(bedrock.max_tokens, Some(1_024));
+        assert_eq!(bedrock.extra.get("reasoning"), Some(&json!("high")));
+        assert!(bedrock.extra.get("thinkingBudgetTokens").is_none());
     }
 
     #[tokio::test]

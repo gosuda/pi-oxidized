@@ -842,8 +842,10 @@ fn create_summarization_options(
         ..StreamOptions::default()
     };
     if model.reasoning
-        && let Some(level) = thinking_level.filter(|level| *level != "off")
+        && let Some(level) = thinking_level
         && thinking_level_from_str(level).is_some()
+        && (level != "off"
+            || matches!(model.api.as_str(), "google-generative-ai" | "google-vertex"))
     {
         options
             .extra
@@ -1398,6 +1400,19 @@ mod tests {
                     >
             })
         })
+    }
+
+    #[test]
+    fn summarization_preserves_off_for_google_models() {
+        let mut model = test_model(4_096, 32_000);
+        model.api = "google-vertex".to_owned();
+        model.reasoning = true;
+        let options =
+            create_summarization_options(&model, 1_024, None, None, None, None, Some("off"));
+        assert_eq!(
+            options.extra.get("reasoning"),
+            Some(&Value::String("off".to_owned()))
+        );
     }
 
     #[test]
