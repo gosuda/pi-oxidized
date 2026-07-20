@@ -245,9 +245,16 @@ fn build_overlay(state: &ViewState, md_theme: &MarkdownTheme) -> Option<Box<dyn 
         OverlayKind::Changelog => {
             startup::build_changelog(&overlay.lines.join("\n"), md_theme.clone(), &state.theme)
         }
-        OverlayKind::FirstTimeSetup => {
-            startup::build_first_time_setup(0, md_theme.clone(), &state.theme)
-        }
+        OverlayKind::FirstTimeSetup => startup::build_first_time_setup_with_selection(
+            state
+                .first_run_step
+                .unwrap_or(startup::FIRST_RUN_STEP_FAMILY),
+            state.first_run_selected,
+            state.first_run_family.as_deref(),
+            state.first_run_mode,
+            md_theme.clone(),
+            &state.theme,
+        ),
         OverlayKind::Login => {
             let mut stack = messages::ColumnStack::new();
             for line in &overlay.lines {

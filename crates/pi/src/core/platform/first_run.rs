@@ -19,13 +19,15 @@ use crate::core::config::{
     ENV_AGENT_DIR, get_agent_dir_with, get_settings_path_with, is_official_distribution,
 };
 use crate::core::experimental::are_experimental_features_enabled;
-use crate::core::settings::SettingsManager;
+use crate::core::settings::{SettingsManager, ThemeMode};
 
 /// A completed first-run selection ready to persist.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FirstRunSelection {
-    /// Theme name to store under the `theme` setting.
+    /// Theme name to store under the `theme` setting (family dark member).
     pub theme: String,
+    /// Theme polarity mode to store under `themeMode`.
+    pub theme_mode: ThemeMode,
     /// Whether the user opted into anonymous usage analytics.
     pub share_analytics: bool,
 }
@@ -72,9 +74,9 @@ pub fn should_run_first_time_setup_on_host(
 
 /// Persist a first-run selection into global settings.
 ///
-/// Writes `theme` and `enableAnalytics` (generating a tracking id on first
-/// opt-in via [`SettingsManager::set_enable_analytics`]) and flushes so the
-/// file lands on disk immediately, closing the first-run gate.
+/// Writes `theme`, `themeMode`, and `enableAnalytics` (generating a tracking
+/// id on first opt-in via [`SettingsManager::set_enable_analytics`]) and
+/// flushes so the file lands on disk immediately, closing the first-run gate.
 ///
 /// # Errors
 ///
@@ -84,6 +86,7 @@ pub fn persist_first_run_selection(
     selection: &FirstRunSelection,
 ) -> Result<(), String> {
     settings.set_theme(&selection.theme);
+    settings.set_theme_mode(selection.theme_mode);
     settings.set_enable_analytics(selection.share_analytics);
     settings.flush();
     Ok(())
@@ -92,6 +95,7 @@ pub fn persist_first_run_selection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     #[test]
     fn gate_requires_all_conditions() {
@@ -116,5 +120,29 @@ mod tests {
         // matching Option::is_none semantics used by the reference's existence
         // check.
         assert!(!should_run_first_time_setup(true, true, Some(""), false));
+    }
+
+    #[test]
+    fn persist_writes_theme_mode_and_analytics() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let agent = dir.path().join("agent");
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&agent)?;
+        std::fs::create_dir_all(&project)?;
+        let mut manager = SettingsManager::create(
+            &project,
+            Some(&agent),
+            crate::core::settings::SettingsManagerCreateOptions::default(),
+        );
+        let selection = FirstRunSelection {
+            theme: "motion-dark".to_owned(),
+            theme_mode: ThemeMode::Auto,
+            share_analytics: false,
+        };
+        persist_first_run_selection(&mut manager, &selection)?;
+        assert_eq!(manager.get_theme().as_deref(), Some("motion-dark"));
+        assert_eq!(manager.get_theme_mode(), ThemeMode::Auto);
+        assert!(!manager.get_enable_analytics());
+        Ok(())
     }
 }

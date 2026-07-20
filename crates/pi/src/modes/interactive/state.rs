@@ -16,6 +16,8 @@ use pi_ai::{AssistantMessage, ModelThinkingLevel};
 use pi_ext::sanitize::SanitizedSlot;
 use pi_tui::component::EventResult;
 
+use crate::core::settings::ThemeMode;
+
 use super::messages::MessageView;
 use super::theme::ResolvedTheme;
 
@@ -64,6 +66,14 @@ pub struct ViewState {
     pub streaming: bool,
     /// Startup diagnostics (errors/warnings from resource load).
     pub diagnostics: StartupDiagnostics,
+    /// Active first-run wizard step (`None` when the wizard is not running).
+    pub first_run_step: Option<usize>,
+    /// Highlighted option index within the current first-run step.
+    pub first_run_selected: usize,
+    /// Family chosen on the first-run family step (label form).
+    pub first_run_family: Option<String>,
+    /// Mode chosen on the first-run mode step.
+    pub first_run_mode: Option<ThemeMode>,
 }
 
 /// Header view-model data.
@@ -539,6 +549,10 @@ impl ViewState {
             focus: FocusArea::Editor,
             streaming: false,
             diagnostics: StartupDiagnostics::default(),
+            first_run_step: None,
+            first_run_selected: 0,
+            first_run_family: None,
+            first_run_mode: None,
         }
     }
 
@@ -746,6 +760,8 @@ pub enum SelectorKind {
     Config,
     /// Scoped-models selector.
     ScopedModels,
+    /// Theme selector (`/theme`).
+    Theme,
 }
 
 impl From<EventResult> for ViewAction {

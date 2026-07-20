@@ -310,6 +310,28 @@ pub trait SessionHost: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Apply one settings-row change from the settings/config selector.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable message when the id is unknown or persisting
+    /// fails.
+    fn apply_settings_change(&self, _id: &str, _value: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Persist a completed first-run wizard selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable message when persisting fails.
+    fn persist_first_run(
+        &self,
+        _selection: &crate::core::platform::first_run::FirstRunSelection,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Configured external editor command.
     fn external_editor_command(&self) -> String {
         if cfg!(windows) {
@@ -917,6 +939,18 @@ pub struct InteractiveRuntime<W: Write, S: SessionHost> {
     /// Pending selector cancels.
     cancel_rx: mpsc::UnboundedReceiver<()>,
     cancel_tx: mpsc::UnboundedSender<()>,
+    /// Pending settings-row changes emitted by the live settings list.
+    settings_change_rx: mpsc::UnboundedReceiver<(String, String)>,
+    settings_change_tx: mpsc::UnboundedSender<(String, String)>,
+    /// Pending live previews from the `/theme` selector.
+    theme_preview_rx: mpsc::UnboundedReceiver<String>,
+    theme_preview_tx: mpsc::UnboundedSender<String>,
+    /// Theme snapshot restored when the `/theme` selector is cancelled.
+    theme_preview_restore: Option<Arc<ResolvedTheme>>,
+    /// Live first-run wizard state (drives the `FirstTimeSetup` overlay).
+    first_run: Option<FirstRunWizardState>,
+    /// `/debug` dump directory (agent dir, resolved once at construction).
+    debug_dump_dir: std::path::PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -953,6 +987,15 @@ struct PendingExtensionDialog {
     deadline: Option<Instant>,
 }
 
+/// Live first-run wizard state (family → mode → analytics).
+struct FirstRunWizardState {
+    step: usize,
+    selected: usize,
+    family: Option<String>,
+    mode: Option<ThemeMode>,
+    pre_theme: Arc<ResolvedTheme>,
+}
+
 #[derive(Clone, Debug)]
 struct EffectiveExtensionShortcut {
     key: String,
@@ -979,6 +1022,25 @@ impl PromptOperations {
             bash_operation: None,
         }
     }
+}
+
+/// Build the live editor with the runtime's fixed options and submit hook.
+fn build_initial_editor(
+    options: &InteractiveRuntimeOptions,
+    submit_tx: mpsc::UnboundedSender<String>,
+) -> Editor {
+    let mut editor = Editor::new(
+        &pi_tui::components::editor::EditorTheme::default(),
+        &EditorOptions {
+            padding_x: 1,
+            autocomplete_max_visible: 5,
+            terminal_rows: options.size.1,
+        },
+    );
+    editor.on_submit = Some(Box::new(move |text: String| {
+        let _ = submit_tx.send(text);
+    }));
+    editor
 }
 
 impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
@@ -1035,21 +1097,13 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         let (select_tx, select_rx) =
             mpsc::unbounded_channel::<(super::state::SelectorKind, String)>();
         let (cancel_tx, cancel_rx) = mpsc::unbounded_channel::<()>();
+        let (settings_change_tx, settings_change_rx) =
+            mpsc::unbounded_channel::<(String, String)>();
+        let (theme_preview_tx, theme_preview_rx) = mpsc::unbounded_channel::<String>();
         let (extension_select_tx, extension_select_rx) = mpsc::unbounded_channel::<String>();
         let (extension_action_tx, extension_action_rx) = mpsc::unbounded_channel();
 
-        let mut editor = Editor::new(
-            &pi_tui::components::editor::EditorTheme::default(),
-            &EditorOptions {
-                padding_x: 1,
-                autocomplete_max_visible: 5,
-                terminal_rows: options.size.1,
-            },
-        );
-        let submit_tx_cb = submit_tx.clone();
-        editor.on_submit = Some(Box::new(move |text: String| {
-            let _ = submit_tx_cb.send(text);
-        }));
+        let editor = build_initial_editor(options, submit_tx.clone());
 
         let mut runtime = Self {
             tui,
@@ -1099,6 +1153,13 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             select_tx,
             cancel_rx,
             cancel_tx,
+            settings_change_rx,
+            settings_change_tx,
+            theme_preview_rx,
+            theme_preview_tx,
+            theme_preview_restore: None,
+            first_run: None,
+            debug_dump_dir: crate::core::config::get_agent_dir(),
         };
         for slot in initial_extension_slots {
             runtime.project_extension_slot(slot);
@@ -1197,6 +1258,10 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         // `ctx.ui.theme` / `getAllThemes` observe real data immediately.
         self.push_theme_to_host().await;
         self.refresh_footer().await;
+        if crate::core::platform::first_run::should_run_first_time_setup_on_host(None, None) {
+            self.open_first_run_wizard();
+            self.push_theme_to_host().await;
+        }
         if let Err(error) = self.paint_frame() {
             self.exit_kind = InteractiveExit::IoFailure;
             self.last_error = Some(error.to_string());
@@ -1387,6 +1452,17 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         if self.route_extension_input(&event) {
             return Ok(());
         }
+        // First-run wizard owns all keys while its overlay is up.
+        if self.first_run.is_some()
+            && let UiEvent::Key(key_event) = &event
+        {
+            if key_event.kind != crossterm::event::KeyEventKind::Release {
+                let code = key_event.code;
+                self.handle_first_run_key(code).await;
+                self.paint_frame()?;
+            }
+            return Ok(());
+        }
         // Swap the editor (and active selector) into a throwaway-built
         // InteractiveRoot so we can route the event, then recover both.
         let saved_editor = std::mem::replace(&mut self.editor, Editor::with_defaults());
@@ -1426,6 +1502,15 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 actions.push(ViewAction::SelectCancelled);
             }
         }
+        let mut settings_mutated = false;
+        while let Ok((id, value)) = self.settings_change_rx.try_recv() {
+            self.handle_settings_change(&id, &value).await;
+            settings_mutated = true;
+        }
+        while let Ok(selection) = self.theme_preview_rx.try_recv() {
+            self.preview_theme_selection(&selection);
+            settings_mutated = true;
+        }
 
         // Map app-level keys (skipped when the focused component already
         // handled the event — including selector confirm/cancel).
@@ -1437,7 +1522,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             editor_result.is_handled(),
         ));
 
-        let mut needs_immediate_repaint = editor_result.needs_render();
+        let mut needs_immediate_repaint = editor_result.needs_render() || settings_mutated;
         for action in actions {
             let outcome = self.dispatch_action(action).await;
             if matches!(outcome, ActionOutcome::Repaint) {
@@ -1610,22 +1695,13 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             ViewAction::QueueFollowUp { text } => self.queue_follow_up(text).await,
             ViewAction::DequeueFollowUp => self.dequeue_follow_up(),
             ViewAction::CopyLastAssistant => self.copy_last_assistant().await,
-            ViewAction::Reload => {
-                if self.pending_extension_dialog.is_some() {
-                    self.cancel_extension_dialog().await;
-                }
-                self.record_err(self.session.reload().await);
-                self.rebind_extension_channels().await;
-                self.requery_terminal_theme();
-                self.apply_theme_from_settings();
-                self.push_theme_to_host().await;
-                ActionOutcome::Repaint
-            }
+            ViewAction::Reload => self.handle_reload_action().await,
             ViewAction::SlashCommand { name, args } => self.submit_slash_command(name, args).await,
             ViewAction::SelectConfirmed { selector, value } => {
                 self.handle_select_confirmed(selector, value).await
             }
             ViewAction::SelectCancelled => {
+                self.restore_theme_preview();
                 self.close_selector();
                 ActionOutcome::Repaint
             }
@@ -1646,7 +1722,30 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         }
     }
 
+    /// `/reload` (hotkey path): reload host resources, re-probe the terminal
+    /// background, and re-resolve the theme.
+    async fn handle_reload_action(&mut self) -> ActionOutcome {
+        if self.pending_extension_dialog.is_some() {
+            self.cancel_extension_dialog().await;
+        }
+        self.record_err(self.session.reload().await);
+        self.rebind_extension_channels().await;
+        if let Ok(Some(dark)) = self.input.requery_background(self.tui.outer_mut()).await {
+            self.tui.capabilities_mut().set_dark_background(Some(dark));
+        }
+        self.requery_terminal_theme();
+        self.apply_theme_from_settings();
+        self.push_theme_to_host().await;
+        ActionOutcome::Repaint
+    }
+
     async fn submit_slash_command(&mut self, name: String, args: String) -> ActionOutcome {
+        if name == "debug" {
+            return self.handle_debug_command();
+        }
+        if name == "theme" {
+            return self.open_selector(super::state::SelectorKind::Theme).await;
+        }
         if let Some(runner) = self.extension_runner.as_ref()
             && runner
                 .registry()
@@ -1826,6 +1925,12 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         if trimmed == "/quit" {
             return ActionOutcome::Exit;
         }
+        if trimmed == "/debug" {
+            return self.handle_debug_command();
+        }
+        if trimmed == "/theme" {
+            return self.open_selector(super::state::SelectorKind::Theme).await;
+        }
         if let Some(command) = parse_typed_builtin(&trimmed) {
             return match command {
                 TypedBuiltin::Compact(instructions) => {
@@ -1837,13 +1942,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                     self.open_selector(super::state::SelectorKind::Session)
                         .await
                 }
-                TypedBuiltin::Reload => {
-                    self.record_err(self.session.reload().await);
-                    self.requery_terminal_theme();
-                    self.apply_theme_from_settings();
-                    self.push_theme_to_host().await;
-                    ActionOutcome::Repaint
-                }
+                TypedBuiltin::Reload => self.handle_reload_action().await,
             };
         }
 
@@ -2046,6 +2145,16 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 self.close_selector();
                 ActionOutcome::Repaint
             }
+            super::state::SelectorKind::Theme => {
+                self.theme_preview_restore = None;
+                let storage = super::theme::theme_selection_to_storage(&value);
+                let (_, mode) = self.session.theme_settings();
+                self.record_err(self.session.persist_theme(&storage, mode));
+                self.apply_theme_from_settings();
+                self.close_selector();
+                self.push_theme_to_host().await;
+                ActionOutcome::Repaint
+            }
             super::state::SelectorKind::Session => {
                 self.quiesce_prompt_operations().await;
                 if self.pending_extension_dialog.is_some() {
@@ -2216,6 +2325,32 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 let rows = self.session.get_config_entries().await?;
                 Ok(self.build_settings_list(kind, rows))
             }
+            super::state::SelectorKind::Theme => {
+                self.theme_preview_restore = Some(self.view.theme.clone());
+                let items = super::theme::theme_selector_values()
+                    .into_iter()
+                    .map(|value| SelectItem::new(value.clone(), value))
+                    .collect();
+                let mut list = pi_tui::components::SelectList::new(
+                    items,
+                    super::selectors::SELECTOR_MAX_VISIBLE,
+                    super::theme::select_list_theme(),
+                );
+                list.set_selected_index(0);
+                let select_tx = self.select_tx.clone();
+                list.on_select = Some(Box::new(move |item| {
+                    let _ = select_tx.send((kind, item.value.clone()));
+                }));
+                let cancel_tx = self.cancel_tx.clone();
+                list.on_cancel = Some(Box::new(move || {
+                    let _ = cancel_tx.send(());
+                }));
+                let preview_tx = self.theme_preview_tx.clone();
+                list.on_selection_change = Some(Box::new(move |item| {
+                    let _ = preview_tx.send(item.value.clone());
+                }));
+                Ok(Box::new(list))
+            }
         }
     }
 
@@ -2258,20 +2393,34 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
 
     fn build_settings_list(
         &self,
-        kind: super::state::SelectorKind,
+        _kind: super::state::SelectorKind,
         rows: Vec<super::state::SettingsRow>,
     ) -> Box<dyn Component> {
         let items = rows
             .into_iter()
-            .map(|row| {
-                pi_tui::components::SelectItem::new(
-                    row.id,
-                    format!("{}  {}", row.label, row.current_value),
-                )
-                .with_description(row.description.unwrap_or_default())
+            .map(|row| pi_tui::components::SettingItem {
+                id: row.id,
+                label: row.label,
+                description: row.description,
+                current_value: row.current_value,
+                values: row.values,
+                submenu: None,
             })
             .collect();
-        self.build_select_list(kind, items)
+        let change_tx = self.settings_change_tx.clone();
+        let cancel_tx = self.cancel_tx.clone();
+        Box::new(pi_tui::components::SettingsList::new(
+            items,
+            super::selectors::SELECTOR_MAX_VISIBLE,
+            super::theme::settings_list_theme(),
+            move |id: &str, value: &str| {
+                let _ = change_tx.send((id.to_owned(), value.to_owned()));
+            },
+            move || {
+                let _ = cancel_tx.send(());
+            },
+            &pi_tui::components::SettingsListOptions::default(),
+        ))
     }
 
     fn build_extension_select_list(
@@ -2490,6 +2639,220 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             self.theme_generation,
         );
         Arc::clone(runner).push_theme_update(&update).await;
+    }
+
+    /// Apply one settings-row change through the host, then refresh
+    /// theme-derived state when the row affects the theme.
+    async fn handle_settings_change(&mut self, id: &str, value: &str) {
+        if let Err(error) = self.session.apply_settings_change(id, value) {
+            self.last_error = Some(error);
+            return;
+        }
+        if matches!(id, "theme" | "themeMode") {
+            self.apply_theme_from_settings();
+            self.push_theme_to_host().await;
+        }
+        self.arm_coalescer();
+    }
+
+    /// Preview a highlighted `/theme` selection without persisting.
+    fn preview_theme_selection(&mut self, selection: &str) {
+        let storage = super::theme::theme_selection_to_storage(selection);
+        let (_, mode) = self.session.theme_settings();
+        let resolved =
+            super::theme::resolve_active_theme(Some(&storage), mode, self.terminal_theme);
+        self.apply_theme(resolved);
+    }
+
+    /// Restore the pre-`/theme` theme after a cancelled selector.
+    fn restore_theme_preview(&mut self) {
+        if let Some(previous) = self.theme_preview_restore.take() {
+            self.apply_theme(previous);
+        }
+    }
+
+    /// `/debug`: write a support dump (rendered frame + transcript JSONL) and
+    /// surface the written path in the transcript.
+    fn handle_debug_command(&mut self) -> ActionOutcome {
+        use crate::core::platform::debug_dump::{DebugDumpInput, write_debug_dump_with};
+        let (width, height) = (self.view.width, self.view.height);
+        let buffer = super::view::render_view(&self.view, width, height);
+        let rendered_lines = buffer_plain_lines(&buffer, width, height);
+        let messages: Vec<String> = self
+            .session
+            .messages()
+            .iter()
+            .filter_map(|message| serde_json::to_string(message).ok())
+            .collect();
+        let timestamp = jiff::Timestamp::now().to_string();
+        let input = DebugDumpInput {
+            timestamp: &timestamp,
+            width,
+            height,
+            rendered_lines: &rendered_lines,
+            messages: &messages,
+        };
+        let written = write_debug_dump_with(&input, &self.debug_dump_dir);
+        match written {
+            Ok(path) => {
+                self.view
+                    .messages
+                    .push(MessageView::Custom(super::messages::CustomMessageView {
+                        custom_type: "debug".to_owned(),
+                        text: format!("✓ Debug log written\n{}", path.display()),
+                    }));
+                self.chat_dirty = true;
+            }
+            Err(error) => self.last_error = Some(format!("debug dump failed: {error}")),
+        }
+        ActionOutcome::Repaint
+    }
+
+    // ----- First-run wizard -----
+
+    /// Open the first-time-setup overlay and seed the wizard state.
+    fn open_first_run_wizard(&mut self) {
+        self.first_run = Some(FirstRunWizardState {
+            step: super::startup::FIRST_RUN_STEP_FAMILY,
+            selected: 0,
+            family: None,
+            mode: None,
+            pre_theme: self.view.theme.clone(),
+        });
+        self.view.overlay = Some(Overlay {
+            kind: OverlayKind::FirstTimeSetup,
+            lines: Vec::new(),
+            height: 1,
+        });
+        self.view.extension_overlay_slot = None;
+        self.view.focus = FocusArea::Overlay;
+        self.input_state.reset_taps();
+        self.sync_first_run_view();
+        self.preview_first_run_selection();
+    }
+
+    fn first_run_option_count(step: usize) -> usize {
+        match step {
+            super::startup::FIRST_RUN_STEP_FAMILY => {
+                super::startup::first_run_family_options().len()
+            }
+            super::startup::FIRST_RUN_STEP_MODE => super::startup::first_run_mode_options().len(),
+            super::startup::FIRST_RUN_STEP_ANALYTICS => {
+                super::startup::first_run_analytics_options().len()
+            }
+            _ => 0,
+        }
+    }
+
+    /// Mirror the wizard state into [`ViewState`] for composition.
+    fn sync_first_run_view(&mut self) {
+        if let Some(state) = self.first_run.as_ref() {
+            self.view.first_run_step = Some(state.step);
+            self.view.first_run_selected = state.selected;
+            self.view.first_run_family = state.family.clone();
+            self.view.first_run_mode = state.mode;
+        } else {
+            self.view.first_run_step = None;
+            self.view.first_run_selected = 0;
+            self.view.first_run_family = None;
+            self.view.first_run_mode = None;
+        }
+    }
+
+    /// Live-preview the highlighted wizard option (family and mode steps).
+    fn preview_first_run_selection(&mut self) {
+        let Some(state) = self.first_run.as_ref() else {
+            return;
+        };
+        let family = match state.step {
+            super::startup::FIRST_RUN_STEP_FAMILY => super::startup::first_run_family_options()
+                .get(state.selected)
+                .copied()
+                .map(str::to_owned),
+            _ => state.family.clone(),
+        };
+        let mode = match state.step {
+            super::startup::FIRST_RUN_STEP_MODE => super::startup::first_run_mode_options()
+                .get(state.selected)
+                .map(|(mode, _)| *mode),
+            _ => state.mode,
+        }
+        .unwrap_or(ThemeMode::Auto);
+        let Some(family) = family else {
+            return;
+        };
+        let storage = super::theme::theme_selection_to_storage(&family);
+        let resolved =
+            super::theme::resolve_active_theme(Some(&storage), mode, self.terminal_theme);
+        self.apply_theme(resolved);
+    }
+
+    /// Route a key to the first-run wizard: Up/Down move the highlight (with
+    /// live preview), Enter advances/persists, Esc cancels and restores the
+    /// pre-wizard theme.
+    async fn handle_first_run_key(&mut self, code: crossterm::event::KeyCode) {
+        use crossterm::event::KeyCode;
+        let Some(mut state) = self.first_run.take() else {
+            return;
+        };
+        let count = Self::first_run_option_count(state.step).max(1);
+        match code {
+            KeyCode::Up => {
+                state.selected = (state.selected + count - 1) % count;
+                self.first_run = Some(state);
+                self.preview_first_run_selection();
+            }
+            KeyCode::Down => {
+                state.selected = (state.selected + 1) % count;
+                self.first_run = Some(state);
+                self.preview_first_run_selection();
+            }
+            KeyCode::Esc => {
+                self.apply_theme(state.pre_theme);
+                let _ = self.dismiss_overlay();
+                self.push_theme_to_host().await;
+            }
+            KeyCode::Enter => match state.step {
+                super::startup::FIRST_RUN_STEP_FAMILY => {
+                    state.family = super::startup::first_run_family_options()
+                        .get(state.selected)
+                        .copied()
+                        .map(str::to_owned);
+                    state.step = super::startup::FIRST_RUN_STEP_MODE;
+                    state.selected = 0;
+                    self.first_run = Some(state);
+                    self.preview_first_run_selection();
+                }
+                super::startup::FIRST_RUN_STEP_MODE => {
+                    state.mode = super::startup::first_run_mode_options()
+                        .get(state.selected)
+                        .map(|(mode, _)| *mode);
+                    state.step = super::startup::FIRST_RUN_STEP_ANALYTICS;
+                    state.selected = 0;
+                    self.first_run = Some(state);
+                }
+                _ => {
+                    let share_analytics = super::startup::first_run_analytics_options()
+                        .get(state.selected)
+                        .is_some_and(|(share, _)| *share);
+                    let family = state.family.clone().unwrap_or_else(|| "default".to_owned());
+                    let selection = crate::core::platform::first_run::FirstRunSelection {
+                        theme: super::theme::theme_selection_to_storage(&family),
+                        theme_mode: state.mode.unwrap_or(ThemeMode::Auto),
+                        share_analytics,
+                    };
+                    self.record_err(self.session.persist_first_run(&selection));
+                    let _ = self.dismiss_overlay();
+                    self.apply_theme_from_settings();
+                    self.push_theme_to_host().await;
+                }
+            },
+            _ => {
+                self.first_run = Some(state);
+            }
+        }
+        self.sync_first_run_view();
+        self.arm_coalescer();
     }
 
     fn project_extension_slot(&mut self, slot: SanitizedSlot) {
@@ -3266,6 +3629,31 @@ fn project_messages(messages: &[pi_agent::AgentMessage]) -> Vec<MessageView> {
         .collect()
 }
 
+/// Flatten a rendered frame buffer into `(text, visible width)` rows for the
+/// `/debug` dump. Wide-glyph continuation cells are skipped like the snapshot
+/// helpers; trailing spaces are trimmed.
+fn buffer_plain_lines(buffer: &Buffer, width: u16, height: u16) -> Vec<(String, u16)> {
+    use ratatui::buffer::CellDiffOption;
+    let mut out = Vec::with_capacity(usize::from(height));
+    for row in 0..height {
+        let mut line = String::new();
+        for x in 0..width {
+            if let Some(cell) = buffer.cell((x, row)) {
+                if cell.diff_option == CellDiffOption::Skip {
+                    continue;
+                }
+                line.push_str(cell.symbol());
+            } else {
+                line.push(' ');
+            }
+        }
+        let trimmed = line.trim_end();
+        let visible = u16::try_from(trimmed.chars().count()).unwrap_or(u16::MAX);
+        out.push((trimmed.to_owned(), visible));
+    }
+    out
+}
+
 /// Resolve the theme to install at startup from persisted settings and the
 /// probed terminal polarity.
 fn startup_theme<S: SessionHost + ?Sized>(
@@ -4012,6 +4400,48 @@ impl SessionHost for AgentSessionHost {
         Ok(())
     }
 
+    fn apply_settings_change(&self, id: &str, value: &str) -> Result<(), String> {
+        let session = self.read_session();
+        let mut settings = session.lock_settings();
+        match id {
+            "theme" => settings.set_theme(&super::theme::theme_selection_to_storage(value)),
+            "themeMode" => {
+                let mode = match value {
+                    "auto" => ThemeMode::Auto,
+                    "dark" => ThemeMode::Dark,
+                    "light" => ThemeMode::Light,
+                    other => return Err(format!("unknown theme mode: {other}")),
+                };
+                settings.set_theme_mode(mode);
+            }
+            "compaction.enabled" => settings.set_compaction_enabled(value == "on"),
+            "retry.enabled" => settings.set_retry_enabled(value == "on"),
+            "doubleEscapeAction" => {
+                use crate::core::settings::DoubleEscapeAction as Action;
+                let action = match value {
+                    "fork" => Action::Fork,
+                    "tree" => Action::Tree,
+                    "none" => Action::None,
+                    other => return Err(format!("unknown double-escape action: {other}")),
+                };
+                settings.set_double_escape_action(action);
+            }
+            "quietStartup" => settings.set_quiet_startup(value == "on"),
+            "showImages" => settings.set_show_images(value == "on"),
+            other => return Err(format!("unknown setting: {other}")),
+        }
+        Ok(())
+    }
+
+    fn persist_first_run(
+        &self,
+        selection: &crate::core::platform::first_run::FirstRunSelection,
+    ) -> Result<(), String> {
+        let session = self.read_session();
+        let mut settings = session.lock_settings();
+        crate::core::platform::first_run::persist_first_run_selection(&mut settings, selection)
+    }
+
     fn external_editor_command(&self) -> String {
         self.read_session()
             .lock_settings()
@@ -4196,8 +4626,21 @@ impl SessionHost for AgentSessionHost {
                     id: "theme".to_owned(),
                     label: "Theme".to_owned(),
                     description: Some("Color scheme".to_owned()),
-                    current_value: settings.get_theme().unwrap_or_else(|| "default".to_owned()),
-                    values: Some(vec!["dark".to_owned(), "light".to_owned()]),
+                    current_value: super::theme::storage_name_to_display(
+                        settings.get_theme().as_deref(),
+                    ),
+                    values: Some(super::theme::theme_selector_values()),
+                },
+                super::state::SettingsRow {
+                    id: "themeMode".to_owned(),
+                    label: "Theme mode".to_owned(),
+                    description: Some("Auto matches the terminal background".to_owned()),
+                    current_value: settings.get_theme_mode().as_str().to_owned(),
+                    values: Some(vec![
+                        "auto".to_owned(),
+                        "dark".to_owned(),
+                        "light".to_owned(),
+                    ]),
                 },
                 super::state::SettingsRow {
                     id: "compaction.enabled".to_owned(),
@@ -4225,8 +4668,7 @@ impl SessionHost for AgentSessionHost {
                     id: "doubleEscapeAction".to_owned(),
                     label: "Double-Esc action".to_owned(),
                     description: Some("tree / fork / none".to_owned()),
-                    current_value: format!("{:?}", settings.get_double_escape_action())
-                        .to_lowercase(),
+                    current_value: settings.get_double_escape_action().as_str().to_owned(),
                     values: Some(vec![
                         "tree".to_owned(),
                         "fork".to_owned(),
@@ -4987,6 +5429,8 @@ mod tests {
         steers: Mutex<Vec<String>>,
         last_text: Mutex<Option<String>>,
         themes: std::sync::Mutex<Vec<(String, ThemeMode)>>,
+        settings_changes: std::sync::Mutex<Vec<(String, String)>>,
+        first_runs: std::sync::Mutex<Vec<crate::core::platform::first_run::FirstRunSelection>>,
     }
 
     struct FakeHost {
@@ -5043,6 +5487,34 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push((theme.to_owned(), mode));
+            Ok(())
+        }
+
+        fn apply_settings_change(&self, id: &str, value: &str) -> Result<(), String> {
+            self.log
+                .settings_changes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((id.to_owned(), value.to_owned()));
+            if id == "theme" {
+                let (_, mode) = self.theme_settings();
+                self.persist_theme(
+                    &crate::modes::interactive::theme::theme_selection_to_storage(value),
+                    mode,
+                )?;
+            }
+            Ok(())
+        }
+
+        fn persist_first_run(
+            &self,
+            selection: &crate::core::platform::first_run::FirstRunSelection,
+        ) -> Result<(), String> {
+            self.log
+                .first_runs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(selection.clone());
             Ok(())
         }
 
@@ -6739,5 +7211,156 @@ mod tests {
             *log.prompts.lock().await,
             vec!["/foo custom args".to_owned()]
         );
+    }
+
+    fn lock_plain<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+        mutex
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[tokio::test]
+    async fn debug_intercept_writes_dump_and_pushes_message() -> Result<(), String> {
+        let dir = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let (mut rt, _log) = try_make_runtime()?;
+        rt.debug_dump_dir = dir.path().to_path_buf();
+        let outcome = rt.submit_text("/debug".to_owned(), false).await;
+        assert_eq!(outcome, ActionOutcome::Repaint);
+        let dump = dir.path().join("pi-debug.log");
+        assert!(
+            dump.exists(),
+            "debug dump not written at {}",
+            dump.display()
+        );
+        let Some(MessageView::Custom(custom)) = rt.view.messages.last() else {
+            return Err("expected trailing custom debug message".to_owned());
+        };
+        assert_eq!(custom.custom_type, "debug");
+        assert!(custom.text.starts_with("✓ Debug log written\n"));
+        assert!(custom.text.contains("pi-debug.log"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn settings_change_theme_persists_and_applies() {
+        let (mut rt, log) = make_runtime();
+        rt.handle_settings_change("theme", "classic").await;
+        assert_eq!(
+            *lock_plain(&log.settings_changes),
+            vec![("theme".to_owned(), "classic".to_owned())]
+        );
+        assert_eq!(
+            lock_plain(&log.themes).last(),
+            Some(&("classic-dark".to_owned(), ThemeMode::Auto))
+        );
+        assert!(rt.view.theme.name.starts_with("classic"));
+    }
+
+    #[tokio::test]
+    async fn settings_selector_enter_cycles_value_through_host() -> Result<(), String> {
+        let (mut rt, log) = try_make_runtime()?;
+        let _ = rt.dispatch_action(ViewAction::OpenSettings).await;
+        assert_eq!(rt.active_selector_kind, Some(SelectorKind::Settings));
+        // Enter cycles the highlighted row (theme: dark → light) via on_change.
+        rt.step_ui(key(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .map_err(|error| format!("settings step failed: {error}"))?;
+        assert_eq!(
+            *lock_plain(&log.settings_changes),
+            vec![("theme".to_owned(), "light".to_owned())]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn theme_selector_preview_and_cancel_restore() -> Result<(), String> {
+        let (mut rt, _log) = try_make_runtime()?;
+        let original = rt.view.theme.name.clone();
+        let outcome = rt.open_selector(SelectorKind::Theme).await;
+        assert_eq!(outcome, ActionOutcome::Repaint);
+        assert_eq!(rt.active_selector_kind, Some(SelectorKind::Theme));
+        assert!(rt.theme_preview_restore.is_some());
+        rt.preview_theme_selection("classic");
+        assert!(rt.view.theme.name.starts_with("classic"));
+        let _ = rt.dispatch_action(ViewAction::SelectCancelled).await;
+        assert_eq!(rt.view.theme.name, original);
+        assert!(rt.theme_preview_restore.is_none());
+        assert_eq!(rt.view.focus, FocusArea::Editor);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn theme_selector_confirm_persists_selection() {
+        let (mut rt, log) = make_runtime();
+        let _ = rt.open_selector(SelectorKind::Theme).await;
+        let _ = rt
+            .dispatch_action(ViewAction::SelectConfirmed {
+                selector: SelectorKind::Theme,
+                value: "motion".to_owned(),
+            })
+            .await;
+        assert_eq!(
+            lock_plain(&log.themes).last(),
+            Some(&("motion-dark".to_owned(), ThemeMode::Auto))
+        );
+        assert!(rt.view.theme.name.starts_with("motion"));
+        assert!(rt.theme_preview_restore.is_none());
+        assert_eq!(rt.view.focus, FocusArea::Editor);
+    }
+
+    #[tokio::test]
+    async fn typed_theme_command_opens_theme_selector() {
+        let (mut rt, log) = make_runtime();
+        let outcome = rt.submit_text("/theme".to_owned(), false).await;
+        assert_eq!(outcome, ActionOutcome::Repaint);
+        assert_eq!(rt.active_selector_kind, Some(SelectorKind::Theme));
+        assert_eq!(rt.view.focus, FocusArea::Selector);
+        assert!(log.prompts.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn first_run_wizard_persists_selection() {
+        let (mut rt, log) = make_runtime();
+        rt.open_first_run_wizard();
+        assert_eq!(
+            rt.view.overlay.as_ref().map(|overlay| overlay.kind),
+            Some(OverlayKind::FirstTimeSetup)
+        );
+        assert_eq!(rt.view.focus, FocusArea::Overlay);
+        assert_eq!(rt.view.first_run_step, Some(0));
+        // Family: pick the second entry ("classic").
+        rt.handle_first_run_key(KeyCode::Down).await;
+        rt.handle_first_run_key(KeyCode::Enter).await;
+        // Mode: keep Auto.
+        rt.handle_first_run_key(KeyCode::Enter).await;
+        // Analytics: choose "Don't share".
+        rt.handle_first_run_key(KeyCode::Down).await;
+        rt.handle_first_run_key(KeyCode::Enter).await;
+        assert_eq!(
+            *lock_plain(&log.first_runs),
+            vec![crate::core::platform::first_run::FirstRunSelection {
+                theme: "classic-dark".to_owned(),
+                theme_mode: ThemeMode::Auto,
+                share_analytics: false,
+            }]
+        );
+        assert!(rt.first_run.is_none());
+        assert!(rt.view.overlay.is_none());
+        assert_eq!(rt.view.first_run_step, None);
+        assert_eq!(rt.view.focus, FocusArea::Editor);
+    }
+
+    #[tokio::test]
+    async fn first_run_wizard_esc_restores_pre_theme() {
+        let (mut rt, log) = make_runtime();
+        let original = rt.view.theme.name.clone();
+        rt.open_first_run_wizard();
+        rt.handle_first_run_key(KeyCode::Down).await;
+        assert_ne!(rt.view.theme.name, original, "preview should change theme");
+        rt.handle_first_run_key(KeyCode::Esc).await;
+        assert_eq!(rt.view.theme.name, original);
+        assert!(rt.first_run.is_none());
+        assert!(rt.view.overlay.is_none());
+        assert!(lock_plain(&log.first_runs).is_empty());
     }
 }

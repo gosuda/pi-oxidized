@@ -10,6 +10,7 @@ use pi_tui::components::{Markdown, Spacer, Text};
 
 use super::state::{LoadedResource, ShortcutHint, StartupDiagnostics};
 use super::theme::{self, MarkdownOptions, MarkdownTheme, ResolvedTheme, ThemeColor};
+use crate::core::settings::ThemeMode;
 
 // ---------------------------------------------------------------------------
 // Loaded resources
@@ -67,10 +68,53 @@ pub fn build_diagnostics(
 // First-time setup
 // ---------------------------------------------------------------------------
 
-/// Build the first-time-setup wizard component (theme + analytics steps).
+/// First-run wizard steps: family → mode → analytics.
+pub const FIRST_RUN_STEP_FAMILY: usize = 0;
+/// Theme-mode step.
+pub const FIRST_RUN_STEP_MODE: usize = 1;
+/// Analytics opt-in step.
+pub const FIRST_RUN_STEP_ANALYTICS: usize = 2;
+
+/// Built-in family options for the first-run family step.
+#[must_use]
+pub fn first_run_family_options() -> Vec<&'static str> {
+    super::theme::BUILT_IN_THEME_FAMILIES.to_vec()
+}
+
+/// Mode options for the first-run mode step (`value`, label).
+#[must_use]
+pub fn first_run_mode_options() -> Vec<(ThemeMode, &'static str)> {
+    vec![
+        (ThemeMode::Auto, "Auto"),
+        (ThemeMode::Dark, "Dark"),
+        (ThemeMode::Light, "Light"),
+    ]
+}
+
+/// Analytics options for the final first-run step (`value`, label).
+#[must_use]
+pub fn first_run_analytics_options() -> Vec<(bool, &'static str)> {
+    vec![(true, "Share anonymous usage data"), (false, "Don't share")]
+}
+
+/// Build the first-time-setup wizard component (family + mode + analytics).
 #[must_use]
 pub fn build_first_time_setup(
     step: usize,
+    md_theme: MarkdownTheme,
+    th: &ResolvedTheme,
+) -> Box<dyn Component> {
+    build_first_time_setup_with_selection(step, 0, None, None, md_theme, th)
+}
+
+/// Build the first-time-setup wizard with highlighted option index and retained
+/// family/mode for the live-preview path.
+#[must_use]
+pub fn build_first_time_setup_with_selection(
+    step: usize,
+    selected_index: usize,
+    family: Option<&str>,
+    mode: Option<ThemeMode>,
     md_theme: MarkdownTheme,
     th: &ResolvedTheme,
 ) -> Box<dyn Component> {
@@ -81,8 +125,11 @@ pub fn build_first_time_setup(
         0,
     )));
     let body = match step {
-        0 => "Choose a theme: **dark** or **light**?\nUse `/theme` later to change.",
-        1 => "Enable anonymous usage analytics?\n(you can change this in settings)",
+        FIRST_RUN_STEP_FAMILY => "Choose a theme family.\nHighlight previews live; Enter confirms.",
+        FIRST_RUN_STEP_MODE => "Choose a theme mode.\nAuto matches the terminal background.",
+        FIRST_RUN_STEP_ANALYTICS => {
+            "Enable anonymous usage analytics?\n(you can change this in settings)"
+        }
         _ => "Setup complete. Type a message to begin.",
     };
     stack.push(Box::new(Markdown::new(
@@ -93,6 +140,44 @@ pub fn build_first_time_setup(
         theme::default_text_style(),
         MarkdownOptions::default(),
     )));
+
+    let options: Vec<String> = match step {
+        FIRST_RUN_STEP_FAMILY => first_run_family_options()
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        FIRST_RUN_STEP_MODE => first_run_mode_options()
+            .into_iter()
+            .map(|(_, label)| label.to_owned())
+            .collect(),
+        FIRST_RUN_STEP_ANALYTICS => first_run_analytics_options()
+            .into_iter()
+            .map(|(_, label)| label.to_owned())
+            .collect(),
+        _ => Vec::new(),
+    };
+    for (idx, label) in options.iter().enumerate() {
+        let marker = if idx == selected_index { "→ " } else { "  " };
+        let line = format!("{marker}{label}");
+        let color = if idx == selected_index {
+            ThemeColor::Accent
+        } else {
+            ThemeColor::Muted
+        };
+        stack.push(Box::new(Text::with_padding(th.fg(color, &line), 1, 0)));
+    }
+
+    if let Some(family) = family {
+        let mode_label = mode.map_or("—", ThemeMode::as_str);
+        stack.push(Box::new(Text::with_padding(
+            th.fg(
+                ThemeColor::Dim,
+                &format!("Selected family: {family} · mode: {mode_label}"),
+            ),
+            1,
+            0,
+        )));
+    }
     Box::new(stack)
 }
 

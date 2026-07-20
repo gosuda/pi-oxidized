@@ -1197,6 +1197,74 @@ pub const BUILT_IN_THEME_NAMES: [&str; 10] = [
     "antd-light",
 ];
 
+/// Built-in theme families shown in `/settings` and `/theme` (storage uses dark members).
+pub const BUILT_IN_THEME_FAMILIES: [&str; 5] = ["default", "classic", "motion", "m3", "antd"];
+
+/// Dark-member storage name for a built-in family label, or `None` when custom/unknown.
+#[must_use]
+pub fn family_to_storage_name(family: &str) -> Option<&'static str> {
+    match family {
+        "default" => Some("dark"),
+        "classic" => Some("classic-dark"),
+        "motion" => Some("motion-dark"),
+        "m3" => Some("m3-dark"),
+        "antd" => Some("antd-dark"),
+        _ => None,
+    }
+}
+
+/// Display family (or custom/pair raw) for a stored `theme` setting value.
+///
+/// Built-in `dark`/`light` and `*-dark`/`*-light` map to their family label.
+/// Slash pairs and unpaired customs display as the raw stored string.
+#[must_use]
+pub fn storage_name_to_display(raw: Option<&str>) -> String {
+    let Some(raw) = raw.filter(|s| !s.is_empty()) else {
+        return "default".to_owned();
+    };
+    if parse_theme_pair(raw).is_some() {
+        return raw.to_owned();
+    }
+    match raw {
+        "dark" | "light" => "default".to_owned(),
+        name if name.ends_with("-dark") => name.strip_suffix("-dark").unwrap_or(name).to_owned(),
+        name if name.ends_with("-light") => name.strip_suffix("-light").unwrap_or(name).to_owned(),
+        other => other.to_owned(),
+    }
+}
+
+/// Values for the Theme settings row: five built-in families plus custom theme names.
+#[must_use]
+pub fn theme_selector_values() -> Vec<String> {
+    let mut values: Vec<String> = BUILT_IN_THEME_FAMILIES
+        .iter()
+        .map(|family| (*family).to_owned())
+        .collect();
+    let mut customs: Vec<String> = available_themes(ColorMode::Truecolor)
+        .into_iter()
+        .filter_map(|(info, _)| {
+            let name = info.name;
+            if BUILT_IN_THEME_NAMES.contains(&name.as_str()) {
+                None
+            } else {
+                Some(name)
+            }
+        })
+        .collect();
+    customs.sort();
+    customs.dedup();
+    values.extend(customs);
+    values
+}
+
+/// Map a Theme-row selection value to the persisted `theme` storage string.
+///
+/// Families store their dark member; customs store the literal name.
+#[must_use]
+pub fn theme_selection_to_storage(selection: &str) -> String {
+    family_to_storage_name(selection).map_or_else(|| selection.to_owned(), str::to_owned)
+}
+
 /// Parse a `light/dark` pair setting (upstream `parseAutoThemeSetting`).
 ///
 /// Exactly one `/`, both members non-empty after trimming; member names are
@@ -1528,6 +1596,36 @@ mod tests {
         assert_eq!(paired_name("m3-light", true).as_deref(), Some("m3-dark"));
         assert_eq!(paired_name("mytheme", true), None);
         assert_eq!(paired_name("mytheme", false), None);
+    }
+
+    #[test]
+    fn family_storage_round_trip() {
+        assert_eq!(family_to_storage_name("default"), Some("dark"));
+        assert_eq!(family_to_storage_name("classic"), Some("classic-dark"));
+        assert_eq!(family_to_storage_name("motion"), Some("motion-dark"));
+        assert_eq!(family_to_storage_name("m3"), Some("m3-dark"));
+        assert_eq!(family_to_storage_name("antd"), Some("antd-dark"));
+        assert_eq!(family_to_storage_name("mytheme"), None);
+
+        assert_eq!(storage_name_to_display(None), "default");
+        assert_eq!(storage_name_to_display(Some("dark")), "default");
+        assert_eq!(storage_name_to_display(Some("light")), "default");
+        assert_eq!(storage_name_to_display(Some("classic-light")), "classic");
+        assert_eq!(storage_name_to_display(Some("motion-dark")), "motion");
+        assert_eq!(storage_name_to_display(Some("mytheme")), "mytheme");
+        assert_eq!(
+            storage_name_to_display(Some("solarized-light/gruvbox-dark")),
+            "solarized-light/gruvbox-dark"
+        );
+        assert_eq!(theme_selection_to_storage("default"), "dark");
+        assert_eq!(theme_selection_to_storage("m3"), "m3-dark");
+        assert_eq!(theme_selection_to_storage("custom-x"), "custom-x");
+        let values = theme_selector_values();
+        assert_eq!(
+            &values[..5],
+            &["default", "classic", "motion", "m3", "antd"]
+        );
+        assert!(!values.iter().any(|v| v == "dark" || v == "classic-dark"));
     }
 
     #[test]
