@@ -34,7 +34,7 @@ use pi_ai::providers::{
     OpenAiCompletions, OpenAiResponses, PiMessages, ProviderRegistry,
 };
 use pi_ai::types::{
-    AssistantMessageEvent, Context, Model, ModelCost, ModelInput, ModelThinkingLevel, ThinkingLevel,
+    AssistantMessageEvent, Context, Model, ModelCost, ModelInput, ModelThinkingLevel,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -611,6 +611,30 @@ impl ModelRuntime {
             .map_err(|error| ModelsError::new(ModelsErrorCode::Auth, error.to_string()).into())
     }
 
+    /// Remove the stored credential for `provider_id` (logout).
+    ///
+    /// Mirrors upstream `Models.logout`: deletes the credential from the store
+    /// and refreshes availability so the removed provider drops out of the
+    /// active catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelRuntimeError::Models`] when the credential store delete
+    /// fails.
+    pub async fn logout(&self, provider_id: &str) -> Result<(), ModelRuntimeError> {
+        self.inner
+            .credentials
+            .delete(provider_id)
+            .await
+            .map_err(|error| ModelsError::new(ModelsErrorCode::Auth, error.to_string()))?;
+        let _ = self
+            .refresh(ModelsRefreshOptions {
+                allow_network: Some(self.inner.allow_model_network),
+            })
+            .await;
+        Ok(())
+    }
+
     /// Registered extension provider configuration for `provider_id`.
     #[must_use]
     pub fn get_registered_provider_config(&self, provider_id: &str) -> Option<ProviderConfigInput> {
@@ -861,6 +885,7 @@ impl ModelRuntime {
             let mut merged = headers;
             if let Some(option_headers) = options.headers.take() {
                 for (name, value) in option_headers {
+                    merged.retain(|existing, _| !existing.eq_ignore_ascii_case(&name));
                     merged.insert(name, value);
                 }
             }
@@ -877,31 +902,69 @@ impl ModelRuntime {
         if let Some(base_url) = resolution.auth.base_url {
             model.base_url = base_url;
         }
-        // TS streamSimple / buildBaseOptions clamp path, with thinking-budget
-        // adjustment when a reasoning model carries a non-off level in extra.
+        options = Self::shape_reasoning_options(&model, context, options);
+        // Shared retry-delay default when product paths leave it unset.
+        if options.max_retry_delay_ms.is_none() {
+            options.max_retry_delay_ms = Some(pi_ai::DEFAULT_MAX_RETRY_DELAY_MS);
+        }
+        Ok(PreparedRequest { model, options })
+    }
+
+    /// Map the generic `extra["reasoning"]` onto per-API activation keys and
+    /// apply the upstream max-token clamps (thinking-budget inflation for the
+    /// anthropic/bedrock family, plain context clamp otherwise), mirroring
+    /// what each reference `streamSimple` does inside its API module.
+    fn shape_reasoning_options(
+        model: &Model,
+        context: &Context,
+        mut options: StreamOptions,
+    ) -> StreamOptions {
         let reasoning_level = if model.reasoning {
             options
                 .extra
                 .get("reasoning")
-                .and_then(|value| value.as_str())
+                .and_then(Value::as_str)
                 .and_then(|level| {
-                    if level == "off" {
-                        None
-                    } else {
-                        serde_json::from_value::<ThinkingLevel>(Value::String(level.to_owned()))
-                            .ok()
-                    }
+                    (level != "off")
+                        .then(|| serde_json::from_value(Value::String(level.to_owned())).ok())
+                        .flatten()
                 })
         } else {
             None
+        };
+        let Some(level) = reasoning_level else {
+            return pi_ai::apply_simple_max_tokens_clamp(model, context, options);
         };
         let custom_budgets = options
             .extra
             .get("thinkingBudgets")
             .and_then(|value| serde_json::from_value(value.clone()).ok());
-        if let Some(level) = reasoning_level {
+        match model.api.as_str() {
+            "anthropic-messages" => {
+                options
+                    .extra
+                    .insert("thinkingEnabled".to_owned(), Value::Bool(true));
+            }
+            "openai-responses"
+            | "azure-openai-responses"
+            | "openai-codex-responses"
+            | "openai-completions" => {
+                // ThinkingLevel is a plain string enum; serde cannot fail.
+                #[allow(clippy::expect_used)]
+                options.extra.insert(
+                    "reasoningEffort".to_owned(),
+                    serde_json::to_value(level)
+                        .expect("ThinkingLevel serializes to a plain string"),
+                );
+            }
+            _ => {}
+        }
+        if matches!(
+            model.api.as_str(),
+            "anthropic-messages" | "bedrock-converse-stream"
+        ) {
             let (adjusted, thinking_budget) = pi_ai::apply_thinking_and_context_clamp(
-                &model,
+                model,
                 context,
                 options,
                 level,
@@ -914,14 +977,10 @@ impl ModelRuntime {
                     Value::Number(serde_json::Number::from(thinking_budget)),
                 );
             }
+            options
         } else {
-            options = pi_ai::apply_simple_max_tokens_clamp(&model, context, options);
+            pi_ai::apply_simple_max_tokens_clamp(model, context, options)
         }
-        // Shared retry-delay default when product paths leave it unset.
-        if options.max_retry_delay_ms.is_none() {
-            options.max_retry_delay_ms = Some(pi_ai::DEFAULT_MAX_RETRY_DELAY_MS);
-        }
-        Ok(PreparedRequest { model, options })
     }
 
     async fn resolve_auth(
@@ -2836,6 +2895,81 @@ mod tests {
             extra.get("thinkingBudgetTokens"),
             Some(&Value::Number(3_072.into())),
             "thinking budget should be exposed for adapter use"
+        );
+        assert_eq!(
+            extra.get("thinkingEnabled"),
+            Some(&Value::Bool(true)),
+            "anthropic-messages activates extended thinking via thinkingEnabled"
+        );
+        assert!(
+            extra.get("reasoningEffort").is_none(),
+            "anthropic-messages must not receive the openai activation key"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prepare_request_maps_reasoning_effort_for_openai_family()
+    -> Result<(), ModelRuntimeError> {
+        let runtime = ModelRuntime::create_in_memory().await?;
+        let mut extra = serde_json::Map::new();
+        extra.insert("reasoning".to_owned(), Value::String("high".to_owned()));
+        runtime.register_provider(
+            "openai-reasoning",
+            &ProviderConfigInput {
+                base_url: Some("https://openai-reasoning.test/v1".to_owned()),
+                api: Some("openai-responses".to_owned()),
+                api_key: Some("sk-openai-reasoning".to_owned()),
+                auth_header: Some(true),
+                models: Some(vec![ProviderModelDefinition {
+                    id: "m".to_owned(),
+                    name: Some("m".to_owned()),
+                    api: Some("openai-responses".to_owned()),
+                    base_url: Some("https://openai-reasoning.test/v1".to_owned()),
+                    reasoning: true,
+                    thinking_level_map: None,
+                    input: Some(vec![ModelInput::Text]),
+                    cost: Some(ModelCost::default()),
+                    context_window: Some(32_000),
+                    max_tokens: Some(4_096),
+                    headers: None,
+                    compat: None,
+                }]),
+                ..ProviderConfigInput::default()
+            },
+        )?;
+        let extension = Arc::new(RecordingExtensionProvider::new());
+        runtime.register_extension_stream_provider("openai-reasoning", extension.clone());
+
+        let model = required(runtime.get_model("openai-reasoning", "m"), "model")?;
+        let options = StreamOptions {
+            max_tokens: Some(1_024),
+            extra,
+            ..StreamOptions::default()
+        };
+        let mut stream = runtime.stream_simple(model, Context::default(), options);
+        let first = futures::StreamExt::next(&mut stream).await;
+        assert!(
+            matches!(&first, Some(Err(error)) if error.message() == "extension-stream-hit"),
+            "expected extension stream hit, got {first:?}"
+        );
+
+        let calls = extension.calls();
+        assert_eq!(calls.len(), 1);
+        let extra = &calls[0].extra;
+        assert_eq!(
+            extra.get("reasoningEffort"),
+            Some(&Value::String("high".to_owned())),
+            "openai family activates reasoning via reasoningEffort"
+        );
+        assert!(
+            extra.get("thinkingEnabled").is_none() && extra.get("thinkingBudgetTokens").is_none(),
+            "openai family must not receive anthropic thinking keys"
+        );
+        assert_eq!(
+            calls[0].max_tokens,
+            Some(1_024),
+            "openai family keeps the caller max_tokens (no budget inflation)"
         );
         Ok(())
     }
