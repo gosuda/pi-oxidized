@@ -22,11 +22,19 @@
 //! `emit` self-gates on handler presence, so the gate would only suppress
 //! correct emissions.
 
+use crate::core::extension_host::{HostExtensionRunner, SessionBridgeEvent};
+use crate::core::messages::CustomMessageContent;
 use crate::core::resources::{
     ResourceLoader, SlashCommandInfo, SlashCommandSource, SyntheticSourceInfoOptions,
     create_synthetic_source_info,
 };
+use pi_ai::{ImageContent, Model, ModelThinkingLevel};
+use pi_ext::protocol::{SessionCommand, SessionCommandInfoWire, SessionStateWire, SessionToolWire};
+use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
+
+use super::prompt::{CustomMessageInput, DeliverAs};
+use super::tools::RefreshToolRegistryOptions;
 
 use super::AgentSession;
 use super::events::{
@@ -175,6 +183,10 @@ impl AgentSession {
                 .extension_command_context
                 .clone_from(&bindings.command_context_actions);
         }
+
+        // Claim the host session-action bridge (first bind per host instance
+        // wins; later binds are no-ops because the receiver is taken).
+        self.bind_session_bridge().await;
 
         let pending = self.lock_inner().pending_session_start.take();
         if let Some(event) = &pending {
@@ -359,6 +371,8 @@ impl AgentSession {
                 active_tool_names: None,
                 include_all_extension_tools: true,
             });
+            // Re-claim the fresh host's session-action bridge.
+            self.bind_session_bridge().await;
             self.emit_session_start_reload().await;
             self.extend_resources_from_extensions(SessionStartReason::Reload.as_str())
                 .await?;
@@ -515,6 +529,345 @@ impl AgentSession {
         if let Ok(mut guard) = self.host_extension_runner.write() {
             *guard = runner;
         }
+    }
+}
+
+impl AgentSession {
+    // -- Host session-action bridge ----------------------------------------
+
+    /// Claim the host's session-action bridge, push the initial
+    /// `session.update` snapshot (awaited, so extension handlers running in
+    /// the very next lifecycle event — `session_start` included — observe
+    /// real state, not defaults), and spawn the applier task.
+    ///
+    /// The task consumes `session.command` / `session.setModel` items from
+    /// the host, applies them against this session, and keeps the host's
+    /// mirror fresh (after every applied command and on relevant public
+    /// session events). No-op when no concrete host is attached or the
+    /// bridge is already claimed.
+    async fn bind_session_bridge(&self) {
+        let Some(host) = self.host_extension_runner() else {
+            return;
+        };
+        let Some(mut bridge_rx) = host.take_session_bridge() else {
+            return;
+        };
+        let Some(weak) = self.upgrade_self() else {
+            return;
+        };
+        let (dirty_tx, mut dirty_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let unsubscribe = self.subscribe(move |event| {
+            if matches!(
+                event,
+                AgentSessionEvent::AgentStart
+                    | AgentSessionEvent::AgentEnd { .. }
+                    | AgentSessionEvent::AgentSettled
+                    | AgentSessionEvent::ModelSelect { .. }
+                    | AgentSessionEvent::ThinkingLevelChanged { .. }
+                    | AgentSessionEvent::SessionInfoChanged { .. }
+                    | AgentSessionEvent::QueueUpdate { .. }
+                    | AgentSessionEvent::CompactionEnd { .. }
+            ) {
+                let _ = dirty_tx.send(());
+            }
+        });
+        // Awaited: the mirror must be warm before session_start is emitted.
+        let state = self.session_state_wire().await;
+        host.push_session_state(&state).await;
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    item = bridge_rx.recv() => {
+                        let Some(item) = item else { break };
+                        let Some(session) = weak.upgrade() else { break };
+                        session.apply_session_bridge_event(&host, item).await;
+                        let state = session.session_state_wire().await;
+                        host.push_session_state(&state).await;
+                    }
+                    ping = dirty_rx.recv() => {
+                        if ping.is_none() {
+                            break;
+                        }
+                        // Coalesce bursts into one push.
+                        while dirty_rx.try_recv().is_ok() {}
+                        if !host.is_active() {
+                            break;
+                        }
+                        let Some(session) = weak.upgrade() else { break };
+                        let state = session.session_state_wire().await;
+                        host.push_session_state(&state).await;
+                    }
+                }
+            }
+            unsubscribe();
+        });
+    }
+
+    /// Build the `session.update` mirror behind the host's synchronous
+    /// session getters.
+    pub(crate) async fn session_state_wire(&self) -> SessionStateWire {
+        let model = self.model();
+        let context_usage = self.get_context_usage().await.map(|usage| {
+            json!({
+                "tokens": usage.tokens,
+                "contextWindow": usage.context_window,
+                "percent": usage.percent,
+            })
+        });
+        let prompt = self.hooks.system_prompt_snapshot();
+        SessionStateWire {
+            session_name: self.session_name().await,
+            thinking_level: thinking_level_wire(self.thinking_level()),
+            active_tools: self.active_tool_names(),
+            all_tools: self
+                .get_all_tools()
+                .into_iter()
+                .map(|tool| SessionToolWire {
+                    name: tool.name,
+                    description: tool.description,
+                    parameters: tool.parameters,
+                    source: None,
+                })
+                .collect(),
+            commands: self
+                .slash_commands()
+                .into_iter()
+                .map(|command| SessionCommandInfoWire {
+                    name: command.name,
+                    description: command.description,
+                    source: match command.source {
+                        SlashCommandSource::Extension => "extension".to_owned(),
+                        SlashCommandSource::Prompt => "prompt".to_owned(),
+                        SlashCommandSource::Skill => "skill".to_owned(),
+                    },
+                })
+                .collect(),
+            model: serde_json::to_value(&model).ok(),
+            is_idle: self.is_idle(),
+            has_pending_messages: self.pending_message_count() > 0,
+            context_usage,
+            system_prompt: prompt.override_prompt.unwrap_or(prompt.base),
+        }
+    }
+
+    /// Apply one host bridge item. Failures are isolated through
+    /// [`AgentSession::report_extension_error`]; nothing aborts the session.
+    async fn apply_session_bridge_event(
+        self: &Arc<Self>,
+        host: &Arc<HostExtensionRunner>,
+        event: SessionBridgeEvent,
+    ) {
+        match event {
+            SessionBridgeEvent::Command(command) => self.apply_session_command(command).await,
+            SessionBridgeEvent::SetModel { id, request } => {
+                let success = match serde_json::from_value::<Model>(request.model) {
+                    Ok(model) => match self.set_model(model).await {
+                        Ok(()) => true,
+                        Err(error) => {
+                            self.report_extension_error(format!("setModel: {error}"));
+                            false
+                        }
+                    },
+                    Err(error) => {
+                        self.report_extension_error(format!("setModel: invalid model: {error}"));
+                        false
+                    }
+                };
+                if let Err(error) = host.respond_set_model(id, success).await {
+                    self.report_extension_error(format!("setModel response: {error}"));
+                }
+            }
+            SessionBridgeEvent::Compact { id, request } => {
+                // Compaction can be slow; run it off the bridge loop so other
+                // commands (abort included) stay responsive.
+                let session = Arc::clone(self);
+                let host = Arc::clone(host);
+                tokio::spawn(async move {
+                    let outcome = match session
+                        .compact(request.custom_instructions.as_deref())
+                        .await
+                    {
+                        Ok(result) => serde_json::to_value(&result)
+                            .map_err(|error| format!("encode compaction result: {error}")),
+                        Err(error) => Err(error.to_string()),
+                    };
+                    if let Err(error) = host.respond_compact(id, outcome).await {
+                        session.report_extension_error(format!("compact response: {error}"));
+                    }
+                });
+            }
+        }
+    }
+
+    async fn apply_session_command(self: &Arc<Self>, command: SessionCommand) {
+        match command {
+            SessionCommand::SendMessage { message, options } => {
+                let input = match custom_message_input(&message) {
+                    Ok(input) => input,
+                    Err(error) => {
+                        self.report_extension_error(format!("sendMessage: {error}"));
+                        return;
+                    }
+                };
+                let trigger_turn = options
+                    .as_ref()
+                    .and_then(|o| o.get("triggerTurn"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let deliver_as = options
+                    .as_ref()
+                    .and_then(|o| o.get("deliverAs"))
+                    .and_then(Value::as_str)
+                    .and_then(parse_deliver_as);
+                if let Err(error) = self
+                    .send_custom_message(input, trigger_turn, deliver_as)
+                    .await
+                {
+                    self.report_extension_error(format!("sendMessage: {error}"));
+                }
+            }
+            SessionCommand::SendUserMessage { content, options } => {
+                let (text, images) = user_message_parts(&content);
+                let deliver_as = options
+                    .as_ref()
+                    .and_then(|o| o.get("deliverAs"))
+                    .and_then(Value::as_str)
+                    .and_then(parse_deliver_as)
+                    // `nextTurn` is not a valid sendUserMessage delivery mode.
+                    .filter(|mode| *mode != DeliverAs::NextTurn);
+                if let Err(error) = self.send_user_message(&text, images, deliver_as).await {
+                    self.report_extension_error(format!("sendUserMessage: {error}"));
+                }
+            }
+            SessionCommand::AppendEntry { custom_type, data } => {
+                let entry = {
+                    let mut manager = self.session_manager.lock().await;
+                    match manager.append_custom_entry(&custom_type, data) {
+                        Ok(id) => manager.get_entry(&id).cloned(),
+                        Err(error) => {
+                            drop(manager);
+                            self.report_extension_error(format!("appendEntry: {error}"));
+                            return;
+                        }
+                    }
+                };
+                if let Some(entry) = entry {
+                    self.emit_public(AgentSessionEvent::EntryAppended { entry });
+                }
+            }
+            SessionCommand::SetSessionName { name } => {
+                if let Err(error) = self.set_session_name(&name).await {
+                    self.report_extension_error(format!("setSessionName: {error}"));
+                }
+            }
+            SessionCommand::SetLabel { entry_id, label } => {
+                let result = self
+                    .session_manager
+                    .lock()
+                    .await
+                    .append_label_change(&entry_id, label.as_deref());
+                if let Err(error) = result {
+                    self.report_extension_error(format!("setLabel: {error}"));
+                }
+            }
+            SessionCommand::SetActiveTools { tool_names } => {
+                self.set_active_tools_by_name(tool_names);
+            }
+            SessionCommand::RefreshTools => {
+                self.refresh_tool_registry(&RefreshToolRegistryOptions::default());
+            }
+            SessionCommand::SetThinkingLevel { level } => match parse_thinking_level(&level) {
+                Some(level) => {
+                    let _ = self.set_thinking_level(level).await;
+                }
+                None => {
+                    self.report_extension_error(format!(
+                        "setThinkingLevel: unknown level: {level}"
+                    ));
+                }
+            },
+            SessionCommand::Abort => self.abort().await,
+            SessionCommand::Shutdown => self.invoke_extension_shutdown_handler(),
+        }
+    }
+}
+
+/// Wire string for a thinking level (serde `lowercase` discriminant).
+fn thinking_level_wire(level: ModelThinkingLevel) -> String {
+    serde_json::to_value(level)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "medium".to_owned())
+}
+
+/// Parse a wire thinking-level discriminant.
+fn parse_thinking_level(raw: &str) -> Option<ModelThinkingLevel> {
+    serde_json::from_value(Value::String(raw.to_owned())).ok()
+}
+
+/// Parse an upstream `deliverAs` discriminant.
+fn parse_deliver_as(raw: &str) -> Option<DeliverAs> {
+    match raw {
+        "steer" => Some(DeliverAs::Steer),
+        "followUp" => Some(DeliverAs::FollowUp),
+        "nextTurn" => Some(DeliverAs::NextTurn),
+        _ => None,
+    }
+}
+
+/// Convert the wire `sendMessage` payload into a [`CustomMessageInput`].
+fn custom_message_input(message: &Value) -> Result<CustomMessageInput, String> {
+    let custom_type = message
+        .get("customType")
+        .and_then(Value::as_str)
+        .ok_or("customType is required")?
+        .to_owned();
+    let content = message.get("content").cloned().map_or(
+        Ok(CustomMessageContent::Text(String::new())),
+        |value| {
+            serde_json::from_value::<CustomMessageContent>(value)
+                .map_err(|error| format!("invalid content: {error}"))
+        },
+    )?;
+    let display = message
+        .get("display")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let details = message.get("details").filter(|v| !v.is_null()).cloned();
+    Ok(CustomMessageInput {
+        custom_type,
+        content,
+        display,
+        details,
+    })
+}
+
+/// Split a wire `sendUserMessage` content (string or block array) into the
+/// prompt text and image attachments.
+fn user_message_parts(content: &Value) -> (String, Vec<ImageContent>) {
+    match content {
+        Value::String(text) => (text.clone(), Vec::new()),
+        Value::Array(blocks) => {
+            let mut texts: Vec<&str> = Vec::new();
+            let mut images = Vec::new();
+            for block in blocks {
+                match block.get("type").and_then(Value::as_str) {
+                    Some("text") => {
+                        if let Some(text) = block.get("text").and_then(Value::as_str) {
+                            texts.push(text);
+                        }
+                    }
+                    Some("image") => {
+                        if let Ok(image) = serde_json::from_value::<ImageContent>(block.clone()) {
+                            images.push(image);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            (texts.join("\n"), images)
+        }
+        _ => (String::new(), Vec::new()),
     }
 }
 

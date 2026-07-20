@@ -775,6 +775,21 @@ fn map_extension_ui_event(event: ExtensionUiEvent) -> Option<RpcExtensionUiReque
         // Theme switching is an interactive-mode surface; headless RPC has no
         // paint path to apply it to.
         ExtensionUiEvent::ThemeSet(_) => return None,
+        // Forward the controls the RPC extension-ui surface already names;
+        // interactive-only controls (working indicator, thinking label,
+        // paste, tool expansion) have no RPC counterpart.
+        ExtensionUiEvent::UiControl(control) => match control {
+            pi_ext::protocol::UiControl::SetStatus { key, text } => {
+                ExtensionUiProxy::set_status(&key, text.as_deref())
+            }
+            pi_ext::protocol::UiControl::SetTitle { title } => {
+                ExtensionUiProxy::set_title(title.as_deref().unwrap_or_default())
+            }
+            pi_ext::protocol::UiControl::SetEditorText { text } => {
+                ExtensionUiProxy::set_editor_text(&text)
+            }
+            _ => return None,
+        },
     })
 }
 

@@ -205,6 +205,38 @@ interface ThemeCatalogEntryPayload {
 	theme: ThemeWirePayload;
 }
 
+/** Mirrored session state pushed by Rust (`session.update`). */
+interface SessionStatePayload {
+	sessionName?: string;
+	thinkingLevel: string;
+	activeTools: string[];
+	allTools: Array<{ name: string; description: string; parameters: unknown; source?: string }>;
+	commands: Array<{ name: string; description?: string; source: string }>;
+	model?: Record<string, unknown>;
+	isIdle: boolean;
+	hasPendingMessages: boolean;
+	contextUsage?: Record<string, unknown>;
+	systemPrompt: string;
+}
+
+/** Mirror served before the first `session.update` arrives. */
+function initialSessionState(): SessionStatePayload {
+	return {
+		thinkingLevel: "medium",
+		activeTools: [],
+		allTools: [],
+		commands: [],
+		isIdle: true,
+		hasPendingMessages: false,
+		systemPrompt: "",
+	};
+}
+
+/** Minimal `SourceInfo` for natively owned tools/commands crossing the bridge. */
+function nativeSourceInfo(source: string): Record<string, unknown> {
+	return { path: `<${source}>`, source };
+}
+
 /** `theme.update` event payload (Rust → host). */
 interface ThemeUpdatePayload {
 	theme: ThemeWirePayload;
@@ -444,6 +476,14 @@ export class ExtensionHost {
 	private terminalTheme: "dark" | "light" = "dark";
 	/** Active `themeMode` from the latest `theme.update` push. */
 	private themeMode = "auto";
+	/** Mirrored session state behind the synchronous session getters. */
+	private sessionState: SessionStatePayload = initialSessionState();
+	/** Mirrored UI state behind `getEditorText` / `getToolsExpanded`. */
+	private uiState = { editorText: "", toolsExpanded: false };
+	/** Abort controller for the current agent turn (`ctx.getSignal`). */
+	private turnAbort: AbortController | undefined;
+	/** Extension statuses set via `ui.setStatus` (served to custom footers). */
+	private readonly extensionStatuses = new Map<string, string>();
 
 	constructor(stdin: ByteReadable, stdout: ByteWritable) {
 		const onFrame: FrameHandler = (frame) => this.onInbound(frame);
@@ -1238,6 +1278,70 @@ export class ExtensionHost {
 		}).catch(() => void 0);
 	}
 
+	/**
+	 * Install (or clear, when `content` is `undefined`) a keyed slot from
+	 * either a static `string[]` or an upstream component factory. Factories
+	 * receive the host TUI shim and the active theme; footer factories also
+	 * receive a `ReadonlyFooterDataProvider` backed by the statuses this host
+	 * observed via `ui.setStatus` (git branch / provider count are native
+	 * data the headless host does not own).
+	 */
+	private setComponentSlot(key: string, content: unknown, placement: SlotPlacement): void {
+		if (content === undefined || content === null) {
+			this.disposeSlot(key);
+			return;
+		}
+		let component: SlotEntry["component"];
+		if (Array.isArray(content)) {
+			const lines = content as string[];
+			component = { render: () => lines };
+		} else if (typeof content === "function") {
+			const tui = {
+				requestRender: () => {
+					const entry = this.slots.get(key);
+					if (entry !== undefined) this.pushSlot(key, entry, entry.width);
+				},
+			};
+			const footerData = {
+				getGitBranch: () => null,
+				getExtensionStatuses: () => this.extensionStatuses as ReadonlyMap<string, string>,
+				getAvailableProviderCount: () => 0,
+				onBranchChange: () => () => {},
+			};
+			try {
+				component = (content as (...args: unknown[]) => SlotEntry["component"])(
+					tui,
+					this.currentTheme,
+					footerData,
+				);
+			} catch (err) {
+				this.emitExtensionError("<inline>", "setComponentSlot", String(err));
+				return;
+			}
+			if (component === null || typeof component?.render !== "function") {
+				this.emitExtensionError(
+					"<inline>",
+					"setComponentSlot",
+					`factory for ${key} did not return a component`,
+				);
+				return;
+			}
+		} else {
+			return;
+		}
+		this.slots.get(key)?.component?.dispose?.();
+		const entry: SlotEntry = {
+			generation: this.nextGeneration++,
+			component,
+			placement,
+			focusable: false,
+			overlayOptions: undefined,
+			width: 80,
+		};
+		this.slots.set(key, entry);
+		this.pushSlot(key, entry, 80);
+	}
+
 	// -----------------------------------------------------------------------
 	// UI context bridge (extension → Rust dialogs)
 	// -----------------------------------------------------------------------
@@ -1276,28 +1380,40 @@ export class ExtensionHost {
 			},
 			onTerminalInput: (handler: TerminalInputHandler) =>
 				self.registerTerminalInputHandler(handler),
-			setStatus: () => {},
-			setWorkingMessage: () => {},
-			setWorkingVisible: () => {},
-			setWorkingIndicator: () => {},
-			setHiddenThinkingLabel: () => {},
-			setWidget: (key: string, content: unknown) => {
-				if (Array.isArray(content)) {
-					const entry: SlotEntry = {
-						generation: self.nextGeneration++,
-						component: { render: () => content as string[] },
-						placement: "aboveEditor",
-						focusable: false,
-						overlayOptions: undefined,
-						width: 80,
-					};
-					self.slots.set(key, entry);
-					self.pushSlot(key, entry, 80);
+			setStatus: (key: string, text: string | undefined) => {
+				if (text === undefined) {
+					self.extensionStatuses.delete(key);
+				} else {
+					self.extensionStatuses.set(key, text);
 				}
+				self.sendUiControl({ control: "setStatus", key, text });
 			},
-			setFooter: () => {},
-			setHeader: () => {},
-			setTitle: () => {},
+			setWorkingMessage: (message?: string) => {
+				self.sendUiControl({ control: "setWorkingMessage", message });
+			},
+			setWorkingVisible: (visible: boolean) => {
+				self.sendUiControl({ control: "setWorkingVisible", visible });
+			},
+			setWorkingIndicator: (options?: unknown) => {
+				self.sendUiControl({ control: "setWorkingIndicator", options });
+			},
+			setHiddenThinkingLabel: (label?: string) => {
+				self.sendUiControl({ control: "setHiddenThinkingLabel", label });
+			},
+			setWidget: (key: string, content: unknown, options?: { placement?: string }) => {
+				const placement: SlotPlacement =
+					options?.placement === "belowEditor" ? "belowEditor" : "aboveEditor";
+				self.setComponentSlot(key, content, placement);
+			},
+			setFooter: (factory: unknown) => {
+				self.setComponentSlot("footer.extension", factory, "footer");
+			},
+			setHeader: (factory: unknown) => {
+				self.setComponentSlot("header.extension", factory, "header");
+			},
+			setTitle: (title: string) => {
+				self.sendUiControl({ control: "setTitle", title });
+			},
 			custom: async (factory: any, options: any) => {
 				const { promise, resolve } = Promise.withResolvers<unknown>();
 				const key = `overlay.${self.nextGeneration++}`;
@@ -1338,9 +1454,18 @@ export class ExtensionHost {
 			editor: (title: string, prefill?: string) =>
 				self.dialog<{ value?: string | null }>("editor", { title, prefill })
 					.then((r) => r.value ?? undefined),
-			pasteToEditor: () => {},
-			setEditorText: () => {},
-			getEditorText: () => "",
+			pasteToEditor: (text: string) => {
+				self.uiState.editorText += text;
+				self.sendUiControl({ control: "pasteToEditor", text });
+			},
+			setEditorText: (text: string) => {
+				self.uiState.editorText = text;
+				self.sendUiControl({ control: "setEditorText", text });
+			},
+			getEditorText: () => self.uiState.editorText,
+			// Not portable: autocomplete stacking and editor-component
+			// replacement require an interactive editor protocol the bridge
+			// does not carry (documented divergence; ledgered by the audit).
 			addAutocompleteProvider: () => {},
 			setEditorComponent: () => {},
 			getEditorComponent: () => undefined,
@@ -1354,8 +1479,11 @@ export class ExtensionHost {
 				return entry === undefined ? undefined : buildThemeFromWire(entry.theme);
 			},
 			setTheme: (themeOrName: string | Theme) => self.setThemeFromExtension(themeOrName),
-			getToolsExpanded: () => false,
-			setToolsExpanded: () => {},
+			getToolsExpanded: () => self.uiState.toolsExpanded,
+			setToolsExpanded: (expanded: boolean) => {
+				self.uiState.toolsExpanded = expanded;
+				self.sendUiControl({ control: "setToolsExpanded", expanded });
+			},
 		};
 		// Documented escape hatch: the bridge implements the subset extensions
 		// use at runtime. The full ExtensionUIContext carries TUI/Theme types
@@ -1529,6 +1657,20 @@ export class ExtensionHost {
 			this.applyThemeUpdate(frame.payload as ThemeUpdatePayload);
 			return;
 		}
+		if (frame.method === "session.update") {
+			this.applySessionUpdate(frame.payload as Partial<SessionStatePayload>);
+			return;
+		}
+		if (frame.method === "ui.state") {
+			const payload = frame.payload as Record<string, unknown>;
+			if (typeof payload["editorText"] === "string") {
+				this.uiState.editorText = payload["editorText"];
+			}
+			if (typeof payload["toolsExpanded"] === "boolean") {
+				this.uiState.toolsExpanded = payload["toolsExpanded"];
+			}
+			return;
+		}
 		if (frame.method !== "tool.cancel" && frame.method !== "provider.cancel") {
 			return;
 		}
@@ -1537,6 +1679,24 @@ export class ExtensionHost {
 		if (requestId === undefined) return;
 		this.inFlightTools.get(requestId)?.abort();
 		this.inFlightProviders.get(requestId)?.abort();
+	}
+
+	/**
+	 * Apply an authoritative `session.update` push: the synchronous session
+	 * getters (`getSessionName`, `isIdle`, `getActiveTools`, …) serve the
+	 * latest mirror. An idle→busy transition arms a fresh turn abort
+	 * controller so `ctx.getSignal()` tracks the current agent run.
+	 */
+	private applySessionUpdate(update: Partial<SessionStatePayload>): void {
+		if (update === null || typeof update !== "object") return;
+		const wasIdle = this.sessionState.isIdle;
+		// Rust pushes complete snapshots; optional fields are OMITTED when
+		// cleared (serde skip_serializing_if), so absent keys must reset to
+		// their defaults — never survive from the previous mirror.
+		this.sessionState = { ...initialSessionState(), ...update };
+		if (wasIdle && !this.sessionState.isIdle) {
+			this.turnAbort = new AbortController();
+		}
 	}
 
 	/**
@@ -1619,6 +1779,20 @@ export class ExtensionHost {
 	}): void {
 		this.client.send({
 			id: 0, kind: "event", method: "theme.set" as Method, payload,
+		}).catch(() => void 0);
+	}
+
+	/** Fire-and-forget `session.command` action to Rust. */
+	private sendSessionCommand(payload: Record<string, unknown>): void {
+		this.client.send({
+			id: 0, kind: "event", method: "session.command" as Method, payload,
+		}).catch(() => void 0);
+	}
+
+	/** Fire-and-forget `ui.control` data-surface control to Rust. */
+	private sendUiControl(payload: Record<string, unknown>): void {
+		this.client.send({
+			id: 0, kind: "event", method: "ui.control" as Method, payload,
 		}).catch(() => void 0);
 	}
 
@@ -1857,28 +2031,162 @@ export class ExtensionHost {
 		}
 	}
 
-		// Escape hatch: ExtensionActions is a 14-method reference interface; the
-	// bridge stub implements the subset extensions use. Rust owns the real state.
+	/**
+	 * Real `ExtensionActions` bridged to Rust.
+	 *
+	 * Bridge design (mirrors upstream `runner.bindCore` in agent-session.ts):
+	 * - Void setters (`sendMessage`, `sendUserMessage`, `appendEntry`,
+	 *   `setSessionName`, `setLabel`, `setActiveTools`, `refreshTools`,
+	 *   `setThinkingLevel`) are fire-and-forget `session.command` events —
+	 *   upstream returns `void`, so no response is observable.
+	 * - Sync getters (`getSessionName`, `getActiveTools`, `getAllTools`,
+	 *   `getCommands`, `getThinkingLevel`) serve the mirrored state pushed by
+	 *   Rust via `session.update` (a blocking stdio round-trip cannot satisfy
+	 *   a synchronous signature on the JS event loop). Rust pushes an awaited
+	 *   initial snapshot before `session_start`, after every applied command,
+	 *   and on relevant session events. Setters with a paired getter apply an
+	 *   optimistic local mirror update BEFORE sending, so setter-then-getter
+	 *   within one handler is coherent; the next authoritative push corrects
+	 *   any divergence (e.g. a clamped thinking level or dropped tool name).
+	 * - `setModel` is the one async member: a correlated `session.setModel`
+	 *   request whose typed response carries upstream's boolean result.
+	 *
+	 * Documented escape hatch: the mirror carries structural equivalents of
+	 * reference types (`Model`, `ToolInfo.sourceInfo`) that the host cannot
+	 * instantiate as the reference classes; the final cast bridges that gap.
+	 */
 	private createExtensionActions(): ExtensionActions {
+		const self = this;
 		return {
-			sendMessage: () => {}, sendUserMessage: () => {}, appendEntry: () => {},
-			setSessionName: () => {}, getSessionName: () => undefined, setLabel: () => {},
-			getActiveTools: () => [], getAllTools: () => [], setActiveTools: () => {},
-			refreshTools: () => {}, getCommands: () => [],
-			setModel: async () => false,
-			getThinkingLevel: () => "medium",
-			setThinkingLevel: () => {},
+			sendMessage: (message: Record<string, unknown>, options?: Record<string, unknown>) => {
+				self.sendSessionCommand({
+					action: "sendMessage",
+					message: {
+						customType: message["customType"],
+						content: message["content"],
+						display: message["display"],
+						details: message["details"],
+					},
+					options,
+				});
+			},
+			sendUserMessage: (content: unknown, options?: Record<string, unknown>) => {
+				self.sendSessionCommand({ action: "sendUserMessage", content, options });
+			},
+			appendEntry: (customType: string, data?: unknown) => {
+				self.sendSessionCommand({ action: "appendEntry", customType, data });
+			},
+			setSessionName: (name: string) => {
+				self.sessionState.sessionName = name;
+				self.sendSessionCommand({ action: "setSessionName", name });
+			},
+			getSessionName: () => self.sessionState.sessionName,
+			setLabel: (entryId: string, label: string | undefined) => {
+				self.sendSessionCommand({ action: "setLabel", entryId, label });
+			},
+			getActiveTools: () => [...self.sessionState.activeTools],
+			getAllTools: () =>
+				self.sessionState.allTools.map((tool) => ({
+					name: tool.name,
+					description: tool.description,
+					parameters: tool.parameters,
+					sourceInfo: nativeSourceInfo(tool.source ?? "native"),
+				})),
+			setActiveTools: (toolNames: string[]) => {
+				self.sessionState.activeTools = [...toolNames];
+				self.sendSessionCommand({ action: "setActiveTools", toolNames });
+			},
+			refreshTools: () => {
+				self.sendSessionCommand({ action: "refreshTools" });
+			},
+			getCommands: () =>
+				self.sessionState.commands.map((command) => ({
+					name: command.name,
+					description: command.description,
+					source: command.source,
+					sourceInfo: nativeSourceInfo(command.source),
+				})),
+			setModel: async (model: unknown) => {
+				try {
+					const frame = await self.client.request(
+						"session.setModel" as Method,
+						{ model },
+						{ timeoutMs: EXTENSION_HOOK_TIMEOUT_MS },
+					);
+					const ok = (frame.payload as Record<string, unknown>)["success"] === true;
+					// Same-handler reads of ctx.model must observe the switch
+					// before the follow-up session.update lands.
+					if (ok) self.sessionState.model = model as typeof self.sessionState.model;
+					return ok;
+				} catch {
+					return false;
+				}
+			},
+			getThinkingLevel: () => self.sessionState.thinkingLevel,
+			setThinkingLevel: (level: string) => {
+				self.sessionState.thinkingLevel = level;
+				self.sendSessionCommand({ action: "setThinkingLevel", level });
+			},
 		} as unknown as ExtensionActions;
 	}
 
-	// Escape hatch: ExtensionContextActions is an 11-method reference interface.
+	/**
+	 * Real `ExtensionContextActions` bridged to Rust.
+	 *
+	 * Bridge design (verified against upstream `runner.bindCore` context
+	 * actions):
+	 * - Sync getters (`getModel`, `isIdle`, `hasPendingMessages`,
+	 *   `getContextUsage`, `getSystemPrompt`) serve the `session.update`
+	 *   mirror (see `createExtensionActions` for freshness guarantees).
+	 * - `isProjectTrusted` is host-local truth (set at `extensions.load`).
+	 * - `getSignal` returns the per-turn AbortController's signal; a fresh
+	 *   controller is armed on every idle→busy mirror transition. `abort()`
+	 *   aborts it locally (immediate, like upstream `agent.signal`) AND
+	 *   forwards the abort to Rust.
+	 * - `shutdown` is a fire-and-forget command. `compact` is a correlated
+	 *   `session.compact` request (no timeout); `onComplete`/`onError`
+	 *   receive the serialized result or error from the response frame.
+	 *
+	 * Documented escape hatch: `getModel` returns the mirrored plain object,
+	 * not a reference `Model` instance; the final cast bridges that gap.
+	 */
 	private createContextActions(): ExtensionContextActions {
+		const self = this;
 		return {
-			getModel: () => undefined, isIdle: () => true,
-			isProjectTrusted: () => this.projectTrusted,
-			getSignal: () => undefined, abort: () => {}, hasPendingMessages: () => false,
-			shutdown: () => {}, getContextUsage: () => undefined, compact: () => {},
-			getSystemPrompt: () => "",
+			getModel: () => self.sessionState.model,
+			isIdle: () => self.sessionState.isIdle,
+			isProjectTrusted: () => self.projectTrusted,
+			getSignal: () => self.turnAbort?.signal,
+			abort: () => {
+				self.turnAbort?.abort();
+				self.sendSessionCommand({ action: "abort" });
+			},
+			hasPendingMessages: () => self.sessionState.hasPendingMessages,
+			shutdown: () => {
+				self.sendSessionCommand({ action: "shutdown" });
+			},
+			getContextUsage: () => self.sessionState.contextUsage,
+			compact: (options?: {
+				customInstructions?: string;
+				onComplete?: (result: unknown) => void;
+				onError?: (error: Error) => void;
+			}) => {
+				// Correlated request (no timeout: compaction can be slow);
+				// upstream compact() is void with async completion callbacks.
+				self.client.request(
+					"session.compact" as Method,
+					{ customInstructions: options?.customInstructions },
+				).then(
+					(frame) => {
+						const result = (frame.payload as Record<string, unknown>)["result"];
+						options?.onComplete?.(result);
+					},
+					(error: unknown) => {
+						options?.onError?.(error instanceof Error ? error : new Error(String(error)));
+					},
+				);
+			},
+			getSystemPrompt: () => self.sessionState.systemPrompt,
 		} as unknown as ExtensionContextActions;
 	}
 

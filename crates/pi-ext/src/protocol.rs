@@ -1294,6 +1294,262 @@ pub struct ThemeSet {
     #[serde(default)]
     pub persist: bool,
 }
+// ---------------------------------------------------------------------------
+// Session-action bridge wire types (open methods)
+// ---------------------------------------------------------------------------
+
+/// Open method string: Rust pushes the mirrored session state to the host.
+///
+/// The host serves the synchronous `ExtensionActions` / context getters
+/// (`getSessionName`, `getActiveTools`, `isIdle`, …) from the latest push.
+pub const SESSION_UPDATE_METHOD: &str = "session.update";
+
+/// Open method string: the host forwards a fire-and-forget extension session
+/// action (`pi.setSessionName`, `ctx.abort`, …).
+pub const SESSION_COMMAND_METHOD: &str = "session.command";
+
+/// Open method string: correlated `pi.setModel` request (host → Rust).
+pub const SESSION_SET_MODEL_METHOD: &str = "session.setModel";
+
+/// Open method string: the host forwards a fire-and-forget extension UI
+/// control (`ui.setStatus`, `ui.setEditorText`, …).
+pub const UI_CONTROL_METHOD: &str = "ui.control";
+
+/// Open method string: Rust pushes mirrored UI state (editor text, tool
+/// expansion) so the host can serve `getEditorText` / `getToolsExpanded`.
+pub const UI_STATE_METHOD: &str = "ui.state";
+
+/// One registered tool as extensions observe it via `pi.getAllTools()`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionToolWire {
+    /// Registered tool name.
+    pub name: String,
+    /// Human-readable description.
+    pub description: String,
+    /// JSON Schema for arguments.
+    pub parameters: Value,
+    /// Origin label (`builtin` or `extension:<name>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+/// One slash command as extensions observe it via `pi.getCommands()`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionCommandInfoWire {
+    /// Command name without leading `/`.
+    pub name: String,
+    /// Optional description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Origin discriminant (`extension` | `prompt` | `skill`).
+    pub source: String,
+}
+
+/// `session.update` event payload (Rust → host): the authoritative mirror
+/// behind every synchronous session getter on the host.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionStateWire {
+    /// Session display name (`None` until set).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
+    /// Current thinking level discriminant (`off` | `minimal` | …).
+    pub thinking_level: String,
+    /// Active tool names.
+    pub active_tools: Vec<String>,
+    /// All registered tools.
+    pub all_tools: Vec<SessionToolWire>,
+    /// Extension/prompt/skill slash-command catalog.
+    pub commands: Vec<SessionCommandInfoWire>,
+    /// Serialized active `Model` (upstream shape), if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<Value>,
+    /// Whether the session has no active agent run.
+    pub is_idle: bool,
+    /// Whether steering/follow-up messages are queued.
+    pub has_pending_messages: bool,
+    /// Serialized `ContextUsage`, when computable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_usage: Option<Value>,
+    /// Current effective system prompt.
+    pub system_prompt: String,
+}
+
+/// `session.command` event payload (host → Rust): one fire-and-forget
+/// extension session action. Field names mirror the reference handler
+/// signatures (`types.ts` `ExtensionActions` / `ExtensionContextActions`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "camelCase")]
+pub enum SessionCommand {
+    /// `pi.sendMessage(message, options)`.
+    SendMessage {
+        /// `Pick<CustomMessage, "customType" | "content" | "display" | "details">`.
+        message: Value,
+        /// `{ triggerTurn?, deliverAs? }`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        options: Option<Value>,
+    },
+    /// `pi.sendUserMessage(content, options)`.
+    SendUserMessage {
+        /// String or `(TextContent | ImageContent)[]`.
+        content: Value,
+        /// `{ deliverAs? }`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        options: Option<Value>,
+    },
+    /// `pi.appendEntry(customType, data)`.
+    AppendEntry {
+        /// Custom entry type discriminant.
+        #[serde(rename = "customType")]
+        custom_type: String,
+        /// Arbitrary payload.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        data: Option<Value>,
+    },
+    /// `pi.setSessionName(name)`.
+    SetSessionName {
+        /// New display name.
+        name: String,
+    },
+    /// `pi.setLabel(entryId, label)`.
+    SetLabel {
+        /// Target session entry.
+        #[serde(rename = "entryId")]
+        entry_id: String,
+        /// New label (`None` clears).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
+    /// `pi.setActiveTools(toolNames)`.
+    SetActiveTools {
+        /// Requested active tool names.
+        #[serde(rename = "toolNames")]
+        tool_names: Vec<String>,
+    },
+    /// `pi.refreshTools()`.
+    RefreshTools,
+    /// `pi.setThinkingLevel(level)`.
+    SetThinkingLevel {
+        /// Requested level discriminant.
+        level: String,
+    },
+    /// `ctx.abort()`.
+    Abort,
+    /// `ctx.shutdown()`.
+    Shutdown,
+}
+
+/// Open method string: correlated `ctx.compact` request (host → Rust). The
+/// response carries the serialized `CompactionResult`; failures arrive as a
+/// protocol error frame (upstream delivers them to `onError`).
+pub const SESSION_COMPACT_METHOD: &str = "session.compact";
+
+/// `session.compact` request payload (host → Rust, correlated).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionCompactRequest {
+    /// Optional custom compaction instructions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_instructions: Option<String>,
+}
+
+/// `session.compact` response payload (Rust → host).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionCompactResponse {
+    /// Serialized `CompactionResult` (upstream shape).
+    pub result: Value,
+}
+
+/// `session.setModel` request payload (host → Rust, correlated).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSetModelRequest {
+    /// Serialized `Model` the extension asked to switch to.
+    pub model: Value,
+}
+
+/// `session.setModel` response payload (Rust → host).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSetModelResponse {
+    /// Upstream `SetModelHandler` result: false when auth/persist failed.
+    pub success: bool,
+}
+
+/// `ui.control` event payload (host → Rust): one fire-and-forget
+/// `ExtensionUIContext` data-surface control.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "control", rename_all = "camelCase")]
+pub enum UiControl {
+    /// `ui.setStatus(key, text)`; `None` clears the keyed entry.
+    SetStatus {
+        /// Status entry key.
+        key: String,
+        /// Status text (`None` clears).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+    },
+    /// `ui.setWorkingMessage(message)`; `None` restores the default.
+    SetWorkingMessage {
+        /// Override for the streaming loader text.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+    /// `ui.setWorkingVisible(visible)`.
+    SetWorkingVisible {
+        /// Whether the working indicator is shown while streaming.
+        visible: bool,
+    },
+    /// `ui.setWorkingIndicator(options)`; `None` restores the default.
+    SetWorkingIndicator {
+        /// `WorkingIndicatorOptions` (frames/intervalMs), upstream shape.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        options: Option<Value>,
+    },
+    /// `ui.setHiddenThinkingLabel(label)`; `None` restores the default.
+    SetHiddenThinkingLabel {
+        /// Label shown instead of hidden thinking blocks.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
+    /// `ui.setTitle(title)`; `None` clears.
+    SetTitle {
+        /// Terminal title text.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
+    /// `ui.pasteToEditor(text)`: insert at the cursor.
+    PasteToEditor {
+        /// Text to insert.
+        text: String,
+    },
+    /// `ui.setEditorText(text)`: replace the editor content.
+    SetEditorText {
+        /// Replacement text.
+        text: String,
+    },
+    /// `ui.setToolsExpanded(expanded)`.
+    SetToolsExpanded {
+        /// Whether tool blocks render expanded.
+        expanded: bool,
+    },
+}
+
+/// `ui.state` event payload (Rust → host): mirrored UI state behind the
+/// synchronous `getEditorText` / `getToolsExpanded` getters. Pushed at UI
+/// sync points (control application, submit, tool-expansion toggle), not per
+/// keystroke.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UiStateWire {
+    /// Current editor content as of the last sync point.
+    pub editor_text: String,
+    /// Whether tool blocks render expanded.
+    pub tools_expanded: bool,
+}
 
 /// Encode a frame to a single UTF-8 JSON line including the trailing `\n`.
 ///
@@ -2010,6 +2266,159 @@ mod tests {
         assert_eq!(payload["name"], "light/dark");
         assert!(payload.get("theme").is_none());
         assert_eq!(from_payload::<ThemeSet>(&payload)?, set);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod bridge_tests {
+    use super::*;
+
+    type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
+
+    const FIXTURES: &str =
+        include_str!("../../../packages/pi-tui-protocol/tests/fixtures/frames.jsonl");
+
+    /// Every open bridge method must be locked into the shared witness, and
+    /// each witnessed payload must decode through its typed wire struct.
+    #[test]
+    fn shared_fixtures_cover_bridge_methods_typed() -> TestResult {
+        let mut seen: std::collections::HashSet<(String, FrameKind)> =
+            std::collections::HashSet::new();
+        for line in FIXTURES.lines() {
+            if line.trim().is_empty() || line.trim_start().starts_with('#') {
+                continue;
+            }
+            let frame = decode_frame_str(line)?;
+            match frame.method.as_str() {
+                THEME_UPDATE_METHOD => {
+                    from_payload::<ThemeUpdate>(&frame.payload)?;
+                }
+                THEME_SET_METHOD => {
+                    from_payload::<ThemeSet>(&frame.payload)?;
+                }
+                SESSION_UPDATE_METHOD => {
+                    from_payload::<SessionStateWire>(&frame.payload)?;
+                }
+                SESSION_COMMAND_METHOD => {
+                    from_payload::<SessionCommand>(&frame.payload)?;
+                }
+                SESSION_SET_MODEL_METHOD if frame.kind == FrameKind::Req => {
+                    from_payload::<SessionSetModelRequest>(&frame.payload)?;
+                }
+                SESSION_SET_MODEL_METHOD => {
+                    from_payload::<SessionSetModelResponse>(&frame.payload)?;
+                }
+                SESSION_COMPACT_METHOD if frame.kind == FrameKind::Req => {
+                    from_payload::<SessionCompactRequest>(&frame.payload)?;
+                }
+                SESSION_COMPACT_METHOD => {
+                    from_payload::<SessionCompactResponse>(&frame.payload)?;
+                }
+                UI_CONTROL_METHOD => {
+                    from_payload::<UiControl>(&frame.payload)?;
+                }
+                UI_STATE_METHOD => {
+                    from_payload::<UiStateWire>(&frame.payload)?;
+                }
+                _ => continue,
+            }
+            seen.insert((frame.method, frame.kind));
+        }
+        for (method, kind) in [
+            (THEME_UPDATE_METHOD, FrameKind::Event),
+            (THEME_SET_METHOD, FrameKind::Event),
+            (SESSION_UPDATE_METHOD, FrameKind::Event),
+            (SESSION_COMMAND_METHOD, FrameKind::Event),
+            (SESSION_SET_MODEL_METHOD, FrameKind::Req),
+            (SESSION_SET_MODEL_METHOD, FrameKind::Res),
+            (SESSION_COMPACT_METHOD, FrameKind::Req),
+            (SESSION_COMPACT_METHOD, FrameKind::Res),
+            (UI_CONTROL_METHOD, FrameKind::Event),
+            (UI_STATE_METHOD, FrameKind::Event),
+        ] {
+            assert!(
+                seen.contains(&(method.to_owned(), kind)),
+                "fixture missing {method} {kind} frame"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn session_command_wire_discriminants() -> TestResult {
+        let cmd = SessionCommand::SetLabel {
+            entry_id: "e1".to_owned(),
+            label: None,
+        };
+        let payload = to_payload(&cmd)?;
+        assert_eq!(payload["action"], "setLabel");
+        assert_eq!(payload["entryId"], "e1");
+        assert!(payload.get("label").is_none());
+        assert_eq!(from_payload::<SessionCommand>(&payload)?, cmd);
+
+        let cmd = SessionCommand::SetActiveTools {
+            tool_names: vec!["read".to_owned()],
+        };
+        let payload = to_payload(&cmd)?;
+        assert_eq!(payload["action"], "setActiveTools");
+        assert_eq!(payload["toolNames"][0], "read");
+
+        let request = SessionCompactRequest {
+            custom_instructions: Some("keep decisions".to_owned()),
+        };
+        let payload = to_payload(&request)?;
+        assert_eq!(payload["customInstructions"], "keep decisions");
+        assert_eq!(from_payload::<SessionCompactRequest>(&payload)?, request);
+        Ok(())
+    }
+
+    #[test]
+    fn ui_control_wire_discriminants() -> TestResult {
+        let control = UiControl::SetStatus {
+            key: "lint".to_owned(),
+            text: None,
+        };
+        let payload = to_payload(&control)?;
+        assert_eq!(payload["control"], "setStatus");
+        assert!(payload.get("text").is_none());
+        assert_eq!(from_payload::<UiControl>(&payload)?, control);
+
+        let control = UiControl::SetToolsExpanded { expanded: true };
+        let payload = to_payload(&control)?;
+        assert_eq!(payload["control"], "setToolsExpanded");
+        assert_eq!(payload["expanded"], true);
+        Ok(())
+    }
+
+    #[test]
+    fn session_state_wire_roundtrip() -> TestResult {
+        let state = SessionStateWire {
+            session_name: Some("s".to_owned()),
+            thinking_level: "high".to_owned(),
+            active_tools: vec!["read".to_owned()],
+            all_tools: vec![SessionToolWire {
+                name: "read".to_owned(),
+                description: "Read".to_owned(),
+                parameters: serde_json::json!({"type": "object"}),
+                source: Some("builtin".to_owned()),
+            }],
+            commands: vec![SessionCommandInfoWire {
+                name: "review".to_owned(),
+                description: None,
+                source: "extension".to_owned(),
+            }],
+            model: None,
+            is_idle: false,
+            has_pending_messages: true,
+            context_usage: None,
+            system_prompt: "p".to_owned(),
+        };
+        let payload = to_payload(&state)?;
+        assert_eq!(payload["thinkingLevel"], "high");
+        assert_eq!(payload["hasPendingMessages"], true);
+        assert!(payload.get("model").is_none());
+        assert_eq!(from_payload::<SessionStateWire>(&payload)?, state);
         Ok(())
     }
 }

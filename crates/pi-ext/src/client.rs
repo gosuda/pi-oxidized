@@ -186,6 +186,24 @@ pub enum HostEvent {
     ExtensionError(crate::protocol::ExtensionErrorEvent),
     /// Extension `setTheme` application request.
     ThemeSet(crate::protocol::ThemeSet),
+    /// Extension fire-and-forget session action (`pi.setSessionName`, …).
+    SessionCommand(crate::protocol::SessionCommand),
+    /// Correlated `pi.setModel` request awaiting [`HostClient::respond_set_model`].
+    SetModelRequest {
+        /// Original host correlation id.
+        id: FrameId,
+        /// Requested model payload.
+        request: crate::protocol::SessionSetModelRequest,
+    },
+    /// Correlated `ctx.compact` request awaiting [`HostClient::respond_compact`].
+    CompactRequest {
+        /// Original host correlation id.
+        id: FrameId,
+        /// Compact request payload.
+        request: crate::protocol::SessionCompactRequest,
+    },
+    /// Extension fire-and-forget UI control (`ui.setStatus`, …).
+    UiControl(crate::protocol::UiControl),
     /// Untyped / unrecognized frame.
     Raw(Frame),
     /// Host stdout closed.
@@ -483,6 +501,66 @@ impl HostClient {
         let payload = payload
             .map_err(|error| HostClientError::Payload(format!("encode UI response: {error}")))?;
         self.send_frame(Frame::response(id, method, payload)).await
+    }
+
+    /// Answer a correlated `session.setModel` request from the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns a payload or transport error when the response cannot be
+    /// encoded or sent.
+    pub async fn respond_set_model(&self, id: FrameId, success: bool) -> HostResult<()> {
+        let payload = serde_json::to_value(crate::protocol::SessionSetModelResponse { success })
+            .map_err(|error| {
+                HostClientError::Payload(format!("encode setModel response: {error}"))
+            })?;
+        self.send_frame(Frame {
+            id,
+            kind: FrameKind::Res,
+            method: crate::protocol::SESSION_SET_MODEL_METHOD.to_owned(),
+            payload,
+        })
+        .await
+    }
+
+    /// Answer a correlated `session.compact` request from the host.
+    ///
+    /// Success sends the serialized `CompactionResult`; failure sends an
+    /// error frame the host surfaces to the extension's `onError` callback.
+    ///
+    /// # Errors
+    ///
+    /// Returns a payload or transport error when the response cannot be
+    /// encoded or sent.
+    pub async fn respond_compact(
+        &self,
+        id: FrameId,
+        outcome: Result<serde_json::Value, String>,
+    ) -> HostResult<()> {
+        let frame = match outcome {
+            Ok(result) => Frame {
+                id,
+                kind: FrameKind::Res,
+                method: crate::protocol::SESSION_COMPACT_METHOD.to_owned(),
+                payload: serde_json::to_value(crate::protocol::SessionCompactResponse { result })
+                    .map_err(|error| {
+                    HostClientError::Payload(format!("encode compact response: {error}"))
+                })?,
+            },
+            Err(message) => Frame {
+                id,
+                kind: FrameKind::Error,
+                method: crate::protocol::SESSION_COMPACT_METHOD.to_owned(),
+                payload: serde_json::to_value(crate::protocol::ErrorPayload::new(
+                    "extension_error",
+                    &message,
+                ))
+                .map_err(|error| {
+                    HostClientError::Payload(format!("encode compact error: {error}"))
+                })?,
+            },
+        };
+        self.send_frame(frame).await
     }
 
     /// Send a fire-and-forget event frame (id 0) with an open method string.
@@ -961,14 +1039,37 @@ fn dispatch(shared: &Shared, frame: Frame) {
                 forward_stream_event(shared, frame);
             }
         }
-        FrameKind::Req => match decode_ui_request(&frame) {
-            Some(request) => {
+        FrameKind::Req => {
+            if frame.method == crate::protocol::SESSION_SET_MODEL_METHOD {
+                match from_payload::<crate::protocol::SessionSetModelRequest>(&frame.payload) {
+                    Ok(request) => {
+                        let _ = shared.events.send(HostEvent::SetModelRequest {
+                            id: frame.id,
+                            request,
+                        });
+                    }
+                    Err(_) => {
+                        let _ = shared.events.send(HostEvent::Raw(frame));
+                    }
+                }
+            } else if frame.method == crate::protocol::SESSION_COMPACT_METHOD {
+                match from_payload::<crate::protocol::SessionCompactRequest>(&frame.payload) {
+                    Ok(request) => {
+                        let _ = shared.events.send(HostEvent::CompactRequest {
+                            id: frame.id,
+                            request,
+                        });
+                    }
+                    Err(_) => {
+                        let _ = shared.events.send(HostEvent::Raw(frame));
+                    }
+                }
+            } else if let Some(request) = decode_ui_request(&frame) {
                 let _ = shared.events.send(HostEvent::UiRequest(request));
-            }
-            None => {
+            } else {
                 let _ = shared.events.send(HostEvent::Raw(frame));
             }
-        },
+        }
     }
 }
 
@@ -1036,6 +1137,24 @@ fn forward_event(shared: &Shared, frame: Frame) {
         match from_payload::<crate::protocol::ThemeSet>(&frame.payload) {
             Ok(set) => {
                 let _ = shared.events.send(HostEvent::ThemeSet(set));
+            }
+            Err(_) => {
+                let _ = shared.events.send(HostEvent::Raw(frame));
+            }
+        }
+    } else if method == crate::protocol::SESSION_COMMAND_METHOD {
+        match from_payload::<crate::protocol::SessionCommand>(&frame.payload) {
+            Ok(command) => {
+                let _ = shared.events.send(HostEvent::SessionCommand(command));
+            }
+            Err(_) => {
+                let _ = shared.events.send(HostEvent::Raw(frame));
+            }
+        }
+    } else if method == crate::protocol::UI_CONTROL_METHOD {
+        match from_payload::<crate::protocol::UiControl>(&frame.payload) {
+            Ok(control) => {
+                let _ = shared.events.send(HostEvent::UiControl(control));
             }
             Err(_) => {
                 let _ = shared.events.send(HostEvent::Raw(frame));

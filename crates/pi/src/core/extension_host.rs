@@ -31,8 +31,10 @@ use pi_ext::client::{HostClient, HostClientError, HostEvent, HostUiRequest, Host
 use pi_ext::host::{self, HostError, HostSpec};
 use pi_ext::protocol::{
     self, DisposeSlot, ExtensionErrorEvent, FlagValueWire, FlagsSetRequest, FlagsSetResponse,
-    NotifyRequest, ProviderEvent, ShortcutExecuteRequest, ShortcutExecuteResponse, ThemeSet,
-    ThemeUpdate, ToolUpdate, UiEventRequest, UiEventResponse, UiSlot,
+    FrameId, NotifyRequest, ProviderEvent, SessionCommand, SessionCompactRequest,
+    SessionSetModelRequest, SessionStateWire, ShortcutExecuteRequest, ShortcutExecuteResponse,
+    ThemeSet, ThemeUpdate, ToolUpdate, UiControl, UiEventRequest, UiEventResponse, UiSlot,
+    UiStateWire,
 };
 use pi_ext::sanitize::{SanitizedSlot, sanitize_slot};
 use serde::{Deserialize, Serialize};
@@ -139,6 +141,33 @@ pub enum ExtensionUiEvent {
     },
     /// Extension `setTheme` application request (string or object form).
     ThemeSet(ThemeSet),
+    /// Extension fire-and-forget UI control (`ui.setStatus`, `ui.setEditorText`, …).
+    UiControl(UiControl),
+}
+
+/// One item on the claimed session-action bridge.
+///
+/// Delivered by [`HostExtensionRunner::take_session_bridge`]; the claiming
+/// session task applies each item against the live `AgentSession` and answers
+/// `SetModel` via [`HostExtensionRunner::respond_set_model`].
+#[derive(Debug, Clone)]
+pub enum SessionBridgeEvent {
+    /// Fire-and-forget extension session action.
+    Command(SessionCommand),
+    /// Correlated `pi.setModel` request.
+    SetModel {
+        /// Host correlation id (echo into `respond_set_model`).
+        id: FrameId,
+        /// Requested model payload.
+        request: SessionSetModelRequest,
+    },
+    /// Correlated `ctx.compact` request.
+    Compact {
+        /// Host correlation id (echo into `respond_compact`).
+        id: FrameId,
+        /// Compact request payload.
+        request: SessionCompactRequest,
+    },
 }
 
 /// Failure while starting the extension host.
@@ -589,6 +618,9 @@ struct Inner {
     ui_requests_tx: mpsc::Sender<HostUiRequest>,
     ui_requests_rx: StdMutex<Option<mpsc::Receiver<HostUiRequest>>>,
     ui_requests_claimed: AtomicBool,
+    session_bridge_tx: mpsc::Sender<SessionBridgeEvent>,
+    session_bridge_rx: StdMutex<Option<mpsc::Receiver<SessionBridgeEvent>>>,
+    session_bridge_claimed: AtomicBool,
     /// Paths passed to `extensions.load` (restart reuses them).
     extension_paths: Vec<String>,
     /// Cwd passed to `extensions.load`.
@@ -628,6 +660,7 @@ impl Inner {
         let (errors_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let (ui_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let (ui_requests_tx, ui_requests_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        let (session_bridge_tx, session_bridge_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let flag_values = snapshot.flag_values.clone();
         Self {
             client,
@@ -641,6 +674,9 @@ impl Inner {
             ui_requests_tx,
             ui_requests_rx: StdMutex::new(Some(ui_requests_rx)),
             ui_requests_claimed: AtomicBool::new(false),
+            session_bridge_tx,
+            session_bridge_rx: StdMutex::new(Some(session_bridge_rx)),
+            session_bridge_claimed: AtomicBool::new(false),
             extension_paths,
             load_cwd,
             project_trusted,
@@ -775,6 +811,17 @@ impl Inner {
             return;
         }
         let _ = self.ui_tx.send(ExtensionUiEvent::ThemeSet(set));
+    }
+
+    fn ui_control_send(&self, control: UiControl) {
+        // Same lock discipline as notify_send: serialize against teardown.
+        let Ok(_slots) = self.slots.write() else {
+            return;
+        };
+        if !self.active() {
+            return;
+        }
+        let _ = self.ui_tx.send(ExtensionUiEvent::UiControl(control));
     }
 
     fn notify_send(&self, notification: NotifyRequest) {
@@ -1417,6 +1464,117 @@ impl HostExtensionRunner {
         self.inner.client.respond_ui(response).await
     }
 
+    /// Whether the host transport is live and the runner not invalidated.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.inner.active()
+    }
+
+    /// Claim the sole lossless receiver for extension session actions
+    /// (`session.command` events and `session.setModel` requests).
+    ///
+    /// The session bridge task calls this exactly once per host instance.
+    /// Subsequent callers receive `None`. While unclaimed, commands are
+    /// dropped and `setModel` requests are answered `success: false`.
+    #[must_use]
+    pub fn take_session_bridge(&self) -> Option<mpsc::Receiver<SessionBridgeEvent>> {
+        let receiver = self
+            .inner
+            .session_bridge_rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if receiver.is_some() {
+            self.inner
+                .session_bridge_claimed
+                .store(true, Ordering::Release);
+        }
+        receiver
+    }
+
+    /// Answer a correlated `session.setModel` request.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport error if the host has already exited.
+    pub async fn respond_set_model(
+        &self,
+        id: FrameId,
+        success: bool,
+    ) -> Result<(), HostClientError> {
+        self.inner.client.respond_set_model(id, success).await
+    }
+
+    /// Answer a correlated `session.compact` request.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport error if the host has already exited.
+    pub async fn respond_compact(
+        &self,
+        id: FrameId,
+        outcome: Result<Value, String>,
+    ) -> Result<(), HostClientError> {
+        self.inner.client.respond_compact(id, outcome).await
+    }
+    /// Push the mirrored session state to the host (`session.update` event).
+    ///
+    /// The host serves the synchronous `ExtensionActions` / context getters
+    /// from the latest push. Host failures are isolated as a single
+    /// non-retryable `extension_error`; the session survives.
+    pub async fn push_session_state(&self, state: &SessionStateWire) {
+        if !self.inner.active() {
+            return;
+        }
+        let payload = match serde_json::to_value(state) {
+            Ok(payload) => payload,
+            Err(error) => {
+                self.inner.publish_error(
+                    "extension_protocol",
+                    &format!("encode session.update: {error}"),
+                    None,
+                );
+                return;
+            }
+        };
+        if let Err(error) = self
+            .inner
+            .client
+            .send_event(protocol::SESSION_UPDATE_METHOD, payload)
+            .await
+        {
+            self.inner.report_host_error(&error);
+        }
+    }
+
+    /// Push mirrored UI state (editor text, tool expansion) to the host
+    /// (`ui.state` event). Pushed at UI sync points, not per keystroke; the
+    /// host serves `getEditorText` / `getToolsExpanded` from the latest push.
+    pub async fn push_ui_state(&self, state: &UiStateWire) {
+        if !self.inner.active() {
+            return;
+        }
+        let payload = match serde_json::to_value(state) {
+            Ok(payload) => payload,
+            Err(error) => {
+                self.inner.publish_error(
+                    "extension_protocol",
+                    &format!("encode ui.state: {error}"),
+                    None,
+                );
+                return;
+            }
+        };
+        if let Err(error) = self
+            .inner
+            .client
+            .send_event(protocol::UI_STATE_METHOD, payload)
+            .await
+        {
+            self.inner.report_host_error(&error);
+        }
+    }
+
     // -- Custom tool HTML rendering (session export) ----------------------
 
     /// Render an extension tool call or result as sanitized HTML for session
@@ -1646,6 +1804,20 @@ fn spawn_event_pump(inner: Arc<Inner>) {
                 Ok(HostEvent::ThemeSet(set)) => {
                     inner.theme_set_send(set);
                 }
+                Ok(HostEvent::UiControl(control)) => {
+                    inner.ui_control_send(control);
+                }
+                Ok(HostEvent::SessionCommand(command)) => {
+                    forward_session_bridge(&inner, SessionBridgeEvent::Command(command)).await;
+                }
+                Ok(HostEvent::SetModelRequest { id, request }) => {
+                    forward_session_bridge(&inner, SessionBridgeEvent::SetModel { id, request })
+                        .await;
+                }
+                Ok(HostEvent::CompactRequest { id, request }) => {
+                    forward_session_bridge(&inner, SessionBridgeEvent::Compact { id, request })
+                        .await;
+                }
                 Ok(HostEvent::UiSlot(slot)) => {
                     forward_slot(&inner, &slot);
                 }
@@ -1696,6 +1868,35 @@ fn spawn_event_pump(inner: Arc<Inner>) {
             }
         }
     });
+}
+
+/// Route one session-bridge item to the claiming session task. Unclaimed or
+/// closed bridges answer correlated requests immediately (so the host's
+/// awaiting extension never hangs) and drop fire-and-forget commands.
+async fn forward_session_bridge(inner: &Arc<Inner>, event: SessionBridgeEvent) {
+    let claimed = inner.active() && inner.session_bridge_claimed.load(Ordering::Acquire);
+    let undelivered = if claimed {
+        inner
+            .session_bridge_tx
+            .send(event)
+            .await
+            .err()
+            .map(|error| error.0)
+    } else {
+        Some(event)
+    };
+    match undelivered {
+        None | Some(SessionBridgeEvent::Command(_)) => {}
+        Some(SessionBridgeEvent::SetModel { id, .. }) => {
+            let _ = inner.client.respond_set_model(id, false).await;
+        }
+        Some(SessionBridgeEvent::Compact { id, .. }) => {
+            let _ = inner
+                .client
+                .respond_compact(id, Err("no active session".to_owned()))
+                .await;
+        }
+    }
 }
 
 fn default_ui_response(request: &HostUiRequest) -> HostUiResponse {

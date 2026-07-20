@@ -44,6 +44,13 @@ export function getExtensionAliases(): Record<string, string> {
 	const aiCompat = `${REF_ROOT}/ai/src/compat.ts`;
 	const aiOauth = `${REF_ROOT}/ai/src/oauth.ts`;
 	const aiProviders = `${REF_ROOT}/ai/src/providers/all.ts`;
+	// The reference loader resolves typebox via require.resolve from the
+	// coding-agent package; mirror that exact copy so extension schemas share
+	// one typebox instance with the reference extension machinery.
+	const typeboxRoot = `${REF_ROOT}/coding-agent/node_modules/typebox/build`;
+	const typebox = `${typeboxRoot}/index.mjs`;
+	const typeboxCompile = `${typeboxRoot}/compile/index.mjs`;
+	const typeboxValue = `${typeboxRoot}/value/index.mjs`;
 
 	return {
 		// Modern names → reference source (extensions subsystem, not full pkg).
@@ -63,6 +70,14 @@ export function getExtensionAliases(): Record<string, string> {
 		"@mariozechner/pi-ai/compat": aiCompat,
 		"@mariozechner/pi-ai/oauth": aiOauth,
 		"@mariozechner/pi-ai/providers/all": aiProviders,
+
+		// Typebox (mirrors reference loader VIRTUAL_MODULES / getAliases).
+		typebox,
+		"typebox/compile": typeboxCompile,
+		"typebox/value": typeboxValue,
+		"@sinclair/typebox": typebox,
+		"@sinclair/typebox/compile": typeboxCompile,
+		"@sinclair/typebox/value": typeboxValue,
 	};
 }
 

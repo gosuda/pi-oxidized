@@ -21,12 +21,34 @@ declare module "@earendil-works/pi-coding-agent" {
 		editor(title: string, prefill?: string): Promise<string | undefined>;
 		notify(message: string, type?: string): void;
 		onTerminalInput(handler: (data: string) => unknown): () => void;
-		setWidget(key: string, content: string[] | undefined, options?: Record<string, unknown>): void;
+		setStatus(key: string, text: string | undefined): void;
+		setWorkingMessage(message?: string): void;
+		setWorkingVisible(visible: boolean): void;
+		setWorkingIndicator(options?: { frames?: string[]; intervalMs?: number }): void;
+		setHiddenThinkingLabel(label?: string): void;
+		setWidget(key: string, content: string[] | ((tui: unknown, theme: Theme) => Component) | undefined, options?: Record<string, unknown>): void;
+		setFooter(factory: ((tui: unknown, theme: Theme, footerData: unknown) => Component) | undefined): void;
+		setHeader(factory: ((tui: unknown, theme: Theme) => Component) | undefined): void;
+		setTitle(title: string): void;
+		pasteToEditor(text: string): void;
+		setEditorText(text: string): void;
+		getEditorText(): string;
+		addAutocompleteProvider(factory: unknown): void;
+		setEditorComponent(factory: unknown): void;
+		getEditorComponent(): unknown;
 		custom<T>(factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (result: T) => void) => unknown, options?: unknown): Promise<T>;
 		readonly theme: Theme;
 		getAllThemes(): { name: string; path: string | undefined }[];
 		getTheme(name: string): Theme | undefined;
 		setTheme(theme: string | Theme): { success: boolean; error?: string };
+		getToolsExpanded(): boolean;
+		setToolsExpanded(expanded: boolean): void;
+	}
+
+	export interface ContextUsage {
+		tokens?: number;
+		contextWindow: number;
+		percent?: number;
 	}
 
 	export interface ExtensionContext {
@@ -34,6 +56,20 @@ declare module "@earendil-works/pi-coding-agent" {
 		mode: ExtensionMode;
 		hasUI: boolean;
 		cwd: string;
+		readonly model: unknown;
+		readonly signal: AbortSignal | undefined;
+		isIdle(): boolean;
+		isProjectTrusted(): boolean;
+		abort(): void;
+		hasPendingMessages(): boolean;
+		shutdown(): void;
+		getContextUsage(): ContextUsage | undefined;
+		compact(options?: {
+			customInstructions?: string;
+			onComplete?: (result: unknown) => void;
+			onError?: (error: Error) => void;
+		}): void;
+		getSystemPrompt(): string;
 	}
 
 	export type ToolExecutionMode = "sequential" | "parallel";
@@ -227,6 +263,22 @@ declare module "@earendil-works/pi-coding-agent" {
 		registerProvider(name: string, config: ProviderConfig): void;
 		unregisterProvider(name: string): void;
 		getFlag(name: string): boolean | string | undefined;
+		sendMessage(
+			message: { customType: string; content: unknown; display?: boolean; details?: unknown },
+			options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
+		): void;
+		sendUserMessage(content: unknown, options?: { deliverAs?: "steer" | "followUp" }): void;
+		appendEntry(customType: string, data?: unknown): void;
+		setSessionName(name: string): void;
+		getSessionName(): string | undefined;
+		setLabel(entryId: string, label: string | undefined): void;
+		getActiveTools(): string[];
+		getAllTools(): Array<{ name: string; description: string; parameters: unknown; sourceInfo: unknown }>;
+		setActiveTools(toolNames: string[]): void;
+		getCommands(): Array<{ name: string; description?: string; source: string; sourceInfo: unknown }>;
+		setModel(model: unknown): Promise<boolean>;
+		getThinkingLevel(): string;
+		setThinkingLevel(level: string): void;
 	}
 
 	export interface ExtensionActions {
@@ -342,4 +394,36 @@ declare module "@earendil-works/pi-ai/utils/json-parse.ts" {
 	export function parseStreamingJson<T = Record<string, unknown>>(
 		partialJson: string | undefined,
 	): T;
+}
+
+declare module "typebox" {
+	export const Type: {
+		Object(properties: Record<string, unknown>, options?: Record<string, unknown>): Record<string, unknown>;
+		String(options?: Record<string, unknown>): unknown;
+		Number(options?: Record<string, unknown>): unknown;
+		Boolean(options?: Record<string, unknown>): unknown;
+		Optional(schema: unknown, options?: Record<string, unknown>): unknown;
+	};
+}
+
+declare module "typebox/value" {
+	export const Value: {
+		Check(schema: unknown, value: unknown): boolean;
+	};
+}
+
+declare module "typebox/compile" {
+	export const Compile: (schema: unknown) => { Check(value: unknown): boolean };
+}
+
+declare module "@sinclair/typebox" {
+	export { Type } from "typebox";
+}
+
+declare module "@sinclair/typebox/value" {
+	export { Value } from "typebox/value";
+}
+
+declare module "@sinclair/typebox/compile" {
+	export { Compile } from "typebox/compile";
 }

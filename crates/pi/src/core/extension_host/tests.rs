@@ -2115,3 +2115,296 @@ async fn push_theme_update_sends_event_and_records_generation() -> R {
     runner.shutdown_once().await;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Session-action bridge (session.command / session.setModel / session.update)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn session_command_and_set_model_route_through_claimed_bridge() -> R {
+    use crate::core::extension_host::SessionBridgeEvent;
+    use pi_ext::protocol::SessionCommand;
+
+    let (runner, host) = make_runner(json!({})).await?;
+    let mut bridge = runner
+        .take_session_bridge()
+        .ok_or("first claim must yield the bridge receiver")?;
+    assert!(
+        runner.take_session_bridge().is_none(),
+        "second claim must be rejected"
+    );
+
+    host.emit(Frame {
+        id: 0,
+        kind: FrameKind::Event,
+        method: "session.command".to_owned(),
+        payload: json!({"action": "setSessionName", "name": "Renamed"}),
+    })
+    .await;
+    let event = tokio::time::timeout(Duration::from_millis(500), bridge.recv())
+        .await?
+        .ok_or("bridge closed")?;
+    let SessionBridgeEvent::Command(SessionCommand::SetSessionName { name }) = event else {
+        return Err(format!("expected SetSessionName, got {event:?}").into());
+    };
+    assert_eq!(name, "Renamed");
+
+    host.emit(Frame {
+        id: 41,
+        kind: FrameKind::Req,
+        method: "session.setModel".to_owned(),
+        payload: json!({"model": {"id": "gpt-x", "provider": "openai"}}),
+    })
+    .await;
+    let event = tokio::time::timeout(Duration::from_millis(500), bridge.recv())
+        .await?
+        .ok_or("bridge closed")?;
+    let SessionBridgeEvent::SetModel { id, request } = event else {
+        return Err(format!("expected SetModel, got {event:?}").into());
+    };
+    assert_eq!(id, 41);
+    assert_eq!(request.model["id"], "gpt-x");
+
+    runner.respond_set_model(id, true).await?;
+    host.wait_for_request("session.setModel").await?;
+    let response = host
+        .requests
+        .lock()
+        .ok()
+        .and_then(|requests| {
+            requests
+                .iter()
+                .find(|frame| frame.method == "session.setModel" && frame.kind == FrameKind::Res)
+                .cloned()
+        })
+        .ok_or("setModel response missing")?;
+    assert_eq!(response.id, 41);
+    assert_eq!(response.payload["success"], true);
+
+    runner.shutdown_once().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn unclaimed_set_model_request_is_answered_failure() -> R {
+    let (runner, host) = make_runner(json!({})).await?;
+
+    host.emit(Frame {
+        id: 7,
+        kind: FrameKind::Req,
+        method: "session.setModel".to_owned(),
+        payload: json!({"model": {"id": "gpt-x", "provider": "openai"}}),
+    })
+    .await;
+
+    host.wait_for_request("session.setModel").await?;
+    let response = host
+        .requests
+        .lock()
+        .ok()
+        .and_then(|requests| {
+            requests
+                .iter()
+                .find(|frame| frame.method == "session.setModel" && frame.kind == FrameKind::Res)
+                .cloned()
+        })
+        .ok_or("setModel failure response missing")?;
+    assert_eq!(response.id, 7);
+    assert_eq!(response.payload["success"], false);
+
+    runner.shutdown_once().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn ui_control_event_forwards_typed_to_ui_subscribers() -> R {
+    use crate::core::extension_host::ExtensionUiEvent;
+    use pi_ext::protocol::UiControl;
+
+    let (runner, host) = make_runner(json!({})).await?;
+    let mut ui = runner.subscribe_ui();
+
+    host.emit(Frame {
+        id: 0,
+        kind: FrameKind::Event,
+        method: "ui.control".to_owned(),
+        payload: json!({"control": "setEditorText", "text": "draft"}),
+    })
+    .await;
+
+    let event = tokio::time::timeout(Duration::from_millis(500), ui.recv()).await??;
+    let ExtensionUiEvent::UiControl(UiControl::SetEditorText { text }) = event else {
+        return Err(format!("expected SetEditorText, got {event:?}").into());
+    };
+    assert_eq!(text, "draft");
+
+    runner.shutdown_once().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn push_session_and_ui_state_send_mirror_events() -> R {
+    use pi_ext::protocol::{SessionStateWire, UiStateWire};
+
+    let (runner, host) = make_runner(json!({})).await?;
+
+    let state = SessionStateWire {
+        session_name: Some("s".to_owned()),
+        thinking_level: "medium".to_owned(),
+        active_tools: vec!["read".to_owned()],
+        is_idle: true,
+        system_prompt: "p".to_owned(),
+        ..SessionStateWire::default()
+    };
+    runner.push_session_state(&state).await;
+    host.wait_for_request("session.update").await?;
+    let frame = host
+        .requests
+        .lock()
+        .ok()
+        .and_then(|requests| {
+            requests
+                .iter()
+                .find(|frame| frame.method == "session.update")
+                .cloned()
+        })
+        .ok_or("session.update frame missing")?;
+    assert_eq!(frame.kind, FrameKind::Event);
+    assert_eq!(frame.payload["sessionName"], "s");
+    assert_eq!(frame.payload["isIdle"], true);
+    assert_eq!(frame.payload["activeTools"][0], "read");
+
+    runner
+        .push_ui_state(&UiStateWire {
+            editor_text: "draft".to_owned(),
+            tools_expanded: true,
+        })
+        .await;
+    host.wait_for_request("ui.state").await?;
+    let frame = host
+        .requests
+        .lock()
+        .ok()
+        .and_then(|requests| {
+            requests
+                .iter()
+                .find(|frame| frame.method == "ui.state")
+                .cloned()
+        })
+        .ok_or("ui.state frame missing")?;
+    assert_eq!(frame.payload["editorText"], "draft");
+    assert_eq!(frame.payload["toolsExpanded"], true);
+
+    runner.shutdown_once().await;
+    Ok(())
+}
+
+/// The awaited initial `session.update` push must land BEFORE `session_start`
+/// is emitted: a handler reading the mirrored synchronous getters inside its
+/// `session_start` hook observes real session state (the pre-bind session
+/// name), never the host defaults. The second half proves the reverse
+/// direction: a bridged `pi.setSessionName` command mutates the real session.
+#[tokio::test]
+async fn real_host_session_start_observes_initial_snapshot_and_commands_mutate() -> R {
+    use futures::stream::StreamExt;
+
+    #[derive(Clone)]
+    struct StubProvider;
+
+    impl pi_ai::Provider for StubProvider {
+        fn stream(
+            &self,
+            _model: &pi_ai::Model,
+            _context: pi_ai::Context,
+            _options: pi_ai::StreamOptions,
+        ) -> futures::stream::BoxStream<
+            'static,
+            std::result::Result<AssistantMessageEvent, pi_ai::ProviderError>,
+        > {
+            futures::stream::empty().boxed()
+        }
+    }
+
+    let host_path = real_host_path()?;
+    assert!(
+        host_path.is_file(),
+        "compiled host artifact missing: {}",
+        host_path.display()
+    );
+
+    let directory = tempfile::tempdir()?;
+    let log_path = directory.path().join("bridge.log");
+    let extension_path = directory.path().join("bridge-observer.ts");
+    std::fs::write(
+        &extension_path,
+        format!(
+            r#"import {{ appendFileSync }} from "node:fs";
+
+const LOG = {log:?};
+
+export default function bridgeObserver(pi) {{
+	pi.on("session_start", () => {{
+		appendFileSync(LOG, `session_start:${{pi.getSessionName()}}\n`);
+	}});
+	pi.registerCommand("renameSession", {{
+		description: "Rename via the bridge",
+		async handler() {{
+			pi.setSessionName("renamed-by-ext");
+		}},
+	}});
+}}
+"#,
+            log = log_path.to_string_lossy()
+        ),
+    )?;
+
+    let spec = pi_ext::host::HostSpec {
+        source: pi_ext::host::HostSource::Env(host_path.clone()),
+        program: host_path,
+        args: Vec::new(),
+    };
+    let runner =
+        HostExtensionRunner::spawn_from(&spec, vec![extension_path.to_string_lossy().into_owned()])
+            .await?;
+
+    let mut config = crate::core::agent_session::AgentSessionConfig::test_config(
+        Arc::new(StubProvider),
+        pi_agent::state::default_model(),
+    )?;
+    config.extension_runner = Some(Arc::clone(&runner) as Arc<dyn ExtensionRunner>);
+    config.host_extension_runner = Some(Arc::clone(&runner));
+    let session = crate::core::agent_session::AgentSession::new(config)?;
+
+    // Real pre-bind state the mirror must carry into the session_start hook.
+    session.set_session_name("witness").await?;
+
+    session
+        .bind_extensions(crate::core::agent_session::ExtensionBindings::default())
+        .await?;
+
+    let log = std::fs::read_to_string(&log_path)?;
+    assert_eq!(
+        log.lines().collect::<Vec<_>>(),
+        vec!["session_start:witness"],
+        "session_start handler must observe the awaited initial snapshot, not host defaults"
+    );
+
+    // Host → Rust: the bridged command mutates the real session.
+    assert!(runner.execute_command("renameSession", "").await?);
+    let renamed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if session.session_name().await.as_deref() == Some("renamed-by-ext") {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        renamed.is_ok(),
+        "bridged setSessionName must reach the session"
+    );
+
+    runner.shutdown_once().await;
+    Ok(())
+}

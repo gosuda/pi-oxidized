@@ -69,7 +69,8 @@ use crate::core::platform::external_editor::{EditOutcome, edit_text_in_external_
 use pi_ext::client::{HostUiRequest, HostUiResponse};
 use pi_ext::protocol::{
     KeyEventKindWire, KeyModifiersWire, NotifyLevel, SlotPlacement, ThemeCatalogEntry,
-    ThemeColorValue, ThemeSet, ThemeUpdate, ThemeWire, UiEventRequest, UiEventWire,
+    ThemeColorValue, ThemeSet, ThemeUpdate, ThemeWire, UiControl, UiEventRequest, UiEventWire,
+    UiStateWire,
 };
 use pi_ext::sanitize::SanitizedSlot;
 
@@ -1066,13 +1067,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         session: Arc<S>,
         options: &InteractiveRuntimeOptions,
     ) -> Self {
-        let mut view = ViewState::empty();
-        view.theme = options.theme.clone();
-        super::theme::set_current(options.theme.clone());
-        view.width = options.size.0;
-        view.height = options.size.1;
-        view.quiet = options.quiet;
-        view.resize(options.size.0, options.size.1);
+        let mut view = Self::seed_view(options);
 
         let events = session.subscribe();
         let partial = session.partial_rx();
@@ -1108,6 +1103,9 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         let (extension_action_tx, extension_action_rx) = mpsc::unbounded_channel();
 
         let editor = build_initial_editor(options, submit_tx.clone());
+        let agent_dir = crate::core::config::get_agent_dir();
+        // Process-global table for TUI components + mapper snapshot for app.* ids.
+        let keybindings = crate::core::keybindings::install_app_keybindings(&agent_dir);
 
         let mut runtime = Self {
             tui,
@@ -1115,7 +1113,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             session,
             editor,
             view,
-            mapper: InputMapper::new(),
+            mapper: super::input::InputMapper::with_keybindings(keybindings),
             input_state: InputState::new(options.double_escape),
             events,
             partial,
@@ -1164,12 +1162,25 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             theme_preview_restore: None,
             theme_push_pending: false,
             first_run: None,
-            debug_dump_dir: crate::core::config::get_agent_dir(),
+            debug_dump_dir: agent_dir,
         };
         for slot in initial_extension_slots {
             runtime.project_extension_slot(slot);
         }
         runtime
+    }
+
+    /// Build the initial [`ViewState`] from startup options and install the
+    /// startup theme as the thread-local current.
+    fn seed_view(options: &InteractiveRuntimeOptions) -> ViewState {
+        let mut view = ViewState::empty();
+        view.theme = options.theme.clone();
+        super::theme::set_current(options.theme.clone());
+        view.width = options.size.0;
+        view.height = options.size.1;
+        view.quiet = options.quiet;
+        view.resize(options.size.0, options.size.1);
+        view
     }
 
     // ----- Public accessors (driver seam) -----
@@ -1262,6 +1273,9 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         // Hand the host the startup theme + catalog before serving events so
         // `ctx.ui.theme` / `getAllThemes` observe real data immediately.
         self.push_theme_to_host().await;
+        // Warm the ui.state mirror so getEditorText / getToolsExpanded are
+        // defined before any extension control arrives.
+        self.push_ui_state_to_host().await;
         self.refresh_footer().await;
         if crate::core::platform::first_run::should_run_first_time_setup_on_host(None, None) {
             self.open_first_run_wizard();
@@ -1738,7 +1752,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     }
 
     /// `/reload` (hotkey path): reload host resources, re-probe the terminal
-    /// background, and re-resolve the theme.
+    /// background, re-resolve the theme, and refresh app keybindings.
     async fn handle_reload_action(&mut self) -> ActionOutcome {
         if self.pending_extension_dialog.is_some() {
             self.cancel_extension_dialog().await;
@@ -1751,6 +1765,8 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         self.requery_terminal_theme();
         self.apply_theme_from_settings();
         self.push_theme_to_host().await;
+        let keybindings = crate::core::keybindings::reload_app_keybindings(&self.debug_dump_dir);
+        self.mapper.set_keybindings(keybindings);
         ActionOutcome::Repaint
     }
 
@@ -2582,8 +2598,115 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             ExtensionUiEvent::Slot(slot) => self.project_extension_slot(slot),
             ExtensionUiEvent::Dispose { key } => self.dispose_extension_slot(&key),
             ExtensionUiEvent::ThemeSet(set) => self.handle_extension_theme_set(set).await,
+            ExtensionUiEvent::UiControl(control) => {
+                self.handle_extension_ui_control(control).await;
+            }
         }
         self.arm_coalescer();
+    }
+
+    /// Apply a fire-and-forget extension UI control (`ui.setStatus`, …).
+    async fn handle_extension_ui_control(&mut self, control: UiControl) {
+        match control {
+            UiControl::SetStatus { key, text } => match text {
+                Some(text) if !text.is_empty() => {
+                    self.view.footer.extension_statuses.insert(key, text);
+                }
+                _ => {
+                    self.view.footer.extension_statuses.remove(&key);
+                }
+            },
+            UiControl::SetWorkingMessage { message } => {
+                if let Some(message) = message {
+                    self.set_status(SessionStatus {
+                        kind: StatusKind::Working,
+                        frame: 0,
+                        message,
+                    });
+                } else if self
+                    .view
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.kind == StatusKind::Working)
+                {
+                    self.view.status = None;
+                }
+            }
+            UiControl::SetWorkingVisible { visible } => {
+                if visible {
+                    if self.view.status.is_none() {
+                        self.set_status(SessionStatus {
+                            kind: StatusKind::Working,
+                            frame: 0,
+                            message: "Working…".to_owned(),
+                        });
+                    }
+                } else if self
+                    .view
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.kind == StatusKind::Working)
+                {
+                    self.view.status = None;
+                }
+            }
+            UiControl::SetWorkingIndicator { options } => {
+                // Upstream: empty `frames` hides the indicator. Custom frames
+                // are not portable to the native braille spinner (ledgered).
+                let hide = options
+                    .as_ref()
+                    .and_then(|value| value.get("frames"))
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(Vec::is_empty);
+                if hide
+                    && self
+                        .view
+                        .status
+                        .as_ref()
+                        .is_some_and(|status| status.kind == StatusKind::Working)
+                {
+                    self.view.status = None;
+                }
+            }
+            UiControl::SetHiddenThinkingLabel { label } => {
+                let label = label.unwrap_or_else(|| "Thinking…".to_owned());
+                for message in &mut self.view.messages {
+                    if let MessageView::Assistant(view) = message {
+                        view.hidden_thinking_label.clone_from(&label);
+                    }
+                }
+                self.chat_dirty = true;
+            }
+            UiControl::SetTitle { title } => {
+                // Best-effort OSC 0 title; terminals that ignore it are fine.
+                let title = title.unwrap_or_default();
+                let _ = write!(self.tui.outer_mut(), "\x1b]0;{title}\x07");
+            }
+            UiControl::PasteToEditor { text } => {
+                let _ = self.paste_text(&text);
+            }
+            UiControl::SetEditorText { text } => {
+                self.editor.set_text(&text);
+                self.view.editor.text = text;
+            }
+            UiControl::SetToolsExpanded { expanded } => {
+                self.display.tools_expanded = expanded;
+                let _ = self.reapply_display_preferences();
+            }
+        }
+        self.push_ui_state_to_host().await;
+    }
+
+    /// Mirror editor text + tool expansion to the extension host.
+    async fn push_ui_state_to_host(&mut self) {
+        let Some(runner) = self.extension_runner.as_ref() else {
+            return;
+        };
+        let state = UiStateWire {
+            editor_text: self.editor.get_text(),
+            tools_expanded: self.display.tools_expanded,
+        };
+        Arc::clone(runner).push_ui_state(&state).await;
     }
 
     /// Re-resolve the active theme from settings + detected terminal polarity

@@ -193,4 +193,30 @@ describe("shared fixtures", () => {
 		}
 		expect(count).toBeGreaterThanOrEqual(8);
 	});
+
+	test("bridge open methods are witnessed with both directions", () => {
+		const text = readFileSync(fixturesPath, "utf8");
+		const seen = new Set<string>();
+		for (const line of text.split("\n")) {
+			if (line.trim() === "" || line.trimStart().startsWith("#")) {
+				continue;
+			}
+			const frame = decodeFrameStr(line);
+			seen.add(`${frame.method}:${frame.kind}`);
+		}
+		for (const key of [
+			"theme.update:event",
+			"theme.set:event",
+			"session.update:event",
+			"session.command:event",
+			"session.setModel:req",
+			"session.compact:req",
+			"session.compact:res",
+			"session.setModel:res",
+			"ui.control:event",
+			"ui.state:event",
+		]) {
+			expect(seen).toContain(key);
+		}
+	});
 });
