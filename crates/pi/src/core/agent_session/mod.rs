@@ -478,6 +478,12 @@ impl AgentSession {
                 on_payload: None,
                 on_response: None,
             });
+            // Upstream sdk.ts sets sessionId on the Agent config so provider
+            // session-affinity, prompt-cache keys, and opencode session
+            // headers fire. The config still owns the manager by value here;
+            // session switches construct a fresh AgentSession, so the id
+            // snapshot tracks the live session.
+            base.session_id = Some(config.session_manager.get_session_id().to_owned());
             base.before_tool_call = Some(hooks.before_tool_call_hook());
             base.after_tool_call = Some(hooks.after_tool_call_hook());
             base.prepare_next_turn = Some(hooks.prepare_next_turn_hook());
@@ -1391,6 +1397,60 @@ mod tests {
             .position(|t| t == "agent_settled")
             .ok_or_else(|| std::io::Error::other("missing agent_settled"))?;
         assert!(start < end && end < settled, "order {types:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_options_carry_the_session_id() -> Result<(), Box<dyn std::error::Error>> {
+        // Upstream sdk.ts sets sessionId on the Agent so provider
+        // session-affinity / prompt-cache headers fire; prove the id survives
+        // AgentSession::new -> Agent -> StreamOptions at the provider boundary.
+        struct CapturingProvider {
+            seen: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+        }
+        impl Provider for CapturingProvider {
+            fn stream(
+                &self,
+                _model: &Model,
+                _context: Context,
+                options: StreamOptions,
+            ) -> BoxStream<'static, Result<AssistantMessageEvent, ProviderError>> {
+                self.seen
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(options.session_id);
+                Box::pin(futures::stream::iter(vec![
+                    Ok(start_event()),
+                    Ok(done_event("ok")),
+                ]))
+            }
+        }
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(CapturingProvider {
+            seen: Arc::clone(&seen),
+        });
+        let session = AgentSession::new(AgentSessionConfig::test_config(provider, test_model())?)?;
+        let expected = session.session_id().await;
+
+        session.mark_agent_run_active();
+        session
+            .agent
+            .prompt(vec![user_text("hi", std::iter::empty())])
+            .await?;
+        session.agent.wait_for_idle().await;
+
+        let captured = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .first()
+            .cloned()
+            .ok_or("provider was never called")?;
+        assert_eq!(
+            captured.as_deref(),
+            Some(expected.as_str()),
+            "StreamOptions.session_id must match the live session"
+        );
         Ok(())
     }
 
