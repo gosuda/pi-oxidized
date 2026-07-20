@@ -64,6 +64,7 @@ const KNOWN_SETTINGS_KEYS: &[&str] = &[
     "steeringMode",
     "followUpMode",
     "theme",
+    "themeMode",
     "compaction",
     "branchSummary",
     "retry",
@@ -247,6 +248,54 @@ impl TreeFilterMode {
             "all" => Some(Self::All),
             _ => None,
         }
+    }
+}
+
+/// Theme polarity mode (`themeMode`).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ThemeMode {
+    /// Match the terminal background (default).
+    #[default]
+    Auto,
+    /// Always use the light member of the current theme family.
+    Light,
+    /// Always use the dark member of the current theme family.
+    Dark,
+}
+
+impl ThemeMode {
+    /// Wire string used in settings JSON.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "auto" => Some(Self::Auto),
+            "light" => Some(Self::Light),
+            "dark" => Some(Self::Dark),
+            _ => None,
+        }
+    }
+}
+
+/// Infer the effective `themeMode` from the stored `theme` value.
+///
+/// Used when `themeMode` is unset or invalid, and for plain theme names
+/// before `themeMode` becomes meaningful to the user.
+#[must_use]
+fn infer_theme_mode(theme: Option<&str>) -> ThemeMode {
+    match theme {
+        None => ThemeMode::Auto,
+        Some(name) if name.contains('/') => ThemeMode::Auto,
+        Some(name) if name == "light" || name.ends_with("-light") => ThemeMode::Light,
+        Some(name) if name == "dark" || name.ends_with("-dark") => ThemeMode::Dark,
+        Some(_) => ThemeMode::Dark,
     }
 }
 
@@ -474,6 +523,8 @@ pub struct Settings {
     pub follow_up_mode: Option<QueueMode>,
     /// Theme name or path.
     pub theme: Option<String>,
+    /// Theme polarity mode (`auto`, `light`, `dark`).
+    pub theme_mode: Option<ThemeMode>,
     /// Compaction settings.
     pub compaction: Option<CompactionSettings>,
     /// Branch-summary settings.
@@ -565,6 +616,10 @@ impl Settings {
             steering_mode: parse_queue_mode(map.get("steeringMode")),
             follow_up_mode: parse_queue_mode(map.get("followUpMode")),
             theme: string_field(map, "theme"),
+            theme_mode: map
+                .get("themeMode")
+                .and_then(Value::as_str)
+                .and_then(ThemeMode::parse),
             compaction: nested_field(map, "compaction", CompactionSettings::from_map),
             branch_summary: nested_field(map, "branchSummary", BranchSummarySettings::from_map),
             retry: nested_field(map, "retry", RetrySettings::from_map),
@@ -659,6 +714,12 @@ impl Settings {
             self.follow_up_mode.map(queue_mode_value),
         );
         insert_opt_string(map, "theme", self.theme.as_deref());
+        insert_opt_value(
+            map,
+            "themeMode",
+            self.theme_mode
+                .map(|mode| Value::String(mode.as_str().to_owned())),
+        );
         insert_opt_bool(map, "hideThinkingBlock", self.hide_thinking_block);
         insert_opt_bool(map, "showCacheMissNotices", self.show_cache_miss_notices);
         insert_opt_string(map, "externalEditor", self.external_editor.as_deref());
@@ -1748,16 +1809,33 @@ impl SettingsManager {
         string_field(&self.settings, "theme")
     }
 
-    /// Theme name; `None` when unset or path-like (contains `/`).
+    /// Theme name or pair; `None` when unset.
+    ///
+    /// Slash-pair strings such as `"a/b"` are returned verbatim so callers
+    /// can resolve them later.
     #[must_use]
     pub fn get_theme(&self) -> Option<String> {
         self.get_theme_setting()
-            .filter(|theme| !theme.contains('/'))
     }
 
     /// Set `theme` (global).
     pub fn set_theme(&mut self, theme: &str) {
         self.set_global_field("theme", Value::String(theme.to_owned()));
+    }
+
+    /// Theme polarity mode (default inferred from `theme`).
+    #[must_use]
+    pub fn get_theme_mode(&self) -> ThemeMode {
+        self.global_settings
+            .get("themeMode")
+            .and_then(Value::as_str)
+            .and_then(ThemeMode::parse)
+            .unwrap_or_else(|| infer_theme_mode(self.get_theme().as_deref()))
+    }
+
+    /// Set `themeMode` (global).
+    pub fn set_theme_mode(&mut self, mode: ThemeMode) {
+        self.set_global_field("themeMode", Value::String(mode.as_str().to_owned()));
     }
 
     /// `themes` resource paths from merged settings.
@@ -3552,16 +3630,68 @@ mod tests {
     }
 
     #[test]
-    fn theme_path_hiding() {
+    fn theme_slash_pair_preserved() {
         let mut manager = SettingsManager::in_memory(
             &Settings::default(),
             SettingsManagerCreateOptions::default(),
         );
         manager.set_theme("foo/bar");
         assert_eq!(manager.get_theme_setting().as_deref(), Some("foo/bar"));
-        assert!(manager.get_theme().is_none());
+        assert_eq!(manager.get_theme().as_deref(), Some("foo/bar"));
         manager.set_theme("plain");
         assert_eq!(manager.get_theme().as_deref(), Some("plain"));
+    }
+
+    #[test]
+    fn theme_mode_roundtrip() {
+        let mut manager = SettingsManager::in_memory(
+            &Settings::default(),
+            SettingsManagerCreateOptions::default(),
+        );
+        assert_eq!(manager.get_theme_mode(), ThemeMode::Auto);
+        manager.set_theme_mode(ThemeMode::Light);
+        assert_eq!(manager.get_theme_mode(), ThemeMode::Light);
+        let value = manager.get_global_settings().to_map();
+        assert_eq!(value["themeMode"], "light");
+
+        manager.set_theme_mode(ThemeMode::Dark);
+        assert_eq!(manager.get_theme_mode(), ThemeMode::Dark);
+        manager.set_theme_mode(ThemeMode::Auto);
+        assert_eq!(manager.get_theme_mode(), ThemeMode::Auto);
+    }
+
+    #[test]
+    fn theme_mode_fallback_matrix() {
+        let cases: &[(Option<&str>, Option<&str>, ThemeMode)] = &[
+            (None, None, ThemeMode::Auto),
+            (None, Some("purple"), ThemeMode::Auto),
+            (Some("a/b"), None, ThemeMode::Auto),
+            (Some("m3-light"), None, ThemeMode::Light),
+            (Some("light"), None, ThemeMode::Light),
+            (Some("m3-dark"), None, ThemeMode::Dark),
+            (Some("dark"), None, ThemeMode::Dark),
+            (Some("mytheme"), None, ThemeMode::Dark),
+            (Some("mytheme"), Some("purple"), ThemeMode::Dark),
+        ];
+
+        for (theme, mode_str, expected) in cases {
+            let mut map = Map::new();
+            if let Some(t) = theme {
+                map.insert("theme".into(), Value::String(t.to_string()));
+            }
+            if let Some(m) = mode_str {
+                map.insert("themeMode".into(), Value::String(m.to_string()));
+            }
+            let manager = SettingsManager::in_memory(
+                &Settings::from_map(&map),
+                SettingsManagerCreateOptions::default(),
+            );
+            assert_eq!(
+                manager.get_theme_mode(),
+                *expected,
+                "theme={theme:?}, mode={mode_str:?}"
+            );
+        }
     }
 
     #[test]
