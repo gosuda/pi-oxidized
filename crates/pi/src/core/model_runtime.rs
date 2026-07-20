@@ -1658,11 +1658,18 @@ fn parse_models_json(
 }
 
 fn strip_json_comments(input: &str) -> String {
-    // Ports stripJsonComments from .references/pi/utils/json.ts exactly:
-    //  - remove // line comments (preserving the newline)
-    //  - remove trailing commas before } or ]
-    //  - leave string literals untouched
-    //  - do NOT strip /* */ block comments
+    // Ports stripJsonComments from .references/pi/utils/json.ts exactly: two
+    // independent string-aware passes, matching the upstream regexes (which
+    // alternate the string-literal pattern first) — comments first, THEN
+    // trailing commas — so a comma separated from its closing }/] by a //
+    // comment is still removed. /* */ block comments are NOT stripped
+    // (upstream leaves them).
+    let without_comments = strip_line_comments(input);
+    strip_trailing_commas(&without_comments)
+}
+
+/// Remove `//…` line comments outside string literals, preserving newlines.
+fn strip_line_comments(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
     let mut in_string = false;
@@ -1685,8 +1692,6 @@ fn strip_json_comments(input: &str) -> String {
             continue;
         }
         if ch == '/' && chars.peek() == Some(&'/') {
-            // Skip the second slash and everything until (but not including)
-            // the newline, matching the TS regex `\/\/[^\n]*`.
             chars.next();
             for next in chars.by_ref() {
                 if next == '\n' {
@@ -1696,35 +1701,45 @@ fn strip_json_comments(input: &str) -> String {
             }
             continue;
         }
+        out.push(ch);
+    }
+    out
+}
+
+/// Remove a comma followed only by whitespace and a closing `}`/`]`.
+fn strip_trailing_commas(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    let mut in_string = false;
+    let mut escaped = false;
+    while let Some(ch) = chars.next() {
+        if in_string {
+            out.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if ch == '"' {
+            in_string = true;
+            out.push('"');
+            continue;
+        }
         if ch == ',' {
-            // Drop a comma when only whitespace precedes a closing } or ].
-            // Keep the whitespace and bracket.
-            let mut cloned = chars.clone();
-            let mut has_ws = false;
-            let mut found_close = false;
-            while let Some(&next) = cloned.peek() {
+            let mut lookahead = chars.clone();
+            while let Some(&next) = lookahead.peek() {
                 if next.is_whitespace() {
-                    has_ws = true;
-                    cloned.next();
+                    lookahead.next();
                     continue;
-                }
-                if next == '}' || next == ']' {
-                    found_close = true;
                 }
                 break;
             }
-            if found_close {
-                // Emit whitespace (but not the comma) so line/column hints stay close.
-                if has_ws {
-                    while let Some(&next) = chars.peek() {
-                        if next.is_whitespace() {
-                            out.push(next);
-                            chars.next();
-                            continue;
-                        }
-                        break;
-                    }
-                }
+            if matches!(lookahead.peek(), Some('}' | ']')) {
+                // Drop the comma; keep the whitespace and bracket.
                 continue;
             }
         }
@@ -2541,6 +2556,18 @@ mod tests {
         let stripped = strip_json_comments(raw);
         assert!(stripped.contains("1,}"));
         assert!(serde_json::from_str::<Value>(&stripped).is_ok());
+    }
+
+    #[test]
+    fn strip_json_comments_removes_comma_separated_by_comment_from_close() {
+        // Upstream strips comments first, THEN trailing commas, so a comma
+        // followed by a comment and the closing brace still gets removed.
+        let raw = "{\"providers\":{\"a\":1, // note\n}}";
+        let stripped = strip_json_comments(raw);
+        assert!(
+            serde_json::from_str::<Value>(&stripped).is_ok(),
+            "comma-then-comment must parse after stripping: {stripped:?}"
+        );
     }
 
     #[tokio::test]
