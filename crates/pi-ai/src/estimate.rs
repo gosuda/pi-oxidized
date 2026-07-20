@@ -41,6 +41,13 @@ pub fn calculate_context_tokens(usage: &Usage) -> u64 {
     }
 }
 
+/// Upstream `.length` counts UTF-16 code units, not bytes; parity requires
+/// the same unit so the max-token clamp and overflow thresholds agree on
+/// non-ASCII text.
+fn utf16_len(text: &str) -> u64 {
+    text.chars().map(|c| c.len_utf16() as u64).sum()
+}
+
 fn safe_json_stringify(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "[unserializable]".to_owned())
 }
@@ -50,7 +57,7 @@ fn estimate_text_and_image_content_chars_blocks(blocks: &[UserContent]) -> u64 {
     for block in blocks {
         match block {
             UserContent::Text(TextContent { text, .. }) => {
-                chars = chars.saturating_add(text.len() as u64);
+                chars = chars.saturating_add(utf16_len(text));
             }
             UserContent::Image(_) => {
                 chars = chars.saturating_add(ESTIMATED_IMAGE_CHARS);
@@ -65,7 +72,7 @@ fn estimate_tool_result_content_chars(blocks: &[ToolResultContent]) -> u64 {
     for block in blocks {
         match block {
             ToolResultContent::Text(TextContent { text, .. }) => {
-                chars = chars.saturating_add(text.len() as u64);
+                chars = chars.saturating_add(utf16_len(text));
             }
             ToolResultContent::Image(_) => {
                 chars = chars.saturating_add(ESTIMATED_IMAGE_CHARS);
@@ -78,15 +85,14 @@ fn estimate_tool_result_content_chars(blocks: &[ToolResultContent]) -> u64 {
 /// Estimate tokens for plain text (`ceil(len / 4)`).
 #[must_use]
 pub fn estimate_text_tokens(text: &str) -> u64 {
-    let len = text.len() as u64;
-    len.div_ceil(CHARS_PER_TOKEN)
+    utf16_len(text).div_ceil(CHARS_PER_TOKEN)
 }
 
 /// Estimate tokens for user/tool text-or-image content.
 #[must_use]
 pub fn estimate_text_and_image_content_tokens(content: &UserMessageContent) -> u64 {
     let chars = match content {
-        UserMessageContent::Text(text) => text.len() as u64,
+        UserMessageContent::Text(text) => utf16_len(text),
         UserMessageContent::Blocks(blocks) => estimate_text_and_image_content_chars_blocks(blocks),
     };
     chars.div_ceil(CHARS_PER_TOKEN)
@@ -106,15 +112,15 @@ pub fn estimate_message_tokens(message: &Message) -> u64 {
             for block in &assistant.content {
                 match block {
                     AssistantContent::Text(text) => {
-                        chars = chars.saturating_add(text.text.len() as u64);
+                        chars = chars.saturating_add(utf16_len(&text.text));
                     }
                     AssistantContent::Thinking(thinking) => {
-                        chars = chars.saturating_add(thinking.thinking.len() as u64);
+                        chars = chars.saturating_add(utf16_len(&thinking.thinking));
                     }
                     AssistantContent::ToolCall(call) => {
-                        chars = chars.saturating_add(call.name.len() as u64);
+                        chars = chars.saturating_add(utf16_len(&call.name));
                         let args = Value::Object(call.arguments.clone());
-                        chars = chars.saturating_add(safe_json_stringify(&args).len() as u64);
+                        chars = chars.saturating_add(utf16_len(&safe_json_stringify(&args)));
                     }
                 }
             }
@@ -274,6 +280,16 @@ mod tests {
         assert_eq!(estimate_text_tokens("a"), 1);
         assert_eq!(estimate_text_tokens("abcd"), 1);
         assert_eq!(estimate_text_tokens("abcde"), 2);
+    }
+
+    #[test]
+    fn estimate_text_tokens_counts_utf16_units_like_upstream() {
+        // "中" = 3 UTF-8 bytes but 1 UTF-16 unit; "😀" = 4 bytes but 2 units.
+        // Upstream .length counts units, so 4 CJK chars = 4 units = 1 token
+        // and two emoji = 4 units = 1 token; byte counting would give 3 and 2.
+        assert_eq!(estimate_text_tokens("中中中中"), 1);
+        assert_eq!(estimate_text_tokens("😀😀"), 1);
+        assert_eq!(estimate_text_tokens("中中中中中"), 2);
     }
 
     #[test]
