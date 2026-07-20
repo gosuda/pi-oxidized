@@ -19,13 +19,16 @@
 
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 
 pub use pi_tui::components::{DefaultTextStyle, MarkdownOptions, MarkdownTheme};
 use pi_tui::components::{SelectListTheme, SettingsListTheme};
+use pi_tui::terminal::probe::TerminalTheme;
 use pi_tui::text::{truncate_to_width, visible_width};
 
 use crate::core::config;
+use crate::core::settings::ThemeMode;
 
 /// Terminal color depth selected at startup.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -433,6 +436,78 @@ impl ResolvedTheme {
         self.push_fg(&mut out, self.fg[Self::fg_index(color)]);
         out
     }
+    /// Resolved value of a foreground slot for wire serialization.
+    #[must_use]
+    pub fn fg_value(&self, color: ThemeColor) -> ThemeSlotValue {
+        ThemeSlotValue::from(self.fg[Self::fg_index(color)])
+    }
+
+    /// Resolved value of a background slot for wire serialization.
+    #[must_use]
+    pub fn bg_value(&self, bg: ThemeBg) -> ThemeSlotValue {
+        ThemeSlotValue::from(self.bg[Self::bg_index(bg)])
+    }
+
+    /// Build a theme from per-slot wire values (extension `setTheme` object
+    /// form). Missing slots stay empty (reset).
+    #[must_use]
+    pub fn from_value_slots(
+        fg: impl IntoIterator<Item = (ThemeColor, ThemeSlotValue)>,
+        bg: impl IntoIterator<Item = (ThemeBg, ThemeSlotValue)>,
+        mode: ColorMode,
+        name: impl Into<Cow<'static, str>>,
+    ) -> Self {
+        Self::from_resolved_slots(
+            fg.into_iter().map(|(slot, value)| (slot, value.into())),
+            bg.into_iter().map(|(slot, value)| (slot, value.into())),
+            mode,
+            name,
+        )
+    }
+}
+
+/// One theme slot value in the JSON / extension wire vocabulary:
+/// empty (reset), a 256-color index, or an RGB triple.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ThemeSlotValue {
+    /// No color: emits the reset sequence.
+    Empty,
+    /// 256-color palette index.
+    Indexed(u8),
+    /// 24-bit color.
+    Rgb(Rgb),
+}
+
+impl From<ResolvedColor> for ThemeSlotValue {
+    fn from(color: ResolvedColor) -> Self {
+        match color {
+            ResolvedColor::Default => Self::Empty,
+            ResolvedColor::Indexed(index) => Self::Indexed(index),
+            ResolvedColor::Rgb(rgb) => Self::Rgb(rgb),
+        }
+    }
+}
+
+impl From<ThemeSlotValue> for ResolvedColor {
+    fn from(value: ThemeSlotValue) -> Self {
+        match value {
+            ThemeSlotValue::Empty => Self::Default,
+            ThemeSlotValue::Indexed(index) => Self::Indexed(index),
+            ThemeSlotValue::Rgb(rgb) => Self::Rgb(rgb),
+        }
+    }
+}
+
+/// Foreground slot enum ↔ JSON slot name table (schema order).
+#[must_use]
+pub const fn fg_slot_names() -> &'static [(ThemeColor, &'static str)] {
+    ALL_FG_SLOTS
+}
+
+/// Background slot enum ↔ JSON slot name table (schema order).
+#[must_use]
+pub const fn bg_slot_names() -> &'static [(ThemeBg, &'static str)] {
+    ALL_BG_SLOTS
 }
 
 fn push_rgb(out: &mut String, Rgb(r, g, b): Rgb) {
@@ -1044,8 +1119,7 @@ fn built_in_theme(name: &str) -> Option<Arc<ResolvedTheme>> {
 #[must_use]
 pub fn paired_name(name: &str, want_dark: bool) -> Option<String> {
     match name {
-        "dark" => Some(if want_dark { "dark" } else { "light" }.to_owned()),
-        "light" => Some(if want_dark { "dark" } else { "light" }.to_owned()),
+        "dark" | "light" => Some(if want_dark { "dark" } else { "light" }.to_owned()),
         _ => {
             let stem = name
                 .strip_suffix("-dark")
@@ -1056,6 +1130,12 @@ pub fn paired_name(name: &str, want_dark: bool) -> Option<String> {
             ))
         }
     }
+}
+
+/// Parse `#rrggbb` into an [`Rgb`] (wire deserialization helper).
+#[must_use]
+pub fn parse_hex_color(hex: &str) -> Option<Rgb> {
+    hex_to_rgb(hex)
 }
 
 fn hex_to_rgb(hex: &str) -> Option<Rgb> {
@@ -1101,6 +1181,146 @@ pub fn load_by_name(name: &str, mode: ColorMode) -> Result<Arc<ResolvedTheme>, T
 #[must_use]
 pub fn load_or_dark(name: &str, mode: ColorMode) -> Arc<ResolvedTheme> {
     load_by_name(name, mode).unwrap_or_else(|_| dark())
+}
+
+/// The ten built-in theme names in stable order (dark member first per family).
+pub const BUILT_IN_THEME_NAMES: [&str; 10] = [
+    "dark",
+    "light",
+    "classic-dark",
+    "classic-light",
+    "motion-dark",
+    "motion-light",
+    "m3-dark",
+    "m3-light",
+    "antd-dark",
+    "antd-light",
+];
+
+/// Parse a `light/dark` pair setting (upstream `parseAutoThemeSetting`).
+///
+/// Exactly one `/`, both members non-empty after trimming; member names are
+/// arbitrary (no `-light`/`-dark` suffix assumption). Returns
+/// `(light, dark)`.
+#[must_use]
+pub fn parse_theme_pair(raw: &str) -> Option<(String, String)> {
+    let (light, dark) = raw.split_once('/')?;
+    if dark.contains('/') {
+        return None;
+    }
+    let light = light.trim();
+    let dark = dark.trim();
+    if light.is_empty() || dark.is_empty() {
+        return None;
+    }
+    Some((light.to_owned(), dark.to_owned()))
+}
+
+/// Resolve the active theme from the raw `theme` setting, the `themeMode`
+/// polarity, and the detected terminal background.
+///
+/// Ports the upstream `parseAutoThemeSetting` / `resolveThemeSetting`
+/// semantics with the `themeMode` extension:
+///
+/// - unset ⇒ base `"dark"`;
+/// - `"a/b"` ⇒ `{light: a, dark: b}`, member picked by `want_dark`, each
+///   member falling back independently via [`load_or_dark`];
+/// - plain name ⇒ [`paired_name`] flips polarity when the mode asks for the
+///   other variant; `None` or a failed pair load keeps the base name.
+///
+/// `want_dark = mode == Dark || (mode == Auto && terminal == Dark)`.
+#[must_use]
+pub fn resolve_active_theme(
+    raw: Option<&str>,
+    mode: ThemeMode,
+    terminal: TerminalTheme,
+) -> Arc<ResolvedTheme> {
+    let want_dark = match mode {
+        ThemeMode::Dark => true,
+        ThemeMode::Light => false,
+        ThemeMode::Auto => terminal == TerminalTheme::Dark,
+    };
+    let base = raw.unwrap_or("dark");
+    if let Some((light, dark)) = parse_theme_pair(base) {
+        let member = if want_dark { dark } else { light };
+        return load_or_dark(&member, ColorMode::Truecolor);
+    }
+    if let Some(paired) = paired_name(base, want_dark)
+        && let Ok(theme) = load_by_name(&paired, ColorMode::Truecolor)
+    {
+        return theme;
+    }
+    load_or_dark(base, ColorMode::Truecolor)
+}
+
+/// A discoverable theme: display name plus its JSON path when file-backed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ThemeInfo {
+    /// Display name (built-in name, or the custom theme's JSON `name` field).
+    pub name: String,
+    /// JSON file path (built-ins report the shipped path; customs their file).
+    pub path: Option<PathBuf>,
+    /// File stem for customs whose JSON `name` differs from the filename
+    /// (upstream `getTheme` loads customs by filename).
+    pub file_stem: Option<String>,
+}
+
+/// Enumerate every available theme with its resolved colors: the ten
+/// built-ins followed by discovered custom themes, deduplicated by name and
+/// sorted by name (upstream `getAvailableThemesWithPaths`). Invalid custom
+/// JSONs are skipped.
+#[must_use]
+pub fn available_themes(mode: ColorMode) -> Vec<(ThemeInfo, Arc<ResolvedTheme>)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut result = Vec::new();
+    let builtin_dir = config::get_themes_dir();
+    for name in BUILT_IN_THEME_NAMES {
+        let Some(theme) = built_in_theme(name) else {
+            continue;
+        };
+        seen.insert(name.to_owned());
+        result.push((
+            ThemeInfo {
+                name: name.to_owned(),
+                path: Some(builtin_dir.join(format!("{name}.json"))),
+                file_stem: None,
+            },
+            theme,
+        ));
+    }
+    let custom_dir = config::get_custom_themes_dir();
+    if let Ok(entries) = std::fs::read_dir(&custom_dir) {
+        let mut files: Vec<PathBuf> = entries
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .collect();
+        files.sort();
+        for path in files {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(theme) = ThemeJson::parse(&text).and_then(|json| json.resolve(mode)) else {
+                continue;
+            };
+            let name = theme.name.to_string();
+            if name.is_empty() || !seen.insert(name.clone()) {
+                continue;
+            }
+            let file_stem = path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned());
+            result.push((
+                ThemeInfo {
+                    name,
+                    path: Some(path),
+                    file_stem,
+                },
+                theme,
+            ));
+        }
+    }
+    result.sort_by(|a, b| a.0.name.cmp(&b.0.name));
+    result
 }
 
 // --- slot name tables ------------------------------------------------------
@@ -1276,28 +1496,29 @@ mod tests {
     ];
 
     #[test]
-    fn built_in_jsons_parse_and_resolve() {
+    fn built_in_jsons_parse_and_resolve() -> TestResult {
         for (name, json) in BUILTIN_JSONS {
             let theme = ThemeJson::parse(json)
-                .unwrap_or_else(|error| panic!("{name} should parse: {error}"))
+                .map_err(|error| format!("{name} should parse: {error}"))?
                 .resolve(ColorMode::Truecolor)
-                .unwrap_or_else(|error| panic!("{name} should resolve: {error}"));
+                .map_err(|error| format!("{name} should resolve: {error}"))?;
             assert_eq!(theme.name, *name);
         }
+        Ok(())
     }
 
     #[test]
-    fn built_in_jsons_are_the_intern_authority() {
+    fn built_in_jsons_are_the_intern_authority() -> TestResult {
         for (name, json) in BUILTIN_JSONS {
             let resolved = ThemeJson::parse(json)
-                .unwrap_or_else(|error| panic!("{name} should parse: {error}"))
+                .map_err(|error| format!("{name} should parse: {error}"))?
                 .resolve(ColorMode::Truecolor)
-                .unwrap_or_else(|error| panic!("{name} should resolve: {error}"));
-            assert_eq!(
-                resolved,
-                built_in_theme(name).expect("built-in intern should exist")
-            );
+                .map_err(|error| format!("{name} should resolve: {error}"))?;
+            let intern =
+                built_in_theme(name).ok_or_else(|| format!("{name} intern should exist"))?;
+            assert_eq!(resolved, intern);
         }
+        Ok(())
     }
 
     #[test]
@@ -1310,26 +1531,129 @@ mod tests {
     }
 
     #[test]
-    fn built_in_palette_spot_checks() {
+    fn built_in_palette_spot_checks() -> TestResult {
+        let lookup =
+            |name: &str| built_in_theme(name).ok_or_else(|| format!("{name} intern should exist"));
         assert_eq!(dark().fg_rgb(ThemeColor::Text), Rgb(237, 237, 237));
         assert_eq!(
-            built_in_theme("m3-dark")
-                .expect("m3-dark intern should exist")
-                .fg_rgb(ThemeColor::SyntaxKeyword),
+            lookup("m3-dark")?.fg_rgb(ThemeColor::SyntaxKeyword),
             Rgb(158, 202, 255)
         );
         assert_eq!(
-            built_in_theme("antd-light")
-                .expect("antd-light intern should exist")
-                .fg_rgb(ThemeColor::Accent),
+            lookup("antd-light")?.fg_rgb(ThemeColor::Accent),
             Rgb(22, 119, 255)
         );
         assert_eq!(
-            built_in_theme("classic-light")
-                .expect("classic-light intern should exist")
-                .fg_rgb(ThemeColor::ThinkingMax),
+            lookup("classic-light")?.fg_rgb(ThemeColor::ThinkingMax),
             Rgb(175, 0, 95)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn theme_pair_parsing_follows_upstream() {
+        assert_eq!(
+            parse_theme_pair("solarized-light/gruvbox-dark"),
+            Some(("solarized-light".to_owned(), "gruvbox-dark".to_owned()))
+        );
+        assert_eq!(
+            parse_theme_pair(" a / b "),
+            Some(("a".to_owned(), "b".to_owned()))
+        );
+        assert_eq!(parse_theme_pair("plain"), None);
+        assert_eq!(parse_theme_pair("a/b/c"), None, "two slashes are invalid");
+        assert_eq!(parse_theme_pair("/dark"), None, "empty light member");
+        assert_eq!(parse_theme_pair("light/"), None, "empty dark member");
+    }
+
+    /// Resolution matrix over (mode, terminal) ∈ {auto,dark,light}×{dark,light}.
+    #[test]
+    fn resolve_active_theme_matrix() {
+        let cells = [
+            (ThemeMode::Auto, TerminalTheme::Dark, true),
+            (ThemeMode::Auto, TerminalTheme::Light, false),
+            (ThemeMode::Dark, TerminalTheme::Dark, true),
+            (ThemeMode::Dark, TerminalTheme::Light, true),
+            (ThemeMode::Light, TerminalTheme::Dark, false),
+            (ThemeMode::Light, TerminalTheme::Light, false),
+        ];
+        for (mode, terminal, want_dark) in cells {
+            // Unset raw setting: base "dark", flipped by polarity.
+            let expected = if want_dark { "dark" } else { "light" };
+            assert_eq!(
+                resolve_active_theme(None, mode, terminal).name,
+                expected,
+                "unset raw, {mode:?}/{terminal:?}"
+            );
+            assert_eq!(
+                resolve_active_theme(Some("dark"), mode, terminal).name,
+                expected,
+                "base dark, {mode:?}/{terminal:?}"
+            );
+            // Plain suffixed name: paired_name flips within the family.
+            let expected = if want_dark { "antd-dark" } else { "antd-light" };
+            assert_eq!(
+                resolve_active_theme(Some("antd-light"), mode, terminal).name,
+                expected,
+                "base antd-light, {mode:?}/{terminal:?}"
+            );
+            // Pair members are positional, not suffix-derived: the reversed
+            // pair "dark/light" means {light: dark-theme, dark: light-theme}.
+            let expected = if want_dark { "light" } else { "dark" };
+            assert_eq!(
+                resolve_active_theme(Some("dark/light"), mode, terminal).name,
+                expected,
+                "reversed pair, {mode:?}/{terminal:?}"
+            );
+            // Unknown pair members fall back per-member to built-in dark.
+            assert_eq!(
+                resolve_active_theme(Some("solarized-light/gruvbox-dark"), mode, terminal).name,
+                "dark",
+                "unknown pair members, {mode:?}/{terminal:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_active_theme_member_failure_falls_back_per_member() {
+        // Dark member loads; light member is unknown and falls back to dark.
+        assert_eq!(
+            resolve_active_theme(Some("nope/m3-dark"), ThemeMode::Dark, TerminalTheme::Dark).name,
+            "m3-dark"
+        );
+        assert_eq!(
+            resolve_active_theme(Some("nope/m3-dark"), ThemeMode::Light, TerminalTheme::Dark).name,
+            "dark"
+        );
+        // Unpaired custom name that does not exist: load_or_dark fallback.
+        assert_eq!(
+            resolve_active_theme(Some("mytheme"), ThemeMode::Auto, TerminalTheme::Light).name,
+            "dark"
+        );
+        // Paired name whose counterpart does not exist keeps the base.
+        // ("classic-light" pairs to "classic-dark", both exist; use a fake
+        // family to hit the fallback.)
+        assert_eq!(
+            resolve_active_theme(Some("ghost-light"), ThemeMode::Dark, TerminalTheme::Dark).name,
+            "dark",
+            "ghost-dark fails to load, ghost-light fails to load, dark fallback"
+        );
+    }
+
+    #[test]
+    fn slot_values_roundtrip_through_wire_vocabulary() {
+        let theme = dark();
+        let fg: Vec<_> = fg_slot_names()
+            .iter()
+            .map(|(slot, _)| (*slot, theme.fg_value(*slot)))
+            .collect();
+        let bg: Vec<_> = bg_slot_names()
+            .iter()
+            .map(|(slot, _)| (*slot, theme.bg_value(*slot)))
+            .collect();
+        let rebuilt =
+            ResolvedTheme::from_value_slots(fg, bg, theme.mode(), theme.name.clone().into_owned());
+        assert_eq!(rebuilt, *theme);
     }
 
     #[test]
@@ -1339,13 +1663,15 @@ mod tests {
     }
 
     #[test]
-    fn classic_light_literal_black_remains_a_color() {
-        let theme = built_in_theme("classic-light").expect("classic-light intern should exist");
+    fn classic_light_literal_black_remains_a_color() -> TestResult {
+        let theme = built_in_theme("classic-light")
+            .ok_or_else(|| "classic-light intern should exist".to_owned())?;
         assert!(!theme.is_fg_empty(ThemeColor::SyntaxOperator));
         assert_eq!(
             theme.fg_ansi(ThemeColor::SyntaxOperator),
             "\x1b[38;2;0;0;0m"
         );
+        Ok(())
     }
 
     #[test]

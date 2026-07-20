@@ -722,7 +722,9 @@ async fn run_extension_event_bridge(
 ) {
     let mut events = runner.subscribe_ui();
     for slot in runner.current_slots() {
-        let request = map_extension_ui_event(ExtensionUiEvent::Slot(slot));
+        let Some(request) = map_extension_ui_event(ExtensionUiEvent::Slot(slot)) else {
+            continue;
+        };
         let _ = write_tx.send(WriteMessage::Line(to_jsonl(&ServerOutput::UiRequest(
             request,
         ))));
@@ -736,15 +738,17 @@ async fn run_extension_event_bridge(
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             },
         };
-        let request = map_extension_ui_event(event);
+        let Some(request) = map_extension_ui_event(event) else {
+            continue;
+        };
         let _ = write_tx.send(WriteMessage::Line(to_jsonl(&ServerOutput::UiRequest(
             request,
         ))));
     }
 }
 
-fn map_extension_ui_event(event: ExtensionUiEvent) -> RpcExtensionUiRequest {
-    match event {
+fn map_extension_ui_event(event: ExtensionUiEvent) -> Option<RpcExtensionUiRequest> {
+    Some(match event {
         ExtensionUiEvent::Notify(notification) => ExtensionUiProxy::notify(
             &notification.message,
             Some(match notification.level {
@@ -768,7 +772,10 @@ fn map_extension_ui_event(event: ExtensionUiEvent) -> RpcExtensionUiRequest {
             ExtensionUiProxy::set_widget(&slot.key, Some(&lines), placement)
         }
         ExtensionUiEvent::Dispose { key } => ExtensionUiProxy::set_widget(&key, None, None),
-    }
+        // Theme switching is an interactive-mode surface; headless RPC has no
+        // paint path to apply it to.
+        ExtensionUiEvent::ThemeSet(_) => return None,
+    })
 }
 
 // ---------------------------------------------------------------------------

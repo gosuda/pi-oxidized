@@ -31,8 +31,8 @@ use pi_ext::client::{HostClient, HostClientError, HostEvent, HostUiRequest, Host
 use pi_ext::host::{self, HostError, HostSpec};
 use pi_ext::protocol::{
     self, DisposeSlot, ExtensionErrorEvent, FlagValueWire, FlagsSetRequest, FlagsSetResponse,
-    NotifyRequest, ProviderEvent, ShortcutExecuteRequest, ShortcutExecuteResponse, ToolUpdate,
-    UiEventRequest, UiEventResponse, UiSlot,
+    NotifyRequest, ProviderEvent, ShortcutExecuteRequest, ShortcutExecuteResponse, ThemeSet,
+    ThemeUpdate, ToolUpdate, UiEventRequest, UiEventResponse, UiSlot,
 };
 use pi_ext::sanitize::{SanitizedSlot, sanitize_slot};
 use serde::{Deserialize, Serialize};
@@ -137,6 +137,8 @@ pub enum ExtensionUiEvent {
         /// Stable extension widget key to remove.
         key: String,
     },
+    /// Extension `setTheme` application request (string or object form).
+    ThemeSet(ThemeSet),
 }
 
 /// Failure while starting the extension host.
@@ -595,6 +597,9 @@ struct Inner {
     project_trusted: bool,
     /// Monotonic reload generation; bumps invalidate every active slot.
     reload_generation: AtomicU64,
+    /// Runtime theme generation carried on measure/render requests; updated
+    /// by every `theme.update` push.
+    theme_generation: AtomicU64,
     /// Host transport is gone (EOF / crash / protocol error). All hooks and
     /// handler-presence queries short-circuit to no-ops once set.
     disabled: AtomicBool,
@@ -645,6 +650,7 @@ impl Inner {
             shutdown_done: AtomicBool::new(false),
             shutdown_lock: tokio::sync::Mutex::new(()),
             hook_timeout,
+            theme_generation: AtomicU64::new(0),
         }
     }
 
@@ -758,6 +764,17 @@ impl Inner {
         let _ = self.ui_tx.send(ExtensionUiEvent::Dispose {
             key: key.to_owned(),
         });
+    }
+
+    fn theme_set_send(&self, set: ThemeSet) {
+        // Same lock discipline as notify_send: serialize against teardown.
+        let Ok(_slots) = self.slots.write() else {
+            return;
+        };
+        if !self.active() {
+            return;
+        }
+        let _ = self.ui_tx.send(ExtensionUiEvent::ThemeSet(set));
     }
 
     fn notify_send(&self, notification: NotifyRequest) {
@@ -1328,6 +1345,49 @@ impl HostExtensionRunner {
         self.inner.ui_tx.subscribe()
     }
 
+    /// Runtime theme generation from the latest [`Self::push_theme_update`].
+    ///
+    /// Measure/render callers pass this so host components re-measure after
+    /// a theme switch.
+    #[must_use]
+    pub fn theme_generation(&self) -> u64 {
+        self.inner.theme_generation.load(Ordering::Relaxed)
+    }
+
+    /// Push the active theme, catalog, and generation to the host
+    /// (`theme.update` event). The host refreshes `ctx.ui.theme`, its theme
+    /// catalog, and re-pushes every live slot with the new colors.
+    ///
+    /// Host failures are isolated as a single non-retryable
+    /// `extension_error`; the session survives.
+    pub async fn push_theme_update(&self, update: &ThemeUpdate) {
+        if !self.inner.active() {
+            return;
+        }
+        self.inner
+            .theme_generation
+            .store(update.theme_generation, Ordering::Relaxed);
+        let payload = match serde_json::to_value(update) {
+            Ok(payload) => payload,
+            Err(error) => {
+                self.inner.publish_error(
+                    "extension_protocol",
+                    &format!("encode theme.update: {error}"),
+                    None,
+                );
+                return;
+            }
+        };
+        if let Err(error) = self
+            .inner
+            .client
+            .send_event(protocol::THEME_UPDATE_METHOD, payload)
+            .await
+        {
+            self.inner.report_host_error(&error);
+        }
+    }
+
     /// Claim the sole lossless receiver for correlated host dialog requests.
     ///
     /// A product mode calls this exactly once when it binds. Subsequent callers
@@ -1582,6 +1642,9 @@ fn spawn_event_pump(inner: Arc<Inner>) {
                 }
                 Ok(HostEvent::Notify(notification)) => {
                     inner.notify_send(notification);
+                }
+                Ok(HostEvent::ThemeSet(set)) => {
+                    inner.theme_set_send(set);
                 }
                 Ok(HostEvent::UiSlot(slot)) => {
                     forward_slot(&inner, &slot);

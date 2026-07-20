@@ -2012,3 +2012,106 @@ export default function flagObserver(pi) {{
     runner.shutdown_once().await;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Theme bridge (theme.set / theme.update)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn theme_set_event_forwards_typed_and_keeps_runner_alive() -> R {
+    use crate::core::extension_host::ExtensionUiEvent;
+
+    let (runner, host) = make_runner(json!({})).await?;
+    let mut ui = runner.subscribe_ui();
+
+    host.emit(Frame {
+        id: 0,
+        kind: FrameKind::Event,
+        method: "theme.set".to_owned(),
+        payload: json!({"name": "classic-light", "persist": true}),
+    })
+    .await;
+
+    let event = tokio::time::timeout(Duration::from_millis(500), ui.recv()).await??;
+    let ExtensionUiEvent::ThemeSet(set) = event else {
+        return Err(format!("expected ThemeSet, got {event:?}").into());
+    };
+    assert_eq!(set.name.as_deref(), Some("classic-light"));
+    assert!(set.persist);
+    assert_eq!(set.theme, None);
+
+    // An unknown open method would have tripped the fatal Raw path and shut
+    // the pump down; prove the pump is still routing by receiving a second
+    // typed event after the first.
+    host.emit(Frame {
+        id: 0,
+        kind: FrameKind::Event,
+        method: "theme.set".to_owned(),
+        payload: json!({"persist": false, "theme": {
+            "colorMode": "truecolor", "fg": {"text": "#ffffff"}, "bg": {}
+        }}),
+    })
+    .await;
+    let event = tokio::time::timeout(Duration::from_millis(500), ui.recv()).await??;
+    let ExtensionUiEvent::ThemeSet(object_form) = event else {
+        return Err(format!("expected object-form ThemeSet, got {event:?}").into());
+    };
+    assert!(!object_form.persist);
+    let wire = object_form.theme.ok_or("object form must carry a theme")?;
+    assert_eq!(wire.color_mode, "truecolor");
+
+    runner.shutdown_once().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn push_theme_update_sends_event_and_records_generation() -> R {
+    use pi_ext::protocol::{ThemeColorValue, ThemeUpdate, ThemeWire};
+    use std::collections::BTreeMap as Map;
+
+    let (runner, host) = make_runner(json!({})).await?;
+    assert_eq!(runner.theme_generation(), 0);
+
+    let mut fg = Map::new();
+    fg.insert(
+        "text".to_owned(),
+        ThemeColorValue::Text("#ededed".to_owned()),
+    );
+    let update = ThemeUpdate {
+        theme: ThemeWire {
+            name: Some("dark".to_owned()),
+            source_path: None,
+            color_mode: "truecolor".to_owned(),
+            fg,
+            bg: Map::new(),
+        },
+        terminal_theme: "dark".to_owned(),
+        theme_mode: "auto".to_owned(),
+        theme_generation: 3,
+        themes: Vec::new(),
+    };
+    runner.push_theme_update(&update).await;
+
+    host.wait_for_request("theme.update").await?;
+    let frame = host
+        .requests
+        .lock()
+        .ok()
+        .and_then(|requests| {
+            requests
+                .iter()
+                .find(|frame| frame.method == "theme.update")
+                .cloned()
+        })
+        .ok_or("theme.update frame missing")?;
+    assert_eq!(frame.kind, FrameKind::Event);
+    assert_eq!(frame.id, 0);
+    assert_eq!(frame.payload["theme"]["name"], "dark");
+    assert_eq!(frame.payload["theme"]["fg"]["text"], "#ededed");
+    assert_eq!(frame.payload["themeGeneration"], 3);
+    assert_eq!(frame.payload["terminalTheme"], "dark");
+    assert_eq!(runner.theme_generation(), 3);
+
+    runner.shutdown_once().await;
+    Ok(())
+}

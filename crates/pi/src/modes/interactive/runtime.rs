@@ -68,9 +68,12 @@ use crate::core::extension_host::{ExtensionUiEvent, HostExtensionRunner};
 use crate::core::platform::external_editor::{EditOutcome, edit_text_in_external_editor};
 use pi_ext::client::{HostUiRequest, HostUiResponse};
 use pi_ext::protocol::{
-    KeyEventKindWire, KeyModifiersWire, NotifyLevel, SlotPlacement, UiEventRequest, UiEventWire,
+    KeyEventKindWire, KeyModifiersWire, NotifyLevel, SlotPlacement, ThemeCatalogEntry,
+    ThemeColorValue, ThemeSet, ThemeUpdate, ThemeWire, UiEventRequest, UiEventWire,
 };
 use pi_ext::sanitize::SanitizedSlot;
+
+use crate::core::settings::ThemeMode;
 
 use super::input::{DoubleEscapeAction, InputMapper, InputState};
 use super::messages::{AssistantMessageView, MessageView};
@@ -290,6 +293,20 @@ pub trait SessionHost: Send + Sync + 'static {
     ///
     /// Returns a human-readable message when persisting the preference fails.
     fn set_hide_thinking_block(&self, _hide: bool) -> Result<(), String> {
+        Ok(())
+    }
+    /// Current theme settings: raw `theme` string (may be a `light/dark`
+    /// pair) and the `themeMode` polarity.
+    fn theme_settings(&self) -> (Option<String>, ThemeMode) {
+        (None, ThemeMode::Auto)
+    }
+
+    /// Persist the `theme` setting (raw string) and `themeMode`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable message when persisting fails.
+    fn persist_theme(&self, _theme: &str, _mode: ThemeMode) -> Result<(), String> {
         Ok(())
     }
 
@@ -865,6 +882,10 @@ pub struct InteractiveRuntime<W: Write, S: SessionHost> {
     last_error: Option<String>,
     shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
     terminal_theme: TerminalTheme,
+    /// Runtime theme generation: bumped on every theme switch so extension
+    /// slots re-measure/re-render (flows to the host via `theme.update` and
+    /// back on measure/render requests).
+    theme_generation: u64,
     pending_ui_reinject: Vec<UiEvent>,
     extension_runner: Option<Arc<HostExtensionRunner>>,
     extension_events: Option<tokio::sync::broadcast::Receiver<ExtensionUiEvent>>,
@@ -981,6 +1002,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     ) -> Self {
         let mut view = ViewState::empty();
         view.theme = options.theme.clone();
+        super::theme::set_current(options.theme.clone());
         view.width = options.size.0;
         view.height = options.size.1;
         view.quiet = options.quiet;
@@ -1048,6 +1070,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             last_error: None,
             shutdown_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             terminal_theme: options.terminal_theme,
+            theme_generation: 0,
             pending_ui_reinject: options.pending_ui_events.iter().rev().cloned().collect(),
             extension_runner,
             extension_events,
@@ -1170,6 +1193,9 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     // ----- Main loop -----
 
     async fn initialize_run(&mut self) -> bool {
+        // Hand the host the startup theme + catalog before serving events so
+        // `ctx.ui.theme` / `getAllThemes` observe real data immediately.
+        self.push_theme_to_host().await;
         self.refresh_footer().await;
         if let Err(error) = self.paint_frame() {
             self.exit_kind = InteractiveExit::IoFailure;
@@ -1266,7 +1292,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 }
                 extension_event = recv_extension_event(&mut self.extension_events) => {
                     if let Some(extension_event) = extension_event {
-                        self.handle_extension_event(extension_event);
+                        self.handle_extension_event(extension_event).await;
                     } else {
                         self.extension_events = None;
                     }
@@ -1591,6 +1617,8 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 self.record_err(self.session.reload().await);
                 self.rebind_extension_channels().await;
                 self.requery_terminal_theme();
+                self.apply_theme_from_settings();
+                self.push_theme_to_host().await;
                 ActionOutcome::Repaint
             }
             ViewAction::SlashCommand { name, args } => self.submit_slash_command(name, args).await,
@@ -1812,6 +1840,8 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 TypedBuiltin::Reload => {
                     self.record_err(self.session.reload().await);
                     self.requery_terminal_theme();
+                    self.apply_theme_from_settings();
+                    self.push_theme_to_host().await;
                     ActionOutcome::Repaint
                 }
             };
@@ -2372,7 +2402,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         self.arm_coalescer();
     }
 
-    fn handle_extension_event(&mut self, event: ExtensionUiEvent) {
+    async fn handle_extension_event(&mut self, event: ExtensionUiEvent) {
         match event {
             ExtensionUiEvent::Notify(notification) => {
                 let severity = match notification.level {
@@ -2387,8 +2417,79 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             }
             ExtensionUiEvent::Slot(slot) => self.project_extension_slot(slot),
             ExtensionUiEvent::Dispose { key } => self.dispose_extension_slot(&key),
+            ExtensionUiEvent::ThemeSet(set) => self.handle_extension_theme_set(set).await,
         }
         self.arm_coalescer();
+    }
+
+    /// Re-resolve the active theme from settings + detected terminal polarity
+    /// and apply it. Called on `/reload` and after settings-driven changes.
+    pub(crate) fn apply_theme_from_settings(&mut self) {
+        let (raw, mode) = self.session.theme_settings();
+        let resolved =
+            super::theme::resolve_active_theme(raw.as_deref(), mode, self.terminal_theme);
+        self.apply_theme(resolved);
+    }
+
+    /// Install `resolved` as the live theme: thread-local current, view theme,
+    /// generation bump, and memoized chat-line cache invalidation. No-op when
+    /// the theme is unchanged. Callers push to the host afterwards.
+    fn apply_theme(&mut self, resolved: Arc<ResolvedTheme>) {
+        if *resolved == *self.view.theme {
+            return;
+        }
+        super::theme::set_current(resolved.clone());
+        self.view.theme = resolved;
+        self.theme_generation = self.theme_generation.wrapping_add(1);
+        // Memoized chat lines carry baked-in ANSI colors; drop them all.
+        self.chat_prefix_cache = None;
+        self.chat_prefix_len = usize::MAX;
+        self.chat_tail_cache = None;
+        self.chat_dirty = true;
+        self.arm_coalescer();
+    }
+
+    /// Apply an extension `setTheme` request forwarded by the host.
+    ///
+    /// String form (`persist == true`): persist the raw setting plus its
+    /// inferred polarity mode, then resolve through the theme engine. The
+    /// host's failure fallback (`persist == false`) and the `Theme`-object
+    /// form apply without persistence (upstream `setThemeInstance`).
+    async fn handle_extension_theme_set(&mut self, set: ThemeSet) {
+        if let Some(wire) = set.theme {
+            self.apply_theme(Arc::new(resolved_theme_from_wire(&wire)));
+            self.push_theme_to_host().await;
+            return;
+        }
+        let Some(name) = set.name else {
+            return;
+        };
+        let resolved = if set.persist {
+            let mode = theme_mode_for_name(&name);
+            if let Err(error) = self.session.persist_theme(&name, mode) {
+                self.last_error = Some(error);
+            }
+            super::theme::resolve_active_theme(Some(&name), mode, self.terminal_theme)
+        } else {
+            super::theme::load_or_dark(&name, super::theme::ColorMode::Truecolor)
+        };
+        self.apply_theme(resolved);
+        self.push_theme_to_host().await;
+    }
+
+    /// Push the active theme, catalog, and generation to the extension host.
+    async fn push_theme_to_host(&mut self) {
+        let Some(runner) = self.extension_runner.as_ref() else {
+            return;
+        };
+        let (_, mode) = self.session.theme_settings();
+        let update = build_theme_update(
+            &self.view.theme,
+            mode,
+            self.terminal_theme,
+            self.theme_generation,
+        );
+        Arc::clone(runner).push_theme_update(&update).await;
     }
 
     fn project_extension_slot(&mut self, slot: SanitizedSlot) {
@@ -3165,6 +3266,138 @@ fn project_messages(messages: &[pi_agent::AgentMessage]) -> Vec<MessageView> {
         .collect()
 }
 
+/// Resolve the theme to install at startup from persisted settings and the
+/// probed terminal polarity.
+fn startup_theme<S: SessionHost + ?Sized>(
+    session: &S,
+    terminal: TerminalTheme,
+) -> Arc<ResolvedTheme> {
+    let (raw_theme, theme_mode) = session.theme_settings();
+    super::theme::resolve_active_theme(raw_theme.as_deref(), theme_mode, terminal)
+}
+
+/// Polarity mode implied by a raw theme setting an extension just set:
+/// pairs mean auto; plain names pin their own polarity (upstream
+/// "disable auto-sync"); unpaired custom names pin Dark (mode is inert).
+fn theme_mode_for_name(raw: &str) -> ThemeMode {
+    if super::theme::parse_theme_pair(raw).is_some() {
+        ThemeMode::Auto
+    } else if raw == "light" || raw.ends_with("-light") {
+        ThemeMode::Light
+    } else {
+        ThemeMode::Dark
+    }
+}
+
+fn wire_color(
+    value: super::theme::ThemeSlotValue,
+    mode: super::theme::ColorMode,
+) -> ThemeColorValue {
+    use super::theme::{ThemeSlotValue, rgb_to_256};
+    match value {
+        ThemeSlotValue::Empty => ThemeColorValue::Text(String::new()),
+        ThemeSlotValue::Indexed(index) => ThemeColorValue::Index(index),
+        ThemeSlotValue::Rgb(rgb) => match mode {
+            super::theme::ColorMode::Truecolor => {
+                let super::theme::Rgb(r, g, b) = rgb;
+                ThemeColorValue::Text(format!("#{r:02x}{g:02x}{b:02x}"))
+            }
+            super::theme::ColorMode::Palette256 => ThemeColorValue::Index(rgb_to_256(rgb)),
+        },
+    }
+}
+
+fn slot_value_from_wire(value: &ThemeColorValue) -> super::theme::ThemeSlotValue {
+    use super::theme::ThemeSlotValue;
+    match value {
+        ThemeColorValue::Index(index) => ThemeSlotValue::Indexed(*index),
+        ThemeColorValue::Text(text) => {
+            super::theme::parse_hex_color(text).map_or(ThemeSlotValue::Empty, ThemeSlotValue::Rgb)
+        }
+    }
+}
+
+/// Serialize a resolved theme into the extension wire shape (per-slot
+/// `"" | "#rrggbb" | index` values keyed by schema slot name).
+fn theme_wire_from_resolved(theme: &ResolvedTheme, source_path: Option<String>) -> ThemeWire {
+    let mode = theme.mode();
+    let fg = super::theme::fg_slot_names()
+        .iter()
+        .map(|(slot, name)| ((*name).to_owned(), wire_color(theme.fg_value(*slot), mode)))
+        .collect();
+    let bg = super::theme::bg_slot_names()
+        .iter()
+        .map(|(slot, name)| ((*name).to_owned(), wire_color(theme.bg_value(*slot), mode)))
+        .collect();
+    ThemeWire {
+        name: (!theme.name.is_empty()).then(|| theme.name.to_string()),
+        source_path,
+        color_mode: match mode {
+            super::theme::ColorMode::Truecolor => "truecolor".to_owned(),
+            super::theme::ColorMode::Palette256 => "256color".to_owned(),
+        },
+        fg,
+        bg,
+    }
+}
+
+/// Build a theme from the extension `setTheme` object form. Unknown slots
+/// are ignored; missing slots stay empty (reset).
+fn resolved_theme_from_wire(wire: &ThemeWire) -> ResolvedTheme {
+    let mode = if wire.color_mode == "256color" {
+        super::theme::ColorMode::Palette256
+    } else {
+        super::theme::ColorMode::Truecolor
+    };
+    let fg = super::theme::fg_slot_names()
+        .iter()
+        .filter_map(|(slot, name)| {
+            wire.fg
+                .get(*name)
+                .map(|value| (*slot, slot_value_from_wire(value)))
+        });
+    let bg = super::theme::bg_slot_names()
+        .iter()
+        .filter_map(|(slot, name)| {
+            wire.bg
+                .get(*name)
+                .map(|value| (*slot, slot_value_from_wire(value)))
+        });
+    ResolvedTheme::from_value_slots(fg, bg, mode, wire.name.clone().unwrap_or_default())
+}
+
+/// Assemble the `theme.update` payload: active theme, polarity context,
+/// generation, and the full discovered catalog.
+fn build_theme_update(
+    active: &ResolvedTheme,
+    mode: ThemeMode,
+    terminal: TerminalTheme,
+    theme_generation: u64,
+) -> ThemeUpdate {
+    let themes = super::theme::available_themes(super::theme::ColorMode::Truecolor)
+        .into_iter()
+        .map(|(info, resolved)| {
+            let path = info.path.map(|path| path.to_string_lossy().into_owned());
+            ThemeCatalogEntry {
+                name: info.name,
+                path: path.clone(),
+                file_stem: info.file_stem,
+                theme: theme_wire_from_resolved(&resolved, path),
+            }
+        })
+        .collect();
+    ThemeUpdate {
+        theme: theme_wire_from_resolved(active, None),
+        terminal_theme: match terminal {
+            TerminalTheme::Dark => "dark".to_owned(),
+            TerminalTheme::Light => "light".to_owned(),
+        },
+        theme_mode: mode.as_str().to_owned(),
+        theme_generation,
+        themes,
+    }
+}
+
 fn extract_chat_component(view: &ViewState) -> Box<dyn Component> {
     compose(view)
         .sections
@@ -3765,6 +3998,19 @@ impl SessionHost for AgentSessionHost {
             .set_hide_thinking_block(hide);
         Ok(())
     }
+    fn theme_settings(&self) -> (Option<String>, ThemeMode) {
+        let session = self.read_session();
+        let settings = session.lock_settings();
+        (settings.get_theme(), settings.get_theme_mode())
+    }
+
+    fn persist_theme(&self, theme: &str, mode: ThemeMode) -> Result<(), String> {
+        let session = self.read_session();
+        let mut settings = session.lock_settings();
+        settings.set_theme(theme);
+        settings.set_theme_mode(mode);
+        Ok(())
+    }
 
     fn external_editor_command(&self) -> String {
         self.read_session()
@@ -4337,6 +4583,9 @@ pub async fn run_interactive_mode(
         })));
     }
 
+    // Resolve the startup theme from settings + the just-probed terminal
+    // polarity (replaces the static dark default).
+    options.theme = startup_theme(host_arc.as_ref(), options.terminal_theme);
     let mut rt = InteractiveRuntime::new(tui, input, host_arc, &options);
 
     // 5. Drive the loop. Suspend restores the terminal, raises SIGTSTP on
@@ -4737,6 +4986,7 @@ mod tests {
         follows: Mutex<Vec<String>>,
         steers: Mutex<Vec<String>>,
         last_text: Mutex<Option<String>>,
+        themes: std::sync::Mutex<Vec<(String, ThemeMode)>>,
     }
 
     struct FakeHost {
@@ -4772,6 +5022,28 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone()
+        }
+
+        fn theme_settings(&self) -> (Option<String>, ThemeMode) {
+            let themes = self
+                .log
+                .themes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            themes
+                .last()
+                .map_or((None, ThemeMode::Auto), |(name, mode)| {
+                    (Some(name.clone()), *mode)
+                })
+        }
+
+        fn persist_theme(&self, theme: &str, mode: ThemeMode) -> Result<(), String> {
+            self.log
+                .themes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((theme.to_owned(), mode));
+            Ok(())
         }
 
         fn subscribe(&self) -> EventSubscription {
@@ -5159,6 +5431,73 @@ mod tests {
             Ok(runtime) => runtime,
             Err(error) => std::panic::resume_unwind(Box::new(error)),
         }
+    }
+
+    #[tokio::test]
+    async fn extension_theme_set_applies_persists_and_bumps_generation() {
+        let (mut rt, log) = make_runtime();
+        assert_eq!(rt.view.theme.name, "dark");
+        let generation = rt.theme_generation;
+
+        // String form with persist: applies, persists name + inferred mode.
+        rt.handle_extension_event(ExtensionUiEvent::ThemeSet(ThemeSet {
+            name: Some("classic-light".to_owned()),
+            theme: None,
+            persist: true,
+        }))
+        .await;
+        assert_eq!(rt.view.theme.name, "classic-light");
+        assert_eq!(rt.theme_generation, generation + 1);
+        {
+            let themes = log
+                .themes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(
+                *themes,
+                vec![("classic-light".to_owned(), ThemeMode::Light)]
+            );
+        }
+
+        // Object form: applies without persistence.
+        let mut fg = std::collections::BTreeMap::new();
+        fg.insert(
+            "text".to_owned(),
+            pi_ext::protocol::ThemeColorValue::Text("#010203".to_owned()),
+        );
+        rt.handle_extension_event(ExtensionUiEvent::ThemeSet(ThemeSet {
+            name: None,
+            theme: Some(ThemeWire {
+                name: Some("inmem".to_owned()),
+                source_path: None,
+                color_mode: "truecolor".to_owned(),
+                fg,
+                bg: std::collections::BTreeMap::new(),
+            }),
+            persist: false,
+        }))
+        .await;
+        assert_eq!(rt.view.theme.name, "inmem");
+        assert_eq!(
+            rt.view.theme.fg_rgb(super::super::theme::ThemeColor::Text),
+            super::super::theme::Rgb(1, 2, 3)
+        );
+        assert_eq!(rt.theme_generation, generation + 2);
+
+        // Host failure fallback: literal dark, still no new persistence.
+        rt.handle_extension_event(ExtensionUiEvent::ThemeSet(ThemeSet {
+            name: Some("dark".to_owned()),
+            theme: None,
+            persist: false,
+        }))
+        .await;
+        assert_eq!(rt.view.theme.name, "dark");
+        let persisted = log
+            .themes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        assert_eq!(persisted, 1);
     }
 
     #[tokio::test]

@@ -184,6 +184,8 @@ pub enum HostEvent {
     ProviderEvent(crate::protocol::ProviderEvent),
     /// Non-retryable extension failure.
     ExtensionError(crate::protocol::ExtensionErrorEvent),
+    /// Extension `setTheme` application request.
+    ThemeSet(crate::protocol::ThemeSet),
     /// Untyped / unrecognized frame.
     Raw(Frame),
     /// Host stdout closed.
@@ -481,6 +483,24 @@ impl HostClient {
         let payload = payload
             .map_err(|error| HostClientError::Payload(format!("encode UI response: {error}")))?;
         self.send_frame(Frame::response(id, method, payload)).await
+    }
+
+    /// Send a fire-and-forget event frame (id 0) with an open method string.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostClientError::NotRunning`] or [`HostClientError::Closed`].
+    pub async fn send_event(&self, method: &str, payload: serde_json::Value) -> HostResult<()> {
+        if !self.is_running() {
+            return Err(HostClientError::NotRunning);
+        }
+        self.send_frame(Frame {
+            id: 0,
+            kind: FrameKind::Event,
+            method: method.to_owned(),
+            payload,
+        })
+        .await
     }
 
     async fn send_cancel(&self, id: FrameId, control_method: &'static str) -> HostResult<()> {
@@ -1012,6 +1032,15 @@ fn forward_event(shared: &Shared, frame: Frame) {
                 let _ = shared.events.send(HostEvent::Raw(frame));
             }
         }
+    } else if method == crate::protocol::THEME_SET_METHOD {
+        match from_payload::<crate::protocol::ThemeSet>(&frame.payload) {
+            Ok(set) => {
+                let _ = shared.events.send(HostEvent::ThemeSet(set));
+            }
+            Err(_) => {
+                let _ = shared.events.send(HostEvent::Raw(frame));
+            }
+        }
     } else {
         let _ = shared.events.send(HostEvent::Raw(frame));
     }
@@ -1187,6 +1216,40 @@ mod tests {
         host.write_frame(&res).await?;
         let frame = client_task.await??;
         assert_eq!(frame.payload["ok"], true);
+        Ok(())
+    }
+    #[tokio::test]
+    async fn theme_set_event_is_typed_and_send_event_writes_id_zero() -> R {
+        let (client, mut host) = make_pair().await;
+        let mut events = client.subscribe();
+
+        // Host → client: theme.set arrives typed, not as a fatal Raw frame.
+        host.write_frame(&Frame {
+            id: 0,
+            kind: FrameKind::Event,
+            method: crate::protocol::THEME_SET_METHOD.to_owned(),
+            payload: serde_json::json!({"name": "m3-light", "persist": true}),
+        })
+        .await?;
+        let event = tokio::time::timeout(Duration::from_secs(1), events.recv()).await??;
+        let HostEvent::ThemeSet(set) = event else {
+            return Err(format!("expected typed theme.set, got {event:?}").into());
+        };
+        assert_eq!(set.name.as_deref(), Some("m3-light"));
+        assert!(set.persist);
+
+        // Client → host: send_event emits a fire-and-forget event frame.
+        client
+            .send_event(
+                crate::protocol::THEME_UPDATE_METHOD,
+                serde_json::json!({"themeGeneration": 7}),
+            )
+            .await?;
+        let frame = host.read_frame().await.ok_or("no theme.update event")?;
+        assert_eq!(frame.kind, FrameKind::Event);
+        assert_eq!(frame.id, 0);
+        assert_eq!(frame.method, crate::protocol::THEME_UPDATE_METHOD);
+        assert_eq!(frame.payload["themeGeneration"], 7);
         Ok(())
     }
     #[tokio::test]

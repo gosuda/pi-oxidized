@@ -181,6 +181,204 @@ const TOOL_RENDER_THEME = {
 	getThinkingBorderColor: (_level: string) => (text: string) => text,
 	getBashModeBorderColor: () => (text: string) => text,
 } as Theme;
+// ---------------------------------------------------------------------------
+// Theme bridge (theme.update / theme.set open methods)
+// ---------------------------------------------------------------------------
+
+/** One slot value in the theme wire vocabulary: `""`, `"#rrggbb"`, or index. */
+type ThemeColorValue = string | number;
+
+/** Resolved theme payload pushed by Rust and sent back for the object form. */
+interface ThemeWirePayload {
+	name?: string;
+	sourcePath?: string;
+	colorMode: string;
+	fg: Record<string, ThemeColorValue>;
+	bg: Record<string, ThemeColorValue>;
+}
+
+/** Catalog entry for `getAllThemes` / `getTheme`. */
+interface ThemeCatalogEntryPayload {
+	name: string;
+	path?: string;
+	fileStem?: string;
+	theme: ThemeWirePayload;
+}
+
+/** `theme.update` event payload (Rust → host). */
+interface ThemeUpdatePayload {
+	theme: ThemeWirePayload;
+	terminalTheme: "dark" | "light";
+	themeMode: string;
+	themeGeneration: number;
+	themes: ThemeCatalogEntryPayload[];
+}
+
+/** Foreground slot names in schema order (mirrors Rust `ALL_FG_SLOTS`). */
+const THEME_FG_SLOTS = [
+	"accent", "border", "borderAccent", "borderMuted", "success", "error",
+	"warning", "muted", "dim", "text", "thinkingText", "userMessageText",
+	"customMessageText", "customMessageLabel", "toolTitle", "toolOutput",
+	"mdHeading", "mdLink", "mdLinkUrl", "mdCode", "mdCodeBlock",
+	"mdCodeBlockBorder", "mdQuote", "mdQuoteBorder", "mdHr", "mdListBullet",
+	"toolDiffAdded", "toolDiffRemoved", "toolDiffContext", "syntaxComment",
+	"syntaxKeyword", "syntaxFunction", "syntaxVariable", "syntaxString",
+	"syntaxNumber", "syntaxType", "syntaxOperator", "syntaxPunctuation",
+	"thinkingOff", "thinkingMinimal", "thinkingLow", "thinkingMedium",
+	"thinkingHigh", "thinkingXhigh", "thinkingMax", "bashMode",
+] as const;
+
+/** Background slot names in schema order (mirrors Rust `ALL_BG_SLOTS`). */
+const THEME_BG_SLOTS = [
+	"selectedBg", "userMessageBg", "customMessageBg", "toolPendingBg",
+	"toolSuccessBg", "toolErrorBg",
+] as const;
+
+function hexToRgbTriple(hex: string): [number, number, number] | undefined {
+	if (!/^#[0-9a-fA-F]{6}$/.test(hex)) return undefined;
+	return [
+		Number.parseInt(hex.slice(1, 3), 16),
+		Number.parseInt(hex.slice(3, 5), 16),
+		Number.parseInt(hex.slice(5, 7), 16),
+	];
+}
+
+/** Upstream `fgAnsi` for the wire vocabulary (indices are pre-downsampled). */
+function colorAnsi(value: ThemeColorValue, layer: "fg" | "bg"): string {
+	const [set, reset] = layer === "fg" ? ["38", "39"] : ["48", "49"];
+	if (value === "") return `\x1b[${reset}m`;
+	if (typeof value === "number") return `\x1b[${set};5;${value}m`;
+	const rgb = hexToRgbTriple(value);
+	if (rgb === undefined) return `\x1b[${reset}m`;
+	return `\x1b[${set};2;${rgb[0]};${rgb[1]};${rgb[2]}m`;
+}
+
+/** Parse a single fg/bg ANSI prefix back into the wire vocabulary. */
+function ansiToColorValue(ansi: string, layer: "fg" | "bg"): ThemeColorValue {
+	const set = layer === "fg" ? "38" : "48";
+	const rgbMatch = new RegExp(`^\\x1b\\[${set};2;(\\d+);(\\d+);(\\d+)m$`).exec(ansi);
+	if (rgbMatch !== null) {
+		const [r, g, b] = [rgbMatch[1], rgbMatch[2], rgbMatch[3]].map((n) => Number.parseInt(n ?? "0", 10));
+		const hex = (n: number | undefined) => (n ?? 0).toString(16).padStart(2, "0");
+		return `#${hex(r)}${hex(g)}${hex(b)}`;
+	}
+	const indexMatch = new RegExp(`^\\x1b\\[${set};5;(\\d+)m$`).exec(ansi);
+	if (indexMatch !== null) return Number.parseInt(indexMatch[1] ?? "0", 10);
+	return "";
+}
+
+const THINKING_LEVEL_SLOTS: Record<string, string> = {
+	off: "thinkingOff",
+	minimal: "thinkingMinimal",
+	low: "thinkingLow",
+	medium: "thinkingMedium",
+	high: "thinkingHigh",
+	xhigh: "thinkingXhigh",
+	max: "thinkingMax",
+};
+
+/**
+ * Construct a reference-shaped `Theme` from wire data. Method behavior
+ * mirrors the upstream `Theme` class: `fg`/`bg` wrap text with a
+ * color-scoped reset, unknown slots throw, and thinkingMax falls back to
+ * thinkingXhigh.
+ */
+function buildThemeFromWire(wire: ThemeWirePayload): Theme {
+	const fgColors = new Map<string, string>();
+	for (const slot of THEME_FG_SLOTS) {
+		const value = wire.fg[slot] ?? (slot === "thinkingMax" ? wire.fg["thinkingXhigh"] : undefined);
+		if (value !== undefined) fgColors.set(slot, colorAnsi(value, "fg"));
+	}
+	const bgColors = new Map<string, string>();
+	for (const slot of THEME_BG_SLOTS) {
+		const value = wire.bg[slot];
+		if (value !== undefined) bgColors.set(slot, colorAnsi(value, "bg"));
+	}
+	const getFgAnsi = (color: string): string => {
+		const ansi = fgColors.get(color);
+		if (ansi === undefined) throw new Error(`Unknown theme color: ${color}`);
+		return ansi;
+	};
+	const getBgAnsi = (color: string): string => {
+		const ansi = bgColors.get(color);
+		if (ansi === undefined) throw new Error(`Unknown theme background color: ${color}`);
+		return ansi;
+	};
+	const fg = (color: string, text: string) => `${getFgAnsi(color)}${text}\x1b[39m`;
+	const theme = {
+		name: wire.name,
+		sourcePath: wire.sourcePath,
+		fg,
+		bg: (color: string, text: string) => `${getBgAnsi(color)}${text}\x1b[49m`,
+		bold: (text: string) => `\x1b[1m${text}\x1b[22m`,
+		italic: (text: string) => `\x1b[3m${text}\x1b[23m`,
+		underline: (text: string) => `\x1b[4m${text}\x1b[24m`,
+		inverse: (text: string) => `\x1b[7m${text}\x1b[27m`,
+		strikethrough: (text: string) => `\x1b[9m${text}\x1b[29m`,
+		getFgAnsi,
+		getBgAnsi,
+		getColorMode: () => (wire.colorMode === "256color" ? "256color" : "truecolor"),
+		getThinkingBorderColor: (level: string) => (text: string) =>
+			fg(THINKING_LEVEL_SLOTS[level] ?? "thinkingOff", text),
+		getBashModeBorderColor: () => (text: string) => fg("bashMode", text),
+	};
+	return theme as Theme;
+}
+
+/** Reset-only theme served before the first `theme.update` arrives. */
+function fallbackTheme(): Theme {
+	const fg: Record<string, ThemeColorValue> = {};
+	for (const slot of THEME_FG_SLOTS) fg[slot] = "";
+	const bg: Record<string, ThemeColorValue> = {};
+	for (const slot of THEME_BG_SLOTS) bg[slot] = "";
+	return buildThemeFromWire({ name: "dark", colorMode: "truecolor", fg, bg });
+}
+
+/**
+ * Serialize an extension-supplied `Theme` instance into wire form via its
+ * public accessors. Throws when the object is not Theme-shaped.
+ */
+function serializeThemeInstance(theme: Theme): ThemeWirePayload {
+	const fg: Record<string, ThemeColorValue> = {};
+	for (const slot of THEME_FG_SLOTS) {
+		try {
+			fg[slot] = ansiToColorValue(theme.getFgAnsi(slot), "fg");
+		} catch {
+			// Upstream themes may omit optional slots (e.g. thinkingMax).
+		}
+	}
+	const bg: Record<string, ThemeColorValue> = {};
+	for (const slot of THEME_BG_SLOTS) {
+		try {
+			bg[slot] = ansiToColorValue(theme.getBgAnsi(slot), "bg");
+		} catch {
+			// Optional slot; leave empty.
+		}
+	}
+	if (Object.keys(fg).length === 0) {
+		throw new Error("theme object exposes no foreground colors");
+	}
+	// `sourcePath` exists on the upstream Theme class but not on the
+	// re-exported structural type; probe it without asserting a new shape.
+	const sourcePath = "sourcePath" in theme ? theme.sourcePath : undefined;
+	return {
+		name: typeof theme.name === "string" ? theme.name : undefined,
+		sourcePath: typeof sourcePath === "string" ? sourcePath : undefined,
+		colorMode: theme.getColorMode(),
+		fg,
+		bg,
+	};
+}
+
+/** Upstream `parseAutoThemeSetting`: exactly one `/`, both members non-empty. */
+function parseThemePair(raw: string): { lightTheme: string; darkTheme: string } | undefined {
+	const slashIndex = raw.indexOf("/");
+	if (slashIndex === -1 || raw.indexOf("/", slashIndex + 1) !== -1) return undefined;
+	const lightTheme = raw.slice(0, slashIndex).trim();
+	const darkTheme = raw.slice(slashIndex + 1).trim();
+	if (lightTheme === "" || darkTheme === "") return undefined;
+	return { lightTheme, darkTheme };
+}
 
 function escapeHtml(text: string): string {
 	return text
@@ -238,6 +436,14 @@ export class ExtensionHost {
 	private activeAssistant: Record<string, unknown> | undefined;
 	/** Raw streamed tool-argument fragments keyed by assistant content index. */
 	private readonly activeToolArguments = new Map<number, string>();
+	/** Active theme served to extensions (`ctx.ui.theme`). */
+	private currentTheme: Theme = fallbackTheme();
+	/** Theme catalog from the latest `theme.update` push. */
+	private themeCatalog: ThemeCatalogEntryPayload[] = [];
+	/** Detected terminal polarity from the latest `theme.update` push. */
+	private terminalTheme: "dark" | "light" = "dark";
+	/** Active `themeMode` from the latest `theme.update` push. */
+	private themeMode = "auto";
 
 	constructor(stdin: ByteReadable, stdout: ByteWritable) {
 		const onFrame: FrameHandler = (frame) => this.onInbound(frame);
@@ -1108,7 +1314,7 @@ export class ExtensionHost {
 						if (entry !== undefined) self.pushSlot(key, entry, entry.width);
 					},
 				};
-				Promise.resolve(factory(tui, {}, {}, done)).then((component: any) => {
+				Promise.resolve(factory(tui, self.currentTheme, {}, done)).then((component: any) => {
 					if (resolved) {
 						component?.dispose?.();
 						return;
@@ -1138,10 +1344,16 @@ export class ExtensionHost {
 			addAutocompleteProvider: () => {},
 			setEditorComponent: () => {},
 			getEditorComponent: () => undefined,
-			theme: {},
-			getAllThemes: () => [],
-			getTheme: () => undefined,
-			setTheme: () => ({ success: false }),
+			get theme() {
+				return self.currentTheme;
+			},
+			getAllThemes: () =>
+				self.themeCatalog.map((entry) => ({ name: entry.name, path: entry.path })),
+			getTheme: (name: string) => {
+				const entry = self.findThemeEntry(name);
+				return entry === undefined ? undefined : buildThemeFromWire(entry.theme);
+			},
+			setTheme: (themeOrName: string | Theme) => self.setThemeFromExtension(themeOrName),
 			getToolsExpanded: () => false,
 			setToolsExpanded: () => {},
 		};
@@ -1313,6 +1525,10 @@ export class ExtensionHost {
 	}
 
 	private handleControlEvent(frame: Frame): void {
+		if (frame.method === "theme.update") {
+			this.applyThemeUpdate(frame.payload as ThemeUpdatePayload);
+			return;
+		}
 		if (frame.method !== "tool.cancel" && frame.method !== "provider.cancel") {
 			return;
 		}
@@ -1321,6 +1537,89 @@ export class ExtensionHost {
 		if (requestId === undefined) return;
 		this.inFlightTools.get(requestId)?.abort();
 		this.inFlightProviders.get(requestId)?.abort();
+	}
+
+	/**
+	 * Apply an authoritative `theme.update` push: refresh `ctx.ui.theme`, the
+	 * catalog, polarity context, and re-render every live slot with the new
+	 * colors.
+	 */
+	private applyThemeUpdate(update: ThemeUpdatePayload): void {
+		if (update === null || typeof update !== "object" || typeof update.theme !== "object") {
+			return;
+		}
+		this.currentTheme = buildThemeFromWire(update.theme);
+		this.themeCatalog = Array.isArray(update.themes) ? update.themes : [];
+		this.terminalTheme = update.terminalTheme === "light" ? "light" : "dark";
+		this.themeMode = typeof update.themeMode === "string" ? update.themeMode : "auto";
+		for (const [key, entry] of this.slots) {
+			this.pushSlot(key, entry, entry.width);
+		}
+	}
+
+	/** Catalog lookup by display name or custom-theme file stem. */
+	private findThemeEntry(name: string): ThemeCatalogEntryPayload | undefined {
+		return (
+			this.themeCatalog.find((entry) => entry.name === name)
+			?? this.themeCatalog.find((entry) => entry.fileStem === name)
+		);
+	}
+
+	/**
+	 * `ctx.ui.setTheme` bridge. Mirrors the upstream theme-controller
+	 * semantics: the string form (plain name or `light/dark` pair) persists on
+	 * success and falls back to dark on failure without persisting; the
+	 * `Theme`-object form applies without persistence.
+	 */
+	private setThemeFromExtension(
+		themeOrName: string | Theme,
+	): { success: boolean; error?: string } {
+		if (typeof themeOrName !== "string") {
+			let wire: ThemeWirePayload;
+			try {
+				wire = serializeThemeInstance(themeOrName);
+			} catch (err) {
+				return {
+					success: false,
+					error: err instanceof Error ? err.message : String(err),
+				};
+			}
+			this.currentTheme = themeOrName;
+			this.sendThemeSet({ theme: wire, persist: false });
+			return { success: true };
+		}
+
+		const pair = parseThemePair(themeOrName);
+		const wantDark =
+			this.themeMode === "dark"
+			|| (this.themeMode === "auto" && this.terminalTheme === "dark");
+		const member = pair === undefined
+			? themeOrName
+			: (wantDark ? pair.darkTheme : pair.lightTheme);
+		const entry = this.findThemeEntry(member);
+		if (entry === undefined) {
+			// Upstream applyThemeName failure: fall back to dark, do not persist.
+			const dark = this.findThemeEntry("dark");
+			if (dark !== undefined) {
+				this.currentTheme = buildThemeFromWire(dark.theme);
+				this.sendThemeSet({ name: "dark", persist: false });
+			}
+			return { success: false, error: `Theme not found: ${member}` };
+		}
+		this.currentTheme = buildThemeFromWire(entry.theme);
+		this.sendThemeSet({ name: themeOrName, persist: true });
+		return { success: true };
+	}
+
+	/** Fire-and-forget `theme.set` event to Rust (applies + persists there). */
+	private sendThemeSet(payload: {
+		name?: string;
+		theme?: ThemeWirePayload;
+		persist: boolean;
+	}): void {
+		this.client.send({
+			id: 0, kind: "event", method: "theme.set" as Method, payload,
+		}).catch(() => void 0);
 	}
 
 	private async handleToolPrepare(id: number, p: Record<string, unknown>): Promise<void> {

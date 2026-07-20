@@ -35,6 +35,7 @@ import hooksFactory from "../fixtures/extensions/hooks.ts";
 import toolFactory from "../fixtures/extensions/tool.ts";
 import toolProgressFactory from "../fixtures/extensions/tool-progress.ts";
 import providerStreamFactory from "../fixtures/extensions/provider-stream.ts";
+import themeApiFactory from "../fixtures/extensions/theme-api.ts";
 
 const noopContextActions: ExtensionContextActions = {
 	getModel: () => undefined,
@@ -1490,6 +1491,131 @@ describe("tool rendering and argument preflight", () => {
 		expect(error["code"]).toBe("invalid_arguments");
 		expect(String(error["message"])).toContain("Validation failed for tool \"preflight_fixture\"");
 		expect(prepareCalls).toBe(1);
+
+		stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
+	});
+});
+
+describe("extension theme API", () => {
+	const BUILT_IN_NAMES = [
+		"dark", "light", "classic-dark", "classic-light", "motion-dark",
+		"motion-light", "m3-dark", "m3-light", "antd-dark", "antd-light",
+	];
+
+	function themeWireFor(name: string): Record<string, unknown> {
+		return {
+			name,
+			colorMode: "truecolor",
+			fg: { accent: "#112233", text: "#ededed" },
+			bg: { selectedBg: "#0a0a0a" },
+		};
+	}
+
+	function themeUpdateFrame(): Frame {
+		return {
+			id: 0, kind: "event", method: "theme.update",
+			payload: {
+				theme: themeWireFor("dark"),
+				terminalTheme: "dark",
+				themeMode: "auto",
+				themeGeneration: 1,
+				themes: BUILT_IN_NAMES.map((name) => ({
+					name,
+					path: `/pkg/theme/${name}.json`,
+					theme: themeWireFor(name),
+				})),
+			},
+		};
+	}
+
+	test("catalog, getTheme, and every setTheme form behave like upstream", async () => {
+		const { collector, stdin, host, runPromise } = await connectHost([themeApiFactory]);
+		stdin.push(Buffer.from(encodeFrameString(themeUpdateFrame())));
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 60, kind: "req", method: "command.execute",
+			payload: { command: "themeProbe", args: "" },
+		})));
+
+		const notifyFrame = await collector.awaitFrame((f) => f.method === "notify");
+		const notifyPayload = notifyFrame.payload as { message: string };
+		const report = JSON.parse(notifyPayload.message) as Record<string, unknown>;
+
+		// ctx.ui.theme reflects the authoritative push.
+		expect(report["initial"]).toBe("dark");
+
+		// getAllThemes: 10 built-ins with shipped paths.
+		expect(report["count"]).toBe(10);
+		expect(report["names"]).toEqual(BUILT_IN_NAMES);
+		expect(report["allHavePaths"]).toBe(true);
+
+		// getTheme loads without switching; ANSI comes from the wire values.
+		expect(report["m3"]).toEqual({ name: "m3-dark", accent: "\x1b[38;2;17;34;51m" });
+		expect(report["missing"]).toBe(true);
+
+		// Plain name: success + immediate ctx.ui.theme switch.
+		expect(report["setClassic"]).toEqual({ success: true });
+		expect(report["afterClassic"]).toBe("classic-light");
+
+		// Pair resolves by polarity (auto + dark terminal → dark member).
+		expect(report["setPair"]).toEqual({ success: true });
+		expect(report["afterPair"]).toBe("dark");
+
+		// Unknown name: upstream failure semantics — dark fallback, error text.
+		expect(report["setMissing"]).toEqual({
+			success: false,
+			error: "Theme not found: nope",
+		});
+		expect(report["afterMissing"]).toBe("dark");
+
+		// Theme-object form applies the instance itself.
+		expect(report["setObject"]).toEqual({ success: true });
+		expect(report["final"]).toBe("inmem");
+
+		const commandRes = await collector.awaitFrame((f) => f.id === 60 && f.kind === "res");
+		expect(commandRes.payload).toEqual({ ok: true });
+
+		// Every switch reached Rust as a theme.set event with upstream
+		// persistence semantics (persist on string success, never otherwise).
+		const themeSets = collector.frames
+			.filter((f) => f.method === "theme.set")
+			.map((f) => f.payload as Record<string, unknown>);
+		expect(themeSets.length).toBe(4);
+		expect(themeSets[0]).toEqual({ name: "classic-light", persist: true });
+		expect(themeSets[1]).toEqual({ name: "light/dark", persist: true });
+		expect(themeSets[2]).toEqual({ name: "dark", persist: false });
+		const objectSet = themeSets[3] ?? {};
+		expect(objectSet["persist"]).toBe(false);
+		const objectWire = objectSet["theme"] as Record<string, unknown>;
+		expect(objectWire["name"]).toBe("inmem");
+		expect((objectWire["fg"] as Record<string, unknown>)["accent"]).toBe("#010203");
+		expect((objectWire["bg"] as Record<string, unknown>)["selectedBg"]).toBe(17);
+
+		stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
+	});
+
+	test("theme.update re-renders live slots with the new theme", async () => {
+		const { collector, stdin, host, runPromise } = await connectHost([toolFactory]);
+		// tool.ts greet does not set a widget; use setWidget via the host's UI
+		// bridge indirectly: showOverlay creates an overlay slot.
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 61, kind: "req", method: "command.execute",
+			payload: { command: "showOverlay", args: "x" },
+		})));
+		const firstSlot = await collector.awaitFrame((f) => f.method === "uiSlot");
+		const slotCountBefore = collector.frames.filter((f) => f.method === "uiSlot").length;
+
+		stdin.push(Buffer.from(encodeFrameString(themeUpdateFrame())));
+		await collector.awaitFrame((f) =>
+			f.method === "uiSlot"
+			&& collector.frames.filter((frame) => frame.method === "uiSlot").length > slotCountBefore,
+		);
+		const repushed = collector.frames.filter((f) => f.method === "uiSlot").at(-1);
+		expect((repushed?.payload as Record<string, unknown>)["key"])
+			.toBe((firstSlot.payload as Record<string, unknown>)["key"]);
 
 		stdin.push(null);
 		host.dispose("test");

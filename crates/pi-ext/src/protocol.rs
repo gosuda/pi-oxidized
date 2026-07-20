@@ -1204,6 +1204,96 @@ pub struct MeasureResponse {
     /// Measured height in rows.
     pub height: u16,
 }
+// ---------------------------------------------------------------------------
+// Theme wire types (open methods, outside the fixed Method allowlist)
+// ---------------------------------------------------------------------------
+
+/// Open method string: Rust pushes the active theme + catalog to the host.
+pub const THEME_UPDATE_METHOD: &str = "theme.update";
+
+/// Open method string: the host applies an extension `setTheme` call.
+pub const THEME_SET_METHOD: &str = "theme.set";
+
+/// One theme slot value: `""` (reset), a 256-color index, or `"#rrggbb"`.
+///
+/// Mirrors the upstream theme-JSON `ColorValue` vocabulary so the host can
+/// feed values straight into a reference-shaped `Theme` constructor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ThemeColorValue {
+    /// 256-color palette index.
+    Index(u8),
+    /// `"#rrggbb"` hex, or `""` for reset.
+    Text(String),
+}
+
+/// A fully resolved theme as extensions observe it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThemeWire {
+    /// Display name (`None` for in-memory themes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Source JSON path when file-backed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+    /// `"truecolor"` or `"256color"`.
+    pub color_mode: String,
+    /// Foreground slot values keyed by schema slot name.
+    pub fg: BTreeMap<String, ThemeColorValue>,
+    /// Background slot values keyed by schema slot name.
+    pub bg: BTreeMap<String, ThemeColorValue>,
+}
+
+/// One catalog entry for `getAllThemes` / `getTheme`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThemeCatalogEntry {
+    /// Display name.
+    pub name: String,
+    /// Theme JSON path (built-ins report the shipped path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Custom-theme file stem when it differs from `name` (upstream
+    /// `getTheme` loads customs by filename).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_stem: Option<String>,
+    /// Fully resolved colors.
+    pub theme: ThemeWire,
+}
+
+/// `theme.update` event payload (Rust → host).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThemeUpdate {
+    /// The active resolved theme.
+    pub theme: ThemeWire,
+    /// Detected terminal polarity: `"dark"` or `"light"`.
+    pub terminal_theme: String,
+    /// Active `themeMode`: `"auto"`, `"light"`, or `"dark"`.
+    pub theme_mode: String,
+    /// Runtime theme generation (flows back on measure/render).
+    pub theme_generation: u64,
+    /// Every available theme (built-ins + discovered customs).
+    pub themes: Vec<ThemeCatalogEntry>,
+}
+
+/// `theme.set` event payload (host → Rust). Exactly one of `name` / `theme`
+/// is set: the string form carries the raw name or `light/dark` pair; the
+/// object form applies without persistence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThemeSet {
+    /// Raw theme name or slash pair.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// In-memory theme instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme: Option<ThemeWire>,
+    /// Whether Rust should persist the setting (string form on success).
+    #[serde(default)]
+    pub persist: bool,
+}
 
 /// Encode a frame to a single UTF-8 JSON line including the trailing `\n`.
 ///
@@ -1862,6 +1952,64 @@ mod tests {
         let frame = Frame::request(9, Method::UiEvent, to_payload(&ui)?);
         let decoded = decode_frame_str(encode_frame_string(&frame)?.trim_end())?;
         assert_eq!(from_payload::<UiEventRequest>(&decoded.payload)?, ui);
+        Ok(())
+    }
+    #[test]
+    fn theme_wire_payloads_roundtrip_with_json_color_vocabulary() -> TestResult {
+        let mut fg = BTreeMap::new();
+        fg.insert(
+            "text".to_owned(),
+            ThemeColorValue::Text("#ededed".to_owned()),
+        );
+        fg.insert("accent".to_owned(), ThemeColorValue::Index(39));
+        fg.insert("muted".to_owned(), ThemeColorValue::Text(String::new()));
+        let mut bg = BTreeMap::new();
+        bg.insert(
+            "selectedBg".to_owned(),
+            ThemeColorValue::Text("#0a0a0a".to_owned()),
+        );
+        let update = ThemeUpdate {
+            theme: ThemeWire {
+                name: Some("dark".to_owned()),
+                source_path: Some("/pkg/theme/dark.json".to_owned()),
+                color_mode: "truecolor".to_owned(),
+                fg,
+                bg,
+            },
+            terminal_theme: "light".to_owned(),
+            theme_mode: "auto".to_owned(),
+            theme_generation: 42,
+            themes: vec![ThemeCatalogEntry {
+                name: "mytheme".to_owned(),
+                path: Some("/agent/themes/my-file.json".to_owned()),
+                file_stem: Some("my-file".to_owned()),
+                theme: ThemeWire {
+                    name: Some("mytheme".to_owned()),
+                    source_path: None,
+                    color_mode: "256color".to_owned(),
+                    fg: BTreeMap::new(),
+                    bg: BTreeMap::new(),
+                },
+            }],
+        };
+        let payload = to_payload(&update)?;
+        // Slot values serialize as bare JSON scalars (upstream ColorValue).
+        assert_eq!(payload["theme"]["fg"]["text"], "#ededed");
+        assert_eq!(payload["theme"]["fg"]["accent"], 39);
+        assert_eq!(payload["theme"]["fg"]["muted"], "");
+        assert_eq!(payload["themeGeneration"], 42);
+        assert_eq!(payload["themes"][0]["fileStem"], "my-file");
+        assert_eq!(from_payload::<ThemeUpdate>(&payload)?, update);
+
+        let set = ThemeSet {
+            name: Some("light/dark".to_owned()),
+            theme: None,
+            persist: true,
+        };
+        let payload = to_payload(&set)?;
+        assert_eq!(payload["name"], "light/dark");
+        assert!(payload.get("theme").is_none());
+        assert_eq!(from_payload::<ThemeSet>(&payload)?, set);
         Ok(())
     }
 }

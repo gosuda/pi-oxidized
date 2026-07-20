@@ -23,6 +23,10 @@ declare module "@earendil-works/pi-coding-agent" {
 		onTerminalInput(handler: (data: string) => unknown): () => void;
 		setWidget(key: string, content: string[] | undefined, options?: Record<string, unknown>): void;
 		custom<T>(factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (result: T) => void) => unknown, options?: unknown): Promise<T>;
+		readonly theme: Theme;
+		getAllThemes(): { name: string; path: string | undefined }[];
+		getTheme(name: string): Theme | undefined;
+		setTheme(theme: string | Theme): { success: boolean; error?: string };
 	}
 
 	export interface ExtensionContext {

@@ -66,6 +66,10 @@ pub fn detect_terminal_theme(osc_dark: Option<bool>, colorfgbg: Option<&str>) ->
 ///
 /// This runs before [`crate::terminal::TerminalInput`] takes ownership of
 /// stdin, preserving early keystrokes as UI events for its caller to re-inject.
+///
+/// # Errors
+///
+/// Returns [`io::Error`] when writing or flushing the probe batch fails.
 pub fn probe_terminal<W: Write>(
     output: &mut W,
     caps: &mut TerminalCapabilities,
@@ -410,7 +414,8 @@ fn colorfgbg_background_index(colorfgbg: &str) -> Option<u8> {
 
 fn ansi256_luminance(index: u8) -> u8 {
     let [red, green, blue] = ansi256_rgb(index);
-    ((u32::from(red) * 299 + u32::from(green) * 587 + u32::from(blue) * 114) / 1000) as u8
+    let weighted = (u32::from(red) * 299 + u32::from(green) * 587 + u32::from(blue) * 114) / 1000;
+    u8::try_from(weighted).unwrap_or(u8::MAX)
 }
 
 fn ansi256_rgb(index: u8) -> [u8; 3] {
@@ -444,7 +449,8 @@ fn ansi256_rgb(index: u8) -> [u8; 3] {
             ]
         }
         232..=255 => {
-            let gray = (u16::from(index - 232) * 10 + 8) as u8;
+            // index - 232 ∈ 0..=23, so the ramp value 8..=238 always fits u8.
+            let gray = u8::try_from(u16::from(index - 232) * 10 + 8).unwrap_or(u8::MAX);
             [gray, gray, gray]
         }
     }
