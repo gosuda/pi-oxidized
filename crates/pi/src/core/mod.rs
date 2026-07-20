@@ -18,6 +18,7 @@ pub mod model_runtime;
 pub mod output_guard;
 pub mod package_manager;
 pub mod platform;
+pub mod provider_attribution;
 pub mod resources;
 pub mod session_transfer;
 pub mod sessions;

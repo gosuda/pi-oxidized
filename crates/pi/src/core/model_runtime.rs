@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use futures::future::FutureExt;
 use futures::stream::{self, BoxStream};
@@ -40,6 +41,11 @@ use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
 
+use super::provider_attribution::{
+    merge_provider_attribution_headers, merge_provider_attribution_headers_with_telemetry,
+};
+use super::settings::{DEFAULT_HTTP_IDLE_TIMEOUT_MS, SettingsManager};
+
 /// Options for constructing a [`ModelRuntime`].
 #[derive(Clone, Default)]
 pub struct CreateModelRuntimeOptions {
@@ -65,6 +71,13 @@ pub struct CreateModelRuntimeOptions {
     /// Optional OAuth handler map (tests / host injectors). When present,
     /// [`resolve_provider_auth`] uses these handlers so expired tokens refresh.
     pub oauth_handlers: Option<HashMap<String, Arc<dyn OAuthAuth>>>,
+    /// Settings consulted for telemetry-gated provider attribution.
+    pub settings_manager: Option<Arc<Mutex<SettingsManager>>>,
+    /// Provider HTTP proxy URL. An empty value leaves the system proxy unchanged.
+    pub http_proxy: Option<String>,
+    /// Provider connection-pool idle timeout in milliseconds; zero disables
+    /// reqwest's idle-pool eviction.
+    pub http_idle_timeout_ms: Option<u64>,
 }
 
 /// Auth overrides for a single request or status probe.
@@ -260,6 +273,9 @@ pub enum ModelRuntimeError {
     /// Provider registration validation failure.
     #[error("{0}")]
     Registration(String),
+    /// Provider HTTP client construction failure.
+    #[error("Failed to configure provider HTTP client: {0}")]
+    HttpClient(String),
 }
 
 /// Result of [`ModelRuntime::refresh`].
@@ -295,6 +311,7 @@ struct ModelRuntimeInner {
     allow_model_network: bool,
     auth_env: ProviderEnv,
     oauth_handlers: HashMap<String, Arc<dyn OAuthAuth>>,
+    settings_manager: Option<Arc<Mutex<SettingsManager>>>,
     config: Mutex<ModelsJsonConfig>,
     extension_providers: Mutex<HashMap<String, ProviderConfigInput>>,
     /// Extension stream handlers keyed by provider id.
@@ -371,7 +388,13 @@ impl ModelRuntime {
         let allow_model_network = options.allow_model_network.unwrap_or(false);
         let auth_env = options.auth_env.unwrap_or_default();
         let oauth_handlers = options.oauth_handlers.unwrap_or_default();
-        let stream_provider = Arc::new(default_provider_registry());
+        let settings_manager = options.settings_manager;
+        let stream_provider = Arc::new(default_provider_registry(
+            options.http_proxy.as_deref(),
+            options
+                .http_idle_timeout_ms
+                .unwrap_or(DEFAULT_HTTP_IDLE_TIMEOUT_MS),
+        )?);
 
         let runtime = Self {
             inner: Arc::new(ModelRuntimeInner {
@@ -381,6 +404,7 @@ impl ModelRuntime {
                 allow_model_network,
                 auth_env,
                 oauth_handlers,
+                settings_manager,
                 config: Mutex::new(config),
                 extension_providers: Mutex::new(HashMap::new()),
                 extension_stream_providers: Mutex::new(HashMap::new()),
@@ -879,28 +903,32 @@ impl ModelRuntime {
         if options.api_key.is_none() {
             options.api_key.clone_from(&resolution.auth.api_key);
         }
-        if let Some(headers) = resolution.auth.headers.clone() {
-            // Precedence matches upstream applyAuth: options.headers override
-            // auth/model/config headers; None values suppress defaults.
-            let mut merged = headers;
-            if let Some(option_headers) = options.headers.take() {
-                for (name, value) in option_headers {
-                    merged.retain(|existing, _| !existing.eq_ignore_ascii_case(&name));
-                    merged.insert(name, value);
-                }
-            }
-            options.headers = Some(merged);
+        let mut model = model.clone();
+        if let Some(base_url) = resolution.auth.base_url {
+            model.base_url = base_url;
         }
+        let header_sources = [resolution.auth.headers.clone(), options.headers.take()];
+        options.headers = if let Some(settings) = &self.inner.settings_manager {
+            merge_provider_attribution_headers(
+                &model,
+                &lock(settings),
+                options.session_id.as_deref(),
+                header_sources,
+            )
+        } else {
+            merge_provider_attribution_headers_with_telemetry(
+                &model,
+                true,
+                options.session_id.as_deref(),
+                header_sources,
+            )
+        };
         if let Some(env) = resolution.env {
             let mut merged = options.env.take().unwrap_or_default();
             for (key, value) in env {
                 merged.entry(key).or_insert(value);
             }
             options.env = Some(merged);
-        }
-        let mut model = model.clone();
-        if let Some(base_url) = resolution.auth.base_url {
-            model.base_url = base_url;
         }
         options = Self::shape_reasoning_options(&model, context, options);
         // Shared retry-delay default when product paths leave it unset.
@@ -1545,9 +1573,48 @@ struct PreparedRequest {
     options: StreamOptions,
 }
 
-fn default_provider_registry() -> ProviderRegistry {
-    let client = reqwest::Client::new();
-    ProviderRegistry::new([
+#[derive(Debug, PartialEq, Eq)]
+struct ProviderClientSettings {
+    proxy: Option<String>,
+    pool_idle_timeout: Option<Duration>,
+}
+
+fn provider_client_settings(
+    http_proxy: Option<&str>,
+    http_idle_timeout_ms: u64,
+) -> ProviderClientSettings {
+    ProviderClientSettings {
+        proxy: http_proxy
+            .map(str::trim)
+            .filter(|proxy| !proxy.is_empty())
+            .map(ToOwned::to_owned),
+        pool_idle_timeout: (http_idle_timeout_ms != 0)
+            .then(|| Duration::from_millis(http_idle_timeout_ms)),
+    }
+}
+
+/// Build the shared native-provider registry.
+///
+/// `reqwest` has no header/body **activity** timeout equivalent to undici's
+/// `bodyTimeout` and `headersTimeout`; `httpIdleTimeoutMs` therefore controls
+/// pooled connection idle eviction. A zero timeout disables that eviction,
+/// matching the reference's "disabled" intent as closely as reqwest allows.
+fn default_provider_registry(
+    http_proxy: Option<&str>,
+    http_idle_timeout_ms: u64,
+) -> Result<ProviderRegistry, ModelRuntimeError> {
+    let settings = provider_client_settings(http_proxy, http_idle_timeout_ms);
+    let mut client = reqwest::Client::builder().pool_idle_timeout(settings.pool_idle_timeout);
+    if let Some(proxy) = settings.proxy {
+        client = client.proxy(
+            reqwest::Proxy::all(proxy)
+                .map_err(|error| ModelRuntimeError::HttpClient(error.to_string()))?,
+        );
+    }
+    let client = client
+        .build()
+        .map_err(|error| ModelRuntimeError::HttpClient(error.to_string()))?;
+    Ok(ProviderRegistry::new([
         Arc::new(OpenAiCompletions::new(client.clone())),
         Arc::new(OpenAiResponses::new(client.clone())),
         Arc::new(AzureOpenAiResponses::new(client.clone())),
@@ -1560,7 +1627,7 @@ fn default_provider_registry() -> ProviderRegistry {
         Arc::new(GoogleVertex::new(client.clone(), None)),
         Arc::new(MistralConversations::new(client.clone())),
         Arc::new(PiMessages::new(client)),
-    ])
+    ]))
 }
 
 fn parse_models_json(
@@ -1591,51 +1658,77 @@ fn parse_models_json(
 }
 
 fn strip_json_comments(input: &str) -> String {
-    // Minimal // and /* */ stripper for models.json tolerance. Strings are preserved.
+    // Ports stripJsonComments from .references/pi/utils/json.ts exactly:
+    //  - remove // line comments (preserving the newline)
+    //  - remove trailing commas before } or ]
+    //  - leave string literals untouched
+    //  - do NOT strip /* */ block comments
     let mut out = String::with_capacity(input.len());
-    let bytes = input.as_bytes();
-    let mut i = 0;
+    let mut chars = input.chars().peekable();
     let mut in_string = false;
     let mut escaped = false;
-    while i < bytes.len() {
-        let b = bytes[i];
+    while let Some(ch) = chars.next() {
         if in_string {
-            out.push(b as char);
+            out.push(ch);
             if escaped {
                 escaped = false;
-            } else if b == b'\\' {
+            } else if ch == '\\' {
                 escaped = true;
-            } else if b == b'"' {
+            } else if ch == '"' {
                 in_string = false;
             }
-            i += 1;
             continue;
         }
-        if b == b'"' {
+        if ch == '"' {
             in_string = true;
             out.push('"');
-            i += 1;
             continue;
         }
-        if b == b'/' && i + 1 < bytes.len() {
-            if bytes[i + 1] == b'/' {
-                i += 2;
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
+        if ch == '/' && chars.peek() == Some(&'/') {
+            // Skip the second slash and everything until (but not including)
+            // the newline, matching the TS regex `\/\/[^\n]*`.
+            chars.next();
+            for next in chars.by_ref() {
+                if next == '\n' {
+                    out.push('\n');
+                    break;
                 }
-                continue;
             }
-            if bytes[i + 1] == b'*' {
-                i += 2;
-                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                    i += 1;
+            continue;
+        }
+        if ch == ',' {
+            // Drop a comma when only whitespace precedes a closing } or ].
+            // Keep the whitespace and bracket.
+            let mut cloned = chars.clone();
+            let mut has_ws = false;
+            let mut found_close = false;
+            while let Some(&next) = cloned.peek() {
+                if next.is_whitespace() {
+                    has_ws = true;
+                    cloned.next();
+                    continue;
                 }
-                i = (i + 2).min(bytes.len());
+                if next == '}' || next == ']' {
+                    found_close = true;
+                }
+                break;
+            }
+            if found_close {
+                // Emit whitespace (but not the comma) so line/column hints stay close.
+                if has_ws {
+                    while let Some(&next) = chars.peek() {
+                        if next.is_whitespace() {
+                            out.push(next);
+                            chars.next();
+                            continue;
+                        }
+                        break;
+                    }
+                }
                 continue;
             }
         }
-        out.push(b as char);
-        i += 1;
+        out.push(ch);
     }
     out
 }
@@ -1893,6 +1986,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::settings::{Settings, SettingsManagerCreateOptions};
     use pi_ai::auth::OAuthCredential;
     use serde_json::json;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1916,6 +2010,24 @@ mod tests {
             headers: None,
             compat: None,
         }
+    }
+
+    #[test]
+    fn provider_client_settings_apply_proxy_and_idle_timeout() {
+        assert_eq!(
+            provider_client_settings(Some(" http://proxy.test:8080 "), 30_000),
+            ProviderClientSettings {
+                proxy: Some("http://proxy.test:8080".to_owned()),
+                pool_idle_timeout: Some(Duration::from_secs(30)),
+            }
+        );
+        assert_eq!(
+            provider_client_settings(Some("  "), 0),
+            ProviderClientSettings {
+                proxy: None,
+                pool_idle_timeout: None,
+            }
+        );
     }
 
     #[tokio::test]
@@ -2397,12 +2509,38 @@ mod tests {
     }
 
     #[test]
-    fn strip_json_comments_preserves_strings() {
-        let raw = r#"{ "a": "http://x", /* c */ "b": 1 } // tail"#;
+    fn strip_json_comments_removes_line_comments_and_trailing_commas() {
+        let raw = r#"{ "a": "http://x", // comment
+ "b": 1, }"#;
         let stripped = strip_json_comments(raw);
         assert!(stripped.contains("http://x"));
-        assert!(!stripped.contains("/*"));
-        assert!(!stripped.contains("// tail"));
+        assert!(!stripped.contains("// comment"));
+        // Trailing comma before the closing brace is removed.
+        assert!(!stripped.contains(", }"));
+        let parsed = serde_json::from_str::<Value>(&stripped);
+        assert!(parsed.is_ok(), "{parsed:?}");
+    }
+
+    #[test]
+    fn strip_json_comments_preserves_block_comments_as_invalid() {
+        // TypeScript stripJsonComments does NOT strip /* */ blocks, so the
+        // output must still contain them and serde_json must reject it.
+        let raw = r#"{/*c*/"a":1}"#;
+        let stripped = strip_json_comments(raw);
+        assert!(stripped.contains("/*c*/"));
+        let parsed = serde_json::from_str::<Value>(&stripped);
+        assert!(
+            parsed.is_err(),
+            "block comment should remain and cause a parse error"
+        );
+    }
+
+    #[test]
+    fn strip_json_comments_does_not_touch_strings() {
+        let raw = r#"{ "a": "1,}", "b": 2 }"#;
+        let stripped = strip_json_comments(raw);
+        assert!(stripped.contains("1,}"));
+        assert!(serde_json::from_str::<Value>(&stripped).is_ok());
     }
 
     #[tokio::test]
@@ -2940,6 +3078,57 @@ mod tests {
         assert_eq!(
             headers.get("X-Options-Only").and_then(|v| v.as_deref()),
             Some("options")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prepare_request_merges_telemetry_attribution_below_explicit_headers()
+    -> Result<(), ModelRuntimeError> {
+        let settings = Arc::new(Mutex::new(SettingsManager::in_memory(
+            &Settings::default(),
+            SettingsManagerCreateOptions::default(),
+        )));
+        let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
+            credentials: Some(Arc::new(InMemoryCredentialStore::new())),
+            models_store: Some(Arc::new(InMemoryModelsStore::new())),
+            models_config: Some(ModelsJsonConfig::empty()),
+            allow_model_network: Some(false),
+            settings_manager: Some(settings),
+            ..CreateModelRuntimeOptions::default()
+        })
+        .await?;
+        runtime.register_provider(
+            "openrouter",
+            &ProviderConfigInput {
+                base_url: Some("https://openrouter.ai/api/v1".to_owned()),
+                api: Some("openai-completions".to_owned()),
+                api_key: Some("sk-test".to_owned()),
+                models: Some(vec![custom_model("openrouter", "m")]),
+                ..ProviderConfigInput::default()
+            },
+        )?;
+        let extension = Arc::new(RecordingExtensionProvider::new());
+        runtime.register_extension_stream_provider("openrouter", extension.clone());
+        let mut model = required(runtime.get_model("openrouter", "m"), "model")?;
+        model.base_url = "https://openrouter.ai/api/v1".to_owned();
+        let options = StreamOptions {
+            headers: Some(BTreeMap::from([(
+                "http-referer".to_owned(),
+                Some("https://example.test".to_owned()),
+            )])),
+            ..StreamOptions::default()
+        };
+        let mut stream = runtime.stream_simple(model, Context::default(), options);
+        let _ = futures::StreamExt::next(&mut stream).await;
+        let headers = required(extension.calls()[0].headers.clone(), "headers")?;
+        assert_eq!(
+            headers.get("http-referer").and_then(Option::as_deref),
+            Some("https://example.test")
+        );
+        assert_eq!(
+            headers.get("X-OpenRouter-Title").and_then(Option::as_deref),
+            Some("pi")
         );
         Ok(())
     }
