@@ -20,12 +20,18 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 
 pub use pi_tui::components::{DefaultTextStyle, MarkdownOptions, MarkdownTheme};
 use pi_tui::components::{SelectListTheme, SettingsListTheme};
 use pi_tui::terminal::probe::TerminalTheme;
 use pi_tui::text::{truncate_to_width, visible_width};
+use syntect::highlighting::ScopeSelector;
+use syntect::parsing::{
+    ParseState, ScopeStack, ScopeStackOp, SyntaxDefinition, SyntaxSet, SyntaxSetBuilder,
+};
+use syntect::util::LinesWithEndings;
 
 use crate::core::config;
 use crate::core::settings::ThemeMode;
@@ -630,9 +636,352 @@ pub fn markdown_theme() -> MarkdownTheme {
         italic,
         underline,
         strikethrough,
-        highlight_code: None,
+        highlight_code: Some(Arc::new(highlight_code)),
         code_block_indent: "  ".to_owned(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Syntax highlighting (ports `highlightCode`/`getLanguageFromPath` from theme.ts)
+// ---------------------------------------------------------------------------
+
+/// Curated `.sublime-syntax` grammars embedded at compile time. Provenance,
+/// upstream pins, and the hand-authored stubs are documented in
+/// `assets/syntax/NOTICE`.
+const SYNTAX_SOURCES: &[(&str, &str)] = &[
+    (
+        "Plain-Text",
+        include_str!("../../../assets/syntax/Plain-Text.sublime-syntax"),
+    ),
+    (
+        "Bash",
+        include_str!("../../../assets/syntax/Bash.sublime-syntax"),
+    ),
+    ("C", include_str!("../../../assets/syntax/C.sublime-syntax")),
+    (
+        "C++",
+        include_str!("../../../assets/syntax/C++.sublime-syntax"),
+    ),
+    (
+        "CSS",
+        include_str!("../../../assets/syntax/CSS.sublime-syntax"),
+    ),
+    (
+        "Diff",
+        include_str!("../../../assets/syntax/Diff.sublime-syntax"),
+    ),
+    (
+        "Go",
+        include_str!("../../../assets/syntax/Go.sublime-syntax"),
+    ),
+    (
+        "HTML",
+        include_str!("../../../assets/syntax/HTML.sublime-syntax"),
+    ),
+    (
+        "JSON",
+        include_str!("../../../assets/syntax/JSON.sublime-syntax"),
+    ),
+    (
+        "Java",
+        include_str!("../../../assets/syntax/Java.sublime-syntax"),
+    ),
+    (
+        "JavaScript",
+        include_str!("../../../assets/syntax/JavaScript.sublime-syntax"),
+    ),
+    (
+        "JavaScript-RegExp",
+        include_str!("../../../assets/syntax/JavaScript-RegExp.sublime-syntax"),
+    ),
+    (
+        "Python",
+        include_str!("../../../assets/syntax/Python.sublime-syntax"),
+    ),
+    (
+        "Python-RegExp",
+        include_str!("../../../assets/syntax/Python-RegExp.sublime-syntax"),
+    ),
+    (
+        "Python-RegExp-RawFString",
+        include_str!("../../../assets/syntax/Python-RegExp-RawFString.sublime-syntax"),
+    ),
+    (
+        "Rust",
+        include_str!("../../../assets/syntax/Rust.sublime-syntax"),
+    ),
+    (
+        "SQL",
+        include_str!("../../../assets/syntax/SQL.sublime-syntax"),
+    ),
+    (
+        "Shell-Unix-Generic",
+        include_str!("../../../assets/syntax/Shell-Unix-Generic.sublime-syntax"),
+    ),
+    (
+        "TOML",
+        include_str!("../../../assets/syntax/TOML.sublime-syntax"),
+    ),
+    (
+        "YAML",
+        include_str!("../../../assets/syntax/YAML.sublime-syntax"),
+    ),
+];
+
+/// Build a syntax set from the named vendored grammars. `Plain-Text` should
+/// always be included: it is syntect's fallback target for unresolved `embed`
+/// references.
+// Panic rationale: vendored grammars are compile-time constants; a parse
+// failure is a build-time bug the syntax tests catch, never a runtime state.
+#[expect(clippy::panic)]
+fn build_syntax_set(names: &[&str]) -> SyntaxSet {
+    let mut builder = SyntaxSetBuilder::new();
+    for (name, source) in SYNTAX_SOURCES {
+        if names.contains(name) {
+            let definition = SyntaxDefinition::load_from_str(source, true, Some(name))
+                .unwrap_or_else(|error| panic!("vendored syntax {name} should parse: {error}"));
+            builder.add(definition);
+        }
+    }
+    builder.build()
+}
+
+/// Per-language syntax-set shards, each parsed lazily on first use. Sharding
+/// keeps the first highlighted code block cheap (a `rust` fence never pays
+/// for CSS or C++) and startup paths (including `--version`) never touch any
+/// shard. Each shard carries the grammars reachable from its root language:
+/// cross-grammar `include`s must be present, while `embed`s degrade to the
+/// `Plain-Text` fallback when their target is not.
+macro_rules! shard {
+    ($name:ident, $($source:literal),+ $(,)?) => {
+        static $name: LazyLock<SyntaxSet> = LazyLock::new(|| build_syntax_set(&[$($source),+]));
+    };
+}
+
+shard!(SHARD_BASH, "Plain-Text", "Bash", "Shell-Unix-Generic");
+shard!(SHARD_C, "Plain-Text", "C");
+shard!(SHARD_CPP, "Plain-Text", "C", "C++");
+shard!(SHARD_CSS, "Plain-Text", "CSS");
+shard!(SHARD_DIFF, "Plain-Text", "Diff");
+shard!(SHARD_GO, "Plain-Text", "Go");
+shard!(
+    SHARD_HTML,
+    "Plain-Text",
+    "HTML",
+    "CSS",
+    "JavaScript",
+    "JavaScript-RegExp",
+);
+shard!(SHARD_JSON, "Plain-Text", "JSON");
+shard!(SHARD_JAVA, "Plain-Text", "Java");
+shard!(SHARD_JS, "Plain-Text", "JavaScript", "JavaScript-RegExp",);
+shard!(
+    SHARD_PYTHON,
+    "Plain-Text",
+    "Python",
+    "Python-RegExp",
+    "Python-RegExp-RawFString",
+    "SQL",
+);
+shard!(SHARD_RUST, "Plain-Text", "Rust", "TOML");
+shard!(SHARD_SQL, "Plain-Text", "SQL");
+shard!(SHARD_TOML, "Plain-Text", "TOML");
+shard!(SHARD_YAML, "Plain-Text", "YAML");
+
+/// Every shard, for tests that validate the whole vendored set.
+#[cfg(test)]
+const ALL_SHARDS: &[&LazyLock<SyntaxSet>] = &[
+    &SHARD_BASH,
+    &SHARD_C,
+    &SHARD_CPP,
+    &SHARD_CSS,
+    &SHARD_DIFF,
+    &SHARD_GO,
+    &SHARD_HTML,
+    &SHARD_JSON,
+    &SHARD_JAVA,
+    &SHARD_JS,
+    &SHARD_PYTHON,
+    &SHARD_RUST,
+    &SHARD_SQL,
+    &SHARD_TOML,
+    &SHARD_YAML,
+];
+
+/// Scope selectors mapped onto the product syntax slots, checked against the
+/// scope stack in order; first match wins. Ports the hljs-class-to-syntax-slot
+/// table in upstream `buildCliHighlightTheme` to `TextMate` scopes.
+// Panic rationale: selector strings are compile-time constants, validated by
+// the syntax tests on first use.
+#[expect(clippy::panic)]
+static SLOT_SELECTORS: LazyLock<Vec<(ScopeSelector, ThemeColor)>> = LazyLock::new(|| {
+    const TABLE: &[(&str, ThemeColor)] = &[
+        ("comment", ThemeColor::SyntaxComment),
+        ("string", ThemeColor::SyntaxString),
+        ("constant.character", ThemeColor::SyntaxString),
+        ("constant.numeric", ThemeColor::SyntaxNumber),
+        ("constant.language", ThemeColor::SyntaxNumber),
+        ("keyword.operator", ThemeColor::SyntaxOperator),
+        ("keyword", ThemeColor::SyntaxKeyword),
+        ("storage", ThemeColor::SyntaxKeyword),
+        ("entity.name.tag", ThemeColor::SyntaxKeyword),
+        ("entity.name.function", ThemeColor::SyntaxFunction),
+        ("support.function", ThemeColor::SyntaxFunction),
+        ("support.macro", ThemeColor::SyntaxFunction),
+        ("variable.function", ThemeColor::SyntaxFunction),
+        ("entity.name.type", ThemeColor::SyntaxType),
+        ("entity.name.class", ThemeColor::SyntaxType),
+        ("entity.name.struct", ThemeColor::SyntaxType),
+        ("entity.name.enum", ThemeColor::SyntaxType),
+        ("entity.name.trait", ThemeColor::SyntaxType),
+        ("entity.name.interface", ThemeColor::SyntaxType),
+        ("entity.name.impl", ThemeColor::SyntaxType),
+        ("support.type", ThemeColor::SyntaxType),
+        ("support.class", ThemeColor::SyntaxType),
+        ("markup.inserted", ThemeColor::ToolDiffAdded),
+        ("markup.deleted", ThemeColor::ToolDiffRemoved),
+        ("variable", ThemeColor::SyntaxVariable),
+        ("entity.name.variable", ThemeColor::SyntaxVariable),
+        ("entity.other.attribute-name", ThemeColor::SyntaxVariable),
+        ("support.constant", ThemeColor::SyntaxVariable),
+        ("punctuation", ThemeColor::SyntaxPunctuation),
+    ];
+    TABLE
+        .iter()
+        .map(|(selector, slot)| {
+            (
+                ScopeSelector::from_str(selector).unwrap_or_else(|error| {
+                    panic!("slot selector {selector} should parse: {error}")
+                }),
+                *slot,
+            )
+        })
+        .collect()
+});
+
+/// Map a code-fence language token onto its vendored syntax token and shard.
+///
+/// Mirrors the language names upstream's `highlightCode` accepts via hljs,
+/// reduced to the vendored grammar set. `ts`/`tsx` map to JavaScript: the
+/// upstream TypeScript grammar cannot be loaded by syntect (see
+/// `assets/syntax/NOTICE`). Unmapped languages return `None` (plain text —
+/// auto-detection stays disabled, matching upstream).
+fn syntax_for(lang: &str) -> Option<(&'static str, &'static LazyLock<SyntaxSet>)> {
+    Some(match lang.to_ascii_lowercase().as_str() {
+        "js" | "jsx" | "mjs" | "cjs" | "javascript" | "node" | "ts" | "tsx" | "mts" | "cts"
+        | "typescript" => ("js", &SHARD_JS),
+        "py" | "python" | "python3" => ("py", &SHARD_PYTHON),
+        "rs" | "rust" => ("rs", &SHARD_RUST),
+        "go" | "golang" => ("go", &SHARD_GO),
+        "c" | "h" => ("c", &SHARD_C),
+        "cpp" | "cc" | "cxx" | "c++" | "hpp" | "hxx" | "hh" => ("cpp", &SHARD_CPP),
+        "java" => ("java", &SHARD_JAVA),
+        "sh" | "bash" | "zsh" | "shell" | "shellscript" => ("sh", &SHARD_BASH),
+        "json" | "jsonc" => ("json", &SHARD_JSON),
+        "yaml" | "yml" => ("yaml", &SHARD_YAML),
+        "toml" => ("toml", &SHARD_TOML),
+        "html" | "htm" => ("html", &SHARD_HTML),
+        "css" => ("css", &SHARD_CSS),
+        "sql" => ("sql", &SHARD_SQL),
+        "diff" | "patch" => ("diff", &SHARD_DIFF),
+        _ => return None,
+    })
+}
+
+/// Language token for a file path's extension (ports `getLanguageFromPath`).
+///
+/// Returns the token the markdown highlighter understands, or `None` when no
+/// vendored grammar covers the extension. Extension aliases match upstream's
+/// table within the vendored set (`ts`/`tsx` yield the JavaScript grammar).
+#[must_use]
+pub fn language_from_path(path: &str) -> Option<&'static str> {
+    path.rsplit('.')
+        .next()
+        .and_then(|ext| syntax_for(ext).map(|(token, _)| token))
+}
+
+/// Highlight `code` as `lang`, one styled [`String`] per line.
+///
+/// Ports upstream `highlightCode`: only known languages are highlighted
+/// (auto-detection stays disabled); unknown languages and parse failures
+/// degrade to `mdCodeBlock`-colored plain lines. Colors resolve through
+/// [`current()`] at call time, so a theme switch needs no cache invalidation.
+fn highlight_code(code: &str, lang: Option<&str>) -> Vec<String> {
+    let theme = current();
+    let Some((token, shard)) = lang.and_then(|lang| syntax_for(lang.trim())) else {
+        return plain_lines(&theme, code);
+    };
+    let syntax_set = &**shard;
+    let Some(syntax) = syntax_set.find_syntax_by_token(token) else {
+        return plain_lines(&theme, code);
+    };
+    let mut state = ParseState::new(syntax);
+    let mut stack = ScopeStack::new();
+    let mut lines = Vec::new();
+    for line in LinesWithEndings::from(code) {
+        match state.parse_line(line, syntax_set) {
+            Ok(ops) => lines.push(highlight_line(&theme, line, &ops, &mut stack)),
+            Err(_) => return plain_lines(&theme, code),
+        }
+    }
+    lines
+}
+
+/// `mdCodeBlock`-colored plain lines for the no-highlight path, matching the
+/// renderer's trailing-newline handling (no synthetic empty final line).
+fn plain_lines(theme: &ResolvedTheme, code: &str) -> Vec<String> {
+    if code.is_empty() {
+        return Vec::new();
+    }
+    code.strip_suffix('\n')
+        .unwrap_or(code)
+        .split('\n')
+        .map(|line| theme.fg(ThemeColor::MdCodeBlock, line))
+        .collect()
+}
+
+/// Emit one line with tokens wrapped in the active theme's syntax colors.
+/// `line` may end with `\n`; the newline is neither colored nor emitted.
+fn highlight_line(
+    theme: &ResolvedTheme,
+    line: &str,
+    ops: &[(usize, ScopeStackOp)],
+    stack: &mut ScopeStack,
+) -> String {
+    let body = line.strip_suffix('\n').unwrap_or(line);
+    let mut out = String::with_capacity(body.len() + 32);
+    let mut offset = 0;
+    for &(end, ref op) in ops {
+        push_segment(&mut out, theme, stack, &line[offset..end.min(body.len())]);
+        // Parser-produced ops are well-formed for this stack.
+        let _ = stack.apply(op);
+        offset = end;
+    }
+    push_segment(
+        &mut out,
+        theme,
+        stack,
+        &line[offset..body.len().max(offset)],
+    );
+    out
+}
+
+/// Append `segment` colored by its scope-stack slot (raw when unstyled).
+fn push_segment(out: &mut String, theme: &ResolvedTheme, stack: &ScopeStack, segment: &str) {
+    if segment.is_empty() {
+        return;
+    }
+    match slot_for_stack(stack) {
+        Some(slot) if !theme.is_fg_empty(slot) => out.push_str(&theme.fg(slot, segment)),
+        _ => out.push_str(segment),
+    }
+}
+
+/// First syntax slot whose selector matches the scope stack, if any.
+fn slot_for_stack(stack: &ScopeStack) -> Option<ThemeColor> {
+    SLOT_SELECTORS
+        .iter()
+        .find_map(|(selector, slot)| selector.does_match(stack.as_slice()).map(|_| *slot))
 }
 
 /// Markdown options matching the user-message renderer.
@@ -1814,5 +2163,142 @@ mod tests {
             assert_eq!(theme.bg_rgb(ThemeBg::SelectedBg), Rgb(231, 231, 231));
         }
         Ok(())
+    }
+
+    // ---- syntax highlighting ----
+
+    #[test]
+    fn markdown_theme_wires_highlight_code() {
+        assert!(markdown_theme().highlight_code.is_some());
+    }
+
+    #[test]
+    fn vendored_syntaxes_link_except_known_go_injections() {
+        for shard in ALL_SHARDS {
+            for context in shard.find_unlinked_contexts() {
+                assert!(
+                    context.starts_with("Syntax 'Go'"),
+                    "unexpected unresolved context: {context}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn highlight_rust_uses_active_theme_syntax_slots() {
+        let theme = dark();
+        let lines = with_theme(Arc::clone(&theme), || {
+            highlight_code("fn main() {\n    let s = \"hi\"; // c\n}\n", Some("rust"))
+        });
+        let keyword = theme.fg_ansi(ThemeColor::SyntaxKeyword);
+        let string = theme.fg_ansi(ThemeColor::SyntaxString);
+        let comment = theme.fg_ansi(ThemeColor::SyntaxComment);
+        assert_eq!(lines.len(), 3);
+        assert!(
+            lines[0].contains(&format!("{keyword}fn\x1b[39m")),
+            "`fn` should carry the keyword color: {:?}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains(&format!("{string}\"\x1b[39m{string}hi\x1b[39m")),
+            "string literal should carry the string color: {:?}",
+            lines[1]
+        );
+        assert!(
+            lines[1].contains(&format!("{comment}//\x1b[39m")),
+            "comment should carry the comment color: {:?}",
+            lines[1]
+        );
+    }
+
+    #[test]
+    fn highlight_js_and_ts_alias_to_javascript() {
+        let theme = dark();
+        let keyword = theme.fg_ansi(ThemeColor::SyntaxKeyword);
+        for lang in ["javascript", "js", "jsx", "typescript", "ts", "tsx"] {
+            let lines = with_theme(Arc::clone(&theme), || {
+                highlight_code("const f = (a) => a * 2;\n", Some(lang))
+            });
+            assert!(
+                lines[0].contains(&format!("{keyword}const\x1b[39m")),
+                "{lang}: `const` should carry the keyword color: {:?}",
+                lines[0]
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_language_stays_plain() {
+        let theme = dark();
+        let expected = vec![theme.fg(ThemeColor::MdCodeBlock, "hello world")];
+        let unknown = with_theme(Arc::clone(&theme), || {
+            highlight_code("hello world\n", Some("cobol"))
+        });
+        assert_eq!(unknown, expected);
+        let bare = with_theme(Arc::clone(&theme), || highlight_code("hello world\n", None));
+        assert_eq!(bare, expected);
+    }
+
+    #[test]
+    fn empty_code_block_yields_no_lines() {
+        let theme = dark();
+        let highlighted = with_theme(Arc::clone(&theme), || highlight_code("", Some("rust")));
+        assert!(highlighted.is_empty());
+        let plain = with_theme(Arc::clone(&theme), || highlight_code("", None));
+        assert!(plain.is_empty());
+    }
+
+    #[test]
+    fn theme_switch_changes_highlight_colors() {
+        let code = "fn f() {}\n";
+        let dark_lines = with_theme(dark(), || highlight_code(code, Some("rust")));
+        let light_lines = with_theme(light(), || highlight_code(code, Some("rust")));
+        assert_ne!(dark_lines, light_lines);
+    }
+
+    #[test]
+    fn palette256_mode_downsamples_highlight_colors() -> TestResult {
+        let theme = ThemeJson::parse(BUILTIN_JSONS[0].1)
+            .map_err(|error| format!("dark should parse: {error}"))?
+            .resolve_owned(ColorMode::Palette256)
+            .map_err(|error| format!("dark should resolve: {error}"))?;
+        let lines = with_theme(Arc::new(theme), || {
+            highlight_code("fn f() {}\n", Some("rust"))
+        });
+        assert!(
+            lines[0].contains("\x1b[38;5;"),
+            "expected 256-color sequences: {:?}",
+            lines[0]
+        );
+        assert!(
+            !lines[0].contains("\x1b[38;2;"),
+            "truecolor sequences should be downsampled: {:?}",
+            lines[0]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn python_regexp_raw_strings_still_highlight() {
+        let theme = dark();
+        let lines = with_theme(Arc::clone(&theme), || {
+            highlight_code("import re\nm = re.compile(r\"\\d+\")\n", Some("python"))
+        });
+        assert_eq!(lines.len(), 2);
+        let keyword = theme.fg_ansi(ThemeColor::SyntaxKeyword);
+        assert!(
+            lines[0].contains(&format!("{keyword}import\x1b[39m")),
+            "`import` should carry the keyword color: {:?}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn language_from_path_maps_vendored_extensions() {
+        assert_eq!(language_from_path("src/main.rs"), Some("rs"));
+        assert_eq!(language_from_path("a/b/Component.TSX"), Some("js"));
+        assert_eq!(language_from_path("notes.yaml"), Some("yaml"));
+        assert_eq!(language_from_path("Makefile"), None);
+        assert_eq!(language_from_path("x.kt"), None);
     }
 }

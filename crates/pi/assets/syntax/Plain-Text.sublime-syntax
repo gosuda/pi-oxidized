@@ -1,0 +1,14 @@
+%YAML 1.2
+---
+# Hand-authored minimal Plain Text syntax.
+#
+# syntect falls back to a syntax named "Plain Text" when an `embed` reference
+# cannot be resolved (e.g. JavaDoc inside `/** */`, TOML inside Python
+# docstrings). The bundled default syntaxes provide one; since we vendor a
+# curated set instead, we provide our own.
+name: Plain Text
+scope: text.plain
+hidden: true
+
+contexts:
+  main: []

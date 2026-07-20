@@ -37,6 +37,7 @@ same-file = "=1.0.6"
 serde-saphyr = { version = "=0.0.29", default-features = false, features = ["deserialize"] }
 sha2 = { version = "=0.11.0", default-features = false }
 serde_json = "=1.0.150"
+syntect = { version = "=5.3.0", default-features = false, features = ["parsing", "regex-fancy", "yaml-load"] }
 thiserror = "=2.0.18"
 tokio = { version = "=1.52.4", default-features = false, features = ["fs", "io-std", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "=0.7.18", default-features = false, features = ["rt"] }

@@ -1,0 +1,62 @@
+Vendored syntax highlighting grammars for pi's TUI code blocks.
+
+Most files in this directory are unmodified `.sublime-syntax` grammars from
+https://github.com/sublimehq/Packages, vendored so syntect
+(default-features = false, no bundled dumps) can build a curated syntax set
+via `include_str!`. The upstream license (sublimehq/Packages/LICENSE) reads:
+
+    Permission to copy, use, modify, sell and distribute this
+    software is granted. This software is provided "as is" without
+    express or implied warranty, and with no claim as to its
+    suitability for any purpose.
+
+Pinned revisions
+----------------
+
+Unless listed below, files are from sublimehq/Packages commit
+e4e988e202322a04bea88e6d991f3dc537600731 (2026-07-19).
+
+syntect 5.x cannot load `version: 2` grammars that use `extends:`, so these
+three are pinned to their last `version: 1` revisions instead:
+
+  HTML.sublime-syntax   <- HTML/HTML.sublime-syntax   @ eb30451f0df3259cf1bfc219265a21ddfe9c0630 (2020-07-20)
+  SQL.sublime-syntax    <- SQL/SQL.sublime-syntax     @ 4a51942b8e0792ad0818a5aa41f6d95cfea9f2da (2024-07-13)
+  Diff.sublime-syntax   <- Diff/Diff.sublime-syntax   @ c275309827fc9551873975e92b9a4b2d0b183b32 (2024-02-18)
+
+File mapping (upstream path -> local name):
+
+  Rust/Rust.sublime-syntax                                -> Rust.sublime-syntax
+  JavaScript/JavaScript.sublime-syntax                    -> JavaScript.sublime-syntax
+  JavaScript/Regular Expressions (JavaScript).sublime-syntax -> JavaScript-RegExp.sublime-syntax
+  Python/Python.sublime-syntax                            -> Python.sublime-syntax
+  Go/Go.sublime-syntax                                    -> Go.sublime-syntax
+  C++/C.sublime-syntax                                    -> C.sublime-syntax
+  C++/C++.sublime-syntax                                  -> C++.sublime-syntax
+  ShellScript/Bash.sublime-syntax                         -> Bash.sublime-syntax
+  ShellScript/Shell-Unix-Generic.sublime-syntax           -> Shell-Unix-Generic.sublime-syntax
+  JSON/JSON.sublime-syntax                                -> JSON.sublime-syntax
+  YAML/YAML.sublime-syntax                                -> YAML.sublime-syntax
+  TOML/TOML.sublime-syntax                                -> TOML.sublime-syntax
+  CSS/CSS.sublime-syntax                                  -> CSS.sublime-syntax
+  Java/Java.sublime-syntax                                -> Java.sublime-syntax
+
+Hand-authored files (no upstream provenance, MIT like the rest of pi):
+
+  Plain-Text.sublime-syntax              minimal `text.plain` fallback target for
+                                         syntect's unresolved-`embed` handling
+  Python-RegExp.sublime-syntax           minimal `source.regexp.python` stub
+  Python-RegExp-RawFString.sublime-syntax minimal `source.regexp.python.embedded.raw-f-string` stub
+
+  The two Python regexp stubs exist because upstream ships the real ones
+  (`Python/Embeddings/RegExp (for Python)*.sublime-syntax`) as `version: 2`
+  grammars. Without the stubs, raw strings passed to `re.*` leave unresolved
+  context references that abort highlighting for the whole block.
+
+Known omissions
+---------------
+
+  * TypeScript/TSX: upstream's grammar has been `version: 2`/`extends:`-only
+    since 2020; `ts`/`tsx` fences are highlighted with the JavaScript grammar.
+  * Go backtick-string magic-language injections (`// language=css` comments)
+    reference per-language `source.go.embedded-backtick-string.*` grammars we
+    do not vendor; hitting one degrades that block to plain text.

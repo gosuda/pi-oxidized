@@ -1,0 +1,47 @@
+%YAML 1.2
+---
+# Minimal syntect-compatible stub for Python's regexp-embedded raw strings.
+#
+# sublimehq/Packages ships the real `RegExp (for Python).sublime-syntax` as a
+# `version: 2`/`extends:` syntax, which syntect 5.x cannot load. Python pushes
+# `scope:source.regexp.python#base-literal{,-extended}` as the body of raw
+# strings passed to `re.*`; without this stub the reference stays unresolved
+# and the whole code block fails to parse. Scopes emitted here map to the
+# string/number/punctuation syntax slots of the active theme.
+name: Regular Expression (for Python)
+scope: source.regexp.python
+hidden: true
+
+contexts:
+  main:
+    - include: base-literal
+
+  base-literal:
+    - match: \\[AbBdDsSwWZzG]
+      scope: keyword.control.anchor.regexp
+    - match: \\.
+      scope: constant.character.escape.regexp
+    - match: (\()(\?)([aiLmsux-]+|<[^>]*>|[P]?[=!:])?
+      captures:
+        1: punctuation.section.group.begin.regexp
+        2: punctuation.definition.group.regexp
+        3: keyword.other.group-options.regexp
+    - match: '\)'
+      scope: punctuation.section.group.end.regexp
+    - match: '\['
+      scope: punctuation.section.character-class.begin.regexp
+    - match: '\]'
+      scope: punctuation.section.character-class.end.regexp
+    - match: (\{)(\d+(,\d*)?)(\})
+      captures:
+        1: punctuation.section.quantifier.begin.regexp
+        2: constant.numeric.quantifier.regexp
+        4: punctuation.section.quantifier.end.regexp
+    - match: '[*+?|]'
+      scope: keyword.operator.quantifier.regexp
+
+  base-literal-extended:
+    - match: '\s+'
+    - match: (#[^\n]*)
+      scope: comment.line.number-sign.regexp
+    - include: base-literal

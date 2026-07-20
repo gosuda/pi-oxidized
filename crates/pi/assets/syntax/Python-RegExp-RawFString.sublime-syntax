@@ -1,0 +1,41 @@
+%YAML 1.2
+---
+# Minimal syntect-compatible stub for Python's regexp-embedded raw f-strings.
+# See `RegExp (for Python).sublime-syntax` (stub) for why this exists.
+name: Regular Expression (for Python raw f-string)
+scope: source.regexp.python.embedded.raw-f-string
+hidden: true
+
+contexts:
+  main:
+    - include: base-literal
+
+  base-literal:
+    - match: \\[AbBdDsSwWZzG]
+      scope: keyword.control.anchor.regexp
+    - match: \\.
+      scope: constant.character.escape.regexp
+    - match: (\()(\?)([aiLmsux-]+|<[^>]*>|[P]?[=!:])?
+      captures:
+        1: punctuation.section.group.begin.regexp
+        2: punctuation.definition.group.regexp
+        3: keyword.other.group-options.regexp
+    - match: '\)'
+      scope: punctuation.section.group.end.regexp
+    - match: '\['
+      scope: punctuation.section.character-class.begin.regexp
+    - match: '\]'
+      scope: punctuation.section.character-class.end.regexp
+    - match: (\{)(\d+(,\d*)?)(\})
+      captures:
+        1: punctuation.section.quantifier.begin.regexp
+        2: constant.numeric.quantifier.regexp
+        4: punctuation.section.quantifier.end.regexp
+    - match: '[*+?|]'
+      scope: keyword.operator.quantifier.regexp
+
+  base-literal-extended:
+    - match: '\s+'
+    - match: (#[^\n]*)
+      scope: comment.line.number-sign.regexp
+    - include: base-literal

@@ -1,0 +1,874 @@
+%YAML 1.2
+# The MIT License (MIT)
+#
+# Copyright (c) 2015 FichteFoll <fichtefoll2@googlemail.com>
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to
+# deal in the Software without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+# sell copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+# IN THE SOFTWARE.
+#
+#
+# This syntax definition
+# is based on http://yaml.org/spec/1.2/spec.html,
+# which also serves as a base for variables.
+# References have been included where appropriate.
+#
+# Acknowledgements:
+# - Most indentation is not checked,
+#   except for block scalars,
+#   where it is also not verified
+#   (i.e. highlights even if less indentation used than required).
+# - Properties are sometimes incorrectly highlighted
+#   for nested block collections (`- !!seq -`).
+---
+name: YAML
+scope: source.yaml
+version: 2
+
+file_extensions:
+  - yaml
+  - yml
+  - sublime-syntax
+
+hidden_file_extensions:
+  - CITATION.cff
+
+first_line_match: ^%YAML( ?1.\d+)? # Technically the number is required, but we'll be a bit loose here
+
+##############################################################################
+
+variables:
+  # General
+  s_sep: '[ \t]+' # actually s-separate-in-line
+  c_indicator: '[-?:,\[\]{}#&*!|>''"%@`]'
+  c_flow_indicator: '[\[\]{},]'
+  ns_word_char: '[0-9A-Za-z\-]'
+  ns_uri_char: '(?x: %[0-9A-Fa-f]{2} | [0-9A-Za-z\-#;/?:@&=+$,_.!~*''()\[\]] )'
+
+  # Tag stuff
+  c_tag_handle: (?:!(?:{{ns_word_char}}*!)?)
+  ns_tag_char: '(?x: %[0-9A-Fa-f]{2} | [0-9A-Za-z\-#;/?:@&=+$_.~*''()] )' # ns-uri-char - "!" - c-flow-indicator
+  ns_tag_prefix: |- # "!" ns-uri-char*  | ns-tag-char ns-uri-char*
+    (?x:
+        !              {{ns_uri_char}}*
+      | (?![,!\[\]{}]) {{ns_uri_char}}+
+    )
+  c_ns_tag_property: |- # c-verbatim-tag | c-ns-shorthand-tag | c-non-specific-tag
+    (?x:
+        ! < {{ns_uri_char}}+ >
+      | {{c_tag_handle}} {{ns_tag_char}}+
+      | !
+    )
+
+  # Anchor & Alias
+  ns_anchor_char: '[^\s\[\]/{/},]'
+  ns_anchor_name: '{{ns_anchor_char}}+'
+
+  # plain scalar begin and end patterns
+  ns_plain_first_plain_in: |- # c=plain-in
+    (?x:
+        [^\s{{c_indicator}}]
+      | [?:-] [^\s{{c_flow_indicator}}]
+    )
+
+  ns_plain_first_plain_out: |- # c=plain-out
+    (?x:
+        [^\s{{c_indicator}}]
+      | [?:-] \S
+    )
+
+  _flow_scalar_end_plain_in: |- # kind of the negation of nb-ns-plain-in-line(c) c=plain-in
+    (?x:
+      (?=
+          \s+ \#
+        | \s* (?: $ | {{c_flow_indicator}} | : (?:\s|$|{{c_flow_indicator}}) )
+      )
+    )
+
+  _flow_scalar_end_plain_out: |- # kind of the negation of nb-ns-plain-in-line(c) c=plain-out
+    (?x:
+      (?=
+          \s+ \#
+        | \s* (?: $ | : (?:\s|$))
+      )
+    )
+
+  _flow_key_in_lookahead: |-
+    (?x:
+      (?=
+        (
+            {{ns_plain_first_plain_in}}
+            ( [^\s:{{c_flow_indicator}}]
+            | : [^\s{{c_flow_indicator}}]
+            | \s+ (?![#\s])
+            )*
+          | \".*\" # simplified
+          | \'.*\'
+        )
+        \s*
+        :
+        (?:\s|$)
+      )
+    )
+
+  _flow_key_out_lookahead: |-
+    (?x:
+      (?=
+        (
+            {{ns_plain_first_plain_out}}
+            ( [^\s:]
+            | : \S
+            | \s+ (?![#\s])
+            )*
+          | \".*\" # simplified
+          | \'.*\'
+        )
+        \s*
+        :
+        (?:\s|$)
+      )
+    )
+
+  # patterns for plain scalars of implicit different types
+  # (for the Core Schema: http://www.yaml.org/spec/1.2/spec.html#schema/core/)
+
+  # http://yaml.org/type/null.html
+  _type_null: (?:null|Null|NULL|~)
+
+  # http://yaml.org/type/bool.html
+  _type_bool_false_11: |-
+    (?x:
+       n|N|no|No|NO
+      |false|False|FALSE
+      |off|Off|OFF
+    )
+  _type_bool_true_11: |-
+    (?x:
+       y|Y|yes|Yes|YES
+      |true|True|TRUE
+      |on|On|ON
+    )
+  # https://yaml.org/spec/1.2/spec.html#id2805071
+  _type_bool_false_12: (?x:false | False | FALSE)
+  _type_bool_true_12: (?x:true | True | TRUE)
+
+  # http://yaml.org/type/int.html
+  _type_int_binary: ([-+]?)(0b)([0-1_]+) # (base 2)
+  _type_int_octal: ([-+]?)(0)([0-7_]+) # (base 8)
+  _type_int_decimal: ([-+]?)(0|[1-9][0-9_]*) # (base 10)
+  _type_int_hexadecimal: ([-+]?)(0x)([0-9a-fA-F_]+) # (base 16)
+  _type_int_other: ([-+]?)([1-9][0-9_]*(?::[0-5]?[0-9])+) # (base 60)
+
+  # http://yaml.org/type/float.html
+  _type_float_decimal: |-
+    (?x)
+    ([-+]?) (
+      (?:
+        [0-9][0-9_]* (\.) [0-9_]*
+      | (\.) _*[0-9][0-9_]*
+      )
+      (?:[eE][-+]?[0-9]+)?
+    )
+  _type_float_other: ([-+]?)([0-9][0-9_]*(?::[0-5]?[0-9])+(\.)[0-9_]*) # (base 60)
+  _type_float_infinity: ([-+])?(\.(?:inf|Inf|INF)) # (infinity)
+  _type_float_nan: \.(?:nan|NaN|NAN) # (not a number)
+
+  # http://yaml.org/type/timestamp.html
+  _type_timestamp: |-
+    (?x:
+        \d{4} (-) \d{2} (-) \d{2}       # (y-m-d)
+      | \d{4}                           # (year)
+        (-) \d{1,2}                     # (month)
+        (-) \d{1,2}                     # (day)
+        (?: [Tt] | [ \t]+) \d{1,2}      # (hour)
+        (:) \d{2}                       # (minute)
+        (:) \d{2}                       # (second)
+        (?: (\.)\d*)?                   # (fraction)
+        [ \t]*
+        (?:
+          Z | [-+] \d{1,2} (?: (:)\d{1,2})?
+        )?                              # (time zone)
+    )
+
+  # http://yaml.org/type/value.html
+  _type_value: '='
+
+  # http://yaml.org/type/merge.html
+  _type_merge: '<<'
+
+##############################################################################
+
+contexts:
+  prototype:
+    - include: comment
+    - include: property
+
+  main:
+    - match: ^---
+      scope: punctuation.section.document.begin.yaml
+    - match: ^\.{3}
+      scope: punctuation.section.document.end.yaml
+    - include: directive
+    - include: node
+
+  node:
+    - include: block-node-11
+
+  block-node-11:
+    # http://yaml.org/spec/1.2/spec.html#style/block/
+    - include: block-scalar
+    - include: block-collection
+    - include: flow-alias
+    - include: flow-collection
+    - include: flow-scalar-out-11
+
+  block-node-12:
+    # http://yaml.org/spec/1.2/spec.html#style/block/
+    - include: block-scalar
+    - include: block-collection
+    - include: flow-alias
+    - include: flow-collection
+    - include: flow-scalar-out-12
+
+  block-collection:
+    # http://yaml.org/spec/1.2/spec.html#style/block/collection
+    - include: block-sequence
+    - include: block-mapping
+
+  flow-node-11:
+    # http://yaml.org/spec/1.2/spec.html#style/flow/
+    # ns-flow-yaml-node(n,c)
+    - include: flow-alias
+    - include: flow-collection
+    - include: flow-scalar-in-11
+
+  flow-node-12:
+    # http://yaml.org/spec/1.2/spec.html#style/flow/
+    # ns-flow-yaml-node(n,c)
+    - include: flow-alias
+    - include: flow-collection
+    - include: flow-scalar-in-12
+
+  flow-collection:
+    # http://yaml.org/spec/1.2/spec.html#style/flow/collection
+    - include: flow-sequence
+    - include: flow-mapping
+
+  flow-scalar-in-11:
+    # http://yaml.org/spec/1.2/spec.html#style/flow/scalar
+    - include: flow-scalar-double-quoted-in
+    - include: flow-scalar-single-quoted-in
+    - include: flow-scalar-plain-in-11
+
+  flow-scalar-in-12:
+    # http://yaml.org/spec/1.2/spec.html#style/flow/scalar
+    - include: flow-scalar-double-quoted-in
+    - include: flow-scalar-single-quoted-in
+    - include: flow-scalar-plain-in-12
+
+  flow-scalar-out-11:
+    # for block keys
+    - include: flow-scalar-double-quoted-out
+    - include: flow-scalar-single-quoted-out
+    - include: flow-scalar-plain-out-11
+
+  flow-scalar-out-12:
+    # for block keys
+    - include: flow-scalar-double-quoted-out
+    - include: flow-scalar-single-quoted-out
+    - include: flow-scalar-plain-out-12
+
+###[ COMMENTS ]###############################################################
+
+  comment:
+    # http://www.yaml.org/spec/1.2/spec.html#comment//
+    - match: |- # l-comment
+        (?x)
+        (?: ^ [ \t]* | [ \t]+ )
+        (?=\#)
+      push: comment-begin
+    - include: merge-conflict-markers
+
+  comment-begin:
+    - meta_include_prototype: false
+    - match: \#
+      scope: punctuation.definition.comment.line.number-sign.yaml
+      set: comment-body
+
+  comment-body:
+    - meta_include_prototype: false
+    - meta_scope: comment.line.number-sign.yaml
+    - match: \n
+      pop: 1
+
+###[ MERGE CONFLICT MARKERS ]##################################################
+
+  merge-conflict-markers:
+    # see also: Diff.sublime-syntax#conflict-markers
+    - match: ^(<{7})(?:\s+(\S.*?))?$\n?
+      scope: meta.block.conflict.begin.diff
+      captures:
+        1: punctuation.section.block.begin.diff
+        2: entity.name.section.diff
+    - match: ^(>{7})(?:\s+(\S.*?))?$\n?
+      scope: meta.block.conflict.end.diff
+      captures:
+        1: punctuation.section.block.end.diff
+        2: entity.name.section.diff
+    - match: ^(\|{7}|={7})(?:\s+(\S.*?))?$\n?
+      scope: meta.block.conflict.separator.diff
+      captures:
+        1: punctuation.section.block.diff
+        2: entity.name.section.diff
+
+###[ DIRECTIVES ]#############################################################
+
+  directive:
+    # http://yaml.org/spec/1.2/spec.html#directive//
+    - match: ^%
+      scope: punctuation.definition.directive.begin.yaml
+      push: directive-body
+
+  directive-body:
+    - meta_scope: meta.directive.yaml
+    # %YAML directive
+    # http://yaml.org/spec/1.2/spec.html#directive/YAML/
+    - match: (YAML)[ \t]+(\d+\.\d+)
+      captures:
+        1: keyword.control.directive.yaml.yaml
+        2: constant.numeric.yaml-version.yaml
+      set: directive-finish
+    # %TAG directive
+    # http://yaml.org/spec/1.2/spec.html#directive/TAG/
+    - match: |
+        (?x)
+        (TAG)
+        (?:[ \t]+
+         ({{c_tag_handle}})
+         (?:[ \t]+ ({{ns_tag_prefix}}) )?
+        )?
+      # handle and prefix are optional for when typing
+      captures:
+        1: keyword.control.directive.tag.yaml
+        2: storage.type.tag-handle.yaml
+        3: support.type.tag-prefix.yaml
+      set: directive-finish
+    # Any other directive
+    # http://yaml.org/spec/1.2/spec.html#directive/reserved/
+    - match: (?x) (\w+) (?:[ \t]+ (\w+) (?:[ \t]+ (\w+))? )?
+      # name and parameter are optional for when typing
+      captures:
+        1: support.other.directive.reserved.yaml
+        2: string.unquoted.directive-name.yaml
+        3: string.unquoted.directive-parameter.yaml
+      set: directive-finish
+    - match: ''
+      set: directive-finish
+
+  directive-finish:
+    - match: (?=$|[ \t]+($|#))
+      pop: 1
+    - match: \S+
+      scope: invalid.illegal.unrecognized.yaml
+
+###[ PROPERTIES ]#############################################################
+
+  property:
+    # http://yaml.org/spec/1.2/spec.html#node/property/
+    - match: (?=!|&)
+      push: property-body
+
+  property-body:
+    - meta_scope: meta.property.yaml
+    # &Anchor
+    # http://yaml.org/spec/1.2/spec.html#&%20anchor//
+    - match: (&)({{ns_anchor_name}})(\S+)?
+      captures:
+        1: keyword.control.property.anchor.yaml punctuation.definition.anchor.yaml
+        2: entity.name.other.anchor.yaml
+        3: invalid.illegal.character.anchor.yaml
+      pop: 1
+    # !Tag Handle
+    # http://yaml.org/spec/1.2/spec.html#tag/property/
+    - match: '{{c_ns_tag_property}}(?=\ |\t|$)'
+      scope: storage.type.tag-handle.yaml
+      pop: 1
+    - match: \S+
+      scope: invalid.illegal.tag-handle.yaml
+      pop: 1
+
+###[ BLOCK SCALARS ]##########################################################
+
+  block-scalar:
+    # http://www.yaml.org/spec/1.2/spec.html#style/block/scalar
+    # c-l+literal(n) | c-l+folded(n)
+    - match: (?:(\|)|(>))(?:([1-9])([-+])|([-+])?([1-9])?)  # c-b-block-header(m,t)
+      captures:
+        1: keyword.control.flow.block-scalar.literal.yaml
+        2: keyword.control.flow.block-scalar.folded.yaml
+        3: constant.numeric.indentation-indicator.yaml
+        4: storage.modifier.chomping-indicator.yaml
+        5: storage.modifier.chomping-indicator.yaml
+        6: constant.numeric.indentation-indicator.yaml
+      push: block-scalar-begin
+
+  block-scalar-begin:
+    - meta_include_prototype: false
+    - match: ^([ ]+)(?! )  # match first non-empty line to determine indentation level
+      # note that we do not check if indentation is enough
+      set: block-scalar-body
+    - match: ^(?=\S)  # the block is empty
+      pop: 1
+    - include: comment  # include comments but not properties
+    - match: .+
+      scope: invalid.illegal.expected-comment-or-newline.yaml
+
+  block-scalar-body:
+    - meta_include_prototype: false
+    - meta_scope: meta.string.yaml string.unquoted.block.yaml
+    - match: ^(?!\1|\s*$)
+      pop: 1
+
+###[ BLOCK COLLECTIONS ]######################################################
+
+  block-sequence:
+    # http://www.yaml.org/spec/1.2/spec.html#style/block/sequence
+    # l+block-sequence(n)
+    - match: (-)(?!\S)
+      scope: punctuation.definition.block.sequence.item.yaml
+
+  block-mapping:
+    # http://www.yaml.org/spec/1.2/spec.html#style/block/mapping
+    # l+block-mapping(n)
+    - include: block-pair
+
+  block-pair:
+    - match: ( *)(\?)(?=\s)
+      captures:
+        2: meta.mapping.yaml punctuation.definition.key-value.begin.yaml
+      push: block-key-explicit
+    # Attempt to match plain-out scalars and highlight as "meta.mapping.key",
+    # if followed by a colon
+    - match: '{{_flow_key_out_lookahead}}'
+      push: block-key-implicit
+    - match: :(?=\s)
+      scope: meta.mapping.yaml punctuation.separator.key-value.mapping.yaml
+
+  block-key-explicit:
+    - meta_content_scope: meta.mapping.key.yaml
+    # the colon *must* be on a new line
+    - match: ^ *(:)
+      scope: meta.mapping.yaml
+      captures:
+        1: punctuation.separator.key-value.mapping.yaml
+      pop: 1
+    # multi-line keys are indented by at least one more space than `?`
+    - match: ^(?!\1 +\S|\s*$)
+      pop: 1
+    - include: block-node-12
+
+  block-key-implicit:
+    - meta_content_scope: meta.mapping.key.yaml
+    - match: :(?=\s)
+      scope: meta.mapping.yaml punctuation.separator.key-value.mapping.yaml
+      pop: 1
+    - include: flow-scalar-out-12
+
+###[ FLOW SCALARS ]###########################################################
+
+  flow-alias:
+    # http://yaml.org/spec/1.2/spec.html#alias//
+    - match: (\*)({{ns_anchor_name}})([^\s\]},]\S*)?
+      captures:
+        1: keyword.control.flow.alias.yaml punctuation.definition.alias.yaml
+        2: variable.other.alias.yaml
+        3: invalid.illegal.character.anchor.yaml
+
+  flow-scalar-double-quoted-in:
+    # http://yaml.org/spec/1.2/spec.html#style/flow/double-quoted
+    # c-double-quoted(n,c)
+    - match: \"
+      scope: punctuation.definition.string.begin.yaml
+      push:
+        - flow-scalar-in-expect-end
+        - flow-scalar-double-quoted-body
+
+  flow-scalar-double-quoted-out:
+    # http://yaml.org/spec/1.2/spec.html#style/flow/double-quoted
+    # c-double-quoted(n,c)
+    - match: \"
+      scope: punctuation.definition.string.begin.yaml
+      push:
+        - flow-scalar-out-expect-end
+        - flow-scalar-double-quoted-body
+
+  flow-scalar-double-quoted-body:
+    # TODO consider scoping meaningful trailing whitespace for color
+    # schemes with background color definitions.
+    - meta_include_prototype: false
+    - meta_scope: meta.string.yaml string.quoted.double.yaml
+    - match: \"
+      scope: punctuation.definition.string.end.yaml
+      pop: 1
+    - match: \\[ 0_abefLnNPprtv/\\"]
+      scope: constant.character.escape.yaml
+    - match: \\x\h{2}
+      scope: constant.character.escape.unicode.8bit.yaml
+    - match: \\u\h{4}
+      scope: constant.character.escape.unicode.16bit.yaml
+    - match: \\U\h{8}
+      scope: constant.character.escape.unicode.32bit.yaml
+    - match: \\.
+      scope: invalid.illegal.escape.yaml
+
+  flow-scalar-single-quoted-in:
+    # http://yaml.org/spec/1.2/spec.html#style/flow/single-quoted
+    # c-single-quoted(n,c)
+    - match: \'
+      scope: punctuation.definition.string.begin.yaml
+      push:
+        - flow-scalar-in-expect-end
+        - flow-scalar-single-quoted-body
+
+  flow-scalar-single-quoted-out:
+    # http://yaml.org/spec/1.2/spec.html#style/flow/single-quoted
+    # c-single-quoted(n,c)
+    - match: \'
+      scope: punctuation.definition.string.begin.yaml
+      push:
+        - flow-scalar-out-expect-end
+        - flow-scalar-single-quoted-body
+
+  flow-scalar-single-quoted-body:
+    - meta_include_prototype: false
+    - meta_scope: meta.string.yaml string.quoted.single.yaml
+    - match: \'\'
+      scope: constant.character.escape.single-quoted.yaml
+    - match: \'
+      scope: punctuation.definition.string.end.yaml
+      pop: 1
+
+  flow-scalar-in-expect-end:
+    - meta_include_prototype: false
+    - match: (?:(?!{{_flow_scalar_end_plain_in}}).)*
+      scope: invalid.illegal.unexpected.yaml
+      pop: 1
+
+  flow-scalar-out-expect-end:
+    - meta_include_prototype: false
+    - match: (?:(?!{{_flow_scalar_end_plain_out}}).)*
+      scope: invalid.illegal.unexpected.yaml
+      pop: 1
+
+  flow-scalar-plain-in-implicit-type-11:
+    - match: '{{_type_bool_false_11}}{{_flow_scalar_end_plain_in}}'
+      scope: constant.language.boolean.false.yaml
+    - match: '{{_type_bool_true_11}}{{_flow_scalar_end_plain_in}}'
+      scope: constant.language.boolean.true.yaml
+    - include: flow-scalar-plain-in-implicit-type-common
+
+  flow-scalar-plain-in-implicit-type-12:
+    # Less aggressive variant based on the YAML 1.2 core schema
+    - match: '{{_type_bool_false_12}}{{_flow_scalar_end_plain_in}}'
+      scope: constant.language.boolean.false.yaml
+    - match: '{{_type_bool_true_12}}{{_flow_scalar_end_plain_in}}'
+      scope: constant.language.boolean.true.yaml
+    - include: flow-scalar-plain-in-implicit-type-common
+
+  flow-scalar-plain-in-implicit-type-common:
+    - match: '{{_type_null}}{{_flow_scalar_end_plain_in}}'
+      scope: constant.language.null.yaml
+    - match: '{{_type_value}}{{_flow_scalar_end_plain_in}}'
+      scope: constant.language.value.yaml
+    - match: '{{_type_merge}}{{_flow_scalar_end_plain_in}}'
+      scope: constant.language.merge.yaml
+    # integers
+    - match: '{{_type_int_binary}}{{_flow_scalar_end_plain_in}}'
+      scope: meta.number.integer.binary.yaml
+      captures:
+        1: keyword.operator.arithmetic.yaml
+        2: constant.numeric.base.yaml
+        3: constant.numeric.value.yaml
+    - match: '{{_type_int_octal}}{{_flow_scalar_end_plain_in}}'
+      scope: meta.number.integer.octal.yaml
+      captures:
+        1: keyword.operator.arithmetic.yaml
+        2: constant.numeric.base.yaml
+        3: constant.numeric.value.yaml
+    - match: '{{_type_int_decimal}}{{_flow_scalar_end_plain_in}}'
+      scope: meta.number.integer.decimal.yaml
+      captures:
+        1: keyword.operator.arithmetic.yaml
+        2: constant.numeric.value.yaml
+    - match: '{{_type_int_hexadecimal}}{{_flow_scalar_end_plain_in}}'
+      scope: meta.number.integer.hexadecimal.yaml
+      captures:
+        1: keyword.operator.arithmetic.yaml
+        2: constant.numeric.base.yaml
+        3: constant.numeric.value.yaml
+    - match: '{{_type_int_other}}{{_flow_scalar_end_plain_in}}'
+      scope: meta.number.integer.other.yaml
+      captures:
+        1: keyword.operator.arithmetic.yaml
+        2: constant.numeric.value.yaml
+    # floats
+    - match: '{{_type_float_decimal}}{{_flow_scalar_end_plain_in}}'
+      scope: meta.number.float.decimal.yaml
+      captures:
+        1: keyword.operator.arithmetic.yaml
+        2: constant.numeric.value.yaml
+        3: punctuation.separator.decimal.yaml
+        4: punctuation.separator.decimal.yaml
+    - match: '{{_type_float_other}}{{_flow_scalar_end_plain_in}}'
+      scope: meta.number.float.other.yaml
+      captures:
+        1: keyword.operator.arithmetic.yaml
+        2: constant.numeric.value.yaml
+        3: punctuation.separator.decimal.yaml
+    - match: '{{_type_float_infinity}}{{_flow_scalar_end_plain_in}}'
+      scope: meta.number.float.yaml
+      captures:
+        1: keyword.operator.arithmetic.yaml
+        2: constant.language.infinity.yaml
+    - match: '{{_type_float_nan}}{{_flow_scalar_end_plain_in}}'
+      scope: meta.number.yaml constant.language.nan.yaml
+    # timestamp
+    - match: '{{_type_timestamp}}{{_flow_scalar_end_plain_in}}'
+      scope: constant.other.timestamp.yaml
+      captures:
+        1: punctuation.separator.date.yaml
+        2: punctuation.separator.date.yaml
+        3: punctuation.separator.date.yaml
+        4: punctuation.separator.date.yaml
+        5: punctuation.separator.time.yaml
+        6: punctuation.separator.time.yaml
+        7: punctuation.separator.time.yaml
+        8: punctuation.separator.time.yaml
+
+  flow-scalar-plain-in-11:
+    # http://yaml.org/spec/1.2/spec.html#style/flow/plain
+    # ns-plain(n,c) (c=flow-in, c=flow-key)
+    - include: flow-scalar-plain-in-implicit-type-11
+    - include: flow-scalar-plain-in-common
+
+  flow-scalar-plain-in-12:
+    # http://yaml.org/spec/1.2/spec.html#style/flow/plain
+    # ns-plain(n,c) (c=flow-in, c=flow-key)
+    - include: flow-scalar-plain-in-implicit-type-12
+    - include: flow-scalar-plain-in-common
+
+  flow-scalar-plain-in-common:
+    - match: (?={{ns_plain_first_plain_in}})
+      push: flow-scalar-plain-in-body
+
+  flow-scalar-plain-in-body:
+    - meta_include_prototype: false
+    - meta_scope: meta.string.yaml string.unquoted.plain.in.yaml
+    - match: '{{_flow_scalar_end_plain_in}}'
+      pop: 1
+
+  flow-scalar-plain-out-implicit-type-11:
+    - match: '{{_type_bool_false_11}}{{_flow_scalar_end_plain_out}}'
+      scope: constant.language.boolean.false.yaml
+    - match: '{{_type_bool_true_11}}{{_flow_scalar_end_plain_out}}'
+      scope: constant.language.boolean.true.yaml
+    - include: flow-scalar-plain-out-implicit-type-common
+
+  flow-scalar-plain-out-implicit-type-12:
+    # Less aggressive variant based on the YAML 1.2 core schema
+    - match: '{{_type_bool_false_12}}{{_flow_scalar_end_plain_out}}'
+      scope: constant.language.boolean.false.yaml
+    - match: '{{_type_bool_true_12}}{{_flow_scalar_end_plain_out}}'
+      scope: constant.language.boolean.true.yaml
+    - include: flow-scalar-plain-out-implicit-type-common
+
+  flow-scalar-plain-out-implicit-type-common:
+    - match: '{{_type_null}}{{_flow_scalar_end_plain_out}}'
+      scope: constant.language.null.yaml
+    - match: '{{_type_value}}{{_flow_scalar_end_plain_out}}'
+      scope: constant.language.value.yaml
+    - match: '{{_type_merge}}{{_flow_scalar_end_plain_out}}'
+      scope: constant.language.merge.yaml
+    # integers
+    - match: '{{_type_int_binary}}{{_flow_scalar_end_plain_out}}'
+      scope: meta.number.integer.binary.yaml
+      captures:
+        1: keyword.operator.arithmetic.yaml
+        2: constant.numeric.base.yaml
+        3: constant.numeric.value.yaml
+    - match: '{{_type_int_octal}}{{_flow_scalar_end_plain_out}}'
+      scope: meta.number.integer.octal.yaml
+      captures:
+        1: keyword.operator.arithmetic.yaml
+        2: constant.numeric.base.yaml
+        3: constant.numeric.value.yaml
+    - match: '{{_type_int_decimal}}{{_flow_scalar_end_plain_out}}'
+      scope: meta.number.integer.decimal.yaml
+      captures:
+        1: keyword.operator.arithmetic.yaml
+        2: constant.numeric.value.yaml
+    - match: '{{_type_int_hexadecimal}}{{_flow_scalar_end_plain_out}}'
+      scope: meta.number.integer.hexadecimal.yaml
+      captures:
+        1: keyword.operator.arithmetic.yaml
+        2: constant.numeric.base.yaml
+        3: constant.numeric.value.yaml
+    - match: '{{_type_int_other}}{{_flow_scalar_end_plain_out}}'
+      scope: meta.number.integer.other.yaml
+      captures:
+        1: keyword.operator.arithmetic.yaml
+        2: constant.numeric.value.yaml
+    # floats
+    - match: '{{_type_float_decimal}}{{_flow_scalar_end_plain_out}}'
+      scope: meta.number.float.decimal.yaml
+      captures:
+        1: keyword.operator.arithmetic.yaml
+        2: constant.numeric.value.yaml
+        3: punctuation.separator.decimal.yaml
+        4: punctuation.separator.decimal.yaml
+    - match: '{{_type_float_other}}{{_flow_scalar_end_plain_out}}'
+      scope: meta.number.float.other.yaml
+      captures:
+        1: keyword.operator.arithmetic.yaml
+        2: constant.numeric.value.yaml
+        3: punctuation.separator.decimal.yaml
+    - match: '{{_type_float_infinity}}{{_flow_scalar_end_plain_out}}'
+      scope: meta.number.float.yaml
+      captures:
+        1: keyword.operator.arithmetic.yaml
+        2: constant.language.infinity.yaml
+    - match: '{{_type_float_nan}}{{_flow_scalar_end_plain_out}}'
+      scope: meta.number.yaml constant.language.nan.yaml
+    # timestamp
+    - match: '{{_type_timestamp}}{{_flow_scalar_end_plain_out}}'
+      scope: constant.other.timestamp.yaml
+      captures:
+        1: punctuation.separator.date.yaml
+        2: punctuation.separator.date.yaml
+        3: punctuation.separator.date.yaml
+        4: punctuation.separator.date.yaml
+        5: punctuation.separator.time.yaml
+        6: punctuation.separator.time.yaml
+        7: punctuation.separator.time.yaml
+        8: punctuation.separator.time.yaml
+
+  flow-scalar-plain-out-11:
+    # http://yaml.org/spec/1.2/spec.html#style/flow/plain
+    # ns-plain(n,c) (c=flow-out, c=block-key)
+    - include: flow-scalar-plain-out-implicit-type-11
+    - include: flow-scalar-plain-out-common
+
+  flow-scalar-plain-out-12:
+    # http://yaml.org/spec/1.2/spec.html#style/flow/plain
+    # ns-plain(n,c) (c=flow-out, c=block-key)
+    - include: flow-scalar-plain-out-implicit-type-12
+    - include: flow-scalar-plain-out-common
+
+  flow-scalar-plain-out-common:
+    - match: (?={{ns_plain_first_plain_out}})
+      push: flow-scalar-plain-out-body
+
+  flow-scalar-plain-out-body:
+    - meta_include_prototype: false
+    - meta_scope: meta.string.yaml string.unquoted.plain.out.yaml
+    - match: '{{_flow_scalar_end_plain_out}}'
+      pop: 1
+
+###[ FLOW COLLECTIONS ]#######################################################
+
+  flow-sequence:
+    # http://yaml.org/spec/1.2/spec.html#style/flow/sequence
+    # c-flow-sequence(n,c)
+    - match: \[
+      scope: punctuation.definition.sequence.begin.yaml
+      push: flow-sequence-body
+
+  flow-sequence-body:
+    - meta_scope: meta.sequence.flow.yaml
+    - match: \]
+      scope: punctuation.definition.sequence.end.yaml
+      pop: 1
+    - match: ','
+      scope: punctuation.separator.sequence.yaml
+    - include: flow-pair-no-clear
+    - include: flow-node-11
+
+  flow-mapping:
+    - match: \{
+      scope: punctuation.definition.mapping.begin.yaml
+      push: flow-mapping-body
+
+  flow-mapping-body:
+    - meta_scope: meta.mapping.yaml
+    - match: \}
+      scope: punctuation.definition.mapping.end.yaml
+      pop: 1
+    - match: ','
+      scope: punctuation.separator.sequence.yaml
+    - include: flow-pair
+    - include: flow-node-11  # for sets
+
+  flow-pair:
+    - match: \?
+      scope: meta.mapping.key.yaml punctuation.definition.key.begin.yaml
+      push:
+        - flow-pair-clear-1
+        - flow-pair-key
+    # Attempt to match plain-in scalars followed by a colon
+    - match: '{{_flow_key_in_lookahead}}'
+      push:
+        - flow-pair-clear-1
+        - flow-pair-key
+    - match: :(?=\s|$|{{c_flow_indicator}}) # Empty mapping keys allowed
+      scope: meta.mapping.yaml punctuation.separator.key-value.mapping.yaml
+      push:
+        - flow-pair-clear-1
+        - flow-pair-value
+
+  # Variant without clearing the parent scope for pairs in a sequence
+  flow-pair-no-clear:
+    - match: \?
+      scope: meta.mapping.key.yaml punctuation.definition.key.begin.yaml
+      push: flow-pair-key
+    - match: '{{_flow_key_in_lookahead}}'
+      push: flow-pair-key
+    - match: :(?=\s|$|{{c_flow_indicator}})
+      scope: meta.mapping.yaml punctuation.separator.key-value.mapping.yaml
+      push: flow-pair-value
+
+  flow-pair-key:
+    - meta_content_scope: meta.mapping.key.yaml
+    - match: :(?=\s|$|{{c_flow_indicator}})
+      scope: meta.mapping.yaml punctuation.separator.key-value.mapping.yaml
+      set: flow-pair-value
+    - include: flow-pair-end  # Empty mapping keys & values are allowed
+    - include: flow-node-12
+
+  flow-pair-value:
+    - meta_content_scope: meta.mapping.value.yaml
+    - include: flow-pair-end
+    - include: flow-node-11
+
+  flow-pair-clear-1:
+    - meta_include_prototype: false
+    - clear_scopes: 1
+    - match: ''
+      pop: 1
+
+  flow-pair-end:
+    - match: (?=[},\]])
+      pop: 1
