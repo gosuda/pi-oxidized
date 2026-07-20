@@ -349,6 +349,11 @@ async fn preflight_parallel_tools<E: EmitAgentEvent>(preflight: ParallelPrefligh
                 jobs.push((index, prepared));
             }
         }
+        // Upstream breaks after each preflighted call when the signal is
+        // aborted: later calls get no tool_execution_start and no result.
+        if cancel.is_cancelled() {
+            break;
+        }
     }
 }
 
@@ -1394,7 +1399,10 @@ mod tests {
         Ok(())
     }
 
-    async fn cancellation_preserves_all_tool_result_ids(mode: ToolExecutionMode) -> TestResult {
+    /// Upstream breaks both scheduling loops on an aborted signal after each
+    /// finalized/preflighted call: only the in-flight call gets a result and
+    /// later calls never see `tool_execution_start`.
+    async fn cancellation_breaks_after_first_call(mode: ToolExecutionMode) -> TestResult {
         let tool = RecordingTool::new("cancel-me");
         let executed = Arc::clone(&tool.executed);
         let context = context_with(vec![Arc::new(tool)]);
@@ -1423,11 +1431,7 @@ mod tests {
         )
         .await
         .map_err(|error| error.to_string())?;
-        let expected_ids: &[&str] = if mode == ToolExecutionMode::Sequential {
-            &["c1"]
-        } else {
-            &["c1", "c2", "c3"]
-        };
+        let expected_ids: &[&str] = &["c1"];
         let ids: Vec<&str> = batch
             .messages
             .iter()
@@ -1458,21 +1462,17 @@ mod tests {
                 ));
             }
         }
-        if mode == ToolExecutionMode::Sequential {
-            let events = snapshot_events(&events)?;
-            for id in ["c2", "c3"] {
-                let started = events.iter().any(|event| {
-                    matches!(
-                        event,
-                        AgentEvent::ToolExecutionStart { tool_call_id, .. }
-                            if tool_call_id == id
-                    )
-                });
-                if started {
-                    return Err(format!(
-                        "post-cancel sequential call {id} was still started"
-                    ));
-                }
+        let events = snapshot_events(&events)?;
+        for id in ["c2", "c3"] {
+            let started = events.iter().any(|event| {
+                matches!(
+                    event,
+                    AgentEvent::ToolExecutionStart { tool_call_id, .. }
+                        if tool_call_id == id
+                )
+            });
+            if started {
+                return Err(format!("post-cancel {mode:?} call {id} was still started"));
             }
         }
         if executed.load(Ordering::SeqCst) {
@@ -1483,12 +1483,12 @@ mod tests {
 
     #[tokio::test]
     async fn sequential_cancellation_pairs_first_call_and_breaks() -> TestResult {
-        cancellation_preserves_all_tool_result_ids(ToolExecutionMode::Sequential).await
+        cancellation_breaks_after_first_call(ToolExecutionMode::Sequential).await
     }
 
     #[tokio::test]
-    async fn parallel_cancellation_preserves_all_tool_result_ids() -> TestResult {
-        cancellation_preserves_all_tool_result_ids(ToolExecutionMode::Parallel).await
+    async fn parallel_cancellation_breaks_preflight_like_upstream() -> TestResult {
+        cancellation_breaks_after_first_call(ToolExecutionMode::Parallel).await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

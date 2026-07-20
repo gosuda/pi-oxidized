@@ -180,11 +180,6 @@ async fn run_loop(
                 tool_results: tool_results.clone(),
             });
 
-            if cancel.is_cancelled() {
-                emit_agent_end(io.sink, new_messages);
-                return Ok(());
-            }
-
             apply_prepare_next_turn(
                 current_context,
                 &mut config,
@@ -1122,8 +1117,32 @@ mod tests {
         Ok(())
     }
 
+    /// The final turn and the returned message tail must both be the
+    /// synthesized aborted assistant, like upstream's extra aborted turn.
+    fn assert_aborted_tail(messages: &[AgentMessage], events: &[AgentEvent]) -> TestResult {
+        let last_turn = events.iter().rev().find_map(|event| match event {
+            AgentEvent::TurnEnd { message, .. } => Some(message.clone()),
+            _ => None,
+        });
+        let Some(AgentMessage::Llm(boxed)) = last_turn else {
+            return Err("missing final aborted turn".into());
+        };
+        let Message::Assistant(aborted) = *boxed else {
+            return Err("final turn message must be an assistant message".into());
+        };
+        assert_eq!(aborted.stop_reason, StopReason::Aborted);
+        let Some(AgentMessage::Llm(tail)) = messages.last() else {
+            return Err("returned messages must end with the aborted assistant".into());
+        };
+        let Message::Assistant(tail) = tail.as_ref() else {
+            return Err("returned tail must be an assistant message".into());
+        };
+        assert_eq!(tail.stop_reason, StopReason::Aborted);
+        Ok(())
+    }
+
     #[tokio::test]
-    async fn cancellation_after_tools_ends_without_another_turn_or_hooks() -> TestResult {
+    async fn cancellation_after_tools_runs_hooks_then_one_aborted_turn() -> TestResult {
         let tool = Arc::new(RecordingTool::new("cancel-me"));
         let provider = ScriptedProvider::new(vec![
             vec![
@@ -1183,7 +1202,7 @@ mod tests {
             })
         }));
 
-        let (_messages, events, _) = run_prompt(
+        let (messages, events, _) = run_prompt(
             vec![text_user_message("cancel tools")],
             base_context(vec![tool]),
             config,
@@ -1192,6 +1211,10 @@ mod tests {
         )
         .await?;
 
+        // Upstream (agent-loop.ts:225-260) has no post-turn signal check: the
+        // hooks run, steering is polled, and the loop re-enters streaming with
+        // the aborted signal, producing exactly one extra aborted assistant
+        // turn before agent_end.
         let result_ids = events.iter().find_map(|event| match event {
             AgentEvent::TurnEnd { tool_results, .. } if !tool_results.is_empty() => Some(
                 tool_results
@@ -1202,15 +1225,25 @@ mod tests {
             _ => None,
         });
         assert_eq!(result_ids, Some(vec!["c1"]));
-        assert_eq!(provider.call_count(), 1);
-        assert_eq!(prepare_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(stop_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(steering_polls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            provider.call_count(),
+            2,
+            "aborted turn still calls streamFn"
+        );
+        assert_eq!(prepare_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(stop_calls.load(Ordering::SeqCst), 1);
         assert_eq!(follow_up_polls.load(Ordering::SeqCst), 0);
         assert_eq!(
-            &event_types(&events)[events.len() - 2..],
-            ["turn_end", "agent_end"]
+            &event_types(&events)[events.len() - 5..],
+            [
+                "turn_start",
+                "message_start",
+                "message_end",
+                "turn_end",
+                "agent_end"
+            ]
         );
+        assert_aborted_tail(&messages, &events)?;
         Ok(())
     }
 
