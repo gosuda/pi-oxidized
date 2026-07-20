@@ -7,6 +7,8 @@
 
 [resolver.paths]
 "@earendil-works/pi-coding-agent" = "/home/alpha/exp/pi-oxidized/.references/pi/packages/coding-agent/src/core/extensions/index.ts"
+"@earendil-works/pi-coding-agent/builtins" = "/home/alpha/exp/pi-oxidized/.references/pi/packages/coding-agent/src/extensions/index.ts"
+"@mariozechner/pi-coding-agent/builtins" = "/home/alpha/exp/pi-oxidized/.references/pi/packages/coding-agent/src/extensions/index.ts"
 "pi-coding-agent-full" = "/home/alpha/exp/pi-oxidized/.references/pi/packages/coding-agent/src/index.ts"
 "@earendil-works/pi-coding-agent/*" = "/home/alpha/exp/pi-oxidized/.references/pi/packages/coding-agent/src/core/extensions/*"
 "@earendil-works/pi-agent-core" = "/home/alpha/exp/pi-oxidized/.references/pi/packages/agent/src/index.ts"

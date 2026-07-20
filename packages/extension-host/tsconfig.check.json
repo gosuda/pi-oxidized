@@ -7,6 +7,7 @@
 			"@earendil-works/pi-tui-protocol": ["../pi-tui-protocol/src/index.ts"],
 			"@earendil-works/pi-tui-protocol/*": ["../pi-tui-protocol/src/*"],
 			"@earendil-works/pi-coding-agent": ["./src/refs.d.ts"],
+			"@earendil-works/pi-coding-agent/builtins": ["./src/refs.d.ts"],
 			"@earendil-works/pi-ai": ["./src/refs.d.ts"]
 		}
 	},

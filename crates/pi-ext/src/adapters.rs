@@ -1468,8 +1468,19 @@ mod tests {
                 Duration::from_secs(5),
             )
             .await?;
-        assert_eq!(loaded.payload["providers"][0]["name"], "verification");
-        assert_eq!(loaded.payload["providers"][0]["streamSimple"], true);
+        // Built-in extensions (llama.cpp) register before user extensions, so
+        // find the fixture provider by name rather than position.
+        let providers = loaded.payload["providers"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let verification = providers
+            .iter()
+            .find(|provider| provider["name"] == "verification")
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(verification["name"], "verification");
+        assert_eq!(verification["streamSimple"], true);
 
         let provider = ExtensionProvider::new("verification", Arc::clone(&client));
         let model = Model {

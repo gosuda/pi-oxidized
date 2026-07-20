@@ -17,12 +17,14 @@ import {
 import type {
 	ExtensionFactory,
 	ExtensionContextActions,
+	InlineExtension,
 } from "@earendil-works/pi-coding-agent";
 import {
 	loadExtensionFromFactory,
 	createExtensionRuntime,
 } from "@earendil-works/pi-coding-agent";
 import { ExtensionRunner } from "@earendil-works/pi-coding-agent";
+import { builtInExtensions } from "@earendil-works/pi-coding-agent/builtins";
 import { ExtensionHost, createEventBus } from "../src/host.ts";
 import { COMPATIBILITY_VERSION } from "../src/version.ts";
 import { createExtensionJiti } from "../src/virtual-modules.ts";
@@ -124,7 +126,7 @@ class FrameCollector {
 }
 
 /** Create a host wired to a FrameCollector; send hello and await ack. */
-async function connectHost(factories: ExtensionFactory[]): Promise<{
+async function connectHost(factories: InlineExtension[]): Promise<{
 	collector: FrameCollector;
 	stdin: Readable;
 	host: ExtensionHost;
@@ -1616,6 +1618,38 @@ describe("extension theme API", () => {
 		const repushed = collector.frames.filter((f) => f.method === "uiSlot").at(-1);
 		expect((repushed?.payload as Record<string, unknown>)["key"])
 			.toBe((firstSlot.payload as Record<string, unknown>)["key"]);
+
+		stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
+	});
+});
+
+// ===========================================================================
+// 7. Built-in extensions are loaded in production
+// ===========================================================================
+
+describe("acceptance: built-in extensions load by default", () => {
+	test("extensions.load snapshot includes llama.cpp provider and /llama command", async () => {
+		const { collector, stdin, host, runPromise } = await connectHost(builtInExtensions);
+
+		const id = 100;
+		stdin.push(Buffer.from(encodeFrameString({
+			id,
+			kind: "req",
+			method: "extensions.load",
+			payload: { extensionPaths: [], cwd: process.cwd(), projectTrusted: true },
+		})));
+		const res = await collector.awaitFrame((f) => f.id === id && f.kind === "res");
+		const payload = res.payload as Record<string, unknown>;
+
+		const providers = payload["providers"] as Array<Record<string, unknown>>;
+		expect(providers.some((p) => p["name"] === "llama.cpp")).toBe(true);
+
+		const commands = payload["commands"] as Array<Record<string, unknown>>;
+		const llamaCmd = commands.find((c) => c["name"] === "llama");
+		expect(llamaCmd).toBeDefined();
+		expect(llamaCmd?.["source"]).toBe("<inline:llama.cpp>");
 
 		stdin.push(null);
 		host.dispose("test");

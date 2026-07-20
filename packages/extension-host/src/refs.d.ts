@@ -11,7 +11,11 @@ declare module "@earendil-works/pi-coding-agent" {
 	export type ExtensionMode = "tui" | "rpc" | "json" | "print";
 
 	export interface SourceInfo {
-		extensionPath: string;
+		path: string;
+		source: string;
+		scope?: string;
+		origin?: string;
+		baseDir?: string;
 	}
 
 	export interface ExtensionUIContext {
@@ -234,6 +238,7 @@ declare module "@earendil-works/pi-coding-agent" {
 	export interface Extension {
 		path: string;
 		resolvedPath: string;
+		hidden?: boolean;
 		sourceInfo: SourceInfo;
 		handlers: Map<string, Array<(event: unknown, ctx: ExtensionContext) => Promise<unknown>>>;
 		tools: Map<string, RegisteredTool>;
@@ -245,6 +250,14 @@ declare module "@earendil-works/pi-coding-agent" {
 	}
 
 	export type ExtensionFactory = (pi: ExtensionAPI) => void | Promise<void>;
+
+	export type InlineExtension =
+		| ExtensionFactory
+		| {
+				name: string;
+				factory: ExtensionFactory;
+				hidden?: boolean;
+		  };
 
 	export interface ExtensionAPI {
 		on(event: "session_start", handler: ExtensionHandler<SessionStartEvent>): void;
@@ -330,6 +343,7 @@ declare module "@earendil-works/pi-coding-agent" {
 			contextActions: ExtensionContextActions,
 			providerActions?: {
 				registerProvider?: (name: string, config: ProviderConfig) => void;
+				registerNativeProvider?: (provider: ProviderConfig) => void;
 				unregisterProvider?: (name: string) => void;
 			},
 		): void;
@@ -426,6 +440,11 @@ declare module "@sinclair/typebox/value" {
 
 declare module "@sinclair/typebox/compile" {
 	export { Compile } from "typebox/compile";
+}
+
+declare module "@earendil-works/pi-coding-agent/builtins" {
+	import type { InlineExtension } from "@earendil-works/pi-coding-agent";
+	export const builtInExtensions: InlineExtension[];
 }
 
 // Opaque bundles passed straight to jiti virtualModules (no typed surface

@@ -37,6 +37,7 @@ import type {
 	ExtensionFactory,
 	ExtensionRuntime,
 	ExtensionUIContext,
+	InlineExtension,
 	ProviderConfig,
 	ToolDefinition,
 	Theme,
@@ -142,7 +143,7 @@ interface SlotEntry {
 interface LoadOptions {
 	cwd: string;
 	extensionPaths: string[];
-	factories: ExtensionFactory[];
+	factories: InlineExtension[];
 }
 
 interface ExtensionsLoadRequest {
@@ -499,7 +500,7 @@ export class ExtensionHost {
 	run(options: {
 		cwd: string;
 		extensionPaths: string[];
-		factories?: ExtensionFactory[];
+		factories?: InlineExtension[];
 	}): Promise<void> {
 		this.loadOptions = {
 			cwd: options.cwd,
@@ -579,15 +580,19 @@ export class ExtensionHost {
 		const eventBus = createEventBus();
 		const errors: Array<{ path: string; error: string }> = [];
 
-		for (const factory of opts.factories) {
+		for (const [index, input] of opts.factories.entries()) {
+			const isNamed = typeof input !== "function";
+			const factory = isNamed ? input.factory : input;
+			const extensionPath = `<inline:${isNamed ? input.name : index + 1}>`;
 			try {
 				const ext = await loadExtensionFromFactory(
-					factory, opts.cwd, eventBus, this.runtime, "<inline>",
+					factory, opts.cwd, eventBus, this.runtime, extensionPath,
 				);
+				ext.hidden = isNamed ? input.hidden ?? false : false;
 				this.extensions.push(ext);
 			} catch (err) {
 				errors.push({
-					path: "<inline>",
+					path: extensionPath,
 					error: err instanceof Error ? err.message : String(err),
 				});
 			}
@@ -1534,6 +1539,17 @@ export class ExtensionHost {
 						this.providers.set(name, config);
 					}
 				},
+				registerNativeProvider: (provider) => {
+					const id = (provider as Record<string, unknown>)["id"];
+					if (typeof id === "string" && !this.providers.has(id)) {
+						const native = provider as ProviderConfig;
+						this.providers.set(id, {
+							name: native.name,
+							baseUrl: native.baseUrl,
+							streamSimple: native.streamSimple,
+						});
+					}
+				},
 				unregisterProvider: (name) => {
 					this.providers.delete(name);
 				},
@@ -1577,7 +1593,7 @@ export class ExtensionHost {
 		const commands = runner.getRegisteredCommands().map((cmd) => ({
 			name: cmd.invocationName,
 			description: cmd.description,
-			source: cmd.sourceInfo.extensionPath,
+			source: cmd.sourceInfo.path,
 		}));
 
 		const shortcuts: Array<Record<string, unknown>> = [];

@@ -8,6 +8,7 @@
  */
 
 import { ExtensionHost } from "./host.ts";
+import { builtInExtensions } from "@earendil-works/pi-coding-agent/builtins";
 
 function parseArgs(argv: string[]): { cwd: string; extensionPaths: string[] } {
 	let cwd = process.cwd();
@@ -42,7 +43,7 @@ class StdoutSink {
 async function main(): Promise<void> {
 	const { cwd, extensionPaths } = parseArgs(process.argv);
 	const host = new ExtensionHost(process.stdin, new StdoutSink());
-	await host.run({ cwd, extensionPaths });
+	await host.run({ cwd, extensionPaths, factories: builtInExtensions });
 }
 
 main().catch((err) => {
