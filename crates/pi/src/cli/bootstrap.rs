@@ -11,8 +11,9 @@
 //! # Pipeline order (matches `main.ts:472-858`)
 //!
 //! 1. Reset timings (no-op here; the timings module is a sibling concern).
-//! 2. Offline mode: `args.contains("--offline") || PI_OFFLINE` → set
-//!    `PI_OFFLINE=1`, `PI_SKIP_VERSION_CHECK=1`.
+//! 2. Offline mode: `args.contains("--offline") || PI_OFFLINE` →
+//!    `PackageHandler::set_offline(true)` (no process-env mutation under
+//!    `unsafe_code = "forbid"`).
 //! 3. Package/config short-circuit (`pi install …`, `pi config …`).
 //! 4. `parse_args` + report diagnostics (errors exit 1, warnings continue).
 //! 5. `--version` → print version, exit 0.
@@ -446,8 +447,10 @@ fn initialize_bootstrap(inputs: &BootstrapInputs<'_>) -> BootstrapStep<Args> {
     let offline_mode = parsed.offline || is_truthy_env_flag(inputs.io.env("PI_OFFLINE").as_deref());
     parsed.offline = offline_mode;
     if offline_mode {
-        inputs.io.set_env("PI_OFFLINE", "1");
-        inputs.io.set_env("PI_SKIP_VERSION_CHECK", "1");
+        // Process-env mutation is impossible under `unsafe_code = "forbid"`.
+        // Thread the bool into package handlers and any other consumers that
+        // previously read PI_OFFLINE / PI_SKIP_VERSION_CHECK from the env.
+        inputs.package_handler.set_offline(true);
     }
 
     if let Some(outcome) = package_manager_cli::handle_package_command(
@@ -460,6 +463,7 @@ fn initialize_bootstrap(inputs: &BootstrapInputs<'_>) -> BootstrapStep<Args> {
     }
     if let Some(outcome) = package_manager_cli::handle_config_command(
         &inputs.args,
+        inputs.package_handler,
         inputs.package_output,
         inputs.io.stdin_is_tty(),
         inputs.io.stdout_is_tty(),
@@ -1278,6 +1282,7 @@ mod tests {
     #[derive(Default, Clone)]
     struct FakePackageHandler {
         trusted: bool,
+        offline: Arc<Mutex<bool>>,
         calls: Arc<Mutex<Vec<String>>>,
     }
 
@@ -1294,6 +1299,9 @@ mod tests {
             lock_recover(&self.calls).push("list".to_owned());
             Ok(Vec::new())
         }
+        fn set_offline(&self, offline: bool) {
+            *lock_recover(&self.offline) = offline;
+        }
         fn is_project_trusted(&self) -> bool {
             self.trusted
         }
@@ -1301,12 +1309,21 @@ mod tests {
             Ok(())
         }
         fn update_extensions(&self, source: Option<&str>) -> Result<(), String> {
-            lock_recover(&self.calls).push(format!("ext:{source:?}"));
+            lock_recover(&self.calls).push(format!("update_ext:{source:?}"));
             Ok(())
         }
         fn update_self(&self, force: bool) -> Result<bool, String> {
-            lock_recover(&self.calls).push(format!("self:{force}"));
-            Ok(false)
+            lock_recover(&self.calls).push(format!("update_self:{force}"));
+            Ok(true)
+        }
+        fn open_config_selector(
+            &self,
+            local: bool,
+            project_trust_override: Option<bool>,
+        ) -> Result<(), String> {
+            lock_recover(&self.calls)
+                .push(format!("open_config:{local}:{project_trust_override:?}"));
+            Ok(())
         }
     }
 
@@ -1626,7 +1643,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_sets_offline_env() {
+    async fn bootstrap_threads_offline_to_package_handler() {
         let io = Arc::new(FakeIo::new());
         let factory = Arc::new(FakeFactory::default());
         let pkg_out = CapturedOutput::default();
@@ -1639,12 +1656,13 @@ mod tests {
             package_output: &pkg_out,
         })
         .await;
-        let env = lock_recover(&io.env);
-        assert_eq!(env.get("PI_OFFLINE").map(String::as_str), Some("1"));
-        assert_eq!(
-            env.get("PI_SKIP_VERSION_CHECK").map(String::as_str),
-            Some("1")
+        assert!(
+            *lock_recover(&pkg.offline),
+            "package handler must observe bootstrap offline mode"
         );
+        // Production RealIo cannot mutate process env; FakeIo still records the
+        // historical set_env call sites only if callers invoke them. We no longer
+        // rely on env mutation for offline propagation.
     }
 
     #[tokio::test]

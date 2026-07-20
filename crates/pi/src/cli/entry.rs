@@ -230,9 +230,9 @@ impl BootstrapIo for RealBootstrapIo {
         std::env::var(key).ok()
     }
     fn set_env(&self, _key: &str, _value: &str) {
-        // `unsafe_code = "forbid"` prevents `std::env::set_var`. The bootstrap
-        // captures `--offline` locally and threads it through the factory.
-        // Callers that need PI_OFFLINE in the process env set it before launch.
+        // `unsafe_code = "forbid"` prevents `std::env::set_var`. Offline is
+        // threaded via `PackageHandler::set_offline` and explicit offline
+        // parameters; env-only readers are not used for --offline.
     }
     fn cwd(&self) -> PathBuf {
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
@@ -861,7 +861,7 @@ fn assemble_replacement_session(
 struct RealPackageHandler {
     cwd: PathBuf,
     agent_dir: PathBuf,
-    offline: bool,
+    offline: std::sync::Mutex<bool>,
     project_trust_override: std::sync::Mutex<Option<bool>>,
 }
 
@@ -872,9 +872,16 @@ impl RealPackageHandler {
         Self {
             cwd,
             agent_dir,
-            offline,
+            offline: std::sync::Mutex::new(offline),
             project_trust_override: std::sync::Mutex::new(None),
         }
+    }
+
+    fn offline(&self) -> bool {
+        *self
+            .offline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn build_settings(&self, trusted: bool) -> SettingsManager {
@@ -906,7 +913,7 @@ impl RealPackageHandler {
     fn build_package_manager(&self) -> PackageManager {
         PackageManager::with_offline(
             PackageManager::new(PackageManagerOptions::new(&self.cwd, &self.agent_dir)),
-            self.offline,
+            self.offline(),
         )
     }
 
@@ -921,6 +928,13 @@ impl PackageHandler for RealPackageHandler {
             .project_trust_override
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = trust_override;
+    }
+
+    fn set_offline(&self, offline: bool) {
+        *self
+            .offline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = offline;
     }
 
     fn install(&self, source: &str, local: bool) -> Result<(), String> {
@@ -965,7 +979,7 @@ impl PackageHandler for RealPackageHandler {
     }
 
     fn refresh_models(&self) -> Result<(), String> {
-        if self.offline {
+        if self.offline() {
             return Err("Cannot refresh model catalogs while offline".to_owned());
         }
         let agent_dir = self.agent_dir.clone();
@@ -1011,6 +1025,26 @@ impl PackageHandler for RealPackageHandler {
             "Self-update is not supported by this build; install the new release with your package manager"
                 .to_owned(),
         )
+    }
+
+    fn open_config_selector(
+        &self,
+        local: bool,
+        project_trust_override: Option<bool>,
+    ) -> Result<(), String> {
+        let options = crate::cli::config_selector::ConfigSelectorOptions {
+            cwd: self.cwd.clone(),
+            agent_dir: self.agent_dir.clone(),
+            write_project: local,
+            project_trust_override,
+            offline: self.offline(),
+        };
+        // Bootstrap already owns a multi-thread runtime; park the worker while
+        // the standalone TUI drives TerminalInput / paint futures.
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(crate::cli::config_selector::select_config(options))
+        })
     }
 }
 

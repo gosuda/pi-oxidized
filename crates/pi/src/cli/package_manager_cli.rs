@@ -175,9 +175,11 @@ pub trait PackageHandler {
     /// Supply the invocation-scoped project trust override before preflight.
     fn set_project_trust_override(&self, _trust_override: Option<bool>) {}
 
+    /// Propagate bootstrap offline mode into package-network operations.
+    fn set_offline(&self, _offline: bool) {}
+
     /// Whether the project is currently trusted (for the local-write gate).
     fn is_project_trusted(&self) -> bool;
-
     /// Refresh model catalogs (`update --models`).
     ///
     /// # Errors
@@ -198,6 +200,19 @@ pub trait PackageHandler {
     /// # Errors
     /// Implementation-defined.
     fn update_self(&self, force: bool) -> Result<bool, String>;
+
+    /// Open the resource-config TUI (`pi config`).
+    ///
+    /// # Errors
+    /// Implementation-defined; error strings are shown verbatim.
+    fn open_config_selector(
+        &self,
+        local: bool,
+        project_trust_override: Option<bool>,
+    ) -> Result<(), String> {
+        let _ = (local, project_trust_override);
+        Err(format!("{APP_NAME} config TUI runner not configured."))
+    }
 }
 
 /// Output sink for status/error lines. Implementations capture into a buffer
@@ -568,29 +583,50 @@ fn writes_project_package_config(command: PackageCommand, local: bool) -> bool {
 /// `package-manager-cli.ts:603`.
 pub fn handle_config_command(
     args: &[String],
+    handler: &dyn PackageHandler,
     out: &dyn PackageOutput,
     stdin_is_tty: bool,
     stdout_is_tty: bool,
 ) -> Option<PackageOutcome> {
-    let (raw, _rest) = args.split_first()?;
+    let (raw, rest) = args.split_first()?;
     if !is_config_command(raw) {
         return None;
     }
-    if args.iter().any(|a| a == "-h" || a == "--help") {
+    if rest.iter().any(|a| a == "-h" || a == "--help") {
         out.status(&format_config_command_help());
         return Some(PackageOutcome::success());
     }
+
+    let flags = crate::cli::config_selector::parse_config_flags(rest);
+    if let Some(option) = flags.invalid_option.as_deref() {
+        out.error(&format!("Unknown option {option} for \"config\"."));
+        out.error(&format!(
+            "Use \"{APP_NAME} --help\" or \"{}\".",
+            config_command_usage()
+        ));
+        return Some(PackageOutcome::failure(1));
+    }
+    if let Some(argument) = flags.invalid_argument.as_deref() {
+        out.error(&format!("Unexpected argument {argument}."));
+        out.error(&format!("Usage: {}", config_command_usage()));
+        return Some(PackageOutcome::failure(1));
+    }
+
     if !stdin_is_tty || !stdout_is_tty {
         out.error(&format!(
             "{APP_NAME} config requires an interactive terminal."
         ));
         return Some(PackageOutcome::failure(1));
     }
-    // The resource-config TUI is launched by the interactive mode dispatcher.
-    // The bootstrap routes `config` to interactive mode when TTY is available;
-    // if we reach here, the TUI runner was not injected.
-    out.error(&format!("{APP_NAME} config TUI runner not configured."));
-    Some(PackageOutcome::failure(1))
+
+    handler.set_project_trust_override(flags.project_trust_override);
+    match handler.open_config_selector(flags.local, flags.project_trust_override) {
+        Ok(()) => Some(PackageOutcome::success()),
+        Err(error) => {
+            out.error(&error);
+            Some(PackageOutcome::failure(1))
+        }
+    }
 }
 ///
 /// Mirrors the verbatim status/error strings and exit-code mapping of
@@ -938,6 +974,16 @@ mod tests {
         fn update_self(&self, force: bool) -> Result<bool, String> {
             self.borrow_mut().calls.push(format!("update_self:{force}"));
             self.borrow().update_self_result.clone()
+        }
+        fn open_config_selector(
+            &self,
+            local: bool,
+            project_trust_override: Option<bool>,
+        ) -> Result<(), String> {
+            self.borrow_mut()
+                .calls
+                .push(format!("open_config:{local}:{project_trust_override:?}"));
+            Ok(())
         }
     }
 
@@ -1485,9 +1531,11 @@ mod tests {
 
     #[test]
     fn config_command_dispatch_help() -> Result<(), String> {
+        let handler = Rc::new(RefCell::new(FakeHandler::default()));
         let out = Rc::new(RefCell::new(CapturedOutput::default()));
-        let outcome = handle_config_command(&args(&["config", "--help"]), &out, true, true)
-            .ok_or_else(|| "expected config help dispatch outcome".to_owned())?;
+        let outcome =
+            handle_config_command(&args(&["config", "--help"]), &handler, &out, true, true)
+                .ok_or_else(|| "expected config help dispatch outcome".to_owned())?;
         assert_eq!(outcome.exit_code, 0);
         assert!(out.borrow().status[0].contains("Usage:"));
         Ok(())
@@ -1495,8 +1543,9 @@ mod tests {
 
     #[test]
     fn config_command_dispatch_non_tty_reports_error() -> Result<(), String> {
+        let handler = Rc::new(RefCell::new(FakeHandler::default()));
         let out = Rc::new(RefCell::new(CapturedOutput::default()));
-        let outcome = handle_config_command(&args(&["config"]), &out, false, true)
+        let outcome = handle_config_command(&args(&["config"]), &handler, &out, false, true)
             .ok_or_else(|| "expected non-TTY config dispatch outcome".to_owned())?;
         assert_eq!(outcome.exit_code, 1);
         assert!(out.borrow().error[0].contains("interactive terminal"));
@@ -1505,7 +1554,41 @@ mod tests {
 
     #[test]
     fn config_command_returns_none_for_other_subcommands() {
+        let handler = Rc::new(RefCell::new(FakeHandler::default()));
         let out = Rc::new(RefCell::new(CapturedOutput::default()));
-        assert!(handle_config_command(&args(&["install"]), &out, true, true).is_none());
+        assert!(handle_config_command(&args(&["install"]), &handler, &out, true, true).is_none());
+    }
+
+    #[test]
+    fn config_command_unknown_option_exits_one() -> Result<(), String> {
+        let handler = Rc::new(RefCell::new(FakeHandler::default()));
+        let out = Rc::new(RefCell::new(CapturedOutput::default()));
+        let outcome =
+            handle_config_command(&args(&["config", "--bogus"]), &handler, &out, true, true)
+                .ok_or_else(|| "expected unknown option outcome".to_owned())?;
+        assert_eq!(outcome.exit_code, 1);
+        assert!(out.borrow().error[0].contains("Unknown option --bogus"));
+        Ok(())
+    }
+
+    #[test]
+    fn config_command_tty_opens_selector() -> Result<(), String> {
+        let handler = Rc::new(RefCell::new(FakeHandler::default()));
+        let out = Rc::new(RefCell::new(CapturedOutput::default()));
+        let outcome = handle_config_command(
+            &args(&["config", "-l", "--approve"]),
+            &handler,
+            &out,
+            true,
+            true,
+        )
+        .ok_or_else(|| "expected TTY config dispatch outcome".to_owned())?;
+        assert_eq!(outcome.exit_code, 0);
+        assert!(out.borrow().error.is_empty());
+        assert_eq!(
+            handler.borrow().calls,
+            vec!["open_config:true:Some(true)".to_owned()]
+        );
+        Ok(())
     }
 }
