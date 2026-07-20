@@ -1870,18 +1870,20 @@ fn spawn_event_pump(inner: Arc<Inner>) {
     });
 }
 
-/// Route one session-bridge item to the claiming session task. Unclaimed or
-/// closed bridges answer correlated requests immediately (so the host's
-/// awaiting extension never hangs) and drop fire-and-forget commands.
+/// Route one session-bridge item to the claiming session task. Unclaimed,
+/// closed, or FULL bridges answer correlated requests immediately (so the
+/// host's awaiting extension never hangs) and drop fire-and-forget commands.
+/// `try_send` keeps the pump from blocking behind a stalled drain task: the
+/// drain task may itself await a hook response only the pump can read, so an
+/// awaited send here could deadlock the transport.
 async fn forward_session_bridge(inner: &Arc<Inner>, event: SessionBridgeEvent) {
     let claimed = inner.active() && inner.session_bridge_claimed.load(Ordering::Acquire);
     let undelivered = if claimed {
         inner
             .session_bridge_tx
-            .send(event)
-            .await
+            .try_send(event)
             .err()
-            .map(|error| error.0)
+            .map(mpsc::error::TrySendError::into_inner)
     } else {
         Some(event)
     };

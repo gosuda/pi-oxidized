@@ -1143,10 +1143,12 @@ async fn pump_eof_shuts_down_and_reaps_exactly_once() -> R {
     let mut errors = runner.subscribe_errors();
 
     // The child exits right after load: the pump's EOF branch must publish
-    // extension_closed and shut down / reap the transport on its own.
-    let error = tokio::time::timeout(Duration::from_secs(2), errors.recv()).await??;
+    // extension_closed and shut down / reap the transport on its own. The
+    // deadlines are generous: a real process spawn under full-suite load can
+    // take seconds, and the assertions are eventual, not latency-bound.
+    let error = tokio::time::timeout(Duration::from_secs(30), errors.recv()).await??;
     assert_eq!(error.code, "extension_closed");
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         while runner.is_running() {
             tokio::task::yield_now().await;
         }
@@ -1154,7 +1156,7 @@ async fn pump_eof_shuts_down_and_reaps_exactly_once() -> R {
     .await?;
     // Reap is asynchronous relative to the error broadcast; poll kill -0.
     let pid = fs::read_to_string(&pid_path)?.trim().to_owned();
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let alive = std::process::Command::new("/bin/kill")
                 .args(["-0", &pid])
