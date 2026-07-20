@@ -205,6 +205,54 @@ impl SessionSnapshot {
     pub fn is_streaming(&self) -> bool {
         self.activity == SessionActivity::Streaming
     }
+
+    /// Whether context compaction is currently running.
+    #[must_use]
+    pub fn is_compacting(&self) -> bool {
+        self.activity == SessionActivity::Compacting
+    }
+}
+
+/// Outcome of a `/clone` request (ports the branches of upstream
+/// `handleCloneCommand`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloneOutcome {
+    /// The session was cloned into a new session.
+    Cloned,
+    /// No current leaf entry — there is nothing to clone yet.
+    NothingToClone,
+    /// A before-switch hook cancelled the clone.
+    Cancelled,
+}
+
+/// Typed `/import` failure so the runtime can mirror upstream's per-error
+/// handling (`MissingSessionCwdError` prompt, file-not-found notice, fatal).
+#[derive(Clone, Debug)]
+pub enum ImportError {
+    /// The imported session's recorded cwd no longer exists; carries the
+    /// fallback cwd the runtime would continue in (upstream `issue.fallbackCwd`).
+    MissingCwd {
+        /// Fallback (runtime) cwd offered for the retry.
+        fallback_cwd: String,
+    },
+    /// The import source file was not found.
+    FileNotFound(String),
+    /// Any other import failure.
+    Other(String),
+}
+
+impl ImportError {
+    /// Human-readable message for the file-not-found / fatal notice.
+    fn message(&self) -> String {
+        match self {
+            Self::MissingCwd { fallback_cwd } => {
+                format!(
+                    "Stored session working directory does not exist (fallback: {fallback_cwd})"
+                )
+            }
+            Self::FileNotFound(message) | Self::Other(message) => message.clone(),
+        }
+    }
 }
 
 /// Scoped-model selector entries and their enabled-state map.
@@ -390,8 +438,9 @@ pub trait SessionHost: Send + Sync + 'static {
     /// Open the fork selector's confirmation; runtime supplies the entry id.
     fn fork(&self, entry_id: &str) -> BoxFuture<'_, Result<(), String>>;
 
-    /// Clone the session at the current leaf.
-    fn clone(&self) -> BoxFuture<'_, Result<(), String>>;
+    /// Clone the session at the current leaf. `Ok(NothingToClone)` when there is
+    /// no leaf yet; `Ok(Cancelled)` when a before-switch hook cancels the fork.
+    fn clone(&self) -> BoxFuture<'_, Result<CloneOutcome, String>>;
 
     /// Switch to a different session file (resume).
     fn switch_session(&self, path: &str) -> BoxFuture<'_, Result<(), String>>;
@@ -402,8 +451,14 @@ pub trait SessionHost: Send + Sync + 'static {
     /// Export the current session to JSONL; runtime passes an optional path.
     fn export_jsonl(&self, path: Option<&str>) -> BoxFuture<'_, Result<String, String>>;
 
-    /// Import and replace the current session from a JSONL file.
-    fn import_jsonl(&self, path: &str) -> BoxFuture<'_, Result<(), String>>;
+    /// Import and replace the current session from a JSONL file. `cwd_override`
+    /// supplies the fallback cwd for the missing-cwd retry (upstream
+    /// `importFromJsonl(path, selectedCwd)`).
+    fn import_jsonl(
+        &self,
+        path: &str,
+        cwd_override: Option<&str>,
+    ) -> BoxFuture<'_, Result<bool, ImportError>>;
 
     /// Export to a temp HTML and upload it as a secret gist; returns
     /// `(viewer_url, gist_url)`.
@@ -412,11 +467,20 @@ pub trait SessionHost: Send + Sync + 'static {
     /// Aggregate session statistics for `/session`.
     fn session_stats(&self) -> BoxFuture<'_, crate::core::agent_session::stats::SessionStats>;
 
-    /// Set the session display name.
-    fn set_session_name(&self, name: &str) -> BoxFuture<'_, Result<(), String>>;
+    /// Set the session display name and return the normalized name the session
+    /// manager actually stored (upstream reads it back via `getSessionName`).
+    fn set_session_name(&self, name: &str) -> BoxFuture<'_, Result<Option<String>, String>>;
 
-    /// Log out of the active auth / open the login selector.
-    fn logout(&self) -> BoxFuture<'_, Result<(), String>>;
+    /// List stored credentials offered by the `/logout` selector.
+    fn logout_provider_options(
+        &self,
+    ) -> BoxFuture<'_, Result<Vec<super::state::LogoutOption>, String>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    /// Remove the stored credential for `provider_id` (upstream
+    /// `modelRuntime.logout`).
+    fn logout(&self, provider_id: &str) -> BoxFuture<'_, Result<(), String>>;
 
     /// Copy the last assistant text (returns the text so the runtime can
     /// resolve the platform clipboard).
@@ -1009,6 +1073,26 @@ pub struct InteractiveRuntime<W: Write, S: SessionHost> {
     first_run: Option<FirstRunWizardState>,
     /// `/debug` dump directory (agent dir, resolved once at construction).
     debug_dump_dir: std::path::PathBuf,
+    /// In-flight `/import` awaiting its confirm dialog(s).
+    pending_import: Option<PendingImport>,
+    /// Stored-credential options backing the active `/logout` selector.
+    logout_options: Vec<super::state::LogoutOption>,
+    /// Set by the `before_session_invalidate` callback so the next
+    /// `rebind_session_channels` resets extension-owned UI (ports upstream
+    /// wiring `resetExtensionUI` on session invalidation).
+    reset_ui_flag: Arc<std::sync::atomic::AtomicBool>,
+    /// Editor placeholder saved while a built-in confirm/logout selector shows
+    /// its prompt; restored when the selector closes.
+    confirm_saved_placeholder: Option<String>,
+}
+
+/// In-flight `/import` awaiting its confirm dialog(s).
+struct PendingImport {
+    /// Import source path.
+    path: String,
+    /// Fallback cwd for the missing-cwd retry phase (`Some` once the first
+    /// attempt hit a missing-cwd error and we re-confirm with the fallback).
+    retry_cwd: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1216,6 +1300,10 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             theme_push_pending: false,
             first_run: None,
             debug_dump_dir: agent_dir,
+            pending_import: None,
+            logout_options: Vec::new(),
+            reset_ui_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            confirm_saved_placeholder: None,
         };
         for slot in initial_extension_slots {
             runtime.project_extension_slot(slot);
@@ -1764,10 +1852,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 self.open_selector(super::state::SelectorKind::Trust).await
             }
             ViewAction::OpenLogin { .. } => self.open_overlay(OverlayKind::Login),
-            ViewAction::Logout => {
-                self.record_err(self.session.logout().await);
-                ActionOutcome::None
-            }
+            ViewAction::Logout => self.handle_logout_command().await,
             ViewAction::OpenScopedModels => {
                 self.open_selector(super::state::SelectorKind::ScopedModels)
                     .await
@@ -1787,8 +1872,19 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 self.handle_select_confirmed(selector, value).await
             }
             ViewAction::SelectCancelled => {
+                let was_import = matches!(
+                    self.active_selector_kind,
+                    Some(
+                        super::state::SelectorKind::ImportConfirm
+                            | super::state::SelectorKind::ImportCwdConfirm
+                    )
+                );
                 self.restore_theme_preview();
                 self.close_selector();
+                if was_import {
+                    self.pending_import = None;
+                    self.push_notice("import", "Import cancelled".to_owned());
+                }
                 ActionOutcome::Repaint
             }
             ViewAction::FocusChanged { area } => {
@@ -1811,6 +1907,22 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     /// `/reload` (hotkey path): reload host resources, re-probe the terminal
     /// background, re-resolve the theme, and refresh app keybindings.
     async fn handle_reload_action(&mut self) -> ActionOutcome {
+        let snapshot = self.session.snapshot();
+        if snapshot.is_streaming() {
+            self.push_notice(
+                "reload",
+                "Wait for the current response to finish before reloading.".to_owned(),
+            );
+            return ActionOutcome::Repaint;
+        }
+        if snapshot.is_compacting() {
+            self.push_notice(
+                "reload",
+                "Wait for compaction to finish before reloading.".to_owned(),
+            );
+            return ActionOutcome::Repaint;
+        }
+        self.reset_extension_ui();
         if self.pending_extension_dialog.is_some() {
             self.cancel_extension_dialog().await;
         }
@@ -1841,7 +1953,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             "model" => self.open_selector(SelectorKind::Model).await,
             "scoped-models" => self.open_selector(SelectorKind::ScopedModels).await,
             "export" => self.handle_export_command(args).await,
-            "import" => self.handle_import_command(args).await,
+            "import" => self.handle_import_command(args),
             "share" => self.handle_share_command().await,
             "copy" => self.copy_last_assistant().await,
             "name" => self.handle_name_command(args).await,
@@ -1849,21 +1961,12 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             "changelog" => self.handle_changelog_command(),
             "hotkeys" => self.handle_hotkeys_command(),
             "fork" => self.open_selector(SelectorKind::Fork).await,
-            "clone" => {
-                self.record_err(<S as SessionHost>::clone(&self.session).await);
-                ActionOutcome::None
-            }
+            "clone" => self.replace_session(SessionReplacement::Clone).await,
             "tree" => self.open_selector(SelectorKind::Tree).await,
             "trust" => self.open_selector(SelectorKind::Trust).await,
             "login" => self.open_selector(SelectorKind::Auth).await,
-            "logout" => {
-                self.record_err(self.session.logout().await);
-                ActionOutcome::None
-            }
-            "new" => {
-                self.record_err(self.session.new_session().await);
-                ActionOutcome::None
-            }
+            "logout" => self.handle_logout_command().await,
+            "new" => self.replace_session(SessionReplacement::New).await,
             "compact" => {
                 let instructions = (!args.is_empty()).then_some(args);
                 self.record_err(self.session.compact(instructions).await);
@@ -1879,11 +1982,11 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     /// `/export [path]`: JSONL when the path ends in `.jsonl`, else HTML.
     async fn handle_export_command(&mut self, args: &str) -> ActionOutcome {
         let path = parse_path_argument(args);
-        let is_jsonl = path.as_deref().is_some_and(|value| {
-            std::path::Path::new(value)
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
-        });
+        // Case-sensitive `.jsonl` suffix, matching upstream `endsWith(".jsonl")`.
+        #[allow(clippy::case_sensitive_file_extension_comparisons)]
+        let is_jsonl = path
+            .as_deref()
+            .is_some_and(|value| value.ends_with(".jsonl"));
         let result = if is_jsonl {
             self.session.export_jsonl(path.as_deref()).await
         } else {
@@ -1899,22 +2002,209 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     }
 
     /// `/import <path>`: replace the current session from a JSONL file.
-    async fn handle_import_command(&mut self, args: &str) -> ActionOutcome {
+    fn handle_import_command(&mut self, args: &str) -> ActionOutcome {
         let Some(path) = parse_path_argument(args) else {
             self.push_notice("import", "Usage: /import <path.jsonl>".to_owned());
             return ActionOutcome::Repaint;
         };
-        match self.session.import_jsonl(&path).await {
+        self.open_import_confirm(path)
+    }
+
+    /// Reset extension-owned UI state to defaults (ports `resetExtensionUI`).
+    ///
+    /// Clears extension working-message/visibility overrides, extension footer
+    /// statuses, and restores the hidden-thinking label so extension state does
+    /// not bleed across a session replacement (`/new`, `/fork`, `/clone`,
+    /// `/import`, `/resume`) or `/reload`.
+    fn reset_extension_ui(&mut self) {
+        self.view.footer.extension_statuses.clear();
+        self.view.working_message = None;
+        self.view.working_visible = true;
+        if let Some(status) = self.view.status.as_mut()
+            && status.kind == StatusKind::Working
+        {
+            DEFAULT_WORKING_MESSAGE.clone_into(&mut status.message);
+        }
+        for message in &mut self.view.messages {
+            if let MessageView::Assistant(view) = message {
+                "Thinking…".clone_into(&mut view.hidden_thinking_label);
+            }
+        }
+        self.chat_dirty = true;
+    }
+
+    /// `/logout`: list stored credentials and open the removal selector, or
+    /// notice when none are stored (ports `showOAuthSelector("logout")`).
+    async fn handle_logout_command(&mut self) -> ActionOutcome {
+        let options = match self.session.logout_provider_options().await {
+            Ok(options) => options,
+            Err(error) => {
+                self.last_error = Some(error);
+                return ActionOutcome::Repaint;
+            }
+        };
+        if options.is_empty() {
+            self.push_notice(
+                "logout",
+                "No stored credentials to remove. /logout only removes credentials saved by /login; environment variables and models.json config are unchanged.".to_owned(),
+            );
+            return ActionOutcome::Repaint;
+        }
+        let items = options
+            .iter()
+            .map(|option| {
+                pi_tui::components::SelectItem::new(option.id.clone(), option.name.clone())
+            })
+            .collect();
+        self.logout_options = options;
+        self.install_confirm_selector(
+            super::state::SelectorKind::Logout,
+            "Select a credential to remove",
+            items,
+        );
+        ActionOutcome::Repaint
+    }
+
+    /// Apply a `/logout` selection: remove the chosen credential and report
+    /// (message wording per credential kind, ports the OAuth-selector callback).
+    async fn handle_logout_confirm(&mut self, provider_id: &str) -> ActionOutcome {
+        let option = self
+            .logout_options
+            .iter()
+            .find(|option| option.id == provider_id)
+            .cloned();
+        self.logout_options.clear();
+        self.close_selector();
+        let Some(option) = option else {
+            return ActionOutcome::Repaint;
+        };
+        match self.session.logout(&option.id).await {
             Ok(()) => {
+                let message = if option.is_oauth {
+                    format!("Logged out of {}", option.name)
+                } else {
+                    format!(
+                        "Removed stored API key for {}. Environment variables and models.json config are unchanged.",
+                        option.name
+                    )
+                };
+                self.push_notice("logout", message);
+            }
+            Err(error) => self.push_notice("logout", format!("Logout failed: {error}")),
+        }
+        ActionOutcome::Repaint
+    }
+
+    /// Show the `/import` replace-session confirmation (ports upstream
+    /// `showExtensionConfirm("Import session", ...)`).
+    fn open_import_confirm(&mut self, path: String) -> ActionOutcome {
+        let prompt = format!("Import session — Replace current session with {path}?");
+        self.pending_import = Some(PendingImport {
+            path,
+            retry_cwd: None,
+        });
+        self.install_confirm_selector(
+            super::state::SelectorKind::ImportConfirm,
+            &prompt,
+            Self::confirm_items(),
+        );
+        ActionOutcome::Repaint
+    }
+
+    /// Resolve the `/import` replace confirmation: `"true"` runs the import,
+    /// anything else cancels.
+    async fn handle_import_confirm(&mut self, value: &str) -> ActionOutcome {
+        self.close_selector();
+        let Some(pending) = self.pending_import.take() else {
+            return ActionOutcome::Repaint;
+        };
+        if value != "true" {
+            self.push_notice("import", "Import cancelled".to_owned());
+            return ActionOutcome::Repaint;
+        }
+        self.run_import(pending.path, None).await
+    }
+
+    /// Resolve the missing-cwd retry confirmation: `"true"` retries the import
+    /// in the fallback cwd (ports `promptForMissingSessionCwd`).
+    async fn handle_import_cwd_confirm(&mut self, value: &str) -> ActionOutcome {
+        self.close_selector();
+        let Some(pending) = self.pending_import.take() else {
+            return ActionOutcome::Repaint;
+        };
+        if value != "true" {
+            self.push_notice("import", "Import cancelled".to_owned());
+            return ActionOutcome::Repaint;
+        }
+        self.run_import(pending.path, pending.retry_cwd).await
+    }
+
+    /// Perform the import and project the outcome; on missing-cwd, open the
+    /// fallback-cwd retry confirmation.
+    async fn run_import(&mut self, path: String, cwd_override: Option<String>) -> ActionOutcome {
+        match self
+            .session
+            .import_jsonl(&path, cwd_override.as_deref())
+            .await
+        {
+            Ok(true) => {
                 self.rebind_session_channels().await;
                 self.refresh_footer().await;
                 self.push_notice("import", format!("Session imported from: {path}"));
             }
+            Ok(false) => {
+                self.push_notice("import", "Import cancelled".to_owned());
+            }
+            Err(ImportError::MissingCwd { fallback_cwd }) => {
+                let prompt =
+                    format!("Session cwd not found — continue in current cwd {fallback_cwd}?");
+                self.pending_import = Some(PendingImport {
+                    path,
+                    retry_cwd: Some(fallback_cwd),
+                });
+                self.install_confirm_selector(
+                    super::state::SelectorKind::ImportCwdConfirm,
+                    &prompt,
+                    Self::confirm_items(),
+                );
+            }
             Err(error) => {
-                self.push_notice("import", format!("Failed to import session: {error}"));
+                self.push_notice(
+                    "import",
+                    format!("Failed to import session: {}", error.message()),
+                );
             }
         }
         ActionOutcome::Repaint
+    }
+
+    /// Install a built-in confirm/logout selector: save the editor placeholder,
+    /// show the prompt, and route confirms/cancels through the selector channel
+    /// under `kind`.
+    fn install_confirm_selector(
+        &mut self,
+        kind: super::state::SelectorKind,
+        prompt: &str,
+        items: Vec<pi_tui::components::SelectItem>,
+    ) {
+        if self.confirm_saved_placeholder.is_none() {
+            self.confirm_saved_placeholder = Some(self.view.editor.placeholder.clone());
+        }
+        prompt.clone_into(&mut self.view.editor.placeholder);
+        self.active_selector = Some(self.build_select_list(kind, items));
+        self.active_selector_kind = Some(kind);
+        self.view.focus = FocusArea::Selector;
+        self.view.overlay = None;
+        self.view.extension_overlay_slot = None;
+        self.input_state.reset_taps();
+    }
+
+    /// Yes/No items for a built-in confirm selector (`"true"`/`"false"` values).
+    fn confirm_items() -> Vec<pi_tui::components::SelectItem> {
+        vec![
+            pi_tui::components::SelectItem::new("true", "Yes"),
+            pi_tui::components::SelectItem::new("false", "No"),
+        ]
     }
 
     /// `/share`: export to a temp HTML and upload it as a secret gist.
@@ -1942,7 +2232,16 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             return ActionOutcome::Repaint;
         }
         match self.session.set_session_name(name).await {
-            Ok(()) => self.push_notice("name", format!("Session name set: {name}")),
+            Ok(stored) => {
+                let stored_name = stored.clone().unwrap_or_else(|| name.to_owned());
+                if stored.as_deref() != Some(name) {
+                    self.push_notice(
+                        "name",
+                        format!("Session name was normalized from {name:?} to {stored_name:?}"),
+                    );
+                }
+                self.push_notice("name", format!("Session name set: {stored_name}"));
+            }
             Err(error) => {
                 self.push_notice("name", format!("Failed to set session name: {error}"));
             }
@@ -2143,14 +2442,33 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         if self.pending_extension_dialog.is_some() {
             self.cancel_extension_dialog().await;
         }
-        let result = match replacement {
-            SessionReplacement::New => self.session.new_session().await,
-            SessionReplacement::Fork => self.session.fork("").await,
-            SessionReplacement::Clone => <S as SessionHost>::clone(&self.session).await,
-        };
-        self.record_err(result);
-        self.rebind_session_channels().await;
-        self.refresh_footer().await;
+        match replacement {
+            SessionReplacement::New => match self.session.new_session().await {
+                Ok(()) => {
+                    self.rebind_session_channels().await;
+                    self.refresh_footer().await;
+                    self.push_notice("new", "✓ New session started".to_owned());
+                }
+                Err(error) => self.record_err(Err(error)),
+            },
+            SessionReplacement::Fork => {
+                self.record_err(self.session.fork("").await);
+                self.rebind_session_channels().await;
+                self.refresh_footer().await;
+            }
+            SessionReplacement::Clone => match <S as SessionHost>::clone(&self.session).await {
+                Ok(CloneOutcome::Cloned) => {
+                    self.rebind_session_channels().await;
+                    self.refresh_footer().await;
+                    self.push_notice("clone", "Cloned to new session".to_owned());
+                }
+                Ok(CloneOutcome::NothingToClone) => {
+                    self.push_notice("clone", "Nothing to clone yet".to_owned());
+                }
+                Ok(CloneOutcome::Cancelled) => {}
+                Err(error) => self.record_err(Err(error)),
+            },
+        }
         ActionOutcome::Repaint
     }
 
@@ -2417,10 +2735,18 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 self.close_selector();
                 ActionOutcome::Repaint
             }
+            super::state::SelectorKind::ImportConfirm => self.handle_import_confirm(&value).await,
+            super::state::SelectorKind::ImportCwdConfirm => {
+                self.handle_import_cwd_confirm(&value).await
+            }
+            super::state::SelectorKind::Logout => self.handle_logout_confirm(&value).await,
         }
     }
 
     fn close_selector(&mut self) {
+        if let Some(placeholder) = self.confirm_saved_placeholder.take() {
+            self.view.editor.placeholder = placeholder;
+        }
         self.view.overlay = None;
         self.view.extension_overlay_slot = None;
         self.active_selector = None;
@@ -2489,6 +2815,8 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         ActionOutcome::Repaint
     }
 
+    // Large exhaustive selector dispatch; adding a variant tips the line count.
+    #[allow(clippy::too_many_lines)]
     async fn load_selector_component(
         &mut self,
         kind: super::state::SelectorKind,
@@ -2590,6 +2918,11 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                     let _ = preview_tx.send(item.value.clone());
                 }));
                 Ok(Box::new(list))
+            }
+            super::state::SelectorKind::ImportConfirm
+            | super::state::SelectorKind::ImportCwdConfirm
+            | super::state::SelectorKind::Logout => {
+                Err("confirm/logout selectors are installed by their command handlers".to_owned())
             }
         }
     }
@@ -3422,6 +3755,12 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     /// Rebind event/partial subscriptions and reload the transcript after a
     /// session replacement. Used by production rebind callback and tests.
     pub async fn rebind_session_channels(&mut self) {
+        if self
+            .reset_ui_flag
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.reset_extension_ui();
+        }
         self.events = self.session.subscribe();
         self.partial = self.session.partial_rx();
         let snapshot = self.session.snapshot();
@@ -5129,7 +5468,7 @@ impl SessionHost for AgentSessionHost {
         })
     }
 
-    fn clone(&self) -> BoxFuture<'_, Result<(), String>> {
+    fn clone(&self) -> BoxFuture<'_, Result<CloneOutcome, String>> {
         let runtime = Arc::clone(&self.runtime);
         let host_session = Arc::clone(&self.session);
         Box::pin(async move {
@@ -5139,17 +5478,23 @@ impl SessionHost for AgentSessionHost {
                 let sm = manager.lock().await;
                 sm.get_leaf_id().map(str::to_owned)
             };
-            let leaf =
-                leaf.ok_or_else(|| "Cannot clone session: no current entry selected".to_owned())?;
-            runtime
+            let Some(leaf) = leaf else {
+                return Ok(CloneOutcome::NothingToClone);
+            };
+            let outcome = runtime
                 .fork(&leaf, ForkPosition::At)
                 .await
-                .map(|_| ())
                 .map_err(|err| runtime_err_to_string(&err))?;
-            if let Ok(mut guard) = host_session.write() {
+            if !outcome.cancelled
+                && let Ok(mut guard) = host_session.write()
+            {
                 *guard = runtime.session();
             }
-            Ok(())
+            Ok(if outcome.cancelled {
+                CloneOutcome::Cancelled
+            } else {
+                CloneOutcome::Cloned
+            })
         })
     }
 
@@ -5181,19 +5526,58 @@ impl SessionHost for AgentSessionHost {
         })
     }
 
-    fn set_session_name(&self, name: &str) -> BoxFuture<'_, Result<(), String>> {
+    fn set_session_name(&self, name: &str) -> BoxFuture<'_, Result<Option<String>, String>> {
         let session = self.read_session();
         let name = name.to_owned();
         Box::pin(async move {
             session
                 .set_session_name(&name)
                 .await
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string())?;
+            Ok(session.session_name().await)
         })
     }
 
-    fn logout(&self) -> BoxFuture<'_, Result<(), String>> {
-        Box::pin(async { Ok(()) })
+    fn logout_provider_options(
+        &self,
+    ) -> BoxFuture<'_, Result<Vec<super::state::LogoutOption>, String>> {
+        let session = self.read_session();
+        Box::pin(async move {
+            let Some(runtime) = session.model_runtime_handle() else {
+                return Ok(Vec::new());
+            };
+            let credentials = runtime
+                .list_credentials()
+                .await
+                .map_err(|e| e.to_string())?;
+            let mut options: Vec<super::state::LogoutOption> = credentials
+                .into_iter()
+                .map(|info| super::state::LogoutOption {
+                    // Upstream prefers the provider display name; the runtime's
+                    // provider catalog is not addressable by id here, so fall
+                    // back to the id (upstream's `?? providerId` behavior).
+                    name: info.provider_id.clone(),
+                    id: info.provider_id,
+                    is_oauth: matches!(info.kind, pi_ai::auth::CredentialKind::Oauth),
+                })
+                .collect();
+            options.sort_by(|a, b| a.name.cmp(&b.name));
+            Ok(options)
+        })
+    }
+
+    fn logout(&self, provider_id: &str) -> BoxFuture<'_, Result<(), String>> {
+        let session = self.read_session();
+        let provider_id = provider_id.to_owned();
+        Box::pin(async move {
+            let runtime = session
+                .model_runtime_handle()
+                .ok_or_else(|| "No model runtime available".to_owned())?;
+            runtime
+                .logout(&provider_id)
+                .await
+                .map_err(|e| e.to_string())
+        })
     }
 
     fn last_assistant_text(&self) -> BoxFuture<'_, Result<Option<String>, String>> {
@@ -5212,20 +5596,34 @@ impl SessionHost for AgentSessionHost {
         })
     }
 
-    fn import_jsonl(&self, path: &str) -> BoxFuture<'_, Result<(), String>> {
+    fn import_jsonl(
+        &self,
+        path: &str,
+        cwd_override: Option<&str>,
+    ) -> BoxFuture<'_, Result<bool, ImportError>> {
         let runtime = Arc::clone(&self.runtime);
         let host_session = Arc::clone(&self.session);
         let path = path.to_owned();
+        let cwd_override = cwd_override.map(str::to_owned);
         Box::pin(async move {
-            runtime
-                .import_from_jsonl(&path, None)
+            let outcome = runtime
+                .import_from_jsonl(&path, cwd_override.as_deref())
                 .await
-                .map(|_| ())
-                .map_err(|err| runtime_err_to_string(&err))?;
-            if let Ok(mut guard) = host_session.write() {
+                .map_err(|err| match err {
+                    AgentSessionRuntimeError::MissingSessionCwd => ImportError::MissingCwd {
+                        fallback_cwd: runtime.cwd(),
+                    },
+                    AgentSessionRuntimeError::ImportNotFound(inner) => {
+                        ImportError::FileNotFound(inner.to_string())
+                    }
+                    other => ImportError::Other(runtime_err_to_string(&other)),
+                })?;
+            if !outcome.cancelled
+                && let Ok(mut guard) = host_session.write()
+            {
                 *guard = runtime.session();
             }
-            Ok(())
+            Ok(!outcome.cancelled)
         })
     }
 
@@ -5369,6 +5767,7 @@ where
 ///
 /// Returns an error string when terminal initialization fails. The caller
 /// should surface it on stderr and exit nonzero.
+#[allow(clippy::too_many_lines)]
 pub async fn run_interactive_mode(
     runtime: Arc<AgentSessionRuntime>,
     mut options: InteractiveRuntimeOptions,
@@ -5456,6 +5855,17 @@ pub async fn run_interactive_mode(
     options.theme = startup_theme(host_arc.as_ref(), options.terminal_theme);
     let mut rt = InteractiveRuntime::new(tui, input, host_arc, &options);
 
+    // Reset extension-owned UI on every session invalidation (ports upstream
+    // `setBeforeSessionInvalidate(() => resetExtensionUI())`). The synchronous
+    // teardown callback sets a flag that the runtime applies on its next
+    // `rebind_session_channels`, covering /new, /fork, /clone, /import, /resume.
+    {
+        let reset_flag = Arc::clone(&rt.reset_ui_flag);
+        runtime.set_before_session_invalidate(Some(Arc::new(move || {
+            reset_flag.store(true, std::sync::atomic::Ordering::Release);
+        })));
+    }
+
     // 5. Drive the loop. Suspend restores the terminal, raises SIGTSTP on
     //    Unix, then resumes/resizes and re-enters run() without exiting.
     let exit = loop {
@@ -5502,6 +5912,7 @@ pub async fn run_interactive_mode(
     // 6. Drop runtime first so any final paint commits before guard restore.
     drop(rt);
     runtime.set_rebind_session(None);
+    runtime.set_before_session_invalidate(None);
 
     // 7. Guard restores on Drop. Convert exit kind to a process exit code.
     let code = match exit {
@@ -5834,6 +6245,8 @@ mod tests {
     use crate::core::agent_session::events::AgentSessionEvent;
     use crate::modes::interactive::state::SelectorKind;
 
+    type TestResult = Result<(), String>;
+
     /// Records every action dispatched to it; tests assert on the call log.
     #[derive(Default)]
     struct ActionLog {
@@ -5850,7 +6263,7 @@ mod tests {
         forks: Mutex<Vec<String>>,
         clones: Mutex<u32>,
         switches: Mutex<Vec<String>>,
-        logouts: Mutex<u32>,
+        logout_ids: Mutex<Vec<String>>,
         imports: Mutex<Vec<String>>,
         shares: Mutex<u32>,
         follows: Mutex<Vec<String>>,
@@ -5867,6 +6280,8 @@ mod tests {
         snapshot: Arc<std::sync::Mutex<SessionSnapshot>>,
         event_senders: Arc<std::sync::Mutex<Vec<mpsc::UnboundedSender<AgentSessionEvent>>>>,
         stream_chunks: Arc<AtomicUsize>,
+        logout_options: Arc<std::sync::Mutex<Vec<super::state::LogoutOption>>>,
+        clone_nothing: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl FakeHost {
@@ -5879,12 +6294,25 @@ mod tests {
                 snapshot: Arc::new(std::sync::Mutex::new(SessionSnapshot::default())),
                 event_senders: Arc::new(std::sync::Mutex::new(Vec::new())),
                 stream_chunks: Arc::new(AtomicUsize::new(0)),
+                logout_options: Arc::new(std::sync::Mutex::new(Vec::new())),
+                clone_nothing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             };
             (host, log)
         }
 
         fn set_stream_chunks(&self, chunks: usize) {
             self.stream_chunks.store(chunks, Ordering::SeqCst);
+        }
+
+        fn set_logout_options(&self, options: Vec<super::state::LogoutOption>) {
+            *self
+                .logout_options
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = options;
+        }
+
+        fn set_clone_nothing(&self, nothing: bool) {
+            self.clone_nothing.store(nothing, Ordering::SeqCst);
         }
     }
 
@@ -6098,11 +6526,14 @@ mod tests {
             })
         }
 
-        fn clone(&self) -> BoxFuture<'_, Result<(), String>> {
+        fn clone(&self) -> BoxFuture<'_, Result<CloneOutcome, String>> {
+            if self.clone_nothing.load(Ordering::SeqCst) {
+                return Box::pin(async { Ok(CloneOutcome::NothingToClone) });
+            }
             let log = Arc::clone(&self.log);
             Box::pin(async move {
                 *log.clones.lock().await += 1;
-                Ok(())
+                Ok(CloneOutcome::Cloned)
             })
         }
 
@@ -6124,12 +6555,16 @@ mod tests {
             Box::pin(async move { Ok(owned.unwrap_or_else(|| "session.jsonl".to_owned())) })
         }
 
-        fn import_jsonl(&self, path: &str) -> BoxFuture<'_, Result<(), String>> {
+        fn import_jsonl(
+            &self,
+            path: &str,
+            _cwd_override: Option<&str>,
+        ) -> BoxFuture<'_, Result<bool, ImportError>> {
             let log = Arc::clone(&self.log);
             let owned = path.to_owned();
             Box::pin(async move {
                 log.imports.lock().await.push(owned);
-                Ok(())
+                Ok(true)
             })
         }
 
@@ -6161,16 +6596,31 @@ mod tests {
             })
         }
 
-        fn set_session_name(&self, _name: &str) -> BoxFuture<'_, Result<(), String>> {
-            Box::pin(async { Ok(()) })
+        fn set_session_name(&self, name: &str) -> BoxFuture<'_, Result<Option<String>, String>> {
+            // Mirror the real manager's whitespace normalization so tests can
+            // exercise the normalization warning.
+            let normalized = name.split_whitespace().collect::<Vec<_>>().join(" ");
+            Box::pin(async move { Ok((!normalized.is_empty()).then_some(normalized)) })
         }
 
-        fn logout(&self) -> BoxFuture<'_, Result<(), String>> {
+        fn logout(&self, provider_id: &str) -> BoxFuture<'_, Result<(), String>> {
             let log = Arc::clone(&self.log);
+            let id = provider_id.to_owned();
             Box::pin(async move {
-                *log.logouts.lock().await += 1;
+                log.logout_ids.lock().await.push(id);
                 Ok(())
             })
+        }
+
+        fn logout_provider_options(
+            &self,
+        ) -> BoxFuture<'_, Result<Vec<super::state::LogoutOption>, String>> {
+            let options = self
+                .logout_options
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            Box::pin(async move { Ok(options) })
         }
 
         fn messages(&self) -> Vec<pi_agent::AgentMessage> {
@@ -7937,6 +8387,292 @@ mod tests {
             Some(MessageView::Custom(custom))
                 if custom.custom_type == "name" && custom.text.contains("my-session")
         ));
+    }
+
+    #[tokio::test]
+    async fn reload_resets_extension_ui() -> TestResult {
+        let (mut rt, _log) = try_make_runtime()?;
+        rt.view.working_message = Some("Custom…".to_owned());
+        rt.view.working_visible = false;
+        rt.view
+            .footer
+            .extension_statuses
+            .insert("ext".to_owned(), "busy".to_owned());
+        let mut message = AssistantMessage::new("test", "test", "test", 0);
+        message
+            .content
+            .push(AssistantContent::Text(TextContent::new("hi")));
+        rt.view
+            .messages
+            .push(MessageView::Assistant(AssistantMessageView {
+                message,
+                hide_thinking: true,
+                hidden_thinking_label: "Custom label".to_owned(),
+                streaming: false,
+            }));
+
+        let outcome = rt.dispatch_action(ViewAction::Reload).await;
+
+        assert_eq!(outcome, ActionOutcome::Repaint);
+        assert!(rt.view.working_message.is_none());
+        assert!(rt.view.working_visible);
+        assert!(rt.view.footer.extension_statuses.is_empty());
+        assert!(
+            rt.view.messages.iter().all(|message| match message {
+                MessageView::Assistant(view) => view.hidden_thinking_label == "Thinking…",
+                _ => true,
+            }),
+            "hidden thinking label must reset to default"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_invalidate_flag_resets_extension_ui() -> TestResult {
+        let (mut rt, _log) = try_make_runtime()?;
+        rt.view.working_message = Some("Custom…".to_owned());
+        rt.view.working_visible = false;
+        rt.view
+            .footer
+            .extension_statuses
+            .insert("ext".to_owned(), "busy".to_owned());
+        // A plain rebind (no invalidate) must NOT reset extension UI.
+        rt.rebind_session_channels().await;
+        assert_eq!(rt.view.working_message.as_deref(), Some("Custom…"));
+        assert!(!rt.view.working_visible);
+        assert!(rt.view.footer.extension_statuses.contains_key("ext"));
+        // The before_session_invalidate callback sets the flag; next rebind resets.
+        rt.reset_ui_flag.store(true, Ordering::Release);
+        rt.rebind_session_channels().await;
+        assert!(rt.view.working_message.is_none());
+        assert!(rt.view.working_visible);
+        assert!(rt.view.footer.extension_statuses.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reload_guarded_while_streaming_and_compacting() -> TestResult {
+        let (mut rt, log) = try_make_runtime()?;
+        rt.session
+            .snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .activity = SessionActivity::Streaming;
+        let _ = rt.dispatch_action(ViewAction::Reload).await;
+        assert_eq!(*log.reloads.lock().await, 0);
+        assert!(matches!(
+            rt.view.messages.last(),
+            Some(MessageView::Custom(custom))
+                if custom.custom_type == "reload" && custom.text.contains("current response")
+        ));
+        rt.session
+            .snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .activity = SessionActivity::Compacting;
+        let _ = rt.dispatch_action(ViewAction::Reload).await;
+        assert_eq!(*log.reloads.lock().await, 0);
+        assert!(matches!(
+            rt.view.messages.last(),
+            Some(MessageView::Custom(custom))
+                if custom.custom_type == "reload" && custom.text.contains("compaction")
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn import_confirm_decline_cancels() -> TestResult {
+        let (mut rt, log) = try_make_runtime()?;
+        let _ = rt
+            .submit_text("/import session.jsonl".to_owned(), false)
+            .await;
+        assert_eq!(rt.active_selector_kind, Some(SelectorKind::ImportConfirm));
+        let _ = rt
+            .dispatch_action(ViewAction::SelectConfirmed {
+                selector: SelectorKind::ImportConfirm,
+                value: "false".to_owned(),
+            })
+            .await;
+        assert!(log.imports.lock().await.is_empty());
+        assert!(rt.active_selector_kind.is_none());
+        assert!(matches!(
+            rt.view.messages.last(),
+            Some(MessageView::Custom(custom))
+                if custom.custom_type == "import" && custom.text.contains("Import cancelled")
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn import_confirm_accept_runs_import() -> TestResult {
+        let (mut rt, log) = try_make_runtime()?;
+        let _ = rt
+            .submit_text("/import session.jsonl".to_owned(), false)
+            .await;
+        let _ = rt
+            .dispatch_action(ViewAction::SelectConfirmed {
+                selector: SelectorKind::ImportConfirm,
+                value: "true".to_owned(),
+            })
+            .await;
+        assert_eq!(
+            log.imports.lock().await.as_slice(),
+            &["session.jsonl".to_owned()]
+        );
+        assert!(matches!(
+            rt.view.messages.last(),
+            Some(MessageView::Custom(custom))
+                if custom.custom_type == "import" && custom.text.contains("Session imported from")
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn logout_lists_credentials_and_removes_selected() -> TestResult {
+        let (mut rt, log) = try_make_runtime()?;
+        rt.session.set_logout_options(vec![
+            super::state::LogoutOption {
+                id: "anthropic".to_owned(),
+                name: "Anthropic".to_owned(),
+                is_oauth: true,
+            },
+            super::state::LogoutOption {
+                id: "openai".to_owned(),
+                name: "OpenAI".to_owned(),
+                is_oauth: false,
+            },
+        ]);
+        let _ = rt.dispatch_action(ViewAction::Logout).await;
+        assert_eq!(rt.active_selector_kind, Some(SelectorKind::Logout));
+        let _ = rt
+            .dispatch_action(ViewAction::SelectConfirmed {
+                selector: SelectorKind::Logout,
+                value: "anthropic".to_owned(),
+            })
+            .await;
+        assert_eq!(
+            log.logout_ids.lock().await.as_slice(),
+            &["anthropic".to_owned()]
+        );
+        assert!(matches!(
+            rt.view.messages.last(),
+            Some(MessageView::Custom(custom))
+                if custom.custom_type == "logout" && custom.text.contains("Logged out of Anthropic")
+        ));
+        // Second round exercises the API-key wording.
+        let _ = rt.dispatch_action(ViewAction::Logout).await;
+        let _ = rt
+            .dispatch_action(ViewAction::SelectConfirmed {
+                selector: SelectorKind::Logout,
+                value: "openai".to_owned(),
+            })
+            .await;
+        assert!(matches!(
+            rt.view.messages.last(),
+            Some(MessageView::Custom(custom))
+                if custom.custom_type == "logout"
+                    && custom.text.contains("Removed stored API key for OpenAI")
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn logout_with_no_credentials_shows_notice() -> TestResult {
+        let (mut rt, log) = try_make_runtime()?;
+        let _ = rt.dispatch_action(ViewAction::Logout).await;
+        assert!(rt.active_selector_kind.is_none());
+        assert!(log.logout_ids.lock().await.is_empty());
+        assert!(matches!(
+            rt.view.messages.last(),
+            Some(MessageView::Custom(custom))
+                if custom.custom_type == "logout" && custom.text.contains("No stored credentials")
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn name_warns_when_normalized() -> TestResult {
+        let (mut rt, _log) = try_make_runtime()?;
+        let _ = rt
+            .submit_text("/name  spaced   out ".to_owned(), false)
+            .await;
+        let notices: Vec<String> = rt
+            .view
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                MessageView::Custom(custom) if custom.custom_type == "name" => {
+                    Some(custom.text.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            notices
+                .iter()
+                .any(|text| text.contains("was normalized from")),
+            "expected normalization warning: {notices:?}"
+        );
+        assert!(
+            notices
+                .iter()
+                .any(|text| text.contains("Session name set: spaced out")),
+            "expected normalized set notice: {notices:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn clone_guard_shows_nothing_to_clone() -> TestResult {
+        let (mut rt, log) = try_make_runtime()?;
+        rt.session.set_clone_nothing(true);
+        let _ = rt.submit_text("/clone".to_owned(), false).await;
+        assert_eq!(*log.clones.lock().await, 0);
+        assert!(matches!(
+            rt.view.messages.last(),
+            Some(MessageView::Custom(custom))
+                if custom.custom_type == "clone" && custom.text.contains("Nothing to clone yet")
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn clone_success_shows_notice() -> TestResult {
+        let (mut rt, log) = try_make_runtime()?;
+        let _ = rt.submit_text("/clone".to_owned(), false).await;
+        assert_eq!(*log.clones.lock().await, 1);
+        assert!(matches!(
+            rt.view.messages.last(),
+            Some(MessageView::Custom(custom))
+                if custom.custom_type == "clone" && custom.text.contains("Cloned to new session")
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn new_session_success_shows_notice() -> TestResult {
+        let (mut rt, log) = try_make_runtime()?;
+        let _ = rt.submit_text("/new".to_owned(), false).await;
+        assert_eq!(*log.new_sessions.lock().await, 1);
+        assert!(matches!(
+            rt.view.messages.last(),
+            Some(MessageView::Custom(custom))
+                if custom.custom_type == "new" && custom.text.contains("New session started")
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn export_uppercase_jsonl_uses_html() -> TestResult {
+        let (mut rt, _log) = try_make_runtime()?;
+        // Upstream `endsWith(".jsonl")` is case-sensitive → `.JSONL` exports HTML.
+        let _ = rt.submit_text("/export out.JSONL".to_owned(), false).await;
+        assert!(matches!(
+            rt.view.messages.last(),
+            Some(MessageView::Custom(custom))
+                if custom.custom_type == "export" && custom.text.contains("<html></html>")
+        ));
+        Ok(())
     }
 
     #[tokio::test]

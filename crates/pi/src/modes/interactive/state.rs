@@ -439,6 +439,21 @@ pub struct AuthSelectorEntry {
     pub description: Option<String>,
 }
 
+/// One stored credential offered by the `/logout` selector.
+///
+/// Ports the `AuthSelectorProvider` shape upstream builds in
+/// `getLogoutProviderOptions`: the runtime keeps the fetched list so the
+/// confirm handler can format the removal notice by credential kind.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogoutOption {
+    /// Provider id the credential belongs to.
+    pub id: String,
+    /// Provider display name (falls back to the id).
+    pub name: String,
+    /// Whether the credential is an OAuth credential (vs a stored API key).
+    pub is_oauth: bool,
+}
+
 /// OAuth progress state.
 #[derive(Clone, Debug)]
 pub struct AuthProgress {
@@ -770,6 +785,12 @@ pub enum SelectorKind {
     ScopedModels,
     /// Theme selector (`/theme`).
     Theme,
+    /// `/import` replace-session confirmation (Yes/No).
+    ImportConfirm,
+    /// `/import` continue-in-fallback-cwd confirmation (Yes/No).
+    ImportCwdConfirm,
+    /// `/logout` stored-credential selector.
+    Logout,
 }
 
 impl From<EventResult> for ViewAction {

@@ -671,59 +671,90 @@ async fn handle_runtime_metadata(
         ListModels::Search(search) => Some(search.to_lowercase()),
         ListModels::All | ListModels::None => None,
     };
-    let model_runtime = handle.runtime.session().model_runtime_handle();
-    if let Some(model_runtime) = model_runtime
-        && let Ok(models) = model_runtime.get_available(None).await
-    {
-        let load_error = model_runtime.get_error();
-        if let Some(message) = load_error.as_deref() {
-            io.write_stderr(&format!("Warning: errors loading models.json:\n{message}"));
-        }
-        let mut filtered: Vec<&pi_ai::Model> = models
-            .iter()
-            .filter(|model| match &pattern {
-                Some(search) => {
-                    model.provider.to_lowercase().contains(search)
-                        || model.id.to_lowercase().contains(search)
-                }
-                None => true,
-            })
-            .collect();
-        filtered.sort_by(|left, right| {
-            left.provider
-                .cmp(&right.provider)
-                .then_with(|| left.id.cmp(&right.id))
-        });
-        let header = ListModelsRow {
-            provider: "provider".to_owned(),
-            model: "model".to_owned(),
-            context: "context".to_owned(),
-            max_out: "max-out".to_owned(),
-            thinking: "thinking".to_owned(),
-            images: "images".to_owned(),
-        };
-        let rows: Vec<ListModelsRow> = filtered
-            .iter()
-            .map(|model| ListModelsRow {
-                provider: model.provider.clone(),
-                model: model.id.clone(),
-                context: format_token_count(model.context_window),
-                max_out: format_token_count(model.max_tokens),
-                thinking: if model.reasoning { "yes" } else { "no" }.to_owned(),
-                images: if model
-                    .input
-                    .iter()
-                    .any(|m| matches!(m, pi_ai::ModelInput::Image))
-                {
-                    "yes"
-                } else {
-                    "no"
-                }
-                .to_owned(),
-            })
-            .collect();
-        emit_list_models_table(io, &header, &rows);
+    let model_runtime = handle.runtime.session().model_runtime_handle()?;
+    render_list_models(io, model_runtime.as_ref(), pattern.as_deref()).await
+}
+
+/// Render the `--list-models` table or its empty/no-match messages.
+async fn render_list_models(
+    io: &dyn BootstrapIo,
+    model_runtime: &crate::core::model_runtime::ModelRuntime,
+    pattern: Option<&str>,
+) -> Option<BootstrapOutcome> {
+    let Ok(models) = model_runtime.get_available(None).await else {
+        return Some(exit(0, false));
+    };
+    let load_error = model_runtime.get_error();
+    if let Some(message) = load_error.as_deref() {
+        io.write_stderr(&format!("Warning: errors loading models.json:\n{message}"));
     }
+    if models.is_empty() {
+        io.write_stdout(&crate::core::agent_session_services::format_no_models_available_message());
+        return Some(exit(0, false));
+    }
+
+    let mut filtered: Vec<&pi_ai::Model> = if let Some(search) = pattern {
+        #[derive(Clone)]
+        struct ModelRefWithText<'a> {
+            model: &'a pi_ai::Model,
+            text: String,
+        }
+        let wrapped: Vec<ModelRefWithText> = models
+            .iter()
+            .map(|model| ModelRefWithText {
+                model,
+                text: format!("{} {}", model.provider, model.id),
+            })
+            .collect();
+        pi_tui::fuzzy::fuzzy_filter(&wrapped, search, |item| &item.text)
+            .iter()
+            .map(|item| item.model)
+            .collect()
+    } else {
+        models.iter().collect()
+    };
+
+    if filtered.is_empty()
+        && let Some(search) = pattern
+    {
+        io.write_stdout(&format!(r#"No models matching "{search}""#));
+        return Some(exit(0, false));
+    }
+
+    filtered.sort_by(|left, right| {
+        left.provider
+            .cmp(&right.provider)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let header = ListModelsRow {
+        provider: "provider".to_owned(),
+        model: "model".to_owned(),
+        context: "context".to_owned(),
+        max_out: "max-out".to_owned(),
+        thinking: "thinking".to_owned(),
+        images: "images".to_owned(),
+    };
+    let rows: Vec<ListModelsRow> = filtered
+        .iter()
+        .map(|model| ListModelsRow {
+            provider: model.provider.clone(),
+            model: model.id.clone(),
+            context: format_token_count(model.context_window),
+            max_out: format_token_count(model.max_tokens),
+            thinking: if model.reasoning { "yes" } else { "no" }.to_owned(),
+            images: if model
+                .input
+                .iter()
+                .any(|m| matches!(m, pi_ai::ModelInput::Image))
+            {
+                "yes"
+            } else {
+                "no"
+            }
+            .to_owned(),
+        })
+        .collect();
+    emit_list_models_table(io, &header, &rows);
     Some(exit(0, false))
 }
 
@@ -749,22 +780,30 @@ fn format_token_count(count: u64) -> String {
     const ONE_MILLION: u64 = 1_000_000;
     const ONE_THOUSAND: u64 = 1_000;
     if count >= ONE_MILLION {
-        let millions = count / ONE_THOUSAND;
-        let whole = millions.is_multiple_of(ONE_THOUSAND);
-        let value = f64::from(u32::try_from(millions).unwrap_or(u32::MAX)) / 1000.0;
-        if whole {
-            format!("{value:.0}M")
+        let whole = count / ONE_MILLION;
+        let remainder = count % ONE_MILLION;
+        if remainder == 0 {
+            format!("{whole}M")
         } else {
-            format!("{value:.1}M")
+            let tenths = (remainder * 10 + ONE_MILLION / 2) / ONE_MILLION;
+            if tenths == 10 {
+                format!("{}.0M", whole + 1)
+            } else {
+                format!("{whole}.{tenths}M")
+            }
         }
     } else if count >= ONE_THOUSAND {
-        let thousands = count / 10;
-        let whole = thousands.is_multiple_of(100);
-        let value = f64::from(u32::try_from(thousands).unwrap_or(u32::MAX)) / 100.0;
-        if whole {
-            format!("{value:.0}K")
+        let whole = count / ONE_THOUSAND;
+        let remainder = count % ONE_THOUSAND;
+        if remainder == 0 {
+            format!("{whole}K")
         } else {
-            format!("{value:.1}K")
+            let tenths = (remainder * 10 + ONE_THOUSAND / 2) / ONE_THOUSAND;
+            if tenths == 10 {
+                format!("{}.0K", whole + 1)
+            } else {
+                format!("{whole}.{tenths}K")
+            }
         }
     } else {
         count.to_string()
@@ -1315,6 +1354,9 @@ mod tests {
         supports_interactive: bool,
         /// When true, build a lightweight runtime with a non-`unknown` model.
         succeed: bool,
+        /// Models exposed by the runtime's model catalog. Empty yields an empty
+        /// availability list for `--list-models` tests.
+        models: Vec<pi_ai::Model>,
     }
 
     #[derive(Clone)]
@@ -1353,6 +1395,77 @@ mod tests {
         }
     }
 
+    /// Build a deterministic in-memory model runtime seeded with `models`.
+    ///
+    /// Each model's provider is registered with a synthetic API key so the
+    /// composed models appear in `get_available(None)`.
+    async fn build_fake_model_runtime(
+        models: Vec<pi_ai::Model>,
+    ) -> Result<Arc<crate::core::model_runtime::ModelRuntime>, String> {
+        use std::collections::BTreeMap;
+
+        use crate::core::model_runtime::{
+            CreateModelRuntimeOptions, ModelRuntime, ModelsJsonConfig, ProviderConfigInput,
+            ProviderModelDefinition,
+        };
+        use pi_ai::auth::InMemoryCredentialStore;
+        use pi_ai::models_store::InMemoryModelsStore;
+
+        let mut grouped: BTreeMap<String, (ProviderConfigInput, Vec<ProviderModelDefinition>)> =
+            BTreeMap::new();
+        for model in models {
+            let (_, defs) = grouped.entry(model.provider.clone()).or_insert_with(|| {
+                (
+                    ProviderConfigInput {
+                        name: Some(model.provider.clone()),
+                        api: Some(model.api.clone()),
+                        base_url: Some(model.base_url.clone()),
+                        ..Default::default()
+                    },
+                    Vec::new(),
+                )
+            });
+            defs.push(ProviderModelDefinition {
+                id: model.id,
+                name: Some(model.name),
+                api: Some(model.api),
+                base_url: Some(model.base_url),
+                reasoning: model.reasoning,
+                thinking_level_map: model.thinking_level_map,
+                input: Some(model.input),
+                cost: Some(model.cost),
+                context_window: Some(model.context_window),
+                max_tokens: Some(model.max_tokens),
+                headers: model.headers,
+                compat: model.compat,
+            });
+        }
+        let providers: BTreeMap<String, ProviderConfigInput> = grouped
+            .into_iter()
+            .map(|(id, (mut config, defs))| {
+                config.models = Some(defs);
+                (id, config)
+            })
+            .collect();
+
+        let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
+            credentials: Some(Arc::new(InMemoryCredentialStore::new())),
+            models_store: Some(Arc::new(InMemoryModelsStore::new())),
+            models_config: Some(ModelsJsonConfig::from_providers(providers.clone())),
+            allow_model_network: Some(false),
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+        for provider in providers.keys() {
+            runtime
+                .set_runtime_api_key(provider, "sk-test")
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(Arc::new(runtime))
+    }
+
     #[derive(Default)]
     struct StubRuntimeFactory;
 
@@ -1388,15 +1501,17 @@ mod tests {
                 options.session_manager.get_session_id()
             ));
             let succeed = self.succeed;
+            let models = self.models.clone();
             Box::pin(async move {
                 if !succeed {
                     return Err("__fake_factory_unavailable__".to_owned());
                 }
-                let config = crate::core::agent_session::AgentSessionConfig::test_config(
+                let mut config = crate::core::agent_session::AgentSessionConfig::test_config(
                     Arc::new(StubProvider),
                     fake_runtime_model(),
                 )
                 .map_err(|e| e.to_string())?;
+                config.model_runtime = Some(build_fake_model_runtime(models).await?);
                 let session = crate::core::agent_session::AgentSession::new(config)
                     .map_err(|e| e.to_string())?;
                 let runtime = AgentSessionRuntime::new(
@@ -2134,6 +2249,108 @@ mod tests {
             lock_recover(&host_errors).is_empty(),
             "fake host reported errors: {:?}",
             lock_recover(&host_errors).clone()
+        );
+        Ok(())
+    }
+
+    // ----- list-models tests -------------------------------------------------
+
+    #[test]
+    fn format_token_count_boundary_cases() {
+        assert_eq!(format_token_count(999), "999");
+        assert_eq!(format_token_count(1000), "1K");
+        assert_eq!(format_token_count(1500), "1.5K");
+        assert_eq!(format_token_count(1_000_000), "1M");
+        assert_eq!(format_token_count(1_500_000), "1.5M");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_list_models_empty_catalog_message() -> Result<(), String> {
+        let io = Arc::new(FakeIo::new());
+        let factory = Arc::new(FakeFactory {
+            succeed: true,
+            ..FakeFactory::default()
+        });
+        let pkg_out = CapturedOutput::default();
+        let pkg = FakePackageHandler::default();
+        let outcome = run_bootstrap(BootstrapInputs {
+            args: args_vec(&["--list-models"]),
+            io: &io,
+            factory: &factory,
+            package_handler: &pkg,
+            package_output: &pkg_out,
+        })
+        .await;
+        assert_exit_code(outcome, 0)?;
+        let stdout = io.stdout_lines();
+        let expected = crate::core::agent_session_services::format_no_models_available_message();
+        assert!(
+            stdout.iter().any(|line| line.contains(&expected)),
+            "expected empty-catalog message in stdout: {stdout:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bootstrap_list_models_no_match_message() -> Result<(), String> {
+        let io = Arc::new(FakeIo::new());
+        let factory = Arc::new(FakeFactory {
+            succeed: true,
+            models: vec![fake_runtime_model()],
+            ..FakeFactory::default()
+        });
+        let pkg_out = CapturedOutput::default();
+        let pkg = FakePackageHandler::default();
+        let outcome = run_bootstrap(BootstrapInputs {
+            args: args_vec(&["--list-models", "nomatch"]),
+            io: &io,
+            factory: &factory,
+            package_handler: &pkg,
+            package_output: &pkg_out,
+        })
+        .await;
+        assert_exit_code(outcome, 0)?;
+        let stdout = io.stdout_lines();
+        assert!(
+            stdout
+                .iter()
+                .any(|line| line.contains(r#"No models matching "nomatch""#)),
+            "expected no-match message in stdout: {stdout:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bootstrap_list_models_fuzzy_non_substring_match() -> Result<(), String> {
+        let mut model = fake_runtime_model();
+        model.provider = "openai".to_owned();
+        model.id = "o3-mini".to_owned();
+        model.name = model.id.clone();
+        model.api = "openai".to_owned();
+        model.base_url = "https://example.com".to_owned();
+        let io = Arc::new(FakeIo::new());
+        let factory = Arc::new(FakeFactory {
+            succeed: true,
+            models: vec![model],
+            ..FakeFactory::default()
+        });
+        let pkg_out = CapturedOutput::default();
+        let pkg = FakePackageHandler::default();
+        let outcome = run_bootstrap(BootstrapInputs {
+            args: args_vec(&["--list-models", "opmini"]),
+            io: &io,
+            factory: &factory,
+            package_handler: &pkg,
+            package_output: &pkg_out,
+        })
+        .await;
+        assert_exit_code(outcome, 0)?;
+        let stdout = io.stdout_lines();
+        assert!(
+            stdout
+                .iter()
+                .any(|line| line.contains("openai") && line.contains("o3-mini")),
+            "expected fuzzy-matched model row in stdout: {stdout:?}"
         );
         Ok(())
     }
