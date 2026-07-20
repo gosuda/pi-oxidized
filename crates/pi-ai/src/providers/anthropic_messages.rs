@@ -11,8 +11,8 @@ use serde_json::{Map, Value, json};
 use crate::provider::{Provider, StreamOptions};
 use crate::types::{
     AssistantContent, AssistantMessage, AssistantMessageEvent, CacheRetention, Context, DoneReason,
-    ErrorReason, Message, Model, StopReason, ThinkingContent, ToolCall, ToolResultContent,
-    UserContent, UserMessageContent,
+    ErrorReason, Message, Model, ModelThinkingLevel, StopReason, ThinkingContent, ToolCall,
+    ToolResultContent, UserContent, UserMessageContent,
 };
 
 use super::shared::{
@@ -340,7 +340,15 @@ fn insert_thinking(payload: &mut Map<String, Value>, model: &Model, options: &St
             }
         }
         Some(false) => {
-            payload.insert("thinking".to_owned(), json!({ "type": "disabled" }));
+            // Upstream omits the explicit disable when the model's thinking
+            // level map pins `off` to null (adaptive-only models).
+            let off_is_null = model
+                .thinking_level_map
+                .as_ref()
+                .is_some_and(|map| map.get(&ModelThinkingLevel::Off) == Some(&None));
+            if !off_is_null {
+                payload.insert("thinking".to_owned(), json!({ "type": "disabled" }));
+            }
         }
         None => {}
     }
@@ -1265,6 +1273,28 @@ mod tests {
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
         );
         assert_eq!(payload["messages"][2]["content"][0]["tool_use_id"], tool_id);
+    }
+
+    #[test]
+    fn thinking_disable_respects_off_null_sentinel() {
+        let context = Context::default();
+        let mut options = StreamOptions::default();
+        options
+            .extra
+            .insert("thinkingEnabled".to_owned(), Value::Bool(false));
+
+        // Plain reasoning model: explicit disable is sent (upstream parity).
+        let payload = build_payload(&model(), &context, &options);
+        assert_eq!(payload["thinking"]["type"], "disabled");
+
+        // off:null pins the level as unsupported: the disable is omitted.
+        let mut adaptive = model();
+        adaptive.thinking_level_map = Some(std::collections::BTreeMap::from([(
+            ModelThinkingLevel::Off,
+            None,
+        )]));
+        let payload = build_payload(&adaptive, &context, &options);
+        assert!(payload.get("thinking").is_none());
     }
 
     #[test]
