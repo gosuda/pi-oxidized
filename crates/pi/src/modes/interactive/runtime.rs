@@ -1463,10 +1463,8 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         let Some(event) = self.intercept_terminal_input(event).await else {
             return Ok(());
         };
-        if self.route_extension_input(&event) {
-            return Ok(());
-        }
-        // First-run wizard owns all keys while its overlay is up.
+        // First-run wizard owns all keys while its overlay is up; a focused
+        // extension slot must not steal them.
         if self.first_run.is_some()
             && let UiEvent::Key(key_event) = &event
         {
@@ -1475,6 +1473,9 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 self.handle_first_run_key(code).await;
                 self.paint_frame()?;
             }
+            return Ok(());
+        }
+        if self.route_extension_input(&event) {
             return Ok(());
         }
         // Swap the editor (and active selector) into a throwaway-built
