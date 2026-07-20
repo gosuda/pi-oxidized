@@ -18,7 +18,7 @@ pub mod util;
 pub use image::{ImageComponent, ImageOptions, ImageTheme};
 pub use input::Input;
 pub use loader::{CancellableLoader, DEFAULT_LOADER_FRAMES, Loader, LoaderIndicatorOptions};
-pub use markdown::{DefaultTextStyle, Markdown, MarkdownOptions, MarkdownTheme};
+pub use markdown::{DefaultTextStyle, HighlightCodeFn, Markdown, MarkdownOptions, MarkdownTheme};
 pub use padded::Padded;
 pub use select_list::{
     SelectItem, SelectList, SelectListLayoutOptions, SelectListTheme,

@@ -618,6 +618,11 @@ pub fn make_fg(color: ThemeColor) -> fn(&str) -> String {
     }
 }
 
+/// Shared highlighter handle: `markdown_theme()` runs once per painted frame,
+/// so the `Arc<dyn Fn>` wrapper is built once and refcount-bumped per frame.
+static HIGHLIGHT_CODE: LazyLock<pi_tui::components::HighlightCodeFn> =
+    LazyLock::new(|| Arc::new(highlight_code));
+
 /// Build a markdown theme from [`current()`]. Mirrors `getMarkdownTheme()`.
 #[must_use]
 pub fn markdown_theme() -> MarkdownTheme {
@@ -636,7 +641,7 @@ pub fn markdown_theme() -> MarkdownTheme {
         italic,
         underline,
         strikethrough,
-        highlight_code: Some(Arc::new(highlight_code)),
+        highlight_code: Some(HIGHLIGHT_CODE.clone()),
         code_block_indent: "  ".to_owned(),
     }
 }

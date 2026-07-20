@@ -2,8 +2,6 @@
 //!
 //! Port of `.references/pi/packages/ai/src/utils/estimate.ts`.
 
-use serde_json::Value;
-
 use crate::types::{
     AssistantContent, Context, Message, StopReason, TextContent, Tool, ToolResultContent, Usage,
     UserContent, UserMessageContent,
@@ -48,7 +46,9 @@ fn utf16_len(text: &str) -> u64 {
     text.chars().map(|c| c.len_utf16() as u64).sum()
 }
 
-fn safe_json_stringify(value: &Value) -> String {
+/// Serialize for char counting; the "[unserializable]" marker keeps the
+/// estimate total even when a value cannot serialize (upstream fallback).
+fn stringify_or_marker<T: serde::Serialize>(value: &T) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "[unserializable]".to_owned())
 }
 
@@ -119,8 +119,8 @@ pub fn estimate_message_tokens(message: &Message) -> u64 {
                     }
                     AssistantContent::ToolCall(call) => {
                         chars = chars.saturating_add(utf16_len(&call.name));
-                        let args = Value::Object(call.arguments.clone());
-                        chars = chars.saturating_add(utf16_len(&safe_json_stringify(&args)));
+                        chars =
+                            chars.saturating_add(utf16_len(&stringify_or_marker(&call.arguments)));
                     }
                 }
             }
@@ -188,8 +188,7 @@ fn estimate_tools_tokens(tools: Option<&[Tool]>) -> u64 {
     let Some(tools) = tools.filter(|tools| !tools.is_empty()) else {
         return 0;
     };
-    let value = serde_json::to_value(tools).unwrap_or(Value::Null);
-    estimate_text_tokens(&safe_json_stringify(&value))
+    estimate_text_tokens(&stringify_or_marker(&tools))
 }
 
 /// Estimate context tokens for a [`Context`] or bare message list.
