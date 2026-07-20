@@ -908,6 +908,10 @@ pub struct InteractiveRuntime<W: Write, S: SessionHost> {
     /// slots re-measure/re-render (flows to the host via `theme.update` and
     /// back on measure/render requests).
     theme_generation: u64,
+    /// Set by [`Self::apply_theme`]; the event loop flushes it with
+    /// `push_theme_to_host` so previews and restores reach extension slots
+    /// while rapid highlight changes coalesce into one update.
+    theme_push_pending: bool,
     pending_ui_reinject: Vec<UiEvent>,
     extension_runner: Option<Arc<HostExtensionRunner>>,
     extension_events: Option<tokio::sync::broadcast::Receiver<ExtensionUiEvent>>,
@@ -1158,6 +1162,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             theme_preview_rx,
             theme_preview_tx,
             theme_preview_restore: None,
+            theme_push_pending: false,
             first_run: None,
             debug_dump_dir: crate::core::config::get_agent_dir(),
         };
@@ -1401,11 +1406,20 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 }
             }
 
-            // Run any pending settle as its own transaction.
-            self.settle_pending();
+            self.end_loop_turn().await;
         }
 
         Ok(self.finish_run().await)
+    }
+
+    /// Per-turn epilogue: flush a pending theme push (previews/restores mark
+    /// the theme dirty without pushing inline, so extension slots track the
+    /// switch while rapid changes coalesce) and settle as its own transaction.
+    async fn end_loop_turn(&mut self) {
+        if self.theme_push_pending {
+            self.push_theme_to_host().await;
+        }
+        self.settle_pending();
     }
 
     /// Record an unrecoverable terminal I/O failure and request exit.
@@ -2582,7 +2596,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
 
     /// Install `resolved` as the live theme: thread-local current, view theme,
     /// generation bump, and memoized chat-line cache invalidation. No-op when
-    /// the theme is unchanged. Callers push to the host afterwards.
+    /// the theme is unchanged. The event loop flushes the pending host push.
     fn apply_theme(&mut self, resolved: Arc<ResolvedTheme>) {
         if *resolved == *self.view.theme {
             return;
@@ -2590,6 +2604,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         super::theme::set_current(resolved.clone());
         self.view.theme = resolved;
         self.theme_generation = self.theme_generation.wrapping_add(1);
+        self.theme_push_pending = true;
         // Memoized chat lines carry baked-in ANSI colors; drop them all.
         self.chat_prefix_cache = None;
         self.chat_prefix_len = usize::MAX;
@@ -2628,6 +2643,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
 
     /// Push the active theme, catalog, and generation to the extension host.
     async fn push_theme_to_host(&mut self) {
+        self.theme_push_pending = false;
         let Some(runner) = self.extension_runner.as_ref() else {
             return;
         };
