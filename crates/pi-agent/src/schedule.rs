@@ -1490,6 +1490,7 @@ mod tests {
             cancel_seen: Arc::clone(&cancel_seen),
             ..RecordingTool::new("cancel-me")
         };
+        let started = Arc::clone(&tool.executed);
         let context = context_with(vec![Arc::new(tool)]);
         let assistant = assistant_with_calls(vec![ToolCall::new("c1", "cancel-me", Map::new())]);
         let config = sample_config(ToolExecutionMode::Parallel);
@@ -1501,7 +1502,17 @@ mod tests {
             execute_tool_calls(&context, &assistant, &config, &cancel_task, &emit).await
         });
 
-        sleep(Duration::from_millis(20)).await;
+        // Bounded wait for the tool to actually start; a fixed sleep loses the
+        // race under full-suite load and cancels before execution begins.
+        for _ in 0..500 {
+            if started.load(Ordering::SeqCst) {
+                break;
+            }
+            sleep(Duration::from_millis(2)).await;
+        }
+        if !started.load(Ordering::SeqCst) {
+            return Err("tool never started".to_owned());
+        }
         cancel.cancel();
         let batch = run
             .await
