@@ -105,6 +105,20 @@ pub type OnResponseFn = Arc<
 ///
 /// All optional scalar and map fields use `Option`. This type is not `Debug`
 /// or serde because it contains async callbacks.
+///
+/// # Shared implicit defaults (TypeScript parity)
+///
+/// When a field is `None`, adapters apply these defaults where the TypeScript
+/// port does the same:
+/// - `cache_retention`: `simple_options::DEFAULT_CACHE_RETENTION` (`short`),
+///   with `PI_CACHE_RETENTION=long` env override in adapters.
+/// - `max_retry_delay_ms`: `simple_options::DEFAULT_MAX_RETRY_DELAY_MS`
+///   (`60000`) in adapters that implement client-side retry (e.g. Codex).
+/// - [`Self::timeout_ms`] / [`Self::max_retries`]: left unset. TypeScript only
+///   forwards these to the OpenAI/Anthropic SDK when provided; SDK-internal
+///   defaults (10 minutes / 2 retries) are not reimplemented by pi-ai HTTP
+///   adapters, and the create path uses `maxRetries ?? 0`. Do not invent a
+///   crate-level timeout/retry default without a golden transcript requiring it.
 #[derive(Clone, Default)]
 pub struct StreamOptions {
     /// Sampling temperature.
@@ -123,6 +137,8 @@ pub struct StreamOptions {
     pub transport: Option<Transport>,
 
     /// Prompt cache retention preference.
+    ///
+    /// Default when unset: `short` (see module docs).
     pub cache_retention: Option<CacheRetention>,
 
     /// Optional session identifier for session-aware providers.
@@ -139,16 +155,23 @@ pub struct StreamOptions {
     pub headers: Option<BTreeMap<String, Option<String>>>,
 
     /// Request timeout in milliseconds.
+    ///
+    /// No crate-level default; see struct docs.
     pub timeout_ms: Option<u64>,
 
     /// WebSocket connect handshake timeout in milliseconds.
     pub websocket_connect_timeout_ms: Option<u64>,
 
     /// Maximum retry attempts for clients that support client-side retries.
+    ///
+    /// No crate-level default; adapters that pass this to SDKs use `0` when
+    /// unset (matching TypeScript `maxRetries ?? 0` on the create call).
     pub max_retries: Option<u32>,
 
     /// Maximum delay in milliseconds to honor when a server requests a long
     /// retry wait.
+    ///
+    /// Default when unset in retrying adapters: 60000 (see struct docs).
     pub max_retry_delay_ms: Option<u64>,
 
     /// Optional metadata to include in API requests.

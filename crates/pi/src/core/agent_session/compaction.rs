@@ -572,10 +572,7 @@ impl AgentSession {
                 })?;
 
             let api_key = auth.as_ref().and_then(|a| a.auth.api_key.clone());
-            let headers = auth
-                .as_ref()
-                .and_then(|a| a.auth.headers.clone())
-                .map(header_map_to_option);
+            let headers = auth.as_ref().and_then(|a| a.auth.headers.clone());
             let env = auth.and_then(|a| {
                 a.env.map(|provider_env| {
                     provider_env
@@ -781,12 +778,6 @@ fn thinking_level_str(level: pi_ai::ModelThinkingLevel) -> Option<String> {
     serde_json::to_value(level)
         .ok()
         .and_then(|v| v.as_str().map(str::to_owned))
-}
-
-/// Convert a provider header map to the `Option<String>` form expected by
-/// [`CompactOptions`].
-fn header_map_to_option(headers: BTreeMap<String, String>) -> BTreeMap<String, Option<String>> {
-    headers.into_iter().map(|(k, v)| (k, Some(v))).collect()
 }
 
 /// Parse an ISO-8601 timestamp to Unix milliseconds.

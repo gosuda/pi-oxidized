@@ -18,7 +18,11 @@ pub use super::error::AuthError;
 pub type ProviderEnv = BTreeMap<String, String>;
 
 /// Additional request headers derived from auth resolution.
-pub type ProviderHeaders = BTreeMap<String, String>;
+///
+/// A `None` value suppresses a provider/API default header with the same name,
+/// matching TypeScript `ProviderHeaders = Record<string, string | null>` and
+/// [`crate::provider::StreamOptions::headers`].
+pub type ProviderHeaders = BTreeMap<String, Option<String>>;
 
 /// Request auth for a single model request.
 ///
@@ -31,6 +35,8 @@ pub struct ModelAuth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
     /// Extra request headers contributed by auth.
+    ///
+    /// Values may be `None` to suppress a default header with the same name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub headers: Option<ProviderHeaders>,
     /// Per-credential base URL override (for example GitHub Copilot).
@@ -519,7 +525,10 @@ mod tests {
         let result = AuthResult {
             auth: ModelAuth {
                 api_key: Some("sk-test".into()),
-                headers: Some(BTreeMap::from([("X-Title".into(), "pi".into())])),
+                headers: Some(BTreeMap::from([
+                    ("X-Title".into(), Some("pi".into())),
+                    ("Authorization".into(), None),
+                ])),
                 base_url: Some("https://example.test".into()),
             },
             env: Some(BTreeMap::from([("FOO".into(), "bar".into())])),
@@ -528,7 +537,46 @@ mod tests {
         let value = serde_json::to_value(&result)?;
         assert_eq!(value["auth"]["apiKey"], json!("sk-test"));
         assert_eq!(value["auth"]["baseUrl"], json!("https://example.test"));
+        assert_eq!(value["auth"]["headers"]["X-Title"], json!("pi"));
+        assert_eq!(value["auth"]["headers"]["Authorization"], json!(null));
         assert_eq!(value["source"], json!("OAuth"));
+        let decoded: AuthResult = serde_json::from_value(value)?;
+        assert_eq!(
+            decoded
+                .auth
+                .headers
+                .as_ref()
+                .and_then(|h| h.get("Authorization")),
+            Some(&None)
+        );
         Ok(())
+    }
+
+    #[test]
+    fn null_auth_header_suppresses_default_at_merge() {
+        // Mirrors StreamOptions/adapter merge: None removes a default key.
+        let mut defaults = BTreeMap::from([
+            ("Authorization".to_owned(), "Bearer default".to_owned()),
+            ("X-Title".to_owned(), "pi".to_owned()),
+        ]);
+        let auth_headers: ProviderHeaders = BTreeMap::from([
+            ("Authorization".to_owned(), None),
+            ("X-Custom".to_owned(), Some("yes".to_owned())),
+        ]);
+        for (name, value) in &auth_headers {
+            if let Some(existing) = defaults
+                .keys()
+                .find(|existing| existing.eq_ignore_ascii_case(name))
+                .cloned()
+            {
+                defaults.remove(&existing);
+            }
+            if let Some(value) = value {
+                defaults.insert(name.clone(), value.clone());
+            }
+        }
+        assert!(!defaults.contains_key("Authorization"));
+        assert_eq!(defaults.get("X-Title").map(String::as_str), Some("pi"));
+        assert_eq!(defaults.get("X-Custom").map(String::as_str), Some("yes"));
     }
 }

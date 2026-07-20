@@ -454,16 +454,27 @@ pub fn resolve_config_value_or_error(
 }
 
 /// Resolve all header values with the same rules as API keys.
+///
+/// Present `None` values are suppression markers and pass through without
+/// config-value expansion. A failure to resolve any non-null template drops
+/// the whole map (matching the previous all-or-nothing behavior).
 #[must_use]
 pub fn resolve_headers(
-    headers: Option<&std::collections::BTreeMap<String, String>>,
+    headers: Option<&std::collections::BTreeMap<String, Option<String>>>,
     env: Option<&ConfigEnv>,
-) -> Option<std::collections::BTreeMap<String, String>> {
+) -> Option<std::collections::BTreeMap<String, Option<String>>> {
     let headers = headers?;
     let mut resolved = std::collections::BTreeMap::new();
     for (key, value) in headers {
-        let resolved_value = resolve_config_value(value, env)?;
-        resolved.insert(key.clone(), resolved_value);
+        match value {
+            None => {
+                resolved.insert(key.clone(), None);
+            }
+            Some(template) => {
+                let resolved_value = resolve_config_value(template, env)?;
+                resolved.insert(key.clone(), Some(resolved_value));
+            }
+        }
     }
     Some(resolved)
 }
@@ -487,6 +498,7 @@ fn command_cache_len() -> usize {
 
 #[cfg(test)]
 mod tests {
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
     use super::*;
 
     #[test]
@@ -592,6 +604,23 @@ mod tests {
         assert!(
             !marker.exists(),
             "the timed-out command's process group must not survive"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_headers_passes_null_suppression_and_expands_templates() -> TestResult {
+        clear_config_value_cache();
+        let env = ConfigEnv::from([("TOKEN".into(), "secret".into())]);
+        let headers = std::collections::BTreeMap::from([
+            ("Authorization".to_owned(), None),
+            ("X-Auth".to_owned(), Some("Bearer $TOKEN".to_owned())),
+        ]);
+        let resolved = resolve_headers(Some(&headers), Some(&env)).ok_or("headers resolved")?;
+        assert_eq!(resolved.get("Authorization"), Some(&None));
+        assert_eq!(
+            resolved.get("X-Auth").and_then(|v| v.as_deref()),
+            Some("Bearer secret")
         );
         Ok(())
     }

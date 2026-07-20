@@ -19,7 +19,7 @@ use pi_ai::auth::resolve::resolve_provider_auth_with_signal;
 use pi_ai::auth::{
     AMBIENT_AUTH_MARKER, AuthCheck, AuthContext, AuthResolutionOverrides, AuthResult, AuthType,
     Credential, CredentialInfo, CredentialStore, FileCredentialStore, InMemoryCredentialStore,
-    ModelAuth, ModelsError, ModelsErrorCode, OAuthAuth, ProviderAuth, ProviderEnv, ProviderHeaders,
+    ModelAuth, ModelsError, ModelsErrorCode, OAuthAuth, ProviderAuth, ProviderEnv,
     RuntimeCredentials, api_key_env_vars, env_api_key_auth, get_env_api_key,
 };
 use pi_ai::catalog::{BuiltinModels, ModelsStoreEntry, builtin_models};
@@ -784,7 +784,7 @@ impl ModelRuntime {
         let native = Arc::clone(&self.inner.stream_provider);
         Box::pin(
             async move {
-                match runtime.prepare_request(&model, options).await {
+                match runtime.prepare_request(&model, options, &context).await {
                     Ok(prepared) => {
                         let provider = runtime.select_stream_provider(&prepared.model, native);
                         provider.stream(&prepared.model, context, prepared.options)
@@ -831,6 +831,7 @@ impl ModelRuntime {
         &self,
         model: &Model,
         mut options: StreamOptions,
+        context: &Context,
     ) -> Result<PreparedRequest, ModelRuntimeError> {
         let overrides = ModelRuntimeAuthOverrides {
             api_key: options.api_key.clone(),
@@ -857,7 +858,8 @@ impl ModelRuntime {
         if let Some(headers) = resolution.auth.headers.clone() {
             let mut merged = options.headers.take().unwrap_or_default();
             for (name, value) in headers {
-                merged.insert(name, Some(value));
+                // Auth values are Option<String>: None suppresses a default.
+                merged.insert(name, value);
             }
             options.headers = Some(merged);
         }
@@ -871,6 +873,12 @@ impl ModelRuntime {
         let mut model = model.clone();
         if let Some(base_url) = resolution.auth.base_url {
             model.base_url = base_url;
+        }
+        // TS streamSimple / buildBaseOptions clamp path.
+        options = pi_ai::apply_simple_max_tokens_clamp(&model, context, options);
+        // Shared retry-delay default when product paths leave it unset.
+        if options.max_retry_delay_ms.is_none() {
+            options.max_retry_delay_ms = Some(pi_ai::DEFAULT_MAX_RETRY_DELAY_MS);
         }
         Ok(PreparedRequest { model, options })
     }
@@ -975,14 +983,19 @@ impl ModelRuntime {
             && let Some(model_headers) = model.headers.as_ref()
         {
             for (name, value) in model_headers {
-                headers.insert(name.clone(), value.clone());
+                headers.insert(name.clone(), Some(value.clone()));
             }
         }
-        if let Some(config_headers) = self.configured_headers(provider_id)
-            && let Some(resolved) = resolve_headers(Some(&config_headers), Some(&env))
-        {
-            for (name, value) in resolved {
-                headers.insert(name, value);
+        if let Some(config_headers) = self.configured_headers(provider_id) {
+            // Config headers are literal/templates without null suppression.
+            let as_options: BTreeMap<String, Option<String>> = config_headers
+                .into_iter()
+                .map(|(name, value)| (name, Some(value)))
+                .collect();
+            if let Some(resolved) = resolve_headers(Some(&as_options), Some(&env)) {
+                for (name, value) in resolved {
+                    headers.insert(name, value);
+                }
             }
         }
 
@@ -994,7 +1007,10 @@ impl ModelRuntime {
                     "authHeader requires a resolved API key",
                 )));
             };
-            headers.insert("Authorization".to_owned(), format!("Bearer {api_key}"));
+            headers.insert(
+                "Authorization".to_owned(),
+                Some(format!("Bearer {api_key}")),
+            );
         }
 
         if !headers.is_empty() {
@@ -1017,7 +1033,7 @@ impl ModelRuntime {
             })
     }
 
-    fn configured_headers(&self, provider_id: &str) -> Option<ProviderHeaders> {
+    fn configured_headers(&self, provider_id: &str) -> Option<BTreeMap<String, String>> {
         let extension = lock(&self.inner.extension_providers)
             .get(provider_id)
             .and_then(|config| config.headers.clone());
@@ -2304,10 +2320,15 @@ mod tests {
         )?;
         let headers = required(auth.auth.headers, "headers")?;
         assert_eq!(
-            headers.get("Authorization").map(String::as_str),
+            headers
+                .get("Authorization")
+                .and_then(|value| value.as_deref()),
             Some("Bearer sk-env")
         );
-        assert_eq!(headers.get("X-Custom").map(String::as_str), Some("yes"));
+        assert_eq!(
+            headers.get("X-Custom").and_then(|value| value.as_deref()),
+            Some("yes")
+        );
 
         // authHeader without a key fails.
         let mut providers = BTreeMap::new();
