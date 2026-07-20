@@ -427,3 +427,11 @@ declare module "@sinclair/typebox/value" {
 declare module "@sinclair/typebox/compile" {
 	export { Compile } from "typebox/compile";
 }
+
+// Opaque bundles passed straight to jiti virtualModules (no typed surface
+// needed host-side); runtime resolution comes from bunfig.toml.
+declare module "pi-coding-agent-full";
+declare module "@earendil-works/pi-agent-core";
+declare module "@earendil-works/pi-tui";
+declare module "@earendil-works/pi-ai/oauth";
+declare module "@earendil-works/pi-ai/providers/all";

@@ -19,6 +19,7 @@
 		"paths": {
 			"@earendil-works/pi-tui-protocol": ["../pi-tui-protocol/src/index.ts"],
 			"@earendil-works/pi-tui-protocol/*": ["../pi-tui-protocol/src/*"],
+			"pi-coding-agent-full": ["../../.references/pi/packages/coding-agent/src/index.ts"],
 			"@earendil-works/pi-coding-agent": ["../../.references/pi/packages/coding-agent/src/core/extensions/index.ts"],
 			"@earendil-works/pi-coding-agent/*": ["../../.references/pi/packages/coding-agent/src/core/extensions/*"],
 			"@mariozechner/pi-coding-agent": ["../../.references/pi/packages/coding-agent/src/core/extensions/index.ts"],
