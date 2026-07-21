@@ -747,12 +747,15 @@ const streamingArgs = [
 	"--approve",
 ] as const;
 
+async function checkSettledExit(pty: PtyProcess, label: string): Promise<boolean> {
+	if (!pty.exited) return false;
+	const code = await pty.waitForExit(1);
+	if (code !== 0) throw new HarnessFailure(label, `${label} exited ${code}\nPTY tail:\n${tail(pty.snapshot().rawText, 4_000)}`);
+	return true;
+}
+
 async function terminateAndRequireCleanExit(pty: PtyProcess, label: string): Promise<void> {
-	if (pty.exited) {
-		const code = await pty.waitForExit(1);
-		if (code !== 0) throw new HarnessFailure(label, `${label} exited ${code}\nPTY tail:\n${tail(pty.snapshot().rawText, 4_000)}`);
-		return;
-	}
+	if (await checkSettledExit(pty, label)) return;
 	pty.writeKeys("/quit", PTY_KEYS.enter);
 	let code: number;
 	try {
@@ -829,7 +832,9 @@ async function runFirstFrameSample(
 		const frame = frameObservation(snapshot);
 		if (!frame) throw new HarnessFailure(`first-frame:${implementation}`, "first-frame predicate returned without a frame");
 		const frameCpu = sampler.snapshot();
-		await terminateAndRequireCleanExit(pty, `first-frame:${implementation}`);
+		// Startup sampling ends at the first frame. Product smoke tests own
+		// clean `/quit`; the finally block reaps this isolated baseline process.
+		await checkSettledExit(pty, `first-frame:${implementation}`);
 		return {
 			kind,
 			wallMs: frame.elapsedMs,
