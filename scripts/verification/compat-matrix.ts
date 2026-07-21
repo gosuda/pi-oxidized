@@ -42,7 +42,7 @@ export interface Matrix {
 	readonly rows: readonly MatrixRow[];
 }
 
-interface CommandResult {
+export interface CommandResult {
 	readonly key: string;
 	readonly cwd: string;
 	readonly argv: readonly string[];
@@ -259,6 +259,34 @@ export function uniqueCommands(rows: readonly MatrixRow[]): GroupedCommand[] {
 function tail(text: string, maximum: number): string {
 	if (text.length <= maximum) return text;
 	return text.slice(-maximum);
+}
+
+const FAILURE_FIELD_MAX_CHARS = 4_000;
+
+function truncateFailureField(text: string): string {
+	if (text.length <= FAILURE_FIELD_MAX_CHARS) return text;
+	const omitted = text.length - FAILURE_FIELD_MAX_CHARS;
+	return `${text.slice(0, FAILURE_FIELD_MAX_CHARS)}… [${omitted} chars omitted]`;
+}
+
+export function formatFailedCommands(results: readonly CommandResult[]): string {
+	return results
+		.filter((result) => result.timedOut || result.exitCode !== 0)
+		.map((result) => {
+			const status = result.timedOut
+				? "timed out"
+				: result.exitCode === null
+					? "launch failed"
+					: `exit code ${result.exitCode}`;
+			return [
+				`Compatibility command failed for rows [${truncateFailureField(result.rowIds.join(", "))}]: ${status} after ${result.durationMs}ms`,
+				`cwd: ${truncateFailureField(result.cwd)}`,
+				`argv: ${truncateFailureField(JSON.stringify(result.argv))}`,
+				`stdout tail:\n${result.stdoutTail || "<empty>"}`,
+				`stderr tail:\n${result.stderrTail || "<empty>"}`,
+			].join("\n");
+		})
+		.join("\n\n");
 }
 
 export interface SpawnResult {
@@ -594,6 +622,8 @@ async function main(): Promise<void> {
 	writeFileSync(outPath, JSON.stringify(result, null, "\t"), "utf8");
 
 	if (result.summary.requiredFailed.length > 0) {
+		const commandFailures = formatFailedCommands(result.commandResults);
+		if (commandFailures.length > 0) console.error(commandFailures);
 		console.error(
 			`Compatibility matrix failed required rows: ${result.summary.requiredFailed.join(", ")}`,
 		);

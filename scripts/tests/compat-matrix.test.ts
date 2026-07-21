@@ -1,11 +1,13 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+	formatFailedCommands,
 	runCommand,
 	runMatrix,
 	selectRows,
 	uniqueCommands,
 	validateMatrix,
+	type CommandResult,
 	type Matrix,
 } from "../verification/compat-matrix.ts";
 
@@ -20,7 +22,11 @@ function validCommand() {
 function failingCommand() {
 	return {
 		cwd: ".",
-		argv: ["bun", "-e", "process.exit(2)"],
+		argv: [
+			"bun",
+			"-e",
+			"process.stdout.write('stdout-witness'); process.stderr.write('stderr-witness'); process.exit(2)",
+		],
 		timeoutMs: 10_000,
 	};
 }
@@ -227,6 +233,11 @@ describe("runMatrix", () => {
 		expect(result.rowResults[0]?.status).toBe("failed");
 		expect(result.rowResults[0]?.exitCode).toBe(2);
 		expect(result.summary.requiredFailed).toEqual(["r1"]);
+		const report = formatFailedCommands(result.commandResults);
+		expect(report).toContain("rows [r1]: exit code 2");
+		expect(report).toContain('argv: ["bun","-e"');
+		expect(report).toContain("stdout tail:\nstdout-witness");
+		expect(report).toContain("stderr tail:\nstderr-witness");
 	});
 
 	test("does not list an optional failing row in requiredFailed", async () => {
@@ -285,6 +296,39 @@ describe("runMatrix", () => {
 		expect(result.rowResults[0]?.exitCode).toBeNull();
 		expect(result.rowResults[0]?.error).toMatch(/launch\/read error/);
 		expect(result.summary.requiredFailed).toEqual(["r1"]);
+		const report = formatFailedCommands(result.commandResults);
+		expect(report).toContain("rows [r1]: launch failed");
+		expect(report).toContain("stderr tail:\nlaunch/read error:");
+	});
+});
+
+describe("formatFailedCommands", () => {
+	const timeoutResult: CommandResult = {
+		key: "timeout",
+		cwd: "fixtures",
+		argv: ["bun", "slow.ts"],
+		exitCode: null,
+		durationMs: 125,
+		timedOut: true,
+		stdoutTail: "",
+		stderrTail: "",
+		rowIds: ["slow"],
+	};
+
+	test("renders timeout metadata and empty output tails", () => {
+		const report = formatFailedCommands([timeoutResult]);
+		expect(report).toContain("rows [slow]: timed out after 125ms");
+		expect(report).toContain("cwd: fixtures");
+		expect(report).toContain('argv: ["bun","slow.ts"]');
+		expect(report.match(/<empty>/g)).toHaveLength(2);
+	});
+
+	test("bounds dynamic command fields", () => {
+		const report = formatFailedCommands([
+			{ ...timeoutResult, argv: ["x".repeat(5_000)] },
+		]);
+		expect(report).toContain("chars omitted]");
+		expect(report.length).toBeLessThan(5_000);
 	});
 });
 
