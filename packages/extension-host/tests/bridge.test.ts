@@ -360,3 +360,25 @@ describe("bridge: typebox virtual-module aliases", () => {
 		await teardown(connected);
 	});
 });
+
+describe("bridge: pi-ai root image exports", () => {
+	test("extension imports image generation and registries through the root alias", async () => {
+		const fixturePath = resolve(import.meta.dir, "../fixtures/extensions/pi-ai-images-import.ts");
+		const connected = await connectHost([]);
+		const { collector, stdin } = connected;
+
+		push(stdin, {
+			id: 31, kind: "req", method: "extensions.load",
+			payload: { extensionPaths: [fixturePath], cwd: process.cwd(), projectTrusted: true },
+		});
+		const response = await collector.awaitFrame((frame) => frame.id === 31 && frame.kind === "res");
+		const payload = payloadOf(response);
+		expect(payload["errors"]).toEqual([]);
+		expect(payload["extensions"]).toBe(1);
+		const tools = payload["tools"] as Array<{ name: string; description: string }>;
+		const probe = tools.find((tool) => tool.name === "piAiImagesProbe");
+		expect(probe?.description).toBe("generate=true;models=true;api=true");
+
+		await teardown(connected);
+	});
+});

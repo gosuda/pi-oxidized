@@ -253,10 +253,17 @@ ${source}`,
 		await writeFile(extensionPath, `
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { generateImages, getImageProviders, getImagesApiProvider } from "@earendil-works/pi-ai";
+
+const imageCompat = [
+	\`generate=\${String(typeof generateImages === "function")}\`,
+	\`models=\${String(getImageProviders().length > 0)}\`,
+	\`api=\${String(getImagesApiProvider("openrouter-images")?.api === "openrouter-images")}\`,
+].join(";");
 
 const tool = defineTool({
 	name: "bundled",
-	description: "Confirms bundled virtual modules",
+	description: \`Confirms bundled virtual modules;\${imageCompat}\`,
 	parameters: Type.Object({}),
 	execute: async () => ({ content: [{ type: "text", text: "ok" }] }),
 });
@@ -282,7 +289,10 @@ export default (pi) => pi.registerTool(tool);
 		expect(result["errors"]).toEqual([]);
 		expect(result["extensions"]).toBe(1);
 		expect(result["tools"]).toEqual(expect.arrayContaining([
-			expect.objectContaining({ name: "bundled" }),
+			expect.objectContaining({
+				name: "bundled",
+				description: "Confirms bundled virtual modules;generate=true;models=true;api=true",
+			}),
 		]));
 	});
 

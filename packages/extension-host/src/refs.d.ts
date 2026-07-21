@@ -444,6 +444,16 @@ declare module "@earendil-works/pi-ai" {
 	}
 
 	export function createAssistantMessageEventStream(): AssistantMessageEventStream;
+
+	export function generateImages(
+		model: unknown,
+		context: unknown,
+		options?: unknown,
+	): Promise<unknown>;
+	export function getImageProviders(): string[];
+	export function getImagesApiProvider(api: string):
+		| { api: string; generateImages: (...args: never[]) => Promise<unknown> }
+		| undefined;
 }
 
 declare module "@earendil-works/pi-ai/compat" {
