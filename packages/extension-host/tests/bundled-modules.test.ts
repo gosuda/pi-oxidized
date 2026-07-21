@@ -35,22 +35,37 @@ async function loadExtension(
 		cwd,
 		stdio: ["pipe", "pipe", "pipe"],
 	});
+	const closePromise = new Promise<void>((resolveClose) => {
+		child.once("close", () => resolveClose());
+	});
 	let stdout = "";
 	let stderr = "";
 	let settled = false;
-	// A real compiled process has no fake clock; this bounds a stuck child process.
-	const timeout = setTimeout(
-		() => finish(new Error("compiled host did not answer extensions.load")),
-		30_000,
-	);
+	let resultError: Error | undefined;
+	let resultPayload: Record<string, unknown> | undefined;
+	// A compiled child can lock both its executable and cwd on Windows. Keep
+	// the integration deadline live until `close`, the deletion-safe boundary.
+	const timeout = setTimeout(() => {
+		resultError ??= new Error(
+			settled
+				? "compiled host did not exit after extensions.load"
+				: "compiled host did not answer extensions.load",
+		);
+		settled = true;
+		if (child.exitCode === null) child.kill("SIGKILL");
+	}, 30_000);
+	void closePromise.then(() => {
+		clearTimeout(timeout);
+		if (resultError) rejectPromise(resultError);
+		else resolvePromise(resultPayload ?? {});
+	});
 	function finish(error?: Error, payload?: Record<string, unknown>): void {
 		if (settled) return;
 		settled = true;
-		clearTimeout(timeout);
+		resultError = error;
+		resultPayload = payload;
 		child.stdin.end();
-		child.kill("SIGTERM");
-		if (error) rejectPromise(error);
-		else resolvePromise(payload ?? {});
+		if (child.exitCode === null) child.kill("SIGTERM");
 	}
 	child.stdout.on("data", (chunk: Buffer) => {
 		stdout += chunk.toString();
