@@ -16,6 +16,7 @@
 //! [`super::agent_session::extension_runner`].
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::Duration;
@@ -27,8 +28,10 @@ use pi_ext::adapters::{
     self, CommandRegistration, ExtensionAgentTool, ExtensionProvider, FlagRegistration,
     ProviderRegistration, Registry, RendererRegistration, ShortcutRegistration, ToolRegistration,
 };
-use pi_ext::client::{HostClient, HostClientError, HostEvent, HostUiRequest, HostUiResponse};
-use pi_ext::host::{self, HostError, HostSpec};
+use pi_ext::client::{
+    HandshakePolicy, HostClient, HostClientError, HostEvent, HostUiRequest, HostUiResponse,
+};
+use pi_ext::host::{self, HostError, HostSource, HostSpec};
 use pi_ext::protocol::{
     self, DisposeSlot, ExtensionErrorEvent, FlagValueWire, FlagsSetRequest, FlagsSetResponse,
     FrameId, NotifyRequest, ProviderEvent, SessionCommand, SessionCompactRequest,
@@ -45,6 +48,7 @@ use super::agent_session::events::AgentSessionEvent;
 use super::agent_session::extension_runner::{
     BeforeAgentStartResult, CancelResult, ExtensionRunner, InputTransformResult,
 };
+use super::extension_manifest::{ClassifiedExtension, ExtensionMode, classify_extension};
 use super::model_runtime::{
     ModelRuntime, ModelRuntimeError, ProviderConfigInput, ProviderModelDefinition,
 };
@@ -608,11 +612,35 @@ struct ToolRenderHtmlWire {
 /// Slot subscription state: latest sanitized slot (or `None` when disposed).
 type SlotWatch = watch::Sender<Option<SanitizedSlot>>;
 
-struct Inner {
-    client: Arc<HostClient>,
-    snapshot: RwLock<RegistrySnapshot>,
-    flag_values: RwLock<HashMap<String, Value>>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingKind {
+    Ui,
+    SetModel,
+    Compact,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingRoute {
+    endpoint_id: u64,
+    generation: u64,
+    local_id: FrameId,
+    kind: PendingKind,
+}
+
+#[derive(Clone, Debug)]
+struct SlotRoute {
+    endpoint_id: u64,
+    generation: u64,
+    local_key: String,
+}
+
+struct AggregateState {
+    endpoint_count: usize,
+    startup_errors: Vec<(String, String)>,
     slots: RwLock<HashMap<String, SlotWatch>>,
+    slot_routes: RwLock<HashMap<String, SlotRoute>>,
+    pending_routes: StdMutex<HashMap<FrameId, PendingRoute>>,
+    next_frame_id: AtomicU64,
     tool_updates_tx: broadcast::Sender<ToolUpdate>,
     provider_events_tx: broadcast::Sender<ProviderEvent>,
     errors_tx: broadcast::Sender<ExtensionErrorEvent>,
@@ -623,52 +651,25 @@ struct Inner {
     session_bridge_tx: mpsc::Sender<SessionBridgeEvent>,
     session_bridge_rx: StdMutex<Option<mpsc::Receiver<SessionBridgeEvent>>>,
     session_bridge_claimed: AtomicBool,
-    /// Paths passed to `extensions.load` (restart reuses them).
-    extension_paths: Vec<String>,
-    /// Cwd passed to `extensions.load`.
-    load_cwd: String,
-    /// Project trust passed to `extensions.load` and preserved across restart.
-    project_trusted: bool,
-    /// Monotonic reload generation; bumps invalidate every active slot.
     reload_generation: AtomicU64,
-    /// Runtime theme generation carried on measure/render requests; updated
-    /// by every `theme.update` push.
     theme_generation: AtomicU64,
-    /// Host transport is gone (EOF / crash / protocol error). All hooks and
-    /// handler-presence queries short-circuit to no-ops once set.
-    disabled: AtomicBool,
-    /// Runner invalidated after session replacement (`/reload` / runtime swap).
-    stale: AtomicBool,
-    /// `shutdown` has completed at least once.
-    shutdown_done: AtomicBool,
-    /// Serializes shutdown so concurrent callers await the same completed reap.
-    shutdown_lock: tokio::sync::Mutex<()>,
-    /// Per-hook control-RPC deadline (`HOOK_TIMEOUT` in production; shorter in
-    /// tests to exercise the timeout path quickly).
-    hook_timeout: Duration,
 }
 
-impl Inner {
-    fn new(
-        client: Arc<HostClient>,
-        snapshot: RegistrySnapshot,
-        extension_paths: Vec<String>,
-        load_cwd: String,
-        project_trusted: bool,
-        hook_timeout: Duration,
-    ) -> Self {
+impl AggregateState {
+    fn new(endpoint_count: usize, startup_errors: Vec<(String, String)>) -> Self {
         let (tool_updates_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let (provider_events_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let (errors_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let (ui_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let (ui_requests_tx, ui_requests_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let (session_bridge_tx, session_bridge_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
-        let flag_values = snapshot.flag_values.clone();
         Self {
-            client,
-            snapshot: RwLock::new(snapshot),
-            flag_values: RwLock::new(flag_values),
+            endpoint_count,
+            startup_errors,
             slots: RwLock::new(HashMap::new()),
+            slot_routes: RwLock::new(HashMap::new()),
+            pending_routes: StdMutex::new(HashMap::new()),
+            next_frame_id: AtomicU64::new(1),
             tool_updates_tx,
             provider_events_tx,
             errors_tx,
@@ -679,49 +680,236 @@ impl Inner {
             session_bridge_tx,
             session_bridge_rx: StdMutex::new(Some(session_bridge_rx)),
             session_bridge_claimed: AtomicBool::new(false),
+            reload_generation: AtomicU64::new(1),
+            theme_generation: AtomicU64::new(0),
+        }
+    }
+
+    fn publish_error(&self, code: &str, message: &str, data: Option<Value>) {
+        let _ = self.errors_tx.send(ExtensionErrorEvent {
+            code: code.to_owned(),
+            message: message.to_owned(),
+            retryable: false,
+            data,
+        });
+    }
+
+    fn next_route_id(&self) -> FrameId {
+        loop {
+            let id = self.next_frame_id.fetch_add(1, Ordering::Relaxed);
+            if id != 0 {
+                return id;
+            }
+        }
+    }
+
+    fn insert_route(&self, endpoint: &Endpoint, local_id: FrameId, kind: PendingKind) -> FrameId {
+        let id = if self.endpoint_count == 1 {
+            local_id
+        } else {
+            self.next_route_id()
+        };
+        let route = PendingRoute {
+            endpoint_id: endpoint.id,
+            generation: endpoint.reload_generation.load(Ordering::Relaxed),
+            local_id,
+            kind,
+        };
+        self.pending_routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id, route);
+        id
+    }
+
+    fn take_route(&self, id: FrameId, kind: PendingKind) -> Option<PendingRoute> {
+        let mut routes = self
+            .pending_routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let route = routes.get(&id).copied()?;
+        if route.kind != kind {
+            return None;
+        }
+        routes.remove(&id)
+    }
+
+    fn remove_endpoint_routes(&self, endpoint_id: u64, generation: u64) {
+        self.pending_routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|_, route| route.endpoint_id != endpoint_id || route.generation != generation);
+    }
+
+    fn external_slot_key(&self, endpoint_id: u64, local_key: &str) -> String {
+        if self.endpoint_count == 1 {
+            local_key.to_owned()
+        } else {
+            format!("endpoint-{endpoint_id}:{local_key}")
+        }
+    }
+
+    fn slot_send(&self, endpoint: &Endpoint, mut slot: SanitizedSlot) {
+        if !endpoint.active() {
+            return;
+        }
+        let external_key = self.external_slot_key(endpoint.id, &slot.key);
+        let local_key = std::mem::replace(&mut slot.key, external_key.clone());
+        let Ok(mut slots) = self.slots.write() else {
+            return;
+        };
+        if !endpoint.active() {
+            return;
+        }
+        let sender = slots
+            .entry(external_key.clone())
+            .or_insert_with(|| watch::channel(None).0);
+        sender.send_replace(Some(slot.clone()));
+        if let Ok(mut routes) = self.slot_routes.write() {
+            routes.insert(
+                external_key,
+                SlotRoute {
+                    endpoint_id: endpoint.id,
+                    generation: endpoint.reload_generation.load(Ordering::Relaxed),
+                    local_key,
+                },
+            );
+        }
+        let _ = self.ui_tx.send(ExtensionUiEvent::Slot(slot));
+    }
+
+    fn slot_dispose(&self, endpoint: &Endpoint, local_key: &str) {
+        if !endpoint.active() {
+            return;
+        }
+        let external_key = self.external_slot_key(endpoint.id, local_key);
+        let Ok(mut slots) = self.slots.write() else {
+            return;
+        };
+        // Mirror slot_send: a dispose buffered before invalidate/reload must
+        // not win the lock race against teardown and emit a duplicate
+        // disposal (or kill a re-registered slot) afterwards.
+        if !endpoint.active() {
+            return;
+        }
+        if let Some(sender) = slots.remove(&external_key) {
+            sender.send_replace(None);
+        }
+        if let Ok(mut routes) = self.slot_routes.write() {
+            routes.remove(&external_key);
+        }
+        let _ = self
+            .ui_tx
+            .send(ExtensionUiEvent::Dispose { key: external_key });
+    }
+
+    fn dispose_endpoint_slots(&self, endpoint_id: u64, generation: u64) {
+        let keys = self
+            .slot_routes
+            .read()
+            .map(|routes| {
+                routes
+                    .iter()
+                    .filter(|(_, route)| {
+                        route.endpoint_id == endpoint_id && route.generation == generation
+                    })
+                    .map(|(key, _)| key.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let Ok(mut slots) = self.slots.write() else {
+            return;
+        };
+        let Ok(mut routes) = self.slot_routes.write() else {
+            return;
+        };
+        for key in keys {
+            if let Some(sender) = slots.remove(&key) {
+                sender.send_replace(None);
+            }
+            routes.remove(&key);
+            let _ = self.ui_tx.send(ExtensionUiEvent::Dispose { key });
+        }
+    }
+
+    fn dispose_all_slots(&self) {
+        let Ok(mut slots) = self.slots.write() else {
+            return;
+        };
+        for (key, sender) in slots.drain() {
+            sender.send_replace(None);
+            let _ = self.ui_tx.send(ExtensionUiEvent::Dispose { key });
+        }
+        if let Ok(mut routes) = self.slot_routes.write() {
+            routes.clear();
+        }
+    }
+}
+
+/// Load-time parameters shared by every endpoint start path: the working
+/// directory handed to `extensions.load`, the project-trust flag, and the
+/// per-hook RPC timeout.
+#[derive(Clone)]
+struct StartContext {
+    load_cwd: String,
+    project_trusted: bool,
+    hook_timeout: Duration,
+}
+
+struct Endpoint {
+    id: u64,
+    client: Arc<HostClient>,
+    snapshot: RwLock<RegistrySnapshot>,
+    flag_values: RwLock<HashMap<String, Value>>,
+    extension_paths: Vec<String>,
+    load_cwd: String,
+    project_trusted: bool,
+    reload_generation: AtomicU64,
+    disabled: AtomicBool,
+    stale: AtomicBool,
+    shutdown_done: AtomicBool,
+    shutdown_lock: tokio::sync::Mutex<()>,
+    hook_timeout: Duration,
+}
+
+impl Endpoint {
+    fn new(
+        id: u64,
+        client: Arc<HostClient>,
+        snapshot: RegistrySnapshot,
+        extension_paths: Vec<String>,
+        context: StartContext,
+    ) -> Self {
+        let flag_values = snapshot.flag_values.clone();
+        Self {
+            id,
+            client,
+            snapshot: RwLock::new(snapshot),
+            flag_values: RwLock::new(flag_values),
             extension_paths,
-            load_cwd,
-            project_trusted,
+            load_cwd: context.load_cwd,
+            project_trusted: context.project_trusted,
             reload_generation: AtomicU64::new(1),
             disabled: AtomicBool::new(false),
             stale: AtomicBool::new(false),
             shutdown_done: AtomicBool::new(false),
             shutdown_lock: tokio::sync::Mutex::new(()),
-            hook_timeout,
-            theme_generation: AtomicU64::new(0),
+            hook_timeout: context.hook_timeout,
         }
     }
 
     fn has_handlers(&self, event: &str) -> bool {
-        if self.disabled.load(Ordering::Relaxed) || self.stale.load(Ordering::Relaxed) {
-            return false;
-        }
-        self.snapshot
-            .read()
-            .is_ok_and(|guard| guard.handlers.contains(event))
+        self.active()
+            && self
+                .snapshot
+                .read()
+                .is_ok_and(|guard| guard.handlers.contains(event))
     }
 
     fn active(&self) -> bool {
         !self.disabled.load(Ordering::Relaxed) && !self.stale.load(Ordering::Relaxed)
     }
 
-    /// Whether a slash command named `name` is registered (handler-presence
-    /// and disabled/stale gates apply).
-    fn has_command(&self, name: &str) -> bool {
-        if !self.active() {
-            return false;
-        }
-        self.snapshot.read().is_ok_and(|guard| {
-            guard
-                .registry
-                .commands()
-                .iter()
-                .any(|command| command.name == name)
-        })
-    }
-
-    /// Send one hook request. Returns the validated response frame, or an
-    /// error when the host is gone / timed out / returned an error frame.
     async fn hook_request(
         &self,
         method: &str,
@@ -735,10 +923,7 @@ impl Inner {
             .await
     }
 
-    /// Map a transport failure to a single non-retryable `extension_error`,
-    /// publish it to subscribers, and flip the disabled flag on fatal
-    /// conditions. Never aborts the caller.
-    fn report_host_error(&self, err: &HostClientError) {
+    fn report_host_error(&self, aggregate: &AggregateState, err: &HostClientError) {
         let fatal = matches!(
             err,
             HostClientError::Closed { .. }
@@ -748,112 +933,7 @@ impl Inner {
         if fatal {
             self.disabled.store(true, Ordering::Relaxed);
         }
-        let event = ExtensionErrorEvent {
-            code: error_code(err).to_owned(),
-            message: err.to_string(),
-            retryable: false,
-            data: None,
-        };
-        let _ = self.errors_tx.send(event);
-    }
-
-    fn publish_error(&self, code: &str, message: &str, data: Option<Value>) {
-        let event = ExtensionErrorEvent {
-            code: code.to_owned(),
-            message: message.to_owned(),
-            retryable: false,
-            data,
-        };
-        let _ = self.errors_tx.send(event);
-    }
-
-    fn slot_send(&self, slot: SanitizedSlot) {
-        // Teardown must not be reanimated: after invalidate/shutdown a
-        // delayed in-flight slot would otherwise re-insert a watch entry.
-        // Both the active check AND the synchronous ui_tx publish run UNDER
-        // the slots lock, so they serialize against dispose_all_slots and a
-        // Slot event can never be published after the teardown Dispose.
-        let Ok(mut slots) = self.slots.write() else {
-            return;
-        };
-        if !self.active() {
-            return;
-        }
-        let sender = slots
-            .entry(slot.key.clone())
-            .or_insert_with(|| watch::channel(None).0);
-        let _ = sender.send(Some(slot.clone()));
-        let _ = self.ui_tx.send(ExtensionUiEvent::Slot(slot));
-    }
-
-    fn slot_dispose(&self, key: &str) {
-        // Same lock discipline as slot_send: watch update and public publish
-        // are one atomic step relative to teardown.
-        let Ok(mut slots) = self.slots.write() else {
-            return;
-        };
-        if !self.active() {
-            return;
-        }
-        if let Some(sender) = slots.get(key) {
-            let _ = sender.send(None);
-        }
-        slots.remove(key);
-        let _ = self.ui_tx.send(ExtensionUiEvent::Dispose {
-            key: key.to_owned(),
-        });
-    }
-
-    fn theme_set_send(&self, set: ThemeSet) {
-        // Same lock discipline as notify_send: serialize against teardown.
-        let Ok(_slots) = self.slots.write() else {
-            return;
-        };
-        if !self.active() {
-            return;
-        }
-        let _ = self.ui_tx.send(ExtensionUiEvent::ThemeSet(set));
-    }
-
-    fn ui_control_send(&self, control: UiControl) {
-        // Same lock discipline as notify_send: serialize against teardown.
-        let Ok(_slots) = self.slots.write() else {
-            return;
-        };
-        if !self.active() {
-            return;
-        }
-        let _ = self.ui_tx.send(ExtensionUiEvent::UiControl(control));
-    }
-
-    fn notify_send(&self, notification: NotifyRequest) {
-        // Same lock discipline as slot_send/slot_dispose: the active check
-        // and the synchronous publish serialize against teardown so a Notify
-        // can never land after the teardown Dispose.
-        let Ok(_slots) = self.slots.write() else {
-            return;
-        };
-        if !self.active() {
-            return;
-        }
-        let _ = self.ui_tx.send(ExtensionUiEvent::Notify(notification));
-    }
-
-    fn dispose_all_slots(&self) {
-        // Publishing the Dispose events while still holding the lock keeps
-        // Slot-before-teardown-Dispose ordering: any concurrent slot_send
-        // either published before we acquired the lock or is dropped by the
-        // inactive gate afterwards. `broadcast::Sender::send` never blocks.
-        let Ok(mut slots) = self.slots.write() else {
-            return;
-        };
-        for (key, sender) in slots.iter() {
-            let _ = sender.send(None);
-            let _ = self
-                .ui_tx
-                .send(ExtensionUiEvent::Dispose { key: key.clone() });
-        }
-        slots.clear();
+        aggregate.publish_error(error_code(err), &err.to_string(), None);
     }
 }
 
@@ -880,45 +960,149 @@ fn error_code(err: &HostClientError) -> &'static str {
 /// 15-hook merge. Host failures are isolated as a single non-retryable
 /// `extension_error` and never abort the session.
 pub struct HostExtensionRunner {
-    inner: Arc<Inner>,
+    endpoints: Arc<[Arc<Endpoint>]>,
+    aggregate: Arc<AggregateState>,
+}
+
+/// Spawn program selected by the classified endpoint mode. Native plans carry
+/// their resolved executable, so native spec construction is total.
+#[derive(Debug)]
+enum EndpointProgram {
+    /// Bun-hosted script endpoint (compat or lean).
+    Bun,
+    /// Self-contained native executable endpoint.
+    Native(std::path::PathBuf),
+}
+
+#[derive(Debug)]
+struct EndpointPlan {
+    id: u64,
+    mode: ExtensionMode,
+    program: EndpointProgram,
+    paths: Vec<String>,
+    diagnostic_path: String,
+}
+
+impl EndpointPlan {
+    fn accepts(&self, classified: &ClassifiedExtension) -> bool {
+        if self.mode != classified.mode {
+            return false;
+        }
+        match &self.program {
+            EndpointProgram::Bun => true,
+            EndpointProgram::Native(executable) => executable == &classified.entry,
+        }
+    }
+}
+
+fn current_target_triple() -> String {
+    let arch = std::env::consts::ARCH;
+    let os = std::env::consts::OS;
+    let environment = if cfg!(target_env = "musl") {
+        "musl"
+    } else if cfg!(target_env = "msvc") {
+        "msvc"
+    } else if cfg!(target_os = "linux") {
+        "gnu"
+    } else {
+        ""
+    };
+    match (arch, os, environment) {
+        ("x86_64", "linux", env) => format!("x86_64-unknown-linux-{env}"),
+        ("aarch64", "linux", env) => format!("aarch64-unknown-linux-{env}"),
+        ("x86_64", "macos", _) => "x86_64-apple-darwin".to_owned(),
+        ("aarch64", "macos", _) => "aarch64-apple-darwin".to_owned(),
+        ("x86_64", "windows", "msvc") => "x86_64-pc-windows-msvc".to_owned(),
+        ("aarch64", "windows", "msvc") => "aarch64-pc-windows-msvc".to_owned(),
+        _ => format!("{arch}-unknown-{os}"),
+    }
+}
+
+fn classify_endpoint_plans(
+    extension_paths: Vec<String>,
+) -> (Vec<EndpointPlan>, Vec<(String, String)>) {
+    let target = current_target_triple();
+    let mut plans: Vec<EndpointPlan> = Vec::new();
+    let mut errors = Vec::new();
+    let mut contiguous = false;
+    for (index, path) in extension_paths.into_iter().enumerate() {
+        match classify_extension(Path::new(&path), &target) {
+            Ok(classified) => {
+                let load_path =
+                    if classified.mode == ExtensionMode::Compat && classified.manifest.is_none() {
+                        path.clone()
+                    } else if classified.mode == ExtensionMode::Native {
+                        classified.root.to_string_lossy().into_owned()
+                    } else {
+                        classified.entry.to_string_lossy().into_owned()
+                    };
+                if contiguous
+                    && let Some(plan) = plans.last_mut()
+                    && plan.accepts(&classified)
+                {
+                    plan.paths.push(load_path);
+                    continue;
+                }
+                plans.push(EndpointPlan {
+                    id: index as u64,
+                    mode: classified.mode,
+                    program: if classified.mode == ExtensionMode::Native {
+                        EndpointProgram::Native(classified.entry)
+                    } else {
+                        EndpointProgram::Bun
+                    },
+                    paths: vec![load_path],
+                    diagnostic_path: path,
+                });
+                contiguous = true;
+            }
+            Err(error) => {
+                errors.push((path, error.to_string()));
+                contiguous = false;
+            }
+        }
+    }
+    (plans, errors)
 }
 
 impl HostExtensionRunner {
-    /// Resolve, spawn, handshake, and load the host, returning a ready runner.
+    /// Resolve, spawn, handshake, and load all classified extension endpoints.
     ///
     /// # Errors
     ///
-    /// Returns [`HostStartError::Resolve`] when no host executable is
-    /// available, [`HostStartError::Spawn`] when the process cannot start,
-    /// [`HostStartError::Handshake`] on version mismatch, or
-    /// [`HostStartError::Load`] when the registration snapshot is unreadable.
+    /// Per-endpoint failures are isolated and surfaced through
+    /// [`HostExtensionRunner::load_errors`]; an `Err` is reserved for failures
+    /// that prevent the aggregate runner itself from being constructed.
     pub async fn start(extension_paths: Vec<String>) -> Result<Arc<Self>, HostStartError> {
-        let spec = host::resolve_host()?;
-        Self::spawn_from(&spec, extension_paths).await
+        let load_cwd = std::env::current_dir()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        Self::start_with_cwd_and_trust(extension_paths, load_cwd, false).await
     }
 
-    /// Spawn from an explicit [`HostSpec`], then bind.
+    /// Spawn one explicit compatibility host, then bind.
     ///
     /// # Errors
     ///
-    /// See [`HostExtensionRunner::start`].
+    /// Returns `HostStartError::Spawn` when the host process cannot be
+    /// spawned, and the handshake/load error when binding fails.
     pub async fn spawn_from(
         spec: &HostSpec,
         extension_paths: Vec<String>,
     ) -> Result<Arc<Self>, HostStartError> {
-        let client =
-            Arc::new(HostClient::spawn(spec).map_err(|e| HostStartError::Spawn(e.to_string()))?);
+        let client = Arc::new(
+            HostClient::spawn(spec).map_err(|error| HostStartError::Spawn(error.to_string()))?,
+        );
         let startup = Self::connect(Arc::clone(&client), extension_paths).await;
         Self::finish_startup(&client, startup).await
     }
 
-    /// Bind a runner to a pre-built client: handshake, load, spawn the event
-    /// pump. Used by [`start`](Self::start), the reload restart path, and the
-    /// fake-host test harness.
+    /// Bind one compatibility endpoint to a pre-built client.
     ///
     /// # Errors
     ///
-    /// Returns [`HostStartError::Handshake`] or [`HostStartError::Load`].
+    /// Returns the handshake or registry-load `HostStartError` when the
+    /// endpoint cannot be bound.
     pub async fn connect(
         client: Arc<HostClient>,
         extension_paths: Vec<String>,
@@ -926,29 +1110,30 @@ impl HostExtensionRunner {
         Self::connect_with_timeout(client, extension_paths, HOOK_TIMEOUT).await
     }
 
-    /// Bind a runner with a custom hook timeout (test harness; production uses
-    /// [`connect`](Self::connect) which applies [`HOOK_TIMEOUT`]).
+    /// Bind one compatibility endpoint with a custom hook timeout.
     ///
     /// # Errors
     ///
-    /// Returns [`HostStartError::Handshake`] or [`HostStartError::Load`].
+    /// Returns the handshake or registry-load `HostStartError` when the
+    /// endpoint cannot be bound.
     pub async fn connect_with_timeout(
         client: Arc<HostClient>,
         extension_paths: Vec<String>,
         hook_timeout: Duration,
     ) -> Result<Arc<Self>, HostStartError> {
         let load_cwd = std::env::current_dir()
-            .map(|p| p.to_string_lossy().into_owned())
+            .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_default();
         Self::connect_with_cwd_and_trust(client, extension_paths, load_cwd, false, hook_timeout)
             .await
     }
 
-    /// Bind a runner with an explicit load cwd (services factory / tests).
+    /// Bind one compatibility endpoint with an explicit load cwd.
     ///
     /// # Errors
     ///
-    /// Returns [`HostStartError::Handshake`] or [`HostStartError::Load`].
+    /// Returns the handshake or registry-load `HostStartError` when the
+    /// endpoint cannot be bound.
     pub async fn connect_with_cwd(
         client: Arc<HostClient>,
         extension_paths: Vec<String>,
@@ -959,11 +1144,12 @@ impl HostExtensionRunner {
             .await
     }
 
-    /// Bind a runner with an explicit load cwd and project-trust value.
+    /// Bind one compatibility endpoint with explicit cwd and trust.
     ///
     /// # Errors
     ///
-    /// Returns [`HostStartError::Handshake`] or [`HostStartError::Load`].
+    /// Returns the handshake or registry-load `HostStartError` when the
+    /// endpoint cannot be bound.
     pub async fn connect_with_cwd_and_trust(
         client: Arc<HostClient>,
         extension_paths: Vec<String>,
@@ -971,22 +1157,183 @@ impl HostExtensionRunner {
         project_trusted: bool,
         hook_timeout: Duration,
     ) -> Result<Arc<Self>, HostStartError> {
-        client.handshake().await?;
-        let load_cwd = load_cwd.into();
-        let snapshot = Self::load(&client, &extension_paths, &load_cwd, project_trusted).await?;
-        let inner = Arc::new(Inner::new(
-            Arc::clone(&client),
+        let endpoint = Self::connect_endpoint(
+            0,
+            client,
+            extension_paths,
+            &StartContext {
+                load_cwd: load_cwd.into(),
+                project_trusted,
+                hook_timeout,
+            },
+            HandshakePolicy::Compat,
+        )
+        .await?;
+        Ok(Self::from_endpoints(vec![endpoint], Vec::new()))
+    }
+
+    async fn connect_endpoint(
+        id: u64,
+        client: Arc<HostClient>,
+        extension_paths: Vec<String>,
+        context: &StartContext,
+        handshake_policy: HandshakePolicy,
+    ) -> Result<Arc<Endpoint>, HostStartError> {
+        client.handshake_with_policy(handshake_policy).await?;
+        let snapshot = Self::load(
+            &client,
+            &extension_paths,
+            &context.load_cwd,
+            context.project_trusted,
+        )
+        .await?;
+        Ok(Arc::new(Endpoint::new(
+            id,
+            client,
             snapshot,
+            extension_paths,
+            context.clone(),
+        )))
+    }
+
+    fn from_endpoints(
+        endpoints: Vec<Arc<Endpoint>>,
+        startup_errors: Vec<(String, String)>,
+    ) -> Arc<Self> {
+        let aggregate = Arc::new(AggregateState::new(endpoints.len(), startup_errors));
+        let runner = Arc::new(Self {
+            endpoints: endpoints.into(),
+            aggregate: Arc::clone(&aggregate),
+        });
+        for endpoint in runner.endpoints.iter() {
+            spawn_event_pump(Arc::clone(endpoint), Arc::clone(&aggregate));
+        }
+        runner
+    }
+
+    #[cfg(test)]
+    async fn connect_test_endpoints(
+        clients: Vec<(u64, Arc<HostClient>, Vec<String>)>,
+        hook_timeout: Duration,
+    ) -> Result<Arc<Self>, HostStartError> {
+        let load_cwd = std::env::current_dir()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let context = StartContext {
+            load_cwd,
+            project_trusted: false,
+            hook_timeout,
+        };
+        let futures = clients.into_iter().map(|(id, client, paths)| {
+            Self::connect_endpoint(id, client, paths, &context, HandshakePolicy::Compat)
+        });
+        let endpoints = futures::future::try_join_all(futures).await?;
+        Ok(Self::from_endpoints(endpoints, Vec::new()))
+    }
+
+    async fn start_classified(
+        extension_paths: Vec<String>,
+        load_cwd: String,
+        project_trusted: bool,
+    ) -> Result<Arc<Self>, HostStartError> {
+        Self::start_classified_with_resolver(
             extension_paths,
             load_cwd,
             project_trusted,
-            hook_timeout,
-        ));
-        let runner = Arc::new(Self {
-            inner: Arc::clone(&inner),
+            host::resolve_host,
+        )
+        .await
+    }
+
+    async fn start_classified_with_resolver<F>(
+        extension_paths: Vec<String>,
+        load_cwd: String,
+        project_trusted: bool,
+        resolve_bun: F,
+    ) -> Result<Arc<Self>, HostStartError>
+    where
+        F: FnOnce() -> Result<HostSpec, HostError>,
+    {
+        let (plans, mut errors) = classify_endpoint_plans(extension_paths);
+        let bun_spec = if plans.iter().any(|plan| plan.mode != ExtensionMode::Native) {
+            resolve_bun().map(Some).map_err(|error| error.to_string())
+        } else {
+            Ok(None)
+        };
+        let context = StartContext {
+            load_cwd,
+            project_trusted,
+            hook_timeout: HOOK_TIMEOUT,
+        };
+        let startups = plans.into_iter().map(|plan| {
+            let context = context.clone();
+            let spec = match &plan.program {
+                EndpointProgram::Native(executable) => Ok(HostSpec {
+                    source: HostSource::InstalledAsset(executable.clone()),
+                    program: executable.clone(),
+                    args: Vec::new(),
+                }),
+                EndpointProgram::Bun => bun_spec
+                    .as_ref()
+                    .map_err(Clone::clone)
+                    .and_then(|spec| {
+                        spec.clone().ok_or_else(|| {
+                            if plan.mode == ExtensionMode::Lean {
+                                "lean host was not resolved".to_owned()
+                            } else {
+                                "compat host was not resolved".to_owned()
+                            }
+                        })
+                    })
+                    .map(|mut spec| {
+                        if plan.mode == ExtensionMode::Lean {
+                            spec.args.push("--lean".to_owned());
+                        }
+                        spec
+                    }),
+            };
+            async move {
+                let diagnostic_path = plan.diagnostic_path.clone();
+                let spec = match spec {
+                    Ok(spec) => spec,
+                    Err(error) => {
+                        return Err((
+                            diagnostic_path,
+                            format!("extension host resolution failed: {error}"),
+                        ));
+                    }
+                };
+                let client = match HostClient::spawn(&spec) {
+                    Ok(client) => Arc::new(client),
+                    Err(error) => return Err((diagnostic_path, error.to_string())),
+                };
+                let policy = if plan.mode == ExtensionMode::Compat {
+                    HandshakePolicy::Compat
+                } else {
+                    HandshakePolicy::ProtocolOnly
+                };
+                let startup = Self::connect_endpoint(
+                    plan.id,
+                    Arc::clone(&client),
+                    plan.paths,
+                    &context,
+                    policy,
+                )
+                .await;
+                if startup.is_err() {
+                    let _ = client.shutdown().await;
+                }
+                startup.map_err(|error| (diagnostic_path, error.to_string()))
+            }
         });
-        spawn_event_pump(inner);
-        Ok(runner)
+        let mut endpoints = Vec::new();
+        for startup in futures::future::join_all(startups).await {
+            match startup {
+                Ok(endpoint) => endpoints.push(endpoint),
+                Err(error) => errors.push(error),
+            }
+        }
+        Ok(Self::from_endpoints(endpoints, errors))
     }
 
     async fn finish_startup(
@@ -1019,315 +1366,514 @@ impl HostExtensionRunner {
         Ok(build_snapshot(wire, client))
     }
 
-    /// Borrowed host client (for provider registration by the model runtime).
+    /// Borrowed primary client for the legacy one-endpoint API, or `None`
+    /// when no endpoint loaded successfully.
     #[must_use]
-    pub fn client(&self) -> &Arc<HostClient> {
-        &self.inner.client
+    pub fn client(&self) -> Option<&Arc<HostClient>> {
+        self.endpoints.first().map(|endpoint| &endpoint.client)
     }
 
-    /// Extension paths used for the current host load.
+    fn endpoint_for_route(&self, route: PendingRoute) -> Result<&Arc<Endpoint>, HostClientError> {
+        self.endpoints
+            .iter()
+            .find(|endpoint| {
+                endpoint.id == route.endpoint_id
+                    && endpoint.reload_generation.load(Ordering::Relaxed) == route.generation
+                    && endpoint.active()
+            })
+            .ok_or(HostClientError::NotRunning)
+    }
+
+    fn first_owner(&self, predicate: impl Fn(&RegistrySnapshot) -> bool) -> Option<&Arc<Endpoint>> {
+        self.endpoints.iter().find(|endpoint| {
+            endpoint
+                .snapshot
+                .read()
+                .is_ok_and(|snapshot| predicate(&snapshot))
+        })
+    }
+
+    /// Extension paths in true endpoint/path order.
     #[must_use]
     pub fn extension_paths(&self) -> Vec<String> {
-        self.inner.extension_paths.clone()
+        self.endpoints
+            .iter()
+            .flat_map(|endpoint| endpoint.extension_paths.iter().cloned())
+            .collect()
     }
 
-    /// Host-reported per-path load errors from the latest snapshot.
+    /// Per-path load, classification, startup, and cross-endpoint collision diagnostics.
     #[must_use]
     pub fn load_errors(&self) -> Vec<(String, String)> {
-        self.inner
-            .snapshot
-            .read()
-            .map(|guard| guard.load_errors.clone())
-            .unwrap_or_default()
+        let mut errors = self.aggregate.startup_errors.clone();
+        for endpoint in self.endpoints.iter() {
+            if let Ok(snapshot) = endpoint.snapshot.read() {
+                errors.extend(snapshot.load_errors.clone());
+            }
+        }
+        let mut seen = HashSet::<(String, String)>::new();
+        let mut reported = HashSet::<(String, String)>::new();
+        for endpoint in self.endpoints.iter() {
+            let Ok(snapshot) = endpoint.snapshot.read() else {
+                continue;
+            };
+            let path = endpoint
+                .extension_paths
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "<unknown>".to_owned());
+            let registrations = [
+                (
+                    "tool",
+                    snapshot
+                        .registry
+                        .tools()
+                        .iter()
+                        .map(|item| item.name.as_str())
+                        .collect::<Vec<_>>(),
+                ),
+                (
+                    "command",
+                    snapshot
+                        .registry
+                        .commands()
+                        .iter()
+                        .map(|item| item.name.as_str())
+                        .collect::<Vec<_>>(),
+                ),
+                (
+                    "shortcut",
+                    snapshot
+                        .registry
+                        .shortcuts()
+                        .iter()
+                        .map(|item| item.key.as_str())
+                        .collect::<Vec<_>>(),
+                ),
+                (
+                    "flag",
+                    snapshot
+                        .registry
+                        .flags()
+                        .iter()
+                        .map(|item| item.name.as_str())
+                        .collect::<Vec<_>>(),
+                ),
+                (
+                    "renderer",
+                    snapshot
+                        .registry
+                        .renderers()
+                        .iter()
+                        .map(|item| item.name.as_str())
+                        .collect::<Vec<_>>(),
+                ),
+                (
+                    "provider",
+                    snapshot
+                        .registry
+                        .providers()
+                        .iter()
+                        .map(|item| item.name.as_str())
+                        .collect::<Vec<_>>(),
+                ),
+            ];
+            for (kind, names) in registrations {
+                for name in names {
+                    let key = (kind.to_owned(), name.to_owned());
+                    if !seen.insert(key.clone()) && reported.insert(key) {
+                        errors.push((
+                            path.clone(),
+                            format!("duplicate {kind} {name:?} ignored; first registration wins"),
+                        ));
+                    }
+                }
+            }
+        }
+        errors
     }
 
-    /// Registered provider config inputs keyed by provider id.
     #[must_use]
+    /// Return provider configs, resolving duplicates by endpoint order.
     pub fn provider_configs(&self) -> HashMap<String, ProviderConfigInput> {
-        self.inner
-            .snapshot
-            .read()
-            .map(|guard| guard.provider_configs.clone())
-            .unwrap_or_default()
+        let mut configs = HashMap::new();
+        for endpoint in self.endpoints.iter() {
+            if let Ok(snapshot) = endpoint.snapshot.read() {
+                for (name, config) in &snapshot.provider_configs {
+                    configs
+                        .entry(name.clone())
+                        .or_insert_with(|| config.clone());
+                }
+            }
+        }
+        configs
     }
 
-    /// Provider ids that expose a host-side `streamSimple` handler.
     #[must_use]
+    /// Return first-winning provider ids that own a custom stream handler.
     pub fn stream_provider_ids(&self) -> HashSet<String> {
-        self.inner
-            .snapshot
-            .read()
-            .map(|guard| guard.stream_provider_ids.clone())
-            .unwrap_or_default()
+        let mut selected = HashSet::new();
+        let mut seen = HashSet::new();
+        for endpoint in self.endpoints.iter() {
+            if let Ok(snapshot) = endpoint.snapshot.read() {
+                for name in snapshot.provider_configs.keys() {
+                    if seen.insert(name.clone()) && snapshot.stream_provider_ids.contains(name) {
+                        selected.insert(name.clone());
+                    }
+                }
+            }
+        }
+        selected
     }
 
-    /// Optional extension path per provider (diagnostics).
     #[must_use]
+    /// Return diagnostic extension paths for first-winning providers.
     pub fn provider_extension_paths(&self) -> HashMap<String, String> {
-        self.inner
-            .snapshot
-            .read()
-            .map(|guard| guard.provider_extension_paths.clone())
-            .unwrap_or_default()
+        let mut paths = HashMap::new();
+        for endpoint in self.endpoints.iter() {
+            if let Ok(snapshot) = endpoint.snapshot.read() {
+                for (name, path) in &snapshot.provider_extension_paths {
+                    paths.entry(name.clone()).or_insert_with(|| path.clone());
+                }
+            }
+        }
+        paths
     }
 
-    /// Registered extension flags as name → type, for CLI validation.
     #[must_use]
+    /// Return flag types, resolving duplicates by endpoint order.
     pub fn registered_flag_types(
         &self,
     ) -> BTreeMap<String, super::agent_session_services::ExtensionFlagType> {
         use super::agent_session_services::ExtensionFlagType;
-        self.inner
-            .snapshot
-            .read()
-            .map(|guard| {
-                guard
-                    .registry
-                    .flags()
-                    .iter()
-                    .map(|flag| {
-                        let kind = match flag.kind {
+        let mut flags = BTreeMap::new();
+        for endpoint in self.endpoints.iter() {
+            if let Ok(snapshot) = endpoint.snapshot.read() {
+                for flag in snapshot.registry.flags() {
+                    flags
+                        .entry(flag.name.clone())
+                        .or_insert_with(|| match flag.kind {
                             adapters::FlagKind::Boolean => ExtensionFlagType::Boolean,
                             adapters::FlagKind::String => ExtensionFlagType::String,
-                        };
-                        (flag.name.clone(), kind)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+                        });
+                }
+            }
+        }
+        flags
     }
 
-    /// Registered extension provider adapters keyed by provider id, freshly
-    /// bound to the live host client (callers register them with the model
-    /// runtime). Rebuilt per call since [`ExtensionProvider`] is not `Clone`.
-    ///
-    /// Includes every host-registered provider. Custom-stream selection still
-    /// requires `streamSimple: true` at registration time
-    /// ([`Self::register_providers_on`]); baseURL-only providers stay native.
     #[must_use]
+    /// Build provider adapters bound to each first-winning provider's endpoint client.
     pub fn providers(&self) -> HashMap<String, ExtensionProvider> {
-        let client = Arc::clone(&self.inner.client);
-        self.inner
-            .snapshot
-            .read()
-            .map(|guard| {
-                guard
-                    .registry
-                    .providers()
-                    .iter()
-                    .map(|provider| {
-                        (
-                            provider.name.clone(),
-                            ExtensionProvider::new(provider.name.clone(), Arc::clone(&client)),
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+        let mut providers = HashMap::new();
+        for endpoint in self.endpoints.iter() {
+            if let Ok(snapshot) = endpoint.snapshot.read() {
+                for provider in snapshot.registry.providers() {
+                    providers.entry(provider.name.clone()).or_insert_with(|| {
+                        ExtensionProvider::new(provider.name.clone(), Arc::clone(&endpoint.client))
+                    });
+                }
+            }
+        }
+        providers
     }
 
-    /// Register this host's provider configs + stream adapters on `runtime`.
-    ///
-    /// Each provider failure becomes a diagnostic string; siblings continue.
-    /// Stream handlers are registered only when `streamSimple` was true.
     #[must_use]
+    /// Register first-winning provider configs and owning stream adapters.
     pub fn register_providers_on(
         &self,
         runtime: &ModelRuntime,
     ) -> Vec<(String, Result<(), ModelRuntimeError>)> {
-        let configs = self.provider_configs();
-        let stream_ids = self.stream_provider_ids();
-        let paths = self.provider_extension_paths();
-        let mut results = Vec::with_capacity(configs.len());
-        for (name, config) in configs {
-            let path = paths.get(&name).cloned().unwrap_or_else(|| name.clone());
-            let outcome = runtime.register_provider(&name, config);
-            if outcome.is_ok() && stream_ids.contains(&name) {
-                let adapter = ExtensionProvider::new(name.clone(), Arc::clone(self.client()));
-                runtime.register_extension_stream_provider(name.clone(), Arc::new(adapter));
+        let mut seen = HashSet::new();
+        let mut results = Vec::new();
+        for endpoint in self.endpoints.iter() {
+            let Ok(snapshot) = endpoint.snapshot.read() else {
+                continue;
+            };
+            for (name, config) in &snapshot.provider_configs {
+                if !seen.insert(name.clone()) {
+                    continue;
+                }
+                let path = snapshot
+                    .provider_extension_paths
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| name.clone());
+                let outcome = runtime.register_provider(name, config.clone());
+                if outcome.is_ok() && snapshot.stream_provider_ids.contains(name) {
+                    let adapter =
+                        ExtensionProvider::new(name.clone(), Arc::clone(&endpoint.client));
+                    runtime.register_extension_stream_provider(name.clone(), Arc::new(adapter));
+                }
+                results.push((path, outcome));
             }
-            results.push((path, outcome));
         }
         results
     }
 
-    /// Unregister every provider currently owned by this runner from `runtime`.
+    /// Unregister every first-winning provider from the model runtime.
     pub fn unregister_providers_from(&self, runtime: &ModelRuntime) {
         for name in self.provider_configs().keys() {
             runtime.unregister_provider(name);
         }
     }
 
-    /// Snapshot of the pi-ext [`Registry`] (tools/commands/shortcuts/flags/
-    /// renderers/providers with first-wins dedup applied).
     #[must_use]
+    /// Build the ordered first-winning aggregate extension registry.
     pub fn registry(&self) -> Registry {
-        self.inner
-            .snapshot
-            .read()
-            .map(|guard| clone_registry(&guard.registry))
-            .unwrap_or_default()
+        let mut registry = Registry::new();
+        for endpoint in self.endpoints.iter() {
+            if let Ok(snapshot) = endpoint.snapshot.read() {
+                let source = &snapshot.registry;
+                for item in source.tools() {
+                    let _ = registry.register_tool(item.clone());
+                }
+                for item in source.commands() {
+                    let _ = registry.register_command(item.clone());
+                }
+                for item in source.shortcuts() {
+                    let _ = registry.register_shortcut(item.clone());
+                }
+                for item in source.flags() {
+                    let _ = registry.register_flag(item.clone());
+                }
+                for item in source.renderers() {
+                    let _ = registry.register_renderer(item.clone());
+                }
+                for item in source.providers() {
+                    let _ = registry.register_provider(item.clone());
+                }
+            }
+        }
+        registry
     }
 
-    /// Ordered, undeduplicated host shortcut registrations.
-    ///
-    /// Product code applies last-wins filtering after combining extension and native shortcuts.
     #[must_use]
+    /// Return raw shortcut registrations in true endpoint and path order.
     pub fn raw_shortcuts(&self) -> Vec<ShortcutRegistration> {
-        self.inner
-            .snapshot
-            .read()
-            .map(|guard| guard.raw_shortcuts.clone())
-            .unwrap_or_default()
+        self.endpoints
+            .iter()
+            .flat_map(|endpoint| {
+                endpoint
+                    .snapshot
+                    .read()
+                    .map(|snapshot| snapshot.raw_shortcuts.clone())
+                    .unwrap_or_default()
+            })
+            .collect()
     }
 
-    /// Current reload generation (starts at 1, bumps on each reload).
     #[must_use]
+    /// Return the aggregate reload generation.
     pub fn reload_generation(&self) -> u64 {
-        self.inner.reload_generation.load(Ordering::Relaxed)
+        self.aggregate.reload_generation.load(Ordering::Relaxed)
     }
 
-    /// Whether the host transport is still believed alive.
     #[must_use]
+    /// Return whether any endpoint transport remains live.
     pub fn is_running(&self) -> bool {
-        self.inner.client.is_running() && !self.inner.disabled.load(Ordering::Relaxed)
+        self.endpoints.iter().any(|endpoint| {
+            endpoint.client.is_running() && !endpoint.disabled.load(Ordering::Relaxed)
+        })
     }
 
-    /// Synchronize a complete validated flag overlay with the host.
-    ///
-    /// The local flag snapshot is updated only after the host acknowledges the request.
+    /// Route validated flags to their first-owning endpoints.
     ///
     /// # Errors
     ///
-    /// Returns [`HostClientError::Payload`] when the request or response payload
-    /// cannot be (de)serialized, or when the host rejects the overlay
-    /// (`ok == false`). Propagates the transport-level error from
-    /// [`hook_request`](HostClientInner::hook_request) otherwise:
-    /// [`HostClientError::NotRunning`] when the host is down, and
-    /// [`HostClientError::Timeout`], [`HostClientError::Closed`], or
-    /// [`HostClientError::Remote`] on transport failure.
+    /// With a single endpoint, returns the `flags.set` RPC failure; with
+    /// multiple endpoints, per-endpoint failures are isolated and reported as
+    /// `extension_error` events instead.
     pub async fn apply_flag_values(
         &self,
         values: &BTreeMap<String, FlagValueWire>,
     ) -> Result<(), HostClientError> {
-        let payload = protocol::to_payload(&FlagsSetRequest {
-            values: values.clone(),
-        })
-        .map_err(|error| HostClientError::Payload(format!("encode flags.set: {error}")))?;
-        let frame = self
-            .inner
-            .hook_request(protocol::FLAGS_SET_METHOD, payload)
-            .await?;
-        let response: FlagsSetResponse = protocol::from_payload(&frame.payload)
-            .map_err(|error| HostClientError::Payload(format!("decode flags.set: {error}")))?;
-        if !response.ok {
-            return Err(HostClientError::Payload(
-                "flags.set rejected by extension host".to_owned(),
-            ));
-        }
-        if let Ok(mut flags) = self.inner.flag_values.write() {
-            for (name, value) in values {
-                let value = match value {
-                    FlagValueWire::Boolean(value) => Value::Bool(*value),
-                    FlagValueWire::String(value) => Value::String(value.clone()),
+        for (index, endpoint) in self.endpoints.iter().enumerate() {
+            let selected = if self.endpoints.len() == 1 {
+                values.clone()
+            } else {
+                let earlier = &self.endpoints[..index];
+                let Ok(snapshot) = endpoint.snapshot.read() else {
+                    continue;
                 };
-                flags.insert(name.clone(), value);
+                values
+                    .iter()
+                    .filter(|(name, _)| {
+                        snapshot
+                            .registry
+                            .flags()
+                            .iter()
+                            .any(|flag| flag.name.as_str() == name.as_str())
+                            && !earlier.iter().any(|candidate| {
+                                candidate.snapshot.read().is_ok_and(|snapshot| {
+                                    snapshot
+                                        .registry
+                                        .flags()
+                                        .iter()
+                                        .any(|flag| flag.name.as_str() == name.as_str())
+                                })
+                            })
+                    })
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect()
+            };
+            if selected.is_empty() && self.endpoints.len() != 1 {
+                continue;
+            }
+            let payload = protocol::to_payload(&FlagsSetRequest {
+                values: selected.clone(),
+            })
+            .map_err(|error| HostClientError::Payload(format!("encode flags.set: {error}")))?;
+            let outcome = async {
+                let frame = endpoint
+                    .hook_request(protocol::FLAGS_SET_METHOD, payload)
+                    .await?;
+                let response: FlagsSetResponse =
+                    protocol::from_payload(&frame.payload).map_err(|error| {
+                        HostClientError::Payload(format!("decode flags.set: {error}"))
+                    })?;
+                response.ok.then_some(()).ok_or_else(|| {
+                    HostClientError::Payload("flags.set rejected by extension host".to_owned())
+                })
+            }
+            .await;
+            if let Err(error) = outcome {
+                if self.endpoints.len() == 1 {
+                    return Err(error);
+                }
+                endpoint.report_host_error(&self.aggregate, &error);
+                continue;
+            }
+            if let Ok(mut flags) = endpoint.flag_values.write() {
+                for (name, value) in selected {
+                    flags.insert(
+                        name,
+                        match value {
+                            FlagValueWire::Boolean(value) => Value::Bool(value),
+                            FlagValueWire::String(value) => Value::String(value),
+                        },
+                    );
+                }
             }
         }
         Ok(())
     }
 
-    /// Dispatch one effective extension shortcut.
+    /// Execute a shortcut on its first-owning endpoint.
     ///
     /// # Errors
     ///
-    /// Returns [`HostClientError::Payload`] when the request or response payload
-    /// cannot be (de)serialized. Propagates the transport-level error from
-    /// [`hook_request`](HostClientInner::hook_request) otherwise:
-    /// [`HostClientError::NotRunning`] when the host is down, and
-    /// [`HostClientError::Timeout`], [`HostClientError::Closed`], or
-    /// [`HostClientError::Remote`] on transport failure.
+    /// Returns `HostClientError::NotRunning` when no owning endpoint is
+    /// active, or the RPC/encode/decode failure from the owning endpoint.
     pub async fn execute_shortcut(
         &self,
         key: impl Into<String>,
     ) -> Result<ShortcutExecuteResponse, HostClientError> {
-        let payload =
-            protocol::to_payload(&ShortcutExecuteRequest { key: key.into() }).map_err(|error| {
-                HostClientError::Payload(format!("encode shortcut.execute: {error}"))
-            })?;
-        let frame = self
-            .inner
+        let key = key.into();
+        let endpoint = self
+            .first_owner(|snapshot| {
+                snapshot
+                    .registry
+                    .shortcuts()
+                    .iter()
+                    .any(|item| item.key == key)
+            })
+            .or_else(|| {
+                (self.endpoints.len() == 1)
+                    .then(|| self.endpoints.first())
+                    .flatten()
+            })
+            .ok_or(HostClientError::NotRunning)?;
+        if !endpoint.active() {
+            return Err(HostClientError::NotRunning);
+        }
+        let payload = protocol::to_payload(&ShortcutExecuteRequest { key }).map_err(|error| {
+            HostClientError::Payload(format!("encode shortcut.execute: {error}"))
+        })?;
+        let frame = endpoint
             .hook_request(protocol::SHORTCUT_EXECUTE_METHOD, payload)
             .await?;
         protocol::from_payload(&frame.payload)
             .map_err(|error| HostClientError::Payload(format!("decode shortcut.execute: {error}")))
     }
 
-    /// Deliver one event to a keyed UI slot generation.
+    /// Route a namespaced slot event back to the owning endpoint.
     ///
     /// # Errors
     ///
-    /// Returns [`HostClientError::Payload`] when the request or response payload
-    /// cannot be (de)serialized. Propagates the transport-level error from
-    /// [`hook_request`](HostClientInner::hook_request) otherwise:
-    /// [`HostClientError::NotRunning`] when the host is down, and
-    /// [`HostClientError::Timeout`], [`HostClientError::Closed`], or
-    /// [`HostClientError::Remote`] on transport failure.
+    /// Returns `HostClientError::NotRunning` when the routed endpoint is gone
+    /// or inactive, or the RPC/encode/decode failure from the owner.
     pub async fn send_ui_event(
         &self,
-        request: UiEventRequest,
+        mut request: UiEventRequest,
     ) -> Result<UiEventResponse, HostClientError> {
+        let route = self
+            .aggregate
+            .slot_routes
+            .read()
+            .ok()
+            .and_then(|routes| routes.get(&request.key).cloned())
+            .or_else(|| {
+                let endpoint = self.endpoints.first()?;
+                (self.endpoints.len() == 1).then(|| SlotRoute {
+                    endpoint_id: endpoint.id,
+                    generation: endpoint.reload_generation.load(Ordering::Relaxed),
+                    local_key: request.key.clone(),
+                })
+            });
+        let Some(route) = route else {
+            return Ok(UiEventResponse { delivered: false });
+        };
+        let endpoint = self
+            .endpoints
+            .iter()
+            .find(|endpoint| {
+                endpoint.id == route.endpoint_id
+                    && endpoint.reload_generation.load(Ordering::Relaxed) == route.generation
+                    && endpoint.active()
+            })
+            .ok_or(HostClientError::NotRunning)?;
+        request.key = route.local_key;
         let payload = protocol::to_payload(&request)
             .map_err(|error| HostClientError::Payload(format!("encode uiEvent: {error}")))?;
-        let frame = self
-            .inner
+        let frame = endpoint
             .hook_request(protocol::Method::UiEvent.as_str(), payload)
             .await?;
         protocol::from_payload(&frame.payload)
             .map_err(|error| HostClientError::Payload(format!("decode uiEvent: {error}")))
     }
 
-    // -- Slot / tool-update / provider / error subscriptions ---------------
-
-    /// Subscribe to a keyed UI slot lifecycle. The receiver yields the latest
-    /// sanitized slot, or `None` when the slot is disposed or invalidated by a
-    /// reload. New keys start disposed (`None`) until the host pushes content.
     #[must_use]
+    /// Subscribe to one external aggregate slot key.
     pub fn subscribe_slot(&self, key: &str) -> watch::Receiver<Option<SanitizedSlot>> {
-        if let Ok(mut slots) = self.inner.slots.write() {
-            let sender = slots
+        if let Ok(mut slots) = self.aggregate.slots.write() {
+            return slots
                 .entry(key.to_owned())
-                .or_insert_with(|| watch::channel(None).0);
-            return sender.subscribe();
+                .or_insert_with(|| watch::channel(None).0)
+                .subscribe();
         }
-        // Lock poisoned: hand back a dead receiver.
-        let (tx, rx) = watch::channel(None);
-        let _ = tx.send(None);
-        rx
+        watch::channel(None).1
     }
 
-    /// Currently live slot keys.
     #[must_use]
+    /// Return all live external aggregate slot keys.
     pub fn slot_keys(&self) -> Vec<String> {
-        self.inner
+        self.aggregate
             .slots
             .read()
-            .map(|guard| guard.keys().cloned().collect())
+            .map(|slots| slots.keys().cloned().collect())
             .unwrap_or_default()
     }
 
-    /// Snapshot all currently live sanitized slots.
-    ///
-    /// This lets a mode attach after `session_start` without losing widgets
-    /// already published before its broadcast subscription existed.
     #[must_use]
+    /// Snapshot every live sanitized aggregate slot.
     pub fn current_slots(&self) -> Vec<SanitizedSlot> {
         let mut slots = self
-            .inner
+            .aggregate
             .slots
             .read()
-            .map(|guard| {
-                guard
+            .map(|slots| {
+                slots
                     .values()
                     .filter_map(|sender| sender.borrow().clone())
                     .collect::<Vec<_>>()
@@ -1337,89 +1883,115 @@ impl HostExtensionRunner {
         slots
     }
 
-    /// Subscribe to unsolicited partial tool updates from extension tools.
     #[must_use]
+    /// Subscribe to tool updates fanned in from every endpoint.
     pub fn subscribe_tool_updates(&self) -> broadcast::Receiver<ToolUpdate> {
-        self.inner.tool_updates_tx.subscribe()
+        self.aggregate.tool_updates_tx.subscribe()
     }
 
-    /// Subscribe to unsolicited custom-provider stream events.
     #[must_use]
+    /// Subscribe to provider events fanned in from every endpoint.
     pub fn subscribe_provider_events(&self) -> broadcast::Receiver<ProviderEvent> {
-        self.inner.provider_events_tx.subscribe()
+        self.aggregate.provider_events_tx.subscribe()
     }
 
-    /// Subscribe to non-retryable extension errors (host crashes, timeouts,
-    /// remote error frames, handler-reported failures).
     #[must_use]
+    /// Subscribe to errors fanned in from every endpoint.
     pub fn subscribe_errors(&self) -> broadcast::Receiver<ExtensionErrorEvent> {
-        self.inner.errors_tx.subscribe()
+        self.aggregate.errors_tx.subscribe()
     }
 
-    /// Whether the loaded host has an active `ui.onTerminalInput` handler.
     #[must_use]
+    /// Return whether any active endpoint handles terminal input.
     pub fn has_terminal_input_handlers(&self) -> bool {
-        self.inner
-            .snapshot
-            .read()
-            .is_ok_and(|snapshot| snapshot.terminal_input)
+        self.endpoints.iter().any(|endpoint| {
+            endpoint.active()
+                && endpoint
+                    .snapshot
+                    .read()
+                    .is_ok_and(|snapshot| snapshot.terminal_input)
+        })
     }
 
-    /// Offer canonical terminal input to the host's sequential 4 ms actor.
+    /// Fold terminal input rewrites in endpoint order and stop when consumed.
     ///
     /// # Errors
     ///
-    /// Returns [`HostClientError`] when the host transport is down, the 4 ms
-    /// deadline elapses, or the response payload cannot be decoded.
+    /// With a single endpoint, returns the `terminalInput` RPC failure; with
+    /// multiple endpoints, per-endpoint failures are isolated and reported as
+    /// `extension_error` events instead.
     pub async fn terminal_input(
         &self,
         data: &str,
     ) -> Result<protocol::TerminalInputResult, HostClientError> {
-        let frame = self
-            .inner
-            .client
-            .request(
-                protocol::Method::TerminalInput,
-                serde_json::json!({ "data": data }),
-                Duration::from_millis(4),
-            )
-            .await?;
-        protocol::from_payload(&frame.payload)
-            .map_err(|error| HostClientError::Payload(format!("decode terminalInput: {error}")))
-    }
-
-    /// Subscribe to host notifications and sanitized slot lifecycle.
-    #[must_use]
-    pub fn subscribe_ui(&self) -> broadcast::Receiver<ExtensionUiEvent> {
-        self.inner.ui_tx.subscribe()
-    }
-
-    /// Runtime theme generation from the latest [`Self::push_theme_update`].
-    ///
-    /// Measure/render callers pass this so host components re-measure after
-    /// a theme switch.
-    #[must_use]
-    pub fn theme_generation(&self) -> u64 {
-        self.inner.theme_generation.load(Ordering::Relaxed)
-    }
-
-    /// Push the active theme, catalog, and generation to the host
-    /// (`theme.update` event). The host refreshes `ctx.ui.theme`, its theme
-    /// catalog, and re-pushes every live slot with the new colors.
-    ///
-    /// Host failures are isolated as a single non-retryable
-    /// `extension_error`; the session survives.
-    pub async fn push_theme_update(&self, update: &ThemeUpdate) {
-        if !self.inner.active() {
-            return;
+        let mut current = data.to_owned();
+        let mut transformed = false;
+        for endpoint in self.endpoints.iter() {
+            if !endpoint.active()
+                || !endpoint
+                    .snapshot
+                    .read()
+                    .is_ok_and(|snapshot| snapshot.terminal_input)
+            {
+                continue;
+            }
+            let result = endpoint
+                .client
+                .request(
+                    protocol::Method::TerminalInput,
+                    serde_json::json!({ "data": current }),
+                    Duration::from_millis(4),
+                )
+                .await
+                .and_then(|frame| {
+                    protocol::from_payload::<protocol::TerminalInputResult>(&frame.payload).map_err(
+                        |error| HostClientError::Payload(format!("decode terminalInput: {error}")),
+                    )
+                });
+            match result {
+                Ok(result) => {
+                    if let Some(data) = result.data {
+                        current = data;
+                        transformed = true;
+                    }
+                    if result.consume {
+                        return Ok(protocol::TerminalInputResult {
+                            consume: true,
+                            data: transformed.then_some(current),
+                        });
+                    }
+                }
+                Err(error) if self.endpoints.len() == 1 => return Err(error),
+                Err(error) => endpoint.report_host_error(&self.aggregate, &error),
+            }
         }
-        self.inner
+        Ok(protocol::TerminalInputResult {
+            consume: false,
+            data: transformed.then_some(current),
+        })
+    }
+
+    #[must_use]
+    /// Subscribe to UI activity fanned in from every endpoint.
+    pub fn subscribe_ui(&self) -> broadcast::Receiver<ExtensionUiEvent> {
+        self.aggregate.ui_tx.subscribe()
+    }
+
+    #[must_use]
+    /// Return the latest aggregate theme generation.
+    pub fn theme_generation(&self) -> u64 {
+        self.aggregate.theme_generation.load(Ordering::Relaxed)
+    }
+
+    /// Broadcast a theme update to every active endpoint in order.
+    pub async fn push_theme_update(&self, update: &ThemeUpdate) {
+        self.aggregate
             .theme_generation
             .store(update.theme_generation, Ordering::Relaxed);
         let payload = match serde_json::to_value(update) {
             Ok(payload) => payload,
             Err(error) => {
-                self.inner.publish_error(
+                self.aggregate.publish_error(
                     "extension_protocol",
                     &format!("encode theme.update: {error}"),
                     None,
@@ -1427,177 +1999,171 @@ impl HostExtensionRunner {
                 return;
             }
         };
-        if let Err(error) = self
-            .inner
-            .client
-            .send_event(protocol::THEME_UPDATE_METHOD, payload)
-            .await
-        {
-            self.inner.report_host_error(&error);
+        for endpoint in self.endpoints.iter().filter(|endpoint| endpoint.active()) {
+            if let Err(error) = endpoint
+                .client
+                .send_event(protocol::THEME_UPDATE_METHOD, payload.clone())
+                .await
+            {
+                endpoint.report_host_error(&self.aggregate, &error);
+            }
         }
     }
 
-    /// Claim the sole lossless receiver for correlated host dialog requests.
-    ///
-    /// A product mode calls this exactly once when it binds. Subsequent callers
-    /// receive `None`, preventing two modes from racing responses.
     #[must_use]
+    /// Claim the sole aggregate UI-request receiver.
     pub fn take_ui_requests(&self) -> Option<mpsc::Receiver<HostUiRequest>> {
         let receiver = self
-            .inner
+            .aggregate
             .ui_requests_rx
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         if receiver.is_some() {
-            self.inner
+            self.aggregate
                 .ui_requests_claimed
                 .store(true, Ordering::Release);
         }
         receiver
     }
 
-    /// Answer a correlated host-initiated dialog request.
+    /// Route a synthetic UI response to its generation-matched endpoint.
     ///
     /// # Errors
     ///
-    /// Returns a transport error if the host has already exited.
+    /// Returns `HostClientError::NotRunning` when no pending route matches the
+    /// response id or the endpoint is gone, or the response send failure.
     pub async fn respond_ui(&self, response: HostUiResponse) -> Result<(), HostClientError> {
-        self.inner.client.respond_ui(response).await
+        let aggregate_id = host_ui_response_id(&response);
+        let route = self
+            .aggregate
+            .take_route(aggregate_id, PendingKind::Ui)
+            .ok_or(HostClientError::NotRunning)?;
+        let endpoint = self.endpoint_for_route(route)?;
+        endpoint
+            .client
+            .respond_ui(retag_ui_response(response, route.local_id))
+            .await
     }
 
-    /// Whether the host transport is live and the runner not invalidated.
     #[must_use]
+    /// Return whether any endpoint remains active.
     pub fn is_active(&self) -> bool {
-        self.inner.active()
+        self.endpoints.iter().any(|endpoint| endpoint.active())
     }
 
-    /// Claim the sole lossless receiver for extension session actions
-    /// (`session.command` events and `session.setModel` requests).
-    ///
-    /// The session bridge task calls this exactly once per host instance.
-    /// Subsequent callers receive `None`. While unclaimed, commands are
-    /// dropped and `setModel` requests are answered `success: false`.
     #[must_use]
+    /// Claim the sole aggregate session-action receiver.
     pub fn take_session_bridge(&self) -> Option<mpsc::Receiver<SessionBridgeEvent>> {
         let receiver = self
-            .inner
+            .aggregate
             .session_bridge_rx
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         if receiver.is_some() {
-            self.inner
+            self.aggregate
                 .session_bridge_claimed
                 .store(true, Ordering::Release);
         }
         receiver
     }
 
-    /// Answer a correlated `session.setModel` request.
+    /// Route a synthetic set-model response to its generation-matched endpoint.
     ///
     /// # Errors
     ///
-    /// Returns a transport error if the host has already exited.
+    /// Returns `HostClientError::NotRunning` when no pending route matches the
+    /// response id or the endpoint is gone, or the response send failure.
     pub async fn respond_set_model(
         &self,
         id: FrameId,
         success: bool,
     ) -> Result<(), HostClientError> {
-        self.inner.client.respond_set_model(id, success).await
+        let route = self
+            .aggregate
+            .take_route(id, PendingKind::SetModel)
+            .ok_or(HostClientError::NotRunning)?;
+        self.endpoint_for_route(route)?
+            .client
+            .respond_set_model(route.local_id, success)
+            .await
     }
 
-    /// Answer a correlated `session.compact` request.
+    /// Route a synthetic compact response to its generation-matched endpoint.
     ///
     /// # Errors
     ///
-    /// Returns a transport error if the host has already exited.
+    /// Returns `HostClientError::NotRunning` when no pending route matches the
+    /// response id or the endpoint is gone, or the response send failure.
     pub async fn respond_compact(
         &self,
         id: FrameId,
         outcome: Result<Value, String>,
     ) -> Result<(), HostClientError> {
-        self.inner.client.respond_compact(id, outcome).await
+        let route = self
+            .aggregate
+            .take_route(id, PendingKind::Compact)
+            .ok_or(HostClientError::NotRunning)?;
+        self.endpoint_for_route(route)?
+            .client
+            .respond_compact(route.local_id, outcome)
+            .await
     }
-    /// Push the mirrored session state to the host (`session.update` event).
-    ///
-    /// The host serves the synchronous `ExtensionActions` / context getters
-    /// from the latest push. Host failures are isolated as a single
-    /// non-retryable `extension_error`; the session survives.
+
+    /// Broadcast mirrored session state to every active endpoint in order.
     pub async fn push_session_state(&self, state: &SessionStateWire) {
-        if !self.inner.active() {
-            return;
-        }
-        let payload = match serde_json::to_value(state) {
-            Ok(payload) => payload,
-            Err(error) => {
-                self.inner.publish_error(
-                    "extension_protocol",
-                    &format!("encode session.update: {error}"),
-                    None,
-                );
-                return;
-            }
-        };
-        if let Err(error) = self
-            .inner
-            .client
-            .send_event(protocol::SESSION_UPDATE_METHOD, payload)
-            .await
-        {
-            self.inner.report_host_error(&error);
-        }
+        self.broadcast_event(protocol::SESSION_UPDATE_METHOD, state, "session.update")
+            .await;
     }
 
-    /// Push mirrored UI state (editor text, tool expansion) to the host
-    /// (`ui.state` event). Pushed at UI sync points, not per keystroke; the
-    /// host serves `getEditorText` / `getToolsExpanded` from the latest push.
+    /// Broadcast mirrored UI state to every active endpoint in order.
     pub async fn push_ui_state(&self, state: &UiStateWire) {
-        if !self.inner.active() {
-            return;
-        }
-        let payload = match serde_json::to_value(state) {
+        self.broadcast_event(protocol::UI_STATE_METHOD, state, "ui.state")
+            .await;
+    }
+
+    async fn broadcast_event<T: Serialize>(&self, method: &str, value: &T, label: &str) {
+        let payload = match serde_json::to_value(value) {
             Ok(payload) => payload,
             Err(error) => {
-                self.inner.publish_error(
+                self.aggregate.publish_error(
                     "extension_protocol",
-                    &format!("encode ui.state: {error}"),
+                    &format!("encode {label}: {error}"),
                     None,
                 );
                 return;
             }
         };
-        if let Err(error) = self
-            .inner
-            .client
-            .send_event(protocol::UI_STATE_METHOD, payload)
-            .await
-        {
-            self.inner.report_host_error(&error);
+        for endpoint in self.endpoints.iter().filter(|endpoint| endpoint.active()) {
+            if let Err(error) = endpoint.client.send_event(method, payload.clone()).await {
+                endpoint.report_host_error(&self.aggregate, &error);
+            }
         }
     }
 
-    // -- Custom tool HTML rendering (session export) ----------------------
-
-    /// Render an extension tool call or result as sanitized HTML for session
-    /// export. Returns `Ok(None)` when no renderer is registered for
-    /// `tool_name`. The host runs the registered `renderCall` / `renderResult`
-    /// and returns an HTML fragment; Rust strips `<script>` / `<style>` blocks
-    /// and escapes the remaining markup so plugin bytes never inject active
-    /// content into an exported document.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ExtensionRunner` error](super::agent_session::extension_runner::ExtensionRunnerError)
-    /// semantics: transport failures are reported as a non-retryable
-    /// `extension_error` and the call resolves to `Ok(None)` (isolation).
+    /// Render extension tool HTML on the first-owning endpoint.
     pub async fn render_extension_tool_html(
         &self,
         phase: ToolRenderPhase,
         tool_name: &str,
         payload: &Value,
     ) -> Option<String> {
-        if !self.inner.active() {
+        let endpoint = self
+            .first_owner(|snapshot| {
+                snapshot.registry.tool(tool_name).is_some()
+                    || snapshot
+                        .registry
+                        .renderers()
+                        .iter()
+                        .any(|renderer| renderer.name == tool_name)
+            })
+            .or_else(|| {
+                (self.endpoints.len() == 1)
+                    .then(|| self.endpoints.first())
+                    .flatten()
+            })?;
+        if !endpoint.active() {
             return None;
         }
         let request = serde_json::json!({
@@ -1605,50 +2171,43 @@ impl HostExtensionRunner {
             "toolName": tool_name,
             "payload": payload,
         });
-        match self
-            .inner
+        match endpoint
             .client
-            .request_raw(TOOL_RENDER_HTML_METHOD, request, self.inner.hook_timeout)
+            .request_raw(TOOL_RENDER_HTML_METHOD, request, endpoint.hook_timeout)
             .await
         {
-            Ok(frame) => match serde_json::from_value::<ToolRenderHtmlWire>(frame.payload) {
-                Ok(wire) => wire.html.as_deref().map(sanitize_html),
-                Err(_) => None,
-            },
-            Err(err) => {
-                self.inner.report_host_error(&err);
+            Ok(frame) => serde_json::from_value::<ToolRenderHtmlWire>(frame.payload)
+                .ok()
+                .and_then(|wire| wire.html.as_deref().map(sanitize_html)),
+            Err(error) => {
+                endpoint.report_host_error(&self.aggregate, &error);
                 None
             }
         }
     }
 
-    // -- Reload / invalidate / shutdown -----------------------------------
-
-    /// Bump the reload generation, dispose every active slot, and reap the
-    /// current host exactly once (reap-only; the session layer owns the
-    /// typed `session_shutdown{reload}` emission before calling this). The
-    /// caller re-creates the runner (via [`HostExtensionRunner::start`] /
-    /// [`connect`](Self::connect)) for the clean registration pass. Returns
-    /// the new generation.
+    /// Reap every endpoint and advance the aggregate reload generation.
     pub async fn reload(&self) -> u64 {
         let generation = self
-            .inner
+            .aggregate
             .reload_generation
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
-        Self::shutdown_once_with_inner(&self.inner).await;
-        self.inner.stale.store(true, Ordering::Relaxed);
+        self.shutdown_once().await;
+        for endpoint in self.endpoints.iter() {
+            endpoint.stale.store(true, Ordering::Relaxed);
+        }
         generation
     }
 
-    /// Sequential restart: await old transport reap, spawn a fresh host with
-    /// the same extension paths, re-register providers on `runtime`, and
-    /// restore flag values. Returns the new runner.
+    /// Restart all classified endpoints and restore providers and flags.
     ///
     /// # Errors
     ///
-    /// Returns [`HostStartError`] when the replacement host fails to start.
-    /// On failure the old runner remains shut down; callers must degrade.
+    /// Returns `HostStartError` when the replacement runner fails to start,
+    /// when a preserved flag value is not a boolean or string
+    /// (`HostStartError::FlagSync`), or when flag synchronization with the
+    /// replacement fails.
     pub async fn restart_and_rewire(
         &self,
         runtime: &ModelRuntime,
@@ -1674,18 +2233,19 @@ impl HostExtensionRunner {
         F: FnOnce(Vec<String>, String, bool) -> Fut,
         Fut: std::future::Future<Output = Result<Arc<Self>, HostStartError>>,
     {
-        // 1. Drop old provider registrations before the new host binds.
         self.unregister_providers_from(runtime);
-        // 2. Await old transport shutdown / process reap exactly once.
+        let paths = self.extension_paths();
+        let load_cwd = self
+            .endpoints
+            .first()
+            .map(|endpoint| endpoint.load_cwd.clone())
+            .unwrap_or_default();
+        let project_trusted = self
+            .endpoints
+            .first()
+            .is_some_and(|endpoint| endpoint.project_trusted);
         let _ = self.reload().await;
-        // 3. Spawn replacement host with the same paths + cwd + trust bit.
-        let replacement = start(
-            self.inner.extension_paths.clone(),
-            self.inner.load_cwd.clone(),
-            self.inner.project_trusted,
-        )
-        .await?;
-        // 4. Restore flags before any replacement-host hook can run.
+        let replacement = start(paths, load_cwd, project_trusted).await?;
         let preserved_flags = preserved_flags
             .into_iter()
             .map(|(name, value)| {
@@ -1705,16 +2265,17 @@ impl HostExtensionRunner {
             .apply_flag_values(&preserved_flags)
             .await
             .map_err(|error| HostStartError::FlagSync(error.to_string()))?;
-        // 5. Re-register providers (sibling isolation on individual failures).
         let _ = replacement.register_providers_on(runtime);
         Ok(replacement)
     }
 
-    /// Resolve + spawn with an explicit load cwd.
+    /// Classify and start extension endpoints with an explicit load directory.
     ///
     /// # Errors
     ///
-    /// See [`HostExtensionRunner::start`].
+    /// Per-endpoint failures are isolated and surfaced through
+    /// [`HostExtensionRunner::load_errors`]; an `Err` is reserved for failures
+    /// that prevent the aggregate runner itself from being constructed.
     pub async fn start_with_cwd(
         extension_paths: Vec<String>,
         load_cwd: impl Into<String>,
@@ -1722,67 +2283,45 @@ impl HostExtensionRunner {
         Self::start_with_cwd_and_trust(extension_paths, load_cwd, false).await
     }
 
-    /// Resolve + spawn with an explicit load cwd and project-trust value.
+    /// Classify and start extension endpoints with explicit load trust.
     ///
     /// # Errors
     ///
-    /// See [`HostExtensionRunner::start`].
+    /// Per-endpoint failures are isolated and surfaced through
+    /// [`HostExtensionRunner::load_errors`]; an `Err` is reserved for failures
+    /// that prevent the aggregate runner itself from being constructed.
     pub async fn start_with_cwd_and_trust(
         extension_paths: Vec<String>,
         load_cwd: impl Into<String>,
         project_trusted: bool,
     ) -> Result<Arc<Self>, HostStartError> {
-        let spec = host::resolve_host()?;
-        let client =
-            Arc::new(HostClient::spawn(&spec).map_err(|e| HostStartError::Spawn(e.to_string()))?);
-        let startup = Self::connect_with_cwd_and_trust(
-            Arc::clone(&client),
-            extension_paths,
-            load_cwd,
-            project_trusted,
-            HOOK_TIMEOUT,
+        Self::start_classified(extension_paths, load_cwd.into(), project_trusted).await
+    }
+
+    /// Invalidate every endpoint and clear aggregate routes and slots.
+    pub fn invalidate(&self) {
+        for endpoint in self.endpoints.iter() {
+            endpoint.stale.store(true, Ordering::Relaxed);
+        }
+        self.aggregate.dispose_all_slots();
+        let mut routes = self
+            .aggregate
+            .pending_routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        routes.clear();
+    }
+
+    /// Shut down and reap every endpoint exactly once.
+    pub async fn shutdown_once(&self) {
+        futures::future::join_all(
+            self.endpoints
+                .iter()
+                .map(|endpoint| Self::shutdown_endpoint_once(endpoint, &self.aggregate)),
         )
         .await;
-        Self::finish_startup(&client, startup).await
+        self.aggregate.dispose_all_slots();
     }
-
-    /// Mark this runner stale (session replacement). Subsequent hooks and
-    /// handler-presence queries short-circuit to no-ops; active slots are
-    /// disposed so the host disposes the previous component generation.
-    pub fn invalidate(&self) {
-        self.inner.stale.store(true, Ordering::Relaxed);
-        self.inner.dispose_all_slots();
-    }
-
-    /// Graceful shutdown of the host client, exactly once. Repeated calls are
-    /// no-ops. Slot subscriptions are disposed and the runner is marked
-    /// disabled.
-    pub async fn shutdown_once(&self) {
-        Self::shutdown_once_with_inner(&self.inner).await;
-    }
-}
-
-fn clone_registry(source: &Registry) -> Registry {
-    let mut copy = Registry::new();
-    for tool in source.tools() {
-        let _ = copy.register_tool(tool.clone());
-    }
-    for command in source.commands() {
-        let _ = copy.register_command(command.clone());
-    }
-    for shortcut in source.shortcuts() {
-        let _ = copy.register_shortcut(shortcut.clone());
-    }
-    for flag in source.flags() {
-        let _ = copy.register_flag(flag.clone());
-    }
-    for renderer in source.renderers() {
-        let _ = copy.register_renderer(renderer.clone());
-    }
-    for provider in source.providers() {
-        let _ = copy.register_provider(provider.clone());
-    }
-    copy
 }
 
 /// Spawn the unsolicited-event pump. Routes typed host events into the bounded
@@ -1792,106 +2331,182 @@ fn clone_registry(source: &Registry) -> Registry {
 /// Subscribe-then-check: a fast-exiting host can broadcast `Eof` (then clear
 /// `running`) before this pump subscribes, so the flag is probed after
 /// subscribing — state catches an early EOF, the broadcast catches a late one.
-fn spawn_event_pump(inner: Arc<Inner>) {
-    let mut rx = inner.client.subscribe();
+fn spawn_event_pump(endpoint: Arc<Endpoint>, aggregate: Arc<AggregateState>) {
+    let mut rx = endpoint.client.subscribe();
     tokio::spawn(async move {
-        if !inner.client.is_running() {
-            inner.disabled.store(true, Ordering::Relaxed);
-            inner.publish_error("extension_closed", "extension host stream closed", None);
-            HostExtensionRunner::shutdown_once_with_inner(&inner).await;
+        let pump = EventPump {
+            endpoint: &endpoint,
+            aggregate: &aggregate,
+        };
+        if !endpoint.client.is_running() {
+            pump.fatal("extension_closed", "extension host stream closed")
+                .await;
             return;
         }
-        loop {
-            match rx.recv().await {
-                Ok(HostEvent::UiRequest(request)) => {
-                    if !inner.active() || !inner.ui_requests_claimed.load(Ordering::Acquire) {
-                        let _ = inner.client.respond_ui(default_ui_response(&request)).await;
-                    } else if let Err(error) = inner.ui_requests_tx.send(request).await {
-                        let _ = inner.client.respond_ui(default_ui_response(&error.0)).await;
-                    }
-                }
-                Ok(HostEvent::Notify(notification)) => {
-                    inner.notify_send(notification);
-                }
-                Ok(HostEvent::ThemeSet(set)) => {
-                    inner.theme_set_send(set);
-                }
-                Ok(HostEvent::UiControl(control)) => {
-                    inner.ui_control_send(control);
-                }
-                Ok(HostEvent::SessionCommand(command)) => {
-                    forward_session_bridge(&inner, SessionBridgeEvent::Command(command)).await;
-                }
-                Ok(HostEvent::SetModelRequest { id, request }) => {
-                    forward_session_bridge(&inner, SessionBridgeEvent::SetModel { id, request })
-                        .await;
-                }
-                Ok(HostEvent::CompactRequest { id, request }) => {
-                    forward_session_bridge(&inner, SessionBridgeEvent::Compact { id, request })
-                        .await;
-                }
-                Ok(HostEvent::UiSlot(slot)) => {
-                    forward_slot(&inner, &slot);
-                }
-                Ok(HostEvent::DisposeSlot(d)) => {
-                    forward_dispose(&inner, &d);
-                }
-                Ok(HostEvent::ToolUpdate(update)) => {
-                    let _ = inner.tool_updates_tx.send(update);
-                }
-                Ok(HostEvent::ProviderEvent(event)) => {
-                    let _ = inner.provider_events_tx.send(event);
-                }
-                Ok(HostEvent::ExtensionError(event)) => {
-                    let _ = inner.errors_tx.send(event);
-                }
-                Ok(HostEvent::Raw(frame)) => {
-                    inner.disabled.store(true, Ordering::Relaxed);
-                    inner.publish_error(
-                        "extension_protocol",
-                        &format!("unhandled host frame: {} {}", frame.kind, frame.method),
-                        None,
-                    );
-                    HostExtensionRunner::shutdown_once_with_inner(&inner).await;
-                    break;
-                }
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    inner.publish_error(
-                        "extension_event_lagged",
-                        &format!("dropped {skipped} extension host events"),
-                        None,
-                    );
-                }
-                Ok(HostEvent::Eof) => {
-                    // Host stdout closed: fatal. Disable once, report, then
-                    // shut down / reap the transport exactly once before exit.
-                    inner.disabled.store(true, Ordering::Relaxed);
-                    inner.publish_error("extension_closed", "extension host stream closed", None);
-                    HostExtensionRunner::shutdown_once_with_inner(&inner).await;
-                    break;
-                }
-                Ok(HostEvent::ProtocolError(message)) => {
-                    inner.disabled.store(true, Ordering::Relaxed);
-                    inner.publish_error("extension_protocol", &message, None);
-                    HostExtensionRunner::shutdown_once_with_inner(&inner).await;
-                    break;
-                }
-                Err(broadcast::error::RecvError::Closed) => break,
-            }
-        }
+        while pump.handle(rx.recv().await).await {}
     });
 }
 
-/// Route one session-bridge item to the claiming session task. Unclaimed,
-/// closed, or FULL bridges answer correlated requests immediately (so the
-/// host's awaiting extension never hangs) and drop fire-and-forget commands.
-/// `try_send` keeps the pump from blocking behind a stalled drain task: the
-/// drain task may itself await a hook response only the pump can read, so an
-/// awaited send here could deadlock the transport.
-async fn forward_session_bridge(inner: &Arc<Inner>, event: SessionBridgeEvent) {
-    let claimed = inner.active() && inner.session_bridge_claimed.load(Ordering::Acquire);
+/// Typed forwarding view over one endpoint's unsolicited-event stream.
+struct EventPump<'a> {
+    endpoint: &'a Arc<Endpoint>,
+    aggregate: &'a Arc<AggregateState>,
+}
+
+impl EventPump<'_> {
+    /// Handle one pump event; returns `false` when the pump must stop.
+    async fn handle(&self, event: Result<HostEvent, broadcast::error::RecvError>) -> bool {
+        match event {
+            Ok(HostEvent::UiRequest(request)) => self.forward_ui_request(request).await,
+            Ok(HostEvent::Notify(notification)) => {
+                self.forward_ui(ExtensionUiEvent::Notify(notification));
+            }
+            Ok(HostEvent::ThemeSet(set)) => self.forward_ui(ExtensionUiEvent::ThemeSet(set)),
+            Ok(HostEvent::UiControl(control)) => {
+                self.forward_ui(ExtensionUiEvent::UiControl(control));
+            }
+            Ok(HostEvent::SessionCommand(command)) => {
+                forward_session_bridge(
+                    self.endpoint,
+                    self.aggregate,
+                    SessionBridgeEvent::Command(command),
+                )
+                .await;
+            }
+            Ok(HostEvent::SetModelRequest { id, request }) => {
+                forward_session_bridge(
+                    self.endpoint,
+                    self.aggregate,
+                    SessionBridgeEvent::SetModel { id, request },
+                )
+                .await;
+            }
+            Ok(HostEvent::CompactRequest { id, request }) => {
+                forward_session_bridge(
+                    self.endpoint,
+                    self.aggregate,
+                    SessionBridgeEvent::Compact { id, request },
+                )
+                .await;
+            }
+            Ok(HostEvent::UiSlot(slot)) => forward_slot(self.endpoint, self.aggregate, &slot),
+            Ok(HostEvent::DisposeSlot(dispose)) => {
+                forward_dispose(self.endpoint, self.aggregate, &dispose);
+            }
+            Ok(HostEvent::ToolUpdate(update)) => {
+                let _ = self.aggregate.tool_updates_tx.send(update);
+            }
+            Ok(HostEvent::ProviderEvent(event)) => {
+                let _ = self.aggregate.provider_events_tx.send(event);
+            }
+            Ok(HostEvent::ExtensionError(event)) => {
+                let _ = self.aggregate.errors_tx.send(event);
+            }
+            Ok(HostEvent::Raw(frame)) => {
+                self.fatal(
+                    "extension_protocol",
+                    &format!("unhandled host frame: {} {}", frame.kind, frame.method),
+                )
+                .await;
+                return false;
+            }
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                self.aggregate.publish_error(
+                    "extension_event_lagged",
+                    &format!("dropped {skipped} extension host events"),
+                    None,
+                );
+            }
+            Ok(HostEvent::Eof) => {
+                self.fatal("extension_closed", "extension host stream closed")
+                    .await;
+                return false;
+            }
+            Ok(HostEvent::ProtocolError(message)) => {
+                self.fatal("extension_protocol", &message).await;
+                return false;
+            }
+            Err(broadcast::error::RecvError::Closed) => return false,
+        }
+        true
+    }
+
+    /// Disable the endpoint, publish one terminal error, and reap exactly once.
+    async fn fatal(&self, code: &str, message: &str) {
+        self.endpoint.disabled.store(true, Ordering::Relaxed);
+        self.aggregate.publish_error(code, message, None);
+        HostExtensionRunner::shutdown_endpoint_once(self.endpoint, self.aggregate).await;
+    }
+
+    /// Forward extension UI activity when the endpoint is still active.
+    fn forward_ui(&self, event: ExtensionUiEvent) {
+        if self.endpoint.active() {
+            let _ = self.aggregate.ui_tx.send(event);
+        }
+    }
+
+    /// Claim-or-default a host UI request and retag it with an aggregate id.
+    async fn forward_ui_request(&self, request: HostUiRequest) {
+        if !self.endpoint.active() || !self.aggregate.ui_requests_claimed.load(Ordering::Acquire) {
+            let _ = self
+                .endpoint
+                .client
+                .respond_ui(default_ui_response(&request))
+                .await;
+            return;
+        }
+        let local_request = request.clone();
+        let local_id = host_ui_request_id(&request);
+        let aggregate_id = self
+            .aggregate
+            .insert_route(self.endpoint, local_id, PendingKind::Ui);
+        let request = retag_ui_request(request, aggregate_id);
+        if self.aggregate.ui_requests_tx.send(request).await.is_err() {
+            let _ = self.aggregate.take_route(aggregate_id, PendingKind::Ui);
+            let _ = self
+                .endpoint
+                .client
+                .respond_ui(default_ui_response(&local_request))
+                .await;
+        }
+    }
+}
+
+async fn forward_session_bridge(
+    endpoint: &Arc<Endpoint>,
+    aggregate: &Arc<AggregateState>,
+    event: SessionBridgeEvent,
+) {
+    let claimed = endpoint.active() && aggregate.session_bridge_claimed.load(Ordering::Acquire);
+    let (event, route) = if claimed {
+        match event {
+            SessionBridgeEvent::SetModel { id, request } => {
+                let aggregate_id = aggregate.insert_route(endpoint, id, PendingKind::SetModel);
+                (
+                    SessionBridgeEvent::SetModel {
+                        id: aggregate_id,
+                        request,
+                    },
+                    Some((aggregate_id, PendingKind::SetModel)),
+                )
+            }
+            SessionBridgeEvent::Compact { id, request } => {
+                let aggregate_id = aggregate.insert_route(endpoint, id, PendingKind::Compact);
+                (
+                    SessionBridgeEvent::Compact {
+                        id: aggregate_id,
+                        request,
+                    },
+                    Some((aggregate_id, PendingKind::Compact)),
+                )
+            }
+            SessionBridgeEvent::Command(command) => (SessionBridgeEvent::Command(command), None),
+        }
+    } else {
+        (event, None)
+    };
     let undelivered = if claimed {
-        inner
+        aggregate
             .session_bridge_tx
             .try_send(event)
             .err()
@@ -1902,15 +2517,59 @@ async fn forward_session_bridge(inner: &Arc<Inner>, event: SessionBridgeEvent) {
     match undelivered {
         None | Some(SessionBridgeEvent::Command(_)) => {}
         Some(SessionBridgeEvent::SetModel { id, .. }) => {
-            let _ = inner.client.respond_set_model(id, false).await;
+            let local_id = route
+                .and_then(|(aggregate_id, kind)| aggregate.take_route(aggregate_id, kind))
+                .map_or(id, |route| route.local_id);
+            let _ = endpoint.client.respond_set_model(local_id, false).await;
         }
         Some(SessionBridgeEvent::Compact { id, .. }) => {
-            let _ = inner
+            let local_id = route
+                .and_then(|(aggregate_id, kind)| aggregate.take_route(aggregate_id, kind))
+                .map_or(id, |route| route.local_id);
+            let _ = endpoint
                 .client
-                .respond_compact(id, Err("no active session".to_owned()))
+                .respond_compact(local_id, Err("no active session".to_owned()))
                 .await;
         }
     }
+}
+
+fn host_ui_request_id(request: &HostUiRequest) -> FrameId {
+    match request {
+        HostUiRequest::Select { id, .. }
+        | HostUiRequest::Confirm { id, .. }
+        | HostUiRequest::Input { id, .. }
+        | HostUiRequest::Editor { id, .. } => *id,
+    }
+}
+
+fn retag_ui_request(mut request: HostUiRequest, id: FrameId) -> HostUiRequest {
+    match &mut request {
+        HostUiRequest::Select { id: current, .. }
+        | HostUiRequest::Confirm { id: current, .. }
+        | HostUiRequest::Input { id: current, .. }
+        | HostUiRequest::Editor { id: current, .. } => *current = id,
+    }
+    request
+}
+
+fn host_ui_response_id(response: &HostUiResponse) -> FrameId {
+    match response {
+        HostUiResponse::Select { id, .. }
+        | HostUiResponse::Confirm { id, .. }
+        | HostUiResponse::Input { id, .. }
+        | HostUiResponse::Editor { id, .. } => *id,
+    }
+}
+
+fn retag_ui_response(mut response: HostUiResponse, id: FrameId) -> HostUiResponse {
+    match &mut response {
+        HostUiResponse::Select { id: current, .. }
+        | HostUiResponse::Confirm { id: current, .. }
+        | HostUiResponse::Input { id: current, .. }
+        | HostUiResponse::Editor { id: current, .. } => *current = id,
+    }
+    response
 }
 
 fn default_ui_response(request: &HostUiRequest) -> HostUiResponse {
@@ -1934,22 +2593,24 @@ fn default_ui_response(request: &HostUiRequest) -> HostUiResponse {
     }
 }
 
-fn forward_slot(inner: &Arc<Inner>, slot: &UiSlot) {
-    // Rust is the trust boundary: re-scrub every run/style/link field even
-    // though the host is supposed to send structured runs.
+fn forward_slot(endpoint: &Arc<Endpoint>, aggregate: &Arc<AggregateState>, slot: &UiSlot) {
     let sanitized = sanitize_slot(slot);
     if sanitized.had_rejections {
-        inner.publish_error(
+        aggregate.publish_error(
             "extension_sanitized",
             "extension uiSlot contained rejected control sequences or oversized fields",
             None,
         );
     }
-    inner.slot_send(sanitized);
+    aggregate.slot_send(endpoint, sanitized);
 }
 
-fn forward_dispose(inner: &Arc<Inner>, dispose: &DisposeSlot) {
-    inner.slot_dispose(&dispose.key);
+fn forward_dispose(
+    endpoint: &Arc<Endpoint>,
+    aggregate: &Arc<AggregateState>,
+    dispose: &DisposeSlot,
+) {
+    aggregate.slot_dispose(endpoint, &dispose.key);
 }
 
 /// Strip `<script>` / `<style>` blocks and escape ampersand / angle brackets
@@ -2122,7 +2783,9 @@ fn compact_message_update_event(event: &AssistantMessageEvent) -> Value {
 
 impl ExtensionRunner for HostExtensionRunner {
     fn has_handlers(&self, event: &str) -> bool {
-        self.inner.has_handlers(event)
+        self.endpoints
+            .iter()
+            .any(|endpoint| endpoint.has_handlers(event))
     }
 
     fn emit(
@@ -2132,7 +2795,8 @@ impl ExtensionRunner for HostExtensionRunner {
         '_,
         Result<Option<CancelResult>, super::agent_session::extension_runner::ExtensionRunnerError>,
     > {
-        let inner = Arc::clone(&self.inner);
+        let endpoints = Arc::clone(&self.endpoints);
+        let aggregate = Arc::clone(&self.aggregate);
         Box::pin(async move {
             let method = match event.type_name() {
                 "compaction_start" => "session_before_compact",
@@ -2140,27 +2804,30 @@ impl ExtensionRunner for HostExtensionRunner {
                 "thinking_level_changed" => "thinking_level_select",
                 name => name,
             };
-            if !inner.has_handlers(method) {
-                return Ok(None);
-            }
             let payload =
                 serde_json::to_value(&event).unwrap_or_else(|_| Value::Object(Map::new()));
-            match inner.hook_request(method, payload).await {
-                Ok(frame) => {
-                    let result = serde_json::from_value::<Option<CancelWire>>(frame.payload)
-                        .ok()
-                        .flatten()
-                        .map(|wire| CancelResult {
-                            cancel: wire.cancel,
-                            reason: wire.reason,
-                        });
-                    Ok(result)
+            for endpoint in endpoints.iter() {
+                if !endpoint.has_handlers(method) {
+                    continue;
                 }
-                Err(err) => {
-                    inner.report_host_error(&err);
-                    Ok(None)
+                match endpoint.hook_request(method, payload.clone()).await {
+                    Ok(frame) => {
+                        let result = serde_json::from_value::<Option<CancelWire>>(frame.payload)
+                            .ok()
+                            .flatten();
+                        if let Some(wire) = result
+                            && wire.cancel
+                        {
+                            return Ok(Some(CancelResult {
+                                cancel: true,
+                                reason: wire.reason,
+                            }));
+                        }
+                    }
+                    Err(error) => endpoint.report_host_error(&aggregate, &error),
                 }
             }
+            Ok(None)
         })
     }
 
@@ -2171,34 +2838,38 @@ impl ExtensionRunner for HostExtensionRunner {
         'a,
         Result<Option<CancelResult>, super::agent_session::extension_runner::ExtensionRunnerError>,
     > {
-        let inner = Arc::clone(&self.inner);
+        let endpoints = Arc::clone(&self.endpoints);
+        let aggregate = Arc::clone(&self.aggregate);
         let payload = serde_json::json!({
             "type": MESSAGE_UPDATE_DELTA_METHOD,
             "event": compact_message_update_event(event),
         });
         Box::pin(async move {
-            if !inner.has_handlers("message_update") {
-                return Ok(None);
-            }
-            match inner
-                .hook_request(MESSAGE_UPDATE_DELTA_METHOD, payload)
-                .await
-            {
-                Ok(frame) => {
-                    let result = serde_json::from_value::<Option<CancelWire>>(frame.payload)
-                        .ok()
-                        .flatten()
-                        .map(|wire| CancelResult {
-                            cancel: wire.cancel,
-                            reason: wire.reason,
-                        });
-                    Ok(result)
+            for endpoint in endpoints.iter() {
+                if !endpoint.has_handlers("message_update") {
+                    continue;
                 }
-                Err(error) => {
-                    inner.report_host_error(&error);
-                    Ok(None)
+                match endpoint
+                    .hook_request(MESSAGE_UPDATE_DELTA_METHOD, payload.clone())
+                    .await
+                {
+                    Ok(frame) => {
+                        if let Some(wire) =
+                            serde_json::from_value::<Option<CancelWire>>(frame.payload)
+                                .ok()
+                                .flatten()
+                            && wire.cancel
+                        {
+                            return Ok(Some(CancelResult {
+                                cancel: true,
+                                reason: wire.reason,
+                            }));
+                        }
+                    }
+                    Err(error) => endpoint.report_host_error(&aggregate, &error),
                 }
             }
+            Ok(None)
         })
     }
 
@@ -2209,40 +2880,38 @@ impl ExtensionRunner for HostExtensionRunner {
         '_,
         Result<Option<AgentMessage>, super::agent_session::extension_runner::ExtensionRunnerError>,
     > {
-        let inner = Arc::clone(&self.inner);
+        let endpoints = Arc::clone(&self.endpoints);
+        let aggregate = Arc::clone(&self.aggregate);
         Box::pin(async move {
-            if !inner.has_handlers("message_end") {
-                return Ok(None);
-            }
-            let payload = serde_json::to_value(&message).unwrap_or(Value::Null);
-            match inner.hook_request("message_end", payload).await {
-                Ok(frame) => {
-                    let replacement = serde_json::from_value::<MessageEndWire>(frame.payload)
-                        .ok()
-                        .and_then(|wire| wire.message);
-                    // Enforce the role-preservation invariant the host merge
-                    // guarantees; a mismatched role is dropped + reported.
-                    let role_matches = replacement
-                        .as_ref()
-                        .is_some_and(|replacement| replacement.role() == message.role());
-                    match replacement {
-                        Some(message) if role_matches => Ok(Some(message)),
-                        Some(_) => {
-                            inner.publish_error(
-                                "extension_message_end",
-                                "message_end handler returned a message with a different role",
-                                None,
-                            );
-                            Ok(None)
+            let mut current = message;
+            let mut changed = false;
+            for endpoint in endpoints.iter() {
+                if !endpoint.has_handlers("message_end") {
+                    continue;
+                }
+                let payload = serde_json::to_value(&current).unwrap_or(Value::Null);
+                match endpoint.hook_request("message_end", payload).await {
+                    Ok(frame) => {
+                        let replacement = serde_json::from_value::<MessageEndWire>(frame.payload)
+                            .ok()
+                            .and_then(|wire| wire.message);
+                        if let Some(replacement) = replacement {
+                            if replacement.role() == current.role() {
+                                current = replacement;
+                                changed = true;
+                            } else {
+                                aggregate.publish_error(
+                                    "extension_message_end",
+                                    "message_end handler returned a message with a different role",
+                                    None,
+                                );
+                            }
                         }
-                        None => Ok(None),
                     }
-                }
-                Err(err) => {
-                    inner.report_host_error(&err);
-                    Ok(None)
+                    Err(error) => endpoint.report_host_error(&aggregate, &error),
                 }
             }
+            Ok(changed.then_some(current))
         })
     }
 
@@ -2258,36 +2927,57 @@ impl ExtensionRunner for HostExtensionRunner {
             super::agent_session::extension_runner::ExtensionRunnerError,
         >,
     > {
-        let inner = Arc::clone(&self.inner);
+        let endpoints = Arc::clone(&self.endpoints);
+        let aggregate = Arc::clone(&self.aggregate);
         let tool_name = tool_name.to_owned();
         let tool_call_id = tool_call_id.to_owned();
         Box::pin(async move {
-            if !inner.has_handlers("tool_call") {
-                return Ok(None);
-            }
-            let payload = serde_json::json!({
-                "toolName": tool_name,
-                "toolCallId": tool_call_id,
-                "input": input,
-            });
-            match inner.hook_request("tool_call", payload).await {
-                Ok(frame) => {
-                    let result =
-                        serde_json::from_value::<Option<BeforeToolCallWire>>(frame.payload)
-                            .ok()
-                            .flatten()
-                            .map(|wire| BeforeToolCallResult {
-                                block: wire.block,
-                                reason: wire.reason,
-                                arguments: wire.input,
-                            });
-                    Ok(result)
+            let mut current = input;
+            let mut changed = false;
+            let mut responded = false;
+            let mut reason = None;
+            for endpoint in endpoints.iter() {
+                if !endpoint.has_handlers("tool_call") {
+                    continue;
                 }
-                Err(err) => {
-                    inner.report_host_error(&err);
-                    Ok(None)
+                let payload = serde_json::json!({
+                    "toolName": tool_name,
+                    "toolCallId": tool_call_id,
+                    "input": current,
+                });
+                match endpoint.hook_request("tool_call", payload).await {
+                    Ok(frame) => {
+                        let wire =
+                            serde_json::from_value::<Option<BeforeToolCallWire>>(frame.payload)
+                                .ok()
+                                .flatten();
+                        if let Some(wire) = wire {
+                            responded = true;
+                            if let Some(input) = wire.input {
+                                current = input;
+                                changed = true;
+                            }
+                            // The last responder owns the reason outright: a
+                            // blocking endpoint that omits it must not inherit
+                            // an earlier non-blocking endpoint's reason.
+                            reason = wire.reason;
+                            if wire.block {
+                                return Ok(Some(BeforeToolCallResult {
+                                    block: true,
+                                    reason,
+                                    arguments: changed.then_some(current),
+                                }));
+                            }
+                        }
+                    }
+                    Err(error) => endpoint.report_host_error(&aggregate, &error),
                 }
             }
+            Ok(responded.then_some(BeforeToolCallResult {
+                block: false,
+                reason,
+                arguments: changed.then_some(current),
+            }))
         })
     }
 
@@ -2306,39 +2996,65 @@ impl ExtensionRunner for HostExtensionRunner {
             super::agent_session::extension_runner::ExtensionRunnerError,
         >,
     > {
-        let inner = Arc::clone(&self.inner);
+        let endpoints = Arc::clone(&self.endpoints);
+        let aggregate = Arc::clone(&self.aggregate);
         let tool_name = tool_name.to_owned();
         let tool_call_id = tool_call_id.to_owned();
         Box::pin(async move {
-            if !inner.has_handlers("tool_result") {
-                return Ok(None);
-            }
-            let payload = serde_json::json!({
-                "toolName": tool_name,
-                "toolCallId": tool_call_id,
-                "input": input,
-                "content": content,
-                "details": details,
-                "isError": is_error,
-            });
-            match inner.hook_request("tool_result", payload).await {
-                Ok(frame) => {
-                    let result = serde_json::from_value::<Option<AfterToolCallWire>>(frame.payload)
-                        .ok()
-                        .flatten()
-                        .map(|wire| AfterToolCallResult {
-                            content: wire.content,
-                            details: wire.details,
-                            is_error: wire.is_error,
-                            terminate: wire.terminate,
-                        });
-                    Ok(result)
+            let mut current_content = content;
+            let mut current_details = details;
+            let mut current_is_error = is_error;
+            let mut content_changed = false;
+            let mut details_changed = false;
+            let mut error_changed = false;
+            let mut responded = false;
+            let mut terminate = None;
+            for endpoint in endpoints.iter() {
+                if !endpoint.has_handlers("tool_result") {
+                    continue;
                 }
-                Err(err) => {
-                    inner.report_host_error(&err);
-                    Ok(None)
+                let payload = serde_json::json!({
+                    "toolName": tool_name,
+                    "toolCallId": tool_call_id,
+                    "input": input,
+                    "content": current_content,
+                    "details": current_details,
+                    "isError": current_is_error,
+                });
+                match endpoint.hook_request("tool_result", payload).await {
+                    Ok(frame) => {
+                        let wire =
+                            serde_json::from_value::<Option<AfterToolCallWire>>(frame.payload)
+                                .ok()
+                                .flatten();
+                        if let Some(wire) = wire {
+                            responded = true;
+                            if let Some(content) = wire.content {
+                                current_content = content;
+                                content_changed = true;
+                            }
+                            if let Some(details) = wire.details {
+                                current_details = details;
+                                details_changed = true;
+                            }
+                            if let Some(is_error) = wire.is_error {
+                                current_is_error = is_error;
+                                error_changed = true;
+                            }
+                            if wire.terminate.is_some() {
+                                terminate = wire.terminate;
+                            }
+                        }
+                    }
+                    Err(error) => endpoint.report_host_error(&aggregate, &error),
                 }
             }
+            Ok(responded.then_some(AfterToolCallResult {
+                content: content_changed.then_some(current_content),
+                details: details_changed.then_some(current_details),
+                is_error: error_changed.then_some(current_is_error),
+                terminate,
+            }))
         })
     }
 
@@ -2352,41 +3068,54 @@ impl ExtensionRunner for HostExtensionRunner {
         '_,
         Result<InputTransformResult, super::agent_session::extension_runner::ExtensionRunnerError>,
     > {
-        let inner = Arc::clone(&self.inner);
-        let text = text.to_owned();
+        let endpoints = Arc::clone(&self.endpoints);
+        let aggregate = Arc::clone(&self.aggregate);
+        let mut current_text = text.to_owned();
+        let mut current_images = images;
         let source = source.to_owned();
         let streaming_behavior = streaming_behavior.map(str::to_owned);
         Box::pin(async move {
-            if !inner.has_handlers("input") {
-                return Ok(InputTransformResult::default());
-            }
-            let payload = serde_json::json!({
-                "text": text,
-                "images": images,
-                "source": source,
-                "streamingBehavior": streaming_behavior,
-            });
-            match inner.hook_request("input", payload).await {
-                Ok(frame) => {
-                    let (handled, mapped_text, mapped_images) =
+            let mut text_changed = false;
+            let mut images_changed = false;
+            for endpoint in endpoints.iter() {
+                if !endpoint.has_handlers("input") {
+                    continue;
+                }
+                let payload = serde_json::json!({
+                    "text": current_text,
+                    "images": current_images,
+                    "source": source,
+                    "streamingBehavior": streaming_behavior,
+                });
+                match endpoint.hook_request("input", payload).await {
+                    Ok(frame) => {
                         match serde_json::from_value::<InputTransformWire>(frame.payload) {
-                            Ok(InputTransformWire::Handled) => (true, None, None),
-                            Ok(InputTransformWire::Transform { text, images }) => {
-                                (false, Some(text), images)
+                            Ok(InputTransformWire::Handled) => {
+                                return Ok(InputTransformResult {
+                                    handled: true,
+                                    text: text_changed.then_some(current_text),
+                                    images: images_changed.then_some(current_images).flatten(),
+                                });
                             }
-                            _ => (false, None, None),
-                        };
-                    Ok(InputTransformResult {
-                        handled,
-                        text: mapped_text,
-                        images: mapped_images,
-                    })
-                }
-                Err(err) => {
-                    inner.report_host_error(&err);
-                    Ok(InputTransformResult::default())
+                            Ok(InputTransformWire::Transform { text, images }) => {
+                                current_text = text;
+                                text_changed = true;
+                                if let Some(images) = images {
+                                    current_images = Some(images);
+                                    images_changed = true;
+                                }
+                            }
+                            Ok(InputTransformWire::Continue) | Err(_) => {}
+                        }
+                    }
+                    Err(error) => endpoint.report_host_error(&aggregate, &error),
                 }
             }
+            Ok(InputTransformResult {
+                handled: false,
+                text: text_changed.then_some(current_text),
+                images: images_changed.then_some(current_images).flatten(),
+            })
         })
     }
 
@@ -2401,32 +3130,47 @@ impl ExtensionRunner for HostExtensionRunner {
             super::agent_session::extension_runner::ExtensionRunnerError,
         >,
     > {
-        let inner = Arc::clone(&self.inner);
+        let endpoints = Arc::clone(&self.endpoints);
+        let aggregate = Arc::clone(&self.aggregate);
         let prompt = prompt.to_owned();
         Box::pin(async move {
-            if !inner.has_handlers("before_agent_start") {
-                return Ok(None);
-            }
-            let payload = serde_json::json!({
-                "prompt": prompt,
-                "images": images,
-            });
-            match inner.hook_request("before_agent_start", payload).await {
-                Ok(frame) => {
-                    let wire =
-                        serde_json::from_value::<Option<BeforeAgentStartWire>>(frame.payload)
-                            .ok()
-                            .flatten();
-                    Ok(wire.map(|wire| BeforeAgentStartResult {
-                        messages: wire.messages,
-                        system_prompt: wire.system_prompt,
-                    }))
+            let mut messages = Vec::new();
+            let mut system_prompt: Option<String> = None;
+            let mut responded = false;
+            for endpoint in endpoints.iter() {
+                if !endpoint.has_handlers("before_agent_start") {
+                    continue;
                 }
-                Err(err) => {
-                    inner.report_host_error(&err);
-                    Ok(None)
+                let payload = serde_json::json!({
+                    "prompt": prompt,
+                    "images": images,
+                    "messages": messages,
+                    "systemPrompt": system_prompt,
+                });
+                match endpoint.hook_request("before_agent_start", payload).await {
+                    Ok(frame) => {
+                        let wire =
+                            serde_json::from_value::<Option<BeforeAgentStartWire>>(frame.payload)
+                                .ok()
+                                .flatten();
+                        if let Some(wire) = wire {
+                            responded = true;
+                            // Injections accumulate across endpoints; each
+                            // endpoint observes the running list in the next
+                            // request payload.
+                            messages.extend(wire.messages);
+                            if wire.system_prompt.is_some() {
+                                system_prompt = wire.system_prompt;
+                            }
+                        }
+                    }
+                    Err(error) => endpoint.report_host_error(&aggregate, &error),
                 }
             }
+            Ok(responded.then_some(BeforeAgentStartResult {
+                messages,
+                system_prompt,
+            }))
         })
     }
 
@@ -2441,54 +3185,50 @@ impl ExtensionRunner for HostExtensionRunner {
             super::agent_session::extension_runner::ExtensionRunnerError,
         >,
     > {
-        let inner = Arc::clone(&self.inner);
+        let endpoints = Arc::clone(&self.endpoints);
+        let aggregate = Arc::clone(&self.aggregate);
         let cwd = cwd.to_owned();
         let reason = reason.to_owned();
         Box::pin(async move {
-            if !inner.has_handlers("resources_discover") {
-                return Ok(ResourceExtensionPaths::default());
-            }
-            let payload = serde_json::json!({ "cwd": cwd, "reason": reason });
-            match inner.hook_request("resources_discover", payload).await {
-                Ok(frame) => {
-                    let wire = serde_json::from_value::<ResourcesDiscoverWire>(frame.payload)
-                        .unwrap_or_default();
-                    let discovered = |paths: Option<Vec<ResourcePathWire>>| {
-                        paths
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(|entry| {
-                                ExtensionResourcePath::discovered(entry.path, &entry.extension_path)
-                            })
-                            .collect()
-                    };
-                    Ok(ResourceExtensionPaths {
-                        skill_paths: discovered(wire.skills),
-                        prompt_paths: discovered(wire.prompts),
-                        theme_paths: discovered(wire.themes),
-                    })
+            let mut result = ResourceExtensionPaths::default();
+            for endpoint in endpoints.iter() {
+                if !endpoint.has_handlers("resources_discover") {
+                    continue;
                 }
-                Err(err) => {
-                    inner.report_host_error(&err);
-                    Ok(ResourceExtensionPaths::default())
+                let payload = serde_json::json!({ "cwd": cwd, "reason": reason });
+                match endpoint.hook_request("resources_discover", payload).await {
+                    Ok(frame) => {
+                        let wire = serde_json::from_value::<ResourcesDiscoverWire>(frame.payload)
+                            .unwrap_or_default();
+                        let discovered = |paths: Option<Vec<ResourcePathWire>>| {
+                            paths
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|entry| {
+                                    ExtensionResourcePath::discovered(
+                                        entry.path,
+                                        &entry.extension_path,
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        };
+                        result.skill_paths.extend(discovered(wire.skills));
+                        result.prompt_paths.extend(discovered(wire.prompts));
+                        result.theme_paths.extend(discovered(wire.themes));
+                    }
+                    Err(error) => endpoint.report_host_error(&aggregate, &error),
                 }
             }
+            Ok(result)
         })
     }
 
     fn get_registered_commands(&self) -> Vec<String> {
-        self.inner
-            .snapshot
-            .read()
-            .map(|guard| {
-                guard
-                    .registry
-                    .commands()
-                    .iter()
-                    .map(|command| command.name.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.registry()
+            .commands()
+            .iter()
+            .map(|command| command.name.clone())
+            .collect()
     }
 
     fn execute_command(
@@ -2497,49 +3237,66 @@ impl ExtensionRunner for HostExtensionRunner {
         args: &str,
     ) -> BoxFuture<'_, Result<bool, super::agent_session::extension_runner::ExtensionRunnerError>>
     {
-        let inner = Arc::clone(&self.inner);
+        let endpoint = self
+            .first_owner(|snapshot| {
+                snapshot
+                    .registry
+                    .commands()
+                    .iter()
+                    .any(|command| command.name == name)
+            })
+            .cloned();
+        let aggregate = Arc::clone(&self.aggregate);
         let name = name.to_owned();
         let args = args.to_owned();
         Box::pin(async move {
-            if !inner.has_command(&name) {
+            let Some(endpoint) = endpoint else {
                 return Ok(false);
-            }
-            if !inner.active() {
+            };
+            if !endpoint.active() {
                 return Ok(false);
             }
             let payload = serde_json::json!({ "name": name, "args": args });
-            match inner
+            match endpoint
                 .client
-                .request_raw(COMMAND_EXECUTE_METHOD, payload, inner.hook_timeout)
+                .request_raw(COMMAND_EXECUTE_METHOD, payload, endpoint.hook_timeout)
                 .await
             {
-                Ok(frame) => {
-                    let ok = serde_json::from_value::<CommandExecuteWire>(frame.payload)
-                        .is_ok_and(|wire| wire.ok);
-                    Ok(ok)
-                }
-                Err(err) => {
-                    inner.report_host_error(&err);
-                    Ok(true)
+                Ok(frame) => Ok(serde_json::from_value::<CommandExecuteWire>(frame.payload)
+                    .is_ok_and(|wire| wire.ok)),
+                Err(error) => {
+                    let not_running = matches!(error, HostClientError::NotRunning);
+                    endpoint.report_host_error(&aggregate, &error);
+                    Ok(!not_running)
                 }
             }
         })
     }
 
     fn get_all_registered_tools(&self) -> HashMap<String, Arc<dyn AgentTool>> {
-        self.inner
-            .snapshot
-            .read()
-            .map(|guard| guard.tools.clone())
-            .unwrap_or_default()
+        let mut tools = HashMap::new();
+        for endpoint in self.endpoints.iter() {
+            if let Ok(snapshot) = endpoint.snapshot.read() {
+                for (name, tool) in &snapshot.tools {
+                    tools
+                        .entry(name.clone())
+                        .or_insert_with(|| Arc::clone(tool));
+                }
+            }
+        }
+        tools
     }
 
     fn get_flag_values(&self) -> HashMap<String, Value> {
-        self.inner
-            .flag_values
-            .read()
-            .map(|guard| guard.clone())
-            .unwrap_or_default()
+        let mut values = HashMap::new();
+        for endpoint in self.endpoints.iter() {
+            if let Ok(flags) = endpoint.flag_values.read() {
+                for (name, value) in flags.iter() {
+                    values.entry(name.clone()).or_insert_with(|| value.clone());
+                }
+            }
+        }
+        values
     }
 
     fn invalidate(&self) {
@@ -2547,26 +3304,23 @@ impl ExtensionRunner for HostExtensionRunner {
     }
 
     fn emit_error(&self, message: String) {
-        self.inner.publish_error("extension_error", &message, None);
+        self.aggregate
+            .publish_error("extension_error", &message, None);
     }
 }
 
 impl HostExtensionRunner {
-    async fn shutdown_once_with_inner(inner: &Arc<Inner>) {
-        let _guard = inner.shutdown_lock.lock().await;
-        if inner.shutdown_done.load(Ordering::Relaxed) {
+    async fn shutdown_endpoint_once(endpoint: &Arc<Endpoint>, aggregate: &Arc<AggregateState>) {
+        let _guard = endpoint.shutdown_lock.lock().await;
+        if endpoint.shutdown_done.load(Ordering::Relaxed) {
             return;
         }
-        Self::reap_inner(inner).await;
-        inner.shutdown_done.store(true, Ordering::Relaxed);
-    }
-
-    async fn reap_inner(inner: &Arc<Inner>) {
-        // Order matters for the slot_send/slot_dispose teardown gate: the
-        // flag must be set before dispose_all_slots takes the slots lock.
-        inner.disabled.store(true, Ordering::Relaxed);
-        inner.dispose_all_slots();
-        let _ = inner.client.shutdown().await;
+        let generation = endpoint.reload_generation.load(Ordering::Relaxed);
+        endpoint.disabled.store(true, Ordering::Relaxed);
+        aggregate.remove_endpoint_routes(endpoint.id, generation);
+        aggregate.dispose_endpoint_slots(endpoint.id, generation);
+        let _ = endpoint.client.shutdown().await;
+        endpoint.shutdown_done.store(true, Ordering::Relaxed);
     }
 }
 

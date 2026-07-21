@@ -9,6 +9,8 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -28,9 +30,9 @@ use pi_agent::{
     CustomAgentMessage,
 };
 use pi_ai::{AssistantContent, AssistantMessage, AssistantMessageEvent, TextContent, ToolCall};
-use pi_ext::client::HostClient;
+use pi_ext::client::{HostClient, HostUiRequest, HostUiResponse};
 #[cfg(unix)]
-use pi_ext::host::{HostSource, HostSpec};
+use pi_ext::host::{HostError, HostSource, HostSpec};
 use pi_ext::protocol::{
     ExtensionErrorEvent, FlagValueWire, Frame, FrameKind, HelloAck, KeyEventKindWire,
     KeyModifiersWire, UiEventRequest, UiEventWire, decode_frame_str, encode_frame,
@@ -45,8 +47,8 @@ use super::super::agent_session::events::{
 use super::super::agent_session::extension_runner::{ExtensionRunner, SessionHooks};
 use super::super::model_runtime::{CreateModelRuntimeOptions, ModelRuntime};
 use super::{
-    ALL_EVENT_TYPES, HostExtensionRunner, HostStartError, ToolRenderPhase,
-    compact_message_update_event, sanitize_html,
+    ALL_EVENT_TYPES, ExtensionMode, HostExtensionRunner, HostStartError, SessionBridgeEvent,
+    ToolRenderPhase, classify_endpoint_plans, compact_message_update_event, sanitize_html,
 };
 
 type BoxErr = Box<dyn Error>;
@@ -119,33 +121,7 @@ async fn make_runner_with_trust(
     snapshot: Value,
     project_trusted: bool,
 ) -> Result<(Arc<HostExtensionRunner>, FakeHost), BoxErr> {
-    let (client_to_host, host_read) = tokio::io::duplex(64 * 1024);
-    let (host_write, client_read) = tokio::io::duplex(64 * 1024);
-    let (err_write, _err_read) = tokio::io::duplex(4096);
-    let client = HostClient::connect_boxed(
-        Box::new(client_to_host),
-        Box::new(client_read),
-        Box::new(err_write),
-        None,
-    );
-    let client = Arc::new(client);
-
-    let responses = Arc::new(Mutex::new(HashMap::new()));
-    let drop_methods = Arc::new(Mutex::new(HashSet::new()));
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let (cmd_tx, cmd_rx) = mpsc::channel(64);
-    let resp_clone = Arc::clone(&responses);
-    let drop_clone = Arc::clone(&drop_methods);
-    let requests_clone = Arc::clone(&requests);
-    tokio::spawn(fake_host_task(
-        host_read,
-        host_write,
-        snapshot,
-        resp_clone,
-        drop_clone,
-        requests_clone,
-        cmd_rx,
-    ));
+    let (client, host) = make_fake_client(snapshot);
     let runner = HostExtensionRunner::connect_with_cwd_and_trust(
         Arc::clone(&client),
         vec![],
@@ -154,15 +130,171 @@ async fn make_runner_with_trust(
         FAST_TIMEOUT,
     )
     .await?;
-    Ok((
-        runner,
+    Ok((runner, host))
+}
+
+fn make_fake_client(snapshot: Value) -> (Arc<HostClient>, FakeHost) {
+    let (client_to_host, host_read) = tokio::io::duplex(64 * 1024);
+    let (host_write, client_read) = tokio::io::duplex(64 * 1024);
+    let (err_write, _err_read) = tokio::io::duplex(4096);
+    let client = Arc::new(HostClient::connect_boxed(
+        Box::new(client_to_host),
+        Box::new(client_read),
+        Box::new(err_write),
+        None,
+    ));
+    let responses = Arc::new(Mutex::new(HashMap::new()));
+    let drop_methods = Arc::new(Mutex::new(HashSet::new()));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let (cmd_tx, cmd_rx) = mpsc::channel(64);
+    tokio::spawn(fake_host_task(
+        host_read,
+        host_write,
+        snapshot,
+        Arc::clone(&responses),
+        Arc::clone(&drop_methods),
+        Arc::clone(&requests),
+        cmd_rx,
+    ));
+    (
+        client,
         FakeHost {
             cmd_tx,
             responses,
             drop_methods,
             requests,
         },
-    ))
+    )
+}
+
+async fn make_aggregate_runner(
+    endpoints: Vec<(u64, Value, &str)>,
+) -> Result<(Arc<HostExtensionRunner>, Vec<FakeHost>), BoxErr> {
+    let mut clients = Vec::with_capacity(endpoints.len());
+    let mut hosts = Vec::with_capacity(endpoints.len());
+    for (id, snapshot, path) in endpoints {
+        let (client, host) = make_fake_client(snapshot);
+        clients.push((id, client, vec![path.to_owned()]));
+        hosts.push(host);
+    }
+    let runner = HostExtensionRunner::connect_test_endpoints(clients, FAST_TIMEOUT).await?;
+    Ok((runner, hosts))
+}
+
+/// Three-endpoint runner whose hosts all handle the given mutable hooks.
+async fn make_mutable_hook_runner(
+    handlers: &[&str],
+) -> Result<(Arc<HostExtensionRunner>, Vec<FakeHost>), BoxErr> {
+    let snapshot = || json!({ "handlers": handlers });
+    make_aggregate_runner(vec![
+        (0, snapshot(), "compat-a"),
+        (1, snapshot(), "lean-b"),
+        (2, snapshot(), "compat-c"),
+    ])
+    .await
+}
+
+/// Two-endpoint runner with empty registry snapshots.
+async fn make_pair_runner() -> Result<(Arc<HostExtensionRunner>, Vec<FakeHost>), BoxErr> {
+    make_aggregate_runner(vec![(0, json!({}), "compat-a"), (1, json!({}), "lean-b")]).await
+}
+
+/// Last request payload a fake host recorded for `method`.
+fn last_request_payload(host: &FakeHost, method: &str) -> Result<Value, BoxErr> {
+    host.requests
+        .lock()
+        .map_err(|_| "request lock poisoned")?
+        .iter()
+        .rev()
+        .find(|frame| frame.method == method)
+        .map(|frame| frame.payload.clone())
+        .ok_or_else(|| format!("{method} request missing").into())
+}
+
+/// Whether the host recorded any request for `method`.
+fn host_received(host: &FakeHost, method: &str) -> Result<bool, BoxErr> {
+    Ok(host
+        .requests
+        .lock()
+        .map_err(|_| "request lock poisoned")?
+        .iter()
+        .any(|frame| frame.method == method))
+}
+
+/// Receive one mpsc item within 500ms or fail with `label`.
+async fn recv_labeled<T>(rx: &mut mpsc::Receiver<T>, label: &str) -> Result<T, BoxErr> {
+    tokio::time::timeout(Duration::from_millis(500), rx.recv())
+        .await
+        .map_err(|_| format!("{label} timed out"))?
+        .ok_or_else(|| format!("{label} missing").into())
+}
+
+/// Extract the frame id from a select UI request.
+fn select_id(request: &HostUiRequest) -> Result<u64, BoxErr> {
+    let HostUiRequest::Select { id, .. } = request else {
+        return Err("expected select".into());
+    };
+    Ok(*id)
+}
+
+/// Extract the frame id from a set-model bridge event.
+fn set_model_id(event: &SessionBridgeEvent) -> Result<u64, BoxErr> {
+    let SessionBridgeEvent::SetModel { id, .. } = event else {
+        return Err("expected setModel".into());
+    };
+    Ok(*id)
+}
+
+/// Emit a colliding select + set-model request pair from every host.
+async fn emit_colliding_requests(hosts: &[FakeHost]) {
+    for host in hosts {
+        host.emit(Frame {
+            id: 7,
+            kind: FrameKind::Req,
+            method: "select".to_owned(),
+            payload: json!({"title":"Pick","options":["a"]}),
+        })
+        .await;
+        host.emit(Frame {
+            id: 41,
+            kind: FrameKind::Req,
+            method: "session.setModel".to_owned(),
+            payload: json!({"model":{"id":"m","provider":"p"}}),
+        })
+        .await;
+    }
+}
+
+/// Wait until the host recorded the local responses for the colliding ids.
+async fn wait_for_local_responses(host: &FakeHost) -> R {
+    tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            let complete = host.requests.lock().is_ok_and(|requests| {
+                requests.iter().any(|frame| {
+                    frame.kind == FrameKind::Res && frame.method == "select" && frame.id == 7
+                }) && requests.iter().any(|frame| {
+                    frame.kind == FrameKind::Res
+                        && frame.method == "session.setModel"
+                        && frame.id == 41
+                })
+            });
+            if complete {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| "local response routing timed out")?;
+    Ok(())
+}
+
+/// The endpoint-namespaced aggregate keys for one colliding local slot key.
+fn namespaced_same_keys() -> HashSet<String> {
+    HashSet::from([
+        "endpoint-0:same-key".to_owned(),
+        "endpoint-1:same-key".to_owned(),
+    ])
 }
 
 async fn fake_host_task(
@@ -223,6 +355,9 @@ fn dispatch(
     responses: &Mutex<HashMap<String, Value>>,
     drop_methods: &Mutex<HashSet<String>>,
 ) -> Option<Frame> {
+    if req.kind != FrameKind::Req {
+        return None;
+    }
     if drop_methods
         .lock()
         .is_ok_and(|set| set.contains(&req.method))
@@ -677,6 +812,49 @@ async fn flags_set_acks_before_updating_local_values_and_rejection_preserves_sta
 }
 
 #[tokio::test]
+async fn aggregate_flag_rejection_does_not_skip_later_endpoints() -> R {
+    let (runner, hosts) = make_aggregate_runner(vec![
+        (
+            0,
+            json!({
+                "flags": [{"name": "first", "type": "boolean", "value": false}]
+            }),
+            "first",
+        ),
+        (
+            1,
+            json!({
+                "flags": [{"name": "second", "type": "boolean", "value": false}]
+            }),
+            "second",
+        ),
+    ])
+    .await?;
+    hosts[0].set_response(pi_ext::protocol::FLAGS_SET_METHOD, json!({"ok": false}));
+    hosts[1].set_response(pi_ext::protocol::FLAGS_SET_METHOD, json!({"ok": true}));
+
+    runner
+        .apply_flag_values(&BTreeMap::from([
+            ("first".to_owned(), FlagValueWire::Boolean(true)),
+            ("second".to_owned(), FlagValueWire::Boolean(true)),
+        ]))
+        .await?;
+
+    let values = runner.get_flag_values();
+    assert_eq!(values.get("first"), Some(&Value::Bool(false)));
+    assert_eq!(values.get("second"), Some(&Value::Bool(true)));
+    let later_requests = hosts[1]
+        .requests
+        .lock()
+        .map_err(|_| "request lock poisoned")?;
+    assert!(later_requests.iter().any(|request| {
+        request.method == pi_ext::protocol::FLAGS_SET_METHOD
+            && request.payload == json!({"values": {"second": true}})
+    }));
+    Ok(())
+}
+
+#[tokio::test]
 async fn flags_set_must_ack_before_startup_can_complete() -> R {
     let snapshot = json!({
         "flags": [{"name": "verbose", "type": "boolean", "value": false}]
@@ -775,6 +953,563 @@ async fn shortcut_and_ui_event_requests_use_typed_wire_payloads() -> R {
             "data": "\u{10}"
         })
     );
+    Ok(())
+}
+
+// ===========================================================================
+// Ordered multi-endpoint aggregation
+// ===========================================================================
+
+#[test]
+fn classified_runs_preserve_compat_lean_compat_interleaving() -> R {
+    let temp = tempfile::tempdir()?;
+    let compat_a = temp.path().join("compat-a");
+    let lean_b = temp.path().join("lean-b");
+    let compat_c = temp.path().join("compat-c");
+    for directory in [&compat_a, &lean_b, &compat_c] {
+        std::fs::create_dir_all(directory)?;
+        std::fs::write(directory.join("index.ts"), "export default {}")?;
+    }
+    std::fs::write(
+        lean_b.join("pi-extension.json"),
+        format!(
+            r#"{{"$schema":"pi.extension.v1","name":"lean-b","version":"1.0.0","runtime":"ts-lean","entry":"index.ts","protocolVersion":{}}}"#,
+            pi_ext::protocol::PROTOCOL_VERSION
+        ),
+    )?;
+    let (plans, errors) = classify_endpoint_plans(vec![
+        compat_a.to_string_lossy().into_owned(),
+        lean_b.to_string_lossy().into_owned(),
+        compat_c.to_string_lossy().into_owned(),
+    ]);
+    assert!(
+        errors.is_empty(),
+        "unexpected classification errors: {errors:?}"
+    );
+    assert_eq!(plans.len(), 3);
+    assert_eq!(
+        plans.iter().map(|plan| plan.mode).collect::<Vec<_>>(),
+        vec![
+            ExtensionMode::Compat,
+            ExtensionMode::Lean,
+            ExtensionMode::Compat
+        ]
+    );
+    assert_eq!(
+        plans.iter().map(|plan| plan.id).collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn native_only_startup_skips_bun_and_isolates_run_failure() -> R {
+    let temp = tempfile::tempdir()?;
+    let good = temp.path().join("native-good");
+    let bad = temp.path().join("native-bad");
+    std::fs::create_dir_all(&good)?;
+    std::fs::create_dir_all(&bad)?;
+    let script = good.join("native-host.sh");
+    std::fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"hello"'*)
+      printf '%s\n' '{{"id":1,"kind":"res","method":"hello","payload":{{"protocolVersion":{},"compatibilityVersion":"native"}}}}'
+      ;;
+    *'"method":"extensions.load"'*)
+      printf '%s\n' '{{"id":2,"kind":"res","method":"extensions.load","payload":{{}}}}'
+      ;;
+    *'"method":"shutdown"'*) exit 0 ;;
+  esac
+done
+"#,
+            pi_ext::protocol::PROTOCOL_VERSION
+        ),
+    )?;
+    let mut permissions = std::fs::metadata(&script)?.permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions)?;
+    let bad_entry = bad.join("native-host.sh");
+    std::fs::write(&bad_entry, "not executable")?;
+    for (directory, name) in [(&good, "good"), (&bad, "bad")] {
+        std::fs::write(
+            directory.join("pi-extension.json"),
+            format!(
+                r#"{{"$schema":"pi.extension.v1","name":"{name}","version":"1.0.0","runtime":"native","entry":"native-host.sh","protocolVersion":{}}}"#,
+                pi_ext::protocol::PROTOCOL_VERSION
+            ),
+        )?;
+    }
+    let bun_resolutions = Arc::new(AtomicUsize::new(0));
+    let runner = HostExtensionRunner::start_classified_with_resolver(
+        vec![
+            good.to_string_lossy().into_owned(),
+            bad.to_string_lossy().into_owned(),
+        ],
+        "/workspace".to_owned(),
+        false,
+        {
+            let bun_resolutions = Arc::clone(&bun_resolutions);
+            move || {
+                bun_resolutions.fetch_add(1, Ordering::Relaxed);
+                Err(HostError::NotAFile(PathBuf::from("bun-must-not-resolve")))
+            }
+        },
+    )
+    .await?;
+    assert_eq!(
+        bun_resolutions.load(Ordering::Relaxed),
+        0,
+        "native-only startup must not resolve Bun"
+    );
+    assert!(runner.is_active(), "good native sibling must remain active");
+    let errors = runner.load_errors();
+    assert_eq!(errors.len(), 1, "unexpected run diagnostics: {errors:?}");
+    assert!(errors[0].0.contains("native-bad"));
+    assert!(errors[0].1.contains("Permission denied"));
+    runner.shutdown_once().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn aggregate_registry_and_command_collisions_are_first_wins() -> R {
+    let (runner, hosts) = make_aggregate_runner(vec![
+        (
+            0,
+            json!({
+                "commands":[{"name":"same"}],
+                "shortcuts":[{"key":"ctrl+x"}],
+                "tools":[{"name":"sameTool","label":"Same","description":"d","parameters":{}}],
+                "handlers":[]
+            }),
+            "compat-a",
+        ),
+        (
+            1,
+            json!({
+                "commands":[{"name":"same"},{"name":"only-b"}],
+                "shortcuts":[{"key":"ctrl+x"}],
+                "tools":[{"name":"sameTool","label":"Same B","description":"d","parameters":{}}],
+                "handlers":[]
+            }),
+            "lean-b",
+        ),
+    ])
+    .await?;
+    hosts[0].set_response("command.execute", json!({"ok": true}));
+    hosts[1].set_response("command.execute", json!({"ok": true}));
+    hosts[1].set_response(
+        pi_ext::protocol::SHORTCUT_EXECUTE_METHOD,
+        json!({"handled": true}),
+    );
+    hosts[1].set_response("tool.renderHtml", json!({"html": "wrong owner"}));
+    assert_eq!(runner.get_registered_commands(), vec!["same", "only-b"]);
+    let collision_errors = runner
+        .load_errors()
+        .into_iter()
+        .filter(|(_, message)| message.contains("duplicate command \"same\""))
+        .collect::<Vec<_>>();
+    assert_eq!(collision_errors.len(), 1);
+    assert!(runner.execute_command("same", "args").await?);
+    hosts[0].wait_for_request("command.execute").await?;
+    assert!(
+        !hosts[1]
+            .requests
+            .lock()
+            .map_err(|_| "request lock poisoned")?
+            .iter()
+            .any(|frame| frame.method == "command.execute")
+    );
+    let mut errors = runner.subscribe_errors();
+    hosts[0].close().await;
+    let closed = next_error(&mut errors, Duration::from_millis(500)).await?;
+    assert_eq!(closed.code, "extension_closed");
+    assert!(
+        !runner.execute_command("same", "after-crash").await?,
+        "a command owned by a dead first endpoint must not be swallowed"
+    );
+    assert!(matches!(
+        runner.execute_shortcut("ctrl+x").await,
+        Err(pi_ext::client::HostClientError::NotRunning)
+    ));
+    assert!(
+        runner
+            .render_extension_tool_html(ToolRenderPhase::Result, "sameTool", &json!({}))
+            .await
+            .is_none()
+    );
+    assert!(
+        !hosts[1]
+            .requests
+            .lock()
+            .map_err(|_| "request lock poisoned")?
+            .iter()
+            .any(|frame| {
+                matches!(
+                    frame.method.as_str(),
+                    "command.execute" | "shortcut.execute" | "tool.renderHtml"
+                )
+            }),
+        "a lower-precedence duplicate must not receive command, shortcut, or render requests"
+    );
+    runner.shutdown_once().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn aggregate_message_end_threads_replacements_in_order() -> R {
+    let (runner, hosts) = make_mutable_hook_runner(&["message_end"]).await?;
+    hosts[0].set_response("message_end", json!({"message": assistant_text("A")}));
+    hosts[1].set_response("message_end", json!({"message": assistant_text("B")}));
+    hosts[2].set_response("message_end", Value::Null);
+    let message = runner
+        .emit_message_end(assistant_text("raw"))
+        .await?
+        .ok_or("message_end should replace")?;
+    assert_eq!(message, assistant_text("B"));
+    assert_eq!(
+        last_request_payload(&hosts[1], "message_end")?,
+        serde_json::to_value(assistant_text("A"))?
+    );
+    runner.shutdown_once().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn aggregate_tool_call_threads_inputs_and_short_circuits_on_block() -> R {
+    let (runner, hosts) = make_mutable_hook_runner(&["tool_call"]).await?;
+    hosts[0].set_response("tool_call", json!({"input":{"stage":"A"}}));
+    hosts[1].set_response("tool_call", json!({"input":{"stage":"B"}}));
+    hosts[2].set_response("tool_call", json!({"block":true,"reason":"stop"}));
+    let tool_call = runner
+        .emit_tool_call("read", "tc", Map::new())
+        .await?
+        .ok_or("tool_call result missing")?;
+    assert!(tool_call.block);
+    assert_eq!(tool_call.reason.as_deref(), Some("stop"));
+    assert_eq!(
+        tool_call
+            .arguments
+            .as_ref()
+            .and_then(|args| args.get("stage")),
+        Some(&json!("B"))
+    );
+    for (index, expected) in [(1, "A"), (2, "B")] {
+        assert_eq!(
+            last_request_payload(&hosts[index], "tool_call")?["input"]["stage"],
+            expected
+        );
+    }
+    runner.shutdown_once().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn aggregate_tool_call_block_without_reason_does_not_inherit_earlier_reason() -> R {
+    let (runner, hosts) = make_mutable_hook_runner(&["tool_call"]).await?;
+    hosts[0].set_response("tool_call", json!({"reason":"early"}));
+    hosts[1].set_response("tool_call", json!({}));
+    hosts[2].set_response("tool_call", json!({"block":true}));
+    let tool_call = runner
+        .emit_tool_call("read", "tc", Map::new())
+        .await?
+        .ok_or("tool_call result missing")?;
+    assert!(tool_call.block);
+    assert_eq!(
+        tool_call.reason, None,
+        "a blocking endpoint without a reason must not inherit an earlier endpoint's reason"
+    );
+    runner.shutdown_once().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn aggregate_tool_result_threads_content_details_and_error_flag() -> R {
+    let (runner, hosts) = make_mutable_hook_runner(&["tool_result"]).await?;
+    hosts[0].set_response(
+        "tool_result",
+        json!({"content":[{"type":"text","text":"A"}]}),
+    );
+    hosts[1].set_response(
+        "tool_result",
+        json!({"details":{"stage":"B"},"isError":true}),
+    );
+    hosts[2].set_response("tool_result", json!({"terminate":true}));
+    let tool_result = runner
+        .emit_tool_result("read", "tc", Map::new(), Vec::new(), Value::Null, false)
+        .await?
+        .ok_or("tool_result missing")?;
+    assert_eq!(
+        serde_json::to_value(tool_result.content)?,
+        json!([{"type":"text","text":"A"}])
+    );
+    assert_eq!(tool_result.details, Some(json!({"stage":"B"})));
+    assert_eq!(tool_result.is_error, Some(true));
+    assert_eq!(tool_result.terminate, Some(true));
+    assert_eq!(
+        last_request_payload(&hosts[1], "tool_result")?["content"],
+        json!([{"type":"text","text":"A"}])
+    );
+    runner.shutdown_once().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn aggregate_input_transform_threads_and_short_circuits_on_handled() -> R {
+    let (runner, hosts) = make_mutable_hook_runner(&["input"]).await?;
+    hosts[0].set_response(
+        "input",
+        json!({"action":"transform","text":"A","images":{"stage":"A"}}),
+    );
+    hosts[1].set_response("input", json!({"action":"handled"}));
+    hosts[2].set_response("input", json!({"action":"transform","text":"must-not-run"}));
+    let input = runner.emit_input("raw", None, "user", None).await?;
+    assert!(input.handled);
+    assert_eq!(input.text.as_deref(), Some("A"));
+    assert_eq!(input.images, Some(json!({"stage":"A"})));
+    let b_input = last_request_payload(&hosts[1], "input")?;
+    assert_eq!(b_input["text"], "A");
+    assert_eq!(b_input["images"], json!({"stage":"A"}));
+    assert!(
+        !host_received(&hosts[2], "input")?,
+        "a handled input transform must short-circuit later endpoints"
+    );
+    runner.shutdown_once().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn aggregate_before_agent_start_threads_prompt_and_messages() -> R {
+    let (runner, hosts) = make_mutable_hook_runner(&["before_agent_start"]).await?;
+    hosts[0].set_response(
+        "before_agent_start",
+        json!({
+            "systemPrompt":"system-A",
+            "messages":[assistant_text("injected-A")]
+        }),
+    );
+    hosts[1].set_response("before_agent_start", json!({"systemPrompt":"system-B"}));
+    hosts[2].set_response("before_agent_start", Value::Null);
+    let before = runner
+        .emit_before_agent_start("prompt", None)
+        .await?
+        .ok_or("before_agent_start missing")?;
+    assert_eq!(before.system_prompt.as_deref(), Some("system-B"));
+    assert_eq!(before.messages, vec![assistant_text("injected-A")]);
+    let b_before = last_request_payload(&hosts[1], "before_agent_start")?;
+    assert_eq!(b_before["systemPrompt"], "system-A");
+    assert_eq!(b_before["messages"], json!([assistant_text("injected-A")]));
+    runner.shutdown_once().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn aggregate_before_agent_start_accumulates_messages_across_endpoints() -> R {
+    let (runner, hosts) = make_mutable_hook_runner(&["before_agent_start"]).await?;
+    hosts[0].set_response(
+        "before_agent_start",
+        json!({"messages":[assistant_text("injected-A")]}),
+    );
+    hosts[1].set_response(
+        "before_agent_start",
+        json!({"messages":[assistant_text("injected-B")]}),
+    );
+    hosts[2].set_response("before_agent_start", json!({"systemPrompt":"sys"}));
+    let before = runner
+        .emit_before_agent_start("prompt", None)
+        .await?
+        .ok_or("before_agent_start missing")?;
+    assert_eq!(
+        before.messages,
+        vec![assistant_text("injected-A"), assistant_text("injected-B")],
+        "injected messages from every endpoint accumulate in endpoint order"
+    );
+    assert_eq!(before.system_prompt.as_deref(), Some("sys"));
+    let c_before = last_request_payload(&hosts[2], "before_agent_start")?;
+    assert_eq!(c_before["prompt"], "prompt");
+    assert_eq!(
+        c_before["messages"],
+        json!([assistant_text("injected-A"), assistant_text("injected-B")]),
+        "later endpoints observe the accumulated message list"
+    );
+    runner.shutdown_once().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn aggregate_colliding_ui_and_session_ids_route_to_owning_clients() -> R {
+    let (runner, hosts) = make_pair_runner().await?;
+    let mut ui = runner.take_ui_requests().ok_or("ui claim failed")?;
+    let mut bridge = runner.take_session_bridge().ok_or("bridge claim failed")?;
+    emit_colliding_requests(&hosts).await;
+    let first_ui_id = select_id(&recv_labeled(&mut ui, "first ui request").await?)?;
+    let second_ui_id = select_id(&recv_labeled(&mut ui, "second ui request").await?)?;
+    assert_ne!(first_ui_id, second_ui_id);
+    runner
+        .respond_ui(HostUiResponse::Select {
+            id: first_ui_id,
+            value: Some("a".to_owned()),
+        })
+        .await?;
+    runner
+        .respond_ui(HostUiResponse::Select {
+            id: second_ui_id,
+            value: None,
+        })
+        .await?;
+
+    let first_session_id = set_model_id(&recv_labeled(&mut bridge, "first setModel").await?)?;
+    let second_session_id = set_model_id(&recv_labeled(&mut bridge, "second setModel").await?)?;
+    assert_ne!(first_session_id, second_session_id);
+    runner.respond_set_model(first_session_id, true).await?;
+    runner.respond_set_model(second_session_id, false).await?;
+
+    for host in &hosts {
+        wait_for_local_responses(host).await?;
+    }
+    runner.shutdown_once().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn aggregate_colliding_slot_keys_namespace_and_route_to_owners() -> R {
+    let (runner, hosts) = make_pair_runner().await?;
+    hosts[0].emit(ui_slot_frame("same-key", 1, "A")).await;
+    hosts[1].emit(ui_slot_frame("same-key", 1, "B")).await;
+    tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            if runner.current_slots().len() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| format!("colliding slots timed out: {:?}", runner.slot_keys()))?;
+    assert_eq!(
+        runner.slot_keys().into_iter().collect::<HashSet<_>>(),
+        namespaced_same_keys()
+    );
+    for (index, key) in [(0, "endpoint-0:same-key"), (1, "endpoint-1:same-key")] {
+        hosts[index].set_response("uiEvent", json!({"delivered": true}));
+        assert!(
+            runner
+                .send_ui_event(UiEventRequest {
+                    key: key.to_owned(),
+                    generation: 1,
+                    event: UiEventWire::Key {
+                        code: "x".to_owned(),
+                        modifiers: KeyModifiersWire::default(),
+                        kind: KeyEventKindWire::Press,
+                    },
+                    data: None,
+                })
+                .await?
+                .delivered
+        );
+        hosts[index].wait_for_request("uiEvent").await?;
+        let request = hosts[index]
+            .requests
+            .lock()
+            .map_err(|_| "request lock poisoned")?
+            .iter()
+            .find(|frame| frame.method == "uiEvent")
+            .cloned()
+            .ok_or("routed uiEvent missing")?;
+        assert_eq!(request.payload["key"], "same-key");
+    }
+    hosts[0].emit(ui_slot_frame("same-key", 2, "A2")).await;
+    hosts[1].emit(ui_slot_frame("same-key", 2, "B2")).await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(
+        runner.slot_keys().into_iter().collect::<HashSet<_>>(),
+        namespaced_same_keys()
+    );
+    runner.shutdown_once().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn aggregate_stale_session_route_fails_after_reload() -> R {
+    let (runner, hosts) = make_pair_runner().await?;
+    let mut bridge = runner.take_session_bridge().ok_or("bridge claim failed")?;
+    hosts[0]
+        .emit(Frame {
+            id: 42,
+            kind: FrameKind::Req,
+            method: "session.setModel".to_owned(),
+            payload: json!({"model":{"id":"stale","provider":"p"}}),
+        })
+        .await;
+    let stale_id = set_model_id(&recv_labeled(&mut bridge, "stale setModel").await?)?;
+    assert_eq!(runner.reload().await, 2);
+    assert!(matches!(
+        runner.respond_set_model(stale_id, true).await,
+        Err(pi_ext::client::HostClientError::NotRunning)
+    ));
+    runner.shutdown_once().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn aggregate_host_crash_disables_only_that_endpoint() -> R {
+    let snapshot = json!({"handlers":["message_end"]});
+    let (runner, hosts) = make_aggregate_runner(vec![
+        (0, snapshot.clone(), "compat-a"),
+        (1, snapshot, "lean-b"),
+    ])
+    .await?;
+    hosts[1].set_response("message_end", json!({"message":assistant_text("survivor")}));
+    let mut errors = runner.subscribe_errors();
+    hosts[0].close().await;
+    let closed = next_error(&mut errors, Duration::from_millis(500)).await?;
+    assert_eq!(closed.code, "extension_closed");
+    assert!(runner.is_active());
+    let result = runner
+        .emit_message_end(assistant_text("raw"))
+        .await?
+        .ok_or("surviving endpoint did not run")?;
+    assert_eq!(result, assistant_text("survivor"));
+    hosts[1].wait_for_request("message_end").await?;
+    runner.shutdown_once().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn one_endpoint_keeps_local_frame_ids_and_slot_keys() -> R {
+    let (runner, host) = make_runner(json!({})).await?;
+    let mut bridge = runner.take_session_bridge().ok_or("bridge claim failed")?;
+    host.emit(Frame {
+        id: 41,
+        kind: FrameKind::Req,
+        method: "session.setModel".to_owned(),
+        payload: json!({"model":{"id":"m","provider":"p"}}),
+    })
+    .await;
+    let event = tokio::time::timeout(Duration::from_millis(500), bridge.recv())
+        .await?
+        .ok_or("setModel missing")?;
+    let SessionBridgeEvent::SetModel { id, .. } = event else {
+        return Err("expected setModel".into());
+    };
+    assert_eq!(id, 41);
+    host.emit(ui_slot_frame("plain-key", 1, "slot")).await;
+    tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            if runner.slot_keys().iter().any(|key| key == "plain-key") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    assert_eq!(runner.slot_keys(), vec!["plain-key"]);
+    runner.respond_set_model(id, true).await?;
+    runner.shutdown_once().await;
     Ok(())
 }
 
@@ -909,6 +1644,53 @@ async fn invalidate_drops_delayed_slot_and_notify_with_single_dispose() -> R {
     assert!(
         late_events.is_empty(),
         "no slot/notify may follow the teardown dispose: {late_events:?}"
+    );
+    assert!(runner.slot_keys().is_empty(), "slot map must stay empty");
+    runner.shutdown_once().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn stale_dispose_after_invalidate_does_not_duplicate_disposal() -> R {
+    use crate::core::extension_host::ExtensionUiEvent;
+
+    let (runner, host) = make_runner(full_snapshot()).await?;
+    let mut ui = runner.subscribe_ui();
+
+    host.emit(ui_slot_frame("w", 1, "live")).await;
+    let first = tokio::time::timeout(Duration::from_millis(500), ui.recv()).await??;
+    assert!(
+        matches!(&first, ExtensionUiEvent::Slot(slot) if slot.key == "w"),
+        "expected live slot first: {first:?}"
+    );
+
+    runner.invalidate();
+    // A dispose frame buffered before teardown arrives after it; the stale
+    // gate must drop it instead of emitting a second Dispose.
+    host.emit(Frame {
+        id: 0,
+        kind: FrameKind::Event,
+        method: "disposeSlot".to_owned(),
+        payload: json!({"key":"w","generation":1}),
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let mut disposals = 0;
+    let mut unexpected = Vec::new();
+    while let Ok(event) = ui.try_recv() {
+        match event {
+            ExtensionUiEvent::Dispose { key } => {
+                assert_eq!(key, "w");
+                disposals += 1;
+            }
+            other => unexpected.push(format!("{other:?}")),
+        }
+    }
+    assert_eq!(disposals, 1, "stale dispose must not duplicate disposal");
+    assert!(
+        unexpected.is_empty(),
+        "no event may follow the teardown dispose: {unexpected:?}"
     );
     assert!(runner.slot_keys().is_empty(), "slot map must stay empty");
     runner.shutdown_once().await;

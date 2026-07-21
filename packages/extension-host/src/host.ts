@@ -46,6 +46,7 @@ import { EventEmitter } from "node:events";
 import { validateToolArguments } from "@earendil-works/pi-ai/compat";
 import { parseStreamingJson } from "@earendil-works/pi-ai/utils/json-parse.ts";
 
+
 /** Minimal event bus for extension-to-extension communication. */
 export function createEventBus() {
 	const emitter = new EventEmitter();
@@ -821,7 +822,11 @@ export class ExtensionHost {
 					result = await runner.emitBeforeAgentStart(
 						String(payload["prompt"] ?? ""),
 						payload["images"] as Parameters<typeof runner.emitBeforeAgentStart>[1],
-						this.sessionState.systemPrompt,
+						// Cross-endpoint folds carry the running prompt in the payload;
+						// the session mirror is only the single-endpoint fallback.
+						typeof payload["systemPrompt"] === "string"
+							? payload["systemPrompt"]
+							: this.sessionState.systemPrompt,
 						{ cwd: this.loadOptions?.cwd ?? process.cwd() },
 					);
 					await this.client.respond(id, eventType as Method, result ?? {});

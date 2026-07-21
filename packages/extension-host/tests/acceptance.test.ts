@@ -795,6 +795,21 @@ describe("acceptance: extension runtime", () => {
 			`base|${process.cwd()}`,
 		);
 
+		// An incoming payload systemPrompt seeds the fold ahead of the session
+		// mirror: cross-endpoint aggregates thread the running value this way.
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 133,
+			kind: "req",
+			method: "before_agent_start",
+			payload: { prompt: "go", systemPrompt: "wire-seed" },
+		})));
+		const beforeStartSeeded = await collector.awaitFrame(
+			(frame) => frame.id === 133 && frame.kind === "res",
+		);
+		expect((beforeStartSeeded.payload as Record<string, unknown>)["systemPrompt"]).toBe(
+			`wire-seed|${process.cwd()}`,
+		);
+
 		stdin.push(null);
 		host.dispose("test");
 		await runPromise.catch(() => void 0);

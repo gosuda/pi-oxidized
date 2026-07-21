@@ -9,6 +9,7 @@ pub mod config_value;
 pub mod experimental;
 pub mod export_html;
 pub mod extension_host;
+pub mod extension_manifest;
 pub mod keybindings;
 pub mod lockfile;
 pub mod messages;
