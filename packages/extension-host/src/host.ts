@@ -790,6 +790,42 @@ export class ExtensionHost {
 			}
 			let result: unknown;
 			switch (eventType) {
+				case "tool_call": {
+					const input = payload["input"];
+					if (!isRecord(input)) throw new Error("tool_call.input is required");
+					result = await runner.emitToolCall({
+						type: eventType,
+						toolName: String(payload["toolName"] ?? ""),
+						toolCallId: String(payload["toolCallId"] ?? ""),
+						input,
+					});
+					await this.client.respond(id, eventType as Method, {
+						...(result ?? {}),
+						input,
+					});
+					return;
+				}
+				case "tool_result":
+					result = await runner.emitToolResult({
+						type: eventType,
+						toolName: String(payload["toolName"] ?? ""),
+						toolCallId: String(payload["toolCallId"] ?? ""),
+						input: payload["input"],
+						content: payload["content"],
+						details: payload["details"],
+						isError: payload["isError"] === true,
+					} as Parameters<typeof runner.emitToolResult>[0]);
+					await this.client.respond(id, eventType as Method, result ?? {});
+					return;
+				case "before_agent_start":
+					result = await runner.emitBeforeAgentStart(
+						String(payload["prompt"] ?? ""),
+						payload["images"] as Parameters<typeof runner.emitBeforeAgentStart>[1],
+						this.sessionState.systemPrompt,
+						{ cwd: this.loadOptions?.cwd ?? process.cwd() },
+					);
+					await this.client.respond(id, eventType as Method, result ?? {});
+					return;
 				case "message_end":
 					this.clearActiveAssistant();
 					result = await runner.emitMessageEnd({ type: eventType, ...payload });

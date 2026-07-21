@@ -324,15 +324,29 @@ async fn load_reports_all_33_handlers_and_registry_surfaces() -> R {
 }
 
 #[tokio::test]
-async fn hook_tool_call_maps_typed_block_result() -> R {
+async fn hook_tool_call_maps_block_and_mutated_input() -> R {
     let (runner, host) = make_runner(full_snapshot()).await?;
     host.set_response(
         "tool_call",
-        json!({"block": true, "reason": "denied by policy"}),
+        json!({
+            "block": true,
+            "reason": "denied by policy",
+            "input": {"path": "rewritten"}
+        }),
     );
     let result = runner.emit_tool_call("read", "tc1", Map::new()).await?;
-    let mapped = result.map(|r| (r.block, r.reason));
-    assert_eq!(mapped, Some((true, Some("denied by policy".to_owned()))));
+    let mapped = result.map(|r| (r.block, r.reason, r.arguments));
+    assert_eq!(
+        mapped,
+        Some((
+            true,
+            Some("denied by policy".to_owned()),
+            Some(Map::from_iter([(
+                "path".to_owned(),
+                Value::String("rewritten".to_owned())
+            )]))
+        ))
+    );
     Ok(())
 }
 

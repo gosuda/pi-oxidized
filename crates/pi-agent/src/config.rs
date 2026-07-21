@@ -34,6 +34,11 @@ pub struct BeforeToolCallResult {
     pub block: bool,
     /// Error text used when blocking; a default is used when omitted.
     pub reason: Option<String>,
+    /// Replacement arguments after trusted extension mutation.
+    ///
+    /// These already crossed the tool's validation boundary before the hook,
+    /// matching the upstream in-place mutation contract.
+    pub arguments: Option<Map<String, Value>>,
 }
 
 /// Partial override returned from `after_tool_call`.

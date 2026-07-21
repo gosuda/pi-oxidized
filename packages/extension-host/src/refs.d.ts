@@ -228,6 +228,41 @@ declare module "@earendil-works/pi-coding-agent" {
 	export interface MessageEndEvent { type: "message_end"; message: unknown }
 	export interface ContextEvent { type: "context"; messages: unknown[] }
 	export interface InputEvent { type: "input"; source: string }
+	export interface ToolCallEvent {
+		type: "tool_call";
+		toolName: string;
+		toolCallId: string;
+		input: Record<string, unknown>;
+	}
+	export interface ToolResultEvent {
+		type: "tool_result";
+		toolName: string;
+		toolCallId: string;
+		input: Record<string, unknown>;
+		content: unknown[];
+		details: unknown;
+		isError: boolean;
+	}
+	export interface BeforeAgentStartEvent {
+		type: "before_agent_start";
+		prompt: string;
+		images?: unknown;
+		systemPrompt: string;
+		systemPromptOptions: { cwd: string; [key: string]: unknown };
+	}
+	export interface ToolCallEventResult {
+		block?: boolean;
+		reason?: string;
+	}
+	export interface ToolResultEventResult {
+		content?: unknown[];
+		details?: unknown;
+		isError?: boolean;
+	}
+	export interface BeforeAgentStartEventResult {
+		message?: unknown;
+		systemPrompt?: string;
+	}
 	export interface TurnStartEvent { type: "turn_start"; turnIndex: number }
 	export interface ToolExecutionStartEvent { type: "tool_execution_start"; toolName: string }
 
@@ -265,6 +300,12 @@ declare module "@earendil-works/pi-coding-agent" {
 		on(event: "message_end", handler: ExtensionHandler<MessageEndEvent, { message?: unknown }>): void;
 		on(event: "context", handler: ExtensionHandler<ContextEvent, { messages?: unknown[] }>): void;
 		on(event: "input", handler: ExtensionHandler<InputEvent, { action: string; text?: string }>): void;
+		on(event: "tool_call", handler: ExtensionHandler<ToolCallEvent, ToolCallEventResult>): void;
+		on(event: "tool_result", handler: ExtensionHandler<ToolResultEvent, ToolResultEventResult>): void;
+		on(
+			event: "before_agent_start",
+			handler: ExtensionHandler<BeforeAgentStartEvent, BeforeAgentStartEventResult>,
+		): void;
 		on(event: "turn_start", handler: ExtensionHandler<TurnStartEvent>): void;
 		on(event: "tool_execution_start", handler: ExtensionHandler<ToolExecutionStartEvent>): void;
 		on(event: string, handler: (...args: unknown[]) => unknown): void;
@@ -355,6 +396,14 @@ declare module "@earendil-works/pi-coding-agent" {
 		emitInput(text: string, images: unknown, source: string, streamingBehavior?: string): Promise<{ action: string; text?: string }>;
 		emitMessageEnd(event: unknown): Promise<unknown>;
 		emitResourcesDiscover(cwd: string, reason: string): Promise<unknown>;
+		emitToolCall(event: ToolCallEvent): Promise<ToolCallEventResult | undefined>;
+		emitToolResult(event: ToolResultEvent): Promise<ToolResultEventResult | undefined>;
+		emitBeforeAgentStart(
+			prompt: string,
+			images: unknown,
+			systemPrompt: string,
+			systemPromptOptions: { cwd: string; [key: string]: unknown },
+		): Promise<BeforeAgentStartEventResult | undefined>;
 		getCommand(name: string): ResolvedCommand | undefined;
 		getRegisteredCommands(): ResolvedCommand[];
 		getToolDefinition(toolName: string): ToolDefinition | undefined;

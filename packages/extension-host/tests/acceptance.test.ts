@@ -61,6 +61,21 @@ const projectTrustFactory: ExtensionFactory = (pi) => {
 	});
 };
 
+const typedHookFactory: ExtensionFactory = (pi) => {
+	pi.on("tool_call", (event) => {
+		event.input["patched"] = true;
+		return { block: false };
+	});
+	pi.on("tool_result", () => ({
+		content: [{ type: "text", text: "rewritten" }],
+		details: { source: "typed-hook" },
+		isError: true,
+	}));
+	pi.on("before_agent_start", (event) => ({
+		systemPrompt: `${event.systemPrompt}|${event.systemPromptOptions.cwd}`,
+	}));
+};
+
 async function runProcess(
 	command: string,
 	args: readonly string[],
@@ -721,6 +736,65 @@ describe("acceptance: extension runtime", () => {
 		})));
 		const res = await collector.awaitFrame((f) => f.id === 30 && f.kind === "res");
 		expect(res.payload).toEqual({ action: "continue" });
+		stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
+	});
+
+	test("dispatches mutable lifecycle hooks through their typed runner methods", async () => {
+		const { collector, stdin, host, runPromise } = await connectHost([typedHookFactory]);
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 0,
+			kind: "event",
+			method: "session.update",
+			payload: { systemPrompt: "base" },
+		})));
+
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 130,
+			kind: "req",
+			method: "tool_call",
+			payload: { toolName: "read", toolCallId: "tc1", input: { path: "a" } },
+		})));
+		const toolCall = await collector.awaitFrame((frame) => frame.id === 130 && frame.kind === "res");
+		expect((toolCall.payload as Record<string, unknown>)["input"]).toEqual({
+			path: "a",
+			patched: true,
+		});
+
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 131,
+			kind: "req",
+			method: "tool_result",
+			payload: {
+				toolName: "read",
+				toolCallId: "tc1",
+				input: {},
+				content: [],
+				details: null,
+				isError: false,
+			},
+		})));
+		const toolResult = await collector.awaitFrame((frame) => frame.id === 131 && frame.kind === "res");
+		expect(toolResult.payload).toEqual({
+			content: [{ type: "text", text: "rewritten" }],
+			details: { source: "typed-hook" },
+			isError: true,
+		});
+
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 132,
+			kind: "req",
+			method: "before_agent_start",
+			payload: { prompt: "go" },
+		})));
+		const beforeStart = await collector.awaitFrame(
+			(frame) => frame.id === 132 && frame.kind === "res",
+		);
+		expect((beforeStart.payload as Record<string, unknown>)["systemPrompt"]).toBe(
+			`base|${process.cwd()}`,
+		);
+
 		stdin.push(null);
 		host.dispose("test");
 		await runPromise.catch(() => void 0);

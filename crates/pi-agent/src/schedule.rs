@@ -602,7 +602,7 @@ async fn prepare_tool_call(
         });
     };
 
-    let validated_args = match tool
+    let mut validated_args = match tool
         .prepare_and_validate_arguments(tool_call.arguments.clone())
         .await
     {
@@ -627,17 +627,22 @@ async fn prepare_tool_call(
         )
         .await
         {
-            Ok(Some(result)) if result.block => {
-                return Preparation::Immediate(ImmediateOutcome {
-                    result: error_tool_result(
-                        result
-                            .reason
-                            .unwrap_or_else(|| "Tool execution was blocked".to_owned()),
-                    ),
-                    is_error: true,
-                });
+            Ok(Some(result)) => {
+                if result.block {
+                    return Preparation::Immediate(ImmediateOutcome {
+                        result: error_tool_result(
+                            result
+                                .reason
+                                .unwrap_or_else(|| "Tool execution was blocked".to_owned()),
+                        ),
+                        is_error: true,
+                    });
+                }
+                if let Some(arguments) = result.arguments {
+                    validated_args = arguments;
+                }
             }
-            Ok(_) => {}
+            Ok(None) => {}
             Err(error) => {
                 return Preparation::Immediate(ImmediateOutcome {
                     result: error_tool_result(error.to_string()),
@@ -980,6 +985,7 @@ mod tests {
             active: Arc::clone(active),
             max_active: Arc::clone(max_active),
             executed: Arc::new(AtomicBool::new(false)),
+            seen_args: Arc::new(Mutex::new(None)),
             behavior: ToolBehavior::Normal,
             cancel_seen: Arc::new(AtomicBool::new(false)),
             result_text: format!("{name}-ok"),
@@ -1011,6 +1017,7 @@ mod tests {
         active: Arc<AtomicUsize>,
         max_active: Arc<AtomicUsize>,
         executed: Arc<AtomicBool>,
+        seen_args: Arc<Mutex<Option<Map<String, Value>>>>,
         behavior: ToolBehavior,
         cancel_seen: Arc<AtomicBool>,
         result_text: String,
@@ -1028,6 +1035,7 @@ mod tests {
                 active: Arc::new(AtomicUsize::new(0)),
                 max_active: Arc::new(AtomicUsize::new(0)),
                 executed: Arc::new(AtomicBool::new(false)),
+                seen_args: Arc::new(Mutex::new(None)),
                 behavior: ToolBehavior::Normal,
                 cancel_seen: Arc::new(AtomicBool::new(false)),
                 result_text: format!("{name}-ok"),
@@ -1072,7 +1080,7 @@ mod tests {
         fn execute(
             &self,
             _tool_call_id: &str,
-            _args: Map<String, Value>,
+            args: Map<String, Value>,
             cancel: CancellationToken,
             updates: ToolUpdates,
         ) -> BoxFuture<'static, Result<AgentToolResult, ToolError>> {
@@ -1081,12 +1089,19 @@ mod tests {
             let max_active = Arc::clone(&self.max_active);
             let executed = Arc::clone(&self.executed);
             let cancel_seen = Arc::clone(&self.cancel_seen);
+            let seen_args = Arc::clone(&self.seen_args);
             let result_text = self.result_text.clone();
             let image = self.image;
             let terminate = self.terminate;
             let behavior = self.behavior;
 
             Box::pin(async move {
+                {
+                    let mut seen_args = seen_args
+                        .lock()
+                        .map_err(|_| ToolError::new("seen_args poisoned"))?;
+                    *seen_args = Some(args);
+                }
                 executed.store(true, Ordering::SeqCst);
                 let current = active.fetch_add(1, Ordering::SeqCst) + 1;
                 max_active.fetch_max(current, Ordering::SeqCst);
@@ -1308,6 +1323,7 @@ mod tests {
                 Ok(Some(BeforeToolCallResult {
                     block: true,
                     reason: Some("nope".to_owned()),
+                    arguments: None,
                 }))
             })
         }));
@@ -1346,6 +1362,49 @@ mod tests {
             .collect();
         if kinds != ["start", "end", "msg_start", "msg_end"] {
             return Err(format!("preflight block order wrong: {kinds:?}"));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn before_hook_replacement_arguments_reach_execute() -> TestResult {
+        let tool = RecordingTool::new("patched");
+        let seen_args = Arc::clone(&tool.seen_args);
+        let context = context_with(vec![Arc::new(tool)]);
+        let assistant = assistant_with_calls(vec![ToolCall::new(
+            "c1",
+            "patched",
+            Map::from_iter([("original".to_owned(), Value::Bool(true))]),
+        )]);
+        let mut config = sample_config(ToolExecutionMode::Sequential);
+        config.before_tool_call = Some(Arc::new(|_ctx, _cancel| {
+            Box::pin(async {
+                Ok(Some(BeforeToolCallResult {
+                    block: false,
+                    reason: None,
+                    arguments: Some(Map::from_iter([("patched".to_owned(), Value::Bool(true))])),
+                }))
+            })
+        }));
+        let (_events, emit) = collect_emit();
+
+        execute_tool_calls(
+            &context,
+            &assistant,
+            &config,
+            &CancellationToken::new(),
+            &emit,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+        let actual = seen_args
+            .lock()
+            .map_err(|_| "seen_args poisoned".to_owned())?
+            .clone();
+        let expected = Map::from_iter([("patched".to_owned(), Value::Bool(true))]);
+        if actual.as_ref() != Some(&expected) {
+            return Err(format!("replacement arguments not executed: {actual:?}"));
         }
         Ok(())
     }

@@ -527,6 +527,8 @@ struct BeforeToolCallWire {
     block: bool,
     #[serde(default)]
     reason: Option<String>,
+    #[serde(default)]
+    input: Option<Map<String, Value>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -2277,6 +2279,7 @@ impl ExtensionRunner for HostExtensionRunner {
                             .map(|wire| BeforeToolCallResult {
                                 block: wire.block,
                                 reason: wire.reason,
+                                arguments: wire.input,
                             });
                     Ok(result)
                 }
