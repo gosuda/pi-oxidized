@@ -2,21 +2,36 @@
  * Extension host entrypoint. Reads JSONL protocol frames from stdin, writes
  * structured frames to stdout (protocol only), and stderr for logs.
  *
- * Usage:  pi-extension-host [--cwd <dir>] [--extension <path>]...
+ * Usage:  pi-extension-host [--cwd <dir>] [--extension <path>]... [--lean]
  *
  * The Rust binary spawns this process and drives it via the JSONL protocol.
+ *
+ * Mode selection (frozen contract): this module statically imports NOTHING
+ * from the host graphs. It parses `--lean` with the tiny local parser below,
+ * then dynamically imports exactly one implementation:
+ * - default (Mode 1, compat): `./host.ts` plus upstream builtins — byte-for-
+ *   byte the historical behavior, CLI included;
+ * - `--lean` (Mode 2): `./lean-runner.ts`, which never evaluates host.ts,
+ *   builtins, virtual-modules, or any upstream coding-agent module.
  */
 
-import { ExtensionHost } from "./host.ts";
-import { builtInExtensions } from "@earendil-works/pi-coding-agent/builtins";
+interface CliArgs {
+	cwd: string;
+	extensionPaths: string[];
+	lean: boolean;
+}
 
-function parseArgs(argv: string[]): { cwd: string; extensionPaths: string[] } {
+/** Tiny local CLI parse; MUST stay dependency-free so mode selection is hermetic. */
+function parseArgs(argv: string[]): CliArgs {
 	let cwd = process.cwd();
+	let lean = false;
 	const extensionPaths: string[] = [];
 	for (let i = 2; i < argv.length; i++) {
 		const arg = argv[i];
 		if (arg === undefined) continue;
-		if (arg === "--cwd" || arg === "-C") {
+		if (arg === "--lean") {
+			lean = true;
+		} else if (arg === "--cwd" || arg === "-C") {
 			const next = argv[i + 1];
 			if (next !== undefined) {
 				cwd = next;
@@ -30,7 +45,7 @@ function parseArgs(argv: string[]): { cwd: string; extensionPaths: string[] } {
 			}
 		}
 	}
-	return { cwd, extensionPaths };
+	return { cwd, extensionPaths, lean };
 }
 
 /** Wrap process.stdout as a ByteWritable (protocol frames only). */
@@ -41,7 +56,21 @@ class StdoutSink {
 }
 
 async function main(): Promise<void> {
-	const { cwd, extensionPaths } = parseArgs(process.argv);
+	const { cwd, extensionPaths, lean } = parseArgs(process.argv);
+	if (lean) {
+		// Dynamic import is required: mode selection happens at runtime and the
+		// lean graph must stay the only graph evaluated in this mode.
+		const { LeanRunner } = await import("./lean-runner.ts");
+		const runner = new LeanRunner(process.stdin, new StdoutSink());
+		await runner.run({ cwd, extensionPaths });
+		return;
+	}
+	// Dynamic import is required: the compat graph (host + upstream builtins)
+	// must not be evaluated until AFTER mode selection rejects --lean.
+	const [{ ExtensionHost }, { builtInExtensions }] = await Promise.all([
+		import("./host.ts"),
+		import("@earendil-works/pi-coding-agent/builtins"),
+	]);
 	const host = new ExtensionHost(process.stdin, new StdoutSink());
 	await host.run({ cwd, extensionPaths, factories: builtInExtensions });
 }
