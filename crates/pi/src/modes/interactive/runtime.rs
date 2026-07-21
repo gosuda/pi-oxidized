@@ -87,7 +87,7 @@ use super::state::{
     PendingMessage, SessionStatus, StartupDiagnostic, StatusKind, ViewAction, ViewState,
     WidgetSlot,
 };
-use super::theme::ResolvedTheme;
+use super::theme::{ColorMode, ResolvedTheme};
 use super::view::{ComposedSection, compose};
 
 /// Maximum time the runtime will wait for one [`Tui::commit`] before declaring
@@ -1016,6 +1016,9 @@ pub struct InteractiveRuntime<W: Write, S: SessionHost> {
     last_error: Option<String>,
     shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
     terminal_theme: TerminalTheme,
+    /// Terminal color depth selected at startup from capabilities; threaded
+    /// into theme resolution so 256-color terminals emit indexed SGR.
+    color_mode: ColorMode,
     /// Runtime theme generation: bumped on every theme switch so extension
     /// slots re-measure/re-render (flows to the host via `theme.update` and
     /// back on measure/render requests).
@@ -1191,7 +1194,8 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     ///
     /// Never. Construction is infallible.
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
+    // Keep every runtime field default visible in one auditable state map.
+    #[allow(clippy::too_many_lines)]
     pub fn new(
         tui: Tui<W>,
         input: TerminalInput,
@@ -1257,6 +1261,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             last_error: None,
             shutdown_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             terminal_theme: options.terminal_theme,
+            color_mode: ColorMode::from_true_color(options.caps.true_color),
             theme_generation: 0,
             pending_ui_reinject: options.pending_ui_events.iter().rev().cloned().collect(),
             extension_runner,
@@ -3275,8 +3280,12 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     /// and apply it. Called on `/reload` and after settings-driven changes.
     pub(crate) fn apply_theme_from_settings(&mut self) {
         let (raw, mode) = self.session.theme_settings();
-        let resolved =
-            super::theme::resolve_active_theme(raw.as_deref(), mode, self.terminal_theme);
+        let resolved = super::theme::resolve_active_theme(
+            raw.as_deref(),
+            mode,
+            self.terminal_theme,
+            self.color_mode,
+        );
         self.apply_theme(resolved);
     }
 
@@ -3319,9 +3328,14 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             if let Err(error) = self.session.persist_theme(&name, mode) {
                 self.last_error = Some(error);
             }
-            super::theme::resolve_active_theme(Some(&name), mode, self.terminal_theme)
+            super::theme::resolve_active_theme(
+                Some(&name),
+                mode,
+                self.terminal_theme,
+                self.color_mode,
+            )
         } else {
-            super::theme::load_or_dark(&name, super::theme::ColorMode::Truecolor)
+            super::theme::load_or_dark(&name, self.color_mode)
         };
         self.apply_theme(resolved);
         self.push_theme_to_host().await;
@@ -3338,6 +3352,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             &self.view.theme,
             mode,
             self.terminal_theme,
+            self.color_mode,
             self.theme_generation,
         );
         Arc::clone(runner).push_theme_update(&update).await;
@@ -3361,8 +3376,12 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     fn preview_theme_selection(&mut self, selection: &str) {
         let storage = super::theme::theme_selection_to_storage(selection);
         let (_, mode) = self.session.theme_settings();
-        let resolved =
-            super::theme::resolve_active_theme(Some(&storage), mode, self.terminal_theme);
+        let resolved = super::theme::resolve_active_theme(
+            Some(&storage),
+            mode,
+            self.terminal_theme,
+            self.color_mode,
+        );
         self.apply_theme(resolved);
     }
 
@@ -3484,8 +3503,12 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             return;
         };
         let storage = super::theme::theme_selection_to_storage(&family);
-        let resolved =
-            super::theme::resolve_active_theme(Some(&storage), mode, self.terminal_theme);
+        let resolved = super::theme::resolve_active_theme(
+            Some(&storage),
+            mode,
+            self.terminal_theme,
+            self.color_mode,
+        );
         self.apply_theme(resolved);
     }
 
@@ -4371,9 +4394,10 @@ fn buffer_plain_lines(buffer: &Buffer, width: u16, height: u16) -> Vec<(String, 
 fn startup_theme<S: SessionHost + ?Sized>(
     session: &S,
     terminal: TerminalTheme,
+    color: ColorMode,
 ) -> Arc<ResolvedTheme> {
     let (raw_theme, theme_mode) = session.theme_settings();
-    super::theme::resolve_active_theme(raw_theme.as_deref(), theme_mode, terminal)
+    super::theme::resolve_active_theme(raw_theme.as_deref(), theme_mode, terminal, color)
 }
 
 /// Polarity mode implied by a raw theme setting an extension just set:
@@ -4472,9 +4496,10 @@ fn build_theme_update(
     active: &ResolvedTheme,
     mode: ThemeMode,
     terminal: TerminalTheme,
+    color: ColorMode,
     theme_generation: u64,
 ) -> ThemeUpdate {
-    let themes = super::theme::available_themes(super::theme::ColorMode::Truecolor)
+    let themes = super::theme::available_themes(color)
         .into_iter()
         .map(|(info, resolved)| {
             let path = info.path.map(|path| path.to_string_lossy().into_owned());
@@ -5840,7 +5865,11 @@ pub async fn run_interactive_mode(
 
     // Resolve the startup theme from settings + the just-probed terminal
     // polarity (replaces the static dark default).
-    options.theme = startup_theme(host_arc.as_ref(), options.terminal_theme);
+    options.theme = startup_theme(
+        host_arc.as_ref(),
+        options.terminal_theme,
+        ColorMode::from_true_color(options.caps.true_color),
+    );
     let mut rt = InteractiveRuntime::new(tui, input, host_arc, &options);
 
     // Reset extension-owned UI on every session invalidation (ports upstream

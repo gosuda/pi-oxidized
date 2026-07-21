@@ -92,18 +92,12 @@ impl TerminalCapabilities {
             || term.as_deref().is_some_and(|t| t.starts_with("tmux-"));
         let screen = term.as_deref().is_some_and(|t| t.starts_with("screen"));
 
-        caps.true_color = colorterm.as_deref() == Some("truecolor")
-            || colorterm.as_deref() == Some("24bit")
-            || term_program.as_deref() == Some("iterm.app")
-            || term_program.as_deref() == Some("apple_terminal")
-            || term_program.as_deref() == Some("wezterm")
-            || term_program.as_deref() == Some("ghostty")
-            || term_program.as_deref() == Some("warpterminal")
-            || term_program.as_deref() == Some("vscode")
-            || wt_session
-            || term
-                .as_deref()
-                .is_some_and(|t| t.contains("256color") || t.contains("truecolor"));
+        caps.true_color = detect_true_color(
+            colorterm.as_deref(),
+            term_program.as_deref(),
+            term.as_deref(),
+            wt_session,
+        );
 
         // Hyperlinks: most modern terminals; disable under classic screen/tmux without overrides.
         caps.hyperlinks = !screen && !tmux
@@ -187,6 +181,24 @@ fn detect_image_protocol(
     }
 }
 
+fn detect_true_color(
+    colorterm: Option<&str>,
+    term_program: Option<&str>,
+    term: Option<&str>,
+    wt_session: bool,
+) -> bool {
+    colorterm == Some("truecolor")
+        || colorterm == Some("24bit")
+        || term_program == Some("iterm.app")
+        || term_program == Some("apple_terminal")
+        || term_program == Some("wezterm")
+        || term_program == Some("ghostty")
+        || term_program == Some("warpterminal")
+        || term_program == Some("vscode")
+        || wt_session
+        || term.is_some_and(|t| t.contains("truecolor"))
+}
+
 fn env_lower(key: &str) -> Option<String> {
     env::var(key).ok().map(|value| value.to_ascii_lowercase())
 }
@@ -214,7 +226,7 @@ pub fn kitty_delete_all() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{TerminalCapabilities, kitty_delete_id};
+    use super::{TerminalCapabilities, detect_true_color, kitty_delete_id};
 
     #[test]
     fn kitty_delete_id_format() {
@@ -233,5 +245,37 @@ mod tests {
         // to construct a value without panicking.
         let caps = TerminalCapabilities::detect();
         let _ = caps.cell;
+    }
+
+    #[test]
+    fn xterm_256color_is_not_true_color() {
+        // Bare `TERM=xterm-256color` advertises a 256-color palette, not 24-bit
+        // truecolor; it must no longer be misclassified as true color.
+        assert!(!detect_true_color(
+            None,
+            None,
+            Some("xterm-256color"),
+            false
+        ));
+        // `COLORTERM` promotion still wins even over a 256-color `TERM`.
+        assert!(detect_true_color(
+            Some("truecolor"),
+            None,
+            Some("xterm-256color"),
+            false
+        ));
+        assert!(detect_true_color(Some("24bit"), None, None, false));
+        // Windows Terminal and known true-color programs still promote.
+        assert!(detect_true_color(None, None, None, true));
+        assert!(detect_true_color(None, Some("wezterm"), None, false));
+        // A `TERM` that explicitly says `truecolor` still promotes.
+        assert!(detect_true_color(
+            None,
+            None,
+            Some("xterm-truecolor"),
+            false
+        ));
+        // Unknown bare terminals stay 256-color.
+        assert!(!detect_true_color(None, None, Some("dumb"), false));
     }
 }

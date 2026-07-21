@@ -45,6 +45,18 @@ pub enum ColorMode {
     Palette256,
 }
 
+impl ColorMode {
+    /// Map a terminal true-color capability flag to the emitted color depth.
+    #[must_use]
+    pub const fn from_true_color(tc: bool) -> Self {
+        if tc {
+            Self::Truecolor
+        } else {
+            Self::Palette256
+        }
+    }
+}
+
 /// Product foreground/text color slots (see reference `ThemeColor`).
 ///
 /// Order matches the JSON schema and the reference type alias.
@@ -330,6 +342,20 @@ impl ResolvedTheme {
     #[must_use]
     pub const fn mode(&self) -> ColorMode {
         self.mode
+    }
+
+    /// Clone this theme with a different color [`mode`](Self::mode).
+    ///
+    /// Slot arrays are `Copy`; only an owned `name` allocates. Byte-equivalent
+    /// to re-resolving the source JSON at `mode` (slot values downsample at
+    /// emit time), so built-in interns become 256-color without re-parsing.
+    fn with_mode(&self, mode: ColorMode) -> Self {
+        Self {
+            fg: self.fg,
+            bg: self.bg,
+            mode,
+            name: self.name.clone(),
+        }
     }
 
     /// Raw RGB for a foreground slot (empty slots return black; check [`Self::is_fg_empty`]).
@@ -1433,20 +1459,26 @@ fn resolve_value(
     }
 }
 
-fn built_in_theme(name: &str) -> Option<Arc<ResolvedTheme>> {
-    match name {
-        "dark" => Some(dark()),
-        "light" => Some(light()),
-        "classic-dark" => Some(CLASSIC_DARK_INTERN.clone()),
-        "classic-light" => Some(CLASSIC_LIGHT_INTERN.clone()),
-        "motion-dark" => Some(MOTION_DARK_INTERN.clone()),
-        "motion-light" => Some(MOTION_LIGHT_INTERN.clone()),
-        "m3-dark" => Some(M3_DARK_INTERN.clone()),
-        "m3-light" => Some(M3_LIGHT_INTERN.clone()),
-        "antd-dark" => Some(ANTD_DARK_INTERN.clone()),
-        "antd-light" => Some(ANTD_LIGHT_INTERN.clone()),
-        _ => None,
-    }
+fn built_in_theme(name: &str, mode: ColorMode) -> Option<Arc<ResolvedTheme>> {
+    let intern = match name {
+        "dark" => dark(),
+        "light" => light(),
+        "classic-dark" => CLASSIC_DARK_INTERN.clone(),
+        "classic-light" => CLASSIC_LIGHT_INTERN.clone(),
+        "motion-dark" => MOTION_DARK_INTERN.clone(),
+        "motion-light" => MOTION_LIGHT_INTERN.clone(),
+        "m3-dark" => M3_DARK_INTERN.clone(),
+        "m3-light" => M3_LIGHT_INTERN.clone(),
+        "antd-dark" => ANTD_DARK_INTERN.clone(),
+        "antd-light" => ANTD_LIGHT_INTERN.clone(),
+        _ => return None,
+    };
+    // Interns are the canonical Truecolor authority; hand back a downsampled
+    // 256-color clone only when the terminal lacks 24-bit support.
+    Some(match mode {
+        ColorMode::Truecolor => intern,
+        ColorMode::Palette256 => Arc::new(intern.with_mode(ColorMode::Palette256)),
+    })
 }
 
 /// Other-variant theme name for light/dark switching; `None` when the name has no convention pair.
@@ -1492,7 +1524,7 @@ fn hex_to_rgb(hex: &str) -> Option<Rgb> {
 ///
 /// See [`ThemeError`] variants.
 pub fn load_by_name(name: &str, mode: ColorMode) -> Result<Arc<ResolvedTheme>, ThemeError> {
-    if let Some(theme) = built_in_theme(name) {
+    if let Some(theme) = built_in_theme(name, mode) {
         return Ok(theme);
     }
     let builtin_path = config::get_themes_dir().join(format!("{name}.json"));
@@ -1514,7 +1546,7 @@ pub fn load_by_name(name: &str, mode: ColorMode) -> Result<Arc<ResolvedTheme>, T
 /// never breaks rendering.
 #[must_use]
 pub fn load_or_dark(name: &str, mode: ColorMode) -> Arc<ResolvedTheme> {
-    load_by_name(name, mode).unwrap_or_else(|_| dark())
+    load_by_name(name, mode).unwrap_or_else(|_| built_in_theme("dark", mode).unwrap_or_else(dark))
 }
 
 /// The ten built-in theme names in stable order (dark member first per family).
@@ -1631,11 +1663,15 @@ pub fn parse_theme_pair(raw: &str) -> Option<(String, String)> {
 ///   other variant; `None` or a failed pair load keeps the base name.
 ///
 /// `want_dark = mode == Dark || (mode == Auto && terminal == Dark)`.
+///
+/// `color` selects the emitted color depth (24-bit truecolor vs downsampled
+/// 256-color), sourced from the terminal's detected capability at the callsite.
 #[must_use]
 pub fn resolve_active_theme(
     raw: Option<&str>,
     mode: ThemeMode,
     terminal: TerminalTheme,
+    color: ColorMode,
 ) -> Arc<ResolvedTheme> {
     let want_dark = match mode {
         ThemeMode::Dark => true,
@@ -1645,14 +1681,14 @@ pub fn resolve_active_theme(
     let base = raw.unwrap_or("dark");
     if let Some((light, dark)) = parse_theme_pair(base) {
         let member = if want_dark { dark } else { light };
-        return load_or_dark(&member, ColorMode::Truecolor);
+        return load_or_dark(&member, color);
     }
     if let Some(paired) = paired_name(base, want_dark)
-        && let Ok(theme) = load_by_name(&paired, ColorMode::Truecolor)
+        && let Ok(theme) = load_by_name(&paired, color)
     {
         return theme;
     }
-    load_or_dark(base, ColorMode::Truecolor)
+    load_or_dark(base, color)
 }
 
 /// A discoverable theme: display name plus its JSON path when file-backed.
@@ -1677,7 +1713,7 @@ pub fn available_themes(mode: ColorMode) -> Vec<(ThemeInfo, Arc<ResolvedTheme>)>
     let mut result = Vec::new();
     let builtin_dir = config::get_themes_dir();
     for name in BUILT_IN_THEME_NAMES {
-        let Some(theme) = built_in_theme(name) else {
+        let Some(theme) = built_in_theme(name, mode) else {
             continue;
         };
         seen.insert(name.to_owned());
@@ -1916,8 +1952,8 @@ mod tests {
                 .map_err(|error| format!("{name} should parse: {error}"))?
                 .resolve(ColorMode::Truecolor)
                 .map_err(|error| format!("{name} should resolve: {error}"))?;
-            let intern =
-                built_in_theme(name).ok_or_else(|| format!("{name} intern should exist"))?;
+            let intern = built_in_theme(name, ColorMode::Truecolor)
+                .ok_or_else(|| format!("{name} intern should exist"))?;
             assert_eq!(resolved, intern);
         }
         Ok(())
@@ -1964,8 +2000,10 @@ mod tests {
 
     #[test]
     fn built_in_palette_spot_checks() -> TestResult {
-        let lookup =
-            |name: &str| built_in_theme(name).ok_or_else(|| format!("{name} intern should exist"));
+        let lookup = |name: &str| {
+            built_in_theme(name, ColorMode::Truecolor)
+                .ok_or_else(|| format!("{name} intern should exist"))
+        };
         assert_eq!(dark().fg_rgb(ThemeColor::Text), Rgb(237, 237, 237));
         assert_eq!(
             lookup("m3-dark")?.fg_rgb(ThemeColor::SyntaxKeyword),
@@ -2013,19 +2051,19 @@ mod tests {
             // Unset raw setting: base "dark", flipped by polarity.
             let expected = if want_dark { "dark" } else { "light" };
             assert_eq!(
-                resolve_active_theme(None, mode, terminal).name,
+                resolve_active_theme(None, mode, terminal, ColorMode::Truecolor).name,
                 expected,
                 "unset raw, {mode:?}/{terminal:?}"
             );
             assert_eq!(
-                resolve_active_theme(Some("dark"), mode, terminal).name,
+                resolve_active_theme(Some("dark"), mode, terminal, ColorMode::Truecolor).name,
                 expected,
                 "base dark, {mode:?}/{terminal:?}"
             );
             // Plain suffixed name: paired_name flips within the family.
             let expected = if want_dark { "antd-dark" } else { "antd-light" };
             assert_eq!(
-                resolve_active_theme(Some("antd-light"), mode, terminal).name,
+                resolve_active_theme(Some("antd-light"), mode, terminal, ColorMode::Truecolor).name,
                 expected,
                 "base antd-light, {mode:?}/{terminal:?}"
             );
@@ -2033,13 +2071,19 @@ mod tests {
             // pair "dark/light" means {light: dark-theme, dark: light-theme}.
             let expected = if want_dark { "light" } else { "dark" };
             assert_eq!(
-                resolve_active_theme(Some("dark/light"), mode, terminal).name,
+                resolve_active_theme(Some("dark/light"), mode, terminal, ColorMode::Truecolor).name,
                 expected,
                 "reversed pair, {mode:?}/{terminal:?}"
             );
             // Unknown pair members fall back per-member to built-in dark.
             assert_eq!(
-                resolve_active_theme(Some("solarized-light/gruvbox-dark"), mode, terminal).name,
+                resolve_active_theme(
+                    Some("solarized-light/gruvbox-dark"),
+                    mode,
+                    terminal,
+                    ColorMode::Truecolor
+                )
+                .name,
                 "dark",
                 "unknown pair members, {mode:?}/{terminal:?}"
             );
@@ -2050,26 +2094,130 @@ mod tests {
     fn resolve_active_theme_member_failure_falls_back_per_member() {
         // Dark member loads; light member is unknown and falls back to dark.
         assert_eq!(
-            resolve_active_theme(Some("nope/m3-dark"), ThemeMode::Dark, TerminalTheme::Dark).name,
+            resolve_active_theme(
+                Some("nope/m3-dark"),
+                ThemeMode::Dark,
+                TerminalTheme::Dark,
+                ColorMode::Truecolor
+            )
+            .name,
             "m3-dark"
         );
         assert_eq!(
-            resolve_active_theme(Some("nope/m3-dark"), ThemeMode::Light, TerminalTheme::Dark).name,
+            resolve_active_theme(
+                Some("nope/m3-dark"),
+                ThemeMode::Light,
+                TerminalTheme::Dark,
+                ColorMode::Truecolor
+            )
+            .name,
             "dark"
         );
         // Unpaired custom name that does not exist: load_or_dark fallback.
         assert_eq!(
-            resolve_active_theme(Some("mytheme"), ThemeMode::Auto, TerminalTheme::Light).name,
+            resolve_active_theme(
+                Some("mytheme"),
+                ThemeMode::Auto,
+                TerminalTheme::Light,
+                ColorMode::Truecolor
+            )
+            .name,
             "dark"
         );
         // Paired name whose counterpart does not exist keeps the base.
         // ("classic-light" pairs to "classic-dark", both exist; use a fake
         // family to hit the fallback.)
         assert_eq!(
-            resolve_active_theme(Some("ghost-light"), ThemeMode::Dark, TerminalTheme::Dark).name,
+            resolve_active_theme(
+                Some("ghost-light"),
+                ThemeMode::Dark,
+                TerminalTheme::Dark,
+                ColorMode::Truecolor
+            )
+            .name,
             "dark",
             "ghost-dark fails to load, ghost-light fails to load, dark fallback"
         );
+    }
+
+    #[test]
+    fn color_mode_from_true_color_maps_capability() {
+        assert_eq!(ColorMode::from_true_color(true), ColorMode::Truecolor);
+        assert_eq!(ColorMode::from_true_color(false), ColorMode::Palette256);
+    }
+
+    #[test]
+    fn built_in_palette256_downsamples_at_emit() -> TestResult {
+        let truecolor = built_in_theme("dark", ColorMode::Truecolor)
+            .ok_or_else(|| "dark truecolor intern should exist".to_owned())?;
+        let palette = built_in_theme("dark", ColorMode::Palette256)
+            .ok_or_else(|| "dark 256-color built-in should exist".to_owned())?;
+        assert_eq!(truecolor.mode(), ColorMode::Truecolor);
+        assert_eq!(palette.mode(), ColorMode::Palette256);
+        // Same resolved slot values; only the emitted depth differs.
+        assert_eq!(
+            truecolor.fg_rgb(ThemeColor::Text),
+            palette.fg_rgb(ThemeColor::Text)
+        );
+        let tc = truecolor.fg_ansi(ThemeColor::Text);
+        let p256 = palette.fg_ansi(ThemeColor::Text);
+        assert!(
+            tc.contains("\x1b[38;2;"),
+            "truecolor emits 24-bit SGR: {tc:?}"
+        );
+        assert!(
+            p256.contains("\x1b[38;5;"),
+            "256-color built-in emits indexed SGR: {p256:?}"
+        );
+        assert!(
+            !p256.contains("\x1b[38;2;"),
+            "256-color built-in must not emit 24-bit SGR: {p256:?}"
+        );
+        // Clone-with-mode is byte-equivalent to re-resolving the JSON at 256.
+        let reresolved = ThemeJson::parse(BUILTIN_JSONS[0].1)
+            .map_err(|error| format!("dark should parse: {error}"))?
+            .resolve_owned(ColorMode::Palette256)
+            .map_err(|error| format!("dark should resolve: {error}"))?;
+        assert_eq!(*palette, reresolved, "clone-with-mode equals re-resolve");
+        Ok(())
+    }
+
+    #[test]
+    fn fallback_theme_matches_terminal_color_mode() {
+        // A missing theme on a 256-color terminal degrades to 256-color dark,
+        // not truecolor dark.
+        let p256 = load_or_dark("nonexistent-theme-xyz", ColorMode::Palette256);
+        assert_eq!(p256.name, "dark");
+        assert_eq!(p256.mode(), ColorMode::Palette256);
+        assert!(p256.fg_ansi(ThemeColor::Text).contains("\x1b[38;5;"));
+        // Truecolor terminals still fall back to truecolor dark.
+        let tc = load_or_dark("nonexistent-theme-xyz", ColorMode::Truecolor);
+        assert_eq!(tc.name, "dark");
+        assert_eq!(tc.mode(), ColorMode::Truecolor);
+    }
+
+    #[test]
+    fn resolve_active_theme_honors_color_mode() {
+        let dark256 = resolve_active_theme(
+            Some("dark"),
+            ThemeMode::Dark,
+            TerminalTheme::Dark,
+            ColorMode::Palette256,
+        );
+        assert_eq!(dark256.mode(), ColorMode::Palette256);
+        assert!(
+            dark256.fg_ansi(ThemeColor::Text).contains("\x1b[38;5;"),
+            "256-color capability selects indexed emission"
+        );
+        assert!(!dark256.fg_ansi(ThemeColor::Text).contains("\x1b[38;2;"));
+        let dark24 = resolve_active_theme(
+            Some("dark"),
+            ThemeMode::Dark,
+            TerminalTheme::Dark,
+            ColorMode::Truecolor,
+        );
+        assert_eq!(dark24.mode(), ColorMode::Truecolor);
+        assert!(dark24.fg_ansi(ThemeColor::Text).contains("\x1b[38;2;"));
     }
 
     #[test]
@@ -2096,7 +2244,7 @@ mod tests {
 
     #[test]
     fn classic_light_literal_black_remains_a_color() -> TestResult {
-        let theme = built_in_theme("classic-light")
+        let theme = built_in_theme("classic-light", ColorMode::Truecolor)
             .ok_or_else(|| "classic-light intern should exist".to_owned())?;
         assert!(!theme.is_fg_empty(ThemeColor::SyntaxOperator));
         assert_eq!(
