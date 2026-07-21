@@ -50,28 +50,6 @@ interface InputWrite {
 	readonly outputOffset: number;
 }
 
-function shellQuote(value: string): string {
-	if (value.includes("\0")) throw new Error("PTY argv cannot contain NUL bytes");
-	return `'${value.replaceAll("'", `'"'"'`)}'`;
-}
-
-function commandString(
-	argv: readonly [string, ...string[]],
-	size: { readonly columns: number; readonly rows: number },
-): string {
-	if (
-		!Number.isSafeInteger(size.columns) ||
-		size.columns < 1 ||
-		size.columns > 10_000 ||
-		!Number.isSafeInteger(size.rows) ||
-		size.rows < 1 ||
-		size.rows > 10_000
-	) {
-		throw new Error("PTY size must use integer columns and rows between 1 and 10000");
-	}
-	return `stty cols ${size.columns} rows ${size.rows}; exec ${argv.map(shellQuote).join(" ")}`;
-}
-
 function mergedEnvironment(overrides: PtyCommand["env"]): Record<string, string> {
 	const result: Record<string, string> = {};
 	for (const [name, value] of Object.entries(process.env)) {
@@ -89,9 +67,9 @@ export class PtyProcess {
 	readonly #startedAt = performance.now();
 	readonly #chunks: PtyChunk[] = [];
 	readonly #writes: InputWrite[] = [];
-	readonly #process: Bun.Subprocess<"pipe", "pipe", "pipe">;
+	readonly #process: Bun.Subprocess;
 	readonly #completed: Promise<number>;
-	readonly #stdin: Bun.FileSink;
+	readonly #decoder = new TextDecoder();
 	readonly #cursorPosition: { readonly row: number; readonly column: number } | false;
 	#rawText = "";
 	#cursorScanOffset = 0;
@@ -100,33 +78,50 @@ export class PtyProcess {
 	#listeners = new Set<() => void>();
 
 	constructor(command: PtyCommand) {
+		if (process.platform === "win32") {
+			throw new Error("Bun terminal spawn is unavailable on Windows; PTY tests must be skipped");
+		}
 		this.#cursorPosition = command.cursorPosition ?? { row: 1, column: 1 };
-		this.#process = Bun.spawn(
-			[
-				"setsid",
-				"--wait",
-				"script",
-				"--quiet",
-				"--flush",
-				"--echo",
-				"always",
-				"--return",
-				"--command",
-				commandString(command.argv, command.size ?? { columns: 80, rows: 24 }),
-				"/dev/null",
-			],
-			{
-				cwd: command.cwd,
-				env: mergedEnvironment(command.env),
-				stdin: "pipe",
-				stdout: "pipe",
-				stderr: "pipe",
+		const size = command.size ?? { columns: 80, rows: 24 };
+		if (
+			!Number.isSafeInteger(size.columns) ||
+			size.columns < 1 ||
+			size.columns > 10_000 ||
+			!Number.isSafeInteger(size.rows) ||
+			size.rows < 1 ||
+			size.rows > 10_000
+		) {
+			throw new Error("PTY size must use integer columns and rows between 1 and 10000");
+		}
+		for (const argument of command.argv) {
+			if (argument.includes("\0")) throw new Error("PTY argv cannot contain NUL bytes");
+		}
+		const ptyEnd = Promise.withResolvers<void>();
+		this.#process = Bun.spawn([...command.argv], {
+			cwd: command.cwd,
+			env: mergedEnvironment(command.env),
+			// Bun's POSIX terminal spawn gives the child its own session and
+			// controlling terminal (setsid + TIOCSCTTY), replacing the
+			// util-linux setsid(1)/script(1) wrapper that exists only on Linux.
+			terminal: {
+				cols: size.columns,
+				rows: size.rows,
+				data: (_terminal, bytes) => this.#receive(bytes),
+				exit: () => {
+					this.#flushTail();
+					ptyEnd.resolve();
+				},
 			},
-		);
-		this.#stdin = this.#process.stdin;
-		const ptyDone = this.#consume(this.#process.stdout, "pty");
-		const driverDone = this.#consume(this.#process.stderr, "driver");
-		this.#completed = Promise.all([this.#process.exited, ptyDone, driverDone]).then(([code]) => {
+		});
+		this.#completed = Promise.all([this.#process.exited, ptyEnd.promise]).then(([code]) => {
+			// Closing the master releases the descriptor and SIGHUPs orphaned group
+			// members, matching script(1) teardown when its child exits.
+			try {
+				const terminal = this.#process.terminal;
+				if (terminal && !terminal.closed) terminal.close();
+			} catch {
+				// Teardown is best-effort; the exit code is already settled.
+			}
 			this.#exitCode = code;
 			this.#notify();
 			return code;
@@ -149,10 +144,9 @@ export class PtyProcess {
 		for (const key of keys) {
 			const bytes = typeof key === "string" ? new TextEncoder().encode(key) : key;
 			text += new TextDecoder().decode(bytes);
-			this.#stdin.write(bytes);
+			this.#writeTerminal(bytes);
 		}
 		this.#writes.push({ text, outputOffset });
-		this.#stdin.flush();
 	}
 
 
@@ -246,38 +240,50 @@ export class PtyProcess {
 		}
 	}
 
-	async #consume(stream: ReadableStream<Uint8Array>, source: PtyChunk["stream"]): Promise<void> {
-		const decoder = new TextDecoder();
-		for await (const bytes of stream) {
-			const copy = Uint8Array.from(bytes);
-			const text = decoder.decode(copy, { stream: true });
-			if (source === "pty") {
-				this.#rawText += text;
-				this.#answerCursorQueries();
+	#receive(bytes: Uint8Array): void {
+		const copy = Uint8Array.from(bytes);
+		const text = this.#decoder.decode(copy, { stream: true });
+		this.#rawText += text;
+		this.#answerCursorQueries();
+		this.#chunks.push({
+			stream: "pty",
+			text,
+			bytes: copy,
+			elapsedMs: performance.now() - this.#startedAt,
+			unixMs: Date.now(),
+		});
+		this.#notify();
+	}
+
+	#flushTail(): void {
+		const tail = this.#decoder.decode();
+		if (!tail) return;
+		this.#rawText += tail;
+		this.#answerCursorQueries();
+		this.#chunks.push({
+			stream: "pty",
+			text: tail,
+			bytes: new Uint8Array(),
+			elapsedMs: performance.now() - this.#startedAt,
+			unixMs: Date.now(),
+		});
+		this.#notify();
+	}
+
+	#writeTerminal(data: string | Uint8Array): void {
+		const terminal = this.#process.terminal;
+		if (!terminal || terminal.closed) return;
+		const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
+		let offset = 0;
+		while (offset < bytes.length) {
+			let written: number;
+			try {
+				written = terminal.write(bytes.subarray(offset));
+			} catch {
+				return; // The child already closed its side of the terminal.
 			}
-			this.#chunks.push({
-				stream: source,
-				text,
-				bytes: copy,
-				elapsedMs: performance.now() - this.#startedAt,
-				unixMs: Date.now(),
-			});
-			this.#notify();
-		}
-		const tail = decoder.decode();
-		if (tail) {
-			if (source === "pty") {
-				this.#rawText += tail;
-				this.#answerCursorQueries();
-			}
-			this.#chunks.push({
-				stream: source,
-				text: tail,
-				bytes: new Uint8Array(),
-				elapsedMs: performance.now() - this.#startedAt,
-				unixMs: Date.now(),
-			});
-			this.#notify();
+			if (written <= 0) break;
+			offset += written;
 		}
 	}
 
@@ -285,8 +291,7 @@ export class PtyProcess {
 		if (this.#cursorPosition === false) return;
 		let query = this.#rawText.indexOf("\x1b[6n", this.#cursorScanOffset);
 		while (query >= 0) {
-			this.#stdin.write(`\x1b[${this.#cursorPosition.row};${this.#cursorPosition.column}R`);
-			this.#stdin.flush();
+			this.#writeTerminal(`\x1b[${this.#cursorPosition.row};${this.#cursorPosition.column}R`);
 			this.#cursorScanOffset = query + 4;
 			query = this.#rawText.indexOf("\x1b[6n", this.#cursorScanOffset);
 		}
@@ -301,10 +306,18 @@ export class PtyProcess {
 	}
 
 	#signalTree(signal: ProcessSignal): void {
+		// Bun terminal spawn is POSIX-only and makes the child a process-group
+		// leader, so signal the complete group.
 		try {
 			process.kill(-this.#process.pid, signal);
 		} catch (error) {
 			if (!(error instanceof Error && "code" in error && error.code === "ESRCH")) throw error;
+			// No such group: the leader is gone or never became a group leader.
+			try {
+				this.#process.kill(signal);
+			} catch {
+				// The leader already exited.
+			}
 		}
 	}
 }

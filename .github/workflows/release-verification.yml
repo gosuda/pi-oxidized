@@ -91,16 +91,18 @@ jobs:
       - name: Reconstruct reference provider data (offline)
         run: bun run scripts/reconstruct-provider-data.ts
 
+      - name: Install reference dependencies
+        run: npm ci --ignore-scripts --prefix .references/pi
+
       - name: Prepare interactive script test prerequisites
+        if: runner.os != 'Windows'
         shell: bash
         run: |
-          npm ci --ignore-scripts --prefix .references/pi
           cargo build -p pi --locked
           case "${RUNNER_OS}-${RUNNER_ARCH}" in
             Linux-X64) host_target=bun-linux-x64-baseline ;;
             macOS-X64) host_target=bun-darwin-x64-baseline ;;
             macOS-ARM64) host_target=bun-darwin-arm64 ;;
-            Windows-X64) host_target=bun-windows-x64-baseline ;;
             *) echo "unsupported test-host runner: ${RUNNER_OS}-${RUNNER_ARCH}" >&2; exit 1 ;;
           esac
           (
@@ -110,6 +112,8 @@ jobs:
             bun build ./src/main.ts --compile --minify --compile-autoload-tsconfig --compile-autoload-package-json --target "$host_target" --outfile dist/pi-extension-host
           )
 
+      # Bun's terminal spawn is POSIX-only. The Windows leg still runs every
+      # non-PTY script test; Linux and macOS run PTY + interactive smoke tests.
       - name: JS checks and scripts tests
         run: |
           bun run check
