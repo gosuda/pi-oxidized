@@ -612,7 +612,7 @@ describe("acceptance: extension runtime", () => {
 			"--outfile",
 			compiledRuntimeImport,
 		], hostDir);
-	});
+	}, 30_000);
 
 	afterAll(async () => {
 		await rm(artifactDir, { force: true, recursive: true });
