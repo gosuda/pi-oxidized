@@ -10,7 +10,7 @@ import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { Readable } from "node:stream";
 import {
 	COMPATIBILITY_VERSION,
@@ -763,7 +763,7 @@ describe("lean: structural graph proofs", () => {
 		const { files, bare } = walkStaticGraph(
 			resolve(PACKAGE_DIR, "src", "lean-runner.ts"),
 		);
-		const basenames = [...files].map((file) => file.split("/").pop());
+		const basenames = [...files].map((file) => basename(file));
 		expect(basenames.sort()).toEqual(["lean-api.ts", "lean-runner.ts", "protocol.ts"]);
 		for (const specifier of bare) {
 			const allowed = specifier === "@earendil-works/pi-tui-protocol"
