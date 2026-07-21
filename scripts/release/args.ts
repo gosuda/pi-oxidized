@@ -106,7 +106,7 @@ function requireFlagValue(argv: readonly string[], i: number, flag: string): str
 export function parseReleaseArgs(
 	argv: readonly string[],
 	cwd: string = process.cwd(),
-	sourceDateEpochEnv: string | undefined = process.env.SOURCE_DATE_EPOCH,
+	sourceDateEpochEnv: string | null | undefined = process.env.SOURCE_DATE_EPOCH,
 ): ReleaseArgs {
 	let target: string | undefined;
 	let outDir: string | undefined;

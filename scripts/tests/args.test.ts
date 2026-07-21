@@ -12,7 +12,11 @@ import { InvalidTargetError, RUST_TARGETS } from "../release/targets.ts";
 
 describe("args", () => {
 	test("resolves the minimal happy path with defaults", () => {
-		const args = parseReleaseArgs(["--target", "x86_64-unknown-linux-gnu"]);
+		const args = parseReleaseArgs(
+			["--target", "x86_64-unknown-linux-gnu"],
+			process.cwd(),
+			null,
+		);
 		expect(args.plan.rustTarget).toBe("x86_64-unknown-linux-gnu");
 		expect(args.dryRun).toBe(false);
 		expect(args.noCargo).toBe(false);

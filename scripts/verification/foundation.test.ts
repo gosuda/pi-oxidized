@@ -293,7 +293,10 @@ async function smokeCli(fixture: CliFixture, sharedDirectory: string): Promise<v
 		},
 	});
 	try {
-		await cli.waitFor((snapshot) => snapshot.rawText.length > 20, { deadlineMs: 20_000, source: "raw" });
+		await cli.waitFor(/0\.0%\/1\.0M \(auto\)/, {
+			deadlineMs: 30_000,
+			source: "application",
+		});
 		cli.writeKeys(`foundation prompt for ${fixture.name}`, PTY_KEYS.enter);
 		const response = await cli.waitFor(new RegExp(DEFAULT_FINAL_MARKER), {
 			deadlineMs: 30_000,

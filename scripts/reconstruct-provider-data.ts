@@ -60,9 +60,9 @@ async function main(): Promise<void> {
 	console.warn(`reconstructed ${written} provider data files from the catalog`);
 
 	// Fail-fast inversion proof: regenerating the catalog from the
-	// reconstructed files must reproduce the exact catalog bytes we read.
-	// Snapshot/restore keeps the generator-owned artifact untouched on every
-	// exit path, no matter how the regeneration ends.
+	// reconstructed files must reproduce the exact catalog text. Normalize
+	// CRLF only because Windows checkout conversion is not generator drift.
+	// Snapshot/restore keeps the generator-owned artifact untouched.
 	const before = await Bun.file(CATALOG_PATH).bytes();
 	try {
 		const regen = Bun.spawnSync(
@@ -75,7 +75,9 @@ async function main(): Promise<void> {
 			);
 		}
 		const after = await Bun.file(CATALOG_PATH).bytes();
-		if (Buffer.compare(Buffer.from(before), Buffer.from(after)) !== 0) {
+		const normalizeCrLf = (bytes: Uint8Array): string =>
+			Buffer.from(bytes).toString("utf8").replaceAll("\r\n", "\n");
+		if (normalizeCrLf(before) !== normalizeCrLf(after)) {
 			throw new Error(
 				"inversion proof failed: regenerated builtin-models.json differs from the catalog the reconstruction used",
 			);
