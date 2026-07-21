@@ -120,11 +120,22 @@ jobs:
           bun run check
           bun test scripts
 
-      # Same-machine relative benchmark: one leg carries the signal, so the
-      # other four targets skip it to avoid fivefold benchmark cost.
-      - name: Extension scaling benchmark
+      # The full correctness and same-machine performance signal runs once;
+      # the remaining four jobs stay focused on target-specific packaging.
+      - name: Generate Rust test fixtures
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: bun run verify:extension-scaling
+        run: bun run scripts/generate-tool-schemas.ts
+
+      - name: Rust quality and tests
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          cargo fmt --all --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --all-targets --no-fail-fast --locked
+
+      - name: Full compatibility matrix
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: bun run verify:compatibility
 
       - name: Upload extension scaling artifact
         if: always() && matrix.target == 'x86_64-unknown-linux-gnu'

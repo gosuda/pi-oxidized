@@ -324,6 +324,20 @@
 			"evidence": "cargo pi-ext integration tests pass (scaling + extension invariants)"
 		},
 		{
+			"id": "product-release-build",
+			"surface": "session interoperability",
+			"tier": "product",
+			"required": true,
+			"commands": [
+				{
+					"cwd": ".",
+					"argv": ["cargo", "build", "-p", "pi", "--release", "--locked"],
+					"timeoutMs": 1200000
+				}
+			],
+			"evidence": "release pi binary exists before the real interactive session interoperability smoke"
+		},
+		{
 			"id": "session-interop",
 			"surface": "session interoperability",
 			"tier": "product",
