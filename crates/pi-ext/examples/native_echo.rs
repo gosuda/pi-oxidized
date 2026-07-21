@@ -30,12 +30,17 @@ use serde_json::{Value, json};
 use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
 
+use pi_ai::types::{
+    AssistantContent, AssistantMessage, AssistantMessageEvent, DoneReason, TextContent,
+};
 use pi_ext::server::{
-    ExtensionFault, NativeExtension, NativeFuture, RegistrySnapshot, ToolCall, ToolSnapshotEntry,
+    ExtensionFault, NativeEventSink, NativeExtension, NativeFuture, ProviderEventSink,
+    ProviderSnapshotEntry, ProviderStreamCall, RegistrySnapshot, ToolCall, ToolSnapshotEntry,
     ToolUpdateSink, serve,
 };
 
 const TOOL_NAME: &str = "native_echo";
+const PROVIDER_NAME: &str = "native_echo";
 const TICK: Duration = Duration::from_millis(10);
 
 /// Strict JSON Schema the host advertises for `native_echo`.
@@ -62,6 +67,14 @@ fn snapshot() -> RegistrySnapshot {
             parameters: parameters_schema(),
             execution_mode: None,
         }],
+        providers: vec![ProviderSnapshotEntry {
+            name: PROVIDER_NAME.to_owned(),
+            stream_simple: true,
+            display_name: Some("Native echo".to_owned()),
+            extension_path: Some("native://example".to_owned()),
+            ..ProviderSnapshotEntry::default()
+        }],
+        handlers: vec!["session_start".to_owned()],
         ..RegistrySnapshot::default()
     }
 }
@@ -164,17 +177,102 @@ impl NativeExtension for NativeEcho {
         .boxed()
     }
 
-    fn execute_command(
+    fn stream_provider(
         &self,
-        command: String,
-        _args: String,
-    ) -> NativeFuture<Result<(), ExtensionFault>> {
+        call: ProviderStreamCall,
+        events: ProviderEventSink,
+        cancel: CancellationToken,
+    ) -> NativeFuture<Result<Value, ExtensionFault>> {
         async move {
-            // Commands are out of scope for this minimal example; unknown
-            // slash names report `not_found`, matching `execute_tool`.
-            Err(ExtensionFault::not_found(format!(
-                "Command not found: {command}"
-            )))
+            if call.provider_id != PROVIDER_NAME {
+                return Err(ExtensionFault::not_found(format!(
+                    "Provider not found: {}",
+                    call.provider_id
+                )));
+            }
+            let model = call
+                .model
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("native-echo");
+            let mut message = AssistantMessage::new("native-echo", PROVIDER_NAME, model, 0);
+            let mut stream = vec![
+                AssistantMessageEvent::Start {
+                    partial: message.clone(),
+                },
+                AssistantMessageEvent::TextStart {
+                    content_index: 0,
+                    partial: message.clone(),
+                },
+            ];
+            let text = "native provider ready";
+            message
+                .content
+                .push(AssistantContent::Text(TextContent::new(text)));
+            stream.extend([
+                AssistantMessageEvent::TextDelta {
+                    content_index: 0,
+                    delta: text.to_owned(),
+                    partial: message.clone(),
+                },
+                AssistantMessageEvent::TextEnd {
+                    content_index: 0,
+                    content: text.to_owned(),
+                    partial: message.clone(),
+                },
+                AssistantMessageEvent::Done {
+                    reason: DoneReason::Stop,
+                    message,
+                },
+            ]);
+            for event in stream {
+                if !events.send(event).await {
+                    let message = if cancel.is_cancelled() {
+                        "native provider cancelled"
+                    } else {
+                        "provider event channel closed"
+                    };
+                    return Err(ExtensionFault::extension_error(message));
+                }
+            }
+            Ok(json!({}))
+        }
+        .boxed()
+    }
+
+    fn on_lifecycle(
+        &self,
+        event_type: String,
+        _payload: Value,
+        events: NativeEventSink,
+    ) -> NativeFuture<Result<Value, ExtensionFault>> {
+        async move {
+            if event_type != "session_start" {
+                return Err(ExtensionFault::not_found(format!(
+                    "Lifecycle handler not found: {event_type}"
+                )));
+            }
+            if !events
+                .send(
+                    "uiSlot",
+                    json!({
+                        "key": "native_echo.lifecycle",
+                        "generation": 1,
+                        "placement": "aboveEditor",
+                        "height": 1,
+                        "runs": [[{
+                            "text": "native extension ready",
+                            "style": {},
+                        }]],
+                    }),
+                )
+                .await
+            {
+                return Err(ExtensionFault::extension_error(
+                    "native lifecycle event channel closed",
+                ));
+            }
+            Ok(json!({}))
         }
         .boxed()
     }
