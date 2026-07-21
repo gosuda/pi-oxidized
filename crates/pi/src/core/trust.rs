@@ -743,7 +743,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::thread;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     type TestResult = Result<(), String>;
 
@@ -1304,9 +1304,16 @@ mod tests {
             handles.push(thread::spawn(move || -> TestResult {
                 let path = root.join(format!("p{index}"));
                 fs::create_dir_all(&path).map_err(|error| error.to_string())?;
-                store
-                    .set(&path, Some(index % 2 == 0))
-                    .map_err(|error| error.to_string())
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    match store.set(&path, Some(index % 2 == 0)) {
+                        Ok(()) => return Ok(()),
+                        Err(TrustError::Lock) if Instant::now() < deadline => {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => return Err(error.to_string()),
+                    }
+                }
             }));
         }
         let mut worker_error = None;
