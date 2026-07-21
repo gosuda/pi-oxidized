@@ -33,8 +33,15 @@ import * as _bundledPiCodingAgent from "pi-coding-agent-full";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-/** Whether this module runs from a compiled Bun binary (`/$bunfs` vfs). */
-const COMPILED = __dirname.startsWith("/$bunfs") || __dirname === "/";
+const COMPILED_PATH_SEGMENT = /(?:^|[\\/])(?:\$bunfs|~bun|%7ebun)(?:[\\/]|$)/i;
+
+/** Whether a module URL points into Bun's compiled virtual filesystem. */
+export function isCompiledModuleUrl(moduleUrl: string): boolean {
+	const [path = moduleUrl] = moduleUrl.split(/[?#]/, 1);
+	return COMPILED_PATH_SEGMENT.test(path);
+}
+
+const COMPILED = isCompiledModuleUrl(import.meta.url) || __dirname === "/";
 /** Bundled module instances served to extensions in compiled mode. */
 function getVirtualModules(): Record<string, unknown> {
 	const modules: Record<string, unknown> = {

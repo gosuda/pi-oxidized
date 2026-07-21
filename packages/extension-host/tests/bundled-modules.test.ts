@@ -9,6 +9,7 @@ import {
 	encodeFrameString,
 	type Frame,
 } from "@earendil-works/pi-tui-protocol";
+import { isCompiledModuleUrl } from "../src/virtual-modules.ts";
 
 async function run(command: string, args: readonly string[], cwd: string): Promise<void> {
 	const { promise, resolve: resolvePromise, reject: rejectPromise } = Promise.withResolvers<void>();
@@ -100,6 +101,15 @@ async function loadExtension(
  * empty archive dir, run from a cwd OUTSIDE the repository, must load an
  * extension importing `@earendil-works/pi-coding-agent` and `typebox`.
  */
+test("detects every Bun compiled-filesystem URL form", () => {
+	expect(isCompiledModuleUrl("file:///$bunfs/root/src/main.ts")).toBe(true);
+	expect(isCompiledModuleUrl("file:///B:/~BUN/root/src/main.ts")).toBe(true);
+	expect(isCompiledModuleUrl("file:///B:/%7EBUN/root/src/main.ts")).toBe(true);
+	expect(isCompiledModuleUrl("file:///C:/repo/~BUN-copy/main.ts")).toBe(false);
+	expect(isCompiledModuleUrl("file:///C:/repo/main.ts?cache=$bunfs")).toBe(false);
+	expect(isCompiledModuleUrl("file:///C:/repo/packages/extension-host/src/main.ts")).toBe(false);
+});
+
 describe("compiled extension module bundling", () => {
 	const hostDir = resolve(import.meta.dirname, "..");
 	const executableSuffix = process.platform === "win32" ? ".exe" : "";
