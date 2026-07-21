@@ -166,7 +166,7 @@ async function testHost(hostDir: string, runner: CommandRunner): Promise<void> {
 	if (res.exitCode !== 0) {
 		throw new HostBuildError(
 			hostDir,
-			`host tests failed (exit ${res.exitCode}). stderr=${res.stderr.slice(0, 1000)}`,
+			`host tests failed (exit ${res.exitCode}). stderr=${res.stderr.slice(-4000)}`,
 		);
 	}
 }
