@@ -47,8 +47,9 @@ use super::super::agent_session::events::{
 use super::super::agent_session::extension_runner::{ExtensionRunner, SessionHooks};
 use super::super::model_runtime::{CreateModelRuntimeOptions, ModelRuntime};
 use super::{
-    ALL_EVENT_TYPES, ExtensionMode, HostExtensionRunner, HostStartError, SessionBridgeEvent,
-    ToolRenderPhase, classify_endpoint_plans, compact_message_update_event, sanitize_html,
+    ALL_EVENT_TYPES, ExtensionMode, HostExtensionRunner, HostStartError, RegistrySnapshotWire,
+    SessionBridgeEvent, ToolRenderPhase, classify_endpoint_plans, compact_message_update_event,
+    sanitize_html,
 };
 
 type BoxErr = Box<dyn Error>;
@@ -773,17 +774,33 @@ async fn shortcut_order_and_extension_metadata_are_preserved() -> R {
     Ok(())
 }
 
+#[test]
+fn registry_snapshot_rejects_non_cli_flag_values() {
+    for snapshot in [
+        json!({"flags": [{"name": "bad", "type": "boolean", "default": 1}]}),
+        json!({"flags": [{"name": "bad", "type": "boolean", "value": 1}]}),
+    ] {
+        let result = serde_json::from_value::<RegistrySnapshotWire>(snapshot);
+        assert!(result.is_err(), "numeric flag values must be rejected");
+    }
+}
+
 #[tokio::test]
 async fn flags_set_acks_before_updating_local_values_and_rejection_preserves_state() -> R {
     let snapshot = json!({
         "flags": [{
             "name": "verbose",
             "type": "boolean",
-            "value": false,
+            "default": false,
             "extensionPath": "/ext/a.ts"
         }]
     });
     let (runner, host) = make_runner(snapshot).await?;
+    assert_eq!(
+        runner.get_flag_values().get("verbose"),
+        Some(&Value::Bool(false)),
+        "boolean defaults must survive the registry snapshot"
+    );
     let values = BTreeMap::from([("verbose".to_owned(), FlagValueWire::Boolean(true))]);
     runner.apply_flag_values(&values).await?;
     let request = host

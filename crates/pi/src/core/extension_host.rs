@@ -263,12 +263,50 @@ struct FlagWire {
     #[serde(default, rename = "type")]
     kind: Option<String>,
     #[serde(default)]
-    default: Option<String>,
+    default: Option<FlagValueWire>,
     /// Currently resolved value (from CLI / settings), if any.
     #[serde(default)]
-    value: Option<Value>,
+    value: Option<FlagValueWire>,
     #[serde(default)]
     extension_path: Option<String>,
+}
+
+impl FlagWire {
+    fn register(self, snapshot: &mut RegistrySnapshot) {
+        let kind = match self.kind.as_deref() {
+            Some("boolean") => adapters::FlagKind::Boolean,
+            _ => adapters::FlagKind::String,
+        };
+        let default = self.default.as_ref().map(|value| match value {
+            FlagValueWire::Boolean(value) => value.to_string(),
+            FlagValueWire::String(value) => value.clone(),
+        });
+        if !snapshot.registry.register_flag(FlagRegistration {
+            name: self.name.clone(),
+            description: self.description,
+            kind,
+            default,
+            extension_path: self.extension_path,
+        }) {
+            return;
+        }
+
+        let selected = self.value.or(self.default);
+        let value = selected.map_or_else(
+            || {
+                if kind == adapters::FlagKind::Boolean {
+                    Value::Bool(false)
+                } else {
+                    Value::String(String::new())
+                }
+            },
+            |value| match value {
+                FlagValueWire::Boolean(value) => Value::Bool(value),
+                FlagValueWire::String(value) => Value::String(value),
+            },
+        );
+        snapshot.flag_values.insert(self.name, value);
+    }
 }
 
 /// Wire form of [`RendererRegistration`].
@@ -446,24 +484,7 @@ fn build_snapshot(wire: RegistrySnapshotWire, client: &Arc<HostClient>) -> Regis
     }
 
     for flag in wire.flags {
-        if snapshot.registry.register_flag(FlagRegistration {
-            name: flag.name.clone(),
-            description: flag.description,
-            kind: match flag.kind.as_deref() {
-                Some("boolean") => adapters::FlagKind::Boolean,
-                _ => adapters::FlagKind::String,
-            },
-            default: flag.default.clone(),
-            extension_path: flag.extension_path,
-        }) {
-            // First-wins: prefer the host-resolved value, fall back to default.
-            let value = flag
-                .value
-                .clone()
-                .or_else(|| flag.default.map(Value::String))
-                .unwrap_or_else(|| Value::String(String::new()));
-            snapshot.flag_values.insert(flag.name, value);
-        }
+        flag.register(&mut snapshot);
     }
 
     for renderer in wire.renderers {
