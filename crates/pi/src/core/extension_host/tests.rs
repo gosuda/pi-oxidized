@@ -29,7 +29,10 @@ use pi_agent::{
     AfterToolCallContext, AgentContext, AgentMessage, AgentToolResult, BeforeToolCallContext,
     CustomAgentMessage,
 };
-use pi_ai::{AssistantContent, AssistantMessage, AssistantMessageEvent, TextContent, ToolCall};
+use pi_ai::{
+    AssistantContent, AssistantMessage, AssistantMessageDiagnostic, AssistantMessageEvent,
+    StopReason, TextContent, ToolCall, Usage, UsageCost,
+};
 use pi_ext::client::{HostClient, HostUiRequest, HostUiResponse};
 #[cfg(unix)]
 use pi_ext::host::{HostError, HostSource, HostSpec};
@@ -48,8 +51,8 @@ use super::super::agent_session::extension_runner::{ExtensionRunner, SessionHook
 use super::super::model_runtime::{CreateModelRuntimeOptions, ModelRuntime};
 use super::{
     ALL_EVENT_TYPES, ExtensionMode, HostExtensionRunner, HostStartError, RegistrySnapshotWire,
-    SessionBridgeEvent, ToolRenderPhase, classify_endpoint_plans, compact_message_update_event,
-    sanitize_html,
+    SessionBridgeEvent, ToolRenderPhase, classify_endpoint_plans, compact_assistant_meta,
+    compact_message_update_event, sanitize_html,
 };
 
 type BoxErr = Box<dyn Error>;
@@ -2034,11 +2037,44 @@ async fn load_request_carries_both_project_trust_values() -> R {
     Ok(())
 }
 #[test]
-fn compact_message_updates_omit_growing_snapshot_content() {
+fn compact_message_updates_match_full_metadata_without_content() -> R {
     let mut partial = AssistantMessage::new("test-api", "test-provider", "m", 1);
     partial
         .content
         .push(AssistantContent::Text(TextContent::new("hello")));
+    partial.response_model = Some("response-model".to_owned());
+    partial.response_id = Some("response-id".to_owned());
+    partial.diagnostics = Some(vec![AssistantMessageDiagnostic {
+        kind: "retry".to_owned(),
+        timestamp: 2,
+        error: None,
+        details: Some(Map::from_iter([("attempt".to_owned(), json!(1))])),
+    }]);
+    partial.usage = Usage {
+        input: 3,
+        output: 4,
+        cache_read: 5,
+        cache_write: 6,
+        cache_write1h: Some(7),
+        reasoning: Some(8),
+        total_tokens: 9,
+        cost: UsageCost {
+            input: 1.0,
+            output: 2.0,
+            cache_read: 3.0,
+            cache_write: 4.0,
+            total: 10.0,
+        },
+    };
+    partial.stop_reason = StopReason::Length;
+    partial.error_message = Some("diagnostic".to_owned());
+
+    let mut expected = serde_json::to_value(&partial)?;
+    expected
+        .as_object_mut()
+        .ok_or("assistant message must serialize as an object")?
+        .remove("content");
+    assert_eq!(compact_assistant_meta(&partial), expected);
 
     let delta = compact_message_update_event(&AssistantMessageEvent::TextDelta {
         content_index: 0,
@@ -2049,7 +2085,7 @@ fn compact_message_updates_omit_growing_snapshot_content() {
     assert_eq!(delta["delta"], "lo");
     assert!(delta.get("partial").is_none());
     assert!(delta.get("block").is_none());
-    assert!(delta["meta"].get("content").is_none());
+    assert_eq!(delta["meta"], expected);
 
     let end = compact_message_update_event(&AssistantMessageEvent::TextEnd {
         content_index: 0,
@@ -2058,7 +2094,8 @@ fn compact_message_updates_omit_growing_snapshot_content() {
     });
     assert_eq!(end["block"]["type"], "text");
     assert_eq!(end["block"]["text"], "hello");
-    assert!(end["meta"].get("content").is_none());
+    assert_eq!(end["meta"], expected);
+    Ok(())
 }
 
 #[tokio::test]

@@ -2683,11 +2683,7 @@ fn sanitize_html(html: &str) -> String {
 
 /// Assistant metadata without the growing `content` array.
 fn compact_assistant_meta(message: &AssistantMessage) -> Value {
-    let mut value = serde_json::to_value(message).unwrap_or_else(|_| Value::Object(Map::new()));
-    if let Value::Object(object) = &mut value {
-        object.remove("content");
-    }
-    value
+    serde_json::to_value(message.metadata_view()).unwrap_or_else(|_| Value::Object(Map::new()))
 }
 
 /// The single content block addressed by a streaming event, if any.

@@ -474,6 +474,26 @@ pub struct AssistantMessage {
     pub timestamp: i64,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AssistantMessageMetadata<'a> {
+    role: &'a AssistantRole,
+    api: &'a str,
+    provider: &'a str,
+    model: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_model: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostics: Option<&'a [AssistantMessageDiagnostic]>,
+    usage: &'a Usage,
+    stop_reason: &'a StopReason,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_message: Option<&'a str>,
+    timestamp: i64,
+}
+
 impl AssistantMessage {
     /// Creates an assistant message with the required literal role.
     #[must_use]
@@ -496,6 +516,41 @@ impl AssistantMessage {
             stop_reason: StopReason::Stop,
             error_message: None,
             timestamp,
+        }
+    }
+
+    /// Returns a borrowed wire view without the growing content array.
+    ///
+    /// Streaming hook payloads use this view so each delta serializes in
+    /// constant time with respect to accumulated assistant content.
+    #[must_use]
+    pub fn metadata_view(&self) -> impl Serialize + '_ {
+        let Self {
+            role,
+            content: _,
+            api,
+            provider,
+            model,
+            response_model,
+            response_id,
+            diagnostics,
+            usage,
+            stop_reason,
+            error_message,
+            timestamp,
+        } = self;
+        AssistantMessageMetadata {
+            role,
+            api,
+            provider,
+            model,
+            response_model: response_model.as_deref(),
+            response_id: response_id.as_deref(),
+            diagnostics: diagnostics.as_deref(),
+            usage,
+            stop_reason,
+            error_message: error_message.as_deref(),
+            timestamp: *timestamp,
         }
     }
 }
