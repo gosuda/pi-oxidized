@@ -1855,13 +1855,11 @@ fn write_startup_host(
          printf '%s\\n' shutdown >> \"$shutdown_file\"\n",
     );
     fs::write(&script_path, script)?;
-    let mut permissions = fs::metadata(&script_path)?.permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&script_path, permissions)?;
     let spec = HostSpec {
         source: HostSource::Env(script_path.clone()),
-        program: script_path,
+        program: PathBuf::from("/bin/sh"),
         args: vec![
+            script_path.to_string_lossy().into_owned(),
             pid_path.to_string_lossy().into_owned(),
             shutdown_path.to_string_lossy().into_owned(),
         ],
