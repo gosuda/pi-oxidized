@@ -120,6 +120,19 @@ jobs:
           bun run check
           bun test scripts
 
+      # Same-machine relative benchmark: one leg carries the signal, so the
+      # other four targets skip it to avoid fivefold benchmark cost.
+      - name: Extension scaling benchmark
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: bun run verify:extension-scaling
+
+      - name: Upload extension scaling artifact
+        if: always() && matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: extension-scaling-${{ matrix.target }}
+          path: target/bench/extension-scaling.json
+
       - name: Build and Package (First Pass)
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc

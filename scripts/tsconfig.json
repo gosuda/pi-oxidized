@@ -32,6 +32,7 @@
 		"tests/**/*.ts",
 		"verification/**/*.ts",
 		"bench-extension-scaling.ts",
+		"lean-scaling.ts",
 		"build-extension-host.ts",
 		"package-release.ts"
 	],

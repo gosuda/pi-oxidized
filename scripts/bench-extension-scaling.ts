@@ -29,6 +29,14 @@ import idleFactory from "../packages/extension-host/fixtures/extensions/idle.ts"
 import widgetActiveFactory from "../packages/extension-host/fixtures/extensions/widget-active.ts";
 import terminalInputFastFactory from "../packages/extension-host/fixtures/extensions/terminal-input-fast.ts";
 import terminalInputSlowFactory from "../packages/extension-host/fixtures/extensions/terminal-input-slow.ts";
+import {
+	DEFAULT_LEAN_MAX_RATIO,
+	DEFAULT_SAMPLES,
+	DEFAULT_WARMUPS,
+	runModeDistinctness,
+} from "./lean-scaling.ts";
+
+const EXTENSION_HOST_PACKAGE = resolve(process.cwd(), "packages", "extension-host");
 
 class FrameCollector {
 	readonly frames: Frame[] = [];
@@ -411,6 +419,32 @@ async function main(): Promise<void> {
 		failures.push("extensionError must be non-retryable");
 	}
 
+	// ----- mode 2 distinctness: compat vs lean child-process startup -----
+	// Same host entry for both modes; only --lean and the fixture differ.
+	// Gate is same-run relative (lean p50 / compat p50), hardware-independent.
+	const modeDistinctness = await runModeDistinctness({
+		hostCwd: EXTENSION_HOST_PACKAGE,
+		hostEntry: "src/main.ts",
+		compatExtension: resolve(
+			EXTENSION_HOST_PACKAGE,
+			"fixtures",
+			"extensions",
+			"idle.ts",
+		),
+		leanExtension: resolve(
+			EXTENSION_HOST_PACKAGE,
+			"tests",
+			"fixtures",
+			"lean",
+			"echo.mjs",
+		),
+		warmups: DEFAULT_WARMUPS,
+		samples: DEFAULT_SAMPLES,
+		toolRounds: DEFAULT_SAMPLES,
+		maxRatio: DEFAULT_LEAN_MAX_RATIO,
+	});
+	failures.push(...modeDistinctness.failures);
+
 	const artifact = {
 		check: 8,
 		name: "extension-scaling",
@@ -421,6 +455,11 @@ async function main(): Promise<void> {
 			fastTerminalInputP99Ms: 5,
 			slowTerminalInputTimeoutMs: EXTENSION_INPUT_TIMEOUT_MS,
 			inputQueueCapacity: EXTENSION_INPUT_QUEUE_CAPACITY,
+			// Lean p50 must be <= 85% of compat p50 in the same run: a relative
+			// margin far below the observed mode gap, robust to CI noise.
+			leanVsCompatP50MaxRatio: DEFAULT_LEAN_MAX_RATIO,
+			modeWarmups: DEFAULT_WARMUPS,
+			modeSamples: DEFAULT_SAMPLES,
 		},
 		machine: machineMetadata(),
 		results: {
@@ -439,6 +478,12 @@ async function main(): Promise<void> {
 				firstPayload: slowFirstPayload,
 				secondPayload: slowSecondPayload,
 			},
+			modeDistinctness: {
+				compat: modeDistinctness.compat,
+				lean: modeDistinctness.lean,
+				verdict: modeDistinctness.verdict,
+				toolRoundTrip: modeDistinctness.toolRoundTrip,
+			},
 		},
 		pass: failures.length === 0,
 		failures,
@@ -455,7 +500,15 @@ async function main(): Promise<void> {
 			`  idle100 keypress p99=${idleKeyStats.p99.toFixed(3)}ms frame p99=${idleFrameStats.p99.toFixed(3)}ms\n` +
 			`  active20 keypress p99=${activeKeyStats.p99.toFixed(3)}ms frame p99=${activeFrameStats.p99.toFixed(3)}ms\n` +
 			`  fast terminalInput p99=${fastStats.p99.toFixed(3)}ms\n` +
-			`  slow first=${slowFirstMs.toFixed(3)}ms second=${slowSecondMs.toFixed(3)}ms\n`,
+			`  slow first=${slowFirstMs.toFixed(3)}ms second=${slowSecondMs.toFixed(3)}ms\n` +
+			`  mode2 compat p50=${modeDistinctness.compat.totalMs.median.toFixed(1)}ms ` +
+			`lean p50=${modeDistinctness.lean.totalMs.median.toFixed(1)}ms ` +
+			`ratio=${modeDistinctness.verdict.ratio.toFixed(3)} (max ${DEFAULT_LEAN_MAX_RATIO})\n` +
+			`  lean 3-RPC rounds=${modeDistinctness.toolRoundTrip.rounds} ` +
+			`responses=${modeDistinctness.toolRoundTrip.responses} ` +
+			`prepare p50=${modeDistinctness.toolRoundTrip.prepareMs.median.toFixed(2)}ms ` +
+			`validate p50=${modeDistinctness.toolRoundTrip.validateMs.median.toFixed(2)}ms ` +
+			`execute p50=${modeDistinctness.toolRoundTrip.executeMs.median.toFixed(2)}ms\n`,
 	);
 	if (failures.length > 0) {
 		for (const f of failures) process.stderr.write(`  FAIL: ${f}\n`);
