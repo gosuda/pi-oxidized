@@ -198,6 +198,21 @@ pub enum HostEvent {
     ProtocolError(String),
 }
 
+/// Handshake validation policy for a host connection.
+///
+/// The wire `hello` payload is identical under every policy; only the
+/// acknowledgment validation differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HandshakePolicy {
+    /// Validate protocol and compatibility versions (Mode 1 compiled host).
+    /// This is the historical [`HostClient::handshake`] behavior.
+    #[default]
+    Compat,
+    /// Validate only the protocol version (Mode 2 lean and Mode 3 native
+    /// endpoints, which carry no upstream TypeScript compatibility surface).
+    ProtocolOnly,
+}
+
 /// Host client error.
 #[derive(Debug, Error, Clone)]
 pub enum HostClientError {
@@ -622,11 +637,30 @@ impl HostClient {
 
     /// Perform the `hello` handshake and validate versions.
     ///
+    /// Equivalent to [`HostClient::handshake_with_policy`] with
+    /// [`HandshakePolicy::Compat`]: both the protocol and compatibility
+    /// versions must match the compiled constants (Mode 1 hosts).
+    ///
     /// # Errors
     ///
     /// Returns [`HostClientError::Handshake`], [`HostClientError::Timeout`],
     /// or transport errors.
     pub async fn handshake(&self) -> HostResult<()> {
+        self.handshake_with_policy(HandshakePolicy::Compat).await
+    }
+
+    /// Perform the `hello` handshake under an explicit validation policy.
+    ///
+    /// The request payload is identical for every policy; only the
+    /// acknowledgment validation differs. [`HandshakePolicy::ProtocolOnly`]
+    /// is used for Mode 2 lean and Mode 3 native endpoints, which carry no
+    /// upstream TypeScript compatibility surface.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostClientError::Handshake`], [`HostClientError::Timeout`],
+    /// or transport errors.
+    pub async fn handshake_with_policy(&self, policy: HandshakePolicy) -> HostResult<()> {
         let hello = Hello::local();
         let payload = serde_json::to_value(&hello)
             .map_err(|e| HostClientError::Payload(format!("encode hello: {e}")))?;
@@ -637,18 +671,32 @@ impl HostClient {
             from_payload(&frame.payload).map_err(|e| HostClientError::Handshake {
                 message: format!("decode helloAck: {e}"),
             })?;
-        if ack.protocol_version != PROTOCOL_VERSION
-            || ack.compatibility_version != COMPATIBILITY_VERSION
-        {
-            return Err(HostClientError::Handshake {
-                message: format!(
-                    "version mismatch: remote protocol={} compat={} (expected {}/{})",
-                    ack.protocol_version,
-                    ack.compatibility_version,
-                    PROTOCOL_VERSION,
-                    COMPATIBILITY_VERSION
-                ),
-            });
+        match policy {
+            HandshakePolicy::Compat => {
+                if ack.protocol_version != PROTOCOL_VERSION
+                    || ack.compatibility_version != COMPATIBILITY_VERSION
+                {
+                    return Err(HostClientError::Handshake {
+                        message: format!(
+                            "version mismatch: remote protocol={} compat={} (expected {}/{})",
+                            ack.protocol_version,
+                            ack.compatibility_version,
+                            PROTOCOL_VERSION,
+                            COMPATIBILITY_VERSION
+                        ),
+                    });
+                }
+            }
+            HandshakePolicy::ProtocolOnly => {
+                if ack.protocol_version != PROTOCOL_VERSION {
+                    return Err(HostClientError::Handshake {
+                        message: format!(
+                            "protocol mismatch: remote protocol={} (expected {PROTOCOL_VERSION})",
+                            ack.protocol_version,
+                        ),
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -1249,6 +1297,78 @@ mod tests {
         assert!(
             matches!(result, Err(HostClientError::Handshake { .. })),
             "expected Handshake error, got {result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn compat_handshake_rejects_compatibility_mismatch() -> R {
+        let (client, mut host) = make_pair().await;
+        let client_task = tokio::spawn(async move { client.handshake().await });
+        let req = host.read_frame().await.ok_or("no hello")?;
+        let bad = Frame::response(
+            req.id,
+            Method::Hello,
+            serde_json::json!({
+                "protocolVersion": PROTOCOL_VERSION,
+                "compatibilityVersion": "0.0.0-bogus",
+            }),
+        );
+        host.write_frame(&bad).await?;
+        let result = client_task.await?;
+        assert!(
+            matches!(result, Err(HostClientError::Handshake { .. })),
+            "compat policy must reject a compatibility mismatch, got {result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn protocol_only_handshake_accepts_compatibility_mismatch() -> R {
+        let (client, mut host) = make_pair().await;
+        let client_task = tokio::spawn(async move {
+            client
+                .handshake_with_policy(HandshakePolicy::ProtocolOnly)
+                .await
+        });
+        let req = host.read_frame().await.ok_or("no hello")?;
+        // Lean/native endpoints carry no upstream TypeScript compatibility
+        // surface, so ProtocolOnly ignores the acknowledgment string.
+        let ack = Frame::response(
+            req.id,
+            Method::Hello,
+            serde_json::json!({
+                "protocolVersion": PROTOCOL_VERSION,
+                "compatibilityVersion": "0.0.0-bogus",
+            }),
+        );
+        host.write_frame(&ack).await?;
+        assert!(client_task.await?.is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn protocol_only_handshake_rejects_protocol_mismatch() -> R {
+        let (client, mut host) = make_pair().await;
+        let client_task = tokio::spawn(async move {
+            client
+                .handshake_with_policy(HandshakePolicy::ProtocolOnly)
+                .await
+        });
+        let req = host.read_frame().await.ok_or("no hello")?;
+        let bad = Frame::response(
+            req.id,
+            Method::Hello,
+            serde_json::json!({
+                "protocolVersion": 99,
+                "compatibilityVersion": COMPATIBILITY_VERSION,
+            }),
+        );
+        host.write_frame(&bad).await?;
+        let result = client_task.await?;
+        assert!(
+            matches!(result, Err(HostClientError::Handshake { .. })),
+            "protocol-only policy must still reject a protocol mismatch, got {result:?}"
         );
         Ok(())
     }
