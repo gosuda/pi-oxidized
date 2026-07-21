@@ -313,6 +313,13 @@ struct ModelRuntimeInner {
     oauth_handlers: HashMap<String, Arc<dyn OAuthAuth>>,
     settings_manager: Option<Arc<Mutex<SettingsManager>>>,
     config: Mutex<ModelsJsonConfig>,
+    /// Lock order: when a code path needs both `config` and
+    /// `extension_providers`, it MUST acquire `config` first and
+    /// `extension_providers` second. `register_provider` spawns a background
+    /// refresh that races any caller-driven refresh, so reverse nesting
+    /// (an `extension_providers` guard alive across a `config` acquire, e.g.
+    /// via a temporary in an `or_else` chain) AB-BA deadlocks against the
+    /// compose paths, freezing startup with zero progress on either side.
     extension_providers: Mutex<HashMap<String, ProviderConfigInput>>,
     /// Extension stream handlers keyed by provider id.
     ///
@@ -1256,22 +1263,23 @@ impl ModelRuntime {
     }
 
     fn configured_api_key(&self, provider_id: &str) -> Option<String> {
-        lock(&self.inner.extension_providers)
+        // Lock order: `config` before `extension_providers` (see ModelRuntimeInner).
+        let models_json = lock(&self.inner.config)
+            .get_provider(provider_id)
+            .and_then(|config| config.api_key.clone());
+        let extension = lock(&self.inner.extension_providers)
             .get(provider_id)
-            .and_then(|config| config.api_key.clone())
-            .or_else(|| {
-                lock(&self.inner.config)
-                    .get_provider(provider_id)
-                    .and_then(|config| config.api_key.clone())
-            })
+            .and_then(|config| config.api_key.clone());
+        extension.or(models_json)
     }
 
     fn configured_headers(&self, provider_id: &str) -> Option<BTreeMap<String, String>> {
-        let extension = lock(&self.inner.extension_providers)
-            .get(provider_id)
-            .and_then(|config| config.headers.clone());
+        // Lock order: `config` before `extension_providers` (see ModelRuntimeInner).
         let models_json = lock(&self.inner.config)
             .get_provider(provider_id)
+            .and_then(|config| config.headers.clone());
+        let extension = lock(&self.inner.extension_providers)
+            .get(provider_id)
             .and_then(|config| config.headers.clone());
         match (models_json, extension) {
             (None, None) => None,
@@ -1287,15 +1295,14 @@ impl ModelRuntime {
     }
 
     fn configured_auth_header(&self, provider_id: &str) -> bool {
-        lock(&self.inner.extension_providers)
+        // Lock order: `config` before `extension_providers` (see ModelRuntimeInner).
+        let models_json = lock(&self.inner.config)
+            .get_provider(provider_id)
+            .and_then(|config| config.auth_header);
+        let extension = lock(&self.inner.extension_providers)
             .get(provider_id)
-            .and_then(|config| config.auth_header)
-            .or_else(|| {
-                lock(&self.inner.config)
-                    .get_provider(provider_id)
-                    .and_then(|config| config.auth_header)
-            })
-            .unwrap_or(false)
+            .and_then(|config| config.auth_header);
+        extension.or(models_json).unwrap_or(false)
     }
 
     async fn rebuild_providers(&self) -> Result<(), ModelRuntimeError> {
@@ -1337,13 +1344,18 @@ impl ModelRuntime {
         // built-ins + models.json + extension config are composed. The next
         // async refresh re-reads the store.
         let store_entry = None;
-        let models = compose_models_static(
-            provider_id,
-            &self.inner.builtins,
-            store_entry,
-            lock(&self.inner.config).get_provider(provider_id),
-            lock(&self.inner.extension_providers).get(provider_id),
-        )?;
+        let models = {
+            // Lock order: `config` before `extension_providers` (see ModelRuntimeInner).
+            let config_guard = lock(&self.inner.config);
+            let extension_guard = lock(&self.inner.extension_providers);
+            compose_models_static(
+                provider_id,
+                &self.inner.builtins,
+                store_entry,
+                config_guard.get_provider(provider_id),
+                extension_guard.get(provider_id),
+            )?
+        };
         lock(&self.inner.provider_models).insert(provider_id.to_owned(), models);
         Ok(())
     }
@@ -1355,12 +1367,15 @@ impl ModelRuntime {
             .read(provider_id)
             .await
             .map_err(|error| error.to_string())?;
+        // Lock order: `config` before `extension_providers` (see ModelRuntimeInner).
+        let models_json = lock(&self.inner.config);
+        let extension = lock(&self.inner.extension_providers);
         compose_models_static(
             provider_id,
             &self.inner.builtins,
             store_entry.as_ref(),
-            lock(&self.inner.config).get_provider(provider_id),
-            lock(&self.inner.extension_providers).get(provider_id),
+            models_json.get_provider(provider_id),
+            extension.get(provider_id),
         )
     }
 
@@ -1390,14 +1405,16 @@ impl ModelRuntime {
             is_config_value_configured(&key, Some(&self.inner.auth_env))
                 || (!key.starts_with('$') && !key.starts_with('!'))
         });
-        let has_oauth = lock(&self.inner.extension_providers)
+        // Lock order: `config` before `extension_providers` (see ModelRuntimeInner).
+        let models_json_oauth = lock(&self.inner.config)
+            .get_provider(provider_id)
+            .and_then(|config| config.oauth.as_ref())
+            .is_some();
+        let extension_oauth = lock(&self.inner.extension_providers)
             .get(provider_id)
             .and_then(|config| config.oauth.as_ref())
-            .is_some()
-            || lock(&self.inner.config)
-                .get_provider(provider_id)
-                .and_then(|config| config.oauth.as_ref())
-                .is_some();
+            .is_some();
+        let has_oauth = extension_oauth || models_json_oauth;
         let stored = lock(&self.inner.snapshot)
             .stored_providers
             .contains(provider_id);
@@ -1534,14 +1551,14 @@ impl ModelRuntime {
                 kind: AuthType::ApiKey,
             });
         }
+        // Lock order: `config` before `extension_providers` (see ModelRuntimeInner).
+        let models_json_oauth = lock(&self.inner.config)
+            .get_provider(provider_id)
+            .and_then(|config| config.oauth.clone());
         let oauth = lock(&self.inner.extension_providers)
             .get(provider_id)
             .and_then(|config| config.oauth.clone())
-            .or_else(|| {
-                lock(&self.inner.config)
-                    .get_provider(provider_id)
-                    .and_then(|config| config.oauth.clone())
-            });
+            .or(models_json_oauth);
         if oauth.is_some()
             && lock(&self.inner.snapshot)
                 .stored_providers
@@ -3443,5 +3460,76 @@ mod tests {
             "non-reasoning model must not emit thinking budget"
         );
         Ok(())
+    }
+
+    /// Regression: `register_provider` spawns a background refresh that races
+    /// any caller-driven refresh. Probe paths used to nest an
+    /// `extension_providers` guard across a `config` acquire (via a temporary
+    /// in an `or_else` chain) while the compose paths nested `config` across
+    /// `extension_providers` — an AB-BA std-Mutex deadlock that froze startup
+    /// with no progress on either side (~3% of extension-enabled launches).
+    /// This stress run must complete; on the pre-fix lock order it deadlocks.
+    ///
+    /// The stress runs on a dedicated runtime inside a plain thread watched
+    /// via `recv_timeout`: a full deadlock parks every runtime worker on the
+    /// mutexes, so an in-runtime `tokio::time::timeout` would itself starve
+    /// and the test would hang instead of failing.
+    #[test]
+    fn concurrent_register_and_refresh_does_not_deadlock() -> Result<(), String> {
+        async fn stress() -> Result<(), String> {
+            let runtime = ModelRuntime::create_in_memory()
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut workers = Vec::new();
+            for round in 0..24 {
+                let runtime = runtime.clone();
+                workers.push(tokio::spawn(async move {
+                    let provider_id = format!("stress-ext-{round}");
+                    runtime
+                        .register_provider(
+                            &provider_id,
+                            &ProviderConfigInput {
+                                base_url: Some("https://stress.test/v1".to_owned()),
+                                api: Some("openai-completions".to_owned()),
+                                api_key: Some("sk-stress".to_owned()),
+                                ..ProviderConfigInput::default()
+                            },
+                        )
+                        .map_err(|error| error.to_string())?;
+                    runtime
+                        .refresh(ModelsRefreshOptions {
+                            allow_network: Some(false),
+                        })
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    runtime.unregister_provider(&provider_id);
+                    Ok::<(), String>(())
+                }));
+            }
+            for worker in workers {
+                worker
+                    .await
+                    .map_err(|error| format!("worker join failed: {error}"))??;
+            }
+            Ok(())
+        }
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .enable_all()
+                .build()
+                .map_err(|error| error.to_string())
+                .and_then(|runtime| runtime.block_on(stress()));
+            let _ = done_tx.send(outcome);
+        });
+        match done_rx.recv_timeout(Duration::from_mins(1)) {
+            Ok(result) => result,
+            Err(_) => Err(
+                "register/refresh stress deadlocked: config & extension_providers locked in opposite order"
+                    .to_owned(),
+            ),
+        }
     }
 }
