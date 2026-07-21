@@ -270,7 +270,7 @@ const tool = defineTool({
 
 export default (pi) => pi.registerTool(tool);
 `);
-	});
+	}, 30_000);
 
 	afterAll(async () => {
 		await Promise.all([

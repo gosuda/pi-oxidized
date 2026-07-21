@@ -7319,17 +7319,38 @@ mod tests {
             .await;
         let shutdown_flag = Arc::clone(&rt.shutdown_flag);
         let shutdown = Arc::clone(&rt.shutdown);
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(75)).await;
+        let output_for_shutdown = captured.clone();
+        let shutdown_task = tokio::spawn(async move {
+            let done_observed = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if output_for_shutdown
+                        .snapshot()
+                        .windows(b"Done".len())
+                        .any(|window| window == b"Done")
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .is_ok();
             shutdown_flag.store(true, std::sync::atomic::Ordering::SeqCst);
             shutdown.notify_one();
+            done_observed
         });
 
-        let exit = tokio::time::timeout(Duration::from_millis(500), rt.run())
+        let exit = tokio::time::timeout(Duration::from_secs(3), rt.run())
             .await
             .map_err(|_| "runtime blocked on prompt".to_owned())?
             .map_err(|error| format!("runtime failed: {error}"))?;
         assert_eq!(exit, InteractiveExit::Clean);
+        assert!(
+            shutdown_task
+                .await
+                .map_err(|error| format!("shutdown task failed: {error}"))?,
+            "stream never painted its final frame"
+        );
 
         let output = String::from_utf8_lossy(&captured.snapshot()).into_owned();
         let intermediate = output

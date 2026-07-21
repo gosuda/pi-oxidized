@@ -1119,8 +1119,8 @@ mod tests {
         AssistantContent, AssistantMessage, AssistantMessageEvent, Context, DoneReason, Model,
         ModelCost, ModelInput, Provider, ProviderError, StopReason, StreamOptions, TextContent,
     };
-    use tokio::sync::{Mutex as TokioMutex, mpsc};
-    use tokio::time::{sleep, timeout};
+    use tokio::sync::mpsc;
+    use tokio::time::sleep;
 
     fn test_model() -> Model {
         Model {
@@ -1185,13 +1185,13 @@ mod tests {
 
     /// Extension runner that records emit order and can delay `message_end`.
     struct RecordingRunner {
-        order: Arc<TokioMutex<Vec<String>>>,
+        order: Arc<Mutex<Vec<String>>>,
         delay_message_end: Duration,
         replace_with: Mutex<Option<AgentMessage>>,
     }
 
     impl RecordingRunner {
-        fn new(order: Arc<TokioMutex<Vec<String>>>) -> Self {
+        fn new(order: Arc<Mutex<Vec<String>>>) -> Self {
             Self {
                 order,
                 delay_message_end: Duration::ZERO,
@@ -1212,7 +1212,10 @@ mod tests {
         {
             let label = format!("ext:{}", event.type_name());
             Box::pin(async move {
-                self.order.lock().await.push(label);
+                self.order
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(label);
                 Ok(None)
             })
         }
@@ -1227,7 +1230,10 @@ mod tests {
                 if !delay.is_zero() {
                     sleep(delay).await;
                 }
-                self.order.lock().await.push("ext:message_end".into());
+                self.order
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push("ext:message_end".into());
                 let replacement = self
                     .replace_with
                     .lock()
@@ -1324,13 +1330,10 @@ mod tests {
         fn emit_error(&self, _message: String) {}
     }
 
-    async fn collect_types(rx: &mut mpsc::UnboundedReceiver<String>, n: usize) -> Vec<String> {
+    fn collect_types(rx: &mut mpsc::UnboundedReceiver<String>) -> Vec<String> {
         let mut out = Vec::new();
-        while out.len() < n {
-            match timeout(Duration::from_secs(2), rx.recv()).await {
-                Ok(Some(v)) => out.push(v),
-                _ => break,
-            }
+        while let Ok(event) = rx.try_recv() {
+            out.push(event);
         }
         out
     }
@@ -1351,17 +1354,20 @@ mod tests {
         });
 
         session.mark_agent_run_active();
+        let processed_agent_ends = session.processed_agent_end_count();
         session
             .agent
             .prompt(vec![user_text("hi", std::iter::empty())])
             .await?;
-        session.agent.wait_for_idle().await;
-        // Allow the lossless event pump to drain agent_end/turn_end after the
-        // agent run token is released.
-        sleep(Duration::from_millis(50)).await;
+        assert!(
+            session
+                .wait_for_processed_agent_end(processed_agent_ends)
+                .await,
+            "event pump disconnected before agent_end"
+        );
         session.emit_agent_settled().await;
 
-        let types = collect_types(&mut rx, 16).await;
+        let types = collect_types(&mut rx);
         // agent_start -> turn_start -> message_start -> message_end (user)
         // -> message_start -> message_end (assistant) -> turn_end -> agent_end -> agent_settled
         assert!(
@@ -1449,7 +1455,7 @@ mod tests {
 
     #[tokio::test]
     async fn extension_before_public_ordering() -> Result<(), Box<dyn std::error::Error>> {
-        let order = Arc::new(TokioMutex::new(Vec::new()));
+        let order = Arc::new(Mutex::new(Vec::new()));
         let runner = Arc::new(RecordingRunner::new(Arc::clone(&order)));
         let provider = Arc::new(MockProvider(vec![Ok(start_event()), Ok(done_event("ok"))]));
         let mut config = AgentSessionConfig::test_config(provider, test_model())?;
@@ -1458,36 +1464,43 @@ mod tests {
 
         let public_order = Arc::clone(&order);
         let _unsub = session.subscribe(move |event| {
-            let label = format!("pub:{}", event.type_name());
-            // Block-free: try_lock; if busy push via blocking.
-            if let Ok(mut g) = public_order.try_lock() {
-                g.push(label);
-            } else {
-                let order = Arc::clone(&public_order);
-                let label = label.clone();
-                tokio::spawn(async move {
-                    order.lock().await.push(label);
-                });
-            }
+            public_order
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(format!("pub:{}", event.type_name()));
         });
 
         session.mark_agent_run_active();
+        let processed_agent_ends = session.processed_agent_end_count();
         session
             .agent
             .prompt(vec![user_text("hi", std::iter::empty())])
             .await?;
-        session.agent.wait_for_idle().await;
-        // Drain any spawned public pushes.
-        sleep(Duration::from_millis(50)).await;
+        assert!(
+            session
+                .wait_for_processed_agent_end(processed_agent_ends)
+                .await,
+            "event pump disconnected before agent_end"
+        );
 
-        let recorded = order.lock().await.clone();
+        let recorded = order
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         // For each event type that has both, ext must appear before pub.
         // Check agent_start specifically.
-        let ext_start = recorded.iter().position(|s| s == "ext:agent_start");
-        let pub_start = recorded.iter().position(|s| s == "pub:agent_start");
-        if let (Some(e), Some(p)) = (ext_start, pub_start) {
-            assert!(e < p, "extension before public: {recorded:?}");
-        }
+        let ext_start = recorded
+            .iter()
+            .position(|s| s == "ext:agent_start")
+            .ok_or("missing extension agent_start")?;
+        let pub_start = recorded
+            .iter()
+            .position(|s| s == "pub:agent_start")
+            .ok_or("missing public agent_start")?;
+        assert!(
+            ext_start < pub_start,
+            "extension before public: {recorded:?}"
+        );
         Ok(())
     }
 
@@ -1518,11 +1531,17 @@ mod tests {
 
         // First prompt to establish assistant tail, then steer, then continue.
         session.mark_agent_run_active();
+        let first_processed_agent_end = session.processed_agent_end_count();
         session
             .agent
             .prompt(vec![user_text("first", std::iter::empty())])
             .await?;
-        session.agent.wait_for_idle().await;
+        assert!(
+            session
+                .wait_for_processed_agent_end(first_processed_agent_end)
+                .await,
+            "event pump disconnected before first agent_end"
+        );
 
         session.mirror_steering_push("steer-text".into());
         session
@@ -1530,9 +1549,14 @@ mod tests {
             .steer(user_text("steer-text", std::iter::empty()));
         assert_eq!(session.pending_message_count(), 1);
 
+        let second_processed_agent_end = session.processed_agent_end_count();
         session.agent.continue_run().await?;
-        session.agent.wait_for_idle().await;
-        sleep(Duration::from_millis(50)).await;
+        assert!(
+            session
+                .wait_for_processed_agent_end(second_processed_agent_end)
+                .await,
+            "event pump disconnected before second agent_end"
+        );
 
         // pendingMessageCount is already decremented by the time message_start is observed.
         let pending = pending_at_user_start.load(Ordering::SeqCst);
@@ -1546,7 +1570,7 @@ mod tests {
     #[tokio::test]
     async fn message_end_replacement_updates_live_and_persists()
     -> Result<(), Box<dyn std::error::Error>> {
-        let order = Arc::new(TokioMutex::new(Vec::new()));
+        let order = Arc::new(Mutex::new(Vec::new()));
         let runner = Arc::new(RecordingRunner {
             order: Arc::clone(&order),
             delay_message_end: Duration::ZERO,
@@ -1572,12 +1596,17 @@ mod tests {
         let session = AgentSession::new(config)?;
 
         session.mark_agent_run_active();
+        let processed_agent_ends = session.processed_agent_end_count();
         session
             .agent
             .prompt(vec![user_text("hi", std::iter::empty())])
             .await?;
-        session.agent.wait_for_idle().await;
-        sleep(Duration::from_millis(50)).await;
+        assert!(
+            session
+                .wait_for_processed_agent_end(processed_agent_ends)
+                .await,
+            "event pump disconnected before agent_end"
+        );
 
         // Live agent transcript tail should be the replacement.
         let last = session.agent.last_assistant();
@@ -1648,7 +1677,7 @@ mod tests {
 
     #[tokio::test]
     async fn slow_extension_does_not_reorder() -> Result<(), Box<dyn std::error::Error>> {
-        let order = Arc::new(TokioMutex::new(Vec::new()));
+        let order = Arc::new(Mutex::new(Vec::new()));
         let runner = Arc::new(RecordingRunner {
             order: Arc::clone(&order),
             delay_message_end: Duration::from_millis(30),
@@ -1665,14 +1694,19 @@ mod tests {
         });
 
         session.mark_agent_run_active();
+        let processed_agent_ends = session.processed_agent_end_count();
         session
             .agent
             .prompt(vec![user_text("hi", std::iter::empty())])
             .await?;
-        session.agent.wait_for_idle().await;
-        sleep(Duration::from_millis(80)).await;
+        assert!(
+            session
+                .wait_for_processed_agent_end(processed_agent_ends)
+                .await,
+            "event pump disconnected before agent_end"
+        );
 
-        let types = collect_types(&mut rx, 16).await;
+        let types = collect_types(&mut rx);
         // message_end (user) must come before message_start (assistant), etc.
         let user_end = types
             .iter()
@@ -1701,12 +1735,17 @@ mod tests {
         unsub();
 
         session.mark_agent_run_active();
+        let processed_agent_ends = session.processed_agent_end_count();
         session
             .agent
             .prompt(vec![user_text("hi", std::iter::empty())])
             .await?;
-        session.agent.wait_for_idle().await;
-        sleep(Duration::from_millis(30)).await;
+        assert!(
+            session
+                .wait_for_processed_agent_end(processed_agent_ends)
+                .await,
+            "event pump disconnected before agent_end"
+        );
 
         assert_eq!(
             count.load(Ordering::SeqCst),
@@ -1719,7 +1758,7 @@ mod tests {
     #[tokio::test]
     async fn dispose_cancels_pump_without_emitting_shutdown()
     -> Result<(), Box<dyn std::error::Error>> {
-        let order = Arc::new(TokioMutex::new(Vec::new()));
+        let order = Arc::new(Mutex::new(Vec::new()));
         let runner = Arc::new(RecordingRunner::new(Arc::clone(&order)));
         let provider = Arc::new(MockProvider(vec![Ok(start_event()), Ok(done_event("ok"))]));
         let mut config = AgentSessionConfig::test_config(provider, test_model())?;
@@ -1727,12 +1766,11 @@ mod tests {
         let session = AgentSession::new(config)?;
         assert!(session.pump_is_active());
         session.dispose().await;
-        sleep(Duration::from_millis(20)).await;
         assert!(!session.pump_is_active());
         assert!(
             order
                 .lock()
-                .await
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .iter()
                 .all(|entry| !entry.starts_with("shutdown:")),
             "runtime teardown owns the single reason-specific shutdown event"
