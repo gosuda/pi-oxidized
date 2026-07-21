@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { resolve } from "node:path";
 import {
 	RUST_TARGETS,
 	archiveName,
@@ -75,7 +76,7 @@ describe("args", () => {
 		);
 		expect(args.plan.rustTarget).toBe("aarch64-apple-darwin");
 		expect(args.dryRun).toBe(true);
-		expect(args.outDir).toBe("/tmp/out");
+		expect(args.outDir).toBe(resolve("/cwd", "/tmp/out"));
 		expect(args.sourceDateEpoch).toBe("123");
 	});
 

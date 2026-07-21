@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { resolve } from "node:path";
 
 import {
 	ArgvHelpRequested,
@@ -48,19 +49,19 @@ describe("args", () => {
 			["--target", "x86_64-apple-darwin", "--out", "/tmp/release"],
 			"/cwd",
 		);
-		expect(abs.outDir).toBe("/tmp/release");
+		expect(abs.outDir).toBe(resolve("/cwd", "/tmp/release"));
 
 		const relative = parseReleaseArgs(
 			["--target", "x86_64-apple-darwin", "--out", "artifacts"],
 			"/cwd",
 		);
-		expect(relative.outDir).toBe("/cwd/artifacts");
+		expect(relative.outDir).toBe(resolve("/cwd", "artifacts"));
 
 		const defaultArgs = parseReleaseArgs(
 			["--target", "x86_64-apple-darwin"],
 			"/cwd",
 		);
-		expect(defaultArgs.outDir).toBe("/cwd/dist/release");
+		expect(defaultArgs.outDir).toBe(resolve("/cwd", "dist/release"));
 	});
 
 	test("accepts the --out-dir alias", () => {
@@ -68,7 +69,7 @@ describe("args", () => {
 			["--target", "x86_64-apple-darwin", "--out-dir", "/tmp/r2"],
 			"/cwd",
 		);
-		expect(args.outDir).toBe("/tmp/r2");
+		expect(args.outDir).toBe(resolve("/cwd", "/tmp/r2"));
 	});
 
 	test("rejects missing --target with MissingTargetError", () => {

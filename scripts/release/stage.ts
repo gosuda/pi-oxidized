@@ -409,8 +409,8 @@ async function verifyNoHostInPi(fs: Fs, piPath: string, host: HostArtifact): Pro
 }
 
 /**
- * Verification: pi (and the host binary in compiled mode) must exist and
- * carry the executable bit on POSIX. Windows archives skip the bit check.
+ * Verify executable bits only when the host filesystem can represent them.
+ * Windows archives carry executability in the release manifest instead.
  */
 async function verifyExecutableBits(
 	fs: Fs,
@@ -418,7 +418,7 @@ async function verifyExecutableBits(
 	archiveDir: string,
 	host: HostArtifact,
 ): Promise<void> {
-	if (plan.windows) return; // Windows uses the manifest's executable flag.
+	if (plan.windows || process.platform === "win32") return;
 	const required = [plan.piBinaryName];
 	if (host.kind === "compiled") required.push(plan.hostBinaryName);
 	if (host.kind === "runtime-bundle") required.push(plan.bunRuntimeName);

@@ -143,7 +143,7 @@ describe("writeTarGz determinism", () => {
 		];
 		await writeTarGz(entries, join(work, "order.tar.gz"), { sourceDateEpoch: 0 });
 		const proc = Bun.spawnSync(["tar", "-tzf", join(work, "order.tar.gz")]);
-		const out = (proc.stdout?.toString("utf8") ?? "").trim().split("\n");
+		const out = (proc.stdout?.toString("utf8") ?? "").trim().split(/\r?\n/);
 		expect(out).toEqual(["alpha", "zeta"]);
 	});
 });
