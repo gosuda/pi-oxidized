@@ -197,6 +197,20 @@ pub struct ProviderStreamCall {
     pub options: Value,
 }
 
+/// One item in the shared outbound queue. Event sinks retain their validated
+/// wire bytes; other responses stay structured for fallback encoding.
+#[derive(Debug)]
+enum OutboundFrame {
+    Structured(Frame),
+    Encoded(Vec<u8>),
+}
+
+impl From<Frame> for OutboundFrame {
+    fn from(frame: Frame) -> Self {
+        Self::Structured(frame)
+    }
+}
+
 /// Bounded, backpressured sink for `providerEvent` stream events.
 ///
 /// Unlike [`ToolUpdateSink`], `send` awaits channel capacity instead of
@@ -212,7 +226,7 @@ pub struct ProviderStreamCall {
 /// events before the terminal frame.
 pub struct ProviderEventSink {
     id: FrameId,
-    tx: mpsc::Sender<Frame>,
+    tx: mpsc::Sender<OutboundFrame>,
     cancel: CancellationToken,
     invalid: Arc<AtomicBool>,
 }
@@ -242,16 +256,18 @@ impl ProviderEventSink {
             method: Method::ProviderEvent.as_str().to_owned(),
             payload,
         };
-        // Pre-validate so an oversize event becomes a correlated
-        // `invalid_payload` terminal instead of a silent drop plus success.
-        if encode_frame(&frame).is_err() {
-            self.invalid.store(true, Ordering::SeqCst);
-            return false;
-        }
+        // Encode once so validation and wire output share the same bytes.
+        let encoded = match encode_frame(&frame) {
+            Ok(encoded) => encoded,
+            Err(_) => {
+                self.invalid.store(true, Ordering::SeqCst);
+                return false;
+            }
+        };
         tokio::select! {
             biased;
             () = self.cancel.cancelled() => false,
-            result = self.tx.send(frame) => result.is_ok(),
+            result = self.tx.send(OutboundFrame::Encoded(encoded)) => result.is_ok(),
         }
     }
 }
@@ -266,7 +282,7 @@ impl ProviderEventSink {
 /// by the writer after a successful queue.
 #[derive(Clone)]
 pub struct NativeEventSink {
-    tx: mpsc::Sender<Frame>,
+    tx: mpsc::Sender<OutboundFrame>,
 }
 
 impl NativeEventSink {
@@ -282,10 +298,10 @@ impl NativeEventSink {
             method: method.to_owned(),
             payload,
         };
-        if encode_frame(&frame).is_err() {
+        let Ok(encoded) = encode_frame(&frame) else {
             return false;
-        }
-        self.tx.send(frame).await.is_ok()
+        };
+        self.tx.send(OutboundFrame::Encoded(encoded)).await.is_ok()
     }
 }
 
@@ -533,7 +549,7 @@ async fn serve_io_inner<R, W, E>(
     reader: R,
     writer: W,
     runtime: Arc<ServerRuntime<E>>,
-    mut out_rx: mpsc::Receiver<Frame>,
+    mut out_rx: mpsc::Receiver<OutboundFrame>,
 ) -> Result<(), ServerError>
 where
     R: AsyncRead + Unpin + Send,
@@ -542,7 +558,7 @@ where
 {
     let writer_dead = CancellationToken::new();
     let mut tasks: JoinSet<()> = JoinSet::new();
-    let (rejection_tx, mut rejection_rx) = mpsc::channel(runtime.out_tx.max_capacity());
+    let (rejection_tx, mut rejection_rx) = mpsc::channel::<Frame>(runtime.out_tx.max_capacity());
 
     let rejection_flusher = {
         let out_tx = runtime.out_tx.clone();
@@ -560,7 +576,7 @@ where
                 let sent = tokio::select! {
                     biased;
                     () = writer_dead.cancelled() => return,
-                    sent = out_tx.send(frame) => sent,
+                    sent = out_tx.send(frame.into()) => sent,
                 };
                 if sent.is_err() {
                     return;
@@ -575,14 +591,19 @@ where
             let mut writer = writer;
             let result: Result<(), ServerError> = async {
                 while let Some(frame) = out_rx.recv().await {
-                    // Contain per-frame encode failures: one bad payload
-                    // (scalar, oversize, or invalid) must not kill the
-                    // endpoint or its sibling requests.
-                    let Some(bytes) = encode_frame(&frame)
-                        .ok()
-                        .or_else(|| encode_fallback(&frame))
-                    else {
-                        continue;
+                    let bytes = match frame {
+                        OutboundFrame::Encoded(bytes) => bytes,
+                        OutboundFrame::Structured(frame) => {
+                            // Contain per-frame encode failures: one bad payload
+                            // must not kill the endpoint or sibling requests.
+                            let Some(bytes) = encode_frame(&frame)
+                                .ok()
+                                .or_else(|| encode_fallback(&frame))
+                            else {
+                                continue;
+                            };
+                            bytes
+                        }
                     };
                     writer.write_all(&bytes).await?;
                     writer.flush().await?;
@@ -678,7 +699,7 @@ struct ServerRuntime<E: NativeExtension> {
     /// calls, keyed by frame id.
     in_flight: Mutex<HashMap<FrameId, CancellationToken>>,
     /// Shared outbound (server → client) frame channel.
-    out_tx: mpsc::Sender<Frame>,
+    out_tx: mpsc::Sender<OutboundFrame>,
     /// Bound on queued per-call streaming updates/events.
     update_capacity: usize,
 }
@@ -686,7 +707,7 @@ struct ServerRuntime<E: NativeExtension> {
 impl<E: NativeExtension> ServerRuntime<E> {
     /// Capture the immutable snapshot once and derive the lifecycle
     /// allowlist from it. Returns the runtime plus the outbound receiver.
-    fn new(extension: E, config: ServerConfig) -> (Self, mpsc::Receiver<Frame>) {
+    fn new(extension: E, config: ServerConfig) -> (Self, mpsc::Receiver<OutboundFrame>) {
         let (out_tx, out_rx) = mpsc::channel(config.outbound_capacity.max(1));
         let snapshot = extension.snapshot();
         let handlers = snapshot.handlers.iter().cloned().collect();
@@ -746,7 +767,7 @@ where
                         payload: to_payload(&HelloAck::local())
                             .map_err(|e| ServerError::Protocol(format!("encode helloAck: {e}")))?,
                     };
-                    runtime.out_tx.send(ack).await.map_err(|_| {
+                    runtime.out_tx.send(ack.into()).await.map_err(|_| {
                         ServerError::Io(std::io::Error::other("outbound channel closed"))
                     })?;
                     state = ServerState::Ready;
@@ -904,7 +925,7 @@ async fn handle_request<E: NativeExtension>(
             }
         }
     };
-    let _ = runtime.out_tx.send(terminal).await;
+    let _ = runtime.out_tx.send(terminal.into()).await;
 }
 
 /// `extensions.load`: encode the cached registry snapshot mirror.
@@ -1111,15 +1132,15 @@ async fn handle_lifecycle<E: NativeExtension>(
     }
 }
 
-async fn send_forwarded_frame(
-    out: &mpsc::Sender<Frame>,
+async fn send_forwarded_frame<T: Into<OutboundFrame>>(
+    out: &mpsc::Sender<OutboundFrame>,
     cancel: &CancellationToken,
-    frame: Frame,
+    frame: T,
 ) -> bool {
     tokio::select! {
         biased;
         () = cancel.cancelled() => false,
-        sent = out.send(frame) => sent.is_ok(),
+        sent = out.send(frame.into()) => sent.is_ok(),
     }
 }
 
@@ -1140,13 +1161,16 @@ async fn execute_tool_request<E: NativeExtension>(
         }
         let _ = runtime
             .out_tx
-            .send(error_frame(
-                id,
-                method,
-                "invalid_request",
-                "tool.execute requires a string name",
-                false,
-            ))
+            .send(
+                error_frame(
+                    id,
+                    method,
+                    "invalid_request",
+                    "tool.execute requires a string name",
+                    false,
+                )
+                .into(),
+            )
             .await;
         return;
     };
@@ -1224,7 +1248,7 @@ async fn execute_tool_request<E: NativeExtension>(
             Err(fault) => fault_frame(id, method, &fault),
         }
     };
-    let _ = runtime.out_tx.send(terminal).await;
+    let _ = runtime.out_tx.send(terminal.into()).await;
 }
 
 /// Run one `provider.stream` call: forward correlated `providerEvent`
@@ -1254,7 +1278,7 @@ async fn execute_provider_request<E: NativeExtension>(
     // The token was registered by the dispatcher before this task spawned,
     // so an early `provider.cancel` is never lost.
     let token = token.unwrap_or_default();
-    let (event_tx, mut event_rx) = mpsc::channel::<Frame>(runtime.update_capacity.max(1));
+    let (event_tx, mut event_rx) = mpsc::channel::<OutboundFrame>(runtime.update_capacity.max(1));
     let (done_tx, mut done_rx) = oneshot::channel::<()>();
     let invalid = Arc::new(AtomicBool::new(false));
     let sink = ProviderEventSink {
@@ -1323,7 +1347,7 @@ async fn execute_provider_request<E: NativeExtension>(
             Err(fault) => fault_frame(id, method, &fault),
         }
     };
-    let _ = runtime.out_tx.send(terminal).await;
+    let _ = runtime.out_tx.send(terminal.into()).await;
 }
 
 /// Build a correlated success response for an open method string.
@@ -3383,12 +3407,35 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn provider_event_sink_retains_encoded_bytes() -> R {
+        let (tx, mut rx) = mpsc::channel::<OutboundFrame>(1);
+        let invalid = Arc::new(AtomicBool::new(false));
+        let sink = ProviderEventSink {
+            id: 7,
+            tx,
+            cancel: CancellationToken::new(),
+            invalid: Arc::clone(&invalid),
+        };
+        assert!(sink.send(demo_event("queued")).await);
+        assert!(!invalid.load(AtomicOrdering::SeqCst));
+        let outbound = rx.recv().await.ok_or("queued event missing")?;
+        let OutboundFrame::Encoded(bytes) = outbound else {
+            return Err("provider event was not retained as encoded bytes".into());
+        };
+        let frame = decode_frame_str(std::str::from_utf8(&bytes)?.trim_end())?;
+        assert_eq!(frame.id, 7);
+        assert_eq!(frame.kind, FrameKind::Event);
+        assert_eq!(frame.method, Method::ProviderEvent.as_str());
+        Ok(())
+    }
+
     /// The native event sink pre-validates events: oversize/unencodable
     /// events fail the `send` itself instead of being dropped by the writer
     /// after a successful queue.
     #[tokio::test]
     async fn native_event_sink_rejects_unencodable_events() -> R {
-        let (tx, mut rx) = mpsc::channel::<Frame>(2);
+        let (tx, mut rx) = mpsc::channel::<OutboundFrame>(2);
         let sink = NativeEventSink { tx };
         assert!(
             !sink
@@ -3410,7 +3457,12 @@ mod tests {
             .await,
             "valid event must queue"
         );
-        let frame = rx.recv().await.ok_or("queued event missing")?;
+        let outbound = rx.recv().await.ok_or("queued event missing")?;
+        let OutboundFrame::Encoded(bytes) = outbound else {
+            return Err("valid native event was not retained as encoded bytes".into());
+        };
+        let line = std::str::from_utf8(&bytes)?.trim_end();
+        let frame = decode_frame_str(line)?;
         assert_eq!(frame.id, 0);
         assert_eq!(frame.kind, FrameKind::Event);
         assert_eq!(frame.method, "uiSlot");
