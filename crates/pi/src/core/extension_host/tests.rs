@@ -789,6 +789,14 @@ fn registry_snapshot_rejects_non_cli_flag_values() {
 }
 
 #[tokio::test]
+async fn empty_flag_overlay_is_elided_for_single_endpoint() -> R {
+    let (runner, host) = make_runner(json!({})).await?;
+    runner.apply_flag_values(&BTreeMap::new()).await?;
+    assert!(!host_received(&host, pi_ext::protocol::FLAGS_SET_METHOD)?);
+    Ok(())
+}
+
+#[tokio::test]
 async fn flags_set_acks_before_updating_local_values_and_rejection_preserves_state() -> R {
     let snapshot = json!({
         "flags": [{
@@ -2108,7 +2116,7 @@ async fn trusted_restart_sends_true_in_replacement_load_request() -> R {
     let replacement = runner
         .restart_and_rewire_with(
             &runtime,
-            HashMap::new(),
+            HashMap::from([("extFlag".to_owned(), Value::String("preserved".to_owned()))]),
             move |_paths, _cwd, project_trusted| async move {
                 let (replacement, host) = make_runner_with_trust(full_snapshot(), project_trusted)
                     .await
