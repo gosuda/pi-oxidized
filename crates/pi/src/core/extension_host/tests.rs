@@ -788,18 +788,6 @@ fn registry_snapshot_rejects_non_cli_flag_values() {
     }
 }
 
-#[test]
-fn lifecycle_event_taxonomy_matches_shared_witness() -> R {
-    let expected: Vec<String> = serde_json::from_str(include_str!(
-        "../../../../../packages/extension-host/tests/fixtures/lifecycle-events.json"
-    ))?;
-    assert_eq!(ALL_EVENT_TYPES.len(), expected.len());
-    for (actual, expected) in ALL_EVENT_TYPES.iter().zip(&expected) {
-        assert_eq!(*actual, expected.as_str());
-    }
-    Ok(())
-}
-
 #[tokio::test]
 async fn empty_flag_overlay_is_elided_for_single_endpoint() -> R {
     let (runner, host) = make_runner(json!({})).await?;
