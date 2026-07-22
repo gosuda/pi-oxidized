@@ -71,8 +71,8 @@ pub type NativeFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 pub struct ServerConfig {
     /// Maximum number of requests handled concurrently. Overload errors use a
     /// bounded deferred queue so the read loop never stalls and cancel frames
-    /// stay observable. If both outbound queues fill, later rejections are
-    /// dropped rather than growing memory without bound.
+    /// stay observable. If both outbound queues fill, the endpoint terminates
+    /// instead of dropping a correlated rejection or growing memory unbounded.
     pub max_in_flight: usize,
     /// Maximum queued streaming updates per `tool.execute` call. When full,
     /// the stale update is dropped (matching the client's stream
@@ -92,7 +92,7 @@ impl Default for ServerConfig {
     }
 }
 
-/// Fatal server error (transport, protocol, or handshake failure).
+/// Fatal server error (transport, protocol, handshake, or bounded overload).
 #[derive(Debug, Error)]
 pub enum ServerError {
     /// The first frame was not an acceptable `hello`.
@@ -101,6 +101,9 @@ pub enum ServerError {
     /// A malformed inbound frame was received.
     #[error("protocol error: {0}")]
     Protocol(String),
+    /// The bounded deferred-rejection queue was exhausted.
+    #[error("outbound overload rejection queue saturated")]
+    OutboundOverflow,
     /// Transport failure.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -462,7 +465,7 @@ pub trait NativeExtension: Send + Sync + 'static {
 ///
 /// # Errors
 ///
-/// Returns [`ServerError`] on handshake, protocol, or io failure.
+/// Returns [`ServerError`] on handshake, protocol, bounded overload, or I/O failure.
 pub async fn serve<E: NativeExtension>(extension: E) -> Result<(), ServerError> {
     // pi-ext does not enable tokio's `io-std` feature; bridge blocking
     // stdin/stdout through in-memory duplex streams pumped by blocking
@@ -524,7 +527,8 @@ pub async fn serve<E: NativeExtension>(extension: E) -> Result<(), ServerError> 
 ///
 /// # Errors
 ///
-/// Returns [`ServerError`] on handshake, protocol, or io failure.
+/// Returns [`ServerError`] on handshake, protocol, bounded overload, or I/O
+/// failure.
 pub async fn serve_io<R, W, E>(
     reader: R,
     writer: W,
@@ -617,6 +621,13 @@ where
     };
 
     let run_result = drive(reader, &runtime, &writer_dead, &rejection_tx, &mut tasks).await;
+
+    if run_result.is_err() {
+        // Fatal read/dispatch errors must not wait on a peer that already
+        // stopped draining the writer or deferred-rejection path.
+        rejection_flusher.abort();
+        writer_task.abort();
+    }
 
     // Teardown: cancel cooperative executions, stop request tasks, then
     // drop the runtime. The outbound channel closes only after the joined
@@ -770,7 +781,7 @@ where
                     state = ServerState::Ready;
                 }
                 ServerState::Ready => {
-                    dispatch_ready(frame, runtime, rejection_tx, tasks);
+                    dispatch_ready(frame, runtime, rejection_tx, tasks)?;
                 }
             }
         }
@@ -804,7 +815,7 @@ fn dispatch_ready<E: NativeExtension>(
     runtime: &Arc<ServerRuntime<E>>,
     rejection_tx: &mpsc::Sender<Frame>,
     tasks: &mut JoinSet<()>,
-) {
+) -> Result<(), ServerError> {
     match frame.kind {
         FrameKind::Req => {
             if let Ok(permit) = runtime.semaphore.clone().try_acquire_owned() {
@@ -827,8 +838,9 @@ fn dispatch_ready<E: NativeExtension>(
                 // Reap finished tasks so the set does not grow per request.
                 while tasks.try_join_next().is_some() {}
             } else {
-                // Defer the correlated rejection without stalling reads. The
-                // queue is bounded with the outbound channel's own capacity.
+                // Defer the correlated rejection without stalling reads. If
+                // this bounded queue also fills, the peer is not draining;
+                // fail the transport instead of orphaning another request.
                 let overloaded = error_frame(
                     frame.id,
                     &frame.method,
@@ -836,7 +848,17 @@ fn dispatch_ready<E: NativeExtension>(
                     "too many in-flight requests",
                     true,
                 );
-                let _ = rejection_tx.try_send(overloaded);
+                match rejection_tx.try_send(overloaded) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        return Err(ServerError::OutboundOverflow);
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        return Err(ServerError::Io(std::io::Error::other(
+                            "deferred rejection channel closed",
+                        )));
+                    }
+                }
             }
         }
         FrameKind::Event => {
@@ -853,6 +875,7 @@ fn dispatch_ready<E: NativeExtension>(
         // carry no correlation state and are ignored.
         FrameKind::Res | FrameKind::Error => {}
     }
+    Ok(())
 }
 
 /// Handle one request to a terminal frame and send it.
@@ -1469,6 +1492,35 @@ mod tests {
                 }),
             })
             .await
+        }
+    }
+
+    struct BlockingWriter {
+        blocked: Arc<AtomicBool>,
+    }
+
+    impl tokio::io::AsyncWrite for BlockingWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.blocked.store(true, AtomicOrdering::SeqCst);
+            std::task::Poll::Pending
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
         }
     }
 
@@ -3463,6 +3515,72 @@ mod tests {
         assert_eq!(frame.id, 0);
         assert_eq!(frame.kind, FrameKind::Event);
         assert_eq!(frame.method, "uiSlot");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deferred_rejection_overflow_terminates_blocked_transport() -> R {
+        let (ext, handles) = DemoExtension::new();
+        let config = ServerConfig {
+            max_in_flight: 1,
+            update_capacity: 1,
+            outbound_capacity: 1,
+        };
+        let (mut client_tx, server_rx) = tokio::io::duplex(64 * 1024);
+        let writer_blocked = Arc::new(AtomicBool::new(false));
+        let writer = BlockingWriter {
+            blocked: Arc::clone(&writer_blocked),
+        };
+        let mut server =
+            tokio::spawn(async move { serve_io(server_rx, writer, ext, config).await });
+
+        let hello = Frame {
+            id: 1,
+            kind: FrameKind::Req,
+            method: Method::Hello.as_str().to_owned(),
+            payload: to_payload(&Hello {
+                protocol_version: PROTOCOL_VERSION,
+                compatibility_version: COMPATIBILITY_VERSION.to_owned(),
+            })?,
+        };
+        client_tx.write_all(&encode_frame(&hello)?).await?;
+        client_tx.flush().await?;
+        wait_flag(&writer_blocked).await?;
+
+        let blocking = Frame {
+            id: 2,
+            kind: FrameKind::Req,
+            method: methods::TOOL_EXECUTE.to_owned(),
+            payload: json!({ "name": "block", "toolCallId": "hold", "args": {} }),
+        };
+        client_tx.write_all(&encode_frame(&blocking)?).await?;
+        client_tx.flush().await?;
+        tokio::time::timeout(TIMEOUT, handles.started.notified()).await?;
+
+        let mut overloads = Vec::new();
+        for id in 3..=8 {
+            overloads.extend(encode_frame(&Frame {
+                id,
+                kind: FrameKind::Req,
+                method: methods::TOOL_EXECUTE.to_owned(),
+                payload: json!({ "name": "echo", "toolCallId": format!("overload-{id}"), "args": {} }),
+            })?);
+        }
+        client_tx.write_all(&overloads).await?;
+        client_tx.flush().await?;
+
+        let joined = match tokio::time::timeout(TIMEOUT, &mut server).await {
+            Ok(joined) => joined?,
+            Err(elapsed) => {
+                server.abort();
+                return Err(elapsed.into());
+            }
+        };
+        assert!(
+            matches!(joined, Err(ServerError::OutboundOverflow)),
+            "expected bounded overflow failure, got {joined:?}"
+        );
+        drop(client_tx);
         Ok(())
     }
 }
