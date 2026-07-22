@@ -1738,7 +1738,7 @@ impl HostExtensionRunner {
                     .map(|(name, value)| (name.clone(), value.clone()))
                     .collect()
             };
-            if selected.is_empty() && self.endpoints.len() != 1 {
+            if selected.is_empty() {
                 continue;
             }
             let payload = protocol::to_payload(&FlagsSetRequest {

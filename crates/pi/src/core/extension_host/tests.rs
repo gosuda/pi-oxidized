@@ -789,6 +789,14 @@ fn registry_snapshot_rejects_non_cli_flag_values() {
 }
 
 #[tokio::test]
+async fn empty_flag_overlay_is_elided_for_single_endpoint() -> R {
+    let (runner, host) = make_runner(json!({})).await?;
+    runner.apply_flag_values(&BTreeMap::new()).await?;
+    assert!(!host_received(&host, pi_ext::protocol::FLAGS_SET_METHOD)?);
+    Ok(())
+}
+
+#[tokio::test]
 async fn flags_set_acks_before_updating_local_values_and_rejection_preserves_state() -> R {
     let snapshot = json!({
         "flags": [{
