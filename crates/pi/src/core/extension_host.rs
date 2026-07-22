@@ -33,8 +33,9 @@ use pi_ext::client::{
 };
 use pi_ext::host::{self, HostError, HostSource, HostSpec};
 use pi_ext::protocol::{
-    self, DisposeSlot, ExtensionErrorEvent, FlagValueWire, FlagsSetRequest, FlagsSetResponse,
-    FrameId, NotifyRequest, ProviderEvent, SessionCommand, SessionCompactRequest,
+    self, DisposeSlot, ExtensionErrorEvent, FlagSnapshotEntry, FlagValueWire, FlagsSetRequest,
+    FlagsSetResponse, FrameId, NotifyRequest, ProviderEvent, ProviderSnapshotEntry,
+    RegistrySnapshot as RegistrySnapshotWire, SessionCommand, SessionCompactRequest,
     SessionSetModelRequest, SessionStateWire, ShortcutExecuteRequest, ShortcutExecuteResponse,
     ThemeSet, ThemeUpdate, ToolUpdate, UiControl, UiEventRequest, UiEventResponse, UiSlot,
     UiStateWire,
@@ -216,203 +217,57 @@ struct ExtensionsLoadRequest<'a> {
     project_trusted: bool,
 }
 
-/// Wire form of [`ToolRegistration`] received from the host load response.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ToolWire {
-    name: String,
-    #[serde(default)]
-    label: String,
-    #[serde(default)]
-    description: String,
-    #[serde(default)]
-    parameters: Value,
-    #[serde(default)]
-    execution_mode: Option<pi_agent::ToolExecutionMode>,
-}
-
-/// Wire form of [`CommandRegistration`].
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CommandWire {
-    name: String,
-    #[serde(default)]
-    description: Option<String>,
-    #[serde(default)]
-    source: Option<String>,
-}
-
-/// Wire form of [`ShortcutRegistration`].
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ShortcutWire {
-    key: String,
-    #[serde(default)]
-    description: Option<String>,
-    #[serde(default)]
-    extension_path: Option<String>,
-}
-
-/// Wire form of [`FlagRegistration`] with its current resolved value.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct FlagWire {
-    name: String,
-    #[serde(default)]
-    description: Option<String>,
-    #[serde(default, rename = "type")]
-    kind: Option<String>,
-    #[serde(default)]
-    default: Option<FlagValueWire>,
-    /// Currently resolved value (from CLI / settings), if any.
-    #[serde(default)]
-    value: Option<FlagValueWire>,
-    #[serde(default)]
-    extension_path: Option<String>,
-}
-
-impl FlagWire {
-    fn register(self, snapshot: &mut RegistrySnapshot) {
-        let kind = match self.kind.as_deref() {
-            Some("boolean") => adapters::FlagKind::Boolean,
-            _ => adapters::FlagKind::String,
-        };
-        let default = self.default.as_ref().map(|value| match value {
-            FlagValueWire::Boolean(value) => value.to_string(),
-            FlagValueWire::String(value) => value.clone(),
-        });
-        if !snapshot.registry.register_flag(FlagRegistration {
-            name: self.name.clone(),
-            description: self.description,
-            kind,
-            default,
-            extension_path: self.extension_path,
-        }) {
-            return;
-        }
-
-        let selected = self.value.or(self.default);
-        let value = selected.map_or_else(
-            || {
-                if kind == adapters::FlagKind::Boolean {
-                    Value::Bool(false)
-                } else {
-                    Value::String(String::new())
-                }
-            },
-            |value| match value {
-                FlagValueWire::Boolean(value) => Value::Bool(value),
-                FlagValueWire::String(value) => Value::String(value),
-            },
-        );
-        snapshot.flag_values.insert(self.name, value);
+fn register_snapshot_flag(flag: FlagSnapshotEntry, snapshot: &mut RegistrySnapshot) {
+    let kind = if flag.kind == "boolean" {
+        adapters::FlagKind::Boolean
+    } else {
+        adapters::FlagKind::String
+    };
+    let default = flag.default.as_ref().map(|value| match value {
+        FlagValueWire::Boolean(value) => value.to_string(),
+        FlagValueWire::String(value) => value.clone(),
+    });
+    let description = (!flag.description.is_empty()).then_some(flag.description);
+    let extension_path = (!flag.extension_path.is_empty()).then_some(flag.extension_path);
+    if !snapshot.registry.register_flag(FlagRegistration {
+        name: flag.name.clone(),
+        description,
+        kind,
+        default,
+        extension_path,
+    }) {
+        return;
     }
+
+    let selected = flag.value.or(flag.default);
+    let value = selected.map_or_else(
+        || {
+            if kind == adapters::FlagKind::Boolean {
+                Value::Bool(false)
+            } else {
+                Value::String(String::new())
+            }
+        },
+        |value| match value {
+            FlagValueWire::Boolean(value) => Value::Bool(value),
+            FlagValueWire::String(value) => Value::String(value),
+        },
+    );
+    snapshot.flag_values.insert(flag.name, value);
 }
 
-/// Wire form of [`RendererRegistration`].
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RendererWire {
-    #[serde(default, rename = "type")]
-    kind: Option<String>,
-    name: String,
-}
-
-/// Wire form of a host-registered custom provider.
-///
-/// Matches the host's `buildRegistrySnapshot` camelCase payload: full
-/// `ProviderConfig` fields plus a boolean `streamSimple` flag (the function
-/// itself never crosses the wire; the host keeps it and Rust proxies via
-/// [`ExtensionProvider`] when the flag is true).
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ProviderWire {
-    name: String,
-    /// Display name (`config.name` in TypeScript); wire key is `displayName`.
-    #[serde(default)]
-    display_name: Option<String>,
-    #[serde(default)]
-    base_url: Option<String>,
-    #[serde(default)]
-    api: Option<String>,
-    #[serde(default)]
-    api_key: Option<String>,
-    #[serde(default)]
-    headers: Option<BTreeMap<String, String>>,
-    #[serde(default)]
-    auth_header: Option<bool>,
-    #[serde(default)]
-    models: Option<Vec<ProviderModelDefinition>>,
-    /// `true` when the host holds a live `streamSimple` function for this provider.
-    #[serde(default)]
-    stream_simple: bool,
-    /// Optional extension path used in diagnostic messages when present.
-    #[serde(default)]
-    extension_path: Option<String>,
-}
-
-impl ProviderWire {
-    fn to_config_input(&self) -> ProviderConfigInput {
-        ProviderConfigInput {
-            name: self.display_name.clone(),
-            base_url: self.base_url.clone(),
-            api_key: self.api_key.clone(),
-            api: self.api.clone(),
-            headers: self.headers.clone(),
-            auth_header: self.auth_header,
-            models: self.models.clone(),
-            model_overrides: None,
-            oauth: None,
-        }
-    }
-}
-
-/// Full host registration snapshot returned by `extensions.load`.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RegistrySnapshotWire {
-    /// Registered extension tools (host already applied first-wins).
-    #[serde(default)]
-    tools: Vec<ToolWire>,
-    /// Registered slash commands.
-    #[serde(default)]
-    commands: Vec<CommandWire>,
-    /// Registered keyboard shortcuts.
-    #[serde(default)]
-    shortcuts: Vec<ShortcutWire>,
-    /// Registered CLI flags with current values.
-    #[serde(default)]
-    flags: Vec<FlagWire>,
-    /// Registered renderers (message / tool / widget).
-    #[serde(default)]
-    renderers: Vec<RendererWire>,
-    /// Registered custom providers.
-    #[serde(default)]
-    providers: Vec<ProviderWire>,
-    /// Lifecycle event types with at least one handler installed.
-    #[serde(default)]
-    handlers: Vec<String>,
-    /// Whether `ui.onTerminalInput` has at least one active handler.
-    #[serde(default)]
-    terminal_input: bool,
-    /// Number of extensions successfully loaded (host diagnostic field).
-    #[serde(default)]
-    extensions: Option<u64>,
-    /// Per-path load errors (sibling isolation).
-    #[serde(default)]
-    errors: Vec<LoadErrorWire>,
-}
-
-/// Per-extension load error from the host snapshot.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct LoadErrorWire {
-    #[serde(default)]
-    path: Option<String>,
-    #[serde(default)]
-    error: Option<String>,
-    #[serde(default)]
-    message: Option<String>,
+fn decode_provider_models(
+    models: Option<Value>,
+) -> Result<Option<Vec<ProviderModelDefinition>>, String> {
+    let Some(models) = models else {
+        return Ok(None);
+    };
+    let Value::Array(models) = models else {
+        return Err("models must be an array".to_owned());
+    };
+    serde_json::from_value(Value::Array(models))
+        .map(Some)
+        .map_err(|error| error.to_string())
 }
 
 /// Built registry snapshot: pi-ext [`Registry`] plus ready tool/provider
@@ -466,32 +321,37 @@ fn build_snapshot(wire: RegistrySnapshotWire, client: &Arc<HostClient>) -> Regis
     }
 
     for command in wire.commands {
+        let description = (!command.description.is_empty()).then_some(command.description);
+        let source = (!command.source.is_empty()).then_some(command.source);
         let _ = snapshot.registry.register_command(CommandRegistration {
             name: command.name,
-            description: command.description,
-            source: command.source,
+            description,
+            source,
         });
     }
 
     for shortcut in wire.shortcuts {
+        let description = (!shortcut.description.is_empty()).then_some(shortcut.description);
+        let extension_path =
+            (!shortcut.extension_path.is_empty()).then_some(shortcut.extension_path);
         let registration = ShortcutRegistration {
             key: shortcut.key,
-            description: shortcut.description,
-            extension_path: shortcut.extension_path,
+            description,
+            extension_path,
         };
         snapshot.raw_shortcuts.push(registration.clone());
         let _ = snapshot.registry.register_shortcut(registration);
     }
 
     for flag in wire.flags {
-        flag.register(&mut snapshot);
+        register_snapshot_flag(flag, &mut snapshot);
     }
 
     for renderer in wire.renderers {
         let _ = snapshot.registry.register_renderer(RendererRegistration {
-            kind: match renderer.kind.as_deref() {
-                Some("tool") => adapters::RendererKind::Tool,
-                Some("widget") => adapters::RendererKind::Widget,
+            kind: match renderer.kind.as_str() {
+                "tool" => adapters::RendererKind::Tool,
+                "widget" => adapters::RendererKind::Widget,
                 _ => adapters::RendererKind::Message,
             },
             name: renderer.name,
@@ -499,10 +359,39 @@ fn build_snapshot(wire: RegistrySnapshotWire, client: &Arc<HostClient>) -> Regis
     }
 
     for provider in wire.providers {
-        let name = provider.name.clone();
-        let stream_simple = provider.stream_simple;
-        let extension_path = provider.extension_path.clone();
-        let config = provider.to_config_input();
+        let ProviderSnapshotEntry {
+            name,
+            stream_simple,
+            base_url,
+            api,
+            display_name,
+            api_key,
+            headers,
+            auth_header,
+            models,
+            extension_path,
+        } = provider;
+        let models = match decode_provider_models(models) {
+            Ok(models) => models,
+            Err(error) => {
+                let path = extension_path.clone().unwrap_or_else(|| name.clone());
+                snapshot
+                    .load_errors
+                    .push((path, format!("provider {name:?} models: {error}")));
+                continue;
+            }
+        };
+        let config = ProviderConfigInput {
+            name: display_name,
+            base_url,
+            api_key,
+            api,
+            headers,
+            auth_header,
+            models,
+            model_overrides: None,
+            oauth: None,
+        };
         if snapshot.registry.register_provider(ProviderRegistration {
             name: name.clone(),
             base_url: config.base_url.clone(),
@@ -518,12 +407,17 @@ fn build_snapshot(wire: RegistrySnapshotWire, client: &Arc<HostClient>) -> Regis
         }
     }
 
-    for err in wire.errors {
-        let path = err.path.unwrap_or_else(|| "<unknown>".to_owned());
-        let message = err
-            .error
-            .or(err.message)
-            .unwrap_or_else(|| "extension load failed".to_owned());
+    for error in wire.errors {
+        let path = if error.path.is_empty() {
+            "<unknown>".to_owned()
+        } else {
+            error.path
+        };
+        let message = if error.error.is_empty() {
+            "extension load failed".to_owned()
+        } else {
+            error.error
+        };
         snapshot.load_errors.push((path, message));
     }
 
