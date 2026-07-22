@@ -411,9 +411,8 @@ fn resolve_entry(
     }
     for component in relative.components() {
         let kind = match component {
-            Component::Normal(_) => continue,
+            Component::Normal(_) | Component::CurDir => continue,
             Component::ParentDir => ManifestErrorKind::EntryEscapesRoot(entry.clone()),
-            Component::CurDir => ManifestErrorKind::InvalidEntryShape,
             Component::RootDir | Component::Prefix(_) => {
                 ManifestErrorKind::AbsoluteEntry(entry.clone())
             }
@@ -739,6 +738,58 @@ mod tests {
         assert_eq!(
             kind,
             ManifestErrorKind::EntryEscapesRoot("../escape".to_owned())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dot_relative_string_entry_is_accepted() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let dir = extension_dir(
+            &temp,
+            "dot-relative",
+            &manifest_json("dot-relative", "native", "\"./index.js\""),
+            &["index.js"],
+        )?;
+        let classified = classify_extension(&dir, TARGET)?;
+        assert_eq!(
+            classified.entry,
+            std::fs::canonicalize(dir.join("index.js"))?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dot_relative_platform_map_entry_is_accepted() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let entry = format!("{{\"{TARGET}\":\"./bin/extension\"}}");
+        let dir = extension_dir(
+            &temp,
+            "dot-relative-map",
+            &manifest_json("dot-relative-map", "native", &entry),
+            &["bin/extension"],
+        )?;
+        let classified = classify_extension(&dir, TARGET)?;
+        assert_eq!(
+            classified.entry,
+            std::fs::canonicalize(dir.join("bin/extension"))?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dot_relative_traversal_is_rejected() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let dir = extension_dir(
+            &temp,
+            "dot-relative-traversal",
+            &manifest_json("dot-relative-traversal", "native", "\"./../escape\""),
+            &[],
+        )?;
+        let kind = expect_kind(classify_extension(&dir, TARGET))?;
+        assert_eq!(
+            kind,
+            ManifestErrorKind::EntryEscapesRoot("./../escape".to_owned())
         );
         Ok(())
     }
