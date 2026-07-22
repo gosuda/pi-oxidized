@@ -27,7 +27,6 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use serde::Serialize;
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -35,14 +34,14 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use pi_agent::ToolExecutionMode;
 use pi_ai::types::AssistantMessageEvent;
 
 use crate::adapters::methods;
 use crate::protocol::{
     ErrorPayload, FLAGS_SET_METHOD, FlagValueWire, FlagsSetRequest, Frame, FrameDecoder, FrameId,
-    FrameKind, Hello, HelloAck, Method, PROTOCOL_VERSION, SHORTCUT_EXECUTE_METHOD,
-    TerminalInputResult, ToolUpdate, encode_frame, from_payload, to_payload,
+    FrameKind, Hello, HelloAck, Method, PROTOCOL_VERSION, RegistrySnapshot,
+    SHORTCUT_EXECUTE_METHOD, TerminalInputResult, ToolUpdate, encode_frame, from_payload,
+    to_payload,
 };
 
 /// Wire method for the registry snapshot request.
@@ -145,154 +144,6 @@ impl fmt::Display for ExtensionFault {
 }
 
 impl std::error::Error for ExtensionFault {}
-
-// ---------------------------------------------------------------------------
-// Registry snapshot mirror
-// ---------------------------------------------------------------------------
-
-/// Tool entry in the `extensions.load` snapshot.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ToolSnapshotEntry {
-    /// Tool name used in LLM tool calls.
-    pub name: String,
-    /// Human-readable label.
-    pub label: String,
-    /// Description for the LLM.
-    pub description: String,
-    /// JSON Schema for the tool arguments.
-    pub parameters: Value,
-    /// Optional execution-mode override.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub execution_mode: Option<ToolExecutionMode>,
-}
-
-/// Slash-command entry in the snapshot.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CommandSnapshotEntry {
-    /// Invocation name (without the leading slash).
-    pub name: String,
-    /// Human-readable description.
-    pub description: String,
-    /// Origin path (diagnostics).
-    pub source: String,
-}
-
-/// Keyboard-shortcut entry in the snapshot.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ShortcutSnapshotEntry {
-    /// Chord (e.g. `ctrl+k`).
-    pub key: String,
-    /// Human-readable description.
-    pub description: String,
-    /// Registering extension path.
-    pub extension_path: String,
-}
-
-/// CLI-flag entry in the snapshot.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FlagSnapshotEntry {
-    /// Flag name.
-    pub name: String,
-    /// Human-readable description.
-    pub description: String,
-    /// Flag type tag (`boolean`, `string`, …).
-    #[serde(rename = "type")]
-    pub kind: String,
-    /// Registering extension path.
-    pub extension_path: String,
-    /// Declared default value, when any.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default: Option<FlagValueWire>,
-    /// Current value, when set.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub value: Option<FlagValueWire>,
-}
-
-/// Renderer entry in the snapshot.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RendererSnapshotEntry {
-    /// Renderer kind (`message` or `widget`).
-    #[serde(rename = "type")]
-    pub kind: String,
-    /// Renderer name.
-    pub name: String,
-}
-
-/// Custom-provider entry in the snapshot.
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProviderSnapshotEntry {
-    /// Provider id.
-    pub name: String,
-    /// Whether the endpoint holds a live `streamSimple` handler.
-    pub stream_simple: bool,
-    /// Optional base URL.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub base_url: Option<String>,
-    /// Optional API shape tag.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api: Option<String>,
-    /// Optional display name.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub display_name: Option<String>,
-    /// Optional static API key.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_key: Option<String>,
-    /// Optional static headers.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub headers: Option<std::collections::BTreeMap<String, String>>,
-    /// Whether the API key is sent as an `Authorization` header.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auth_header: Option<bool>,
-    /// Optional model catalog (open JSON).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub models: Option<Value>,
-    /// Registering extension path, used in provider diagnostics.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub extension_path: Option<String>,
-}
-
-/// Per-path load diagnostic (sibling isolation).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LoadErrorEntry {
-    /// Extension path that failed.
-    pub path: String,
-    /// Failure detail.
-    pub error: String,
-}
-
-/// pi-ext-owned `Serialize` mirror of the `extensions.load` snapshot served
-/// by the TypeScript host.
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RegistrySnapshot {
-    /// Registered tools (first-wins order).
-    pub tools: Vec<ToolSnapshotEntry>,
-    /// Registered slash commands.
-    pub commands: Vec<CommandSnapshotEntry>,
-    /// Registered keyboard shortcuts.
-    pub shortcuts: Vec<ShortcutSnapshotEntry>,
-    /// Registered CLI flags with current values.
-    pub flags: Vec<FlagSnapshotEntry>,
-    /// Registered renderers.
-    pub renderers: Vec<RendererSnapshotEntry>,
-    /// Registered custom providers.
-    pub providers: Vec<ProviderSnapshotEntry>,
-    /// Lifecycle event types with at least one handler installed.
-    pub handlers: Vec<String>,
-    /// Whether a terminal-input handler is active.
-    pub terminal_input: bool,
-    /// Number of extensions successfully loaded.
-    pub extensions: u64,
-    /// Per-path load errors.
-    pub errors: Vec<LoadErrorEntry>,
-}
 
 // ---------------------------------------------------------------------------
 // Tool execution surface
@@ -1489,7 +1340,10 @@ fn encode_fallback(frame: &Frame) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::client::{HandshakePolicy, HostClient, HostClientError};
-    use crate::protocol::{COMPATIBILITY_VERSION, decode_frame_str};
+    use crate::protocol::{
+        COMPATIBILITY_VERSION, CommandSnapshotEntry, FlagSnapshotEntry, ProviderSnapshotEntry,
+        ShortcutSnapshotEntry, ToolSnapshotEntry, decode_frame_str,
+    };
     use pi_ai::types::AssistantMessage;
     use std::error::Error;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};

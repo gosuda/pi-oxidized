@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::str;
 
+use pi_agent::ToolExecutionMode;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
@@ -986,6 +987,172 @@ pub enum FlagValueWire {
     Boolean(bool),
     /// String CLI flag.
     String(String),
+}
+
+/// Tool entry in the `extensions.load` snapshot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolSnapshotEntry {
+    /// Tool name used in LLM tool calls.
+    pub name: String,
+    /// Human-readable label.
+    #[serde(default)]
+    pub label: String,
+    /// Description for the LLM.
+    #[serde(default)]
+    pub description: String,
+    /// JSON Schema for the tool arguments.
+    #[serde(default)]
+    pub parameters: Value,
+    /// Optional execution-mode override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_mode: Option<ToolExecutionMode>,
+}
+
+/// Slash-command entry in the `extensions.load` snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandSnapshotEntry {
+    /// Invocation name (without the leading slash).
+    pub name: String,
+    /// Human-readable description.
+    #[serde(default)]
+    pub description: String,
+    /// Origin path used in diagnostics.
+    #[serde(default)]
+    pub source: String,
+}
+
+/// Keyboard-shortcut entry in the `extensions.load` snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShortcutSnapshotEntry {
+    /// Chord (for example, `ctrl+k`).
+    pub key: String,
+    /// Human-readable description.
+    #[serde(default)]
+    pub description: String,
+    /// Registering extension path.
+    #[serde(default)]
+    pub extension_path: String,
+}
+
+/// CLI-flag entry in the `extensions.load` snapshot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FlagSnapshotEntry {
+    /// Flag name.
+    pub name: String,
+    /// Human-readable description.
+    #[serde(default)]
+    pub description: String,
+    /// Flag type tag (`boolean`, `string`, and so on).
+    #[serde(default, rename = "type")]
+    pub kind: String,
+    /// Registering extension path.
+    #[serde(default)]
+    pub extension_path: String,
+    /// Declared default value, when any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<FlagValueWire>,
+    /// Current value, when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<FlagValueWire>,
+}
+
+/// Renderer entry in the `extensions.load` snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RendererSnapshotEntry {
+    /// Renderer kind (`message`, `tool`, or `widget`).
+    #[serde(default, rename = "type")]
+    pub kind: String,
+    /// Renderer name.
+    pub name: String,
+}
+
+/// Custom-provider entry in the `extensions.load` snapshot.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderSnapshotEntry {
+    /// Provider id.
+    pub name: String,
+    /// Whether the endpoint holds a live `streamSimple` handler.
+    #[serde(default)]
+    pub stream_simple: bool,
+    /// Optional base URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// Optional API shape tag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<String>,
+    /// Optional display name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// Optional static API key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    /// Optional static headers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers: Option<BTreeMap<String, String>>,
+    /// Whether the API key is sent as an `Authorization` header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_header: Option<bool>,
+    /// Optional model catalog. The core validates each provider independently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<Value>,
+    /// Registering extension path, used in provider diagnostics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension_path: Option<String>,
+}
+
+/// Per-path extension load diagnostic.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoadErrorEntry {
+    /// Extension path that failed.
+    #[serde(default)]
+    pub path: String,
+    /// Failure detail. `message` is accepted from compatible hosts.
+    #[serde(default, alias = "message")]
+    pub error: String,
+}
+
+/// Canonical `extensions.load` registration snapshot shared by native and
+/// TypeScript extension endpoints.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegistrySnapshot {
+    /// Registered tools in first-wins order.
+    #[serde(default)]
+    pub tools: Vec<ToolSnapshotEntry>,
+    /// Registered slash commands.
+    #[serde(default)]
+    pub commands: Vec<CommandSnapshotEntry>,
+    /// Registered keyboard shortcuts.
+    #[serde(default)]
+    pub shortcuts: Vec<ShortcutSnapshotEntry>,
+    /// Registered CLI flags with current values.
+    #[serde(default)]
+    pub flags: Vec<FlagSnapshotEntry>,
+    /// Registered renderers.
+    #[serde(default)]
+    pub renderers: Vec<RendererSnapshotEntry>,
+    /// Registered custom providers.
+    #[serde(default)]
+    pub providers: Vec<ProviderSnapshotEntry>,
+    /// Lifecycle event types with at least one handler installed.
+    #[serde(default)]
+    pub handlers: Vec<String>,
+    /// Whether a terminal-input handler is active.
+    #[serde(default)]
+    pub terminal_input: bool,
+    /// Number of extensions successfully loaded.
+    #[serde(default)]
+    pub extensions: u64,
+    /// Per-path load errors.
+    #[serde(default)]
+    pub errors: Vec<LoadErrorEntry>,
 }
 
 /// Payload for [`FLAGS_SET_METHOD`].
@@ -2197,6 +2364,33 @@ mod tests {
         let frame = Frame::request(9, Method::UiEvent, to_payload(&ui)?);
         let decoded = decode_frame_str(encode_frame_string(&frame)?.trim_end())?;
         assert_eq!(from_payload::<UiEventRequest>(&decoded.payload)?, ui);
+        Ok(())
+    }
+
+    #[test]
+    fn registry_snapshot_decodes_host_defaults_and_error_alias() -> TestResult {
+        let snapshot: RegistrySnapshot = serde_json::from_value(serde_json::json!({
+            "tools": [{"name": "tool"}],
+            "commands": [{"name": "command"}],
+            "shortcuts": [{"key": "ctrl+x"}],
+            "flags": [{"name": "flag", "type": "boolean"}],
+            "renderers": [{"name": "renderer"}],
+            "providers": [{"name": "provider"}],
+            "errors": [{"path": "/bad.ts", "message": "broken"}]
+        }))?;
+        assert_eq!(snapshot.tools[0].label, "");
+        assert_eq!(snapshot.commands[0].description, "");
+        assert_eq!(snapshot.shortcuts[0].extension_path, "");
+        assert_eq!(snapshot.flags[0].kind, "boolean");
+        assert_eq!(snapshot.renderers[0].kind, "");
+        assert!(!snapshot.providers[0].stream_simple);
+        assert_eq!(snapshot.errors[0].error, "broken");
+
+        let encoded = serde_json::to_value(snapshot)?;
+        assert_eq!(
+            encoded["errors"][0],
+            serde_json::json!({"path": "/bad.ts", "error": "broken"})
+        );
         Ok(())
     }
     #[test]
