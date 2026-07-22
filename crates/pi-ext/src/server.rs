@@ -69,9 +69,10 @@ pub type NativeFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 /// Server configuration bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServerConfig {
-    /// Maximum number of requests handled concurrently. Requests beyond the
-    /// bound are rejected with a correlated `overloaded` error frame; the
-    /// read loop never stalls, so cancel frames stay observable.
+    /// Maximum number of requests handled concurrently. Overload errors use a
+    /// bounded deferred queue so the read loop never stalls and cancel frames
+    /// stay observable. If both outbound queues fill, later rejections are
+    /// dropped rather than growing memory without bound.
     pub max_in_flight: usize,
     /// Maximum queued streaming updates per `tool.execute` call. When full,
     /// the stale update is dropped (matching the client's stream
@@ -541,6 +542,32 @@ where
 {
     let writer_dead = CancellationToken::new();
     let mut tasks: JoinSet<()> = JoinSet::new();
+    let (rejection_tx, mut rejection_rx) = mpsc::channel(runtime.out_tx.max_capacity());
+
+    let rejection_flusher = {
+        let out_tx = runtime.out_tx.clone();
+        let writer_dead = writer_dead.clone();
+        tokio::spawn(async move {
+            loop {
+                let frame = tokio::select! {
+                    biased;
+                    () = writer_dead.cancelled() => return,
+                    frame = rejection_rx.recv() => frame,
+                };
+                let Some(frame) = frame else {
+                    return;
+                };
+                let sent = tokio::select! {
+                    biased;
+                    () = writer_dead.cancelled() => return,
+                    sent = out_tx.send(frame) => sent,
+                };
+                if sent.is_err() {
+                    return;
+                }
+            }
+        })
+    };
 
     let writer_task = {
         let writer_dead = writer_dead.clone();
@@ -571,7 +598,7 @@ where
         })
     };
 
-    let run_result = drive(reader, &runtime, &writer_dead, &mut tasks).await;
+    let run_result = drive(reader, &runtime, &writer_dead, &rejection_tx, &mut tasks).await;
 
     // Teardown: cancel cooperative executions, stop request tasks, then
     // drop the runtime. The outbound channel closes only after the joined
@@ -587,7 +614,9 @@ where
     while let Some(joined) = tasks.join_next().await {
         let _ = joined;
     }
+    drop(rejection_tx);
     drop(runtime);
+    let _ = rejection_flusher.await;
     let write_result = writer_task.await;
 
     match (run_result, write_result) {
@@ -681,6 +710,7 @@ async fn drive<R, E>(
     reader: R,
     runtime: &Arc<ServerRuntime<E>>,
     writer_dead: &CancellationToken,
+    rejection_tx: &mpsc::Sender<Frame>,
     tasks: &mut JoinSet<()>,
 ) -> Result<(), ServerError>
 where
@@ -722,7 +752,7 @@ where
                     state = ServerState::Ready;
                 }
                 ServerState::Ready => {
-                    dispatch_ready(frame, runtime, tasks);
+                    dispatch_ready(frame, runtime, rejection_tx, tasks);
                 }
             }
         }
@@ -754,6 +784,7 @@ fn validate_hello(frame: &Frame) -> Result<(), ServerError> {
 fn dispatch_ready<E: NativeExtension>(
     frame: Frame,
     runtime: &Arc<ServerRuntime<E>>,
+    rejection_tx: &mpsc::Sender<Frame>,
     tasks: &mut JoinSet<()>,
 ) {
     match frame.kind {
@@ -778,10 +809,8 @@ fn dispatch_ready<E: NativeExtension>(
                 // Reap finished tasks so the set does not grow per request.
                 while tasks.try_join_next().is_some() {}
             } else {
-                // Fail closed without stalling the read loop. The rejection
-                // is best-effort: when the bounded outbound channel is
-                // saturated the frame is dropped rather than blocking the
-                // loop, so `tool.cancel` events stay observable.
+                // Defer the correlated rejection without stalling reads. The
+                // queue is bounded with the outbound channel's own capacity.
                 let overloaded = error_frame(
                     frame.id,
                     &frame.method,
@@ -789,7 +818,7 @@ fn dispatch_ready<E: NativeExtension>(
                     "too many in-flight requests",
                     true,
                 );
-                let _ = runtime.out_tx.try_send(overloaded);
+                let _ = rejection_tx.try_send(overloaded);
             }
         }
         FrameKind::Event => {
@@ -2535,8 +2564,8 @@ mod tests {
         tokio::time::timeout(TIMEOUT, handles.started.notified()).await?;
         wait_flag(&handles.saturated).await?;
 
-        // Overloaded request: its rejection is dropped (outbound full) and
-        // must not block the read loop...
+        // The overloaded request must get a correlated rejection without
+        // blocking the read loop...
         client
             .send(&Frame {
                 id: 3,
@@ -2556,16 +2585,26 @@ mod tests {
             .await?;
         wait_flag(&handles.cancelled).await?;
 
-        // Drain: the cancelled terminal for id 2 eventually arrives once the
-        // client starts reading again.
+        // Drain until both correlated terminals arrive. Their order is not
+        // stable because the rejection and cancelled request share out_tx.
         tokio::time::timeout(TIMEOUT, async {
-            loop {
+            let mut cancelled = false;
+            let mut overloaded = false;
+            while !cancelled || !overloaded {
                 let frame = client.recv().await?;
-                if frame.id == 2 && frame.kind == FrameKind::Error {
-                    assert_eq!(frame.payload["code"], "cancelled");
-                    break Ok::<(), Box<dyn Error>>(());
+                match (frame.id, frame.kind) {
+                    (2, FrameKind::Error) => {
+                        assert_eq!(frame.payload["code"], "cancelled");
+                        cancelled = true;
+                    }
+                    (3, FrameKind::Error) => {
+                        assert_eq!(frame.payload["code"], "overloaded");
+                        overloaded = true;
+                    }
+                    _ => {}
                 }
             }
+            Ok::<(), Box<dyn Error>>(())
         })
         .await??;
 
