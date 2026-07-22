@@ -191,6 +191,46 @@ describe.skipIf(isWindows)("PTY driver", () => {
 		}
 	}, 15_000);
 
+	test("answers fragmented terminal capability queries", async () => {
+		const expected = Buffer.from(
+			"\x1b[?0u\x1b[?1;2c\x1b[6;16;8t\x1b]11;rgb:0000/0000/0000\x1b\\\x1b[?997;1n\x1b[1;1R",
+		).toString("hex");
+		const script = [
+			"process.stdin.setRawMode?.(true); process.stdin.resume();",
+			"let input = Buffer.alloc(0);",
+			`const expected = "${expected}";`,
+			"process.stdin.once('data', () => {",
+			"process.stdin.on('data', (chunk) => {",
+			"input = Buffer.concat([input, chunk]);",
+			"if (input.toString('hex') === expected) {",
+			"process.stdout.write(`RESPONSES:${expected}\\n`); process.exit(0);",
+			"}",
+			"});",
+			"process.stdout.write('u\\x1b[c\\x1b[16t\\x1b]11;?\\x07\\x1b[?996n\\x1b[6n');",
+			"});",
+			"process.stdout.write('\\x1b[?');",
+		].join("");
+		const process = spawnPty({
+			argv: [bunExecutable, "-e", script],
+			cwd: temporaryDirectory("pi-verification-terminal-queries-"),
+		});
+		try {
+			await process.waitFor(
+				(snapshot) => snapshot.rawText.includes("\x1b[?"),
+				{ deadlineMs: 5_000, source: "raw" },
+			);
+			process.writeKeys("x");
+			const snapshot = await process.waitFor(/RESPONSES:/, {
+				deadlineMs: 5_000,
+				source: "raw",
+			});
+			expect(snapshot.rawText).toContain(`RESPONSES:${expected}`);
+			expect(await process.waitForExit(5_000)).toBe(0);
+		} finally {
+			await process.terminate();
+		}
+	}, 15_000);
+
 	test("terminates a running process", async () => {
 		const process = spawnPty({
 			argv: [bunExecutable, "-e", "console.log('READY'); setInterval(() => {}, 1_000);"],

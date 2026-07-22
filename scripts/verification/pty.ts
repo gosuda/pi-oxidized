@@ -45,6 +45,19 @@ export interface WaitForOptions {
 type SnapshotPredicate = (snapshot: PtySnapshot) => boolean;
 type ProcessSignal = "SIGINT" | "SIGTERM" | "SIGKILL";
 
+const CURSOR_POSITION_QUERY = "\x1b[6n";
+const TERMINAL_QUERY_RESPONSES: Readonly<Record<string, string>> = {
+	"\x1b[?u": "\x1b[?0u",
+	"\x1b[c": "\x1b[?1;2c",
+	"\x1b[16t": "\x1b[6;16;8t",
+	"\x1b]11;?\x07": "\x1b]11;rgb:0000/0000/0000\x1b\\",
+	"\x1b[?996n": "\x1b[?997;1n",
+};
+const TERMINAL_QUERY_SEQUENCES = [
+	...Object.keys(TERMINAL_QUERY_RESPONSES),
+	CURSOR_POSITION_QUERY,
+];
+
 interface InputWrite {
 	readonly text: string;
 	readonly outputOffset: number;
@@ -71,8 +84,8 @@ export class PtyProcess {
 	readonly #completed: Promise<number>;
 	readonly #decoder = new TextDecoder();
 	readonly #cursorPosition: { readonly row: number; readonly column: number } | false;
+	#terminalQueryScanOffset = 0;
 	#rawText = "";
-	#cursorScanOffset = 0;
 	#exitCode: number | null = null;
 	#version = 0;
 	#listeners = new Set<() => void>();
@@ -244,7 +257,7 @@ export class PtyProcess {
 		const copy = Uint8Array.from(bytes);
 		const text = this.#decoder.decode(copy, { stream: true });
 		this.#rawText += text;
-		this.#answerCursorQueries();
+		this.#answerTerminalQueries();
 		this.#chunks.push({
 			stream: "pty",
 			text,
@@ -259,7 +272,7 @@ export class PtyProcess {
 		const tail = this.#decoder.decode();
 		if (!tail) return;
 		this.#rawText += tail;
-		this.#answerCursorQueries();
+		this.#answerTerminalQueries();
 		this.#chunks.push({
 			stream: "pty",
 			text: tail,
@@ -287,15 +300,33 @@ export class PtyProcess {
 		}
 	}
 
-	#answerCursorQueries(): void {
-		if (this.#cursorPosition === false) return;
-		let query = this.#rawText.indexOf("\x1b[6n", this.#cursorScanOffset);
-		while (query >= 0) {
-			this.#writeTerminal(`\x1b[${this.#cursorPosition.row};${this.#cursorPosition.column}R`);
-			this.#cursorScanOffset = query + 4;
-			query = this.#rawText.indexOf("\x1b[6n", this.#cursorScanOffset);
+	#answerTerminalQueries(): void {
+		while (this.#terminalQueryScanOffset < this.#rawText.length) {
+			let matched: string | undefined;
+			for (const query of TERMINAL_QUERY_SEQUENCES) {
+				if (this.#rawText.startsWith(query, this.#terminalQueryScanOffset)) {
+					matched = query;
+					break;
+				}
+			}
+			if (matched !== undefined) {
+				const response =
+					matched === CURSOR_POSITION_QUERY
+						? this.#cursorPosition === false
+							? undefined
+							: `\x1b[${this.#cursorPosition.row};${this.#cursorPosition.column}R`
+						: TERMINAL_QUERY_RESPONSES[matched];
+				if (response !== undefined) this.#writeTerminal(response);
+				this.#terminalQueryScanOffset += matched.length;
+				continue;
+			}
+
+			const suffix = this.#rawText.slice(this.#terminalQueryScanOffset);
+			if (TERMINAL_QUERY_SEQUENCES.some((query) => query.startsWith(suffix))) {
+				return;
+			}
+			this.#terminalQueryScanOffset += 1;
 		}
-		this.#cursorScanOffset = Math.max(this.#cursorScanOffset, this.#rawText.length - 3);
 	}
 
 	#notify(): void {
