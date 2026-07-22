@@ -669,6 +669,40 @@ describe("lean: surface validation units", () => {
 		).toThrow('unknown lifecycle event "not_a_hook"');
 	});
 
+	test("parseLeanExtension rejects malformed runtime surfaces", () => {
+		const cases = [
+			[
+				{ flags: [{ name: "f", type: "boolean", default: "true" }] },
+				"default must be a boolean",
+			],
+			[
+				{ flags: [{ name: "f", type: "string", default: true }] },
+				"default must be a string",
+			],
+			[{ tools: [{ name: "", description: "d", execute: () => ({}) }] }, "name must be a non-empty string"],
+			[{ commands: [{ name: "", handler: () => {} }] }, "name must be a non-empty string"],
+			[{ providers: [{ name: "" }] }, "name must be a non-empty string"],
+			[{ tools: [{ name: "t", description: "d", execute: true }] }, "execute must be a function"],
+			[{ commands: [{ name: "c", handler: true }] }, "handler must be a function"],
+			[{ shortcuts: [{ key: "ctrl+x", handler: true }] }, "handler must be a function"],
+		] as const;
+
+		for (const [definition, message] of cases) {
+			expect(() => parseLeanExtension(definition)).toThrow(message);
+		}
+	});
+
+	test("parseLeanExtension accepts optional and correctly typed flag defaults", () => {
+		for (const flag of [
+			{ name: "bool-omitted", type: "boolean" },
+			{ name: "string-omitted", type: "string" },
+			{ name: "bool-default", type: "boolean", default: false },
+			{ name: "string-default", type: "string", default: "" },
+		]) {
+			expect(() => parseLeanExtension({ flags: [flag] })).not.toThrow();
+		}
+	});
+
 	test("parseLeanExtension accepts a full valid definition", () => {
 		const definition = parseLeanExtension({
 			name: "ok",
