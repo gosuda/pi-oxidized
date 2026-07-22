@@ -754,7 +754,25 @@ async function terminateAndRequireCleanExit(pty: PtyProcess, label: string): Pro
 		if (code !== 0) throw new HarnessFailure(label, `${label} exited ${code}\nPTY tail:\n${tail(pty.snapshot().rawText, 4_000)}`);
 		return;
 	}
-	pty.writeKeys("/quit", PTY_KEYS.enter);
+	const quitOutputOffset = pty.snapshot().rawText.length;
+	pty.writeKeys("/quit");
+	try {
+		await pty.waitFor(
+			(snapshot) =>
+				stripTerminalSequences(
+					snapshot.rawText.slice(quitOutputOffset),
+				)
+					.replace(/\s+/g, "")
+					.includes("/quit"),
+			{ deadlineMs: 5_000, source: "raw" },
+		);
+	} catch (error) {
+		throw new HarnessFailure(
+			label,
+			`${label} did not render /quit before Enter: ${errorMessage(error instanceof Error ? error : String(error))}\nPTY tail:\n${tail(pty.snapshot().rawText, 4_000)}`,
+		);
+	}
+	pty.writeKeys(PTY_KEYS.enter);
 	let code: number;
 	try {
 		code = await pty.waitForExit(10_000);
