@@ -18,7 +18,8 @@ import {
 	createExtensionRuntime,
 } from "@earendil-works/pi-coding-agent";
 import { ExtensionRunner } from "@earendil-works/pi-coding-agent";
-import { ExtensionHost, createEventBus } from "../src/host.ts";
+import { ALL_EVENT_TYPES, ExtensionHost, createEventBus } from "../src/host.ts";
+import { LEAN_EVENT_TYPES } from "../src/lean-api.ts";
 import { COMPATIBILITY_VERSION } from "../src/version.ts";
 import { createExtensionJiti } from "../src/virtual-modules.ts";
 
@@ -67,6 +68,26 @@ const noopContextActions: ExtensionContextActions = {
 	compact: () => {},
 	getSystemPrompt: () => "",
 };
+
+const LIFECYCLE_EVENTS_FIXTURE = resolve(
+	import.meta.dirname,
+	"fixtures",
+	"lifecycle-events.json",
+);
+
+function isStringArray(value: unknown): value is readonly string[] {
+	return Array.isArray(value) && value.every((entry: unknown) => typeof entry === "string");
+}
+
+describe("host: lifecycle taxonomy", () => {
+	test("compat and lean event lists match the shared witness", async () => {
+		const expected: unknown = await Bun.file(LIFECYCLE_EVENTS_FIXTURE).json();
+		expect(isStringArray(expected)).toBe(true);
+		if (!isStringArray(expected)) throw new Error("lifecycle event fixture must be a string array");
+		expect(expected).toEqual(ALL_EVENT_TYPES);
+		expect(expected).toEqual(LEAN_EVENT_TYPES);
+	});
+});
 
 describe("host: hello handshake", () => {
 	test("matching versions ack successfully", async () => {
