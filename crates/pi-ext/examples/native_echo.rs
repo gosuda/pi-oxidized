@@ -33,10 +33,10 @@ use tokio_util::sync::CancellationToken;
 use pi_ai::types::{
     AssistantContent, AssistantMessage, AssistantMessageEvent, DoneReason, TextContent,
 };
-use pi_ext::protocol::{ProviderSnapshotEntry, RegistrySnapshot, ToolSnapshotEntry};
 use pi_ext::server::{
     ExtensionFault, NativeEventSink, NativeExtension, NativeFuture, ProviderEventSink,
-    ProviderStreamCall, ToolCall, ToolUpdateSink, serve,
+    ProviderSnapshotEntry, ProviderStreamCall, RegistrySnapshot, ToolCall, ToolSnapshotEntry,
+    ToolUpdateSink, serve,
 };
 
 const TOOL_NAME: &str = "native_echo";

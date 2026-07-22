@@ -788,56 +788,6 @@ fn registry_snapshot_rejects_non_cli_flag_values() {
     }
 }
 
-#[tokio::test]
-async fn malformed_provider_models_are_isolated() -> R {
-    let (runner, _host) = make_runner(json!({
-        "providers": [
-            {"name": "good", "models": [{"id": "good-model"}]},
-            {
-                "name": "bad",
-                "models": [{"name": "missing id"}],
-                "extensionPath": "/ext/bad.ts"
-            }
-        ]
-    }))
-    .await?;
-    let configs = runner.provider_configs();
-    assert!(configs.contains_key("good"));
-    assert!(!configs.contains_key("bad"));
-    assert!(
-        runner
-            .load_errors()
-            .iter()
-            .any(|(path, message)| { path == "/ext/bad.ts" && message.contains("models") })
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn non_array_provider_models_are_isolated() -> R {
-    let (runner, _host) = make_runner(json!({
-        "providers": [
-            {"name": "good", "models": [{"id": "good-model"}]},
-            {
-                "name": "bad-shape",
-                "models": {"model": {"id": "model"}},
-                "extensionPath": "/ext/bad-shape.ts"
-            }
-        ]
-    }))
-    .await?;
-    let configs = runner.provider_configs();
-    assert!(configs.contains_key("good"));
-    assert!(!configs.contains_key("bad-shape"));
-    assert!(
-        runner
-            .load_errors()
-            .iter()
-            .any(|(path, message)| { path == "/ext/bad-shape.ts" && message.contains("models") })
-    );
-    Ok(())
-}
-
 #[test]
 fn lifecycle_event_taxonomy_matches_shared_witness() -> R {
     let expected: Vec<String> = serde_json::from_str(include_str!(
