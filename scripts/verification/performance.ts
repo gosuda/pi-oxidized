@@ -748,31 +748,19 @@ const streamingArgs = [
 ] as const;
 
 
+async function requireCleanExitIfSettled(
+	pty: PtyProcess,
+	label: string,
+): Promise<boolean> {
+	if (!pty.exited) return false;
+	const code = await pty.waitForExit(1);
+	if (code !== 0) throw new HarnessFailure(label, `${label} exited ${code}\nPTY tail:\n${tail(pty.snapshot().rawText, 4_000)}`);
+	return true;
+}
+
 async function terminateAndRequireCleanExit(pty: PtyProcess, label: string): Promise<void> {
-	if (pty.exited) {
-		const code = await pty.waitForExit(1);
-		if (code !== 0) throw new HarnessFailure(label, `${label} exited ${code}\nPTY tail:\n${tail(pty.snapshot().rawText, 4_000)}`);
-		return;
-	}
-	const quitOutputOffset = pty.snapshot().rawText.length;
-	pty.writeKeys("/quit");
-	try {
-		await pty.waitFor(
-			(snapshot) =>
-				stripTerminalSequences(
-					snapshot.rawText.slice(quitOutputOffset),
-				)
-					.replace(/\s+/g, "")
-					.includes("/quit"),
-			{ deadlineMs: 5_000, source: "raw" },
-		);
-	} catch (error) {
-		throw new HarnessFailure(
-			label,
-			`${label} did not render /quit before Enter: ${errorMessage(error instanceof Error ? error : String(error))}\nPTY tail:\n${tail(pty.snapshot().rawText, 4_000)}`,
-		);
-	}
-	pty.writeKeys(PTY_KEYS.enter);
+	if (await requireCleanExitIfSettled(pty, label)) return;
+	pty.writeKeys("/quit", PTY_KEYS.enter);
 	let code: number;
 	try {
 		code = await pty.waitForExit(10_000);
@@ -848,7 +836,9 @@ async function runFirstFrameSample(
 		const frame = frameObservation(snapshot);
 		if (!frame) throw new HarnessFailure(`first-frame:${implementation}`, "first-frame predicate returned without a frame");
 		const frameCpu = sampler.snapshot();
-		await terminateAndRequireCleanExit(pty, `first-frame:${implementation}`);
+		// First-frame sampling ends before input readiness. Product smoke and
+		// streaming checks own `/quit`; finally always reaps this process.
+		await requireCleanExitIfSettled(pty, `first-frame:${implementation}`);
 		return {
 			kind,
 			wallMs: frame.elapsedMs,
