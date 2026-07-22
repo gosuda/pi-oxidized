@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -1082,6 +1082,18 @@ async fn handle_lifecycle<E: NativeExtension>(
     }
 }
 
+async fn send_forwarded_frame(
+    out: &mpsc::Sender<Frame>,
+    cancel: &CancellationToken,
+    frame: Frame,
+) -> bool {
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => false,
+        sent = out.send(frame) => sent.is_ok(),
+    }
+}
+
 /// Run one `tool.execute` call: stream `toolUpdate` events while the
 /// execution future is active, honor `tool.cancel`, then send the terminal
 /// frame. Cancellation maps to a `cancelled` error regardless of the value
@@ -1125,29 +1137,38 @@ async fn execute_tool_request<E: NativeExtension>(
     // so an early `tool.cancel` is never lost.
     let token = token.unwrap_or_default();
     let (update_tx, mut update_rx) = mpsc::channel::<Value>(runtime.update_capacity.max(1));
+    let (done_tx, mut done_rx) = oneshot::channel::<()>();
 
-    // Forward updates from a dedicated task: backpressure on the bounded
-    // outbound channel stalls only the forwarder, never the extension, so a
-    // `tool.cancel` is observed even while the pipe is saturated. On cancel
-    // the forwarder drops queued updates and returns promptly — the
-    // cancelled terminal supersedes stale updates and the handler must
-    // reach in-flight cleanup even when the client stops draining.
+    // The execution-done signal bounds the forwarder's lifetime even when an
+    // extension moves its sink into detached work. Updates queued before the
+    // extension returns are drained; detached post-return updates are ignored.
     let forwarder = {
         let out = runtime.out_tx.clone();
         let cancel = token.clone();
         let tool_call_id = tool_call_id.clone();
         let name = call.name.clone();
         tokio::spawn(async move {
-            while let Some(partial) = update_rx.recv().await {
-                let frame = update_frame(id, &tool_call_id, &name, partial);
+            loop {
                 tokio::select! {
                     biased;
-                    () = cancel.cancelled() => break,
-                    sent = out.send(frame) => {
-                        if sent.is_err() {
-                            break;
+                    () = cancel.cancelled() => return,
+                    _ = &mut done_rx => break,
+                    partial = update_rx.recv() => {
+                        let Some(partial) = partial else {
+                            return;
+                        };
+                        let frame = update_frame(id, &tool_call_id, &name, partial);
+                        if !send_forwarded_frame(&out, &cancel, frame).await {
+                            return;
                         }
                     }
+                }
+            }
+            update_rx.close();
+            while let Some(partial) = update_rx.recv().await {
+                let frame = update_frame(id, &tool_call_id, &name, partial);
+                if !send_forwarded_frame(&out, &cancel, frame).await {
+                    return;
                 }
             }
         })
@@ -1157,10 +1178,10 @@ async fn execute_tool_request<E: NativeExtension>(
         .extension
         .execute_tool(call, ToolUpdateSink { tx: update_tx }, token.clone())
         .await;
+    let _ = done_tx.send(());
 
-    // The sink was consumed by the call, so the update channel is closed;
-    // awaiting the forwarder flushes every queued update before the
-    // terminal frame is published.
+    // The done signal closes the receiver and flushes all updates accepted
+    // before completion. Await the flush before publishing the terminal.
     let _ = forwarder.await;
     if let Ok(mut map) = runtime.in_flight.lock() {
         map.remove(&id);
@@ -1205,6 +1226,7 @@ async fn execute_provider_request<E: NativeExtension>(
     // so an early `provider.cancel` is never lost.
     let token = token.unwrap_or_default();
     let (event_tx, mut event_rx) = mpsc::channel::<Frame>(runtime.update_capacity.max(1));
+    let (done_tx, mut done_rx) = oneshot::channel::<()>();
     let invalid = Arc::new(AtomicBool::new(false));
     let sink = ProviderEventSink {
         id,
@@ -1213,25 +1235,31 @@ async fn execute_provider_request<E: NativeExtension>(
         invalid: Arc::clone(&invalid),
     };
 
-    // Forward events from a dedicated task: backpressure on the bounded
-    // outbound channel stalls only the forwarder, so a `provider.cancel`
-    // stays observable even while the pipe is saturated. On cancel the
-    // forwarder drops queued events and returns promptly — the cancelled
-    // terminal supersedes stale events and the handler must reach
-    // in-flight cleanup even when the client stops draining.
+    // Match the tool forwarder: completion, not sender ownership, defines the
+    // event stream lifetime. Drain only events queued before completion.
     let forwarder = {
         let out = runtime.out_tx.clone();
         let cancel = token.clone();
         tokio::spawn(async move {
-            while let Some(frame) = event_rx.recv().await {
+            loop {
                 tokio::select! {
                     biased;
-                    () = cancel.cancelled() => break,
-                    sent = out.send(frame) => {
-                        if sent.is_err() {
-                            break;
+                    () = cancel.cancelled() => return,
+                    _ = &mut done_rx => break,
+                    frame = event_rx.recv() => {
+                        let Some(frame) = frame else {
+                            return;
+                        };
+                        if !send_forwarded_frame(&out, &cancel, frame).await {
+                            return;
                         }
                     }
+                }
+            }
+            event_rx.close();
+            while let Some(frame) = event_rx.recv().await {
+                if !send_forwarded_frame(&out, &cancel, frame).await {
+                    return;
                 }
             }
         })
@@ -1241,10 +1269,10 @@ async fn execute_provider_request<E: NativeExtension>(
         .extension
         .stream_provider(call, sink, token.clone())
         .await;
+    let _ = done_tx.send(());
 
-    // The sink was consumed by the call, so the event channel is closed;
-    // awaiting the forwarder flushes every queued event before the
-    // terminal frame is published.
+    // The done signal closes the receiver and flushes all events accepted
+    // before completion. Await the flush before publishing the terminal.
     let _ = forwarder.await;
     if let Ok(mut map) = runtime.in_flight.lock() {
         map.remove(&id);
@@ -1838,6 +1866,96 @@ mod tests {
         }
     }
 
+    struct DetachedSinkExtension {
+        release: CancellationToken,
+    }
+
+    impl NativeExtension for DetachedSinkExtension {
+        fn snapshot(&self) -> RegistrySnapshot {
+            RegistrySnapshot {
+                tools: vec![tool_entry("detached")],
+                providers: vec![ProviderSnapshotEntry {
+                    name: "detached".to_owned(),
+                    stream_simple: true,
+                    ..ProviderSnapshotEntry::default()
+                }],
+                ..RegistrySnapshot::default()
+            }
+        }
+
+        fn prepare_tool(
+            &self,
+            name: String,
+            args: Value,
+        ) -> NativeFuture<Result<Value, ExtensionFault>> {
+            Box::pin(async move {
+                if name == "detached" {
+                    Ok(args)
+                } else {
+                    Err(ExtensionFault::not_found(name))
+                }
+            })
+        }
+
+        fn validate_tool(
+            &self,
+            name: String,
+            args: Value,
+            _tool_call_id: Option<String>,
+        ) -> NativeFuture<Result<Value, ExtensionFault>> {
+            Box::pin(async move {
+                if name == "detached" {
+                    Ok(args)
+                } else {
+                    Err(ExtensionFault::not_found(name))
+                }
+            })
+        }
+
+        fn execute_tool(
+            &self,
+            call: ToolCall,
+            updates: ToolUpdateSink,
+            _cancel: CancellationToken,
+        ) -> NativeFuture<Result<Value, ExtensionFault>> {
+            let release = self.release.clone();
+            Box::pin(async move {
+                if call.name != "detached" {
+                    return Err(ExtensionFault::not_found(call.name));
+                }
+                if !updates.send(json!({"stage": "queued"})) {
+                    return Err(ExtensionFault::extension_error(
+                        "detached update was not accepted",
+                    ));
+                }
+                tokio::spawn(async move {
+                    release.cancelled().await;
+                    drop(updates);
+                });
+                Ok(json!({"done": true}))
+            })
+        }
+
+        fn stream_provider(
+            &self,
+            call: ProviderStreamCall,
+            events: ProviderEventSink,
+            _cancel: CancellationToken,
+        ) -> NativeFuture<Result<Value, ExtensionFault>> {
+            let release = self.release.clone();
+            Box::pin(async move {
+                if call.provider_id != "detached" {
+                    return Err(ExtensionFault::not_found(call.provider_id));
+                }
+                tokio::spawn(async move {
+                    release.cancelled().await;
+                    drop(events);
+                });
+                Ok(json!({}))
+            })
+        }
+    }
+
     /// Extension that overrides nothing but the required methods; used to
     /// assert the honest defaults of every optional surface.
     struct DefaultExtension;
@@ -1875,6 +1993,66 @@ mod tests {
         ) -> NativeFuture<Result<Value, ExtensionFault>> {
             Box::pin(async move { Err(ExtensionFault::not_found(call.name)) })
         }
+    }
+
+    #[tokio::test]
+    async fn detached_stream_sinks_do_not_hold_requests_open() -> R {
+        let release = CancellationToken::new();
+        let extension = DetachedSinkExtension {
+            release: release.clone(),
+        };
+        let config = ServerConfig {
+            max_in_flight: 1,
+            ..ServerConfig::default()
+        };
+        let (mut client, server) = spawn_raw(extension, config);
+        client.hello(PROTOCOL_VERSION, "anything").await?;
+        let _ack = client.recv().await?;
+
+        client
+            .send(&Frame {
+                id: 2,
+                kind: FrameKind::Req,
+                method: methods::TOOL_EXECUTE.to_owned(),
+                payload: json!({
+                    "name": "detached",
+                    "toolCallId": "detached-tool",
+                    "args": {},
+                    "prepared": true,
+                }),
+            })
+            .await?;
+        let update = client.recv().await?;
+        assert_eq!(update.id, 2);
+        assert_eq!(update.kind, FrameKind::Event);
+        assert_eq!(update.method, Method::ToolUpdate.as_str());
+        assert_eq!(update.payload["partialResult"]["stage"], "queued");
+        let tool_terminal = client.recv().await?;
+        assert_eq!(tool_terminal.id, 2);
+        assert_eq!(tool_terminal.kind, FrameKind::Res);
+
+        client
+            .send(&Frame {
+                id: 3,
+                kind: FrameKind::Req,
+                method: methods::PROVIDER_STREAM.to_owned(),
+                payload: json!({
+                    "providerId": "detached",
+                    "model": {},
+                    "context": {},
+                    "options": {},
+                }),
+            })
+            .await?;
+        let provider_terminal = client.recv().await?;
+        assert_eq!(provider_terminal.id, 3);
+        assert_eq!(provider_terminal.kind, FrameKind::Res);
+
+        release.cancel();
+        drop(client);
+        let result = tokio::time::timeout(TIMEOUT, server).await??;
+        assert!(result.is_ok());
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
