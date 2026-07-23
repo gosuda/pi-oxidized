@@ -797,6 +797,87 @@ fn registry_snapshot_rejects_non_cli_flag_values() {
 }
 
 #[tokio::test]
+async fn load_rejects_boolean_flag_with_string_default() -> R {
+    let (client, _host) = make_fake_client(json!({
+        "flags": [{"name": "verbose", "type": "boolean", "default": "true"}]
+    }));
+    let error = match HostExtensionRunner::connect_with_cwd_and_trust(
+        client,
+        vec![],
+        "/workspace",
+        false,
+        FAST_TIMEOUT,
+    )
+    .await
+    {
+        Ok(runner) => {
+            runner.shutdown_once().await;
+            return Err("boolean flag with string default unexpectedly loaded".into());
+        }
+        Err(error) => error,
+    };
+    match error {
+        HostStartError::Load(message) => {
+            assert!(
+                message.contains("flag") && message.contains("boolean"),
+                "Load error should carry the flag validation message, got: {message}"
+            );
+        }
+        other => return Err(format!("expected HostStartError::Load, got {other}").into()),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn load_rejects_flag_with_unknown_kind() -> R {
+    let (client, _host) = make_fake_client(json!({
+        "flags": [{"name": "count", "type": "number"}]
+    }));
+    let error = match HostExtensionRunner::connect_with_cwd_and_trust(
+        client,
+        vec![],
+        "/workspace",
+        false,
+        FAST_TIMEOUT,
+    )
+    .await
+    {
+        Ok(runner) => {
+            runner.shutdown_once().await;
+            return Err("unknown flag kind unexpectedly loaded".into());
+        }
+        Err(error) => error,
+    };
+    match error {
+        HostStartError::Load(message) => {
+            assert!(
+                message.contains("flag") && message.contains("number"),
+                "Load error should carry the unknown-kind validation message, got: {message}"
+            );
+        }
+        other => return Err(format!("expected HostStartError::Load, got {other}").into()),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn load_accepts_valid_flag_snapshot() -> R {
+    let (runner, _host) = make_runner(json!({
+        "flags": [
+            {"name": "verbose", "type": "boolean", "default": false, "value": true},
+            {"name": "mode", "type": "string", "default": "fast"}
+        ]
+    }))
+    .await?;
+    let registry = runner.registry();
+    assert_eq!(registry.flags().len(), 2);
+    assert_eq!(registry.flags()[0].name, "verbose");
+    assert_eq!(registry.flags()[1].name, "mode");
+    runner.shutdown_once().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn malformed_provider_models_are_isolated() -> R {
     let (runner, _host) = make_runner(json!({
         "providers": [
@@ -1352,7 +1433,11 @@ done
     let errors = runner.load_errors();
     assert_eq!(errors.len(), 1, "unexpected run diagnostics: {errors:?}");
     assert!(errors[0].0.contains("native-bad"));
-    assert!(errors[0].1.contains("Permission denied"));
+    assert!(
+        errors[0].1.contains("native entry must be executable"),
+        "expected executable preflight diagnostic, got: {}",
+        errors[0].1
+    );
     runner.shutdown_once().await;
     Ok(())
 }

@@ -1325,6 +1325,8 @@ impl HostExtensionRunner {
             .await?;
         let wire: RegistrySnapshotWire = serde_json::from_value(frame.payload)
             .map_err(|e| HostStartError::Load(e.to_string()))?;
+        wire.validate()
+            .map_err(|error| HostStartError::Load(error.to_string()))?;
         Ok(build_snapshot(wire, client))
     }
 
