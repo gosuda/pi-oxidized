@@ -187,6 +187,10 @@ pub enum ManifestErrorKind {
     /// the resolved entry path).
     #[error("lean entries must be prebundled .mjs files (manifest runtime \"ts-lean\")")]
     LeanEntryNotPrebundled,
+    /// Native entry resolves to a directory or other non-file (symlink
+    /// metadata is followed; a symlink to a regular file is accepted).
+    #[error("native entry must be a regular file")]
+    NativeEntryNotFile,
 }
 
 /// Classify one discovered extension path for `target`.
@@ -201,8 +205,9 @@ pub enum ManifestErrorKind {
 /// Returns a typed [`ManifestError`] for filesystem failures and any
 /// strict-schema violation: unknown fields, wrong schema, blank name,
 /// non-semver version, unknown runtime, protocol mismatch, malformed or
-/// uncontained entries, target maps missing the requested platform, and
-/// lean entries that are not prebundled `.mjs` files.
+/// uncontained entries, target maps with non-string or empty values,
+/// target maps missing the requested platform, lean entries that are not
+/// prebundled `.mjs` files, and native entries that are not regular files.
 pub fn classify_extension(path: &Path, target: &str) -> Result<ClassifiedExtension, ManifestError> {
     let metadata = std::fs::metadata(path)
         .map_err(|error| ManifestError::new(path, ManifestErrorKind::Io(error.to_string())))?;
@@ -264,6 +269,19 @@ fn classify_directory(path: &Path, target: &str) -> Result<ClassifiedExtension, 
             &manifest_path,
             ManifestErrorKind::LeanEntryNotPrebundled,
         ));
+    }
+    if manifest.mode == ExtensionMode::Native {
+        // Follow symlinks (`metadata`, not `symlink_metadata`) so a link to
+        // a regular file is accepted and a link to a directory is rejected.
+        let metadata = std::fs::metadata(&entry).map_err(|error| {
+            ManifestError::new(&manifest_path, ManifestErrorKind::Io(error.to_string()))
+        })?;
+        if !metadata.is_file() {
+            return Err(ManifestError::new(
+                &manifest_path,
+                ManifestErrorKind::NativeEntryNotFile,
+            ));
+        }
     }
     Ok(ClassifiedExtension {
         mode: manifest.mode,
@@ -393,18 +411,32 @@ fn resolve_entry(
     let entry = match raw {
         serde_json::Value::String(entry) => entry.clone(),
         serde_json::Value::Object(map) => {
-            let value = map.get(target).ok_or_else(|| {
-                ManifestError::new(
-                    manifest_path,
-                    ManifestErrorKind::UnsupportedPlatform {
-                        target: target.to_owned(),
-                        available: map.keys().cloned().collect(),
-                    },
-                )
-            })?;
-            value.as_str().map(str::to_owned).ok_or_else(|| {
-                ManifestError::new(manifest_path, ManifestErrorKind::InvalidEntryShape)
-            })?
+            // Validate every target-map value before selecting the host
+            // target so a package that builds on one platform still fails
+            // when another platform's entry is a non-string or empty.
+            for value in map.values() {
+                match value.as_str() {
+                    Some(path) if !path.is_empty() => {}
+                    _ => {
+                        return Err(ManifestError::new(
+                            manifest_path,
+                            ManifestErrorKind::InvalidEntryShape,
+                        ));
+                    }
+                }
+            }
+            map.get(target)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    ManifestError::new(
+                        manifest_path,
+                        ManifestErrorKind::UnsupportedPlatform {
+                            target: target.to_owned(),
+                            available: map.keys().cloned().collect(),
+                        },
+                    )
+                })?
         }
         _ => {
             return Err(ManifestError::new(
@@ -996,6 +1028,91 @@ mod tests {
                 available: vec!["aarch64-apple-darwin".to_owned()],
             }
         );
+        Ok(())
+    }
+
+    #[test]
+    fn native_directory_entry_is_rejected() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let dir = temp.path().join("native-dir-entry");
+        std::fs::create_dir_all(dir.join("bin/tool"))?;
+        std::fs::write(
+            dir.join(MANIFEST_FILE_NAME),
+            manifest_json("native-dir-entry", "native", "\"bin/tool\""),
+        )?;
+        let kind = expect_kind(classify_extension(&dir, TARGET))?;
+        assert_eq!(kind, ManifestErrorKind::NativeEntryNotFile);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_symlink_to_directory_entry_is_rejected() -> TestResult {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        let dir = extension_dir(
+            &temp,
+            "native-symlink-dir",
+            &manifest_json("native-symlink-dir", "native", "\"link\""),
+            &[],
+        )?;
+        let nested = dir.join("nested-dir");
+        std::fs::create_dir_all(&nested)?;
+        symlink(&nested, dir.join("link"))?;
+        let kind = expect_kind(classify_extension(&dir, TARGET))?;
+        assert_eq!(kind, ManifestErrorKind::NativeEntryNotFile);
+        Ok(())
+    }
+
+    #[test]
+    fn native_regular_file_entry_is_accepted() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let dir = extension_dir(
+            &temp,
+            "native-file",
+            &manifest_json("native-file", "native", "\"bin/tool\""),
+            &["bin/tool"],
+        )?;
+        let classified = classify_extension(&dir, TARGET)?;
+        assert_eq!(classified.mode, ExtensionMode::Native);
+        assert_eq!(
+            classified.entry,
+            std::fs::canonicalize(dir.join("bin/tool"))?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn non_string_non_host_target_map_value_is_rejected() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        // Host target is a valid string path; a sibling target is a number.
+        // Malformed maps must fail before host selection so the package
+        // cannot validate on the build platform and fail elsewhere.
+        let entry = format!("{{\"{TARGET}\":\"bin/linux-tool\",\"aarch64-apple-darwin\":123}}");
+        let dir = extension_dir(
+            &temp,
+            "bad-map",
+            &manifest_json("bad-map", "native", &entry),
+            &["bin/linux-tool"],
+        )?;
+        let kind = expect_kind(classify_extension(&dir, TARGET))?;
+        assert_eq!(kind, ManifestErrorKind::InvalidEntryShape);
+        Ok(())
+    }
+
+    #[test]
+    fn empty_non_host_target_map_value_is_rejected() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let entry = format!("{{\"{TARGET}\":\"bin/linux-tool\",\"aarch64-apple-darwin\":\"\"}}");
+        let dir = extension_dir(
+            &temp,
+            "empty-map",
+            &manifest_json("empty-map", "native", &entry),
+            &["bin/linux-tool"],
+        )?;
+        let kind = expect_kind(classify_extension(&dir, TARGET))?;
+        assert_eq!(kind, ManifestErrorKind::InvalidEntryShape);
         Ok(())
     }
 }
