@@ -1143,13 +1143,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn native_other_class_execute_bit_only_is_rejected() -> TestResult {
+        use std::os::unix::fs::PermissionsExt;
         // access(2) honors the effective ids: a file whose ONLY execute bit
         // belongs to a class the process is not in must still reject.
         if nix::unistd::geteuid().is_root() {
             // Root passes X_OK regardless of class bits.
             return Ok(());
         }
-        use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir()?;
         let dir = extension_dir(
             &temp,
