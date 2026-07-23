@@ -135,12 +135,21 @@ impl AgentSession {
                 assistant_message_event,
             } => {
                 let runner = self.hooks.runner();
-                if runner.has_handlers("message_update")
-                    && let Err(error) = runner
+                if runner.has_handlers("message_update") {
+                    match runner
                         .emit_message_update_delta(assistant_message_event.as_ref())
                         .await
-                {
-                    runner.emit_error(error.to_string());
+                    {
+                        Ok(Some(cancel)) if cancel.cancel => {
+                            if let Some(reason) = cancel.reason {
+                                self.agent.abort_with_reason(reason);
+                            } else {
+                                self.agent.abort();
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(error) => runner.emit_error(error.to_string()),
+                    }
                 }
                 (
                     AgentSessionEvent::MessageUpdate {

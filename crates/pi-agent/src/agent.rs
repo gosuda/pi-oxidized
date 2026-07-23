@@ -98,6 +98,8 @@ struct RunState {
     is_streaming: bool,
     /// Cancellation token for the currently active run, if any.
     active: Option<CancellationToken>,
+    /// Human-readable reason supplied by the caller that aborted this run.
+    abort_reason: Option<String>,
 }
 
 struct AgentInner {
@@ -143,6 +145,7 @@ impl Agent {
             run: Arc::new(Mutex::new(RunState {
                 is_streaming: false,
                 active: None,
+                abort_reason: None,
             })),
         });
         Self { inner }
@@ -370,6 +373,18 @@ impl Agent {
         }
     }
 
+    /// Cancels the active run and surfaces `reason` on its aborted assistant.
+    ///
+    /// Queues are not cleared by abort.
+    pub fn abort_with_reason(&self, reason: impl Into<String>) {
+        let mut run = lock(&self.inner.run);
+        let Some(token) = run.active.clone() else {
+            return;
+        };
+        run.abort_reason = Some(reason.into());
+        token.cancel();
+    }
+
     /// Waits until no run is active.
     pub async fn wait_for_idle(&self) {
         loop {
@@ -396,6 +411,7 @@ impl Agent {
         let mut run = lock(&self.inner.run);
         run.is_streaming = false;
         run.active = None;
+        run.abort_reason = None;
     }
 }
 
@@ -420,6 +436,7 @@ fn start_run(inner: &AgentInner) -> Result<CancellationToken, AgentLoopError> {
         }
         run.is_streaming = true;
         run.active = Some(cancel.clone());
+        run.abort_reason = None;
     }
     {
         let mut state = lock(&inner.state);
@@ -466,6 +483,7 @@ fn begin_continue(
 
         run.is_streaming = true;
         run.active = Some(cancel.clone());
+        run.abort_reason = None;
         {
             let mut state = lock(&inner.state);
             state.is_streaming = true;
@@ -552,10 +570,19 @@ struct TrackingSink<'a> {
     inner: &'a dyn EventSink,
     terminal: Arc<AtomicBool>,
     new_messages: Arc<Mutex<Vec<AgentMessage>>>,
+    run: Arc<Mutex<RunState>>,
 }
 
 impl EventSink for TrackingSink<'_> {
-    fn emit(&self, event: AgentEvent) {
+    fn emit(&self, mut event: AgentEvent) {
+        if let AgentEvent::MessageEnd { message } = &mut event
+            && let AgentMessage::Llm(inner) = message
+            && let Message::Assistant(assistant) = inner.as_mut()
+            && assistant.stop_reason == StopReason::Aborted
+            && let Some(reason) = lock(&self.run).abort_reason.clone()
+        {
+            assistant.error_message = Some(reason);
+        }
         if let AgentEvent::MessageEnd { message } = &event {
             if message.role() == "assistant" {
                 self.terminal.store(true, Ordering::SeqCst);
@@ -592,6 +619,7 @@ async fn run_lifecycle(
         inner: &inner.sink,
         terminal: Arc::clone(&terminal),
         new_messages: Arc::clone(&new_messages),
+        run: Arc::clone(&inner.run),
     };
 
     let _ = inner.partial_tx.send(None);
@@ -657,6 +685,7 @@ fn finish_run(
         let mut run = lock(&inner.run);
         run.is_streaming = false;
         run.active = None;
+        run.abort_reason = None;
     }
     inner.idle.notify_waiters();
     outcome

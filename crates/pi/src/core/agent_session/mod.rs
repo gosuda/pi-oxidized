@@ -1183,11 +1183,33 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct PendingDeltaProvider;
+
+    impl Provider for PendingDeltaProvider {
+        fn stream(
+            &self,
+            _model: &Model,
+            _context: Context,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, Result<AssistantMessageEvent, ProviderError>> {
+            let delta = AssistantMessageEvent::TextDelta {
+                content_index: 0,
+                delta: "hello".to_owned(),
+                partial: assistant("hello"),
+            };
+            stream::iter([Ok(start_event()), Ok(delta)])
+                .chain(stream::pending())
+                .boxed()
+        }
+    }
+
     /// Extension runner that records emit order and can delay `message_end`.
     struct RecordingRunner {
         order: Arc<Mutex<Vec<String>>>,
         delay_message_end: Duration,
         replace_with: Mutex<Option<AgentMessage>>,
+        message_update_cancel_reason: Option<String>,
     }
 
     impl RecordingRunner {
@@ -1196,6 +1218,14 @@ mod tests {
                 order,
                 delay_message_end: Duration::ZERO,
                 replace_with: Mutex::new(None),
+                message_update_cancel_reason: None,
+            }
+        }
+
+        fn cancelling_message_updates(reason: &str) -> Self {
+            Self {
+                message_update_cancel_reason: Some(reason.to_owned()),
+                ..Self::new(Arc::new(Mutex::new(Vec::new())))
             }
         }
     }
@@ -1217,6 +1247,22 @@ mod tests {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .push(label);
                 Ok(None)
+            })
+        }
+
+        fn emit_message_update_delta<'a>(
+            &'a self,
+            _event: &'a AssistantMessageEvent,
+        ) -> futures::future::BoxFuture<'a, Result<Option<CancelResult>, ExtensionRunnerError>>
+        {
+            Box::pin(async move {
+                Ok(self
+                    .message_update_cancel_reason
+                    .clone()
+                    .map(|reason| CancelResult {
+                        cancel: true,
+                        reason: Some(reason),
+                    }))
             })
         }
 
@@ -1336,6 +1382,36 @@ mod tests {
             out.push(event);
         }
         out
+    }
+
+    #[tokio::test]
+    async fn message_update_cancel_aborts_stream_with_extension_reason()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut config =
+            AgentSessionConfig::test_config(Arc::new(PendingDeltaProvider), test_model())?;
+        config.extension_runner = Some(Arc::new(RecordingRunner::cancelling_message_updates(
+            "policy stopped this stream",
+        )));
+        let session = AgentSession::new(config)?;
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            session
+                .agent
+                .prompt(vec![user_text("hi", std::iter::empty())]),
+        )
+        .await??;
+
+        let assistant = session
+            .agent
+            .last_assistant()
+            .ok_or("missing aborted assistant")?;
+        assert_eq!(assistant.stop_reason, StopReason::Aborted);
+        assert_eq!(
+            assistant.error_message.as_deref(),
+            Some("policy stopped this stream")
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -1575,6 +1651,7 @@ mod tests {
             order: Arc::clone(&order),
             delay_message_end: Duration::ZERO,
             replace_with: Mutex::new(None),
+            message_update_cancel_reason: None,
         });
 
         // Replace assistant text with "replaced".
@@ -1682,6 +1759,7 @@ mod tests {
             order: Arc::clone(&order),
             delay_message_end: Duration::from_millis(30),
             replace_with: Mutex::new(None),
+            message_update_cancel_reason: None,
         });
         let provider = Arc::new(MockProvider(vec![Ok(start_event()), Ok(done_event("ok"))]));
         let mut config = AgentSessionConfig::test_config(provider, test_model())?;
