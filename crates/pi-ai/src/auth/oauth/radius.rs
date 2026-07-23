@@ -1391,6 +1391,7 @@ mod tests {
 
     #[tokio::test]
     async fn device_login_exchange_completes_with_scope() -> TestResult {
+        let _port_guard = CALLBACK_PORT_TEST_LOCK.lock().await;
         let token_body_initial = serde_json::json!({
             "access_token": "device-access",
             "refresh_token": "device-refresh",
@@ -1453,6 +1454,7 @@ mod tests {
 
     #[tokio::test]
     async fn device_login_rejects_untrusted_verification_destination() -> TestResult {
+        let _port_guard = CALLBACK_PORT_TEST_LOCK.lock().await;
         let routes = Arc::new(Mutex::new(Vec::new()));
         let gateway = spawn_json_server(routes.clone())?;
         let issuer_routes = Arc::new(Mutex::new(vec![(
@@ -1503,6 +1505,7 @@ mod tests {
 
     #[tokio::test]
     async fn device_refresh_rotates_tokens_and_scope() -> TestResult {
+        let _port_guard = CALLBACK_PORT_TEST_LOCK.lock().await;
         let token_body_initial = serde_json::json!({
             "access_token": "device-access",
             "refresh_token": "device-refresh",
@@ -1559,6 +1562,7 @@ mod tests {
 
     #[tokio::test]
     async fn device_access_denied_error() -> TestResult {
+        let _port_guard = CALLBACK_PORT_TEST_LOCK.lock().await;
         let routes = Arc::new(Mutex::new(Vec::new()));
         let gateway = spawn_json_server(routes.clone())?;
         let device_routes = Arc::new(Mutex::new(vec![
@@ -1609,6 +1613,7 @@ mod tests {
 
     #[tokio::test]
     async fn device_cancel_before_config_load() -> TestResult {
+        let _port_guard = CALLBACK_PORT_TEST_LOCK.lock().await;
         let routes = Arc::new(Mutex::new(Vec::new()));
         let gateway = spawn_json_server(routes.clone())?;
         let issuer = spawn_json_server(Arc::new(Mutex::new(Vec::new())))?;
@@ -1642,6 +1647,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_login_method_errors_with_provider_name() -> TestResult {
+        let _port_guard = CALLBACK_PORT_TEST_LOCK.lock().await;
         let routes = Arc::new(Mutex::new(vec![(
             "GET /v1/oauth".to_owned(),
             200,
@@ -1667,6 +1673,7 @@ mod tests {
 
     #[tokio::test]
     async fn soft_failed_callback_reports_incomplete() -> TestResult {
+        let _port_guard = CALLBACK_PORT_TEST_LOCK.lock().await;
         let hold_port = free_port()?;
         let _hold =
             TcpListener::bind(format!("127.0.0.1:{hold_port}")).map_err(|e| err(e.to_string()))?;
