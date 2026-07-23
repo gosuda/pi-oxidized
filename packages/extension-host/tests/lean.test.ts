@@ -34,6 +34,7 @@ const FACTORY_ENTRY = join(LEAN_FIXTURES, "factory-surface.mjs");
 const FOLD_FIRST_ENTRY = join(LEAN_FIXTURES, "fold-first.mjs");
 const FOLD_SECOND_ENTRY = join(LEAN_FIXTURES, "fold-second.mjs");
 const ROLE_BREAKER_ENTRY = join(LEAN_FIXTURES, "role-breaker.mjs");
+const MESSAGE_UPDATE_CANCEL_ENTRY = join(LEAN_FIXTURES, "message-update-cancel.mjs");
 const PRELOAD = resolve(import.meta.dirname, "fixtures", "lean-forbid-compat-graph.ts");
 
 type Marker = { name: string; value: unknown };
@@ -556,6 +557,33 @@ describe("lean: lifecycle hooks", () => {
 		const delta = payload(await link.response(36, "message_update_delta"));
 		expect(delta["ok"]).toBe(true);
 		expect(markerLog().filter((m) => m.name === "hook.message_update")).toHaveLength(2);
+		await link.finish();
+	});
+
+	test("message_update CancelWire is forwarded; non-cancel keeps ok: true", async () => {
+		const link = new LeanLink({ cwd: PACKAGE_DIR, extensionPaths: [] });
+		await link.hello(1);
+		link.request(2, "extensions.load", {
+			extensionPaths: [MESSAGE_UPDATE_CANCEL_ENTRY],
+			cwd: PACKAGE_DIR,
+		});
+		await link.response(2, "extensions.load");
+
+		// Void / non-cancel hook result → Mode 1 shape `{ ok: true }`.
+		link.request(37, "message_update_delta", {
+			type: "message_update_delta",
+			event: { type: "start", meta: { role: "assistant" } },
+		});
+		const started = payload(await link.response(37, "message_update_delta"));
+		expect(started).toEqual({ ok: true });
+
+		// `{ cancel: true, reason }` must reach the wire so Rust sees CancelWire.
+		link.request(38, "message_update_delta", {
+			type: "message_update_delta",
+			event: { type: "text_delta", meta: {}, contentIndex: 0, delta: "hi" },
+		});
+		const cancelled = payload(await link.response(38, "message_update_delta"));
+		expect(cancelled).toEqual({ cancel: true, reason: "stop-from-lean" });
 		await link.finish();
 	});
 });

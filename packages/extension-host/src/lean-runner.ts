@@ -1070,12 +1070,22 @@ export class LeanRunner {
 					? { type, reason: event["reason"], message }
 					: { type, reason: event["reason"], error: message };
 				this.clearActiveAssistant();
+				let result: unknown;
 				await this.runHooks(
 					"message_update",
 					{ type: "message_update", message, assistantMessageEvent },
-					() => void 0,
+					(r) => {
+						if (r === undefined || r === null) return;
+						result = r;
+						// CancelWire short-circuit — same fold as session_before_*.
+						if (isRecord(r) && r["cancel"] === true) return false;
+					},
 				);
-				await this.client.respond(id, "message_update_delta" as Method, { ok: true });
+				await this.client.respond(
+					id,
+					"message_update_delta" as Method,
+					result ?? { ok: true },
+				);
 				return;
 			}
 
@@ -1085,12 +1095,22 @@ export class LeanRunner {
 			}
 			const message = structuredClone(this.activeAssistant);
 			const assistantMessageEvent = this.expandAssistantEvent(event, message);
+			let result: unknown;
 			await this.runHooks(
 				"message_update",
 				{ type: "message_update", message, assistantMessageEvent },
-				() => void 0,
+				(r) => {
+					if (r === undefined || r === null) return;
+					result = r;
+					// CancelWire short-circuit — same fold as session_before_*.
+					if (isRecord(r) && r["cancel"] === true) return false;
+				},
 			);
-			await this.client.respond(id, "message_update_delta" as Method, { ok: true });
+			await this.client.respond(
+				id,
+				"message_update_delta" as Method,
+				result ?? { ok: true },
+			);
 		} catch (error) {
 			await this.client.respondError(id, "message_update_delta" as Method, {
 				code: "extension_error",
