@@ -126,15 +126,18 @@ export class PtyProcess {
 				},
 			},
 		});
-		this.#completed = Promise.all([this.#process.exited, ptyEnd.promise]).then(([code]) => {
+		this.#completed = this.#process.exited.then(async (code) => {
 			// Closing the master releases the descriptor and SIGHUPs orphaned group
-			// members, matching script(1) teardown when its child exits.
+			// members, matching script(1) teardown when its child exits. Do this as
+			// soon as the spawned child exits — waiting for terminal EOF first can
+			// hang forever when a background descendant still holds the slave open.
 			try {
 				const terminal = this.#process.terminal;
 				if (terminal && !terminal.closed) terminal.close();
 			} catch {
-				// Teardown is best-effort; the exit code is already settled.
+				// Teardown is best-effort; the exit code is already known.
 			}
+			await ptyEnd.promise;
 			this.#exitCode = code;
 			this.#notify();
 			return code;

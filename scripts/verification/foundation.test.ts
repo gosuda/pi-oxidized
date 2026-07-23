@@ -331,6 +331,28 @@ describe.skipIf(isWindows)("PTY driver", () => {
 		}
 		expect(childAlive).toBe(false);
 	}, 15_000);
+
+	test("settles waitForExit when a background descendant holds the PTY slave", async () => {
+		// Plain `sleep &; exit` is insufficient: session-leader exit SIGHUPs the
+		// job, the slave closes, and Bun's terminal EOF arrives anyway. Ignore
+		// SIGHUP and arm a marker before the shell exits so the slave stays open;
+		// Promise.all-on-EOF then hangs until terminal.close() forces teardown.
+		const process = spawnPty({
+			argv: [
+				"/bin/sh",
+				"-c",
+				"python3 -c 'import signal,time; signal.signal(signal.SIGHUP, signal.SIG_IGN); open(\"armed\",\"w\").write(\"1\"); print(\"READY\", flush=True); time.sleep(300)' & " +
+					"while [ ! -f armed ]; do sleep 0.01; done; exit 42",
+			],
+			cwd: temporaryDirectory("pi-verification-orphan-slave-"),
+		});
+		try {
+			await process.waitFor(/READY/, { deadlineMs: 5_000, source: "raw" });
+			expect(await process.waitForExit(5_000)).toBe(42);
+		} finally {
+			await process.terminate();
+		}
+	}, 15_000);
 });
 
 interface CliFixture {
