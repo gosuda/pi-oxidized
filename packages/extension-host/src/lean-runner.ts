@@ -1075,10 +1075,11 @@ export class LeanRunner {
 					"message_update",
 					{ type: "message_update", message, assistantMessageEvent },
 					(r) => {
-						if (r === undefined || r === null) return;
+						// CancelWire short-circuit — same fold as session_before_*;
+						// any other return keeps the `{ ok: true }` response.
+						if (!isRecord(r) || r["cancel"] !== true) return;
 						result = r;
-						// CancelWire short-circuit — same fold as session_before_*.
-						if (isRecord(r) && r["cancel"] === true) return false;
+						return false;
 					},
 				);
 				await this.client.respond(
@@ -1100,10 +1101,11 @@ export class LeanRunner {
 				"message_update",
 				{ type: "message_update", message, assistantMessageEvent },
 				(r) => {
-					if (r === undefined || r === null) return;
+					// CancelWire short-circuit — same fold as session_before_*;
+					// any other return keeps the `{ ok: true }` response.
+					if (!isRecord(r) || r["cancel"] !== true) return;
 					result = r;
-					// CancelWire short-circuit — same fold as session_before_*.
-					if (isRecord(r) && r["cancel"] === true) return false;
+					return false;
 				},
 			);
 			await this.client.respond(

@@ -10,7 +10,11 @@ export default {
 	hooks: {
 		message_update: (event) => {
 			if (event.assistantMessageEvent?.type === "text_delta") {
-				return { cancel: true, reason: "stop-from-lean" };
+				if (event.assistantMessageEvent?.delta === "veto") {
+					return { cancel: true, reason: "stop-from-lean" };
+				}
+				// Non-cancel return must keep the `{ ok: true }` response.
+				return { cancel: false };
 			}
 		},
 	},

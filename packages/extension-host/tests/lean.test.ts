@@ -577,12 +577,20 @@ describe("lean: lifecycle hooks", () => {
 		const started = payload(await link.response(37, "message_update_delta"));
 		expect(started).toEqual({ ok: true });
 
-		// `{ cancel: true, reason }` must reach the wire so Rust sees CancelWire.
+		// `{ cancel: false }` is a non-cancel result and keeps `{ ok: true }`.
 		link.request(38, "message_update_delta", {
 			type: "message_update_delta",
 			event: { type: "text_delta", meta: {}, contentIndex: 0, delta: "hi" },
 		});
-		const cancelled = payload(await link.response(38, "message_update_delta"));
+		const nonCancel = payload(await link.response(38, "message_update_delta"));
+		expect(nonCancel).toEqual({ ok: true });
+
+		// `{ cancel: true, reason }` must reach the wire so Rust sees CancelWire.
+		link.request(39, "message_update_delta", {
+			type: "message_update_delta",
+			event: { type: "text_delta", meta: {}, contentIndex: 0, delta: "veto" },
+		});
+		const cancelled = payload(await link.response(39, "message_update_delta"));
 		expect(cancelled).toEqual({ cancel: true, reason: "stop-from-lean" });
 		await link.finish();
 	});
