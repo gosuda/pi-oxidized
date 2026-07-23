@@ -90,7 +90,7 @@ export interface LeanTool {
 	readonly description: string;
 	/** JSON Schema for the arguments; forwarded to the model. */
 	readonly parameters?: Record<string, unknown>;
-	readonly executionMode?: string;
+	readonly executionMode?: "sequential" | "parallel";
 	/** Map raw model arguments before validation. Defaults to identity. */
 	readonly prepare?: (args: unknown, ctx: LeanContext) => unknown | Promise<unknown>;
 	/** Validate (and optionally normalize) prepared args; throw to reject. */
@@ -170,6 +170,7 @@ export interface LeanToolResultHookResult {
 	readonly content?: unknown;
 	readonly details?: unknown;
 	readonly isError?: boolean;
+	readonly terminate?: boolean;
 }
 
 export interface LeanMessageEndEvent {
@@ -387,7 +388,14 @@ function parseTools(value: unknown): void {
 		requireString(context, tool["name"], "name");
 		requireString(context, tool["description"], "description");
 		optionalString(context, tool["label"], "label");
-		optionalString(context, tool["executionMode"], "executionMode");
+		const executionMode = tool["executionMode"];
+		if (
+			executionMode !== undefined
+			&& executionMode !== "sequential"
+			&& executionMode !== "parallel"
+		) {
+			fail(context, 'executionMode must be "sequential" or "parallel"');
+		}
 		if (tool["parameters"] !== undefined && !isRecord(tool["parameters"])) {
 			fail(context, "parameters must be a JSON Schema object");
 		}

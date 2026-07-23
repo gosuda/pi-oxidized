@@ -34,8 +34,9 @@ use pi_ai::{
     StopReason, TextContent, ToolCall, Usage, UsageCost,
 };
 use pi_ext::client::{HostClient, HostUiRequest, HostUiResponse};
+use pi_ext::host::HostError;
 #[cfg(unix)]
-use pi_ext::host::{HostError, HostSource, HostSpec};
+use pi_ext::host::{HostSource, HostSpec};
 use pi_ext::protocol::{
     ExtensionErrorEvent, FlagValueWire, Frame, FrameKind, HelloAck, KeyEventKindWire,
     KeyModifiersWire, UiEventRequest, UiEventWire, decode_frame_str, encode_frame,
@@ -1058,20 +1059,23 @@ fn classified_runs_preserve_compat_lean_compat_interleaving() -> R {
     let compat_c = temp.path().join("compat-c");
     for directory in [&compat_a, &lean_b, &compat_c] {
         std::fs::create_dir_all(directory)?;
-        std::fs::write(directory.join("index.ts"), "export default {}")?;
     }
+    std::fs::write(compat_a.join("index.ts"), "export default {}")?;
+    std::fs::write(compat_c.join("index.ts"), "export default {}")?;
+    std::fs::write(lean_b.join("index.mjs"), "export default {}")?;
     std::fs::write(
         lean_b.join("pi-extension.json"),
         format!(
-            r#"{{"$schema":"pi.extension.v1","name":"lean-b","version":"1.0.0","runtime":"ts-lean","entry":"index.ts","protocolVersion":{}}}"#,
+            r#"{{"$schema":"pi.extension.v1","name":"lean-b","version":"1.0.0","runtime":"ts-lean","entry":"index.mjs","protocolVersion":{}}}"#,
             pi_ext::protocol::PROTOCOL_VERSION
         ),
     )?;
-    let (plans, errors) = classify_endpoint_plans(vec![
+    let discovery = vec![
         compat_a.to_string_lossy().into_owned(),
         lean_b.to_string_lossy().into_owned(),
         compat_c.to_string_lossy().into_owned(),
-    ]);
+    ];
+    let (plans, errors) = classify_endpoint_plans(&discovery);
     assert!(
         errors.is_empty(),
         "unexpected classification errors: {errors:?}"
@@ -1088,6 +1092,14 @@ fn classified_runs_preserve_compat_lean_compat_interleaving() -> R {
     assert_eq!(
         plans.iter().map(|plan| plan.id).collect::<Vec<_>>(),
         vec![0, 1, 2]
+    );
+    assert_eq!(
+        plans
+            .iter()
+            .map(|plan| plan.load_builtins)
+            .collect::<Vec<_>>(),
+        vec![true, false, false],
+        "only the first compat plan in original order may own builtins"
     );
     Ok(())
 }
@@ -1214,6 +1226,22 @@ async fn aggregate_registry_and_command_collisions_are_first_wins() -> R {
             .iter()
             .any(|frame| frame.method == "command.execute")
     );
+    // Shortcut execution is last-raw-owner-wins: ctrl+x routes to the second
+    // endpoint while command/tool routing stays first-wins on the first.
+    let handled = runner.execute_shortcut("ctrl+x").await?;
+    assert!(handled.handled);
+    hosts[1]
+        .wait_for_request(pi_ext::protocol::SHORTCUT_EXECUTE_METHOD)
+        .await?;
+    assert!(
+        !hosts[0]
+            .requests
+            .lock()
+            .map_err(|_| "request lock poisoned")?
+            .iter()
+            .any(|frame| frame.method == pi_ext::protocol::SHORTCUT_EXECUTE_METHOD),
+        "the older duplicate shortcut owner must not receive execute requests"
+    );
     let mut errors = runner.subscribe_errors();
     hosts[0].close().await;
     let closed = next_error(&mut errors, Duration::from_millis(500)).await?;
@@ -1222,10 +1250,10 @@ async fn aggregate_registry_and_command_collisions_are_first_wins() -> R {
         !runner.execute_command("same", "after-crash").await?,
         "a command owned by a dead first endpoint must not be swallowed"
     );
-    assert!(matches!(
-        runner.execute_shortcut("ctrl+x").await,
-        Err(pi_ext::client::HostClientError::NotRunning)
-    ));
+    // The last raw owner survives the first endpoint's crash and keeps
+    // serving ctrl+x.
+    let handled = runner.execute_shortcut("ctrl+x").await?;
+    assert!(handled.handled);
     assert!(
         runner
             .render_extension_tool_html(ToolRenderPhase::Result, "sameTool", &json!({}))
@@ -1239,12 +1267,70 @@ async fn aggregate_registry_and_command_collisions_are_first_wins() -> R {
             .map_err(|_| "request lock poisoned")?
             .iter()
             .any(|frame| {
-                matches!(
-                    frame.method.as_str(),
-                    "command.execute" | "shortcut.execute" | "tool.renderHtml"
-                )
+                matches!(frame.method.as_str(), "command.execute" | "tool.renderHtml")
             }),
-        "a lower-precedence duplicate must not receive command, shortcut, or render requests"
+        "a lower-precedence duplicate must not receive command or render requests"
+    );
+    runner.shutdown_once().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn execute_shortcut_dead_last_owner_does_not_fall_back_to_older_duplicate() -> R {
+    let (runner, hosts) = make_aggregate_runner(vec![
+        (0, json!({"shortcuts": [{"key": "ctrl+x"}]}), "compat-a"),
+        (1, json!({"shortcuts": [{"key": "ctrl+x"}]}), "lean-b"),
+    ])
+    .await?;
+    hosts[0].set_response(
+        pi_ext::protocol::SHORTCUT_EXECUTE_METHOD,
+        json!({"handled": true}),
+    );
+    let mut errors = runner.subscribe_errors();
+    hosts[1].close().await;
+    let closed = next_error(&mut errors, Duration::from_millis(500)).await?;
+    assert_eq!(closed.code, "extension_closed");
+    assert!(matches!(
+        runner.execute_shortcut("ctrl+x").await,
+        Err(pi_ext::client::HostClientError::NotRunning)
+    ));
+    assert!(
+        !host_received(&hosts[0], pi_ext::protocol::SHORTCUT_EXECUTE_METHOD)?,
+        "a dead last raw owner must not fall back to the older duplicate"
+    );
+    runner.shutdown_once().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn aggregate_terminal_input_shares_one_budget_across_endpoints() -> R {
+    let snapshot = || json!({"terminalInput": true, "handlers": []});
+    let (runner, hosts) = make_aggregate_runner(vec![
+        (0, snapshot(), "compat-a"),
+        (1, snapshot(), "lean-b"),
+        (2, snapshot(), "compat-c"),
+    ])
+    .await?;
+    for host in &hosts {
+        host.drop_method("terminalInput");
+    }
+    let started = std::time::Instant::now();
+    let result = runner.terminal_input("abc").await?;
+    let elapsed = started.elapsed();
+    assert!(!result.consume);
+    assert_eq!(result.data, None);
+    assert!(
+        elapsed < Duration::from_millis(12),
+        "one shared 4ms budget must bound the keypress below the old per-endpoint 12ms: {elapsed:?}"
+    );
+    assert!(host_received(&hosts[0], "terminalInput")?);
+    assert!(
+        !host_received(&hosts[1], "terminalInput")?,
+        "an expired shared budget must leave later endpoints uncontacted"
+    );
+    assert!(
+        !host_received(&hosts[2], "terminalInput")?,
+        "an expired shared budget must leave later endpoints uncontacted"
     );
     runner.shutdown_once().await;
     Ok(())
@@ -1810,6 +1896,97 @@ async fn render_extension_tool_html_strips_active_content() -> R {
     Ok(())
 }
 
+#[tokio::test]
+async fn render_extension_tool_html_ignores_non_tool_renderer_kinds() -> R {
+    // Same-named widget/message renderers must not receive tool.renderHtml;
+    // the later endpoint with the tool-kind renderer owns rendering.
+    let (runner, hosts) = make_aggregate_runner(vec![
+        (
+            0,
+            json!({"renderers": [
+                {"type": "widget", "name": "extTool"},
+                {"type": "message", "name": "extTool"}
+            ]}),
+            "compat-a",
+        ),
+        (
+            1,
+            json!({"renderers": [{"type": "tool", "name": "extTool"}]}),
+            "lean-b",
+        ),
+    ])
+    .await?;
+    hosts[0].set_response("tool.renderHtml", json!({"html": "wrong owner"}));
+    hosts[1].set_response("tool.renderHtml", json!({"html": "right owner"}));
+    let html = runner
+        .render_extension_tool_html(ToolRenderPhase::Result, "extTool", &json!({}))
+        .await;
+    assert_eq!(html.as_deref(), Some("right owner"));
+    assert!(!host_received(&hosts[0], "tool.renderHtml")?);
+    assert!(host_received(&hosts[1], "tool.renderHtml")?);
+    runner.shutdown_once().await;
+
+    // No registered tool and no tool-kind renderer: no endpoint owns the
+    // render, and multi-endpoint has no single-endpoint shortcut fallback.
+    let (runner, hosts) = make_aggregate_runner(vec![
+        (
+            0,
+            json!({"renderers": [{"type": "widget", "name": "extTool"}]}),
+            "compat-a",
+        ),
+        (
+            1,
+            json!({"renderers": [{"type": "message", "name": "extTool"}]}),
+            "lean-b",
+        ),
+    ])
+    .await?;
+    let html = runner
+        .render_extension_tool_html(ToolRenderPhase::Result, "extTool", &json!({}))
+        .await;
+    assert!(html.is_none());
+    assert!(!host_received(&hosts[0], "tool.renderHtml")?);
+    assert!(!host_received(&hosts[1], "tool.renderHtml")?);
+    runner.shutdown_once().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn render_extension_tool_html_prefers_tool_definition_owner() -> R {
+    // A registered tool definition remains an ownership match even when a
+    // later endpoint only exposes a same-named Tool renderer.
+    let (runner, hosts) = make_aggregate_runner(vec![
+        (
+            0,
+            json!({
+                "tools": [{
+                    "name": "extTool",
+                    "label": "Ext",
+                    "description": "d",
+                    "parameters": {}
+                }]
+            }),
+            "compat-a",
+        ),
+        (
+            1,
+            json!({"renderers": [{"type": "tool", "name": "extTool"}]}),
+            "lean-b",
+        ),
+    ])
+    .await?;
+    hosts[0].set_response("tool.renderHtml", json!({"html": "tool owner"}));
+    hosts[1].set_response("tool.renderHtml", json!({"html": "renderer only"}));
+    let html = runner
+        .render_extension_tool_html(ToolRenderPhase::Result, "extTool", &json!({}))
+        .await;
+    assert_eq!(html.as_deref(), Some("tool owner"));
+    assert!(host_received(&hosts[0], "tool.renderHtml")?);
+    assert!(!host_received(&hosts[1], "tool.renderHtml")?);
+    runner.shutdown_once().await;
+    Ok(())
+}
+
 #[test]
 fn sanitize_html_handles_interleaved_blocks() {
     let out = sanitize_html("<style>x</style><script>y</script><p>z</p>");
@@ -2241,6 +2418,129 @@ async fn trusted_restart_sends_true_in_replacement_load_request() -> R {
         flags_index < hook_index,
         "replacement flags.set must precede reload resource hooks"
     );
+    replacement.shutdown_once().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn restart_uses_runner_owned_discovery_cwd_and_trust() -> R {
+    let temp = tempfile::tempdir()?;
+    let manifest_dir = temp.path().join("compat-ext");
+    std::fs::create_dir_all(&manifest_dir)?;
+    std::fs::write(manifest_dir.join("index.ts"), "export default {}")?;
+    std::fs::write(
+        manifest_dir.join("pi-extension.json"),
+        format!(
+            r#"{{"$schema":"pi.extension.v1","name":"compat-ext","version":"1.0.0","runtime":"ts-compat","entry":"index.ts","protocolVersion":{}}}"#,
+            pi_ext::protocol::PROTOCOL_VERSION
+        ),
+    )?;
+    // A discovery entry that fails classification (it does not exist) must
+    // still be carried in the runner-owned original vector.
+    let failed_entry = temp.path().join("missing-ext");
+    let discovery = vec![
+        manifest_dir.to_string_lossy().into_owned(),
+        failed_entry.to_string_lossy().into_owned(),
+    ];
+    let (client, _host) = make_fake_client(full_snapshot());
+    let runner = HostExtensionRunner::connect_with_cwd_and_trust(
+        client,
+        discovery.clone(),
+        "/workspace",
+        true,
+        FAST_TIMEOUT,
+    )
+    .await?;
+    assert_eq!(runner.extension_paths(), discovery);
+
+    let runtime = ModelRuntime::create(CreateModelRuntimeOptions::default()).await?;
+    let observed = Arc::new(Mutex::new(None::<(Vec<String>, String, bool)>));
+    let observed_by_start = Arc::clone(&observed);
+    let replacement = runner
+        .restart_and_rewire_with(&runtime, HashMap::new(), move |paths, cwd, trusted| {
+            let observed = Arc::clone(&observed_by_start);
+            async move {
+                *observed
+                    .lock()
+                    .map_err(|_| HostStartError::Load("observed lock poisoned".to_owned()))? =
+                    Some((paths, cwd, trusted));
+                make_runner(full_snapshot())
+                    .await
+                    .map(|(replacement, _host)| replacement)
+                    .map_err(|error| HostStartError::Load(error.to_string()))
+            }
+        })
+        .await?;
+    {
+        let observed = observed.lock().map_err(|_| "observed lock poisoned")?;
+        let (paths, cwd, trusted) = observed.as_ref().ok_or("restart closure never ran")?;
+        assert_eq!(
+            paths, &discovery,
+            "restart must receive the identical ordered raw discovery paths"
+        );
+        assert_eq!(cwd, "/workspace");
+        assert!(trusted);
+    }
+    replacement.shutdown_once().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn restart_with_zero_successful_endpoints_uses_runner_owned_state() -> R {
+    let temp = tempfile::tempdir()?;
+    let manifest_dir = temp.path().join("compat-ext");
+    std::fs::create_dir_all(&manifest_dir)?;
+    std::fs::write(manifest_dir.join("index.ts"), "export default {}")?;
+    let failed_entry = temp.path().join("missing-ext");
+    let discovery = vec![
+        manifest_dir.to_string_lossy().into_owned(),
+        failed_entry.to_string_lossy().into_owned(),
+    ];
+    // Every endpoint fails to start (Bun unresolvable) and one discovery
+    // entry fails classification: zero endpoints succeed.
+    let runner = HostExtensionRunner::start_classified_with_resolver(
+        discovery.clone(),
+        "/workspace".to_owned(),
+        true,
+        || Err(HostError::NotAFile("bun-unavailable".into())),
+    )
+    .await?;
+    assert!(!runner.is_active());
+    assert_eq!(runner.extension_paths(), discovery);
+    assert_eq!(
+        runner.load_errors().len(),
+        2,
+        "classification and resolution failures must both be retained"
+    );
+
+    let runtime = ModelRuntime::create(CreateModelRuntimeOptions::default()).await?;
+    let observed = Arc::new(Mutex::new(None::<(Vec<String>, String, bool)>));
+    let observed_by_start = Arc::clone(&observed);
+    let replacement = runner
+        .restart_and_rewire_with(&runtime, HashMap::new(), move |paths, cwd, trusted| {
+            let observed = Arc::clone(&observed_by_start);
+            async move {
+                *observed
+                    .lock()
+                    .map_err(|_| HostStartError::Load("observed lock poisoned".to_owned()))? =
+                    Some((paths, cwd, trusted));
+                make_runner(full_snapshot())
+                    .await
+                    .map(|(replacement, _host)| replacement)
+                    .map_err(|error| HostStartError::Load(error.to_string()))
+            }
+        })
+        .await?;
+    {
+        let observed = observed.lock().map_err(|_| "observed lock poisoned")?;
+        let (paths, cwd, trusted) = observed.as_ref().ok_or("restart closure never ran")?;
+        assert_eq!(
+            paths, &discovery,
+            "zero-success restart must still receive the original ordered raw discovery paths"
+        );
+        assert_eq!(cwd, "/workspace");
+        assert!(trusted);
+    }
     replacement.shutdown_once().await;
     Ok(())
 }

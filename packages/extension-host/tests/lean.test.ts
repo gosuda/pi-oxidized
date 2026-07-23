@@ -33,6 +33,7 @@ const FORBIDDEN_ENTRY = join(LEAN_FIXTURES, "forbidden-import.mjs");
 const FACTORY_ENTRY = join(LEAN_FIXTURES, "factory-surface.mjs");
 const FOLD_FIRST_ENTRY = join(LEAN_FIXTURES, "fold-first.mjs");
 const FOLD_SECOND_ENTRY = join(LEAN_FIXTURES, "fold-second.mjs");
+const ROLE_BREAKER_ENTRY = join(LEAN_FIXTURES, "role-breaker.mjs");
 const PRELOAD = resolve(import.meta.dirname, "fixtures", "lean-forbid-compat-graph.ts");
 
 type Marker = { name: string; value: unknown };
@@ -609,6 +610,7 @@ describe("lean: ordered folds", () => {
 			content: ["base", "first", "second"],
 			details: { origin: "base", first: true },
 			isError: false,
+			terminate: true,
 		});
 		expect(markerLog()).toContainEqual({
 			name: "first.tool_result",
@@ -620,16 +622,42 @@ describe("lean: ordered folds", () => {
 				content: ["base", "first"],
 				details: { origin: "base", first: true },
 				isError: true,
+				terminate: true,
 			},
 		});
 		await link.finish();
 	});
 
-	test("message_end: second handler receives the running message", async () => {
-		const link = await foldLink();
-		link.request(43, "message_end", {
-			message: { role: "assistant", content: "base" },
+	test("tool_result: later explicit terminate:false overrides prior true", async () => {
+		const terminateFalseEntry = join(LEAN_FIXTURES, "fold-terminate-false.mjs");
+		const link = new LeanLink({ cwd: PACKAGE_DIR, extensionPaths: [] });
+		await link.hello(1);
+		link.request(2, "extensions.load", {
+			extensionPaths: [FOLD_FIRST_ENTRY, terminateFalseEntry],
+			cwd: PACKAGE_DIR,
 		});
+		await link.response(2, "extensions.load");
+		link.request(45, "tool_result", {
+			toolName: "echo",
+			toolCallId: "call-terminate-false",
+			input: {},
+			content: [],
+			details: {},
+			isError: false,
+		});
+		const res = payload(await link.response(45, "tool_result"));
+		expect(res["terminate"]).toBe(false);
+		expect(markerLog()).toContainEqual({
+			name: "second.tool_result",
+			value: expect.objectContaining({ terminate: true }),
+		});
+		await link.finish();
+	});
+
+	test("message_end: raw payload message folds ordered replacements", async () => {
+		const link = await foldLink();
+		// Rust sends the raw AgentMessage as the payload, not { message }.
+		link.request(43, "message_end", { role: "assistant", content: "base" });
 		const res = payload(await link.response(43, "message_end"));
 		expect(res["message"]).toEqual({ role: "assistant", content: "base|first|second" });
 		expect(markerLog()).toContainEqual({
@@ -640,6 +668,24 @@ describe("lean: ordered folds", () => {
 			name: "second.message_end",
 			value: { role: "assistant", content: "base|first" },
 		});
+		await link.finish();
+	});
+
+	test("message_end: a wrong-role replacement emits an extension error and is ignored", async () => {
+		const link = new LeanLink({ cwd: PACKAGE_DIR, extensionPaths: [] });
+		await link.hello(1);
+		link.request(2, "extensions.load", {
+			extensionPaths: [ROLE_BREAKER_ENTRY],
+			cwd: PACKAGE_DIR,
+		});
+		await link.response(2, "extensions.load");
+		link.request(44, "message_end", { role: "assistant", content: "base" });
+		const res = payload(await link.response(44, "message_end"));
+		expect(res["message"]).toBeUndefined();
+		const errEvent = await link.waitFor(
+			(f) => f.kind === "event" && f.method === "extensionError",
+		);
+		expect(String(payload(errEvent)["message"])).toContain("same role");
 		await link.finish();
 	});
 });
@@ -716,16 +762,47 @@ describe("lean: surface validation units", () => {
 		expect(definition.name).toBe("ok");
 	});
 
+	test("parseLeanExtension validates executionMode before the snapshot", () => {
+		const tool = { name: "t", description: "d", execute: () => ({}) };
+		expect(() => parseLeanExtension({ tools: [tool] })).not.toThrow();
+		expect(() =>
+			parseLeanExtension({ tools: [{ ...tool, executionMode: "sequential" }] })
+		).not.toThrow();
+		expect(() =>
+			parseLeanExtension({ tools: [{ ...tool, executionMode: "parallel" }] })
+		).not.toThrow();
+		expect(() =>
+			parseLeanExtension({ tools: [{ ...tool, executionMode: "serial" }] })
+		).toThrow('executionMode must be "sequential" or "parallel"');
+	});
+
 	test("findExcludedImport detects the compat graph and tolerates clean code", () => {
-		expect(
-			findExcludedImport('import { x } from "@earendil-works/pi-coding-agent/builtins";'),
-		).toBe("@earendil-works/pi-coding-agent/builtins");
-		expect(findExcludedImport('const m = await import("jiti");')).toBe("jiti");
-		expect(findExcludedImport('import "./host.ts";')).toBe("./host.ts");
-		expect(
-			findExcludedImport('import { y } from "@earendil-works/pi-tui-protocol";'),
-		).toBeUndefined();
-		expect(findExcludedImport("export default { name: 'clean' };")).toBeUndefined();
+		// One table witnesses T18 (minified/export forms) and
+		// RB14-import-duplicate (ONE scanner covers every form).
+		const cases: Array<[source: string, expected: string | undefined]> = [
+			// Static import, spaced and minified.
+			['import { x } from "@earendil-works/pi-coding-agent/builtins";', "@earendil-works/pi-coding-agent/builtins"],
+			['import{x}from"@earendil-works/pi-coding-agent/builtins";', "@earendil-works/pi-coding-agent/builtins"],
+			// Named and star re-export, spaced and minified.
+			['export { x } from "jiti";', "jiti"],
+			['export{x}from"jiti";', "jiti"],
+			['export*from"typebox";', "typebox"],
+			['export * from "typebox";', "typebox"],
+			// Dynamic import and side-effect import (spaced and minified).
+			['const m = await import("jiti");', "jiti"],
+			['import "./host.ts";', "./host.ts"],
+			['import"./virtual-modules.ts";', "./virtual-modules.ts"],
+			// Clean graph and keyword-shaped traps stay undetected.
+			['import { y } from "@earendil-works/pi-tui-protocol";', undefined],
+			['import{y}from"@earendil-works/pi-tui-protocol";', undefined],
+			["export default { name: 'clean' };", undefined],
+			["const url = import.meta.url;", undefined],
+			['const important = 1; const exporter = 2; const imports = ["jiti"];', undefined],
+			['obj.import("jiti"); deimport("jiti");', undefined],
+		];
+		for (const [source, expected] of cases) {
+			expect(findExcludedImport(source)).toBe(expected);
+		}
 	});
 
 	test("parseStreamingJson tolerates truncated streams", () => {

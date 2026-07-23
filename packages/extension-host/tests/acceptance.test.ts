@@ -972,6 +972,113 @@ describe("acceptance: extension runtime", () => {
 	});
 });
 
+// ===========================================================================
+// 5b. Wire contract regressions: before_agent_start normalize, accepted load
+// cwd persistence, tool_result input guard
+// ===========================================================================
+
+const messageInjectFactory: ExtensionFactory = (pi) => {
+	pi.on("before_agent_start", () => ({
+		message: { role: "user", content: [{ type: "text", text: "injected" }], timestamp: 1 },
+	}));
+};
+
+describe("acceptance: lifecycle wire contracts", () => {
+	test("before_agent_start injected message crosses the wire as messages[] only", async () => {
+		const { collector, stdin, host, runPromise } = await connectHost([messageInjectFactory]);
+		try {
+			stdin.push(Buffer.from(encodeFrameString({
+				id: 134, kind: "req", method: "before_agent_start",
+				payload: { prompt: "go" },
+			})));
+			const res = await collector.awaitFrame((f) => f.id === 134 && f.kind === "res");
+			const payload = res.payload as Record<string, unknown>;
+			// Rust reads ONLY plural `messages`; the singular key must not survive.
+			expect(Array.isArray(payload["messages"])).toBe(true);
+			expect(payload["messages"]).toHaveLength(1);
+			expect((payload["messages"] as Array<Record<string, unknown>>)[0]).toMatchObject({
+				role: "user",
+			});
+			expect("message" in payload).toBe(false);
+		} finally {
+			stdin.push(null);
+			host.dispose("test");
+			await runPromise.catch(() => void 0);
+		}
+	});
+
+	test("accepted extensions.load cwd persists into later lifecycle contexts", async () => {
+		const { collector, stdin, host, runPromise } = await connectHost([typedHookFactory]);
+		const loadCwd = await mkdtemp(join(tmpdir(), "pi-host-load-cwd-"));
+		try {
+			// Partial load failure on purpose: the accepted cwd must survive it.
+			stdin.push(Buffer.from(encodeFrameString({
+				id: 141, kind: "req", method: "extensions.load",
+				payload: {
+					extensionPaths: [resolve(
+						import.meta.dirname, "..", "fixtures", "extensions", "does-not-exist.ts",
+					)],
+					cwd: loadCwd,
+				},
+			})));
+			const loadRes = await collector.awaitFrame((f) => f.id === 141 && f.kind === "res");
+			expect((loadRes.payload as Record<string, unknown>)["errors"]).toHaveLength(1);
+
+			// typedHookFactory echoes `${systemPrompt}|${systemPromptOptions.cwd}`.
+			stdin.push(Buffer.from(encodeFrameString({
+				id: 142, kind: "req", method: "before_agent_start",
+				payload: { prompt: "go", systemPrompt: "base" },
+			})));
+			const res = await collector.awaitFrame((f) => f.id === 142 && f.kind === "res");
+			expect((res.payload as Record<string, unknown>)["systemPrompt"]).toBe(`base|${loadCwd}`);
+		} finally {
+			stdin.push(null);
+			host.dispose("test");
+			await runPromise.catch(() => void 0);
+			await rm(loadCwd, { recursive: true, force: true });
+		}
+	});
+
+	test("tool_result rejects non-record input; a record reaches the hook", async () => {
+		const { collector, stdin, host, runPromise } = await connectHost([typedHookFactory]);
+		try {
+			const base = { toolName: "read", toolCallId: "tc-guard", content: [], details: {}, isError: false };
+			// Missing key, null, array, and primitive inputs all reject.
+			const rejections: Array<[id: number, present: boolean, input: unknown]> = [
+				[150, false, undefined],
+				[154, true, null],
+				[151, true, []],
+				[152, true, "raw"],
+			];
+			for (const [id, present, input] of rejections) {
+				const payload: Record<string, unknown> = { ...base };
+				if (present) payload["input"] = input;
+				stdin.push(Buffer.from(encodeFrameString({ id, kind: "req", method: "tool_result", payload })));
+				const frame = await collector.awaitFrame(
+					(f) => f.id === id && (f.kind === "error" || f.kind === "res"),
+				);
+				expect(frame.kind).toBe("error");
+				const err = frame.payload as Record<string, unknown>;
+				expect(err["code"]).toBe("extension_error");
+				expect(String(err["message"])).toContain("tool_result.input is required");
+			}
+			// A record input reaches the hook and returns the typed rewrite.
+			stdin.push(Buffer.from(encodeFrameString({
+				id: 153, kind: "req", method: "tool_result",
+				payload: { ...base, input: { path: "x" } },
+			})));
+			const ok = await collector.awaitFrame((f) => f.id === 153 && f.kind === "res");
+			expect((ok.payload as Record<string, unknown>)["content"]).toEqual([
+				{ type: "text", text: "rewritten" },
+			]);
+		} finally {
+			stdin.push(null);
+			host.dispose("test");
+			await runPromise.catch(() => void 0);
+		}
+	});
+});
+
 
 // ===========================================================================
 // 6. Registry snapshot + tool/provider wire contract

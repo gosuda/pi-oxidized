@@ -94,8 +94,17 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  */
 const EXCLUDED_SPECIFIER = /^(?:@earendil-works\/(?:pi-coding-agent|pi-agent-core|pi-ai|pi-tui(?!-protocol))|@mariozechner\/|jiti(?:\/|$)|typebox(?:\/|$)|.*\/(?:host|virtual-modules)\.ts$)/;
 
-/** Static `import … from` / `export … from` / side-effect / dynamic import specifier scan. */
-const IMPORT_SPECIFIER = /(?:import|export)\s[^"'()]*?from\s*["']([^"']+)["']|import\s*\(\s*["']([^"']+)["']\s*\)|import\s*["']([^"']+)["']/g;
+/**
+ * ONE boundary-aware scan over every module-specifier form: static
+ * `import … from` / `export … from` (including minified `import{x}from"…"`,
+ * `export{x}from"…"`, `export*from"…"`), dynamic `import("…")`, and
+ * side-effect `import "…"`. Identifier boundaries reject keyword-like
+ * identifiers (`important`, `exporter`), member calls (`a.import("…")`),
+ * and `import.meta`; quotes/parens/backticks cannot bridge clauses across
+ * statements.
+ */
+const IMPORT_SPECIFIER =
+	/(?<![\w$.])(?:import|export)(?![\w$.])[^"'()`]*?\bfrom\s*["']([^"']+)["']|(?<![\w$.])import(?![\w$.])\s*\(\s*["']([^"']+)["']\s*\)|(?<![\w$.])import(?![\w$.])\s*["']([^"']+)["']/g;
 
 /**
  * Best-effort detection of excluded imports in a prebundled entry. The
@@ -880,6 +889,12 @@ export class LeanRunner {
 							current["isError"] = r["isError"];
 							modified = true;
 						}
+						// Explicit `terminate` folds exactly like the other fields:
+						// omission retains the running value, a later explicit wins.
+						if (r["terminate"] !== undefined) {
+							current["terminate"] = r["terminate"];
+							modified = true;
+						}
 					});
 					await this.client.respond(id, eventType as Method, modified ? current : {});
 					return;
@@ -920,9 +935,11 @@ export class LeanRunner {
 				}
 				case "message_end": {
 					this.clearActiveAssistant();
-					let currentMessage = payload["message"];
+					// Rust sends the raw AgentMessage AS the request payload (no
+					// `{ message }` wrapper); the payload itself is the running value.
+					let currentMessage: unknown = payload;
 					let modified = false;
-					await this.runHooks(eventType, () => ({ type: eventType, ...payload, message: currentMessage }), (r, path) => {
+					await this.runHooks(eventType, () => ({ type: eventType, message: currentMessage }), (r, path) => {
 						if (!isRecord(r) || !isRecord(r["message"])) return;
 						const replacement = r["message"];
 						if (

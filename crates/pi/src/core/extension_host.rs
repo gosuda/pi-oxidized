@@ -26,7 +26,8 @@ use pi_agent::{AfterToolCallResult, AgentMessage, AgentTool, BeforeToolCallResul
 use pi_ai::{AssistantMessage, AssistantMessageEvent, ToolResultContent};
 use pi_ext::adapters::{
     self, CommandRegistration, ExtensionAgentTool, ExtensionProvider, FlagRegistration,
-    ProviderRegistration, Registry, RendererRegistration, ShortcutRegistration, ToolRegistration,
+    ProviderRegistration, Registry, RendererKind, RendererRegistration, ShortcutRegistration,
+    ToolRegistration,
 };
 use pi_ext::client::{
     HandshakePolicy, HostClient, HostClientError, HostEvent, HostUiRequest, HostUiResponse,
@@ -400,9 +401,9 @@ fn build_snapshot(wire: RegistrySnapshotWire, client: &Arc<HostClient>) -> Regis
     for renderer in wire.renderers {
         let _ = snapshot.registry.register_renderer(RendererRegistration {
             kind: match renderer.kind.as_str() {
-                "tool" => adapters::RendererKind::Tool,
-                "widget" => adapters::RendererKind::Widget,
-                _ => adapters::RendererKind::Message,
+                "tool" => RendererKind::Tool,
+                "widget" => RendererKind::Widget,
+                _ => RendererKind::Message,
             },
             name: renderer.name,
         });
@@ -781,9 +782,8 @@ struct Endpoint {
     client: Arc<HostClient>,
     snapshot: RwLock<RegistrySnapshot>,
     flag_values: RwLock<HashMap<String, Value>>,
+    /// Resolved load paths handed to this endpoint's `extensions.load`.
     extension_paths: Vec<String>,
-    load_cwd: String,
-    project_trusted: bool,
     reload_generation: AtomicU64,
     disabled: AtomicBool,
     stale: AtomicBool,
@@ -798,7 +798,7 @@ impl Endpoint {
         client: Arc<HostClient>,
         snapshot: RegistrySnapshot,
         extension_paths: Vec<String>,
-        context: StartContext,
+        context: &StartContext,
     ) -> Self {
         let flag_values = snapshot.flag_values.clone();
         Self {
@@ -807,8 +807,6 @@ impl Endpoint {
             snapshot: RwLock::new(snapshot),
             flag_values: RwLock::new(flag_values),
             extension_paths,
-            load_cwd: context.load_cwd,
-            project_trusted: context.project_trusted,
             reload_generation: AtomicU64::new(1),
             disabled: AtomicBool::new(false),
             stale: AtomicBool::new(false),
@@ -882,6 +880,13 @@ fn error_code(err: &HostClientError) -> &'static str {
 pub struct HostExtensionRunner {
     endpoints: Arc<[Arc<Endpoint>]>,
     aggregate: Arc<AggregateState>,
+    /// Original discovery paths in input order, including entries that
+    /// failed classification and never produced an endpoint.
+    discovery_paths: Vec<String>,
+    /// Load working directory accepted at runner construction.
+    load_cwd: String,
+    /// Project-trust flag accepted at runner construction.
+    project_trusted: bool,
 }
 
 /// Spawn program selected by the classified endpoint mode. Native plans carry
@@ -901,6 +906,12 @@ struct EndpointPlan {
     program: EndpointProgram,
     paths: Vec<String>,
     diagnostic_path: String,
+    /// Whether this Bun host loads the compact built-in extensions. Exactly
+    /// one compat plan — the first in original plan order — is designated
+    /// the builtins owner; every later compat Bun host is spawned with
+    /// `--no-builtins`. Ownership is fixed at classification time and never
+    /// promoted to another plan when the owner host fails.
+    load_builtins: bool,
 }
 
 impl EndpointPlan {
@@ -939,14 +950,15 @@ fn current_target_triple() -> String {
 }
 
 fn classify_endpoint_plans(
-    extension_paths: Vec<String>,
+    extension_paths: &[String],
 ) -> (Vec<EndpointPlan>, Vec<(String, String)>) {
     let target = current_target_triple();
     let mut plans: Vec<EndpointPlan> = Vec::new();
     let mut errors = Vec::new();
     let mut contiguous = false;
-    for (index, path) in extension_paths.into_iter().enumerate() {
-        match classify_extension(Path::new(&path), &target) {
+    let mut builtins_owned = false;
+    for (index, path) in extension_paths.iter().enumerate() {
+        match classify_extension(Path::new(path), &target) {
             Ok(classified) => {
                 let load_path =
                     if classified.mode == ExtensionMode::Compat && classified.manifest.is_none() {
@@ -963,6 +975,8 @@ fn classify_endpoint_plans(
                     plan.paths.push(load_path);
                     continue;
                 }
+                let load_builtins = classified.mode == ExtensionMode::Compat && !builtins_owned;
+                builtins_owned |= load_builtins;
                 plans.push(EndpointPlan {
                     id: index as u64,
                     mode: classified.mode,
@@ -972,12 +986,13 @@ fn classify_endpoint_plans(
                         EndpointProgram::Bun
                     },
                     paths: vec![load_path],
-                    diagnostic_path: path,
+                    diagnostic_path: path.clone(),
+                    load_builtins,
                 });
                 contiguous = true;
             }
             Err(error) => {
-                errors.push((path, error.to_string()));
+                errors.push((path.clone(), error.to_string()));
                 contiguous = false;
             }
         }
@@ -1077,19 +1092,25 @@ impl HostExtensionRunner {
         project_trusted: bool,
         hook_timeout: Duration,
     ) -> Result<Arc<Self>, HostStartError> {
+        let context = StartContext {
+            load_cwd: load_cwd.into(),
+            project_trusted,
+            hook_timeout,
+        };
         let endpoint = Self::connect_endpoint(
             0,
             client,
-            extension_paths,
-            &StartContext {
-                load_cwd: load_cwd.into(),
-                project_trusted,
-                hook_timeout,
-            },
+            extension_paths.clone(),
+            &context,
             HandshakePolicy::Compat,
         )
         .await?;
-        Ok(Self::from_endpoints(vec![endpoint], Vec::new()))
+        Ok(Self::from_endpoints(
+            vec![endpoint],
+            Vec::new(),
+            extension_paths,
+            &context,
+        ))
     }
 
     async fn connect_endpoint(
@@ -1112,18 +1133,23 @@ impl HostExtensionRunner {
             client,
             snapshot,
             extension_paths,
-            context.clone(),
+            context,
         )))
     }
 
     fn from_endpoints(
         endpoints: Vec<Arc<Endpoint>>,
         startup_errors: Vec<(String, String)>,
+        discovery_paths: Vec<String>,
+        context: &StartContext,
     ) -> Arc<Self> {
         let aggregate = Arc::new(AggregateState::new(endpoints.len(), startup_errors));
         let runner = Arc::new(Self {
             endpoints: endpoints.into(),
             aggregate: Arc::clone(&aggregate),
+            discovery_paths,
+            load_cwd: context.load_cwd.clone(),
+            project_trusted: context.project_trusted,
         });
         for endpoint in runner.endpoints.iter() {
             spawn_event_pump(Arc::clone(endpoint), Arc::clone(&aggregate));
@@ -1144,11 +1170,25 @@ impl HostExtensionRunner {
             project_trusted: false,
             hook_timeout,
         };
-        let futures = clients.into_iter().map(|(id, client, paths)| {
-            Self::connect_endpoint(id, client, paths, &context, HandshakePolicy::Compat)
-        });
+        let mut discovery_paths = Vec::new();
+        let mut futures = Vec::with_capacity(clients.len());
+        for (id, client, paths) in clients {
+            discovery_paths.extend(paths.iter().cloned());
+            futures.push(Self::connect_endpoint(
+                id,
+                client,
+                paths,
+                &context,
+                HandshakePolicy::Compat,
+            ));
+        }
         let endpoints = futures::future::try_join_all(futures).await?;
-        Ok(Self::from_endpoints(endpoints, Vec::new()))
+        Ok(Self::from_endpoints(
+            endpoints,
+            Vec::new(),
+            discovery_paths,
+            &context,
+        ))
     }
 
     async fn start_classified(
@@ -1174,7 +1214,7 @@ impl HostExtensionRunner {
     where
         F: FnOnce() -> Result<HostSpec, HostError>,
     {
-        let (plans, mut errors) = classify_endpoint_plans(extension_paths);
+        let (plans, mut errors) = classify_endpoint_plans(&extension_paths);
         let bun_spec = if plans.iter().any(|plan| plan.mode != ExtensionMode::Native) {
             resolve_bun().map(Some).map_err(|error| error.to_string())
         } else {
@@ -1208,6 +1248,9 @@ impl HostExtensionRunner {
                     .map(|mut spec| {
                         if plan.mode == ExtensionMode::Lean {
                             spec.args.push("--lean".to_owned());
+                        }
+                        if plan.mode == ExtensionMode::Compat && !plan.load_builtins {
+                            spec.args.push("--no-builtins".to_owned());
                         }
                         spec
                     }),
@@ -1253,7 +1296,12 @@ impl HostExtensionRunner {
                 Err(error) => errors.push(error),
             }
         }
-        Ok(Self::from_endpoints(endpoints, errors))
+        Ok(Self::from_endpoints(
+            endpoints,
+            errors,
+            extension_paths,
+            &context,
+        ))
     }
 
     async fn finish_startup(
@@ -1313,13 +1361,11 @@ impl HostExtensionRunner {
         })
     }
 
-    /// Extension paths in true endpoint/path order.
+    /// Original discovery paths in input order, including entries that
+    /// failed classification and never produced an endpoint.
     #[must_use]
     pub fn extension_paths(&self) -> Vec<String> {
-        self.endpoints
-            .iter()
-            .flat_map(|endpoint| endpoint.extension_paths.iter().cloned())
-            .collect()
+        self.discovery_paths.clone()
     }
 
     /// Per-path load, classification, startup, and cross-endpoint collision diagnostics.
@@ -1679,7 +1725,12 @@ impl HostExtensionRunner {
         Ok(())
     }
 
-    /// Execute a shortcut on its first-owning endpoint.
+    /// Execute a shortcut on its last raw-owning endpoint.
+    ///
+    /// Shortcut execution is last-wins across endpoints: the reverse scan
+    /// finds the final endpoint whose raw shortcut registrations carry `key`,
+    /// and a dead last owner yields `NotRunning` with no fallback to an older
+    /// duplicate. (Command/tool/provider routing stays first-wins.)
     ///
     /// # Errors
     ///
@@ -1690,20 +1741,21 @@ impl HostExtensionRunner {
         key: impl Into<String>,
     ) -> Result<ShortcutExecuteResponse, HostClientError> {
         let key = key.into();
-        let endpoint = self
-            .first_owner(|snapshot| {
-                snapshot
-                    .registry
-                    .shortcuts()
-                    .iter()
-                    .any(|item| item.key == key)
-            })
-            .or_else(|| {
-                (self.endpoints.len() == 1)
-                    .then(|| self.endpoints.first())
-                    .flatten()
-            })
-            .ok_or(HostClientError::NotRunning)?;
+        let endpoint =
+            self.endpoints
+                .iter()
+                .rev()
+                .find(|endpoint| {
+                    endpoint.snapshot.read().is_ok_and(|snapshot| {
+                        snapshot.raw_shortcuts.iter().any(|item| item.key == key)
+                    })
+                })
+                .or_else(|| {
+                    (self.endpoints.len() == 1)
+                        .then(|| self.endpoints.first())
+                        .flatten()
+                })
+                .ok_or(HostClientError::NotRunning)?;
         if !endpoint.active() {
             return Err(HostClientError::NotRunning);
         }
@@ -1835,6 +1887,11 @@ impl HostExtensionRunner {
 
     /// Fold terminal input rewrites in endpoint order and stop when consumed.
     ///
+    /// One shared 4ms deadline bounds the whole keypress: before each active
+    /// endpoint the remaining budget is computed, a zero remainder stops the
+    /// dispatch (later endpoints stay uncontacted), and the remainder is
+    /// handed to that endpoint's request.
+    ///
     /// # Errors
     ///
     /// With a single endpoint, returns the `terminalInput` RPC failure; with
@@ -1846,6 +1903,7 @@ impl HostExtensionRunner {
     ) -> Result<protocol::TerminalInputResult, HostClientError> {
         let mut current = data.to_owned();
         let mut transformed = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(4);
         for endpoint in self.endpoints.iter() {
             if !endpoint.active()
                 || !endpoint
@@ -1855,12 +1913,16 @@ impl HostExtensionRunner {
             {
                 continue;
             }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
             let result = endpoint
                 .client
                 .request(
                     protocol::Method::TerminalInput,
                     serde_json::json!({ "data": current }),
-                    Duration::from_millis(4),
+                    remaining,
                 )
                 .await
                 .and_then(|frame| {
@@ -2063,6 +2125,11 @@ impl HostExtensionRunner {
     }
 
     /// Render extension tool HTML on the first-owning endpoint.
+    ///
+    /// Ownership: the endpoint registering the tool itself wins; otherwise
+    /// only a renderer whose name matches AND whose kind is
+    /// [`RendererKind::Tool`] qualifies — same-named widget/message renderers
+    /// never receive `tool.renderHtml`.
     pub async fn render_extension_tool_html(
         &self,
         phase: ToolRenderPhase,
@@ -2072,11 +2139,9 @@ impl HostExtensionRunner {
         let endpoint = self
             .first_owner(|snapshot| {
                 snapshot.registry.tool(tool_name).is_some()
-                    || snapshot
-                        .registry
-                        .renderers()
-                        .iter()
-                        .any(|renderer| renderer.name == tool_name)
+                    || snapshot.registry.renderers().iter().any(|renderer| {
+                        renderer.name == tool_name && renderer.kind == RendererKind::Tool
+                    })
             })
             .or_else(|| {
                 (self.endpoints.len() == 1)
@@ -2154,16 +2219,9 @@ impl HostExtensionRunner {
         Fut: std::future::Future<Output = Result<Arc<Self>, HostStartError>>,
     {
         self.unregister_providers_from(runtime);
-        let paths = self.extension_paths();
-        let load_cwd = self
-            .endpoints
-            .first()
-            .map(|endpoint| endpoint.load_cwd.clone())
-            .unwrap_or_default();
-        let project_trusted = self
-            .endpoints
-            .first()
-            .is_some_and(|endpoint| endpoint.project_trusted);
+        let paths = self.discovery_paths.clone();
+        let load_cwd = self.load_cwd.clone();
+        let project_trusted = self.project_trusted;
         let _ = self.reload().await;
         let replacement = start(paths, load_cwd, project_trusted).await?;
         let preserved_flags = preserved_flags

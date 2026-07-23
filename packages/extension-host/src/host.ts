@@ -806,19 +806,22 @@ export class ExtensionHost {
 					});
 					return;
 				}
-				case "tool_result":
+				case "tool_result": {
+					const input = payload["input"];
+					if (!isRecord(input)) throw new Error("tool_result.input is required");
 					result = await runner.emitToolResult({
 						type: eventType,
 						toolName: String(payload["toolName"] ?? ""),
 						toolCallId: String(payload["toolCallId"] ?? ""),
-						input: payload["input"],
+						input,
 						content: payload["content"],
 						details: payload["details"],
 						isError: payload["isError"] === true,
 					} as Parameters<typeof runner.emitToolResult>[0]);
 					await this.client.respond(id, eventType as Method, result ?? {});
 					return;
-				case "before_agent_start":
+				}
+				case "before_agent_start": {
 					result = await runner.emitBeforeAgentStart(
 						String(payload["prompt"] ?? ""),
 						payload["images"] as Parameters<typeof runner.emitBeforeAgentStart>[1],
@@ -829,8 +832,26 @@ export class ExtensionHost {
 							: this.sessionState.systemPrompt,
 						{ cwd: this.loadOptions?.cwd ?? process.cwd() },
 					);
-					await this.client.respond(id, eventType as Method, result ?? {});
+					// Wire normalize: Rust reads ONLY plural `messages` (plus
+					// `systemPrompt`). A compat runner result carrying singular
+					// `message` is translated to `messages: [message]`; the singular
+					// key never crosses the wire.
+					const normalized: Record<string, unknown> = {};
+					if (isRecord(result)) {
+						const plural = result["messages"];
+						const singular = result["message"];
+						if (Array.isArray(plural)) {
+							normalized["messages"] = plural;
+						} else if (singular !== undefined && singular !== null) {
+							normalized["messages"] = [singular];
+						}
+						if (result["systemPrompt"] !== undefined) {
+							normalized["systemPrompt"] = result["systemPrompt"];
+						}
+					}
+					await this.client.respond(id, eventType as Method, normalized);
 					return;
+				}
 				case "message_end":
 					this.clearActiveAssistant();
 					result = await runner.emitMessageEnd({ type: eventType, ...payload });
@@ -1020,6 +1041,14 @@ export class ExtensionHost {
 			return;
 		}
 		this.projectTrusted = projectTrusted;
+		// The accepted load cwd becomes the host cwd BEFORE the rebuild: later
+		// lifecycle and render contexts observe it even when individual
+		// extension loads fail.
+		this.loadOptions = {
+			cwd,
+			extensionPaths: this.loadOptions?.extensionPaths ?? [],
+			factories: this.loadOptions?.factories ?? [],
+		};
 
 		const eventBus = createEventBus();
 

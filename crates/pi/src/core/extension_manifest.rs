@@ -183,6 +183,10 @@ pub enum ManifestErrorKind {
         /// Target triples present in the manifest.
         available: Vec<String>,
     },
+    /// Lean entry is not a prebundled `.mjs` file (case-sensitive check on
+    /// the resolved entry path).
+    #[error("lean entries must be prebundled .mjs files (manifest runtime \"ts-lean\")")]
+    LeanEntryNotPrebundled,
 }
 
 /// Classify one discovered extension path for `target`.
@@ -197,7 +201,8 @@ pub enum ManifestErrorKind {
 /// Returns a typed [`ManifestError`] for filesystem failures and any
 /// strict-schema violation: unknown fields, wrong schema, blank name,
 /// non-semver version, unknown runtime, protocol mismatch, malformed or
-/// uncontained entries, and target maps missing the requested platform.
+/// uncontained entries, target maps missing the requested platform, and
+/// lean entries that are not prebundled `.mjs` files.
 pub fn classify_extension(path: &Path, target: &str) -> Result<ClassifiedExtension, ManifestError> {
     let metadata = std::fs::metadata(path)
         .map_err(|error| ManifestError::new(path, ManifestErrorKind::Io(error.to_string())))?;
@@ -252,6 +257,14 @@ fn classify_directory(path: &Path, target: &str) -> Result<ClassifiedExtension, 
     };
     let manifest = parse_manifest(&manifest_path, &text)?;
     let entry = resolve_entry(&manifest_path, &root, &manifest.entry, target)?;
+    if manifest.mode == ExtensionMode::Lean
+        && entry.extension() != Some(std::ffi::OsStr::new("mjs"))
+    {
+        return Err(ManifestError::new(
+            &manifest_path,
+            ManifestErrorKind::LeanEntryNotPrebundled,
+        ));
+    }
     Ok(ClassifiedExtension {
         mode: manifest.mode,
         root,
@@ -544,8 +557,8 @@ mod tests {
         let dir = extension_dir(
             &temp,
             "lean-ext",
-            &manifest_json("lean-ext", "ts-lean", "\"dist/main.ts\""),
-            &["dist/main.ts"],
+            &manifest_json("lean-ext", "ts-lean", "\"dist/main.mjs\""),
+            &["dist/main.mjs"],
         )?;
         let classified = classify_extension(&dir, TARGET)?;
         assert_eq!(classified.mode, ExtensionMode::Lean);
@@ -558,9 +571,101 @@ mod tests {
         );
         assert_eq!(
             classified.entry,
-            std::fs::canonicalize(dir.join("dist/main.ts"))?
+            std::fs::canonicalize(dir.join("dist/main.mjs"))?
         );
         assert!(classified.entry.starts_with(&classified.root));
+        Ok(())
+    }
+
+    #[test]
+    fn lean_scalar_entry_must_be_prebundled_mjs() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let dir = extension_dir(
+            &temp,
+            "lean-ts",
+            &manifest_json("lean-ts", "ts-lean", "\"dist/main.ts\""),
+            &["dist/main.ts"],
+        )?;
+        let error = classify_extension(&dir, TARGET)
+            .err()
+            .ok_or("expected lean .mjs rejection")?;
+        assert_eq!(error.kind(), &ManifestErrorKind::LeanEntryNotPrebundled);
+        assert!(
+            error.to_string().contains(
+                "lean entries must be prebundled .mjs files (manifest runtime \"ts-lean\")"
+            ),
+            "loader diagnostic missing from Display: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lean_target_map_entry_must_be_prebundled_mjs() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let entry = format!("{{\"{TARGET}\":\"dist/main.ts\"}}");
+        let dir = extension_dir(
+            &temp,
+            "lean-map-ts",
+            &manifest_json("lean-map-ts", "ts-lean", &entry),
+            &["dist/main.ts"],
+        )?;
+        let kind = expect_kind(classify_extension(&dir, TARGET))?;
+        assert_eq!(kind, ManifestErrorKind::LeanEntryNotPrebundled);
+        Ok(())
+    }
+
+    #[test]
+    fn lean_target_map_mjs_entry_is_accepted() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let entry = format!("{{\"{TARGET}\":\"./dist/main.mjs\"}}");
+        let dir = extension_dir(
+            &temp,
+            "lean-map-mjs",
+            &manifest_json("lean-map-mjs", "ts-lean", &entry),
+            &["dist/main.mjs"],
+        )?;
+        let classified = classify_extension(&dir, TARGET)?;
+        assert_eq!(classified.mode, ExtensionMode::Lean);
+        assert_eq!(
+            classified.entry,
+            std::fs::canonicalize(dir.join("dist/main.mjs"))?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lean_uppercase_mjs_extension_is_rejected() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let dir = extension_dir(
+            &temp,
+            "lean-upper",
+            &manifest_json("lean-upper", "ts-lean", "\"dist/main.MJS\""),
+            &["dist/main.MJS"],
+        )?;
+        let kind = expect_kind(classify_extension(&dir, TARGET))?;
+        assert_eq!(kind, ManifestErrorKind::LeanEntryNotPrebundled);
+        Ok(())
+    }
+
+    #[test]
+    fn lean_extensionless_entry_must_be_prebundled_mjs() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let dir = extension_dir(
+            &temp,
+            "lean-extensionless",
+            &manifest_json("lean-extensionless", "ts-lean", "\"dist/main\""),
+            &["dist/main"],
+        )?;
+        let error = classify_extension(&dir, TARGET)
+            .err()
+            .ok_or("expected lean extensionless rejection")?;
+        assert_eq!(error.kind(), &ManifestErrorKind::LeanEntryNotPrebundled);
+        assert!(
+            error.to_string().contains(
+                "lean entries must be prebundled .mjs files (manifest runtime \"ts-lean\")"
+            ),
+            "loader diagnostic missing from Display: {error}"
+        );
         Ok(())
     }
 

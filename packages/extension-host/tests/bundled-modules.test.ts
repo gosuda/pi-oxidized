@@ -29,14 +29,14 @@ type LeanStages = {
  * compiled binary; a boolean flag would hide which mode a call site drives.
  */
 type HostMode =
-	| { mode: "compat"; env?: Record<string, string> }
+	| { mode: "compat"; builtins?: boolean; env?: Record<string, string> }
 	| { mode: "lean"; compatibilityVersion: string; env?: Record<string, string> };
 
 async function loadExtension(
 	hostPath: string,
 	cwd: string,
 	extensionPath: string,
-	options: { mode: "compat"; env?: Record<string, string> },
+	options: { mode: "compat"; builtins?: boolean; env?: Record<string, string> },
 ): Promise<Record<string, unknown>>;
 async function loadExtension(
 	hostPath: string,
@@ -52,7 +52,11 @@ async function loadExtension(
 ): Promise<Record<string, unknown>> {
 	const { promise, resolve: resolvePromise, reject: rejectPromise } =
 		Promise.withResolvers<Record<string, unknown>>();
-	const argv = options.mode === "lean" ? ["--lean", "--cwd", cwd] : ["--cwd", cwd];
+	const argv = options.mode === "lean"
+		? ["--lean", "--cwd", cwd]
+		: options.builtins === false
+			? ["--cwd", cwd, "--no-builtins"]
+			: ["--cwd", cwd];
 	const child = spawn(hostPath, argv, {
 		cwd,
 		stdio: ["pipe", "pipe", "pipe"],
@@ -241,6 +245,30 @@ if (__compatGraphProbe) {
 ${source}`,
 						};
 					});
+					// Builtins import-site probe: the builtins module also reaches the
+					// binary through the static virtual-modules graph, so module
+					// evaluation cannot discriminate. Instrumenting main.ts's dynamic
+					// import CALL SITE records exactly the --no-builtins branch.
+					builder.onLoad(
+						{ filter: /[\\/]extension-host[\\/]src[\\/]main\.ts$/ },
+						async ({ path }) => {
+							const source = await Bun.file(path).text();
+							const needle = 'import("@earendil-works/pi-coding-agent/builtins")';
+							if (!source.includes(needle)) {
+								throw new Error("main.ts builtins import site not found");
+							}
+							return {
+								loader: "ts",
+								contents: `
+import { writeFileSync as __writeBuiltinsImportProbe } from "node:fs";
+function __builtinsImportProbe(): void {
+	const __probePath = process.env["PI_EXTENSION_HOST_BUILTINS_PROBE"];
+	if (__probePath) __writeBuiltinsImportProbe(__probePath, "builtins:imported\\n", { flag: "wx" });
+}
+${source.replace(needle, `(__builtinsImportProbe(), ${needle})`)}`,
+							};
+						},
+					);
 				},
 			}],
 		});
@@ -354,5 +382,41 @@ export default (pi) => pi.registerTool(tool);
 		});
 		expect(lean.load["errors"]).toEqual([]);
 		expect(existsSync(leanMarker)).toBe(false);
+	});
+
+	test("--no-builtins omits llama from the snapshot and never evaluates the builtins module", async () => {
+		const extensionPath = join(archiveRoot, "extensions", "bundled.ts");
+
+		// Disabled: the snapshot carries the loaded extension but no llama
+		// provider/command, and the builtins probe file stays unwritten.
+		const disabledMarker = join(archiveRoot, "builtins-disabled.marker");
+		const disabled = await loadExtension(hostPath, outsideCwd, extensionPath, {
+			mode: "compat",
+			builtins: false,
+			env: { PI_EXTENSION_HOST_BUILTINS_PROBE: disabledMarker },
+		});
+		expect(disabled["errors"]).toEqual([]);
+		expect(disabled["tools"]).toEqual(expect.arrayContaining([
+			expect.objectContaining({ name: "bundled" }),
+		]));
+		const disabledProviders = disabled["providers"] as Array<Record<string, unknown>>;
+		expect(disabledProviders.some((p) => p["name"] === "llama.cpp")).toBe(false);
+		const disabledCommands = disabled["commands"] as Array<Record<string, unknown>>;
+		expect(disabledCommands.some((c) => c["name"] === "llama")).toBe(false);
+		expect(existsSync(disabledMarker)).toBe(false);
+
+		// Positive control: without the flag the builtins module evaluates and
+		// llama registers, proving the probe and snapshot assertions have teeth.
+		const enabledMarker = join(archiveRoot, "builtins-enabled.marker");
+		const enabled = await loadExtension(hostPath, outsideCwd, extensionPath, {
+			mode: "compat",
+			env: { PI_EXTENSION_HOST_BUILTINS_PROBE: enabledMarker },
+		});
+		expect(enabled["errors"]).toEqual([]);
+		const enabledProviders = enabled["providers"] as Array<Record<string, unknown>>;
+		expect(enabledProviders.some((p) => p["name"] === "llama.cpp")).toBe(true);
+		const enabledCommands = enabled["commands"] as Array<Record<string, unknown>>;
+		expect(enabledCommands.some((c) => c["name"] === "llama")).toBe(true);
+		expect(existsSync(enabledMarker)).toBe(true);
 	});
 });
