@@ -860,6 +860,7 @@ fn error_code(err: &HostClientError) -> &'static str {
         HostClientError::Spawn { .. } => "extension_spawn",
         HostClientError::NotRunning => "extension_not_running",
         HostClientError::Payload(_) => "extension_payload",
+        HostClientError::StreamOverflow { .. } => "extension_stream_overflow",
     }
 }
 
