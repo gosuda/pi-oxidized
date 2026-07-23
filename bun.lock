@@ -4,9 +4,6 @@
   "workspaces": {
     "": {
       "name": "pi-oxidized",
-      "dependencies": {
-        "ignore": "7.0.5",
-      },
       "devDependencies": {
         "@types/bun": "1.3.9",
         "typescript": "5.9.3",
@@ -26,7 +23,6 @@
         "@earendil-works/pi-coding-agent": "file:../../.references/pi/packages/coding-agent",
         "@earendil-works/pi-tui": "file:../../.references/pi/packages/tui",
         "@types/bun": "1.3.9",
-        "typebox": "1.1.38",
         "typescript": "5.9.3",
       },
     },
