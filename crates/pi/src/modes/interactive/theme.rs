@@ -2020,6 +2020,159 @@ mod tests {
         Ok(())
     }
 
+    /// Golden: every semantic slot in the built-in dark (and light) palette.
+    ///
+    /// Values are the authoritative RGB triples from `assets/theme/{dark,light}.json`.
+    /// Changing any single color in those files must fail these tests.
+    fn assert_palette(theme: &ResolvedTheme, fg: &[(ThemeColor, Rgb)], bg: &[(ThemeBg, Rgb)]) {
+        assert_eq!(
+            fg.len(),
+            ALL_FG.len(),
+            "{}: golden fg must cover every ThemeColor",
+            theme.name
+        );
+        assert_eq!(
+            bg.len(),
+            ALL_BG.len(),
+            "{}: golden bg must cover every ThemeBg",
+            theme.name
+        );
+        for (i, &(slot, rgb)) in fg.iter().enumerate() {
+            assert_eq!(slot, ALL_FG[i], "{}: golden fg order", theme.name);
+            assert_eq!(theme.fg_rgb(slot), rgb, "{} fg {slot:?}", theme.name);
+        }
+        for (i, &(slot, rgb)) in bg.iter().enumerate() {
+            assert_eq!(slot, ALL_BG[i], "{}: golden bg order", theme.name);
+            assert_eq!(theme.bg_rgb(slot), rgb, "{} bg {slot:?}", theme.name);
+        }
+    }
+
+    #[test]
+    fn dark_palette_pins_every_semantic_color() {
+        assert_palette(
+            &dark(),
+            &[
+                (ThemeColor::Accent, Rgb(82, 168, 255)),
+                (ThemeColor::Border, Rgb(69, 69, 69)),
+                (ThemeColor::BorderAccent, Rgb(0, 114, 245)),
+                (ThemeColor::BorderMuted, Rgb(46, 46, 46)),
+                (ThemeColor::Success, Rgb(98, 192, 115)),
+                (ThemeColor::Error, Rgb(255, 97, 102)),
+                (ThemeColor::Warning, Rgb(255, 178, 36)),
+                (ThemeColor::Muted, Rgb(237, 237, 237)),
+                (ThemeColor::Dim, Rgb(161, 161, 161)),
+                (ThemeColor::Text, Rgb(237, 237, 237)),
+                (ThemeColor::ThinkingText, Rgb(237, 237, 237)),
+                (ThemeColor::UserMessageText, Rgb(237, 237, 237)),
+                (ThemeColor::CustomMessageText, Rgb(237, 237, 237)),
+                (ThemeColor::CustomMessageLabel, Rgb(10, 199, 180)),
+                (ThemeColor::ToolTitle, Rgb(82, 168, 255)),
+                (ThemeColor::ToolOutput, Rgb(237, 237, 237)),
+                (ThemeColor::MdHeading, Rgb(82, 168, 255)),
+                (ThemeColor::MdLink, Rgb(82, 168, 255)),
+                (ThemeColor::MdLinkUrl, Rgb(161, 161, 161)),
+                (ThemeColor::MdCode, Rgb(10, 199, 180)),
+                (ThemeColor::MdCodeBlock, Rgb(237, 237, 237)),
+                (ThemeColor::MdCodeBlockBorder, Rgb(46, 46, 46)),
+                (ThemeColor::MdQuote, Rgb(237, 237, 237)),
+                (ThemeColor::MdQuoteBorder, Rgb(69, 69, 69)),
+                (ThemeColor::MdHr, Rgb(46, 46, 46)),
+                (ThemeColor::MdListBullet, Rgb(82, 168, 255)),
+                (ThemeColor::ToolDiffAdded, Rgb(98, 192, 115)),
+                (ThemeColor::ToolDiffRemoved, Rgb(255, 97, 102)),
+                (ThemeColor::ToolDiffContext, Rgb(237, 237, 237)),
+                (ThemeColor::SyntaxComment, Rgb(161, 161, 161)),
+                (ThemeColor::SyntaxKeyword, Rgb(82, 168, 255)),
+                (ThemeColor::SyntaxFunction, Rgb(255, 178, 36)),
+                (ThemeColor::SyntaxVariable, Rgb(237, 237, 237)),
+                (ThemeColor::SyntaxString, Rgb(98, 192, 115)),
+                (ThemeColor::SyntaxNumber, Rgb(242, 162, 13)),
+                (ThemeColor::SyntaxType, Rgb(10, 199, 180)),
+                (ThemeColor::SyntaxOperator, Rgb(161, 161, 161)),
+                (ThemeColor::SyntaxPunctuation, Rgb(161, 161, 161)),
+                (ThemeColor::ThinkingOff, Rgb(161, 161, 161)),
+                (ThemeColor::ThinkingMinimal, Rgb(161, 161, 161)),
+                (ThemeColor::ThinkingLow, Rgb(82, 168, 255)),
+                (ThemeColor::ThinkingMedium, Rgb(10, 199, 180)),
+                (ThemeColor::ThinkingHigh, Rgb(242, 162, 13)),
+                (ThemeColor::ThinkingXhigh, Rgb(255, 97, 102)),
+                (ThemeColor::ThinkingMax, Rgb(255, 97, 102)),
+                (ThemeColor::BashMode, Rgb(255, 178, 36)),
+            ],
+            &[
+                (ThemeBg::SelectedBg, Rgb(41, 41, 41)),
+                (ThemeBg::UserMessageBg, Rgb(26, 26, 26)),
+                (ThemeBg::CustomMessageBg, Rgb(15, 28, 46)),
+                (ThemeBg::ToolPendingBg, Rgb(26, 26, 26)),
+                (ThemeBg::ToolSuccessBg, Rgb(11, 34, 18)),
+                (ThemeBg::ToolErrorBg, Rgb(42, 19, 20)),
+            ],
+        );
+    }
+
+    #[test]
+    fn light_palette_pins_every_semantic_color() {
+        assert_palette(
+            &light(),
+            &[
+                (ThemeColor::Accent, Rgb(0, 114, 245)),
+                (ThemeColor::Border, Rgb(201, 201, 201)),
+                (ThemeColor::BorderAccent, Rgb(0, 114, 245)),
+                (ThemeColor::BorderMuted, Rgb(235, 235, 235)),
+                (ThemeColor::Success, Rgb(69, 165, 87)),
+                (ThemeColor::Error, Rgb(229, 72, 77)),
+                (ThemeColor::Warning, Rgb(163, 82, 0)),
+                (ThemeColor::Muted, Rgb(77, 77, 77)),
+                (ThemeColor::Dim, Rgb(143, 143, 143)),
+                (ThemeColor::Text, Rgb(23, 23, 23)),
+                (ThemeColor::ThinkingText, Rgb(77, 77, 77)),
+                (ThemeColor::UserMessageText, Rgb(23, 23, 23)),
+                (ThemeColor::CustomMessageText, Rgb(23, 23, 23)),
+                (ThemeColor::CustomMessageLabel, Rgb(6, 122, 110)),
+                (ThemeColor::ToolTitle, Rgb(0, 104, 214)),
+                (ThemeColor::ToolOutput, Rgb(77, 77, 77)),
+                (ThemeColor::MdHeading, Rgb(0, 104, 214)),
+                (ThemeColor::MdLink, Rgb(0, 104, 214)),
+                (ThemeColor::MdLinkUrl, Rgb(143, 143, 143)),
+                (ThemeColor::MdCode, Rgb(189, 40, 100)),
+                (ThemeColor::MdCodeBlock, Rgb(77, 77, 77)),
+                (ThemeColor::MdCodeBlockBorder, Rgb(235, 235, 235)),
+                (ThemeColor::MdQuote, Rgb(77, 77, 77)),
+                (ThemeColor::MdQuoteBorder, Rgb(201, 201, 201)),
+                (ThemeColor::MdHr, Rgb(235, 235, 235)),
+                (ThemeColor::MdListBullet, Rgb(0, 104, 214)),
+                (ThemeColor::ToolDiffAdded, Rgb(41, 122, 58)),
+                (ThemeColor::ToolDiffRemoved, Rgb(203, 42, 47)),
+                (ThemeColor::ToolDiffContext, Rgb(77, 77, 77)),
+                (ThemeColor::SyntaxComment, Rgb(143, 143, 143)),
+                (ThemeColor::SyntaxKeyword, Rgb(0, 104, 214)),
+                (ThemeColor::SyntaxFunction, Rgb(120, 32, 188)),
+                (ThemeColor::SyntaxVariable, Rgb(23, 23, 23)),
+                (ThemeColor::SyntaxString, Rgb(41, 122, 58)),
+                (ThemeColor::SyntaxNumber, Rgb(163, 82, 0)),
+                (ThemeColor::SyntaxType, Rgb(6, 122, 110)),
+                (ThemeColor::SyntaxOperator, Rgb(77, 77, 77)),
+                (ThemeColor::SyntaxPunctuation, Rgb(77, 77, 77)),
+                (ThemeColor::ThinkingOff, Rgb(168, 168, 168)),
+                (ThemeColor::ThinkingMinimal, Rgb(77, 77, 77)),
+                (ThemeColor::ThinkingLow, Rgb(0, 104, 214)),
+                (ThemeColor::ThinkingMedium, Rgb(6, 122, 110)),
+                (ThemeColor::ThinkingHigh, Rgb(163, 82, 0)),
+                (ThemeColor::ThinkingXhigh, Rgb(203, 42, 47)),
+                (ThemeColor::ThinkingMax, Rgb(203, 42, 47)),
+                (ThemeColor::BashMode, Rgb(163, 82, 0)),
+            ],
+            &[
+                (ThemeBg::SelectedBg, Rgb(230, 230, 230)),
+                (ThemeBg::UserMessageBg, Rgb(242, 242, 242)),
+                (ThemeBg::CustomMessageBg, Rgb(240, 247, 255)),
+                (ThemeBg::ToolPendingBg, Rgb(242, 242, 242)),
+                (ThemeBg::ToolSuccessBg, Rgb(239, 251, 239)),
+                (ThemeBg::ToolErrorBg, Rgb(255, 240, 240)),
+            ],
+        );
+    }
+
     #[test]
     fn theme_pair_parsing_follows_upstream() {
         assert_eq!(
