@@ -1046,7 +1046,7 @@ pub struct FlagSnapshotEntry {
     /// Human-readable description.
     #[serde(default)]
     pub description: String,
-    /// Flag type tag (`boolean`, `string`, and so on).
+    /// Flag type tag (`boolean` or `string`).
     #[serde(default, rename = "type")]
     pub kind: String,
     /// Registering extension path.
@@ -1058,6 +1058,50 @@ pub struct FlagSnapshotEntry {
     /// Current value, when set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<FlagValueWire>,
+}
+
+impl FlagSnapshotEntry {
+    /// Validate `type` and that optional default/value match it.
+    ///
+    /// Mirrors the TypeScript host contract: `type` must be `boolean` or
+    /// `string`, and a present default/value must use that JSON shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError::InvalidFrame`] when the kind is unknown or a
+    /// present default/value has the wrong variant.
+    pub fn validate(&self) -> Result<()> {
+        let expect_boolean = match self.kind.as_str() {
+            "boolean" => true,
+            "string" => false,
+            other => {
+                return Err(ProtocolError::InvalidFrame(format!(
+                    "flag type must be \"boolean\" or \"string\", got {other:?}"
+                )));
+            }
+        };
+        Self::validate_typed_value("default", self.default.as_ref(), expect_boolean)?;
+        Self::validate_typed_value("value", self.value.as_ref(), expect_boolean)?;
+        Ok(())
+    }
+
+    fn validate_typed_value(
+        field: &str,
+        value: Option<&FlagValueWire>,
+        expect_boolean: bool,
+    ) -> Result<()> {
+        match value {
+            None => Ok(()),
+            Some(FlagValueWire::Boolean(_)) if expect_boolean => Ok(()),
+            Some(FlagValueWire::String(_)) if !expect_boolean => Ok(()),
+            Some(_) => {
+                let expected = if expect_boolean { "boolean" } else { "string" };
+                Err(ProtocolError::InvalidFrame(format!(
+                    "flag {field} must be a {expected} for type \"{expected}\""
+                )))
+            }
+        }
+    }
 }
 
 /// Renderer entry in the `extensions.load` snapshot.
@@ -1153,6 +1197,21 @@ pub struct RegistrySnapshot {
     /// Per-path load errors.
     #[serde(default)]
     pub errors: Vec<LoadErrorEntry>,
+}
+
+impl RegistrySnapshot {
+    /// Validate every registered CLI flag entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError::InvalidFrame`] when any flag fails
+    /// [`FlagSnapshotEntry::validate`].
+    pub fn validate(&self) -> Result<()> {
+        for flag in &self.flags {
+            flag.validate()?;
+        }
+        Ok(())
+    }
 }
 
 /// Payload for [`FLAGS_SET_METHOD`].
@@ -2385,6 +2444,7 @@ mod tests {
         assert_eq!(snapshot.renderers[0].kind, "");
         assert!(!snapshot.providers[0].stream_simple);
         assert_eq!(snapshot.errors[0].error, "broken");
+        snapshot.validate()?;
 
         let encoded = serde_json::to_value(snapshot)?;
         assert_eq!(
@@ -2393,6 +2453,75 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn registry_snapshot_flag_kind_value_cross_check() -> TestResult {
+        let boolean_with_string_default: FlagSnapshotEntry = serde_json::from_value(
+            serde_json::json!({"name": "f", "type": "boolean", "default": "true"}),
+        )?;
+        assert!(matches!(
+            boolean_with_string_default.validate(),
+            Err(ProtocolError::InvalidFrame(_))
+        ));
+
+        let string_with_boolean_value: FlagSnapshotEntry = serde_json::from_value(
+            serde_json::json!({"name": "f", "type": "string", "value": true}),
+        )?;
+        assert!(matches!(
+            string_with_boolean_value.validate(),
+            Err(ProtocolError::InvalidFrame(_))
+        ));
+
+        let unknown_kind: FlagSnapshotEntry =
+            serde_json::from_value(serde_json::json!({"name": "f", "type": "number"}))?;
+        assert!(matches!(
+            unknown_kind.validate(),
+            Err(ProtocolError::InvalidFrame(_))
+        ));
+
+        let valid_boolean: FlagSnapshotEntry = serde_json::from_value(serde_json::json!({
+            "name": "bool-default",
+            "type": "boolean",
+            "default": false,
+            "value": true
+        }))?;
+        valid_boolean.validate()?;
+
+        let valid_string: FlagSnapshotEntry = serde_json::from_value(serde_json::json!({
+            "name": "string-default",
+            "type": "string",
+            "default": "",
+            "value": "x"
+        }))?;
+        valid_string.validate()?;
+
+        let omitted_boolean: FlagSnapshotEntry =
+            serde_json::from_value(serde_json::json!({"name": "bool-omitted", "type": "boolean"}))?;
+        omitted_boolean.validate()?;
+
+        let omitted_string: FlagSnapshotEntry = serde_json::from_value(
+            serde_json::json!({"name": "string-omitted", "type": "string"}),
+        )?;
+        omitted_string.validate()?;
+
+        let good: RegistrySnapshot = serde_json::from_value(serde_json::json!({
+            "flags": [
+                {"name": "b", "type": "boolean", "default": false},
+                {"name": "s", "type": "string"}
+            ]
+        }))?;
+        good.validate()?;
+
+        let bad: RegistrySnapshot = serde_json::from_value(serde_json::json!({
+            "flags": [{"name": "f", "type": "boolean", "default": "true"}]
+        }))?;
+        assert!(matches!(
+            bad.validate(),
+            Err(ProtocolError::InvalidFrame(_))
+        ));
+        Ok(())
+    }
+
     #[test]
     fn theme_wire_payloads_roundtrip_with_json_color_vocabulary() -> TestResult {
         let mut fg = BTreeMap::new();
