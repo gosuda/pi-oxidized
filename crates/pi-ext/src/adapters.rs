@@ -212,6 +212,13 @@ impl AgentTool for ExtensionAgentTool {
                 .open_stream_raw(methods::TOOL_EXECUTE, payload, 64)
                 .await
                 .map_err(tool_error)?;
+            // Bound only the pre-first-decoded-event wait with one absolute
+            // deadline. Unknown/malformed frames are skipped and must not reset
+            // that deadline (a fresh per-wait timeout would let junk spam keep
+            // the call alive forever); after the first decoded toolUpdate (or
+            // stream end / terminal), inter-event gaps are unbounded.
+            let mut seen_event = false;
+            let deadline = tokio::time::Instant::now() + timeout;
             loop {
                 tokio::select! {
                     biased;
@@ -219,9 +226,30 @@ impl AgentTool for ExtensionAgentTool {
                         let _ = stream.cancel(methods::TOOL_CANCEL).await;
                         return Err(ToolError::new("extension tool cancelled"));
                     }
-                    ev = stream.next_event() => match ev {
-                        Some(frame) => forward_tool_update(&frame, &updates),
-                        None => break,
+                    ev = async {
+                        if seen_event {
+                            Ok(stream.next_event().await)
+                        } else {
+                            tokio::time::timeout_at(deadline, stream.next_event()).await
+                        }
+                    } => match ev {
+                        Ok(Some(frame)) => {
+                            if forward_tool_update(&frame, &updates) {
+                                seen_event = true;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(_) => {
+                            // Absolute pre-first-event deadline — do not wait
+                            // for finish (a late terminal inside that window
+                            // would otherwise look like a clean completion).
+                            let err = tool_error(crate::client::HostClientError::Timeout {
+                                id: stream.id(),
+                                timeout,
+                            });
+                            let _ = stream.cancel(methods::TOOL_CANCEL).await;
+                            return Err(err);
+                        }
                     }
                 }
             }
@@ -240,12 +268,17 @@ fn decode_tool_args(frame: &Frame, phase: &str) -> Result<Map<String, Value>, To
         .ok_or_else(|| ToolError::new(format!("extension tool {phase} returned invalid args")))
 }
 
-fn forward_tool_update(frame: &Frame, updates: &ToolUpdates) {
+/// Forward a decoded `toolUpdate` partial result. Returns `true` when the
+/// frame was a valid update (disarms the pre-first-event deadline).
+fn forward_tool_update(frame: &Frame, updates: &ToolUpdates) -> bool {
     if let Ok(update) = from_payload::<ToolUpdate>(&frame.payload)
         && let Ok(partial) =
             serde_json::from_value::<AgentToolResult>(update.partial_result.clone())
     {
         updates.send(partial);
+        true
+    } else {
+        false
     }
 }
 
@@ -1247,6 +1280,179 @@ mod tests {
             err.to_string().contains("cancelled"),
             "unexpected cancel error: {err}"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn extension_tool_hung_host_hits_first_event_deadline() -> R {
+        let (client, mut host) = make_pair().await;
+        let tool = ExtensionAgentTool::new(reg_tool("ext.hung"), Arc::new(client))
+            .with_timeout(Duration::from_millis(50));
+        let exec_fut = tool.execute(
+            "call-hung",
+            Map::new(),
+            CancellationToken::new(),
+            ToolUpdates::noop(),
+        );
+        let driver = tokio::spawn(exec_fut);
+        let req = host.require_frame(methods::TOOL_EXECUTE).await?;
+        let req_id = req.id;
+
+        // Host: no events; late terminal at 80ms sits inside a finish(50ms)
+        // window that would begin at the 50ms idle expiry. Then observe cancel.
+        let host_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            host.write_frame(&Frame::response(
+                req_id,
+                Method::Notify,
+                serde_json::json!({
+                    "content": [{"type":"text","text":"late"}],
+                    "details": {},
+                }),
+            ))
+            .await
+            .map_err(|e| e.to_string())?;
+            let cancel = tokio::time::timeout(
+                Duration::from_secs(2),
+                host.require_frame(methods::TOOL_CANCEL),
+            )
+            .await
+            .map_err(|_| "TOOL_CANCEL not received".to_owned())?
+            .map_err(|e| e.to_string())?;
+            Ok::<_, String>(cancel)
+        });
+
+        let result = tokio::time::timeout(Duration::from_secs(2), driver)
+            .await
+            .map_err(|_| "hung host exceeded outer guard")??;
+        let err = match result {
+            Err(err) => err,
+            Ok(value) => {
+                return Err(format!("hung host must time out, got {value:?}").into());
+            }
+        };
+        assert!(
+            err.to_string().contains("timed out after 50ms"),
+            "unexpected: {err}"
+        );
+
+        let cancel = host_task.await??;
+        assert_eq!(cancel.method, methods::TOOL_CANCEL);
+        assert_eq!(cancel.payload["id"], req_id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn extension_tool_junk_spam_hits_absolute_first_event_deadline() -> R {
+        let (client, mut host) = make_pair().await;
+        let timeout = Duration::from_millis(100);
+        let tool =
+            ExtensionAgentTool::new(reg_tool("ext.junk"), Arc::new(client)).with_timeout(timeout);
+        let started = tokio::time::Instant::now();
+        let exec_fut = tool.execute(
+            "call-junk",
+            Map::new(),
+            CancellationToken::new(),
+            ToolUpdates::noop(),
+        );
+        let driver = tokio::spawn(exec_fut);
+        let req = host.require_frame(methods::TOOL_EXECUTE).await?;
+        let req_id = req.id;
+
+        // Undecodable frames faster than `timeout` forever: a fresh per-wait
+        // timeout would keep the call alive; the absolute deadline must not.
+        let host_task = tokio::spawn(async move {
+            loop {
+                if host
+                    .write_frame(&Frame::event(
+                        req_id,
+                        Method::ToolUpdate,
+                        serde_json::json!({"not": "a-tool-update"}),
+                    ))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        let result = tokio::time::timeout(Duration::from_secs(2), driver)
+            .await
+            .map_err(|_| "junk-spam exceeded outer guard (fresh per-wait timeout?)")??;
+        let elapsed = started.elapsed();
+        let err = match result {
+            Err(err) => err,
+            Ok(value) => {
+                return Err(format!("junk-spam must time out, got {value:?}").into());
+            }
+        };
+        assert!(
+            err.to_string().contains("timed out after 100ms"),
+            "unexpected: {err}"
+        );
+        assert!(
+            elapsed < timeout * 2,
+            "deadline must be absolute from execute start, elapsed={elapsed:?} timeout={timeout:?}"
+        );
+
+        host_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn extension_tool_post_first_event_gaps_are_unbounded() -> R {
+        let (client, mut host) = make_pair().await;
+        let tool = ExtensionAgentTool::new(reg_tool("ext.sparse"), Arc::new(client))
+            .with_timeout(Duration::from_millis(50));
+        let exec_fut = tool.execute(
+            "call-sparse",
+            Map::new(),
+            CancellationToken::new(),
+            ToolUpdates::noop(),
+        );
+        let driver = tokio::spawn(exec_fut);
+        let req = host.require_frame(methods::TOOL_EXECUTE).await?;
+
+        let partial = serde_json::json!({
+            "content": [{"type":"text","text":"half"}],
+            "details": {},
+        });
+        host.write_frame(&Frame::event(
+            req.id,
+            Method::ToolUpdate,
+            serde_json::json!({
+                "toolCallId": "call-sparse",
+                "toolName": "ext.sparse",
+                "partialResult": partial,
+            }),
+        ))
+        .await?;
+        // Gap strictly > 2× `with_timeout` so a per-wait gap timeout would
+        // expire before the terminal (collapsed → Timeout; current → Ok).
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        host.write_frame(&Frame::response(
+            req.id,
+            Method::Notify,
+            serde_json::json!({
+                "content": [{"type":"text","text":"done"}],
+                "details": {"ok": true},
+            }),
+        ))
+        .await?;
+
+        let result = tokio::time::timeout(Duration::from_secs(2), driver)
+            .await
+            .map_err(|_| "post-first-event gap exceeded outer guard")???;
+        assert_eq!(
+            result.content.iter().find_map(|block| match block {
+                pi_ai::ToolResultContent::Text(text) => Some(text.text.as_str()),
+                pi_ai::ToolResultContent::Image(_) => None,
+            }),
+            Some("done")
+        );
+        assert_eq!(result.details["ok"], true);
         Ok(())
     }
 
