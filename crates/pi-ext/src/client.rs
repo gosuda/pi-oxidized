@@ -50,6 +50,9 @@ pub const OUTBOUND_CAPACITY: usize = 128;
 pub const EVENT_CAPACITY: usize = 256;
 /// Default bounded capacity for per-call streaming event channels.
 pub const STREAM_EVENT_CAPACITY: usize = 64;
+/// Provider ingress is 16 times the default consumer channel, absorbing large
+/// bursts while keeping a stalled call's retained memory strictly bounded.
+const PROVIDER_FORWARD_CAPACITY: usize = 16 * STREAM_EVENT_CAPACITY;
 /// Grace period before killing the host on shutdown.
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 /// Default handshake timeout.
@@ -75,8 +78,13 @@ struct PendingEntry {
 enum PendingStream {
     /// Tool progress is explicitly lossy: stale updates may be discarded.
     Lossy(mpsc::Sender<Frame>),
-    /// Provider events enter a per-call forwarding task and are never discarded.
-    Lossless(mpsc::UnboundedSender<Frame>),
+    /// Provider events enter a bounded per-call forwarding task. Saturation
+    /// fails and cancels only this call rather than blocking the shared reader.
+    Lossless {
+        ingress: mpsc::Sender<Frame>,
+        cancel_tx: Option<mpsc::Sender<Frame>>,
+        cancel_method: &'static str,
+    },
 }
 
 /// A typed, correlated UI request initiated by the TypeScript host.
@@ -243,6 +251,14 @@ pub enum HostClientError {
     Cancelled {
         /// Frame id.
         id: FrameId,
+    },
+    /// A lossless stream's bounded ingress queue was exhausted.
+    #[error("host stream {id} exceeded its {capacity}-event forwarding capacity")]
+    StreamOverflow {
+        /// Frame id of the overflowing call.
+        id: FrameId,
+        /// Maximum queued provider events.
+        capacity: usize,
     },
     /// Host stream closed (EOF or write failure).
     #[error("host closed: {message} (stderr: {stderr})")]
@@ -614,11 +630,9 @@ impl HostClient {
         let bound = event_bound.clamp(1, STREAM_EVENT_CAPACITY * 8);
         let (terminal_tx, terminal_rx) = oneshot::channel::<FrameResult>();
         let (stream_tx, stream_rx) = mpsc::channel::<Frame>(bound);
+        let cmd_tx = self.cmd_tx.lock().await.clone();
         let stream = if method == "provider.stream" {
-            let (forward_tx, mut forward_rx) = mpsc::unbounded_channel::<Frame>();
-            // The shared reader must never await one slow call. This call-local
-            // task preserves provider event order while applying backpressure
-            // only between this stream and its consumer.
+            let (forward_tx, mut forward_rx) = mpsc::channel::<Frame>(PROVIDER_FORWARD_CAPACITY);
             tokio::spawn(async move {
                 while let Some(frame) = forward_rx.recv().await {
                     if stream_tx.send(frame).await.is_err() {
@@ -626,7 +640,11 @@ impl HostClient {
                     }
                 }
             });
-            PendingStream::Lossless(forward_tx)
+            PendingStream::Lossless {
+                ingress: forward_tx,
+                cancel_tx: cmd_tx.clone(),
+                cancel_method: "provider.cancel",
+            }
         } else {
             PendingStream::Lossy(stream_tx)
         };
@@ -652,7 +670,7 @@ impl HostClient {
             events: stream_rx,
             terminal: Some(terminal_rx),
             shared: Arc::clone(&self.shared),
-            cmd_tx: self.cmd_tx.lock().await.clone(),
+            cmd_tx,
             runtime: tokio::runtime::Handle::current(),
             cancel_method: cancel_method_for(method),
             cancel_sent: false,
@@ -1200,9 +1218,29 @@ fn forward_stream_event(shared: &Shared, frame: Frame) {
             PendingStream::Lossy(stream) => {
                 let _ = stream.try_send(frame);
             }
-            PendingStream::Lossless(stream) => {
-                let _ = stream.send(frame);
-            }
+            PendingStream::Lossless {
+                ingress,
+                cancel_tx,
+                cancel_method,
+            } => match ingress.try_send(frame) {
+                Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    if let Some(entry) = take_pending(shared, id) {
+                        if let Some(terminal) = entry.terminal {
+                            let _ = terminal.send(Err(HostClientError::StreamOverflow {
+                                id,
+                                capacity: PROVIDER_FORWARD_CAPACITY,
+                            }));
+                        }
+                        if let Some(cancel_tx) = cancel_tx {
+                            let cancel = cancel_frame(id, cancel_method);
+                            tokio::spawn(async move {
+                                let _ = cancel_tx.send(cancel).await;
+                            });
+                        }
+                    }
+                }
+            },
         }
     }
 }
@@ -2080,6 +2118,73 @@ mod tests {
             )
             .await;
         assert!(matches!(result, Err(HostClientError::NotRunning)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_stream_overflow_is_explicit_cancelled_and_call_local() -> R {
+        const FORWARD_CAPACITY: u64 = 1024;
+
+        let (client, mut host) = make_pair().await;
+        let client = Arc::new(client);
+        let provider = client
+            .open_stream_raw("provider.stream", serde_json::json!({}), 1)
+            .await?;
+        let provider_request = host.read_frame().await.ok_or("no provider request")?;
+
+        for n in 0..=FORWARD_CAPACITY + 2 {
+            host.write_frame(&Frame::event(
+                provider_request.id,
+                Method::ProviderEvent,
+                serde_json::json!({"n": n}),
+            ))
+            .await?;
+        }
+
+        let concurrent_client = Arc::clone(&client);
+        let concurrent = tokio::spawn(async move {
+            concurrent_client
+                .request_raw(
+                    "concurrent.call",
+                    serde_json::json!({}),
+                    Duration::from_secs(2),
+                )
+                .await
+        });
+
+        let mut cancel = None;
+        let mut concurrent_request = None;
+        while cancel.is_none() || concurrent_request.is_none() {
+            let frame = tokio::time::timeout(Duration::from_secs(2), host.read_frame())
+                .await?
+                .ok_or("host pipe closed before overflow handling")?;
+            if frame.method == "provider.cancel" {
+                cancel = Some(frame);
+            } else if frame.method == "concurrent.call" {
+                concurrent_request = Some(frame);
+            }
+        }
+        let cancel = cancel.ok_or("missing provider cancel")?;
+        assert_eq!(cancel.payload["id"], provider_request.id);
+
+        let concurrent_request = concurrent_request.ok_or("missing concurrent request")?;
+        host.write_frame(&Frame::response(
+            concurrent_request.id,
+            Method::Notify,
+            serde_json::json!({"done": true}),
+        ))
+        .await?;
+        let concurrent_terminal =
+            tokio::time::timeout(Duration::from_millis(500), concurrent).await???;
+        assert_eq!(concurrent_terminal.payload["done"], true);
+
+        assert!(matches!(
+            provider.finish(Duration::from_secs(2)).await,
+            Err(HostClientError::StreamOverflow {
+                id,
+                capacity: 1024
+            }) if id == provider_request.id
+        ));
         Ok(())
     }
 }
