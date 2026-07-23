@@ -213,12 +213,15 @@ describe("ChildHost malformed stdout", () => {
 			expect(stderrEncoded).toBeDefined();
 			const stdoutSnippet = JSON.parse(stdoutEncoded!) as string;
 			const stderrSnippet = JSON.parse(stderrEncoded!) as string;
-			// DIAGNOSTIC_STDOUT_PREFIX_CHARS (512) + ellipsis marker "…"
-			expect(stdoutSnippet.length).toBeLessThanOrEqual(513);
+			// DIAGNOSTIC_STDOUT_PREFIX_CHARS (512) + ellipsis marker "…" — pin from below
+			// so lowering the cap fails (upper-bound-only would still pass at 64).
+			expect(stdoutSnippet.length).toBe(513);
 			expect(stdoutSnippet.endsWith("…")).toBe(true);
 			expect(stdoutSnippet.startsWith(hostileStdout.slice(0, 32))).toBe(true);
-			// stderrTail is capped at 4096 before diagnosticSnippet(..., 4096).
-			expect(stderrSnippet.length).toBeLessThanOrEqual(4096);
+			// stderrTail is capped at 4096 before diagnosticSnippet(..., 4096); fixture
+			// exceeds that, so the decoded snippet must be exactly the cap (no ellipsis
+			// when length === maxChars). Pin from below so lowering the cap fails.
+			expect(stderrSnippet.length).toBe(4096);
 			expect(stderrSnippet.endsWith("stderr-context-tail")).toBe(true);
 			expect(unhandled).toEqual([]);
 		} finally {
