@@ -158,7 +158,7 @@ impl AgentSession {
             return original;
         };
 
-        // Normalize null/missing content for typed roles (TS untyped-handler guard).
+        // Normalize missing content on untyped `custom` replacements (TS guard).
         replacement = normalize_replacement(replacement);
 
         // Update live agent transcript when the tail is the assistant being replaced.
