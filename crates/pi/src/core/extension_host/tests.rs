@@ -1105,10 +1105,94 @@ fn classified_runs_preserve_compat_lean_compat_interleaving() -> R {
 }
 
 /// Closest testable surface for the spawn-time `--no-builtins` push: argv of
-/// the Bun HostSpecs built inside `start_classified_with_resolver`. Classify
+/// the Bun `HostSpec`s built inside `start_classified_with_resolver`. Classify
 /// only sets `load_builtins`; the flag is attached when cloning the resolved
-/// HostSpec just before `HostClient::spawn`, so a fake host that records its
-/// argv is what would go red if that push were deleted.
+/// `HostSpec` just before `HostClient::spawn`, so a fake host that records its
+/// argv is what would go red if that push were deleted or polarity-inverted.
+///
+/// Captures are keyed by the extension path each plan loads (from the
+/// `extensions.load` request), not by spawn order — `join_all` makes argv
+/// collection order nondeterministic across endpoints.
+#[cfg(unix)]
+fn write_record_argv_host(script: &Path) -> R {
+    std::fs::write(
+        script,
+        format!(
+            r#"#!/bin/sh
+dir="$1"
+shift
+printf '%s\n' "$*" > "$dir/$$.argv"
+IFS= read -r request || exit 10
+printf '%s\n' '{{"id":1,"kind":"res","method":"hello","payload":{{"protocolVersion":{protocol},"compatibilityVersion":"{compat}"}}}}'
+IFS= read -r request || exit 11
+printf '%s\n' "$request" > "$dir/$$.load"
+printf '%s\n' '{{"id":2,"kind":"res","method":"extensions.load","payload":{{}}}}'
+while IFS= read -r request; do
+  case "$request" in
+    *'"method":"shutdown"'*) exit 0 ;;
+  esac
+done
+"#,
+            protocol = pi_ext::protocol::PROTOCOL_VERSION,
+            compat = pi_ext::protocol::COMPATIBILITY_VERSION,
+        ),
+    )?;
+    let mut permissions = std::fs::metadata(script)?.permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(script, permissions)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn collect_argv_by_extension_path(argv_dir: &Path) -> Result<HashMap<String, Vec<String>>, BoxErr> {
+    let mut recorded = HashMap::new();
+    for entry in std::fs::read_dir(argv_dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("argv") {
+            continue;
+        }
+        let stem = path
+            .file_stem()
+            .ok_or("argv capture missing stem")?
+            .to_string_lossy();
+        let flags = std::fs::read_to_string(&path)?
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let load_frame: Value = serde_json::from_str(&std::fs::read_to_string(
+            argv_dir.join(format!("{stem}.load")),
+        )?)?;
+        let extension_paths = load_frame
+            .get("payload")
+            .and_then(|payload| payload.get("extensionPaths"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("extensions.load missing extensionPaths: {load_frame}"))?;
+        assert_eq!(
+            extension_paths.len(),
+            1,
+            "each Bun plan loads exactly one path, got {extension_paths:?}"
+        );
+        let plan_path = extension_paths[0]
+            .as_str()
+            .ok_or("extension path was not a string")?
+            .to_owned();
+        assert!(
+            recorded.insert(plan_path.clone(), flags).is_none(),
+            "duplicate argv capture for plan path {plan_path}"
+        );
+    }
+    Ok(recorded)
+}
+
+#[cfg(unix)]
+fn assert_argv_flag(flags: &[String], flag: &str, expect: bool, label: &str) {
+    let present = flags.iter().any(|item| item == flag);
+    assert_eq!(
+        present, expect,
+        "{label}: expected `{flag}` present={expect}, got {flags:?}"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn classified_compat_hosts_pass_no_builtins_only_to_non_owners() -> R {
@@ -1134,23 +1218,14 @@ async fn classified_compat_hosts_pass_no_builtins_only_to_non_owners() -> R {
         lean_b.to_string_lossy().into_owned(),
         compat_c.to_string_lossy().into_owned(),
     ];
+    let lean_entry = std::fs::canonicalize(lean_b.join("index.mjs"))?
+        .to_string_lossy()
+        .into_owned();
 
     let argv_dir = temp.path().join("argv");
     std::fs::create_dir_all(&argv_dir)?;
     let script = temp.path().join("record-argv-host.sh");
-    std::fs::write(
-        &script,
-        concat!(
-            "#!/bin/sh\n",
-            "dir=\"$1\"\n",
-            "shift\n",
-            "printf '%s\\n' \"$*\" > \"$dir/$$.argv\"\n",
-            "exit 1\n",
-        ),
-    )?;
-    let mut permissions = std::fs::metadata(&script)?.permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&script, permissions)?;
+    write_record_argv_host(&script)?;
 
     let runner = HostExtensionRunner::start_classified_with_resolver(
         discovery,
@@ -1173,48 +1248,30 @@ async fn classified_compat_hosts_pass_no_builtins_only_to_non_owners() -> R {
     )
     .await?;
 
-    let mut recorded: Vec<Vec<String>> = Vec::new();
-    for entry in std::fs::read_dir(&argv_dir)? {
-        let entry = entry?;
-        let raw = std::fs::read_to_string(entry.path())?;
-        let flags = raw
-            .split_whitespace()
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        recorded.push(flags);
-    }
+    let recorded = collect_argv_by_extension_path(&argv_dir)?;
     assert_eq!(
         recorded.len(),
         3,
         "expected one argv capture per Bun endpoint plan, got {recorded:?}"
     );
 
-    let compat_argvs = recorded
-        .iter()
-        .filter(|flags| !flags.iter().any(|flag| flag == "--lean"))
-        .cloned()
-        .collect::<Vec<_>>();
-    assert_eq!(
-        compat_argvs.len(),
-        2,
-        "compat-lean-compat must yield two compat Bun argvs: {recorded:?}"
-    );
-    let owners = compat_argvs
-        .iter()
-        .filter(|flags| !flags.iter().any(|flag| flag == "--no-builtins"))
-        .count();
-    let non_owners = compat_argvs
-        .iter()
-        .filter(|flags| flags.iter().any(|flag| flag == "--no-builtins"))
-        .count();
-    assert_eq!(
-        owners, 1,
-        "exactly one compat HostSpec.args must omit --no-builtins (the builtins owner): {recorded:?}"
-    );
-    assert_eq!(
-        non_owners, 1,
-        "every non-owner compat HostSpec.args must include --no-builtins: {recorded:?}"
-    );
+    let owner = recorded
+        .get(compat_a.to_string_lossy().as_ref())
+        .ok_or_else(|| format!("missing owner compat argv: {recorded:?}"))?;
+    assert_argv_flag(owner, "--no-builtins", false, "builtins owner compat");
+    assert_argv_flag(owner, "--lean", false, "builtins owner compat");
+
+    let non_owner = recorded
+        .get(compat_c.to_string_lossy().as_ref())
+        .ok_or_else(|| format!("missing non-owner compat argv: {recorded:?}"))?;
+    assert_argv_flag(non_owner, "--no-builtins", true, "non-owner compat");
+    assert_argv_flag(non_owner, "--lean", false, "non-owner compat");
+
+    let lean = recorded
+        .get(&lean_entry)
+        .ok_or_else(|| format!("missing lean argv for {lean_entry}: {recorded:?}"))?;
+    assert_argv_flag(lean, "--lean", true, "lean plan");
+    assert_argv_flag(lean, "--no-builtins", false, "lean plan");
 
     runner.shutdown_once().await;
     Ok(())
