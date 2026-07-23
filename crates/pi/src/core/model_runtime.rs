@@ -2724,6 +2724,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auth_header_without_key_errors() -> Result<(), ModelRuntimeError> {
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "openai".to_owned(),
+            ProviderConfigInput {
+                auth_header: Some(true),
+                ..ProviderConfigInput::default()
+            },
+        );
+        // Isolated auth env: status-only marker yields AuthResult without api_key.
+        let mut env = ProviderEnv::new();
+        env.insert("OPENAI_API_KEY".into(), AMBIENT_AUTH_MARKER.into());
+        let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
+            credentials: Some(Arc::new(InMemoryCredentialStore::new())),
+            models_store: Some(Arc::new(InMemoryModelsStore::new())),
+            models_config: Some(ModelsJsonConfig::from_providers(providers)),
+            allow_model_network: Some(false),
+            auth_env: Some(env),
+            ..CreateModelRuntimeOptions::default()
+        })
+        .await?;
+        let error = match runtime
+            .get_auth_for_provider("openai", ModelRuntimeAuthOverrides::default())
+            .await
+        {
+            Err(error) => error,
+            Ok(value) => {
+                return Err(ModelRuntimeError::Registration(format!(
+                    "expected authHeader missing-key error, got {value:?}"
+                )));
+            }
+        };
+        match error {
+            ModelRuntimeError::Models(models) => {
+                assert_eq!(models.code, ModelsErrorCode::Auth);
+                assert_eq!(models.message(), "authHeader requires a resolved API key");
+            }
+            other => {
+                return Err(ModelRuntimeError::Registration(format!(
+                    "expected Models error, got {other}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn expired_oauth_refreshes_via_resolver() -> Result<(), Box<dyn std::error::Error>> {
         #[derive(Clone)]
         struct FakeOauth {
