@@ -1231,6 +1231,7 @@ mod tests {
         assert_eq!(prepare_calls.load(Ordering::SeqCst), 1);
         assert_eq!(stop_calls.load(Ordering::SeqCst), 1);
         assert_eq!(follow_up_polls.load(Ordering::SeqCst), 0);
+        assert_eq!(steering_polls.load(Ordering::SeqCst), 2);
         assert_eq!(
             &event_types(&events)[events.len() - 5..],
             [
