@@ -206,9 +206,20 @@ describe("ChildHost malformed stdout", () => {
 			// Prefixes are present but bounded/escaped (JSON string encoding + truncation).
 			expect(message).toContain("\\u0000");
 			expect(message).toContain("stderr-context-tail");
-			expect(message.length).toBeLessThan(20_000);
-			expect(message).not.toContain(hostileStdout);
-			expect(message).not.toContain(hostileStderr);
+			// Extract JSON-encoded diagnostic snippets (diagnosticSnippet in lean-scaling.ts).
+			const stdoutEncoded = /stdout: ("(?:[^"\\]|\\.)*")/.exec(message)?.[1];
+			const stderrEncoded = /stderr: ("(?:[^"\\]|\\.)*")/.exec(message)?.[1];
+			expect(stdoutEncoded).toBeDefined();
+			expect(stderrEncoded).toBeDefined();
+			const stdoutSnippet = JSON.parse(stdoutEncoded!) as string;
+			const stderrSnippet = JSON.parse(stderrEncoded!) as string;
+			// DIAGNOSTIC_STDOUT_PREFIX_CHARS (512) + ellipsis marker "…"
+			expect(stdoutSnippet.length).toBeLessThanOrEqual(513);
+			expect(stdoutSnippet.endsWith("…")).toBe(true);
+			expect(stdoutSnippet.startsWith(hostileStdout.slice(0, 32))).toBe(true);
+			// stderrTail is capped at 4096 before diagnosticSnippet(..., 4096).
+			expect(stderrSnippet.length).toBeLessThanOrEqual(4096);
+			expect(stderrSnippet.endsWith("stderr-context-tail")).toBe(true);
 			expect(unhandled).toEqual([]);
 		} finally {
 			process.off("uncaughtException", trackUnhandled);
