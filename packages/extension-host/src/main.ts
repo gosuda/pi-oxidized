@@ -66,7 +66,11 @@ async function main(): Promise<void> {
 		// lean graph must stay the only graph evaluated in this mode.
 		const { LeanRunner } = await import("./lean-runner.ts");
 		const runner = new LeanRunner(process.stdin, new StdoutSink());
-		await runner.run({ cwd, extensionPaths });
+		try {
+			await runner.run({ cwd, extensionPaths });
+		} finally {
+			runner.dispose();
+		}
 		return;
 	}
 	// Dynamic import is required: the compat graph (host + upstream builtins)
