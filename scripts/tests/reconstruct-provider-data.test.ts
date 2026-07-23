@@ -298,3 +298,72 @@ describe("reconstructProviderData transaction (Cluster C)", () => {
 		expect(siblingArtifacts(REAL_PROVIDERS_DIR)).toEqual([]);
 	}, 120_000);
 });
+
+describe("reconstructProviderData default inversion proof path gating (P2)", () => {
+	test("custom paths without an explicit inversionProof fail fast with a clear error", async () => {
+		const catalog: ProviderCatalog = {
+			alpha: { model: { id: "model" } },
+		};
+		const fixture = makeFixture(catalog);
+		try {
+			await expect(
+				reconstructProviderData({
+					repoRoot: fixture.root,
+					catalogPath: fixture.catalogPath,
+					providersDir: fixture.providersDir,
+					dataDir: fixture.dataDir,
+				}),
+			).rejects.toThrow(
+				/default inversion proof only covers repository default paths.*explicit inversionProof.*custom paths/,
+			);
+			// Fail-fast: no publish, no leftover siblings.
+			expect(snapshotDir(fixture.dataDir)).toBeNull();
+			expect(siblingArtifacts(fixture.providersDir)).toEqual([]);
+		} finally {
+			rmSync(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	test("custom paths with an explicit inversionProof run that proof", async () => {
+		const catalog: ProviderCatalog = {
+			alpha: { model: { id: "model", v: 1 } },
+		};
+		const fixture = makeFixture(catalog);
+		const seen: ReconstructProofContext[] = [];
+		try {
+			const result = await reconstructProviderData({
+				repoRoot: fixture.root,
+				catalogPath: fixture.catalogPath,
+				providersDir: fixture.providersDir,
+				dataDir: fixture.dataDir,
+				inversionProof: async (ctx) => {
+					seen.push(ctx);
+				},
+			});
+
+			expect(result.written).toBe(1);
+			expect(seen).toHaveLength(1);
+			expect(seen[0]?.catalogPath).toBe(fixture.catalogPath);
+			expect(seen[0]?.dataDir).toBe(fixture.dataDir);
+			expect(readdirSync(fixture.dataDir)).toEqual(["alpha.json"]);
+			expect(siblingArtifacts(fixture.providersDir)).toEqual([]);
+		} finally {
+			rmSync(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	test("default-path reconstruction still uses the default inversion proof", async () => {
+		const catalogBefore = readFileSync(REAL_CATALOG_PATH);
+		const result = await reconstructProviderData({
+			repoRoot: REPO_ROOT,
+			catalogPath: REAL_CATALOG_PATH,
+			providersDir: REAL_PROVIDERS_DIR,
+			dataDir: REAL_DATA_DIR,
+			// inversionProof intentionally omitted — default proof must apply.
+		});
+		expect(result.written).toBeGreaterThan(0);
+		expect(result.providers.length).toBe(result.written);
+		expect(Buffer.compare(readFileSync(REAL_CATALOG_PATH), catalogBefore)).toBe(0);
+		expect(siblingArtifacts(REAL_PROVIDERS_DIR)).toEqual([]);
+	}, 120_000);
+});

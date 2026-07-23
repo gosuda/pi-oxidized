@@ -34,10 +34,13 @@ export type ReconstructProviderDataOptions = {
 	providersDir?: string;
 	dataDir?: string;
 	/**
-	 * Inversion authority hook. Defaults to spawning
-	 * `scripts/generate-builtin-models.ts` against `repoRoot`, always restoring
-	 * `catalogPath` byte-for-byte afterward. Tests may inject a failing or
-	 * no-op proof without touching the checkout generator.
+	 * Inversion authority hook. When omitted, the default proof (spawning
+	 * `scripts/generate-builtin-models.ts` and comparing `catalogPath`
+	 * byte-for-byte) is used only when paths are the repository defaults —
+	 * that generator only rewrites the hard-coded default catalog, so custom
+	 * `catalogPath`/`providersDir`/`dataDir`/`repoRoot` would otherwise pass
+	 * vacuously. Custom paths require an explicit proof. Tests may inject a
+	 * failing or no-op proof without touching the checkout generator.
 	 */
 	inversionProof?: (ctx: ReconstructProofContext) => Promise<void>;
 	/**
@@ -171,11 +174,24 @@ async function validateStagingDirectory(
 	}
 }
 
+function usesRepositoryDefaultPaths(ctx: ReconstructProofContext): boolean {
+	// generate-builtin-models.ts only reads/writes the hard-coded default
+	// checkout paths, so the default inversion proof is meaningful only when
+	// reconstruction targets those same paths.
+	return (
+		resolve(ctx.repoRoot) === resolve(REPO_ROOT) &&
+		resolve(ctx.catalogPath) === resolve(DEFAULT_CATALOG_PATH) &&
+		resolve(ctx.providersDir) === resolve(DEFAULT_PROVIDERS_DIR) &&
+		resolve(ctx.dataDir) === resolve(DEFAULT_DATA_DIR)
+	);
+}
+
 async function defaultInversionProof(ctx: ReconstructProofContext): Promise<void> {
 	// Fail-fast inversion proof: regenerating the catalog from the
 	// reconstructed files must reproduce the exact catalog text. Normalize
 	// CRLF only because Windows checkout conversion is not generator drift.
 	// Snapshot/restore keeps the generator-owned artifact untouched.
+	// Only valid for repository default paths — see usesRepositoryDefaultPaths.
 	const before = await Bun.file(ctx.catalogPath).bytes();
 	try {
 		const regen = Bun.spawnSync(
@@ -217,7 +233,21 @@ export async function reconstructProviderData(
 	const catalogPath = options.catalogPath ?? DEFAULT_CATALOG_PATH;
 	const providersDir = options.providersDir ?? DEFAULT_PROVIDERS_DIR;
 	const dataDir = options.dataDir ?? DEFAULT_DATA_DIR;
-	const inversionProof = options.inversionProof ?? defaultInversionProof;
+	const proofCtx: ReconstructProofContext = {
+		repoRoot,
+		catalogPath,
+		providersDir,
+		dataDir,
+	};
+	let inversionProof = options.inversionProof;
+	if (inversionProof === undefined) {
+		if (!usesRepositoryDefaultPaths(proofCtx)) {
+			throw new Error(
+				"default inversion proof only covers repository default paths (catalog/providers/data under this checkout); pass an explicit inversionProof when reconstructing with custom paths",
+			);
+		}
+		inversionProof = defaultInversionProof;
+	}
 	const removeBackup = options.removeBackup ?? removeIfExists;
 
 	const catalog = (await Bun.file(catalogPath).json()) as ProviderCatalog;
@@ -279,12 +309,7 @@ export async function reconstructProviderData(
 			throw new Error(`failed to publish staging directory to live data: ${detail}`);
 		}
 
-		await inversionProof({
-			repoRoot,
-			catalogPath,
-			providersDir,
-			dataDir,
-		});
+		await inversionProof(proofCtx);
 		// Successful inversion proof commits the published live tree.
 		committed = true;
 	} catch (error) {
