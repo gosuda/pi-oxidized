@@ -234,14 +234,6 @@ async fn recv_labeled<T>(rx: &mut mpsc::Receiver<T>, label: &str) -> Result<T, B
         .ok_or_else(|| format!("{label} missing").into())
 }
 
-/// Extract the frame id from a select UI request.
-fn select_id(request: &HostUiRequest) -> Result<u64, BoxErr> {
-    let HostUiRequest::Select { id, .. } = request else {
-        return Err("expected select".into());
-    };
-    Ok(*id)
-}
-
 /// Extract the frame id from a set-model bridge event.
 fn set_model_id(event: &SessionBridgeEvent) -> Result<u64, BoxErr> {
     let SessionBridgeEvent::SetModel { id, .. } = event else {
@@ -251,36 +243,51 @@ fn set_model_id(event: &SessionBridgeEvent) -> Result<u64, BoxErr> {
 }
 
 /// Emit a colliding select + set-model request pair from every host.
+///
+/// Local frame ids collide across endpoints; payloads are distinct per owner so
+/// response routing can be checked end-to-end (not just method/id).
 async fn emit_colliding_requests(hosts: &[FakeHost]) {
-    for host in hosts {
+    for (index, host) in hosts.iter().enumerate() {
         host.emit(Frame {
             id: 7,
             kind: FrameKind::Req,
             method: "select".to_owned(),
-            payload: json!({"title":"Pick","options":["a"]}),
+            payload: json!({
+                "title": format!("Pick-{index}"),
+                "options": [format!("choice-{index}")],
+            }),
         })
         .await;
         host.emit(Frame {
             id: 41,
             kind: FrameKind::Req,
             method: "session.setModel".to_owned(),
-            payload: json!({"model":{"id":"m","provider":"p"}}),
+            payload: json!({"model":{"id": format!("m-{index}"), "provider":"p"}}),
         })
         .await;
     }
 }
 
-/// Wait until the host recorded the local responses for the colliding ids.
-async fn wait_for_local_responses(host: &FakeHost) -> R {
+/// Wait until the host recorded local responses with the expected owner payloads.
+async fn wait_for_local_responses(
+    host: &FakeHost,
+    select_value: &str,
+    set_model_success: bool,
+) -> R {
     tokio::time::timeout(Duration::from_millis(500), async {
         loop {
             let complete = host.requests.lock().is_ok_and(|requests| {
                 requests.iter().any(|frame| {
-                    frame.kind == FrameKind::Res && frame.method == "select" && frame.id == 7
+                    frame.kind == FrameKind::Res
+                        && frame.method == "select"
+                        && frame.id == 7
+                        && frame.payload.get("value").and_then(Value::as_str) == Some(select_value)
                 }) && requests.iter().any(|frame| {
                     frame.kind == FrameKind::Res
                         && frame.method == "session.setModel"
                         && frame.id == 41
+                        && frame.payload.get("success").and_then(Value::as_bool)
+                            == Some(set_model_success)
                 })
             });
             if complete {
@@ -1695,31 +1702,66 @@ async fn aggregate_colliding_ui_and_session_ids_route_to_owning_clients() -> R {
     let mut ui = runner.take_ui_requests().ok_or("ui claim failed")?;
     let mut bridge = runner.take_session_bridge().ok_or("bridge claim failed")?;
     emit_colliding_requests(&hosts).await;
-    let first_ui_id = select_id(&recv_labeled(&mut ui, "first ui request").await?)?;
-    let second_ui_id = select_id(&recv_labeled(&mut ui, "second ui request").await?)?;
-    assert_ne!(first_ui_id, second_ui_id);
-    runner
-        .respond_ui(HostUiResponse::Select {
-            id: first_ui_id,
-            value: Some("a".to_owned()),
-        })
-        .await?;
-    runner
-        .respond_ui(HostUiResponse::Select {
-            id: second_ui_id,
-            value: None,
-        })
-        .await?;
 
-    let first_session_id = set_model_id(&recv_labeled(&mut bridge, "first setModel").await?)?;
-    let second_session_id = set_model_id(&recv_labeled(&mut bridge, "second setModel").await?)?;
-    assert_ne!(first_session_id, second_session_id);
-    runner.respond_set_model(first_session_id, true).await?;
-    runner.respond_set_model(second_session_id, false).await?;
-
-    for host in &hosts {
-        wait_for_local_responses(host).await?;
+    let mut ui_ids = [0_u64; 2];
+    for label in ["first ui request", "second ui request"] {
+        let request = recv_labeled(&mut ui, label).await?;
+        let HostUiRequest::Select {
+            id,
+            request: select,
+        } = request
+        else {
+            return Err("expected select".into());
+        };
+        let owner = select
+            .title
+            .strip_prefix("Pick-")
+            .and_then(|suffix| suffix.parse::<usize>().ok())
+            .filter(|owner| *owner < hosts.len())
+            .ok_or_else(|| format!("unexpected select title {:?}", select.title))?;
+        let value = select
+            .options
+            .first()
+            .cloned()
+            .ok_or("select options empty")?;
+        // Echo the owner-specific option so the response payload identifies the owner.
+        runner
+            .respond_ui(HostUiResponse::Select {
+                id,
+                value: Some(value),
+            })
+            .await?;
+        assert_eq!(ui_ids[owner], 0, "duplicate select owner {owner}");
+        ui_ids[owner] = id;
     }
+    assert_ne!(ui_ids[0], ui_ids[1]);
+
+    let mut session_ids = [0_u64; 2];
+    for label in ["first setModel", "second setModel"] {
+        let event = recv_labeled(&mut bridge, label).await?;
+        let SessionBridgeEvent::SetModel { id, request } = event else {
+            return Err("expected setModel".into());
+        };
+        let model_id = request
+            .model
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or("setModel model.id missing")?;
+        let owner = model_id
+            .strip_prefix("m-")
+            .and_then(|suffix| suffix.parse::<usize>().ok())
+            .filter(|owner| *owner < hosts.len())
+            .ok_or_else(|| format!("unexpected model id {model_id}"))?;
+        // Distinct success bit per owner — observable on the owning host's response.
+        let success = owner == 0;
+        runner.respond_set_model(id, success).await?;
+        assert_eq!(session_ids[owner], 0, "duplicate setModel owner {owner}");
+        session_ids[owner] = id;
+    }
+    assert_ne!(session_ids[0], session_ids[1]);
+
+    wait_for_local_responses(&hosts[0], "choice-0", true).await?;
+    wait_for_local_responses(&hosts[1], "choice-1", false).await?;
     runner.shutdown_once().await;
     Ok(())
 }
