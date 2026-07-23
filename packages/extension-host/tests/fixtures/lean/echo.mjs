@@ -94,6 +94,22 @@ export default {
 			streamSimple: async function* (model, context, options) {
 				mark("provider.stream", { model, hasSignal: typeof options?.signal?.aborted === "boolean" });
 				yield { type: "start", partial: { role: "assistant", content: [] } };
+				// Cancel fixture: park after the start event until the host
+				// aborts options.signal (mirrors the slow tool).
+				if (model?.id === "slow") {
+					await new Promise((_resolve, reject) => {
+						const signal = options?.signal;
+						if (signal?.aborted) {
+							reject(new Error("provider stream aborted"));
+							return;
+						}
+						signal?.addEventListener(
+							"abort",
+							() => reject(new Error("provider stream aborted")),
+							{ once: true },
+						);
+					});
+				}
 				yield { type: "done", reason: "stop", message: { role: "assistant", content: [] } };
 			},
 		},

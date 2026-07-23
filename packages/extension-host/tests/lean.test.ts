@@ -440,6 +440,35 @@ describe("lean: commands, flags, shortcuts, providers", () => {
 		expect(res).toEqual({});
 		await link.finish();
 	});
+
+	test("provider.stream honors provider.cancel with a cancelled error frame", async () => {
+		const link = await loadedLink();
+		// Sibling stream must keep completing while the slow one is cancelled.
+		link.request(28, "provider.stream", {
+			providerId: "lean-provider",
+			model: { id: "slow" },
+			context: {},
+			options: {},
+		});
+		link.request(29, "provider.stream", {
+			providerId: "lean-provider",
+			model: { id: "m1" },
+			context: {},
+			options: {},
+		});
+		// Synchronize on the slow stream's start event: the AbortController is
+		// registered before streamSimple runs, so the cancel cannot be lost.
+		await link.waitFor(
+			(f) => f.id === 28 && f.kind === "event" && f.method === "providerEvent",
+		);
+		link.event("provider.cancel", { id: 28 });
+		const err = payload(await link.error(28, "provider.stream"));
+		expect(err["code"]).toBe("cancelled");
+		expect(err["message"]).toBe("provider stream cancelled");
+		const sibling = payload(await link.response(29, "provider.stream"));
+		expect(sibling).toEqual({});
+		await link.finish();
+	});
 });
 
 // ---------------------------------------------------------------------------
