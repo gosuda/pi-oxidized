@@ -281,6 +281,10 @@ impl ExtensionProvider {
     }
 
     /// Override the per-call deadline.
+    ///
+    /// Bounds each individual host request (time to first event, terminal
+    /// finish), not the stream's lifetime. Inter-event gaps are unbounded
+    /// once streaming has begun.
     #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
@@ -323,6 +327,9 @@ impl Provider for ExtensionProvider {
                     return;
                 }
             };
+            // Bound only the pre-first-event wait. After the first frame,
+            // inter-event gaps are unbounded (mirrors ExtensionAgentTool).
+            let mut seen_event = false;
             loop {
                 tokio::select! {
                     biased;
@@ -333,10 +340,15 @@ impl Provider for ExtensionProvider {
                             .await;
                         return;
                     }
-                    // Bound each idle wait so a hung host surfaces `with_timeout`
-                    // instead of parking forever on `next_event` (finish never runs).
-                    ev = tokio::time::timeout(timeout, handle.next_event()) => match ev {
+                    ev = async {
+                        if seen_event {
+                            Ok(handle.next_event().await)
+                        } else {
+                            tokio::time::timeout(timeout, handle.next_event()).await
+                        }
+                    } => match ev {
                         Ok(Some(frame)) => {
+                            seen_event = true;
                             if let Some(event) = decode_provider_stream_event(&frame.payload)
                                 && tx.send(Ok(event)).await.is_err()
                             {
@@ -344,9 +356,20 @@ impl Provider for ExtensionProvider {
                                 return;
                             }
                         }
-                        // Channel closed (terminal arrived) or idle deadline elapsed —
-                        // `finish` applies the same timeout and yields Timeout on hang.
-                        Ok(None) | Err(_) => break,
+                        Ok(None) => break,
+                        Err(_) => {
+                            // Pre-first-event idle deadline — do not wait for
+                            // finish (a late terminal inside that window would
+                            // otherwise look like a clean stream).
+                            let _ = tx
+                                .send(Err(provider_error(crate::client::HostClientError::Timeout {
+                                    id: handle.id(),
+                                    timeout,
+                                })))
+                                .await;
+                            let _ = handle.cancel(methods::PROVIDER_CANCEL).await;
+                            return;
+                        }
                     }
                 }
             }
@@ -1877,6 +1900,109 @@ mod tests {
         assert!(
             err.to_string().contains("timed out after 50ms"),
             "unexpected: {err}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn extension_provider_idle_deadline_errors_without_finish_wait() -> R {
+        let (client, mut host) = make_pair().await;
+        let provider = ExtensionProvider::new("custom", Arc::new(client))
+            .with_timeout(Duration::from_millis(50));
+        let model = Model {
+            id: "m".to_owned(),
+            name: "M".to_owned(),
+            api: "custom".to_owned(),
+            provider: "custom".to_owned(),
+            ..base_model_defaults()
+        };
+        let mut stream = provider.stream(&model, Context::default(), StreamOptions::default());
+        let req = host.require_frame(methods::PROVIDER_STREAM).await?;
+        let req_id = req.id;
+
+        // Host: no events; late terminal at 80ms sits inside a finish(50ms)
+        // window that would begin at the 50ms idle expiry. Then observe cancel.
+        let host_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            host.write_frame(&Frame::response(
+                req_id,
+                Method::Notify,
+                serde_json::json!({}),
+            ))
+            .await
+            .map_err(|e| e.to_string())?;
+            let cancel = tokio::time::timeout(
+                Duration::from_secs(2),
+                host.require_frame(methods::PROVIDER_CANCEL),
+            )
+            .await
+            .map_err(|_| "PROVIDER_CANCEL not received".to_owned())?
+            .map_err(|e| e.to_string())?;
+            Ok::<_, String>(cancel)
+        });
+
+        let item = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .map_err(|_| "idle deadline exceeded outer guard")?
+            .ok_or("idle deadline must yield Timeout, not clean EOF")?;
+        let err = match item {
+            Err(err) => err,
+            Ok(value) => {
+                return Err(format!("idle deadline must be Timeout, got Ok({value:?})").into());
+            }
+        };
+        assert!(
+            err.to_string().contains("timed out after 50ms"),
+            "unexpected: {err}"
+        );
+
+        let cancel = host_task.await??;
+        assert_eq!(cancel.method, methods::PROVIDER_CANCEL);
+        assert_eq!(cancel.payload["id"], req_id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn extension_provider_post_first_event_gaps_are_unbounded() -> R {
+        let (client, mut host) = make_pair().await;
+        let provider = ExtensionProvider::new("custom", Arc::new(client))
+            .with_timeout(Duration::from_millis(50));
+        let model = Model {
+            id: "m".to_owned(),
+            name: "M".to_owned(),
+            api: "custom".to_owned(),
+            provider: "custom".to_owned(),
+            ..base_model_defaults()
+        };
+        let mut stream = provider.stream(&model, Context::default(), StreamOptions::default());
+        let req = host.require_frame(methods::PROVIDER_STREAM).await?;
+
+        host.write_frame(&Frame::event(
+            req.id,
+            Method::ProviderEvent,
+            text_delta_event("hi"),
+        ))
+        .await?;
+        // Gap longer than `with_timeout` — must not abort a live stream.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        host.write_frame(&Frame::response(
+            req.id,
+            Method::Notify,
+            serde_json::json!({}),
+        ))
+        .await?;
+
+        let first = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await?
+            .ok_or("missing first event")??;
+        match first {
+            AssistantMessageEvent::TextDelta { delta, .. } => assert_eq!(delta, "hi"),
+            other => return Err(format!("unexpected first event: {other:?}").into()),
+        }
+        let ended = tokio::time::timeout(Duration::from_secs(2), stream.next()).await?;
+        assert!(
+            ended.is_none(),
+            "expected clean EOS after post-first-event gap, got {ended:?}"
         );
         Ok(())
     }

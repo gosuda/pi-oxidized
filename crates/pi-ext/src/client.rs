@@ -745,6 +745,12 @@ pub struct StreamHandle {
 }
 
 impl StreamHandle {
+    /// Correlation id for this streaming call.
+    #[must_use]
+    pub fn id(&self) -> FrameId {
+        self.id
+    }
+
     /// Receive the next intermediate event frame, if any.
     ///
     /// Returns `None` when the stream closed (terminal resolved or host gone).
