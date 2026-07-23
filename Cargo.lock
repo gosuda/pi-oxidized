@@ -2831,6 +2831,7 @@ dependencies = [
  "anstyle-parse",
  "crossterm",
  "futures",
+ "nix 0.31.3",
  "pi-agent",
  "pi-ai",
  "pi-tui",

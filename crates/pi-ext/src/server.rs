@@ -469,45 +469,123 @@ pub trait NativeExtension: Send + Sync + 'static {
 ///
 /// Returns [`ServerError`] on handshake, protocol, bounded overload, or I/O failure.
 pub async fn serve<E: NativeExtension>(extension: E) -> Result<(), ServerError> {
-    // pi-ext does not enable tokio's `io-std` feature; bridge blocking
-    // stdin/stdout through in-memory duplex streams pumped by blocking
-    // threads. The stdin pump detaches on exit (a blocked `read` cannot be
-    // aborted); process teardown reclaims it for a real endpoint binary.
+    // Bridge OS stdio through in-memory duplex streams. Do not use Tokio
+    // `io-std` stdin: docs note an uncancellable blocking read that can hang
+    // runtime shutdown. The stdin pump must be joinable: a detached
+    // `spawn_blocking` read keeps a current-thread runtime alive when the
+    // parent holds the pipe open after an early `serve_io` exit (e.g. bad hello).
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsFd;
+
+        // Own private fds so the pump does not contend on the global Stdin mutex
+        // or its userspace buffer (StdinLock is also !Send).
+        let stdin = std::fs::File::from(
+            std::io::stdin()
+                .as_fd()
+                .try_clone_to_owned()
+                .map_err(ServerError::Io)?,
+        );
+        let stdout = std::fs::File::from(
+            std::io::stdout()
+                .as_fd()
+                .try_clone_to_owned()
+                .map_err(ServerError::Io)?,
+        );
+        serve_stdio(stdin, stdout, extension, ServerConfig::default()).await
+    }
+    #[cfg(not(unix))]
+    {
+        serve_stdio_detached(extension).await
+    }
+}
+
+/// Serve over caller-provided blocking stdio, joining pumps before return.
+///
+/// On Unix the stdin pump `poll`s the reader alongside a self-pipe; dropping
+/// the wake write-end unblocks a stuck read so the thread cannot outlive
+/// [`serve_io`] on the normal return path (wake then join). This is not
+/// outer-future cancellation/Drop-safe: an aborted `serve_stdio` future still
+/// drops the wake writer (unblocking `poll`) but does not join the thread.
+/// Tokio `io-std` stdin is not an alternative — it uses an uncancellable
+/// blocking read that can hang runtime shutdown. Used by [`serve`] and the
+/// stdin-lifecycle regression test.
+#[cfg(unix)]
+async fn serve_stdio<R, W, E>(
+    stdin: R,
+    stdout: W,
+    extension: E,
+    config: ServerConfig,
+) -> Result<(), ServerError>
+where
+    R: std::io::Read + std::os::fd::AsFd + Send + 'static,
+    W: std::io::Write + Send + 'static,
+    E: NativeExtension,
+{
+    let (stdin_reader, stdin_sink) = tokio::io::duplex(64 * 1024);
+    let (stdout_source, stdout_writer) = tokio::io::duplex(64 * 1024);
+    let (wake_reader, wake_writer) = std::io::pipe()?;
+
+    let stdin_pump = std::thread::Builder::new()
+        .name("pi-ext-stdin".into())
+        .spawn(move || {
+            let mut stdin = stdin;
+            let mut stdin_sink = stdin_sink;
+            pump_stdin_cancellable(&mut stdin, &mut stdin_sink, &wake_reader);
+            drop(wake_reader);
+        })
+        .map_err(ServerError::Io)?;
+
+    let stdout_pump = match std::thread::Builder::new()
+        .name("pi-ext-stdout".into())
+        .spawn(move || pump_stdout(stdout_source, stdout))
+    {
+        Ok(handle) => handle,
+        Err(error) => {
+            drop(wake_writer);
+            let _ = stdin_pump.join();
+            return Err(ServerError::Io(error));
+        }
+    };
+
+    let result = serve_io(stdin_reader, stdout_writer, extension, config).await;
+    // Unblock poll, then join — do not detach. `spawn_blocking` abort cannot
+    // stop a running stdin `read` / `poll`.
+    drop(wake_writer);
+    let _ = stdin_pump.join();
+    let _ = stdout_pump.join();
+    result
+}
+
+/// Non-Unix fallback: dedicated threads are not owned by Tokio, so a stuck
+/// stdin read cannot wedge current-thread runtime shutdown. The pump may
+/// still outlive `serve_io` until process exit (no portable interrupt).
+#[cfg(not(unix))]
+async fn serve_stdio_detached<E: NativeExtension>(extension: E) -> Result<(), ServerError> {
     let (stdin_reader, mut stdin_sink) = tokio::io::duplex(64 * 1024);
-    let (mut stdout_source, stdout_writer) = tokio::io::duplex(64 * 1024);
-    let stdin_pump = tokio::task::spawn_blocking(move || {
-        use std::io::Read as _;
-        let mut stdin = std::io::stdin().lock();
-        let mut buf = [0u8; 8192];
-        loop {
-            match stdin.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if block_on(stdin_sink.write_all(&buf[..n])).is_err() {
-                        break;
+    let (stdout_source, stdout_writer) = tokio::io::duplex(64 * 1024);
+    let _stdin_pump = std::thread::Builder::new()
+        .name("pi-ext-stdin".into())
+        .spawn(move || {
+            use std::io::Read as _;
+            let mut stdin = std::io::stdin().lock();
+            let mut buf = [0u8; 8192];
+            loop {
+                match stdin.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if block_on(stdin_sink.write_all(&buf[..n])).is_err() {
+                            break;
+                        }
                     }
                 }
             }
-        }
-    });
-    let stdout_pump = tokio::task::spawn_blocking(move || {
-        use std::io::Write as _;
-        let mut stdout = std::io::stdout().lock();
-        let mut buf = [0u8; 8192];
-        loop {
-            match block_on(stdout_source.read(&mut buf)) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if stdout.write_all(&buf[..n]).is_err() {
-                        break;
-                    }
-                    if stdout.flush().is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    });
+        })
+        .map_err(ServerError::Io)?;
+    let stdout_pump = std::thread::Builder::new()
+        .name("pi-ext-stdout".into())
+        .spawn(move || pump_stdout(stdout_source, std::io::stdout()))
+        .map_err(ServerError::Io)?;
     let result = serve_io(
         stdin_reader,
         stdout_writer,
@@ -515,9 +593,79 @@ pub async fn serve<E: NativeExtension>(extension: E) -> Result<(), ServerError> 
         ServerConfig::default(),
     )
     .await;
-    drop(stdin_pump);
-    let _ = stdout_pump.await;
+    let _ = stdout_pump.join();
     result
+}
+
+/// Pump OS/test stdin into the async duplex until EOF or wake-pipe shutdown.
+#[cfg(unix)]
+fn pump_stdin_cancellable<R>(
+    reader: &mut R,
+    sink: &mut tokio::io::DuplexStream,
+    wake: &std::io::PipeReader,
+) where
+    R: std::io::Read + std::os::fd::AsFd,
+{
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    use std::os::fd::AsFd;
+
+    // Closing the wake write-end surfaces POLLHUP (not necessarily POLLIN).
+    let stop_mask =
+        PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR | PollFlags::POLLNVAL;
+    let mut buf = [0u8; 8192];
+    loop {
+        let mut fds = [
+            // Wake first: shutdown must win over stdin readability.
+            PollFd::new(wake.as_fd(), PollFlags::POLLIN),
+            PollFd::new(reader.as_fd(), PollFlags::POLLIN),
+        ];
+        match poll(&mut fds, PollTimeout::NONE) {
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(_) => return,
+            Ok(_) => {}
+        }
+        let wake_revents = fds[0].revents().unwrap_or_else(PollFlags::empty);
+        let stdin_revents = fds[1].revents().unwrap_or_else(PollFlags::empty);
+        if wake_revents.intersects(stop_mask) {
+            return;
+        }
+        let stdin_readable = stdin_revents.contains(PollFlags::POLLIN);
+        let stdin_hup =
+            stdin_revents.intersects(PollFlags::POLLHUP | PollFlags::POLLERR | PollFlags::POLLNVAL);
+        if !stdin_readable {
+            if stdin_hup {
+                return;
+            }
+            continue;
+        }
+        match reader.read(&mut buf) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Ok(0) | Err(_) => return,
+            Ok(n) => {
+                if block_on(sink.write_all(&buf[..n])).is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn pump_stdout(mut source: tokio::io::DuplexStream, mut stdout: impl std::io::Write) {
+    let mut buf = [0u8; 8192];
+    loop {
+        match block_on(source.read(&mut buf)) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if stdout.write_all(&buf[..n]).is_err() {
+                    break;
+                }
+                if stdout.flush().is_err() {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 /// Serve a native extension over an arbitrary async byte stream pair.
@@ -2195,6 +2343,76 @@ mod tests {
             matches!(result, Err(ServerError::Handshake(ref message)) if message.contains("protocol version mismatch")),
             "expected protocol mismatch handshake failure, got {result:?}"
         );
+        Ok(())
+    }
+
+    /// Bad hello while the parent keeps stdin open must not leave a detached
+    /// stdin pump wedging current-thread runtime shutdown.
+    #[cfg(unix)]
+    #[test]
+    fn serve_exits_promptly_on_bad_hello_while_stdin_stays_open() -> R {
+        use std::sync::mpsc;
+
+        let (stdin_rx, mut stdin_tx) = std::io::pipe()?;
+        let (_stdout_keep, stdout_tx) = std::io::pipe()?;
+        let (done_tx, done_rx) = mpsc::channel();
+
+        let worker = std::thread::spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = done_tx.send(Err(ServerError::Io(error)));
+                    return;
+                }
+            };
+            let (ext, _) = DemoExtension::new();
+            let result = runtime.block_on(serve_stdio(
+                stdin_rx,
+                stdout_tx,
+                ext,
+                ServerConfig::default(),
+            ));
+            // Runtime drop waits on any leftover spawn_blocking work — the
+            // regression target when the stdin pump is detached instead of joined.
+            drop(runtime);
+            let _ = done_tx.send(result);
+        });
+
+        let bad_hello = encode_frame(&Frame {
+            id: 1,
+            kind: FrameKind::Req,
+            method: Method::Hello.as_str().to_owned(),
+            payload: json!({
+                "protocolVersion": 99,
+                "compatibilityVersion": COMPATIBILITY_VERSION,
+            }),
+        })?;
+        std::io::Write::write_all(&mut stdin_tx, &bad_hello)?;
+        std::io::Write::flush(&mut stdin_tx)?;
+        // Keep stdin_tx open across the wait — EOF must not be what unblocks us.
+
+        let Ok(result) = done_rx.recv_timeout(TIMEOUT) else {
+            // Unblock any stuck read and join before failing so a hung
+            // current-thread runtime cannot leave the suite wedged.
+            drop(stdin_tx);
+            let _ = worker.join();
+            return Err(
+                "serve + current-thread runtime shutdown must finish while stdin stays open".into(),
+            );
+        };
+        assert!(
+            matches!(
+                result,
+                Err(ServerError::Handshake(ref message))
+                    if message.contains("protocol version mismatch")
+            ),
+            "expected handshake failure, got {result:?}"
+        );
+        drop(stdin_tx);
+        worker.join().map_err(|_| "serve worker thread panicked")?;
         Ok(())
     }
 
