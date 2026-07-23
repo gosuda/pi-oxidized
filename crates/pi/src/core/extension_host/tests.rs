@@ -1833,11 +1833,26 @@ async fn aggregate_colliding_slot_keys_namespace_and_route_to_owners_reverse_ord
     }
     hosts[1].emit(ui_slot_frame("same-key", 2, "B2")).await;
     hosts[0].emit(ui_slot_frame("same-key", 2, "A2")).await;
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    assert_eq!(
-        runner.slot_keys().into_iter().collect::<HashSet<_>>(),
-        namespaced_same_keys()
-    );
+    tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            let slots = runner.current_slots();
+            let keys = slots
+                .iter()
+                .map(|slot| slot.key.clone())
+                .collect::<HashSet<_>>();
+            if keys == namespaced_same_keys() && slots.iter().all(|slot| slot.generation == 2) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        format!(
+            "generation-2 colliding slots timed out: {:?}",
+            runner.current_slots()
+        )
+    })?;
     runner.shutdown_once().await;
     Ok(())
 }

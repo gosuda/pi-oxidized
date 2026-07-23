@@ -1983,8 +1983,9 @@ mod tests {
             text_delta_event("hi"),
         ))
         .await?;
-        // Gap longer than `with_timeout` — must not abort a live stream.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Gap strictly > 2× `with_timeout` so a finish-collapsed gap timeout
+        // expires before the terminal (collapsed → Timeout; current → clean EOS).
+        tokio::time::sleep(Duration::from_millis(200)).await;
         host.write_frame(&Frame::response(
             req.id,
             Method::Notify,
