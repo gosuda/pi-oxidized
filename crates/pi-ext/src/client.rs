@@ -67,8 +67,16 @@ type FrameResult = HostResult<Frame>;
 struct PendingEntry {
     /// Terminal response/error sender (taken on Res/Error).
     terminal: Option<oneshot::Sender<FrameResult>>,
-    /// Optional streaming event channel for intermediate events.
-    stream: Option<mpsc::Sender<Frame>>,
+    /// Optional streaming event sink for intermediate events.
+    stream: Option<PendingStream>,
+}
+
+#[derive(Clone)]
+enum PendingStream {
+    /// Tool progress is explicitly lossy: stale updates may be discarded.
+    Lossy(mpsc::Sender<Frame>),
+    /// Provider events enter a per-call forwarding task and are never discarded.
+    Lossless(mpsc::UnboundedSender<Frame>),
 }
 
 /// A typed, correlated UI request initiated by the TypeScript host.
@@ -606,11 +614,27 @@ impl HostClient {
         let bound = event_bound.clamp(1, STREAM_EVENT_CAPACITY * 8);
         let (terminal_tx, terminal_rx) = oneshot::channel::<FrameResult>();
         let (stream_tx, stream_rx) = mpsc::channel::<Frame>(bound);
+        let stream = if method == "provider.stream" {
+            let (forward_tx, mut forward_rx) = mpsc::unbounded_channel::<Frame>();
+            // The shared reader must never await one slow call. This call-local
+            // task preserves provider event order while applying backpressure
+            // only between this stream and its consumer.
+            tokio::spawn(async move {
+                while let Some(frame) = forward_rx.recv().await {
+                    if stream_tx.send(frame).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            PendingStream::Lossless(forward_tx)
+        } else {
+            PendingStream::Lossy(stream_tx)
+        };
         self.insert_pending(
             id,
             PendingEntry {
                 terminal: Some(terminal_tx),
-                stream: Some(stream_tx),
+                stream: Some(stream),
             },
         );
         let frame = Frame {
@@ -629,6 +653,7 @@ impl HostClient {
             terminal: Some(terminal_rx),
             shared: Arc::clone(&self.shared),
             cmd_tx: self.cmd_tx.lock().await.clone(),
+            runtime: tokio::runtime::Handle::current(),
             cancel_method: cancel_method_for(method),
             cancel_sent: false,
             consumed: false,
@@ -739,6 +764,7 @@ pub struct StreamHandle {
     terminal: Option<oneshot::Receiver<FrameResult>>,
     shared: Arc<Shared>,
     cmd_tx: Option<mpsc::Sender<Frame>>,
+    runtime: tokio::runtime::Handle,
     cancel_method: Option<&'static str>,
     cancel_sent: bool,
     consumed: bool,
@@ -820,7 +846,14 @@ impl Drop for StreamHandle {
             if !self.cancel_sent
                 && let (Some(control_method), Some(tx)) = (self.cancel_method, self.cmd_tx.as_ref())
             {
-                let _ = tx.try_send(cancel_frame(self.id, control_method));
+                let tx = tx.clone();
+                let frame = cancel_frame(self.id, control_method);
+                // Drop cannot await. A detached send waits for bounded capacity
+                // on the same FIFO, so cancellation is neither lost nor allowed
+                // to overtake this call's request.
+                self.runtime.spawn(async move {
+                    let _ = tx.send(frame).await;
+                });
             }
             Self::remove_pending(&self.shared, self.id);
         }
@@ -1163,8 +1196,14 @@ fn forward_stream_event(shared: &Shared, frame: Frame) {
         None
     };
     if let Some(stream) = stream {
-        // Non-blocking: a full channel drops the stale event (backpressure).
-        let _ = stream.try_send(frame);
+        match stream {
+            PendingStream::Lossy(stream) => {
+                let _ = stream.try_send(frame);
+            }
+            PendingStream::Lossless(stream) => {
+                let _ = stream.send(frame);
+            }
+        }
     }
 }
 
@@ -1640,6 +1679,110 @@ mod tests {
         let (got, _terminal) = client_task.await??;
         // No deadlock: some events were observed, terminal resolved.
         assert!(got > 0, "should have observed some events");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_stream_backpressure_is_lossless_and_call_local() -> R {
+        const EVENT_COUNT: u64 = 128;
+
+        let (client, mut host) = make_pair().await;
+        let client = Arc::new(client);
+        let mut provider = client
+            .open_stream_raw("provider.stream", serde_json::json!({}), 2)
+            .await?;
+        let provider_request = host.read_frame().await.ok_or("no provider request")?;
+
+        let concurrent_client = Arc::clone(&client);
+        let concurrent = tokio::spawn(async move {
+            concurrent_client
+                .request_raw(
+                    "concurrent.call",
+                    serde_json::json!({}),
+                    Duration::from_secs(2),
+                )
+                .await
+        });
+        let concurrent_request = host.read_frame().await.ok_or("no concurrent request")?;
+
+        for n in 0..EVENT_COUNT {
+            host.write_frame(&Frame::event(
+                provider_request.id,
+                Method::ProviderEvent,
+                serde_json::json!({"n": n}),
+            ))
+            .await?;
+        }
+        host.write_frame(&Frame::response(
+            concurrent_request.id,
+            Method::Notify,
+            serde_json::json!({"done": true}),
+        ))
+        .await?;
+
+        let concurrent_terminal =
+            tokio::time::timeout(Duration::from_millis(500), concurrent).await??;
+        assert!(
+            concurrent_terminal?.payload["done"]
+                .as_bool()
+                .unwrap_or(false)
+        );
+
+        host.write_frame(&Frame::response(
+            provider_request.id,
+            Method::Notify,
+            serde_json::json!({"done": true}),
+        ))
+        .await?;
+        let mut seen = Vec::new();
+        while let Some(frame) = provider.next_event().await {
+            seen.push(frame.payload["n"].as_u64().ok_or("missing event index")?);
+        }
+        assert_eq!(seen, (0..EVENT_COUNT).collect::<Vec<_>>());
+        assert!(
+            provider.finish(Duration::from_secs(2)).await?.payload["done"]
+                .as_bool()
+                .unwrap_or(false)
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropped_stream_delivers_cancel_after_command_channel_saturation() -> R {
+        let (client, mut host) = make_pair().await;
+        let stream = client
+            .open_stream_raw("provider.stream", serde_json::json!({}), 2)
+            .await?;
+        let request = host.read_frame().await.ok_or("no provider request")?;
+        let tx = stream
+            .cmd_tx
+            .as_ref()
+            .ok_or("missing command sender")?
+            .clone();
+
+        let filler = Frame::event(0, Method::Notify, serde_json::json!({"filler": true}));
+        for _ in 0..OUTBOUND_CAPACITY {
+            tx.try_send(filler.clone())?;
+        }
+        assert!(matches!(
+            tx.try_send(filler),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
+        drop(stream);
+
+        let cancel = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let frame = host
+                    .read_frame()
+                    .await
+                    .ok_or("host pipe closed before cancel")?;
+                if frame.method == "provider.cancel" {
+                    return Ok::<_, Box<dyn Error>>(frame);
+                }
+            }
+        })
+        .await??;
+        assert_eq!(cancel.payload["id"], request.id);
         Ok(())
     }
 
