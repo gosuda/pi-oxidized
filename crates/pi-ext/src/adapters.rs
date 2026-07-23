@@ -282,9 +282,9 @@ impl ExtensionProvider {
 
     /// Override the per-call deadline.
     ///
-    /// Bounds each individual host request (time to first decoded event,
-    /// terminal finish), not the stream's lifetime. Inter-event gaps are
-    /// unbounded once a decoded event has been yielded.
+    /// Bounds the absolute time to the first decoded event and the terminal
+    /// finish wait, not the stream's lifetime. Inter-event gaps are unbounded
+    /// once a decoded event has been yielded.
     #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
@@ -327,10 +327,13 @@ impl Provider for ExtensionProvider {
                     return;
                 }
             };
-            // Bound only the pre-first-decoded-event wait. Unknown/malformed
-            // frames are skipped and do not disarm the deadline; after the
-            // first decoded event, inter-event gaps are unbounded.
+            // Bound only the pre-first-decoded-event wait with one absolute
+            // deadline. Unknown/malformed frames are skipped and must not reset
+            // that deadline (a fresh per-wait timeout would let junk spam keep
+            // the stream alive forever); after the first decoded event,
+            // inter-event gaps are unbounded.
             let mut seen_event = false;
+            let deadline = tokio::time::Instant::now() + timeout;
             loop {
                 tokio::select! {
                     biased;
@@ -345,7 +348,7 @@ impl Provider for ExtensionProvider {
                         if seen_event {
                             Ok(handle.next_event().await)
                         } else {
-                            tokio::time::timeout(timeout, handle.next_event()).await
+                            tokio::time::timeout_at(deadline, handle.next_event()).await
                         }
                     } => match ev {
                         Ok(Some(frame)) => {
@@ -359,9 +362,9 @@ impl Provider for ExtensionProvider {
                         }
                         Ok(None) => break,
                         Err(_) => {
-                            // Pre-first-event idle deadline — do not wait for
-                            // finish (a late terminal inside that window would
-                            // otherwise look like a clean stream).
+                            // Absolute pre-first-event deadline — do not wait
+                            // for finish (a late terminal inside that window
+                            // would otherwise look like a clean stream).
                             let _ = tx
                                 .send(Err(provider_error(crate::client::HostClientError::Timeout {
                                     id: handle.id(),
@@ -2006,10 +2009,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn extension_provider_junk_spam_hits_absolute_first_event_deadline() -> R {
+        let (client, mut host) = make_pair().await;
+        let timeout = Duration::from_millis(100);
+        let provider = ExtensionProvider::new("custom", Arc::new(client)).with_timeout(timeout);
+        let model = Model {
+            id: "m".to_owned(),
+            name: "M".to_owned(),
+            api: "custom".to_owned(),
+            provider: "custom".to_owned(),
+            ..base_model_defaults()
+        };
+        let started = tokio::time::Instant::now();
+        let mut stream = provider.stream(&model, Context::default(), StreamOptions::default());
+        let req = host.require_frame(methods::PROVIDER_STREAM).await?;
+        let req_id = req.id;
+
+        // Undecodable frames faster than `timeout` forever: a fresh per-wait
+        // timeout would keep the stream alive; the absolute deadline must not.
+        let host_task = tokio::spawn(async move {
+            loop {
+                if host
+                    .write_frame(&Frame::event(
+                        req_id,
+                        Method::ProviderEvent,
+                        serde_json::json!({"not": "an-assistant-event"}),
+                    ))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        let item = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .map_err(|_| "junk-spam exceeded outer guard (fresh per-wait timeout?)")?
+            .ok_or("junk-spam must yield Timeout, not clean EOF")?;
+        let elapsed = started.elapsed();
+        let err = match item {
+            Err(err) => err,
+            Ok(value) => {
+                return Err(format!("junk-spam must be Timeout, got Ok({value:?})").into());
+            }
+        };
+        assert!(
+            err.to_string().contains("timed out after 100ms"),
+            "unexpected: {err}"
+        );
+        assert!(
+            elapsed < timeout * 2,
+            "deadline must be absolute from stream start, elapsed={elapsed:?} timeout={timeout:?}"
+        );
+
+        host_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn extension_provider_malformed_frame_then_valid_event_still_streams() -> R {
         let (client, mut host) = make_pair().await;
         let provider = ExtensionProvider::new("custom", Arc::new(client))
-            .with_timeout(Duration::from_millis(50));
+            .with_timeout(Duration::from_millis(100));
         let model = Model {
             id: "m".to_owned(),
             name: "M".to_owned(),
@@ -2020,12 +2083,17 @@ mod tests {
         let mut stream = provider.stream(&model, Context::default(), StreamOptions::default());
         let req = host.require_frame(methods::PROVIDER_STREAM).await?;
 
-        host.write_frame(&Frame::event(
-            req.id,
-            Method::ProviderEvent,
-            serde_json::json!({"not": "an-assistant-event"}),
-        ))
-        .await?;
+        // Several undecodable frames, then a valid event still inside the
+        // absolute first-event deadline — stream must proceed normally.
+        for _ in 0..3 {
+            host.write_frame(&Frame::event(
+                req.id,
+                Method::ProviderEvent,
+                serde_json::json!({"not": "an-assistant-event"}),
+            ))
+            .await?;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         host.write_frame(&Frame::event(
             req.id,
             Method::ProviderEvent,
