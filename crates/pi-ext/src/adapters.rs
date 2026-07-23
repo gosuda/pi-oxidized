@@ -282,9 +282,9 @@ impl ExtensionProvider {
 
     /// Override the per-call deadline.
     ///
-    /// Bounds each individual host request (time to first event, terminal
-    /// finish), not the stream's lifetime. Inter-event gaps are unbounded
-    /// once streaming has begun.
+    /// Bounds each individual host request (time to first decoded event,
+    /// terminal finish), not the stream's lifetime. Inter-event gaps are
+    /// unbounded once a decoded event has been yielded.
     #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
@@ -327,8 +327,9 @@ impl Provider for ExtensionProvider {
                     return;
                 }
             };
-            // Bound only the pre-first-event wait. After the first frame,
-            // inter-event gaps are unbounded (mirrors ExtensionAgentTool).
+            // Bound only the pre-first-decoded-event wait. Unknown/malformed
+            // frames are skipped and do not disarm the deadline; after the
+            // first decoded event, inter-event gaps are unbounded.
             let mut seen_event = false;
             loop {
                 tokio::select! {
@@ -348,12 +349,12 @@ impl Provider for ExtensionProvider {
                         }
                     } => match ev {
                         Ok(Some(frame)) => {
-                            seen_event = true;
-                            if let Some(event) = decode_provider_stream_event(&frame.payload)
-                                && tx.send(Ok(event)).await.is_err()
-                            {
-                                // Consumer dropped — stop driving the host stream.
-                                return;
+                            if let Some(event) = decode_provider_stream_event(&frame.payload) {
+                                seen_event = true;
+                                if tx.send(Ok(event)).await.is_err() {
+                                    // Consumer dropped — stop driving the host stream.
+                                    return;
+                                }
                             }
                         }
                         Ok(None) => break,
@@ -1959,6 +1960,97 @@ mod tests {
         let cancel = host_task.await??;
         assert_eq!(cancel.method, methods::PROVIDER_CANCEL);
         assert_eq!(cancel.payload["id"], req_id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn extension_provider_malformed_first_frame_keeps_idle_deadline() -> R {
+        let (client, mut host) = make_pair().await;
+        let provider = ExtensionProvider::new("custom", Arc::new(client))
+            .with_timeout(Duration::from_millis(50));
+        let model = Model {
+            id: "m".to_owned(),
+            name: "M".to_owned(),
+            api: "custom".to_owned(),
+            provider: "custom".to_owned(),
+            ..base_model_defaults()
+        };
+        let mut stream = provider.stream(&model, Context::default(), StreamOptions::default());
+        let req = host.require_frame(methods::PROVIDER_STREAM).await?;
+
+        // Undecodable first frame must be skipped without disarming the deadline.
+        host.write_frame(&Frame::event(
+            req.id,
+            Method::ProviderEvent,
+            serde_json::json!({"not": "an-assistant-event"}),
+        ))
+        .await?;
+
+        let item = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .map_err(|_| "malformed-then-silence exceeded outer guard")?
+            .ok_or("malformed-then-silence must yield Timeout, not clean EOF")?;
+        let err = match item {
+            Err(err) => err,
+            Ok(value) => {
+                return Err(
+                    format!("malformed-then-silence must be Timeout, got Ok({value:?})").into(),
+                );
+            }
+        };
+        assert!(
+            err.to_string().contains("timed out after 50ms"),
+            "unexpected: {err}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn extension_provider_malformed_frame_then_valid_event_still_streams() -> R {
+        let (client, mut host) = make_pair().await;
+        let provider = ExtensionProvider::new("custom", Arc::new(client))
+            .with_timeout(Duration::from_millis(50));
+        let model = Model {
+            id: "m".to_owned(),
+            name: "M".to_owned(),
+            api: "custom".to_owned(),
+            provider: "custom".to_owned(),
+            ..base_model_defaults()
+        };
+        let mut stream = provider.stream(&model, Context::default(), StreamOptions::default());
+        let req = host.require_frame(methods::PROVIDER_STREAM).await?;
+
+        host.write_frame(&Frame::event(
+            req.id,
+            Method::ProviderEvent,
+            serde_json::json!({"not": "an-assistant-event"}),
+        ))
+        .await?;
+        host.write_frame(&Frame::event(
+            req.id,
+            Method::ProviderEvent,
+            text_delta_event("after-junk"),
+        ))
+        .await?;
+        host.write_frame(&Frame::response(
+            req.id,
+            Method::Notify,
+            serde_json::json!({}),
+        ))
+        .await?;
+
+        let first = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await?
+            .ok_or("missing first event after malformed skip")??;
+        match first {
+            AssistantMessageEvent::TextDelta { delta, .. } => assert_eq!(delta, "after-junk"),
+            other => return Err(format!("unexpected first event: {other:?}").into()),
+        }
+        let ended = tokio::time::timeout(Duration::from_secs(2), stream.next()).await?;
+        assert!(
+            ended.is_none(),
+            "expected clean EOS after malformed skip + valid event, got {ended:?}"
+        );
         Ok(())
     }
 
