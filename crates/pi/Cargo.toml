@@ -47,7 +47,7 @@ uuid = { version = "=1.24.0", features = ["v4", "v7"] }
 wait-timeout = "=0.2.1"
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "=0.31.3", default-features = false, features = ["signal"] }
+nix = { version = "=0.31.3", default-features = false, features = ["fs", "signal", "user"] }
 
 [dev-dependencies]
 insta = { version = "=1.48.0", features = ["filters"] }

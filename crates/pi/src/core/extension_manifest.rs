@@ -288,12 +288,12 @@ fn classify_directory(path: &Path, target: &str) -> Result<ClassifiedExtension, 
                 ManifestErrorKind::NativeEntryNotFile,
             ));
         }
-        // Spawning a non-executable regular file fails at process launch on
-        // Unix; reject early so discovery surfaces a typed diagnostic.
+        // Spawning a file the process cannot execute fails at launch on
+        // Unix; access(2) checks the effective ids, so an execute bit set
+        // only for a non-applicable class still rejects early here.
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            if metadata.permissions().mode() & 0o111 == 0 {
+            if nix::unistd::access(&entry, nix::unistd::AccessFlags::X_OK).is_err() {
                 return Err(ManifestError::new(
                     &manifest_path,
                     ManifestErrorKind::NativeEntryNotExecutable,
@@ -1135,6 +1135,30 @@ mod tests {
             &["bin/tool"],
         )?;
         // Default write mode has no execute bits; do not chmod.
+        let kind = expect_kind(classify_extension(&dir, TARGET))?;
+        assert_eq!(kind, ManifestErrorKind::NativeEntryNotExecutable);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_other_class_execute_bit_only_is_rejected() -> TestResult {
+        // access(2) honors the effective ids: a file whose ONLY execute bit
+        // belongs to a class the process is not in must still reject.
+        if nix::unistd::geteuid().is_root() {
+            // Root passes X_OK regardless of class bits.
+            return Ok(());
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir()?;
+        let dir = extension_dir(
+            &temp,
+            "native-other-exec",
+            &manifest_json("native-other-exec", "native", "\"bin/tool\""),
+            &["bin/tool"],
+        )?;
+        let tool = dir.join("bin/tool");
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o001))?;
         let kind = expect_kind(classify_extension(&dir, TARGET))?;
         assert_eq!(kind, ManifestErrorKind::NativeEntryNotExecutable);
         Ok(())
