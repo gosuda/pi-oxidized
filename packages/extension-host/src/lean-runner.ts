@@ -87,6 +87,29 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
+ * Canonicalize JSON-like values so object key order does not affect equality.
+ * Arrays keep element order; plain objects get sorted keys recursively.
+ */
+function canonicalizeJson(value: unknown): unknown {
+	if (Array.isArray(value)) {
+		return value.map(canonicalizeJson);
+	}
+	if (isRecord(value)) {
+		const sorted: Record<string, unknown> = {};
+		for (const key of Object.keys(value).sort()) {
+			sorted[key] = canonicalizeJson(value[key]);
+		}
+		return sorted;
+	}
+	return value;
+}
+
+/** Order-insensitive JSON structural equality (key reorder is a no-op). */
+function jsonEqual(a: unknown, b: unknown): boolean {
+	return JSON.stringify(canonicalizeJson(a)) === JSON.stringify(canonicalizeJson(b));
+}
+
+/**
  * Import specifiers a lean entry must never reference. Lean entries are
  * prebundled, so ANY upstream-compat specifier means the entry was built
  * for the wrong mode. `@earendil-works/pi-tui-protocol` stays legal: it is
@@ -858,7 +881,7 @@ export class LeanRunner {
 					if (!isRecord(input)) throw new Error("tool_call.input is required");
 					// Snapshot for omission: Rust treats wire.input = Some as
 					// arguments_changed. Only echo input when a handler actually
-					// mutated it (in-place content change; identity stays the same).
+					// mutated JSON content (key reorder alone is not a change).
 					const baseline = structuredClone(input);
 					let result: unknown;
 					await this.runHooks(eventType, { type: eventType, ...payload, input }, (r) => {
@@ -869,7 +892,7 @@ export class LeanRunner {
 					const response: Record<string, unknown> = {
 						...(isRecord(result) ? result : {}),
 					};
-					if (JSON.stringify(input) !== JSON.stringify(baseline)) {
+					if (!jsonEqual(input, baseline)) {
 						response["input"] = input;
 					} else {
 						delete response["input"];

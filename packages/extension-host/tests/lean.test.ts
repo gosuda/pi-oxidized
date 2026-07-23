@@ -36,6 +36,8 @@ const FOLD_SECOND_ENTRY = join(LEAN_FIXTURES, "fold-second.mjs");
 const ROLE_BREAKER_ENTRY = join(LEAN_FIXTURES, "role-breaker.mjs");
 const MESSAGE_UPDATE_CANCEL_ENTRY = join(LEAN_FIXTURES, "message-update-cancel.mjs");
 const TOOL_CALL_NOOP_ENTRY = join(LEAN_FIXTURES, "tool-call-noop.mjs");
+const TOOL_CALL_REORDER_ENTRY = join(LEAN_FIXTURES, "tool-call-reorder.mjs");
+const TOOL_CALL_VALUE_CHANGE_ENTRY = join(LEAN_FIXTURES, "tool-call-value-change.mjs");
 const TOOL_RESULT_TERMINATE_ONLY_ENTRY = join(LEAN_FIXTURES, "tool-result-terminate-only.mjs");
 const PRELOAD = resolve(import.meta.dirname, "fixtures", "lean-forbid-compat-graph.ts");
 
@@ -516,6 +518,46 @@ describe("lean: lifecycle hooks", () => {
 		const res = payload(await link.response(46, "tool_call"));
 		expect(res).toEqual({ block: false, reason: "noop-ack" });
 		expect(Object.hasOwn(res, "input")).toBe(false);
+		await link.finish();
+	});
+
+
+	test("tool_call omits input when a hook only reorders object keys", async () => {
+		const link = new LeanLink({ cwd: PACKAGE_DIR, extensionPaths: [] });
+		await link.hello(1);
+		link.request(2, "extensions.load", {
+			extensionPaths: [TOOL_CALL_REORDER_ENTRY],
+			cwd: PACKAGE_DIR,
+		});
+		await link.response(2, "extensions.load");
+		link.request(47, "tool_call", {
+			toolName: "echo",
+			toolCallId: "call-reorder",
+			input: { a: 1, m: 2, z: 3 },
+		});
+		const res = payload(await link.response(47, "tool_call"));
+		expect(res).toEqual({ block: false, reason: "reorder-ack" });
+		expect(Object.hasOwn(res, "input")).toBe(false);
+		await link.finish();
+	});
+
+	test("tool_call includes input when a hook changes a value", async () => {
+		const link = new LeanLink({ cwd: PACKAGE_DIR, extensionPaths: [] });
+		await link.hello(1);
+		link.request(2, "extensions.load", {
+			extensionPaths: [TOOL_CALL_VALUE_CHANGE_ENTRY],
+			cwd: PACKAGE_DIR,
+		});
+		await link.response(2, "extensions.load");
+		link.request(48, "tool_call", {
+			toolName: "echo",
+			toolCallId: "call-value",
+			input: { a: "original", m: 2, z: 3 },
+		});
+		const res = payload(await link.response(48, "tool_call"));
+		expect(res["block"]).toBe(false);
+		expect(res["reason"]).toBe("value-ack");
+		expect(res["input"]).toEqual({ a: "changed", m: 2, z: 3 });
 		await link.finish();
 	});
 
