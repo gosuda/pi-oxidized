@@ -99,6 +99,10 @@ use super::view::{ComposedSection, compose};
 /// callers can wire their own alarm.
 pub const DRAW_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Maximum time spent draining aborted prompt operations during teardown.
+/// Matches the extension host's three-second shutdown grace.
+const PROMPT_QUIESCE_GRACE: Duration = Duration::from_secs(3);
+
 /// Background coalescing window for streaming / tool / plugin updates.
 pub const BACKGROUND_COALESCE_WINDOW: Duration = Duration::from_millis(16);
 
@@ -1595,8 +1599,8 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     }
 
     async fn finish_run(&mut self) -> InteractiveExit {
-        // A prompt owns AgentSession turn cleanup until it settles. Abort and
-        // drain before returning so dropping the runtime cannot detach a turn.
+        // Abort prompt-owned AgentSession cleanup and drain it within the
+        // quiesce grace; token-blind work is detached with a diagnostic.
         self.quiesce_prompt_operations().await;
 
         // Final paint so the last view-state mutation is visible.
@@ -2681,14 +2685,25 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     }
 
     /// Abort every session operation against the session it captured, then
-    /// await its cleanup before session replacement or runtime exit.
+    /// drain its cleanup within the quiesce grace.
     async fn quiesce_prompt_operations(&mut self) {
         self.prompt_operations.epoch = self.prompt_operations.epoch.wrapping_add(1);
         for (_, abort) in std::mem::take(&mut self.prompt_operations.aborts) {
             let _ = abort.send(());
         }
         self.prompt_operations.bash_operation = None;
-        while self.prompt_operations.tasks.join_next().await.is_some() {}
+        if tokio::time::timeout(PROMPT_QUIESCE_GRACE, async {
+            while self.prompt_operations.tasks.join_next().await.is_some() {}
+        })
+        .await
+        .is_err()
+        {
+            let detached = self.prompt_operations.tasks.len();
+            self.prompt_operations.tasks.detach_all();
+            self.last_error = Some(format!(
+                "prompt operation shutdown timed out; detached {detached} task(s)"
+            ));
+        }
     }
 
     async fn handle_select_confirmed(
@@ -6301,12 +6316,23 @@ mod tests {
         first_runs: std::sync::Mutex<Vec<crate::core::platform::first_run::FirstRunSelection>>,
     }
 
+    #[derive(Clone, Copy, Default)]
+    enum FakePromptMode {
+        #[default]
+        Normal,
+        ReleaseOnAbort,
+        IgnoreAbort,
+    }
+
     struct FakeHost {
         log: Arc<ActionLog>,
         partial_tx: watch::Sender<Option<Arc<AssistantMessage>>>,
         snapshot: Arc<std::sync::Mutex<SessionSnapshot>>,
         event_senders: Arc<std::sync::Mutex<Vec<mpsc::UnboundedSender<AgentSessionEvent>>>>,
         stream_chunks: Arc<AtomicUsize>,
+        prompt_mode: Arc<std::sync::Mutex<FakePromptMode>>,
+        prompt_started: Arc<Notify>,
+        prompt_release: Arc<Notify>,
         logout_options: Arc<std::sync::Mutex<Vec<super::state::LogoutOption>>>,
         clone_nothing: Arc<std::sync::atomic::AtomicBool>,
         cancel_new: Arc<std::sync::atomic::AtomicBool>,
@@ -6325,6 +6351,9 @@ mod tests {
                 snapshot: Arc::new(std::sync::Mutex::new(SessionSnapshot::default())),
                 event_senders: Arc::new(std::sync::Mutex::new(Vec::new())),
                 stream_chunks: Arc::new(AtomicUsize::new(0)),
+                prompt_mode: Arc::new(std::sync::Mutex::new(FakePromptMode::Normal)),
+                prompt_started: Arc::new(Notify::new()),
+                prompt_release: Arc::new(Notify::new()),
                 logout_options: Arc::new(std::sync::Mutex::new(Vec::new())),
                 clone_nothing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 cancel_new: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -6337,6 +6366,13 @@ mod tests {
 
         fn set_stream_chunks(&self, chunks: usize) {
             self.stream_chunks.store(chunks, Ordering::SeqCst);
+        }
+
+        fn set_prompt_mode(&self, mode: FakePromptMode) {
+            *self
+                .prompt_mode
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = mode;
         }
 
         fn set_logout_options(&self, options: Vec<super::state::LogoutOption>) {
@@ -6450,12 +6486,24 @@ mod tests {
             let partial_tx = self.partial_tx.clone();
             let snapshot = Arc::clone(&self.snapshot);
             let stream_chunks = Arc::clone(&self.stream_chunks);
+            let prompt_mode = *self
+                .prompt_mode
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let prompt_started = Arc::clone(&self.prompt_started);
+            let prompt_release = Arc::clone(&self.prompt_release);
             Box::pin(async move {
                 log.prompts.lock().await.push(owned);
                 log.prompt_behaviors
                     .lock()
                     .await
                     .push(opts.streaming_behavior);
+                prompt_started.notify_one();
+                match prompt_mode {
+                    FakePromptMode::Normal => {}
+                    FakePromptMode::ReleaseOnAbort => prompt_release.notified().await,
+                    FakePromptMode::IgnoreAbort => std::future::pending::<()>().await,
+                }
                 if opts.streaming_behavior.is_some() {
                     return Ok(());
                 }
@@ -6509,9 +6557,11 @@ mod tests {
 
         fn abort(&self) -> BoxFuture<'static, Result<(), String>> {
             let log = Arc::clone(&self.log);
+            let prompt_release = Arc::clone(&self.prompt_release);
             Box::pin(async move {
                 *log.aborts.lock().await += 1;
                 log.bash_release.notify_one();
+                prompt_release.notify_one();
                 Ok(())
             })
         }
@@ -7541,6 +7591,92 @@ mod tests {
             vec![None, Some(StreamingBehavior::Steer)]
         );
         rt.quiesce_prompt_operations().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finish_run_detaches_prompt_operation_that_ignores_abort() -> Result<(), String> {
+        let writer = SharedWriter::new();
+        let tui = Tui::new(
+            writer,
+            Size::new(80, 24),
+            Position::ORIGIN,
+            8,
+            TerminalCapabilities::default(),
+        )
+        .map_err(|error| format!("tui construction failed: {error}"))?;
+        let (_input_tx, input_rx) = mpsc::unbounded_channel::<UiEvent>();
+        let input = TerminalInput::mock(input_rx);
+        let (host, _log) = FakeHost::new();
+        host.set_prompt_mode(FakePromptMode::IgnoreAbort);
+        let prompt_started = Arc::clone(&host.prompt_started);
+        let mut rt = InteractiveRuntime::new(
+            tui,
+            input,
+            Arc::new(host),
+            &InteractiveRuntimeOptions::default(),
+        );
+
+        let _ = rt
+            .dispatch_action(ViewAction::Submit {
+                text: "stuck prompt".to_owned(),
+            })
+            .await;
+        tokio::time::timeout(Duration::from_secs(1), prompt_started.notified())
+            .await
+            .map_err(|_| "prompt operation did not start".to_owned())?;
+
+        let exit = tokio::time::timeout(Duration::from_secs(4), rt.finish_run())
+            .await
+            .map_err(|_| "finish_run exceeded the prompt quiesce bound".to_owned())?;
+
+        assert_eq!(exit, InteractiveExit::Clean);
+        assert_eq!(
+            rt.last_error(),
+            Some("prompt operation shutdown timed out; detached 1 task(s)")
+        );
+        assert!(rt.prompt_operations.tasks.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finish_run_drains_abortable_prompt_without_diagnostic() -> Result<(), String> {
+        let writer = SharedWriter::new();
+        let tui = Tui::new(
+            writer,
+            Size::new(80, 24),
+            Position::ORIGIN,
+            8,
+            TerminalCapabilities::default(),
+        )
+        .map_err(|error| format!("tui construction failed: {error}"))?;
+        let (_input_tx, input_rx) = mpsc::unbounded_channel::<UiEvent>();
+        let input = TerminalInput::mock(input_rx);
+        let (host, _log) = FakeHost::new();
+        host.set_prompt_mode(FakePromptMode::ReleaseOnAbort);
+        let prompt_started = Arc::clone(&host.prompt_started);
+        let mut rt = InteractiveRuntime::new(
+            tui,
+            input,
+            Arc::new(host),
+            &InteractiveRuntimeOptions::default(),
+        );
+
+        let _ = rt
+            .dispatch_action(ViewAction::Submit {
+                text: "abortable prompt".to_owned(),
+            })
+            .await;
+        tokio::time::timeout(Duration::from_secs(1), prompt_started.notified())
+            .await
+            .map_err(|_| "prompt operation did not start".to_owned())?;
+
+        tokio::time::timeout(Duration::from_secs(1), rt.finish_run())
+            .await
+            .map_err(|_| "abortable prompt did not drain promptly".to_owned())?;
+
+        assert_eq!(rt.last_error(), None);
+        assert!(rt.prompt_operations.tasks.is_empty());
         Ok(())
     }
 
