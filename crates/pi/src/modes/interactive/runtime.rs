@@ -99,8 +99,10 @@ use super::view::{ComposedSection, compose};
 /// callers can wire their own alarm.
 pub const DRAW_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Maximum time spent draining aborted prompt operations during teardown.
-/// Matches the extension host's three-second shutdown grace.
+/// Maximum time spent draining aborted prompt operations during final
+/// runtime teardown ([`InteractiveRuntime::finish_run`]). Session replacement
+/// drains without this deadline so token-blind work cannot be orphaned under a
+/// live process. Matches the extension host's three-second shutdown grace.
 const PROMPT_QUIESCE_GRACE: Duration = Duration::from_secs(3);
 
 /// Background coalescing window for streaming / tool / plugin updates.
@@ -1601,7 +1603,9 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     async fn finish_run(&mut self) -> InteractiveExit {
         // Abort prompt-owned AgentSession cleanup and drain it within the
         // quiesce grace; token-blind work is detached with a diagnostic.
-        self.quiesce_prompt_operations().await;
+        // Final teardown must remain bounded so process exit is guaranteed.
+        self.quiesce_prompt_operations(Some(PROMPT_QUIESCE_GRACE))
+            .await;
 
         // Final paint so the last view-state mutation is visible.
         if matches!(
@@ -2441,7 +2445,9 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     }
 
     async fn replace_session(&mut self, replacement: SessionReplacement) -> ActionOutcome {
-        self.quiesce_prompt_operations().await;
+        // Replacement keeps the process alive; drain without a deadline so the
+        // prior turn's provider/extension cleanup cannot be orphaned.
+        self.quiesce_prompt_operations(None).await;
         if self.pending_extension_dialog.is_some() {
             self.cancel_extension_dialog().await;
         }
@@ -2685,24 +2691,29 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     }
 
     /// Abort every session operation against the session it captured, then
-    /// drain its cleanup within the quiesce grace.
-    async fn quiesce_prompt_operations(&mut self) {
+    /// drain its cleanup.
+    ///
+    /// `deadline` of [`Some`] applies a bound (final teardown): leftover
+    /// token-blind tasks are detached with a diagnostic. [`None`] waits until
+    /// every aborted operation completes (session replacement).
+    async fn quiesce_prompt_operations(&mut self, deadline: Option<Duration>) {
         self.prompt_operations.epoch = self.prompt_operations.epoch.wrapping_add(1);
         for (_, abort) in std::mem::take(&mut self.prompt_operations.aborts) {
             let _ = abort.send(());
         }
         self.prompt_operations.bash_operation = None;
-        if tokio::time::timeout(PROMPT_QUIESCE_GRACE, async {
-            while self.prompt_operations.tasks.join_next().await.is_some() {}
-        })
-        .await
-        .is_err()
-        {
-            let detached = self.prompt_operations.tasks.len();
-            self.prompt_operations.tasks.detach_all();
-            self.last_error = Some(format!(
-                "prompt operation shutdown timed out; detached {detached} task(s)"
-            ));
+        let drain = async { while self.prompt_operations.tasks.join_next().await.is_some() {} };
+        match deadline {
+            Some(grace) => {
+                if tokio::time::timeout(grace, drain).await.is_err() {
+                    let detached = self.prompt_operations.tasks.len();
+                    self.prompt_operations.tasks.detach_all();
+                    self.last_error = Some(format!(
+                        "prompt operation shutdown timed out; detached {detached} task(s)"
+                    ));
+                }
+            }
+            None => drain.await,
         }
     }
 
@@ -2733,7 +2744,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 ActionOutcome::Repaint
             }
             super::state::SelectorKind::Session => {
-                self.quiesce_prompt_operations().await;
+                self.quiesce_prompt_operations(None).await;
                 if self.pending_extension_dialog.is_some() {
                     self.cancel_extension_dialog().await;
                 }
@@ -2750,7 +2761,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 ActionOutcome::Repaint
             }
             super::state::SelectorKind::Fork => {
-                self.quiesce_prompt_operations().await;
+                self.quiesce_prompt_operations(None).await;
                 if self.pending_extension_dialog.is_some() {
                     self.cancel_extension_dialog().await;
                 }
@@ -6333,6 +6344,7 @@ mod tests {
         prompt_mode: Arc<std::sync::Mutex<FakePromptMode>>,
         prompt_started: Arc<Notify>,
         prompt_release: Arc<Notify>,
+        abort_delay: Arc<std::sync::Mutex<Duration>>,
         logout_options: Arc<std::sync::Mutex<Vec<super::state::LogoutOption>>>,
         clone_nothing: Arc<std::sync::atomic::AtomicBool>,
         cancel_new: Arc<std::sync::atomic::AtomicBool>,
@@ -6354,6 +6366,7 @@ mod tests {
                 prompt_mode: Arc::new(std::sync::Mutex::new(FakePromptMode::Normal)),
                 prompt_started: Arc::new(Notify::new()),
                 prompt_release: Arc::new(Notify::new()),
+                abort_delay: Arc::new(std::sync::Mutex::new(Duration::ZERO)),
                 logout_options: Arc::new(std::sync::Mutex::new(Vec::new())),
                 clone_nothing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 cancel_new: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -6373,6 +6386,13 @@ mod tests {
                 .prompt_mode
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = mode;
+        }
+
+        fn set_abort_delay(&self, delay: Duration) {
+            *self
+                .abort_delay
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = delay;
         }
 
         fn set_logout_options(&self, options: Vec<super::state::LogoutOption>) {
@@ -6558,8 +6578,15 @@ mod tests {
         fn abort(&self) -> BoxFuture<'static, Result<(), String>> {
             let log = Arc::clone(&self.log);
             let prompt_release = Arc::clone(&self.prompt_release);
+            let delay = *self
+                .abort_delay
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             Box::pin(async move {
                 *log.aborts.lock().await += 1;
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
                 log.bash_release.notify_one();
                 prompt_release.notify_one();
                 Ok(())
@@ -7590,7 +7617,7 @@ mod tests {
             *log.prompt_behaviors.lock().await,
             vec![None, Some(StreamingBehavior::Steer)]
         );
-        rt.quiesce_prompt_operations().await;
+        rt.quiesce_prompt_operations(None).await;
         Ok(())
     }
 
@@ -7713,6 +7740,56 @@ mod tests {
         assert_eq!(*log.new_sessions.lock().await, 1);
         assert!(rt.prompt_operations.tasks.is_empty());
         assert!(rt.prompt_operations.aborts.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_replacement_waits_for_abortable_prompt_completion() -> Result<(), String> {
+        let writer = SharedWriter::new();
+        let tui = Tui::new(
+            writer,
+            Size::new(80, 24),
+            Position::ORIGIN,
+            8,
+            TerminalCapabilities::default(),
+        )
+        .map_err(|error| format!("tui construction failed: {error}"))?;
+        let (_input_tx, input_rx) = mpsc::unbounded_channel::<UiEvent>();
+        let input = TerminalInput::mock(input_rx);
+        let (host, log) = FakeHost::new();
+        host.set_prompt_mode(FakePromptMode::ReleaseOnAbort);
+        // Past the teardown grace: replacement must keep waiting (no detach).
+        host.set_abort_delay(PROMPT_QUIESCE_GRACE + Duration::from_millis(500));
+        let prompt_started = Arc::clone(&host.prompt_started);
+        let mut rt = InteractiveRuntime::new(
+            tui,
+            input,
+            Arc::new(host),
+            &InteractiveRuntimeOptions::default(),
+        );
+
+        let _ = rt
+            .dispatch_action(ViewAction::Submit {
+                text: "abortable across switch".to_owned(),
+            })
+            .await;
+        tokio::time::timeout(Duration::from_secs(1), prompt_started.notified())
+            .await
+            .map_err(|_| "prompt operation did not start".to_owned())?;
+
+        let started = std::time::Instant::now();
+        let _ = rt.dispatch_action(ViewAction::NewSession).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed > PROMPT_QUIESCE_GRACE,
+            "replacement returned before abort cleanup finished: {elapsed:?}"
+        );
+        assert_eq!(*log.aborts.lock().await, 1);
+        assert_eq!(*log.new_sessions.lock().await, 1);
+        assert!(rt.prompt_operations.tasks.is_empty());
+        assert!(rt.prompt_operations.aborts.is_empty());
+        assert_eq!(rt.last_error(), None);
         Ok(())
     }
 
