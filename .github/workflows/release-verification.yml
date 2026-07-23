@@ -38,6 +38,7 @@ jobs:
           repository: earendil-works/pi
           ref: 956074697fc0f59e8a9787717e76d5bb0ee7bc72
           path: .references/pi
+          persist-credentials: false
 
       - name: Verify reference pin
         shell: bash
