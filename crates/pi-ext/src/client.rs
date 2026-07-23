@@ -2123,7 +2123,10 @@ mod tests {
 
     #[tokio::test]
     async fn provider_stream_overflow_is_explicit_cancelled_and_call_local() -> R {
-        const FORWARD_CAPACITY: u64 = 1024;
+        // Flood past the production bound so a capacity change cannot desync the
+        // regression (too-small flood would stop overflowing; stale expected
+        // capacity would fail the assertion below).
+        const FLOOD: usize = PROVIDER_FORWARD_CAPACITY + 3;
 
         let (client, mut host) = make_pair().await;
         let client = Arc::new(client);
@@ -2132,7 +2135,7 @@ mod tests {
             .await?;
         let provider_request = host.read_frame().await.ok_or("no provider request")?;
 
-        for n in 0..=FORWARD_CAPACITY + 2 {
+        for n in 0..FLOOD {
             host.write_frame(&Frame::event(
                 provider_request.id,
                 Method::ProviderEvent,
@@ -2182,7 +2185,7 @@ mod tests {
             provider.finish(Duration::from_secs(2)).await,
             Err(HostClientError::StreamOverflow {
                 id,
-                capacity: 1024
+                capacity: PROVIDER_FORWARD_CAPACITY
             }) if id == provider_request.id
         ));
         Ok(())
