@@ -333,8 +333,10 @@ impl Provider for ExtensionProvider {
                             .await;
                         return;
                     }
-                    ev = handle.next_event() => match ev {
-                        Some(frame) => {
+                    // Bound each idle wait so a hung host surfaces `with_timeout`
+                    // instead of parking forever on `next_event` (finish never runs).
+                    ev = tokio::time::timeout(timeout, handle.next_event()) => match ev {
+                        Ok(Some(frame)) => {
                             if let Some(event) = decode_provider_stream_event(&frame.payload)
                                 && tx.send(Ok(event)).await.is_err()
                             {
@@ -342,7 +344,9 @@ impl Provider for ExtensionProvider {
                                 return;
                             }
                         }
-                        None => break,
+                        // Channel closed (terminal arrived) or idle deadline elapsed —
+                        // `finish` applies the same timeout and yields Timeout on hang.
+                        Ok(None) | Err(_) => break,
                     }
                 }
             }
@@ -1833,6 +1837,38 @@ mod tests {
 
         // Last with_timeout replaces earlier values; hung host hits the 50ms deadline.
         let err = match tool.prepare_and_validate_arguments(Map::new()).await {
+            Err(err) => err,
+            Ok(value) => {
+                return Err(format!("hung host must time out, got {value:?}").into());
+            }
+        };
+        assert!(
+            err.to_string().contains("timed out after 50ms"),
+            "unexpected: {err}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn extension_provider_timeout_builders() -> R {
+        let (client, _host) = make_pair().await;
+        let provider = ExtensionProvider::new("custom", Arc::new(client))
+            .with_timeout(Duration::from_secs(9))
+            .with_timeout(Duration::from_millis(50));
+        let model = Model {
+            id: "m".to_owned(),
+            name: "M".to_owned(),
+            api: "custom".to_owned(),
+            provider: "custom".to_owned(),
+            ..base_model_defaults()
+        };
+        let mut stream = provider.stream(&model, Context::default(), StreamOptions::default());
+        // Last with_timeout replaces earlier values; hung host hits the 50ms deadline.
+        let item = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .map_err(|_| "provider timeout exceeded outer guard")?
+            .ok_or("hung host must yield a stream item")?;
+        let err = match item {
             Err(err) => err,
             Ok(value) => {
                 return Err(format!("hung host must time out, got {value:?}").into());
