@@ -110,6 +110,19 @@ impl ExtensionAgentTool {
             timeout: DEFAULT_CALL_TIMEOUT,
         }
     }
+
+    /// Override the per-call deadline.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Borrowed registration metadata.
+    #[must_use]
+    pub fn registration(&self) -> &ToolRegistration {
+        &self.meta
+    }
 }
 
 impl AgentTool for ExtensionAgentTool {
@@ -265,6 +278,13 @@ impl ExtensionProvider {
             client,
             timeout: DEFAULT_CALL_TIMEOUT,
         }
+    }
+
+    /// Override the per-call deadline.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 }
 
@@ -1782,6 +1802,46 @@ mod tests {
             }
             other => return Err(format!("expected Key wire, got {other:?}").into()),
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn extension_tool_registration_and_timeout_builders() -> R {
+        let (client, _host) = make_pair().await;
+        let meta = ToolRegistration {
+            name: "ext.meta".to_owned(),
+            label: "Meta".to_owned(),
+            description: "desc".to_owned(),
+            parameters: serde_json::json!({"type": "object"}),
+            execution_mode: Some(ToolExecutionMode::Sequential),
+        };
+        let tool = ExtensionAgentTool::new(meta, Arc::new(client))
+            .with_timeout(Duration::from_secs(9))
+            .with_timeout(Duration::from_millis(50));
+        let registration = tool.registration();
+        assert_eq!(registration.name, "ext.meta");
+        assert_eq!(registration.label, "Meta");
+        assert_eq!(registration.description, "desc");
+        assert_eq!(
+            registration.parameters,
+            serde_json::json!({"type": "object"})
+        );
+        assert_eq!(
+            registration.execution_mode,
+            Some(ToolExecutionMode::Sequential)
+        );
+
+        // Last with_timeout replaces earlier values; hung host hits the 50ms deadline.
+        let err = match tool.prepare_and_validate_arguments(Map::new()).await {
+            Err(err) => err,
+            Ok(value) => {
+                return Err(format!("hung host must time out, got {value:?}").into());
+            }
+        };
+        assert!(
+            err.to_string().contains("timed out after 50ms"),
+            "unexpected: {err}"
+        );
         Ok(())
     }
 
