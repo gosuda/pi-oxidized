@@ -349,7 +349,8 @@ impl ResolvedTheme {
     /// Slot arrays are `Copy`; only an owned `name` allocates. Byte-equivalent
     /// to re-resolving the source JSON at `mode` (slot values downsample at
     /// emit time), so built-in interns become 256-color without re-parsing.
-    fn with_mode(&self, mode: ColorMode) -> Self {
+    #[must_use]
+    pub(crate) fn with_mode(&self, mode: ColorMode) -> Self {
         Self {
             fg: self.fg,
             bg: self.bg,

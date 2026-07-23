@@ -3316,7 +3316,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     /// form apply without persistence (upstream `setThemeInstance`).
     async fn handle_extension_theme_set(&mut self, set: ThemeSet) {
         if let Some(wire) = set.theme {
-            self.apply_theme(Arc::new(resolved_theme_from_wire(&wire)));
+            self.apply_theme(Arc::new(resolved_theme_from_wire(&wire, self.color_mode)));
             self.push_theme_to_host().await;
             return;
         }
@@ -4467,8 +4467,13 @@ fn theme_wire_from_resolved(theme: &ResolvedTheme, source_path: Option<String>) 
 
 /// Build a theme from the extension `setTheme` object form. Unknown slots
 /// are ignored; missing slots stay empty (reset).
-fn resolved_theme_from_wire(wire: &ThemeWire) -> ResolvedTheme {
-    let mode = if wire.color_mode == "256color" {
+///
+/// `terminal_mode` caps the wire-declared depth the same way named themes
+/// degrade through [`ResolvedTheme::with_mode`]: a truecolor wire object on a
+/// 256-color terminal becomes Palette256. Terminal truecolor leaves the wire
+/// mode unchanged (including wire 256-color staying 256-color).
+fn resolved_theme_from_wire(wire: &ThemeWire, terminal_mode: ColorMode) -> ResolvedTheme {
+    let wire_mode = if wire.color_mode == "256color" {
         super::theme::ColorMode::Palette256
     } else {
         super::theme::ColorMode::Truecolor
@@ -4487,7 +4492,12 @@ fn resolved_theme_from_wire(wire: &ThemeWire) -> ResolvedTheme {
                 .get(*name)
                 .map(|value| (*slot, slot_value_from_wire(value)))
         });
-    ResolvedTheme::from_value_slots(fg, bg, mode, wire.name.clone().unwrap_or_default())
+    let theme =
+        ResolvedTheme::from_value_slots(fg, bg, wire_mode, wire.name.clone().unwrap_or_default());
+    match terminal_mode {
+        ColorMode::Palette256 => theme.with_mode(ColorMode::Palette256),
+        ColorMode::Truecolor => theme,
+    }
 }
 
 /// Assemble the `theme.update` payload: active theme, polarity context,
@@ -6825,8 +6835,17 @@ mod tests {
 
     fn try_make_runtime()
     -> Result<(InteractiveRuntime<SharedWriter, FakeHost>, Arc<ActionLog>), String> {
+        try_make_runtime_with_true_color(false)
+    }
+
+    fn try_make_runtime_with_true_color(
+        true_color: bool,
+    ) -> Result<(InteractiveRuntime<SharedWriter, FakeHost>, Arc<ActionLog>), String> {
         let writer = SharedWriter::new();
-        let caps = TerminalCapabilities::default();
+        let caps = TerminalCapabilities {
+            true_color,
+            ..TerminalCapabilities::default()
+        };
         let tui = Tui::new(writer, Size::new(80, 24), Position::ORIGIN, 8, caps)
             .map_err(|error| format!("tui construction: {error}"))?;
         let (_tx, rx) = mpsc::unbounded_channel::<UiEvent>();
@@ -6834,11 +6853,24 @@ mod tests {
         let (host, log) = FakeHost::new();
         let options = InteractiveRuntimeOptions {
             size: (80, 24),
+            caps: TerminalCapabilities {
+                true_color,
+                ..TerminalCapabilities::default()
+            },
             ..InteractiveRuntimeOptions::default()
         };
         let mut rt = InteractiveRuntime::new(tui, input, Arc::new(host), &options);
         let _ = rt.paint_now();
         Ok((rt, log))
+    }
+
+    fn make_runtime_with_true_color(
+        true_color: bool,
+    ) -> (InteractiveRuntime<SharedWriter, FakeHost>, Arc<ActionLog>) {
+        match try_make_runtime_with_true_color(true_color) {
+            Ok(runtime) => runtime,
+            Err(error) => std::panic::resume_unwind(Box::new(error)),
+        }
     }
 
     #[tokio::test]
@@ -6945,6 +6977,113 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .len();
         assert_eq!(persisted, 1);
+    }
+
+    #[test]
+    fn wire_truecolor_on_palette256_terminal_matches_named_degradation() {
+        // Named truecolor themes degrade via `with_mode(Palette256)` when the
+        // terminal lacks 24-bit support; wire object themes must match.
+        let named = super::super::theme::load_or_dark("dark", ColorMode::Palette256);
+        let truecolor = super::super::theme::load_or_dark("dark", ColorMode::Truecolor);
+        let wire = theme_wire_from_resolved(&truecolor, None);
+        assert_eq!(wire.color_mode, "truecolor");
+
+        let from_wire = resolved_theme_from_wire(&wire, ColorMode::Palette256);
+        assert_eq!(from_wire.mode(), ColorMode::Palette256);
+        assert_eq!(named.mode(), ColorMode::Palette256);
+        assert_eq!(
+            from_wire.fg_rgb(super::super::theme::ThemeColor::Text),
+            named.fg_rgb(super::super::theme::ThemeColor::Text)
+        );
+        let named_ansi = named.fg_ansi(super::super::theme::ThemeColor::Text);
+        let wire_ansi = from_wire.fg_ansi(super::super::theme::ThemeColor::Text);
+        assert!(
+            wire_ansi.contains("\x1b[38;5;"),
+            "wire path must emit indexed SGR on a 256-color terminal: {wire_ansi:?}"
+        );
+        assert_eq!(wire_ansi, named_ansi);
+    }
+
+    #[test]
+    fn wire_truecolor_on_truecolor_terminal_unchanged() {
+        let truecolor = super::super::theme::load_or_dark("dark", ColorMode::Truecolor);
+        let wire = theme_wire_from_resolved(&truecolor, None);
+        assert_eq!(wire.color_mode, "truecolor");
+
+        let from_wire = resolved_theme_from_wire(&wire, ColorMode::Truecolor);
+        assert_eq!(from_wire.mode(), ColorMode::Truecolor);
+        assert_eq!(
+            from_wire.fg_rgb(super::super::theme::ThemeColor::Text),
+            truecolor.fg_rgb(super::super::theme::ThemeColor::Text)
+        );
+        let ansi = from_wire.fg_ansi(super::super::theme::ThemeColor::Text);
+        assert!(
+            ansi.contains("\x1b[38;2;"),
+            "truecolor terminal must keep 24-bit SGR for a truecolor wire theme: {ansi:?}"
+        );
+        assert_eq!(
+            ansi,
+            truecolor.fg_ansi(super::super::theme::ThemeColor::Text)
+        );
+    }
+
+    #[test]
+    fn wire_256color_on_truecolor_terminal_stays_identity() {
+        let palette = super::super::theme::load_or_dark("dark", ColorMode::Palette256);
+        let wire = theme_wire_from_resolved(&palette, None);
+        assert_eq!(wire.color_mode, "256color");
+
+        let from_wire = resolved_theme_from_wire(&wire, ColorMode::Truecolor);
+        assert_eq!(from_wire.mode(), ColorMode::Palette256);
+        assert!(
+            from_wire
+                .fg_ansi(super::super::theme::ThemeColor::Text)
+                .contains("\x1b[38;5;"),
+            "wire 256-color must stay indexed even on a truecolor terminal"
+        );
+    }
+
+    #[tokio::test]
+    async fn extension_theme_wire_truecolor_respects_terminal_color_mode() {
+        // Default test runtime has true_color=false → Palette256.
+        let (mut rt, _log) = make_runtime();
+        assert_eq!(rt.color_mode, ColorMode::Palette256);
+
+        let truecolor = super::super::theme::load_or_dark("dark", ColorMode::Truecolor);
+        let named = super::super::theme::load_or_dark("dark", ColorMode::Palette256);
+        let wire = theme_wire_from_resolved(&truecolor, None);
+        rt.handle_extension_event(ExtensionUiEvent::ThemeSet(ThemeSet {
+            name: None,
+            theme: Some(wire),
+            persist: false,
+        }))
+        .await;
+
+        assert_eq!(rt.view.theme.mode(), ColorMode::Palette256);
+        assert_eq!(
+            rt.view.theme.fg_ansi(super::super::theme::ThemeColor::Text),
+            named.fg_ansi(super::super::theme::ThemeColor::Text)
+        );
+
+        // Truecolor terminal keeps a truecolor wire theme unchanged.
+        let (mut rt_tc, _log) = make_runtime_with_true_color(true);
+        assert_eq!(rt_tc.color_mode, ColorMode::Truecolor);
+        let wire = theme_wire_from_resolved(&truecolor, None);
+        rt_tc
+            .handle_extension_event(ExtensionUiEvent::ThemeSet(ThemeSet {
+                name: None,
+                theme: Some(wire),
+                persist: false,
+            }))
+            .await;
+        assert_eq!(rt_tc.view.theme.mode(), ColorMode::Truecolor);
+        assert_eq!(
+            rt_tc
+                .view
+                .theme
+                .fg_ansi(super::super::theme::ThemeColor::Text),
+            truecolor.fg_ansi(super::super::theme::ThemeColor::Text)
+        );
     }
 
     #[tokio::test]
