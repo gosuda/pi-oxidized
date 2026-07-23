@@ -1783,6 +1783,66 @@ async fn aggregate_colliding_slot_keys_namespace_and_route_to_owners() -> R {
 }
 
 #[tokio::test]
+async fn aggregate_colliding_slot_keys_namespace_and_route_to_owners_reverse_order() -> R {
+    let (runner, hosts) = make_pair_runner().await?;
+    // Reverse of aggregate_colliding_slot_keys_namespace_and_route_to_owners:
+    // endpoint-1 emits before endpoint-0. Namespace + owner routing must still hold.
+    hosts[1].emit(ui_slot_frame("same-key", 1, "B")).await;
+    hosts[0].emit(ui_slot_frame("same-key", 1, "A")).await;
+    tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            if runner.current_slots().len() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| format!("colliding slots timed out: {:?}", runner.slot_keys()))?;
+    assert_eq!(
+        runner.slot_keys().into_iter().collect::<HashSet<_>>(),
+        namespaced_same_keys()
+    );
+    for (index, key) in [(0, "endpoint-0:same-key"), (1, "endpoint-1:same-key")] {
+        hosts[index].set_response("uiEvent", json!({"delivered": true}));
+        assert!(
+            runner
+                .send_ui_event(UiEventRequest {
+                    key: key.to_owned(),
+                    generation: 1,
+                    event: UiEventWire::Key {
+                        code: "x".to_owned(),
+                        modifiers: KeyModifiersWire::default(),
+                        kind: KeyEventKindWire::Press,
+                    },
+                    data: None,
+                })
+                .await?
+                .delivered
+        );
+        hosts[index].wait_for_request("uiEvent").await?;
+        let request = hosts[index]
+            .requests
+            .lock()
+            .map_err(|_| "request lock poisoned")?
+            .iter()
+            .find(|frame| frame.method == "uiEvent")
+            .cloned()
+            .ok_or("routed uiEvent missing")?;
+        assert_eq!(request.payload["key"], "same-key");
+    }
+    hosts[1].emit(ui_slot_frame("same-key", 2, "B2")).await;
+    hosts[0].emit(ui_slot_frame("same-key", 2, "A2")).await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(
+        runner.slot_keys().into_iter().collect::<HashSet<_>>(),
+        namespaced_same_keys()
+    );
+    runner.shutdown_once().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn aggregate_stale_session_route_fails_after_reload() -> R {
     let (runner, hosts) = make_pair_runner().await?;
     let mut bridge = runner.take_session_bridge().ok_or("bridge claim failed")?;
