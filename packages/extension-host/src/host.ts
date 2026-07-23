@@ -854,7 +854,12 @@ export class ExtensionHost {
 				}
 				case "message_end":
 					this.clearActiveAssistant();
-					result = await runner.emitMessageEnd({ type: eventType, ...payload });
+					// Rust sends the raw AgentMessage AS the request payload (no
+					// `{ message }` wrapper); wrap it for upstream emitMessageEnd.
+					result = await runner.emitMessageEnd({
+						type: eventType,
+						message: payload,
+					} as Parameters<typeof runner.emitMessageEnd>[0]);
 					await this.client.respond(id, eventType as Method, { message: result ?? undefined });
 					return;
 				case "input":

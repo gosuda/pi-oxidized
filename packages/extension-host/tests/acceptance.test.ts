@@ -974,7 +974,7 @@ describe("acceptance: extension runtime", () => {
 
 // ===========================================================================
 // 5b. Wire contract regressions: before_agent_start normalize, accepted load
-// cwd persistence, tool_result input guard
+// cwd persistence, tool_result input guard, message_end raw AgentMessage wrap
 // ===========================================================================
 
 const messageInjectFactory: ExtensionFactory = (pi) => {
@@ -1071,6 +1071,80 @@ describe("acceptance: lifecycle wire contracts", () => {
 			expect((ok.payload as Record<string, unknown>)["content"]).toEqual([
 				{ type: "text", text: "rewritten" },
 			]);
+		} finally {
+			stdin.push(null);
+			host.dispose("test");
+			await runPromise.catch(() => void 0);
+		}
+	});
+
+	test("message_end wraps raw AgentMessage payload and folds same-role replacement", async () => {
+		const observed: unknown[] = [];
+		let call = 0;
+		const messageEndFactory: ExtensionFactory = (pi) => {
+			pi.on("message_end", (event) => {
+				observed.push(event.message);
+				const current = event.message as { role: string };
+				call += 1;
+				if (call === 1) {
+					// Same-role replacement must cross the wire as `{ message }`.
+					return {
+						message: {
+							role: current.role,
+							content: [{ type: "text", text: "replaced" }],
+							timestamp: 99,
+						},
+					};
+				}
+				// Different-role replacement must emit extensionError and leave the
+				// response unmodified (no crash).
+				return {
+					message: {
+						role: current.role === "user" ? "assistant" : "user",
+						content: [{ type: "text", text: "wrong-role" }],
+						timestamp: 100,
+					},
+				};
+			});
+		};
+
+		const { collector, stdin, host, runPromise } = await connectHost([messageEndFactory]);
+		try {
+			// RAW AgentMessage at top level — no `{ message }` wrapper. This pins
+			// Rust's actual wire shape so the old `{ ...payload }` spread fails.
+			const rawMessage = {
+				role: "user",
+				content: [{ type: "text", text: "hello" }],
+				timestamp: 42,
+			};
+			stdin.push(Buffer.from(encodeFrameString({
+				id: 160, kind: "req", method: "message_end",
+				payload: rawMessage,
+			})));
+			const res = await collector.awaitFrame((f) => f.id === 160 && f.kind === "res");
+			expect(observed[0]).toMatchObject({
+				role: "user",
+				content: [{ type: "text", text: "hello" }],
+			});
+			expect(res.payload).toEqual({
+				message: {
+					role: "user",
+					content: [{ type: "text", text: "replaced" }],
+					timestamp: 99,
+				},
+			});
+
+			stdin.push(Buffer.from(encodeFrameString({
+				id: 161, kind: "req", method: "message_end",
+				payload: rawMessage,
+			})));
+			const bad = await collector.awaitFrame((f) => f.id === 161 && f.kind === "res");
+			expect(bad.payload).toEqual({ message: undefined });
+			const errEvent = await collector.awaitFrame((f) => f.method === "extensionError");
+			const err = errEvent.payload as Record<string, unknown>;
+			expect(err["code"]).toBe("extension_error");
+			expect(String(err["message"])).toContain("same role");
+			expect(host.isDisposed).toBe(false);
 		} finally {
 			stdin.push(null);
 			host.dispose("test");
