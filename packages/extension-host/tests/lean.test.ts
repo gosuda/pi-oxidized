@@ -35,6 +35,8 @@ const FOLD_FIRST_ENTRY = join(LEAN_FIXTURES, "fold-first.mjs");
 const FOLD_SECOND_ENTRY = join(LEAN_FIXTURES, "fold-second.mjs");
 const ROLE_BREAKER_ENTRY = join(LEAN_FIXTURES, "role-breaker.mjs");
 const MESSAGE_UPDATE_CANCEL_ENTRY = join(LEAN_FIXTURES, "message-update-cancel.mjs");
+const TOOL_CALL_NOOP_ENTRY = join(LEAN_FIXTURES, "tool-call-noop.mjs");
+const TOOL_RESULT_TERMINATE_ONLY_ENTRY = join(LEAN_FIXTURES, "tool-result-terminate-only.mjs");
 const PRELOAD = resolve(import.meta.dirname, "fixtures", "lean-forbid-compat-graph.ts");
 
 type Marker = { name: string; value: unknown };
@@ -498,6 +500,25 @@ describe("lean: lifecycle hooks", () => {
 		await link.finish();
 	});
 
+	test("tool_call omits input when a no-op hook leaves arguments unchanged", async () => {
+		const link = new LeanLink({ cwd: PACKAGE_DIR, extensionPaths: [] });
+		await link.hello(1);
+		link.request(2, "extensions.load", {
+			extensionPaths: [TOOL_CALL_NOOP_ENTRY],
+			cwd: PACKAGE_DIR,
+		});
+		await link.response(2, "extensions.load");
+		link.request(46, "tool_call", {
+			toolName: "echo",
+			toolCallId: "call-noop",
+			input: { text: "untouched" },
+		});
+		const res = payload(await link.response(46, "tool_call"));
+		expect(res).toEqual({ block: false, reason: "noop-ack" });
+		expect(Object.hasOwn(res, "input")).toBe(false);
+		await link.finish();
+	});
+
 	test("input hook returns the continue action", async () => {
 		const link = await loadedLink();
 		link.request(31, "input", { text: "hello", source: "interactive" });
@@ -716,6 +737,30 @@ describe("lean: ordered folds", () => {
 			name: "second.tool_result",
 			value: expect.objectContaining({ terminate: true }),
 		});
+		await link.finish();
+	});
+
+	test("tool_result: terminate-only hook omits unchanged content and details", async () => {
+		const link = new LeanLink({ cwd: PACKAGE_DIR, extensionPaths: [] });
+		await link.hello(1);
+		link.request(2, "extensions.load", {
+			extensionPaths: [TOOL_RESULT_TERMINATE_ONLY_ENTRY],
+			cwd: PACKAGE_DIR,
+		});
+		await link.response(2, "extensions.load");
+		link.request(47, "tool_result", {
+			toolName: "echo",
+			toolCallId: "call-terminate-only",
+			input: {},
+			content: [{ type: "text", text: "keep-me" }],
+			details: { origin: "payload" },
+			isError: false,
+		});
+		const res = payload(await link.response(47, "tool_result"));
+		expect(res).toEqual({ terminate: true });
+		expect(Object.hasOwn(res, "content")).toBe(false);
+		expect(Object.hasOwn(res, "details")).toBe(false);
+		expect(Object.hasOwn(res, "isError")).toBe(false);
 		await link.finish();
 	});
 

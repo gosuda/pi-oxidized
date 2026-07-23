@@ -856,47 +856,59 @@ export class LeanRunner {
 				case "tool_call": {
 					const input = payload["input"];
 					if (!isRecord(input)) throw new Error("tool_call.input is required");
+					// Snapshot for omission: Rust treats wire.input = Some as
+					// arguments_changed. Only echo input when a handler actually
+					// mutated it (in-place content change; identity stays the same).
+					const baseline = structuredClone(input);
 					let result: unknown;
 					await this.runHooks(eventType, { type: eventType, ...payload, input }, (r) => {
 						if (r === undefined || r === null) return;
 						result = r;
 						if (isRecord(r) && r["block"] === true) return false;
 					});
-					await this.client.respond(id, eventType as Method, {
+					const response: Record<string, unknown> = {
 						...(isRecord(result) ? result : {}),
-						input,
-					});
+					};
+					if (JSON.stringify(input) !== JSON.stringify(baseline)) {
+						response["input"] = input;
+					} else {
+						delete response["input"];
+					}
+					await this.client.respond(id, eventType as Method, response);
 					return;
 				}
 				case "tool_result": {
+					// `current` threads running values to later handlers; `response`
+					// is omission-shaped for Rust AfterToolCallWire (presence of a
+					// field marks that field changed — never echo untouched payload).
 					const current: Record<string, unknown> = {
 						content: payload["content"],
 						details: payload["details"],
 						isError: payload["isError"] === true,
 					};
-					let modified = false;
+					const response: Record<string, unknown> = {};
 					await this.runHooks(eventType, () => ({ type: eventType, ...payload, ...current }), (r) => {
 						if (!isRecord(r)) return;
 						if (r["content"] !== undefined) {
 							current["content"] = r["content"];
-							modified = true;
+							response["content"] = r["content"];
 						}
 						if (r["details"] !== undefined) {
 							current["details"] = r["details"];
-							modified = true;
+							response["details"] = r["details"];
 						}
 						if (r["isError"] !== undefined) {
 							current["isError"] = r["isError"];
-							modified = true;
+							response["isError"] = r["isError"];
 						}
 						// Explicit `terminate` folds exactly like the other fields:
 						// omission retains the running value, a later explicit wins.
 						if (r["terminate"] !== undefined) {
 							current["terminate"] = r["terminate"];
-							modified = true;
+							response["terminate"] = r["terminate"];
 						}
 					});
-					await this.client.respond(id, eventType as Method, modified ? current : {});
+					await this.client.respond(id, eventType as Method, response);
 					return;
 				}
 				case "before_agent_start": {
