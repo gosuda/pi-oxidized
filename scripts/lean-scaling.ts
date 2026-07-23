@@ -107,6 +107,12 @@ interface Waiter {
 
 /** Bound for stdout-line prefixes embedded in parse-failure diagnostics. */
 const DIAGNOSTIC_STDOUT_PREFIX_CHARS = 512;
+/**
+ * Cap on the incomplete stdout line held in `ChildHost.buffer`.
+ * Matches the order of existing bounded-diagnostic constants (KiB-scale);
+ * an unterminated line past this limit is treated as a wedged/hostile child.
+ */
+export const MAX_STDOUT_BUFFER_CHARS = 64 * 1024;
 
 /**
  * Escape and truncate hostile text so diagnostics stay bounded and printable.
@@ -133,6 +139,8 @@ export class ChildHost {
 	readonly frames: Frame[] = [];
 	private readonly child: ChildProcessWithoutNullStreams;
 	private readonly waiters: Waiter[] = [];
+	/** Streaming decoder so multibyte UTF-8 sequences may safely span chunks. */
+	private readonly decoder = new TextDecoder("utf-8");
 	private buffer = "";
 	private stderrTail = "";
 	private nextId = 1;
@@ -175,9 +183,22 @@ export class ChildHost {
 
 	private onData(chunk: Buffer): void {
 		try {
-			this.buffer += chunk.toString();
+			// `{ stream: true }` retains an incomplete trailing multibyte sequence
+			// inside the decoder across chunk boundaries (unlike Buffer#toString).
+			this.buffer += this.decoder.decode(chunk, { stream: true });
 			const lines = this.buffer.split("\n");
 			this.buffer = lines.pop() ?? "";
+			if (this.buffer.length > MAX_STDOUT_BUFFER_CHARS) {
+				const error = new Error(
+					`host stdout unterminated line exceeded ${String(MAX_STDOUT_BUFFER_CHARS)} characters; ` +
+						`stdout: ${diagnosticSnippet(this.buffer, DIAGNOSTIC_STDOUT_PREFIX_CHARS)}; ` +
+						`stderr: ${diagnosticSnippet(this.stderrTail, 4096)}`,
+				);
+				this.buffer = "";
+				this.failAll(error);
+				this.reapChild();
+				return;
+			}
 			for (const line of lines) {
 				if (line.trim().length === 0) continue;
 				let frame: Frame;
@@ -206,6 +227,16 @@ export class ChildHost {
 		} catch (err) {
 			// Stream listeners must never throw into the event loop.
 			this.failAll(err instanceof Error ? err : new Error(String(err)));
+		}
+	}
+
+	/** Best-effort SIGKILL so a hostile/wedged child cannot keep feeding stdout. */
+	private reapChild(): void {
+		if (this.exited) return;
+		try {
+			this.child.kill("SIGKILL");
+		} catch {
+			// Already gone; exit handler still resolves exitPromise.
 		}
 	}
 
@@ -493,6 +524,13 @@ export async function runModeDistinctness(
 ): Promise<ModeDistinctnessResult> {
 	const timeoutMs = options.stepTimeoutMs ?? DEFAULT_STEP_TIMEOUT_MS;
 	const rounds = options.toolRounds ?? options.samples;
+	// Zero/negative rounds make `responses === rounds * 3` hold vacuously
+	// (0 === 0), so the 3-RPC contract proof would pass without driving any RPC.
+	if (!Number.isInteger(rounds) || rounds < 1) {
+		throw new Error(
+			`toolRounds must be a positive integer, got ${String(rounds)}`,
+		);
+	}
 	const compatSpec: HostSpec = {
 		hostCwd: options.hostCwd,
 		hostEntry: options.hostEntry,

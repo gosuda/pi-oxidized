@@ -8,6 +8,7 @@ import { resolve } from "node:path";
 import {
 	ChildHost,
 	DEFAULT_LEAN_MAX_RATIO,
+	MAX_STDOUT_BUFFER_CHARS,
 	TimerHandle,
 	evaluateDistinctness,
 	percentile,
@@ -227,6 +228,150 @@ describe("ChildHost malformed stdout", () => {
 		} finally {
 			process.off("uncaughtException", trackUnhandled);
 			process.off("unhandledRejection", trackUnhandled);
+			await host.close();
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	}, 30_000);
+});
+
+describe("runModeDistinctness toolRounds", () => {
+	test("rejects zero/negative/non-integer round counts before collecting samples", async () => {
+		const hostCwd = resolve(process.cwd(), "packages", "extension-host");
+		const base = {
+			hostCwd,
+			hostEntry: "src/main.ts",
+			compatExtension: resolve(hostCwd, "fixtures", "extensions", "idle.ts"),
+			leanExtension: resolve(hostCwd, "tests", "fixtures", "lean", "echo.mjs"),
+			warmups: 0,
+			samples: 0,
+			maxRatio: undefined,
+		} as const;
+
+		for (const toolRounds of [0, -1, 1.5, Number.NaN]) {
+			await expect(runModeDistinctness({ ...base, toolRounds })).rejects.toThrow(
+				/toolRounds must be a positive integer/,
+			);
+		}
+		// Fallback path: omitted toolRounds uses samples, which must also be positive.
+		await expect(runModeDistinctness({ ...base })).rejects.toThrow(
+			/toolRounds must be a positive integer/,
+		);
+	});
+});
+
+describe("ChildHost UTF-8 framing", () => {
+	test("reassembles a multibyte character split across stdout chunks", async () => {
+		const { mkdtempSync, rmSync, writeFileSync } = await import("node:fs");
+		const { tmpdir } = await import("node:os");
+		const { join } = await import("node:path");
+		const root = resolve(process.cwd(), "packages", "extension-host");
+		const tempDir = mkdtempSync(join(tmpdir(), "lean-scaling-utf8-"));
+		const scriptPath = join(tempDir, "utf8-split-host.mjs");
+
+		// Payload contains U+1F680 (🚀, 4-byte UTF-8 F0 9F 9A 80). The host
+		// writes the JSON line as two buffers that split mid-character so a
+		// naive chunk.toString() would inject U+FFFD and corrupt the frame.
+		const marker = "before-\u{1F680}-after";
+		const frame = {
+			id: 1,
+			kind: "res",
+			method: "hello",
+			payload: { marker },
+		};
+		const lineBytes = Buffer.from(`${JSON.stringify(frame)}\n`, "utf8");
+		const rocket = Buffer.from("\u{1F680}", "utf8");
+		const splitAt = lineBytes.indexOf(rocket) + 2; // mid 4-byte sequence
+		if (splitAt < 2 || splitAt >= lineBytes.length) {
+			throw new Error(`failed to locate mid-rocket split point (splitAt=${splitAt})`);
+		}
+
+		writeFileSync(
+			scriptPath,
+			[
+				`const line = Buffer.from(${JSON.stringify(lineBytes.toString("base64"))}, "base64");`,
+				`const splitAt = ${splitAt};`,
+				"await Bun.sleep(50);",
+				"process.stdout.write(line.subarray(0, splitAt));",
+				"await Bun.sleep(50);",
+				"process.stdout.write(line.subarray(splitAt));",
+				"setInterval(() => {}, 1_000);",
+			].join("\n"),
+			"utf8",
+		);
+
+		const host = new ChildHost({
+			hostCwd: root,
+			hostEntry: scriptPath,
+			lean: false,
+			extensionPath: resolve(root, "tests", "fixtures", "lean", "echo.mjs"),
+		});
+		try {
+			const matched = await host.waitFor(
+				(f) => f.kind === "res" && f.method === "hello" && f.id === 1,
+				10_000,
+				"utf8 hello frame",
+			);
+			const payload = matched.payload as { marker?: string };
+			expect(payload.marker).toBe(marker);
+			expect(payload.marker).toContain("\u{1F680}");
+			expect(payload.marker).not.toContain("\uFFFD");
+		} finally {
+			await host.close();
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	}, 30_000);
+});
+
+describe("ChildHost stdout buffer cap", () => {
+	test("failAll+reaps when an unterminated line exceeds the buffer cap", async () => {
+		const { mkdtempSync, rmSync, writeFileSync } = await import("node:fs");
+		const { tmpdir } = await import("node:os");
+		const { join } = await import("node:path");
+		const root = resolve(process.cwd(), "packages", "extension-host");
+		const tempDir = mkdtempSync(join(tmpdir(), "lean-scaling-overflow-"));
+		const scriptPath = join(tempDir, "overflow-host.mjs");
+		const overflowChars = MAX_STDOUT_BUFFER_CHARS + 1024;
+		writeFileSync(
+			scriptPath,
+			[
+				"await Bun.sleep(50);",
+				`process.stdout.write("X".repeat(${overflowChars}));`,
+				"setInterval(() => {}, 1_000);",
+			].join("\n"),
+			"utf8",
+		);
+
+		const host = new ChildHost({
+			hostCwd: root,
+			hostEntry: scriptPath,
+			lean: false,
+			extensionPath: resolve(root, "tests", "fixtures", "lean", "echo.mjs"),
+		});
+		try {
+			const pending = host.waitFor(() => false, 60_000, "never-arriving frame");
+			const started = performance.now();
+			const rejection = await pending.catch((err: unknown) => err);
+			const elapsedMs = performance.now() - started;
+
+			expect(elapsedMs).toBeLessThan(5_000);
+			expect(rejection).toBeInstanceOf(Error);
+			const message = (rejection as Error).message;
+			expect(message).toMatch(/unterminated line exceeded/);
+			expect(message).toContain(String(MAX_STDOUT_BUFFER_CHARS));
+			expect(message).toContain("stdout:");
+			expect(message).toContain("stderr:");
+			const stdoutEncoded = /stdout: ("(?:[^"\\]|\\.)*")/.exec(message)?.[1];
+			expect(stdoutEncoded).toBeDefined();
+			const stdoutSnippet = JSON.parse(stdoutEncoded!) as string;
+			// diagnosticSnippet caps at DIAGNOSTIC_STDOUT_PREFIX_CHARS (512) + "…".
+			expect(stdoutSnippet.length).toBe(513);
+			expect(stdoutSnippet.endsWith("…")).toBe(true);
+			expect(stdoutSnippet.startsWith("XXXX")).toBe(true);
+			// Reap path: close() should finish promptly because SIGKILL already fired.
+			const closeStarted = performance.now();
+			await host.close(100);
+			expect(performance.now() - closeStarted).toBeLessThan(2_000);
+		} finally {
 			await host.close();
 			rmSync(tempDir, { recursive: true, force: true });
 		}
