@@ -725,32 +725,26 @@ impl AggregateState {
     }
 
     fn dispose_endpoint_slots(&self, endpoint_id: u64, generation: u64) {
-        let keys = self
-            .slot_routes
-            .read()
-            .map(|routes| {
-                routes
-                    .iter()
-                    .filter(|(_, route)| {
-                        route.endpoint_id == endpoint_id && route.generation == generation
-                    })
-                    .map(|(key, _)| key.clone())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        // Match slot_send / slot_dispose / dispose_all_slots: slots then routes.
         let Ok(mut slots) = self.slots.write() else {
             return;
         };
         let Ok(mut routes) = self.slot_routes.write() else {
             return;
         };
-        for key in keys {
-            if let Some(sender) = slots.remove(&key) {
-                sender.send_replace(None);
+        routes.retain(|key, route| {
+            if route.endpoint_id == endpoint_id && route.generation == generation {
+                if let Some(sender) = slots.remove(key) {
+                    sender.send_replace(None);
+                }
+                let _ = self
+                    .ui_tx
+                    .send(ExtensionUiEvent::Dispose { key: key.clone() });
+                false
+            } else {
+                true
             }
-            routes.remove(&key);
-            let _ = self.ui_tx.send(ExtensionUiEvent::Dispose { key });
-        }
+        });
     }
 
     fn dispose_all_slots(&self) {
