@@ -245,7 +245,52 @@ describe.skipIf(isWindows)("PTY driver", () => {
 		}
 	}, 15_000);
 
-	test.skipIf(isWindows)("separates terminal echo from application output", async () => {
+	test("delivers multi-chunk PTY input exactly once under backpressure", async () => {
+		const chunkSize = 256 * 1024;
+		const payloadSize = chunkSize * 8;
+		const payload = Buffer.alloc(payloadSize);
+		for (let i = 0; i < payloadSize; i++) payload[i] = 65 + (i % 26);
+		const expectedHash = new Bun.CryptoHasher("sha256").update(payload).digest("hex");
+		const script = [
+			"process.stdin.setRawMode?.(true);",
+			"process.stdout.write('READY\\n');",
+			// Stay paused so the parent can fill the PTY buffer and exercise drain.
+			"await Bun.sleep(400);",
+			"process.stdin.resume();",
+			"let input = Buffer.alloc(0);",
+			"for await (const chunk of process.stdin) {",
+			"input = Buffer.concat([input, chunk]);",
+			"const end = input.indexOf(Buffer.from('END'));",
+			"if (end >= 0) {",
+			"const data = input.subarray(0, end);",
+			"const hash = new Bun.CryptoHasher('sha256').update(data).digest('hex');",
+			"process.stdout.write(`LEN:${data.length}\\nHASH:${hash}\\n`);",
+			"process.exit(0);",
+			"}",
+			"}",
+		].join("");
+		const process = spawnPty({
+			argv: [bunExecutable, "-e", script],
+			cwd: temporaryDirectory("pi-verification-backpressure-"),
+		});
+		try {
+			await process.waitFor(/READY/, { deadlineMs: 5_000, source: "raw" });
+			for (let offset = 0; offset < payload.length; offset += chunkSize) {
+				process.writeKeys(payload.subarray(offset, offset + chunkSize));
+			}
+			process.writeKeys("END");
+			// Accepted input must not alias caller-owned storage after writeKeys returns.
+			payload.fill(0);
+			const snapshot = await process.waitFor(/HASH:/, { deadlineMs: 15_000, source: "raw" });
+			expect(snapshot.rawText).toContain(`LEN:${payloadSize}`);
+			expect(snapshot.rawText).toContain(`HASH:${expectedHash}`);
+			expect(await process.waitForExit(5_000)).toBe(0);
+		} finally {
+			await process.terminate();
+		}
+	}, 30_000);
+
+	test("separates terminal echo from application output", async () => {
 		const process = spawnPty({
 			argv: ["/bin/sh", "-c", "stty echo; printf APP_READY; IFS= read -r line; printf '\\nAPP:%s\\n' \"$line\""],
 			cwd: temporaryDirectory("pi-verification-echo-"),
@@ -262,7 +307,7 @@ describe.skipIf(isWindows)("PTY driver", () => {
 		}
 	}, 15_000);
 
-	test.skipIf(isWindows)("terminates the complete PTY process group", async () => {
+	test("terminates the complete PTY process group", async () => {
 		const process = spawnPty({
 			argv: ["/bin/sh", "-c", "sleep 300 & printf 'CHILD:%s\\n' \"$!\"; wait"],
 			cwd: temporaryDirectory("pi-verification-tree-"),

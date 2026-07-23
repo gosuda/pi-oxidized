@@ -285,18 +285,13 @@ export class PtyProcess {
 
 	#writeTerminal(data: string | Uint8Array): void {
 		const terminal = this.#process.terminal;
-		if (!terminal || terminal.closed) return;
-		const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
-		let offset = 0;
-		while (offset < bytes.length) {
-			let written: number;
-			try {
-				written = terminal.write(bytes.subarray(offset));
-			} catch {
-				return; // The child already closed its side of the terminal.
-			}
-			if (written <= 0) break;
-			offset += written;
+		if (!terminal || terminal.closed || data.length === 0) return;
+		try {
+			// Bun queues the complete argument even when it reports zero
+			// synchronous progress. Retrying would duplicate accepted bytes.
+			void terminal.write(data);
+		} catch {
+			// The child already closed its side of the terminal.
 		}
 	}
 
