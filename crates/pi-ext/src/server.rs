@@ -170,9 +170,10 @@ pub struct ToolCall {
 ///
 /// When the per-call update channel is full, the stale update is dropped and
 /// `send` returns `false` — matching the client's stream backpressure
-/// policy. Not `Clone`: dropping the sink at the end of `execute_tool`
-/// closes the channel so the server can flush queued updates before the
-/// terminal response.
+/// policy. Not `Clone`: the server's `done_tx` signal — not sink drop —
+/// bounds the forwarder's lifetime. Updates queued before `execute_tool`
+/// returns are flushed before the terminal response; post-return sends
+/// from a detached sink are ignored.
 pub struct ToolUpdateSink {
     tx: mpsc::Sender<Value>,
 }
@@ -224,9 +225,10 @@ impl From<Frame> for OutboundFrame {
 /// `invalid_payload` error (never a success after loss). `send` is
 /// cancellation-aware: a `provider.cancel` observed while the bounded
 /// queue is full unblocks the wait so the execution winds down and
-/// releases its in-flight slot. Not `Clone`: dropping the sink at the end
-/// of `stream_provider` closes the channel so the server flushes queued
-/// events before the terminal frame.
+/// releases its in-flight slot. Not `Clone`: the server's `done_tx`
+/// signal — not sink drop — bounds the forwarder's lifetime. Events
+/// queued before `stream_provider` returns are flushed before the
+/// terminal frame; post-return sends from a detached sink are ignored.
 pub struct ProviderEventSink {
     id: FrameId,
     tx: mpsc::Sender<OutboundFrame>,
