@@ -105,6 +105,18 @@ interface Waiter {
 	timer: TimerHandle;
 }
 
+/** Bound for stdout-line prefixes embedded in parse-failure diagnostics. */
+const DIAGNOSTIC_STDOUT_PREFIX_CHARS = 512;
+
+/**
+ * Escape and truncate hostile text so diagnostics stay bounded and printable.
+ * JSON string encoding keeps control bytes / quotes from corrupting the message.
+ */
+function diagnosticSnippet(text: string, maxChars: number): string {
+	const truncated = text.length > maxChars ? `${text.slice(0, maxChars)}…` : text;
+	return JSON.stringify(truncated);
+}
+
 export interface HostSpec {
 	/** Working directory for `bun` (packages/extension-host, so bunfig applies). */
 	hostCwd: string;
@@ -162,21 +174,38 @@ export class ChildHost {
 
 
 	private onData(chunk: Buffer): void {
-		this.buffer += chunk.toString();
-		const lines = this.buffer.split("\n");
-		this.buffer = lines.pop() ?? "";
-		for (const line of lines) {
-			if (line.trim().length === 0) continue;
-			const frame = JSON.parse(line) as Frame;
-			this.frames.push(frame);
-			for (let i = this.waiters.length - 1; i >= 0; i--) {
-				const waiter = this.waiters[i];
-				if (waiter !== undefined && waiter.predicate(frame)) {
-					this.waiters.splice(i, 1);
-					clearTimeout(waiter.timer);
-					waiter.resolve(frame);
+		try {
+			this.buffer += chunk.toString();
+			const lines = this.buffer.split("\n");
+			this.buffer = lines.pop() ?? "";
+			for (const line of lines) {
+				if (line.trim().length === 0) continue;
+				let frame: Frame;
+				try {
+					frame = JSON.parse(line) as Frame;
+				} catch (err) {
+					const parseMessage = err instanceof Error ? err.message : String(err);
+					const error = new Error(
+						`failed to parse host stdout JSON: ${parseMessage}; ` +
+							`stdout: ${diagnosticSnippet(line, DIAGNOSTIC_STDOUT_PREFIX_CHARS)}; ` +
+							`stderr: ${diagnosticSnippet(this.stderrTail, 4096)}`,
+					);
+					this.failAll(error);
+					return;
+				}
+				this.frames.push(frame);
+				for (let i = this.waiters.length - 1; i >= 0; i--) {
+					const waiter = this.waiters[i];
+					if (waiter !== undefined && waiter.predicate(frame)) {
+						this.waiters.splice(i, 1);
+						clearTimeout(waiter.timer);
+						waiter.resolve(frame);
+					}
 				}
 			}
+		} catch (err) {
+			// Stream listeners must never throw into the event loop.
+			this.failAll(err instanceof Error ? err : new Error(String(err)));
 		}
 	}
 

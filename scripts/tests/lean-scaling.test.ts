@@ -147,6 +147,78 @@ describe("ChildHost.close", () => {
 	}, 30_000);
 });
 
+describe("ChildHost malformed stdout", () => {
+	test("rejects every pending waiter promptly on malformed NDJSON", async () => {
+		const { mkdtempSync, rmSync, writeFileSync } = await import("node:fs");
+		const { tmpdir } = await import("node:os");
+		const { join } = await import("node:path");
+		const root = resolve(process.cwd(), "packages", "extension-host");
+		const tempDir = mkdtempSync(join(tmpdir(), "lean-scaling-malformed-"));
+		const scriptPath = join(tempDir, "malformed-host.mjs");
+		const hostileStdout = `{"not":"json"\x00${"A".repeat(8_000)}`;
+		// Marker at the end so the 4096-byte stderrTail still carries identifiable context.
+		const hostileStderr = `${"B".repeat(5_000)}stderr-context-tail`;
+		writeFileSync(
+			scriptPath,
+			[
+				"await Bun.sleep(150);",
+				`process.stderr.write(${JSON.stringify(hostileStderr)});`,
+				`process.stdout.write(${JSON.stringify(`${hostileStdout}\n`)});`,
+				"setInterval(() => {}, 1_000);",
+			].join("\n"),
+			"utf8",
+		);
+
+		const unhandled: unknown[] = [];
+		const trackUnhandled = (err: unknown) => {
+			unhandled.push(err);
+		};
+		process.on("uncaughtException", trackUnhandled);
+		process.on("unhandledRejection", trackUnhandled);
+
+		const host = new ChildHost({
+			hostCwd: root,
+			hostEntry: scriptPath,
+			lean: false,
+			extensionPath: resolve(root, "tests", "fixtures", "lean", "echo.mjs"),
+		});
+		try {
+			const waiters = [
+				host.waitFor(() => false, 60_000, "waiter-a"),
+				host.waitFor(() => false, 60_000, "waiter-b"),
+				host.waitFor(() => false, 60_000, "waiter-c"),
+			];
+			const started = performance.now();
+			const rejections = await Promise.all(waiters.map((pending) => pending.catch((err: unknown) => err)));
+			const elapsedMs = performance.now() - started;
+
+			expect(elapsedMs).toBeLessThan(5_000);
+			expect(rejections).toHaveLength(3);
+			const messages = rejections.map((err) => {
+				expect(err).toBeInstanceOf(Error);
+				return (err as Error).message;
+			});
+			expect(new Set(messages).size).toBe(1);
+			const message = messages[0] ?? "";
+			expect(message).toMatch(/failed to parse host stdout JSON/);
+			expect(message).toContain("stdout:");
+			expect(message).toContain("stderr:");
+			// Prefixes are present but bounded/escaped (JSON string encoding + truncation).
+			expect(message).toContain("\\u0000");
+			expect(message).toContain("stderr-context-tail");
+			expect(message.length).toBeLessThan(20_000);
+			expect(message).not.toContain(hostileStdout);
+			expect(message).not.toContain(hostileStderr);
+			expect(unhandled).toEqual([]);
+		} finally {
+			process.off("uncaughtException", trackUnhandled);
+			process.off("unhandledRejection", trackUnhandled);
+			await host.close();
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	}, 30_000);
+});
+
 describe("mode distinctness smoke", () => {
 	test(
 		"drives real compat and lean children plus the lean 3-RPC proof",
