@@ -575,13 +575,22 @@ struct TrackingSink<'a> {
 
 impl EventSink for TrackingSink<'_> {
     fn emit(&self, mut event: AgentEvent) {
-        if let AgentEvent::MessageEnd { message } = &mut event
-            && let AgentMessage::Llm(inner) = message
-            && let Message::Assistant(assistant) = inner.as_mut()
-            && assistant.stop_reason == StopReason::Aborted
-            && let Some(reason) = lock(&self.run).abort_reason.clone()
-        {
-            assistant.error_message = Some(reason);
+        // Substitute a caller-supplied abort reason onto every aborted terminal
+        // surface that carries an assistant message. MessageEnd alone is not
+        // enough: TurnEnd (and therefore AgentStateSnapshot.error_message via
+        // reduce) still sees the synthesized "stream cancelled" text unless we
+        // rewrite it here too.
+        match &mut event {
+            AgentEvent::MessageEnd { message } | AgentEvent::TurnEnd { message, .. } => {
+                if let AgentMessage::Llm(inner) = message
+                    && let Message::Assistant(assistant) = inner.as_mut()
+                    && assistant.stop_reason == StopReason::Aborted
+                    && let Some(reason) = lock(&self.run).abort_reason.clone()
+                {
+                    assistant.error_message = Some(reason);
+                }
+            }
+            _ => {}
         }
         if let AgentEvent::MessageEnd { message } = &event {
             if message.role() == "assistant" {
@@ -878,6 +887,13 @@ mod tests {
         }
     }
 
+    fn assistant_error_message(message: &AgentMessage) -> Option<&str> {
+        match message.as_llm() {
+            Some(Message::Assistant(assistant)) => assistant.error_message.as_deref(),
+            _ => None,
+        }
+    }
+
     #[tokio::test]
     async fn prompt_produces_lifecycle_events_and_one_agent_end()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1119,6 +1135,112 @@ mod tests {
             _ => false,
         };
         assert!(aborted, "expected an aborted assistant terminal");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn abort_with_reason_surfaces_reason_on_message_turn_and_snapshot()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let provider = Arc::new(HangingProvider::after_start());
+        let agent = Agent::new(agent_options(provider));
+        let mut rx = agent.subscribe();
+
+        let run = tokio::spawn({
+            let agent = agent.clone();
+            async move {
+                agent
+                    .prompt(vec![user_text("go", std::iter::empty())])
+                    .await
+            }
+        });
+
+        let mut waited = 0;
+        while agent.state().streaming_message.is_none() && waited < 200 {
+            sleep(Duration::from_millis(5)).await;
+            waited += 1;
+        }
+        assert!(
+            agent.state().streaming_message.is_some(),
+            "run never reached mid-turn streaming"
+        );
+
+        let reason = "extension cancelled by user";
+        agent.abort_with_reason(reason);
+        let prompt_result = run.await?;
+        assert!(
+            prompt_result.is_ok(),
+            "abort_with_reason must resolve the prompt successfully: {prompt_result:?}"
+        );
+        agent.wait_for_idle().await;
+
+        let events = drain_events(&mut rx).await;
+        let message_end_error = events.iter().rev().find_map(|event| match event {
+            AgentEvent::MessageEnd { message } if message.role() == "assistant" => {
+                assistant_error_message(message)
+            }
+            _ => None,
+        });
+        let turn_end_error = events.iter().rev().find_map(|event| match event {
+            AgentEvent::TurnEnd { message, .. } => assistant_error_message(message),
+            _ => None,
+        });
+
+        assert_eq!(message_end_error, Some(reason));
+        assert_eq!(turn_end_error, Some(reason));
+        assert_eq!(agent.state().error_message.as_deref(), Some(reason));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn abort_keeps_generic_stream_cancelled_on_message_turn_and_snapshot()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let provider = Arc::new(HangingProvider::after_start());
+        let agent = Agent::new(agent_options(provider));
+        let mut rx = agent.subscribe();
+
+        let run = tokio::spawn({
+            let agent = agent.clone();
+            async move {
+                agent
+                    .prompt(vec![user_text("go", std::iter::empty())])
+                    .await
+            }
+        });
+
+        let mut waited = 0;
+        while agent.state().streaming_message.is_none() && waited < 200 {
+            sleep(Duration::from_millis(5)).await;
+            waited += 1;
+        }
+        assert!(
+            agent.state().streaming_message.is_some(),
+            "run never reached mid-turn streaming"
+        );
+
+        agent.abort();
+        let prompt_result = run.await?;
+        assert!(
+            prompt_result.is_ok(),
+            "plain abort must resolve the prompt successfully: {prompt_result:?}"
+        );
+        agent.wait_for_idle().await;
+
+        let events = drain_events(&mut rx).await;
+        let expected = "stream cancelled";
+        let message_end_error = events.iter().rev().find_map(|event| match event {
+            AgentEvent::MessageEnd { message } if message.role() == "assistant" => {
+                assistant_error_message(message)
+            }
+            _ => None,
+        });
+        let turn_end_error = events.iter().rev().find_map(|event| match event {
+            AgentEvent::TurnEnd { message, .. } => assistant_error_message(message),
+            _ => None,
+        });
+
+        assert_eq!(message_end_error, Some(expected));
+        assert_eq!(turn_end_error, Some(expected));
+        assert_eq!(agent.state().error_message.as_deref(), Some(expected));
         Ok(())
     }
 
