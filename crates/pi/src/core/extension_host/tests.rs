@@ -1104,6 +1104,122 @@ fn classified_runs_preserve_compat_lean_compat_interleaving() -> R {
     Ok(())
 }
 
+/// Closest testable surface for the spawn-time `--no-builtins` push: argv of
+/// the Bun HostSpecs built inside `start_classified_with_resolver`. Classify
+/// only sets `load_builtins`; the flag is attached when cloning the resolved
+/// HostSpec just before `HostClient::spawn`, so a fake host that records its
+/// argv is what would go red if that push were deleted.
+#[cfg(unix)]
+#[tokio::test]
+async fn classified_compat_hosts_pass_no_builtins_only_to_non_owners() -> R {
+    let temp = tempfile::tempdir()?;
+    let compat_a = temp.path().join("compat-a");
+    let lean_b = temp.path().join("lean-b");
+    let compat_c = temp.path().join("compat-c");
+    for directory in [&compat_a, &lean_b, &compat_c] {
+        std::fs::create_dir_all(directory)?;
+    }
+    std::fs::write(compat_a.join("index.ts"), "export default {}")?;
+    std::fs::write(compat_c.join("index.ts"), "export default {}")?;
+    std::fs::write(lean_b.join("index.mjs"), "export default {}")?;
+    std::fs::write(
+        lean_b.join("pi-extension.json"),
+        format!(
+            r#"{{"$schema":"pi.extension.v1","name":"lean-b","version":"1.0.0","runtime":"ts-lean","entry":"index.mjs","protocolVersion":{}}}"#,
+            pi_ext::protocol::PROTOCOL_VERSION
+        ),
+    )?;
+    let discovery = vec![
+        compat_a.to_string_lossy().into_owned(),
+        lean_b.to_string_lossy().into_owned(),
+        compat_c.to_string_lossy().into_owned(),
+    ];
+
+    let argv_dir = temp.path().join("argv");
+    std::fs::create_dir_all(&argv_dir)?;
+    let script = temp.path().join("record-argv-host.sh");
+    std::fs::write(
+        &script,
+        concat!(
+            "#!/bin/sh\n",
+            "dir=\"$1\"\n",
+            "shift\n",
+            "printf '%s\\n' \"$*\" > \"$dir/$$.argv\"\n",
+            "exit 1\n",
+        ),
+    )?;
+    let mut permissions = std::fs::metadata(&script)?.permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions)?;
+
+    let runner = HostExtensionRunner::start_classified_with_resolver(
+        discovery,
+        "/workspace".to_owned(),
+        false,
+        {
+            let script = script.clone();
+            let argv_dir = argv_dir.clone();
+            move || {
+                Ok(HostSpec {
+                    source: HostSource::Env(script.clone()),
+                    program: PathBuf::from("/bin/sh"),
+                    args: vec![
+                        script.to_string_lossy().into_owned(),
+                        argv_dir.to_string_lossy().into_owned(),
+                    ],
+                })
+            }
+        },
+    )
+    .await?;
+
+    let mut recorded: Vec<Vec<String>> = Vec::new();
+    for entry in std::fs::read_dir(&argv_dir)? {
+        let entry = entry?;
+        let raw = std::fs::read_to_string(entry.path())?;
+        let flags = raw
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        recorded.push(flags);
+    }
+    assert_eq!(
+        recorded.len(),
+        3,
+        "expected one argv capture per Bun endpoint plan, got {recorded:?}"
+    );
+
+    let compat_argvs = recorded
+        .iter()
+        .filter(|flags| !flags.iter().any(|flag| flag == "--lean"))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        compat_argvs.len(),
+        2,
+        "compat-lean-compat must yield two compat Bun argvs: {recorded:?}"
+    );
+    let owners = compat_argvs
+        .iter()
+        .filter(|flags| !flags.iter().any(|flag| flag == "--no-builtins"))
+        .count();
+    let non_owners = compat_argvs
+        .iter()
+        .filter(|flags| flags.iter().any(|flag| flag == "--no-builtins"))
+        .count();
+    assert_eq!(
+        owners, 1,
+        "exactly one compat HostSpec.args must omit --no-builtins (the builtins owner): {recorded:?}"
+    );
+    assert_eq!(
+        non_owners, 1,
+        "every non-owner compat HostSpec.args must include --no-builtins: {recorded:?}"
+    );
+
+    runner.shutdown_once().await;
+    Ok(())
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn native_only_startup_skips_bun_and_isolates_run_failure() -> R {
