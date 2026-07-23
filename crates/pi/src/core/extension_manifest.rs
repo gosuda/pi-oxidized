@@ -191,6 +191,11 @@ pub enum ManifestErrorKind {
     /// metadata is followed; a symlink to a regular file is accepted).
     #[error("native entry must be a regular file")]
     NativeEntryNotFile,
+    /// Native entry is a regular file with no Unix execute bit set
+    /// (`mode & 0o111 == 0`). Windows relies on the regular-file check alone.
+    #[cfg(unix)]
+    #[error("native entry must be executable")]
+    NativeEntryNotExecutable,
 }
 
 /// Classify one discovered extension path for `target`.
@@ -207,7 +212,8 @@ pub enum ManifestErrorKind {
 /// non-semver version, unknown runtime, protocol mismatch, malformed or
 /// uncontained entries, target maps with non-string or empty values,
 /// target maps missing the requested platform, lean entries that are not
-/// prebundled `.mjs` files, and native entries that are not regular files.
+/// prebundled `.mjs` files, native entries that are not regular files, and
+/// (on Unix) native entries that are not executable.
 pub fn classify_extension(path: &Path, target: &str) -> Result<ClassifiedExtension, ManifestError> {
     let metadata = std::fs::metadata(path)
         .map_err(|error| ManifestError::new(path, ManifestErrorKind::Io(error.to_string())))?;
@@ -281,6 +287,18 @@ fn classify_directory(path: &Path, target: &str) -> Result<ClassifiedExtension, 
                 &manifest_path,
                 ManifestErrorKind::NativeEntryNotFile,
             ));
+        }
+        // Spawning a non-executable regular file fails at process launch on
+        // Unix; reject early so discovery surfaces a typed diagnostic.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o111 == 0 {
+                return Err(ManifestError::new(
+                    &manifest_path,
+                    ManifestErrorKind::NativeEntryNotExecutable,
+                ));
+            }
         }
     }
     Ok(ClassifiedExtension {
@@ -543,6 +561,18 @@ mod tests {
         }
     }
 
+    /// Grant owner/group/other execute bits so native acceptance tests pass
+    /// the Unix executable-file check (default `write` mode is non-executable).
+    #[cfg(unix)]
+    fn make_executable(path: &Path) -> TestResult {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = std::fs::metadata(path)?.permissions();
+        permissions.set_mode(permissions.mode() | 0o111);
+        std::fs::set_permissions(path, permissions)?;
+        Ok(())
+    }
+
     #[test]
     fn regular_files_without_manifest_stay_compat() -> TestResult {
         let temp = tempfile::tempdir()?;
@@ -730,6 +760,8 @@ mod tests {
             &manifest_json("native-ext", "native", "\"bin/tool\""),
             &["bin/tool"],
         )?;
+        #[cfg(unix)]
+        make_executable(&dir.join("bin/tool"))?;
         let classified = classify_extension(&dir, TARGET)?;
         assert_eq!(classified.mode, ExtensionMode::Native);
         assert_eq!(
@@ -752,6 +784,8 @@ mod tests {
             &manifest_json("native-map", "native", &entry),
             &["bin/linux-tool", "bin/mac-tool"],
         )?;
+        #[cfg(unix)]
+        make_executable(&dir.join("bin/linux-tool"))?;
         let classified = classify_extension(&dir, TARGET)?;
         assert_eq!(classified.mode, ExtensionMode::Native);
         assert_eq!(
@@ -888,6 +922,8 @@ mod tests {
             &manifest_json("dot-relative", "native", "\"./index.js\""),
             &["index.js"],
         )?;
+        #[cfg(unix)]
+        make_executable(&dir.join("index.js"))?;
         let classified = classify_extension(&dir, TARGET)?;
         assert_eq!(
             classified.entry,
@@ -906,6 +942,8 @@ mod tests {
             &manifest_json("dot-relative-map", "native", &entry),
             &["bin/extension"],
         )?;
+        #[cfg(unix)]
+        make_executable(&dir.join("bin/extension"))?;
         let classified = classify_extension(&dir, TARGET)?;
         assert_eq!(
             classified.entry,
@@ -998,6 +1036,7 @@ mod tests {
             &["bin/tool"],
         )?;
         symlink(dir.join("bin/tool"), dir.join("link"))?;
+        make_executable(&dir.join("bin/tool"))?;
         let classified = classify_extension(&dir, TARGET)?;
         assert_eq!(classified.mode, ExtensionMode::Native);
         assert_eq!(
@@ -1074,12 +1113,30 @@ mod tests {
             &manifest_json("native-file", "native", "\"bin/tool\""),
             &["bin/tool"],
         )?;
+        #[cfg(unix)]
+        make_executable(&dir.join("bin/tool"))?;
         let classified = classify_extension(&dir, TARGET)?;
         assert_eq!(classified.mode, ExtensionMode::Native);
         assert_eq!(
             classified.entry,
             std::fs::canonicalize(dir.join("bin/tool"))?
         );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_non_executable_regular_file_entry_is_rejected() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let dir = extension_dir(
+            &temp,
+            "native-nonexec",
+            &manifest_json("native-nonexec", "native", "\"bin/tool\""),
+            &["bin/tool"],
+        )?;
+        // Default write mode has no execute bits; do not chmod.
+        let kind = expect_kind(classify_extension(&dir, TARGET))?;
+        assert_eq!(kind, ManifestErrorKind::NativeEntryNotExecutable);
         Ok(())
     }
 
