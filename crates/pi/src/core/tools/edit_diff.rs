@@ -655,14 +655,23 @@ pub fn generate_diff_string(
     new_content: &str,
     context_lines: usize,
 ) -> DiffStringResult {
-    let old_lines = split_lines_keep_trailing_empty(old_content);
-    let new_lines = split_lines_keep_trailing_empty(new_content);
+    let mut old_lines = split_lines_keep_trailing_empty(old_content);
+    let mut new_lines = split_lines_keep_trailing_empty(new_content);
     let line_num_width = old_lines
         .len()
         .max(new_lines.len())
         .max(1)
         .to_string()
         .len();
+    // `diff.diffLines` includes a terminating newline in the preceding part;
+    // its renderer then removes that part's trailing split element. It does
+    // not expose the file terminator as a synthetic equal empty line.
+    if old_content.ends_with('\n') {
+        old_lines.pop();
+    }
+    if new_content.ends_with('\n') {
+        new_lines.pop();
+    }
     let parts = collapse_ops(&diff_ops(&old_lines, &new_lines));
     render_diff_parts(&parts, context_lines, line_num_width)
 }
@@ -1208,6 +1217,13 @@ mod tests {
 
         let delete = generate_unified_patch("a.txt", "one\nremoved\ntwo\n", "one\ntwo\n", 0);
         assert!(delete.contains("@@ -2,1 +1,0 @@\n-removed\n"));
+    }
+
+    #[test]
+    fn display_diff_does_not_render_trailing_newline_as_context() {
+        let result = generate_diff_string("before\n", "after\n", 4);
+        assert_eq!(result.diff, "-1 before\n+1 after");
+        assert_eq!(result.first_changed_line, Some(1));
     }
 
     #[test]
