@@ -600,6 +600,22 @@ async fn resolve_models(args: &crate::cli::args::Args, runtime: &ModelRuntime) -
         diagnostics,
     }
 }
+async fn install_cli_api_key(
+    api_key: &str,
+    model: &Model,
+    runtime: &ModelRuntime,
+) -> Result<(), String> {
+    runtime
+        .set_runtime_api_key(&model.provider, api_key)
+        .await
+        .map_err(|error| error.to_string())?;
+    runtime
+        .get_available(None)
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
 async fn apply_cli_api_key(
     api_key: Option<&str>,
     selected_model: Option<&Model>,
@@ -616,15 +632,7 @@ async fn apply_cli_api_key(
         return Ok(());
     };
 
-    runtime
-        .set_runtime_api_key(&model.provider, api_key)
-        .await
-        .map_err(|error| error.to_string())?;
-    runtime
-        .get_available(None)
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(())
+    install_cli_api_key(api_key, model, runtime).await
 }
 
 /// Build the settings manager, built-in tools, and base system prompt that
@@ -822,14 +830,13 @@ impl CreateAgentSessionRuntimeFactory for RealReplacementFactory {
                 .as_ref()
                 .and_then(|(provider, model_id)| services.model_runtime.get_model(provider, model_id));
             let mut replacement_diagnostics = Vec::new();
-            apply_cli_api_key(
-                self.configuration.api_key.as_deref(),
-                saved_model.as_ref(),
-                &services.model_runtime,
-                &mut replacement_diagnostics,
-            )
-            .await
-            .map_err(crate::core::agent_session_runtime::AgentSessionRuntimeError::Factory)?;
+            if let (Some(api_key), Some(saved_model)) =
+                (self.configuration.api_key.as_deref(), saved_model.as_ref())
+            {
+                install_cli_api_key(api_key, saved_model, &services.model_runtime)
+                    .await
+                    .map_err(crate::core::agent_session_runtime::AgentSessionRuntimeError::Factory)?;
+            }
 
             let mut session_result = create_agent_session_from_services(
                 crate::core::agent_session_services::CreateAgentSessionFromServicesOptions {
@@ -855,6 +862,14 @@ impl CreateAgentSessionRuntimeFactory for RealReplacementFactory {
                 ))
             })?;
 
+            apply_cli_api_key(
+                self.configuration.api_key.as_deref(),
+                session_result.model.as_ref(),
+                &session_result.model_runtime,
+                &mut replacement_diagnostics,
+            )
+            .await
+            .map_err(crate::core::agent_session_runtime::AgentSessionRuntimeError::Factory)?;
             session_result.diagnostics.extend(replacement_diagnostics);
 
             let built = assemble_replacement_session(
@@ -1357,6 +1372,54 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replacement_fresh_session_applies_api_key_after_model_resolution() -> Result<(), String> {
+        let runtime = ModelRuntime::create_in_memory()
+            .await
+            .map_err(|error| format!("failed to create in-memory model runtime: {error}"))?;
+        let model = runtime
+            .get_models(None)
+            .into_iter()
+            .next()
+            .ok_or_else(|| "built-in model catalog is empty".to_owned())?;
+        let mut diagnostics = Vec::new();
+
+        // `new_session` has no saved model; model selection completes first.
+        apply_cli_api_key(Some("sk-fresh"), Some(&model), &runtime, &mut diagnostics).await?;
+
+        assert!(diagnostics.is_empty());
+        assert!(runtime.has_configured_auth(&model.provider));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replacement_saved_session_provisions_api_key_before_restore() -> Result<(), String> {
+        let runtime = ModelRuntime::create_in_memory()
+            .await
+            .map_err(|error| format!("failed to create in-memory model runtime: {error}"))?;
+        let saved_model = runtime
+            .get_models(None)
+            .into_iter()
+            .next()
+            .ok_or_else(|| "built-in model catalog is empty".to_owned())?;
+
+        // The replacement factory installs this before restore_model_from_session
+        // checks configured auth for the saved provider.
+        install_cli_api_key("sk-restored", &saved_model, &runtime).await?;
+        assert!(runtime.has_configured_auth(&saved_model.provider));
+
+        let mut diagnostics = Vec::new();
+        apply_cli_api_key(
+            Some("sk-restored"),
+            Some(&saved_model),
+            &runtime,
+            &mut diagnostics,
+        )
+        .await?;
+        assert!(diagnostics.is_empty());
         Ok(())
     }
 
