@@ -201,6 +201,7 @@ impl AgentSession {
         let mut manager = self.session_manager.lock().await;
         let id = manager.append_message(&agent_message)?;
         drop(manager);
+        self.agent.push_message(agent_message);
         if let Some(entry) = self.session_manager.lock().await.get_entry(&id).cloned() {
             self.emit_public(super::events::AgentSessionEvent::EntryAppended { entry });
         }
@@ -245,6 +246,7 @@ impl AgentSession {
                 let id = manager.append_message(&agent_message)?;
                 manager.get_entry(&id).cloned()
             };
+            self.agent.push_message(agent_message);
             {
                 let mut inner = self.lock_inner();
                 if inner.pending_bash_messages.first() == Some(&message) {

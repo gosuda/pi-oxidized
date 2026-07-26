@@ -1856,6 +1856,31 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn recorded_bash_result_enters_transcript_and_session_history()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let provider = Arc::new(MockProvider(Vec::new()));
+        let session = AgentSession::new(AgentSessionConfig::test_config(provider, test_model())?)?;
+        session
+            .record_bash_result(
+                "printf ok",
+                super::bash::BashResult {
+                    output: "ok".to_owned(),
+                    exit_code: Some(0),
+                    cancelled: false,
+                    truncated: false,
+                    full_output_path: None,
+                },
+                &super::bash::ExecuteBashOptions::default(),
+            )
+            .await?;
+
+        assert_eq!(session.message_count(), 1);
+        assert_eq!(session.messages()[0].role(), "bashExecution");
+        assert_eq!(session.session_manager.lock().await.get_entries().len(), 1);
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn abort_stops_running_bash() -> Result<(), Box<dyn std::error::Error>> {
