@@ -572,7 +572,7 @@ async fn collect_command_output(
             spawn_context.env,
         )
         .await;
-    finish_collected_output(exec_result, pump, output, throttle).await
+    finish_collected_output(exec_result, pump, output, throttle, updates).await
 }
 
 async fn finish_collected_output(
@@ -580,6 +580,7 @@ async fn finish_collected_output(
     pump: tokio::task::JoinHandle<Result<(), OutputAccumulatorError>>,
     output: Arc<Mutex<OutputAccumulator>>,
     throttle: Arc<Mutex<UpdateThrottle>>,
+    updates: ToolUpdates,
 ) -> Result<CollectedCommandOutput, ToolError> {
     match pump.await {
         Ok(Ok(())) => {}
@@ -600,8 +601,24 @@ async fn finish_collected_output(
         .snapshot(true)
         .map_err(|error| accumulator_error(&error))?;
     let last_line_bytes = output_guard.last_line_bytes();
+    let emitted = EmittedSnapshot::from(&snapshot);
+    let should_emit = {
+        let mut throttle_guard = throttle.lock().await;
+        let ordinary_empty_output = throttle_guard.last_emitted.is_none()
+            && emitted.content.is_empty()
+            && !emitted.truncation.truncated;
+        if ordinary_empty_output || throttle_guard.last_emitted.as_ref() == Some(&emitted) {
+            false
+        } else {
+            throttle_guard.last_emitted = Some(emitted);
+            true
+        }
+    };
     output_guard.close_temp_file();
     drop(output_guard);
+    if should_emit {
+        updates.send(snapshot_to_partial(&snapshot));
+    }
     Ok(CollectedCommandOutput {
         exec_result,
         snapshot,
@@ -979,8 +996,26 @@ fn kill_process_tree(pid: u32) {
     }
 }
 
+#[derive(Clone, PartialEq)]
+struct EmittedSnapshot {
+    content: String,
+    truncation: TruncationResult,
+    full_output_path: Option<PathBuf>,
+}
+
+impl From<&OutputSnapshot> for EmittedSnapshot {
+    fn from(snapshot: &OutputSnapshot) -> Self {
+        Self {
+            content: snapshot.content.clone(),
+            truncation: snapshot.truncation.clone(),
+            full_output_path: snapshot.full_output_path.clone(),
+        }
+    }
+}
+
 struct UpdateThrottle {
     last_update_at: Option<Instant>,
+    last_emitted: Option<EmittedSnapshot>,
     dirty: bool,
     timer_armed: bool,
 }
@@ -989,6 +1024,7 @@ impl UpdateThrottle {
     fn new() -> Self {
         Self {
             last_update_at: None,
+            last_emitted: None,
             dirty: false,
             timer_armed: false,
         }
@@ -1035,7 +1071,19 @@ fn schedule_throttled_update(
             if should_emit {
                 let mut output_guard = output.lock().await;
                 if let Ok(snapshot) = output_guard.snapshot(true) {
-                    updates.send(snapshot_to_partial(&snapshot));
+                    let emitted = EmittedSnapshot::from(&snapshot);
+                    let should_send = {
+                        let mut guard = state.lock().await;
+                        if guard.last_emitted.as_ref() == Some(&emitted) {
+                            false
+                        } else {
+                            guard.last_emitted = Some(emitted);
+                            true
+                        }
+                    };
+                    if should_send {
+                        updates.send(snapshot_to_partial(&snapshot));
+                    }
                 }
             }
 
@@ -1194,6 +1242,74 @@ mod tests {
 
     fn text_of_err(error: &ToolError) -> String {
         error.message().to_owned()
+    }
+
+    #[derive(Clone)]
+    struct ScriptedBashOperations {
+        chunks: Vec<Vec<u8>>,
+        pause_between_chunks: Option<Duration>,
+    }
+
+    impl BashOperations for ScriptedBashOperations {
+        fn exec(
+            &self,
+            _command: String,
+            _cwd: PathBuf,
+            mut on_data: Box<dyn FnMut(Vec<u8>) + Send>,
+            _cancel: CancellationToken,
+            _timeout: Option<f64>,
+            _env: HashMap<String, String>,
+        ) -> BoxFuture<'static, Result<Option<i32>, ToolError>> {
+            let chunks = self.chunks.clone();
+            let pause_between_chunks = self.pause_between_chunks;
+            async move {
+                let chunk_count = chunks.len();
+                for (index, chunk) in chunks.into_iter().enumerate() {
+                    on_data(chunk);
+                    if index + 1 < chunk_count
+                        && let Some(pause) = pause_between_chunks
+                    {
+                        tokio::time::sleep(pause).await;
+                    }
+                }
+                Ok(Some(0))
+            }
+            .boxed()
+        }
+    }
+
+    async fn execute_scripted(
+        chunks: Vec<Vec<u8>>,
+        pause_between_chunks: Option<Duration>,
+    ) -> Result<(AgentToolResult, Vec<AgentToolResult>), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        let mut options = BashToolOptions::new(dir.path());
+        options.operations = Some(Arc::new(ScriptedBashOperations {
+            chunks,
+            pause_between_chunks,
+        }));
+        let tool = BashTool::with_options(options);
+        let updates = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&updates);
+        let stream = ToolUpdates::new(move |partial| {
+            captured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(partial);
+        });
+        let result = tool
+            .execute(
+                "1",
+                json_map(json!({ "command": "scripted" }))?,
+                CancellationToken::new(),
+                stream,
+            )
+            .await?;
+        let updates = updates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        Ok((result, updates))
     }
 
     async fn wait_for_marked_pids(marker: &Path) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
@@ -1590,33 +1706,43 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn byte_truncation_notice_and_spill() -> Result<(), Box<dyn std::error::Error>> {
-        let dir = tempdir()?;
-        let tool = BashTool::new(dir.path());
-        let result = tool
-            .execute(
-                "1",
-                json_map(json!({
-                    "command": format!(
-                        "python3 - <<'PY'\nprint('x'*{})\nPY",
-                        DEFAULT_MAX_BYTES + 100
-                    )
-                }))?,
-                CancellationToken::new(),
-                ToolUpdates::noop(),
-            )
-            .await?;
-        let text = text_of(&result);
-        assert!(
-            text.contains("limit). Full output: ") || text.contains("of line "),
-            "{text}"
+    async fn pending_throttle_still_delivers_final_partial()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (result, updates) = execute_scripted(
+            vec![b"first\n".to_vec(), b"second\n".to_vec()],
+            Some(BASH_UPDATE_THROTTLE + Duration::from_millis(20)),
+        )
+        .await?;
+        assert_eq!(
+            text_of(
+                updates
+                    .last()
+                    .ok_or_else(|| io::Error::other("missing update"))?
+            ),
+            text_of(&result)
         );
-        let details = required(result.details.as_object(), "details object missing")?;
-        let path = required(
-            details.get("fullOutputPath").and_then(Value::as_str),
-            "spill path missing",
-        )?;
-        assert!(Path::new(path).is_file());
+        assert_eq!(text_of(&result), "first\nsecond\n");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finalized_incomplete_utf8_is_streamed() -> Result<(), Box<dyn std::error::Error>> {
+        let (result, updates) =
+            execute_scripted(vec![b"ok".to_vec(), vec![0xf0, 0x9f, 0x98]], None).await?;
+        let final_partial = updates
+            .last()
+            .ok_or_else(|| io::Error::other("missing update"))?;
+        assert_eq!(text_of(final_partial), "ok\u{fffd}");
+        assert_eq!(text_of(final_partial), text_of(&result));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn final_snapshot_matching_stream_does_not_duplicate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_result, updates) = execute_scripted(vec![b"x\n".to_vec()], None).await?;
+        assert_eq!(updates.len(), 2);
+        assert_eq!(text_of(&updates[1]), "x\n");
         Ok(())
     }
 
