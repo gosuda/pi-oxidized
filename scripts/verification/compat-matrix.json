@@ -366,6 +366,20 @@
 			"evidence": "generated source-pinned v1/v2/v3 fixtures migrate and continue/fork/clone through Rust SessionManager, preserve historical prefixes and opaque entries, then reopen unchanged in source-pinned TypeScript pi"
 		},
 		{
+			"id": "rpc-parity",
+			"surface": "rpc protocol parity",
+			"tier": "product",
+			"required": true,
+			"commands": [
+				{
+					"cwd": ".",
+					"argv": ["bun", "run", "scripts/verification/rpc-parity.ts"],
+					"timeoutMs": 900000
+				}
+			],
+			"evidence": "every authoritative RPC command replays through Rust pi --mode rpc and source-pinned TypeScript pi with normalized response/event transcript equality"
+		},
+		{
 			"id": "flicker",
 			"surface": "flicker",
 			"tier": "performance",
