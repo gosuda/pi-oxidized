@@ -59,10 +59,40 @@ use super::types::{
     RpcSessionTreeNode, RpcSlashCommand, SessionStats, StreamingBehavior,
 };
 
-/// Serialize a value as a JSONL line, falling back to an empty string on
-/// serialization failure (our types are infallible serializers).
+/// Serialize one RPC record using the upstream public user-message shape.
+///
+/// Rust keeps text-only user content as a string internally. TypeScript's
+/// session/RPC boundary always exposes it as a text-content block array.
 fn to_jsonl<T: Serialize>(value: &T) -> String {
-    serialize_json_line(value).unwrap_or_default()
+    let Ok(mut wire) = serde_json::to_value(value) else {
+        return String::new();
+    };
+    canonicalize_user_message_content(&mut wire);
+    serialize_json_line(&wire).unwrap_or_default()
+}
+
+fn canonicalize_user_message_content(value: &mut Value) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                canonicalize_user_message_content(item);
+            }
+        }
+        Value::Object(object) => {
+            let is_user = object.get("role").and_then(Value::as_str) == Some("user");
+            if is_user && let Some(Value::String(text)) = object.get_mut("content") {
+                let text = std::mem::take(text);
+                object.insert(
+                    "content".to_owned(),
+                    serde_json::json!([{ "type": "text", "text": text }]),
+                );
+            }
+            for child in object.values_mut() {
+                canonicalize_user_message_content(child);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
 }
 
 /// Future returned by [`RpcSink`] methods.
@@ -1559,6 +1589,27 @@ mod tests {
     use std::task::{Context, Poll};
     use tokio::io::ReadBuf;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
+
+    #[test]
+    fn rpc_wire_canonicalizes_nested_user_text_content_only()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let record = serde_json::json!({
+            "type": "response",
+            "data": {
+                "messages": [
+                    { "role": "user", "content": "hello", "timestamp": 1 },
+                    { "role": "custom", "content": "leave me", "timestamp": 2 }
+                ]
+            }
+        });
+        let wire: Value = serde_json::from_str(to_jsonl(&record).trim_end())?;
+        assert_eq!(
+            wire["data"]["messages"][0]["content"],
+            serde_json::json!([{ "type": "text", "text": "hello" }])
+        );
+        assert_eq!(wire["data"]["messages"][1]["content"], "leave me");
+        Ok(())
+    }
 
     // -----------------------------------------------------------------------
     // FakeRpcHost
