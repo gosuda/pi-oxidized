@@ -2208,6 +2208,13 @@ mod tests {
             }
         }
 
+        fn canonical_expected_user_content(message: &Value) -> Value {
+            match (message["role"].as_str(), message["content"].as_str()) {
+                (Some("user"), Some(text)) => json!([{ "type": "text", "text": text }]),
+                _ => message["content"].clone(),
+            }
+        }
+
         let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../.agent-tasks/pi-rust-rewrite/fixtures/sessions");
         let output_root = std::env::var_os("PI_SESSION_INTEROP_OUTPUT")
@@ -2276,8 +2283,13 @@ mod tests {
                     let actual_message = actual.get("message").ok_or("actual message")?;
                     for key in ["role", "content", "api", "provider", "model", "stopReason"] {
                         if !expected_message[key].is_null() {
+                            let expected_value = if key == "content" {
+                                canonical_expected_user_content(expected_message)
+                            } else {
+                                expected_message[key].clone()
+                            };
                             assert_eq!(
-                                actual_message[key], expected_message[key],
+                                actual_message[key], expected_value,
                                 "{fixture_name}: message {key}"
                             );
                         }
@@ -2343,7 +2355,8 @@ mod tests {
                     "{fixture_name}: context role"
                 );
                 assert_eq!(
-                    actual["content"], expected_message["content"],
+                    actual["content"],
+                    canonical_expected_user_content(expected_message),
                     "{fixture_name}: context content"
                 );
             }
@@ -2459,9 +2472,10 @@ mod tests {
                 .filter(|entry| entry.discriminant() != "label")
             {
                 let id = source_entry.id().ok_or("fork source entry id")?;
+                let forked_entry = reopened_fork.get_entry(id).ok_or("fork entry")?;
                 assert_eq!(
-                    reopened_fork.get_entry(id),
-                    Some(source_entry),
+                    serde_json::to_value(forked_entry)?,
+                    serde_json::to_value(source_entry)?,
                     "{fixture_name}: fork preserved entry {id}"
                 );
             }

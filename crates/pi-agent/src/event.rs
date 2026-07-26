@@ -104,6 +104,14 @@ mod tests {
         ))))
     }
 
+    fn user_json(text: &str) -> Value {
+        json!({
+            "role": "user",
+            "content": [{ "type": "text", "text": text }],
+            "timestamp": 1
+        })
+    }
+
     fn assistant_message() -> AgentMessage {
         AgentMessage::Llm(Box::new(Message::Assistant(AssistantMessage::new(
             "api", "provider", "model", 2,
@@ -153,7 +161,7 @@ mod tests {
             },
             json!({
                 "type": "agent_end",
-                "messages": [{ "role": "user", "content": "done", "timestamp": 1 }]
+                "messages": [user_json("done")]
             }),
         )?;
         assert_wire(&AgentEvent::TurnStart, json!({ "type": "turn_start" }))?;
@@ -164,10 +172,24 @@ mod tests {
             },
             json!({
                 "type": "turn_end",
-                "message": { "role": "user", "content": "turn", "timestamp": 1 },
+                "message": user_json("turn"),
                 "toolResults": []
             }),
         )
+    }
+
+    #[test]
+    fn legacy_user_message_event_reads_as_canonical_wire() -> Result<(), serde_json::Error> {
+        let event: AgentEvent = serde_json::from_value(json!({
+            "type": "message_start",
+            "message": { "role": "user", "content": "legacy", "timestamp": 1 }
+        }))?;
+
+        assert_eq!(
+            serde_json::to_value(event)?,
+            json!({ "type": "message_start", "message": user_json("legacy") })
+        );
+        Ok(())
     }
 
     #[test]
@@ -178,7 +200,7 @@ mod tests {
             },
             json!({
                 "type": "message_start",
-                "message": { "role": "user", "content": "start", "timestamp": 1 }
+                "message": user_json("start")
             }),
         )?;
         let assistant = AssistantMessage::new("api", "provider", "model", 2);
@@ -204,7 +226,7 @@ mod tests {
             },
             json!({
                 "type": "message_end",
-                "message": { "role": "user", "content": "end", "timestamp": 1 }
+                "message": user_json("end")
             }),
         )
     }
