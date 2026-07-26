@@ -504,17 +504,19 @@ fn no_tools_mode(
     }
 }
 
-async fn create_runtime_services(
-    cwd: &str,
-    agent_dir: &str,
-    args: &crate::cli::args::Args,
-) -> Result<AgentSessionServices, String> {
-    create_agent_session_services_with_trust(
-        CreateAgentSessionServicesOptions {
-            cwd: PathBuf::from(cwd),
-            agent_dir: Some(PathBuf::from(agent_dir)),
-            extension_flag_values: Some(extension_flag_values(args)),
-            resource_loader_options: Some(
+#[derive(Clone)]
+struct RuntimeServiceConfiguration {
+    extension_flag_values: BTreeMap<String, ExtensionFlagValue>,
+    resource_loader_options: crate::core::agent_session_services::ResourceLoaderServiceOptions,
+    project_trust_override: Option<bool>,
+}
+
+impl RuntimeServiceConfiguration {
+    fn from_args(args: &crate::cli::args::Args) -> Self {
+        Self {
+            extension_flag_values: extension_flag_values(args),
+            project_trust_override: args.project_trust_override,
+            resource_loader_options:
                 crate::core::agent_session_services::ResourceLoaderServiceOptions {
                     no_extensions: args.no_extensions,
                     no_skills: args.no_skills,
@@ -527,10 +529,39 @@ async fn create_runtime_services(
                     additional_extension_paths: args.extensions.clone(),
                     ..Default::default()
                 },
-            ),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ReplacementRuntimeConfiguration {
+    service: RuntimeServiceConfiguration,
+    api_key: Option<String>,
+}
+
+impl ReplacementRuntimeConfiguration {
+    fn from_args(args: &crate::cli::args::Args) -> Self {
+        Self {
+            service: RuntimeServiceConfiguration::from_args(args),
+            api_key: args.api_key.clone(),
+        }
+    }
+}
+
+async fn create_runtime_services(
+    cwd: &str,
+    agent_dir: &str,
+    configuration: &RuntimeServiceConfiguration,
+) -> Result<AgentSessionServices, String> {
+    create_agent_session_services_with_trust(
+        CreateAgentSessionServicesOptions {
+            cwd: PathBuf::from(cwd),
+            agent_dir: Some(PathBuf::from(agent_dir)),
+            extension_flag_values: Some(configuration.extension_flag_values.clone()),
+            resource_loader_options: Some(configuration.resource_loader_options.clone()),
             ..Default::default()
         },
-        args.project_trust_override,
+        configuration.project_trust_override,
     )
     .await
     .map_err(|error| error.to_string())
@@ -641,6 +672,7 @@ impl RuntimeFactory for RealRuntimeFactory {
                 .session_manager
                 .build_session_context()
                 .map_err(|error| error.to_string())?;
+            let replacement_configuration = ReplacementRuntimeConfiguration::from_args(&parsed);
             let RestoredSession {
                 has_existing_session,
                 saved_session_model,
@@ -648,7 +680,7 @@ impl RuntimeFactory for RealRuntimeFactory {
                 messages: existing_messages,
             } = restore_session(session_context);
 
-            let services = create_runtime_services(&cwd, &agent_dir, &parsed).await?;
+            let services = create_runtime_services(&cwd, &agent_dir, &replacement_configuration.service).await?;
             let project_trusted = services.settings_manager().is_project_trusted();
 
             // Services refresh registers extension providers before model resolution.
@@ -729,7 +761,7 @@ impl RuntimeFactory for RealRuntimeFactory {
                     agent_dir: PathBuf::from(&agent_dir),
                 },
                 Arc::new(RealReplacementFactory {
-                    project_trust_override: parsed.project_trust_override,
+                    configuration: replacement_configuration,
                 }),
                 built.diagnostics,
                 built.model_fallback_message,
@@ -749,7 +781,7 @@ impl RuntimeFactory for RealRuntimeFactory {
 /// Replacement factory for runtime swap operations (new/switch/fork).
 #[derive(Clone)]
 struct RealReplacementFactory {
-    project_trust_override: Option<bool>,
+    configuration: ReplacementRuntimeConfiguration,
 }
 
 impl CreateAgentSessionRuntimeFactory for RealReplacementFactory {
@@ -781,24 +813,25 @@ impl CreateAgentSessionRuntimeFactory for RealReplacementFactory {
                 saved_thinking_level: thinking_level,
                 messages: existing_messages,
             } = restore_session(session_context);
-            let services = create_agent_session_services_with_trust(
-                CreateAgentSessionServicesOptions {
-                    cwd: PathBuf::from(&cwd),
-                    agent_dir: Some(PathBuf::from(&agent_dir)),
-                    ..Default::default()
-                },
-                self.project_trust_override,
-            )
-            .await
-            .map_err(|e| {
-                crate::core::agent_session_runtime::AgentSessionRuntimeError::Factory(format!(
-                    "{e}"
-                ))
-            })?;
+            let services = create_runtime_services(&cwd, &agent_dir, &self.configuration.service)
+                .await
+                .map_err(crate::core::agent_session_runtime::AgentSessionRuntimeError::Factory)?;
             let project_trusted = services.settings_manager().is_project_trusted();
             let resources = session_resources(&services.resource_loader);
+            let saved_model = saved_session_model
+                .as_ref()
+                .and_then(|(provider, model_id)| services.model_runtime.get_model(provider, model_id));
+            let mut replacement_diagnostics = Vec::new();
+            apply_cli_api_key(
+                self.configuration.api_key.as_deref(),
+                saved_model.as_ref(),
+                &services.model_runtime,
+                &mut replacement_diagnostics,
+            )
+            .await
+            .map_err(crate::core::agent_session_runtime::AgentSessionRuntimeError::Factory)?;
 
-            let session_result = create_agent_session_from_services(
+            let mut session_result = create_agent_session_from_services(
                 crate::core::agent_session_services::CreateAgentSessionFromServicesOptions {
                     services,
                     model: None,
@@ -821,6 +854,8 @@ impl CreateAgentSessionRuntimeFactory for RealReplacementFactory {
                     "{e}"
                 ))
             })?;
+
+            session_result.diagnostics.extend(replacement_diagnostics);
 
             let built = assemble_replacement_session(
                 &cwd,
@@ -1216,6 +1251,40 @@ mod tests {
             ["message", "thinking_level_change"]
         );
         Ok(())
+    }
+
+    #[test]
+    fn replacement_runtime_configuration_retains_service_policy_and_api_key() {
+        let args = crate::cli::args::parse_args(&[
+            "--api-key".into(),
+            "sk-replacement".into(),
+            "--extension".into(),
+            "/extensions/provider.ts".into(),
+            "--provider-profile".into(),
+            "strict".into(),
+            "--no-skills".into(),
+            "--no-prompt-templates".into(),
+            "--no-themes".into(),
+            "--no-context-files".into(),
+            "--approve".into(),
+        ]);
+
+        let config = ReplacementRuntimeConfiguration::from_args(&args);
+
+        assert_eq!(config.api_key.as_deref(), Some("sk-replacement"));
+        assert_eq!(config.service.project_trust_override, Some(true));
+        assert_eq!(
+            config.service.resource_loader_options.additional_extension_paths,
+            ["/extensions/provider.ts"]
+        );
+        assert!(config.service.resource_loader_options.no_skills);
+        assert!(config.service.resource_loader_options.no_prompt_templates);
+        assert!(config.service.resource_loader_options.no_themes);
+        assert!(config.service.resource_loader_options.no_context_files);
+        assert_eq!(
+            config.service.extension_flag_values.get("provider-profile"),
+            Some(&ExtensionFlagValue::Str("strict".into()))
+        );
     }
 
     #[tokio::test]
