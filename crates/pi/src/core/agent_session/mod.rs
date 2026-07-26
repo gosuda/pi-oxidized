@@ -185,10 +185,13 @@ impl AgentSessionConfig {
     }
 }
 
-/// Build host-command path provenance from the ResourceLoader extension snapshot.
+/// Build host-command path provenance from the `ResourceLoader` extension snapshot.
 pub(super) fn extension_source_infos(
-    loader: &crate::core::resources::DefaultResourceLoader,
+    loader: Option<&crate::core::resources::DefaultResourceLoader>,
 ) -> std::collections::HashMap<String, crate::core::resources::SourceInfo> {
+    let Some(loader) = loader else {
+        return std::collections::HashMap::new();
+    };
     crate::core::resources::ResourceLoader::get_extensions(loader)
         .paths
         .iter()
@@ -522,11 +525,7 @@ impl AgentSession {
 
         let retry = config.settings_manager.get_retry_settings();
         let compaction = config.settings_manager.get_compaction_settings();
-        let extension_source_infos = config
-            .resource_loader
-            .as_ref()
-            .map_or_else(std::collections::HashMap::new, extension_source_infos);
-
+        let extension_source_infos = extension_source_infos(config.resource_loader.as_ref());
         let mut inner = AgentSessionInner::new(config.scoped_models, config.system_prompt.clone());
         inner.pending_session_start = Some(config.session_start_event.unwrap_or_default());
         inner.auto_retry_enabled = retry.enabled;
