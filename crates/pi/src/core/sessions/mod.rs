@@ -2102,4 +2102,442 @@ mod tests {
         assert_eq!(err.to_string(), "Entry nonexistent not found");
         Ok(())
     }
+
+    #[test]
+    #[ignore = "requires generated fixtures and PI_SESSION_INTEROP_OUTPUT"]
+    #[allow(clippy::too_many_lines)] // End-to-end generated-fixture contract; splitting obscures the proof sequence.
+    fn generated_cross_version_session_interoperability() -> TestResult {
+        fn fixture_files(
+            root: &Path,
+            files: &mut Vec<PathBuf>,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            for entry in fs::read_dir(root)? {
+                let path = entry?.path();
+                if path.is_dir() {
+                    fixture_files(&path, files)?;
+                } else if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+                    files.push(path);
+                }
+            }
+            Ok(())
+        }
+
+        fn tree_ids(nodes: &[SessionTreeNode], ids: &mut Vec<String>) {
+            for node in nodes {
+                if let Some(id) = node.entry.id() {
+                    ids.push(id.to_owned());
+                }
+                tree_ids(&node.children, ids);
+            }
+        }
+
+        fn expected_tree_ids(value: &Value, ids: &mut Vec<String>) {
+            for node in value.as_array().into_iter().flatten() {
+                if let Some(id) = node
+                    .get("entry")
+                    .and_then(|entry| entry.get("id"))
+                    .and_then(Value::as_str)
+                {
+                    ids.push(id.to_owned());
+                }
+                if let Some(children) = node.get("children") {
+                    expected_tree_ids(children, ids);
+                }
+            }
+        }
+
+        let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.agent-tasks/pi-rust-rewrite/fixtures/sessions");
+        let output_root = std::env::var_os("PI_SESSION_INTEROP_OUTPUT")
+            .map(PathBuf::from)
+            .ok_or("PI_SESSION_INTEROP_OUTPUT is required")?;
+        let mut fixtures = Vec::new();
+        fixture_files(&fixture_root, &mut fixtures)?;
+        fixtures.sort();
+
+        let mut saw_v1 = false;
+        let mut saw_v2 = false;
+        let mut saw_v3 = false;
+        let mut saw_unknown = false;
+        for fixture in fixtures {
+            let expected_path = fixture.with_extension("expected.json");
+            let expected: Value = serde_json::from_slice(&fs::read(&expected_path)?)?;
+            let fixture_name = expected["fixture"].as_str().ok_or("fixture name")?;
+            match expected["formatVersion"].as_u64().ok_or("format version")? {
+                1 => saw_v1 = true,
+                2 => saw_v2 = true,
+                3 => saw_v3 = true,
+                version => return Err(format!("unexpected fixture version {version}").into()),
+            }
+
+            let relative = fixture.strip_prefix(&fixture_root)?;
+            let scenario_dir = output_root.join(relative).with_extension("");
+            fs::create_dir_all(&scenario_dir)?;
+            let continued = scenario_dir.join("continued.jsonl");
+            fs::copy(&fixture, &continued)?;
+            let mut session =
+                SessionManager::open(path_str(&continued)?, Some(path_str(&scenario_dir)?), None)?;
+            let migrated_prefix = fs::read(&continued)?;
+
+            let header = session.get_header().ok_or("header")?;
+            let source_session_id = header.id.clone();
+            assert_eq!(
+                header.version,
+                Some(CURRENT_SESSION_VERSION),
+                "{fixture_name}: header version"
+            );
+            assert_eq!(
+                header.id.as_deref(),
+                expected["sessionId"].as_str(),
+                "{fixture_name}: header id"
+            );
+            let entries: Vec<Value> = session
+                .get_entries()
+                .into_iter()
+                .map(serde_json::to_value)
+                .collect::<Result<_, _>>()?;
+            let expected_entries = expected["entries"].as_array().ok_or("expected entries")?;
+            assert_eq!(
+                entries.len(),
+                expected_entries.len(),
+                "{fixture_name}: entry count"
+            );
+            let mut expected_to_actual = HashMap::new();
+            for (actual, expected_entry) in entries.iter().zip(expected_entries) {
+                assert_eq!(
+                    actual["type"], expected_entry["type"],
+                    "{fixture_name}: entry type"
+                );
+                let expected_id = expected_entry["id"].as_str().ok_or("expected entry id")?;
+                let actual_id = actual["id"].as_str().ok_or("actual entry id")?;
+                if let Some(expected_message) = expected_entry.get("message") {
+                    let actual_message = actual.get("message").ok_or("actual message")?;
+                    for key in ["role", "content", "api", "provider", "model", "stopReason"] {
+                        if !expected_message[key].is_null() {
+                            assert_eq!(
+                                actual_message[key], expected_message[key],
+                                "{fixture_name}: message {key}"
+                            );
+                        }
+                    }
+                }
+                expected_to_actual.insert(expected_id.to_owned(), actual_id.to_owned());
+            }
+            assert_eq!(
+                session.get_leaf_id(),
+                expected["leaf"]
+                    .as_str()
+                    .and_then(|id| expected_to_actual.get(id).map(String::as_str)),
+                "{fixture_name}: leaf",
+            );
+            assert_eq!(
+                session.get_session_name(),
+                expected["name"].as_str().map(str::to_owned),
+                "{fixture_name}: name"
+            );
+            for (id, label) in expected["labels"].as_object().ok_or("labels")? {
+                assert_eq!(
+                    session.get_label(expected_to_actual.get(id).ok_or("label target")?),
+                    label.as_str(),
+                    "{fixture_name}: label {id}",
+                );
+            }
+            let mut actual_tree = Vec::new();
+            tree_ids(&session.get_tree(), &mut actual_tree);
+            let mut expected_tree = Vec::new();
+            expected_tree_ids(&expected["tree"], &mut expected_tree);
+            let actual_tree_as_expected: Vec<String> = actual_tree
+                .into_iter()
+                .map(|actual| {
+                    expected_to_actual
+                        .iter()
+                        .find_map(|(expected, mapped)| {
+                            (*mapped == actual).then_some(expected.clone())
+                        })
+                        .ok_or("tree entry")
+                })
+                .collect::<Result<_, _>>()?;
+            assert_eq!(
+                actual_tree_as_expected, expected_tree,
+                "{fixture_name}: tree"
+            );
+            let context = session.build_session_context()?;
+            let expected_context = expected["context"]["messages"]
+                .as_array()
+                .ok_or("context messages")?;
+            let actual_context: Vec<Value> = context
+                .messages
+                .iter()
+                .map(serde_json::to_value)
+                .collect::<Result<_, _>>()?;
+            assert_eq!(
+                actual_context.len(),
+                expected_context.len(),
+                "{fixture_name}: context"
+            );
+            for (actual, expected_message) in actual_context.iter().zip(expected_context) {
+                assert_eq!(
+                    actual["role"], expected_message["role"],
+                    "{fixture_name}: context role"
+                );
+                assert_eq!(
+                    actual["content"], expected_message["content"],
+                    "{fixture_name}: context content"
+                );
+            }
+            assert_eq!(
+                session
+                    .get_entries()
+                    .iter()
+                    .filter(|entry| entry.discriminant() == "compaction")
+                    .count(),
+                expected["entries"]
+                    .as_array()
+                    .ok_or("expected entries")?
+                    .iter()
+                    .filter(|entry| entry["type"] == "compaction")
+                    .count(),
+                "{fixture_name}: compaction",
+            );
+            saw_unknown |= entries.iter().any(|entry| entry["type"] == "future_thing");
+
+            session.append_message(&assistant_agent("Rust interop continuation", 42))?;
+            let continued_bytes = fs::read(&continued)?;
+            assert!(
+                continued_bytes.starts_with(&migrated_prefix),
+                "{fixture_name}: continuation rewrote history"
+            );
+            let leaf = session.get_leaf_id().ok_or("continued leaf")?.to_owned();
+            let continued_path = path_to_string(&resolve_path(path_str(&continued)?));
+            let scenario_path = path_to_string(&resolve_path(path_str(&scenario_dir)?));
+            let source_entries: Vec<SessionEntry> =
+                session.get_entries().into_iter().cloned().collect();
+            let mut source_tree = Vec::new();
+            tree_ids(&session.get_tree(), &mut source_tree);
+            let source_branch: Vec<SessionEntry> = session
+                .get_branch(Some(&leaf))
+                .into_iter()
+                .cloned()
+                .collect();
+            let source_branch_entries: Vec<SessionEntry> = source_branch
+                .iter()
+                .filter(|entry| entry.discriminant() != "label")
+                .cloned()
+                .collect();
+            let source_branch_ids: HashSet<&str> = source_branch_entries
+                .iter()
+                .filter_map(|entry| entry.id())
+                .collect();
+            let source_labels: Vec<(&str, &str)> = expected["labels"]
+                .as_object()
+                .ok_or("labels")?
+                .iter()
+                .map(|(id, label)| Ok((id.as_str(), label.as_str().ok_or("label value")?)))
+                .collect::<Result<_, Box<dyn std::error::Error>>>()?;
+            let expected_clone_leaf_label = session
+                .labels
+                .iter()
+                .filter(|(target, _, _)| source_branch_ids.contains(target))
+                .last()
+                .map(|(target, label, _)| (target.to_owned(), label.to_owned()));
+            let forked = SessionManager::fork_from(
+                path_str(&continued)?,
+                path_str(&scenario_dir)?,
+                Some(path_str(&scenario_dir)?),
+                None,
+            )?;
+            let forked_file = forked.get_session_file().ok_or("forked file")?.to_owned();
+            assert!(
+                Path::new(&forked_file).exists(),
+                "{fixture_name}: fork output missing"
+            );
+            let reopened_fork =
+                SessionManager::open(&forked_file, Some(path_str(&scenario_dir)?), None)?;
+            let fork_header = reopened_fork.get_header().ok_or("fork header")?;
+            assert_eq!(
+                fork_header.version,
+                Some(CURRENT_SESSION_VERSION),
+                "{fixture_name}: fork header version"
+            );
+            assert_eq!(
+                fork_header.parent_session.as_deref(),
+                Some(continued_path.as_str()),
+                "{fixture_name}: fork parent session"
+            );
+            assert_ne!(
+                fork_header.id.as_deref(),
+                source_session_id.as_deref(),
+                "{fixture_name}: fork session id"
+            );
+            assert_eq!(
+                fork_header.cwd.as_deref(),
+                Some(scenario_path.as_str()),
+                "{fixture_name}: fork cwd"
+            );
+            assert_eq!(
+                reopened_fork.get_leaf_id(),
+                Some(leaf.as_str()),
+                "{fixture_name}: fork leaf"
+            );
+            let mut fork_tree = Vec::new();
+            tree_ids(&reopened_fork.get_tree(), &mut fork_tree);
+            assert_eq!(fork_tree, source_tree, "{fixture_name}: fork tree");
+            for (expected_id, expected_label) in &source_labels {
+                let actual_id = expected_to_actual
+                    .get(*expected_id)
+                    .ok_or("fork label target")?;
+                assert_eq!(
+                    reopened_fork.get_label(actual_id),
+                    Some(*expected_label),
+                    "{fixture_name}: fork label {expected_id}"
+                );
+            }
+            for source_entry in source_entries
+                .iter()
+                .filter(|entry| entry.discriminant() != "label")
+            {
+                let id = source_entry.id().ok_or("fork source entry id")?;
+                assert_eq!(
+                    reopened_fork.get_entry(id),
+                    Some(source_entry),
+                    "{fixture_name}: fork preserved entry {id}"
+                );
+            }
+
+            let cloned_file = session
+                .create_branched_session(&leaf)?
+                .ok_or("cloned file")?;
+            assert!(
+                Path::new(&cloned_file).exists(),
+                "{fixture_name}: clone output missing"
+            );
+            let reopened_clone =
+                SessionManager::open(&cloned_file, Some(path_str(&scenario_dir)?), None)?;
+            let clone_header = reopened_clone.get_header().ok_or("clone header")?;
+            assert_eq!(
+                clone_header.parent_session.as_deref(),
+                Some(continued_path.as_str()),
+                "{fixture_name}: clone parent session"
+            );
+            let clone_branch = reopened_clone.get_branch(Some(&leaf));
+            let clone_branch_ids: Vec<&str> = clone_branch
+                .iter()
+                .map(|entry| entry.id().ok_or("clone branch id"))
+                .collect::<Result<_, _>>()?;
+            let expected_branch_ids: Vec<&str> = source_branch_entries
+                .iter()
+                .map(|entry| entry.id().ok_or("source branch id"))
+                .collect::<Result<_, _>>()?;
+            assert_eq!(
+                clone_branch_ids, expected_branch_ids,
+                "{fixture_name}: clone branch ids"
+            );
+            for (index, (clone_entry, source_entry)) in clone_branch
+                .iter()
+                .zip(source_branch_entries.iter())
+                .enumerate()
+            {
+                assert_eq!(
+                    clone_entry.parent_id(),
+                    index
+                        .checked_sub(1)
+                        .and_then(|previous| expected_branch_ids.get(previous).copied()),
+                    "{fixture_name}: clone parent chain"
+                );
+                let mut expected_entry = serde_json::to_value(source_entry)?;
+                expected_entry["parentId"] = index
+                    .checked_sub(1)
+                    .and_then(|previous| expected_branch_ids.get(previous).copied())
+                    .map_or(Value::Null, |parent| Value::String(parent.to_owned()));
+                assert_eq!(
+                    serde_json::to_value(*clone_entry)?,
+                    expected_entry,
+                    "{fixture_name}: clone preserved entry payload"
+                );
+            }
+            let expected_clone_labels: Vec<(&str, &str)> = source_labels
+                .iter()
+                .copied()
+                .filter(|(expected_id, _)| {
+                    expected_to_actual
+                        .get(*expected_id)
+                        .is_some_and(|actual_id| source_branch_ids.contains(actual_id.as_str()))
+                })
+                .collect();
+            assert_eq!(
+                reopened_clone
+                    .get_entries()
+                    .iter()
+                    .filter(|entry| entry.discriminant() == "label")
+                    .count(),
+                expected_clone_labels.len(),
+                "{fixture_name}: clone label count"
+            );
+            for (expected_id, expected_label) in &source_labels {
+                let actual_id = expected_to_actual
+                    .get(*expected_id)
+                    .ok_or("clone label target")?;
+                let expected_label = source_branch_ids
+                    .contains(actual_id.as_str())
+                    .then_some(*expected_label);
+                assert_eq!(
+                    reopened_clone.get_label(actual_id),
+                    expected_label,
+                    "{fixture_name}: clone label {expected_id}"
+                );
+            }
+            let clone_entries = reopened_clone.get_entries();
+            assert_eq!(
+                clone_entries.len(),
+                source_branch_entries.len() + expected_clone_labels.len(),
+                "{fixture_name}: clone excludes entries outside branch"
+            );
+            match expected_clone_leaf_label {
+                Some((target, label)) => {
+                    let clone_leaf = reopened_clone.get_leaf_id().ok_or("clone label leaf")?;
+                    let clone_leaf_entry = reopened_clone
+                        .get_entry(clone_leaf)
+                        .ok_or("clone label leaf entry")?;
+                    let (clone_leaf_target, clone_leaf_label) = clone_leaf_entry
+                        .label_fields()
+                        .ok_or("clone leaf is not a label")?;
+                    assert_eq!(
+                        clone_leaf_target,
+                        Some(target.as_str()),
+                        "{fixture_name}: clone leaf label target"
+                    );
+                    assert_eq!(
+                        clone_leaf_label,
+                        Some(label.as_str()),
+                        "{fixture_name}: clone leaf label value"
+                    );
+                }
+                None => assert_eq!(
+                    reopened_clone.get_leaf_id(),
+                    Some(leaf.as_str()),
+                    "{fixture_name}: clone leaf"
+                ),
+            }
+            let mut clone_tree = Vec::new();
+            tree_ids(&reopened_clone.get_tree(), &mut clone_tree);
+            let clone_tree_source_ids: Vec<&str> = clone_tree
+                .iter()
+                .filter(|id| source_branch_ids.contains(id.as_str()))
+                .map(String::as_str)
+                .collect();
+            assert_eq!(
+                clone_tree_source_ids, expected_branch_ids,
+                "{fixture_name}: clone tree branch"
+            );
+        }
+        assert!(
+            saw_v1 && saw_v2 && saw_v3,
+            "fixture set must cover v1/v2/v3"
+        );
+        assert!(
+            saw_unknown,
+            "fixture set must preserve opaque future entries"
+        );
+        Ok(())
+    }
 }

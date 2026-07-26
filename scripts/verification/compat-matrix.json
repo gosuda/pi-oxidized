@@ -352,6 +352,20 @@
 			"evidence": "e2e-smoke: real Rust host flag, shortcut, dialogs, custom UI input/rerender, reload preservation, tools/steering/compaction/fork/resume, and upstream TypeScript session reopen steps pass"
 		},
 		{
+			"id": "session-v1-v2-v3-interop",
+			"surface": "generated v1/v2/v3 session interoperability",
+			"tier": "product",
+			"required": true,
+			"commands": [
+				{
+					"cwd": ".",
+					"argv": ["bun", "run", "scripts/verification/session-interop.ts"],
+					"timeoutMs": 900000
+				}
+			],
+			"evidence": "generated source-pinned v1/v2/v3 fixtures migrate and continue/fork/clone through Rust SessionManager, preserve historical prefixes and opaque entries, then reopen unchanged in source-pinned TypeScript pi"
+		},
+		{
 			"id": "flicker",
 			"surface": "flicker",
 			"tier": "performance",
