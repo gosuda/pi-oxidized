@@ -862,7 +862,8 @@ fn tool_result_message(finalized: &FinalizedOutcome) -> ToolResultMessage {
         finalized.is_error,
         now_millis(),
     );
-    message.details = Some(finalized.result.details.clone());
+    message.details = (!finalized.result.details.is_null())
+        .then(|| finalized.result.details.clone());
     if let Some(names) = finalized.result.added_tool_names.as_ref()
         && !names.is_empty()
     {
@@ -888,6 +889,27 @@ mod tests {
     use crate::error::ToolError;
 
     type TestResult = Result<(), String>;
+
+    #[test]
+    fn tool_result_message_omits_null_details_and_keeps_real_details() {
+        let mut finalized = FinalizedOutcome {
+            tool_call: ToolCall::new("call", "read", Map::new()),
+            result: AgentToolResult {
+                content: Vec::new(),
+                details: Value::Null,
+                added_tool_names: None,
+                terminate: None,
+            },
+            is_error: false,
+        };
+        assert_eq!(tool_result_message(&finalized).details, None);
+
+        finalized.result.details = json!({ "path": "kept" });
+        assert_eq!(
+            tool_result_message(&finalized).details,
+            Some(json!({ "path": "kept" }))
+        );
+    }
 
     fn sample_model() -> Model {
         Model {
