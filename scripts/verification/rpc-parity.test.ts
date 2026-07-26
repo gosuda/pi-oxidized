@@ -101,7 +101,7 @@ test("normalization scrubs only generated ids, timestamps, and temp paths", () =
 });
 
 test("normalization preserves every streaming update and its payload", () => {
-	const records = [
+	const records: Parameters<typeof normalizeTranscript>[0] = [
 		{ type: "message_start", message: { text: "" } },
 		{ type: "message_update", message: { text: "a" } },
 		{ type: "message_update", message: { text: "ab" } },
@@ -112,7 +112,7 @@ test("normalization preserves every streaming update and its payload", () => {
 
 	expect(
 		normalizeTranscript(records, { volatileRoots: [], repoRoot: "/repo" }),
-	).toEqual(records);
+	).toEqual([...records]);
 });
 
 test("canonicalStringify ignores object key order but not values", () => {
