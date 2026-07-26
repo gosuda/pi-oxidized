@@ -11,6 +11,7 @@ export class ProtocolError extends Error {
     }
 }
 const FRAME_KINDS = new Set(["req", "res", "event", "error"]);
+const HYPERLINK_CONTROL_CHARS = /[\u0000-\u001F\u007F-\u009F]/u;
 function requiresNonzeroId(kind) {
     return kind === "req" || kind === "res";
 }
@@ -77,7 +78,7 @@ function validateHyperlink(value) {
     if (new TextEncoder().encode(value.uri).byteLength > 2048) {
         throw new ProtocolError("invalid_frame", "hyperlink uri exceeds 2048 bytes");
     }
-    if (/[\u0000-\u001F\u007F-\u009F]/u.test(value.uri)) {
+    if (HYPERLINK_CONTROL_CHARS.test(value.uri)) {
         throw new ProtocolError("invalid_frame", "hyperlink uri contains a control character");
     }
     if (!(value.uri.startsWith("http://") || value.uri.startsWith("https://"))) {
@@ -90,7 +91,7 @@ function validateHyperlink(value) {
         if (new TextEncoder().encode(value.id).byteLength > 128) {
             throw new ProtocolError("invalid_frame", "hyperlink id exceeds 128 bytes");
         }
-        if (/[\u0000-\u001F\u007F-\u009F]/u.test(value.id)) {
+        if (HYPERLINK_CONTROL_CHARS.test(value.id)) {
             throw new ProtocolError("invalid_frame", "hyperlink id contains a control character");
         }
     }
