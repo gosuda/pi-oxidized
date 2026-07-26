@@ -1368,8 +1368,7 @@ mod tests {
         sleep(std::time::Duration::from_millis(50)).await;
 
         let mut end_events = Vec::new();
-        while let Ok(Some(event)) =
-            timeout(std::time::Duration::from_millis(100), rx.recv()).await
+        while let Ok(Some(event)) = timeout(std::time::Duration::from_millis(100), rx.recv()).await
         {
             if event.type_name() == "compaction_end" {
                 end_events.push(event);
@@ -1408,8 +1407,7 @@ mod tests {
         sleep(std::time::Duration::from_millis(50)).await;
 
         let mut end_events = Vec::new();
-        while let Ok(Some(event)) =
-            timeout(std::time::Duration::from_millis(100), rx.recv()).await
+        while let Ok(Some(event)) = timeout(std::time::Duration::from_millis(100), rx.recv()).await
         {
             if event.type_name() == "compaction_end" {
                 end_events.push(event);

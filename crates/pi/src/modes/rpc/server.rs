@@ -1560,7 +1560,8 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
 
     #[test]
-    fn rpc_jsonl_does_not_rewrite_non_agent_message_content() -> Result<(), Box<dyn std::error::Error>> {
+    fn rpc_jsonl_does_not_rewrite_non_agent_message_content()
+    -> Result<(), Box<dyn std::error::Error>> {
         let record = serde_json::json!({
             "type": "response",
             "data": {

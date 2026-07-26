@@ -288,7 +288,8 @@ impl AgentSession {
         *self
             .extension_source_infos
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = super::extension_source_infos(loader);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            super::extension_source_infos(loader);
         let skills = loader.get_skills().0.to_vec();
         let prompt_templates = loader.get_prompts().0.to_vec();
         let append = (!loader.get_append_system_prompt().is_empty())
@@ -1027,7 +1028,10 @@ mod tests {
             .collect::<HashMap<_, _>>();
 
         for (path, expected) in cases {
-            assert_eq!(extension_command_source_info(path.into(), &source_infos), expected);
+            assert_eq!(
+                extension_command_source_info(path.into(), &source_infos),
+                expected
+            );
         }
 
         let inline = extension_command_source_info("<inline:built-in>".into(), &source_infos);

@@ -317,7 +317,8 @@ mod tests {
     }
 
     #[test]
-    fn canonical_user_blocks_round_trip_without_losing_mixed_content() -> Result<(), serde_json::Error> {
+    fn canonical_user_blocks_round_trip_without_losing_mixed_content()
+    -> Result<(), serde_json::Error> {
         let fixture = json!({
             "role": "user",
             "content": [

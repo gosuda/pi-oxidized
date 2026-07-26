@@ -1706,7 +1706,10 @@ mod tests {
                 matches!(entry, SessionEntry::Message(message) if message.message.role() == "user")
             })
             .ok_or("reloaded user entry")?;
-        assert_eq!(serde_json::to_value(entry)?["message"]["content"], fixture_content);
+        assert_eq!(
+            serde_json::to_value(entry)?["message"]["content"],
+            fixture_content
+        );
         Ok(())
     }
 

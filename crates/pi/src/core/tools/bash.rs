@@ -1514,7 +1514,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn bash_stream_updates_match_source_event_shape() -> Result<(), Box<dyn std::error::Error>> {
+    async fn bash_stream_updates_match_source_event_shape() -> Result<(), Box<dyn std::error::Error>>
+    {
         let dir = tempdir()?;
         let tool = BashTool::new(dir.path());
         let updates = Arc::new(std::sync::Mutex::new(Vec::new()));

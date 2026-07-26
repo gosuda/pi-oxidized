@@ -265,8 +265,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn absent_tool_details_are_omitted_but_values_are_preserved()
-    -> Result<(), serde_json::Error> {
+    fn absent_tool_details_are_omitted_but_values_are_preserved() -> Result<(), serde_json::Error> {
         let mut result = AgentToolResult {
             content: Vec::new(),
             details: Value::Null,
@@ -274,10 +273,17 @@ mod tests {
             terminate: None,
         };
         let absent = serde_json::to_value(&result)?;
-        assert!(!absent.as_object().is_some_and(|object| object.contains_key("details")));
+        assert!(
+            !absent
+                .as_object()
+                .is_some_and(|object| object.contains_key("details"))
+        );
 
         result.details = json!({ "path": "kept" });
-        assert_eq!(serde_json::to_value(result)?["details"], json!({ "path": "kept" }));
+        assert_eq!(
+            serde_json::to_value(result)?["details"],
+            json!({ "path": "kept" })
+        );
         Ok(())
     }
 

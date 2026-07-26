@@ -688,7 +688,9 @@ impl RuntimeFactory for RealRuntimeFactory {
                 messages: existing_messages,
             } = restore_session(session_context);
 
-            let services = create_runtime_services(&cwd, &agent_dir, &replacement_configuration.service).await?;
+            let services =
+                create_runtime_services(&cwd, &agent_dir, &replacement_configuration.service)
+                    .await?;
             let project_trusted = services.settings_manager().is_project_trusted();
 
             // Services refresh registers extension providers before model resolution.
@@ -828,14 +830,18 @@ impl CreateAgentSessionRuntimeFactory for RealReplacementFactory {
             let resources = session_resources(&services.resource_loader);
             let saved_model = saved_session_model
                 .as_ref()
-                .and_then(|(provider, model_id)| services.model_runtime.get_model(provider, model_id));
+                .and_then(|(provider, model_id)| {
+                    services.model_runtime.get_model(provider, model_id)
+                });
             let mut replacement_diagnostics = Vec::new();
             if let (Some(api_key), Some(saved_model)) =
                 (self.configuration.api_key.as_deref(), saved_model.as_ref())
             {
                 install_cli_api_key(api_key, saved_model, &services.model_runtime)
                     .await
-                    .map_err(crate::core::agent_session_runtime::AgentSessionRuntimeError::Factory)?;
+                    .map_err(
+                        crate::core::agent_session_runtime::AgentSessionRuntimeError::Factory,
+                    )?;
             }
 
             let mut session_result = create_agent_session_from_services(
@@ -1289,7 +1295,10 @@ mod tests {
         assert_eq!(config.api_key.as_deref(), Some("sk-replacement"));
         assert_eq!(config.service.project_trust_override, Some(true));
         assert_eq!(
-            config.service.resource_loader_options.additional_extension_paths,
+            config
+                .service
+                .resource_loader_options
+                .additional_extension_paths,
             ["/extensions/provider.ts"]
         );
         assert!(config.service.resource_loader_options.no_skills);
@@ -1376,7 +1385,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replacement_fresh_session_applies_api_key_after_model_resolution() -> Result<(), String> {
+    async fn replacement_fresh_session_applies_api_key_after_model_resolution() -> Result<(), String>
+    {
         let runtime = ModelRuntime::create_in_memory()
             .await
             .map_err(|error| format!("failed to create in-memory model runtime: {error}"))?;

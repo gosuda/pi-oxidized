@@ -862,8 +862,8 @@ fn tool_result_message(finalized: &FinalizedOutcome) -> ToolResultMessage {
         finalized.is_error,
         now_millis(),
     );
-    message.details = (!finalized.result.details.is_null())
-        .then(|| finalized.result.details.clone());
+    message.details =
+        (!finalized.result.details.is_null()).then(|| finalized.result.details.clone());
     if let Some(names) = finalized.result.added_tool_names.as_ref()
         && !names.is_empty()
     {
