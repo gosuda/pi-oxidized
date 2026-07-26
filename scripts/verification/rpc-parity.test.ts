@@ -37,6 +37,18 @@ test("scenario covers every authoritative command exactly", () => {
 	expect(new Set(names).size).toBe(names.length);
 });
 
+test("scenario inspects replacement sessions before switching away", () => {
+	const commandTypes = buildScenario().map((step) => step.commandType);
+	const clone = commandTypes.indexOf("clone");
+	expect(commandTypes.slice(clone, clone + 5)).toEqual([
+		"clone",
+		"get_state",
+		"new_session",
+		"get_state",
+		"switch_session",
+	]);
+});
+
 test("a newly added authoritative command cannot silently escape", () => {
 	const derived = deriveRpcCommandTypes(readFileSync(AUTHORITATIVE_RPC_TYPES_PATH, "utf8"));
 	const scenario = scenarioCommandTypes(buildScenario());

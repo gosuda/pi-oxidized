@@ -281,41 +281,51 @@ export function buildScenario(): ScenarioStep[] {
 		build: () => ({ id: "c33-clone", type: "clone" }),
 	});
 	steps.push({
-		name: "c34-new_session",
-		commandType: "new_session",
-		build: () => ({ id: "c34-new_session", type: "new_session" }),
+		name: "c34-get_state-postclone",
+		commandType: "get_state",
+		build: () => ({ id: "c34-get_state-postclone", type: "get_state" }),
 	});
 	steps.push({
-		name: "c35-switch_session",
+		name: "c35-new_session",
+		commandType: "new_session",
+		build: () => ({ id: "c35-new_session", type: "new_session" }),
+	});
+	steps.push({
+		name: "c36-get_state-postnew",
+		commandType: "get_state",
+		build: () => ({ id: "c36-get_state-postnew", type: "get_state" }),
+	});
+	steps.push({
+		name: "c37-switch_session",
 		commandType: "switch_session",
 		build: (state) => ({
-			id: "c35-switch_session",
+			id: "c37-switch_session",
 			type: "switch_session",
 			sessionPath: requireString(state.sessionFile, "harvested session file"),
 		}),
 	});
 	steps.push({
-		name: "c36-compact",
+		name: "c38-compact",
 		commandType: "compact",
-		build: () => ({ id: "c36-compact", type: "compact" }),
+		build: () => ({ id: "c38-compact", type: "compact" }),
 	});
 	steps.push({
-		name: "c37-export_html",
+		name: "c39-export_html",
 		commandType: "export_html",
 		build: (state) => ({
-			id: "c37-export_html",
+			id: "c39-export_html",
 			type: "export_html",
 			outputPath: join(state.workDir, "rpc-parity-export.html"),
 		}),
 	});
 	steps.push({
-		name: "c38-unknown-probe",
-		build: () => ({ id: "c38-unknown-probe", type: "rpc_parity_probe", payload: { value: 1 } }),
+		name: "c40-unknown-probe",
+		build: () => ({ id: "c40-unknown-probe", type: "rpc_parity_probe", payload: { value: 1 } }),
 	});
 	steps.push({
-		name: "c39-get_state-final",
+		name: "c41-get_state-final",
 		commandType: "get_state",
-		build: () => ({ id: "c39-get_state-final", type: "get_state" }),
+		build: () => ({ id: "c41-get_state-final", type: "get_state" }),
 	});
 	return steps;
 }
