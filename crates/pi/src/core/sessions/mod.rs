@@ -1725,6 +1725,16 @@ mod tests {
         );
         fs::write(&file, fixture)?;
 
+        let mut session =
+            SessionManager::open(path_str(&file)?, Some(path_str(dir.path())?), None)?;
+        let continuation_id =
+            session.append_message(&assistant_agent("continued from Rust", 43))?;
+        let continued = fs::read(&file)?;
+        assert!(
+            continued.starts_with(fixture.as_bytes()),
+            "canonical TypeScript fixture must be byte-stable on append"
+        );
+
         let reloaded = SessionManager::open(path_str(&file)?, Some(path_str(dir.path())?), None)?;
         let entries = reloaded.get_entries();
         let entry = entries
@@ -1736,6 +1746,13 @@ mod tests {
         assert_eq!(
             serde_json::to_value(entry)?["message"]["content"],
             json!([{ "type": "text", "text": "from TypeScript" }])
+        );
+        let continuation = reloaded
+            .get_entry(&continuation_id)
+            .ok_or("serialized continuation")?;
+        assert_eq!(
+            serde_json::to_value(continuation)?["message"]["content"],
+            json!([{ "type": "text", "text": "continued from Rust" }])
         );
         Ok(())
     }

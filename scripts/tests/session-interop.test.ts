@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { cp, mkdtemp, readdir } from "node:fs/promises";
+import { cp, mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -22,9 +22,13 @@ test("source-pinned TypeScript pi reopens every generated fixture", async () => 
 	expect(expected).toBeGreaterThan(0);
 
 	const directory = await mkdtemp(join(tmpdir(), "pi-session-interop-ts-"));
-	await cp(FIXTURES, directory, { recursive: true });
-	const actual = await reopenWithSourcePinnedTypescript(directory, {
-		preserveHistoricalPrefix: false,
-	});
-	expect(actual).toBe(expected);
+	try {
+		await cp(FIXTURES, directory, { recursive: true });
+		const actual = await reopenWithSourcePinnedTypescript(directory, {
+			preserveHistoricalPrefix: false,
+		});
+		expect(actual).toBe(expected);
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
 });

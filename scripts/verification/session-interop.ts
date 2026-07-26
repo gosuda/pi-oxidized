@@ -95,22 +95,15 @@ export async function reopenWithSourcePinnedTypescript(
 	const files = await jsonlFiles(root);
 	assert(files.length > 0, `Rust proof did not produce session files under ${root}`);
 	let preservedUnknownEntry = false;
-	const outputLeaves = new Set<string>();
-	const reopenedOutputLeaves = new Set<string>();
 
 	for (const file of files) {
 		const before = await readFile(file);
-		const lines = before.toString().trim().split("\n");
-		const rawHeader = JSON.parse(lines[0]!) as { parentSession?: unknown };
-		const rawLeaf = JSON.parse(lines.at(-1)!) as { id?: unknown };
-		const isForkedOrClonedOutput = typeof rawHeader.parentSession === "string";
-		if (isForkedOrClonedOutput) {
-			assert(typeof rawLeaf.id === "string", `Rust output has no leaf id: ${file}`);
-			outputLeaves.add(rawLeaf.id);
-		}
 		const manager = SessionManager.open(file);
 		const after = await readFile(file);
-		preservedUnknownEntry ||= before.includes(Buffer.from('\"type\":\"future_thing\"'));
+		const afterLines = after.toString().trim().split("\n");
+		const finalEntry = JSON.parse(afterLines.at(-1)!) as { id?: unknown };
+		assert(typeof finalEntry.id === "string", `TypeScript output has no final entry id: ${file}`);
+		preservedUnknownEntry ||= before.includes(Buffer.from('"type":"future_thing"'));
 		if (preserveHistoricalPrefix) {
 			assert(
 				Buffer.compare(before, after) === 0,
@@ -122,14 +115,11 @@ export async function reopenWithSourcePinnedTypescript(
 		assert(manager.getTree().length > 0, `TypeScript reopen lost tree: ${file}`);
 		assert(manager.buildSessionContext().messages.length > 0, `TypeScript reopen lost context: ${file}`);
 		const leaf = manager.getLeafId();
-		assert(leaf !== null, `TypeScript reopen lost leaf: ${file}`);
-		if (isForkedOrClonedOutput) reopenedOutputLeaves.add(leaf);
+		assert(
+			leaf === finalEntry.id,
+			`TypeScript reopen leaf differs from final entry: ${relative(REPO_ROOT, file)}`,
+		);
 	}
-	assert(
-		reopenedOutputLeaves.size === outputLeaves.size &&
-			[...outputLeaves].every((leaf) => reopenedOutputLeaves.has(leaf)),
-		"TypeScript reopen changed the forked/cloned output leaf set",
-	);
 	assert(preservedUnknownEntry, "Rust output dropped the generated opaque future entry");
 	return files.length;
 }
