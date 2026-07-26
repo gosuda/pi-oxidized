@@ -514,7 +514,17 @@ impl ServerState {
         let event_tx = self.write_tx.clone();
         let signal = Arc::clone(&self.signal);
         let unsub = host.subscribe(Arc::new(move |event: &AgentSessionEvent| {
-            let _ = event_tx.send(WriteMessage::Line(to_jsonl(event)));
+            // Upstream emits `entry_appended` on the public session stream only
+            // for extension custom entries (agent-session.ts appendCustomEntry);
+            // the Rust core also emits it for internal view projection of
+            // regular persisted entries. Keep those off the RPC wire.
+            let internal_only = matches!(
+                event,
+                AgentSessionEvent::EntryAppended { entry } if entry.discriminant() != "custom"
+            );
+            if !internal_only {
+                let _ = event_tx.send(WriteMessage::Line(to_jsonl(event)));
+            }
             if matches!(event, AgentSessionEvent::AgentSettled) {
                 signal.notify_one();
             }

@@ -424,6 +424,15 @@ impl AgentSession {
                     .source
                     .clone()
                     .unwrap_or_else(|| "<extension>".to_owned());
+                // Upstream commands carry the loading extension's SourceInfo:
+                // `inline` for built-in inline factories, `cli` for
+                // `--extension`-loaded paths. The host snapshot only carries
+                // the extension path, so derive the source from its shape.
+                let source = if path.starts_with("<inline:") {
+                    "inline"
+                } else {
+                    "cli"
+                };
                 commands.push(SlashCommandInfo {
                     name: command.name.clone(),
                     description: command.description.clone(),
@@ -431,7 +440,7 @@ impl AgentSession {
                     source_info: create_synthetic_source_info(
                         path,
                         SyntheticSourceInfoOptions {
-                            source: "extension".to_owned(),
+                            source: source.to_owned(),
                             scope: None,
                             origin: None,
                             base_dir: None,

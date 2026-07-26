@@ -581,24 +581,9 @@ export class ExtensionHost {
 		const eventBus = createEventBus();
 		const errors: Array<{ path: string; error: string }> = [];
 
-		for (const [index, input] of opts.factories.entries()) {
-			const isNamed = typeof input !== "function";
-			const factory = isNamed ? input.factory : input;
-			const extensionPath = `<inline:${isNamed ? input.name : index + 1}>`;
-			try {
-				const ext = await loadExtensionFromFactory(
-					factory, opts.cwd, eventBus, this.runtime, extensionPath,
-				);
-				ext.hidden = isNamed ? input.hidden ?? false : false;
-				this.extensions.push(ext);
-			} catch (err) {
-				errors.push({
-					path: extensionPath,
-					error: err instanceof Error ? err.message : String(err),
-				});
-			}
-		}
-
+		// Upstream order (resource-loader.ts loadExtensions): path extensions
+		// load first, inline built-in factories are appended after, so
+		// downstream registration order (commands, providers) matches TS pi.
 		for (const extPath of opts.extensionPaths) {
 			try {
 				const jiti = createExtensionJiti();
@@ -617,6 +602,24 @@ export class ExtensionHost {
 			} catch (err) {
 				errors.push({
 					path: extPath,
+					error: err instanceof Error ? err.message : String(err),
+				});
+			}
+		}
+
+		for (const [index, input] of opts.factories.entries()) {
+			const isNamed = typeof input !== "function";
+			const factory = isNamed ? input.factory : input;
+			const extensionPath = `<inline:${isNamed ? input.name : index + 1}>`;
+			try {
+				const ext = await loadExtensionFromFactory(
+					factory, opts.cwd, eventBus, this.runtime, extensionPath,
+				);
+				ext.hidden = isNamed ? input.hidden ?? false : false;
+				this.extensions.push(ext);
+			} catch (err) {
+				errors.push({
+					path: extensionPath,
 					error: err instanceof Error ? err.message : String(err),
 				});
 			}
