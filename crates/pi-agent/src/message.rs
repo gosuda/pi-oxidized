@@ -2,9 +2,47 @@
 
 use pi_ai::{ImageContent, Message, TextContent, UserContent, UserMessage, UserMessageContent};
 use serde::de::Error as _;
-use serde::ser::SerializeMap;
+use serde::ser::{SerializeMap, SerializeSeq, SerializeStruct};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
+
+/// Serializes user content in the canonical session/RPC shape.
+struct CanonicalUserContent<'a>(&'a UserMessageContent);
+
+impl Serialize for CanonicalUserContent<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self.0 {
+            UserMessageContent::Text(text) => {
+                let mut blocks = serializer.serialize_seq(Some(1))?;
+                blocks.serialize_element(&CanonicalTextContent { kind: "text", text })?;
+                blocks.end()
+            }
+            UserMessageContent::Blocks(blocks) => blocks.serialize(serializer),
+        }
+    }
+}
+
+/// Borrowed text block used only when serializing legacy internal text content.
+#[derive(Serialize)]
+struct CanonicalTextContent<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    text: &'a str,
+}
+
+fn serialize_user_message<S>(message: &UserMessage, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let mut map = serializer.serialize_struct("UserMessage", 3)?;
+    map.serialize_field("role", "user")?;
+    map.serialize_field("content", &CanonicalUserContent(&message.content))?;
+    map.serialize_field("timestamp", &message.timestamp)?;
+    map.end()
+}
 
 /// Opaque custom message preserved for app-specific transcript roles.
 ///
@@ -88,7 +126,10 @@ impl Serialize for AgentMessage {
         S: Serializer,
     {
         match self {
-            Self::Llm(message) => message.serialize(serializer),
+            Self::Llm(message) => match message.as_ref() {
+                Message::User(user) => serialize_user_message(user, serializer),
+                _ => message.serialize(serializer),
+            },
             Self::Custom(message) => message.serialize(serializer),
         }
     }
@@ -264,7 +305,30 @@ mod tests {
         assert!(message.as_llm().is_some());
         assert_eq!(message.role(), "user");
         let encoded = serde_json::to_value(&message)?;
-        assert_eq!(encoded, raw);
+        assert_eq!(
+            encoded,
+            json!({
+                "role": "user",
+                "content": [{ "type": "text", "text": "hello" }],
+                "timestamp": 42
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_user_blocks_round_trip_without_losing_mixed_content() -> Result<(), serde_json::Error> {
+        let fixture = json!({
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "describe this" },
+                { "type": "image", "data": "aGVsbG8=", "mimeType": "image/png" }
+            ],
+            "timestamp": 42
+        });
+
+        let message: AgentMessage = serde_json::from_value(fixture.clone())?;
+        assert_eq!(serde_json::to_value(message)?, fixture);
         Ok(())
     }
 

@@ -1679,6 +1679,65 @@ mod tests {
     }
 
     #[test]
+    fn persisted_user_text_matches_ts_fixture_and_rust_reloads_it() -> TestResult {
+        let dir = tempdir()?;
+        let mut session =
+            SessionManager::create(path_str(dir.path())?, Some(path_str(dir.path())?), None)?;
+        let file = session.get_session_file().ok_or("file")?.to_owned();
+
+        session.append_message(&user_agent("hello from Rust", 42))?;
+        session.append_message(&assistant_agent("ack", 43))?;
+
+        let persisted = fs::read_to_string(&file)?;
+        let user_line: Value = serde_json::from_str(
+            persisted
+                .lines()
+                .find(|line| line.contains("\"role\":\"user\""))
+                .ok_or("persisted user entry")?,
+        )?;
+        let fixture_content = json!([{ "type": "text", "text": "hello from Rust" }]);
+        assert_eq!(user_line["message"]["content"], fixture_content);
+
+        let reloaded = SessionManager::open(file.as_str(), Some(path_str(dir.path())?), None)?;
+        let entries = reloaded.get_entries();
+        let entry = entries
+            .iter()
+            .find(|entry| {
+                matches!(entry, SessionEntry::Message(message) if message.message.role() == "user")
+            })
+            .ok_or("reloaded user entry")?;
+        assert_eq!(serde_json::to_value(entry)?["message"]["content"], fixture_content);
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_ts_user_fixture_loads_and_round_trips() -> TestResult {
+        let dir = tempdir()?;
+        let file = dir.path().join("ts-fixture.jsonl");
+        let fixture = concat!(
+            r#"{"type":"session","version":3,"id":"ts-fixture","timestamp":"2025-01-01T00:00:00.000Z","cwd":"/tmp"}"#,
+            "\n",
+            r#"{"type":"message","id":"user0001","parentId":null,"timestamp":"2025-01-01T00:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"from TypeScript"}],"timestamp":42}}"#,
+            "\n",
+        );
+        fs::write(&file, fixture)?;
+
+        let reloaded = SessionManager::open(path_str(&file)?, Some(path_str(dir.path())?), None)?;
+        let entries = reloaded.get_entries();
+        let entry = entries
+            .iter()
+            .find(|entry| {
+                matches!(entry, SessionEntry::Message(message) if message.message.role() == "user")
+            })
+            .ok_or("fixture user entry")?;
+        assert_eq!(
+            serde_json::to_value(entry)?["message"]["content"],
+            json!([{ "type": "text", "text": "from TypeScript" }])
+        );
+        Ok(())
+    }
+
+    #[test]
     fn append_prefix_stability() -> TestResult {
         let dir = tempdir()?;
         let file = dir.path().join("stable.jsonl");
