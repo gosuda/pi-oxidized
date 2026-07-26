@@ -536,14 +536,14 @@ impl RuntimeServiceConfiguration {
 #[derive(Clone)]
 struct ReplacementRuntimeConfiguration {
     service: RuntimeServiceConfiguration,
-    api_key: Option<String>,
+    args: crate::cli::args::Args,
 }
 
 impl ReplacementRuntimeConfiguration {
     fn from_args(args: &crate::cli::args::Args) -> Self {
         Self {
             service: RuntimeServiceConfiguration::from_args(args),
-            api_key: args.api_key.clone(),
+            args: args.clone(),
         }
     }
 }
@@ -820,7 +820,7 @@ impl CreateAgentSessionRuntimeFactory for RealReplacementFactory {
             let RestoredSession {
                 has_existing_session,
                 saved_session_model,
-                saved_thinking_level: thinking_level,
+                saved_thinking_level,
                 messages: existing_messages,
             } = restore_session(session_context);
             let services = create_runtime_services(&cwd, &agent_dir, &self.configuration.service)
@@ -828,14 +828,23 @@ impl CreateAgentSessionRuntimeFactory for RealReplacementFactory {
                 .map_err(crate::core::agent_session_runtime::AgentSessionRuntimeError::Factory)?;
             let project_trusted = services.settings_manager().is_project_trusted();
             let resources = session_resources(&services.resource_loader);
+            let args = &self.configuration.args;
+            let ResolvedModels {
+                cli: cli_resolved,
+                scope,
+                diagnostics: mut replacement_diagnostics,
+            } = resolve_models(args, &services.model_runtime).await;
+            let thinking_level = args
+                .thinking
+                .or(cli_resolved.thinking_level)
+                .or(saved_thinking_level);
             let saved_model = saved_session_model
                 .as_ref()
                 .and_then(|(provider, model_id)| {
                     services.model_runtime.get_model(provider, model_id)
                 });
-            let mut replacement_diagnostics = Vec::new();
             if let (Some(api_key), Some(saved_model)) =
-                (self.configuration.api_key.as_deref(), saved_model.as_ref())
+                (args.api_key.as_deref(), saved_model.as_ref())
             {
                 install_cli_api_key(api_key, saved_model, &services.model_runtime)
                     .await
@@ -847,9 +856,9 @@ impl CreateAgentSessionRuntimeFactory for RealReplacementFactory {
             let mut session_result = create_agent_session_from_services(
                 crate::core::agent_session_services::CreateAgentSessionFromServicesOptions {
                     services,
-                    model: None,
+                    model: cli_resolved.model,
                     thinking_level,
-                    scoped_models: Vec::new(),
+                    scoped_models: scope.scoped_models,
                     tools: None,
                     exclude_tools: None,
                     no_tools: None,
@@ -869,7 +878,7 @@ impl CreateAgentSessionRuntimeFactory for RealReplacementFactory {
             })?;
 
             apply_cli_api_key(
-                self.configuration.api_key.as_deref(),
+                args.api_key.as_deref(),
                 session_result.model.as_ref(),
                 &session_result.model_runtime,
                 &mut replacement_diagnostics,
@@ -1275,10 +1284,12 @@ mod tests {
     }
 
     #[test]
-    fn replacement_runtime_configuration_retains_service_policy_and_api_key() {
+    fn replacement_runtime_configuration_retains_invocation_policy() {
         let args = crate::cli::args::parse_args(&[
             "--api-key".into(),
             "sk-replacement".into(),
+            "--model".into(),
+            "verification/model".into(),
             "--extension".into(),
             "/extensions/provider.ts".into(),
             "--provider-profile".into(),
@@ -1292,7 +1303,8 @@ mod tests {
 
         let config = ReplacementRuntimeConfiguration::from_args(&args);
 
-        assert_eq!(config.api_key.as_deref(), Some("sk-replacement"));
+        assert_eq!(config.args.api_key.as_deref(), Some("sk-replacement"));
+        assert_eq!(config.args.model.as_deref(), Some("verification/model"));
         assert_eq!(config.service.project_trust_override, Some(true));
         assert_eq!(
             config
