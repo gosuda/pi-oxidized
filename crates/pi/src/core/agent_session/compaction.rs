@@ -156,12 +156,17 @@ impl AgentSession {
                 Ok(compaction_result)
             }
             Ok(None) => {
-                // Preparation returned None — classify and surface the exact
-                // contract string so the UI shows the right message.
+                // Preparation returned None — classify and surface the
+                // exact contract string. Upstream TypeScript throws the
+                // preparation error and the catch wraps every non-aborted
+                // manual failure with `Compaction failed: `; the `Err`
+                // branch below already matches, so the `Ok(None)` boundary
+                // must too. The returned typed error is preserved and the
+                // aborted flag stays `false` (`Ok(None)` is never a cancel).
                 let path_entries = self.snapshot_branch_entries().await;
                 let path_refs: Vec<&SessionEntry> = path_entries.iter().collect();
                 let err = preparation_none_error(&path_refs);
-                let message = err.to_string();
+                let message = format!("Compaction failed: {err}");
                 self.emit_public_awaited(&AgentSessionEvent::CompactionEnd {
                     reason: CompactionReason::Manual,
                     result: None,
@@ -1327,6 +1332,105 @@ mod tests {
         assert!(
             matches!(result, Err(CompactionError::NothingToCompact)),
             "expected NothingToCompact, got: {result:?}"
+        );
+        Ok(())
+    }
+
+    /// Regression: the `Ok(None)` manual-compaction boundary must emit the
+    /// upstream-pinned `Compaction failed: <preparation error>` event text,
+    /// not the bare preparation string. TypeScript throws the preparation
+    /// error and its catch wraps every non-aborted manual failure with
+    /// `Compaction failed: `; the Rust `Err` branch already matches. Both
+    /// `NothingToCompact` and `AlreadyCompacted` surface through `Ok(None)`.
+    #[tokio::test]
+    async fn manual_compact_ok_none_emits_compaction_failed_prefix() -> TestResult {
+        // NothingToCompact: session too small to compact.
+        let messages = vec![
+            user_text("hi", std::iter::empty()),
+            assistant_with_usage("hello", Usage::default(), StopReason::Stop),
+        ];
+        let session = make_session(8_192, summary_stream_fn("summary"), messages)?;
+        {
+            let mut sm = session.session_manager.lock().await;
+            for msg in session.agent.transcript() {
+                sm.append_message(&msg)?;
+            }
+        }
+        let (tx, mut rx) = mpsc::unbounded_channel::<AgentSessionEvent>();
+        let _unsub = session.subscribe(move |event| {
+            let _ = tx.send(event.clone());
+        });
+        let result = session.compact(None).await;
+        assert!(
+            matches!(result, Err(CompactionError::NothingToCompact)),
+            "expected NothingToCompact, got: {result:?}"
+        );
+        sleep(std::time::Duration::from_millis(50)).await;
+
+        let mut end_events = Vec::new();
+        while let Ok(Some(event)) =
+            timeout(std::time::Duration::from_millis(100), rx.recv()).await
+        {
+            if event.type_name() == "compaction_end" {
+                end_events.push(event);
+            }
+        }
+        assert_eq!(end_events.len(), 1, "expected exactly one compaction_end");
+        let Some(AgentSessionEvent::CompactionEnd {
+            error_message,
+            aborted,
+            result: res,
+            ..
+        }) = end_events.first()
+        else {
+            return Err("expected CompactionEnd variant".into());
+        };
+        assert!(!aborted, "Ok(None) is never an abort");
+        assert!(res.is_none(), "Ok(None) carries no result");
+        assert_eq!(
+            error_message.as_deref(),
+            Some("Compaction failed: Nothing to compact (session too small)"),
+            "NothingToCompact event text must match upstream exactly: {error_message:?}"
+        );
+
+        // AlreadyCompacted: second manual compact after a successful one.
+        let session = session_with_history(8_192, summary_stream_fn("summary")).await?;
+        session.compact(None).await?;
+        let (tx, mut rx) = mpsc::unbounded_channel::<AgentSessionEvent>();
+        let _unsub = session.subscribe(move |event| {
+            let _ = tx.send(event.clone());
+        });
+        let second = session.compact(None).await;
+        assert!(
+            matches!(second, Err(CompactionError::AlreadyCompacted)),
+            "expected AlreadyCompacted, got: {second:?}"
+        );
+        sleep(std::time::Duration::from_millis(50)).await;
+
+        let mut end_events = Vec::new();
+        while let Ok(Some(event)) =
+            timeout(std::time::Duration::from_millis(100), rx.recv()).await
+        {
+            if event.type_name() == "compaction_end" {
+                end_events.push(event);
+            }
+        }
+        assert_eq!(end_events.len(), 1, "expected exactly one compaction_end");
+        let Some(AgentSessionEvent::CompactionEnd {
+            error_message,
+            aborted,
+            result: res,
+            ..
+        }) = end_events.first()
+        else {
+            return Err("expected CompactionEnd variant".into());
+        };
+        assert!(!aborted, "Ok(None) is never an abort");
+        assert!(res.is_none(), "Ok(None) carries no result");
+        assert_eq!(
+            error_message.as_deref(),
+            Some("Compaction failed: Already compacted"),
+            "AlreadyCompacted event text must match upstream exactly: {error_message:?}"
         );
         Ok(())
     }
