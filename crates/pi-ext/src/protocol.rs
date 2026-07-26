@@ -749,18 +749,25 @@ impl Hyperlink {
     /// Returns [`ProtocolError::InvalidFrame`] when the link is rejected.
     pub fn validate(&self) -> Result<()> {
         if let Some(id) = &self.id
-            && id.len() > Self::MAX_ID_BYTES
+            && (id.len() > Self::MAX_ID_BYTES || id.chars().any(char::is_control))
         {
-            return Err(ProtocolError::InvalidFrame(format!(
-                "hyperlink id exceeds {} bytes",
-                Self::MAX_ID_BYTES
-            )));
+            let message = if id.len() > Self::MAX_ID_BYTES {
+                format!("hyperlink id exceeds {} bytes", Self::MAX_ID_BYTES)
+            } else {
+                "hyperlink id contains a control character".to_owned()
+            };
+            return Err(ProtocolError::InvalidFrame(message));
         }
         if self.uri.len() > Self::MAX_URI_BYTES {
             return Err(ProtocolError::InvalidFrame(format!(
                 "hyperlink uri exceeds {} bytes",
                 Self::MAX_URI_BYTES
             )));
+        }
+        if self.uri.chars().any(char::is_control) {
+            return Err(ProtocolError::InvalidFrame(
+                "hyperlink uri contains a control character".to_owned(),
+            ));
         }
         let ok = self.uri.starts_with("http://") || self.uri.starts_with("https://");
         if !ok {
@@ -2369,8 +2376,8 @@ mod tests {
     #[test]
     fn hyperlink_validation() -> TestResult {
         Hyperlink {
-            id: None,
-            uri: "https://ok".to_owned(),
+            id: Some("docs".to_owned()),
+            uri: "https://example.com/docs".to_owned(),
         }
         .validate()?;
         assert!(
@@ -2389,6 +2396,29 @@ mod tests {
             .validate()
             .is_err()
         );
+        for control in (0..=0x1f).chain(0x7f..=0x9f) {
+            let control = char::from_u32(control).ok_or("control character")?;
+            assert!(
+                Hyperlink {
+                    id: None,
+                    uri: format!("https://example.com/{control}"),
+                }
+                .validate()
+                .is_err(),
+                "URI control U+{:04X} must be rejected",
+                u32::from(control)
+            );
+            assert!(
+                Hyperlink {
+                    id: Some(format!("id{control}")),
+                    uri: "https://example.com".to_owned(),
+                }
+                .validate()
+                .is_err(),
+                "id control U+{:04X} must be rejected",
+                u32::from(control)
+            );
+        }
         Ok(())
     }
 

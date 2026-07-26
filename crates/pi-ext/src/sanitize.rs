@@ -435,6 +435,41 @@ mod tests {
     }
 
     #[test]
+    fn drops_hyperlink_controls_before_rendering() {
+        for control in (0..=0x1f).chain(0x7f..=0x9f) {
+            let Some(control) = char::from_u32(control) else {
+                continue;
+            };
+            for link in [
+                Hyperlink {
+                    id: None,
+                    uri: format!("https://example.com/{control}"),
+                },
+                Hyperlink {
+                    id: Some(format!("docs{control}")),
+                    uri: "https://example.com/docs".to_owned(),
+                },
+            ] {
+                let mut styled = run("link");
+                styled.style.link = Some(link);
+                let sanitized = sanitize_slot(&slot(vec![vec![styled]]));
+                assert!(sanitized.lines[0][0].style.link.is_none());
+                assert!(sanitized.had_rejections);
+            }
+        }
+
+        let mut styled = run("docs");
+        styled.style.link = Some(Hyperlink {
+            id: Some("docs".to_owned()),
+            uri: "https://example.com/docs".to_owned(),
+        });
+        let expected = styled.style.link.clone();
+        let sanitized = sanitize_slot(&slot(vec![vec![styled]]));
+        assert_eq!(sanitized.lines[0][0].style.link, expected);
+        assert!(!sanitized.had_rejections);
+    }
+
+    #[test]
     fn keeps_valid_hyperlink_and_colors() {
         let mut styled = run("go");
         styled.style.bold = Some(true);

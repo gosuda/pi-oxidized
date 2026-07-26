@@ -94,11 +94,18 @@ describe("encode/decode", () => {
 	});
 
 	test("uiSlot rejects forbidden and oversized links", () => {
+		const controls = [
+			...Array.from({ length: 32 }, (_, index) => String.fromCodePoint(index)),
+			String.fromCodePoint(0x7f),
+			...Array.from({ length: 32 }, (_, index) => String.fromCodePoint(0x80 + index)),
+		];
 		const links = [
 			{ uri: "javascript:alert(1)" },
 			{ uri: "file:///tmp/x" },
 			{ uri: `https://example.com/${"x".repeat(2048)}` },
 			{ id: "x".repeat(129), uri: "https://example.com" },
+			...controls.map((control) => ({ uri: `https://example.com/${control}` })),
+			...controls.map((control) => ({ id: `id${control}`, uri: "https://example.com" })),
 		];
 		for (const link of links) {
 			const frame = {
@@ -116,6 +123,19 @@ describe("encode/decode", () => {
 			expect(() => encodeFrame(frame)).toThrow(ProtocolError);
 			expect(() => decodeFrameStr(JSON.stringify(frame))).toThrow(ProtocolError);
 		}
+		const safe = {
+			id: 0,
+			kind: "event" as const,
+			method: "uiSlot",
+			payload: {
+				key: "slot",
+				generation: 1,
+				placement: "aboveEditor",
+				height: 1,
+				runs: [[{ text: "safe", style: { link: { id: "docs", uri: "https://example.com/docs" } } }]],
+			},
+		};
+		expect(decodeFrameStr(encodeFrameString(safe).trimEnd())).toEqual(safe);
 	});
 });
 
