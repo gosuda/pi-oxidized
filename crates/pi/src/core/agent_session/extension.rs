@@ -141,6 +141,27 @@ pub enum ExtensionBindError {
     HostRestart(String),
 }
 
+fn extension_command_source_info(
+    path: String,
+    source_infos: &std::collections::HashMap<String, crate::core::resources::SourceInfo>,
+) -> crate::core::resources::SourceInfo {
+    source_infos.get(&path).cloned().unwrap_or_else(|| {
+        create_synthetic_source_info(
+            path.clone(),
+            SyntheticSourceInfoOptions {
+                source: if path.starts_with("<inline:") {
+                    "inline".to_owned()
+                } else {
+                    "extension".to_owned()
+                },
+                scope: None,
+                origin: None,
+                base_dir: None,
+            },
+        )
+    })
+}
+
 impl AgentSession {
     /// Returns true when at least one extension handler is registered for
     /// `event_type`. Cheap delegation to the runner; safe to call from any
@@ -264,6 +285,10 @@ impl AgentSession {
     }
 
     fn apply_resource_snapshot(&self, loader: &crate::core::resources::DefaultResourceLoader) {
+        *self
+            .extension_source_infos
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = super::extension_source_infos(loader);
         let skills = loader.get_skills().0.to_vec();
         let prompt_templates = loader.get_prompts().0.to_vec();
         let append = (!loader.get_append_system_prompt().is_empty())
@@ -443,28 +468,18 @@ impl AgentSession {
                     .source
                     .clone()
                     .unwrap_or_else(|| "<extension>".to_owned());
-                // Upstream commands carry the loading extension's SourceInfo:
-                // `inline` for built-in inline factories, `cli` for
-                // `--extension`-loaded paths. The host snapshot only carries
-                // the extension path, so derive the source from its shape.
-                let source = if path.starts_with("<inline:") {
-                    "inline"
-                } else {
-                    "cli"
+                let source_info = {
+                    let source_infos = self
+                        .extension_source_infos
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    extension_command_source_info(path, &source_infos)
                 };
                 commands.push(SlashCommandInfo {
                     name: command.name.clone(),
                     description: command.description.clone(),
                     source: SlashCommandSource::Extension,
-                    source_info: create_synthetic_source_info(
-                        path,
-                        SyntheticSourceInfoOptions {
-                            source: source.to_owned(),
-                            scope: None,
-                            origin: None,
-                            base_dir: None,
-                        },
-                    ),
+                    source_info,
                 });
             }
         }
@@ -938,6 +953,92 @@ mod tests {
             compat: None,
             extra: std::collections::BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn extension_command_source_info_preserves_loader_metadata() {
+        use crate::core::resources::{SourceInfo, SourceOrigin, SourceScope};
+
+        let cases = [
+            (
+                "/tmp/cli.ts",
+                SourceInfo {
+                    path: "/tmp/cli.ts".into(),
+                    source: "cli".into(),
+                    scope: SourceScope::Temporary,
+                    origin: SourceOrigin::TopLevel,
+                    base_dir: None,
+                },
+            ),
+            (
+                "/workspace/.pi/extensions/project-settings.ts",
+                SourceInfo {
+                    path: "/workspace/.pi/extensions/project-settings.ts".into(),
+                    source: "local".into(),
+                    scope: SourceScope::Project,
+                    origin: SourceOrigin::TopLevel,
+                    base_dir: Some("/workspace/.pi".into()),
+                },
+            ),
+            (
+                "/home/user/.pi/agent/extensions/user-settings.ts",
+                SourceInfo {
+                    path: "/home/user/.pi/agent/extensions/user-settings.ts".into(),
+                    source: "local".into(),
+                    scope: SourceScope::User,
+                    origin: SourceOrigin::TopLevel,
+                    base_dir: Some("/home/user/.pi/agent".into()),
+                },
+            ),
+            (
+                "/workspace/.pi/extensions/project-auto.ts",
+                SourceInfo {
+                    path: "/workspace/.pi/extensions/project-auto.ts".into(),
+                    source: "auto".into(),
+                    scope: SourceScope::Project,
+                    origin: SourceOrigin::TopLevel,
+                    base_dir: Some("/workspace/.pi".into()),
+                },
+            ),
+            (
+                "/home/user/.pi/agent/extensions/user-auto.ts",
+                SourceInfo {
+                    path: "/home/user/.pi/agent/extensions/user-auto.ts".into(),
+                    source: "auto".into(),
+                    scope: SourceScope::User,
+                    origin: SourceOrigin::TopLevel,
+                    base_dir: Some("/home/user/.pi/agent".into()),
+                },
+            ),
+            (
+                "/home/user/.pi/agent/packages/npm:example/extensions/command.ts",
+                SourceInfo {
+                    path: "/home/user/.pi/agent/packages/npm:example/extensions/command.ts".into(),
+                    source: "npm:example".into(),
+                    scope: SourceScope::User,
+                    origin: SourceOrigin::Package,
+                    base_dir: Some("/home/user/.pi/agent/packages/npm:example".into()),
+                },
+            ),
+        ];
+        let source_infos = cases
+            .iter()
+            .map(|(path, source_info)| ((*path).to_owned(), source_info.clone()))
+            .collect::<HashMap<_, _>>();
+
+        for (path, expected) in cases {
+            assert_eq!(extension_command_source_info(path.into(), &source_infos), expected);
+        }
+
+        let inline = extension_command_source_info("<inline:built-in>".into(), &source_infos);
+        assert_eq!(inline.source, "inline");
+        assert_eq!(inline.scope, SourceScope::Temporary);
+        assert_eq!(inline.origin, SourceOrigin::TopLevel);
+
+        let pathless = extension_command_source_info("<extension>".into(), &source_infos);
+        assert_eq!(pathless.source, "extension");
+        assert_eq!(pathless.scope, SourceScope::Temporary);
+        assert_eq!(pathless.origin, SourceOrigin::TopLevel);
     }
 
     #[derive(Clone)]

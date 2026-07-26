@@ -185,6 +185,25 @@ impl AgentSessionConfig {
     }
 }
 
+/// Build host-command path provenance from the ResourceLoader extension snapshot.
+pub(super) fn extension_source_infos(
+    loader: &crate::core::resources::DefaultResourceLoader,
+) -> std::collections::HashMap<String, crate::core::resources::SourceInfo> {
+    crate::core::resources::ResourceLoader::get_extensions(loader)
+        .paths
+        .iter()
+        .flat_map(|extension| {
+            let configured = (extension.path.clone(), extension.source_info.clone());
+            let resolved = (!extension.resolved_path.is_empty()).then(|| {
+                let mut source_info = extension.source_info.clone();
+                source_info.path.clone_from(&extension.resolved_path);
+                (extension.resolved_path.clone(), source_info)
+            });
+            std::iter::once(configured).chain(resolved)
+        })
+        .collect()
+}
+
 /// Mutable session state shared by the event pump and public methods.
 ///
 /// Guarded by `std::sync::Mutex`. Never hold across `.await`.
@@ -405,6 +424,10 @@ pub struct AgentSession {
     pub(super) prompt_templates: Mutex<Vec<crate::core::resources::prompts::PromptTemplate>>,
     /// Resource loader for extension-discovered skills, prompts, and themes.
     pub(super) resource_loader: Option<AsyncMutex<crate::core::resources::DefaultResourceLoader>>,
+    /// ResourceLoader-resolved provenance for extension paths, keyed by both
+    /// configured and resolved paths for host command lookup.
+    pub(super) extension_source_infos:
+        Mutex<std::collections::HashMap<String, crate::core::resources::SourceInfo>>,
     /// Self handle for pump (set after construction).
     pub(super) self_handle: Mutex<Option<std::sync::Weak<AgentSession>>>,
     /// Serializes the whole `bind_extensions` lifecycle (record → emit →
@@ -499,6 +522,10 @@ impl AgentSession {
 
         let retry = config.settings_manager.get_retry_settings();
         let compaction = config.settings_manager.get_compaction_settings();
+        let extension_source_infos = config
+            .resource_loader
+            .as_ref()
+            .map_or_else(std::collections::HashMap::new, extension_source_infos);
 
         let mut inner = AgentSessionInner::new(config.scoped_models, config.system_prompt.clone());
         inner.pending_session_start = Some(config.session_start_event.unwrap_or_default());
@@ -523,6 +550,7 @@ impl AgentSession {
             skills: Mutex::new(config.skills),
             prompt_templates: Mutex::new(config.prompt_templates),
             resource_loader: config.resource_loader.map(AsyncMutex::new),
+            extension_source_infos: Mutex::new(extension_source_infos),
             self_handle: Mutex::new(None),
             bind_lock: AsyncMutex::new(()),
         });
