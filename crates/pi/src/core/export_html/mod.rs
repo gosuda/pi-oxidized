@@ -777,7 +777,10 @@ mod tests {
         assert_eq!(data["leafId"], "a1");
         assert!(data.get("systemPrompt").is_none());
         assert!(data.get("tools").is_none());
-        assert_eq!(data["entries"][0]["message"]["content"], "<hello>&");
+        assert_eq!(
+            data["entries"][0]["message"]["content"],
+            serde_json::json!([{ "type": "text", "text": "<hello>&" }])
+        );
         Ok(())
     }
 
