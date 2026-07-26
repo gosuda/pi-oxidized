@@ -189,9 +189,6 @@ impl AgentSession {
             return Err(ModelError::NoAuth(model.provider.clone(), model.id.clone()));
         }
         let previous = self.model();
-        if models_are_equal(&previous, &model) {
-            return Ok(());
-        }
         let thinking = self.thinking_level_for_model_switch(None);
         // Durable append first: live state, settings, and events publish only
         // model changes the session file actually holds.
@@ -683,6 +680,56 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone()
+        }
+
+        #[tokio::test]
+        async fn same_model_commands_persist_each_model_change() -> TestResult {
+            let session_model = model("m", "p", false);
+            let config =
+                AgentSessionConfig::test_config(Arc::new(StubProvider), session_model.clone())
+                    .map_err(|error| context(error, "test config"))?;
+            let session = AgentSession::new(config).map_err(|error| context(error, "session"))?;
+            {
+                let mut manager = session.session_manager.lock().await;
+                manager
+                    .append_model_change(&session_model.provider, &session_model.id)
+                    .map_err(|error| context(error, "initial model"))?;
+                manager
+                    .append_thinking_level_change("off")
+                    .map_err(|error| context(error, "initial thinking"))?;
+            }
+            let events = record_events(&session);
+
+            session
+                .set_model(session_model.clone())
+                .await
+                .map_err(|error| context(error, "first same-model command"))?;
+            session
+                .set_model(session_model)
+                .await
+                .map_err(|error| context(error, "second same-model command"))?;
+
+            let manager = session.session_manager.lock().await;
+            let entry_types = manager
+                .get_entries()
+                .iter()
+                .map(|entry| entry.discriminant())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                entry_types,
+                [
+                    "model_change",
+                    "thinking_level_change",
+                    "model_change",
+                    "model_change",
+                ]
+            );
+            assert!(
+                recorded(&events).is_empty(),
+                "equal-model selections must not emit public selection events: {:?}",
+                recorded(&events)
+            );
+            Ok(())
         }
 
         #[tokio::test]

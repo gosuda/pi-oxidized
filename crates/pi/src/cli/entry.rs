@@ -31,7 +31,10 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
-use pi_ai::{AssistantMessageEvent, Context, Model, Provider, ProviderError, StreamOptions};
+use pi_ai::{
+    AssistantMessageEvent, Context, Model, ModelThinkingLevel, Provider, ProviderError,
+    StreamOptions,
+};
 
 use crate::cli::bootstrap::{
     BootstrapInputs, BootstrapIo, BootstrapOutcome, RuntimeFactory, RuntimeFactoryOptions,
@@ -324,6 +327,49 @@ fn thinking_level_from_str(level: &str) -> Option<pi_ai::ModelThinkingLevel> {
     }
 }
 
+fn thinking_level_token(level: ModelThinkingLevel) -> &'static str {
+    match level {
+        ModelThinkingLevel::Off => "off",
+        ModelThinkingLevel::Minimal => "minimal",
+        ModelThinkingLevel::Low => "low",
+        ModelThinkingLevel::Medium => "medium",
+        ModelThinkingLevel::High => "high",
+        ModelThinkingLevel::Xhigh => "xhigh",
+        ModelThinkingLevel::Max => "max",
+    }
+}
+
+fn append_session_bootstrap_entries(
+    session_manager: &mut crate::core::sessions::SessionManager,
+    messages: &[pi_agent::AgentMessage],
+    model: Option<&Model>,
+    thinking_level: ModelThinkingLevel,
+) -> Result<(), String> {
+    if messages.is_empty() {
+        if let Some(model) = model {
+            session_manager
+                .append_model_change(&model.provider, &model.id)
+                .map_err(|error| error.to_string())?;
+        }
+        session_manager
+            .append_thinking_level_change(thinking_level_token(thinking_level))
+            .map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+
+    if !session_manager.get_entries().iter().any(|entry| {
+        matches!(
+            entry,
+            crate::core::sessions::SessionEntry::ThinkingLevelChange(_)
+        )
+    }) {
+        session_manager
+            .append_thinking_level_change(thinking_level_token(thinking_level))
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 struct SessionBuildOptions {
     cwd: String,
     session_manager: crate::core::sessions::SessionManager,
@@ -348,12 +394,19 @@ fn build_session(options: SessionBuildOptions) -> Result<BuiltSession, String> {
     let trait_runner = host_runner
         .clone()
         .map(|runner| runner as Arc<dyn crate::core::agent_session::ExtensionRunner>);
+    let mut session_manager = options.session_manager;
+    append_session_bootstrap_entries(
+        &mut session_manager,
+        &options.messages,
+        session_result.model.as_ref(),
+        session_result.thinking_level,
+    )?;
     let config = crate::core::agent_session::AgentSessionConfig {
         agent: None,
         provider: Some(Arc::new(RuntimeProvider(
             session_result.model_runtime.clone(),
         ))),
-        session_manager: options.session_manager,
+        session_manager,
         settings_manager: options.settings_manager,
         cwd: options.cwd,
         scoped_models: session_result
@@ -1109,6 +1162,60 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(line.to_owned());
         }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_entries_match_new_and_restored_session_semantics() -> Result<(), String> {
+        let runtime = ModelRuntime::create_in_memory()
+            .await
+            .map_err(|error| format!("failed to create in-memory model runtime: {error}"))?;
+        let model = runtime
+            .get_models(None)
+            .into_iter()
+            .next()
+            .ok_or_else(|| "built-in model catalog is empty".to_owned())?;
+        let mut fresh = crate::core::sessions::SessionManager::in_memory(Some("/tmp"), None)
+            .map_err(|error| error.to_string())?;
+
+        append_session_bootstrap_entries(&mut fresh, &[], Some(&model), ModelThinkingLevel::High)?;
+        assert_eq!(
+            fresh
+                .get_entries()
+                .iter()
+                .map(|entry| entry.discriminant())
+                .collect::<Vec<_>>(),
+            ["model_change", "thinking_level_change"]
+        );
+
+        let messages = vec![pi_agent::AgentMessage::Llm(Box::new(pi_ai::Message::User(
+            pi_ai::UserMessage::new(pi_ai::UserMessageContent::Text("seed".to_owned()), 0),
+        )))];
+        let mut restored = crate::core::sessions::SessionManager::in_memory(Some("/tmp"), None)
+            .map_err(|error| error.to_string())?;
+        restored
+            .append_message(&messages[0])
+            .map_err(|error| error.to_string())?;
+        append_session_bootstrap_entries(
+            &mut restored,
+            &messages,
+            Some(&model),
+            ModelThinkingLevel::High,
+        )?;
+        append_session_bootstrap_entries(
+            &mut restored,
+            &messages,
+            Some(&model),
+            ModelThinkingLevel::High,
+        )?;
+        assert_eq!(
+            restored
+                .get_entries()
+                .iter()
+                .map(|entry| entry.discriminant())
+                .collect::<Vec<_>>(),
+            ["message", "thinking_level_change"]
+        );
+        Ok(())
     }
 
     #[tokio::test]
