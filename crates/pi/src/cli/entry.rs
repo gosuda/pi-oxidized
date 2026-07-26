@@ -323,6 +323,7 @@ fn thinking_level_from_str(level: &str) -> Option<pi_ai::ModelThinkingLevel> {
         "medium" => Some(pi_ai::ModelThinkingLevel::Medium),
         "high" => Some(pi_ai::ModelThinkingLevel::High),
         "xhigh" => Some(pi_ai::ModelThinkingLevel::Xhigh),
+        "max" => Some(pi_ai::ModelThinkingLevel::Max),
         _ => None,
     }
 }
@@ -1281,6 +1282,50 @@ mod tests {
             ["message", "thinking_level_change"]
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn max_thinking_level_restores_from_session_context() -> Result<(), String> {
+        let runtime = ModelRuntime::create_in_memory()
+            .await
+            .map_err(|error| format!("failed to create in-memory model runtime: {error}"))?;
+        let model = runtime
+            .get_models(None)
+            .into_iter()
+            .next()
+            .ok_or_else(|| "built-in model catalog is empty".to_owned())?;
+
+        let mut manager = crate::core::sessions::SessionManager::in_memory(Some("/tmp"), None)
+            .map_err(|error| error.to_string())?;
+        append_session_bootstrap_entries(&mut manager, &[], Some(&model), ModelThinkingLevel::Max)?;
+
+        let context = crate::core::sessions::build_session_context(
+            &manager.get_entries(),
+            crate::core::sessions::LeafRef::Last,
+        )
+        .map_err(|error| error.to_string())?;
+        let restored = restore_session(context);
+        assert_eq!(restored.saved_thinking_level, Some(ModelThinkingLevel::Max));
+        Ok(())
+    }
+
+    #[test]
+    fn thinking_level_token_round_trips_through_from_str() {
+        for level in [
+            ModelThinkingLevel::Off,
+            ModelThinkingLevel::Minimal,
+            ModelThinkingLevel::Low,
+            ModelThinkingLevel::Medium,
+            ModelThinkingLevel::High,
+            ModelThinkingLevel::Xhigh,
+            ModelThinkingLevel::Max,
+        ] {
+            assert_eq!(
+                thinking_level_from_str(thinking_level_token(level)),
+                Some(level),
+                "thinking_level_from_str should parse thinking_level_token output for {level:?}"
+            );
+        }
     }
 
     #[test]
