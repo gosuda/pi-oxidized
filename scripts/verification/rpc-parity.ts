@@ -408,7 +408,13 @@ function normalizeValue(value: JsonValue, key: string | undefined, state: Normal
 	if (Array.isArray(value)) return value.map((element) => normalizeValue(element, undefined, state));
 	if (isObject(value)) {
 		const normalized: JsonObject = {};
-		for (const [childKey, childValue] of Object.entries(value)) {
+		// Traverse keys in sorted order so generated-id placeholders are
+		// allocated deterministically regardless of insertion order; two
+		// semantically equal objects with different field order must map
+		// their generated ids to the same placeholders.
+		for (const [childKey, childValue] of Object.entries(value).sort(([left], [right]) =>
+			left.localeCompare(right),
+		)) {
 			normalized[childKey] = normalizeValue(childValue, childKey, state);
 		}
 		return normalized;

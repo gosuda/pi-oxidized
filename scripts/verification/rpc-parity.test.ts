@@ -84,12 +84,13 @@ test("normalization scrubs only generated ids, timestamps, and temp paths", () =
 		repoRoot: "/repo",
 	}) as [Record<string, unknown>];
 	const data = normalized.data as Record<string, unknown>;
-	// Generated ids map in first-seen order and stay referentially consistent.
-	expect(data.sessionId).toBe("<uuid-1>");
-	expect(data.sessionFile).toBe("<tmp>/sessions/<ts>_<uuid-1>.jsonl");
-	expect(data.entryId).toBe("<id-2>");
-	expect(data.parentId).toBe("<id-2>");
-	expect(data.leafId).toBe("<id-3>");
+	// Generated ids map in sorted-key order (deterministic regardless of
+	// insertion order) and stay referentially consistent.
+	expect(data.entryId).toBe("<id-1>");
+	expect(data.parentId).toBe("<id-1>");
+	expect(data.leafId).toBe("<id-2>");
+	expect(data.sessionId).toBe("<uuid-3>");
+	expect(data.sessionFile).toBe("<tmp>/sessions/<ts>_<uuid-3>.jsonl");
 	// Timestamps and elapsed-time values are zeroed/blanked.
 	expect(data.timestamp).toBe(0);
 	expect(data.durationMs).toBe(0);
@@ -118,4 +119,94 @@ test("normalization preserves every streaming update and its payload", () => {
 test("canonicalStringify ignores object key order but not values", () => {
 	expect(canonicalStringify({ b: 1, a: [{ d: 2, c: 3 }] })).toBe(canonicalStringify({ a: [{ c: 3, d: 2 }], b: 1 }));
 	expect(canonicalStringify({ a: 1 })).not.toBe(canonicalStringify({ a: 2 }));
+});
+
+test("normalization maps generated ids identically for reordered nested objects", () => {
+	// Two semantically equal objects whose fields arrive in different
+	// insertion order must allocate the same generated-id placeholders,
+	// including inside nested objects. Before the sorted-key traversal
+	// fix, the leafId/entryId/sessionId fields were visited in insertion
+	// order, so the <id-N>/<uuid-N> tokens diverged and canonicalStringify
+	// flagged a false mismatch.
+	const orderA = {
+		type: "response",
+		data: {
+			leafId: "d18f1557",
+			entryId: "c4bbb1af",
+			parentId: "c4bbb1af",
+			sessionId: "0198e3a0-1111-7000-8000-abcdef012345",
+			nested: { zeta: "a1b2c3d4", entryId: "e5f67890", alpha: "literal-stays" },
+		},
+	};
+	const orderB = {
+		type: "response",
+		data: {
+			sessionId: "0198e3a0-1111-7000-8000-abcdef012345",
+			parentId: "c4bbb1af",
+			entryId: "c4bbb1af",
+			leafId: "d18f1557",
+			nested: { alpha: "literal-stays", entryId: "e5f67890", zeta: "a1b2c3d4" },
+		},
+	};
+	const ctx = { volatileRoots: [], repoRoot: "/repo" };
+	const [a] = normalizeTranscript([orderA], ctx) as [Record<string, unknown>];
+	const [b] = normalizeTranscript([orderB], ctx) as [Record<string, unknown>];
+	// Both orderings must canonicalize to the same string — i.e. the
+	// generated-id placeholders were allocated in the same deterministic
+	// (sorted-key) sequence, at every nesting depth.
+	expect(canonicalStringify(a as never)).toBe(canonicalStringify(b as never));
+	const data = a.data as Record<string, unknown>;
+	// Spot-check the placeholder assignment is sorted-key driven:
+	// entryId/leafId/parentId sort before sessionId at the top level, and
+	// the nested object's entryId (an ID_KEY) is visited after the top
+	// level — so it gets <id-3>, not a number that depends on field order.
+	expect(data.entryId).toBe("<id-1>");
+	expect(data.parentId).toBe("<id-1>");
+	expect(data.leafId).toBe("<id-2>");
+	expect(data.sessionId).toBe("<uuid-4>");
+	const nested = data.nested as Record<string, unknown>;
+	expect(nested.entryId).toBe("<id-3>");
+	// Non-id-keyed fields stay literal regardless of order.
+	expect(nested.alpha).toBe("literal-stays");
+	expect(nested.zeta).toBe("a1b2c3d4");
+});
+
+test("normalization keeps cross-references consistent across reordered records", () => {
+	// A later record references a generated id produced by an earlier one.
+	// Both transcripts carry the same ids but in different field order; the
+	// cross-reference must still resolve to the same placeholder in both.
+	const baseRecords = (
+		firstFieldOrder: "entry" | "leaf",
+	): Parameters<typeof normalizeTranscript>[0] => [
+		{
+			type: "response",
+			id: "c01-fetch",
+			data: firstFieldOrder === "entry"
+				? { entryId: "c4bbb1af", leafId: "d18f1557" }
+				: { leafId: "d18f1557", entryId: "c4bbb1af" },
+		},
+		{
+			type: "response",
+			id: "c02-related",
+			data: { targetId: "c4bbb1af", fromId: "d18f1557" },
+		},
+	];
+	const ctx = { volatileRoots: [], repoRoot: "/repo" };
+	const a = normalizeTranscript(baseRecords("entry"), ctx);
+	const b = normalizeTranscript(baseRecords("leaf"), ctx);
+	expect(canonicalStringify(a[0] as never)).toBe(canonicalStringify(b[0] as never));
+	expect(canonicalStringify(a[1] as never)).toBe(canonicalStringify(b[1] as never));
+	// The cross-reference in the second record must match the first
+	// record's allocation: entryId "c4bbb1af" -> <id-1>, leafId "d18f1557"
+	// -> <id-2>, regardless of which field was listed first.
+	const first = (a[0] as Record<string, unknown>).data as Record<string, unknown>;
+	const second = (a[1] as Record<string, unknown>).data as Record<string, unknown>;
+	expect(first.entryId).toBe("<id-1>");
+	expect(first.leafId).toBe("<id-2>");
+	expect(second.targetId).toBe("<id-1>");
+	expect(second.fromId).toBe("<id-2>");
+	// The reordered transcript must agree on the cross-reference too.
+	const secondB = (b[1] as Record<string, unknown>).data as Record<string, unknown>;
+	expect(secondB.targetId).toBe("<id-1>");
+	expect(secondB.fromId).toBe("<id-2>");
 });
