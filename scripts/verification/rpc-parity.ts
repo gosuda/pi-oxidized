@@ -13,10 +13,7 @@
  *
  * Normalization is limited to generated identifiers (UUIDs and 8-hex entry
  * ids, mapped in first-seen order so referential structure is preserved),
- * timestamps/elapsed-time values, and per-run temporary paths. Streaming
- * delta events (`message_update`, `tool_execution_update`) are collapsed per
- * run because delta granularity is transport chunking, not protocol content;
- * final content parity is enforced by `message_end`/`tool_execution_end`.
+ * timestamps/elapsed-time values, and per-run temporary paths.
  */
 
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -363,7 +360,6 @@ const ID_KEYS = new Set([
 const GENERATED_SHORT_ID_RE = /^[0-9a-f]{8}$/;
 const EPOCH_KEYS = new Set(["timestamp"]);
 const DURATION_KEY_RE = /(?:durationMs|elapsedMs|executionTimeMs|latencyMs|timeMs)$/;
-const COLLAPSIBLE_EVENT_TYPES = new Set(["message_update", "tool_execution_update"]);
 
 interface NormalizeState {
 	readonly context: NormalizeContext;
@@ -411,25 +407,11 @@ function normalizeValue(value: JsonValue, key: string | undefined, state: Normal
 }
 
 /**
- * Normalize one binary's transcript: collapse streaming delta runs, then
- * scrub generated ids, timestamps, and temporary paths.
+ * Normalize one binary's transcript by scrubbing generated ids, timestamps, and temporary paths.
  */
 export function normalizeTranscript(records: readonly JsonObject[], context: NormalizeContext): JsonValue[] {
 	const state: NormalizeState = { context, generatedIds: new Map() };
-	const normalized: JsonValue[] = [];
-	let openCollapseType: string | undefined;
-	for (const record of records) {
-		const type = typeof record.type === "string" ? record.type : "";
-		if (COLLAPSIBLE_EVENT_TYPES.has(type)) {
-			if (openCollapseType === type) continue;
-			openCollapseType = type;
-			normalized.push({ type, collapsed: true });
-			continue;
-		}
-		openCollapseType = undefined;
-		normalized.push(normalizeValue(record, undefined, state));
-	}
-	return normalized;
+	return records.map((record) => normalizeValue(record, undefined, state));
 }
 
 // ============================================================================

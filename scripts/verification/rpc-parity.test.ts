@@ -88,30 +88,19 @@ test("normalization scrubs only generated ids, timestamps, and temp paths", () =
 	expect(data.text).toBe("verification-chunk-0001");
 });
 
-test("streaming delta runs collapse; boundary events keep full payloads", () => {
-	const update = (text: string) => ({ type: "message_update", message: { text } });
-	const normalized = normalizeTranscript(
-		[
-			{ type: "message_start", message: { text: "" } },
-			update("a"),
-			update("ab"),
-			update("abc"),
-			{ type: "message_end", message: { text: "abc" } },
-			update("x"),
-			{ type: "tool_execution_update", partial: "1" },
-			{ type: "tool_execution_update", partial: "12" },
-			{ type: "agent_settled" },
-		],
-		{ volatileRoots: [], repoRoot: "/repo" },
-	);
-	expect(normalized).toEqual([
+test("normalization preserves every streaming update and its payload", () => {
+	const records = [
 		{ type: "message_start", message: { text: "" } },
-		{ type: "message_update", collapsed: true },
-		{ type: "message_end", message: { text: "abc" } },
-		{ type: "message_update", collapsed: true },
-		{ type: "tool_execution_update", collapsed: true },
+		{ type: "message_update", message: { text: "a" } },
+		{ type: "message_update", message: { text: "ab" } },
+		{ type: "tool_execution_update", partialResult: { content: [] } },
+		{ type: "tool_execution_update", partialResult: { content: [{ text: "bash\n" }], details: {} } },
 		{ type: "agent_settled" },
-	]);
+	];
+
+	expect(
+		normalizeTranscript(records, { volatileRoots: [], repoRoot: "/repo" }),
+	).toEqual(records);
 });
 
 test("canonicalStringify ignores object key order but not values", () => {

@@ -572,7 +572,7 @@ async fn collect_command_output(
             spawn_context.env,
         )
         .await;
-    finish_collected_output(exec_result, pump, output, throttle, updates).await
+    finish_collected_output(exec_result, pump, output, throttle).await
 }
 
 async fn finish_collected_output(
@@ -580,7 +580,6 @@ async fn finish_collected_output(
     pump: tokio::task::JoinHandle<Result<(), OutputAccumulatorError>>,
     output: Arc<Mutex<OutputAccumulator>>,
     throttle: Arc<Mutex<UpdateThrottle>>,
-    updates: ToolUpdates,
 ) -> Result<CollectedCommandOutput, ToolError> {
     match pump.await {
         Ok(Ok(())) => {}
@@ -600,7 +599,6 @@ async fn finish_collected_output(
     let snapshot = output_guard
         .snapshot(true)
         .map_err(|error| accumulator_error(&error))?;
-    updates.send(snapshot_to_partial(&snapshot));
     let last_line_bytes = output_guard.last_line_bytes();
     output_guard.close_temp_file();
     drop(output_guard);
@@ -1068,11 +1066,7 @@ fn snapshot_to_partial(snapshot: &OutputSnapshot) -> AgentToolResult {
         content: vec![ToolResultContent::Text(TextContent::new(
             snapshot.content.clone(),
         ))],
-        details: if details.is_empty() {
-            Value::Null
-        } else {
-            Value::Object(details)
-        },
+        details: Value::Object(details),
         added_tool_names: None,
         terminate: None,
     }
@@ -1516,6 +1510,39 @@ mod tests {
         let count = seen.load(Ordering::SeqCst);
         assert!(count >= 2, "expected streaming updates, got {count}");
         assert!(count < 20, "updates were not throttled: {count}");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bash_stream_updates_match_source_event_shape() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        let tool = BashTool::new(dir.path());
+        let updates = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&updates);
+        let stream = ToolUpdates::new(move |partial| {
+            captured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(partial);
+        });
+
+        tool.execute(
+            "1",
+            json_map(json!({ "command": "printf 'bash-stream\\n'" }))?,
+            CancellationToken::new(),
+            stream,
+        )
+        .await?;
+
+        let updates = updates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(updates.len(), 2);
+        let initial = serde_json::to_value(&updates[0])?;
+        let streamed = serde_json::to_value(&updates[1])?;
+        assert!(initial.get("details").is_none());
+        assert_eq!(streamed.get("details"), Some(&json!({})));
+        assert_eq!(text_of(&updates[1]), "bash-stream\n");
         Ok(())
     }
 
