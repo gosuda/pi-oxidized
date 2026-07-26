@@ -418,7 +418,26 @@ impl AgentSession {
         let mut extension_names = std::collections::HashSet::new();
 
         if let Some(host) = self.host_extension_runner() {
-            for command in host.registry().commands() {
+            let registered = host.registry();
+            let extension_commands = registered.commands();
+            // Upstream loads explicit/discovered extensions before inline
+            // built-ins, while the compact host aggregates built-ins first.
+            // Preserve upstream's public registration order within each group.
+            let ordered_commands = extension_commands
+                .iter()
+                .filter(|command| {
+                    !command
+                        .source
+                        .as_deref()
+                        .is_some_and(|path| path.starts_with("<inline:"))
+                })
+                .chain(extension_commands.iter().filter(|command| {
+                    command
+                        .source
+                        .as_deref()
+                        .is_some_and(|path| path.starts_with("<inline:"))
+                }));
+            for command in ordered_commands {
                 extension_names.insert(command.name.clone());
                 let path = command
                     .source
