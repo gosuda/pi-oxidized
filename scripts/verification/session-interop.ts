@@ -11,10 +11,6 @@ import { readdir, readFile, rm } from "node:fs/promises";
 import { join, relative, resolve } from "node:path";
 
 const REPO_ROOT = resolve(import.meta.dirname, "../..");
-const FIXTURES = join(
-	REPO_ROOT,
-	".agent-tasks/pi-rust-rewrite/fixtures/sessions",
-);
 const OUTPUT = join(REPO_ROOT, "target/verification/session-interop");
 const REFERENCE_ROOT = join(REPO_ROOT, ".references/pi");
 const REFERENCE_UUID = join(REFERENCE_ROOT, "packages/agent/src/harness/session/uuid.ts");
