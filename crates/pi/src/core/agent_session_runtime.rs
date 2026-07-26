@@ -717,8 +717,11 @@ impl AgentSessionRuntime {
                 target_session_file: target_session_file.map(str::to_owned),
             })
             .await;
-        // Pre-invalidate callback (host UI teardown, sync). Falls back to the
-        // session-bound shutdown handler when no runtime-level callback exists.
+        // Pre-invalidate callback (host UI teardown, sync). Upstream invokes
+        // only the runtime-level callback here; the session-bound extension
+        // shutdown handler is an extension-initiated "quit" request and must
+        // NOT fire on session replacement (it would shut the RPC server down
+        // after every fork/clone/new_session/switch_session).
         let runtime_cb = self
             .before_session_invalidate
             .read()
@@ -726,8 +729,6 @@ impl AgentSessionRuntime {
             .and_then(|g| g.clone());
         if let Some(cb) = runtime_cb {
             cb();
-        } else {
-            session.invoke_extension_shutdown_handler();
         }
         // dispose always awaits host process reap exactly once when bound.
         session.dispose().await;
@@ -1423,6 +1424,29 @@ mod tests {
         })));
         runtime.new_session(NewSessionOptions::default()).await?;
         assert_eq!(called.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn teardown_without_pre_invalidate_leaves_shutdown_handler_alone() -> TestResult {
+        // The extension shutdown handler is an extension-initiated quit
+        // request; session replacement must not invoke it (upstream
+        // teardownCurrent only calls beforeSessionInvalidate). Regression:
+        // the RPC server exited after every fork/new_session/switch_session.
+        let runtime = Arc::new(make_runtime().await?);
+        let called = Arc::new(AtomicUsize::new(0));
+        let called_clone = Arc::clone(&called);
+        runtime
+            .session()
+            .bind_extensions(crate::core::agent_session::extension::ExtensionBindings {
+                shutdown_handler: Some(Arc::new(move || {
+                    called_clone.fetch_add(1, Ordering::SeqCst);
+                })),
+                ..Default::default()
+            })
+            .await?;
+        runtime.new_session(NewSessionOptions::default()).await?;
+        assert_eq!(called.load(Ordering::SeqCst), 0);
         Ok(())
     }
 
