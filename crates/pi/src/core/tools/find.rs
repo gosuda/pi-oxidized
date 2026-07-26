@@ -468,10 +468,70 @@ pub fn create_find_tool(cwd: impl Into<PathBuf>) -> Arc<dyn AgentTool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use std::fs;
 
+    use proptest::prelude::*;
     use serde_json::json;
     use tempfile::tempdir;
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 8, .. ProptestConfig::default() })]
+        #[test]
+        fn gitignore_rules_hide_only_their_matching_tree(root_ignores_build in any::<bool>(), nested_ignores_file in any::<bool>()) {
+            let result: Result<(BTreeSet<String>, BTreeSet<String>), String> = (|| {
+                let dir = tempdir().map_err(|error| error.to_string())?;
+                fs::create_dir_all(dir.path().join("build")).map_err(|error| error.to_string())?;
+                fs::create_dir_all(dir.path().join("nested")).map_err(|error| error.to_string())?;
+                fs::write(dir.path().join("visible.txt"), "visible").map_err(|error| error.to_string())?;
+                fs::write(dir.path().join("build/generated.txt"), "generated").map_err(|error| error.to_string())?;
+                fs::write(dir.path().join("nested/kept.txt"), "kept").map_err(|error| error.to_string())?;
+                fs::write(dir.path().join("nested/ignored.txt"), "ignored").map_err(|error| error.to_string())?;
+
+                // Both runs use the same production walker (`collect_find_matches`)
+                // with identical configuration, so machine/ancestor/parent
+                // ignore sources cancel identically and cannot mask a local
+                // rule's effect. Baseline is captured with the local .gitignore
+                // files absent; then the generated rules are written and the
+                // same query is re-run to capture `actual`.
+                let cancel = CancellationToken::new();
+                let baseline = collect_find_matches("**/*.txt", dir.path(), DEFAULT_LIMIT, &cancel)
+                    .map_err(|error| error.to_string())?;
+                let baseline: BTreeSet<String> = baseline.into_iter().collect();
+
+                if root_ignores_build {
+                    fs::write(dir.path().join(".gitignore"), "build/\n").map_err(|error| error.to_string())?;
+                }
+                if nested_ignores_file {
+                    fs::write(dir.path().join("nested/.gitignore"), "ignored.txt\n").map_err(|error| error.to_string())?;
+                }
+
+                let actual = collect_find_matches("**/*.txt", dir.path(), DEFAULT_LIMIT, &cancel)
+                    .map_err(|error| error.to_string())?;
+                let actual: BTreeSet<String> = actual.into_iter().collect();
+
+                Ok((baseline, actual))
+            })();
+            let error = result.as_ref().err().map_or("", String::as_str);
+            prop_assert!(result.is_ok(), "{error}");
+            let (baseline, actual) = result.unwrap_or_default();
+
+            // The generated-rule paths that were present in baseline; paths
+            // already hidden by machine/ancestor rules (identical in both runs)
+            // are excluded from the expectation because they are absent from
+            // baseline.
+            let mut expected_hidden = BTreeSet::new();
+            if root_ignores_build && baseline.contains("build/generated.txt") {
+                expected_hidden.insert("build/generated.txt".to_owned());
+            }
+            if nested_ignores_file && baseline.contains("nested/ignored.txt") {
+                expected_hidden.insert("nested/ignored.txt".to_owned());
+            }
+
+            let hidden: BTreeSet<String> = baseline.difference(&actual).cloned().collect();
+            prop_assert_eq!(hidden, expected_hidden);
+        }
+    }
 
     fn fixture_schema() -> Result<Value, serde_json::Error> {
         let text = include_str!(

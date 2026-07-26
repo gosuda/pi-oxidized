@@ -362,6 +362,7 @@ pub fn truncate_line_with(line: &str, max_chars: usize) -> TruncatedLine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn head(content: &str, max_lines: usize, max_bytes: usize) -> TruncationResult {
         truncate_head(
@@ -381,6 +382,87 @@ mod tests {
                 max_bytes: Some(max_bytes),
             },
         )
+    }
+
+    proptest! {
+        #[test]
+        fn head_truncation_respects_byte_and_line_limits(
+            lines in prop::collection::vec("(?:[a-z]|é|界|😀){0,12}", 0..16),
+            trailing_newline in any::<bool>(),
+            max_lines in 0_usize..16,
+            max_bytes in 1_usize..96,
+        ) {
+            let mut content = lines.join("\n");
+            if trailing_newline {
+                content.push('\n');
+            }
+            let result = truncate_head(&content, TruncationOptions {
+                max_lines: Some(max_lines),
+                max_bytes: Some(max_bytes),
+            });
+
+            prop_assert_eq!(result.output_bytes, result.content.len());
+            let expected_output_lines = if result.last_line_partial {
+                1
+            } else if !result.truncated {
+                split_lines_for_counting(&result.content).len()
+            } else if result.content.is_empty()
+                && result.truncated
+                && max_lines > 0
+                && !result.first_line_exceeds_limit
+            {
+                1
+            } else {
+                split_lines_for_counting(&result.content).len()
+                    + usize::from(result.content.ends_with('\n'))
+            };
+            prop_assert_eq!(result.output_lines, expected_output_lines);
+            prop_assert!(result.output_bytes <= max_bytes);
+            prop_assert!(result.output_lines <= max_lines);
+            prop_assert!(content.starts_with(&result.content));
+        }
+
+        #[test]
+        fn tail_truncation_respects_byte_and_line_limits(
+            lines in prop::collection::vec("(?:[a-z]|é|界|😀){0,12}", 0..16),
+            trailing_newline in any::<bool>(),
+            max_lines in 0_usize..16,
+            max_bytes in 1_usize..96,
+        ) {
+            let mut content = lines.join("\n");
+            if trailing_newline {
+                content.push('\n');
+            }
+            let result = truncate_tail(&content, TruncationOptions {
+                max_lines: Some(max_lines),
+                max_bytes: Some(max_bytes),
+            });
+
+            prop_assert_eq!(result.output_bytes, result.content.len());
+            let expected_output_lines = if result.last_line_partial {
+                1
+            } else if !result.truncated {
+                split_lines_for_counting(&result.content).len()
+            } else if result.content.is_empty()
+                && result.truncated
+                && max_lines > 0
+                && !result.first_line_exceeds_limit
+            {
+                1
+            } else {
+                split_lines_for_counting(&result.content).len()
+                    + usize::from(result.content.ends_with('\n'))
+            };
+            prop_assert_eq!(result.output_lines, expected_output_lines);
+            prop_assert!(result.output_bytes <= max_bytes);
+            prop_assert!(result.output_lines <= max_lines);
+            let suffix_source = if result.truncated {
+                content.strip_suffix('\n').unwrap_or(&content)
+            } else {
+                &content
+            };
+            prop_assert!(suffix_source.ends_with(&result.content));
+        }
     }
 
     #[test]

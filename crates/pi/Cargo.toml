@@ -50,4 +50,5 @@ nix = { version = "=0.31.3", default-features = false, features = ["fs", "signal
 
 [dev-dependencies]
 insta = { version = "=1.48.0", features = ["filters"] }
+proptest = "=1.11.0"
 tempfile = "=3.27.0"
