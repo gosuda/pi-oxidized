@@ -1930,6 +1930,7 @@ mod tests {
         started: Arc<Notify>,
         release: Arc<Notify>,
         cancelled: Arc<AtomicBool>,
+        tool_cancel_token: Arc<Mutex<Option<CancellationToken>>>,
         saturated: Arc<AtomicBool>,
         commands: Arc<Mutex<Vec<(String, String)>>>,
         snapshot_calls: Arc<AtomicUsize>,
@@ -1943,6 +1944,7 @@ mod tests {
         tool_contexts: Arc<Mutex<Vec<Arc<NativeExtensionContext>>>>,
         provider_started: Arc<Notify>,
         provider_cancelled: Arc<AtomicBool>,
+        provider_cancel_token: Arc<Mutex<Option<CancellationToken>>>,
         provider_send_failed: Arc<AtomicBool>,
         provider_ticks: Arc<AtomicUsize>,
     }
@@ -1958,6 +1960,7 @@ mod tests {
                 started: Arc::new(Notify::new()),
                 release: Arc::new(Notify::new()),
                 cancelled: Arc::new(AtomicBool::new(false)),
+                tool_cancel_token: Arc::new(Mutex::new(None)),
                 saturated: Arc::new(AtomicBool::new(false)),
                 commands: Arc::new(Mutex::new(Vec::new())),
                 snapshot_calls: Arc::new(AtomicUsize::new(0)),
@@ -1971,6 +1974,7 @@ mod tests {
                 tool_contexts: Arc::new(Mutex::new(Vec::new())),
                 provider_started: Arc::new(Notify::new()),
                 provider_cancelled: Arc::new(AtomicBool::new(false)),
+                provider_cancel_token: Arc::new(Mutex::new(None)),
                 provider_send_failed: Arc::new(AtomicBool::new(false)),
                 provider_ticks: Arc::new(AtomicUsize::new(0)),
             }
@@ -1981,6 +1985,7 @@ mod tests {
                 started: Arc::clone(&self.started),
                 release: Arc::clone(&self.release),
                 cancelled: Arc::clone(&self.cancelled),
+                tool_cancel_token: Arc::clone(&self.tool_cancel_token),
                 saturated: Arc::clone(&self.saturated),
                 commands: Arc::clone(&self.commands),
                 snapshot_calls: Arc::clone(&self.snapshot_calls),
@@ -1994,6 +1999,7 @@ mod tests {
                 tool_contexts: Arc::clone(&self.tool_contexts),
                 provider_started: Arc::clone(&self.provider_started),
                 provider_cancelled: Arc::clone(&self.provider_cancelled),
+                provider_cancel_token: Arc::clone(&self.provider_cancel_token),
                 provider_send_failed: Arc::clone(&self.provider_send_failed),
                 provider_ticks: Arc::clone(&self.provider_ticks),
             }
@@ -2158,6 +2164,10 @@ mod tests {
             updates: ToolUpdateSink,
             cancel: CancellationToken,
         ) -> NativeFuture<Result<Value, ExtensionFault>> {
+            let tool_cancel_token = Arc::clone(&self.handles.tool_cancel_token);
+            *tool_cancel_token
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cancel.clone());
             let started = Arc::clone(&self.handles.started);
             let release = Arc::clone(&self.handles.release);
             let cancelled = Arc::clone(&self.handles.cancelled);
@@ -2244,6 +2254,10 @@ mod tests {
             events: ProviderEventSink,
             cancel: CancellationToken,
         ) -> NativeFuture<Result<Value, ExtensionFault>> {
+            let provider_cancel_token = Arc::clone(&self.handles.provider_cancel_token);
+            *provider_cancel_token
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cancel.clone());
             let started = Arc::clone(&self.handles.provider_started);
             let cancelled = Arc::clone(&self.handles.provider_cancelled);
             let send_failed = Arc::clone(&self.handles.provider_send_failed);
@@ -3569,7 +3583,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplex_cancel_maps_to_cancelled_error() -> R {
+    async fn cancel_token_for_matching_kind_is_cancelled_after_terminal() -> R {
         let fixture = DuplexFixture::connect().await?;
 
         // A running tool is cancelled by a tool.cancel control event read
@@ -3583,6 +3597,13 @@ mod tests {
             )
             .await?;
         tokio::time::timeout(TIMEOUT, fixture.handles.started.notified()).await?;
+        let token = fixture
+            .handles
+            .tool_cancel_token
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or("extension did not retain the tool cancellation token")?;
         slow.cancel(methods::TOOL_CANCEL)?;
         let cancelled_terminal = slow.finish(TIMEOUT).await;
         assert!(
@@ -3590,8 +3611,8 @@ mod tests {
             "expected cancelled remote error, got {cancelled_terminal:?}"
         );
         assert!(
-            fixture.handles.cancelled.load(AtomicOrdering::SeqCst),
-            "extension must observe the cancellation token"
+            token.is_cancelled(),
+            "the retained tool cancellation token must be cancelled after its terminal"
         );
         fixture.finish().await
     }
@@ -3618,6 +3639,12 @@ mod tests {
             .await?;
         tokio::time::timeout(TIMEOUT, handles.started.notified()).await?;
 
+        let token = handles
+            .tool_cancel_token
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or("extension did not retain the tool cancellation token")?;
         client
             .send(&Frame {
                 id: 0,
@@ -3626,9 +3653,20 @@ mod tests {
                 payload: json!({ "id": 2 }),
             })
             .await?;
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // A correlated sibling terminal is an in-order fence: the read loop
+        // has already dispatched the preceding provider.cancel by this point.
+        let marker = client
+            .request(
+                3,
+                COMMAND_EXECUTE_METHOD,
+                json!({ "command": "demo", "args": "kind-isolation-fence" }),
+            )
+            .await?;
+        assert_eq!(marker.id, 3);
+        assert_eq!(marker.kind, FrameKind::Res);
+        assert_eq!(marker.payload, json!({ "ok": true }));
         assert!(
-            !handles.cancelled.load(AtomicOrdering::SeqCst),
+            !token.is_cancelled(),
             "provider.cancel must not cancel tool work"
         );
 
@@ -3644,7 +3682,10 @@ mod tests {
         assert_eq!(terminal.id, 2);
         assert_eq!(terminal.kind, FrameKind::Error);
         assert_eq!(terminal.payload["code"], "cancelled");
-        assert!(handles.cancelled.load(AtomicOrdering::SeqCst));
+        assert!(
+            token.is_cancelled(),
+            "the retained tool token must be cancelled after its terminal"
+        );
 
         drop(client);
         let result = tokio::time::timeout(TIMEOUT, server).await??;
@@ -4289,6 +4330,12 @@ mod tests {
             })
             .await?;
         tokio::time::timeout(TIMEOUT, handles.provider_started.notified()).await?;
+        let token = handles
+            .provider_cancel_token
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or("extension did not retain the provider cancellation token")?;
         client
             .send(&Frame {
                 id: 0,
@@ -4326,7 +4373,10 @@ mod tests {
             Ok::<(), Box<dyn Error>>(())
         })
         .await??;
-        assert!(handles.provider_cancelled.load(AtomicOrdering::SeqCst));
+        assert!(
+            token.is_cancelled(),
+            "the retained provider token must be cancelled after its terminal"
+        );
         drop(client);
         let result = tokio::time::timeout(TIMEOUT, server).await??;
         assert!(result.is_ok());

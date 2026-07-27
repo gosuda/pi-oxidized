@@ -50,8 +50,9 @@ pub const OUTBOUND_CAPACITY: usize = 128;
 pub const EVENT_CAPACITY: usize = 256;
 /// Default bounded capacity for per-call streaming event channels.
 pub const STREAM_EVENT_CAPACITY: usize = 64;
-/// Provider ingress is 16 times the default consumer channel, absorbing large
-/// bursts while keeping a stalled call's retained memory strictly bounded.
+/// Provider ingress queues provider-event frames: this capacity bounds frame
+/// count, not bytes. Per-frame payload bytes are independently bounded by
+/// [`crate::protocol::MAX_FRAME_BYTES`].
 const PROVIDER_FORWARD_CAPACITY: usize = 16 * STREAM_EVENT_CAPACITY;
 /// Grace period before killing the host on shutdown.
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
@@ -302,6 +303,16 @@ pub enum HostClientError {
         /// Frame id of the overflowing call.
         id: FrameId,
         /// Maximum queued provider events.
+        capacity: usize,
+    },
+    /// An explicit stream cancel could not be queued because outbound capacity was full.
+    #[error(
+        "host stream {id} cancel could not enqueue: outbound channel is saturated at {capacity} frames; dropping the stream will retry"
+    )]
+    OutboundCancelFull {
+        /// Frame id of the stream being cancelled.
+        id: FrameId,
+        /// Maximum queued outbound frames.
         capacity: usize,
     },
     /// Host stream closed (EOF or write failure).
@@ -870,7 +881,8 @@ impl StreamHandle {
     ///
     /// # Errors
     ///
-    /// Returns [`HostClientError::Closed`] when the outbound pipe is broken.
+    /// Returns [`HostClientError::OutboundCancelFull`] when the outbound queue
+    /// is full, or [`HostClientError::Closed`] when the pipe is broken.
     pub fn cancel(&mut self, control_method: &str) -> HostResult<()> {
         let frame = cancel_frame(self.id, control_method);
         match &self.cmd_tx {
@@ -879,7 +891,12 @@ impl StreamHandle {
                     self.cancel_sent = true;
                     Ok(())
                 }
-                Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    Err(HostClientError::OutboundCancelFull {
+                        id: self.id,
+                        capacity: tx.max_capacity(),
+                    })
+                }
                 Err(mpsc::error::TrySendError::Closed(_)) => Err(HostClientError::Closed {
                     message: "cancel send failed: outbound pipe closed".to_owned(),
                     stderr: stderr_of(&self.shared),
@@ -1846,6 +1863,68 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn explicit_cancel_against_full_outbound_returns_typed_error() -> R {
+        let (client, _host) = make_pair().await;
+        let (mut stalled, _original) = client.stall_outbound_for_test().await;
+        let mut stream = client
+            .open_stream_raw("provider.stream", serde_json::json!({}), 2)
+            .await?;
+        let id = stream.id();
+        let shared = Arc::clone(&stream.shared);
+
+        // Opening the stream fills the one-slot test channel, so cancellation
+        // must fail synchronously rather than wait for the writer.
+        let started = std::time::Instant::now();
+        let error = match stream.cancel("provider.cancel") {
+            Ok(()) => return Err("saturated outbound cancellation unexpectedly succeeded".into()),
+            Err(error) => error,
+        };
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "explicit cancellation blocked on the saturated outbound queue"
+        );
+        assert!(matches!(
+            error,
+            HostClientError::OutboundCancelFull { id: error_id, capacity: 1 } if error_id == id
+        ));
+        assert!(
+            !stream.cancel_sent,
+            "a failed explicit cancellation must leave drop retry armed"
+        );
+        assert!(
+            shared
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&id),
+            "a failed explicit cancellation must retain pending state"
+        );
+
+        let request = tokio::time::timeout(Duration::from_millis(100), stalled.recv())
+            .await
+            .map_err(|_| "missing queued stream request")?
+            .ok_or("missing queued stream request")?;
+        assert_eq!(request.id, id);
+        drop(stream);
+
+        let cancel = tokio::time::timeout(Duration::from_millis(100), stalled.recv())
+            .await
+            .map_err(|_| "drop did not retry cancellation")?
+            .ok_or("drop did not retry cancellation")?;
+        assert_eq!(cancel.method, "provider.cancel");
+        assert_eq!(cancel.payload["id"], id);
+        assert!(
+            shared
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "dropping a stream must remove its pending state"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn mass_drop_under_saturation_is_prompt_and_runtime_independent() -> R {
         const STREAMS: usize = 256;
 
@@ -1871,11 +1950,16 @@ mod tests {
         ));
 
         let cancel_started = std::time::Instant::now();
-        stream.cancel("provider.cancel")?;
+        let cancel = stream.cancel("provider.cancel");
         assert!(
             cancel_started.elapsed() < Duration::from_millis(100),
             "explicit cancellation blocked on the saturated outbound queue"
         );
+        assert!(matches!(
+            cancel,
+            Err(HostClientError::OutboundCancelFull { id, capacity })
+                if id == request.id && capacity == OUTBOUND_CAPACITY
+        ));
         assert!(
             !stream.cancel_sent,
             "a full queue cannot accept cancellation"
