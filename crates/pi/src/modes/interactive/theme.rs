@@ -935,7 +935,7 @@ fn highlight_code(code: &str, lang: Option<&str>) -> Vec<String> {
     let Some((token, shard)) = lang.and_then(|lang| syntax_for(lang.trim())) else {
         return plain_lines(&theme, code);
     };
-    let syntax_set = &**shard;
+    let syntax_set = shard;
     let Some(syntax) = syntax_set.find_syntax_by_token(token) else {
         return plain_lines(&theme, code);
     };
@@ -1200,8 +1200,8 @@ pub fn light() -> Arc<ResolvedTheme> {
 }
 
 macro_rules! built_in_theme {
-    ($static_name:ident, $file:literal) => {
-        static $static_name: LazyLock<Arc<ResolvedTheme>> = LazyLock::new(|| {
+    ($truecolor_static:ident, $palette256_static:ident, $file:literal) => {
+        static $truecolor_static: LazyLock<Arc<ResolvedTheme>> = LazyLock::new(|| {
             ThemeJson::parse(include_str!(concat!(
                 "../../../assets/theme/",
                 $file,
@@ -1210,19 +1210,41 @@ macro_rules! built_in_theme {
             .and_then(|theme| theme.resolve(ColorMode::Truecolor))
             .expect("built-in theme JSON is valid")
         });
+        static $palette256_static: LazyLock<Arc<ResolvedTheme>> =
+            LazyLock::new(|| Arc::new((&*$truecolor_static).with_mode(ColorMode::Palette256)));
     };
 }
 
-built_in_theme!(DARK_INTERN, "dark");
-built_in_theme!(LIGHT_INTERN, "light");
-built_in_theme!(CLASSIC_DARK_INTERN, "classic-dark");
-built_in_theme!(CLASSIC_LIGHT_INTERN, "classic-light");
-built_in_theme!(MOTION_DARK_INTERN, "motion-dark");
-built_in_theme!(MOTION_LIGHT_INTERN, "motion-light");
-built_in_theme!(M3_DARK_INTERN, "m3-dark");
-built_in_theme!(M3_LIGHT_INTERN, "m3-light");
-built_in_theme!(ANTD_DARK_INTERN, "antd-dark");
-built_in_theme!(ANTD_LIGHT_INTERN, "antd-light");
+built_in_theme!(DARK_INTERN, DARK_PALETTE256_INTERN, "dark");
+built_in_theme!(LIGHT_INTERN, LIGHT_PALETTE256_INTERN, "light");
+built_in_theme!(
+    CLASSIC_DARK_INTERN,
+    CLASSIC_DARK_PALETTE256_INTERN,
+    "classic-dark"
+);
+built_in_theme!(
+    CLASSIC_LIGHT_INTERN,
+    CLASSIC_LIGHT_PALETTE256_INTERN,
+    "classic-light"
+);
+built_in_theme!(
+    MOTION_DARK_INTERN,
+    MOTION_DARK_PALETTE256_INTERN,
+    "motion-dark"
+);
+built_in_theme!(
+    MOTION_LIGHT_INTERN,
+    MOTION_LIGHT_PALETTE256_INTERN,
+    "motion-light"
+);
+built_in_theme!(M3_DARK_INTERN, M3_DARK_PALETTE256_INTERN, "m3-dark");
+built_in_theme!(M3_LIGHT_INTERN, M3_LIGHT_PALETTE256_INTERN, "m3-light");
+built_in_theme!(ANTD_DARK_INTERN, ANTD_DARK_PALETTE256_INTERN, "antd-dark");
+built_in_theme!(
+    ANTD_LIGHT_INTERN,
+    ANTD_LIGHT_PALETTE256_INTERN,
+    "antd-light"
+);
 
 /// Errors produced while loading or validating a theme JSON document.
 #[derive(Debug, thiserror::Error)]
@@ -1461,25 +1483,30 @@ fn resolve_value(
 }
 
 fn built_in_theme(name: &str, mode: ColorMode) -> Option<Arc<ResolvedTheme>> {
-    let intern = match name {
-        "dark" => dark(),
-        "light" => light(),
-        "classic-dark" => CLASSIC_DARK_INTERN.clone(),
-        "classic-light" => CLASSIC_LIGHT_INTERN.clone(),
-        "motion-dark" => MOTION_DARK_INTERN.clone(),
-        "motion-light" => MOTION_LIGHT_INTERN.clone(),
-        "m3-dark" => M3_DARK_INTERN.clone(),
-        "m3-light" => M3_LIGHT_INTERN.clone(),
-        "antd-dark" => ANTD_DARK_INTERN.clone(),
-        "antd-light" => ANTD_LIGHT_INTERN.clone(),
+    let intern: &Arc<ResolvedTheme> = match (name, mode) {
+        ("dark", ColorMode::Truecolor) => &DARK_INTERN,
+        ("dark", ColorMode::Palette256) => &DARK_PALETTE256_INTERN,
+        ("light", ColorMode::Truecolor) => &LIGHT_INTERN,
+        ("light", ColorMode::Palette256) => &LIGHT_PALETTE256_INTERN,
+        ("classic-dark", ColorMode::Truecolor) => &CLASSIC_DARK_INTERN,
+        ("classic-dark", ColorMode::Palette256) => &CLASSIC_DARK_PALETTE256_INTERN,
+        ("classic-light", ColorMode::Truecolor) => &CLASSIC_LIGHT_INTERN,
+        ("classic-light", ColorMode::Palette256) => &CLASSIC_LIGHT_PALETTE256_INTERN,
+        ("motion-dark", ColorMode::Truecolor) => &MOTION_DARK_INTERN,
+        ("motion-dark", ColorMode::Palette256) => &MOTION_DARK_PALETTE256_INTERN,
+        ("motion-light", ColorMode::Truecolor) => &MOTION_LIGHT_INTERN,
+        ("motion-light", ColorMode::Palette256) => &MOTION_LIGHT_PALETTE256_INTERN,
+        ("m3-dark", ColorMode::Truecolor) => &M3_DARK_INTERN,
+        ("m3-dark", ColorMode::Palette256) => &M3_DARK_PALETTE256_INTERN,
+        ("m3-light", ColorMode::Truecolor) => &M3_LIGHT_INTERN,
+        ("m3-light", ColorMode::Palette256) => &M3_LIGHT_PALETTE256_INTERN,
+        ("antd-dark", ColorMode::Truecolor) => &ANTD_DARK_INTERN,
+        ("antd-dark", ColorMode::Palette256) => &ANTD_DARK_PALETTE256_INTERN,
+        ("antd-light", ColorMode::Truecolor) => &ANTD_LIGHT_INTERN,
+        ("antd-light", ColorMode::Palette256) => &ANTD_LIGHT_PALETTE256_INTERN,
         _ => return None,
     };
-    // Interns are the canonical Truecolor authority; hand back a downsampled
-    // 256-color clone only when the terminal lacks 24-bit support.
-    Some(match mode {
-        ColorMode::Truecolor => intern,
-        ColorMode::Palette256 => Arc::new(intern.with_mode(ColorMode::Palette256)),
-    })
+    Some(Arc::clone(intern))
 }
 
 /// Other-variant theme name for light/dark switching; `None` when the name has no convention pair.
@@ -2333,6 +2360,23 @@ mod tests {
             .resolve_owned(ColorMode::Palette256)
             .map_err(|error| format!("dark should resolve: {error}"))?;
         assert_eq!(*palette, reresolved, "clone-with-mode equals re-resolve");
+        Ok(())
+    }
+
+    #[test]
+    fn built_in_themes_are_cached_per_color_mode() -> TestResult {
+        for name in BUILT_IN_THEME_NAMES {
+            for mode in [ColorMode::Truecolor, ColorMode::Palette256] {
+                let first = built_in_theme(name, mode)
+                    .ok_or_else(|| format!("{name} {mode:?} built-in should exist"))?;
+                let second = built_in_theme(name, mode)
+                    .ok_or_else(|| format!("{name} {mode:?} built-in should exist"))?;
+                assert!(
+                    std::sync::Arc::ptr_eq(&first, &second),
+                    "{name} {mode:?} lookup must return its cached allocation"
+                );
+            }
+        }
         Ok(())
     }
 

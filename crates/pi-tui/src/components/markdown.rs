@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
@@ -634,8 +634,9 @@ impl<'a> MarkdownRenderer<'a> {
 
     fn consume_table(&mut self, event: &Event<'_>) {
         match event {
-            Event::Start(Tag::Table(_)) => {
+            Event::Start(Tag::Table(alignments)) => {
                 self.table = Some(TableBuilder {
+                    alignments: alignments.clone(),
                     headers: Vec::new(),
                     rows: Vec::new(),
                     current_row: Vec::new(),
@@ -649,8 +650,19 @@ impl<'a> MarkdownRenderer<'a> {
                     self.lines.push(String::new());
                 }
             }
-            Event::Start(Tag::TableHead) => self.set_table_head(true),
-            Event::End(TagEnd::TableHead) => self.set_table_head(false),
+            Event::Start(Tag::TableHead) => {
+                if let Some(table) = self.table.as_mut() {
+                    table.in_head = true;
+                }
+            }
+            Event::End(TagEnd::TableHead) => {
+                if let Some(table) = self.table.as_mut() {
+                    if table.headers.is_empty() {
+                        table.headers = std::mem::take(&mut table.current_row);
+                    }
+                    table.in_head = false;
+                }
+            }
             Event::Start(Tag::TableRow) => {
                 if let Some(table) = self.table.as_mut() {
                     table.current_row.clear();
@@ -664,12 +676,6 @@ impl<'a> MarkdownRenderer<'a> {
                 }
             }
             _ => {}
-        }
-    }
-
-    fn set_table_head(&mut self, in_head: bool) {
-        if let Some(table) = self.table.as_mut() {
-            table.in_head = in_head;
         }
     }
 
@@ -801,6 +807,7 @@ fn rewrite_quote_borders(lines: &mut Vec<String>, theme: &MarkdownTheme, width: 
 }
 
 struct TableBuilder {
+    alignments: Vec<Alignment>,
     headers: Vec<String>,
     rows: Vec<Vec<String>>,
     current_row: Vec<String>,
@@ -958,13 +965,19 @@ fn render_table_grid(
     let mut lines = Vec::new();
     lines.push(table_border(column_widths, "┌─", "─┬─", "─┐"));
     let header_cells = wrap_table_row(&table.headers, column_widths);
-    append_table_row(&mut lines, &header_cells, column_widths, Some(theme.bold));
+    append_table_row(
+        &mut lines,
+        &header_cells,
+        column_widths,
+        &table.alignments,
+        Some(theme.bold),
+    );
 
     let separator = table_border(column_widths, "├─", "─┼─", "─┤");
     lines.push(separator.clone());
     for (index, row) in table.rows.iter().enumerate() {
         let cells = wrap_table_row(row, column_widths);
-        append_table_row(&mut lines, &cells, column_widths, None);
+        append_table_row(&mut lines, &cells, column_widths, &table.alignments, None);
         if index + 1 < table.rows.len() {
             lines.push(separator.clone());
         }
@@ -987,6 +1000,7 @@ fn append_table_row(
     lines: &mut Vec<String>,
     cells: &[Vec<String>],
     widths: &[usize],
+    alignments: &[Alignment],
     style: Option<fn(&str) -> String>,
 ) {
     let height = cells.iter().map(Vec::len).max().unwrap_or(1);
@@ -1000,11 +1014,29 @@ fn append_table_row(
                     .and_then(|cell| cell.get(row))
                     .cloned()
                     .unwrap_or_default();
-                let padded = format!(
-                    "{text}{}",
-                    " ".repeat(width.saturating_sub(visible_width(&text)))
-                );
-                style.map_or(padded.clone(), |apply| apply(&padded))
+                let padding = width.saturating_sub(visible_width(&text));
+                let (left_padding, right_padding) =
+                    match alignments.get(column).copied().unwrap_or(Alignment::None) {
+                        Alignment::None | Alignment::Left => (0, padding),
+                        Alignment::Center => {
+                            let left_padding = padding / 2;
+                            (left_padding, padding.saturating_sub(left_padding))
+                        }
+                        Alignment::Right => (padding, 0),
+                    };
+                let mut padded =
+                    String::with_capacity(text.len().saturating_add(left_padding + right_padding));
+                for _ in 0..left_padding {
+                    padded.push(' ');
+                }
+                padded.push_str(&text);
+                for _ in 0..right_padding {
+                    padded.push(' ');
+                }
+                match style {
+                    Some(apply) => apply(&padded),
+                    None => padded,
+                }
             })
             .collect();
         lines.push(format!("│ {} │", parts.join(" │ ")));
@@ -1065,6 +1097,21 @@ mod tests {
         m.invalidate();
         let narrow = render_snapshot(&mut m, 8);
         assert!(!narrow.is_empty());
+    }
+
+    #[test]
+    fn gfm_table_alignment_pads_each_column() {
+        let src = "| Left | Center | Right | None |\n| :--- | :----: | ----: | ---- |\n| L | C | R | N |\n";
+        let mut m = md(src);
+        let joined = render_snapshot(&mut m, 80)
+            .iter()
+            .map(|line| strip_ansi(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("│ L    │   C    │     R │ N    │"),
+            "all GFM alignment modes should determine cell padding: {joined:?}"
+        );
     }
 
     #[test]

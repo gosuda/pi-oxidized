@@ -190,7 +190,6 @@ fn detect_true_color(
     colorterm == Some("truecolor")
         || colorterm == Some("24bit")
         || term_program == Some("iterm.app")
-        || term_program == Some("apple_terminal")
         || term_program == Some("wezterm")
         || term_program == Some("ghostty")
         || term_program == Some("warpterminal")
@@ -255,6 +254,26 @@ mod tests {
             None,
             None,
             Some("xterm-256color"),
+            false
+        ));
+        // Apple Terminal itself only guarantees a 256-color palette.
+        assert!(!detect_true_color(
+            None,
+            Some("apple_terminal"),
+            Some("xterm-256color"),
+            false
+        ));
+        // Explicit color-depth signals still outrank its terminal identity.
+        assert!(detect_true_color(
+            Some("truecolor"),
+            Some("apple_terminal"),
+            Some("xterm-256color"),
+            false
+        ));
+        assert!(detect_true_color(
+            None,
+            Some("apple_terminal"),
+            Some("xterm-truecolor"),
             false
         ));
         // `COLORTERM` promotion still wins even over a 256-color `TERM`.
