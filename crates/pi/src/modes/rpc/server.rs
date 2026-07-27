@@ -516,12 +516,15 @@ impl ServerState {
             // Upstream emits `entry_appended` on the public session stream only
             // for extension custom entries (agent-session.ts appendCustomEntry);
             // the Rust core also emits it for internal view projection of
-            // regular persisted entries. Keep those off the RPC wire.
-            let internal_only = matches!(
-                event,
-                AgentSessionEvent::EntryAppended { entry } if entry.discriminant() != "custom"
-            );
-            if !internal_only {
+            // regular persisted entries. Preserve the typed boundary: an
+            // unknown payload that claims `"type": "custom"` is not custom.
+            let should_publish = match event {
+                AgentSessionEvent::EntryAppended { entry } => {
+                    matches!(entry, SessionEntry::Custom(_))
+                }
+                _ => true,
+            };
+            if should_publish {
                 let _ = event_tx.send(WriteMessage::Line(to_jsonl(event)));
             }
             if matches!(event, AgentSessionEvent::AgentSettled) {
@@ -1559,20 +1562,94 @@ mod tests {
     use tokio::io::ReadBuf;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
 
-    #[test]
-    fn rpc_jsonl_does_not_rewrite_non_agent_message_content()
+    #[tokio::test]
+    async fn rpc_entry_appended_only_for_structural_custom_entries()
     -> Result<(), Box<dyn std::error::Error>> {
-        let record = serde_json::json!({
-            "type": "response",
-            "data": {
-                "messages": [
-                    { "role": "user", "content": "extension-owned string", "timestamp": 1 },
-                    { "role": "custom", "content": "leave me", "timestamp": 2 }
-                ]
-            }
-        });
-        let wire: Value = serde_json::from_str(to_jsonl(&record).trim_end())?;
-        assert_eq!(wire, record);
+        let host = FakeRpcHost::new(FakeConfig::default());
+        let sink = BufferSink::new();
+        let (state, sink_clone, write_rx) = make_state(sink);
+        let writer = tokio::spawn(writer_actor(
+            write_rx,
+            Arc::new(sink_clone.clone()) as Arc<dyn RpcSink>,
+        ));
+        state.rebind(&host).await;
+
+        let event_tx = host
+            .events_tx
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("rebind should install an event subscription");
+        let custom = serde_json::from_value::<SessionEntry>(serde_json::json!({
+            "type": "custom",
+            "customType": "extension-state",
+            "id": "custom-entry",
+            "parentId": null,
+            "timestamp": "2026-01-01T00:00:00Z"
+        }))?;
+        let custom_message = serde_json::from_value::<SessionEntry>(serde_json::json!({
+            "type": "custom_message",
+            "customType": "internal-transcript",
+            "content": "do not publish",
+            "display": true,
+            "id": "custom-message-entry",
+            "parentId": null,
+            "timestamp": "2026-01-01T00:00:01Z"
+        }))?;
+        let standard = serde_json::from_value::<SessionEntry>(serde_json::json!({
+            "type": "thinking_level_change",
+            "thinkingLevel": "high",
+            "id": "thinking-entry",
+            "parentId": null,
+            "timestamp": "2026-01-01T00:00:02Z"
+        }))?;
+        let unknown_custom = SessionEntry::Unknown(serde_json::json!({
+            "type": "custom",
+            "id": "unknown-custom-entry"
+        }));
+        assert!(matches!(&custom, SessionEntry::Custom(_)));
+        assert!(matches!(&custom_message, SessionEntry::CustomMessage(_)));
+        assert!(matches!(&standard, SessionEntry::ThinkingLevelChange(_)));
+        assert!(matches!(&unknown_custom, SessionEntry::Unknown(_)));
+        assert_eq!(unknown_custom.discriminant(), "custom");
+
+        for entry in [custom, custom_message, standard, unknown_custom] {
+            event_tx
+                .send(AgentSessionEvent::EntryAppended { entry })
+                .expect("fake event receiver should remain active");
+        }
+        event_tx
+            .send(AgentSessionEvent::AgentSettled)
+            .expect("fake event receiver should remain active");
+        tokio::time::timeout(std::time::Duration::from_secs(1), state.signal.notified())
+            .await
+            .expect("agent-settled sentinel should pass through the RPC subscriber");
+        state.wait_for_output().await;
+        writer.abort();
+
+        let records = sink_clone
+            .stdout_lines()
+            .into_iter()
+            .map(|line| serde_json::from_str::<Value>(&line))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record["type"].as_str())
+                .collect::<Vec<_>>(),
+            [Some("entry_appended"), Some("agent_settled")]
+        );
+        let entry_records = records
+            .iter()
+            .filter(|record| record["type"] == "entry_appended")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entry_records.len(),
+            1,
+            "only extension custom entries may cross the RPC event stream"
+        );
+        assert_eq!(entry_records[0]["entry"]["type"], "custom");
+        assert_eq!(entry_records[0]["entry"]["id"], "custom-entry");
         Ok(())
     }
 

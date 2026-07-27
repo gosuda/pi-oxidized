@@ -357,14 +357,21 @@ fn append_session_bootstrap_entries(
         return Ok(());
     }
 
-    if !session_manager.get_entries().iter().any(|entry| {
-        matches!(
-            entry,
-            crate::core::sessions::SessionEntry::ThinkingLevelChange(_)
-        )
-    }) {
+    let requested_thinking_level = thinking_level_token(thinking_level);
+    let entries = session_manager.get_entries();
+    let latest_thinking_level =
+        crate::core::sessions::build_session_path(&entries, crate::core::sessions::LeafRef::Last)
+            .into_iter()
+            .rev()
+            .find_map(|entry| match entry {
+                crate::core::sessions::SessionEntry::ThinkingLevelChange(change) => {
+                    Some(change.thinking_level.as_str())
+                }
+                _ => None,
+            });
+    if latest_thinking_level != Some(requested_thinking_level) {
         session_manager
-            .append_thinking_level_change(thinking_level_token(thinking_level))
+            .append_thinking_level_change(requested_thinking_level)
             .map_err(|error| error.to_string())?;
     }
     Ok(())
@@ -1322,6 +1329,88 @@ mod tests {
                 .map(|entry| entry.discriminant())
                 .collect::<Vec<_>>(),
             ["message", "thinking_level_change"]
+        );
+        Ok(())
+    }
+    #[test]
+    fn bootstrap_thinking_level_uses_latest_active_path() -> Result<(), String> {
+        let mut manager = crate::core::sessions::SessionManager::in_memory(Some("/tmp"), None)
+            .map_err(|error| error.to_string())?;
+        let root_id = manager
+            .append_model_change("test", "model")
+            .map_err(|error| error.to_string())?;
+
+        // No persisted level appends the requested value.
+        append_session_bootstrap_entries(&mut manager, None, ModelThinkingLevel::High)?;
+        let first_level_id = manager
+            .get_entries()
+            .last()
+            .and_then(|entry| entry.id())
+            .ok_or_else(|| "bootstrap thinking entry has no id".to_owned())?
+            .to_owned();
+
+        // The latest matching level is already authoritative, so do not duplicate it.
+        append_session_bootstrap_entries(&mut manager, None, ModelThinkingLevel::High)?;
+        assert_eq!(
+            manager
+                .get_entries()
+                .into_iter()
+                .filter_map(|entry| match entry {
+                    crate::core::sessions::SessionEntry::ThinkingLevelChange(change) => {
+                        Some(change.thinking_level.as_str())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            ["high"]
+        );
+
+        // A historical sibling level must not override the active path.
+        manager
+            .branch(&root_id)
+            .map_err(|error| error.to_string())?;
+        manager
+            .append_thinking_level_change("low")
+            .map_err(|error| error.to_string())?;
+        manager
+            .branch(&first_level_id)
+            .map_err(|error| error.to_string())?;
+        manager
+            .append_model_change("test", "continued")
+            .map_err(|error| error.to_string())?;
+        append_session_bootstrap_entries(&mut manager, None, ModelThinkingLevel::High)?;
+        assert_eq!(
+            manager
+                .get_entries()
+                .into_iter()
+                .filter_map(|entry| match entry {
+                    crate::core::sessions::SessionEntry::ThinkingLevelChange(change) => {
+                        Some(change.thinking_level.as_str())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            ["high", "low"]
+        );
+
+        // An older matching value must not mask a newer active-path value.
+        manager
+            .append_thinking_level_change("medium")
+            .map_err(|error| error.to_string())?;
+        append_session_bootstrap_entries(&mut manager, None, ModelThinkingLevel::High)?;
+
+        assert_eq!(
+            manager
+                .get_entries()
+                .into_iter()
+                .filter_map(|entry| match entry {
+                    crate::core::sessions::SessionEntry::ThinkingLevelChange(change) => {
+                        Some(change.thinking_level.as_str())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            ["high", "low", "medium", "high"]
         );
         Ok(())
     }
