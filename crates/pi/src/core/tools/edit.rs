@@ -654,6 +654,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remove_final_crlf_produces_visible_diff() -> Result<(), Box<dyn std::error::Error>> {
+        // A CRLF file whose final newline is removed must surface a visible diff
+        // and a first_changed_line. The diff operates on LF-normalized content,
+        // so the asymmetric terminator becomes a real line change.
+        let dir = tempdir()?;
+        let path = dir.path().join("crlf.txt");
+        tokio::fs::write(&path, "first\r\nsecond\r\n").await?;
+        let tool = EditTool::new(dir.path());
+        let result = tool
+            .execute(
+                "1",
+                json_map(&json!({
+                    "path": "crlf.txt",
+                    "edits": [{"oldText": "second\n", "newText": "second"}]
+                })),
+                CancellationToken::new(),
+                ToolUpdates::noop(),
+            )
+            .await?;
+        // Written bytes keep the CRLF style for the surviving line and drop the
+        // final terminator: "first\r\nsecond".
+        assert_eq!(tokio::fs::read_to_string(&path).await?, "first\r\nsecond");
+        let details = result.details;
+        let diff = details
+            .get("diff")
+            .and_then(Value::as_str)
+            .ok_or("missing diff")?;
+        assert!(!diff.is_empty(), "remove-final-CRLF diff must be visible");
+        assert!(diff.contains("-2 second"));
+        assert!(diff.contains("+2 second"));
+        assert_eq!(
+            details.get("firstChangedLine").and_then(Value::as_u64),
+            Some(2)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn add_final_crlf_produces_visible_diff() -> Result<(), Box<dyn std::error::Error>> {
+        // Adding a final newline to a CRLF file (no trailing terminator) must
+        // surface a visible diff and first_changed_line.
+        let dir = tempdir()?;
+        let path = dir.path().join("crlf-noeol.txt");
+        tokio::fs::write(&path, "first\r\nsecond").await?;
+        let tool = EditTool::new(dir.path());
+        let result = tool
+            .execute(
+                "1",
+                json_map(&json!({
+                    "path": "crlf-noeol.txt",
+                    "edits": [{"oldText": "second", "newText": "second\n"}]
+                })),
+                CancellationToken::new(),
+                ToolUpdates::noop(),
+            )
+            .await?;
+        assert_eq!(
+            tokio::fs::read_to_string(&path).await?,
+            "first\r\nsecond\r\n"
+        );
+        let details = result.details;
+        let diff = details
+            .get("diff")
+            .and_then(Value::as_str)
+            .ok_or("missing diff")?;
+        assert!(!diff.is_empty(), "add-final-CRLF diff must be visible");
+        assert!(diff.contains("-2 second"));
+        assert!(diff.contains("+2 second"));
+        assert_eq!(
+            details.get("firstChangedLine").and_then(Value::as_u64),
+            Some(2)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn fuzzy_punctuation_and_space() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempdir()?;
         let path = dir.path().join("fuzzy.txt");

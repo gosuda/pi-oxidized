@@ -467,16 +467,30 @@ pub fn apply_edits_to_normalized_content(
     })
 }
 
-fn split_lines_keep_trailing_empty(content: &str) -> Vec<&str> {
-    content.split('\n').collect()
+/// Split content into lines that each carry their own trailing `\n` terminator.
+///
+/// The final element includes a trailing `\n` iff `content` ends with `\n`,
+/// so an asymmetric final newline (`"b\n"` vs `"b"`) is a genuine line
+/// difference to the differ rather than a stripped terminal artifact. This
+/// matches `Diff.diffLines`, which keeps the terminator in each part value.
+fn split_lines_keep_terminator(content: &str) -> Vec<&str> {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    for (index, byte) in content.bytes().enumerate() {
+        if byte == b'\n' {
+            lines.push(&content[start..=index]);
+            start = index + 1;
+        }
+    }
+    if start < content.len() {
+        lines.push(&content[start..]);
+    }
+    lines
 }
 
-fn split_patch_lines(content: &str) -> Vec<&str> {
-    if content.is_empty() {
-        Vec::new()
-    } else {
-        content.split_terminator('\n').collect()
-    }
+/// Strip a single trailing `\n` from a line for display.
+fn strip_trailing_newline(line: &str) -> &str {
+    line.strip_suffix('\n').unwrap_or(line)
 }
 
 #[derive(Clone, Debug)]
@@ -500,8 +514,8 @@ impl PatchLine {
 }
 
 fn patch_lines(old_content: &str, new_content: &str) -> Vec<PatchLine> {
-    let old_lines = split_patch_lines(old_content);
-    let new_lines = split_patch_lines(new_content);
+    let old_lines = split_lines_keep_terminator(old_content);
+    let new_lines = split_lines_keep_terminator(new_content);
     let lcs = longest_common_subsequence(&old_lines, &new_lines);
     let mut ops = Vec::new();
     let mut old_index = 0;
@@ -531,22 +545,19 @@ fn patch_lines(old_content: &str, new_content: &str) -> Vec<PatchLine> {
     let mut lines = Vec::new();
     for part in collapse_ops(&ops) {
         match part {
-            DiffPart::Equal(equal) => lines.extend(
-                equal
-                    .into_iter()
-                    .map(|text| PatchLine { prefix: ' ', text }),
-            ),
+            DiffPart::Equal(equal) => lines.extend(equal.into_iter().map(|text| PatchLine {
+                prefix: ' ',
+                text: strip_trailing_newline(&text).to_owned(),
+            })),
             DiffPart::Change { removed, added } => {
-                lines.extend(
-                    removed
-                        .into_iter()
-                        .map(|text| PatchLine { prefix: '-', text }),
-                );
-                lines.extend(
-                    added
-                        .into_iter()
-                        .map(|text| PatchLine { prefix: '+', text }),
-                );
+                lines.extend(removed.into_iter().map(|text| PatchLine {
+                    prefix: '-',
+                    text: strip_trailing_newline(&text).to_owned(),
+                }));
+                lines.extend(added.into_iter().map(|text| PatchLine {
+                    prefix: '+',
+                    text: strip_trailing_newline(&text).to_owned(),
+                }));
             }
         }
     }
@@ -655,23 +666,19 @@ pub fn generate_diff_string(
     new_content: &str,
     context_lines: usize,
 ) -> DiffStringResult {
-    let mut old_lines = split_lines_keep_trailing_empty(old_content);
-    let mut new_lines = split_lines_keep_trailing_empty(new_content);
+    let old_lines = split_lines_keep_terminator(old_content);
+    let new_lines = split_lines_keep_terminator(new_content);
     let line_num_width = old_lines
         .len()
         .max(new_lines.len())
         .max(1)
         .to_string()
         .len();
-    // `diff.diffLines` includes a terminating newline in the preceding part;
-    // its renderer then removes that part's trailing split element. It does
-    // not expose the file terminator as a synthetic equal empty line.
-    if old_content.ends_with('\n') {
-        old_lines.pop();
-    }
-    if new_content.ends_with('\n') {
-        new_lines.pop();
-    }
+    // Lines carry their own `\n` terminator so an asymmetric final newline
+    // (`"b\n"` vs `"b"`) is a real line difference, not a stripped artifact.
+    // The renderer strips the terminator for display; both-terminated content
+    // still produces no synthetic blank context line because every element
+    // ends in `\n` on both sides and matches in the LCS.
     let parts = collapse_ops(&diff_ops(&old_lines, &new_lines));
     render_diff_parts(&parts, context_lines, line_num_width)
 }
@@ -735,8 +742,9 @@ impl DiffRenderState {
         } else {
             self.old_line_num
         };
+        let display = strip_trailing_newline(line);
         self.output
-            .push(format!("{prefix}{line_num:>width$} {line}"));
+            .push(format!("{prefix}{line_num:>width$} {display}"));
     }
 
     fn advance_both(&mut self, count: usize) {
@@ -1231,5 +1239,106 @@ mod tests {
         let result = generate_diff_string("a\nb\nc\n", "a\nB\nc\n", 4);
         assert_eq!(result.first_changed_line, Some(2));
         assert!(result.diff.contains('B'));
+    }
+
+    #[test]
+    fn display_diff_remove_final_lf_is_visible() {
+        // "foo\n" -> "foo": removing the final terminator changes line 1.
+        let result = generate_diff_string("foo\n", "foo", 4);
+        assert!(
+            !result.diff.is_empty(),
+            "remove-final-LF diff must be visible"
+        );
+        assert_eq!(result.diff, "-1 foo\n+1 foo");
+        assert_eq!(result.first_changed_line, Some(1));
+    }
+
+    #[test]
+    fn display_diff_add_final_lf_is_visible() {
+        // "foo" -> "foo\n": adding the final terminator changes line 1.
+        let result = generate_diff_string("foo", "foo\n", 4);
+        assert!(!result.diff.is_empty(), "add-final-LF diff must be visible");
+        assert_eq!(result.diff, "-1 foo\n+1 foo");
+        assert_eq!(result.first_changed_line, Some(1));
+    }
+
+    #[test]
+    fn display_diff_remove_final_lf_multiline_context_preceding() {
+        // "a\nb\n" -> "a\nb": only the final terminator changes; line 1 stays context.
+        let result = generate_diff_string("a\nb\n", "a\nb", 4);
+        assert!(!result.diff.is_empty());
+        assert_eq!(result.diff, " 1 a\n-2 b\n+2 b");
+        assert_eq!(result.first_changed_line, Some(2));
+    }
+
+    #[test]
+    fn display_diff_add_final_lf_multiline_context_preceding() {
+        let result = generate_diff_string("a\nb", "a\nb\n", 4);
+        assert!(!result.diff.is_empty());
+        assert_eq!(result.diff, " 1 a\n-2 b\n+2 b");
+        assert_eq!(result.first_changed_line, Some(2));
+    }
+
+    #[test]
+    fn display_diff_asymmetric_final_newline_with_content_change() {
+        // "a\nb\n" -> "a\nB": both content (b->B) and terminator change on the last line.
+        let result = generate_diff_string("a\nb\n", "a\nB", 4);
+        assert_eq!(result.diff, " 1 a\n-2 b\n+2 B");
+        assert_eq!(result.first_changed_line, Some(2));
+    }
+
+    #[test]
+    fn display_diff_both_terminated_has_no_synthetic_blank_context() {
+        // Symmetric terminated content must not surface the file terminator as a
+        // phantom blank context or change line.
+        let result = generate_diff_string("same\n", "same\n", 4);
+        assert_eq!(result.diff, "");
+        assert_eq!(result.first_changed_line, None);
+    }
+
+    #[test]
+    fn display_diff_both_unterminated_unchanged() {
+        let result = generate_diff_string("same", "same", 4);
+        assert_eq!(result.diff, "");
+        assert_eq!(result.first_changed_line, None);
+    }
+
+    #[test]
+    fn display_diff_empty_to_terminated_line() {
+        let result = generate_diff_string("", "foo\n", 4);
+        assert_eq!(result.diff, "+1 foo");
+        assert_eq!(result.first_changed_line, Some(1));
+    }
+
+    #[test]
+    fn display_diff_terminated_line_to_empty() {
+        let result = generate_diff_string("foo\n", "", 4);
+        assert_eq!(result.diff, "-1 foo");
+        assert_eq!(result.first_changed_line, Some(1));
+    }
+
+    #[test]
+    fn unified_patch_remove_final_lf_is_visible() {
+        // The patch path must not panic on an asymmetric final newline and must
+        // surface the change as a remove/add pair.
+        let patch = generate_unified_patch("a.txt", "foo\n", "foo", 4);
+        assert!(patch.contains("@@ -1,1 +1,1 @@"));
+        assert!(patch.contains("-foo\n"));
+        assert!(patch.contains("+foo\n"));
+    }
+
+    #[test]
+    fn unified_patch_add_final_lf_is_visible() {
+        let patch = generate_unified_patch("a.txt", "foo", "foo\n", 4);
+        assert!(patch.contains("@@ -1,1 +1,1 @@"));
+        assert!(patch.contains("-foo\n"));
+        assert!(patch.contains("+foo\n"));
+    }
+
+    #[test]
+    fn unified_patch_both_terminated_unchanged_emits_no_hunks() {
+        // Symmetric terminated content with no change emits only the headers.
+        let patch = generate_unified_patch("a.txt", "same\n", "same\n", 4);
+        assert_eq!(patch, "--- a.txt\n+++ a.txt\n");
     }
 }
