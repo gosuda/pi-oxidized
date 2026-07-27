@@ -1,15 +1,39 @@
-import { expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { afterAll, expect, test } from "bun:test";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
 	AUTHORITATIVE_RPC_TYPES_PATH,
 	assertFullCoverage,
 	buildScenario,
 	canonicalStringify,
+	createScenarioStepBuilder,
 	deriveRpcCommandTypes,
+	driveBinary,
+	executeScenarioStep,
+	MAX_STDOUT_BUFFER_CHARS,
 	normalizeTranscript,
 	scenarioCommandTypes,
+	type ScenarioState,
+	TranscriptWaiter,
 } from "./rpc-parity.ts";
+
+// Any rejection that escapes the driver's pump/exit observation would have
+// crashed the old implementation; record and assert none occurred.
+const unhandledRejections: unknown[] = [];
+function recordUnhandledRejection(reason: unknown): void {
+	unhandledRejections.push(reason);
+}
+process.on("unhandledRejection", recordUnhandledRejection);
+
+const tempRoots: string[] = [];
+
+afterAll(() => {
+	process.off("unhandledRejection", recordUnhandledRejection);
+	for (const root of tempRoots) rmSync(root, { recursive: true, force: true });
+	expect(unhandledRejections).toEqual([]);
+});
 
 test("derives the authoritative RPC command set from the source-pinned union", () => {
 	const derived = deriveRpcCommandTypes(readFileSync(AUTHORITATIVE_RPC_TYPES_PATH, "utf8"));
@@ -233,3 +257,202 @@ test("normalization keeps cross-references consistent across reordered records",
 	expect(secondB.targetId).toBe("<id-1>");
 	expect(secondB.fromId).toBe("<id-2>");
 });
+
+// ============================================================================
+// Step builder (N12/N13)
+// ============================================================================
+
+test("step builder renumbers downstream ids when a step is inserted", () => {
+	const original = createScenarioStepBuilder();
+	expect([original("get_state", {}), original("compact", {})].map((scenarioStep) => scenarioStep.name)).toEqual([
+		"c01-get_state",
+		"c02-compact",
+	]);
+	const inserted = createScenarioStepBuilder();
+	expect(
+		[inserted("get_state", {}), inserted("abort", {}), inserted("compact", {})].map(
+			(scenarioStep) => scenarioStep.name,
+		),
+	).toEqual(["c01-get_state", "c02-abort", "c03-compact"]);
+});
+
+test("every scenario id is builder-generated, monotonic c01…c41", () => {
+	const scenario = buildScenario();
+	expect(scenario.length).toBe(41);
+	const state: ScenarioState = {
+		workDir: "/tmp/rpc-parity-ids",
+		sessionFile: "/tmp/rpc-parity-ids/session.jsonl",
+		firstEntryId: "entry-1",
+		forkEntryId: "fork-1",
+	};
+	scenario.forEach((scenarioStep, index) => {
+		expect(scenarioStep.name.startsWith(`c${String(index + 1).padStart(2, "0")}-`)).toBe(true);
+		expect(scenarioStep.build(state).id).toBe(scenarioStep.name);
+	});
+	const probe = scenario.find((scenarioStep) => scenarioStep.commandType === undefined);
+	expect(probe?.name).toBe("c40-unknown-probe");
+	expect(probe?.build(state).type).toBe("rpc_parity_probe");
+});
+
+test("a step with both settle and harvest retains and executes both", async () => {
+	const builder = createScenarioStepBuilder();
+	const scenarioStep = builder(
+		"get_state",
+		{},
+		{
+			settle: true,
+			harvest: (response, state) => {
+				const data = response.data as { sessionFile?: string } | undefined;
+				state.sessionFile = data?.sessionFile ?? "harvest-failed";
+			},
+		},
+	);
+	expect(scenarioStep.settle).toBe(true);
+	expect(typeof scenarioStep.harvest).toBe("function");
+
+	const transcript = new TranscriptWaiter();
+	const state: ScenarioState = { workDir: "/tmp/rpc-parity-step" };
+	const sent: unknown[] = [];
+	let completed = false;
+	const running = executeScenarioStep(scenarioStep, state, transcript, (command) => {
+		sent.push(command);
+	}, "fake").then(() => {
+		completed = true;
+	});
+
+	transcript.push({ type: "response", id: "c01-get_state", success: true, data: { sessionFile: "/tmp/session.jsonl" } });
+	// Deterministic microtask drain (no wall-clock wait): the step has no
+	// timers to fire, so if the settle gate were missing it would complete
+	// within these hops.
+	for (let hop = 0; hop < 16; hop++) await Promise.resolve();
+	// The response alone must not complete the step: settle still gates it,
+	// and harvest only runs once the step is fully observed.
+	expect(completed).toBe(false);
+	expect(state.sessionFile).toBeUndefined();
+
+	transcript.push({ type: "agent_settled" });
+	await running;
+	expect(completed).toBe(true);
+	expect(state.sessionFile).toBe("/tmp/session.jsonl");
+	expect(sent).toEqual([{ id: "c01-get_state", type: "get_state" }]);
+});
+
+// ============================================================================
+// TranscriptWaiter failure channel (N02/N03)
+// ============================================================================
+
+test("TranscriptWaiter rejects pending and late waiters with the stored first failure", async () => {
+	const transcript = new TranscriptWaiter();
+	const pending = transcript.waitFor((record) => record.type === "response", 0, 60_000, "response");
+	const first = new Error("pump failed first");
+	transcript.fail(first);
+	transcript.fail(new Error("pump failed second"));
+	await expect(pending).rejects.toBe(first);
+	expect(transcript.failure).toBe(first);
+	// Late waiters reject immediately with the same stored error, even when
+	// a matching record arrived after the failure.
+	transcript.push({ type: "response", id: "c01-late" });
+	await expect(transcript.waitFor((record) => record.type === "response", 0, 60_000, "late")).rejects.toBe(first);
+});
+
+test("TranscriptWaiter timeout removes its waiter; a later failure stays clean", async () => {
+	const transcript = new TranscriptWaiter();
+	await expect(transcript.waitFor(() => true, 0, 1, "never-arrives")).rejects.toThrow(
+		"timed out after 1ms waiting for never-arrives",
+	);
+	// The timed-out waiter is gone: failing now must not double-settle it.
+	const late = new Error("failure after timeout");
+	transcript.fail(late);
+	await expect(transcript.waitFor(() => true, 0, 60_000, "post-failure")).rejects.toBe(late);
+});
+
+test("TranscriptWaiter resolves from the requested index and via the fast path", async () => {
+	const transcript = new TranscriptWaiter();
+	transcript.push({ type: "response", id: "old" });
+	const next = transcript.waitFor((record) => record.type === "response", transcript.records.length, 60_000, "next");
+	transcript.push({ type: "note" });
+	transcript.push({ type: "response", id: "new" });
+	await expect(next).resolves.toBe(2);
+	await expect(transcript.waitFor((record) => record.id === "old", 0, 60_000, "old")).resolves.toBe(0);
+});
+
+// ============================================================================
+// Drive lifecycle against misbehaving children (N02/N03)
+// ============================================================================
+
+// The fixture scripts below run inside the SPAWNED child, not in this test
+// process. Their `Bun.sleep(60_000)` never elapses: it pins the child alive
+// so the observed failure is deterministically the pump's (not a racing
+// child exit); the driver's failure path SIGKILLs the child immediately.
+
+function tempRunRoot(): string {
+	const dir = mkdtempSync(join(tmpdir(), "rpc-parity-fake-"));
+	tempRoots.push(dir);
+	return dir;
+}
+
+async function expectDriveFailure(argv: readonly string[], pattern: RegExp): Promise<{ message: string; runRoot: string }> {
+	const runRoot = tempRunRoot();
+	const startedAt = Date.now();
+	let caught: unknown;
+	try {
+		await driveBinary("fake", argv, runRoot);
+	} catch (error) {
+		caught = error;
+	}
+	const elapsedMs = Date.now() - startedAt;
+	expect(caught).toBeInstanceOf(Error);
+	const message = (caught as Error).message;
+	expect(message).toMatch(pattern);
+	// Prompt failure: nowhere near the 120s step deadline.
+	expect(elapsedMs).toBeLessThan(20_000);
+	return { message, runRoot };
+}
+
+test("early child exit fails the pending waiter promptly with evidence", async () => {
+	const { message, runRoot } = await expectDriveFailure(
+		[process.execPath, "-e", "process.exit(0);"],
+		/exited with code 0 before the scenario completed/,
+	);
+	const partialPath = join(runRoot, "partial-transcript.jsonl");
+	expect(message).toContain(`fake partial transcript: ${partialPath} (0 records)`);
+	expect(message).toContain("fake stderr tail:");
+	expect(existsSync(partialPath)).toBe(true);
+}, 30_000);
+
+test("malformed stdout JSON fails the active waiter and keeps decoded evidence", async () => {
+	const script = [
+		'console.log(JSON.stringify({ type: "response", id: "c01-get_state", success: true, data: {} }));',
+		'console.log("rpc-parity-not-json");',
+		"await Bun.sleep(60_000);",
+	].join(" ");
+	const { message, runRoot } = await expectDriveFailure(
+		[process.execPath, "-e", script],
+		/non-JSON stdout line: "rpc-parity-not-json"/,
+	);
+	expect(message).toContain("(1 records)");
+	expect(readFileSync(join(runRoot, "partial-transcript.jsonl"), "utf8")).toContain("c01-get_state");
+}, 30_000);
+
+test("a non-object stdout JSON value fails the waiter", async () => {
+	await expectDriveFailure(
+		[process.execPath, "-e", 'console.log("42"); await Bun.sleep(60_000);'],
+		/stdout line is not a JSON object/,
+	);
+}, 30_000);
+
+test("an unterminated stdout line beyond 64 KiB fails promptly", async () => {
+	const overflowLength = MAX_STDOUT_BUFFER_CHARS + 4_096;
+	const script = `require("node:fs").writeSync(1, "a".repeat(${overflowLength})); await Bun.sleep(60_000);`;
+	await expectDriveFailure([process.execPath, "-e", script], /stdout unterminated line exceeded 65536 characters/);
+}, 30_000);
+
+test("a truncated stdout tail at EOF fails instead of waiting out the deadline", async () => {
+	// `exec 1>&- 2>&-` closes the real pipe write ends while sh stays alive,
+	// so the pump observes EOF (not a racing child exit) with a non-empty
+	// unterminated tail, and the `sleep` grandchild inherits no pipe that
+	// could delay pump settlement. bun cannot stage this: its runtime holds
+	// a dup of fd 1, so closeSync(1) leaves the pipe open until death.
+	const script = "printf '{\"truncated\":'; exec 1>&- 2>&-; sleep 30";
+	await expectDriveFailure(["sh", "-c", script], /stdout ended with a truncated line/);
+}, 30_000);
