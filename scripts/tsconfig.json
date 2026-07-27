@@ -39,7 +39,7 @@
 	"exclude": [
 		"verification/extension.ts",
 		"verification/foundation.test.ts",
-		"verification/performance.ts",
+		"verification/performance.test.ts",
 		"verification/e2e-smoke.ts",
 		"verification/pty.ts"
 	]

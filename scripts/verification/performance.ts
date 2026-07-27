@@ -836,9 +836,9 @@ async function runFirstFrameSample(
 		const frame = frameObservation(snapshot);
 		if (!frame) throw new HarnessFailure(`first-frame:${implementation}`, "first-frame predicate returned without a frame");
 		const frameCpu = sampler.snapshot();
-		// First-frame sampling ends before input readiness. Product smoke and
-		// streaming checks own `/quit`; finally always reaps this process.
-		await requireCleanExitIfSettled(pty, `first-frame:${implementation}`);
+		// First-frame measurement is complete; require the process to leave
+		// via /quit so the finally kill stays cleanup-only, never success.
+		await terminateAndRequireCleanExit(pty, `first-frame:${implementation}`);
 		return {
 			kind,
 			wallMs: frame.elapsedMs,
