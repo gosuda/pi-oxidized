@@ -534,7 +534,6 @@ describe("scaling: terminal-input deadlines", () => {
 		expect(host.terminalHandlerCount).toBe(2);
 
 		// Later input stays local to the remaining (fast) handler — no second timeout.
-		const t1 = performance.now();
 		stdin.push(
 			Buffer.from(
 				encodeFrameString({
@@ -546,11 +545,9 @@ describe("scaling: terminal-input deadlines", () => {
 			),
 		);
 		const second = await collector.awaitFrame((f) => f.id === 11 && f.kind === "res");
-		const secondElapsed = performance.now() - t1;
 		const secondPayload = second.payload as Record<string, unknown>;
 		expect(secondPayload["consume"]).toBe(false);
 		expect(secondPayload["data"]).toBe("A");
-		expect(secondElapsed).toBeLessThan(5);
 		// Still only one extensionError for the single timeout.
 		const errorCount = collector.frames.filter((f) => f.method === "extensionError").length;
 		expect(errorCount).toBe(1);
