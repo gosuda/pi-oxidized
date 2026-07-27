@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import {
 	chmodSync,
 	mkdirSync,
@@ -6,6 +7,7 @@ import {
 	readFileSync,
 	readdirSync,
 	rmSync,
+	utimesSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -13,7 +15,10 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+	acquireDataDirectoryLock,
+	recoverStaleLock,
 	reconstructProviderData,
+	releaseDataDirectoryLock,
 	type ProviderCatalog,
 	type ReconstructProofContext,
 	type ReconstructProviderDataResult,
@@ -507,4 +512,324 @@ describe("reconstructProviderData default inversion proof path gating (P2)", () 
 			rmSync(fakeBin, { recursive: true, force: true });
 		}
 	}, 120_000);
+});
+
+const LOCK_OWNER_FILE = "owner.json";
+
+type LockFixture = { root: string; dataDir: string; lockDir: string };
+
+function makeLockFixture(): LockFixture {
+	const root = mkdtempSync(join(tmpdir(), "reconstruct-lock-"));
+	const dataDir = join(root, "data");
+	return { root, dataDir, lockDir: `${dataDir}.lock` };
+}
+
+function writeLockOwner(lockDir: string, record: Record<string, unknown>): void {
+	mkdirSync(lockDir, { recursive: true });
+	writeFileSync(join(lockDir, LOCK_OWNER_FILE), `${JSON.stringify(record)}\n`, "utf8");
+}
+
+function readLockOwner(lockDir: string): Record<string, unknown> {
+	return asRecord(JSON.parse(readFileSync(join(lockDir, LOCK_OWNER_FILE), "utf8")));
+}
+
+function lockOwnerRecord(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+	return {
+		version: 1,
+		pid: process.pid,
+		token: crypto.randomUUID(),
+		createdAtMs: Date.now(),
+		phase: "held",
+		...overrides,
+	};
+}
+
+function lockArtifacts(parentDir: string): string[] {
+	return readdirSync(parentDir)
+		.filter((name) => name.startsWith("data.lock"))
+		.sort();
+}
+
+function deadPid(): number {
+	for (let attempt = 0; attempt < 5; attempt += 1) {
+		const child = spawnSync(process.execPath, ["--version"], { stdio: "ignore" });
+		const pid = child.pid;
+		if (typeof pid !== "number") continue;
+		try {
+			process.kill(pid, 0);
+		} catch (error) {
+			if (error instanceof Error && "code" in error && error.code === "ESRCH") return pid;
+		}
+	}
+	throw new Error("failed to obtain a provably dead pid for lock fixtures");
+}
+
+async function captureError(promise: Promise<unknown>): Promise<Error> {
+	try {
+		await promise;
+	} catch (error) {
+		if (error instanceof Error) return error;
+		throw new Error(`expected an Error rejection, got: ${String(error)}`);
+	}
+	throw new Error("expected promise to reject");
+}
+
+// These lock tests exercise the real OS-backed mkdir/rename/stat contention
+// protocol and its wall-clock acquisition bound; fake timers cannot advance
+// the competing filesystem operations or the production retry sleeps.
+describe("reconstruction data-directory lock stale recovery (N16/N21)", () => {
+	test("waiter on a live holder times out at its configured bound with owner diagnostics", async () => {
+		const fx = makeLockFixture();
+		try {
+			const holder = await acquireDataDirectoryLock(fx.dataDir, 5_000);
+			expect(holder.lockDir).toBe(fx.lockDir);
+			expect(holder.token.length).toBeGreaterThan(0);
+			expect(readLockOwner(fx.lockDir).phase).toBe("held");
+
+			const startedAt = Date.now();
+			const error = await captureError(acquireDataDirectoryLock(fx.dataDir, 200));
+			const waitedMs = Date.now() - startedAt;
+			expect(error.message).toContain("timed out acquiring reconstruction lock");
+			expect(error.message).toContain("(bound 200ms)");
+			expect(error.message).toContain(`live owner pid ${process.pid}`);
+			expect(waitedMs).toBeGreaterThanOrEqual(180);
+			expect(waitedMs).toBeLessThan(5_000);
+			// The live holder was never reaped while the waiter spun.
+			expect(readLockOwner(fx.lockDir).token).toBe(holder.token);
+
+			await releaseDataDirectoryLock(holder);
+			expect(lockArtifacts(fx.root)).toEqual([]);
+		} finally {
+			rmSync(fx.root, { recursive: true, force: true });
+		}
+	});
+
+	test("a live owner is never reaped merely because its lock is old", async () => {
+		const fx = makeLockFixture();
+		try {
+			const ancientMs = Date.now() - 3_600_000;
+			const liveToken = crypto.randomUUID();
+			writeLockOwner(fx.lockDir, lockOwnerRecord({ token: liveToken, createdAtMs: ancientMs }));
+			const past = new Date(ancientMs);
+			utimesSync(fx.lockDir, past, past);
+
+			const error = await captureError(acquireDataDirectoryLock(fx.dataDir, 200));
+			expect(error.message).toContain(`live owner pid ${process.pid}`);
+			// Old but alive: the canonical lock is untouched and never quarantined.
+			expect(lockArtifacts(fx.root)).toEqual(["data.lock"]);
+			expect(readLockOwner(fx.lockDir).token).toBe(liveToken);
+		} finally {
+			rmSync(fx.root, { recursive: true, force: true });
+		}
+	});
+
+	test("reconstructProviderData bounds its lock wait via lockAcquireTimeoutMs and validates it", async () => {
+		const catalog: ProviderCatalog = { alpha: { model: { id: "model" } } };
+		const fixture = makeFixture(catalog);
+		try {
+			const holder = await acquireDataDirectoryLock(fixture.dataDir, 5_000);
+			try {
+				await expect(
+					reconstructProviderData({
+						repoRoot: fixture.root,
+						catalogPath: fixture.catalogPath,
+						providersDir: fixture.providersDir,
+						dataDir: fixture.dataDir,
+						inversionProof: noopProof,
+						lockAcquireTimeoutMs: 150,
+					}),
+				).rejects.toThrow("timed out acquiring reconstruction lock");
+			} finally {
+				await releaseDataDirectoryLock(holder);
+			}
+
+			for (const bad of [0, -1, 2.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+				await expect(
+					reconstructProviderData({
+						repoRoot: fixture.root,
+						catalogPath: fixture.catalogPath,
+						providersDir: fixture.providersDir,
+						dataDir: fixture.dataDir,
+						inversionProof: noopProof,
+						lockAcquireTimeoutMs: bad,
+					}),
+				).rejects.toThrow("lockAcquireTimeoutMs must be a finite positive integer");
+			}
+		} finally {
+			rmSync(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	test("a valid dead-owner lock is recovered and reconstruction completes", async () => {
+		const catalog: ProviderCatalog = { alpha: { model: { id: "model", v: 1 } } };
+		const fixture = makeFixture(catalog);
+		try {
+			writeLockOwner(
+				`${fixture.dataDir}.lock`,
+				lockOwnerRecord({ pid: deadPid(), createdAtMs: Date.now() - 60_000 }),
+			);
+
+			const result = await reconstructProviderData({
+				repoRoot: fixture.root,
+				catalogPath: fixture.catalogPath,
+				providersDir: fixture.providersDir,
+				dataDir: fixture.dataDir,
+				inversionProof: noopProof,
+				lockAcquireTimeoutMs: 3_000,
+			});
+
+			expect(result.written).toBe(1);
+			expect(readdirSync(fixture.dataDir)).toEqual(["alpha.json"]);
+			expect(lockArtifacts(fixture.providersDir)).toEqual([]);
+			expect(siblingArtifacts(fixture.providersDir)).toEqual([]);
+		} finally {
+			rmSync(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	test("two simultaneous stale reapers yield exactly one held critical section", async () => {
+		const fx = makeLockFixture();
+		try {
+			writeLockOwner(
+				fx.lockDir,
+				lockOwnerRecord({ pid: deadPid(), createdAtMs: Date.now() - 60_000 }),
+			);
+			let held = 0;
+			let maxConcurrent = 0;
+			let sections = 0;
+			const contend = async (): Promise<void> => {
+				const handle = await acquireDataDirectoryLock(fx.dataDir, 5_000);
+				held += 1;
+				sections += 1;
+				maxConcurrent = Math.max(maxConcurrent, held);
+				// Real hold window: gives the rival reaper wall-clock time to
+				// (incorrectly) acquire concurrently; fake timers cannot advance
+				// its OS-backed polling loop.
+				await Bun.sleep(25);
+				held -= 1;
+				await releaseDataDirectoryLock(handle);
+			};
+
+			await Promise.all([contend(), contend()]);
+
+			expect(maxConcurrent).toBe(1);
+			expect(sections).toBe(2);
+			expect(lockArtifacts(fx.root)).toEqual([]);
+		} finally {
+			rmSync(fx.root, { recursive: true, force: true });
+		}
+	});
+
+	test("injected A→B ABA swap never deletes the live replacement and blocks claimants until release", async () => {
+		const fx = makeLockFixture();
+		try {
+			const staleTokenA = crypto.randomUUID();
+			const liveTokenB = crypto.randomUUID();
+			// The reaper observed stale token A; before its rename that owner
+			// vanished and live owner B acquired the canonical path.
+			writeLockOwner(fx.lockDir, lockOwnerRecord({ token: liveTokenB }));
+
+			const recovered = await recoverStaleLock(fx.dataDir, staleTokenA);
+			expect(recovered).toBe(false);
+
+			const artifacts = lockArtifacts(fx.root);
+			expect(artifacts).toHaveLength(1);
+			const quarantineName = artifacts[0] ?? "";
+			expect(quarantineName.startsWith("data.lock.reap-")).toBe(true);
+			const quarantineDir = join(fx.root, quarantineName);
+			expect(readLockOwner(quarantineDir).token).toBe(liveTokenB);
+
+			// No third claimant becomes held while B sits in quarantine.
+			const error = await captureError(acquireDataDirectoryLock(fx.dataDir, 250));
+			expect(error.message).toContain("timed out acquiring reconstruction lock");
+			expect(readLockOwner(quarantineDir).token).toBe(liveTokenB);
+			// The failed claimant withdrew its provisional canonical directory.
+			expect(lockArtifacts(fx.root)).toEqual([quarantineName]);
+
+			// B's token-verified release removes its quarantined directory...
+			await releaseDataDirectoryLock({ lockDir: fx.lockDir, token: liveTokenB });
+			expect(lockArtifacts(fx.root)).toEqual([]);
+
+			// ...which lifts the barrier for the next claimant.
+			const successor = await acquireDataDirectoryLock(fx.dataDir, 1_000);
+			await releaseDataDirectoryLock(successor);
+			expect(lockArtifacts(fx.root)).toEqual([]);
+		} finally {
+			rmSync(fx.root, { recursive: true, force: true });
+		}
+	});
+
+	test("a reaped owner's delayed release cannot delete the successor's lock", async () => {
+		const fx = makeLockFixture();
+		try {
+			const old = await acquireDataDirectoryLock(fx.dataDir, 1_000);
+			// The old owner "dies" without releasing: same token, dead pid.
+			writeLockOwner(
+				fx.lockDir,
+				lockOwnerRecord({ token: old.token, pid: deadPid(), createdAtMs: Date.now() - 60_000 }),
+			);
+
+			const successor = await acquireDataDirectoryLock(fx.dataDir, 3_000);
+			expect(successor.token).not.toBe(old.token);
+
+			// Delayed finally from the reaped owner: tokens differ, nothing removed.
+			await releaseDataDirectoryLock(old);
+			expect(readLockOwner(fx.lockDir).token).toBe(successor.token);
+			expect(readLockOwner(fx.lockDir).phase).toBe("held");
+
+			await releaseDataDirectoryLock(successor);
+			expect(lockArtifacts(fx.root)).toEqual([]);
+		} finally {
+			rmSync(fx.root, { recursive: true, force: true });
+		}
+	});
+
+	test("invalid metadata inside the initializing grace is waited on, never reaped", async () => {
+		const fx = makeLockFixture();
+		try {
+			mkdirSync(fx.lockDir);
+			writeFileSync(join(fx.lockDir, LOCK_OWNER_FILE), "{not json", "utf8");
+
+			const error = await captureError(acquireDataDirectoryLock(fx.dataDir, 250));
+			expect(error.message).toContain("timed out acquiring reconstruction lock");
+			expect(error.message).toContain("treated as initializing");
+			expect(readFileSync(join(fx.lockDir, LOCK_OWNER_FILE), "utf8")).toBe("{not json");
+			expect(lockArtifacts(fx.root)).toEqual(["data.lock"]);
+		} finally {
+			rmSync(fx.root, { recursive: true, force: true });
+		}
+	});
+
+	test("an abandoned lock with unwritten metadata is recovered after the grace", async () => {
+		const fx = makeLockFixture();
+		try {
+			mkdirSync(fx.lockDir); // owner metadata never written
+			const past = new Date(Date.now() - 60_000);
+			utimesSync(fx.lockDir, past, past);
+
+			const handle = await acquireDataDirectoryLock(fx.dataDir, 2_000);
+			expect(readLockOwner(fx.lockDir).token).toBe(handle.token);
+			expect(readLockOwner(fx.lockDir).phase).toBe("held");
+			await releaseDataDirectoryLock(handle);
+			expect(lockArtifacts(fx.root)).toEqual([]);
+		} finally {
+			rmSync(fx.root, { recursive: true, force: true });
+		}
+	});
+
+	test("an orphaned dead quarantine is swept so acquisition proceeds", async () => {
+		const fx = makeLockFixture();
+		try {
+			writeLockOwner(
+				`${fx.lockDir}.reap-${crypto.randomUUID()}`,
+				lockOwnerRecord({ pid: deadPid(), createdAtMs: Date.now() - 60_000 }),
+			);
+
+			const handle = await acquireDataDirectoryLock(fx.dataDir, 2_000);
+			await releaseDataDirectoryLock(handle);
+			expect(lockArtifacts(fx.root)).toEqual([]);
+		} finally {
+			rmSync(fx.root, { recursive: true, force: true });
+		}
+	});
 });

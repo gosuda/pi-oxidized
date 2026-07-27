@@ -14,8 +14,17 @@
  * previous live tree (if any) is retained as a unique sibling backup until the
  * inversion proof succeeds.
  */
-import { access, mkdir, readdir, rename, rm, writeFile } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import {
+	access,
+	mkdir,
+	readdir,
+	readFile,
+	rename,
+	rm,
+	stat,
+	writeFile,
+} from "node:fs/promises";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -26,6 +35,10 @@ const DEFAULT_PROVIDERS_DIR = join(
 );
 const DEFAULT_DATA_DIR = join(DEFAULT_PROVIDERS_DIR, "data");
 const DATA_DIRECTORY_LOCK_RETRY_MS = 10;
+const DEFAULT_LOCK_ACQUIRE_TIMEOUT_MS = 10_000;
+const LOCK_INITIALIZING_GRACE_MS = 30_000;
+const LOCK_OWNER_FILE = "owner.json";
+const LOCK_OWNER_VERSION = 1;
 type FileSystemError = Error & { code?: string };
 
 export type ProviderCatalog = Record<string, Record<string, unknown>>;
@@ -52,6 +65,13 @@ export type ReconstructProviderDataOptions = {
 	 * stale backup. Tests may inject a failing cleanup through this public seam.
 	 */
 	removeBackup?: (backupDir: string) => Promise<void>;
+	/**
+	 * Bounded lock acquisition: total milliseconds to wait for the data
+	 * directory lock before failing with owner/bounded-wait diagnostics. Must
+	 * be a finite positive integer; defaults to 10_000. A live lock owner is
+	 * never reaped — waiters simply time out at this bound.
+	 */
+	lockAcquireTimeoutMs?: number;
 };
 
 export type ReconstructProofContext = {
@@ -65,6 +85,16 @@ export type ReconstructProviderDataResult = {
 	written: number;
 	providers: string[];
 	dataDir: string;
+};
+
+/**
+ * Ownership handle for the reconstruction data-directory lock. `token` is the
+ * acquisition's private random identity; release removes only directories
+ * whose stored owner metadata still carries this exact token.
+ */
+export type DataDirectoryLockHandle = {
+	lockDir: string;
+	token: string;
 };
 
 function sortDeep(value: unknown): unknown {
@@ -99,29 +129,307 @@ function uniqueSibling(dataDir: string, kind: "staging" | "backup"): string {
 }
 
 
-async function acquireDataDirectoryLock(dataDir: string): Promise<string> {
-	const lockDir = `${dataDir}.lock`;
-	for (;;) {
-		try {
-			await mkdir(lockDir);
-			return lockDir;
-		} catch (error) {
-			const errorCode = error instanceof Error ? (error as FileSystemError).code : undefined;
-			if (errorCode !== "EEXIST") {
-				const detail = error instanceof Error ? error.message : String(error);
-				throw new Error(`failed to acquire reconstruction lock ${lockDir}: ${detail}`);
-			}
-			await Bun.sleep(DATA_DIRECTORY_LOCK_RETRY_MS);
-		}
+type LockOwnerRecord = {
+	version: typeof LOCK_OWNER_VERSION;
+	pid: number;
+	token: string;
+	createdAtMs: number;
+	phase: "initializing" | "held";
+};
+
+type LockContention =
+	| { kind: "retry" }
+	| { kind: "wait"; detail: string }
+	| { kind: "stale"; observedToken: string | null; detail: string };
+
+function errorCode(error: unknown): string | undefined {
+	return error instanceof Error ? (error as FileSystemError).code : undefined;
+}
+
+function errorDetail(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+/** ESRCH alone proves death; success or EPERM (or anything else) counts as live. */
+function isProcessAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return errorCode(error) !== "ESRCH";
 	}
 }
 
-async function releaseDataDirectoryLock(lockDir: string): Promise<void> {
+/**
+ * Strictly parse a versioned lock owner record. Anything short of the exact
+ * shape is invalid and is treated as still-initializing metadata; parsed
+ * values are identity only and never supply filesystem paths.
+ */
+function parseLockOwnerRecord(raw: string): LockOwnerRecord | null {
+	let value: unknown;
 	try {
-		await rm(lockDir, { recursive: true, force: false });
+		value = JSON.parse(raw);
+	} catch {
+		return null;
+	}
+	if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+	const candidate = value as Record<string, unknown>;
+	if (Object.keys(candidate).sort().join(",") !== "createdAtMs,phase,pid,token,version") {
+		return null;
+	}
+	const { version, pid, token, createdAtMs, phase } = candidate;
+	if (version !== LOCK_OWNER_VERSION) return null;
+	if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0) return null;
+	if (typeof token !== "string" || token.length === 0) return null;
+	if (typeof createdAtMs !== "number" || !Number.isFinite(createdAtMs) || createdAtMs < 0) {
+		return null;
+	}
+	if (phase !== "initializing" && phase !== "held") return null;
+	return { version: LOCK_OWNER_VERSION, pid, token, createdAtMs, phase };
+}
+
+async function readLockOwnerRecord(dir: string): Promise<LockOwnerRecord | null> {
+	let raw: string;
+	try {
+		raw = await readFile(join(dir, LOCK_OWNER_FILE), "utf8");
+	} catch {
+		return null;
+	}
+	return parseLockOwnerRecord(raw);
+}
+
+/** Atomic within the lock directory: temp write, then same-directory rename. */
+async function writeLockOwnerRecord(dir: string, record: LockOwnerRecord): Promise<void> {
+	const target = join(dir, LOCK_OWNER_FILE);
+	const temp = `${target}.${record.token}.tmp`;
+	await writeFile(temp, `${JSON.stringify(record)}\n`, "utf8");
+	await rename(temp, target);
+}
+
+/** Quarantine sibling paths, derived from the canonical lock path by listing. */
+async function listQuarantineDirs(lockDir: string): Promise<string[]> {
+	const parent = dirname(lockDir);
+	const prefix = `${basename(lockDir)}.reap-`;
+	let names: string[];
+	try {
+		names = await readdir(parent);
+	} catch {
+		return [];
+	}
+	return names
+		.filter((name) => name.startsWith(prefix))
+		.sort()
+		.map((name) => join(parent, name));
+}
+
+/**
+ * Remove quarantined lock directories whose owner is provably gone: a valid
+ * record with a dead pid, or invalid metadata older than the initializing
+ * grace. A quarantine with a live owner is left untouched — it is the barrier
+ * that keeps claimants provisional until that owner releases it.
+ */
+async function sweepDeadQuarantines(lockDir: string): Promise<void> {
+	for (const quarantineDir of await listQuarantineDirs(lockDir)) {
+		const record = await readLockOwnerRecord(quarantineDir);
+		if (record === null) {
+			let mtimeMs: number;
+			try {
+				mtimeMs = (await stat(quarantineDir)).mtimeMs;
+			} catch {
+				continue;
+			}
+			if (Date.now() - mtimeMs < LOCK_INITIALIZING_GRACE_MS) continue;
+		} else if (isProcessAlive(record.pid)) {
+			continue;
+		}
+		await rm(quarantineDir, { recursive: true, force: true });
+	}
+}
+
+/**
+ * Remove only directories whose stored owner token is exactly `token`, at the
+ * canonical path or in any quarantine. A missing directory or a different
+ * token means ownership was lost; that is never an instruction to remove
+ * another owner's directory.
+ */
+async function removeOwnedLockDirectories(lockDir: string, token: string): Promise<void> {
+	for (const dir of [lockDir, ...(await listQuarantineDirs(lockDir))]) {
+		const record = await readLockOwnerRecord(dir);
+		if (record === null || record.token !== token) continue;
+		await rm(dir, { recursive: true, force: true });
+	}
+}
+
+async function confirmProvisionalOwnership(lockDir: string, token: string): Promise<boolean> {
+	if ((await listQuarantineDirs(lockDir)).length > 0) return false;
+	const canonical = await readLockOwnerRecord(lockDir);
+	return canonical !== null && canonical.token === token;
+}
+
+/**
+ * Complete a provisional claim on a freshly created lock directory. The
+ * acquirer stays `initializing` until it proves that no reaper quarantine
+ * exists and that the canonical metadata still carries its exact token; only
+ * then does it promote to `held`, re-verify, and return ownership. Any failed
+ * check withdraws the exact-token directories and reports the claim as lost,
+ * closing the observe→rename ABA window from the claimant's side.
+ */
+async function claimLockDirectory(lockDir: string, token: string): Promise<boolean> {
+	const record: LockOwnerRecord = {
+		version: LOCK_OWNER_VERSION,
+		pid: process.pid,
+		token,
+		createdAtMs: Date.now(),
+		phase: "initializing",
+	};
+	try {
+		await writeLockOwnerRecord(lockDir, record);
+		if (!(await confirmProvisionalOwnership(lockDir, token))) {
+			await removeOwnedLockDirectories(lockDir, token);
+			return false;
+		}
+		await writeLockOwnerRecord(lockDir, { ...record, phase: "held" });
+		if (!(await confirmProvisionalOwnership(lockDir, token))) {
+			await removeOwnedLockDirectories(lockDir, token);
+			return false;
+		}
+		return true;
 	} catch (error) {
-		const detail = error instanceof Error ? error.message : String(error);
-		throw new Error(`failed to release reconstruction lock ${lockDir}: ${detail}`);
+		await removeOwnedLockDirectories(lockDir, token).catch(() => undefined);
+		if (errorCode(error) === "ENOENT") return false;
+		throw new Error(`failed to claim reconstruction lock ${lockDir}: ${errorDetail(error)}`);
+	}
+}
+
+async function inspectLockOwner(lockDir: string): Promise<LockContention> {
+	let mtimeMs: number;
+	try {
+		mtimeMs = (await stat(lockDir)).mtimeMs;
+	} catch (error) {
+		if (errorCode(error) === "ENOENT") return { kind: "retry" };
+		throw new Error(`failed to inspect reconstruction lock ${lockDir}: ${errorDetail(error)}`);
+	}
+	const record = await readLockOwnerRecord(lockDir);
+	if (record === null) {
+		const ageMs = Math.max(0, Math.round(Date.now() - mtimeMs));
+		if (ageMs < LOCK_INITIALIZING_GRACE_MS) {
+			return {
+				kind: "wait",
+				detail: `owner metadata is missing or invalid (age ${ageMs}ms); treated as initializing within the ${LOCK_INITIALIZING_GRACE_MS}ms grace`,
+			};
+		}
+		return {
+			kind: "stale",
+			observedToken: null,
+			detail: `abandoned lock without valid owner metadata (age ${ageMs}ms)`,
+		};
+	}
+	if (isProcessAlive(record.pid)) {
+		return {
+			kind: "wait",
+			detail: `live owner pid ${record.pid} (phase ${record.phase}); a live owner is never reaped`,
+		};
+	}
+	return {
+		kind: "stale",
+		observedToken: record.token,
+		detail: `dead owner pid ${record.pid} (phase ${record.phase})`,
+	};
+}
+
+/**
+ * Race-safe takeover of a lock previously observed stale. The canonical
+ * directory is atomically renamed to a unique same-directory quarantine and
+ * its metadata re-read afterwards; it is deleted only when that post-rename
+ * identity still matches the observed token (`null` = observed invalid).
+ * Between observation and rename the old owner may have released and a live
+ * replacement acquired the canonical path (ABA); a mismatched quarantine is
+ * therefore never deleted here — its owner's token-verified release (or the
+ * dead-owner sweep) removes it, and until then it blocks every provisional
+ * claimant from becoming held.
+ */
+export async function recoverStaleLock(
+	dataDir: string,
+	observedToken: string | null,
+): Promise<boolean> {
+	const lockDir = `${dataDir}.lock`;
+	const quarantineDir = `${lockDir}.reap-${crypto.randomUUID()}`;
+	try {
+		await rename(lockDir, quarantineDir);
+	} catch (error) {
+		if (errorCode(error) === "ENOENT") return false;
+		throw new Error(
+			`failed to quarantine stale reconstruction lock ${lockDir}: ${errorDetail(error)}`,
+		);
+	}
+	const record = await readLockOwnerRecord(quarantineDir);
+	const sameIdentity =
+		observedToken === null ? record === null : record !== null && record.token === observedToken;
+	if (!sameIdentity) return false;
+	await rm(quarantineDir, { recursive: true, force: true });
+	return true;
+}
+
+/**
+ * Acquire the reconstruction lock for `dataDir` within a bounded wait. Owners
+ * store versioned metadata; a live owner pid is never reaped no matter how
+ * old, while dead-owner and abandoned-invalid locks are recovered through the
+ * quarantine protocol in {@link recoverStaleLock}.
+ */
+export async function acquireDataDirectoryLock(
+	dataDir: string,
+	lockAcquireTimeoutMs: number,
+): Promise<DataDirectoryLockHandle> {
+	const lockDir = `${dataDir}.lock`;
+	const token = crypto.randomUUID();
+	const startedAtMs = Date.now();
+	let contention = "lock directory already exists";
+	for (;;) {
+		await sweepDeadQuarantines(lockDir);
+		let created = false;
+		try {
+			await mkdir(lockDir);
+			created = true;
+		} catch (error) {
+			if (errorCode(error) !== "EEXIST") {
+				throw new Error(`failed to acquire reconstruction lock ${lockDir}: ${errorDetail(error)}`);
+			}
+		}
+		if (created) {
+			if (await claimLockDirectory(lockDir, token)) return { lockDir, token };
+			contention =
+				"withdrew provisional claim: an active quarantine or lost canonical ownership forced a retry";
+		} else {
+			const inspection = await inspectLockOwner(lockDir);
+			if (inspection.kind === "stale") {
+				contention = `recovering stale lock: ${inspection.detail}`;
+				await recoverStaleLock(dataDir, inspection.observedToken);
+			} else if (inspection.kind === "wait") {
+				contention = inspection.detail;
+			}
+		}
+		const elapsedMs = Date.now() - startedAtMs;
+		if (elapsedMs >= lockAcquireTimeoutMs) {
+			throw new Error(
+				`timed out acquiring reconstruction lock ${lockDir} after ${elapsedMs}ms (bound ${lockAcquireTimeoutMs}ms); ${contention}`,
+			);
+		}
+		await Bun.sleep(DATA_DIRECTORY_LOCK_RETRY_MS);
+	}
+}
+
+/**
+ * Release only directories that still carry this handle's exact token — the
+ * canonical lock directory and any quarantine that captured it. ENOENT or a
+ * different token means ownership was lost and removes nothing.
+ */
+export async function releaseDataDirectoryLock(handle: DataDirectoryLockHandle): Promise<void> {
+	try {
+		await removeOwnedLockDirectories(handle.lockDir, handle.token);
+	} catch (error) {
+		throw new Error(
+			`failed to release reconstruction lock ${handle.lockDir}: ${errorDetail(error)}`,
+		);
 	}
 }
 
@@ -249,8 +557,10 @@ async function defaultInversionProof(ctx: ReconstructProofContext): Promise<void
  * Reconstruct provider data JSONs transactionally.
  *
  * Never writes directly into the live data directory: candidates are staged,
- * validated, published by rename, then inversion-proved while a sibling lock
- * serializes every observation and mutation of that data directory. Successful
+ * validated, published by rename, then inversion-proved while a token-owned
+ * sibling lock serializes every observation and mutation of that data
+ * directory (dead or abandoned owners are recovered race-safely; live owners
+ * are only ever waited on, bounded by `lockAcquireTimeoutMs`). Successful
  * `inversionProof` is the commit point. On proof or rename failure the previous
  * live tree is restored byte-for-byte (or removed when it was initially absent)
  * and staging/backup siblings are cleaned up. After commit, backup cleanup
@@ -279,6 +589,12 @@ export async function reconstructProviderData(
 		inversionProof = defaultInversionProof;
 	}
 	const removeBackup = options.removeBackup ?? removeIfExists;
+	const lockAcquireTimeoutMs = options.lockAcquireTimeoutMs ?? DEFAULT_LOCK_ACQUIRE_TIMEOUT_MS;
+	if (!Number.isInteger(lockAcquireTimeoutMs) || lockAcquireTimeoutMs <= 0) {
+		throw new Error(
+			`lockAcquireTimeoutMs must be a finite positive integer of milliseconds; received ${String(options.lockAcquireTimeoutMs)}`,
+		);
+	}
 
 	const catalog = (await Bun.file(catalogPath).json()) as ProviderCatalog;
 	if (catalog === null || typeof catalog !== "object" || Array.isArray(catalog)) {
@@ -301,7 +617,7 @@ export async function reconstructProviderData(
 		expectedBodies.set(provider, encodeProviderModels(models));
 	}
 
-	const lockDir = await acquireDataDirectoryLock(dataDir);
+	const lock = await acquireDataDirectoryLock(dataDir, lockAcquireTimeoutMs);
 	try {
 		const hadLive = await pathExists(dataDir);
 		const stagingDir = uniqueSibling(dataDir, "staging");
@@ -400,7 +716,9 @@ export async function reconstructProviderData(
 			dataDir,
 		};
 	} finally {
-		await releaseDataDirectoryLock(lockDir);
+		// Token-verified release: runs even after publish/proof/cleanup failures
+		// above and removes only directories still owned by this acquisition.
+		await releaseDataDirectoryLock(lock);
 	}
 }
 
