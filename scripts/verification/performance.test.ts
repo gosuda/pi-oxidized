@@ -6,11 +6,11 @@ import {
 	assertPinnedBuildScriptContracts,
 	buildProducts,
 	HarnessFailure,
+	loadPinnedBuildScriptManifests,
 	referenceBuildCommands,
 	requireCleanExitIfSettled,
 	terminateAndRequireCleanExit,
 } from "./performance.ts";
-import type { PinnedBuildScriptManifests } from "./performance.ts";
 import { spawnPty } from "./pty.ts";
 import type { PtySnapshot } from "./pty.ts";
 
@@ -41,21 +41,10 @@ function temporaryDirectory(prefix: string): string {
 	return path;
 }
 
-function pinnedBuildScriptManifests(): PinnedBuildScriptManifests {
-	const packages = ["tui", "ai", "agent", "coding-agent"] as const;
-	return Object.fromEntries(
-		packages.map((name) => [
-			name,
-			JSON.parse(
-				readFileSync(resolve(import.meta.dirname, "../../.references/pi/packages", name, "package.json"), "utf8"),
-			),
-		]),
-	) as PinnedBuildScriptManifests;
-}
 
 describe("pinned reference build contract", () => {
 	test("accepts the current pinned manifests", () => {
-		expect(() => assertPinnedBuildScriptContracts(pinnedBuildScriptManifests())).not.toThrow();
+		expect(() => assertPinnedBuildScriptContracts(loadPinnedBuildScriptManifests())).not.toThrow();
 	});
 
 	test("keeps generate-models out of the hand-expanded command plan", () => {
@@ -73,7 +62,7 @@ describe("pinned reference build contract", () => {
 		["coding-agent", "copy-binary-assets"],
 	] as const) {
 		test(`rejects drift in ${packageName} scripts.${script}`, () => {
-			const manifests = pinnedBuildScriptManifests();
+			const manifests = loadPinnedBuildScriptManifests();
 			const manifest = manifests[packageName] as { scripts: Record<string, string> };
 			manifest.scripts[script] = `${manifest.scripts[script]} && echo drift`;
 			expect(() => assertPinnedBuildScriptContracts(manifests)).toThrow(/reference build contract/);
@@ -81,7 +70,7 @@ describe("pinned reference build contract", () => {
 	}
 
 	test("rejects manifest drift before executing a build command", async () => {
-		const manifests = pinnedBuildScriptManifests();
+		const manifests = loadPinnedBuildScriptManifests();
 		const manifest = manifests.ai as { scripts: Record<string, string> };
 		manifest.scripts.build = `${manifest.scripts.build} && echo drift`;
 		let commandCount = 0;

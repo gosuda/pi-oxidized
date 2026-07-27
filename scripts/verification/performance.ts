@@ -354,7 +354,7 @@ export function assertPinnedBuildScriptContracts(manifests: PinnedBuildScriptMan
 	}
 }
 
-function loadPinnedBuildScriptManifests(): PinnedBuildScriptManifests {
+export function loadPinnedBuildScriptManifests(): PinnedBuildScriptManifests {
 	const manifests = {} as Record<PinnedReferencePackageName, unknown>;
 	for (const packageName of PINNED_REFERENCE_PACKAGE_NAMES) {
 		const path = resolve(REPOSITORY_ROOT, PINNED_REFERENCE_PACKAGE_PATHS[packageName]);
