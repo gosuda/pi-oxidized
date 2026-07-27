@@ -38,12 +38,15 @@ import {
 
 const EXTENSION_HOST_PACKAGE = resolve(process.cwd(), "packages", "extension-host");
 
+interface FrameWaiter {
+	predicate: (frame: Frame) => boolean;
+	resolve: (frame: Frame) => void;
+	timer: NodeJS.Timeout;
+}
+
 class FrameCollector {
 	readonly frames: Frame[] = [];
-	private readonly waiters: Array<{
-		predicate: (f: Frame) => boolean;
-		resolve: (f: Frame) => void;
-	}> = [];
+	private readonly waiters: FrameWaiter[] = [];
 	private buf = "";
 
 	write(chunk: Uint8Array): void {
@@ -57,8 +60,8 @@ class FrameCollector {
 			for (let i = this.waiters.length - 1; i >= 0; i--) {
 				const waiter = this.waiters[i];
 				if (waiter !== undefined && waiter.predicate(frame)) {
-					waiter.resolve(frame);
 					this.waiters.splice(i, 1);
+					waiter.resolve(frame);
 				}
 			}
 		}
@@ -68,16 +71,23 @@ class FrameCollector {
 		const existing = this.frames.find(predicate);
 		if (existing !== undefined) return Promise.resolve(existing);
 		const { promise, resolve, reject } = Promise.withResolvers<Frame>();
+		let waiter: FrameWaiter | undefined;
 		const timer = setTimeout(() => {
+			if (waiter === undefined) return;
+			const index = this.waiters.indexOf(waiter);
+			if (index === -1) return;
+			this.waiters.splice(index, 1);
 			reject(new Error(`awaitFrame timed out after ${timeoutMs}ms`));
 		}, timeoutMs);
-		this.waiters.push({
+		waiter = {
 			predicate,
 			resolve: (frame) => {
 				clearTimeout(timer);
 				resolve(frame);
 			},
-		});
+			timer,
+		};
+		this.waiters.push(waiter);
 		return promise;
 	}
 }

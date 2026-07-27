@@ -8,7 +8,7 @@
  *   the original key, and keeps later input local.
  * - active widget bursts remain bounded, drop stale generations, stay responsive.
  */
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, vi } from "bun:test";
 import { Readable } from "node:stream";
 import {
 	PROTOCOL_VERSION,
@@ -27,12 +27,15 @@ import widgetActiveFactory from "../fixtures/extensions/widget-active.ts";
 import terminalInputFastFactory from "../fixtures/extensions/terminal-input-fast.ts";
 import terminalInputSlowFactory from "../fixtures/extensions/terminal-input-slow.ts";
 
+interface FrameWaiter {
+	predicate: (frame: Frame) => boolean;
+	resolve: (frame: Frame) => void;
+	timer: NodeJS.Timeout;
+}
+
 class FrameCollector {
 	readonly frames: Frame[] = [];
-	private readonly waiters: Array<{
-		predicate: (f: Frame) => boolean;
-		resolve: (f: Frame) => void;
-	}> = [];
+	private readonly waiters: FrameWaiter[] = [];
 	private buf = "";
 
 	write(chunk: Uint8Array): void {
@@ -46,8 +49,8 @@ class FrameCollector {
 			for (let i = this.waiters.length - 1; i >= 0; i--) {
 				const waiter = this.waiters[i];
 				if (waiter !== undefined && waiter.predicate(frame)) {
-					waiter.resolve(frame);
 					this.waiters.splice(i, 1);
+					waiter.resolve(frame);
 				}
 			}
 		}
@@ -57,19 +60,73 @@ class FrameCollector {
 		const existing = this.frames.find(predicate);
 		if (existing !== undefined) return Promise.resolve(existing);
 		const { promise, resolve, reject } = Promise.withResolvers<Frame>();
+		let waiter: FrameWaiter | undefined;
 		const timer = setTimeout(() => {
+			if (waiter === undefined) return;
+			const index = this.waiters.indexOf(waiter);
+			if (index === -1) return;
+			this.waiters.splice(index, 1);
 			reject(new Error(`awaitFrame timed out after ${timeoutMs}ms`));
 		}, timeoutMs);
-		this.waiters.push({
+		waiter = {
 			predicate,
 			resolve: (frame) => {
 				clearTimeout(timer);
 				resolve(frame);
 			},
-		});
+			timer,
+		};
+		this.waiters.push(waiter);
 		return promise;
 	}
 }
+
+describe("FrameCollector timeout cleanup", () => {
+	test("does not retain or invoke a timed-out predicate for a late matching frame", async () => {
+		const collector = new FrameCollector();
+		let predicateCalls = 0;
+		const unhandled: unknown[] = [];
+		const trackUnhandled = (err: unknown) => {
+			unhandled.push(err);
+		};
+		process.on("unhandledRejection", trackUnhandled);
+
+		vi.useFakeTimers();
+		try {
+			let timeoutError: unknown;
+			const timedOut = collector.awaitFrame(() => {
+				predicateCalls += 1;
+				return true;
+			}, 5);
+			void timedOut.catch((error: unknown) => {
+				timeoutError = error;
+			});
+			vi.advanceTimersByTime(5);
+			await Promise.resolve();
+			if (!(timeoutError instanceof Error)) {
+				throw new Error("FrameCollector timeout did not reject");
+			}
+			expect(timeoutError.message).toMatch(/awaitFrame timed out/);
+
+			collector.write(
+				Buffer.from(
+					`${JSON.stringify({
+						id: 99,
+						kind: "event",
+						method: "late",
+						payload: { afterTimeout: true },
+					})}\n`,
+				),
+			);
+
+			expect(predicateCalls).toBe(0);
+			expect(unhandled).toEqual([]);
+		} finally {
+			vi.useRealTimers();
+			process.off("unhandledRejection", trackUnhandled);
+		}
+	});
+});
 
 
 /** Await the next frame matching predicate that appears after `fromIndex`. */

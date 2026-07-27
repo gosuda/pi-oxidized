@@ -105,6 +105,11 @@ interface Waiter {
 	timer: TimerHandle;
 }
 
+interface WaitHandle {
+	promise: Promise<Frame>;
+	rejectAndRemove(error: Error): void;
+}
+
 /** Bound for stdout-line prefixes embedded in parse-failure diagnostics. */
 const DIAGNOSTIC_STDOUT_PREFIX_CHARS = 512;
 /**
@@ -113,8 +118,21 @@ const DIAGNOSTIC_STDOUT_PREFIX_CHARS = 512;
  * an unterminated line past this limit is treated as a wedged/hostile child.
  */
 export const MAX_STDOUT_BUFFER_CHARS = 64 * 1024;
-/** Maximum parsed frames retained for late `waitFor` calls and final counters. */
+/** Default parsed-frame cap for hosts outside the tool-round-trip workload. */
 export const MAX_RETAINED_FRAMES = 128;
+/** Absolute cap for retained hostile child output. */
+export const DEFAULT_HOSTILE_OUTPUT_CEILING = 10_000;
+
+/**
+ * Four frames per tool round (prepare, validate, update, execute), plus
+ * setup slack. The hard ceiling still bounds hostile child output.
+ */
+export function deriveRetainedFrameBudget(rounds: number): number {
+	return Math.min(
+		DEFAULT_HOSTILE_OUTPUT_CEILING,
+		Math.max(MAX_RETAINED_FRAMES, 16 + rounds * 4),
+	);
+}
 
 /**
  * Escape and truncate hostile text so diagnostics stay bounded and printable.
@@ -134,6 +152,8 @@ export interface HostSpec {
 	lean: boolean;
 	/** Extension entry loaded through the extensions.load RPC. */
 	extensionPath: string;
+	/** Per-host retained-frame cap; tool rounds derive this from their workload. */
+	maxRetainedFrames?: number;
 }
 
 /** One bounded host child: frame pump, request/response correlation, reap-on-close. */
@@ -151,8 +171,10 @@ export class ChildHost {
 	private resolveExit: (() => void) | undefined;
 	private fatalError: Error | undefined;
 	private pumping = true;
+	private readonly maxRetainedFrames: number;
 
 	constructor(spec: HostSpec) {
+		this.maxRetainedFrames = spec.maxRetainedFrames ?? MAX_RETAINED_FRAMES;
 		const args = [spec.hostEntry];
 		if (spec.lean) args.push("--lean");
 		args.push("--cwd", spec.hostCwd);
@@ -217,10 +239,10 @@ export class ChildHost {
 					);
 					return;
 				}
-				if (this.frames.length >= MAX_RETAINED_FRAMES) {
+				if (this.frames.length >= this.maxRetainedFrames) {
 					this.failAll(
 						this.stdoutError(
-							`host retained frame limit exceeded ${String(MAX_RETAINED_FRAMES)}`,
+							`host retained frame limit exceeded ${String(this.maxRetainedFrames)}`,
 							line,
 						),
 					);
@@ -230,9 +252,7 @@ export class ChildHost {
 				for (let i = this.waiters.length - 1; i >= 0; i--) {
 					const waiter = this.waiters[i];
 					if (waiter !== undefined && waiter.predicate(frame)) {
-						this.waiters.splice(i, 1);
-						clearTimeout(waiter.timer);
-						waiter.resolve(frame);
+						if (this.removeWaiter(waiter)) waiter.resolve(frame);
 					}
 				}
 			}
@@ -273,31 +293,62 @@ export class ChildHost {
 		}
 	}
 
+	private removeWaiter(waiter: Waiter): boolean {
+		const index = this.waiters.indexOf(waiter);
+		if (index === -1) return false;
+		this.waiters.splice(index, 1);
+		clearTimeout(waiter.timer);
+		return true;
+	}
+
+	private createWaiter(
+		predicate: (frame: Frame) => boolean,
+		timeoutMs: number,
+		label: string,
+	): WaitHandle {
+		if (this.fatalError !== undefined) {
+			return {
+				promise: Promise.reject(this.fatalError),
+				rejectAndRemove() {},
+			};
+		}
+		const existing = this.frames.find(predicate);
+		if (existing !== undefined) {
+			return {
+				promise: Promise.resolve(existing),
+				rejectAndRemove() {},
+			};
+		}
+
+		const { promise, resolve, reject } = Promise.withResolvers<Frame>();
+		let waiter: Waiter | undefined;
+		const rejectAndRemove = (error: Error): void => {
+			if (waiter === undefined || !this.removeWaiter(waiter)) return;
+			reject(error);
+		};
+		const timer = setTimeout(() => {
+			rejectAndRemove(
+				new Error(`timeout waiting for ${label} after ${timeoutMs}ms; stderr: ${this.stderrTail}`),
+			);
+		}, timeoutMs);
+		waiter = { predicate, resolve, reject, timer };
+		this.waiters.push(waiter);
+		return { promise, rejectAndRemove };
+	}
+
 	/** Wait for one matching frame; the timeout is only a wedge guard. */
 	waitFor(
 		predicate: (frame: Frame) => boolean,
 		timeoutMs: number,
 		label: string,
 	): Promise<Frame> {
-		if (this.fatalError !== undefined) return Promise.reject(this.fatalError);
-		const existing = this.frames.find(predicate);
-		if (existing !== undefined) return Promise.resolve(existing);
-		const { promise, resolve, reject } = Promise.withResolvers<Frame>();
-		const timer = setTimeout(() => {
-			const idx = this.waiters.findIndex((w) => w.resolve === resolve);
-			if (idx !== -1) this.waiters.splice(idx, 1);
-			reject(
-				new Error(`timeout waiting for ${label} after ${timeoutMs}ms; stderr: ${this.stderrTail}`),
-			);
-		}, timeoutMs);
-		this.waiters.push({ predicate, resolve, reject, timer });
-		return promise;
+		return this.createWaiter(predicate, timeoutMs, label).promise;
 	}
 
 	/** Send a request and await its terminal res/error frame (matched by id). */
 	async request(method: string, payload: unknown, timeoutMs: number): Promise<Frame> {
 		const id = this.nextId++;
-		const response = this.waitFor(
+		const response = this.createWaiter(
 			(f) => f.id === id && (f.kind === "res" || f.kind === "error") && f.method === method,
 			timeoutMs,
 			`${method} response`,
@@ -305,11 +356,14 @@ export class ChildHost {
 		try {
 			this.child.stdin.write(encodeFrameString({ id, kind: "req", method, payload }));
 		} catch (err) {
-			throw new Error(
+			const failure = new Error(
 				`failed to write ${method}: ${err instanceof Error ? err.message : String(err)}`,
 			);
+			response.rejectAndRemove(failure);
+			void response.promise.catch(() => {});
+			throw failure;
 		}
-		const frame = await response;
+		const frame = await response.promise;
 		if (frame.kind === "error") {
 			throw new Error(`${method} returned error: ${JSON.stringify(frame.payload)}`);
 		}
@@ -463,7 +517,10 @@ async function measureToolRoundTrips(
 	rounds: number,
 	timeoutMs: number,
 ): Promise<ToolRoundTripResult> {
-	const host = new ChildHost(spec);
+	const host = new ChildHost({
+		...spec,
+		maxRetainedFrames: deriveRetainedFrameBudget(rounds),
+	});
 	const prepareMs: number[] = [];
 	const validateMs: number[] = [];
 	const executeMs: number[] = [];

@@ -10,10 +10,12 @@ import { join, resolve } from "node:path";
 import { evaluateZeroIdleSanity } from "../bench-extension-scaling.ts";
 import {
 	ChildHost,
+	DEFAULT_HOSTILE_OUTPUT_CEILING,
 	DEFAULT_LEAN_MAX_RATIO,
 	MAX_RETAINED_FRAMES,
 	MAX_STDOUT_BUFFER_CHARS,
 	TimerHandle,
+	deriveRetainedFrameBudget,
 	evaluateDistinctness,
 	percentile,
 	runModeDistinctness,
@@ -45,6 +47,16 @@ function interceptTimers() {
 		},
 	};
 }
+
+describe("retained frame budgets", () => {
+	test("scales configured tool rounds without exceeding the hostile ceiling", () => {
+		expect(MAX_RETAINED_FRAMES).toBe(128);
+		expect(DEFAULT_HOSTILE_OUTPUT_CEILING).toBe(10_000);
+		expect(deriveRetainedFrameBudget(2)).toBe(128);
+		expect(deriveRetainedFrameBudget(50)).toBe(216);
+		expect(deriveRetainedFrameBudget(3_000)).toBe(10_000);
+	});
+});
 
 describe("percentile", () => {
 	test("empty input yields zero", () => {
@@ -178,6 +190,87 @@ describe("ChildHost.close", () => {
 	}, 30_000);
 });
 
+describe("ChildHost request write failure", () => {
+	test("removes the response waiter before rejecting and leaves no unhandled rejection", async () => {
+		const root = resolve(process.cwd(), "packages", "extension-host");
+		const tempDir = mkdtempSync(join(tmpdir(), "lean-scaling-write-failure-"));
+		const scriptPath = join(tempDir, "write-failure-host.mjs");
+		writeFileSync(
+			scriptPath,
+			[
+				"await Bun.sleep(100);",
+				`process.stdout.write(${JSON.stringify("not-json\n")});`,
+				"setInterval(() => {}, 1_000);",
+			].join("\n"),
+			"utf8",
+		);
+
+		const unhandled: unknown[] = [];
+		const trackUnhandled = (err: unknown) => {
+			unhandled.push(err);
+		};
+		process.on("unhandledRejection", trackUnhandled);
+
+		const host = new ChildHost({
+			hostCwd: root,
+			hostEntry: scriptPath,
+			lean: false,
+			extensionPath: resolve(root, "tests", "fixtures", "lean", "echo.mjs"),
+		});
+		// Deliberate error-path probe: install a synchronous stdin write failure
+		// without changing the public harness contract.
+		const child = Reflect.get(host, "child");
+		if (typeof child !== "object" || child === null) {
+			throw new Error("ChildHost child is unavailable");
+		}
+		const stdin = Reflect.get(child, "stdin");
+		if (typeof stdin !== "object" || stdin === null) {
+			throw new Error("ChildHost stdin is unavailable");
+		}
+		const originalWrite = Reflect.get(stdin, "write");
+		if (typeof originalWrite !== "function") {
+			throw new Error("ChildHost stdin.write is unavailable");
+		}
+		if (
+			!Reflect.set(stdin, "write", () => {
+				throw new Error("synthetic stdin write failure");
+			})
+		) {
+			throw new Error("failed to replace ChildHost stdin.write");
+		}
+
+		const pendingWaiters = (): unknown[] => {
+			const waiters = Reflect.get(host, "waiters");
+			if (!Array.isArray(waiters)) throw new Error("ChildHost waiters are unavailable");
+			return waiters;
+		};
+
+		try {
+			await expect(host.request("hello", {}, 60_000)).rejects.toThrow(
+				/failed to write hello: synthetic stdin write failure/,
+			);
+			expect(pendingWaiters()).toHaveLength(0);
+			// The later malformed frame exercises failAll. A stale response promise
+			// would reject here after request() had already returned.
+			const laterFailure = await host
+				.waitFor(() => false, 60_000, "malformed child output")
+				.catch((error: unknown) => error);
+			if (!(laterFailure instanceof Error)) {
+				throw new Error("malformed child output did not reject with an Error");
+			}
+			expect(laterFailure.message).toMatch(/failed to parse host stdout JSON/);
+			await new Promise<void>((resolveImmediate) => setImmediate(resolveImmediate));
+			expect(pendingWaiters()).toHaveLength(0);
+			expect(unhandled).toEqual([]);
+		} finally {
+			Reflect.set(stdin, "write", originalWrite);
+			process.off("unhandledRejection", trackUnhandled);
+			await host.close();
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	}, 30_000);
+});
+
 describe("ChildHost malformed stdout", () => {
 	test("rejects every pending waiter promptly on malformed NDJSON", async () => {
 		const root = resolve(process.cwd(), "packages", "extension-host");
@@ -303,6 +396,28 @@ describe("runModeDistinctness toolRounds", () => {
 		);
 	});
 });
+
+	test("allows configured tool rounds above the legacy retained-frame cap", async () => {
+		const hostCwd = resolve(process.cwd(), "packages", "extension-host");
+		const result = await runModeDistinctness({
+			hostCwd,
+			hostEntry: "src/main.ts",
+			compatExtension: resolve(hostCwd, "fixtures", "extensions", "idle.ts"),
+			leanExtension: resolve(hostCwd, "tests", "fixtures", "lean", "echo.mjs"),
+			warmups: 0,
+			samples: 0,
+			toolRounds: 32,
+			maxRatio: undefined,
+		});
+
+		expect(result.toolRoundTrip.rounds).toBe(32);
+		expect(result.toolRoundTrip.responses).toBe(96);
+		expect(result.toolRoundTrip.updateEvents).toBeGreaterThanOrEqual(32);
+		expect(result.toolRoundTrip.prepareMs.n).toBe(32);
+		expect(result.toolRoundTrip.validateMs.n).toBe(32);
+		expect(result.toolRoundTrip.executeMs.n).toBe(32);
+		expect(result.failures).toEqual([]);
+	}, 180_000);
 
 describe("runModeDistinctness validatedBy gate", () => {
 	test("rejects a lean fixture whose validate merely echoes args (no validatedBy marker)", async () => {
@@ -477,7 +592,7 @@ describe("ChildHost retained frame cap", () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "lean-scaling-frame-flood-"));
 		const scriptPath = join(tempDir, "frame-flood-host.mjs");
 		const sentinelPath = join(tempDir, "child-survived");
-		const retainedFrameLimit = MAX_RETAINED_FRAMES;
+		const retainedFrameLimit = 3;
 		const frame = { id: 1, kind: "event", method: "toolUpdate", payload: { ok: true } };
 		const flood = `${JSON.stringify(frame)}\n`.repeat(retainedFrameLimit + 1);
 		writeFileSync(
@@ -497,6 +612,7 @@ describe("ChildHost retained frame cap", () => {
 			hostEntry: scriptPath,
 			lean: false,
 			extensionPath: resolve(root, "tests", "fixtures", "lean", "echo.mjs"),
+			maxRetainedFrames: retainedFrameLimit,
 		});
 		try {
 			const waiters = [
