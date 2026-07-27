@@ -279,18 +279,17 @@ fn decode_tool_args(frame: &Frame, phase: &str) -> Result<Map<String, Value>, To
         .ok_or_else(|| ToolError::new(format!("extension tool {phase} returned invalid args")))
 }
 
-/// Forward a decoded `toolUpdate` partial result. Returns `true` when the
-/// frame was a valid update (disarms the pre-first-event deadline).
+/// Forward a decoded `toolUpdate` partial result. A decoded outer update
+/// returns `true` to disarm the pre-first-event deadline even if its partial
+/// result is malformed.
 fn forward_tool_update(frame: &Frame, updates: &ToolUpdates) -> bool {
-    if let Ok(update) = from_payload::<ToolUpdate>(&frame.payload)
-        && let Ok(partial) =
-            serde_json::from_value::<AgentToolResult>(update.partial_result.clone())
-    {
+    let Ok(update) = from_payload::<ToolUpdate>(&frame.payload) else {
+        return false;
+    };
+    if let Ok(partial) = serde_json::from_value::<AgentToolResult>(update.partial_result) {
         updates.send(partial);
-        true
-    } else {
-        false
     }
+    true
 }
 
 fn parse_tool_result(frame: &Frame) -> Result<AgentToolResult, ToolError> {
@@ -1500,6 +1499,74 @@ mod tests {
         );
 
         host_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn extension_tool_malformed_partial_disarms_first_event_deadline() -> R {
+        let (client, mut host) = make_pair().await;
+        let timeout = Duration::from_millis(100);
+        let tool = ExtensionAgentTool::new(reg_tool("ext.malformed"), Arc::new(client))
+            .with_timeout(timeout);
+        let forwarded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let updates = ToolUpdates::new({
+            let forwarded = Arc::clone(&forwarded);
+            move |partial| {
+                forwarded
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(partial);
+            }
+        });
+        let driver = tokio::spawn(tool.execute(
+            "call-malformed",
+            Map::new(),
+            CancellationToken::new(),
+            updates,
+        ));
+        let req = host.require_frame(methods::TOOL_EXECUTE).await?;
+
+        host.write_frame(&Frame::event(
+            req.id,
+            Method::ToolUpdate,
+            serde_json::json!({
+                "toolCallId": "call-malformed",
+                "toolName": "ext.malformed",
+                "partialResult": "not-an-agent-tool-result",
+            }),
+        ))
+        .await?;
+        // This terminal arrives after the original first-event deadline. The
+        // decoded outer update must have disarmed it even though its partial
+        // result could not be forwarded.
+        tokio::time::sleep(timeout * 2).await;
+        host.write_frame(&Frame::response(
+            req.id,
+            Method::Notify,
+            serde_json::json!({
+                "content": [{"type":"text","text":"done"}],
+                "details": {},
+            }),
+        ))
+        .await?;
+
+        let result = tokio::time::timeout(Duration::from_secs(2), driver)
+            .await
+            .map_err(|_| "malformed partial exceeded outer guard")???;
+        assert_eq!(
+            result.content.iter().find_map(|block| match block {
+                pi_ai::ToolResultContent::Text(text) => Some(text.text.as_str()),
+                pi_ai::ToolResultContent::Image(_) => None,
+            }),
+            Some("done")
+        );
+        assert!(
+            forwarded
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "malformed partial result must not be forwarded"
+        );
         Ok(())
     }
 
