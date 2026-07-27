@@ -202,28 +202,40 @@ impl AgentTool for ExtensionAgentTool {
         let timeout = self.timeout;
         let tool_call_id = tool_call_id.to_owned();
         Box::pin(async move {
+            let deadline = tokio::time::Instant::now() + timeout;
             let payload = serde_json::json!({
                 "name": name,
                 "toolCallId": tool_call_id,
                 "args": args,
                 "prepared": true,
             });
-            let mut stream = client
-                .open_stream_raw(methods::TOOL_EXECUTE, payload, 64)
-                .await
-                .map_err(tool_error)?;
+            let mut stream = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    return Err(ToolError::new("extension tool cancelled"));
+                }
+                opened = tokio::time::timeout_at(
+                    deadline,
+                    client.open_stream_raw(methods::TOOL_EXECUTE, payload, 64),
+                ) => match opened {
+                    Ok(result) => result.map_err(tool_error)?,
+                    Err(_) => {
+                        return Err(ToolError::new(format!(
+                            "extension tool timed out after {timeout:?}"
+                        )));
+                    }
+                }
+            };
             // Bound only the pre-first-decoded-event wait with one absolute
             // deadline. Unknown/malformed frames are skipped and must not reset
             // that deadline (a fresh per-wait timeout would let junk spam keep
             // the call alive forever); after the first decoded toolUpdate (or
             // stream end / terminal), inter-event gaps are unbounded.
             let mut seen_event = false;
-            let deadline = tokio::time::Instant::now() + timeout;
             loop {
                 tokio::select! {
                     biased;
                     () = cancel.cancelled() => {
-                        let _ = stream.cancel(methods::TOOL_CANCEL).await;
                         return Err(ToolError::new("extension tool cancelled"));
                     }
                     ev = async {
@@ -247,7 +259,6 @@ impl AgentTool for ExtensionAgentTool {
                                 id: stream.id(),
                                 timeout,
                             });
-                            let _ = stream.cancel(methods::TOOL_CANCEL).await;
                             return Err(err);
                         }
                     }
@@ -349,15 +360,29 @@ impl Provider for ExtensionProvider {
 
         // Capacity-64 matches STREAM_EVENT_CAPACITY / host provider channel bound.
         let (tx, rx) = mpsc::channel::<Result<AssistantMessageEvent, ProviderError>>(64);
+        let deadline = tokio::time::Instant::now() + timeout;
         tokio::spawn(async move {
-            let mut handle = match client
-                .open_stream_raw(methods::PROVIDER_STREAM, Value::Object(payload), 64)
-                .await
-            {
-                Ok(h) => h,
-                Err(e) => {
-                    let _ = tx.send(Err(provider_error(e))).await;
+            let mut handle = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    let _ = tx.try_send(Err(ProviderError::new("provider stream cancelled")));
                     return;
+                }
+                opened = tokio::time::timeout_at(
+                    deadline,
+                    client.open_stream_raw(methods::PROVIDER_STREAM, Value::Object(payload), 64),
+                ) => match opened {
+                    Ok(Ok(handle)) => handle,
+                    Ok(Err(error)) => {
+                        let _ = tx.send(Err(provider_error(error))).await;
+                        return;
+                    }
+                    Err(_) => {
+                        let _ = tx.try_send(Err(ProviderError::new(format!(
+                            "provider stream timed out after {timeout:?}"
+                        ))));
+                        return;
+                    }
                 }
             };
             // Bound only the pre-first-decoded-event wait with one absolute
@@ -366,15 +391,13 @@ impl Provider for ExtensionProvider {
             // the stream alive forever); after the first decoded event,
             // inter-event gaps are unbounded.
             let mut seen_event = false;
-            let deadline = tokio::time::Instant::now() + timeout;
             loop {
                 tokio::select! {
                     biased;
                     () = cancel.cancelled() => {
-                        let _ = handle.cancel(methods::PROVIDER_CANCEL).await;
-                        let _ = tx
-                            .send(Err(ProviderError::new("provider stream cancelled")))
-                            .await;
+                        let _ = tx.try_send(Err(ProviderError::new(
+                            "provider stream cancelled",
+                        )));
                         return;
                     }
                     ev = async {
@@ -404,7 +427,6 @@ impl Provider for ExtensionProvider {
                                     timeout,
                                 })))
                                 .await;
-                            let _ = handle.cancel(methods::PROVIDER_CANCEL).await;
                             return;
                         }
                     }
@@ -1342,6 +1364,86 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn extension_tool_open_uses_the_operation_deadline() -> R {
+        let (client, _host) = make_pair().await;
+        let client = Arc::new(client);
+        let (mut stalled, _original) = client.stall_outbound_for_test().await;
+        client
+            .send_event(
+                Method::ToolUpdate.as_str(),
+                serde_json::json!({"fills": true}),
+            )
+            .await?;
+        let timeout = Duration::from_millis(50);
+        let tool = ExtensionAgentTool::new(reg_tool("ext.stalled"), Arc::clone(&client))
+            .with_timeout(timeout);
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            tool.execute(
+                "call-stalled",
+                Map::new(),
+                CancellationToken::new(),
+                ToolUpdates::noop(),
+            ),
+        )
+        .await
+        .map_err(|_| "stalled open exceeded outer guard")?;
+        let Err(error) = result else {
+            return Err("stalled open must time out".into());
+        };
+        assert!(
+            error.to_string().contains("timed out after 50ms"),
+            "unexpected open error: {error}"
+        );
+        assert!(
+            started.elapsed() < timeout * 2,
+            "stream open did not share the operation deadline"
+        );
+        assert_eq!(
+            client.pending_count(),
+            0,
+            "cancelled open retained its pending registration"
+        );
+        assert!(
+            stalled.try_recv().is_ok(),
+            "the test must actually stall a full outbound queue"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn extension_tool_cancel_returns_while_stream_open_is_backpressured() -> R {
+        let (client, _host) = make_pair().await;
+        let client = Arc::new(client);
+        let _stalled = client.stall_outbound_for_test().await;
+        client
+            .send_event(
+                Method::ToolUpdate.as_str(),
+                serde_json::json!({"fills": true}),
+            )
+            .await?;
+        let tool = ExtensionAgentTool::new(reg_tool("ext.stalled"), Arc::clone(&client));
+        let cancel = CancellationToken::new();
+        let driver = tokio::spawn(tool.execute(
+            "call-stalled-cancel",
+            Map::new(),
+            cancel.clone(),
+            ToolUpdates::noop(),
+        ));
+        tokio::task::yield_now().await;
+        assert_eq!(client.pending_count(), 1);
+
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_millis(100), driver)
+            .await
+            .map_err(|_| "tool cancellation waited for outbound capacity")??;
+        assert!(matches!(&result, Err(error) if error.to_string().contains("cancelled")));
+        assert_eq!(client.pending_count(), 0);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn extension_tool_junk_spam_hits_absolute_first_event_deadline() -> R {
         let (client, mut host) = make_pair().await;
@@ -1778,6 +1880,44 @@ mod tests {
             err.to_string().contains("cancelled"),
             "unexpected cancel error: {err}"
         );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn extension_provider_cancel_returns_while_stream_open_is_backpressured() -> R {
+        let (client, _host) = make_pair().await;
+        let client = Arc::new(client);
+        let _stalled = client.stall_outbound_for_test().await;
+        client
+            .send_event(
+                Method::ProviderEvent.as_str(),
+                serde_json::json!({"fills": true}),
+            )
+            .await?;
+        let provider = ExtensionProvider::new("custom", Arc::clone(&client));
+        let model = Model {
+            id: "m".to_owned(),
+            name: "M".to_owned(),
+            api: "custom".to_owned(),
+            provider: "custom".to_owned(),
+            ..base_model_defaults()
+        };
+        let cancel = CancellationToken::new();
+        let options = StreamOptions {
+            signal: Some(cancel.clone()),
+            ..StreamOptions::default()
+        };
+        let mut stream = provider.stream(&model, Context::default(), options);
+        tokio::task::yield_now().await;
+        assert_eq!(client.pending_count(), 1);
+
+        cancel.cancel();
+        let item = tokio::time::timeout(Duration::from_millis(100), stream.next())
+            .await
+            .map_err(|_| "provider cancellation waited for outbound capacity")?
+            .ok_or("cancelled provider stream ended without an error")?;
+        assert!(matches!(&item, Err(error) if error.to_string().contains("cancelled")));
+        assert_eq!(client.pending_count(), 0);
         Ok(())
     }
 

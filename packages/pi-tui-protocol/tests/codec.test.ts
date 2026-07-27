@@ -26,6 +26,33 @@ const fixturesPath = join(
 	"frames.jsonl",
 );
 
+function fixtureLines(): Array<{ line: string; invalidFrame: boolean }> {
+	const fixtures: Array<{ line: string; invalidFrame: boolean }> = [];
+	let invalidFrame = false;
+	for (const line of readFileSync(fixturesPath, "utf8").split("\n")) {
+		const trimmed = line.trim();
+		if (trimmed === "") {
+			continue;
+		}
+		if (trimmed.startsWith("# invalid_frame")) {
+			if (invalidFrame) {
+				throw new Error("shared fixture has consecutive invalid-frame markers");
+			}
+			invalidFrame = true;
+			continue;
+		}
+		if (trimmed.startsWith("#")) {
+			continue;
+		}
+		fixtures.push({ line, invalidFrame });
+		invalidFrame = false;
+	}
+	if (invalidFrame) {
+		throw new Error("shared fixture has an invalid-frame marker without a frame");
+	}
+	return fixtures;
+}
+
 describe("constants", () => {
 	test("versions and size", () => {
 		expect(PROTOCOL_VERSION).toBe(1);
@@ -104,6 +131,8 @@ describe("encode/decode", () => {
 			{ uri: "file:///tmp/x" },
 			{ uri: `https://example.com/${"x".repeat(2048)}` },
 			{ id: "x".repeat(129), uri: "https://example.com" },
+			{ id: ";", uri: "https://example.com" },
+			{ id: ":", uri: "https://example.com" },
 			...controls.map((control) => ({ uri: `https://example.com/${control}` })),
 			...controls.map((control) => ({ id: `id${control}`, uri: "https://example.com" })),
 		];
@@ -199,29 +228,40 @@ describe("FrameDecoder", () => {
 });
 
 describe("shared fixtures", () => {
-	test("field and discriminant parity", () => {
-		const text = readFileSync(fixturesPath, "utf8");
-		let count = 0;
-		for (const line of text.split("\n")) {
-			if (line.trim() === "" || line.trimStart().startsWith("#")) {
+	test("wire parity and invalid-frame rejection", () => {
+		let validCount = 0;
+		let invalidCount = 0;
+		for (const fixture of fixtureLines()) {
+			if (fixture.invalidFrame) {
+				let caught: unknown;
+				try {
+					decodeFrameStr(fixture.line);
+				} catch (error) {
+					caught = error;
+				}
+				if (!(caught instanceof ProtocolError)) {
+					throw new Error("invalid shared fixture was not rejected with ProtocolError");
+				}
+				expect(caught.code).toBe("invalid_frame");
+				invalidCount += 1;
 				continue;
 			}
-			const frame = decodeFrameStr(line);
+			const frame = decodeFrameStr(fixture.line);
 			const again = decodeFrameStr(encodeFrameString(frame).trimEnd());
 			expect(again).toEqual(frame);
-			count += 1;
+			validCount += 1;
 		}
-		expect(count).toBeGreaterThanOrEqual(8);
+		expect(validCount).toBeGreaterThanOrEqual(8);
+		expect(invalidCount).toBe(2);
 	});
 
 	test("bridge open methods are witnessed with both directions", () => {
-		const text = readFileSync(fixturesPath, "utf8");
 		const seen = new Set<string>();
-		for (const line of text.split("\n")) {
-			if (line.trim() === "" || line.trimStart().startsWith("#")) {
+		for (const fixture of fixtureLines()) {
+			if (fixture.invalidFrame) {
 				continue;
 			}
-			const frame = decodeFrameStr(line);
+			const frame = decodeFrameStr(fixture.line);
 			seen.add(`${frame.method}:${frame.kind}`);
 		}
 		for (const key of [

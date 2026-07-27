@@ -43,3 +43,7 @@
 {"id":0,"kind":"event","method":"ui.control","payload":{"control":"setEditorText","text":"draft"}}
 {"id":0,"kind":"event","method":"ui.control","payload":{"control":"setToolsExpanded","expanded":true}}
 {"id":0,"kind":"event","method":"ui.state","payload":{"editorText":"draft","toolsExpanded":true}}
+# invalid_frame: hyperlink id contains a disallowed ';'
+{"id":0,"kind":"event","method":"uiSlot","payload":{"key":"widget.invalid-id-semicolon","generation":1,"placement":"aboveEditor","height":1,"runs":[[{"text":"invalid","style":{"link":{"id":";","uri":"https://example.com"}}}]]}}
+# invalid_frame: hyperlink id contains a disallowed ':'
+{"id":0,"kind":"event","method":"uiSlot","payload":{"key":"widget.invalid-id-colon","generation":1,"placement":"aboveEditor","height":1,"runs":[[{"text":"invalid","style":{"link":{"id":":","uri":"https://example.com"}}}]]}}

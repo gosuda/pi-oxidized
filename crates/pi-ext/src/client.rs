@@ -74,6 +74,50 @@ struct PendingEntry {
     stream: Option<PendingStream>,
 }
 
+/// Removes a just-registered call if opening its outbound stream is cancelled.
+struct PendingRegistration {
+    shared: Arc<Shared>,
+    id: FrameId,
+    cmd_tx: Option<mpsc::Sender<Frame>>,
+    cancel_method: Option<&'static str>,
+    armed: bool,
+}
+
+impl PendingRegistration {
+    fn new(
+        shared: Arc<Shared>,
+        id: FrameId,
+        cmd_tx: Option<mpsc::Sender<Frame>>,
+        cancel_method: Option<&'static str>,
+    ) -> Self {
+        Self {
+            shared,
+            id,
+            cmd_tx,
+            cancel_method,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingRegistration {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Ok(mut pending) = self.shared.pending.lock() {
+            pending.remove(&self.id);
+        }
+        if let (Some(control_method), Some(tx)) = (self.cancel_method, self.cmd_tx.as_ref()) {
+            let _ = tx.try_send(cancel_frame(self.id, control_method));
+        }
+    }
+}
+
 #[derive(Clone)]
 enum PendingStream {
     /// Tool progress is explicitly lossy: stale updates may be discarded.
@@ -399,6 +443,23 @@ impl HostClient {
         self.shared.running.load(Ordering::Relaxed)
     }
 
+    #[cfg(test)]
+    pub(crate) fn pending_count(&self) -> usize {
+        self.shared
+            .pending
+            .lock()
+            .map_or(0, |pending| pending.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn stall_outbound_for_test(
+        &self,
+    ) -> (mpsc::Receiver<Frame>, Option<mpsc::Sender<Frame>>) {
+        let (tx, rx) = mpsc::channel(1);
+        let original = self.cmd_tx.lock().await.replace(tx);
+        (rx, original)
+    }
+
     /// Latest retained stderr tail.
     #[must_use]
     pub fn stderr_tail(&self) -> String {
@@ -655,27 +716,31 @@ impl HostClient {
                 stream: Some(stream),
             },
         );
+        let mut registration = PendingRegistration::new(
+            Arc::clone(&self.shared),
+            id,
+            cmd_tx.clone(),
+            cancel_method_for(method),
+        );
         let frame = Frame {
             id,
             kind: FrameKind::Req,
             method: method.to_owned(),
             payload,
         };
-        if let Err(e) = self.send_frame(frame).await {
-            Self::remove_pending(&self.shared, id);
-            return Err(e);
-        }
-        Ok(StreamHandle {
+        self.send_frame(frame).await?;
+        let handle = StreamHandle {
             id,
             events: stream_rx,
             terminal: Some(terminal_rx),
             shared: Arc::clone(&self.shared),
             cmd_tx,
-            runtime: tokio::runtime::Handle::current(),
             cancel_method: cancel_method_for(method),
             cancel_sent: false,
             consumed: false,
-        })
+        };
+        registration.disarm();
+        Ok(handle)
     }
 
     /// Perform the `hello` handshake and validate versions.
@@ -782,7 +847,6 @@ pub struct StreamHandle {
     terminal: Option<oneshot::Receiver<FrameResult>>,
     shared: Arc<Shared>,
     cmd_tx: Option<mpsc::Sender<Frame>>,
-    runtime: tokio::runtime::Handle,
     cancel_method: Option<&'static str>,
     cancel_sent: bool,
     consumed: bool,
@@ -807,17 +871,20 @@ impl StreamHandle {
     /// # Errors
     ///
     /// Returns [`HostClientError::Closed`] when the outbound pipe is broken.
-    pub async fn cancel(&mut self, control_method: &str) -> HostResult<()> {
+    pub fn cancel(&mut self, control_method: &str) -> HostResult<()> {
         let frame = cancel_frame(self.id, control_method);
         match &self.cmd_tx {
-            Some(tx) => {
-                tx.send(frame).await.map_err(|e| HostClientError::Closed {
-                    message: format!("cancel send failed: {e}"),
+            Some(tx) => match tx.try_send(frame) {
+                Ok(()) => {
+                    self.cancel_sent = true;
+                    Ok(())
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
+                Err(mpsc::error::TrySendError::Closed(_)) => Err(HostClientError::Closed {
+                    message: "cancel send failed: outbound pipe closed".to_owned(),
                     stderr: stderr_of(&self.shared),
-                })?;
-                self.cancel_sent = true;
-                Ok(())
-            }
+                }),
+            },
             None => Err(HostClientError::NotRunning),
         }
     }
@@ -830,25 +897,23 @@ impl StreamHandle {
     /// the remote error payload.
     pub async fn finish(mut self, timeout: Duration) -> HostResult<Frame> {
         let terminal = self.terminal.take().ok_or(HostClientError::NotRunning)?;
-        let result = match tokio::time::timeout(timeout, terminal).await {
-            Ok(Ok(r)) => r,
-            Ok(Err(_)) => Err(HostClientError::Closed {
-                message: "stream terminal closed".to_owned(),
-                stderr: stderr_of(&self.shared),
-            }),
-            Err(_) => {
-                if let Some(control_method) = self.cancel_method {
-                    let _ = self.cancel(control_method).await;
-                }
-                Self::remove_pending(&self.shared, self.id);
-                Err(HostClientError::Timeout {
-                    id: self.id,
-                    timeout,
+        match tokio::time::timeout(timeout, terminal).await {
+            Ok(Ok(result)) => {
+                self.consumed = true;
+                result
+            }
+            Ok(Err(_)) => {
+                self.consumed = true;
+                Err(HostClientError::Closed {
+                    message: "stream terminal closed".to_owned(),
+                    stderr: stderr_of(&self.shared),
                 })
             }
-        };
-        self.consumed = true;
-        result
+            Err(_) => Err(HostClientError::Timeout {
+                id: self.id,
+                timeout,
+            }),
+        }
     }
 
     fn remove_pending(shared: &Shared, id: FrameId) {
@@ -860,20 +925,15 @@ impl StreamHandle {
 
 impl Drop for StreamHandle {
     fn drop(&mut self) {
-        if !self.consumed {
-            if !self.cancel_sent
-                && let (Some(control_method), Some(tx)) = (self.cancel_method, self.cmd_tx.as_ref())
-            {
-                let tx = tx.clone();
-                let frame = cancel_frame(self.id, control_method);
-                // Drop cannot await. A detached send waits for bounded capacity
-                // on the same FIFO, so cancellation is neither lost nor allowed
-                // to overtake this call's request.
-                self.runtime.spawn(async move {
-                    let _ = tx.send(frame).await;
-                });
-            }
-            Self::remove_pending(&self.shared, self.id);
+        if self.consumed {
+            return;
+        }
+        Self::remove_pending(&self.shared, self.id);
+        if !self.cancel_sent
+            && let (Some(control_method), Some(tx)) = (self.cancel_method, self.cmd_tx.as_ref())
+            && tx.try_send(cancel_frame(self.id, control_method)).is_ok()
+        {
+            self.cancel_sent = true;
         }
     }
 }
@@ -1786,12 +1846,15 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn dropped_stream_delivers_cancel_after_command_channel_saturation() -> R {
+    async fn mass_drop_under_saturation_is_prompt_and_runtime_independent() -> R {
+        const STREAMS: usize = 256;
+
         let (client, mut host) = make_pair().await;
-        let stream = client
+        let mut stream = client
             .open_stream_raw("provider.stream", serde_json::json!({}), 2)
             .await?;
         let request = host.read_frame().await.ok_or("no provider request")?;
+        let shared = Arc::clone(&stream.shared);
         let tx = stream
             .cmd_tx
             .as_ref()
@@ -1806,21 +1869,75 @@ mod tests {
             tx.try_send(filler),
             Err(mpsc::error::TrySendError::Full(_))
         ));
-        drop(stream);
 
-        let cancel = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let frame = host
-                    .read_frame()
-                    .await
-                    .ok_or("host pipe closed before cancel")?;
-                if frame.method == "provider.cancel" {
-                    return Ok::<_, Box<dyn Error>>(frame);
-                }
-            }
-        })
-        .await??;
-        assert_eq!(cancel.payload["id"], request.id);
+        let cancel_started = std::time::Instant::now();
+        stream.cancel("provider.cancel")?;
+        assert!(
+            cancel_started.elapsed() < Duration::from_millis(100),
+            "explicit cancellation blocked on the saturated outbound queue"
+        );
+        assert!(
+            !stream.cancel_sent,
+            "a full queue cannot accept cancellation"
+        );
+
+        let mut streams = Vec::with_capacity(STREAMS);
+        streams.push(stream);
+        for offset in 1..STREAMS {
+            let id = request.id + offset as u64;
+            let (_event_tx, events) = mpsc::channel(1);
+            let (terminal_tx, terminal) = oneshot::channel();
+            shared
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(
+                    id,
+                    PendingEntry {
+                        terminal: Some(terminal_tx),
+                        stream: None,
+                    },
+                );
+            streams.push(StreamHandle {
+                id,
+                events,
+                terminal: Some(terminal),
+                shared: Arc::clone(&shared),
+                cmd_tx: Some(tx.clone()),
+                cancel_method: Some("provider.cancel"),
+                cancel_sent: false,
+                consumed: false,
+            });
+        }
+        assert_eq!(
+            shared
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            STREAMS
+        );
+
+        let started = std::time::Instant::now();
+        std::thread::spawn(move || drop(streams))
+            .join()
+            .map_err(|_| "dropping streams outside Tokio panicked")?;
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "synchronous drops blocked on the saturated outbound queue"
+        );
+        assert!(
+            shared
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+        );
+        assert_eq!(
+            tx.strong_count(),
+            2,
+            "dropped streams retained command senders"
+        );
         Ok(())
     }
 

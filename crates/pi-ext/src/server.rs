@@ -55,6 +55,12 @@ pub const TOOL_RENDER_HTML_METHOD: &str = "tool.renderHtml";
 pub const MESSAGE_UPDATE_DELTA_METHOD: &str = "message_update_delta";
 /// Advertised lifecycle handler key for [`MESSAGE_UPDATE_DELTA_METHOD`].
 const MESSAGE_UPDATE_HANDLER: &str = "message_update";
+/// Dedicated keypress-to-paint budget for native terminal-input callbacks.
+///
+/// This latency-sensitive path intentionally does not inherit a general hook
+/// timeout. Dropping the callback at the deadline stops its work and releases
+/// the request's server permit.
+pub const NATIVE_TERMINAL_INPUT_BUDGET: std::time::Duration = std::time::Duration::from_millis(4);
 
 /// Default bound on concurrently handled requests.
 pub const DEFAULT_MAX_IN_FLIGHT: usize = 64;
@@ -817,8 +823,8 @@ where
     // forwarders flushed and released their sender clones, so awaiting the
     // writer below drains every queued frame exactly once.
     if let Ok(map) = runtime.in_flight.lock() {
-        for token in map.values() {
-            token.cancel();
+        for entry in map.values() {
+            entry.token.cancel();
         }
     }
     tasks.abort_all();
@@ -873,6 +879,19 @@ enum ServerState {
     Ready,
 }
 
+/// Operation class for an in-flight cancellable request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InFlightKind {
+    Tool,
+    Provider,
+}
+
+/// Cancellation state retained until a streaming request terminates.
+struct InFlightEntry {
+    token: CancellationToken,
+    kind: InFlightKind,
+}
+
 /// Shared server state: one per `serve_io`, shared by the read loop and
 /// every spawned request task. Dropping the last `Arc` clone closes the
 /// outbound channel, so the writer drains only after all tasks finish.
@@ -885,9 +904,9 @@ struct ServerRuntime<E: NativeExtension> {
     handlers: HashSet<String>,
     /// Bound on concurrently handled requests.
     semaphore: Arc<Semaphore>,
-    /// Cancel tokens for in-flight `tool.execute` and `provider.stream`
+    /// Cancellation state for in-flight `tool.execute` and `provider.stream`
     /// calls, keyed by frame id.
-    in_flight: Mutex<HashMap<FrameId, CancellationToken>>,
+    in_flight: Mutex<HashMap<FrameId, InFlightEntry>>,
     /// Last valid session context. `None` until the first accepted
     /// `extensions.load`; cloned snapshots are never held under this lock
     /// across callback awaits.
@@ -953,7 +972,12 @@ where
             read = reader.read(&mut buf) => read,
         };
         let n = match read {
-            Ok(0) => break,
+            Ok(0) => {
+                decoder
+                    .finish()
+                    .map_err(|e| ServerError::Protocol(e.to_string()))?;
+                break;
+            }
             Ok(n) => n,
             Err(e) => return Err(ServerError::Io(e)),
         };
@@ -1017,12 +1041,21 @@ fn dispatch_ready<E: NativeExtension>(
             if let Ok(permit) = runtime.semaphore.clone().try_acquire_owned() {
                 // Register the cancel token BEFORE spawning: a cancel event
                 // read right after this request must find its target.
-                let streaming = frame.method == methods::TOOL_EXECUTE
-                    || frame.method == methods::PROVIDER_STREAM;
-                let token = streaming.then(|| {
+                let kind = match frame.method.as_str() {
+                    methods::TOOL_EXECUTE => Some(InFlightKind::Tool),
+                    methods::PROVIDER_STREAM => Some(InFlightKind::Provider),
+                    _ => None,
+                };
+                let token = kind.map(|kind| {
                     let token = CancellationToken::new();
                     if let Ok(mut map) = runtime.in_flight.lock() {
-                        map.insert(frame.id, token.clone());
+                        map.insert(
+                            frame.id,
+                            InFlightEntry {
+                                token: token.clone(),
+                                kind,
+                            },
+                        );
                     }
                     token
                 });
@@ -1058,12 +1091,18 @@ fn dispatch_ready<E: NativeExtension>(
             }
         }
         FrameKind::Event => {
-            if (frame.method == methods::TOOL_CANCEL || frame.method == methods::PROVIDER_CANCEL)
+            let kind = match frame.method.as_str() {
+                methods::TOOL_CANCEL => Some(InFlightKind::Tool),
+                methods::PROVIDER_CANCEL => Some(InFlightKind::Provider),
+                _ => None,
+            };
+            if let Some(kind) = kind
                 && let Some(id) = frame.payload.get("id").and_then(Value::as_u64)
                 && let Ok(map) = runtime.in_flight.lock()
-                && let Some(token) = map.get(&id)
+                && let Some(entry) = map.get(&id)
+                && entry.kind == kind
             {
-                token.cancel();
+                entry.token.cancel();
             }
             // Unknown events are fire-and-forget: ignored by design.
         }
@@ -1355,13 +1394,25 @@ async fn handle_terminal_input<E: NativeExtension>(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
-    match runtime.extension.handle_terminal_input(context, data).await {
-        Ok(result) => res_frame(
+    match tokio::time::timeout(
+        NATIVE_TERMINAL_INPUT_BUDGET,
+        runtime.extension.handle_terminal_input(context, data),
+    )
+    .await
+    {
+        Ok(Ok(result)) => res_frame(
             id,
             method,
             to_payload(&result).unwrap_or_else(|_| json!({})),
         ),
-        Err(fault) => fault_frame(id, method, &fault),
+        Ok(Err(fault)) => fault_frame(id, method, &fault),
+        Err(_) => error_frame(
+            id,
+            method,
+            "timeout",
+            "terminal input callback exceeded its 4ms budget",
+            false,
+        ),
     }
 }
 
@@ -1886,6 +1937,8 @@ mod tests {
         flags: Arc<Mutex<BTreeMap<String, FlagValueWire>>>,
         shortcuts: Arc<Mutex<Vec<String>>>,
         terminal_inputs: Arc<Mutex<Vec<String>>>,
+        terminal_started: Arc<Notify>,
+        terminal_stopped: Arc<AtomicBool>,
         renders: Arc<Mutex<Vec<(String, String)>>>,
         tool_contexts: Arc<Mutex<Vec<Arc<NativeExtensionContext>>>>,
         provider_started: Arc<Notify>,
@@ -1912,6 +1965,8 @@ mod tests {
                 flags: Arc::new(Mutex::new(BTreeMap::new())),
                 shortcuts: Arc::new(Mutex::new(Vec::new())),
                 terminal_inputs: Arc::new(Mutex::new(Vec::new())),
+                terminal_started: Arc::new(Notify::new()),
+                terminal_stopped: Arc::new(AtomicBool::new(false)),
                 renders: Arc::new(Mutex::new(Vec::new())),
                 tool_contexts: Arc::new(Mutex::new(Vec::new())),
                 provider_started: Arc::new(Notify::new()),
@@ -1933,6 +1988,8 @@ mod tests {
                 flags: Arc::clone(&self.flags),
                 shortcuts: Arc::clone(&self.shortcuts),
                 terminal_inputs: Arc::clone(&self.terminal_inputs),
+                terminal_started: Arc::clone(&self.terminal_started),
+                terminal_stopped: Arc::clone(&self.terminal_stopped),
                 renders: Arc::clone(&self.renders),
                 tool_contexts: Arc::clone(&self.tool_contexts),
                 provider_started: Arc::clone(&self.provider_started),
@@ -1947,6 +2004,14 @@ mod tests {
         cell.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(value);
+    }
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, AtomicOrdering::SeqCst);
+        }
     }
 
     /// Typed provider event carrying `delta` (valid `text_delta` wire).
@@ -2270,7 +2335,14 @@ mod tests {
             data: String,
         ) -> NativeFuture<Result<TerminalInputResult, ExtensionFault>> {
             let seen = Arc::clone(&self.handles.terminal_inputs);
+            let started = Arc::clone(&self.handles.terminal_started);
+            let stopped = Arc::clone(&self.handles.terminal_stopped);
             Box::pin(async move {
+                if data == "stall" {
+                    let _drop_flag = DropFlag(stopped);
+                    started.notify_one();
+                    std::future::pending::<()>().await;
+                }
                 record(&seen, data.clone());
                 Ok(TerminalInputResult {
                     consume: false,
@@ -3039,6 +3111,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn eof_rejects_a_truncated_frame() -> R {
+        let (ext, _handles) = DemoExtension::new();
+        let (client, server) = spawn_raw(ext, ServerConfig::default());
+        let RawClient {
+            mut write,
+            read: _read,
+        } = client;
+        write.write_all(br#"{"id":1,"kind":"req""#).await?;
+        write.shutdown().await?;
+
+        let result = tokio::time::timeout(TIMEOUT, server).await??;
+        assert!(
+            matches!(&result, Err(ServerError::Protocol(message)) if message.contains("truncated")),
+            "expected truncated frame failure, got {result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn hello_rejects_protocol_mismatch() -> R {
         let (ext, _handles) = DemoExtension::new();
         let (mut client, server) = spawn_raw(ext, ServerConfig::default());
@@ -3492,7 +3583,7 @@ mod tests {
             )
             .await?;
         tokio::time::timeout(TIMEOUT, fixture.handles.started.notified()).await?;
-        slow.cancel(methods::TOOL_CANCEL).await?;
+        slow.cancel(methods::TOOL_CANCEL)?;
         let cancelled_terminal = slow.finish(TIMEOUT).await;
         assert!(
             matches!(cancelled_terminal, Err(HostClientError::Remote { ref code, .. }) if code == "cancelled"),
@@ -3503,6 +3594,62 @@ mod tests {
             "extension must observe the cancellation token"
         );
         fixture.finish().await
+    }
+
+    #[tokio::test]
+    async fn cancel_events_only_cancel_matching_in_flight_kinds() -> R {
+        let (ext, handles) = DemoExtension::new();
+        let (mut client, server) = spawn_raw(ext, ServerConfig::default());
+        client.hello(PROTOCOL_VERSION, "anything").await?;
+        let _ack = client.recv().await?;
+        client.load_context().await?;
+
+        client
+            .send(&Frame {
+                id: 2,
+                kind: FrameKind::Req,
+                method: methods::TOOL_EXECUTE.to_owned(),
+                payload: json!({
+                    "name": "slow",
+                    "toolCallId": "kind-isolation",
+                    "args": {},
+                }),
+            })
+            .await?;
+        tokio::time::timeout(TIMEOUT, handles.started.notified()).await?;
+
+        client
+            .send(&Frame {
+                id: 0,
+                kind: FrameKind::Event,
+                method: methods::PROVIDER_CANCEL.to_owned(),
+                payload: json!({ "id": 2 }),
+            })
+            .await?;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !handles.cancelled.load(AtomicOrdering::SeqCst),
+            "provider.cancel must not cancel tool work"
+        );
+
+        client
+            .send(&Frame {
+                id: 0,
+                kind: FrameKind::Event,
+                method: methods::TOOL_CANCEL.to_owned(),
+                payload: json!({ "id": 2 }),
+            })
+            .await?;
+        let terminal = client.recv().await?;
+        assert_eq!(terminal.id, 2);
+        assert_eq!(terminal.kind, FrameKind::Error);
+        assert_eq!(terminal.payload["code"], "cancelled");
+        assert!(handles.cancelled.load(AtomicOrdering::SeqCst));
+
+        drop(client);
+        let result = tokio::time::timeout(TIMEOUT, server).await??;
+        assert!(result.is_ok());
+        Ok(())
     }
 
     #[tokio::test]
@@ -3983,6 +4130,66 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             assert_eq!(seen.as_slice(), &["ls".to_owned()]);
         }
+        drop(client);
+        let result = tokio::time::timeout(TIMEOUT, server).await??;
+        assert!(result.is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn terminal_input_timeout_stops_callback_and_releases_permit() -> R {
+        let (ext, handles) = DemoExtension::new();
+        let config = ServerConfig {
+            max_in_flight: 1,
+            ..ServerConfig::default()
+        };
+        let (mut client, server) = spawn_raw(ext, config);
+        client.hello(PROTOCOL_VERSION, "anything").await?;
+        let _ack = client.recv().await?;
+        client.load_context().await?;
+
+        let started_at = std::time::Instant::now();
+        client
+            .send(&Frame {
+                id: 2,
+                kind: FrameKind::Req,
+                method: Method::TerminalInput.as_str().to_owned(),
+                payload: json!({ "data": "stall" }),
+            })
+            .await?;
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            handles.terminal_started.notified(),
+        )
+        .await?;
+        let terminal = tokio::time::timeout(Duration::from_millis(100), client.recv()).await??;
+        let elapsed = started_at.elapsed();
+        assert!(
+            elapsed >= NATIVE_TERMINAL_INPUT_BUDGET,
+            "terminal callback timed out before its budget: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "terminal callback exceeded its bounded timeout: {elapsed:?}"
+        );
+        assert_eq!(terminal.id, 2);
+        assert_eq!(terminal.kind, FrameKind::Error);
+        assert_eq!(terminal.payload["code"], "timeout");
+        assert!(
+            handles.terminal_stopped.load(AtomicOrdering::SeqCst),
+            "timed-out callback future must be dropped"
+        );
+
+        tokio::task::yield_now().await;
+        let sibling = client
+            .request(
+                3,
+                EXTENSIONS_LOAD_METHOD,
+                json!({ "cwd": "/after-timeout" }),
+            )
+            .await?;
+        assert_eq!(sibling.kind, FrameKind::Res);
+
         drop(client);
         let result = tokio::time::timeout(TIMEOUT, server).await??;
         assert!(result.is_ok());

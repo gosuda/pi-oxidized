@@ -32,6 +32,7 @@ export class ProtocolError extends Error {
 
 const FRAME_KINDS: ReadonlySet<string> = new Set(["req", "res", "event", "error"]);
 const HYPERLINK_CONTROL_CHARS = /[\u0000-\u001F\u007F-\u009F]/u;
+const HYPERLINK_ID_DISALLOWED_CHARS = /[;:]/u;
 
 function requiresNonzeroId(kind: FrameKind): boolean {
 	return kind === "req" || kind === "res";
@@ -119,6 +120,9 @@ function validateHyperlink(value: unknown): void {
 		}
 		if (HYPERLINK_CONTROL_CHARS.test(value.id)) {
 			throw new ProtocolError("invalid_frame", "hyperlink id contains a control character");
+		}
+		if (HYPERLINK_ID_DISALLOWED_CHARS.test(value.id)) {
+			throw new ProtocolError("invalid_frame", "hyperlink id contains a disallowed character");
 		}
 	}
 }

@@ -748,15 +748,23 @@ impl Hyperlink {
     ///
     /// Returns [`ProtocolError::InvalidFrame`] when the link is rejected.
     pub fn validate(&self) -> Result<()> {
-        if let Some(id) = &self.id
-            && (id.len() > Self::MAX_ID_BYTES || id.chars().any(char::is_control))
-        {
-            let message = if id.len() > Self::MAX_ID_BYTES {
-                format!("hyperlink id exceeds {} bytes", Self::MAX_ID_BYTES)
-            } else {
-                "hyperlink id contains a control character".to_owned()
-            };
-            return Err(ProtocolError::InvalidFrame(message));
+        if let Some(id) = &self.id {
+            if id.len() > Self::MAX_ID_BYTES {
+                return Err(ProtocolError::InvalidFrame(format!(
+                    "hyperlink id exceeds {} bytes",
+                    Self::MAX_ID_BYTES
+                )));
+            }
+            if id.chars().any(char::is_control) {
+                return Err(ProtocolError::InvalidFrame(
+                    "hyperlink id contains a control character".to_owned(),
+                ));
+            }
+            if id.chars().any(|character| matches!(character, ';' | ':')) {
+                return Err(ProtocolError::InvalidFrame(
+                    "hyperlink id contains a disallowed character".to_owned(),
+                ));
+            }
         }
         if self.uri.len() > Self::MAX_URI_BYTES {
             return Err(ProtocolError::InvalidFrame(format!(
@@ -1009,7 +1017,7 @@ pub struct ToolSnapshotEntry {
     #[serde(default)]
     pub description: String,
     /// JSON Schema for the tool arguments.
-    #[serde(default)]
+    #[serde(default = "empty_object")]
     pub parameters: Value,
     /// Optional execution-mode override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1996,11 +2004,42 @@ pub fn empty_object() -> Value {
 }
 
 #[cfg(test)]
+const SHARED_FIXTURES: &str =
+    include_str!("../../../packages/pi-tui-protocol/tests/fixtures/frames.jsonl");
+
+#[cfg(test)]
+fn shared_fixture_lines() -> Vec<(&'static str, bool)> {
+    let mut fixtures = Vec::new();
+    let mut invalid_frame = false;
+    for line in SHARED_FIXTURES.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with("# invalid_frame") {
+            assert!(
+                !invalid_frame,
+                "shared fixture has consecutive invalid-frame markers"
+            );
+            invalid_frame = true;
+            continue;
+        }
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        fixtures.push((line, invalid_frame));
+        invalid_frame = false;
+    }
+    assert!(
+        !invalid_frame,
+        "shared fixture has an invalid-frame marker without a frame"
+    );
+    fixtures
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-
-    const FIXTURES: &str =
-        include_str!("../../../packages/pi-tui-protocol/tests/fixtures/frames.jsonl");
 
     type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
@@ -2164,6 +2203,8 @@ mod tests {
             serde_json::json!({"uri": "file:///tmp/x"}),
             serde_json::json!({"uri": format!("https://example.com/{}", "x".repeat(2048))}),
             serde_json::json!({"id": "x".repeat(129), "uri": "https://example.com"}),
+            serde_json::json!({"id": ";", "uri": "https://example.com"}),
+            serde_json::json!({"id": ":", "uri": "https://example.com"}),
         ] {
             let frame = Frame::event(
                 0,
@@ -2343,10 +2384,16 @@ mod tests {
     }
 
     #[test]
-    fn shared_fixtures_field_and_discriminant_parity() -> TestResult {
-        let mut count = 0usize;
-        for line in FIXTURES.lines() {
-            if line.trim().is_empty() || line.trim_start().starts_with('#') {
+    fn shared_fixtures_cover_wire_parity_and_invalid_frames() -> TestResult {
+        let mut valid_count = 0usize;
+        let mut invalid_count = 0usize;
+        for (line, expects_invalid_frame) in shared_fixture_lines() {
+            if expects_invalid_frame {
+                assert!(
+                    matches!(decode_frame_str(line), Err(ProtocolError::InvalidFrame(_))),
+                    "invalid shared fixture must return invalid_frame: {line}"
+                );
+                invalid_count += 1;
                 continue;
             }
             let frame = decode_frame_str(line)?;
@@ -2356,9 +2403,10 @@ mod tests {
             if let Some(method) = frame.method_enum() {
                 assert!(Method::ALL.contains(&method));
             }
-            count += 1;
+            valid_count += 1;
         }
-        assert!(count >= 8);
+        assert!(valid_count >= 8);
+        assert_eq!(invalid_count, 2);
         Ok(())
     }
 
@@ -2468,6 +2516,7 @@ mod tests {
             "errors": [{"path": "/bad.ts", "message": "broken"}]
         }))?;
         assert_eq!(snapshot.tools[0].label, "");
+        assert_eq!(snapshot.tools[0].parameters, serde_json::json!({}));
         assert_eq!(snapshot.commands[0].description, "");
         assert_eq!(snapshot.shortcuts[0].extension_path, "");
         assert_eq!(snapshot.flags[0].kind, "boolean");
@@ -2477,6 +2526,7 @@ mod tests {
         snapshot.validate()?;
 
         let encoded = serde_json::to_value(snapshot)?;
+        assert_eq!(encoded["tools"][0]["parameters"], serde_json::json!({}));
         assert_eq!(
             encoded["errors"][0],
             serde_json::json!({"path": "/bad.ts", "error": "broken"})
@@ -2618,17 +2668,18 @@ mod bridge_tests {
 
     type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
-    const FIXTURES: &str =
-        include_str!("../../../packages/pi-tui-protocol/tests/fixtures/frames.jsonl");
-
     /// Every open bridge method must be locked into the shared witness, and
     /// each witnessed payload must decode through its typed wire struct.
     #[test]
     fn shared_fixtures_cover_bridge_methods_typed() -> TestResult {
         let mut seen: std::collections::HashSet<(String, FrameKind)> =
             std::collections::HashSet::new();
-        for line in FIXTURES.lines() {
-            if line.trim().is_empty() || line.trim_start().starts_with('#') {
+        for (line, expects_invalid_frame) in shared_fixture_lines() {
+            if expects_invalid_frame {
+                assert!(
+                    matches!(decode_frame_str(line), Err(ProtocolError::InvalidFrame(_))),
+                    "invalid shared fixture must return invalid_frame: {line}"
+                );
                 continue;
             }
             let frame = decode_frame_str(line)?;
