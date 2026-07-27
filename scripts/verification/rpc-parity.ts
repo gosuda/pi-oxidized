@@ -413,7 +413,7 @@ function normalizeValue(value: JsonValue, key: string | undefined, state: Normal
 		// semantically equal objects with different field order must map
 		// their generated ids to the same placeholders.
 		for (const [childKey, childValue] of Object.entries(value).sort(([left], [right]) =>
-			left.localeCompare(right),
+			left < right ? -1 : Number(left > right),
 		)) {
 			normalized[childKey] = normalizeValue(childValue, childKey, state);
 		}

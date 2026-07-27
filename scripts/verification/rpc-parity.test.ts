@@ -121,6 +121,29 @@ test("canonicalStringify ignores object key order but not values", () => {
 	expect(canonicalStringify({ a: 1 })).not.toBe(canonicalStringify({ a: 2 }));
 });
 
+test("normalization orders ignorable/unicode keys by code unit, not locale", () => {
+	// U+00E9 (precomposed é) and e + U+0301 (decomposed) are distinct code-unit
+	// sequences but collate equal in many locales. A localeCompare-based sort
+	// would preserve insertion order for these distinct keys and make generated-id
+	// placeholder allocation depend on field order.
+	const k1 = "e" + String.fromCodePoint(0x0301);
+	const k2 = String.fromCharCode(0x00e9);
+	const uuid1 = "0198e3a0-1111-7000-8000-abcdef012345";
+	const uuid2 = "0198e3a0-2222-7000-8000-abcdef012345";
+	const ctx = { volatileRoots: [], repoRoot: "/repo" };
+	const a = { type: "response", data: { [k1]: uuid1, [k2]: uuid2 } };
+	const b = { type: "response", data: { [k2]: uuid2, [k1]: uuid1 } };
+	const [normA] = normalizeTranscript([a], ctx) as [Record<string, unknown>];
+	const [normB] = normalizeTranscript([b], ctx) as [Record<string, unknown>];
+	expect(canonicalStringify(normA as never)).toBe(canonicalStringify(normB as never));
+	const dataA = normA.data as Record<string, unknown>;
+	const dataB = normB.data as Record<string, unknown>;
+	expect(dataA[k1]).toBe(dataB[k1]);
+	expect(dataA[k2]).toBe(dataB[k2]);
+	expect(dataA[k1]).toBe("<uuid-1>");
+	expect(dataA[k2]).toBe("<uuid-2>");
+});
+
 test("normalization maps generated ids identically for reordered nested objects", () => {
 	// Two semantically equal objects whose fields arrive in different
 	// insertion order must allocate the same generated-id placeholders,
