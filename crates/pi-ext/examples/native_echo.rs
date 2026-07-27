@@ -25,6 +25,8 @@
 //! `cargo build --release --example native_echo` produces for your
 //! platform.
 
+use std::sync::Arc;
+
 use futures::FutureExt;
 use serde_json::{Value, json};
 use tokio::time::{Duration, sleep};
@@ -35,8 +37,8 @@ use pi_ai::types::{
 };
 use pi_ext::protocol::{ProviderSnapshotEntry, RegistrySnapshot, ToolSnapshotEntry};
 use pi_ext::server::{
-    ExtensionFault, NativeEventSink, NativeExtension, NativeFuture, ProviderEventSink,
-    ProviderStreamCall, ToolCall, ToolUpdateSink, serve,
+    ExtensionFault, NativeEventSink, NativeExtension, NativeExtensionContext, NativeFuture,
+    ProviderEventSink, ProviderStreamCall, ToolCall, ToolUpdateSink, serve,
 };
 
 const TOOL_NAME: &str = "native_echo";
@@ -118,6 +120,7 @@ impl NativeExtension for NativeEcho {
 
     fn prepare_tool(
         &self,
+        _context: Arc<NativeExtensionContext>,
         name: String,
         args: Value,
     ) -> NativeFuture<Result<Value, ExtensionFault>> {
@@ -130,6 +133,7 @@ impl NativeExtension for NativeEcho {
 
     fn validate_tool(
         &self,
+        _context: Arc<NativeExtensionContext>,
         name: String,
         args: Value,
         _tool_call_id: Option<String>,
@@ -143,6 +147,7 @@ impl NativeExtension for NativeEcho {
 
     fn execute_tool(
         &self,
+        _context: Arc<NativeExtensionContext>,
         call: ToolCall,
         updates: ToolUpdateSink,
         cancel: CancellationToken,
@@ -179,6 +184,7 @@ impl NativeExtension for NativeEcho {
 
     fn stream_provider(
         &self,
+        _context: Arc<NativeExtensionContext>,
         call: ProviderStreamCall,
         events: ProviderEventSink,
         cancel: CancellationToken,
@@ -242,6 +248,7 @@ impl NativeExtension for NativeEcho {
 
     fn on_lifecycle(
         &self,
+        _context: Arc<NativeExtensionContext>,
         event_type: String,
         _payload: Value,
         events: NativeEventSink,

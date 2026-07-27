@@ -153,6 +153,21 @@ impl std::error::Error for ExtensionFault {}
 // Tool execution surface
 // ---------------------------------------------------------------------------
 
+/// Immutable session context published by a valid `extensions.load`.
+///
+/// The server passes an owned [`Arc`] snapshot to every asynchronous
+/// [`NativeExtension`] callback. A later successful load replaces the
+/// runtime snapshot without changing contexts already held by in-flight
+/// callbacks. `project_trusted` is true only when the load payload contains
+/// the JSON boolean `projectTrusted: true`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeExtensionContext {
+    /// Session working directory supplied by `extensions.load`.
+    pub cwd: String,
+    /// Whether the host marked this project trusted for the session.
+    pub project_trusted: bool,
+}
+
 /// A single `tool.execute` invocation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolCall {
@@ -311,6 +326,10 @@ impl NativeEventSink {
 ///
 /// This trait is pre-1.0: methods may change between releases. Implementors
 /// are compiled into a native endpoint executable served by [`serve`].
+///
+/// Every asynchronous callback receives an owned [`Arc`] of the immutable
+/// [`NativeExtensionContext`] captured for that request. `snapshot()` remains
+/// startup-only and deliberately has no session context.
 pub trait NativeExtension: Send + Sync + 'static {
     /// Registry snapshot mirror returned for `extensions.load`.
     fn snapshot(&self) -> RegistrySnapshot;
@@ -318,6 +337,7 @@ pub trait NativeExtension: Send + Sync + 'static {
     /// Prepare raw tool arguments (`tool.prepare`).
     fn prepare_tool(
         &self,
+        context: Arc<NativeExtensionContext>,
         name: String,
         args: Value,
     ) -> NativeFuture<Result<Value, ExtensionFault>>;
@@ -325,6 +345,7 @@ pub trait NativeExtension: Send + Sync + 'static {
     /// Validate prepared tool arguments (`tool.validate`).
     fn validate_tool(
         &self,
+        context: Arc<NativeExtensionContext>,
         name: String,
         args: Value,
         tool_call_id: Option<String>,
@@ -340,6 +361,7 @@ pub trait NativeExtension: Send + Sync + 'static {
     /// value.
     fn execute_tool(
         &self,
+        context: Arc<NativeExtensionContext>,
         call: ToolCall,
         updates: ToolUpdateSink,
         cancel: CancellationToken,
@@ -351,6 +373,7 @@ pub trait NativeExtension: Send + Sync + 'static {
     /// registered commands.
     fn execute_command(
         &self,
+        _context: Arc<NativeExtensionContext>,
         command: String,
         args: String,
     ) -> NativeFuture<Result<(), ExtensionFault>> {
@@ -373,6 +396,7 @@ pub trait NativeExtension: Send + Sync + 'static {
     /// streaming providers.
     fn stream_provider(
         &self,
+        _context: Arc<NativeExtensionContext>,
         call: ProviderStreamCall,
         events: ProviderEventSink,
         cancel: CancellationToken,
@@ -393,6 +417,7 @@ pub trait NativeExtension: Send + Sync + 'static {
     /// not store anything.
     fn set_flags(
         &self,
+        _context: Arc<NativeExtensionContext>,
         values: BTreeMap<String, FlagValueWire>,
     ) -> NativeFuture<Result<bool, ExtensionFault>> {
         let _ = values;
@@ -404,7 +429,11 @@ pub trait NativeExtension: Send + Sync + 'static {
     /// Returns whether the key was owned and dispatched. The default
     /// returns `Ok(false)` (`{"handled": false}`), matching the
     /// TypeScript hosts' no-owner reply.
-    fn execute_shortcut(&self, key: String) -> NativeFuture<Result<bool, ExtensionFault>> {
+    fn execute_shortcut(
+        &self,
+        _context: Arc<NativeExtensionContext>,
+        key: String,
+    ) -> NativeFuture<Result<bool, ExtensionFault>> {
         let _ = key;
         Box::pin(async { Ok(false) })
     }
@@ -414,6 +443,7 @@ pub trait NativeExtension: Send + Sync + 'static {
     /// The default returns an empty result (`{}`): no rewrite, no consume.
     fn handle_terminal_input(
         &self,
+        _context: Arc<NativeExtensionContext>,
         data: String,
     ) -> NativeFuture<Result<TerminalInputResult, ExtensionFault>> {
         let _ = data;
@@ -427,6 +457,7 @@ pub trait NativeExtension: Send + Sync + 'static {
     /// `{}` (no renderer), mirroring both TypeScript hosts.
     fn render_tool_html(
         &self,
+        _context: Arc<NativeExtensionContext>,
         tool_name: String,
         phase: String,
         payload: Value,
@@ -448,6 +479,7 @@ pub trait NativeExtension: Send + Sync + 'static {
     /// observed, no mutation).
     fn on_lifecycle(
         &self,
+        _context: Arc<NativeExtensionContext>,
         event_type: String,
         payload: Value,
         events: NativeEventSink,
@@ -856,6 +888,10 @@ struct ServerRuntime<E: NativeExtension> {
     /// Cancel tokens for in-flight `tool.execute` and `provider.stream`
     /// calls, keyed by frame id.
     in_flight: Mutex<HashMap<FrameId, CancellationToken>>,
+    /// Last valid session context. `None` until the first accepted
+    /// `extensions.load`; cloned snapshots are never held under this lock
+    /// across callback awaits.
+    context: Mutex<Option<Arc<NativeExtensionContext>>>,
     /// Shared outbound (server → client) frame channel.
     out_tx: mpsc::Sender<OutboundFrame>,
     /// Bound on queued per-call streaming updates/events.
@@ -876,11 +912,21 @@ impl<E: NativeExtension> ServerRuntime<E> {
                 handlers,
                 semaphore: Arc::new(Semaphore::new(config.max_in_flight.max(1))),
                 in_flight: Mutex::new(HashMap::new()),
+                context: Mutex::new(None),
                 out_tx,
                 update_capacity: config.update_capacity,
             },
             out_rx,
         )
+    }
+
+    /// Clone the current immutable session context without retaining the
+    /// runtime lock into asynchronous extension work.
+    fn capture_context(&self) -> Option<Arc<NativeExtensionContext>> {
+        self.context
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -1037,13 +1083,9 @@ async fn handle_request<E: NativeExtension>(
     let id = frame.id;
     let method = frame.method.clone();
     let terminal = match method.as_str() {
-        EXTENSIONS_LOAD_METHOD => handle_load(&runtime, id, &method),
-        methods::TOOL_PREPARE => {
-            handle_prepare(&runtime.extension, id, &method, &frame.payload).await
-        }
-        methods::TOOL_VALIDATE => {
-            handle_validate(&runtime.extension, id, &method, &frame.payload).await
-        }
+        EXTENSIONS_LOAD_METHOD => handle_load(&runtime, id, &method, &frame.payload),
+        methods::TOOL_PREPARE => handle_prepare(&runtime, id, &method, &frame.payload).await,
+        methods::TOOL_VALIDATE => handle_validate(&runtime, id, &method, &frame.payload).await,
         methods::TOOL_EXECUTE => {
             execute_tool_request(&runtime, id, &method, frame.payload, token).await;
             return;
@@ -1052,18 +1094,12 @@ async fn handle_request<E: NativeExtension>(
             execute_provider_request(&runtime, id, &method, frame.payload, token).await;
             return;
         }
-        COMMAND_EXECUTE_METHOD => {
-            handle_command(&runtime.extension, id, &method, &frame.payload).await
-        }
-        FLAGS_SET_METHOD => handle_flags_set(&runtime.extension, id, &method, &frame.payload).await,
-        SHORTCUT_EXECUTE_METHOD => {
-            handle_shortcut(&runtime.extension, id, &method, &frame.payload).await
-        }
-        TOOL_RENDER_HTML_METHOD => {
-            handle_render_html(&runtime.extension, id, &method, &frame.payload).await
-        }
+        COMMAND_EXECUTE_METHOD => handle_command(&runtime, id, &method, &frame.payload).await,
+        FLAGS_SET_METHOD => handle_flags_set(&runtime, id, &method, &frame.payload).await,
+        SHORTCUT_EXECUTE_METHOD => handle_shortcut(&runtime, id, &method, &frame.payload).await,
+        TOOL_RENDER_HTML_METHOD => handle_render_html(&runtime, id, &method, &frame.payload).await,
         m if m == Method::TerminalInput.as_str() => {
-            handle_terminal_input(&runtime.extension, id, &method, &frame.payload).await
+            handle_terminal_input(&runtime, id, &method, &frame.payload).await
         }
         m if m == Method::Hello.as_str() => error_frame(
             id,
@@ -1098,8 +1134,31 @@ async fn handle_request<E: NativeExtension>(
     let _ = runtime.out_tx.send(terminal.into()).await;
 }
 
-/// `extensions.load`: encode the cached registry snapshot mirror.
-fn handle_load<E: NativeExtension>(runtime: &ServerRuntime<E>, id: FrameId, method: &str) -> Frame {
+/// `extensions.load`: publish its session context and encode the cached registry snapshot mirror.
+fn handle_load<E: NativeExtension>(
+    runtime: &ServerRuntime<E>,
+    id: FrameId,
+    method: &str,
+    payload: &Value,
+) -> Frame {
+    let Some(cwd) = payload.get("cwd").and_then(Value::as_str) else {
+        return error_frame(
+            id,
+            method,
+            "invalid_request",
+            "extensions.load requires a string cwd",
+            false,
+        );
+    };
+
+    let context = Arc::new(NativeExtensionContext {
+        cwd: cwd.to_owned(),
+        project_trusted: payload.get("projectTrusted") == Some(&Value::Bool(true)),
+    });
+    *runtime
+        .context
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(context);
     match serde_json::to_value(&runtime.snapshot) {
         Ok(payload) => res_frame(id, method, payload),
         Err(e) => error_frame(
@@ -1112,13 +1171,35 @@ fn handle_load<E: NativeExtension>(runtime: &ServerRuntime<E>, id: FrameId, meth
     }
 }
 
+/// Capture the request's immutable context or fail closed before an extension
+/// callback starts.
+fn callback_context<E: NativeExtension>(
+    runtime: &ServerRuntime<E>,
+    id: FrameId,
+    method: &str,
+) -> Result<Arc<NativeExtensionContext>, Frame> {
+    runtime.capture_context().ok_or_else(|| {
+        error_frame(
+            id,
+            method,
+            "extension_not_loaded",
+            "extensions.load must succeed before invoking native callbacks",
+            false,
+        )
+    })
+}
+
 /// `tool.prepare`: run the extension's argument preparation.
 async fn handle_prepare<E: NativeExtension>(
-    extension: &E,
+    runtime: &ServerRuntime<E>,
     id: FrameId,
     method: &str,
     payload: &Value,
 ) -> Frame {
+    let context = match callback_context(runtime, id, method) {
+        Ok(context) => context,
+        Err(error) => return error,
+    };
     let Some(name) = payload.get("name").and_then(Value::as_str) else {
         return error_frame(
             id,
@@ -1129,7 +1210,11 @@ async fn handle_prepare<E: NativeExtension>(
         );
     };
     let args = payload.get("args").cloned().unwrap_or(Value::Null);
-    match extension.prepare_tool(name.to_owned(), args).await {
+    match runtime
+        .extension
+        .prepare_tool(context, name.to_owned(), args)
+        .await
+    {
         Ok(args) => res_frame(id, method, json!({ "args": args })),
         Err(fault) => fault_frame(id, method, &fault),
     }
@@ -1137,11 +1222,15 @@ async fn handle_prepare<E: NativeExtension>(
 
 /// `tool.validate`: run the extension's argument validation.
 async fn handle_validate<E: NativeExtension>(
-    extension: &E,
+    runtime: &ServerRuntime<E>,
     id: FrameId,
     method: &str,
     payload: &Value,
 ) -> Frame {
+    let context = match callback_context(runtime, id, method) {
+        Ok(context) => context,
+        Err(error) => return error,
+    };
     let Some(name) = payload.get("name").and_then(Value::as_str) else {
         return error_frame(
             id,
@@ -1156,8 +1245,9 @@ async fn handle_validate<E: NativeExtension>(
         .get("toolCallId")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    match extension
-        .validate_tool(name.to_owned(), args, tool_call_id)
+    match runtime
+        .extension
+        .validate_tool(context, name.to_owned(), args, tool_call_id)
         .await
     {
         Ok(args) => res_frame(id, method, json!({ "args": args })),
@@ -1167,11 +1257,15 @@ async fn handle_validate<E: NativeExtension>(
 
 /// `command.execute`: run a slash command.
 async fn handle_command<E: NativeExtension>(
-    extension: &E,
+    runtime: &ServerRuntime<E>,
     id: FrameId,
     method: &str,
     payload: &Value,
 ) -> Frame {
+    let context = match callback_context(runtime, id, method) {
+        Ok(context) => context,
+        Err(error) => return error,
+    };
     let command = payload
         .get("command")
         .or_else(|| payload.get("name"))
@@ -1183,7 +1277,11 @@ async fn handle_command<E: NativeExtension>(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
-    match extension.execute_command(command, args).await {
+    match runtime
+        .extension
+        .execute_command(context, command, args)
+        .await
+    {
         Ok(()) => res_frame(id, method, json!({ "ok": true })),
         Err(fault) => fault_frame(id, method, &fault),
     }
@@ -1191,11 +1289,15 @@ async fn handle_command<E: NativeExtension>(
 
 /// `flags.set`: apply the validated flag overlay.
 async fn handle_flags_set<E: NativeExtension>(
-    extension: &E,
+    runtime: &ServerRuntime<E>,
     id: FrameId,
     method: &str,
     payload: &Value,
 ) -> Frame {
+    let context = match callback_context(runtime, id, method) {
+        Ok(context) => context,
+        Err(error) => return error,
+    };
     let request = match from_payload::<FlagsSetRequest>(payload) {
         Ok(request) => request,
         Err(e) => {
@@ -1208,7 +1310,7 @@ async fn handle_flags_set<E: NativeExtension>(
             );
         }
     };
-    match extension.set_flags(request.values).await {
+    match runtime.extension.set_flags(context, request.values).await {
         Ok(ok) => res_frame(id, method, json!({ "ok": ok })),
         Err(fault) => fault_frame(id, method, &fault),
     }
@@ -1217,17 +1319,21 @@ async fn handle_flags_set<E: NativeExtension>(
 /// `shortcut.execute`: dispatch one key; unowned keys answer
 /// `handled: false` rather than an error, matching the TypeScript hosts.
 async fn handle_shortcut<E: NativeExtension>(
-    extension: &E,
+    runtime: &ServerRuntime<E>,
     id: FrameId,
     method: &str,
     payload: &Value,
 ) -> Frame {
+    let context = match callback_context(runtime, id, method) {
+        Ok(context) => context,
+        Err(error) => return error,
+    };
     let key = payload
         .get("key")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
-    match extension.execute_shortcut(key).await {
+    match runtime.extension.execute_shortcut(context, key).await {
         Ok(handled) => res_frame(id, method, json!({ "handled": handled })),
         Err(fault) => fault_frame(id, method, &fault),
     }
@@ -1235,17 +1341,21 @@ async fn handle_shortcut<E: NativeExtension>(
 
 /// `terminalInput`: rewrite or consume one input chunk.
 async fn handle_terminal_input<E: NativeExtension>(
-    extension: &E,
+    runtime: &ServerRuntime<E>,
     id: FrameId,
     method: &str,
     payload: &Value,
 ) -> Frame {
+    let context = match callback_context(runtime, id, method) {
+        Ok(context) => context,
+        Err(error) => return error,
+    };
     let data = payload
         .get("data")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
-    match extension.handle_terminal_input(data).await {
+    match runtime.extension.handle_terminal_input(context, data).await {
         Ok(result) => res_frame(
             id,
             method,
@@ -1258,11 +1368,15 @@ async fn handle_terminal_input<E: NativeExtension>(
 /// `tool.renderHtml`: render one tool phase; endpoints without a renderer
 /// answer `{}`.
 async fn handle_render_html<E: NativeExtension>(
-    extension: &E,
+    runtime: &ServerRuntime<E>,
     id: FrameId,
     method: &str,
     payload: &Value,
 ) -> Frame {
+    let context = match callback_context(runtime, id, method) {
+        Ok(context) => context,
+        Err(error) => return error,
+    };
     let phase = payload
         .get("phase")
         .and_then(Value::as_str)
@@ -1274,7 +1388,11 @@ async fn handle_render_html<E: NativeExtension>(
         .unwrap_or_default()
         .to_owned();
     let body = payload.get("payload").cloned().unwrap_or(Value::Null);
-    match extension.render_tool_html(tool_name, phase, body).await {
+    match runtime
+        .extension
+        .render_tool_html(context, tool_name, phase, body)
+        .await
+    {
         Ok(value) => res_frame(id, method, value),
         Err(fault) => fault_frame(id, method, &fault),
     }
@@ -1289,12 +1407,16 @@ async fn handle_lifecycle<E: NativeExtension>(
     event_type: &str,
     payload: Value,
 ) -> Frame {
+    let context = match callback_context(runtime, id, method) {
+        Ok(context) => context,
+        Err(error) => return error,
+    };
     let events = NativeEventSink {
         tx: runtime.out_tx.clone(),
     };
     match runtime
         .extension
-        .on_lifecycle(event_type.to_owned(), payload, events)
+        .on_lifecycle(context, event_type.to_owned(), payload, events)
         .await
     {
         Ok(value) => res_frame(id, method, value),
@@ -1325,6 +1447,16 @@ async fn execute_tool_request<E: NativeExtension>(
     payload: Value,
     token: Option<CancellationToken>,
 ) {
+    let context = match callback_context(runtime, id, method) {
+        Ok(context) => context,
+        Err(terminal) => {
+            if let Ok(mut map) = runtime.in_flight.lock() {
+                map.remove(&id);
+            }
+            let _ = runtime.out_tx.send(terminal.into()).await;
+            return;
+        }
+    };
     let Some(name) = payload.get("name").and_then(Value::as_str) else {
         if let Ok(mut map) = runtime.in_flight.lock() {
             map.remove(&id);
@@ -1399,7 +1531,12 @@ async fn execute_tool_request<E: NativeExtension>(
 
     let result = runtime
         .extension
-        .execute_tool(call, ToolUpdateSink { tx: update_tx }, token.clone())
+        .execute_tool(
+            context,
+            call,
+            ToolUpdateSink { tx: update_tx },
+            token.clone(),
+        )
         .await;
     let _ = done_tx.send(());
 
@@ -1433,6 +1570,16 @@ async fn execute_provider_request<E: NativeExtension>(
     payload: Value,
     token: Option<CancellationToken>,
 ) {
+    let context = match callback_context(runtime, id, method) {
+        Ok(context) => context,
+        Err(terminal) => {
+            if let Ok(mut map) = runtime.in_flight.lock() {
+                map.remove(&id);
+            }
+            let _ = runtime.out_tx.send(terminal.into()).await;
+            return;
+        }
+    };
     let call = ProviderStreamCall {
         provider_id: payload
             .get("providerId")
@@ -1490,7 +1637,7 @@ async fn execute_provider_request<E: NativeExtension>(
 
     let result = runtime
         .extension
-        .stream_provider(call, sink, token.clone())
+        .stream_provider(context, call, sink, token.clone())
         .await;
     let _ = done_tx.send(());
 
@@ -1631,6 +1778,22 @@ mod tests {
             Ok(decode_frame_str(line.trim_end())?)
         }
 
+        async fn request(
+            &mut self,
+            id: FrameId,
+            method: &str,
+            payload: Value,
+        ) -> Result<Frame, Box<dyn Error>> {
+            self.send(&Frame {
+                id,
+                kind: FrameKind::Req,
+                method: method.to_owned(),
+                payload,
+            })
+            .await?;
+            self.recv().await
+        }
+
         async fn hello(&mut self, protocol_version: u32, compat: &str) -> R {
             self.send(&Frame {
                 id: 1,
@@ -1643,19 +1806,41 @@ mod tests {
             })
             .await
         }
+
+        async fn load_context(&mut self) -> R {
+            self.send(&Frame {
+                id: u64::MAX,
+                kind: FrameKind::Req,
+                method: EXTENSIONS_LOAD_METHOD.to_owned(),
+                payload: json!({
+                    "extensionPaths": [],
+                    "cwd": "/raw-test-context",
+                    "projectTrusted": false,
+                }),
+            })
+            .await?;
+            let response = self.recv().await?;
+            assert_eq!(response.id, u64::MAX);
+            assert_eq!(response.kind, FrameKind::Res);
+            Ok(())
+        }
     }
 
     struct BlockingWriter {
-        blocked: Arc<AtomicBool>,
+        block: Arc<AtomicBool>,
+        writes: Arc<AtomicUsize>,
     }
 
     impl tokio::io::AsyncWrite for BlockingWriter {
         fn poll_write(
             self: std::pin::Pin<&mut Self>,
             _cx: &mut std::task::Context<'_>,
-            _buf: &[u8],
+            buf: &[u8],
         ) -> std::task::Poll<std::io::Result<usize>> {
-            self.blocked.store(true, AtomicOrdering::SeqCst);
+            if !self.block.load(AtomicOrdering::SeqCst) {
+                self.writes.fetch_add(1, AtomicOrdering::SeqCst);
+                return std::task::Poll::Ready(Ok(buf.len()));
+            }
             std::task::Poll::Pending
         }
 
@@ -1702,6 +1887,7 @@ mod tests {
         shortcuts: Arc<Mutex<Vec<String>>>,
         terminal_inputs: Arc<Mutex<Vec<String>>>,
         renders: Arc<Mutex<Vec<(String, String)>>>,
+        tool_contexts: Arc<Mutex<Vec<Arc<NativeExtensionContext>>>>,
         provider_started: Arc<Notify>,
         provider_cancelled: Arc<AtomicBool>,
         provider_send_failed: Arc<AtomicBool>,
@@ -1727,6 +1913,7 @@ mod tests {
                 shortcuts: Arc::new(Mutex::new(Vec::new())),
                 terminal_inputs: Arc::new(Mutex::new(Vec::new())),
                 renders: Arc::new(Mutex::new(Vec::new())),
+                tool_contexts: Arc::new(Mutex::new(Vec::new())),
                 provider_started: Arc::new(Notify::new()),
                 provider_cancelled: Arc::new(AtomicBool::new(false)),
                 provider_send_failed: Arc::new(AtomicBool::new(false)),
@@ -1747,6 +1934,7 @@ mod tests {
                 shortcuts: Arc::clone(&self.shortcuts),
                 terminal_inputs: Arc::clone(&self.terminal_inputs),
                 renders: Arc::clone(&self.renders),
+                tool_contexts: Arc::clone(&self.tool_contexts),
                 provider_started: Arc::clone(&self.provider_started),
                 provider_cancelled: Arc::clone(&self.provider_cancelled),
                 provider_send_failed: Arc::clone(&self.provider_send_failed),
@@ -1855,6 +2043,7 @@ mod tests {
 
         fn prepare_tool(
             &self,
+            _context: Arc<NativeExtensionContext>,
             name: String,
             args: Value,
         ) -> NativeFuture<Result<Value, ExtensionFault>> {
@@ -1876,6 +2065,7 @@ mod tests {
 
         fn validate_tool(
             &self,
+            _context: Arc<NativeExtensionContext>,
             name: String,
             args: Value,
             _tool_call_id: Option<String>,
@@ -1898,6 +2088,7 @@ mod tests {
 
         fn execute_tool(
             &self,
+            context: Arc<NativeExtensionContext>,
             call: ToolCall,
             updates: ToolUpdateSink,
             cancel: CancellationToken,
@@ -1906,7 +2097,9 @@ mod tests {
             let release = Arc::clone(&self.handles.release);
             let cancelled = Arc::clone(&self.handles.cancelled);
             let saturated = Arc::clone(&self.handles.saturated);
+            let tool_contexts = Arc::clone(&self.handles.tool_contexts);
             Box::pin(async move {
+                record(&tool_contexts, context);
                 match call.name.as_str() {
                     "echo" => {
                         let _ = updates.send(json!({ "stage": "half" }));
@@ -1959,6 +2152,7 @@ mod tests {
 
         fn execute_command(
             &self,
+            _context: Arc<NativeExtensionContext>,
             command: String,
             args: String,
         ) -> NativeFuture<Result<(), ExtensionFault>> {
@@ -1980,6 +2174,7 @@ mod tests {
 
         fn stream_provider(
             &self,
+            _context: Arc<NativeExtensionContext>,
             call: ProviderStreamCall,
             events: ProviderEventSink,
             cancel: CancellationToken,
@@ -2043,6 +2238,7 @@ mod tests {
 
         fn set_flags(
             &self,
+            _context: Arc<NativeExtensionContext>,
             values: BTreeMap<String, FlagValueWire>,
         ) -> NativeFuture<Result<bool, ExtensionFault>> {
             let flags = Arc::clone(&self.handles.flags);
@@ -2055,7 +2251,11 @@ mod tests {
             })
         }
 
-        fn execute_shortcut(&self, key: String) -> NativeFuture<Result<bool, ExtensionFault>> {
+        fn execute_shortcut(
+            &self,
+            _context: Arc<NativeExtensionContext>,
+            key: String,
+        ) -> NativeFuture<Result<bool, ExtensionFault>> {
             let shortcuts = Arc::clone(&self.handles.shortcuts);
             Box::pin(async move {
                 let owned = key == "ctrl+alt+d";
@@ -2066,6 +2266,7 @@ mod tests {
 
         fn handle_terminal_input(
             &self,
+            _context: Arc<NativeExtensionContext>,
             data: String,
         ) -> NativeFuture<Result<TerminalInputResult, ExtensionFault>> {
             let seen = Arc::clone(&self.handles.terminal_inputs);
@@ -2080,6 +2281,7 @@ mod tests {
 
         fn render_tool_html(
             &self,
+            _context: Arc<NativeExtensionContext>,
             tool_name: String,
             phase: String,
             payload: Value,
@@ -2094,6 +2296,7 @@ mod tests {
 
         fn on_lifecycle(
             &self,
+            _context: Arc<NativeExtensionContext>,
             event_type: String,
             payload: Value,
             events: NativeEventSink,
@@ -2137,6 +2340,7 @@ mod tests {
 
         fn prepare_tool(
             &self,
+            _context: Arc<NativeExtensionContext>,
             name: String,
             args: Value,
         ) -> NativeFuture<Result<Value, ExtensionFault>> {
@@ -2151,6 +2355,7 @@ mod tests {
 
         fn validate_tool(
             &self,
+            _context: Arc<NativeExtensionContext>,
             name: String,
             args: Value,
             _tool_call_id: Option<String>,
@@ -2166,6 +2371,7 @@ mod tests {
 
         fn execute_tool(
             &self,
+            _context: Arc<NativeExtensionContext>,
             call: ToolCall,
             updates: ToolUpdateSink,
             _cancel: CancellationToken,
@@ -2190,6 +2396,7 @@ mod tests {
 
         fn stream_provider(
             &self,
+            _context: Arc<NativeExtensionContext>,
             call: ProviderStreamCall,
             events: ProviderEventSink,
             _cancel: CancellationToken,
@@ -2222,6 +2429,7 @@ mod tests {
 
         fn prepare_tool(
             &self,
+            _context: Arc<NativeExtensionContext>,
             name: String,
             _args: Value,
         ) -> NativeFuture<Result<Value, ExtensionFault>> {
@@ -2230,6 +2438,7 @@ mod tests {
 
         fn validate_tool(
             &self,
+            _context: Arc<NativeExtensionContext>,
             name: String,
             _args: Value,
             _tool_call_id: Option<String>,
@@ -2239,12 +2448,507 @@ mod tests {
 
         fn execute_tool(
             &self,
+            _context: Arc<NativeExtensionContext>,
             call: ToolCall,
             _updates: ToolUpdateSink,
             _cancel: CancellationToken,
         ) -> NativeFuture<Result<Value, ExtensionFault>> {
             Box::pin(async move { Err(ExtensionFault::not_found(call.name)) })
         }
+    }
+
+    type ObservedContext = (String, Arc<NativeExtensionContext>);
+
+    #[derive(Clone)]
+    struct ContextProbeHandles {
+        observed: Arc<Mutex<Vec<ObservedContext>>>,
+        blocked_started: Arc<Notify>,
+        blocked_release: Arc<Notify>,
+    }
+
+    /// Records the exact context Arc passed to every native callback.
+    struct ContextProbeExtension {
+        handles: ContextProbeHandles,
+    }
+
+    impl ContextProbeExtension {
+        fn new() -> (Self, ContextProbeHandles) {
+            let handles = ContextProbeHandles {
+                observed: Arc::new(Mutex::new(Vec::new())),
+                blocked_started: Arc::new(Notify::new()),
+                blocked_release: Arc::new(Notify::new()),
+            };
+            (
+                Self {
+                    handles: handles.clone(),
+                },
+                handles,
+            )
+        }
+
+        fn observe(&self, callback: impl Into<String>, context: Arc<NativeExtensionContext>) {
+            record(&self.handles.observed, (callback.into(), context));
+        }
+    }
+
+    impl NativeExtension for ContextProbeExtension {
+        fn snapshot(&self) -> RegistrySnapshot {
+            RegistrySnapshot {
+                handlers: vec!["context.lifecycle".to_owned()],
+                ..RegistrySnapshot::default()
+            }
+        }
+
+        fn prepare_tool(
+            &self,
+            context: Arc<NativeExtensionContext>,
+            _name: String,
+            args: Value,
+        ) -> NativeFuture<Result<Value, ExtensionFault>> {
+            self.observe("prepare_tool", context);
+            Box::pin(async move { Ok(args) })
+        }
+
+        fn validate_tool(
+            &self,
+            context: Arc<NativeExtensionContext>,
+            _name: String,
+            args: Value,
+            _tool_call_id: Option<String>,
+        ) -> NativeFuture<Result<Value, ExtensionFault>> {
+            self.observe("validate_tool", context);
+            Box::pin(async move { Ok(args) })
+        }
+
+        fn execute_tool(
+            &self,
+            context: Arc<NativeExtensionContext>,
+            call: ToolCall,
+            _updates: ToolUpdateSink,
+            _cancel: CancellationToken,
+        ) -> NativeFuture<Result<Value, ExtensionFault>> {
+            let name = call.name;
+            let blocks = name == "block";
+            self.observe(format!("execute_tool:{name}"), context);
+            let started = Arc::clone(&self.handles.blocked_started);
+            let release = Arc::clone(&self.handles.blocked_release);
+            Box::pin(async move {
+                if blocks {
+                    started.notify_one();
+                    release.notified().await;
+                }
+                Ok(json!({}))
+            })
+        }
+
+        fn execute_command(
+            &self,
+            context: Arc<NativeExtensionContext>,
+            _command: String,
+            _args: String,
+        ) -> NativeFuture<Result<(), ExtensionFault>> {
+            self.observe("execute_command", context);
+            Box::pin(async { Ok(()) })
+        }
+
+        fn stream_provider(
+            &self,
+            context: Arc<NativeExtensionContext>,
+            _call: ProviderStreamCall,
+            _events: ProviderEventSink,
+            _cancel: CancellationToken,
+        ) -> NativeFuture<Result<Value, ExtensionFault>> {
+            self.observe("stream_provider", context);
+            Box::pin(async { Ok(json!({})) })
+        }
+
+        fn set_flags(
+            &self,
+            context: Arc<NativeExtensionContext>,
+            _values: BTreeMap<String, FlagValueWire>,
+        ) -> NativeFuture<Result<bool, ExtensionFault>> {
+            self.observe("set_flags", context);
+            Box::pin(async { Ok(true) })
+        }
+
+        fn execute_shortcut(
+            &self,
+            context: Arc<NativeExtensionContext>,
+            _key: String,
+        ) -> NativeFuture<Result<bool, ExtensionFault>> {
+            self.observe("execute_shortcut", context);
+            Box::pin(async { Ok(true) })
+        }
+
+        fn handle_terminal_input(
+            &self,
+            context: Arc<NativeExtensionContext>,
+            _data: String,
+        ) -> NativeFuture<Result<TerminalInputResult, ExtensionFault>> {
+            self.observe("handle_terminal_input", context);
+            Box::pin(async { Ok(TerminalInputResult::default()) })
+        }
+
+        fn render_tool_html(
+            &self,
+            context: Arc<NativeExtensionContext>,
+            _tool_name: String,
+            _phase: String,
+            _payload: Value,
+        ) -> NativeFuture<Result<Value, ExtensionFault>> {
+            self.observe("render_tool_html", context);
+            Box::pin(async { Ok(json!({})) })
+        }
+
+        fn on_lifecycle(
+            &self,
+            context: Arc<NativeExtensionContext>,
+            _event_type: String,
+            _payload: Value,
+            _events: NativeEventSink,
+        ) -> NativeFuture<Result<Value, ExtensionFault>> {
+            self.observe("on_lifecycle", context);
+            Box::pin(async { Ok(json!({})) })
+        }
+    }
+
+    /// Builds the ordered `(id, method, payload)` probe sequence used to
+    /// enumerate every native callback surface. Both the pre-load rejection
+    /// pass and the post-load acceptance pass share this sequence; only the
+    /// starting id differs.
+    fn probe_callback_requests(start_id: FrameId) -> Vec<(FrameId, &'static str, Value)> {
+        let mut id = start_id;
+        let mut push = |method: &'static str, payload: Value| {
+            let entry = (id, method, payload);
+            id += 1;
+            entry
+        };
+        vec![
+            push(
+                methods::TOOL_PREPARE,
+                json!({ "name": "probe", "args": {} }),
+            ),
+            push(
+                methods::TOOL_VALIDATE,
+                json!({ "name": "probe", "args": {}, "toolCallId": "probe" }),
+            ),
+            push(
+                methods::TOOL_EXECUTE,
+                json!({ "name": "probe", "toolCallId": "probe", "args": {} }),
+            ),
+            push(
+                COMMAND_EXECUTE_METHOD,
+                json!({ "command": "probe", "args": "" }),
+            ),
+            push(
+                methods::PROVIDER_STREAM,
+                json!({ "providerId": "probe", "model": {}, "context": {}, "options": {} }),
+            ),
+            push(FLAGS_SET_METHOD, json!({ "values": { "probe": true } })),
+            push(SHORTCUT_EXECUTE_METHOD, json!({ "key": "ctrl+probe" })),
+            push(Method::TerminalInput.as_str(), json!({ "data": "probe" })),
+            push(
+                TOOL_RENDER_HTML_METHOD,
+                json!({ "toolName": "probe", "phase": "call", "payload": {} }),
+            ),
+            push("context.lifecycle", json!({})),
+        ]
+    }
+
+    /// Before any load, every callback-bearing request must surface an
+    /// `extension_not_loaded` error and must not invoke the extension.
+    async fn assert_callbacks_rejected_before_load(
+        client: &mut RawClient,
+        handles: &ContextProbeHandles,
+    ) -> R {
+        for (id, method, payload) in probe_callback_requests(2) {
+            let error = client.request(id, method, payload).await?;
+            assert_eq!(error.kind, FrameKind::Error);
+            assert_eq!(error.payload["code"], "extension_not_loaded");
+        }
+        assert!(
+            handles
+                .observed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "pre-load requests must not invoke extension callbacks"
+        );
+        Ok(())
+    }
+
+    /// After a valid load, every callback-bearing request must succeed and
+    /// must have invoked the extension exactly once, all sharing one Arc
+    /// snapshot. Returns that shared context.
+    async fn assert_callbacks_observed_after_load(
+        client: &mut RawClient,
+        handles: &ContextProbeHandles,
+        synthetic_cwd: &str,
+        process_cwd: &std::path::Path,
+    ) -> Result<Arc<NativeExtensionContext>, Box<dyn Error>> {
+        for (id, method, payload) in probe_callback_requests(21) {
+            let response = client.request(id, method, payload).await?;
+            assert_eq!(response.kind, FrameKind::Res);
+        }
+
+        let observed = handles
+            .observed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            observed
+                .iter()
+                .map(|(callback, _)| callback.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "prepare_tool",
+                "validate_tool",
+                "execute_tool:probe",
+                "execute_command",
+                "stream_provider",
+                "set_flags",
+                "execute_shortcut",
+                "handle_terminal_input",
+                "render_tool_html",
+                "on_lifecycle",
+            ]
+        );
+        let first_context = Arc::clone(&observed[0].1);
+        for (_, context) in &observed {
+            assert!(
+                Arc::ptr_eq(&first_context, context),
+                "all callbacks from one load must receive the same Arc snapshot"
+            );
+            assert_eq!(context.cwd, synthetic_cwd);
+            assert!(context.project_trusted);
+        }
+        assert_eq!(
+            std::env::current_dir()?,
+            process_cwd,
+            "native context must not mutate the process-global cwd"
+        );
+        Ok(first_context)
+    }
+
+    /// Each subsequent valid load (including ones carrying malformed
+    /// `projectTrusted` shapes that must coerce to untrusted) must publish a
+    /// fresh, distinct Arc snapshot. Returns the last published context.
+    async fn assert_untrusted_reloads_replace_snapshot(
+        client: &mut RawClient,
+        handles: &ContextProbeHandles,
+        synthetic_cwd: &str,
+        mut last_context: Arc<NativeExtensionContext>,
+    ) -> Result<Arc<NativeExtensionContext>, Box<dyn Error>> {
+        for (index, project_trusted) in [
+            None,
+            Some(Value::Null),
+            Some(Value::Bool(false)),
+            Some(Value::String("true".to_owned())),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let expected_cwd = format!("{synthetic_cwd}/untrusted-{index}");
+            let mut payload = json!({ "cwd": expected_cwd.clone() });
+            if let Some(project_trusted) = project_trusted {
+                payload
+                    .as_object_mut()
+                    .ok_or("load payload is an object")?
+                    .insert("projectTrusted".to_owned(), project_trusted);
+            }
+            let load_id = 40 + index as u64 * 2;
+            let reload = client
+                .request(load_id, EXTENSIONS_LOAD_METHOD, payload)
+                .await?;
+            assert_eq!(reload.kind, FrameKind::Res);
+            let response = client
+                .request(
+                    load_id + 1,
+                    methods::TOOL_PREPARE,
+                    json!({ "name": "probe", "args": {} }),
+                )
+                .await?;
+            assert_eq!(response.kind, FrameKind::Res);
+            let context = {
+                let observed = handles
+                    .observed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                Arc::clone(&observed.last().ok_or("reload callback observed")?.1)
+            };
+            assert_eq!(context.cwd, expected_cwd);
+            assert!(!context.project_trusted);
+            assert!(
+                !Arc::ptr_eq(&last_context, &context),
+                "each valid load must replace the published Arc snapshot"
+            );
+            last_context = context;
+        }
+        Ok(last_context)
+    }
+
+    /// A malformed load must error and must not replace the previously
+    /// published Arc snapshot, which stays untrusted.
+    async fn assert_malformed_load_preserves_snapshot(
+        client: &mut RawClient,
+        handles: &ContextProbeHandles,
+        last_context: &Arc<NativeExtensionContext>,
+    ) -> R {
+        let malformed = client
+            .request(
+                50,
+                EXTENSIONS_LOAD_METHOD,
+                json!({ "cwd": 7, "projectTrusted": true }),
+            )
+            .await?;
+        assert_eq!(malformed.kind, FrameKind::Error);
+        assert_eq!(malformed.payload["code"], "invalid_request");
+        let response = client
+            .request(
+                51,
+                methods::TOOL_PREPARE,
+                json!({ "name": "probe", "args": {} }),
+            )
+            .await?;
+        assert_eq!(response.kind, FrameKind::Res);
+        let preserved_context = {
+            let observed = handles
+                .observed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Arc::clone(&observed.last().ok_or("preserved callback observed")?.1)
+        };
+        assert!(Arc::ptr_eq(last_context, &preserved_context));
+        assert!(!preserved_context.project_trusted);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_context_contract_gates_callbacks_and_preserves_valid_snapshots() -> R {
+        let process_cwd = std::env::current_dir()?;
+        let synthetic_cwd = format!("{}-native-context-contract", process_cwd.display());
+        assert_ne!(synthetic_cwd, process_cwd.to_string_lossy());
+
+        let (extension, handles) = ContextProbeExtension::new();
+        let (mut client, server) = spawn_raw(extension, ServerConfig::default());
+        client.hello(PROTOCOL_VERSION, "anything").await?;
+        let _ack = client.recv().await?;
+
+        assert_callbacks_rejected_before_load(&mut client, &handles).await?;
+
+        let loaded = client
+            .request(
+                20,
+                EXTENSIONS_LOAD_METHOD,
+                json!({
+                    "extensionPaths": [],
+                    "cwd": synthetic_cwd,
+                    "projectTrusted": true,
+                }),
+            )
+            .await?;
+        assert_eq!(loaded.kind, FrameKind::Res);
+
+        let first_context = assert_callbacks_observed_after_load(
+            &mut client,
+            &handles,
+            &synthetic_cwd,
+            &process_cwd,
+        )
+        .await?;
+
+        let last_context = assert_untrusted_reloads_replace_snapshot(
+            &mut client,
+            &handles,
+            &synthetic_cwd,
+            first_context,
+        )
+        .await?;
+
+        assert_malformed_load_preserves_snapshot(&mut client, &handles, &last_context).await?;
+
+        drop(client);
+        let result = tokio::time::timeout(TIMEOUT, server).await??;
+        assert!(result.is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_context_snapshot_survives_concurrent_replacement() -> R {
+        let (extension, handles) = ContextProbeExtension::new();
+        let (mut client, server) = spawn_raw(extension, ServerConfig::default());
+        client.hello(PROTOCOL_VERSION, "anything").await?;
+        let _ack = client.recv().await?;
+        let old = client
+            .request(
+                2,
+                EXTENSIONS_LOAD_METHOD,
+                json!({ "cwd": "/context-before-reload", "projectTrusted": true }),
+            )
+            .await?;
+        assert_eq!(old.kind, FrameKind::Res);
+
+        client
+            .send(&Frame {
+                id: 3,
+                kind: FrameKind::Req,
+                method: methods::TOOL_EXECUTE.to_owned(),
+                payload: json!({ "name": "block", "toolCallId": "block", "args": {} }),
+            })
+            .await?;
+        tokio::time::timeout(TIMEOUT, handles.blocked_started.notified()).await?;
+
+        let replacement = client
+            .request(
+                4,
+                EXTENSIONS_LOAD_METHOD,
+                json!({ "cwd": "/context-after-reload", "projectTrusted": false }),
+            )
+            .await?;
+        assert_eq!(replacement.kind, FrameKind::Res);
+        handles.blocked_release.notify_one();
+
+        let blocked_terminal = client.recv().await?;
+        assert_eq!(blocked_terminal.id, 3);
+        assert_eq!(blocked_terminal.kind, FrameKind::Res);
+        let fresh = client
+            .request(
+                5,
+                methods::TOOL_EXECUTE,
+                json!({ "name": "fresh", "toolCallId": "fresh", "args": {} }),
+            )
+            .await?;
+        assert_eq!(fresh.kind, FrameKind::Res);
+
+        let observed = handles
+            .observed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let blocked_context = observed
+            .iter()
+            .find(|(callback, _)| callback == "execute_tool:block")
+            .map(|(_, context)| Arc::clone(context))
+            .ok_or("blocked callback was not observed")?;
+        let fresh_context = observed
+            .iter()
+            .find(|(callback, _)| callback == "execute_tool:fresh")
+            .map(|(_, context)| Arc::clone(context))
+            .ok_or("fresh callback was not observed")?;
+        assert_eq!(blocked_context.cwd, "/context-before-reload");
+        assert!(blocked_context.project_trusted);
+        assert_eq!(fresh_context.cwd, "/context-after-reload");
+        assert!(!fresh_context.project_trusted);
+        assert!(
+            !Arc::ptr_eq(&blocked_context, &fresh_context),
+            "a replacement load must not mutate an in-flight callback snapshot"
+        );
+
+        drop(client);
+        let result = tokio::time::timeout(TIMEOUT, server).await??;
+        assert!(result.is_ok());
+        Ok(())
     }
 
     #[tokio::test]
@@ -2260,6 +2964,7 @@ mod tests {
         let (mut client, server) = spawn_raw(extension, config);
         client.hello(PROTOCOL_VERSION, "anything").await?;
         let _ack = client.recv().await?;
+        client.load_context().await?;
 
         client
             .send(&Frame {
@@ -2436,6 +3141,31 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn callbacks_fail_closed_before_extensions_load() -> R {
+        let (ext, _handles) = DemoExtension::new();
+        let (mut client, server) = spawn_raw(ext, ServerConfig::default());
+        client.hello(PROTOCOL_VERSION, "anything").await?;
+        let _ack = client.recv().await?;
+
+        client
+            .send(&Frame {
+                id: 2,
+                kind: FrameKind::Req,
+                method: methods::TOOL_PREPARE.to_owned(),
+                payload: json!({ "name": "echo", "args": {} }),
+            })
+            .await?;
+        let error = client.recv().await?;
+        assert_eq!(error.kind, FrameKind::Error);
+        assert_eq!(error.payload["code"], "extension_not_loaded");
+
+        drop(client);
+        let result = tokio::time::timeout(TIMEOUT, server).await??;
+        assert!(result.is_ok());
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // Unknown methods fail closed
     // -----------------------------------------------------------------------
@@ -2446,6 +3176,7 @@ mod tests {
         let (mut client, server) = spawn_raw(ext, ServerConfig::default());
         client.hello(PROTOCOL_VERSION, "anything").await?;
         let _ack = client.recv().await?;
+        client.load_context().await?;
 
         client
             .send(&Frame {
@@ -2494,6 +3225,7 @@ mod tests {
         let (mut client, server) = spawn_raw(ext, config);
         client.hello(PROTOCOL_VERSION, "anything").await?;
         let _ack = client.recv().await?;
+        client.load_context().await?;
 
         // Occupy the single in-flight slot with a blocking execution.
         client
@@ -2547,8 +3279,8 @@ mod tests {
     }
 
     impl DuplexFixture {
-        /// Connect a `HostClient` to a fresh `DemoExtension` server and
-        /// complete the protocol-only handshake against the native endpoint.
+        /// Connect a `HostClient` to a fresh `DemoExtension`, complete the
+        /// protocol-only handshake, and establish a default test context.
         async fn connect() -> Result<Self, Box<dyn Error>> {
             let (ext, handles) = DemoExtension::new();
             let (client_to_server, server_rx) = tokio::io::duplex(64 * 1024);
@@ -2565,6 +3297,17 @@ mod tests {
             );
             client
                 .handshake_with_policy(HandshakePolicy::ProtocolOnly)
+                .await?;
+            client
+                .request_raw(
+                    EXTENSIONS_LOAD_METHOD,
+                    json!({
+                        "extensionPaths": [],
+                        "cwd": "/duplex-fixture",
+                        "projectTrusted": false,
+                    }),
+                    TIMEOUT,
+                )
                 .await?;
             Ok(Self {
                 client,
@@ -2645,6 +3388,54 @@ mod tests {
             matches!(missing, Err(HostClientError::Remote { ref code, .. }) if code == "not_found"),
             "expected not_found remote error, got {missing:?}"
         );
+        fixture.finish().await
+    }
+
+    #[tokio::test]
+    async fn duplex_load_context_is_required_and_replaced_for_tool_calls() -> R {
+        let fixture = DuplexFixture::connect().await?;
+
+        for payload in [json!({}), json!({ "cwd": 7 })] {
+            let result = fixture
+                .client
+                .request_raw(EXTENSIONS_LOAD_METHOD, payload, TIMEOUT)
+                .await;
+            assert!(
+                matches!(result, Err(HostClientError::Remote { ref code, .. }) if code == "invalid_request"),
+                "expected invalid_request remote error, got {result:?}"
+            );
+        }
+
+        for cwd in ["/first", "/second"] {
+            fixture
+                .client
+                .request_raw(EXTENSIONS_LOAD_METHOD, json!({ "cwd": cwd }), TIMEOUT)
+                .await?;
+            fixture
+                .client
+                .request_raw(
+                    methods::TOOL_EXECUTE,
+                    json!({ "name": "echo", "toolCallId": cwd, "args": {} }),
+                    TIMEOUT,
+                )
+                .await?;
+        }
+
+        {
+            let contexts = fixture
+                .handles
+                .tool_contexts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(
+                contexts
+                    .iter()
+                    .map(|context| context.cwd.as_str())
+                    .collect::<Vec<_>>(),
+                ["/first", "/second"]
+            );
+            assert!(contexts.iter().all(|context| !context.project_trusted));
+        }
         fixture.finish().await
     }
 
@@ -2773,6 +3564,7 @@ mod tests {
         let (mut client, server) = spawn_raw(ext, ServerConfig::default());
         client.hello(PROTOCOL_VERSION, "anything").await?;
         let _ack = client.recv().await?;
+        client.load_context().await?;
 
         for (id, name) in [(2u64, "scalar"), (3, "echo"), (4, "huge")] {
             client
@@ -2815,7 +3607,7 @@ mod tests {
                 id: 5,
                 kind: FrameKind::Req,
                 method: EXTENSIONS_LOAD_METHOD.to_owned(),
-                payload: json!({}),
+                payload: json!({ "cwd": "/tmp" }),
             })
             .await?;
         let load = client.recv().await?;
@@ -2843,6 +3635,7 @@ mod tests {
         let (mut client, server) = spawn_raw(ext, config);
         client.hello(PROTOCOL_VERSION, "anything").await?;
         let _ack = client.recv().await?;
+        client.load_context().await?;
 
         // Occupy the single in-flight slot and saturate the whole bounded
         // pipeline (per-call update channel -> outbound -> duplex).
@@ -2933,13 +3726,14 @@ mod tests {
         let (mut client, server) = spawn_raw(ext, ServerConfig::default());
         client.hello(PROTOCOL_VERSION, "anything").await?;
         let _ack = client.recv().await?;
+        client.load_context().await?;
         for id in 2u64..=3 {
             client
                 .send(&Frame {
                     id,
                     kind: FrameKind::Req,
                     method: EXTENSIONS_LOAD_METHOD.to_owned(),
-                    payload: json!({}),
+                    payload: json!({ "cwd": "/tmp" }),
                 })
                 .await?;
             let load = client.recv().await?;
@@ -2970,6 +3764,7 @@ mod tests {
         let (mut client, server) = spawn_raw(ext, ServerConfig::default());
         client.hello(PROTOCOL_VERSION, "anything").await?;
         let _ack = client.recv().await?;
+        client.load_context().await?;
         let payload = json!({ "type": "session_start", "cwd": "/tmp" });
         client
             .send(&Frame {
@@ -3011,6 +3806,7 @@ mod tests {
         let (mut client, server) = spawn_raw(ext, ServerConfig::default());
         client.hello(PROTOCOL_VERSION, "anything").await?;
         let _ack = client.recv().await?;
+        client.load_context().await?;
         client
             .send(&Frame {
                 id: 2,
@@ -3054,6 +3850,7 @@ mod tests {
         let (mut client, server) = spawn_raw(ext, ServerConfig::default());
         client.hello(PROTOCOL_VERSION, "anything").await?;
         let _ack = client.recv().await?;
+        client.load_context().await?;
         client
             .send(&Frame {
                 id: 2,
@@ -3071,7 +3868,7 @@ mod tests {
                 id: 3,
                 kind: FrameKind::Req,
                 method: EXTENSIONS_LOAD_METHOD.to_owned(),
-                payload: json!({}),
+                payload: json!({ "cwd": "/tmp" }),
             })
             .await?;
         let load = client.recv().await?;
@@ -3091,6 +3888,7 @@ mod tests {
         let (mut client, server) = spawn_raw(ext, ServerConfig::default());
         client.hello(PROTOCOL_VERSION, "anything").await?;
         let _ack = client.recv().await?;
+        client.load_context().await?;
         client
             .send(&Frame {
                 id: 2,
@@ -3127,6 +3925,7 @@ mod tests {
         let (mut client, server) = spawn_raw(ext, ServerConfig::default());
         client.hello(PROTOCOL_VERSION, "anything").await?;
         let _ack = client.recv().await?;
+        client.load_context().await?;
         for (id, key, handled) in [(2u64, "ctrl+alt+d", true), (3u64, "ctrl+alt+z", false)] {
             client
                 .send(&Frame {
@@ -3164,6 +3963,7 @@ mod tests {
         let (mut client, server) = spawn_raw(ext, ServerConfig::default());
         client.hello(PROTOCOL_VERSION, "anything").await?;
         let _ack = client.recv().await?;
+        client.load_context().await?;
         client
             .send(&Frame {
                 id: 2,
@@ -3196,6 +3996,7 @@ mod tests {
         let (mut client, server) = spawn_raw(ext, ServerConfig::default());
         client.hello(PROTOCOL_VERSION, "anything").await?;
         let _ack = client.recv().await?;
+        client.load_context().await?;
         client
             .send(&Frame {
                 id: 2,
@@ -3229,6 +4030,7 @@ mod tests {
         let (mut client, server) = spawn_raw(ext, ServerConfig::default());
         client.hello(PROTOCOL_VERSION, "anything").await?;
         let _ack = client.recv().await?;
+        client.load_context().await?;
         client
             .send(&Frame {
                 id: 2,
@@ -3270,6 +4072,7 @@ mod tests {
         let (mut client, server) = spawn_raw(ext, ServerConfig::default());
         client.hello(PROTOCOL_VERSION, "anything").await?;
         let _ack = client.recv().await?;
+        client.load_context().await?;
         client
             .send(&Frame {
                 id: 2,
@@ -3344,6 +4147,7 @@ mod tests {
         };
         client.hello(PROTOCOL_VERSION, "anything").await?;
         let _ack = client.recv().await?;
+        client.load_context().await?;
         client
             .send(&Frame {
                 id: 2,
@@ -3377,7 +4181,7 @@ mod tests {
                 id: 3,
                 kind: FrameKind::Req,
                 method: EXTENSIONS_LOAD_METHOD.to_owned(),
-                payload: json!({}),
+                payload: json!({ "cwd": "/tmp" }),
             })
             .await?;
         let load = client.recv().await?;
@@ -3398,6 +4202,7 @@ mod tests {
         let (mut client, server) = spawn_raw(DefaultExtension, ServerConfig::default());
         client.hello(PROTOCOL_VERSION, "anything").await?;
         let _ack = client.recv().await?;
+        client.load_context().await?;
 
         let cases: &[(u64, &str, Value, Value)] = &[
             (
@@ -3513,6 +4318,7 @@ mod tests {
         };
         client.hello(PROTOCOL_VERSION, "anything").await?;
         let _ack = client.recv().await?;
+        client.load_context().await?;
 
         // Occupy the only slot and saturate the whole bounded pipeline.
         client
@@ -3564,7 +4370,7 @@ mod tests {
                 id: 3,
                 kind: FrameKind::Req,
                 method: EXTENSIONS_LOAD_METHOD.to_owned(),
-                payload: json!({}),
+                payload: json!({ "cwd": "/tmp" }),
             })
             .await?;
         let load = client.recv().await?;
@@ -3603,6 +4409,7 @@ mod tests {
         };
         client.hello(PROTOCOL_VERSION, "anything").await?;
         let _ack = client.recv().await?;
+        client.load_context().await?;
 
         client
             .send(&Frame {
@@ -3663,7 +4470,7 @@ mod tests {
                 id: 3,
                 kind: FrameKind::Req,
                 method: EXTENSIONS_LOAD_METHOD.to_owned(),
-                payload: json!({}),
+                payload: json!({ "cwd": "/tmp" }),
             })
             .await?;
         let load = client.recv().await?;
@@ -3747,9 +4554,11 @@ mod tests {
             outbound_capacity: 1,
         };
         let (mut client_tx, server_rx) = tokio::io::duplex(64 * 1024);
-        let writer_blocked = Arc::new(AtomicBool::new(false));
+        let writer_block = Arc::new(AtomicBool::new(false));
+        let writer_writes = Arc::new(AtomicUsize::new(0));
         let writer = BlockingWriter {
-            blocked: Arc::clone(&writer_blocked),
+            block: Arc::clone(&writer_block),
+            writes: Arc::clone(&writer_writes),
         };
         let mut server =
             tokio::spawn(async move { serve_io(server_rx, writer, ext, config).await });
@@ -3765,10 +4574,21 @@ mod tests {
         };
         client_tx.write_all(&encode_frame(&hello)?).await?;
         client_tx.flush().await?;
-        wait_flag(&writer_blocked).await?;
+        wait_until(|| writer_writes.load(AtomicOrdering::SeqCst) >= 1).await?;
+
+        let load = Frame {
+            id: 2,
+            kind: FrameKind::Req,
+            method: EXTENSIONS_LOAD_METHOD.to_owned(),
+            payload: json!({ "cwd": "/blocked-transport-context" }),
+        };
+        client_tx.write_all(&encode_frame(&load)?).await?;
+        client_tx.flush().await?;
+        wait_until(|| writer_writes.load(AtomicOrdering::SeqCst) >= 2).await?;
+        writer_block.store(true, AtomicOrdering::SeqCst);
 
         let blocking = Frame {
-            id: 2,
+            id: 3,
             kind: FrameKind::Req,
             method: methods::TOOL_EXECUTE.to_owned(),
             payload: json!({ "name": "block", "toolCallId": "hold", "args": {} }),
@@ -3778,7 +4598,7 @@ mod tests {
         tokio::time::timeout(TIMEOUT, handles.started.notified()).await?;
 
         let mut overloads = Vec::new();
-        for id in 3..=8 {
+        for id in 4..=9 {
             overloads.extend(encode_frame(&Frame {
                 id,
                 kind: FrameKind::Req,
