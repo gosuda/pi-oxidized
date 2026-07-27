@@ -507,6 +507,13 @@ async function measureToolRoundTrips(
 			validateMs.push(performance.now() - v0);
 			responses += 1;
 			const validatedArgs = (validated.payload as Record<string, unknown>)["args"];
+			if (
+				(validatedArgs as Record<string, unknown> | undefined)?.["validatedBy"] !== "lean"
+			) {
+				throw new Error(
+					`tool.validate did not perform real work: ${diagnosticSnippet(JSON.stringify(validated.payload), DIAGNOSTIC_STDOUT_PREFIX_CHARS)}`,
+				);
+			}
 
 			const e0 = performance.now();
 			const executed = await host.request(

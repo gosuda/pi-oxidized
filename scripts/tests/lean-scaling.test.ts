@@ -304,6 +304,60 @@ describe("runModeDistinctness toolRounds", () => {
 	});
 });
 
+describe("runModeDistinctness validatedBy gate", () => {
+	test("rejects a lean fixture whose validate merely echoes args (no validatedBy marker)", async () => {
+		const hostCwd = resolve(process.cwd(), "packages", "extension-host");
+		const tempDir = mkdtempSync(join(tmpdir(), "lean-scaling-validatedby-"));
+		const leanPath = join(tempDir, "echo-no-validated-by.mjs");
+		// Mirrors the shared lean echo fixture but validate returns args verbatim
+		// without stamping validatedBy, so the gate must reject it and name validate.
+		writeFileSync(
+			leanPath,
+			[
+				"export default {",
+				"  name: \"lean-echo-no-validate\",",
+				"  tools: [",
+				"    {",
+				"      name: \"echo\",",
+				"      description: \"Echo without a validate marker\",",
+				"      parameters: { type: \"object\", properties: { text: { type: \"string\" } }, required: [\"text\"] },",
+				"      prepare: (args) => ({ ...args, preparedBy: \"lean\" }),",
+				"      validate: (args) => args,",
+				"      execute: (args, ctx) => {",
+				"        ctx.onUpdate({ content: [{ type: \"text\", text: \"echoing...\" }] });",
+				"        return { content: [{ type: \"text\", text: `echo:${args.text}` }] };",
+				"      },",
+				"    },",
+				"  ],",
+				"};",
+			].join("\n"),
+			"utf8",
+		);
+
+		try {
+			const result = runModeDistinctness({
+				hostCwd,
+				hostEntry: "src/main.ts",
+				compatExtension: resolve(hostCwd, "fixtures", "extensions", "idle.ts"),
+				leanExtension: leanPath,
+				warmups: 0,
+				samples: 1,
+				toolRounds: 1,
+				maxRatio: undefined,
+			});
+			// Capture the actual rejection so we assert the gate — not a
+			// load-time failure that happens to mention validate — rejected it.
+			const rejection = await result.catch((err: unknown) => err);
+			expect(rejection).toBeInstanceOf(Error);
+			expect((rejection as Error).message).toMatch(
+				/^tool\.validate did not perform real work:/,
+			);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	}, 60_000);
+});
+
 describe("ChildHost UTF-8 framing", () => {
 	test("reassembles a multibyte character split across stdout chunks", async () => {
 		const root = resolve(process.cwd(), "packages", "extension-host");
