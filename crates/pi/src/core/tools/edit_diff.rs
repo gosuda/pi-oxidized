@@ -497,9 +497,22 @@ fn strip_trailing_newline(line: &str) -> &str {
 struct PatchLine {
     prefix: char,
     text: String,
+    has_terminator: bool,
 }
 
 impl PatchLine {
+    fn from_diff_line(prefix: char, mut text: String) -> Self {
+        let has_terminator = text.ends_with('\n');
+        if has_terminator {
+            text.truncate(text.len() - 1);
+        }
+        Self {
+            prefix,
+            text,
+            has_terminator,
+        }
+    }
+
     const fn is_context(&self) -> bool {
         self.prefix == ' '
     }
@@ -545,19 +558,22 @@ fn patch_lines(old_content: &str, new_content: &str) -> Vec<PatchLine> {
     let mut lines = Vec::new();
     for part in collapse_ops(&ops) {
         match part {
-            DiffPart::Equal(equal) => lines.extend(equal.into_iter().map(|text| PatchLine {
-                prefix: ' ',
-                text: strip_trailing_newline(&text).to_owned(),
-            })),
+            DiffPart::Equal(equal) => lines.extend(
+                equal
+                    .into_iter()
+                    .map(|text| PatchLine::from_diff_line(' ', text)),
+            ),
             DiffPart::Change { removed, added } => {
-                lines.extend(removed.into_iter().map(|text| PatchLine {
-                    prefix: '-',
-                    text: strip_trailing_newline(&text).to_owned(),
-                }));
-                lines.extend(added.into_iter().map(|text| PatchLine {
-                    prefix: '+',
-                    text: strip_trailing_newline(&text).to_owned(),
-                }));
+                lines.extend(
+                    removed
+                        .into_iter()
+                        .map(|text| PatchLine::from_diff_line('-', text)),
+                );
+                lines.extend(
+                    added
+                        .into_iter()
+                        .map(|text| PatchLine::from_diff_line('+', text)),
+                );
             }
         }
     }
@@ -654,6 +670,9 @@ pub fn generate_unified_patch(
             out.push(line.prefix);
             out.push_str(&line.text);
             out.push('\n');
+            if !line.has_terminator {
+                out.push_str("\\ No newline at end of file\n");
+            }
         }
     }
     out
@@ -1318,27 +1337,57 @@ mod tests {
     }
 
     #[test]
-    fn unified_patch_remove_final_lf_is_visible() {
-        // The patch path must not panic on an asymmetric final newline and must
-        // surface the change as a remove/add pair.
+    fn unified_patch_remove_final_lf_marks_only_added_unterminated_line() {
         let patch = generate_unified_patch("a.txt", "foo\n", "foo", 4);
-        assert!(patch.contains("@@ -1,1 +1,1 @@"));
-        assert!(patch.contains("-foo\n"));
-        assert!(patch.contains("+foo\n"));
+        assert_eq!(
+            patch,
+            "--- a.txt\n+++ a.txt\n@@ -1,1 +1,1 @@\n-foo\n+foo\n\\ No newline at end of file\n"
+        );
     }
 
     #[test]
-    fn unified_patch_add_final_lf_is_visible() {
+    fn unified_patch_add_final_lf_marks_only_removed_unterminated_line() {
         let patch = generate_unified_patch("a.txt", "foo", "foo\n", 4);
-        assert!(patch.contains("@@ -1,1 +1,1 @@"));
-        assert!(patch.contains("-foo\n"));
-        assert!(patch.contains("+foo\n"));
+        assert_eq!(
+            patch,
+            "--- a.txt\n+++ a.txt\n@@ -1,1 +1,1 @@\n-foo\n\\ No newline at end of file\n+foo\n"
+        );
     }
 
     #[test]
-    fn unified_patch_both_terminated_unchanged_emits_no_hunks() {
-        // Symmetric terminated content with no change emits only the headers.
-        let patch = generate_unified_patch("a.txt", "same\n", "same\n", 4);
-        assert_eq!(patch, "--- a.txt\n+++ a.txt\n");
+    fn unified_patch_marks_both_unterminated_changed_eof_lines() {
+        let patch = generate_unified_patch("a.txt", "old", "new", 4);
+        assert_eq!(
+            patch,
+            "--- a.txt\n+++ a.txt\n@@ -1,1 +1,1 @@\n-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file\n"
+        );
+    }
+
+    #[test]
+    fn unified_patch_marks_multiline_unterminated_eof_change() {
+        let patch = generate_unified_patch("a.txt", "first\nold", "first\nnew", 4);
+        assert_eq!(
+            patch,
+            "--- a.txt\n+++ a.txt\n@@ -1,2 +1,2 @@\n first\n-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file\n"
+        );
+    }
+
+    #[test]
+    fn unified_patch_marks_unterminated_eof_context_line() {
+        let patch = generate_unified_patch("a.txt", "before\nlast", "after\nlast", 4);
+        assert_eq!(
+            patch,
+            "--- a.txt\n+++ a.txt\n@@ -1,2 +1,2 @@\n-before\n+after\n last\n\\ No newline at end of file\n"
+        );
+    }
+
+    #[test]
+    fn unified_patch_unchanged_terminated_or_unterminated_emits_only_headers() {
+        for content in ["same\n", "same"] {
+            assert_eq!(
+                generate_unified_patch("a.txt", content, content, 4),
+                "--- a.txt\n+++ a.txt\n"
+            );
+        }
     }
 }
