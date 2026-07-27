@@ -65,6 +65,8 @@ export interface AssembleInputs {
 	readonly bunRuntimePath?: string;
 	/** Filesystem seam. */
 	readonly fs: Fs;
+	/** Host platform used for executable-bit verification; tests may pin it. */
+	readonly hostPlatform?: NodeJS.Platform;
 	/** Source-date-epoch stamp for the manifest + archive mtimes. */
 	readonly sourceDateEpoch: number;
 	/** Compatibility version recorded in the manifest. */
@@ -232,7 +234,7 @@ export async function assembleRelease(
 	await verifyNoHostInPi(fs, inputs.piBinaryPath, inputs.host);
 
 	// Verification gate: binaries present and (on POSIX) executable.
-	await verifyExecutableBits(fs, plan, archiveDir, inputs.host);
+	await verifyExecutableBits(fs, plan, archiveDir, inputs.host, inputs.hostPlatform);
 
 	const manifest: ReleaseManifest = {
 		schema: RELEASE_MANIFEST_SCHEMA,
@@ -409,19 +411,27 @@ async function verifyNoHostInPi(fs: Fs, piPath: string, host: HostArtifact): Pro
 }
 
 /**
- * Verify executable bits only when the host filesystem can represent them.
- * Windows archives carry executability in the release manifest instead.
+ * Windows targets carry executability in the release manifest instead. A
+ * non-Windows target must be verified from a host that can inspect POSIX mode
+ * bits.
  */
 async function verifyExecutableBits(
 	fs: Fs,
 	plan: TargetPlan,
 	archiveDir: string,
 	host: HostArtifact,
+	hostPlatform: NodeJS.Platform = process.platform,
 ): Promise<void> {
-	if (plan.windows || process.platform === "win32") return;
+	if (plan.windows) return;
 	const required = [plan.piBinaryName];
 	if (host.kind === "compiled") required.push(plan.hostBinaryName);
 	if (host.kind === "runtime-bundle") required.push(plan.bunRuntimeName);
+	if (hostPlatform === "win32") {
+		const paths = required.map((name) => safeJoinPath(archiveDir, name)).join(", ");
+		throw new ReleaseVerifyError(
+			`cannot verify POSIX executable modes for non-Windows target ${plan.rustTarget} on a Windows host: ${paths}. Stage this artifact on a POSIX host or WSL.`,
+		);
+	}
 	for (const name of required) {
 		const path = safeJoinPath(archiveDir, name);
 		const s = await fs.stat(path);

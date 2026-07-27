@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { assembleRelease } from "../release/stage.ts";
+import { assembleRelease, ReleaseVerifyError } from "../release/stage.ts";
 import { planFor } from "../release/targets.ts";
 import type { Fs, FsStat } from "../release/runner.ts";
 
@@ -63,6 +63,13 @@ class MemoryFs implements Fs {
 	}
 }
 
+/** Filesystem whose chmod operation cannot establish executable mode bits. */
+class UnchmodableMemoryFs extends MemoryFs {
+	override async chmod(_path: string, _mode: number): Promise<void> {
+		throw new Error("chmod unavailable");
+	}
+}
+
 describe("assembleRelease", () => {
 	test("assembles a deterministic manifest and verifies file order", async () => {
 		const fs = new MemoryFs();
@@ -93,6 +100,7 @@ describe("assembleRelease", () => {
 			docsSource: "/workspace/docs",
 			examplesSource: "/workspace/examples",
 			assetsSource: "/workspace/assets",
+			hostPlatform: "linux" as const,
 		};
 
 		const assembly1 = await assembleRelease("/staging", inputs);
@@ -130,7 +138,35 @@ describe("assembleRelease", () => {
 		expect(readmeEntry?.executable).toBe(false);
 	});
 
-	test("skips chmod on Windows targets", async () => {
+	test("rejects missing executable bits for non-Windows targets on POSIX hosts", async () => {
+		const fs = new UnchmodableMemoryFs();
+		const plan = planFor("x86_64-unknown-linux-gnu");
+		const piPath = "/workspace/target/x86_64-unknown-linux-gnu/release/pi";
+		const hostPath = "/staging/pi-extension-host";
+		const stagedPiPath = `/staging/${plan.archiveDir}/${plan.piBinaryName}`;
+		fs.files.set(piPath, new Uint8Array([1]));
+		fs.files.set(hostPath, new Uint8Array([2]));
+		fs.modes.set(piPath, 0o644);
+		fs.modes.set(hostPath, 0o644);
+
+		await expect(
+			assembleRelease("/staging", {
+				plan,
+				version: "1.0.0",
+				piBinaryPath: piPath,
+				repoRoot: "/workspace",
+				host: { kind: "compiled", binaryPath: hostPath },
+				fs,
+				sourceDateEpoch: 1000,
+				compatibilityVersion: "0.8",
+				protocolVersion: 1,
+				createdAt: "2024-01-01T00:00:00Z",
+				hostPlatform: "linux",
+			}),
+		).rejects.toThrow(`${stagedPiPath} is missing the executable bit`);
+	});
+
+	test("skips POSIX mode verification and retains executable metadata for Windows targets", async () => {
 		const fs = new MemoryFs();
 		const plan = planFor("x86_64-pc-windows-msvc");
 
@@ -152,12 +188,55 @@ describe("assembleRelease", () => {
 			docsSource: "/workspace/docs",
 			examplesSource: "/workspace/examples",
 			assetsSource: "/workspace/assets",
+			hostPlatform: "win32" as const,
 		};
 
-		await assembleRelease("/staging", inputs);
+		const assembly = await assembleRelease("/staging", inputs);
 
 		// Ensure no chmod calls were made because it's Windows.
 		expect(fs.chmodCalls).toHaveLength(0);
+		expect(assembly.manifest.files.find((file) => file.path === "pi.exe")?.executable).toBe(true);
+		expect(
+			assembly.manifest.files.find((file) => file.path === "pi-extension-host.exe")?.executable,
+		).toBe(true);
+
+	});
+
+	test("refuses non-Windows artifacts on Windows hosts before manifest publication", async () => {
+		const fs = new MemoryFs();
+		const plan = planFor("x86_64-unknown-linux-gnu");
+		const piPath = "/workspace/target/x86_64-unknown-linux-gnu/release/pi";
+		const hostPath = "/staging/pi-extension-host";
+		const archiveDir = `/staging/${plan.archiveDir}`;
+		fs.files.set(piPath, new Uint8Array([1]));
+		fs.files.set(hostPath, new Uint8Array([2]));
+		fs.modes.set(piPath, 0o755);
+		fs.modes.set(hostPath, 0o755);
+
+		const failure = await assembleRelease("/staging", {
+			plan,
+			version: "1.0.0",
+			piBinaryPath: piPath,
+			repoRoot: "/workspace",
+			host: { kind: "compiled", binaryPath: hostPath },
+			fs,
+			sourceDateEpoch: 1000,
+			compatibilityVersion: "0.8",
+			protocolVersion: 1,
+			createdAt: "2024-01-01T00:00:00Z",
+			hostPlatform: "win32",
+		}).then(
+			() => undefined,
+			(error: unknown) => error,
+		);
+
+		expect(failure).toBeInstanceOf(ReleaseVerifyError);
+		if (!(failure instanceof ReleaseVerifyError)) return;
+		expect(failure.message).toContain(plan.rustTarget);
+		expect(failure.message).toContain(`${archiveDir}/${plan.piBinaryName}`);
+		expect(failure.message).toContain(`${archiveDir}/${plan.hostBinaryName}`);
+		expect(failure.message).toContain("POSIX host or WSL");
+		expect(fs.files.has(`${archiveDir}/release.json`)).toBe(false);
 	});
 
 	test("assembles the provisioned Bun runtime and JavaScript fallback", async () => {
@@ -184,6 +263,7 @@ describe("assembleRelease", () => {
 			compatibilityVersion: "0.80.10",
 			protocolVersion: 1,
 			createdAt: "2024-01-01T00:00:00Z",
+			hostPlatform: "linux",
 		});
 
 		expect(assembly.manifest.hostKind).toBe("runtime-bundle");
@@ -221,6 +301,7 @@ describe("assembleRelease", () => {
 			compatibilityVersion: "0.80.10",
 			protocolVersion: 1,
 			createdAt: "2024-01-01T00:00:00Z",
+			hostPlatform: "linux" as const,
 		};
 		await expect(
 			assembleRelease("/staging", { ...inputs, bunRuntimePath: undefined }),
