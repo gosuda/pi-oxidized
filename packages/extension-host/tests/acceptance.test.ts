@@ -76,6 +76,26 @@ const typedHookFactory: ExtensionFactory = (pi) => {
 	}));
 };
 
+const noOpToolCallFactory: ExtensionFactory = (pi) => {
+	pi.on("tool_call", () => ({ block: false, reason: "noop" }));
+};
+
+const reorderedToolCallFactory: ExtensionFactory = (pi) => {
+	pi.on("tool_call", (event) => {
+		const entries = Object.entries(event.input).reverse();
+		for (const key of Object.keys(event.input)) delete event.input[key];
+		for (const [key, value] of entries) event.input[key] = value;
+		return { block: false, reason: "reordered" };
+	});
+};
+
+const changedToolCallFactory: ExtensionFactory = (pi) => {
+	pi.on("tool_call", (event) => {
+		event.input["value"] = "changed";
+		return { block: false, reason: "changed" };
+	});
+};
+
 async function runProcess(
 	command: string,
 	args: readonly string[],
@@ -813,6 +833,51 @@ describe("acceptance: extension runtime", () => {
 		stdin.push(null);
 		host.dispose("test");
 		await runPromise.catch(() => void 0);
+	});
+
+	test("tool_call only returns input for structural mutations", async () => {
+		const cases = [
+			{
+				factory: noOpToolCallFactory,
+				input: { value: "same", nested: { a: 1, b: 2 } },
+				expected: { block: false, reason: "noop" },
+			},
+			{
+				factory: reorderedToolCallFactory,
+				input: { a: 1, m: 2, z: 3 },
+				expected: { block: false, reason: "reordered" },
+			},
+			{
+				factory: changedToolCallFactory,
+				input: { value: "original" },
+				expected: {
+					block: false,
+					reason: "changed",
+					input: { value: "changed" },
+				},
+			},
+		] as const;
+
+		for (const [index, entry] of cases.entries()) {
+			const { collector, stdin, host, runPromise } = await connectHost([entry.factory]);
+			try {
+				const id = 140 + index;
+				stdin.push(Buffer.from(encodeFrameString({
+					id,
+					kind: "req",
+					method: "tool_call",
+					payload: { toolName: "read", toolCallId: `call-${index}`, input: entry.input },
+				})));
+				const response = await collector.awaitFrame(
+					(frame) => frame.id === id && frame.kind === "res",
+				);
+				expect(response.payload).toEqual(entry.expected);
+			} finally {
+				stdin.push(null);
+				host.dispose("test");
+				await runPromise.catch(() => void 0);
+			}
+		}
 	});
 
 	test("extensions.load RPC dynamically loads extensions", async () => {

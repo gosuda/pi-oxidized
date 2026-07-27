@@ -18,7 +18,7 @@
 
 import { readFile } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
 	COMPATIBILITY_VERSION,
 	type ByteReadable,
@@ -30,6 +30,9 @@ import {
 	ProtocolClient,
 } from "./protocol.ts";
 import {
+	assertJsonValue,
+	cloneJsonValue,
+	jsonValuesEqual,
 	LEAN_EVENT_TYPES,
 	type LeanCommand,
 	type LeanContext,
@@ -86,28 +89,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-/**
- * Canonicalize JSON-like values so object key order does not affect equality.
- * Arrays keep element order; plain objects get sorted keys recursively.
- */
-function canonicalizeJson(value: unknown): unknown {
-	if (Array.isArray(value)) {
-		return value.map(canonicalizeJson);
-	}
-	if (isRecord(value)) {
-		const sorted: Record<string, unknown> = {};
-		for (const key of Object.keys(value).sort()) {
-			sorted[key] = canonicalizeJson(value[key]);
-		}
-		return sorted;
-	}
-	return value;
-}
-
-/** Order-insensitive JSON structural equality (key reorder is a no-op). */
-function jsonEqual(a: unknown, b: unknown): boolean {
-	return JSON.stringify(canonicalizeJson(a)) === JSON.stringify(canonicalizeJson(b));
-}
 
 /**
  * Import specifiers a lean entry must never reference. Lean entries are
@@ -117,28 +98,55 @@ function jsonEqual(a: unknown, b: unknown): boolean {
  */
 const EXCLUDED_SPECIFIER = /^(?:@earendil-works\/(?:pi-coding-agent|pi-agent-core|pi-ai|pi-tui(?!-protocol))|@mariozechner\/|jiti(?:\/|$)|typebox(?:\/|$)|.*\/(?:host|virtual-modules)\.ts$)/;
 
-/**
- * ONE boundary-aware scan over every module-specifier form: static
- * `import … from` / `export … from` (including minified `import{x}from"…"`,
- * `export{x}from"…"`, `export*from"…"`), dynamic `import("…")`, and
- * side-effect `import "…"`. Identifier boundaries reject keyword-like
- * identifiers (`important`, `exporter`), member calls (`a.import("…")`),
- * and `import.meta`; quotes/parens/backticks cannot bridge clauses across
- * statements.
- */
 const IMPORT_SPECIFIER =
 	/(?<![\w$.])(?:import|export)(?![\w$.])[^"'()`]*?\bfrom\s*["']([^"']+)["']|(?<![\w$.])import(?![\w$.])\s*\(\s*["']([^"']+)["']\s*\)|(?<![\w$.])import(?![\w$.])\s*["']([^"']+)["']/g;
 
 /**
- * Best-effort detection of excluded imports in a prebundled entry. The
- * compiled-fixture suite proves graph absence independently; this scan turns
- * the detectable cases into precise per-extension load errors.
+ * Extract literal module specifiers from every import form that can load a
+ * lean dependency. The same extractor drives direct exclusion and local graph
+ * traversal, so minification cannot create a weaker path.
  */
-export function findExcludedImport(source: string): string | undefined {
-	for (const match of source.matchAll(IMPORT_SPECIFIER)) {
+function extractImportSpecifiers(source: string): string[] {
+	const specifiers: string[] = [];
+	for (const match of source.matchAll(new RegExp(IMPORT_SPECIFIER))) {
 		const specifier = match[1] ?? match[2] ?? match[3];
-		if (specifier !== undefined && EXCLUDED_SPECIFIER.test(specifier)) {
-			return specifier;
+		if (specifier !== undefined) specifiers.push(specifier);
+	}
+	return specifiers;
+}
+
+/** Detect an excluded direct specifier without evaluating the module. */
+export function findExcludedImport(source: string): string | undefined {
+	return extractImportSpecifiers(source).find((specifier) => EXCLUDED_SPECIFIER.test(specifier));
+}
+
+function resolveLocalSpecifier(importer: string, specifier: string): string | undefined {
+	if (
+		!specifier.startsWith("./")
+		&& !specifier.startsWith("../")
+		&& !specifier.startsWith("/")
+		&& !specifier.startsWith("file:")
+	) {
+		return undefined;
+	}
+	const resolved = new URL(specifier, pathToFileURL(importer));
+	if (resolved.protocol !== "file:") return undefined;
+	return fileURLToPath(resolved);
+}
+
+/** Walk every literal local dependency once before evaluating the entry. */
+async function findExcludedImportInGraph(entry: string): Promise<string | undefined> {
+	const pending = [entry];
+	const visited = new Set<string>();
+	while (pending.length > 0) {
+		const current = pending.pop();
+		if (current === undefined || visited.has(current)) continue;
+		visited.add(current);
+		const source = await readFile(current, "utf8");
+		for (const specifier of extractImportSpecifiers(source)) {
+			if (EXCLUDED_SPECIFIER.test(specifier)) return specifier;
+			const local = resolveLocalSpecifier(current, specifier);
+			if (local !== undefined && !visited.has(local)) pending.push(local);
 		}
 	}
 	return undefined;
@@ -386,8 +394,7 @@ export class LeanRunner {
 			);
 		}
 		const absolute = isAbsolute(entryPath) ? entryPath : resolve(cwd, entryPath);
-		const source = await readFile(absolute, "utf8");
-		const excluded = findExcludedImport(source);
+		const excluded = await findExcludedImportInGraph(absolute);
 		if (excluded !== undefined) {
 			throw new Error(
 				`excluded import "${excluded}" in lean entry: the upstream module graph ` +
@@ -882,7 +889,7 @@ export class LeanRunner {
 					// Snapshot for omission: Rust treats wire.input = Some as
 					// arguments_changed. Only echo input when a handler actually
 					// mutated JSON content (key reorder alone is not a change).
-					const baseline = structuredClone(input);
+					const baseline = cloneJsonValue("tool_call.input", input);
 					let result: unknown;
 					await this.runHooks(eventType, { type: eventType, ...payload, input }, (r) => {
 						if (r === undefined || r === null) return;
@@ -892,7 +899,7 @@ export class LeanRunner {
 					const response: Record<string, unknown> = {
 						...(isRecord(result) ? result : {}),
 					};
-					if (!jsonEqual(input, baseline)) {
+					if (!jsonValuesEqual(input, baseline)) {
 						response["input"] = input;
 					} else {
 						delete response["input"];
@@ -901,6 +908,9 @@ export class LeanRunner {
 					return;
 				}
 				case "tool_result": {
+					const input = payload["input"];
+					if (!isRecord(input)) throw new Error("tool_result.input is required");
+					assertJsonValue("tool_result.input", input);
 					// `current` threads running values to later handlers; `response`
 					// is omission-shaped for Rust AfterToolCallWire (presence of a
 					// field marks that field changed — never echo untouched payload).
@@ -910,7 +920,7 @@ export class LeanRunner {
 						isError: payload["isError"] === true,
 					};
 					const response: Record<string, unknown> = {};
-					await this.runHooks(eventType, () => ({ type: eventType, ...payload, ...current }), (r) => {
+					await this.runHooks(eventType, () => ({ type: eventType, ...payload, input, ...current }), (r) => {
 						if (!isRecord(r)) return;
 						if (r["content"] !== undefined) {
 							current["content"] = r["content"];
@@ -999,6 +1009,8 @@ export class LeanRunner {
 				case "input": {
 					let text = payload["text"];
 					let images = payload["images"];
+					const originalImages =
+						images === undefined ? undefined : cloneJsonValue("input.images", images);
 					let handled = false;
 					await this.runHooks(eventType, () => ({ type: eventType, ...payload, text, images }), (r) => {
 						if (!isRecord(r)) return;
@@ -1015,7 +1027,11 @@ export class LeanRunner {
 						await this.client.respond(id, eventType as Method, { action: "handled" });
 						return;
 					}
-					const changed = text !== payload["text"] || images !== payload["images"];
+					const imagesChanged =
+						originalImages === undefined
+							? images !== undefined
+							: images === undefined || !jsonValuesEqual(images, originalImages);
+					const changed = text !== payload["text"] || imagesChanged;
 					await this.client.respond(
 						id,
 						eventType as Method,

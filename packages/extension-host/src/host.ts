@@ -22,6 +22,11 @@ import {
 
 import { COMPATIBILITY_VERSION } from "./version.ts";
 import { parseAnsiLines } from "./sanitize.ts";
+import {
+	assertJsonValue,
+	cloneJsonValue,
+	jsonValuesEqual,
+} from "./lean-api.ts";
 import type { StyledRun, UiSlot, SlotPlacement, OverlayOptions } from "./protocol.ts";
 import { createExtensionJiti } from "./virtual-modules.ts";
 
@@ -797,21 +802,26 @@ export class ExtensionHost {
 				case "tool_call": {
 					const input = payload["input"];
 					if (!isRecord(input)) throw new Error("tool_call.input is required");
+					const originalInput = cloneJsonValue("tool_call.input", input);
 					result = await runner.emitToolCall({
 						type: eventType,
 						toolName: String(payload["toolName"] ?? ""),
 						toolCallId: String(payload["toolCallId"] ?? ""),
 						input,
 					});
-					await this.client.respond(id, eventType as Method, {
-						...(result ?? {}),
-						input,
-					});
+					const response: Record<string, unknown> = isRecord(result) ? { ...result } : {};
+					if (!jsonValuesEqual(input, originalInput)) {
+						response["input"] = input;
+					} else {
+						delete response["input"];
+					}
+					await this.client.respond(id, eventType as Method, response);
 					return;
 				}
 				case "tool_result": {
 					const input = payload["input"];
 					if (!isRecord(input)) throw new Error("tool_result.input is required");
+					assertJsonValue("tool_result.input", input);
 					result = await runner.emitToolResult({
 						type: eventType,
 						toolName: String(payload["toolName"] ?? ""),

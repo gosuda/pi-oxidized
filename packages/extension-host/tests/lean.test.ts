@@ -8,7 +8,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { Readable } from "node:stream";
@@ -273,6 +273,98 @@ describe("lean: extensions.load registry", () => {
 		expect(String(payload(event)["message"])).toContain("excluded import");
 		expect(link.runner.extensionCount).toBe(0);
 		await link.finish();
+	});
+
+	test("rejects excluded imports through direct, minified, transitive, and cyclic graphs", async () => {
+		const directory = await mkdtemp(join(PACKAGE_DIR, ".test-lean-import-graph-"));
+		const direct = join(directory, "direct.mjs");
+		const minified = join(directory, "minified.mjs");
+		const transitive = join(directory, "transitive.mjs");
+		const cyclic = join(directory, "cyclic-a.mjs");
+		const link = new LeanLink({ cwd: directory, extensionPaths: [] });
+		try {
+			await Promise.all([
+				writeFile(direct, 'import "jiti"; export default { name: "direct" };'),
+				writeFile(minified, 'import{x}from"jiti";export default{name:"minified"};'),
+				writeFile(transitive, 'import "./transitive-dependency.mjs"; export default { name: "transitive" };'),
+				writeFile(
+					join(directory, "transitive-dependency.mjs"),
+					'export{x}from"jiti";',
+				),
+				writeFile(cyclic, 'import "./cyclic-b.mjs"; export default { name: "cyclic" };'),
+				writeFile(
+					join(directory, "cyclic-b.mjs"),
+					'import "./cyclic-a.mjs"; import "typebox";',
+				),
+			]);
+			await link.hello(1);
+			link.request(2, "extensions.load", {
+				extensionPaths: [ECHO_ENTRY, direct, minified, transitive, cyclic],
+				cwd: directory,
+			});
+			const response = payload(await link.response(2, "extensions.load"));
+			expect(response["extensions"]).toBe(1);
+			const errors = new Map(
+				(response["errors"] as Array<{ path: string; error: string }>).map(
+					(error) => [error.path, error.error],
+				),
+			);
+			expect(errors.get(direct)).toContain('excluded import "jiti"');
+			expect(errors.get(minified)).toContain('excluded import "jiti"');
+			expect(errors.get(transitive)).toContain('excluded import "jiti"');
+			expect(errors.get(cyclic)).toContain('excluded import "typebox"');
+		} finally {
+			await link.finish();
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
+
+	test("isolates nested non-JSON metadata failures from valid extensions", async () => {
+		const directory = await mkdtemp(join(PACKAGE_DIR, ".test-lean-metadata-"));
+		const bigint = join(directory, "bigint.mjs");
+		const undefinedValue = join(directory, "undefined.mjs");
+		const infinity = join(directory, "infinity.mjs");
+		const notANumber = join(directory, "nan.mjs");
+		const link = new LeanLink({ cwd: directory, extensionPaths: [] });
+		try {
+			await Promise.all([
+				writeFile(
+					bigint,
+					'export default { name: "bigint", tools: [{ name: "t", description: "d", parameters: { nested: { value: 1n } }, execute() {} }] };',
+				),
+				writeFile(
+					undefinedValue,
+					'export default { name: "undefined", providers: [{ name: "p", models: [{ nested: { value: undefined } }] }] };',
+				),
+				writeFile(
+					infinity,
+					'export default { name: "infinity", providers: [{ name: "p", models: [{ nested: { value: Infinity } }] }] };',
+				),
+				writeFile(
+					notANumber,
+					'export default { name: "nan", providers: [{ name: "p", models: [{ nested: { value: NaN } }] }] };',
+				),
+			]);
+			await link.hello(1);
+			link.request(2, "extensions.load", {
+				extensionPaths: [ECHO_ENTRY, bigint, undefinedValue, infinity, notANumber],
+				cwd: directory,
+			});
+			const response = payload(await link.response(2, "extensions.load"));
+			expect(response["extensions"]).toBe(1);
+			const errors = new Map(
+				(response["errors"] as Array<{ path: string; error: string }>).map(
+					(error) => [error.path, error.error],
+				),
+			);
+			expect(errors.get(bigint)).toContain("BigInt");
+			expect(errors.get(undefinedValue)).toContain("undefined");
+			expect(errors.get(infinity)).toContain("finite JSON number");
+			expect(errors.get(notANumber)).toContain("finite JSON number");
+		} finally {
+			await link.finish();
+			await rm(directory, { recursive: true, force: true });
+		}
 	});
 });
 
@@ -561,6 +653,60 @@ describe("lean: lifecycle hooks", () => {
 		await link.finish();
 	});
 
+	test("input detects in-place image mutations but ignores JSON-equivalent images", async () => {
+		const directory = await mkdtemp(join(PACKAGE_DIR, ".test-lean-images-"));
+		const unchanged = join(directory, "unchanged.mjs");
+		const reordered = join(directory, "reordered.mjs");
+		const mutated = join(directory, "mutated.mjs");
+		try {
+			await Promise.all([
+				writeFile(
+					unchanged,
+					'export default { name: "unchanged", hooks: { input: (event) => ({ action: "transform", text: event.text }) } };',
+				),
+				writeFile(
+					reordered,
+					'export default { name: "reordered", hooks: { input(event) { const image = event.images[0]; const entries = Object.entries(image).reverse(); for (const key of Object.keys(image)) delete image[key]; for (const [key, value] of entries) image[key] = value; return { action: "transform", text: event.text }; } } };',
+				),
+				writeFile(
+					mutated,
+					'export default { name: "mutated", hooks: { input(event) { event.images[0].metadata.state = "changed"; return { action: "transform", text: event.text }; } } };',
+				),
+			]);
+			const cases = [
+				{ entry: unchanged, expected: { action: "continue" } },
+				{ entry: reordered, expected: { action: "continue" } },
+				{
+					entry: mutated,
+					expected: {
+						action: "transform",
+						text: "image",
+						images: [{ id: "one", metadata: { state: "changed", tags: ["keep"] } }],
+					},
+				},
+			] as const;
+			for (const [index, entry] of cases.entries()) {
+				const link = new LeanLink({ cwd: directory, extensionPaths: [] });
+				try {
+					await link.hello(1);
+					link.request(2, "extensions.load", { extensionPaths: [entry.entry], cwd: directory });
+					await link.response(2, "extensions.load");
+					const id = 50 + index;
+					link.request(id, "input", {
+						text: "image",
+						images: [{ id: "one", metadata: { state: "base", tags: ["keep"] } }],
+						source: "interactive",
+					});
+					expect(payload(await link.response(id, "input"))).toEqual(entry.expected);
+				} finally {
+					await link.finish();
+				}
+			}
+		} finally {
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
+
 	test("input hook returns the continue action", async () => {
 		const link = await loadedLink();
 		link.request(31, "input", { text: "hello", source: "interactive" });
@@ -806,6 +952,31 @@ describe("lean: ordered folds", () => {
 		await link.finish();
 	});
 
+	test("tool_result rejects malformed input before dispatching hooks", async () => {
+		const link = await foldLink();
+		try {
+			const malformed = [undefined, null, [], "raw"] as const;
+			for (const [index, input] of malformed.entries()) {
+				const requestPayload: Record<string, unknown> = {
+					toolName: "echo",
+					toolCallId: `malformed-${index}`,
+					content: [],
+					details: {},
+					isError: false,
+				};
+				if (input !== undefined) requestPayload["input"] = input;
+				const id = 60 + index;
+				link.request(id, "tool_result", requestPayload);
+				const error = payload(await link.error(id, "tool_result"));
+				expect(error["code"]).toBe("extension_error");
+				expect(String(error["message"])).toContain("tool_result.input is required");
+			}
+			expect(markerLog().some((entry) => entry.name.endsWith(".tool_result"))).toBe(false);
+		} finally {
+			await link.finish();
+		}
+	});
+
 	test("message_end: raw payload message folds ordered replacements", async () => {
 		const link = await foldLink();
 		// Rust sends the raw AgentMessage as the payload, not { message }.
@@ -926,6 +1097,59 @@ describe("lean: surface validation units", () => {
 		expect(() =>
 			parseLeanExtension({ tools: [{ ...tool, executionMode: "serial" }] })
 		).toThrow('executionMode must be "sequential" or "parallel"');
+	});
+
+	test("parseLeanExtension rejects nested non-JSON tool and provider metadata", () => {
+		const cycle: Record<string, unknown> = {};
+		cycle["self"] = cycle;
+		const invalidDefinitions: Array<[definition: unknown, message: string]> = [
+			[
+				{
+					tools: [{
+						name: "t",
+						description: "d",
+						parameters: { properties: { nested: { const: 1n } } },
+						execute: () => ({}),
+					}],
+				},
+				"BigInt",
+			],
+			[
+				{
+					tools: [{
+						name: "t",
+						description: "d",
+						parameters: { properties: { nested: { default: undefined } } },
+						execute: () => ({}),
+					}],
+				},
+				"undefined",
+			],
+			[
+				{ providers: [{ name: "p", models: [{ metadata: { score: Infinity } }] }] },
+				"finite JSON number",
+			],
+			[
+				{ providers: [{ name: "p", models: [{ metadata: { score: Number.NaN } }] }] },
+				"finite JSON number",
+			],
+			[
+				{ providers: [{ name: "p", models: [{ metadata: { callback: () => {} } }] }] },
+				"function",
+			],
+			[
+				{ providers: [{ name: "p", models: [{ metadata: { marker: Symbol("x") } }] }] },
+				"symbol",
+			],
+			[
+				{ providers: [{ name: "p", models: [cycle] }] },
+				"cycle",
+			],
+		];
+
+		for (const [definition, message] of invalidDefinitions) {
+			expect(() => parseLeanExtension(definition)).toThrow(message);
+		}
 	});
 
 	test("findExcludedImport detects the compat graph and tolerates clean code", () => {

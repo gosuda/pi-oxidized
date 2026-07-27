@@ -356,6 +356,81 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+
+function validateJsonValue(
+	context: string,
+	value: unknown,
+	ancestors: WeakSet<object>,
+): void {
+	if (value === null || typeof value === "boolean" || typeof value === "string") return;
+	if (typeof value === "number") {
+		if (Number.isFinite(value)) return;
+		fail(context, "must be a finite JSON number");
+	}
+	if (typeof value !== "object") {
+		fail(
+			context,
+			`must be a JSON value, got ${typeof value === "bigint" ? "BigInt" : typeof value}`,
+		);
+	}
+	if (ancestors.has(value)) fail(context, "must not contain a cycle");
+	ancestors.add(value);
+	try {
+		if (Array.isArray(value)) {
+			for (let index = 0; index < value.length; index++) {
+				if (!Object.hasOwn(value, index)) {
+					fail(`${context}[${index}]`, "must be a JSON value, got undefined");
+				}
+				validateJsonValue(`${context}[${index}]`, value[index], ancestors);
+			}
+			return;
+		}
+		if (!isRecord(value)) fail(context, "must be a JSON object");
+		const prototype = Object.getPrototypeOf(value);
+		if (prototype !== Object.prototype && prototype !== null) {
+			fail(context, "must be a plain JSON object");
+		}
+		if (Object.getOwnPropertySymbols(value).length > 0) {
+			fail(context, "must not contain symbol keys");
+		}
+		for (const key of Object.keys(value)) {
+			validateJsonValue(`${context}.${key}`, value[key], ancestors);
+		}
+	} finally {
+		ancestors.delete(value);
+	}
+}
+
+/** Reject values that cannot cross the lean JSONL boundary unchanged. */
+export function assertJsonValue(context: string, value: unknown): void {
+	validateJsonValue(context, value, new WeakSet<object>());
+}
+
+/** Snapshot a validated JSON value before mutable extension hooks run. */
+export function cloneJsonValue<T>(context: string, value: T): T {
+	assertJsonValue(context, value);
+	return structuredClone(value);
+}
+
+function canonicalizeJson(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(canonicalizeJson);
+	if (isRecord(value)) {
+		const normalized = Object.create(null) as Record<string, unknown>;
+		for (const key of Object.keys(value).sort()) {
+			normalized[key] = canonicalizeJson(value[key]);
+		}
+		return normalized;
+	}
+	return value;
+}
+
+/** Compare validated JSON values while ignoring object-key order. */
+export function jsonValuesEqual(left: unknown, right: unknown): boolean {
+	assertJsonValue("left JSON value", left);
+	assertJsonValue("right JSON value", right);
+	return JSON.stringify(canonicalizeJson(left)) === JSON.stringify(canonicalizeJson(right));
+}
+
 function fail(context: string, problem: string): never {
 	throw new LeanSurfaceError(`${context}: ${problem}`);
 }
@@ -396,8 +471,10 @@ function parseTools(value: unknown): void {
 		) {
 			fail(context, 'executionMode must be "sequential" or "parallel"');
 		}
-		if (tool["parameters"] !== undefined && !isRecord(tool["parameters"])) {
-			fail(context, "parameters must be a JSON Schema object");
+		const parameters = tool["parameters"];
+		if (parameters !== undefined) {
+			if (!isRecord(parameters)) fail(context, "parameters must be a JSON Schema object");
+			assertJsonValue(`${context}.parameters`, parameters);
 		}
 		if (tool["prepare"] !== undefined) requireFunction(context, tool["prepare"], "prepare");
 		if (tool["validate"] !== undefined) requireFunction(context, tool["validate"], "validate");
@@ -476,8 +553,10 @@ function parseProviders(value: unknown): void {
 				}
 			}
 		}
-		if (provider["models"] !== undefined && !Array.isArray(provider["models"])) {
-			fail(context, "models must be an array when present");
+		const models = provider["models"];
+		if (models !== undefined) {
+			if (!Array.isArray(models)) fail(context, "models must be an array when present");
+			assertJsonValue(`${context}.models`, models);
 		}
 		if (provider["streamSimple"] !== undefined) {
 			requireFunction(context, provider["streamSimple"], "streamSimple");
