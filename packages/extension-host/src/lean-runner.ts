@@ -43,6 +43,7 @@ import {
 	type LeanTool,
 	parseLeanExtension,
 } from "./lean-api.ts";
+import { AssistantDeltaReducer } from "./assistant-delta.ts";
 
 /** Host lifecycle state. */
 const RunnerState = {
@@ -352,116 +353,6 @@ async function findExcludedImportInGraph(entry: string): Promise<string | undefi
 }
 
 /**
- * Tolerant parse of possibly-incomplete streamed JSON (toolcall argument
- * fragments). Strict parse first; on failure one forward lexical pass
- * records recovery boundaries in the final
- * MAX_STREAMING_JSON_RECOVERY_CHARS characters and the longest boundary
- * whose closure survives JSON.parse wins. `{}` when nothing parses or the
- * recovery point is older than the bounded tail.
- */
-export function parseStreamingJson(text: string | undefined): Record<string, unknown> {
-	if (text === undefined || text.trim() === "") {
-		return {};
-	}
-	try {
-		const strict: unknown = JSON.parse(text);
-		return isRecord(strict) ? strict : {};
-	} catch {
-		// Fall through to bounded tail recovery.
-	}
-	return recoverStreamingJsonTail(text) ?? {};
-}
-
-/**
- * Streaming argument fragments arrive append-only, so a parse failure is
- * recoverable only near the end of the buffer. Bounding candidate closures
- * to a constant tail keeps recovery linear in the input instead of
- * quadratic full-prefix retries.
- */
-const MAX_STREAMING_JSON_RECOVERY_CHARS = 512;
-
-/** Immutable open-container stack so boundary snapshots share structure. */
-interface OpenContainerNode {
-	readonly close: "}" | "]";
-	readonly parent: OpenContainerNode | undefined;
-}
-
-/** Lexical state at one candidate prefix end (`text.slice(0, end)`). */
-interface RecoveryBoundary {
-	readonly end: number;
-	readonly inString: boolean;
-	readonly escaped: boolean;
-	readonly stack: OpenContainerNode | undefined;
-}
-
-function recoverStreamingJsonTail(text: string): Record<string, unknown> | undefined {
-	const boundaries = collectRecoveryBoundaries(text);
-	for (let index = boundaries.length - 1; index >= 0; index--) {
-		const closed = closeAtBoundary(text, boundaries[index]);
-		try {
-			const parsed: unknown = JSON.parse(closed);
-			return isRecord(parsed) ? parsed : {};
-		} catch {
-			// Try the next shorter boundary.
-		}
-	}
-	return undefined;
-}
-
-/**
- * One forward pass tracking JSON string/escape state and the open
- * container stack. Prefix boundaries become candidates only inside the
- * final MAX_STREAMING_JSON_RECOVERY_CHARS characters; a mismatched closing
- * bracket ends the scan because every longer prefix is structurally
- * unrecoverable.
- */
-function collectRecoveryBoundaries(text: string): RecoveryBoundary[] {
-	const boundaries: RecoveryBoundary[] = [];
-	const firstCandidate = Math.max(1, text.length - MAX_STREAMING_JSON_RECOVERY_CHARS);
-	let inString = false;
-	let escaped = false;
-	let stack: OpenContainerNode | undefined;
-	for (let index = 0; index < text.length; index++) {
-		if (index >= firstCandidate) {
-			boundaries.push({ end: index, inString, escaped, stack });
-		}
-		const char = text[index];
-		if (inString) {
-			if (escaped) escaped = false;
-			else if (char === "\\") escaped = true;
-			else if (char === '"') inString = false;
-			continue;
-		}
-		if (char === '"') {
-			inString = true;
-		} else if (char === "{") {
-			stack = { close: "}", parent: stack };
-		} else if (char === "[") {
-			stack = { close: "]", parent: stack };
-		} else if (char === "}" || char === "]") {
-			if (stack === undefined || stack.close !== char) return boundaries;
-			stack = stack.parent;
-		}
-	}
-	boundaries.push({ end: text.length, inString, escaped, stack });
-	return boundaries;
-}
-
-/** Close one candidate prefix: balance the open string, then containers. */
-function closeAtBoundary(text: string, boundary: RecoveryBoundary): string {
-	let closed = text.slice(0, boundary.end);
-	if (boundary.inString) {
-		// A trailing unescaped backslash would escape the closing quote.
-		if (boundary.escaped) closed = closed.slice(0, -1);
-		closed += '"';
-	}
-	for (let node = boundary.stack; node !== undefined; node = node.parent) {
-		closed += node.close;
-	}
-	return closed;
-}
-
-/**
  * Structured cancellation only: a real Error (or DOMException, which is
  * not Error-derived in every runtime) named AbortError. Message text is
  * deliberately never consulted — an extension failure that merely says
@@ -501,9 +392,7 @@ export class LeanRunner {
 	/** System prompt mirrored from `session.update` control events. */
 	private systemPrompt = "";
 	/** Active assistant snapshot reconstructed from compact Rust updates. */
-	private activeAssistant: Record<string, unknown> | undefined;
-	/** Raw streamed tool-argument fragments keyed by assistant content index. */
-	private readonly activeToolArguments = new Map<number, string>();
+	private readonly assistantDelta = new AssistantDeltaReducer();
 
 	constructor(stdin: ByteReadable, stdout: ByteWritable) {
 		const onFrame: FrameHandler = (frame) => this.onInbound(frame);
@@ -823,7 +712,7 @@ export class LeanRunner {
 	}
 
 	private async handleExtensionsLoad(id: number, p: Record<string, unknown>): Promise<void> {
-		this.clearActiveAssistant();
+		this.assistantDelta.clearActiveAssistant();
 		const paths = p["extensionPaths"] ?? p["paths"];
 		const extensionPaths = Array.isArray(paths)
 			? paths.filter((path): path is string => typeof path === "string")
@@ -1122,7 +1011,7 @@ export class LeanRunner {
 			if (eventType === "message_start") {
 				const message = payload["message"];
 				if (isRecord(message) && message["role"] === "assistant") {
-					this.seedActiveAssistant(message);
+					this.assistantDelta.seedActiveAssistant(message);
 				}
 			}
 			switch (eventType) {
@@ -1222,7 +1111,7 @@ export class LeanRunner {
 					return;
 				}
 				case "message_end": {
-					this.clearActiveAssistant();
+					this.assistantDelta.clearActiveAssistant();
 					// Rust sends the raw AgentMessage AS the request payload (no
 					// `{ message }` wrapper); the payload itself is the running value.
 					let currentMessage: unknown = payload;
@@ -1318,7 +1207,7 @@ export class LeanRunner {
 				}
 				default: {
 					if (eventType === "agent_end" || eventType === "session_shutdown") {
-						this.clearActiveAssistant();
+						this.assistantDelta.clearActiveAssistant();
 					}
 					await this.runHooks(eventType, { type: eventType, ...payload }, () => void 0);
 					await this.client.respond(id, eventType as Method, { ok: true });
@@ -1342,10 +1231,6 @@ export class LeanRunner {
 		id: number,
 		payload: Record<string, unknown>,
 	): Promise<void> {
-		if (!this.hooks.has("message_update")) {
-			await this.client.respond(id, "message_update_delta" as Method, { ok: true });
-			return;
-		}
 		const event = payload["event"];
 		if (!isRecord(event) || typeof event["type"] !== "string") {
 			await this.client.respondError(id, "message_update_delta" as Method, {
@@ -1363,7 +1248,7 @@ export class LeanRunner {
 				const assistantMessageEvent = type === "done"
 					? { type, reason: event["reason"], message }
 					: { type, reason: event["reason"], error: message };
-				this.clearActiveAssistant();
+				this.assistantDelta.clearActiveAssistant();
 				let result: unknown;
 				await this.runHooks(
 					"message_update",
@@ -1384,12 +1269,13 @@ export class LeanRunner {
 				return;
 			}
 
-			this.applyAssistantDelta(event);
-			if (this.activeAssistant === undefined) {
+			this.assistantDelta.applyAssistantDelta(event);
+			const activeAssistant = this.assistantDelta.getActiveAssistant();
+			if (activeAssistant === undefined) {
 				throw new Error("message update arrived before assistant start");
 			}
-			const message = structuredClone(this.activeAssistant);
-			const assistantMessageEvent = this.expandAssistantEvent(event, message);
+			const message = structuredClone(activeAssistant);
+			const assistantMessageEvent = this.assistantDelta.expandAssistantEvent(event, message);
 			let result: unknown;
 			await this.runHooks(
 				"message_update",
@@ -1416,77 +1302,6 @@ export class LeanRunner {
 		}
 	}
 
-	private seedActiveAssistant(message: Record<string, unknown>): void {
-		this.activeAssistant = structuredClone(message);
-		this.activeToolArguments.clear();
-	}
-
-	private clearActiveAssistant(): void {
-		this.activeAssistant = undefined;
-		this.activeToolArguments.clear();
-	}
-
-	private applyAssistantDelta(event: Record<string, unknown>): void {
-		const meta = isRecord(event["meta"]) ? event["meta"] : {};
-		if (this.activeAssistant === undefined) {
-			if (event["type"] !== "start") {
-				throw new Error("message update arrived before assistant start");
-			}
-			this.activeAssistant = { ...meta, content: [] };
-		} else if (event["type"] === "start") {
-			this.activeAssistant = { ...meta, content: [] };
-			this.activeToolArguments.clear();
-		} else {
-			const content = this.activeAssistant["content"];
-			this.activeAssistant = { ...this.activeAssistant, ...meta, content };
-		}
-		const content = this.activeAssistant["content"];
-		if (!Array.isArray(content)) {
-			throw new Error("active assistant content is not an array");
-		}
-		const index = event["contentIndex"];
-		if (typeof index !== "number") return;
-		const type = event["type"];
-		if (
-			(type === "text_start" || type === "thinking_start" || type === "toolcall_start"
-				|| type === "text_end" || type === "thinking_end" || type === "toolcall_end")
-			&& isRecord(event["block"])
-		) {
-			content[index] = structuredClone(event["block"]);
-			if (type === "toolcall_start") this.activeToolArguments.set(index, "");
-			if (type === "toolcall_end") this.activeToolArguments.delete(index);
-			return;
-		}
-		const delta = event["delta"];
-		const block = content[index];
-		if (typeof delta !== "string" || !isRecord(block)) return;
-		if (type === "text_delta") {
-			block["text"] = `${typeof block["text"] === "string" ? block["text"] : ""}${delta}`;
-		} else if (type === "thinking_delta") {
-			block["thinking"] = `${typeof block["thinking"] === "string" ? block["thinking"] : ""}${delta}`;
-		} else if (type === "toolcall_delta") {
-			const fragments = `${this.activeToolArguments.get(index) ?? ""}${delta}`;
-			this.activeToolArguments.set(index, fragments);
-			block["arguments"] = parseStreamingJson(fragments);
-		}
-	}
-
-	private expandAssistantEvent(
-		event: Record<string, unknown>,
-		partial: Record<string, unknown>,
-	): Record<string, unknown> {
-		const type = event["type"] as string;
-		const expanded: Record<string, unknown> = { type, partial };
-		const index = event["contentIndex"];
-		if (typeof index === "number") expanded["contentIndex"] = index;
-		if (typeof event["delta"] === "string") expanded["delta"] = event["delta"];
-		const content = partial["content"];
-		const block = Array.isArray(content) && typeof index === "number" ? content[index] : undefined;
-		if (type === "text_end" && isRecord(block)) expanded["content"] = block["text"];
-		if (type === "thinking_end" && isRecord(block)) expanded["content"] = block["thinking"];
-		if (type === "toolcall_end" && isRecord(block)) expanded["toolCall"] = block;
-		return expanded;
-	}
 
 	// -----------------------------------------------------------------------
 	// Control events, errors, shutdown
@@ -1495,9 +1310,9 @@ export class LeanRunner {
 	private handleControlEvent(frame: Frame): void {
 		if (frame.method === "session.update") {
 			const payload = frame.payload;
-			if (isRecord(payload) && typeof payload["systemPrompt"] === "string") {
-				this.systemPrompt = payload["systemPrompt"];
-			}
+			this.systemPrompt = isRecord(payload) && typeof payload["systemPrompt"] === "string"
+				? payload["systemPrompt"]
+				: "";
 			return;
 		}
 		if (frame.method !== "tool.cancel" && frame.method !== "provider.cancel") {
@@ -1533,13 +1348,14 @@ export class LeanRunner {
 	}
 
 	private terminate(reason: string): void {
-		this.clearActiveAssistant();
+		this.assistantDelta.clearActiveAssistant();
 		console.error(`[lean] fatal: ${reason}`);
 		this.dispose(reason);
 	}
 
 	dispose(reason = "lean runner disposed"): void {
 		if (this.state === RunnerState.DISPOSED) return;
+		this.assistantDelta.clearActiveAssistant();
 		this.state = RunnerState.DISPOSED;
 		for (const controller of this.inFlightTools.values()) controller.abort();
 		this.inFlightTools.clear();

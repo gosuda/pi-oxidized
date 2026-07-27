@@ -861,6 +861,7 @@ fn error_code(err: &HostClientError) -> &'static str {
         HostClientError::NotRunning => "extension_not_running",
         HostClientError::Payload(_) => "extension_payload",
         HostClientError::StreamOverflow { .. } => "extension_stream_overflow",
+        HostClientError::OutboundCancelFull { .. } => "extension_outbound_capacity",
     }
 }
 
@@ -1640,51 +1641,26 @@ impl HostExtensionRunner {
         })
     }
 
-    /// Route validated flags to their first-owning endpoints.
+    /// Fan out every validated flag value to every endpoint.
+    ///
+    /// Registry declarations describe flags but do not authorize or route user
+    /// values. Each endpoint receives the complete map and updates its local
+    /// overlay only after acknowledging it.
     ///
     /// # Errors
     ///
-    /// With a single endpoint, returns the `flags.set` RPC failure; with
-    /// multiple endpoints, per-endpoint failures are isolated and reported as
-    /// `extension_error` events instead.
+    /// Returns the first endpoint transport or payload error after all
+    /// remaining endpoints have received the validated values.
     pub async fn apply_flag_values(
         &self,
         values: &BTreeMap<String, FlagValueWire>,
     ) -> Result<(), HostClientError> {
-        for (index, endpoint) in self.endpoints.iter().enumerate() {
-            let selected = if self.endpoints.len() == 1 {
-                values.clone()
-            } else {
-                let earlier = &self.endpoints[..index];
-                let Ok(snapshot) = endpoint.snapshot.read() else {
-                    continue;
-                };
-                values
-                    .iter()
-                    .filter(|(name, _)| {
-                        snapshot
-                            .registry
-                            .flags()
-                            .iter()
-                            .any(|flag| flag.name.as_str() == name.as_str())
-                            && !earlier.iter().any(|candidate| {
-                                candidate.snapshot.read().is_ok_and(|snapshot| {
-                                    snapshot
-                                        .registry
-                                        .flags()
-                                        .iter()
-                                        .any(|flag| flag.name.as_str() == name.as_str())
-                                })
-                            })
-                    })
-                    .map(|(name, value)| (name.clone(), value.clone()))
-                    .collect()
-            };
-            if selected.is_empty() {
+        for endpoint in self.endpoints.iter() {
+            if values.is_empty() {
                 continue;
             }
             let payload = protocol::to_payload(&FlagsSetRequest {
-                values: selected.clone(),
+                values: values.clone(),
             })
             .map_err(|error| HostClientError::Payload(format!("encode flags.set: {error}")))?;
             let outcome = async {
@@ -1708,12 +1684,12 @@ impl HostExtensionRunner {
                 continue;
             }
             if let Ok(mut flags) = endpoint.flag_values.write() {
-                for (name, value) in selected {
+                for (name, value) in values {
                     flags.insert(
-                        name,
+                        name.clone(),
                         match value {
-                            FlagValueWire::Boolean(value) => Value::Bool(value),
-                            FlagValueWire::String(value) => Value::String(value),
+                            FlagValueWire::Boolean(value) => Value::Bool(*value),
+                            FlagValueWire::String(value) => Value::String(value.clone()),
                         },
                     );
                 }

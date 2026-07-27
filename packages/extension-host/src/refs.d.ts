@@ -370,6 +370,21 @@ declare module "@earendil-works/pi-coding-agent" {
 
 	export interface ExtensionRuntime {
 		flagValues: Map<string, boolean | string>;
+		pendingProviderRegistrations: Array<{
+			name: string;
+			config: ProviderConfig;
+			extensionPath: string;
+		}>;
+		pendingNativeProviderRegistrations: Array<{
+			provider: ProviderConfig & { id: string };
+			extensionPath: string;
+		}>;
+		registerProvider: (name: string, config: ProviderConfig, extensionPath?: string) => void;
+		registerNativeProvider: (
+			provider: ProviderConfig & { id: string },
+			extensionPath?: string,
+		) => void;
+		unregisterProvider: (name: string, extensionPath?: string) => void;
 		assertActive: () => void;
 		invalidate: (message?: string) => void;
 	}
@@ -387,7 +402,7 @@ declare module "@earendil-works/pi-coding-agent" {
 			contextActions: ExtensionContextActions,
 			providerActions?: {
 				registerProvider?: (name: string, config: ProviderConfig) => void;
-				registerNativeProvider?: (provider: ProviderConfig) => void;
+				registerNativeProvider?: (provider: ProviderConfig & { id: string }) => void;
 				unregisterProvider?: (name: string) => void;
 			},
 		): void;

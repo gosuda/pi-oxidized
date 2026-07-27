@@ -29,6 +29,7 @@ import {
 } from "./lean-api.ts";
 import type { StyledRun, UiSlot, SlotPlacement, OverlayOptions } from "./protocol.ts";
 import { createExtensionJiti } from "./virtual-modules.ts";
+import { AssistantDeltaReducer } from "./assistant-delta.ts";
 
 import {
 	ExtensionRunner,
@@ -49,7 +50,6 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { EventEmitter } from "node:events";
 import { validateToolArguments } from "@earendil-works/pi-ai/compat";
-import { parseStreamingJson } from "@earendil-works/pi-ai/utils/json-parse.ts";
 
 
 /** Minimal event bus for extension-to-extension communication. */
@@ -143,6 +143,11 @@ interface SlotEntry {
 	focusable: boolean;
 	overlayOptions: OverlayOptions | undefined;
 	width: number;
+}
+
+interface RegisteredProviderConfig {
+	config: ProviderConfig;
+	extensionPath: string;
 }
 
 /** Pending load options captured during the hello handshake. */
@@ -455,8 +460,8 @@ export class ExtensionHost {
 	private runner: ExtensionRunner | undefined;
 	private runtime: ExtensionRuntime | undefined;
 	private extensions: Extension[] = [];
-	/** Captured custom providers (first registration wins). */
-	private readonly providers = new Map<string, ProviderConfig>();
+	/** Captured custom providers with source provenance (first registration wins). */
+	private readonly providers = new Map<string, RegisteredProviderConfig>();
 	/** In-flight tool.execute AbortControllers keyed by request id. */
 	private readonly inFlightTools = new Map<number, AbortController>();
 	/** In-flight provider.stream AbortControllers keyed by request id. */
@@ -472,9 +477,7 @@ export class ExtensionHost {
 	private readonly terminalInputQueue: Array<() => Promise<void>> = [];
 	private terminalInputDraining = false;
 	/** Active assistant snapshot reconstructed from compact Rust updates. */
-	private activeAssistant: Record<string, unknown> | undefined;
-	/** Raw streamed tool-argument fragments keyed by assistant content index. */
-	private readonly activeToolArguments = new Map<number, string>();
+	private readonly assistantDelta = new AssistantDeltaReducer();
 	/** Active theme served to extensions (`ctx.ui.theme`). */
 	private currentTheme: Theme = fallbackTheme();
 	/** Theme catalog from the latest `theme.update` push. */
@@ -794,7 +797,7 @@ export class ExtensionHost {
 			if (eventType === "message_start") {
 				const message = payload["message"];
 				if (isRecord(message) && message["role"] === "assistant") {
-					this.seedActiveAssistant(message);
+					this.assistantDelta.seedActiveAssistant(message);
 				}
 			}
 			let result: unknown;
@@ -866,7 +869,7 @@ export class ExtensionHost {
 					return;
 				}
 				case "message_end":
-					this.clearActiveAssistant();
+					this.assistantDelta.clearActiveAssistant();
 					// Rust sends the raw AgentMessage AS the request payload (no
 					// `{ message }` wrapper); wrap it for upstream emitMessageEnd.
 					result = await runner.emitMessageEnd({
@@ -899,7 +902,7 @@ export class ExtensionHost {
 					return;
 				default:
 					if (eventType === "agent_end" || eventType === "session_shutdown") {
-						this.clearActiveAssistant();
+						this.assistantDelta.clearActiveAssistant();
 					}
 					result = await runner.emit({ type: eventType, ...payload } as Parameters<typeof runner.emit>[0]);
 					await this.client.respond(id, eventType as Method, result ?? { ok: true });
@@ -940,7 +943,7 @@ export class ExtensionHost {
 				const assistantMessageEvent = type === "done"
 					? { type, reason: event["reason"], message }
 					: { type, reason: event["reason"], error: message };
-				this.clearActiveAssistant();
+				this.assistantDelta.clearActiveAssistant();
 				const result = await runner.emit({
 					type: "message_update",
 					message,
@@ -950,12 +953,13 @@ export class ExtensionHost {
 				return;
 			}
 
-			this.applyAssistantDelta(event);
-			if (this.activeAssistant === undefined) {
+			this.assistantDelta.applyAssistantDelta(event);
+			const activeAssistant = this.assistantDelta.getActiveAssistant();
+			if (activeAssistant === undefined) {
 				throw new Error("message update arrived before assistant start");
 			}
-			const message = structuredClone(this.activeAssistant);
-			const assistantMessageEvent = this.expandAssistantEvent(event, message);
+			const message = structuredClone(activeAssistant);
+			const assistantMessageEvent = this.assistantDelta.expandAssistantEvent(event, message);
 			const result = await runner.emit({
 				type: "message_update",
 				message,
@@ -971,77 +975,9 @@ export class ExtensionHost {
 		}
 	}
 
-	private seedActiveAssistant(message: Record<string, unknown>): void {
-		this.activeAssistant = structuredClone(message);
-		this.activeToolArguments.clear();
-	}
-
-	private clearActiveAssistant(): void {
-		this.activeAssistant = undefined;
-		this.activeToolArguments.clear();
-	}
-
-	private applyAssistantDelta(event: Record<string, unknown>): void {
-		const meta = isRecord(event["meta"]) ? event["meta"] : {};
-		if (this.activeAssistant === undefined) {
-			if (event["type"] !== "start") {
-				throw new Error("message update arrived before assistant start");
-			}
-			this.activeAssistant = { ...meta, content: [] };
-		} else if (event["type"] === "start") {
-			this.activeAssistant = { ...meta, content: [] };
-			this.activeToolArguments.clear();
-		} else {
-			const content = this.activeAssistant["content"];
-			this.activeAssistant = { ...this.activeAssistant, ...meta, content };
-		}
-		const content = this.activeAssistant["content"];
-		if (!Array.isArray(content)) {
-			throw new Error("active assistant content is not an array");
-		}
-		const index = event["contentIndex"];
-		if (typeof index !== "number") return;
-		const type = event["type"];
-		if ((type === "text_start" || type === "thinking_start" || type === "toolcall_start"
-			|| type === "text_end" || type === "thinking_end" || type === "toolcall_end")
-			&& isRecord(event["block"])) {
-			content[index] = structuredClone(event["block"]);
-			if (type === "toolcall_start") this.activeToolArguments.set(index, "");
-			if (type === "toolcall_end") this.activeToolArguments.delete(index);
-			return;
-		}
-		const delta = event["delta"];
-		const block = content[index];
-		if (typeof delta !== "string" || !isRecord(block)) return;
-		if (type === "text_delta") {
-			block["text"] = `${typeof block["text"] === "string" ? block["text"] : ""}${delta}`;
-		} else if (type === "thinking_delta") {
-			block["thinking"] = `${typeof block["thinking"] === "string" ? block["thinking"] : ""}${delta}`;
-		} else if (type === "toolcall_delta") {
-			const fragments = `${this.activeToolArguments.get(index) ?? ""}${delta}`;
-			this.activeToolArguments.set(index, fragments);
-			block["arguments"] = parseStreamingJson(fragments);
-		}
-	}
-
-	private expandAssistantEvent(
-		event: Record<string, unknown>, partial: Record<string, unknown>,
-	): Record<string, unknown> {
-		const type = event["type"] as string;
-		const expanded: Record<string, unknown> = { type, partial };
-		const index = event["contentIndex"];
-		if (typeof index === "number") expanded["contentIndex"] = index;
-		if (typeof event["delta"] === "string") expanded["delta"] = event["delta"];
-		const content = partial["content"];
-		const block = Array.isArray(content) && typeof index === "number" ? content[index] : undefined;
-		if (type === "text_end" && isRecord(block)) expanded["content"] = block["text"];
-		if (type === "thinking_end" && isRecord(block)) expanded["content"] = block["thinking"];
-		if (type === "toolcall_end" && isRecord(block)) expanded["toolCall"] = block;
-		return expanded;
-	}
 
 	private async handleExtensionsLoad(id: number, p: Record<string, unknown>): Promise<void> {
-		this.clearActiveAssistant();
+		this.assistantDelta.clearActiveAssistant();
 		const request = parseExtensionsLoadRequest(
 			p,
 			this.loadOptions?.cwd ?? process.cwd(),
@@ -1609,8 +1545,26 @@ export class ExtensionHost {
 	 */
 	private rebuildRunner(cwd: string): void {
 		if (this.runtime === undefined) return;
-		// Keep captured providers across rebuild: late-loaded extensions register
-		// via the live callback before rebuild, and pending is already drained.
+		// Capture source provenance before bindCore drains the initial queues.
+		for (const { name, config, extensionPath } of this.runtime.pendingProviderRegistrations) {
+			if (!this.providers.has(name)) {
+				this.providers.set(name, { config, extensionPath });
+			}
+		}
+		for (const { provider, extensionPath } of this.runtime.pendingNativeProviderRegistrations) {
+			const id = provider.id;
+			if (!this.providers.has(id)) {
+				const native = provider;
+				this.providers.set(id, {
+					config: {
+						name: native.name,
+						baseUrl: native.baseUrl,
+						streamSimple: native.streamSimple,
+					},
+					extensionPath,
+				});
+			}
+		}
 		this.runner = new ExtensionRunner(
 			this.extensions,
 			this.runtime,
@@ -1622,27 +1576,40 @@ export class ExtensionHost {
 			this.createExtensionActions(),
 			this.createContextActions(),
 			{
-				registerProvider: (name, config) => {
-					if (!this.providers.has(name)) {
-						this.providers.set(name, config);
-					}
-				},
-				registerNativeProvider: (provider) => {
-					const id = (provider as Record<string, unknown>)["id"];
-					if (typeof id === "string" && !this.providers.has(id)) {
-						const native = provider as ProviderConfig;
-						this.providers.set(id, {
-							name: native.name,
-							baseUrl: native.baseUrl,
-							streamSimple: native.streamSimple,
-						});
-					}
-				},
+				// Initial registrations were captured above with their source
+				// paths. bindCore now drains those queues; these callbacks must
+				// not replace provenance with an endpoint-wide placeholder.
+				registerProvider: () => {},
+				registerNativeProvider: () => {},
 				unregisterProvider: (name) => {
 					this.providers.delete(name);
 				},
 			},
 		);
+		// bindCore's compatibility callback omits provenance. Restore the runtime
+		// contract so registrations made later by commands retain extensionPath.
+		this.runtime.registerProvider = (name, config, extensionPath = "<unknown>") => {
+			if (!this.providers.has(name)) {
+				this.providers.set(name, { config, extensionPath });
+			}
+		};
+		this.runtime.registerNativeProvider = (provider, extensionPath = "<unknown>") => {
+			const id = provider.id;
+			if (!this.providers.has(id)) {
+				const native = provider;
+				this.providers.set(id, {
+					config: {
+						name: native.name,
+						baseUrl: native.baseUrl,
+						streamSimple: native.streamSimple,
+					},
+					extensionPath,
+				});
+			}
+		};
+		this.runtime.unregisterProvider = (name) => {
+			this.providers.delete(name);
+		};
 		this.runner.setUIContext(this.createUIContext(), "tui");
 		this.runner.onError((error) => {
 			this.emitExtensionError(error.extensionPath, error.event, error.error);
@@ -1733,9 +1700,11 @@ export class ExtensionHost {
 		}
 
 		const providers: Array<Record<string, unknown>> = [];
-		for (const [name, config] of this.providers) {
+		for (const [name, registered] of this.providers) {
+			const { config, extensionPath } = registered;
 			const entry: Record<string, unknown> = {
 				name,
+				extensionPath,
 				streamSimple: typeof config.streamSimple === "function",
 			};
 			if (config.baseUrl !== undefined) entry["baseUrl"] = config.baseUrl;
@@ -2083,7 +2052,8 @@ export class ExtensionHost {
 
 	private async handleProviderStream(id: number, p: Record<string, unknown>): Promise<void> {
 		const providerId = String(p["providerId"] ?? p["name"] ?? "");
-		const config = this.providers.get(providerId);
+		const registered = this.providers.get(providerId);
+		const config = registered?.config;
 		if (config === undefined || typeof config.streamSimple !== "function") {
 			await this.client.respondError(id, "provider.stream" as Method, {
 				code: "not_found",
@@ -2332,13 +2302,14 @@ export class ExtensionHost {
 	}
 
 	private terminate(reason: string): void {
-		this.clearActiveAssistant();
+		this.assistantDelta.clearActiveAssistant();
 		console.error(`[host] fatal: ${reason}`);
 		this.dispose(reason);
 	}
 
 	dispose(reason = "host disposed"): void {
 		if (this.state === HostState.DISPOSED) return;
+		this.assistantDelta.clearActiveAssistant();
 		this.state = HostState.DISPOSED;
 		this.terminalHandlers.length = 0;
 		this.terminalInputQueue.length = 0;

@@ -897,6 +897,7 @@ describe("acceptance: extension runtime", () => {
 			const providers = payload["providers"] as Array<Record<string, unknown>>;
 			expect(providers.map((provider) => provider["name"])).toEqual(["crash_provider"]);
 			expect(providers[0]?.["streamSimple"]).toBe(true);
+			expect(providers[0]?.["extensionPath"]).toBe(extPath);
 			expect(payload["handlers"]).toEqual(["session_start", "agent_start", "message_end"]);
 		} finally {
 			stdin.push(null);
@@ -1274,6 +1275,7 @@ describe("acceptance: registry snapshot and tool/provider bridges", () => {
 		expect(fixture?.["baseUrl"]).toBe("https://fixture.example");
 		expect(fixture?.["api"]).toBe("custom");
 
+		expect(fixture?.["extensionPath"]).toBe(goodPath);
 		const handlers = payload["handlers"] as string[];
 		expect(handlers).toEqual(expect.arrayContaining(["session_start", "agent_start"]));
 
@@ -1288,6 +1290,52 @@ describe("acceptance: registry snapshot and tool/provider bridges", () => {
 		stdin.push(null);
 		host.dispose("test");
 		await runPromise.catch(() => void 0);
+	});
+
+	test("late provider registrations retain the registering extension path", async () => {
+		const lateFactory: ExtensionFactory = (pi) => {
+			pi.on("session_start", () => {
+				pi.registerProvider("late_provider", {
+					streamSimple: async function* () {
+						yield {
+							type: "done",
+							reason: "stop",
+							message: { role: "assistant", content: [] },
+						};
+					},
+				});
+			});
+		};
+		const { collector, stdin, host, runPromise } = await connectHost([
+			{ name: "late-provenance", factory: lateFactory },
+		]);
+		try {
+			stdin.push(Buffer.from(encodeFrameString({
+				id: 42,
+				kind: "req",
+				method: "session_start",
+				payload: { reason: "startup" },
+			})));
+			await collector.awaitFrame((frame) => frame.id === 42 && frame.kind === "res");
+			stdin.push(Buffer.from(encodeFrameString({
+				id: 43,
+				kind: "req",
+				method: "extensions.load",
+				payload: { extensionPaths: [], cwd: process.cwd() },
+			})));
+			const response = await collector.awaitFrame((frame) => frame.id === 43 && frame.kind === "res");
+			const providers = (
+				response.payload as Record<string, unknown>
+			)["providers"] as Array<Record<string, unknown>>;
+			expect(providers.find((provider) => provider["name"] === "late_provider")).toMatchObject({
+				extensionPath: "<inline:late-provenance>",
+				streamSimple: true,
+			});
+		} finally {
+			stdin.push(null);
+			host.dispose("test");
+			await runPromise.catch(() => undefined);
+		}
 	});
 
 	test("tool.execute returns result and streams toolUpdate progress", async () => {

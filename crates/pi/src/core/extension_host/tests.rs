@@ -991,7 +991,7 @@ async fn flags_set_acks_before_updating_local_values_and_rejection_preserves_sta
 }
 
 #[tokio::test]
-async fn aggregate_flag_rejection_does_not_skip_later_endpoints() -> R {
+async fn aggregate_flags_fan_out_declared_and_arbitrary_values_to_every_endpoint() -> R {
     let (runner, hosts) = make_aggregate_runner(vec![
         (
             0,
@@ -1016,20 +1016,33 @@ async fn aggregate_flag_rejection_does_not_skip_later_endpoints() -> R {
         .apply_flag_values(&BTreeMap::from([
             ("first".to_owned(), FlagValueWire::Boolean(true)),
             ("second".to_owned(), FlagValueWire::Boolean(true)),
+            (
+                "undeclared".to_owned(),
+                FlagValueWire::String("user-value".to_owned()),
+            ),
         ]))
         .await?;
 
     let values = runner.get_flag_values();
     assert_eq!(values.get("first"), Some(&Value::Bool(false)));
     assert_eq!(values.get("second"), Some(&Value::Bool(true)));
-    let later_requests = hosts[1]
-        .requests
-        .lock()
-        .map_err(|_| "request lock poisoned")?;
-    assert!(later_requests.iter().any(|request| {
-        request.method == pi_ext::protocol::FLAGS_SET_METHOD
-            && request.payload == json!({"values": {"second": true}})
-    }));
+    assert_eq!(
+        values.get("undeclared"),
+        Some(&Value::String("user-value".to_owned()))
+    );
+    let expected = json!({
+        "values": {
+            "first": true,
+            "second": true,
+            "undeclared": "user-value"
+        }
+    });
+    for host in &hosts {
+        let requests = host.requests.lock().map_err(|_| "request lock poisoned")?;
+        assert!(requests.iter().any(|request| {
+            request.method == pi_ext::protocol::FLAGS_SET_METHOD && request.payload == expected
+        }));
+    }
     Ok(())
 }
 

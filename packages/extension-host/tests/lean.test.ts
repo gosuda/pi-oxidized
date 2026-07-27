@@ -24,8 +24,8 @@ import type { LeanExtension } from "../src/lean-api.ts";
 import {
 	findExcludedImport,
 	LeanRunner,
-	parseStreamingJson,
 } from "../src/lean-runner.ts";
+import { parseStreamingJson } from "../src/assistant-delta.ts";
 
 const PACKAGE_DIR = resolve(import.meta.dirname, "..");
 const LEAN_FIXTURES = resolve(import.meta.dirname, "fixtures", "lean");
@@ -254,6 +254,7 @@ describe("lean: extensions.load registry", () => {
 			displayName: "Lean Provider",
 			baseUrl: "https://example.invalid",
 			streamSimple: true,
+			extensionPath: ECHO_ENTRY,
 		});
 
 		expect(res["handlers"]).toEqual(
@@ -1426,7 +1427,12 @@ describe("lean: structural graph proofs", () => {
 			resolve(PACKAGE_DIR, "src", "lean-runner.ts"),
 		);
 		const basenames = [...files].map((file) => basename(file));
-		expect(basenames.sort()).toEqual(["lean-api.ts", "lean-runner.ts", "protocol.ts"]);
+		expect(basenames.sort()).toEqual([
+			"assistant-delta.ts",
+			"lean-api.ts",
+			"lean-runner.ts",
+			"protocol.ts",
+		]);
 		for (const specifier of bare) {
 			const allowed = specifier === "@earendil-works/pi-tui-protocol"
 				|| specifier.startsWith("node:");
