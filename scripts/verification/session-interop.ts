@@ -94,7 +94,8 @@ export async function reopenWithSourcePinnedTypescript(
 	const SessionManager = await referenceSessionManager();
 	const files = await jsonlFiles(root);
 	assert(files.length > 0, `Rust proof did not produce session files under ${root}`);
-	let preservedUnknownEntry = false;
+	let fixtureContainsOpaqueFutureEntry = false;
+	let sourcePinnedManagerRetainsOpaqueFutureEntry = false;
 
 	for (const file of files) {
 		const before = await readFile(file);
@@ -103,15 +104,17 @@ export async function reopenWithSourcePinnedTypescript(
 		const afterLines = after.toString().trim().split("\n");
 		const finalEntry = JSON.parse(afterLines.at(-1)!) as { id?: unknown };
 		assert(typeof finalEntry.id === "string", `TypeScript output has no final entry id: ${file}`);
-		preservedUnknownEntry ||= before.includes(Buffer.from('"type":"future_thing"'));
+		fixtureContainsOpaqueFutureEntry ||= before.includes(Buffer.from('"type":"future_thing"'));
 		if (preserveHistoricalPrefix) {
 			assert(
 				Buffer.compare(before, after) === 0,
 				`TypeScript reopen rewrote historical JSONL: ${relative(REPO_ROOT, file)}`,
 			);
 		}
+		const entries = manager.getEntries();
+		sourcePinnedManagerRetainsOpaqueFutureEntry ||= entries.some((entry) => entry.type === "future_thing");
 		assert(manager.getHeader()?.version === 3, `TypeScript reopen did not see v3 header: ${file}`);
-		assert(manager.getEntries().length > 0, `TypeScript reopen lost entries: ${file}`);
+		assert(entries.length > 0, `TypeScript reopen lost entries: ${file}`);
 		assert(manager.getTree().length > 0, `TypeScript reopen lost tree: ${file}`);
 		assert(manager.buildSessionContext().messages.length > 0, `TypeScript reopen lost context: ${file}`);
 		const leaf = manager.getLeafId();
@@ -120,7 +123,11 @@ export async function reopenWithSourcePinnedTypescript(
 			`TypeScript reopen leaf differs from final entry: ${relative(REPO_ROOT, file)}`,
 		);
 	}
-	assert(preservedUnknownEntry, "Rust output dropped the generated opaque future entry");
+	assert(fixtureContainsOpaqueFutureEntry, "Rust output dropped the generated opaque future entry");
+	assert(
+		sourcePinnedManagerRetainsOpaqueFutureEntry,
+		"source-pinned TypeScript SessionManager dropped the opaque future entry",
+	);
 	return files.length;
 }
 

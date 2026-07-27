@@ -32,7 +32,7 @@ pub struct AgentToolResult {
     /// Text or image content returned to the model.
     pub content: Vec<ToolResultContent>,
     /// Arbitrary structured details for logs or UI rendering.
-    #[serde(default = "empty_object", skip_serializing_if = "Value::is_null")]
+    #[serde(default, skip_serializing_if = "Value::is_null")]
     pub details: Value,
     /// Tool names introduced by this result and available afterward.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -265,7 +265,8 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn absent_tool_details_are_omitted_but_values_are_preserved() -> Result<(), serde_json::Error> {
+    fn absent_tool_details_round_trip_as_null_and_preserve_values() -> Result<(), serde_json::Error>
+    {
         let mut result = AgentToolResult {
             content: Vec::new(),
             details: Value::Null,
@@ -278,6 +279,8 @@ mod tests {
                 .as_object()
                 .is_some_and(|object| object.contains_key("details"))
         );
+        let decoded: AgentToolResult = serde_json::from_value(absent)?;
+        assert_eq!(decoded.details, Value::Null);
 
         result.details = json!({ "path": "kept" });
         assert_eq!(
@@ -440,6 +443,14 @@ mod tests {
             serde_json::to_value(&error_result)?,
             json!({
                 "content": [{ "type": "text", "text": "nope" }],
+                "details": {}
+            })
+        );
+
+        assert_eq!(
+            serde_json::to_value(AgentToolResult::default())?,
+            json!({
+                "content": [],
                 "details": {}
             })
         );

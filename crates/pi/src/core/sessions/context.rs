@@ -50,6 +50,8 @@ pub struct SessionModel {
 /// Resolved session context for the LLM turn.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionContext {
+    /// Whether the selected persisted path contains entries.
+    pub has_entries: bool,
     /// Messages projected from the compaction-aware path.
     pub messages: Vec<AgentMessage>,
     /// Last thinking level on the full path (default `"off"`).
@@ -161,6 +163,7 @@ pub fn build_session_context(
     leaf: LeafRef<'_>,
 ) -> Result<SessionContext, MessageConversionError> {
     let path = build_session_path(entries, leaf);
+    let has_entries = !path.is_empty();
     let (thinking_level, model) = get_session_context_settings(&path);
     let context_entries = build_context_entries(entries, leaf);
     let mut messages = Vec::new();
@@ -168,6 +171,7 @@ pub fn build_session_context(
         messages.extend(session_entry_to_context_messages(entry)?);
     }
     Ok(SessionContext {
+        has_entries,
         messages,
         thinking_level,
         model,
@@ -423,6 +427,28 @@ mod tests {
         assert!(ctx.messages.is_empty());
         assert_eq!(ctx.thinking_level, "off");
         assert!(ctx.model.is_none());
+        assert!(!ctx.has_entries);
+        Ok(())
+    }
+
+    #[test]
+    fn settings_only_path_is_existing_without_messages() -> TestResult {
+        let entries = [
+            model_change("1", None, "openai", "gpt-4")?,
+            thinking("2", Some("1"), "high")?,
+        ];
+        let context = build_session_context(&refs(&entries), LeafRef::Last)?;
+
+        assert!(context.has_entries);
+        assert!(context.messages.is_empty());
+        assert_eq!(context.thinking_level, "high");
+        assert_eq!(
+            context.model,
+            Some(SessionModel {
+                provider: "openai".to_owned(),
+                model_id: "gpt-4".to_owned(),
+            })
+        );
         Ok(())
     }
 

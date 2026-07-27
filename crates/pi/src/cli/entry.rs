@@ -342,11 +342,10 @@ fn thinking_level_token(level: ModelThinkingLevel) -> &'static str {
 
 fn append_session_bootstrap_entries(
     session_manager: &mut crate::core::sessions::SessionManager,
-    messages: &[pi_agent::AgentMessage],
     model: Option<&Model>,
     thinking_level: ModelThinkingLevel,
 ) -> Result<(), String> {
-    if messages.is_empty() {
+    if session_manager.get_entries().is_empty() {
         if let Some(model) = model {
             session_manager
                 .append_model_change(&model.provider, &model.id)
@@ -398,7 +397,6 @@ fn build_session(options: SessionBuildOptions) -> Result<BuiltSession, String> {
     let mut session_manager = options.session_manager;
     append_session_bootstrap_entries(
         &mut session_manager,
-        &options.messages,
         session_result.model.as_ref(),
         session_result.thinking_level,
     )?;
@@ -473,7 +471,7 @@ struct RestoredSession {
 
 fn restore_session(context: crate::core::sessions::SessionContext) -> RestoredSession {
     RestoredSession {
-        has_existing_session: !context.messages.is_empty(),
+        has_existing_session: context.has_entries,
         saved_session_model: context.model.map(|model| (model.provider, model.model_id)),
         saved_thinking_level: thinking_level_from_str(&context.thinking_level),
         messages: context.messages,
@@ -502,6 +500,21 @@ fn no_tools_mode(
         Some(crate::core::agent_session_services::NoToolsMode::Builtin)
     } else {
         None
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct InvocationToolPolicy {
+    tools: Option<Vec<String>>,
+    exclude_tools: Option<Vec<String>>,
+    no_tools: Option<crate::core::agent_session_services::NoToolsMode>,
+}
+
+fn invocation_tool_policy(args: &crate::cli::args::Args) -> InvocationToolPolicy {
+    InvocationToolPolicy {
+        tools: (!args.tools.is_empty()).then(|| args.tools.clone()),
+        exclude_tools: (!args.exclude_tools.is_empty()).then(|| args.exclude_tools.clone()),
+        no_tools: no_tools_mode(args),
     }
 }
 
@@ -723,7 +736,7 @@ impl RuntimeFactory for RealRuntimeFactory {
             } = resolve_models(&parsed, &services.model_runtime).await;
 
             let resources = session_resources(&services.resource_loader);
-            let no_tools = no_tools_mode(&parsed);
+            let tool_policy = invocation_tool_policy(&parsed);
 
             let thinking_level = parsed
                 .thinking
@@ -737,17 +750,9 @@ impl RuntimeFactory for RealRuntimeFactory {
                     model: cli_resolved.model.clone(),
                     thinking_level,
                     scoped_models: scope.scoped_models,
-                    tools: if parsed.tools.is_empty() {
-                        None
-                    } else {
-                        Some(parsed.tools.clone())
-                    },
-                    exclude_tools: if parsed.exclude_tools.is_empty() {
-                        None
-                    } else {
-                        Some(parsed.exclude_tools.clone())
-                    },
-                    no_tools,
+                    tools: tool_policy.tools,
+                    exclude_tools: tool_policy.exclude_tools,
+                    no_tools: tool_policy.no_tools,
                     session_start_event: None,
                     saved_session_model,
                     has_existing_session,
@@ -851,6 +856,7 @@ impl CreateAgentSessionRuntimeFactory for RealReplacementFactory {
             let project_trusted = services.settings_manager().is_project_trusted();
             let resources = session_resources(&services.resource_loader);
             let args = &self.configuration.args;
+            let tool_policy = invocation_tool_policy(args);
             let ResolvedModels {
                 cli: cli_resolved,
                 scope,
@@ -880,9 +886,9 @@ impl CreateAgentSessionRuntimeFactory for RealReplacementFactory {
                     model: cli_resolved.model,
                     thinking_level,
                     scoped_models: scope.scoped_models,
-                    tools: None,
-                    exclude_tools: None,
-                    no_tools: None,
+                    tools: tool_policy.tools,
+                    exclude_tools: tool_policy.exclude_tools,
+                    no_tools: tool_policy.no_tools,
                     session_start_event: Some(crate::core::agent_session::SessionStartEvent {
                         reason: options.start_reason,
                         previous_session_file: options.previous_session_file.clone(),
@@ -1263,7 +1269,7 @@ mod tests {
         let mut fresh = crate::core::sessions::SessionManager::in_memory(Some("/tmp"), None)
             .map_err(|error| error.to_string())?;
 
-        append_session_bootstrap_entries(&mut fresh, &[], Some(&model), ModelThinkingLevel::High)?;
+        append_session_bootstrap_entries(&mut fresh, Some(&model), ModelThinkingLevel::High)?;
         assert_eq!(
             fresh
                 .get_entries()
@@ -1273,7 +1279,33 @@ mod tests {
             ["model_change", "thinking_level_change"]
         );
 
-        let messages = vec![pi_agent::AgentMessage::Llm(Box::new(pi_ai::Message::User(
+        let restored = restore_session(
+            fresh
+                .build_session_context()
+                .map_err(|error| error.to_string())?,
+        );
+        assert!(restored.has_existing_session);
+        assert!(restored.messages.is_empty());
+        assert_eq!(
+            restored.saved_session_model,
+            Some((model.provider.clone(), model.id.clone()))
+        );
+        assert_eq!(
+            restored.saved_thinking_level,
+            Some(ModelThinkingLevel::High)
+        );
+
+        append_session_bootstrap_entries(&mut fresh, Some(&model), ModelThinkingLevel::High)?;
+        assert_eq!(
+            fresh
+                .get_entries()
+                .iter()
+                .map(|entry| entry.discriminant())
+                .collect::<Vec<_>>(),
+            ["model_change", "thinking_level_change"]
+        );
+
+        let messages = [pi_agent::AgentMessage::Llm(Box::new(pi_ai::Message::User(
             pi_ai::UserMessage::new(pi_ai::UserMessageContent::Text("seed".to_owned()), 0),
         )))];
         let mut restored = crate::core::sessions::SessionManager::in_memory(Some("/tmp"), None)
@@ -1281,18 +1313,8 @@ mod tests {
         restored
             .append_message(&messages[0])
             .map_err(|error| error.to_string())?;
-        append_session_bootstrap_entries(
-            &mut restored,
-            &messages,
-            Some(&model),
-            ModelThinkingLevel::High,
-        )?;
-        append_session_bootstrap_entries(
-            &mut restored,
-            &messages,
-            Some(&model),
-            ModelThinkingLevel::High,
-        )?;
+        append_session_bootstrap_entries(&mut restored, Some(&model), ModelThinkingLevel::High)?;
+        append_session_bootstrap_entries(&mut restored, Some(&model), ModelThinkingLevel::High)?;
         assert_eq!(
             restored
                 .get_entries()
@@ -1317,7 +1339,7 @@ mod tests {
 
         let mut manager = crate::core::sessions::SessionManager::in_memory(Some("/tmp"), None)
             .map_err(|error| error.to_string())?;
-        append_session_bootstrap_entries(&mut manager, &[], Some(&model), ModelThinkingLevel::Max)?;
+        append_session_bootstrap_entries(&mut manager, Some(&model), ModelThinkingLevel::Max)?;
 
         let context = crate::core::sessions::build_session_context(
             &manager.get_entries(),
@@ -1385,6 +1407,59 @@ mod tests {
         assert_eq!(
             config.service.extension_flag_values.get("provider-profile"),
             Some(&ExtensionFlagValue::Str("strict".into()))
+        );
+    }
+
+    #[test]
+    fn replacement_tool_policy_matches_initial_cli_modes() {
+        let allow = invocation_tool_policy(&crate::cli::args::parse_args(&[
+            "--tools".into(),
+            "read,bash".into(),
+        ]));
+        assert_eq!(
+            allow,
+            InvocationToolPolicy {
+                tools: Some(vec!["read".into(), "bash".into()]),
+                exclude_tools: None,
+                no_tools: None,
+            }
+        );
+
+        let deny = invocation_tool_policy(&crate::cli::args::parse_args(&[
+            "--exclude-tools".into(),
+            "bash".into(),
+        ]));
+        assert_eq!(
+            deny,
+            InvocationToolPolicy {
+                tools: None,
+                exclude_tools: Some(vec!["bash".into()]),
+                no_tools: None,
+            }
+        );
+
+        let no_tools =
+            invocation_tool_policy(&crate::cli::args::parse_args(&["--no-tools".into()]));
+        assert_eq!(
+            no_tools,
+            InvocationToolPolicy {
+                tools: None,
+                exclude_tools: None,
+                no_tools: Some(crate::core::agent_session_services::NoToolsMode::All),
+            }
+        );
+
+        let no_builtin_tools =
+            invocation_tool_policy(&crate::cli::args::parse_args(
+                &["--no-builtin-tools".into()],
+            ));
+        assert_eq!(
+            no_builtin_tools,
+            InvocationToolPolicy {
+                tools: None,
+                exclude_tools: None,
+                no_tools: Some(crate::core::agent_session_services::NoToolsMode::Builtin),
+            }
         );
     }
 
