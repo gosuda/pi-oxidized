@@ -20,6 +20,7 @@ import {
 	encodeFrameString,
 } from "@earendil-works/pi-tui-protocol";
 import { parseLeanExtension } from "../src/lean-api.ts";
+import type { LeanExtension } from "../src/lean-api.ts";
 import {
 	findExcludedImport,
 	LeanRunner,
@@ -401,7 +402,8 @@ describe("lean: tool RPCs", () => {
 		const link = await loadedLink();
 		link.request(12, "tool.validate", { name: "echo", args: { text: "hi" } });
 		const ok = payload(await link.response(12, "tool.validate"));
-		expect(ok["args"]).toEqual({ text: "hi" });
+		expect(ok["args"]).toEqual({ text: "hi", validatedBy: "lean" });
+		expect(markerLog()).toContainEqual({ name: "validate", value: { text: "hi" } });
 
 		link.request(13, "tool.validate", { name: "echo", args: { text: 42 } });
 		const err = payload(await link.error(13, "tool.validate"));
@@ -412,10 +414,20 @@ describe("lean: tool RPCs", () => {
 
 	test("tool.execute streams toolUpdate then resolves the tool result", async () => {
 		const link = await loadedLink();
+		link.request(13, "tool.validate", {
+			name: "echo",
+			args: { text: "hi", preparedBy: "lean" },
+		});
+		const validated = payload(await link.response(13, "tool.validate"));
+		expect(validated["args"]).toEqual({
+			text: "hi",
+			preparedBy: "lean",
+			validatedBy: "lean",
+		});
 		link.request(14, "tool.execute", {
 			name: "echo",
 			toolCallId: "call-1",
-			args: { text: "hi", preparedBy: "lean" },
+			args: validated["args"],
 			prepared: true,
 		});
 		const update = await link.waitFor(
@@ -425,6 +437,14 @@ describe("lean: tool RPCs", () => {
 		const res = payload(await link.response(14, "tool.execute"));
 		expect(res["content"]).toEqual([{ type: "text", text: "echo:hi" }]);
 		expect(res["details"]).toMatchObject({ preparedBy: "lean", extensionPath: ECHO_ENTRY });
+		expect(markerLog()).toContainEqual({
+			name: "execute",
+			value: {
+				args: { text: "hi", preparedBy: "lean", validatedBy: "lean" },
+				toolCallId: "call-1",
+				cwd: PACKAGE_DIR,
+			},
+		});
 		await link.finish();
 	});
 
@@ -436,8 +456,8 @@ describe("lean: tool RPCs", () => {
 			args: {},
 			prepared: true,
 		});
-		// Synchronize on the tool's own started signal: the AbortController is
-		// registered before execute runs, so the cancel cannot be lost.
+		// Synchronize on the tool's own started event before cancelling; the
+		// separate test below covers an already-aborted signal.
 		await link.waitFor(
 			(f) => f.id === 15 && f.kind === "event" && f.method === "toolUpdate",
 		);
@@ -445,6 +465,36 @@ describe("lean: tool RPCs", () => {
 		const err = payload(await link.error(15, "tool.execute"));
 		expect(err["code"]).toBe("cancelled");
 		await link.finish();
+	});
+
+	test("slow tool rejects when its signal was already aborted", async () => {
+		// The fixture is selected by the absolute runtime path LeanRunner uses,
+		// so this deliberately crosses the plugin-loading boundary.
+		const fixture = (await import(ECHO_ENTRY)) as { default: LeanExtension };
+		const slow = fixture.default.tools?.find((tool) => tool.name === "slow");
+		if (slow === undefined) throw new Error("slow tool fixture is missing");
+
+		const controller = new AbortController();
+		controller.abort();
+		let rejection: Error | undefined;
+		const settled = await Promise.race([
+			Promise.resolve(slow.execute({}, {
+				cwd: PACKAGE_DIR,
+				extensionPath: ECHO_ENTRY,
+				toolCallId: "already-aborted",
+				signal: controller.signal,
+				onUpdate: () => {},
+			})).then(
+				() => "fulfilled" as const,
+				(error) => {
+					rejection = error instanceof Error ? error : undefined;
+					return "rejected" as const;
+				},
+			),
+			Promise.resolve().then(() => "pending" as const),
+		]);
+		expect(settled).toBe("rejected");
+		expect(rejection?.message).toBe("slow tool aborted");
 	});
 });
 
@@ -1189,6 +1239,131 @@ describe("lean: surface validation units", () => {
 		expect(parseStreamingJson('{"a":"hel')).toEqual({ a: "hel" });
 		expect(parseStreamingJson("garbage")).toEqual({});
 		expect(parseStreamingJson(undefined)).toEqual({});
+	});
+
+	test("lexical import scanner separates code from comments, strings, and template text", () => {
+		const cases: Array<[source: string, expected: string | undefined]> = [
+			// Commented-out imports of every form are not imports.
+			['// import "jiti";', undefined],
+			['// const m = await import("jiti");', undefined],
+			['/* import { x } from "jiti"; */', undefined],
+			['/* export * from "typebox"; */', undefined],
+			// Import-shaped text inside strings and template raw text is inert.
+			["const s = 'import \"jiti\"';", undefined],
+			['const s = "export { x } from \'typebox\'";', undefined],
+			['const s = `import "jiti" from "typebox"`;', undefined],
+			['const s = `a ${ `b import "jiti" b` } c`;', undefined],
+			// Escaped template characters stay raw text.
+			['const s = `\\${ import("jiti") }`;', undefined],
+			// Dynamic imports may carry comments between their tokens.
+			['await import(/* lazy */ "jiti");', "jiti"],
+			['await import /* call */ ("jiti");', "jiti"],
+			['await import( // arg\n\t"jiti",\n);', "jiti"],
+			// Template expressions are code, at any nesting depth.
+			['const s = `${await import("jiti")}`;', "jiti"],
+			['const s = `raw ${ `${ import("jiti") }` } raw`;', "jiti"],
+			// Comments inside a static clause do not hide the specifier.
+			['import { x } /* bindings */ from "jiti";', "jiti"],
+			['import.meta.url; await import("jiti");', "jiti"],
+		];
+		for (const [source, expected] of cases) {
+			expect(findExcludedImport(source)).toBe(expected);
+		}
+	});
+
+	test("parseStreamingJson recovery is bounded to a constant tail", () => {
+		// Recovery boundary inside the 512-char tail: recovered in full.
+		const longText = "x".repeat(600);
+		expect(parseStreamingJson(`{"a":1,"b":"${longText}`)).toEqual({ a: 1, b: longText });
+		// Recovery would need a boundary older than the tail: bounded give-up.
+		expect(parseStreamingJson(`{"a":1,"b":${"!".repeat(600)}`)).toEqual({});
+		// A mismatched closer ends recovery at the last sound prefix.
+		expect(parseStreamingJson('{"a":1}]')).toEqual({ a: 1 });
+		// A trailing unescaped backslash is dropped before closing the string.
+		expect(parseStreamingJson('{"a":"x\\')).toEqual({ a: "x" });
+		// No full-input backwards retries: 100k of garbage returns cheaply.
+		expect(parseStreamingJson("z".repeat(100_000))).toEqual({});
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Cancellation classification: signal/AbortError only, never message text
+// ---------------------------------------------------------------------------
+
+describe("lean: cancellation classification", () => {
+	test("message text never classifies; only the signal or a structured AbortError does", async () => {
+		const directory = await mkdtemp(join(PACKAGE_DIR, ".test-lean-cancel-classify-"));
+		const entry = join(directory, "cancel-classify.mjs");
+		await writeFile(
+			entry,
+			`export default {
+	name: "cancel-classify",
+	tools: [
+		{
+			name: "says-cancelled",
+			description: "Fails with a message that merely mentions cancellation",
+			execute: () => {
+				throw new Error("operation cancelled by upstream; please abort retries");
+			},
+		},
+		{
+			name: "aborts-structurally",
+			description: "Throws a structured AbortError without an aborted signal",
+			execute: () => {
+				const error = new Error("interrupted");
+				error.name = "AbortError";
+				throw error;
+			},
+		},
+	],
+	providers: [
+		{
+			name: "says-cancelled-provider",
+			streamSimple: async function* () {
+				throw new Error("stream cancelled midway");
+			},
+		},
+		{
+			name: "aborts-structurally-provider",
+			streamSimple: async function* () {
+				throw new DOMException("interrupted", "AbortError");
+			},
+		},
+	],
+};
+`,
+		);
+		const link = new LeanLink({ cwd: directory, extensionPaths: [] });
+		try {
+			await link.hello(1);
+			link.request(2, "extensions.load", { extensionPaths: [entry], cwd: directory });
+			expect(payload(await link.response(2, "extensions.load"))["errors"]).toEqual([]);
+
+			link.request(3, "tool.execute", { name: "says-cancelled", toolCallId: "cc-1", args: {}, prepared: true });
+			const toolPlain = payload(await link.error(3, "tool.execute"));
+			expect(toolPlain["code"]).toBe("extension_error");
+			expect(toolPlain["message"]).toBe("operation cancelled by upstream; please abort retries");
+
+			link.request(4, "tool.execute", { name: "aborts-structurally", toolCallId: "cc-2", args: {}, prepared: true });
+			const toolAbort = payload(await link.error(4, "tool.execute"));
+			expect(toolAbort["code"]).toBe("cancelled");
+			expect(toolAbort["message"]).toBe("extension tool cancelled");
+			expect(toolAbort["retryable"]).toBe(false);
+
+			link.request(5, "provider.stream", { providerId: "says-cancelled-provider", model: {}, context: {}, options: {} });
+			const providerPlain = payload(await link.error(5, "provider.stream"));
+			expect(providerPlain["code"]).toBe("extension_error");
+			expect(providerPlain["message"]).toBe("stream cancelled midway");
+
+			link.request(6, "provider.stream", { providerId: "aborts-structurally-provider", model: {}, context: {}, options: {} });
+			const providerAbort = payload(await link.error(6, "provider.stream"));
+			expect(providerAbort["code"]).toBe("cancelled");
+			expect(providerAbort["message"]).toBe("provider stream cancelled");
+			expect(providerAbort["retryable"]).toBe(false);
+		} finally {
+			await link.finish();
+			await rm(directory, { recursive: true, force: true });
+		}
 	});
 });
 

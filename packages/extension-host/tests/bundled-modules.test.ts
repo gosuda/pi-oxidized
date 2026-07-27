@@ -340,7 +340,11 @@ export default (pi) => pi.registerTool(tool);
 			expect.objectContaining({ name: "slow" }),
 		]));
 		expect(stages.prepare["args"]).toEqual({ text: "hi", preparedBy: "lean" });
-		expect(stages.validate["args"]).toEqual({ text: "hi", preparedBy: "lean" });
+		expect(stages.validate["args"]).toEqual({
+			text: "hi",
+			preparedBy: "lean",
+			validatedBy: "lean",
+		});
 		expect(stages.toolUpdate).toMatchObject({
 			toolCallId: "compiled-lean-1",
 			toolName: "echo",

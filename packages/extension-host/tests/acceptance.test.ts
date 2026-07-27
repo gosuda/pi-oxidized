@@ -881,22 +881,28 @@ describe("acceptance: extension runtime", () => {
 	});
 
 	test("extensions.load RPC dynamically loads extensions", async () => {
-		const { collector, stdin } = await connectHost([]);
-		const extPath = resolve(import.meta.dirname, "..", "fixtures", "extensions", "crash.ts");
-		stdin.push(Buffer.from(encodeFrameString({
-			id: 31, kind: "req", method: "extensions.load",
-			payload: { extensionPaths: [extPath], cwd: process.cwd() },
-		})));
-		const res = await collector.awaitFrame((f) => f.id === 31 && f.kind === "res");
-		const payload = res.payload as Record<string, unknown>;
-		expect(payload["extensions"]).toBe(1);
-		expect(payload["errors"]).toEqual([]);
-		const tools = payload["tools"] as Array<Record<string, unknown>>;
-		expect(tools.map((tool) => tool["name"])).toEqual(["crash_tool"]);
-		const providers = payload["providers"] as Array<Record<string, unknown>>;
-		expect(providers.map((provider) => provider["name"])).toEqual(["crash_provider"]);
-		expect(providers[0]?.["streamSimple"]).toBe(true);
-		expect(payload["handlers"]).toEqual(["session_start", "agent_start", "message_end"]);
+		const { collector, stdin, host, runPromise } = await connectHost([]);
+		try {
+			const extPath = resolve(import.meta.dirname, "..", "fixtures", "extensions", "crash.ts");
+			stdin.push(Buffer.from(encodeFrameString({
+				id: 31, kind: "req", method: "extensions.load",
+				payload: { extensionPaths: [extPath], cwd: process.cwd() },
+			})));
+			const res = await collector.awaitFrame((f) => f.id === 31 && f.kind === "res");
+			const payload = res.payload as Record<string, unknown>;
+			expect(payload["extensions"]).toBe(1);
+			expect(payload["errors"]).toEqual([]);
+			const tools = payload["tools"] as Array<Record<string, unknown>>;
+			expect(tools.map((tool) => tool["name"])).toEqual(["crash_tool"]);
+			const providers = payload["providers"] as Array<Record<string, unknown>>;
+			expect(providers.map((provider) => provider["name"])).toEqual(["crash_provider"]);
+			expect(providers[0]?.["streamSimple"]).toBe(true);
+			expect(payload["handlers"]).toEqual(["session_start", "agent_start", "message_end"]);
+		} finally {
+			stdin.push(null);
+			host.dispose("test");
+			await runPromise.catch(() => void 0);
+		}
 	});
 
 	test("extensions.load parses projectTrusted and exposes it through hook context", async () => {

@@ -253,11 +253,14 @@ declare module "@earendil-works/pi-coding-agent" {
 	export interface ToolCallEventResult {
 		block?: boolean;
 		reason?: string;
+		input?: Record<string, unknown>;
+		terminate?: boolean;
 	}
 	export interface ToolResultEventResult {
 		content?: unknown[];
 		details?: unknown;
 		isError?: boolean;
+		terminate?: boolean;
 	}
 	export interface BeforeAgentStartEventResult {
 		message?: unknown;

@@ -98,19 +98,218 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  */
 const EXCLUDED_SPECIFIER = /^(?:@earendil-works\/(?:pi-coding-agent|pi-agent-core|pi-ai|pi-tui(?!-protocol))|@mariozechner\/|jiti(?:\/|$)|typebox(?:\/|$)|.*\/(?:host|virtual-modules)\.ts$)/;
 
-const IMPORT_SPECIFIER =
-	/(?<![\w$.])(?:import|export)(?![\w$.])[^"'()`]*?\bfrom\s*["']([^"']+)["']|(?<![\w$.])import(?![\w$.])\s*\(\s*["']([^"']+)["']\s*\)|(?<![\w$.])import(?![\w$.])\s*["']([^"']+)["']/g;
+/** ASCII identifier alphabet; enough to token-split `import`/`export`. */
+function isIdentifierCharCode(code: number): boolean {
+	return (
+		(code >= 97 && code <= 122) // a-z
+		|| (code >= 65 && code <= 90) // A-Z
+		|| (code >= 48 && code <= 57) // 0-9
+		|| code === 95 // _
+		|| code === 36 // $
+	);
+}
+
+function isWhitespaceChar(char: string): boolean {
+	return char === " " || char === "\t" || char === "\n" || char === "\r" || char === "\v" || char === "\f";
+}
 
 /**
  * Extract literal module specifiers from every import form that can load a
- * lean dependency. The same extractor drives direct exclusion and local graph
- * traversal, so minification cannot create a weaker path.
+ * lean dependency. The same extractor drives direct exclusion and local
+ * graph traversal, so minification cannot create a weaker path.
+ *
+ * One forward lexical pass mirrors the JS lexer's view of the source:
+ * line/block comments, single/double-quoted strings, and template raw text
+ * are opaque (import-shaped text inside them never counts), while template
+ * `${...}` expressions are scanned as code with full nesting. Static
+ * import/export-from clauses, side-effect imports, and dynamic
+ * `import(...)` calls are recognized only in code, and whitespace or
+ * inline comments may separate `import`, `(`, and the quoted literal.
  */
 function extractImportSpecifiers(source: string): string[] {
 	const specifiers: string[] = [];
-	for (const match of source.matchAll(new RegExp(IMPORT_SPECIFIER))) {
-		const specifier = match[1] ?? match[2] ?? match[3];
-		if (specifier !== undefined) specifiers.push(specifier);
+	const length = source.length;
+	/** Object-brace depth of each open `${...}` expression, innermost last. */
+	const templateExpressionDepths: number[] = [];
+	let inTemplateRaw = false;
+	// `import`/`export` preceded by `.` is member access (`obj.import(...)`;
+	// `import.meta` is handled on the other side), never an import statement.
+	let lastSignificant = "";
+	let index = 0;
+
+	const skipLineComment = (from: number): number => {
+		const end = source.indexOf("\n", from);
+		return end === -1 ? length : end;
+	};
+	const skipBlockComment = (from: number): number => {
+		const end = source.indexOf("*/", from);
+		return end === -1 ? length : end + 2;
+	};
+	/** Next code index at or after `from`, past whitespace and comments. */
+	const skipInsignificant = (from: number): number => {
+		let at = from;
+		while (at < length) {
+			const char = source[at];
+			if (isWhitespaceChar(char)) at += 1;
+			else if (char === "/" && source[at + 1] === "/") at = skipLineComment(at + 2);
+			else if (char === "/" && source[at + 1] === "*") at = skipBlockComment(at + 2);
+			else break;
+		}
+		return at;
+	};
+	/** Advance past the quoted string whose opening quote sits at `from`. */
+	const skipString = (from: number, quote: string): number => {
+		let at = from + 1;
+		while (at < length) {
+			const char = source[at];
+			if (char === "\\") at += 2;
+			else if (char === quote) return at + 1;
+			else at += 1;
+		}
+		return at;
+	};
+	/**
+	 * Record the terminated string literal at `from` as a specifier and
+	 * return the index after its closing quote; undefined otherwise.
+	 */
+	const readSpecifier = (from: number): number | undefined => {
+		const quote = source[from];
+		if (quote !== '"' && quote !== "'") return undefined;
+		const end = skipString(from, quote);
+		if (end <= from + 1 || source[end - 1] !== quote) return undefined;
+		specifiers.push(source.slice(from + 1, end - 1));
+		lastSignificant = quote;
+		return end;
+	};
+	/**
+	 * Walk an import/export clause looking for `from "specifier"`. The
+	 * clause region may span anything except quotes, parens, and backticks
+	 * (the retired regex contract); a nested `import`/`export` keyword
+	 * hands control back to the main scan so dynamic forms inside a
+	 * malformed clause are not lost.
+	 */
+	const scanFromClause = (from: number): number => {
+		let at = from;
+		while (at < length) {
+			const char = source[at];
+			if (isWhitespaceChar(char)) {
+				at += 1;
+				continue;
+			}
+			if (char === "/" && (source[at + 1] === "/" || source[at + 1] === "*")) {
+				at = source[at + 1] === "/" ? skipLineComment(at + 2) : skipBlockComment(at + 2);
+				continue;
+			}
+			if (char === '"' || char === "'" || char === "(" || char === ")" || char === "`") return at;
+			if (!isIdentifierCharCode(source.charCodeAt(at))) {
+				lastSignificant = char;
+				at += 1;
+				continue;
+			}
+			const start = at;
+			while (at < length && isIdentifierCharCode(source.charCodeAt(at))) at += 1;
+			const word = source.slice(start, at);
+			if (word === "import" || word === "export") return start;
+			lastSignificant = source[at - 1];
+			if (word !== "from") continue;
+			const literalEnd = readSpecifier(skipInsignificant(at));
+			if (literalEnd !== undefined) return literalEnd;
+		}
+		return at;
+	};
+
+	while (index < length) {
+		const char = source[index];
+		if (inTemplateRaw) {
+			if (char === "\\") {
+				index += 2;
+			} else if (char === "`") {
+				inTemplateRaw = false;
+				lastSignificant = "`";
+				index += 1;
+			} else if (char === "$" && source[index + 1] === "{") {
+				templateExpressionDepths.push(0);
+				inTemplateRaw = false;
+				lastSignificant = "{";
+				index += 2;
+			} else {
+				index += 1;
+			}
+			continue;
+		}
+		if (isWhitespaceChar(char)) {
+			index += 1;
+			continue;
+		}
+		if (char === "/" && (source[index + 1] === "/" || source[index + 1] === "*")) {
+			index = source[index + 1] === "/" ? skipLineComment(index + 2) : skipBlockComment(index + 2);
+			continue;
+		}
+		if (char === '"' || char === "'") {
+			index = skipString(index, char);
+			lastSignificant = char;
+			continue;
+		}
+		if (char === "`") {
+			inTemplateRaw = true;
+			lastSignificant = "`";
+			index += 1;
+			continue;
+		}
+		if (char === "{" || char === "}") {
+			index += 1;
+			lastSignificant = char;
+			const top = templateExpressionDepths.length - 1;
+			if (top < 0) continue;
+			if (char === "{") {
+				templateExpressionDepths[top] += 1;
+			} else if (templateExpressionDepths[top] > 0) {
+				templateExpressionDepths[top] -= 1;
+			} else {
+				templateExpressionDepths.pop();
+				inTemplateRaw = true;
+			}
+			continue;
+		}
+		if (!isIdentifierCharCode(source.charCodeAt(index))) {
+			lastSignificant = char;
+			index += 1;
+			continue;
+		}
+		const start = index;
+		while (index < length && isIdentifierCharCode(source.charCodeAt(index))) index += 1;
+		const word = source.slice(start, index);
+		const preceded = lastSignificant;
+		lastSignificant = source[index - 1];
+		if ((word !== "import" && word !== "export") || preceded === ".") continue;
+		if (word === "export") {
+			index = scanFromClause(index);
+			continue;
+		}
+		const next = skipInsignificant(index);
+		const nextChar = next < length ? source[next] : "";
+		if (nextChar === "(") {
+			const literalStart = skipInsignificant(next + 1);
+			const literalEnd = readSpecifier(literalStart);
+			if (literalEnd !== undefined) {
+				index = literalEnd;
+			} else {
+				// Non-literal dynamic import argument: rescan it as code.
+				lastSignificant = "(";
+				index = literalStart;
+			}
+			continue;
+		}
+		if (nextChar === '"' || nextChar === "'") {
+			index = readSpecifier(next) ?? next;
+			continue;
+		}
+		if (nextChar === ".") {
+			// `import.meta` — not an import; resume at the dot.
+			index = next;
+			continue;
+		}
+		index = scanFromClause(next);
 	}
 	return specifiers;
 }
@@ -154,9 +353,11 @@ async function findExcludedImportInGraph(entry: string): Promise<string | undefi
 
 /**
  * Tolerant parse of possibly-incomplete streamed JSON (toolcall argument
- * fragments). Mirrors upstream `parseStreamingJson`: strict parse first,
- * then progressively trim to the longest prefix that closes into valid
- * JSON; `{}` when nothing parses.
+ * fragments). Strict parse first; on failure one forward lexical pass
+ * records recovery boundaries in the final
+ * MAX_STREAMING_JSON_RECOVERY_CHARS characters and the longest boundary
+ * whose closure survives JSON.parse wins. `{}` when nothing parses or the
+ * recovery point is older than the bounded tail.
  */
 export function parseStreamingJson(text: string | undefined): Record<string, unknown> {
 	if (text === undefined || text.trim() === "") {
@@ -166,63 +367,109 @@ export function parseStreamingJson(text: string | undefined): Record<string, unk
 		const strict: unknown = JSON.parse(text);
 		return isRecord(strict) ? strict : {};
 	} catch {
-		// Fall through to tolerant trimming.
+		// Fall through to bounded tail recovery.
 	}
-	for (let end = text.length; end > 0; end--) {
-		const closed = closePartialJson(text.slice(0, end));
-		if (closed === undefined) continue;
+	return recoverStreamingJsonTail(text) ?? {};
+}
+
+/**
+ * Streaming argument fragments arrive append-only, so a parse failure is
+ * recoverable only near the end of the buffer. Bounding candidate closures
+ * to a constant tail keeps recovery linear in the input instead of
+ * quadratic full-prefix retries.
+ */
+const MAX_STREAMING_JSON_RECOVERY_CHARS = 512;
+
+/** Immutable open-container stack so boundary snapshots share structure. */
+interface OpenContainerNode {
+	readonly close: "}" | "]";
+	readonly parent: OpenContainerNode | undefined;
+}
+
+/** Lexical state at one candidate prefix end (`text.slice(0, end)`). */
+interface RecoveryBoundary {
+	readonly end: number;
+	readonly inString: boolean;
+	readonly escaped: boolean;
+	readonly stack: OpenContainerNode | undefined;
+}
+
+function recoverStreamingJsonTail(text: string): Record<string, unknown> | undefined {
+	const boundaries = collectRecoveryBoundaries(text);
+	for (let index = boundaries.length - 1; index >= 0; index--) {
+		const closed = closeAtBoundary(text, boundaries[index]);
 		try {
 			const parsed: unknown = JSON.parse(closed);
 			return isRecord(parsed) ? parsed : {};
 		} catch {
-			// Keep trimming.
+			// Try the next shorter boundary.
 		}
 	}
-	return {};
+	return undefined;
 }
 
 /**
- * Close a JSON prefix: balance an unterminated string and any open
- * arrays/objects. Returns undefined when the prefix is structurally
- * unrecoverable (e.g. a stray closing bracket).
+ * One forward pass tracking JSON string/escape state and the open
+ * container stack. Prefix boundaries become candidates only inside the
+ * final MAX_STREAMING_JSON_RECOVERY_CHARS characters; a mismatched closing
+ * bracket ends the scan because every longer prefix is structurally
+ * unrecoverable.
  */
-function closePartialJson(prefix: string): string | undefined {
+function collectRecoveryBoundaries(text: string): RecoveryBoundary[] {
+	const boundaries: RecoveryBoundary[] = [];
+	const firstCandidate = Math.max(1, text.length - MAX_STREAMING_JSON_RECOVERY_CHARS);
 	let inString = false;
 	let escaped = false;
-	const stack: string[] = [];
-	for (const char of prefix) {
+	let stack: OpenContainerNode | undefined;
+	for (let index = 0; index < text.length; index++) {
+		if (index >= firstCandidate) {
+			boundaries.push({ end: index, inString, escaped, stack });
+		}
+		const char = text[index];
 		if (inString) {
-			if (escaped) {
-				escaped = false;
-			} else if (char === "\\") {
-				escaped = true;
-			} else if (char === '"') {
-				inString = false;
-			}
+			if (escaped) escaped = false;
+			else if (char === "\\") escaped = true;
+			else if (char === '"') inString = false;
 			continue;
 		}
 		if (char === '"') {
 			inString = true;
-		} else if (char === "{" || char === "[") {
-			stack.push(char);
+		} else if (char === "{") {
+			stack = { close: "}", parent: stack };
+		} else if (char === "[") {
+			stack = { close: "]", parent: stack };
 		} else if (char === "}" || char === "]") {
-			const open = stack.pop();
-			if (open === undefined) return undefined;
-			if ((open === "{" && char !== "}") || (open === "[" && char !== "]")) {
-				return undefined;
-			}
+			if (stack === undefined || stack.close !== char) return boundaries;
+			stack = stack.parent;
 		}
 	}
-	let closed = prefix;
-	if (inString) {
-		// A trailing escape would escape the closing quote; drop it first.
-		if (escaped) closed = closed.slice(0, -1);
+	boundaries.push({ end: text.length, inString, escaped, stack });
+	return boundaries;
+}
+
+/** Close one candidate prefix: balance the open string, then containers. */
+function closeAtBoundary(text: string, boundary: RecoveryBoundary): string {
+	let closed = text.slice(0, boundary.end);
+	if (boundary.inString) {
+		// A trailing unescaped backslash would escape the closing quote.
+		if (boundary.escaped) closed = closed.slice(0, -1);
 		closed += '"';
 	}
-	for (let index = stack.length - 1; index >= 0; index--) {
-		closed += stack[index] === "{" ? "}" : "]";
+	for (let node = boundary.stack; node !== undefined; node = node.parent) {
+		closed += node.close;
 	}
 	return closed;
+}
+
+/**
+ * Structured cancellation only: a real Error (or DOMException, which is
+ * not Error-derived in every runtime) named AbortError. Message text is
+ * deliberately never consulted — an extension failure that merely says
+ * "cancelled" must stay an extension_error.
+ */
+function isStructuredAbortError(error: unknown): boolean {
+	if (error instanceof Error && error.name === "AbortError") return true;
+	return typeof DOMException === "function" && error instanceof DOMException && error.name === "AbortError";
 }
 
 /**
@@ -713,10 +960,8 @@ export class LeanRunner {
 			}
 			await this.client.respond(id, "tool.execute" as Method, result);
 		} catch (err) {
+			const cancelled = controller.signal.aborted || isStructuredAbortError(err);
 			const message = err instanceof Error ? err.message : String(err);
-			const cancelled = controller.signal.aborted
-				|| message.toLowerCase().includes("abort")
-				|| message.toLowerCase().includes("cancel");
 			await this.client.respondError(id, "tool.execute" as Method, {
 				code: cancelled ? "cancelled" : "extension_error",
 				message: cancelled ? "extension tool cancelled" : message,
@@ -761,10 +1006,8 @@ export class LeanRunner {
 			}
 			await this.client.respond(id, "provider.stream" as Method, {});
 		} catch (err) {
+			const cancelled = controller.signal.aborted || isStructuredAbortError(err);
 			const message = err instanceof Error ? err.message : String(err);
-			const cancelled = controller.signal.aborted
-				|| message.toLowerCase().includes("abort")
-				|| message.toLowerCase().includes("cancel");
 			await this.client.respondError(id, "provider.stream" as Method, {
 				code: cancelled ? "cancelled" : "extension_error",
 				message: cancelled ? "provider stream cancelled" : message,

@@ -31,7 +31,8 @@ export default {
 				if (typeof args?.text !== "string") {
 					throw new Error("echo.text must be a string");
 				}
-				return args;
+				mark("validate", args);
+				return { ...args, validatedBy: "lean" };
 			},
 			execute: (args, ctx) => {
 				ctx.onUpdate({ content: [{ type: "text", text: "echoing…" }] });
@@ -50,12 +51,13 @@ export default {
 				// Signal via the wire that the execute handler is parked, so the
 				// cancel test synchronizes on a real event instead of a sleep.
 				ctx.onUpdate({ content: [{ type: "text", text: "slow:started" }] });
-				return new Promise((resolve, reject) => {
-					ctx.signal.addEventListener(
-						"abort",
-						() => reject(new Error("slow tool aborted")),
-						{ once: true },
-					);
+				return new Promise((_resolve, reject) => {
+					const onAbort = () => reject(new Error("slow tool aborted"));
+					if (ctx.signal.aborted) {
+						onAbort();
+						return;
+					}
+					ctx.signal.addEventListener("abort", onAbort, { once: true });
 				});
 			},
 		},
