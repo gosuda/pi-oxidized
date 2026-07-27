@@ -170,7 +170,7 @@ describe.skipIf(isWindows)("PTY driver", () => {
 			argv: [
 				bunExecutable,
 				"-e",
-				"console.log(`ARGV:${JSON.stringify(process.argv.slice(1))}`); for await (const line of console) { console.log(`APP:${line}`); break; }",
+				"process.stdout.write(`ARGV:${JSON.stringify(process.argv.slice(1))}\\n`); process.stdin.setEncoding('utf8'); process.stdin.resume(); const once = process.stdin[Symbol.asyncIterator](); const { value } = await once.next(); process.stdin.pause(); process.stdin.destroy(); process.stdout.write(`APP:${value}`); process.exit(0);",
 				hostileArgument,
 			],
 			cwd: root,
@@ -341,8 +341,8 @@ describe.skipIf(isWindows)("PTY driver", () => {
 			argv: [
 				"/bin/sh",
 				"-c",
-				"python3 -c 'import signal,time; signal.signal(signal.SIGHUP, signal.SIG_IGN); open(\"armed\",\"w\").write(\"1\"); print(\"READY\", flush=True); time.sleep(300)' & " +
-					"while [ ! -f armed ]; do sleep 0.01; done; exit 42",
+				"sh -c \"trap '' HUP; printf 1 > armed; printf 'READY\\n'; sleep 300\" & " +
+				"while [ ! -f armed ]; do sleep 0.01; done; exit 42",
 			],
 			cwd: temporaryDirectory("pi-verification-orphan-slave-"),
 		});
