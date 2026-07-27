@@ -2381,6 +2381,50 @@ mod tests {
     }
 
     #[test]
+    fn built_in_pairs_name_and_slot_rgb_match_per_pair() -> TestResult {
+        for name in BUILT_IN_THEME_NAMES {
+            let truecolor = built_in_theme(name, ColorMode::Truecolor)
+                .ok_or_else(|| format!("{name} truecolor built-in should exist"))?;
+            let palette256 = built_in_theme(name, ColorMode::Palette256)
+                .ok_or_else(|| format!("{name} 256-color built-in should exist"))?;
+
+            assert_eq!(truecolor.name, name, "{name} truecolor intern name");
+            assert_eq!(palette256.name, name, "{name} 256-color intern name");
+            assert_eq!(truecolor.mode(), ColorMode::Truecolor);
+            assert_eq!(palette256.mode(), ColorMode::Palette256);
+
+            let truecolor_again = built_in_theme(name, ColorMode::Truecolor)
+                .ok_or_else(|| format!("{name} truecolor built-in should remain cached"))?;
+            let palette256_again = built_in_theme(name, ColorMode::Palette256)
+                .ok_or_else(|| format!("{name} 256-color built-in should remain cached"))?;
+            assert!(
+                Arc::ptr_eq(&truecolor, &truecolor_again),
+                "{name} truecolor lookup must return its cached allocation"
+            );
+            assert!(
+                Arc::ptr_eq(&palette256, &palette256_again),
+                "{name} 256-color lookup must return its cached allocation"
+            );
+
+            for (slot, slot_name) in ALL_FG_SLOTS {
+                assert_eq!(
+                    palette256.fg_rgb(*slot),
+                    truecolor.fg_rgb(*slot),
+                    "{name} foreground slot {slot_name} must retain the truecolor RGB for 256-color emission"
+                );
+            }
+            for (slot, slot_name) in ALL_BG_SLOTS {
+                assert_eq!(
+                    palette256.bg_rgb(*slot),
+                    truecolor.bg_rgb(*slot),
+                    "{name} background slot {slot_name} must retain the truecolor RGB for 256-color emission"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn fallback_theme_matches_terminal_color_mode() {
         // A missing theme on a 256-color terminal degrades to 256-color dark,
         // not truecolor dark.
