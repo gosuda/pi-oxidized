@@ -1,14 +1,18 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
 	assertPinnedBuildScriptContracts,
 	buildProducts,
+	HarnessFailure,
 	referenceBuildCommands,
-	type PinnedBuildScriptManifests,
+	requireCleanExitIfSettled,
+	terminateAndRequireCleanExit,
 } from "./performance.ts";
-import { PTY_KEYS, type PtyProcess, type PtySnapshot, spawnPty } from "./pty.ts";
+import type { PinnedBuildScriptManifests } from "./performance.ts";
+import { spawnPty } from "./pty.ts";
+import type { PtySnapshot } from "./pty.ts";
 
 // T33: after capturing the first frame, the performance verifier must send
 // /quit and require a clean process exit. The finally force-kill remains
@@ -20,6 +24,10 @@ const SYNC_BEGIN = "\x1b[?2026h";
 const SYNC_END = "\x1b[?2026l";
 const isWindows = process.platform === "win32";
 const bunExecutable = process.execPath;
+
+const REPOSITORY_ROOT = resolve(import.meta.dirname, "../..");
+const PERFORMANCE_MODULE = resolve(import.meta.dirname, "performance.ts");
+const PERFORMANCE_ARTIFACT = resolve(REPOSITORY_ROOT, "target/bench/performance-comparison.json");
 
 const temporaryPaths: string[] = [];
 
@@ -89,6 +97,53 @@ describe("pinned reference build contract", () => {
 	});
 });
 
+test("does not run the benchmark when performance verification is imported", () => {
+	const sandbox = temporaryDirectory("perf-import-");
+	const artifactBefore = existsSync(PERFORMANCE_ARTIFACT)
+		? readFileSync(PERFORMANCE_ARTIFACT)
+		: undefined;
+	try {
+		// A separate process is required to observe module-entry side effects.
+		const imported = Bun.spawnSync(
+			[
+				bunExecutable,
+				"-e",
+				[
+					"const exitCodeBeforeImport = process.exitCode;",
+					`await import(${JSON.stringify(PERFORMANCE_MODULE)});`,
+					"if (process.exitCode !== exitCodeBeforeImport) throw new Error('performance import changed process.exitCode');",
+				].join("\n"),
+			],
+			{
+				cwd: sandbox,
+				env: { ...process.env, TMPDIR: sandbox },
+				stdout: "pipe",
+				stderr: "pipe",
+				timeout: 10_000,
+			},
+		);
+		expect(imported.exitCode).toBe(0);
+		expect(new TextDecoder().decode(imported.stdout)).toBe("");
+		expect(new TextDecoder().decode(imported.stderr)).toBe("");
+		expect(readdirSync(sandbox).filter((entry) => entry.startsWith("pi-check9-"))).toEqual([]);
+		const artifactExists = existsSync(PERFORMANCE_ARTIFACT);
+		expect(artifactExists).toBe(artifactBefore !== undefined);
+		if (artifactBefore !== undefined && artifactExists) {
+			expect(Buffer.compare(readFileSync(PERFORMANCE_ARTIFACT), artifactBefore)).toBe(0);
+		}
+	} finally {
+		const artifactExists = existsSync(PERFORMANCE_ARTIFACT);
+		const artifactChanged =
+			artifactExists !== (artifactBefore !== undefined) ||
+			(artifactBefore !== undefined &&
+				(!artifactExists || Buffer.compare(readFileSync(PERFORMANCE_ARTIFACT), artifactBefore) !== 0));
+		if (artifactChanged) {
+			if (artifactBefore !== undefined) writeFileSync(PERFORMANCE_ARTIFACT, artifactBefore);
+			else rmSync(PERFORMANCE_ARTIFACT, { force: true });
+		}
+	}
+}, 15_000);
+
 function frameObservation(snapshot: PtySnapshot): { elapsedMs: number; bytes: number } | undefined {
 	let raw = "";
 	let bytes = 0;
@@ -107,46 +162,6 @@ function frameObservation(snapshot: PtySnapshot): { elapsedMs: number; bytes: nu
 	return undefined;
 }
 
-class HarnessFailure extends Error {
-	constructor(
-		label: string,
-		message: string,
-	) {
-		super(`${label}: ${message}`);
-		this.name = "HarnessFailure";
-	}
-}
-
-// Mirrors terminateAndRequireCleanExit in performance.ts: a process that has
-// already exited cleanly succeeds; otherwise /quit must drive a clean exit.
-async function terminateAndRequireCleanExit(pty: PtyProcess, label: string): Promise<void> {
-	if (pty.exited) {
-		const code = await pty.waitForExit(1);
-		if (code !== 0) {
-			const rawText = pty.snapshot().rawText;
-			const snippet = rawText.length <= 4_000 ? rawText : rawText.slice(-4_000);
-			throw new HarnessFailure(label, `${label} exited ${code}\nPTY tail:\n${snippet}`);
-		}
-		return;
-	}
-	pty.writeKeys("/quit", PTY_KEYS.enter);
-	let code: number;
-	try {
-		code = await pty.waitForExit(5_000);
-	} catch (error) {
-		const rawText = pty.snapshot().rawText;
-		const snippet = rawText.length <= 4_000 ? rawText : rawText.slice(-4_000);
-		throw new HarnessFailure(
-			label,
-			`${label} did not exit through /quit: ${error instanceof Error ? error.message : String(error)}\nPTY tail:\n${snippet}`,
-		);
-	}
-	if (code !== 0) {
-		const rawText = pty.snapshot().rawText;
-		const snippet = rawText.length <= 4_000 ? rawText : rawText.slice(-4_000);
-		throw new HarnessFailure(label, `${label} /quit exited ${code}\nPTY tail:\n${snippet}`);
-	}
-}
 
 // A child that emits a synchronized-output frame and then exits with code 0
 // upon receiving any input (honoring /quit). This is the passing case.
@@ -172,7 +187,41 @@ process.stdin.resume();
 setInterval(() => {}, 1_000);
 `;
 
+const CLEAN_EXIT_CHILD = "process.exit(0);";
+const FAILURE_EXIT_CHILD = "process.exit(7);";
+
 describe.skipIf(isWindows)("performance first-frame lifecycle", () => {
+	test("accepts an already-settled clean exit through the production helper", async () => {
+		const sandbox = temporaryDirectory("perf-settled-clean-");
+		const pty = spawnPty({
+			argv: [bunExecutable, "-e", CLEAN_EXIT_CHILD],
+			cwd: sandbox,
+			size: { columns: 100, rows: 32 },
+		});
+		try {
+			expect(await pty.waitForExit(5_000)).toBe(0);
+			expect(await requireCleanExitIfSettled(pty, "first-frame:settled-clean")).toBe(true);
+		} finally {
+			await pty.terminate();
+		}
+	}, 15_000);
+
+	test("rejects a nonzero already-settled exit through the production helper", async () => {
+		const sandbox = temporaryDirectory("perf-settled-failure-");
+		const pty = spawnPty({
+			argv: [bunExecutable, "-e", FAILURE_EXIT_CHILD],
+			cwd: sandbox,
+			size: { columns: 100, rows: 32 },
+		});
+		try {
+			expect(await pty.waitForExit(5_000)).toBe(7);
+			await expect(requireCleanExitIfSettled(pty, "first-frame:settled-failure")).rejects.toBeInstanceOf(
+				HarnessFailure,
+			);
+		} finally {
+			await pty.terminate();
+		}
+	}, 15_000);
 	test("rejects a child that emits a frame but ignores /quit", async () => {
 		const sandbox = temporaryDirectory("perf-ignore-quit-");
 		const pty = spawnPty({

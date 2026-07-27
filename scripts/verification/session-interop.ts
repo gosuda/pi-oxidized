@@ -16,6 +16,8 @@ const REFERENCE_ROOT = join(REPO_ROOT, ".references/pi");
 const REFERENCE_UUID = join(REFERENCE_ROOT, "packages/agent/src/harness/session/uuid.ts");
 const REFERENCE_AI_TYPES = join(REFERENCE_ROOT, "packages/ai/src/types.ts");
 
+export const SESSION_INTEROP_TIMEOUT_MS = 900_000;
+
 interface SessionManagerLike {
 	getHeader(): Record<string, unknown> | null;
 	getEntries(): readonly Record<string, unknown>[];

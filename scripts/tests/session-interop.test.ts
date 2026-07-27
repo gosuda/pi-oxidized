@@ -3,16 +3,31 @@ import { cp, mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-import { reopenWithSourcePinnedTypescript } from "../verification/session-interop.ts";
+import {
+	reopenWithSourcePinnedTypescript,
+	SESSION_INTEROP_TIMEOUT_MS,
+} from "../verification/session-interop.ts";
 
 const ROOT = resolve(import.meta.dir, "../..");
 const FIXTURES = join(ROOT, ".agent-tasks/pi-rust-rewrite/fixtures/sessions");
+
+test("uses the product matrix timeout for source-pinned session interoperability", async () => {
+	const matrix = (await Bun.file(join(ROOT, "scripts/verification/compat-matrix.json")).json()) as {
+		readonly rows: readonly {
+			readonly id: string;
+			readonly commands: readonly { readonly timeoutMs?: number }[];
+		}[];
+	};
+	const command = matrix.rows.find((row) => row.id === "session-v1-v2-v3-interop")?.commands[0];
+	expect(command?.timeoutMs).toBe(SESSION_INTEROP_TIMEOUT_MS);
+});
 
 test("source-pinned TypeScript pi reopens every generated fixture", async () => {
 	const generated = Bun.spawnSync(["bun", "scripts/generate-session-fixtures.ts"], {
 		cwd: ROOT,
 		stdout: "pipe",
 		stderr: "pipe",
+		timeout: SESSION_INTEROP_TIMEOUT_MS,
 	});
 	expect(generated.exitCode).toBe(0);
 
@@ -31,4 +46,4 @@ test("source-pinned TypeScript pi reopens every generated fixture", async () => 
 	} finally {
 		await rm(directory, { recursive: true, force: true });
 	}
-});
+}, SESSION_INTEROP_TIMEOUT_MS);

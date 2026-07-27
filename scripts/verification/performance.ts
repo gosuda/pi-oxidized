@@ -267,7 +267,7 @@ interface PerformanceArtifact {
 	};
 }
 
-class HarnessFailure extends Error {
+export class HarnessFailure extends Error {
 	constructor(
 		readonly stage: string,
 		message: string,
@@ -936,7 +936,7 @@ const streamingArgs = [
 ] as const;
 
 
-async function requireCleanExitIfSettled(
+export async function requireCleanExitIfSettled(
 	pty: PtyProcess,
 	label: string,
 ): Promise<boolean> {
@@ -946,7 +946,7 @@ async function requireCleanExitIfSettled(
 	return true;
 }
 
-async function terminateAndRequireCleanExit(pty: PtyProcess, label: string): Promise<void> {
+export async function terminateAndRequireCleanExit(pty: PtyProcess, label: string): Promise<void> {
 	if (await requireCleanExitIfSettled(pty, label)) return;
 	pty.writeKeys("/quit", PTY_KEYS.enter);
 	let code: number;
