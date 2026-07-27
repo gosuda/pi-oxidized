@@ -15,7 +15,7 @@
 //!   "name": "my-extension",
 //!   "version": "1.2.3",
 //!   "runtime": "ts-lean",
-//!   "entry": "dist/main.ts",
+//!   "entry": "dist/main.mjs",
 //!   "protocolVersion": 1
 //! }
 //! ```
