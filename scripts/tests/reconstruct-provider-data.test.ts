@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+	chmodSync,
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
@@ -15,7 +16,9 @@ import {
 	reconstructProviderData,
 	type ProviderCatalog,
 	type ReconstructProofContext,
+	type ReconstructProviderDataResult,
 } from "../reconstruct-provider-data.ts";
+import { buildSortedCatalog, encodeCatalog } from "../generate-builtin-models.ts";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const REAL_CATALOG_PATH = join(REPO_ROOT, "crates/pi-ai/data/builtin-models.json");
@@ -89,6 +92,13 @@ function siblingArtifacts(providersDir: string, dataDirName = "data"): string[] 
 
 async function noopProof(_ctx: ReconstructProofContext): Promise<void> {}
 
+function asRecord(value: unknown): Record<string, unknown> {
+	if (value === null || typeof value !== "object" || Array.isArray(value)) {
+		throw new Error("expected JSON object");
+	}
+	return value as Record<string, unknown>;
+}
+
 describe("reconstructProviderData transaction (Cluster C)", () => {
 	test("success publishes exact sorted provider JSON and leaves no staging/backup siblings", async () => {
 		const catalog: ProviderCatalog = {
@@ -112,6 +122,48 @@ describe("reconstructProviderData transaction (Cluster C)", () => {
 				`${JSON.stringify({ "m-a": { id: "m-a", nested: { a: 2, b: 1 } } }, null, "\t")}\n`,
 			);
 			expect(siblingArtifacts(fixture.providersDir)).toEqual([]);
+		} finally {
+			rmSync(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	test("round-trips nested __proto__ model maps through reconstruction and inversion", async () => {
+		const catalog = JSON.parse(
+			'{"alpha":{"__proto__":{"id":"__proto__","nested":{"z":1,"__proto__":{"sentinel":true},"a":2}}}}',
+		) as ProviderCatalog;
+		const fixture = makeFixture(catalog);
+		try {
+			await reconstructProviderData({
+				repoRoot: fixture.root,
+				catalogPath: fixture.catalogPath,
+				providersDir: fixture.providersDir,
+				dataDir: fixture.dataDir,
+				inversionProof: noopProof,
+			});
+
+			const providerModels = asRecord(
+				JSON.parse(readFileSync(join(fixture.dataDir, "alpha.json"), "utf8")),
+			);
+			expect(Object.hasOwn(providerModels, "__proto__")).toBe(true);
+			const reconstructedModel = asRecord(providerModels["__proto__"]);
+			const reconstructedNested = asRecord(reconstructedModel.nested);
+			expect(Object.hasOwn(reconstructedNested, "__proto__")).toBe(true);
+			expect(reconstructedNested["__proto__"]).toEqual({ sentinel: true });
+
+			const generatorInput = Object.create(null) as Record<
+				string,
+				Record<string, unknown>
+			>;
+			generatorInput.alpha = providerModels;
+			const inverted = asRecord(
+				JSON.parse(encodeCatalog(buildSortedCatalog(generatorInput))),
+			);
+			const invertedModels = asRecord(inverted.alpha);
+			const invertedModel = asRecord(invertedModels["__proto__"]);
+			const invertedNested = asRecord(invertedModel.nested);
+			expect(Object.hasOwn(invertedModels, "__proto__")).toBe(true);
+			expect(Object.hasOwn(invertedNested, "__proto__")).toBe(true);
+			expect(invertedNested["__proto__"]).toEqual({ sentinel: true });
 		} finally {
 			rmSync(fixture.root, { recursive: true, force: true });
 		}
@@ -174,6 +226,80 @@ describe("reconstructProviderData transaction (Cluster C)", () => {
 			expectSnapshotsEqual(snapshotDir(fixture.dataDir), before);
 			expect(siblingArtifacts(fixture.providersDir)).toEqual([]);
 		} finally {
+			rmSync(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	test("concurrent same-directory reconstruction preserves original bytes through rollback", async () => {
+		const catalog: ProviderCatalog = {
+			alpha: { model: { id: "model", version: 2 } },
+		};
+		const fixture = makeFixture(catalog);
+		const firstProofReached = Promise.withResolvers<void>();
+		const releaseFirstProof = Promise.withResolvers<void>();
+		seedLiveData(fixture.dataDir, {
+			"alpha.json": '{"legacy":true}\n',
+			"stale.json": '{"preserve":"these bytes"}\n',
+		});
+		const before = snapshotDir(fixture.dataDir);
+		const first = reconstructProviderData({
+			repoRoot: fixture.root,
+			catalogPath: fixture.catalogPath,
+			providersDir: fixture.providersDir,
+			dataDir: fixture.dataDir,
+			inversionProof: async () => {
+				firstProofReached.resolve();
+				await releaseFirstProof.promise;
+				throw new Error("first transaction proof failure");
+			},
+		});
+		let second: Promise<ReconstructProviderDataResult> | undefined;
+		try {
+			await firstProofReached.promise;
+			let secondProofRan = false;
+			second = reconstructProviderData({
+				repoRoot: fixture.root,
+				catalogPath: fixture.catalogPath,
+				providersDir: fixture.providersDir,
+				dataDir: fixture.dataDir,
+				inversionProof: async () => {
+					secondProofRan = true;
+					const backup = siblingArtifacts(fixture.providersDir).find((name) =>
+						name.startsWith("data.backup."),
+					);
+					if (backup === undefined) {
+						throw new Error("second transaction did not retain a backup");
+					}
+					expectSnapshotsEqual(snapshotDir(join(fixture.providersDir, backup)), before);
+				},
+			});
+
+			// This integration check needs the competing filesystem operation to run;
+			// fake timers cannot advance the OS-backed mkdir contention.
+			await Bun.sleep(25);
+			const secondProofRanWhileFirstHeld = secondProofRan;
+			releaseFirstProof.resolve();
+			const [firstResult, secondResult] = await Promise.allSettled([first, second]);
+
+			expect(secondProofRanWhileFirstHeld).toBe(false);
+			expect(firstResult.status).toBe("rejected");
+			if (firstResult.status === "rejected") {
+				expect(String(firstResult.reason)).toContain("first transaction proof failure");
+			}
+			expect(secondResult.status).toBe("fulfilled");
+			expectSnapshotsEqual(snapshotDir(fixture.dataDir), new Map([
+				[
+					"alpha.json",
+					`${JSON.stringify({ model: { id: "model", version: 2 } }, null, "\t")}\n`,
+				],
+			]));
+			expect(siblingArtifacts(fixture.providersDir)).toEqual([]);
+		} finally {
+			releaseFirstProof.resolve();
+			await first.catch(() => undefined);
+			if (second !== undefined) {
+				await second.catch(() => undefined);
+			}
 			rmSync(fixture.root, { recursive: true, force: true });
 		}
 	});
@@ -352,18 +478,33 @@ describe("reconstructProviderData default inversion proof path gating (P2)", () 
 		}
 	});
 
-	test("default-path reconstruction still uses the default inversion proof", async () => {
+	test("default-path reconstruction uses the current Bun executable for inversion proof", async () => {
 		const catalogBefore = readFileSync(REAL_CATALOG_PATH);
-		const result = await reconstructProviderData({
-			repoRoot: REPO_ROOT,
-			catalogPath: REAL_CATALOG_PATH,
-			providersDir: REAL_PROVIDERS_DIR,
-			dataDir: REAL_DATA_DIR,
-			// inversionProof intentionally omitted — default proof must apply.
-		});
-		expect(result.written).toBeGreaterThan(0);
-		expect(result.providers.length).toBe(result.written);
-		expect(Buffer.compare(readFileSync(REAL_CATALOG_PATH), catalogBefore)).toBe(0);
-		expect(siblingArtifacts(REAL_PROVIDERS_DIR)).toEqual([]);
+		const fakeBin = mkdtempSync(join(tmpdir(), "reconstruct-provider-data-fake-bun-"));
+		const fakeBun = join(fakeBin, "bun");
+		writeFileSync(fakeBun, "#!/bin/sh\nexit 97\n", "utf8");
+		chmodSync(fakeBun, 0o755);
+		const previousPath = process.env.PATH;
+		try {
+			process.env.PATH = fakeBin;
+			const result = await reconstructProviderData({
+				repoRoot: REPO_ROOT,
+				catalogPath: REAL_CATALOG_PATH,
+				providersDir: REAL_PROVIDERS_DIR,
+				dataDir: REAL_DATA_DIR,
+				// inversionProof intentionally omitted — default proof must apply.
+			});
+			expect(result.written).toBeGreaterThan(0);
+			expect(result.providers.length).toBe(result.written);
+			expect(Buffer.compare(readFileSync(REAL_CATALOG_PATH), catalogBefore)).toBe(0);
+			expect(siblingArtifacts(REAL_PROVIDERS_DIR)).toEqual([]);
+		} finally {
+			if (previousPath === undefined) {
+				delete process.env.PATH;
+			} else {
+				process.env.PATH = previousPath;
+			}
+			rmSync(fakeBin, { recursive: true, force: true });
+		}
 	}, 120_000);
 });

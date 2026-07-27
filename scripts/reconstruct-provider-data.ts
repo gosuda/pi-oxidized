@@ -25,6 +25,8 @@ const DEFAULT_PROVIDERS_DIR = join(
 	".references/pi/packages/ai/src/providers",
 );
 const DEFAULT_DATA_DIR = join(DEFAULT_PROVIDERS_DIR, "data");
+const DATA_DIRECTORY_LOCK_RETRY_MS = 10;
+type FileSystemError = Error & { code?: string };
 
 export type ProviderCatalog = Record<string, Record<string, unknown>>;
 
@@ -68,7 +70,7 @@ export type ReconstructProviderDataResult = {
 function sortDeep(value: unknown): unknown {
 	if (Array.isArray(value)) return value.map(sortDeep);
 	if (value === null || typeof value !== "object") return value;
-	const sorted: Record<string, unknown> = {};
+	const sorted = Object.create(null) as Record<string, unknown>;
 	for (const key of Object.keys(value as Record<string, unknown>).sort()) {
 		sorted[key] = sortDeep((value as Record<string, unknown>)[key]);
 	}
@@ -94,6 +96,33 @@ async function pathExists(path: string): Promise<boolean> {
 
 function uniqueSibling(dataDir: string, kind: "staging" | "backup"): string {
 	return `${dataDir}.${kind}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2, 10)}`;
+}
+
+
+async function acquireDataDirectoryLock(dataDir: string): Promise<string> {
+	const lockDir = `${dataDir}.lock`;
+	for (;;) {
+		try {
+			await mkdir(lockDir);
+			return lockDir;
+		} catch (error) {
+			const errorCode = error instanceof Error ? (error as FileSystemError).code : undefined;
+			if (errorCode !== "EEXIST") {
+				const detail = error instanceof Error ? error.message : String(error);
+				throw new Error(`failed to acquire reconstruction lock ${lockDir}: ${detail}`);
+			}
+			await Bun.sleep(DATA_DIRECTORY_LOCK_RETRY_MS);
+		}
+	}
+}
+
+async function releaseDataDirectoryLock(lockDir: string): Promise<void> {
+	try {
+		await rm(lockDir, { recursive: true, force: false });
+	} catch (error) {
+		const detail = error instanceof Error ? error.message : String(error);
+		throw new Error(`failed to release reconstruction lock ${lockDir}: ${detail}`);
+	}
 }
 
 async function removeIfExists(path: string | null | undefined): Promise<void> {
@@ -195,7 +224,7 @@ async function defaultInversionProof(ctx: ReconstructProofContext): Promise<void
 	const before = await Bun.file(ctx.catalogPath).bytes();
 	try {
 		const regen = Bun.spawnSync(
-			["bun", "run", join(ctx.repoRoot, "scripts/generate-builtin-models.ts")],
+			[process.execPath, "run", join(ctx.repoRoot, "scripts/generate-builtin-models.ts")],
 			{ cwd: ctx.repoRoot, stdout: "ignore", stderr: "pipe" },
 		);
 		if (regen.exitCode !== 0) {
@@ -220,7 +249,8 @@ async function defaultInversionProof(ctx: ReconstructProofContext): Promise<void
  * Reconstruct provider data JSONs transactionally.
  *
  * Never writes directly into the live data directory: candidates are staged,
- * validated, published by rename, then inversion-proved. Successful
+ * validated, published by rename, then inversion-proved while a sibling lock
+ * serializes every observation and mutation of that data directory. Successful
  * `inversionProof` is the commit point. On proof or rename failure the previous
  * live tree is restored byte-for-byte (or removed when it was initially absent)
  * and staging/backup siblings are cleaned up. After commit, backup cleanup
@@ -271,102 +301,107 @@ export async function reconstructProviderData(
 		expectedBodies.set(provider, encodeProviderModels(models));
 	}
 
-	const hadLive = await pathExists(dataDir);
-	const stagingDir = uniqueSibling(dataDir, "staging");
-	let backupDir: string | null = null;
-	let published = false;
-	let committed = false;
-	let stagingPending = true;
-
+	const lockDir = await acquireDataDirectoryLock(dataDir);
 	try {
-		await mkdir(stagingDir, { recursive: true });
-		for (const provider of wrappers) {
-			const body = expectedBodies.get(provider);
-			if (body === undefined) {
-				throw new Error(`missing encoded body for provider "${provider}"`);
-			}
-			await writeFile(join(stagingDir, `${provider}.json`), body, "utf8");
-		}
-
-		await validateStagingDirectory(stagingDir, wrappers, catalog);
-
-		if (hadLive) {
-			backupDir = uniqueSibling(dataDir, "backup");
-			try {
-				await rename(dataDir, backupDir);
-			} catch (error) {
-				const detail = error instanceof Error ? error.message : String(error);
-				throw new Error(`failed to rename live data to backup: ${detail}`);
-			}
-		}
+		const hadLive = await pathExists(dataDir);
+		const stagingDir = uniqueSibling(dataDir, "staging");
+		let backupDir: string | null = null;
+		let published = false;
+		let committed = false;
+		let stagingPending = true;
 
 		try {
-			await rename(stagingDir, dataDir);
-			stagingPending = false;
-			published = true;
-		} catch (error) {
-			const detail = error instanceof Error ? error.message : String(error);
-			throw new Error(`failed to publish staging directory to live data: ${detail}`);
-		}
+			await mkdir(stagingDir, { recursive: true });
+			for (const provider of wrappers) {
+				const body = expectedBodies.get(provider);
+				if (body === undefined) {
+					throw new Error(`missing encoded body for provider "${provider}"`);
+				}
+				await writeFile(join(stagingDir, `${provider}.json`), body, "utf8");
+			}
 
-		await inversionProof(proofCtx);
-		// Successful inversion proof commits the published live tree.
-		committed = true;
-	} catch (error) {
-		// Pre-commit only: restore the pre-publish live tree byte-for-byte (or absent).
-		if (!committed) {
+			await validateStagingDirectory(stagingDir, wrappers, catalog);
+
+			if (hadLive) {
+				backupDir = uniqueSibling(dataDir, "backup");
+				try {
+					await rename(dataDir, backupDir);
+				} catch (error) {
+					const detail = error instanceof Error ? error.message : String(error);
+					throw new Error(`failed to rename live data to backup: ${detail}`);
+				}
+			}
+
 			try {
-				if (published) {
-					await removeIfExists(dataDir);
-					if (backupDir !== null) {
+				await rename(stagingDir, dataDir);
+				stagingPending = false;
+				published = true;
+			} catch (error) {
+				const detail = error instanceof Error ? error.message : String(error);
+				throw new Error(`failed to publish staging directory to live data: ${detail}`);
+			}
+
+			await inversionProof(proofCtx);
+			// Successful inversion proof commits the published live tree.
+			committed = true;
+		} catch (error) {
+			// Pre-commit only: restore the pre-publish live tree byte-for-byte (or absent).
+			if (!committed) {
+				try {
+					if (published) {
+						await removeIfExists(dataDir);
+						if (backupDir !== null) {
+							await rename(backupDir, dataDir);
+							backupDir = null;
+						}
+					} else if (backupDir !== null && !(await pathExists(dataDir))) {
 						await rename(backupDir, dataDir);
 						backupDir = null;
 					}
-				} else if (backupDir !== null && !(await pathExists(dataDir))) {
-					await rename(backupDir, dataDir);
-					backupDir = null;
+				} catch (restoreError) {
+					const primary = error instanceof Error ? error.message : String(error);
+					const secondary =
+						restoreError instanceof Error ? restoreError.message : String(restoreError);
+					throw new Error(
+						`reconstruction failed (${primary}); additionally failed to restore live data: ${secondary}`,
+					);
 				}
-			} catch (restoreError) {
-				const primary = error instanceof Error ? error.message : String(error);
-				const secondary =
-					restoreError instanceof Error ? restoreError.message : String(restoreError);
+
+				if (stagingPending) {
+					await removeIfExists(stagingDir);
+				}
+				await removeIfExists(backupDir);
+			}
+			throw error;
+		}
+
+		if (backupDir !== null) {
+			const leftoverBackup = backupDir;
+			try {
+				await removeBackup(leftoverBackup);
+				backupDir = null;
+			} catch (cleanupError) {
+				const detail =
+					cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
 				throw new Error(
-					`reconstruction failed (${primary}); additionally failed to restore live data: ${secondary}`,
+					`reconstruction published successfully but failed to remove backup ${leftoverBackup}: ${detail}`,
 				);
 			}
-
-			if (stagingPending) {
-				await removeIfExists(stagingDir);
-			}
-			await removeIfExists(backupDir);
 		}
-		throw error;
-	}
 
-	if (backupDir !== null) {
-		const leftoverBackup = backupDir;
-		try {
-			await removeBackup(leftoverBackup);
-			backupDir = null;
-		} catch (cleanupError) {
-			const detail =
-				cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
-			throw new Error(
-				`reconstruction published successfully but failed to remove backup ${leftoverBackup}: ${detail}`,
-			);
+		console.warn(`reconstructed ${wrappers.length} provider data files from the catalog`);
+		if (options.inversionProof === undefined) {
+			console.warn("inversion proof passed: catalog round-trips exactly");
 		}
-	}
 
-	console.warn(`reconstructed ${wrappers.length} provider data files from the catalog`);
-	if (options.inversionProof === undefined) {
-		console.warn("inversion proof passed: catalog round-trips exactly");
+		return {
+			written: wrappers.length,
+			providers: wrappers,
+			dataDir,
+		};
+	} finally {
+		await releaseDataDirectoryLock(lockDir);
 	}
-
-	return {
-		written: wrappers.length,
-		providers: wrappers,
-		dataDir,
-	};
 }
 
 async function main(): Promise<void> {
