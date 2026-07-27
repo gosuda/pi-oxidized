@@ -261,12 +261,22 @@ function tail(text: string, maximum: number): string {
 	return text.slice(-maximum);
 }
 
+const COMMAND_OUTPUT_TAIL_MAX_CHARS = 12_000;
 const FAILURE_FIELD_MAX_CHARS = 4_000;
 
 function truncateFailureField(text: string): string {
 	if (text.length <= FAILURE_FIELD_MAX_CHARS) return text;
 	const omitted = text.length - FAILURE_FIELD_MAX_CHARS;
 	return `${text.slice(0, FAILURE_FIELD_MAX_CHARS)}… [${omitted} chars omitted]`;
+}
+
+function formatDiagnosticTail(text: string): string {
+	return tail(
+		text.replace(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/g, (character) => {
+			return `\\x${character.charCodeAt(0).toString(16).padStart(2, "0")}`;
+		}),
+		COMMAND_OUTPUT_TAIL_MAX_CHARS,
+	);
 }
 
 export function formatFailedCommands(results: readonly CommandResult[]): string {
@@ -282,8 +292,8 @@ export function formatFailedCommands(results: readonly CommandResult[]): string 
 				`Compatibility command failed for rows [${truncateFailureField(result.rowIds.join(", "))}]: ${status} after ${result.durationMs}ms`,
 				`cwd: ${truncateFailureField(result.cwd)}`,
 				`argv: ${truncateFailureField(JSON.stringify(result.argv))}`,
-				`stdout tail:\n${result.stdoutTail || "<empty>"}`,
-				`stderr tail:\n${result.stderrTail || "<empty>"}`,
+				`stdout tail:\n${formatDiagnosticTail(result.stdoutTail) || "<empty>"}`,
+				`stderr tail:\n${formatDiagnosticTail(result.stderrTail) || "<empty>"}`,
 			].join("\n");
 		})
 		.join("\n\n");
@@ -325,8 +335,8 @@ export async function runCommand(
 			exitCode,
 			durationMs,
 			timedOut: abortSignal !== undefined && abortSignal.aborted,
-			stdout: tail(stdout, 12_000),
-			stderr: tail(stderr, 12_000),
+			stdout: tail(stdout, COMMAND_OUTPUT_TAIL_MAX_CHARS),
+			stderr: tail(stderr, COMMAND_OUTPUT_TAIL_MAX_CHARS),
 			killedBySignal: proc.signalCode ?? undefined,
 		};
 	} catch (error) {

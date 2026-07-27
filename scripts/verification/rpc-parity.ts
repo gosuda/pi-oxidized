@@ -16,7 +16,7 @@
  * timestamps/elapsed-time values, and per-run temporary paths.
  */
 
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 export const REPO_ROOT = resolve(import.meta.dirname, "../..");
@@ -35,6 +35,8 @@ const VERIFICATION_MODEL = "model";
 const TOOL_FILE = "verification-rpc.txt";
 const STEP_DEADLINE_MS = Number(process.env.PI_RPC_PARITY_STEP_TIMEOUT_MS ?? "120000");
 const EXIT_DEADLINE_MS = 30_000;
+
+const RUST_RELEASE_BUILD_COMMAND = ["cargo", "build", "-p", "pi", "--release", "--locked"];
 
 interface JsonObject {
 	[key: string]: JsonValue;
@@ -658,16 +660,45 @@ function writeJsonl(path: string, records: readonly JsonValue[]): void {
 	writeFileSync(path, `${records.map((record) => JSON.stringify(record)).join("\n")}\n`, "utf8");
 }
 
+async function ensureRustReleaseBinary(): Promise<void> {
+	if (existsSync(RUST_BINARY)) return;
+
+	console.error(
+		`rpc-parity: release binary missing; running ${RUST_RELEASE_BUILD_COMMAND.join(" ")}`,
+	);
+	let exitCode: number;
+	try {
+		exitCode = await Bun.spawn({
+			cmd: RUST_RELEASE_BUILD_COMMAND,
+			cwd: REPO_ROOT,
+			stdout: "inherit",
+			stderr: "inherit",
+		}).exited;
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		fail(`rpc-parity could not start release build: ${message}`);
+	}
+	if (exitCode !== 0) {
+		fail(`rpc-parity release build failed with exit code ${exitCode}`);
+	}
+	if (!existsSync(RUST_BINARY)) {
+		fail(`rpc-parity release build did not create ${RUST_BINARY}`);
+	}
+}
+
 async function main(): Promise<void> {
-	for (const required of [RUST_BINARY, EXTENSION_HOST, EXTENSION_PATH, TYPESCRIPT_CLI, AUTHORITATIVE_RPC_TYPES_PATH]) {
+	await ensureRustReleaseBinary();
+	for (const required of [
+		RUST_BINARY,
+		EXTENSION_HOST,
+		EXTENSION_PATH,
+		TYPESCRIPT_CLI,
+		AUTHORITATIVE_RPC_TYPES_PATH,
+	]) {
 		try {
 			readFileSync(required);
 		} catch {
-			fail(
-				`rpc-parity prerequisite missing: ${required}${
-					required === RUST_BINARY ? "; run cargo build -p pi --release --locked" : ""
-				}`,
-			);
+			fail(`rpc-parity prerequisite missing: ${required}`);
 		}
 	}
 

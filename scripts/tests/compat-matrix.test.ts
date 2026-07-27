@@ -323,6 +323,40 @@ describe("formatFailedCommands", () => {
 		expect(report.match(/<empty>/g)).toHaveLength(2);
 	});
 
+	test("escapes OSC and CSI controls while retaining diagnostic newlines", () => {
+		const report = formatFailedCommands([
+			{
+				...timeoutResult,
+				stdoutTail: "stdout-first\n\x1b]52;c;clipboard\x07\n\x1b[2Jstdout-last",
+				stderrTail: "stderr-first\n\u009b2Jstderr-last",
+			},
+		]);
+
+		expect(report).toContain(
+			String.raw`stdout tail:
+stdout-first
+\x1b]52;c;clipboard\x07
+\x1b[2Jstdout-last`,
+		);
+		expect(report).toContain(
+			String.raw`stderr tail:
+stderr-first
+\x9b2Jstderr-last`,
+		);
+		expect(report).not.toContain("\x1b");
+		expect(report).not.toContain("\x07");
+		expect(report).not.toContain("\u009b");
+	});
+
+	test("bounds escaped diagnostic tails", () => {
+		const report = formatFailedCommands([
+			{ ...timeoutResult, stdoutTail: "\x1b".repeat(3_001) },
+		]);
+		const stdout = report.split("stdout tail:\n")[1]?.split("\nstderr tail:")[0];
+
+		expect(stdout).toBe(String.raw`\x1b`.repeat(3_000));
+	});
+
 	test("bounds dynamic command fields", () => {
 		const report = formatFailedCommands([
 			{ ...timeoutResult, argv: ["x".repeat(5_000)] },
