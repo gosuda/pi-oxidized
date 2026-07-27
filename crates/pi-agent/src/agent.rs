@@ -573,24 +573,37 @@ struct TrackingSink<'a> {
     run: Arc<Mutex<RunState>>,
 }
 
+fn apply_abort_reason(message: &mut AgentMessage, reason: &str) {
+    if let AgentMessage::Llm(inner) = message
+        && let Message::Assistant(assistant) = inner.as_mut()
+        && assistant.stop_reason == StopReason::Aborted
+    {
+        assistant.error_message = Some(reason.to_owned());
+    }
+}
+
 impl EventSink for TrackingSink<'_> {
     fn emit(&self, mut event: AgentEvent) {
-        // Substitute a caller-supplied abort reason onto every aborted terminal
-        // surface that carries an assistant message. MessageEnd alone is not
-        // enough: TurnEnd (and therefore AgentStateSnapshot.error_message via
-        // reduce) still sees the synthesized "stream cancelled" text unless we
-        // rewrite it here too.
-        match &mut event {
-            AgentEvent::MessageEnd { message } | AgentEvent::TurnEnd { message, .. } => {
-                if let AgentMessage::Llm(inner) = message
-                    && let Message::Assistant(assistant) = inner.as_mut()
-                    && assistant.stop_reason == StopReason::Aborted
-                    && let Some(reason) = lock(&self.run).abort_reason.clone()
-                {
-                    assistant.error_message = Some(reason);
+        // Snapshot the caller-supplied abort reason before rewriting any
+        // terminal event. The run-state lock is never held during fan-out.
+        if matches!(
+            &event,
+            AgentEvent::MessageEnd { .. }
+                | AgentEvent::TurnEnd { .. }
+                | AgentEvent::AgentEnd { .. }
+        ) && let Some(reason) = lock(&self.run).abort_reason.clone()
+        {
+            match &mut event {
+                AgentEvent::MessageEnd { message } | AgentEvent::TurnEnd { message, .. } => {
+                    apply_abort_reason(message, &reason);
                 }
+                AgentEvent::AgentEnd { messages } => {
+                    for message in messages {
+                        apply_abort_reason(message, &reason);
+                    }
+                }
+                _ => {}
             }
-            _ => {}
         }
         if let AgentEvent::MessageEnd { message } = &event {
             if message.role() == "assistant" {
@@ -659,20 +672,33 @@ fn finish_run(
     let outcome = match result {
         Ok(_) => Ok(()),
         Err(error) => {
-            // Make the error observable on every failure. Set it before
-            // `finish_run()` (which clears streaming/pending but preserves
-            // `error_message`), so callers and snapshot readers see it.
+            // Snapshot the reason before terminal fan-out. An explicit abort
+            // wins over a racing hook or loop error on every terminal surface.
+            let abort_reason = lock(&inner.run).abort_reason.clone();
+            let error_message = abort_reason
+                .as_deref()
+                .map_or_else(|| error.to_string(), str::to_owned);
             {
                 let mut state = lock(&inner.state);
-                state.error_message = Some(error.to_string());
+                state.error_message = Some(error_message);
             }
             let mut produced = lock(new_messages).clone();
+            if let Some(reason) = abort_reason.as_deref() {
+                for message in &mut produced {
+                    apply_abort_reason(message, reason);
+                }
+            }
             // Only synthesize an assistant terminal when the loop never emitted
             // one. If `terminal` is already set, the loop produced the single
             // allowed assistant message end + turn end, so we emit exactly one
             // `agent_end` and no duplicate message/turn events.
             if !terminal.load(Ordering::SeqCst) {
-                let assistant = synthesize_error_assistant(&snapshot_config(inner), cancel, &error);
+                let assistant = synthesize_error_assistant(
+                    &snapshot_config(inner),
+                    cancel,
+                    &error,
+                    abort_reason.as_deref(),
+                );
                 let message = AgentMessage::Llm(Box::new(Message::Assistant(assistant)));
                 emit_message_pair(&inner.sink, message.clone());
                 inner.sink.emit(AgentEvent::TurnEnd {
@@ -711,6 +737,7 @@ fn synthesize_error_assistant(
     config: &AgentLoopConfig,
     cancel: &CancellationToken,
     error: &AgentLoopError,
+    abort_reason: Option<&str>,
 ) -> AssistantMessage {
     let mut message = AssistantMessage::new(
         config.model.api.clone(),
@@ -723,7 +750,7 @@ fn synthesize_error_assistant(
     } else {
         StopReason::Error
     };
-    message.error_message = Some(error.to_string());
+    message.error_message = Some(abort_reason.map_or_else(|| error.to_string(), str::to_owned));
     message
 }
 
@@ -1185,8 +1212,16 @@ mod tests {
             _ => None,
         });
 
+        let agent_end_error = events.iter().rev().find_map(|event| match event {
+            AgentEvent::AgentEnd { messages } => {
+                messages.iter().rev().find_map(assistant_error_message)
+            }
+            _ => None,
+        });
+
         assert_eq!(message_end_error, Some(reason));
         assert_eq!(turn_end_error, Some(reason));
+        assert_eq!(agent_end_error, Some(reason));
         assert_eq!(agent.state().error_message.as_deref(), Some(reason));
         Ok(())
     }
@@ -1374,6 +1409,75 @@ mod tests {
             })
             .count();
         assert_eq!(assistant_ends, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn abort_reason_wins_preterminal_conversion_error_race()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let conversion_started = Arc::new(tokio::sync::Notify::new());
+        let release_conversion = Arc::new(tokio::sync::Notify::new());
+        let mut options = agent_options(Arc::new(MockProvider(Vec::new())));
+        let started = Arc::clone(&conversion_started);
+        let release = Arc::clone(&release_conversion);
+        options.config.convert_to_llm = Arc::new(move |_messages| {
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            Box::pin(async move {
+                started.notify_one();
+                release.notified().await;
+                Err(AgentLoopError::message("conversion hook failed"))
+            })
+        });
+        let agent = Agent::new(options);
+        let mut rx = agent.subscribe();
+
+        let run = tokio::spawn({
+            let agent = agent.clone();
+            async move {
+                agent
+                    .prompt(vec![user_text("hi", std::iter::empty())])
+                    .await
+            }
+        });
+        timeout(Duration::from_secs(1), conversion_started.notified())
+            .await
+            .map_err(|_| "conversion hook did not start")?;
+
+        let reason = "extension cancelled by user";
+        agent.abort_with_reason(reason);
+        release_conversion.notify_one();
+        let result = run.await?;
+        assert!(result.is_err(), "hook failure must still propagate");
+        agent.wait_for_idle().await;
+
+        let events = drain_events(&mut rx).await;
+        let terminal = events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                AgentEvent::MessageEnd { message } => match message.as_llm() {
+                    Some(Message::Assistant(assistant)) => Some(assistant),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .ok_or("missing synthesized assistant terminal")?;
+        assert_eq!(terminal.stop_reason, StopReason::Aborted);
+        assert_eq!(terminal.error_message.as_deref(), Some(reason));
+        let turn_end_error = events.iter().rev().find_map(|event| match event {
+            AgentEvent::TurnEnd { message, .. } => assistant_error_message(message),
+            _ => None,
+        });
+        let agent_end_error = events.iter().rev().find_map(|event| match event {
+            AgentEvent::AgentEnd { messages } => {
+                messages.iter().rev().find_map(assistant_error_message)
+            }
+            _ => None,
+        });
+        assert_eq!(turn_end_error, Some(reason));
+        assert_eq!(agent_end_error, Some(reason));
+        assert_eq!(agent.state().error_message.as_deref(), Some(reason));
         Ok(())
     }
 

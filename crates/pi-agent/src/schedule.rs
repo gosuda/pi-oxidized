@@ -67,6 +67,7 @@ enum Preparation {
 
 struct ParallelUpdate {
     index: usize,
+    args: Arc<Map<String, Value>>,
     partial: AgentToolResult,
 }
 
@@ -381,8 +382,13 @@ impl ParallelBatch {
         let update_tx = self.update_tx.clone();
         self.workers.spawn(async move {
             let worker = async move {
+                let update_args = Arc::new(prepared.args.clone());
                 let updates = ToolUpdates::new(move |partial| {
-                    let _ = update_tx.try_send(ParallelUpdate { index, partial });
+                    let _ = update_tx.try_send(ParallelUpdate {
+                        index,
+                        args: Arc::clone(&update_args),
+                        partial,
+                    });
                 });
 
                 let executed = match prepared
@@ -500,13 +506,18 @@ fn emit_parallel_update(
     update: ParallelUpdate,
     emit: &impl EmitAgentEvent,
 ) {
-    let Some(tool_call) = slots.get(update.index).map(|slot| match slot {
+    let ParallelUpdate {
+        index,
+        args,
+        partial,
+    } = update;
+    let Some(tool_call) = slots.get(index).map(|slot| match slot {
         ParallelSlot::Ready(finalized) => &finalized.tool_call,
         ParallelSlot::Pending(tool_call) => tool_call,
     }) else {
         return;
     };
-    emit_tool_execution_update(tool_call, update.partial, emit);
+    emit_tool_execution_update(tool_call, args.as_ref(), partial, emit);
 }
 
 fn settle_worker(
@@ -679,7 +690,6 @@ async fn execute_prepared_tool_call(
     emit: &impl EmitAgentEvent,
 ) -> ExecutedOutcome {
     let (update_tx, mut update_rx) = mpsc::unbounded_channel::<AgentToolResult>();
-    let tool_call = prepared.tool_call.clone();
     let tool = Arc::clone(&prepared.tool);
     let args = prepared.args.clone();
     let tool_call_id = prepared.tool_call.id.clone();
@@ -728,7 +738,7 @@ async fn execute_prepared_tool_call(
                     }
                 }
                 while let Ok(partial) = update_rx.try_recv() {
-                    emit_tool_execution_update(&tool_call, partial, emit);
+                    emit_tool_execution_update(&prepared.tool_call, &prepared.args, partial, emit);
                 }
                 return ready.unwrap_or_else(|| ExecutedOutcome {
                     result: error_tool_result("Operation aborted"),
@@ -737,7 +747,7 @@ async fn execute_prepared_tool_call(
             }
             joined = worker.join_next() => {
                 while let Ok(partial) = update_rx.try_recv() {
-                    emit_tool_execution_update(&tool_call, partial, emit);
+                    emit_tool_execution_update(&prepared.tool_call, &prepared.args, partial, emit);
                 }
                 return match joined {
                     Some(Ok(outcome)) => outcome,
@@ -749,7 +759,7 @@ async fn execute_prepared_tool_call(
             }
             partial = update_rx.recv() => {
                 if let Some(partial) = partial {
-                    emit_tool_execution_update(&tool_call, partial, emit);
+                    emit_tool_execution_update(&prepared.tool_call, &prepared.args, partial, emit);
                 }
             }
         }
@@ -824,13 +834,14 @@ fn emit_tool_execution_start(
 
 fn emit_tool_execution_update(
     tool_call: &ToolCall,
+    args: &Map<String, Value>,
     partial: AgentToolResult,
     emit: &impl EmitAgentEvent,
 ) {
     emit.emit(AgentEvent::ToolExecutionUpdate {
         tool_call_id: tool_call.id.clone(),
         tool_name: tool_call.name.clone(),
-        args: tool_call.arguments.clone(),
+        args: args.clone(),
         partial_result: partial,
     });
 }
@@ -1389,44 +1400,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn before_hook_replacement_arguments_reach_execute() -> TestResult {
-        let tool = RecordingTool::new("patched");
-        let seen_args = Arc::clone(&tool.seen_args);
-        let context = context_with(vec![Arc::new(tool)]);
-        let assistant = assistant_with_calls(vec![ToolCall::new(
-            "c1",
-            "patched",
-            Map::from_iter([("original".to_owned(), Value::Bool(true))]),
-        )]);
-        let mut config = sample_config(ToolExecutionMode::Sequential);
-        config.before_tool_call = Some(Arc::new(|_ctx, _cancel| {
-            Box::pin(async {
-                Ok(Some(BeforeToolCallResult {
-                    block: false,
-                    reason: None,
-                    arguments: Some(Map::from_iter([("patched".to_owned(), Value::Bool(true))])),
-                }))
-            })
-        }));
-        let (_events, emit) = collect_emit();
-
-        execute_tool_calls(
-            &context,
-            &assistant,
-            &config,
-            &CancellationToken::new(),
-            &emit,
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-
-        let actual = seen_args
-            .lock()
-            .map_err(|_| "seen_args poisoned".to_owned())?
-            .clone();
+    async fn before_hook_replacement_arguments_reach_execution_updates() -> TestResult {
         let expected = Map::from_iter([("patched".to_owned(), Value::Bool(true))]);
-        if actual.as_ref() != Some(&expected) {
-            return Err(format!("replacement arguments not executed: {actual:?}"));
+
+        for mode in [ToolExecutionMode::Sequential, ToolExecutionMode::Parallel] {
+            let tool = RecordingTool::new("patched");
+            let seen_args = Arc::clone(&tool.seen_args);
+            let context = context_with(vec![Arc::new(tool)]);
+            let assistant = assistant_with_calls(vec![ToolCall::new(
+                "c1",
+                "patched",
+                Map::from_iter([("original".to_owned(), Value::Bool(true))]),
+            )]);
+            let mut config = sample_config(mode);
+            config.before_tool_call = Some(Arc::new(|_ctx, _cancel| {
+                Box::pin(async {
+                    Ok(Some(BeforeToolCallResult {
+                        block: false,
+                        reason: None,
+                        arguments: Some(Map::from_iter([(
+                            "patched".to_owned(),
+                            Value::Bool(true),
+                        )])),
+                    }))
+                })
+            }));
+            let (events, emit) = collect_emit();
+
+            execute_tool_calls(
+                &context,
+                &assistant,
+                &config,
+                &CancellationToken::new(),
+                &emit,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+
+            let actual = seen_args
+                .lock()
+                .map_err(|_| "seen_args poisoned".to_owned())?
+                .clone();
+            if actual.as_ref() != Some(&expected) {
+                return Err(format!(
+                    "{mode:?} replacement arguments not executed: {actual:?}"
+                ));
+            }
+
+            let update_args: Vec<Map<String, Value>> = snapshot_events(&events)?
+                .into_iter()
+                .filter_map(|event| match event {
+                    AgentEvent::ToolExecutionUpdate { args, .. } => Some(args),
+                    _ => None,
+                })
+                .collect();
+            if update_args != [expected.clone()] {
+                return Err(format!(
+                    "{mode:?} update arguments did not use replacement: {update_args:?}"
+                ));
+            }
         }
         Ok(())
     }

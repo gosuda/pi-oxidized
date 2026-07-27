@@ -207,6 +207,16 @@ pub(super) fn extension_source_infos(
         .collect()
 }
 
+/// Build the product-owned context converter for every constructed session.
+fn product_convert_to_llm_hook() -> pi_agent::ConvertToLlm {
+    Arc::new(|messages| {
+        Box::pin(async move {
+            crate::core::messages::convert_to_llm(&messages)
+                .map_err(|error| pi_agent::AgentLoopError::message(error.to_string()))
+        })
+    })
+}
+
 /// Mutable session state shared by the event pump and public methods.
 ///
 /// Guarded by `std::sync::Mutex`. Never hold across `.await`.
@@ -451,6 +461,36 @@ pub enum AgentSessionError {
     Session(#[from] crate::core::sessions::SessionError),
 }
 
+fn default_agent_loop_config(model: &Model) -> AgentLoopConfig {
+    AgentLoopConfig {
+        model: model.clone(),
+        reasoning: None,
+        temperature: None,
+        max_tokens: None,
+        session_id: None,
+        transport: None,
+        cache_retention: None,
+        thinking_budgets: None,
+        max_retry_delay_ms: None,
+        metadata: None,
+        headers: None,
+        env: None,
+        stream_extra: serde_json::Map::new(),
+        tool_execution: pi_agent::ToolExecutionMode::Parallel,
+        convert_to_llm: product_convert_to_llm_hook(),
+        transform_context: None,
+        get_api_key: None,
+        should_stop_after_turn: None,
+        prepare_next_turn: None,
+        get_steering_messages: None,
+        get_follow_up_messages: None,
+        before_tool_call: None,
+        after_tool_call: None,
+        on_payload: None,
+        on_response: None,
+    }
+}
+
 impl AgentSession {
     /// Construct a session, install hooks, and spawn the event pump.
     ///
@@ -476,33 +516,13 @@ impl AgentSession {
                 .model
                 .clone()
                 .unwrap_or_else(pi_agent::state::default_model);
-            let mut base = config.base_config.unwrap_or_else(|| AgentLoopConfig {
-                model: model.clone(),
-                reasoning: None,
-                temperature: None,
-                max_tokens: None,
-                session_id: None,
-                transport: None,
-                cache_retention: None,
-                thinking_budgets: None,
-                max_retry_delay_ms: None,
-                metadata: None,
-                headers: None,
-                env: None,
-                stream_extra: serde_json::Map::new(),
-                tool_execution: pi_agent::ToolExecutionMode::Parallel,
-                convert_to_llm: pi_agent::default_convert_to_llm_hook(),
-                transform_context: None,
-                get_api_key: None,
-                should_stop_after_turn: None,
-                prepare_next_turn: None,
-                get_steering_messages: None,
-                get_follow_up_messages: None,
-                before_tool_call: None,
-                after_tool_call: None,
-                on_payload: None,
-                on_response: None,
-            });
+            let mut base = match config.base_config {
+                Some(mut base) => {
+                    base.convert_to_llm = product_convert_to_llm_hook();
+                    base
+                }
+                None => default_agent_loop_config(&model),
+            };
             // Upstream sdk.ts sets sessionId on the Agent config so provider
             // session-affinity, prompt-cache keys, and opencode session
             // headers fire. The config still owns the manager by value here;
@@ -1211,6 +1231,26 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct ContextRecordingProvider {
+        contexts: Arc<Mutex<Vec<Context>>>,
+    }
+
+    impl Provider for ContextRecordingProvider {
+        fn stream(
+            &self,
+            _model: &Model,
+            context: Context,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, Result<AssistantMessageEvent, ProviderError>> {
+            self.contexts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(context);
+            stream::iter([Ok(start_event()), Ok(done_event("ok"))]).boxed()
+        }
+    }
+
+    #[derive(Clone)]
     struct PendingDeltaProvider;
 
     impl Provider for PendingDeltaProvider {
@@ -1905,6 +1945,74 @@ mod tests {
         assert_eq!(session.message_count(), 1);
         assert_eq!(session.messages()[0].role(), "bashExecution");
         assert_eq!(session.session_manager.lock().await.get_entries().len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn product_converter_keeps_visible_bash_and_excludes_hidden_bash()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let contexts = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(ContextRecordingProvider {
+            contexts: Arc::clone(&contexts),
+        });
+        let bash_message = |command: &str, output: &str, exclude_from_context: bool| {
+            let mut payload = serde_json::Map::from_iter([
+                (
+                    "command".to_owned(),
+                    serde_json::Value::String(command.to_owned()),
+                ),
+                (
+                    "output".to_owned(),
+                    serde_json::Value::String(output.to_owned()),
+                ),
+                ("exitCode".to_owned(), serde_json::Value::from(0)),
+                ("cancelled".to_owned(), serde_json::Value::Bool(false)),
+                ("truncated".to_owned(), serde_json::Value::Bool(false)),
+                ("timestamp".to_owned(), serde_json::Value::from(1)),
+            ]);
+            if exclude_from_context {
+                payload.insert(
+                    "excludeFromContext".to_owned(),
+                    serde_json::Value::Bool(true),
+                );
+            }
+            AgentMessage::Custom(pi_agent::CustomAgentMessage::new("bashExecution", payload))
+        };
+        let mut config = AgentSessionConfig::test_config(provider, test_model())?;
+        config.messages = vec![
+            bash_message("echo visible", "visible", false),
+            bash_message("echo hidden", "hidden", true),
+        ];
+        let session = AgentSession::new(config)?;
+
+        session
+            .agent
+            .prompt(vec![user_text("continue", std::iter::empty())])
+            .await?;
+        session.agent.wait_for_idle().await;
+
+        let contexts = contexts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let context = contexts
+            .first()
+            .ok_or("provider did not receive a model context")?;
+        assert_eq!(context.messages.len(), 2);
+        let text_at = |index: usize| -> Result<&str, Box<dyn std::error::Error>> {
+            let Some(pi_ai::Message::User(message)) = context.messages.get(index) else {
+                return Err(format!("context message {index} was not a user message").into());
+            };
+            match &message.content {
+                pi_ai::UserMessageContent::Text(text) => Ok(text),
+                pi_ai::UserMessageContent::Blocks(blocks) => match blocks.as_slice() {
+                    [pi_ai::UserContent::Text(text)] => Ok(&text.text),
+                    _ => Err(format!("context message {index} had unexpected blocks").into()),
+                },
+            }
+        };
+        assert_eq!(text_at(0)?, "Ran `echo visible`\n```\nvisible\n```");
+        assert_eq!(text_at(1)?, "continue");
         Ok(())
     }
 

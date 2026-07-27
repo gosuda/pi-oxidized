@@ -1601,11 +1601,17 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     }
 
     async fn finish_run(&mut self) -> InteractiveExit {
-        // Abort prompt-owned AgentSession cleanup and drain it within the
-        // quiesce grace; token-blind work is detached with a diagnostic.
-        // Final teardown must remain bounded so process exit is guaranteed.
-        self.quiesce_prompt_operations(Some(PROMPT_QUIESCE_GRACE))
-            .await;
+        // A temporary terminal handoff must wait for every prompt-owned cleanup
+        // task: this process resumes and must not overlap the old session turn.
+        // Final teardown remains bounded so process exit is guaranteed.
+        let deadline = match self.exit_kind {
+            InteractiveExit::Suspend | InteractiveExit::ExternalEditor => None,
+            InteractiveExit::Clean
+            | InteractiveExit::IoFailure
+            | InteractiveExit::DrawDeadlock
+            | InteractiveExit::SessionEnded => Some(PROMPT_QUIESCE_GRACE),
+        };
+        self.quiesce_prompt_operations(deadline).await;
 
         // Final paint so the last view-state mutation is visible.
         if matches!(
@@ -2695,7 +2701,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     ///
     /// `deadline` of [`Some`] applies a bound (final teardown): leftover
     /// token-blind tasks are detached with a diagnostic. [`None`] waits until
-    /// every aborted operation completes (session replacement).
+    /// every aborted operation completes (session replacement or terminal handoff).
     async fn quiesce_prompt_operations(&mut self, deadline: Option<Duration>) {
         self.prompt_operations.epoch = self.prompt_operations.epoch.wrapping_add(1);
         for (_, abort) in std::mem::take(&mut self.prompt_operations.aborts) {
@@ -7704,6 +7710,55 @@ mod tests {
 
         assert_eq!(rt.last_error(), None);
         assert!(rt.prompt_operations.tasks.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finish_run_temporary_handoffs_drain_prompt_operations() -> Result<(), String> {
+        for exit_kind in [InteractiveExit::Suspend, InteractiveExit::ExternalEditor] {
+            let writer = SharedWriter::new();
+            let tui = Tui::new(
+                writer,
+                Size::new(80, 24),
+                Position::ORIGIN,
+                8,
+                TerminalCapabilities::default(),
+            )
+            .map_err(|error| format!("tui construction failed: {error}"))?;
+            let (_input_tx, input_rx) = mpsc::unbounded_channel::<UiEvent>();
+            let input = TerminalInput::mock(input_rx);
+            let (host, _log) = FakeHost::new();
+            host.set_prompt_mode(FakePromptMode::ReleaseOnAbort);
+            host.set_abort_delay(PROMPT_QUIESCE_GRACE + Duration::from_millis(100));
+            let prompt_started = Arc::clone(&host.prompt_started);
+            let mut rt = InteractiveRuntime::new(
+                tui,
+                input,
+                Arc::new(host),
+                &InteractiveRuntimeOptions::default(),
+            );
+
+            let _ = rt
+                .dispatch_action(ViewAction::Submit {
+                    text: "handoff prompt".to_owned(),
+                })
+                .await;
+            tokio::time::timeout(Duration::from_secs(1), prompt_started.notified())
+                .await
+                .map_err(|_| "prompt operation did not start".to_owned())?;
+
+            rt.exit_kind = exit_kind;
+            let exit = tokio::time::timeout(
+                PROMPT_QUIESCE_GRACE + Duration::from_secs(2),
+                rt.finish_run(),
+            )
+            .await
+            .map_err(|_| format!("{exit_kind:?} did not drain prompt cleanup"))?;
+
+            assert_eq!(exit, exit_kind);
+            assert_eq!(rt.last_error(), None);
+            assert!(rt.prompt_operations.tasks.is_empty());
+        }
         Ok(())
     }
 
