@@ -113,6 +113,8 @@ const DIAGNOSTIC_STDOUT_PREFIX_CHARS = 512;
  * an unterminated line past this limit is treated as a wedged/hostile child.
  */
 export const MAX_STDOUT_BUFFER_CHARS = 64 * 1024;
+/** Maximum parsed frames retained for late `waitFor` calls and final counters. */
+export const MAX_RETAINED_FRAMES = 128;
 
 /**
  * Escape and truncate hostile text so diagnostics stay bounded and printable.
@@ -147,6 +149,8 @@ export class ChildHost {
 	private exited = false;
 	private readonly exitPromise: Promise<void>;
 	private resolveExit: (() => void) | undefined;
+	private fatalError: Error | undefined;
+	private pumping = true;
 
 	constructor(spec: HostSpec) {
 		const args = [spec.hostEntry];
@@ -182,6 +186,7 @@ export class ChildHost {
 
 
 	private onData(chunk: Buffer): void {
+		if (!this.pumping) return;
 		try {
 			// `{ stream: true }` retains an incomplete trailing multibyte sequence
 			// inside the decoder across chunk boundaries (unlike Buffer#toString).
@@ -189,14 +194,12 @@ export class ChildHost {
 			const lines = this.buffer.split("\n");
 			this.buffer = lines.pop() ?? "";
 			if (this.buffer.length > MAX_STDOUT_BUFFER_CHARS) {
-				const error = new Error(
-					`host stdout unterminated line exceeded ${String(MAX_STDOUT_BUFFER_CHARS)} characters; ` +
-						`stdout: ${diagnosticSnippet(this.buffer, DIAGNOSTIC_STDOUT_PREFIX_CHARS)}; ` +
-						`stderr: ${diagnosticSnippet(this.stderrTail, 4096)}`,
+				this.failAll(
+					this.stdoutError(
+						`host stdout unterminated line exceeded ${String(MAX_STDOUT_BUFFER_CHARS)} characters`,
+						this.buffer,
+					),
 				);
-				this.buffer = "";
-				this.failAll(error);
-				this.reapChild();
 				return;
 			}
 			for (const line of lines) {
@@ -205,13 +208,22 @@ export class ChildHost {
 				try {
 					frame = JSON.parse(line) as Frame;
 				} catch (err) {
-					const parseMessage = err instanceof Error ? err.message : String(err);
-					const error = new Error(
-						`failed to parse host stdout JSON: ${parseMessage}; ` +
-							`stdout: ${diagnosticSnippet(line, DIAGNOSTIC_STDOUT_PREFIX_CHARS)}; ` +
-							`stderr: ${diagnosticSnippet(this.stderrTail, 4096)}`,
+					const parseMessage = diagnosticSnippet(
+						err instanceof Error ? err.message : String(err),
+						DIAGNOSTIC_STDOUT_PREFIX_CHARS,
 					);
-					this.failAll(error);
+					this.failAll(
+						this.stdoutError(`failed to parse host stdout JSON: ${parseMessage}`, line),
+					);
+					return;
+				}
+				if (this.frames.length >= MAX_RETAINED_FRAMES) {
+					this.failAll(
+						this.stdoutError(
+							`host retained frame limit exceeded ${String(MAX_RETAINED_FRAMES)}`,
+							line,
+						),
+					);
 					return;
 				}
 				this.frames.push(frame);
@@ -230,6 +242,13 @@ export class ChildHost {
 		}
 	}
 
+	private stdoutError(message: string, stdout: string): Error {
+		return new Error(
+			`${message}; stdout: ${diagnosticSnippet(stdout, DIAGNOSTIC_STDOUT_PREFIX_CHARS)}; ` +
+				`stderr: ${diagnosticSnippet(this.stderrTail, 4096)}`,
+		);
+	}
+
 	/** Best-effort SIGKILL so a hostile/wedged child cannot keep feeding stdout. */
 	private reapChild(): void {
 		if (this.exited) return;
@@ -241,6 +260,11 @@ export class ChildHost {
 	}
 
 	private failAll(error: Error): void {
+		if (this.fatalError !== undefined) return;
+		this.fatalError = error;
+		this.pumping = false;
+		this.buffer = "";
+		this.reapChild();
 		while (this.waiters.length > 0) {
 			const waiter = this.waiters.pop();
 			if (waiter === undefined) break;
@@ -255,6 +279,7 @@ export class ChildHost {
 		timeoutMs: number,
 		label: string,
 	): Promise<Frame> {
+		if (this.fatalError !== undefined) return Promise.reject(this.fatalError);
 		const existing = this.frames.find(predicate);
 		if (existing !== undefined) return Promise.resolve(existing);
 		const { promise, resolve, reject } = Promise.withResolvers<Frame>();

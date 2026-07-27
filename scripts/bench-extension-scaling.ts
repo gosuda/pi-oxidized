@@ -235,6 +235,30 @@ function withinTenPercent(baseline: number, candidate: number): boolean {
 	return candidate <= limit;
 }
 
+export interface ZeroIdleExtensionMetrics {
+	readonly keypressP99: number;
+	readonly frameP99: number;
+}
+
+/** Report zero-vs-idle regressions for both extension-host hot paths. */
+export function evaluateZeroIdleSanity(
+	zero: ZeroIdleExtensionMetrics,
+	idle: ZeroIdleExtensionMetrics,
+): string[] {
+	const failures: string[] = [];
+	if (!withinTenPercent(zero.keypressP99, idle.keypressP99)) {
+		failures.push(
+			`idle keypress p99 ${idle.keypressP99.toFixed(3)}ms > 110% of zero ${zero.keypressP99.toFixed(3)}ms`,
+		);
+	}
+	if (!withinTenPercent(zero.frameP99, idle.frameP99)) {
+		failures.push(
+			`idle frame p99 ${idle.frameP99.toFixed(3)}ms > 110% of zero ${zero.frameP99.toFixed(3)}ms`,
+		);
+	}
+	return failures;
+}
+
 function machineMetadata() {
 	const cpuList = cpus();
 	const first = cpuList[0];
@@ -323,16 +347,12 @@ async function main(): Promise<void> {
 	const idleFrameStats = stats(idleFrame);
 	const activeFrameStats = stats(activeFrame);
 
-	if (!withinTenPercent(zeroKeyStats.p99, idleKeyStats.p99)) {
-		failures.push(
-			`idle keypress p99 ${idleKeyStats.p99.toFixed(3)}ms > 110% of zero ${zeroKeyStats.p99.toFixed(3)}ms`,
-		);
-	}
-	if (!withinTenPercent(zeroFrameStats.p99, idleFrameStats.p99)) {
-		failures.push(
-			`idle frame p99 ${idleFrameStats.p99.toFixed(3)}ms > 110% of zero ${zeroFrameStats.p99.toFixed(3)}ms`,
-		);
-	}
+	failures.push(
+		...evaluateZeroIdleSanity(
+			{ keypressP99: zeroKeyStats.p99, frameP99: zeroFrameStats.p99 },
+			{ keypressP99: idleKeyStats.p99, frameP99: idleFrameStats.p99 },
+		),
+	);
 
 	// ----- fast terminal input -----
 	const fast = await connectHost([terminalInputFastFactory]);
@@ -516,4 +536,4 @@ async function main(): Promise<void> {
 	}
 }
 
-await main();
+if (import.meta.main) await main();

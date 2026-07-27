@@ -4,10 +4,14 @@
  * children through hello -> extensions.load and the lean 3-RPC round-trip.
  */
 import { describe, expect, test } from "bun:test";
-import { resolve } from "node:path";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { evaluateZeroIdleSanity } from "../bench-extension-scaling.ts";
 import {
 	ChildHost,
 	DEFAULT_LEAN_MAX_RATIO,
+	MAX_RETAINED_FRAMES,
 	MAX_STDOUT_BUFFER_CHARS,
 	TimerHandle,
 	evaluateDistinctness,
@@ -120,6 +124,32 @@ describe("evaluateDistinctness", () => {
 	});
 });
 
+describe("zero/idle extension scaling sanity", () => {
+	test("flags injected keypress and frame regressions independently", () => {
+		expect(
+			evaluateZeroIdleSanity(
+				{ keypressP99: 1, frameP99: 1 },
+				{ keypressP99: 1.5, frameP99: 1 },
+			),
+		).toEqual(["idle keypress p99 1.500ms > 110% of zero 1.000ms"]);
+		expect(
+			evaluateZeroIdleSanity(
+				{ keypressP99: 1, frameP99: 1 },
+				{ keypressP99: 1, frameP99: 1.5 },
+			),
+		).toEqual(["idle frame p99 1.500ms > 110% of zero 1.000ms"]);
+	});
+
+	test("permits idle metrics at the zero-extension threshold", () => {
+		expect(
+			evaluateZeroIdleSanity(
+				{ keypressP99: 10, frameP99: 10 },
+				{ keypressP99: 11, frameP99: 11 },
+			),
+		).toEqual([]);
+	});
+});
+
 describe("ChildHost.close", () => {
 	test("clears graceful-exit and SIGKILL race timers when the child exits", async () => {
 		const hostCwd = resolve(process.cwd(), "packages", "extension-host");
@@ -150,21 +180,29 @@ describe("ChildHost.close", () => {
 
 describe("ChildHost malformed stdout", () => {
 	test("rejects every pending waiter promptly on malformed NDJSON", async () => {
-		const { mkdtempSync, rmSync, writeFileSync } = await import("node:fs");
-		const { tmpdir } = await import("node:os");
-		const { join } = await import("node:path");
 		const root = resolve(process.cwd(), "packages", "extension-host");
 		const tempDir = mkdtempSync(join(tmpdir(), "lean-scaling-malformed-"));
 		const scriptPath = join(tempDir, "malformed-host.mjs");
+		const sentinelPath = join(tempDir, "child-survived");
 		const hostileStdout = `{"not":"json"\x00${"A".repeat(8_000)}`;
 		// Marker at the end so the 4096-byte stderrTail still carries identifiable context.
 		const hostileStderr = `${"B".repeat(5_000)}stderr-context-tail`;
+		const postFailureFrame = `${JSON.stringify({
+			id: 99,
+			kind: "event",
+			method: "toolUpdate",
+			payload: { afterMalformed: true },
+		})}\n`;
 		writeFileSync(
 			scriptPath,
 			[
 				"await Bun.sleep(150);",
 				`process.stderr.write(${JSON.stringify(hostileStderr)});`,
 				`process.stdout.write(${JSON.stringify(`${hostileStdout}\n`)});`,
+				"await Bun.sleep(50);",
+				`process.stdout.write(${JSON.stringify(postFailureFrame)});`,
+				"await Bun.sleep(500);",
+				`await Bun.write(${JSON.stringify(sentinelPath)}, "child-survived");`,
 				"setInterval(() => {}, 1_000);",
 			].join("\n"),
 			"utf8",
@@ -225,6 +263,13 @@ describe("ChildHost malformed stdout", () => {
 			expect(stderrSnippet.length).toBe(4096);
 			expect(stderrSnippet.endsWith("stderr-context-tail")).toBe(true);
 			expect(unhandled).toEqual([]);
+			// The fatal parse path must kill the hostile child rather than merely
+			// rejecting its current waiters.
+			// This is a real child-process reaping proof; fake timers cannot advance
+			// the OS process that must be killed before its sentinel write.
+			await Bun.sleep(750);
+			expect(existsSync(sentinelPath)).toBe(false);
+			expect(host.frames).toEqual([]);
 		} finally {
 			process.off("uncaughtException", trackUnhandled);
 			process.off("unhandledRejection", trackUnhandled);
@@ -261,9 +306,6 @@ describe("runModeDistinctness toolRounds", () => {
 
 describe("ChildHost UTF-8 framing", () => {
 	test("reassembles a multibyte character split across stdout chunks", async () => {
-		const { mkdtempSync, rmSync, writeFileSync } = await import("node:fs");
-		const { tmpdir } = await import("node:os");
-		const { join } = await import("node:path");
 		const root = resolve(process.cwd(), "packages", "extension-host");
 		const tempDir = mkdtempSync(join(tmpdir(), "lean-scaling-utf8-"));
 		const scriptPath = join(tempDir, "utf8-split-host.mjs");
@@ -324,9 +366,6 @@ describe("ChildHost UTF-8 framing", () => {
 
 describe("ChildHost stdout buffer cap", () => {
 	test("failAll+reaps when an unterminated line exceeds the buffer cap", async () => {
-		const { mkdtempSync, rmSync, writeFileSync } = await import("node:fs");
-		const { tmpdir } = await import("node:os");
-		const { join } = await import("node:path");
 		const root = resolve(process.cwd(), "packages", "extension-host");
 		const tempDir = mkdtempSync(join(tmpdir(), "lean-scaling-overflow-"));
 		const scriptPath = join(tempDir, "overflow-host.mjs");
@@ -371,6 +410,64 @@ describe("ChildHost stdout buffer cap", () => {
 			const closeStarted = performance.now();
 			await host.close(100);
 			expect(performance.now() - closeStarted).toBeLessThan(2_000);
+		} finally {
+			await host.close();
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	}, 30_000);
+});
+
+describe("ChildHost retained frame cap", () => {
+	test("fails every waiter and reaps after a valid-frame flood reaches the cap", async () => {
+		const root = resolve(process.cwd(), "packages", "extension-host");
+		const tempDir = mkdtempSync(join(tmpdir(), "lean-scaling-frame-flood-"));
+		const scriptPath = join(tempDir, "frame-flood-host.mjs");
+		const sentinelPath = join(tempDir, "child-survived");
+		const retainedFrameLimit = MAX_RETAINED_FRAMES;
+		const frame = { id: 1, kind: "event", method: "toolUpdate", payload: { ok: true } };
+		const flood = `${JSON.stringify(frame)}\n`.repeat(retainedFrameLimit + 1);
+		writeFileSync(
+			scriptPath,
+			[
+				"await Bun.sleep(50);",
+				`process.stdout.write(${JSON.stringify(flood)});`,
+				"await Bun.sleep(500);",
+				`await Bun.write(${JSON.stringify(sentinelPath)}, "child-survived");`,
+				"setInterval(() => {}, 1_000);",
+			].join("\n"),
+			"utf8",
+		);
+
+		const host = new ChildHost({
+			hostCwd: root,
+			hostEntry: scriptPath,
+			lean: false,
+			extensionPath: resolve(root, "tests", "fixtures", "lean", "echo.mjs"),
+		});
+		try {
+			const waiters = [
+				host.waitFor(() => false, 1_500, "waiter-a"),
+				host.waitFor(() => false, 1_500, "waiter-b"),
+				host.waitFor(() => false, 1_500, "waiter-c"),
+			];
+			const started = performance.now();
+			const rejections = await Promise.all(waiters.map((pending) => pending.catch((err: unknown) => err)));
+
+			expect(performance.now() - started).toBeLessThan(1_000);
+			const messages = rejections.map((err) => {
+				expect(err).toBeInstanceOf(Error);
+				return (err as Error).message;
+			});
+			expect(new Set(messages).size).toBe(1);
+			expect(messages[0]).toMatch(/retained frame limit exceeded/);
+			await expect(host.waitFor(() => false, 60_000, "post-failure waiter")).rejects.toThrow(
+				/retained frame limit exceeded/,
+			);
+			expect(host.frames.length).toBeLessThanOrEqual(retainedFrameLimit);
+			// This is a real child-process reaping proof; fake timers cannot advance
+			// the OS process that must be killed before its sentinel write.
+			await Bun.sleep(750);
+			expect(existsSync(sentinelPath)).toBe(false);
 		} finally {
 			await host.close();
 			rmSync(tempDir, { recursive: true, force: true });
