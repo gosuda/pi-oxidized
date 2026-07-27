@@ -635,6 +635,27 @@ async fn apply_cli_api_key(
 
     install_cli_api_key(api_key, model, runtime).await
 }
+/// Preinstall `--api-key` for the saved session model before restore, but only
+/// when no explicit CLI model resolved. When `--provider`/`--model` selects a
+/// different provider, that CLI model wins as the session model and
+/// [`apply_cli_api_key`] installs the key for the winner; preinstalling for the
+/// saved provider here would configure a non-winning provider. Gating on the
+/// absence of a resolved CLI model retains the auth-restoration path for the
+/// saved-model-as-winner case while skipping the redundant install otherwise.
+async fn preinstall_saved_session_api_key(
+    api_key: Option<&str>,
+    cli_resolved_model: Option<&Model>,
+    saved_model: Option<&Model>,
+    runtime: &ModelRuntime,
+) -> Result<(), String> {
+    let (Some(api_key), Some(saved_model)) = (api_key, saved_model) else {
+        return Ok(());
+    };
+    if cli_resolved_model.is_some() {
+        return Ok(());
+    }
+    install_cli_api_key(api_key, saved_model, runtime).await
+}
 
 /// Build the settings manager, built-in tools, and base system prompt that
 /// `build_session` consumes together. Pulled out of `RealRuntimeFactory::create`
@@ -844,15 +865,14 @@ impl CreateAgentSessionRuntimeFactory for RealReplacementFactory {
                 .and_then(|(provider, model_id)| {
                     services.model_runtime.get_model(provider, model_id)
                 });
-            if let (Some(api_key), Some(saved_model)) =
-                (args.api_key.as_deref(), saved_model.as_ref())
-            {
-                install_cli_api_key(api_key, saved_model, &services.model_runtime)
-                    .await
-                    .map_err(
-                        crate::core::agent_session_runtime::AgentSessionRuntimeError::Factory,
-                    )?;
-            }
+            preinstall_saved_session_api_key(
+                args.api_key.as_deref(),
+                cli_resolved.model.as_ref(),
+                saved_model.as_ref(),
+                &services.model_runtime,
+            )
+            .await
+            .map_err(crate::core::agent_session_runtime::AgentSessionRuntimeError::Factory)?;
 
             let mut session_result = create_agent_session_from_services(
                 crate::core::agent_session_services::CreateAgentSessionFromServicesOptions {
@@ -1481,6 +1501,100 @@ mod tests {
         let mut diagnostics = Vec::new();
         apply_cli_api_key(
             Some("sk-restored"),
+            Some(&saved_model),
+            &runtime,
+            &mut diagnostics,
+        )
+        .await?;
+        assert!(diagnostics.is_empty());
+        Ok(())
+    }
+
+    /// Regression: when an explicit CLI model resolves to a different provider
+    /// than the saved session model, the saved-provider preinstall must be
+    /// skipped so only the winning CLI provider ends up configured. The
+    /// replacement factory calls `preinstall_saved_session_api_key` then
+    /// `apply_cli_api_key`; this drives that exact sequence with distinct
+    /// saved/explicit providers.
+    #[tokio::test]
+    async fn replacement_explicit_cli_model_skips_saved_provider_preinstall() -> Result<(), String>
+    {
+        let runtime = ModelRuntime::create_in_memory()
+            .await
+            .map_err(|error| format!("failed to create in-memory model runtime: {error}"))?;
+        let catalog = runtime.get_models(None);
+        let Some(saved_model) = catalog.first().cloned() else {
+            return Err("built-in model catalog is empty".to_owned());
+        };
+        // Pick a distinct provider for the explicit CLI winner.
+        let explicit_model = catalog
+            .iter()
+            .find(|model| model.provider != saved_model.provider)
+            .cloned()
+            .ok_or_else(|| "catalog must expose a second provider for this test".to_owned())?;
+        let cli_resolved = resolve_cli_model(ResolveCliModelOptions {
+            cli_provider: Some(explicit_model.provider.as_str()),
+            cli_model: Some(explicit_model.id.as_str()),
+            cli_thinking: None,
+            model_runtime: &runtime,
+        });
+        let Some(cli_winner) = cli_resolved.model.clone() else {
+            return Err("explicit CLI model did not resolve".to_owned());
+        };
+        assert_ne!(
+            cli_winner.provider, saved_model.provider,
+            "test requires distinct saved and explicit providers"
+        );
+
+        // Factory order: gated preinstall for the saved model, then install
+        // for the resolved winner.
+        preinstall_saved_session_api_key(
+            Some("sk-explicit"),
+            cli_resolved.model.as_ref(),
+            Some(&saved_model),
+            &runtime,
+        )
+        .await?;
+        let mut diagnostics = Vec::new();
+        apply_cli_api_key(
+            Some("sk-explicit"),
+            Some(&cli_winner),
+            &runtime,
+            &mut diagnostics,
+        )
+        .await?;
+
+        assert!(diagnostics.is_empty());
+        assert!(runtime.has_configured_auth(&cli_winner.provider));
+        assert!(
+            !runtime.has_configured_auth(&saved_model.provider),
+            "saved provider must not be preconfigured when an explicit CLI model wins"
+        );
+        Ok(())
+    }
+
+    /// Retained saved-model case: with no explicit CLI model, the saved model
+    /// is the winner, so the preinstall provisions auth for it before restore.
+    #[tokio::test]
+    async fn replacement_saved_model_preinstalls_when_no_explicit_cli_model() -> Result<(), String>
+    {
+        let runtime = ModelRuntime::create_in_memory()
+            .await
+            .map_err(|error| format!("failed to create in-memory model runtime: {error}"))?;
+        let saved_model = runtime
+            .get_models(None)
+            .into_iter()
+            .next()
+            .ok_or_else(|| "built-in model catalog is empty".to_owned())?;
+
+        // No explicit CLI model: the gate allows the saved-provider preinstall.
+        preinstall_saved_session_api_key(Some("sk-saved"), None, Some(&saved_model), &runtime)
+            .await?;
+        assert!(runtime.has_configured_auth(&saved_model.provider));
+
+        let mut diagnostics = Vec::new();
+        apply_cli_api_key(
+            Some("sk-saved"),
             Some(&saved_model),
             &runtime,
             &mut diagnostics,
