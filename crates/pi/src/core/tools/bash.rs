@@ -1278,6 +1278,48 @@ mod tests {
         }
     }
 
+    /// Scripted backend that gates the second chunk behind a `Notify` so the
+    /// test can prove chunk 2 lands inside the throttle window.
+    #[derive(Clone)]
+    struct SyncedBashOperations {
+        first: Vec<u8>,
+        second: Vec<u8>,
+        release: Arc<tokio::sync::Notify>,
+        in_window_pause: Duration,
+    }
+
+    impl BashOperations for SyncedBashOperations {
+        fn exec(
+            &self,
+            _command: String,
+            _cwd: PathBuf,
+            mut on_data: Box<dyn FnMut(Vec<u8>) + Send>,
+            _cancel: CancellationToken,
+            _timeout: Option<f64>,
+            _env: HashMap<String, String>,
+        ) -> BoxFuture<'static, Result<Option<i32>, ToolError>> {
+            let first = self.first.clone();
+            let second = self.second.clone();
+            let release = Arc::clone(&self.release);
+            let in_window_pause = self.in_window_pause;
+            async move {
+                on_data(first);
+                if tokio::time::timeout(BASH_UPDATE_THROTTLE * 10, release.notified())
+                    .await
+                    .is_err()
+                {
+                    return Err(ToolError::new(
+                        "test timed out waiting for the first streamed update",
+                    ));
+                }
+                tokio::time::sleep(in_window_pause).await;
+                on_data(second);
+                Ok(Some(0))
+            }
+            .boxed()
+        }
+    }
+
     async fn execute_scripted(
         chunks: Vec<Vec<u8>>,
         pause_between_chunks: Option<Duration>,
@@ -1706,22 +1748,138 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn byte_truncation_notice_and_spill() -> Result<(), Box<dyn std::error::Error>> {
+        // A single unterminated line exceeding the byte limit is the only
+        // shape that sets `lastLinePartial`: truncate_tail takes a UTF-8-safe
+        // suffix of the lone line when nothing else fits. It also trips the
+        // byte (not line) limit and opens a spill file.
+        let dir = tempdir()?;
+        let tool = BashTool::new(dir.path());
+        let blob_size = DEFAULT_MAX_BYTES + 1024;
+        let command = format!("python3 -c \"import sys; sys.stdout.write('x' * {blob_size})\"");
+        let result = tool
+            .execute(
+                "1",
+                json_map(json!({ "command": command }))?,
+                CancellationToken::new(),
+                ToolUpdates::noop(),
+            )
+            .await?;
+        let text = text_of(&result);
+        // The byte-limit partial-line notice shape (format_output
+        // last_line_partial branch):
+        // `[Showing last {size} of line {N} (line is {size}). Full output: {path}]`.
+        assert!(
+            text.contains("[Showing last ") && text.contains(" of line "),
+            "missing byte-limit partial-line notice: {text}"
+        );
+
+        let details = required(result.details.as_object(), "details object missing")?;
+        let truncation = required(
+            details.get("truncation").and_then(Value::as_object),
+            "truncation details missing",
+        )?;
+        assert_eq!(
+            truncation.get("truncatedBy").and_then(Value::as_str),
+            Some("bytes"),
+            "expected byte truncation, got {truncation:?}"
+        );
+        assert_eq!(
+            truncation.get("lastLinePartial").and_then(Value::as_bool),
+            Some(true),
+            "expected lastLinePartial for the lone oversized line, got {truncation:?}"
+        );
+        assert_eq!(
+            truncation.get("totalBytes").and_then(Value::as_u64),
+            Some(blob_size as u64),
+            "expected totalBytes to equal the emitted blob, got {truncation:?}"
+        );
+
+        let details_path = required(
+            details.get("fullOutputPath").and_then(Value::as_str),
+            "details.fullOutputPath missing",
+        )?;
+        // The partial-line notice shape is
+        // `[Showing last {size} of line {N} (line is {size}). Full output: {path}]`.
+        // The path embedded in the notice must be the same spill file
+        // reported in details.fullOutputPath.
+        assert!(
+            text.contains(&format!("). Full output: {details_path}]")),
+            "notice must reference details.fullOutputPath; text={text}, details_path={details_path}"
+        );
+        assert!(
+            Path::new(details_path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("pi-bash-")
+                        && Path::new(name)
+                            .extension()
+                            .is_some_and(|extension| extension.eq_ignore_ascii_case("log"))
+                }),
+            "details_path={details_path}"
+        );
+        assert!(
+            Path::new(details_path).is_file(),
+            "spill missing: {details_path}"
+        );
+        let full = tokio::fs::read(details_path).await?;
+        assert_eq!(full.len(), blob_size);
+        assert!(full.iter().all(|&b| b == b'x'));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pending_throttle_still_delivers_final_partial()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (result, updates) = execute_scripted(
-            vec![b"first\n".to_vec(), b"second\n".to_vec()],
-            Some(BASH_UPDATE_THROTTLE + Duration::from_millis(20)),
-        )
-        .await?;
-        assert_eq!(
-            text_of(
-                updates
-                    .last()
-                    .ok_or_else(|| io::Error::other("missing update"))?
-            ),
-            text_of(&result)
-        );
+        // A synchronized backend gates the second chunk behind a Notify that
+        // the captured-update callback releases once the initial + first
+        // streamed updates have landed, then sleeps for half the throttle
+        // window before emitting chunk 2. Chunk 2 provably lands inside the
+        // throttle window (the pending case) without relying on scheduler
+        // ordering of a bare sleep.
+        let release = Arc::new(tokio::sync::Notify::new());
+        let dir = tempdir()?;
+        let mut options = BashToolOptions::new(dir.path());
+        options.operations = Some(Arc::new(SyncedBashOperations {
+            first: b"first\n".to_vec(),
+            second: b"second\n".to_vec(),
+            release: Arc::clone(&release),
+            in_window_pause: BASH_UPDATE_THROTTLE / 2,
+        }));
+        let tool = BashTool::with_options(options);
+        let updates = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&updates);
+        let release_for_callback = Arc::clone(&release);
+        let stream = ToolUpdates::new(move |partial| {
+            let mut guard = captured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.push(partial);
+            if guard.len() == 2 {
+                release_for_callback.notify_one();
+            }
+        });
+        let result = tool
+            .execute(
+                "1",
+                json_map(json!({ "command": "scripted" }))?,
+                CancellationToken::new(),
+                stream,
+            )
+            .await?;
+        let updates = updates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        // Exactly three updates reach the stream: the initial empty partial,
+        // the partial for "first", and the complete "first\nsecond\n".
+        assert_eq!(updates.len(), 3, "updates={updates:?}");
+        assert_eq!(text_of(&updates[0]), "");
+        assert_eq!(text_of(&updates[1]), "first\n");
+        assert_eq!(text_of(&updates[2]), "first\nsecond\n");
         assert_eq!(text_of(&result), "first\nsecond\n");
+        assert_eq!(text_of(&updates[2]), text_of(&result));
         Ok(())
     }
 
@@ -1743,6 +1901,23 @@ mod tests {
         let (_result, updates) = execute_scripted(vec![b"x\n".to_vec()], None).await?;
         assert_eq!(updates.len(), 2);
         assert_eq!(text_of(&updates[1]), "x\n");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_output_command_emits_single_initial_update()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // A command that produces no output must emit exactly the one initial
+        // empty partial sent at the start of collection. The throttle never
+        // arms (no chunks arrive) and finish_collected_output suppresses the
+        // final snapshot via the ordinary-empty-output dedup, so no second
+        // update should reach the stream.
+        let (result, updates) = execute_scripted(vec![], None).await?;
+        assert_eq!(updates.len(), 1, "updates={updates:?}");
+        assert_eq!(text_of(&updates[0]), "");
+        assert!(updates[0].details.is_null());
+        assert_eq!(text_of(&result), "(no output)");
+        assert!(result.details.is_null());
         Ok(())
     }
 
