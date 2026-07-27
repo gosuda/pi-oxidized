@@ -234,6 +234,114 @@ describe("reconstructProviderData transaction (Cluster C)", () => {
 			rmSync(fixture.root, { recursive: true, force: true });
 		}
 	});
+	test("failed backup rename reports only the primary error and keeps live data", async () => {
+		const catalog: ProviderCatalog = {
+			alpha: { model: { id: "model", v: 1 } },
+		};
+		const fixture = makeFixture(catalog);
+		try {
+			seedLiveData(fixture.dataDir, {
+				"alpha.json": "{\"legacy\":true}\n",
+				"stale.json": "{\"keep-me\":true}\n",
+			});
+			const before = snapshotDir(fixture.dataDir);
+
+			const error = await captureError(
+				reconstructProviderData({
+					repoRoot: fixture.root,
+					catalogPath: fixture.catalogPath,
+					providersDir: fixture.providersDir,
+					dataDir: fixture.dataDir,
+					inversionProof: noopProof,
+					backupLive: async () => {
+						throw new Error("injected backup rename failure");
+					},
+				}),
+			);
+
+			expect(error.message).toBe(
+				"failed to rename live data to backup: injected backup rename failure",
+			);
+			expectSnapshotsEqual(snapshotDir(fixture.dataDir), before);
+			expect(siblingArtifacts(fixture.providersDir)).toEqual([]);
+		} finally {
+			rmSync(fixture.root, { recursive: true, force: true });
+		}
+	});
+	test("blocked publish rollback preserves the known-good backup and reports its path", async () => {
+		const catalog: ProviderCatalog = {
+			alpha: { model: { id: "model", v: 1 } },
+		};
+		const fixture = makeFixture(catalog);
+		try {
+			seedLiveData(fixture.dataDir, {
+				"alpha.json": '{"legacy":true}\n',
+				"stale.json": '{"keep-me":true}\n',
+			});
+			const before = snapshotDir(fixture.dataDir);
+
+			const error = await captureError(
+				reconstructProviderData({
+					repoRoot: fixture.root,
+					catalogPath: fixture.catalogPath,
+					providersDir: fixture.providersDir,
+					dataDir: fixture.dataDir,
+					inversionProof: noopProof,
+					publishStaging: async (_stagingDir, dataDir) => {
+						mkdirSync(dataDir, { recursive: true });
+						throw new Error("injected publish failure after unexpected live path");
+					},
+				}),
+			);
+
+			const primaryMessage =
+				"failed to publish staging directory to live data: injected publish failure after unexpected live path";
+			const primaryOffset = error.message.indexOf(primaryMessage);
+			const restoreOffset = error.message.indexOf("additionally failed to restore live data");
+			expect(primaryOffset).toBeGreaterThanOrEqual(0);
+			expect(restoreOffset).toBeGreaterThan(primaryOffset);
+			const backupName = siblingArtifacts(fixture.providersDir).find((name) =>
+				name.startsWith("data.backup."),
+			);
+			if (backupName === undefined) throw new Error("expected preserved backup after blocked restore");
+			const backupPath = join(fixture.providersDir, backupName);
+			expect(error.message).toContain(backupPath);
+			expectSnapshotsEqual(snapshotDir(backupPath), before);
+			expect(snapshotDir(fixture.dataDir)).toEqual(new Map());
+			expect(siblingArtifacts(fixture.providersDir)).toEqual([backupName]);
+		} finally {
+			rmSync(fixture.root, { recursive: true, force: true });
+		}
+	});
+	test("lock release failure retains the primary reconstruction failure first", async () => {
+		const catalog: ProviderCatalog = {
+			alpha: { model: { id: "model", v: 1 } },
+		};
+		const fixture = makeFixture(catalog);
+		try {
+			const error = await captureError(
+				reconstructProviderData({
+					repoRoot: fixture.root,
+					catalogPath: fixture.catalogPath,
+					providersDir: fixture.providersDir,
+					dataDir: fixture.dataDir,
+					inversionProof: async () => {
+						throw new Error("injected primary reconstruction failure");
+					},
+					releaseLock: async () => {
+						throw new Error("injected lock release failure");
+					},
+				}),
+			);
+
+			const primaryOffset = error.message.indexOf("injected primary reconstruction failure");
+			const releaseOffset = error.message.indexOf("injected lock release failure");
+			expect(primaryOffset).toBeGreaterThanOrEqual(0);
+			expect(releaseOffset).toBeGreaterThan(primaryOffset);
+		} finally {
+			rmSync(fixture.root, { recursive: true, force: true });
+		}
+	});
 
 	test("concurrent same-directory reconstruction preserves original bytes through rollback", async () => {
 		const catalog: ProviderCatalog = {

@@ -66,6 +66,21 @@ export type ReconstructProviderDataOptions = {
 	 */
 	removeBackup?: (backupDir: string) => Promise<void>;
 	/**
+	 * Live-tree backup hook. Defaults to the atomic sibling rename; tests may
+	 * inject a failed backup without moving the live tree.
+	 */
+	backupLive?: (dataDir: string, backupDir: string) => Promise<void>;
+	/**
+	 * Staging publication hook. Defaults to the atomic sibling rename; tests may
+	 * inject a failed publish that leaves an unexpected live path in place.
+	 */
+	publishStaging?: (stagingDir: string, dataDir: string) => Promise<void>;
+	/**
+	 * Lock release hook. Defaults to token-verified lock removal; tests may
+	 * inject cleanup failure without altering the lock protocol itself.
+	 */
+	releaseLock?: (handle: DataDirectoryLockHandle) => Promise<void>;
+	/**
 	 * Bounded lock acquisition: total milliseconds to wait for the data
 	 * directory lock before failing with owner/bounded-wait diagnostics. Must
 	 * be a finite positive integer; defaults to 10_000. A live lock owner is
@@ -589,6 +604,9 @@ export async function reconstructProviderData(
 		inversionProof = defaultInversionProof;
 	}
 	const removeBackup = options.removeBackup ?? removeIfExists;
+	const publishStaging = options.publishStaging ?? rename;
+	const backupLive = options.backupLive ?? rename;
+	const releaseLock = options.releaseLock ?? releaseDataDirectoryLock;
 	const lockAcquireTimeoutMs = options.lockAcquireTimeoutMs ?? DEFAULT_LOCK_ACQUIRE_TIMEOUT_MS;
 	if (!Number.isInteger(lockAcquireTimeoutMs) || lockAcquireTimeoutMs <= 0) {
 		throw new Error(
@@ -618,6 +636,8 @@ export async function reconstructProviderData(
 	}
 
 	const lock = await acquireDataDirectoryLock(dataDir, lockAcquireTimeoutMs);
+	let primaryFailure: unknown = undefined;
+	let hasPrimaryFailure = false;
 	try {
 		const hadLive = await pathExists(dataDir);
 		const stagingDir = uniqueSibling(dataDir, "staging");
@@ -639,9 +659,10 @@ export async function reconstructProviderData(
 			await validateStagingDirectory(stagingDir, wrappers, catalog);
 
 			if (hadLive) {
-				backupDir = uniqueSibling(dataDir, "backup");
+				const candidate = uniqueSibling(dataDir, "backup");
 				try {
-					await rename(dataDir, backupDir);
+					await backupLive(dataDir, candidate);
+					backupDir = candidate;
 				} catch (error) {
 					const detail = error instanceof Error ? error.message : String(error);
 					throw new Error(`failed to rename live data to backup: ${detail}`);
@@ -649,7 +670,7 @@ export async function reconstructProviderData(
 			}
 
 			try {
-				await rename(stagingDir, dataDir);
+				await publishStaging(stagingDir, dataDir);
 				stagingPending = false;
 				published = true;
 			} catch (error) {
@@ -663,6 +684,7 @@ export async function reconstructProviderData(
 		} catch (error) {
 			// Pre-commit only: restore the pre-publish live tree byte-for-byte (or absent).
 			if (!committed) {
+				let restoreFailure: string | null = null;
 				try {
 					if (published) {
 						await removeIfExists(dataDir);
@@ -670,21 +692,27 @@ export async function reconstructProviderData(
 							await rename(backupDir, dataDir);
 							backupDir = null;
 						}
-					} else if (backupDir !== null && !(await pathExists(dataDir))) {
-						await rename(backupDir, dataDir);
-						backupDir = null;
+					} else if (hadLive && backupDir !== null) {
+						if (await pathExists(dataDir)) {
+							restoreFailure = `live data path ${dataDir} is unexpectedly occupied`;
+						} else {
+							await rename(backupDir, dataDir);
+							backupDir = null;
+						}
 					}
 				} catch (restoreError) {
-					const primary = error instanceof Error ? error.message : String(error);
-					const secondary =
-						restoreError instanceof Error ? restoreError.message : String(restoreError);
-					throw new Error(
-						`reconstruction failed (${primary}); additionally failed to restore live data: ${secondary}`,
-					);
+					restoreFailure = errorDetail(restoreError);
 				}
 
 				if (stagingPending) {
 					await removeIfExists(stagingDir);
+				}
+				if (restoreFailure !== null) {
+					const preservedBackup =
+						backupDir === null ? "" : `; preserved known-good backup at ${backupDir}`;
+					throw new Error(
+						`reconstruction failed (${errorDetail(error)}); additionally failed to restore live data: ${restoreFailure}${preservedBackup}`,
+					);
 				}
 				await removeIfExists(backupDir);
 			}
@@ -715,10 +743,21 @@ export async function reconstructProviderData(
 			providers: wrappers,
 			dataDir,
 		};
+	} catch (error) {
+		hasPrimaryFailure = true;
+		primaryFailure = error;
+		throw error;
 	} finally {
 		// Token-verified release: runs even after publish/proof/cleanup failures
 		// above and removes only directories still owned by this acquisition.
-		await releaseDataDirectoryLock(lock);
+		try {
+			await releaseLock(lock);
+		} catch (releaseError) {
+			if (!hasPrimaryFailure) throw releaseError;
+			throw new Error(
+				`reconstruction failed (${errorDetail(primaryFailure)}); additionally failed to release reconstruction lock: ${errorDetail(releaseError)}`,
+			);
+		}
 	}
 }
 
