@@ -1,7 +1,13 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import {
+	assertPinnedBuildScriptContracts,
+	buildProducts,
+	referenceBuildCommands,
+	type PinnedBuildScriptManifests,
+} from "./performance.ts";
 import { PTY_KEYS, type PtyProcess, type PtySnapshot, spawnPty } from "./pty.ts";
 
 // T33: after capturing the first frame, the performance verifier must send
@@ -26,6 +32,62 @@ function temporaryDirectory(prefix: string): string {
 	temporaryPaths.push(path);
 	return path;
 }
+
+function pinnedBuildScriptManifests(): PinnedBuildScriptManifests {
+	const packages = ["tui", "ai", "agent", "coding-agent"] as const;
+	return Object.fromEntries(
+		packages.map((name) => [
+			name,
+			JSON.parse(
+				readFileSync(resolve(import.meta.dirname, "../../.references/pi/packages", name, "package.json"), "utf8"),
+			),
+		]),
+	) as PinnedBuildScriptManifests;
+}
+
+describe("pinned reference build contract", () => {
+	test("accepts the current pinned manifests", () => {
+		expect(() => assertPinnedBuildScriptContracts(pinnedBuildScriptManifests())).not.toThrow();
+	});
+
+	test("keeps generate-models out of the hand-expanded command plan", () => {
+		const commands = referenceBuildCommands("npm", "bun");
+		expect(commands.flatMap((command) => command.argv)).not.toContain("generate-models");
+		expect(commands.map((command) => command.label)).toContain("TypeScript pi ai build (generate-models skipped)");
+	});
+
+	for (const [packageName, script] of [
+		["tui", "build"],
+		["ai", "build"],
+		["agent", "build"],
+		["coding-agent", "build"],
+		["coding-agent", "build:binary"],
+		["coding-agent", "copy-binary-assets"],
+	] as const) {
+		test(`rejects drift in ${packageName} scripts.${script}`, () => {
+			const manifests = pinnedBuildScriptManifests();
+			const manifest = manifests[packageName] as { scripts: Record<string, string> };
+			manifest.scripts[script] = `${manifest.scripts[script]} && echo drift`;
+			expect(() => assertPinnedBuildScriptContracts(manifests)).toThrow(/reference build contract/);
+		});
+	}
+
+	test("rejects manifest drift before executing a build command", async () => {
+		const manifests = pinnedBuildScriptManifests();
+		const manifest = manifests.ai as { scripts: Record<string, string> };
+		manifest.scripts.build = `${manifest.scripts.build} && echo drift`;
+		let commandCount = 0;
+		await expect(
+			buildProducts({
+				manifests,
+				runCommand: async () => {
+					commandCount += 1;
+				},
+			}),
+		).rejects.toThrow(/reference build contract/);
+		expect(commandCount).toBe(0);
+	});
+});
 
 function frameObservation(snapshot: PtySnapshot): { elapsedMs: number; bytes: number } | undefined {
 	let raw = "";

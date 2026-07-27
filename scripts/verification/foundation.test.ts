@@ -15,7 +15,12 @@ import verificationExtension, {
 	VERIFICATION_MODEL,
 	VERIFICATION_PROVIDER,
 } from "./extension.ts";
-import { PTY_KEYS, spawnPty } from "./pty.ts";
+import {
+	MAX_TERMINAL_QUERY_LENGTH,
+	PTY_KEYS,
+	TERMINAL_QUERY_SEQUENCES,
+	spawnPty,
+} from "./pty.ts";
 
 interface RegisteredProvider {
 	readonly models?: readonly { readonly id: string }[];
@@ -162,6 +167,17 @@ describe("verification extension", () => {
 const isWindows = process.platform === "win32";
 const bunExecutable = process.execPath;
 
+test("terminal query set is prefix-free and has a derived maximum length", () => {
+	expect(MAX_TERMINAL_QUERY_LENGTH).toBe(Math.max(...TERMINAL_QUERY_SEQUENCES.map((query) => query.length)));
+	for (let index = 0; index < TERMINAL_QUERY_SEQUENCES.length; index += 1) {
+		const query = TERMINAL_QUERY_SEQUENCES[index];
+		for (const candidate of TERMINAL_QUERY_SEQUENCES.slice(index + 1)) {
+			expect(query.startsWith(candidate)).toBe(false);
+			expect(candidate.startsWith(query)).toBe(false);
+		}
+	}
+});
+
 describe.skipIf(isWindows)("PTY driver", () => {
 	test("preserves hostile argv, timestamps chunks, and exits cleanly", async () => {
 		const root = temporaryDirectory("pi pty ' $() ");
@@ -191,9 +207,9 @@ describe.skipIf(isWindows)("PTY driver", () => {
 		}
 	}, 15_000);
 
-	test("answers fragmented terminal capability queries", async () => {
+	test("answers the longest terminal query when fragmented across chunks", async () => {
 		const expected = Buffer.from(
-			"\x1b[?0u\x1b[?1;2c\x1b[6;16;8t\x1b]11;rgb:0000/0000/0000\x1b\\\x1b[?997;1n\x1b[1;1R",
+			"\x1b]11;rgb:0000/0000/0000\x1b\\\x1b[?0u\x1b[?1;2c\x1b[6;16;8t\x1b[?997;1n\x1b[1;1R",
 		).toString("hex");
 		const script = [
 			"process.stdin.setRawMode?.(true); process.stdin.resume();",
@@ -206,9 +222,9 @@ describe.skipIf(isWindows)("PTY driver", () => {
 			"process.stdout.write(`RESPONSES:${expected}\\n`); process.exit(0);",
 			"}",
 			"});",
-			"process.stdout.write('u\\x1b[c\\x1b[16t\\x1b]11;?\\x07\\x1b[?996n\\x1b[6n');",
+			"process.stdout.write('\\x07\\x1b[?u\\x1b[c\\x1b[16t\\x1b[?996n\\x1b[6n');",
 			"});",
-			"process.stdout.write('\\x1b[?');",
+			"process.stdout.write('\\x1b]11;?');",
 		].join("");
 		const process = spawnPty({
 			argv: [bunExecutable, "-e", script],
@@ -216,7 +232,7 @@ describe.skipIf(isWindows)("PTY driver", () => {
 		});
 		try {
 			await process.waitFor(
-				(snapshot) => snapshot.rawText.includes("\x1b[?"),
+				(snapshot) => snapshot.rawText.includes("\x1b]11;?"),
 				{ deadlineMs: 5_000, source: "raw" },
 			);
 			process.writeKeys("x");
@@ -225,6 +241,82 @@ describe.skipIf(isWindows)("PTY driver", () => {
 				source: "raw",
 			});
 			expect(snapshot.rawText).toContain(`RESPONSES:${expected}`);
+			expect(await process.waitForExit(5_000)).toBe(0);
+		} finally {
+			await process.terminate();
+		}
+	}, 15_000);
+
+	test("answers every terminal query once after a long non-query prefix", async () => {
+		const queries = "\x1b[?u\x1b[c\x1b[16t\x1b]11;?\x07\x1b[?996n\x1b[6n";
+		const expected = Buffer.from(
+			"\x1b[?0u\x1b[?1;2c\x1b[6;16;8t\x1b]11;rgb:0000/0000/0000\x1b\\\x1b[?997;1n\x1b[1;1R",
+		).toString("hex");
+		const script = [
+			"process.stdin.setRawMode?.(true); process.stdin.resume();",
+			`const expected = Buffer.from("${expected}", "hex");`,
+			"const confirmation = Buffer.from('CONFIRM');",
+			"let input = Buffer.alloc(0);",
+			"let ready = false;",
+			"process.stdin.on('data', (chunk) => {",
+			"input = Buffer.concat([input, chunk]);",
+			"if (!ready && input.length >= expected.length) { ready = true; process.stdout.write('INPUT_READY\\n'); }",
+			"if (!ready || input.length < confirmation.length || !input.subarray(-confirmation.length).equals(confirmation)) return;",
+			"const responses = input.subarray(0, input.length - confirmation.length);",
+			"if (responses.equals(expected)) { process.stdout.write(`RESPONSES:${expected.toString('hex')}\\n`); process.exit(0); }",
+			"process.stdout.write(`UNEXPECTED:${input.toString('hex')}\\n`); process.exit(1);",
+			"});",
+			`process.stdout.write("x".repeat(${256 * 1024}) + ${JSON.stringify(queries)});`,
+		].join("");
+		const process = spawnPty({
+			argv: [bunExecutable, "-e", script],
+			cwd: temporaryDirectory("pi-verification-terminal-query-prefix-"),
+		});
+		try {
+			await process.waitFor(/INPUT_READY/, { deadlineMs: 10_000, source: "raw" });
+			process.writeKeys("CONFIRM");
+			const snapshot = await process.waitFor(/RESPONSES:|UNEXPECTED:/, {
+				deadlineMs: 5_000,
+				source: "raw",
+			});
+			expect(snapshot.rawText).toContain(`RESPONSES:${expected}`);
+			expect(snapshot.rawText).not.toContain("UNEXPECTED:");
+			expect(await process.waitForExit(5_000)).toBe(0);
+		} finally {
+			await process.terminate();
+		}
+	}, 20_000);
+
+	test("does not answer an incomplete terminal-query tail", async () => {
+		const script = [
+			"process.stdin.setRawMode?.(true); process.stdin.resume();",
+			"const confirmation = Buffer.from('CONFIRM');",
+			"let input = Buffer.alloc(0);",
+			"process.stdin.on('data', (chunk) => {",
+			"input = Buffer.concat([input, chunk]);",
+			"if (input.length < confirmation.length || !input.subarray(-confirmation.length).equals(confirmation)) return;",
+			"const responses = input.subarray(0, input.length - confirmation.length);",
+			"if (responses.length === 0) { process.stdout.write('NO_RESPONSE\\n'); process.exit(0); }",
+			"process.stdout.write(`UNEXPECTED:${input.toString('hex')}\\n`); process.exit(1);",
+			"});",
+			"process.stdout.write('\\x1b]11;?');",
+		].join("");
+		const process = spawnPty({
+			argv: [bunExecutable, "-e", script],
+			cwd: temporaryDirectory("pi-verification-terminal-query-tail-"),
+		});
+		try {
+			await process.waitFor(
+				(snapshot) => snapshot.rawText.includes("\x1b]11;?"),
+				{ deadlineMs: 5_000, source: "raw" },
+			);
+			process.writeKeys("CONFIRM");
+			const snapshot = await process.waitFor(/NO_RESPONSE|UNEXPECTED:/, {
+				deadlineMs: 5_000,
+				source: "raw",
+			});
+			expect(snapshot.rawText).toContain("NO_RESPONSE");
+			expect(snapshot.rawText).not.toContain("UNEXPECTED:");
 			expect(await process.waitForExit(5_000)).toBe(0);
 		} finally {
 			await process.terminate();

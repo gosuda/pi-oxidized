@@ -49,6 +49,66 @@ const TYPESCRIPT_SOURCE_ROOTS = [
 	".references/pi/packages/tui",
 	".references/pi/packages/coding-agent",
 ] as const;
+const PINNED_REFERENCE_PACKAGE_NAMES = ["tui", "ai", "agent", "coding-agent"] as const;
+type PinnedReferencePackageName = (typeof PINNED_REFERENCE_PACKAGE_NAMES)[number];
+
+const PINNED_REFERENCE_PACKAGE_PATHS: Readonly<Record<PinnedReferencePackageName, string>> = {
+	tui: ".references/pi/packages/tui/package.json",
+	ai: ".references/pi/packages/ai/package.json",
+	agent: ".references/pi/packages/agent/package.json",
+	"coding-agent": ".references/pi/packages/coding-agent/package.json",
+};
+
+const PINNED_BUILD_SCRIPT_CONTRACTS: Readonly<
+	Record<PinnedReferencePackageName, Readonly<Record<string, readonly string[]>>>
+> = {
+	tui: {
+		build: ["tsgo -p tsconfig.build.json"],
+	},
+	ai: {
+		build: [
+			"npm run generate-models",
+			"tsgo -p tsconfig.build.json",
+			"shx rm -rf dist/providers/data",
+			"shx cp -r src/providers/data dist/providers/data",
+		],
+	},
+	agent: {
+		build: ["tsgo -p tsconfig.build.json"],
+	},
+	"coding-agent": {
+		build: [
+			"tsgo -p tsconfig.build.json",
+			"shx chmod +x dist/cli.js dist/rpc-entry.js",
+			"npm run copy-assets",
+		],
+		"build:binary": [
+			"npm --prefix ../tui run build",
+			"npm --prefix ../ai run build",
+			"npm --prefix ../agent run build",
+			"npm run build",
+			"bun build --compile ./dist/bun/cli.js ./src/utils/image-resize-worker.ts --outfile dist/pi",
+			"npm run copy-binary-assets",
+		],
+		"copy-binary-assets": [
+			"shx cp package.json dist/",
+			"shx cp README.md dist/",
+			"shx cp CHANGELOG.md dist/",
+			"shx mkdir -p dist/theme",
+			"shx cp src/modes/interactive/theme/*.json dist/theme/",
+			"shx mkdir -p dist/assets",
+			"shx cp src/modes/interactive/assets/*.png dist/assets/",
+			"shx mkdir -p dist/export-html/vendor",
+			"shx cp src/core/export-html/template.html dist/export-html/",
+			"shx cp src/core/export-html/vendor/*.js dist/export-html/vendor/",
+			"shx cp -r docs dist/",
+			"shx cp -r examples dist/",
+			"shx cp ../../node_modules/@silvia-odwyer/photon-node/photon_rs_bg.wasm dist/",
+		],
+	},
+};
+
+export type PinnedBuildScriptManifests = Readonly<Record<PinnedReferencePackageName, unknown>>;
 const SOURCE_IGNORED_DIRECTORIES: Record<string, true> = {
 	".git": true,
 	coverage: true,
@@ -156,10 +216,15 @@ interface KeypressSample {
 	readonly synchronizedFramesObserved: number;
 }
 
-interface CommandRecord {
+export interface CommandRecord {
 	readonly label: string;
 	readonly cwd: string;
 	readonly argv: readonly string[];
+}
+
+export interface BuildProductsOptions {
+	readonly manifests?: PinnedBuildScriptManifests;
+	readonly runCommand?: (record: CommandRecord) => Promise<void>;
 }
 
 interface FileRecord {
@@ -240,6 +305,129 @@ function errorMessage(error: Error | string): string {
 	return typeof error === "string" ? error : error.message;
 }
 
+
+function referenceBuildContractFailure(detail: string): never {
+	throw new HarnessFailure("reference-build-contract", `pinned reference build contract: ${detail}`);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function scriptsFromManifest(
+	packageName: PinnedReferencePackageName,
+	manifest: unknown,
+): Readonly<Record<string, string>> {
+	if (!isRecord(manifest)) {
+		return referenceBuildContractFailure(`${packageName} package.json must be an object`);
+	}
+	const { scripts } = manifest;
+	if (!isRecord(scripts)) {
+		return referenceBuildContractFailure(`${packageName} package.json scripts must be an object`);
+	}
+	const result: Record<string, string> = {};
+	for (const [name, command] of Object.entries(scripts)) {
+		if (typeof command !== "string") {
+			return referenceBuildContractFailure(`${packageName} scripts.${name} must be a string`);
+		}
+		result[name] = command;
+	}
+	return result;
+}
+
+export function assertPinnedBuildScriptContracts(manifests: PinnedBuildScriptManifests): void {
+	for (const packageName of PINNED_REFERENCE_PACKAGE_NAMES) {
+		const scripts = scriptsFromManifest(packageName, manifests[packageName]);
+		for (const [scriptName, expectedFragments] of Object.entries(PINNED_BUILD_SCRIPT_CONTRACTS[packageName])) {
+			const actual = scripts[scriptName];
+			const actualFragments = actual?.split(" && ");
+			if (
+				actualFragments === undefined ||
+				actualFragments.length !== expectedFragments.length ||
+				actualFragments.some((fragment, index) => fragment !== expectedFragments[index])
+			) {
+				return referenceBuildContractFailure(
+					`${packageName} scripts.${scriptName} drifted; expected ${JSON.stringify(expectedFragments)}, found ${JSON.stringify(actual)}`,
+				);
+			}
+		}
+	}
+}
+
+function loadPinnedBuildScriptManifests(): PinnedBuildScriptManifests {
+	const manifests = {} as Record<PinnedReferencePackageName, unknown>;
+	for (const packageName of PINNED_REFERENCE_PACKAGE_NAMES) {
+		const path = resolve(REPOSITORY_ROOT, PINNED_REFERENCE_PACKAGE_PATHS[packageName]);
+		try {
+			manifests[packageName] = JSON.parse(readFileSync(path, "utf8"));
+		} catch (error) {
+			const detail = error instanceof Error ? error.message : String(error);
+			return referenceBuildContractFailure(`could not parse ${relative(REPOSITORY_ROOT, path)}: ${detail}`);
+		}
+	}
+	return manifests;
+}
+
+export function referenceBuildCommands(npm: string, bun: string): readonly CommandRecord[] {
+	const refRoot = resolve(REPOSITORY_ROOT, ".references/pi");
+	const tsgo = resolve(refRoot, "node_modules/.bin/tsgo");
+	const shx = resolve(refRoot, "node_modules/.bin/shx");
+	return [
+		{
+			label: "TypeScript pi locked dependency install",
+			cwd: refRoot,
+			argv: [npm, "ci", "--ignore-scripts"],
+		},
+		{
+			label: "TypeScript pi tui build",
+			cwd: resolve(refRoot, "packages/tui"),
+			argv: [tsgo, "-p", "tsconfig.build.json"],
+		},
+		{
+			label: "TypeScript pi ai build (generate-models skipped)",
+			cwd: resolve(refRoot, "packages/ai"),
+			argv: [tsgo, "-p", "tsconfig.build.json"],
+		},
+		{
+			label: "TypeScript pi ai data staging",
+			cwd: resolve(refRoot, "packages/ai"),
+			argv: [shx, "rm", "-rf", "dist/providers/data"],
+		},
+		{
+			label: "TypeScript pi ai data copy",
+			cwd: resolve(refRoot, "packages/ai"),
+			argv: [shx, "cp", "-r", "src/providers/data", "dist/providers/data"],
+		},
+		{
+			label: "TypeScript pi agent build",
+			cwd: resolve(refRoot, "packages/agent"),
+			argv: [tsgo, "-p", "tsconfig.build.json"],
+		},
+		{
+			label: "TypeScript pi coding-agent build",
+			cwd: resolve(refRoot, "packages/coding-agent"),
+			argv: [npm, "run", "build"],
+		},
+		{
+			label: "TypeScript pi binary compile",
+			cwd: resolve(refRoot, "packages/coding-agent"),
+			argv: [
+				bun,
+				"build",
+				"--compile",
+				"./dist/bun/cli.js",
+				"./src/utils/image-resize-worker.ts",
+				"--outfile",
+				"dist/pi",
+			],
+		},
+		{
+			label: "TypeScript pi binary assets",
+			cwd: resolve(refRoot, "packages/coding-agent"),
+			argv: [npm, "run", "copy-binary-assets"],
+		},
+	];
+}
 function requiredExecutable(name: string): string {
 	const path = Bun.which(name);
 	if (!path) throw new HarnessFailure("prerequisite", `required executable not found on PATH: ${name}`);
@@ -1165,16 +1353,18 @@ function writeArtifact(): void {
 	writeFileSync(ARTIFACT_PATH, `${JSON.stringify(artifact, null, 2)}\n`, "utf8");
 }
 
-async function buildProducts(): Promise<void> {
+export async function buildProducts(options: BuildProductsOptions = {}): Promise<void> {
+	assertPinnedBuildScriptContracts(options.manifests ?? loadPinnedBuildScriptManifests());
+	const runCommand = options.runCommand ?? runCheckedCommand;
 	const cargo = requiredExecutable("cargo");
 	const npm = requiredExecutable("npm");
 	const bun = requiredExecutable("bun");
-	await runCheckedCommand({
+	await runCommand({
 		label: "Rust pi release build",
 		cwd: REPOSITORY_ROOT,
 		argv: [cargo, "build", "-p", "pi", "--release", "--locked"],
 	});
-	await runCheckedCommand({
+	await runCommand({
 		label: "Rust extension host release build",
 		cwd: REPOSITORY_ROOT,
 		argv: [
@@ -1187,68 +1377,13 @@ async function buildProducts(): Promise<void> {
 			HOST_BUILD_ROOT,
 		],
 	});
-	await runCheckedCommand({
-		label: "TypeScript pi locked dependency install",
-		cwd: resolve(REPOSITORY_ROOT, ".references/pi"),
-		argv: [npm, "ci", "--ignore-scripts"],
-	});
 	// Offline replacement for the upstream `build:binary` chain: the ai
 	// package's build starts with `npm run generate-models`, which fetches
 	// live provider catalogs (forbidden here) and mutates the reference tree.
 	// main() already provisioned the gitignored provider data (with the
 	// inversion proof) before fingerprinting; run the same compile steps the
 	// upstream chain would, minus the generator.
-	const refRoot = resolve(REPOSITORY_ROOT, ".references/pi");
-	const tsgo = resolve(refRoot, "node_modules/.bin/tsgo");
-	const shx = resolve(refRoot, "node_modules/.bin/shx");
-	await runCheckedCommand({
-		label: "TypeScript pi tui build",
-		cwd: resolve(refRoot, "packages/tui"),
-		argv: [tsgo, "-p", "tsconfig.build.json"],
-	});
-	await runCheckedCommand({
-		label: "TypeScript pi ai build (generate-models skipped)",
-		cwd: resolve(refRoot, "packages/ai"),
-		argv: [tsgo, "-p", "tsconfig.build.json"],
-	});
-	await runCheckedCommand({
-		label: "TypeScript pi ai data staging",
-		cwd: resolve(refRoot, "packages/ai"),
-		argv: [shx, "rm", "-rf", "dist/providers/data"],
-	});
-	await runCheckedCommand({
-		label: "TypeScript pi ai data copy",
-		cwd: resolve(refRoot, "packages/ai"),
-		argv: [shx, "cp", "-r", "src/providers/data", "dist/providers/data"],
-	});
-	await runCheckedCommand({
-		label: "TypeScript pi agent build",
-		cwd: resolve(refRoot, "packages/agent"),
-		argv: [tsgo, "-p", "tsconfig.build.json"],
-	});
-	await runCheckedCommand({
-		label: "TypeScript pi coding-agent build",
-		cwd: resolve(refRoot, "packages/coding-agent"),
-		argv: [npm, "run", "build"],
-	});
-	await runCheckedCommand({
-		label: "TypeScript pi binary compile",
-		cwd: resolve(refRoot, "packages/coding-agent"),
-		argv: [
-			bun,
-			"build",
-			"--compile",
-			"./dist/bun/cli.js",
-			"./src/utils/image-resize-worker.ts",
-			"--outfile",
-			"dist/pi",
-		],
-	});
-	await runCheckedCommand({
-		label: "TypeScript pi binary assets",
-		cwd: resolve(refRoot, "packages/coding-agent"),
-		argv: [npm, "run", "copy-binary-assets"],
-	});
+	for (const command of referenceBuildCommands(npm, bun)) await runCommand(command);
 	artifact.build.artifacts = {
 		rustPi: fileRecord(RUST_BINARY),
 		typescriptPi: fileRecord(TYPESCRIPT_BINARY),
@@ -1259,6 +1394,8 @@ async function buildProducts(): Promise<void> {
 }
 
 async function main(): Promise<void> {
+	const pinnedBuildScriptManifests = loadPinnedBuildScriptManifests();
+	assertPinnedBuildScriptContracts(pinnedBuildScriptManifests);
 	artifact.machine = machineMetadata();
 	const ticksPerSecond = clockTicksPerSecond();
 	const python = requiredExecutable("python3");
@@ -1296,7 +1433,7 @@ async function main(): Promise<void> {
 		streamChunkDelayMs: STREAM_CHUNK_DELAY_MS,
 	};
 
-	await buildProducts();
+	await buildProducts({ manifests: pinnedBuildScriptManifests });
 
 	const versionSamples = await collectVersionSamples(python, ticksPerSecond);
 	const versionSummary = {
@@ -1476,19 +1613,21 @@ async function main(): Promise<void> {
 	process.stdout.write(`check 9 passed; artifact: ${ARTIFACT_PATH}\n`);
 }
 
-try {
-	await main();
-} catch (error) {
-	const failure = error instanceof Error ? error : new Error(String(error));
-	if (!(failure instanceof ThresholdFailure)) {
-		const stage = failure instanceof HarnessFailure ? failure.stage : "unexpected";
-		artifact.pass = false;
-		artifact.blockers = [`${stage}: ${failure.message}`];
-		artifact.failure = { stage, message: failure.message };
-		writeArtifact();
+if (import.meta.main) {
+	try {
+		await main();
+	} catch (error) {
+		const failure = error instanceof Error ? error : new Error(String(error));
+		if (!(failure instanceof ThresholdFailure)) {
+			const stage = failure instanceof HarnessFailure ? failure.stage : "unexpected";
+			artifact.pass = false;
+			artifact.blockers = [`${stage}: ${failure.message}`];
+			artifact.failure = { stage, message: failure.message };
+			writeArtifact();
+		}
+		process.stderr.write(`check 9 failed:\n${failure.message}\nartifact: ${ARTIFACT_PATH}\n`);
+		process.exitCode = 1;
+	} finally {
+		for (const path of temporaryDirectories) rmSync(path, { recursive: true, force: true });
 	}
-	process.stderr.write(`check 9 failed:\n${failure.message}\nartifact: ${ARTIFACT_PATH}\n`);
-	process.exitCode = 1;
-} finally {
-	for (const path of temporaryDirectories) rmSync(path, { recursive: true, force: true });
 }

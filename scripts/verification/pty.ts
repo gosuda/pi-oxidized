@@ -53,10 +53,11 @@ const TERMINAL_QUERY_RESPONSES: Readonly<Record<string, string>> = {
 	"\x1b]11;?\x07": "\x1b]11;rgb:0000/0000/0000\x1b\\",
 	"\x1b[?996n": "\x1b[?997;1n",
 };
-const TERMINAL_QUERY_SEQUENCES = [
+export const TERMINAL_QUERY_SEQUENCES = [
 	...Object.keys(TERMINAL_QUERY_RESPONSES),
 	CURSOR_POSITION_QUERY,
-];
+] as const;
+export const MAX_TERMINAL_QUERY_LENGTH = Math.max(...TERMINAL_QUERY_SEQUENCES.map((query) => query.length));
 
 interface InputWrite {
 	readonly text: string;
@@ -319,9 +320,10 @@ export class PtyProcess {
 				continue;
 			}
 
-			const suffix = this.#rawText.slice(this.#terminalQueryScanOffset);
-			if (TERMINAL_QUERY_SEQUENCES.some((query) => query.startsWith(suffix))) {
-				return;
+			const remaining = this.#rawText.length - this.#terminalQueryScanOffset;
+			if (remaining < MAX_TERMINAL_QUERY_LENGTH) {
+				const tail = this.#rawText.slice(this.#terminalQueryScanOffset);
+				if (TERMINAL_QUERY_SEQUENCES.some((query) => query.startsWith(tail))) return;
 			}
 			this.#terminalQueryScanOffset += 1;
 		}
