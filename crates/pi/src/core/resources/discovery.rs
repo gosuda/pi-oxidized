@@ -19,6 +19,7 @@ use thiserror::Error;
 use crate::core::config::{
     CONFIG_DIR_NAME, PathInputOptions, canonicalize_path, is_local_path, resolve_path_with,
 };
+use crate::core::extension_manifest::MANIFEST_FILE_NAME;
 use crate::core::resources::source_info::{SourceOrigin, SourceScope};
 use crate::core::settings::{PackageSource, PackageSourceFilter, Settings, SettingsManager};
 
@@ -1834,6 +1835,12 @@ fn collect_nonrecursive_entries(dir: &Path, file_pred: impl Fn(&str) -> bool) ->
 }
 
 fn resolve_extension_entries(dir: &Path) -> Option<Vec<String>> {
+    // Manifest roots must reach strict extension classification before
+    // package.json and index-file conventions can select a different entry.
+    if dir.join(MANIFEST_FILE_NAME).exists() {
+        return Some(vec![path_to_string(dir)]);
+    }
+
     let package_json = dir.join("package.json");
     if package_json.exists()
         && let Some(manifest) = read_pi_manifest(dir)
@@ -2411,6 +2418,28 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert!(entries[0].ends_with("SKILL.md"));
         assert!(!entries[0].contains("nested"));
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_extension_directory_wins_over_package_and_index_fallbacks() -> TestResult {
+        let root = temp_root("manifest-extension")?;
+        let extension = root.join("native");
+        fs::create_dir_all(&extension)?;
+        fs::write(extension.join(MANIFEST_FILE_NAME), "{}")?;
+        fs::write(
+            extension.join("package.json"),
+            r#"{"pi":{"extensions":["package.ts"]}}"#,
+        )?;
+        fs::write(extension.join("package.ts"), "export default {}")?;
+        fs::write(extension.join("index.ts"), "export default {}")?;
+
+        assert_eq!(
+            collect_auto_extension_entries(&root),
+            vec![path_to_string(&extension)]
+        );
+
         let _ = fs::remove_dir_all(root);
         Ok(())
     }

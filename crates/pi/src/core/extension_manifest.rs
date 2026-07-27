@@ -268,13 +268,16 @@ fn classify_directory(path: &Path, target: &str) -> Result<ClassifiedExtension, 
     };
     let manifest = parse_manifest(&manifest_path, &text)?;
     let entry = resolve_entry(&manifest_path, &root, &manifest.entry, target)?;
-    if manifest.mode == ExtensionMode::Lean
-        && entry.extension() != Some(std::ffi::OsStr::new("mjs"))
-    {
-        return Err(ManifestError::new(
-            &manifest_path,
-            ManifestErrorKind::LeanEntryNotPrebundled,
-        ));
+    if manifest.mode == ExtensionMode::Lean {
+        let metadata = std::fs::metadata(&entry).map_err(|error| {
+            ManifestError::new(&manifest_path, ManifestErrorKind::Io(error.to_string()))
+        })?;
+        if entry.extension() != Some(std::ffi::OsStr::new("mjs")) || !metadata.is_file() {
+            return Err(ManifestError::new(
+                &manifest_path,
+                ManifestErrorKind::LeanEntryNotPrebundled,
+            ));
+        }
     }
     if manifest.mode == ExtensionMode::Native {
         // Follow symlinks (`metadata`, not `symlink_metadata`) so a link to
@@ -728,6 +731,21 @@ mod tests {
             ),
             "loader diagnostic missing from Display: {error}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn lean_mjs_directory_is_rejected_as_not_prebundled() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let dir = extension_dir(
+            &temp,
+            "lean-mjs-directory",
+            &manifest_json("lean-mjs-directory", "ts-lean", "\"dist/main.mjs\""),
+            &[],
+        )?;
+        std::fs::create_dir_all(dir.join("dist/main.mjs"))?;
+        let kind = expect_kind(classify_extension(&dir, TARGET))?;
+        assert_eq!(kind, ManifestErrorKind::LeanEntryNotPrebundled);
         Ok(())
     }
 

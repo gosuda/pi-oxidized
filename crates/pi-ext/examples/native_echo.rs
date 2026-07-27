@@ -43,6 +43,8 @@ use pi_ext::server::{
 
 const TOOL_NAME: &str = "native_echo";
 const PROVIDER_NAME: &str = "native_echo";
+const MODEL_ID: &str = "native-echo";
+const PROVIDER_BASE_URL: &str = "native://example";
 const TICK: Duration = Duration::from_millis(10);
 
 /// Strict JSON Schema the host advertises for `native_echo`.
@@ -64,7 +66,7 @@ fn snapshot() -> RegistrySnapshot {
     RegistrySnapshot {
         tools: vec![ToolSnapshotEntry {
             name: TOOL_NAME.to_owned(),
-            label: "native_echo".to_owned(),
+            label: TOOL_NAME.to_owned(),
             description: "Echoes the supplied `text` argument back to the model.".to_owned(),
             parameters: parameters_schema(),
             execution_mode: None,
@@ -72,7 +74,14 @@ fn snapshot() -> RegistrySnapshot {
         providers: vec![ProviderSnapshotEntry {
             name: PROVIDER_NAME.to_owned(),
             stream_simple: true,
+            base_url: Some(PROVIDER_BASE_URL.to_owned()),
+            api: Some(PROVIDER_NAME.to_owned()),
             display_name: Some("Native echo".to_owned()),
+            models: Some(json!([{
+                "id": MODEL_ID,
+                "name": "Native Echo Model",
+                "api": PROVIDER_NAME,
+            }])),
             extension_path: Some("native://example".to_owned()),
             ..ProviderSnapshotEntry::default()
         }],
@@ -109,6 +118,53 @@ async fn tick_or_cancel(cancel: &CancellationToken) -> Result<(), ExtensionFault
         () = cancel.cancelled() => Err(ExtensionFault::new("cancelled", "extension tool cancelled")),
         () = sleep(TICK) => Ok(()),
     }
+}
+
+fn provider_stream_events(
+    call: &ProviderStreamCall,
+) -> Result<Vec<AssistantMessageEvent>, ExtensionFault> {
+    if call.provider_id != PROVIDER_NAME {
+        return Err(ExtensionFault::not_found(format!(
+            "Provider not found: {}",
+            call.provider_id
+        )));
+    }
+    let model = call
+        .model
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or(MODEL_ID);
+    let mut message = AssistantMessage::new(PROVIDER_NAME, PROVIDER_NAME, model, 0);
+    let mut stream = vec![
+        AssistantMessageEvent::Start {
+            partial: message.clone(),
+        },
+        AssistantMessageEvent::TextStart {
+            content_index: 0,
+            partial: message.clone(),
+        },
+    ];
+    let text = "native provider ready";
+    message
+        .content
+        .push(AssistantContent::Text(TextContent::new(text)));
+    stream.extend([
+        AssistantMessageEvent::TextDelta {
+            content_index: 0,
+            delta: text.to_owned(),
+            partial: message.clone(),
+        },
+        AssistantMessageEvent::TextEnd {
+            content_index: 0,
+            content: text.to_owned(),
+            partial: message.clone(),
+        },
+        AssistantMessageEvent::Done {
+            reason: DoneReason::Stop,
+            message,
+        },
+    ]);
+    Ok(stream)
 }
 
 struct NativeEcho;
@@ -190,48 +246,7 @@ impl NativeExtension for NativeEcho {
         cancel: CancellationToken,
     ) -> NativeFuture<Result<Value, ExtensionFault>> {
         async move {
-            if call.provider_id != PROVIDER_NAME {
-                return Err(ExtensionFault::not_found(format!(
-                    "Provider not found: {}",
-                    call.provider_id
-                )));
-            }
-            let model = call
-                .model
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or("native-echo");
-            let mut message = AssistantMessage::new("native-echo", PROVIDER_NAME, model, 0);
-            let mut stream = vec![
-                AssistantMessageEvent::Start {
-                    partial: message.clone(),
-                },
-                AssistantMessageEvent::TextStart {
-                    content_index: 0,
-                    partial: message.clone(),
-                },
-            ];
-            let text = "native provider ready";
-            message
-                .content
-                .push(AssistantContent::Text(TextContent::new(text)));
-            stream.extend([
-                AssistantMessageEvent::TextDelta {
-                    content_index: 0,
-                    delta: text.to_owned(),
-                    partial: message.clone(),
-                },
-                AssistantMessageEvent::TextEnd {
-                    content_index: 0,
-                    content: text.to_owned(),
-                    partial: message.clone(),
-                },
-                AssistantMessageEvent::Done {
-                    reason: DoneReason::Stop,
-                    message,
-                },
-            ]);
-            for event in stream {
+            for event in provider_stream_events(&call)? {
                 if !events.send(event).await {
                     let message = if cancel.is_cancelled() {
                         "native provider cancelled"
@@ -282,6 +297,84 @@ impl NativeExtension for NativeEcho {
             Ok(json!({}))
         }
         .boxed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_echo_provider_is_selectable_and_streams() -> Result<(), Box<dyn std::error::Error>> {
+        let snapshot = snapshot();
+        let tool = snapshot
+            .tools
+            .iter()
+            .find(|tool| tool.name == TOOL_NAME)
+            .ok_or("native echo tool missing from snapshot")?;
+        assert_eq!(tool.label, TOOL_NAME);
+        let provider = snapshot
+            .providers
+            .iter()
+            .find(|provider| provider.name == PROVIDER_NAME)
+            .ok_or("native echo provider missing from snapshot")?;
+        assert!(provider.stream_simple);
+        assert_eq!(provider.api.as_deref(), Some(PROVIDER_NAME));
+        assert_eq!(provider.base_url.as_deref(), Some(PROVIDER_BASE_URL));
+        let models = provider
+            .models
+            .as_ref()
+            .and_then(Value::as_array)
+            .ok_or("native echo provider model catalog missing")?;
+        assert_eq!(
+            models.as_slice(),
+            [json!({
+                "id": MODEL_ID,
+                "name": "Native Echo Model",
+                "api": PROVIDER_NAME,
+            })]
+            .as_slice()
+        );
+
+        let call = ProviderStreamCall {
+            provider_id: PROVIDER_NAME.to_owned(),
+            model: json!({ "id": MODEL_ID }),
+            context: json!({}),
+            options: json!({}),
+        };
+        let events = provider_stream_events(&call)?;
+        assert_eq!(events.len(), 5);
+        let start = match &events[0] {
+            AssistantMessageEvent::Start { partial } => partial,
+            event => return Err(format!("expected provider start, got {event:?}").into()),
+        };
+        assert_eq!(start.api, PROVIDER_NAME);
+        assert_eq!(start.provider, PROVIDER_NAME);
+        assert_eq!(start.model, MODEL_ID);
+        assert!(matches!(
+            &events[2],
+            AssistantMessageEvent::TextDelta { delta, .. } if delta == "native provider ready"
+        ));
+        let terminal = match &events[4] {
+            AssistantMessageEvent::Done { reason, message }
+                if matches!(reason, DoneReason::Stop) =>
+            {
+                message
+            }
+            event => return Err(format!("expected provider terminal event, got {event:?}").into()),
+        };
+        assert_eq!(terminal.api, PROVIDER_NAME);
+        assert_eq!(terminal.provider, PROVIDER_NAME);
+        assert_eq!(terminal.model, MODEL_ID);
+
+        let unknown = ProviderStreamCall {
+            provider_id: "other".to_owned(),
+            ..call
+        };
+        let error =
+            provider_stream_events(&unknown).expect_err("unknown provider must be rejected");
+        assert_eq!(error.code, "not_found");
+        Ok(())
     }
 }
 

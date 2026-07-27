@@ -145,21 +145,46 @@ fn extension_command_source_info(
     path: &str,
     source_infos: &std::collections::HashMap<String, crate::core::resources::SourceInfo>,
 ) -> crate::core::resources::SourceInfo {
-    source_infos.get(path).cloned().unwrap_or_else(|| {
-        create_synthetic_source_info(
-            path,
-            SyntheticSourceInfoOptions {
-                source: if path.starts_with("<inline:") {
-                    "inline".to_owned()
-                } else {
-                    "extension".to_owned()
-                },
-                scope: None,
-                origin: None,
-                base_dir: None,
+    let command_path = std::fs::canonicalize(path).ok();
+    if let Some(command_path) = command_path.as_ref()
+        && let Some((_, source_info)) = source_infos
+            .iter()
+            .filter_map(|(source_path, source_info)| {
+                let source_path = std::fs::canonicalize(source_path)
+                    .or_else(|_| std::fs::canonicalize(&source_info.path))
+                    .ok()?;
+                command_path
+                    .starts_with(&source_path)
+                    .then_some((source_path.components().count(), source_info))
+            })
+            .max_by_key(|(depth, _)| *depth)
+    {
+        let mut source_info = source_info.clone();
+        source_info.path = command_path.to_string_lossy().into_owned();
+        return source_info;
+    }
+
+    let command_entry_path = command_path.map_or_else(
+        || path.to_owned(),
+        |command_path| command_path.to_string_lossy().into_owned(),
+    );
+    if let Some(mut source_info) = source_infos.get(path).cloned() {
+        source_info.path = command_entry_path;
+        return source_info;
+    }
+    create_synthetic_source_info(
+        command_entry_path,
+        SyntheticSourceInfoOptions {
+            source: if path.starts_with("<inline:") {
+                "inline".to_owned()
+            } else {
+                "extension".to_owned()
             },
-        )
-    })
+            scope: None,
+            origin: None,
+            base_dir: None,
+        },
+    )
 }
 
 impl AgentSession {
@@ -1037,6 +1062,67 @@ mod tests {
         assert_eq!(pathless.source, "extension");
         assert_eq!(pathless.scope, SourceScope::Temporary);
         assert_eq!(pathless.origin, SourceOrigin::TopLevel);
+    }
+
+    #[test]
+    fn extension_command_source_info_uses_canonical_path_ancestry() -> TestResult {
+        use crate::core::resources::{SourceInfo, SourceOrigin, SourceScope, path_to_string};
+
+        let temp = tempfile::tempdir()?;
+        let extensions = temp.path().join("extensions");
+        let sibling_prefix = extensions.join("native");
+        let owner = extensions.join("native-sibling");
+        let command = owner.join("dist").join("main.mjs");
+        std::fs::create_dir_all(command.parent().ok_or("command parent")?)?;
+        std::fs::create_dir_all(&sibling_prefix)?;
+        std::fs::write(&command, "")?;
+
+        let extensions = std::fs::canonicalize(&extensions)?;
+        let sibling_prefix = std::fs::canonicalize(&sibling_prefix)?;
+        let owner = std::fs::canonicalize(&owner)?;
+        let command = std::fs::canonicalize(&command)?;
+        let source_infos = HashMap::from([
+            (
+                path_to_string(&extensions),
+                SourceInfo {
+                    path: path_to_string(&extensions),
+                    source: "parent".into(),
+                    scope: SourceScope::Project,
+                    origin: SourceOrigin::TopLevel,
+                    base_dir: Some(path_to_string(temp.path())),
+                },
+            ),
+            (
+                path_to_string(&sibling_prefix),
+                SourceInfo {
+                    path: path_to_string(&sibling_prefix),
+                    source: "sibling-prefix".into(),
+                    scope: SourceScope::Temporary,
+                    origin: SourceOrigin::TopLevel,
+                    base_dir: None,
+                },
+            ),
+            (
+                path_to_string(&owner),
+                SourceInfo {
+                    path: path_to_string(&owner),
+                    source: "manifest-owner".into(),
+                    scope: SourceScope::User,
+                    origin: SourceOrigin::Package,
+                    base_dir: Some(path_to_string(&owner)),
+                },
+            ),
+        ]);
+
+        let command_alias = owner.join("dist").join(".").join("main.mjs");
+        let resolved =
+            extension_command_source_info(command_alias.to_string_lossy().as_ref(), &source_infos);
+        assert_eq!(resolved.path, path_to_string(&command));
+        assert_eq!(resolved.source, "manifest-owner");
+        assert_eq!(resolved.scope, SourceScope::User);
+        assert_eq!(resolved.origin, SourceOrigin::Package);
+        assert_eq!(resolved.base_dir.as_deref(), owner.to_str());
+        Ok(())
     }
 
     #[derive(Clone)]
