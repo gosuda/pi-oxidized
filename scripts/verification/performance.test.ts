@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 import {
 	assertPinnedBuildScriptContracts,
 	buildProducts,
+	frameObservation,
 	HarnessFailure,
 	loadPinnedBuildScriptManifests,
 	referenceBuildCommands,
@@ -12,7 +13,6 @@ import {
 	terminateAndRequireCleanExit,
 } from "./performance.ts";
 import { spawnPty } from "./pty.ts";
-import type { PtySnapshot } from "./pty.ts";
 
 // T33: after capturing the first frame, the performance verifier must send
 // /quit and require a clean process exit. The finally force-kill remains
@@ -132,24 +132,6 @@ test("does not run the benchmark when performance verification is imported", () 
 		}
 	}
 }, 15_000);
-
-function frameObservation(snapshot: PtySnapshot): { elapsedMs: number; bytes: number } | undefined {
-	let raw = "";
-	let bytes = 0;
-	for (const chunk of snapshot.chunks) {
-		if (chunk.stream !== "pty") continue;
-		raw += chunk.text;
-		bytes += chunk.bytes.byteLength;
-		const begin = raw.indexOf(SYNC_BEGIN);
-		if (begin >= 0) {
-			if (raw.indexOf(SYNC_END, begin + SYNC_BEGIN.length) >= 0) {
-				return { elapsedMs: chunk.elapsedMs, bytes };
-			}
-			continue;
-		}
-	}
-	return undefined;
-}
 
 
 // A child that emits a synchronized-output frame and then exits with code 0

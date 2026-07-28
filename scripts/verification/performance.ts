@@ -711,13 +711,13 @@ function stripTerminalSequences(text: string): string {
 		.replace(/[\x00-\x1f\x7f]/g, "");
 }
 
-interface FrameObservation {
+export interface FrameObservation {
 	readonly elapsedMs: number;
 	readonly bytes: number;
 	readonly detection: FirstFrameSample["detection"];
 }
 
-function frameObservation(snapshot: PtySnapshot, chunkOffset = 0): FrameObservation | undefined {
+export function frameObservation(snapshot: PtySnapshot, chunkOffset = 0): FrameObservation | undefined {
 	let raw = "";
 	let bytes = 0;
 	for (const chunk of snapshot.chunks.slice(chunkOffset)) {
