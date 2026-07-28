@@ -1649,8 +1649,11 @@ impl HostExtensionRunner {
     ///
     /// # Errors
     ///
-    /// Returns the first endpoint transport or payload error after all
-    /// remaining endpoints have received the validated values.
+    /// `to_payload` returns an encode error for any number of endpoints. If
+    /// exactly one endpoint exists, transport, decode, and rejection failures
+    /// also return directly. If more than one endpoint exists, the function
+    /// reports each per-endpoint transport, decode, or rejection failure through
+    /// `report_host_error` and continues; these failures do not escape.
     pub async fn apply_flag_values(
         &self,
         values: &BTreeMap<String, FlagValueWire>,
