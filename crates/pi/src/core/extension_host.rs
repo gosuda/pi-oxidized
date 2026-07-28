@@ -206,48 +206,6 @@ impl From<HostClientError> for HostStartError {
     }
 }
 
-/// Path-qualified nonfatal extension-host failure.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExtensionHostDiagnostic {
-    /// Discovery or extension path that owns the failed operation.
-    pub path: String,
-    /// Host, flag, or provider failure detail.
-    pub message: String,
-}
-
-impl ExtensionHostDiagnostic {
-    fn new(path: impl Into<String>, message: impl Into<String>) -> Self {
-        Self {
-            path: path.into(),
-            message: message.into(),
-        }
-    }
-}
-
-impl std::fmt::Display for ExtensionHostDiagnostic {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "Extension \"{}\" error: {}",
-            self.path, self.message
-        )
-    }
-}
-
-/// Replacement host prepared while the current host remains fully live.
-pub struct PreparedHostRestart {
-    runner: Arc<HostExtensionRunner>,
-    diagnostics: Vec<ExtensionHostDiagnostic>,
-}
-
-/// Committed replacement and every nonfatal preparation/commit diagnostic.
-pub struct HostRestartResult {
-    /// Live replacement runner.
-    pub runner: Arc<HostExtensionRunner>,
-    /// Deterministically ordered load, flag, then provider diagnostics.
-    pub diagnostics: Vec<ExtensionHostDiagnostic>,
-}
-
 // ---------------------------------------------------------------------------
 // Registration snapshot wire types (host → Rust load response)
 // ---------------------------------------------------------------------------
@@ -945,9 +903,10 @@ struct EndpointPlan {
     paths: Vec<String>,
     diagnostic_path: String,
     /// Whether this Bun host loads the compact built-in extensions. Exactly
-    /// one compat plan — the first in original plan order — is initially
-    /// designated the builtins owner. Startup promotes the first surviving
-    /// compat plan when that owner fails.
+    /// one compat plan — the first in original plan order — is designated
+    /// the builtins owner; every later compat Bun host is spawned with
+    /// `--no-builtins`. Ownership is fixed at classification time and never
+    /// promoted to another plan when the owner host fails.
     load_builtins: bool,
 }
 
@@ -1251,11 +1210,7 @@ impl HostExtensionRunner {
     where
         F: FnOnce() -> Result<HostSpec, HostError>,
     {
-        let (plans, errors) = classify_endpoint_plans(&extension_paths);
-        let mut diagnostics = errors
-            .into_iter()
-            .map(|(path, message)| ExtensionHostDiagnostic::new(path, message))
-            .collect::<Vec<_>>();
+        let (plans, mut errors) = classify_endpoint_plans(&extension_paths);
         let bun_spec = if plans.iter().any(|plan| plan.mode != ExtensionMode::Native) {
             resolve_bun().map(Some).map_err(|error| error.to_string())
         } else {
@@ -1266,130 +1221,83 @@ impl HostExtensionRunner {
             project_trusted,
             hook_timeout: HOOK_TIMEOUT,
         };
-        let startups = plans
-            .iter()
-            .map(|plan| Self::start_endpoint_plan(plan, &bun_spec, &context));
-        let mut live = Vec::new();
-        let mut builtins_owner_failed = false;
-        for (plan, startup) in plans
-            .iter()
-            .cloned()
-            .zip(futures::future::join_all(startups).await)
-        {
-            match startup {
-                Ok(endpoint) => live.push((plan, endpoint)),
-                Err(diagnostic) => {
-                    builtins_owner_failed |= plan.load_builtins;
-                    diagnostics.push(diagnostic);
+        let startups = plans.into_iter().map(|plan| {
+            let context = context.clone();
+            let spec = match &plan.program {
+                EndpointProgram::Native(executable) => Ok(HostSpec {
+                    source: HostSource::InstalledAsset(executable.clone()),
+                    program: executable.clone(),
+                    args: Vec::new(),
+                }),
+                EndpointProgram::Bun => bun_spec
+                    .as_ref()
+                    .map_err(Clone::clone)
+                    .and_then(|spec| {
+                        spec.clone().ok_or_else(|| {
+                            if plan.mode == ExtensionMode::Lean {
+                                "lean host was not resolved".to_owned()
+                            } else {
+                                "compat host was not resolved".to_owned()
+                            }
+                        })
+                    })
+                    .map(|mut spec| {
+                        if plan.mode == ExtensionMode::Lean {
+                            spec.args.push("--lean".to_owned());
+                        }
+                        if plan.mode == ExtensionMode::Compat && !plan.load_builtins {
+                            spec.args.push("--no-builtins".to_owned());
+                        }
+                        spec
+                    }),
+            };
+            async move {
+                let diagnostic_path = plan.diagnostic_path.clone();
+                let spec = match spec {
+                    Ok(spec) => spec,
+                    Err(error) => {
+                        return Err((
+                            diagnostic_path,
+                            format!("extension host resolution failed: {error}"),
+                        ));
+                    }
+                };
+                let client = match HostClient::spawn(&spec) {
+                    Ok(client) => Arc::new(client),
+                    Err(error) => return Err((diagnostic_path, error.to_string())),
+                };
+                let policy = if plan.mode == ExtensionMode::Compat {
+                    HandshakePolicy::Compat
+                } else {
+                    HandshakePolicy::ProtocolOnly
+                };
+                let startup = Self::connect_endpoint(
+                    plan.id,
+                    Arc::clone(&client),
+                    plan.paths,
+                    &context,
+                    policy,
+                )
+                .await;
+                if startup.is_err() {
+                    let _ = client.shutdown().await;
                 }
+                startup.map_err(|error| (diagnostic_path, error.to_string()))
             }
-        }
-
-        if builtins_owner_failed
-            && let Some(index) = live
-                .iter()
-                .position(|(plan, _)| plan.mode == ExtensionMode::Compat)
-        {
-            let mut promoted_plan = live[index].0.clone();
-            promoted_plan.load_builtins = true;
-            match Self::start_endpoint_plan(&promoted_plan, &bun_spec, &context).await {
-                Ok(promoted) => {
-                    let previous = std::mem::replace(&mut live[index].1, promoted);
-                    let _ = previous.client.shutdown().await;
-                    previous.stale.store(true, Ordering::Relaxed);
-                    live[index].0 = promoted_plan;
-                }
-                Err(diagnostic) => diagnostics.push(diagnostic),
-            }
-        }
-
-        let mut diagnostic_order = HashMap::with_capacity(extension_paths.len());
-        for (index, path) in extension_paths.iter().enumerate() {
-            diagnostic_order.entry(path.as_str()).or_insert(index);
-        }
-        diagnostics.sort_by_key(|diagnostic| {
-            diagnostic_order
-                .get(diagnostic.path.as_str())
-                .copied()
-                .unwrap_or(usize::MAX)
         });
-
+        let mut endpoints = Vec::new();
+        for startup in futures::future::join_all(startups).await {
+            match startup {
+                Ok(endpoint) => endpoints.push(endpoint),
+                Err(error) => errors.push(error),
+            }
+        }
         Ok(Self::from_endpoints(
-            live.into_iter().map(|(_, endpoint)| endpoint).collect(),
-            diagnostics
-                .into_iter()
-                .map(|diagnostic| (diagnostic.path, diagnostic.message))
-                .collect(),
+            endpoints,
+            errors,
             extension_paths,
             &context,
         ))
-    }
-
-    async fn start_endpoint_plan(
-        plan: &EndpointPlan,
-        bun_spec: &Result<Option<HostSpec>, String>,
-        context: &StartContext,
-    ) -> Result<Arc<Endpoint>, ExtensionHostDiagnostic> {
-        let spec = match &plan.program {
-            EndpointProgram::Native(executable) => Ok(HostSpec {
-                source: HostSource::InstalledAsset(executable.clone()),
-                program: executable.clone(),
-                args: Vec::new(),
-            }),
-            EndpointProgram::Bun => bun_spec
-                .as_ref()
-                .map_err(Clone::clone)
-                .and_then(|spec| {
-                    spec.clone().ok_or_else(|| {
-                        if plan.mode == ExtensionMode::Lean {
-                            "lean host was not resolved".to_owned()
-                        } else {
-                            "compat host was not resolved".to_owned()
-                        }
-                    })
-                })
-                .map(|mut spec| {
-                    if plan.mode == ExtensionMode::Lean {
-                        spec.args.push("--lean".to_owned());
-                    }
-                    if plan.mode == ExtensionMode::Compat && !plan.load_builtins {
-                        spec.args.push("--no-builtins".to_owned());
-                    }
-                    spec
-                }),
-        }
-        .map_err(|error| {
-            ExtensionHostDiagnostic::new(
-                plan.diagnostic_path.clone(),
-                format!("extension host resolution failed: {error}"),
-            )
-        })?;
-        let client = Arc::new(HostClient::spawn(&spec).map_err(|error| {
-            ExtensionHostDiagnostic::new(plan.diagnostic_path.clone(), error.to_string())
-        })?);
-        let policy = if plan.mode == ExtensionMode::Compat {
-            HandshakePolicy::Compat
-        } else {
-            HandshakePolicy::ProtocolOnly
-        };
-        match Self::connect_endpoint(
-            plan.id,
-            Arc::clone(&client),
-            plan.paths.clone(),
-            context,
-            policy,
-        )
-        .await
-        {
-            Ok(endpoint) => Ok(endpoint),
-            Err(error) => {
-                let _ = client.shutdown().await;
-                Err(ExtensionHostDiagnostic::new(
-                    plan.diagnostic_path.clone(),
-                    error.to_string(),
-                ))
-            }
-        }
     }
 
     async fn finish_startup(
@@ -1538,18 +1446,9 @@ impl HostExtensionRunner {
                 for name in names {
                     let key = (kind.to_owned(), name.to_owned());
                     if !seen.insert(key.clone()) && reported.insert(key) {
-                        // Shortcuts resolve last-wins: `execute_shortcut` reverse-scans
-                        // the endpoints, and the interactive projection shows the same
-                        // owner. Every other kind keeps first-registration-wins, so the
-                        // diagnostic must not name the wrong owner for shortcuts.
-                        let resolution = if kind == "shortcut" {
-                            "later registration wins"
-                        } else {
-                            "first registration wins"
-                        };
                         errors.push((
                             path.clone(),
-                            format!("duplicate {kind} {name:?}; {resolution}"),
+                            format!("duplicate {kind} {name:?} ignored; first registration wins"),
                         ));
                     }
                 }
@@ -1655,11 +1554,7 @@ impl HostExtensionRunner {
             let Ok(snapshot) = endpoint.snapshot.read() else {
                 continue;
             };
-            for provider in snapshot.registry.providers() {
-                let name = &provider.name;
-                let Some(config) = snapshot.provider_configs.get(name) else {
-                    continue;
-                };
+            for (name, config) in &snapshot.provider_configs {
                 if !seen.insert(name.clone()) {
                     continue;
                 }
@@ -1754,28 +1649,29 @@ impl HostExtensionRunner {
     ///
     /// # Errors
     ///
-    /// Only runner-global request encoding failure returns `Err`. Every
-    /// endpoint transport, decode, or rejection failure is returned as a
-    /// path-qualified diagnostic after all siblings have been attempted.
+    /// `to_payload` returns an encode error for any number of endpoints. If
+    /// exactly one endpoint exists, transport, decode, and rejection failures
+    /// also return directly. If more than one endpoint exists, the function
+    /// reports each per-endpoint transport, decode, or rejection failure through
+    /// `report_host_error` and continues; these failures do not escape.
     pub async fn apply_flag_values(
         &self,
         values: &BTreeMap<String, FlagValueWire>,
-    ) -> Result<Vec<ExtensionHostDiagnostic>, HostClientError> {
-        if values.is_empty() {
-            return Ok(Vec::new());
-        }
-        let payload = protocol::to_payload(&FlagsSetRequest {
-            values: values.clone(),
-        })
-        .map_err(|error| HostClientError::Payload(format!("encode flags.set: {error}")))?;
-        let mut diagnostics = Vec::new();
+    ) -> Result<(), HostClientError> {
         for endpoint in self.endpoints.iter() {
+            if values.is_empty() {
+                continue;
+            }
+            let payload = protocol::to_payload(&FlagsSetRequest {
+                values: values.clone(),
+            })
+            .map_err(|error| HostClientError::Payload(format!("encode flags.set: {error}")))?;
             let outcome = async {
                 let frame = endpoint
-                    .hook_request(protocol::FLAGS_SET_METHOD, payload.clone())
+                    .hook_request(protocol::FLAGS_SET_METHOD, payload)
                     .await?;
                 let response: FlagsSetResponse =
-                    protocol::from_payload(frame.payload).map_err(|error| {
+                    protocol::from_payload(&frame.payload).map_err(|error| {
                         HostClientError::Payload(format!("decode flags.set: {error}"))
                     })?;
                 response.ok.then_some(()).ok_or_else(|| {
@@ -1784,15 +1680,10 @@ impl HostExtensionRunner {
             }
             .await;
             if let Err(error) = outcome {
+                if self.endpoints.len() == 1 {
+                    return Err(error);
+                }
                 endpoint.report_host_error(&self.aggregate, &error);
-                diagnostics.push(ExtensionHostDiagnostic::new(
-                    endpoint
-                        .extension_paths
-                        .first()
-                        .cloned()
-                        .unwrap_or_else(|| "<unknown>".to_owned()),
-                    error.to_string(),
-                ));
                 continue;
             }
             if let Ok(mut flags) = endpoint.flag_values.write() {
@@ -1807,7 +1698,7 @@ impl HostExtensionRunner {
                 }
             }
         }
-        Ok(diagnostics)
+        Ok(())
     }
 
     /// Execute a shortcut on its last raw-owning endpoint.
@@ -2270,6 +2161,68 @@ impl HostExtensionRunner {
         generation
     }
 
+    /// Restart all classified endpoints and restore providers and flags.
+    ///
+    /// # Errors
+    ///
+    /// Returns `HostStartError` when the replacement runner fails to start,
+    /// when a preserved flag value is not a boolean or string
+    /// (`HostStartError::FlagSync`), or when flag synchronization with the
+    /// replacement fails.
+    pub async fn restart_and_rewire(
+        &self,
+        runtime: &ModelRuntime,
+        preserved_flags: HashMap<String, Value>,
+    ) -> Result<Arc<Self>, HostStartError> {
+        self.restart_and_rewire_with(
+            runtime,
+            preserved_flags,
+            |paths, cwd, project_trusted| async move {
+                Self::start_with_cwd_and_trust(paths, cwd, project_trusted).await
+            },
+        )
+        .await
+    }
+
+    async fn restart_and_rewire_with<F, Fut>(
+        &self,
+        runtime: &ModelRuntime,
+        preserved_flags: HashMap<String, Value>,
+        start: F,
+    ) -> Result<Arc<Self>, HostStartError>
+    where
+        F: FnOnce(Vec<String>, String, bool) -> Fut,
+        Fut: std::future::Future<Output = Result<Arc<Self>, HostStartError>>,
+    {
+        self.unregister_providers_from(runtime);
+        let paths = self.discovery_paths.clone();
+        let load_cwd = self.load_cwd.clone();
+        let project_trusted = self.project_trusted;
+        let _ = self.reload().await;
+        let replacement = start(paths, load_cwd, project_trusted).await?;
+        let preserved_flags = preserved_flags
+            .into_iter()
+            .map(|(name, value)| {
+                let value = match value {
+                    Value::Bool(value) => FlagValueWire::Boolean(value),
+                    Value::String(value) => FlagValueWire::String(value),
+                    other => {
+                        return Err(HostStartError::FlagSync(format!(
+                            "flag {name:?} has unsupported value {other}"
+                        )));
+                    }
+                };
+                Ok((name, value))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        replacement
+            .apply_flag_values(&preserved_flags)
+            .await
+            .map_err(|error| HostStartError::FlagSync(error.to_string()))?;
+        let _ = replacement.register_providers_on(runtime);
+        Ok(replacement)
+    }
+
     /// Classify and start extension endpoints with an explicit load directory.
     ///
     /// # Errors
@@ -2322,146 +2275,6 @@ impl HostExtensionRunner {
         )
         .await;
         self.aggregate.dispose_all_slots();
-    }
-
-    /// Prepare a replacement without mutating the current runner or provider registry.
-    pub async fn prepare_restart(
-        &self,
-        preserved_flags: HashMap<String, Value>,
-    ) -> Result<PreparedHostRestart, HostStartError> {
-        self.prepare_restart_with(preserved_flags, |paths, cwd, project_trusted| async move {
-            Self::start_with_cwd_and_trust(paths, cwd, project_trusted).await
-        })
-        .await
-    }
-
-    async fn prepare_restart_with<F, Fut>(
-        &self,
-        preserved_flags: HashMap<String, Value>,
-        start: F,
-    ) -> Result<PreparedHostRestart, HostStartError>
-    where
-        F: FnOnce(Vec<String>, String, bool) -> Fut,
-        Fut: Future<Output = Result<Arc<Self>, HostStartError>>,
-    {
-        self.prepare_restart_with_injected_error(preserved_flags, start, None)
-            .await
-    }
-
-    async fn prepare_restart_with_injected_error<F, Fut>(
-        &self,
-        preserved_flags: HashMap<String, Value>,
-        start: F,
-        injected_flag_error: Option<HostClientError>,
-    ) -> Result<PreparedHostRestart, HostStartError>
-    where
-        F: FnOnce(Vec<String>, String, bool) -> Fut,
-        Fut: Future<Output = Result<Arc<Self>, HostStartError>>,
-    {
-        let preserved_flags = preserved_flags
-            .into_iter()
-            .map(|(name, value)| {
-                let value = match value {
-                    Value::Bool(value) => FlagValueWire::Boolean(value),
-                    Value::String(value) => FlagValueWire::String(value),
-                    other => {
-                        return Err(HostStartError::FlagSync(format!(
-                            "flag {name:?} has unsupported value {other}"
-                        )));
-                    }
-                };
-                Ok((name, value))
-            })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
-        let replacement = start(
-            self.discovery_paths.clone(),
-            self.load_cwd.clone(),
-            self.project_trusted,
-        )
-        .await?;
-        let mut diagnostics = replacement
-            .load_errors()
-            .into_iter()
-            .map(|(path, message)| ExtensionHostDiagnostic::new(path, message))
-            .collect::<Vec<_>>();
-        let flag_outcome = match injected_flag_error {
-            Some(error) => Err(error),
-            None => replacement.apply_flag_values(&preserved_flags).await,
-        };
-        match flag_outcome {
-            Ok(flag_diagnostics) => diagnostics.extend(flag_diagnostics),
-            Err(error) => {
-                replacement.shutdown_once().await;
-                return Err(HostStartError::FlagSync(error.to_string()));
-            }
-        }
-        Ok(PreparedHostRestart {
-            runner: replacement,
-            diagnostics,
-        })
-    }
-
-    #[cfg(test)]
-    async fn prepare_restart_with_fatal_flag_error<F, Fut>(
-        &self,
-        preserved_flags: HashMap<String, Value>,
-        start: F,
-    ) -> Result<PreparedHostRestart, HostStartError>
-    where
-        F: FnOnce(Vec<String>, String, bool) -> Fut,
-        Fut: Future<Output = Result<Arc<Self>, HostStartError>>,
-    {
-        self.prepare_restart_with_injected_error(
-            preserved_flags,
-            start,
-            Some(HostClientError::Payload(
-                "injected fatal flag encoding error".to_owned(),
-            )),
-        )
-        .await
-    }
-
-    #[cfg(test)]
-    async fn restart_and_rewire_with<F, Fut>(
-        &self,
-        runtime: &ModelRuntime,
-        preserved_flags: HashMap<String, Value>,
-        start: F,
-    ) -> Result<Arc<Self>, HostStartError>
-    where
-        F: FnOnce(Vec<String>, String, bool) -> Fut,
-        Fut: Future<Output = Result<Arc<Self>, HostStartError>>,
-    {
-        let prepared = self.prepare_restart_with(preserved_flags, start).await?;
-        Ok(self.commit_restart(runtime, prepared).await.runner)
-    }
-
-    /// Commit a prepared replacement. No operation after provider removal can fail.
-    pub async fn commit_restart(
-        &self,
-        runtime: &ModelRuntime,
-        prepared: PreparedHostRestart,
-    ) -> HostRestartResult {
-        let PreparedHostRestart {
-            runner,
-            mut diagnostics,
-        } = prepared;
-        self.unregister_providers_from(runtime);
-        diagnostics.extend(
-            runner
-                .register_providers_on(runtime)
-                .into_iter()
-                .filter_map(|(path, outcome)| {
-                    outcome
-                        .err()
-                        .map(|error| ExtensionHostDiagnostic::new(path, error.to_string()))
-                }),
-        );
-        let _ = self.reload().await;
-        HostRestartResult {
-            runner,
-            diagnostics,
-        }
     }
 }
 

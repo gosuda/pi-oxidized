@@ -372,19 +372,11 @@ describe("reconstructProviderData transaction (Cluster C)", () => {
 		try {
 			await firstProofReached.promise;
 			let secondProofRan = false;
-			// Deferred barrier: resolves only when the second contender's
-			// onLockWait fires, proving it observed the first owner's held
-			// lock before that owner releases. No wall-clock sleep can
-			// degrade this to sequential execution.
-			const secondObservedHeldLock = Promise.withResolvers<void>();
 			second = reconstructProviderData({
 				repoRoot: fixture.root,
 				catalogPath: fixture.catalogPath,
 				providersDir: fixture.providersDir,
 				dataDir: fixture.dataDir,
-				onLockWait: () => {
-					secondObservedHeldLock.resolve();
-				},
 				inversionProof: async () => {
 					secondProofRan = true;
 					const backup = siblingArtifacts(fixture.providersDir).find((name) =>
@@ -397,9 +389,9 @@ describe("reconstructProviderData transaction (Cluster C)", () => {
 				},
 			});
 
-			// Wait until the second contender is proven to have observed the
-			// held lock; at that moment its proof must not yet have entered.
-			await secondObservedHeldLock.promise;
+			// This integration check needs the competing filesystem operation to run;
+			// fake timers cannot advance the OS-backed mkdir contention.
+			await Bun.sleep(25);
 			const secondProofRanWhileFirstHeld = secondProofRan;
 			releaseFirstProof.resolve();
 			const [firstResult, secondResult] = await Promise.allSettled([first, second]);

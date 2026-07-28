@@ -40,7 +40,6 @@ const TOOL_CALL_NOOP_ENTRY = join(LEAN_FIXTURES, "tool-call-noop.mjs");
 const TOOL_CALL_REORDER_ENTRY = join(LEAN_FIXTURES, "tool-call-reorder.mjs");
 const TOOL_CALL_VALUE_CHANGE_ENTRY = join(LEAN_FIXTURES, "tool-call-value-change.mjs");
 const TOOL_RESULT_TERMINATE_ONLY_ENTRY = join(LEAN_FIXTURES, "tool-result-terminate-only.mjs");
-const FLOW_CONTROL_ENTRY = join(LEAN_FIXTURES, "flow-control.mjs");
 const PRELOAD = resolve(import.meta.dirname, "fixtures", "lean-forbid-compat-graph.ts");
 
 type Marker = { name: string; value: unknown };
@@ -54,7 +53,6 @@ function markerLog(): Marker[] {
 
 afterEach(() => {
 	(globalThis as Record<string, unknown>).__leanEchoLog = [];
-	delete (globalThis as Record<string, unknown>).__leanFlow;
 });
 
 // ---------------------------------------------------------------------------
@@ -75,16 +73,10 @@ class LeanLink {
 	}> = [];
 	readonly runPromise: Promise<void>;
 
-	constructor(options: {
-		cwd: string;
-		extensionPaths: string[];
-		beforeDeliver?: (frames: readonly Frame[]) => void | Promise<void>;
-	}) {
+	constructor(options: { cwd: string; extensionPaths: string[] }) {
 		this.runner = new LeanRunner(this.stdin, {
-			write: async (chunk: Uint8Array) => {
-				const frames = this.decoder.push(chunk);
-				await options.beforeDeliver?.(frames);
-				for (const frame of frames) {
+			write: (chunk: Uint8Array) => {
+				for (const frame of this.decoder.push(chunk)) {
 					this.deliver(frame);
 				}
 			},
@@ -131,10 +123,6 @@ class LeanLink {
 
 	response(id: number, method: string): Promise<Frame> {
 		return this.waitFor((f) => f.id === id && f.kind === "res" && f.method === method);
-	}
-
-	allFrames(): readonly Frame[] {
-		return this.frames;
 	}
 
 	error(id: number, method: string): Promise<Frame> {
@@ -480,75 +468,6 @@ describe("lean: tool RPCs", () => {
 		await link.finish();
 	});
 
-	test("tool updates retain only the latest pending value and stop after terminal", async () => {
-		const releaseFirstUpdate = Promise.withResolvers<void>();
-		const late = Promise.withResolvers<void>();
-		let updateWrites = 0;
-		(globalThis as Record<string, unknown>).__leanFlow = { late };
-		const link = new LeanLink({
-			cwd: PACKAGE_DIR,
-			extensionPaths: [FLOW_CONTROL_ENTRY],
-			beforeDeliver: (frames) => {
-				if (!frames.some((frame) => frame.kind === "event" && frame.method === "toolUpdate")) return;
-				updateWrites++;
-				if (updateWrites === 1) return releaseFirstUpdate.promise;
-			},
-		});
-		await link.hello(1);
-		link.request(2, "extensions.load", { extensionPaths: [FLOW_CONTROL_ENTRY], cwd: PACKAGE_DIR });
-		await link.response(2, "extensions.load");
-		link.request(3, "tool.execute", {
-			name: "many-updates",
-			toolCallId: "updates-1",
-			args: {},
-			prepared: true,
-		});
-		await Promise.resolve();
-		expect(updateWrites).toBe(1);
-
-		releaseFirstUpdate.resolve();
-		await link.response(3, "tool.execute");
-		const updates = link.allFrames().filter(
-			(frame) => frame.id === 3 && frame.kind === "event" && frame.method === "toolUpdate",
-		);
-		expect(updates.map((frame) => payload(frame)["partialResult"])).toEqual([{ index: 0 }, { index: 199 }]);
-		const terminalIndex = link.allFrames().findIndex(
-			(frame) => frame.id === 3 && frame.kind === "res" && frame.method === "tool.execute",
-		);
-		expect(terminalIndex).toBeGreaterThan(link.allFrames().indexOf(updates[1] as Frame));
-
-		late.resolve();
-		await Promise.resolve();
-		expect(link.allFrames().filter(
-			(frame) => frame.id === 3 && frame.kind === "event" && frame.method === "toolUpdate",
-		)).toHaveLength(2);
-		await link.finish();
-	});
-
-	test("tool cancellation stops accepting updates", async () => {
-		const abortGate = Promise.withResolvers<void>();
-		(globalThis as Record<string, unknown>).__leanFlow = { abortGate };
-		const link = new LeanLink({ cwd: PACKAGE_DIR, extensionPaths: [FLOW_CONTROL_ENTRY] });
-		await link.hello(1);
-		link.request(2, "extensions.load", { extensionPaths: [FLOW_CONTROL_ENTRY], cwd: PACKAGE_DIR });
-		await link.response(2, "extensions.load");
-		link.request(3, "tool.execute", {
-			name: "abort-updates",
-			toolCallId: "abort-1",
-			args: {},
-			prepared: true,
-		});
-		await link.waitFor((frame) => frame.id === 3 && frame.kind === "event" && frame.method === "toolUpdate");
-		link.event("tool.cancel", { id: 3 });
-		abortGate.resolve();
-		const terminal = payload(await link.error(3, "tool.execute"));
-		expect(terminal["code"]).toBe("cancelled");
-		expect(link.allFrames().filter(
-			(frame) => frame.id === 3 && frame.kind === "event" && frame.method === "toolUpdate",
-		).map((frame) => payload(frame)["partialResult"])).toEqual([{ index: "accepted" }]);
-		await link.finish();
-	});
-
 	test("slow tool rejects when its signal was already aborted", async () => {
 		// The fixture is selected by the absolute runtime path LeanRunner uses,
 		// so this deliberately crosses the plugin-loading boundary.
@@ -643,64 +562,6 @@ describe("lean: commands, flags, shortcuts, providers", () => {
 			name: "shortcut",
 			value: { cwd: PACKAGE_DIR },
 		});
-		await link.finish();
-	});
-
-	test("shortcut single-flights matching keys while distinct keys overlap", async () => {
-		const started = Promise.withResolvers<void>();
-		const pending: Array<ReturnType<typeof Promise.withResolvers<void>>> = [];
-		const seen: string[] = [];
-		(globalThis as Record<string, unknown>).__leanFlow = {
-			shortcut: (key: string) => {
-				seen.push(key);
-				if (seen.length === 2) started.resolve();
-				const wait = Promise.withResolvers<void>();
-				pending.push(wait);
-				return wait.promise;
-			},
-		};
-		const link = new LeanLink({ cwd: PACKAGE_DIR, extensionPaths: [FLOW_CONTROL_ENTRY] });
-		await link.hello(1);
-		link.request(2, "extensions.load", { extensionPaths: [FLOW_CONTROL_ENTRY], cwd: PACKAGE_DIR });
-		await link.response(2, "extensions.load");
-		link.request(3, "shortcut.execute", { key: "ctrl+repeat" });
-		link.request(4, "shortcut.execute", { key: "ctrl+repeat" });
-		link.request(5, "shortcut.execute", { key: "ctrl+other" });
-		await Promise.all([
-			link.response(3, "shortcut.execute"),
-			link.response(4, "shortcut.execute"),
-			link.response(5, "shortcut.execute"),
-		]);
-		await started.promise;
-		expect(seen.sort()).toEqual(["other", "repeat"]);
-		for (const wait of pending) wait.resolve();
-		await link.finish();
-	});
-
-	test("shortcut disposal aborts the active handler and clears its entry", async () => {
-		const started = Promise.withResolvers<void>();
-		const aborted = Promise.withResolvers<void>();
-		(globalThis as Record<string, unknown>).__leanFlow = {
-			shortcut: (_key: string, signal: AbortSignal) => {
-				started.resolve();
-				return new Promise<void>((resolve) => {
-					signal.addEventListener("abort", () => {
-						aborted.resolve();
-						resolve();
-					}, { once: true });
-				});
-			},
-		};
-		const link = new LeanLink({ cwd: PACKAGE_DIR, extensionPaths: [FLOW_CONTROL_ENTRY] });
-		await link.hello(1);
-		link.request(2, "extensions.load", { extensionPaths: [FLOW_CONTROL_ENTRY], cwd: PACKAGE_DIR });
-		await link.response(2, "extensions.load");
-		link.request(3, "shortcut.execute", { key: "ctrl+repeat" });
-		await link.response(3, "shortcut.execute");
-		await started.promise;
-		link.runner.dispose();
-		await aborted.promise;
-		expect((link.runner as unknown as { inFlightShortcuts: Map<string, AbortController> }).inFlightShortcuts.size).toBe(0);
 		await link.finish();
 	});
 
@@ -1151,179 +1012,6 @@ describe("lean: AssistantDeltaReducer contentIndex bound", () => {
 		const content = startBlock("0", "text_start", { type: "text", text: "" });
 		expect(content).toHaveLength(0);
 		expect(Object.keys(content)).toEqual([]);
-	});
-
-	test("text_end at contentIndex === content.length is ignored and appends nothing", () => {
-		const reducer = freshReducer();
-		reducer.applyAssistantDelta({
-			type: "text_start",
-			meta: {},
-			contentIndex: 0,
-			block: { type: "text", text: "hi" },
-		});
-		// content.length is now 1; an end at the append index must not fabricate a block.
-		reducer.applyAssistantDelta({
-			type: "text_end",
-			meta: {},
-			contentIndex: 1,
-			block: { type: "text", text: "phantom" },
-		});
-		expect(contentOf(reducer)).toEqual([{ type: "text", text: "hi" }]);
-	});
-
-	test("thinking_end at contentIndex === content.length is ignored and appends nothing", () => {
-		const reducer = freshReducer();
-		reducer.applyAssistantDelta({
-			type: "thinking_start",
-			meta: {},
-			contentIndex: 0,
-			block: { type: "thinking", thinking: "hi" },
-		});
-		reducer.applyAssistantDelta({
-			type: "thinking_end",
-			meta: {},
-			contentIndex: 1,
-			block: { type: "thinking", thinking: "phantom" },
-		});
-		expect(contentOf(reducer)).toEqual([{ type: "thinking", thinking: "hi" }]);
-	});
-
-	test("toolcall_end at contentIndex === content.length is ignored and appends nothing", () => {
-		const reducer = freshReducer();
-		reducer.applyAssistantDelta({
-			type: "toolcall_start",
-			meta: {},
-			contentIndex: 0,
-			block: { type: "toolCall", id: "c1", name: "read", arguments: {} },
-		});
-		reducer.applyAssistantDelta({
-			type: "toolcall_end",
-			meta: {},
-			contentIndex: 1,
-			block: { type: "toolCall", id: "phantom", name: "read", arguments: {} },
-		});
-		expect(contentOf(reducer)).toEqual([
-			{ type: "toolCall", id: "c1", name: "read", arguments: {} },
-		]);
-	});
-
-	test("text_start at contentIndex === content.length still appends normally", () => {
-		const reducer = freshReducer();
-		reducer.applyAssistantDelta({
-			type: "text_start",
-			meta: {},
-			contentIndex: 0,
-			block: { type: "text", text: "first" },
-		});
-		reducer.applyAssistantDelta({
-			type: "text_start",
-			meta: {},
-			contentIndex: 1,
-			block: { type: "text", text: "second" },
-		});
-		expect(contentOf(reducer)).toEqual([
-			{ type: "text", text: "first" },
-			{ type: "text", text: "second" },
-		]);
-	});
-
-	test("thinking_start at contentIndex === content.length still appends normally", () => {
-		const reducer = freshReducer();
-		reducer.applyAssistantDelta({
-			type: "thinking_start",
-			meta: {},
-			contentIndex: 0,
-			block: { type: "thinking", thinking: "first" },
-		});
-		reducer.applyAssistantDelta({
-			type: "thinking_start",
-			meta: {},
-			contentIndex: 1,
-			block: { type: "thinking", thinking: "second" },
-		});
-		expect(contentOf(reducer)).toEqual([
-			{ type: "thinking", thinking: "first" },
-			{ type: "thinking", thinking: "second" },
-		]);
-	});
-
-	test("toolcall_start at contentIndex === content.length still appends normally", () => {
-		const reducer = freshReducer();
-		reducer.applyAssistantDelta({
-			type: "toolcall_start",
-			meta: {},
-			contentIndex: 0,
-			block: { type: "toolCall", id: "c1", name: "read", arguments: {} },
-		});
-		reducer.applyAssistantDelta({
-			type: "toolcall_start",
-			meta: {},
-			contentIndex: 1,
-			block: { type: "toolCall", id: "c2", name: "write", arguments: {} },
-		});
-		expect(contentOf(reducer)).toEqual([
-			{ type: "toolCall", id: "c1", name: "read", arguments: {} },
-			{ type: "toolCall", id: "c2", name: "write", arguments: {} },
-		]);
-	});
-
-	test("text_end at an existing contentIndex still replaces the block", () => {
-		const reducer = freshReducer();
-		reducer.applyAssistantDelta({
-			type: "text_start",
-			meta: {},
-			contentIndex: 0,
-			block: { type: "text", text: "draft" },
-		});
-		reducer.applyAssistantDelta({
-			type: "text_end",
-			meta: {},
-			contentIndex: 0,
-			block: { type: "text", text: "final" },
-		});
-		expect(contentOf(reducer)).toEqual([{ type: "text", text: "final" }]);
-	});
-
-	test("toolcall_end at an existing contentIndex replaces the block and clears tracked arguments", () => {
-		const reducer = freshReducer();
-		reducer.applyAssistantDelta({
-			type: "toolcall_start",
-			meta: {},
-			contentIndex: 0,
-			block: { type: "toolCall", id: "c1", name: "read", arguments: {} },
-		});
-		reducer.applyAssistantDelta({
-			type: "toolcall_delta",
-			meta: {},
-			contentIndex: 0,
-			delta: '{"path":"a.md"}',
-		});
-		// Pre-end: arguments reflect the accumulated fragment.
-		expect((contentOf(reducer)[0] as Record<string, unknown>)["arguments"]).toEqual({
-			path: "a.md",
-		});
-		reducer.applyAssistantDelta({
-			type: "toolcall_end",
-			meta: {},
-			contentIndex: 0,
-			block: { type: "toolCall", id: "c1", name: "read", arguments: {} },
-		});
-		// The end block replaces the streamed block in place.
-		expect(contentOf(reducer)).toEqual([
-			{ type: "toolCall", id: "c1", name: "read", arguments: {} },
-		]);
-		// Tracked arguments were cleared: a follow-up delta starts fresh rather
-		// than concatenating with the pre-end fragment (which would reparse to
-		// { path: "a.md" } instead of { path: "b.md" }).
-		reducer.applyAssistantDelta({
-			type: "toolcall_delta",
-			meta: {},
-			contentIndex: 0,
-			delta: '{"path":"b.md"}',
-		});
-		expect((contentOf(reducer)[0] as Record<string, unknown>)["arguments"]).toEqual({
-			path: "b.md",
-		});
 	});
 });
 

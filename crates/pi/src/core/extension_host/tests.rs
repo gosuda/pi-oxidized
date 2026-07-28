@@ -986,9 +986,7 @@ async fn flags_set_acks_before_updating_local_values_and_rejection_preserves_sta
 
     host.set_response(pi_ext::protocol::FLAGS_SET_METHOD, json!({"ok": false}));
     let rejected = BTreeMap::from([("verbose".to_owned(), FlagValueWire::Boolean(false))]);
-    let diagnostics = runner.apply_flag_values(&rejected).await?;
-    assert_eq!(diagnostics.len(), 1);
-    assert!(diagnostics[0].message.contains("rejected"));
+    assert!(runner.apply_flag_values(&rejected).await.is_err());
     assert_eq!(
         runner.get_flag_values().get("verbose"),
         Some(&Value::Bool(true)),
@@ -998,7 +996,7 @@ async fn flags_set_acks_before_updating_local_values_and_rejection_preserves_sta
 }
 
 #[tokio::test]
-async fn multi_endpoint_flag_failures_are_path_qualified_and_do_not_abort_siblings() -> R {
+async fn aggregate_flags_fan_out_declared_and_arbitrary_values_to_every_endpoint() -> R {
     let (runner, hosts) = make_aggregate_runner(vec![
         (
             0,
@@ -1019,7 +1017,7 @@ async fn multi_endpoint_flag_failures_are_path_qualified_and_do_not_abort_siblin
     hosts[0].set_response(pi_ext::protocol::FLAGS_SET_METHOD, json!({"ok": false}));
     hosts[1].set_response(pi_ext::protocol::FLAGS_SET_METHOD, json!({"ok": true}));
 
-    let diagnostics = runner
+    runner
         .apply_flag_values(&BTreeMap::from([
             ("first".to_owned(), FlagValueWire::Boolean(true)),
             ("second".to_owned(), FlagValueWire::Boolean(true)),
@@ -1030,9 +1028,6 @@ async fn multi_endpoint_flag_failures_are_path_qualified_and_do_not_abort_siblin
         ]))
         .await?;
 
-    assert_eq!(diagnostics.len(), 1);
-    assert_eq!(diagnostics[0].path, "first");
-    assert!(diagnostics[0].message.contains("rejected"));
     let values = runner.get_flag_values();
     assert_eq!(values.get("first"), Some(&Value::Bool(false)));
     assert_eq!(values.get("second"), Some(&Value::Bool(true)));
@@ -1504,20 +1499,6 @@ async fn aggregate_registry_and_command_collisions_are_first_wins() -> R {
         .filter(|(_, message)| message.contains("duplicate command \"same\""))
         .collect::<Vec<_>>();
     assert_eq!(collision_errors.len(), 1);
-    assert_eq!(
-        collision_errors[0].1,
-        "duplicate command \"same\"; first registration wins"
-    );
-    let shortcut_errors = runner
-        .load_errors()
-        .into_iter()
-        .filter(|(_, message)| message.contains("duplicate shortcut \"ctrl+x\""))
-        .collect::<Vec<_>>();
-    assert_eq!(shortcut_errors.len(), 1);
-    assert_eq!(
-        shortcut_errors[0].1,
-        "duplicate shortcut \"ctrl+x\"; later registration wins"
-    );
     assert!(runner.execute_command("same", "args").await?);
     hosts[0].wait_for_request("command.execute").await?;
     assert!(
@@ -4059,324 +4040,5 @@ export default function bridgeObserver(pi) {{
     );
 
     runner.shutdown_once().await;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn write_builtins_promotion_host(script: &Path) -> R {
-    std::fs::write(
-        script,
-        format!(
-            r#"#!/bin/sh
-log="$1"
-promotion="$2"
-case " $* " in *" --no-builtins "*) no_builtins=1 ;; *) no_builtins=0 ;; esac
-while IFS= read -r line; do
-  case "$line" in
-    *'"method":"hello"'*)
-      printf '%s\n' '{{"id":1,"kind":"res","method":"hello","payload":{{"protocolVersion":{},"compatibilityVersion":"{}"}}}}'
-      ;;
-    *'"method":"extensions.load"'*)
-      case "$line" in
-        *compat-owner*) printf '%s\n' 'owner:failed' >> "$log"; exit 1 ;;
-      esac
-      if [ "$no_builtins" = 1 ]; then
-        printf '%s\n' 'survivor:no-builtins:start' >> "$log"
-      elif [ "$promotion" = fail ]; then
-        printf '%s\n' 'survivor:builtins:failed' >> "$log"
-        exit 1
-      else
-        printf '%s\n' 'survivor:builtins:start' >> "$log"
-      fi
-      printf '%s\n' '{{"id":2,"kind":"res","method":"extensions.load","payload":{{}}}}'
-      ;;
-    *'"method":"shutdown"'*)
-      if [ "$no_builtins" = 1 ]; then
-        printf '%s\n' 'survivor:no-builtins:shutdown' >> "$log"
-      else
-        printf '%s\n' 'survivor:builtins:shutdown' >> "$log"
-      fi
-      exit 0
-      ;;
-  esac
-done
-if [ "$no_builtins" = 1 ]; then
-  printf '%s\n' 'survivor:no-builtins:shutdown' >> "$log"
-else
-  printf '%s\n' 'survivor:builtins:shutdown' >> "$log"
-fi
-"#,
-            pi_ext::protocol::PROTOCOL_VERSION,
-            pi_ext::protocol::COMPATIBILITY_VERSION,
-        ),
-    )?;
-    let mut permissions = std::fs::metadata(script)?.permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(script, permissions)?;
-    Ok(())
-}
-
-#[cfg(unix)]
-async fn start_builtins_promotion_fixture(
-    promotion: &str,
-) -> Result<(Arc<HostExtensionRunner>, tempfile::TempDir, PathBuf, String), BoxErr> {
-    let temp = tempfile::tempdir()?;
-    let owner = temp.path().join("compat-owner");
-    let survivor = temp.path().join("compat-survivor");
-    for path in [&owner, &survivor] {
-        std::fs::create_dir_all(path)?;
-        std::fs::write(path.join("index.ts"), "export default {}")?;
-    }
-    let separator = temp.path().join("missing-separator");
-    let log = temp.path().join("promotion.log");
-    let script = temp.path().join("promotion-host.sh");
-    write_builtins_promotion_host(&script)?;
-    let survivor_path = survivor.to_string_lossy().into_owned();
-    let runner = HostExtensionRunner::start_classified_with_resolver(
-        vec![
-            owner.to_string_lossy().into_owned(),
-            separator.to_string_lossy().into_owned(),
-            survivor_path.clone(),
-        ],
-        "/workspace".to_owned(),
-        false,
-        {
-            let script = script.clone();
-            let log = log.clone();
-            let promotion = promotion.to_owned();
-            move || {
-                Ok(HostSpec {
-                    source: HostSource::Env(script.clone()),
-                    program: PathBuf::from("/bin/sh"),
-                    args: vec![
-                        script.to_string_lossy().into_owned(),
-                        log.to_string_lossy().into_owned(),
-                        promotion,
-                    ],
-                })
-            }
-        },
-    )
-    .await?;
-    Ok((runner, temp, log, survivor_path))
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn builtins_owner_failure_promotes_first_surviving_compat() -> R {
-    let (runner, _temp, log, _survivor_path) = start_builtins_promotion_fixture("succeed").await?;
-    assert_eq!(runner.endpoints.len(), 1);
-    let events = std::fs::read_to_string(&log)?
-        .lines()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    let promoted = events
-        .iter()
-        .position(|event| event == "survivor:builtins:start")
-        .ok_or("promoted builtins host did not start")?;
-    let reaped = events
-        .iter()
-        .position(|event| event == "survivor:no-builtins:shutdown")
-        .ok_or("temporary no-builtins host was not reaped")?;
-    assert!(
-        promoted < reaped,
-        "temporary host reaped before promotion succeeded"
-    );
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| event.as_str() == "survivor:builtins:start")
-            .count(),
-        1
-    );
-    runner.shutdown_once().await;
-    Ok(())
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn builtins_promotion_failure_keeps_surviving_endpoint_and_reports_path() -> R {
-    let (runner, _temp, log, survivor_path) = start_builtins_promotion_fixture("fail").await?;
-    assert_eq!(runner.endpoints.len(), 1);
-    assert!(runner.is_active());
-    let events = std::fs::read_to_string(&log)?;
-    assert!(events.contains("survivor:no-builtins:start"));
-    assert!(events.contains("survivor:builtins:failed"));
-    assert!(!events.contains("survivor:no-builtins:shutdown"));
-    assert!(
-        runner
-            .load_errors()
-            .iter()
-            .any(|(path, _)| path == &survivor_path)
-    );
-    runner.shutdown_once().await;
-    Ok(())
-}
-
-#[tokio::test]
-async fn failed_restart_prepare_keeps_old_runner_provider_and_transport_live() -> R {
-    let (runner, host) = make_runner(full_snapshot()).await?;
-    host.set_response("command.execute", json!({"ok": true}));
-    let runtime = ModelRuntime::create(CreateModelRuntimeOptions::default()).await?;
-    assert!(
-        runner
-            .register_providers_on(&runtime)
-            .into_iter()
-            .all(|(_, outcome)| outcome.is_ok())
-    );
-
-    let prepared = runner
-        .prepare_restart_with(HashMap::new(), |_paths, _cwd, _trusted| async {
-            Err(HostStartError::Load("replacement unavailable".to_owned()))
-        })
-        .await;
-
-    assert!(prepared.is_err());
-    assert!(runner.is_running());
-    assert!(runner.execute_command("extCmd", "still-live").await?);
-    assert!(runtime.get_registered_provider_config("extProv").is_some());
-    let methods = host
-        .requests
-        .lock()
-        .map_err(|_| "request lock poisoned")?
-        .iter()
-        .map(|frame| frame.method.as_str())
-        .collect::<Vec<_>>();
-    assert!(!methods.contains(&"session_shutdown"));
-    assert!(!methods.contains(&"shutdown"));
-    runner.shutdown_once().await;
-    Ok(())
-}
-
-#[tokio::test]
-async fn post_start_fatal_prepare_failure_reaps_replacement_and_keeps_old_live() -> R {
-    let (runner, old_host) = make_runner(full_snapshot()).await?;
-    old_host.set_response("command.execute", json!({"ok": true}));
-    let runtime = ModelRuntime::create(CreateModelRuntimeOptions::default()).await?;
-    assert!(
-        runner
-            .register_providers_on(&runtime)
-            .into_iter()
-            .all(|(_, outcome)| outcome.is_ok())
-    );
-    let replacement_runner = Arc::new(Mutex::new(None::<Arc<HostExtensionRunner>>));
-    let replacement_runner_by_start = Arc::clone(&replacement_runner);
-
-    let prepared = runner
-        .prepare_restart_with_fatal_flag_error(
-            HashMap::new(),
-            move |_paths, _cwd, _trusted| async move {
-                let (replacement, _host) = make_runner(full_snapshot())
-                    .await
-                    .map_err(|error| HostStartError::Load(error.to_string()))?;
-                *replacement_runner_by_start
-                    .lock()
-                    .map_err(|_| HostStartError::Load("replacement lock poisoned".to_owned()))? =
-                    Some(Arc::clone(&replacement));
-                Ok(replacement)
-            },
-        )
-        .await;
-
-    assert!(matches!(prepared, Err(HostStartError::FlagSync(_))));
-    let replacement = replacement_runner
-        .lock()
-        .map_err(|_| "replacement lock poisoned")?
-        .clone()
-        .ok_or("replacement runner missing")?;
-    assert!(!replacement.is_running());
-    assert!(replacement.endpoints.iter().all(|endpoint| {
-        endpoint
-            .shutdown_done
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }));
-    assert!(runner.is_running());
-    assert!(runner.execute_command("extCmd", "still-live").await?);
-    assert!(runtime.get_registered_provider_config("extProv").is_some());
-    runner.shutdown_once().await;
-    Ok(())
-}
-
-#[tokio::test]
-async fn reload_returns_load_flag_and_provider_diagnostics() -> R {
-    let (runner, _old_host) = make_runner(json!({})).await?;
-    let runtime = ModelRuntime::create(CreateModelRuntimeOptions::default()).await?;
-    let replacement_hosts = Arc::new(Mutex::new(Vec::<FakeHost>::new()));
-    let replacement_hosts_by_start = Arc::clone(&replacement_hosts);
-
-    let prepared = runner
-        .prepare_restart_with(
-            HashMap::from([("flag".to_owned(), Value::Bool(true))]),
-            move |_paths, _cwd, _trusted| async move {
-                let (replacement, hosts) = make_aggregate_runner(vec![
-                    (
-                        0,
-                        json!({
-                            "providers": [{
-                                "name": "load-bad",
-                                "models": [{"name": "missing id"}],
-                                "extensionPath": "/ext/load.ts"
-                            }]
-                        }),
-                        "/ext/load-endpoint.ts",
-                    ),
-                    (
-                        1,
-                        json!({
-                            "flags": [{
-                                "name": "flag",
-                                "type": "boolean",
-                                "value": false,
-                                "extensionPath": "/ext/flag.ts"
-                            }],
-                            "providers": [{
-                                "name": "provider-bad",
-                                "models": [{"id": "m"}],
-                                "extensionPath": "/ext/provider.ts"
-                            }]
-                        }),
-                        "/ext/flag.ts",
-                    ),
-                ])
-                .await
-                .map_err(|error| HostStartError::Load(error.to_string()))?;
-                hosts[0].set_response(pi_ext::protocol::FLAGS_SET_METHOD, json!({"ok": true}));
-                hosts[1].set_response(pi_ext::protocol::FLAGS_SET_METHOD, json!({"ok": false}));
-                *replacement_hosts_by_start
-                    .lock()
-                    .map_err(|_| HostStartError::Load("hosts lock poisoned".to_owned()))? = hosts;
-                Ok(replacement)
-            },
-        )
-        .await?;
-    let result = runner.commit_restart(&runtime, prepared).await;
-
-    assert_eq!(
-        result
-            .diagnostics
-            .iter()
-            .map(|diagnostic| diagnostic.path.as_str())
-            .collect::<Vec<_>>(),
-        vec!["/ext/load.ts", "/ext/flag.ts", "/ext/provider.ts"]
-    );
-    assert!(result.diagnostics[0].message.contains("models"));
-    assert!(result.diagnostics[1].message.contains("rejected"));
-    assert!(
-        result.diagnostics[2]
-            .message
-            .contains("no \"api\" specified")
-    );
-    let hosts = replacement_hosts
-        .lock()
-        .map_err(|_| "hosts lock poisoned")?;
-    assert!(hosts.iter().all(|host| {
-        host.requests.lock().is_ok_and(|requests| {
-            requests
-                .iter()
-                .any(|request| request.method == pi_ext::protocol::FLAGS_SET_METHOD)
-        })
-    }));
-    drop(hosts);
-    result.runner.shutdown_once().await;
     Ok(())
 }

@@ -500,6 +500,7 @@ pub async fn create_agent_session_services_with_trust(
         &resource_loader,
         discovery,
         &foundation.cwd,
+        &foundation.model_runtime,
         project_trusted,
         &mut diagnostics,
     )
@@ -510,35 +511,15 @@ pub async fn create_agent_session_services_with_trust(
     let (flag_diagnostics, applied_flags) =
         apply_extension_flag_values(extension_flag_values.unwrap_or_default(), &registered_flags);
     diagnostics.extend(flag_diagnostics);
-    if let Some(runner) = extension_runner.as_deref() {
-        match apply_flags_to_runner(runner, &applied_flags).await {
-            Ok(flag_diagnostics) => diagnostics.extend(
-                flag_diagnostics
-                    .into_iter()
-                    .map(|diagnostic| AgentSessionRuntimeDiagnostic::error(diagnostic.to_string())),
-            ),
-            Err(error) => {
-                diagnostics.push(AgentSessionRuntimeDiagnostic::error(format!(
-                    "Extension flags failed to apply: {error}"
-                )));
-                runner.unregister_providers_from(&foundation.model_runtime);
-                runner.shutdown_once().await;
-                extension_runner = None;
-            }
-        }
-    }
-    if let Some(runner) = extension_runner.as_deref() {
-        for (path, outcome) in runner.register_providers_on(&foundation.model_runtime) {
-            if let Err(error) = outcome {
-                diagnostics.push(AgentSessionRuntimeDiagnostic::error(
-                    crate::core::extension_host::ExtensionHostDiagnostic {
-                        path,
-                        message: error.to_string(),
-                    }
-                    .to_string(),
-                ));
-            }
-        }
+    if let Some(runner) = extension_runner.as_deref()
+        && let Err(error) = apply_flags_to_runner(runner, &applied_flags).await
+    {
+        diagnostics.push(AgentSessionRuntimeDiagnostic::error(format!(
+            "Extension flags failed to apply: {error}"
+        )));
+        runner.unregister_providers_from(&foundation.model_runtime);
+        runner.shutdown_once().await;
+        extension_runner = None;
     }
 
     for registration in pending_provider_registrations {
@@ -666,6 +647,7 @@ async fn start_extension_phase(
     loader: &DefaultResourceLoader,
     discovery: ResourceDiscoveryPolicy,
     cwd: &Path,
+    model_runtime: &ModelRuntime,
     project_trusted: bool,
     diagnostics: &mut Vec<AgentSessionRuntimeDiagnostic>,
 ) -> (
@@ -698,12 +680,18 @@ async fn start_extension_phase(
     .await
     {
         Ok(runner) => {
-            diagnostics.extend(runner.load_errors().into_iter().map(|(path, message)| {
-                AgentSessionRuntimeDiagnostic::error(
-                    crate::core::extension_host::ExtensionHostDiagnostic { path, message }
-                        .to_string(),
-                )
-            }));
+            for (path, message) in runner.load_errors() {
+                diagnostics.push(AgentSessionRuntimeDiagnostic::error(format!(
+                    "Extension \"{path}\" error: {message}"
+                )));
+            }
+            for (path, outcome) in runner.register_providers_on(model_runtime) {
+                if let Err(error) = outcome {
+                    diagnostics.push(AgentSessionRuntimeDiagnostic::error(format!(
+                        "Extension \"{path}\" error: {error}"
+                    )));
+                }
+            }
             let flags = runner.registered_flag_types();
             (Some(runner), flags)
         }
@@ -719,10 +707,7 @@ async fn start_extension_phase(
 async fn apply_flags_to_runner(
     runner: &HostExtensionRunner,
     applied_flags: &BTreeMap<String, ExtensionFlagValue>,
-) -> Result<
-    Vec<crate::core::extension_host::ExtensionHostDiagnostic>,
-    pi_ext::client::HostClientError,
-> {
+) -> Result<(), pi_ext::client::HostClientError> {
     let values = applied_flags
         .iter()
         .map(|(name, value)| {

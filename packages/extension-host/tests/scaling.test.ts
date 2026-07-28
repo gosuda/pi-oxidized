@@ -478,7 +478,7 @@ describe("scaling: zero / idle / active widgets", () => {
 });
 
 describe("scaling: terminal-input deadlines", () => {
-	test("onTerminalInput consume/rewrite rewrites 120 inputs deterministically", async () => {
+	test("fast onTerminalInput consume/rewrite stays under 5ms p99", async () => {
 		const { collector, stdin, host, runPromise } = await connectHost([
 			terminalInputFastFactory,
 		]);
@@ -503,9 +503,11 @@ describe("scaling: terminal-input deadlines", () => {
 			await collector.awaitFrame((f) => f.id === 100 + i && f.kind === "res");
 		}
 
+		const latencies: number[] = [];
 		for (let i = 0; i < samples; i++) {
 			const id = 300 + i;
 			const data = i % 3 === 0 ? "x" : i % 3 === 1 ? "a" : "b";
+			const t0 = performance.now();
 			stdin.push(
 				Buffer.from(
 					encodeFrameString({
@@ -517,6 +519,7 @@ describe("scaling: terminal-input deadlines", () => {
 				),
 			);
 			const res = await collector.awaitFrame((f) => f.id === id && f.kind === "res");
+			latencies.push(performance.now() - t0);
 			const payload = res.payload as Record<string, unknown>;
 			if (data === "x") {
 				expect(payload["consume"]).toBe(true);
@@ -528,6 +531,8 @@ describe("scaling: terminal-input deadlines", () => {
 				expect(payload["data"]).toBe("b");
 			}
 		}
+
+		expect(p99(latencies)).toBeLessThan(5);
 
 		stdin.push(null);
 		host.dispose("test");

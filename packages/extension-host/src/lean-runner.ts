@@ -579,8 +579,6 @@ export class LeanRunner {
 	private readonly inFlightTools = new Map<number, AbortController>();
 	/** In-flight provider.stream AbortControllers keyed by request id. */
 	private readonly inFlightProviders = new Map<number, AbortController>();
-	/** Active shortcut handlers keyed by their resolved shortcut key. */
-	private readonly inFlightShortcuts = new Map<string, AbortController>();
 	/** System prompt mirrored from `session.update` control events. */
 	private systemPrompt = "";
 	/** Active assistant snapshot reconstructed from compact Rust updates. */
@@ -1012,36 +1010,6 @@ export class LeanRunner {
 		}
 
 		const controller = new AbortController();
-		let acceptingUpdates = true;
-		let pendingUpdate: unknown;
-		let hasPendingUpdate = false;
-		let drain: Promise<void> | undefined;
-		const stopAcceptingUpdates = () => {
-			acceptingUpdates = false;
-		};
-		const drainUpdates = (): void => {
-			if (drain !== undefined) return;
-			drain = (async () => {
-				while (hasPendingUpdate) {
-					const partial = pendingUpdate;
-					hasPendingUpdate = false;
-					try {
-						await this.client.send({
-							id,
-							kind: "event",
-							method: "toolUpdate",
-							payload: { toolCallId, toolName: name, partialResult: partial },
-						});
-					} catch {
-						// Preserve the legacy fire-and-forget failure behavior.
-					}
-				}
-			})().finally(() => {
-				drain = undefined;
-				if (acceptingUpdates && hasPendingUpdate) drainUpdates();
-			});
-		};
-		controller.signal.addEventListener("abort", stopAcceptingUpdates, { once: true });
 		this.inFlightTools.set(id, controller);
 		try {
 			const prepared = p["prepared"] === true || registered.tool.prepare === undefined
@@ -1053,14 +1021,14 @@ export class LeanRunner {
 				toolCallId,
 				signal: controller.signal,
 				onUpdate: (partial) => {
-					if (!acceptingUpdates || controller.signal.aborted) return;
-					pendingUpdate = partial;
-					hasPendingUpdate = true;
-					drainUpdates();
+					this.client.send({
+						id,
+						kind: "event",
+						method: "toolUpdate",
+						payload: { toolCallId, toolName: name, partialResult: partial },
+					}).catch(() => void 0);
 				},
 			});
-			stopAcceptingUpdates();
-			await drain;
 			if (controller.signal.aborted) {
 				await this.client.respondError(id, "tool.execute" as Method, {
 					code: "cancelled",
@@ -1071,8 +1039,6 @@ export class LeanRunner {
 			}
 			await this.client.respond(id, "tool.execute" as Method, result);
 		} catch (err) {
-			stopAcceptingUpdates();
-			await drain;
 			const cancelled = controller.signal.aborted || isStructuredAbortError(err);
 			const message = err instanceof Error ? err.message : String(err);
 			await this.client.respondError(id, "tool.execute" as Method, {
@@ -1081,7 +1047,6 @@ export class LeanRunner {
 				retryable: false,
 			});
 		} finally {
-			controller.signal.removeEventListener("abort", stopAcceptingUpdates);
 			this.inFlightTools.delete(id);
 		}
 	}
@@ -1179,37 +1144,15 @@ export class LeanRunner {
 			await this.client.respond(id, "shortcut.execute", { handled: false });
 			return;
 		}
-		const active = this.inFlightShortcuts.get(key);
-		if (active !== undefined) {
-			await this.client.respond(id, "shortcut.execute", { handled: true });
-			return;
-		}
-		const controller = new AbortController();
-		this.inFlightShortcuts.set(key, controller);
-		try {
-			await this.client.respond(id, "shortcut.execute", { handled: true });
-		} catch (error) {
-			if (this.inFlightShortcuts.get(key) === controller) {
-				this.inFlightShortcuts.delete(key);
-			}
-			throw error;
-		}
-		void Promise.resolve()
-			.then(() => registered.shortcut.handler({
-				...this.hookContext(registered.extensionPath),
-				signal: controller.signal,
-			}))
+		await this.client.respond(id, "shortcut.execute", { handled: true });
+		Promise.resolve()
+			.then(() => registered.shortcut.handler(this.hookContext(registered.extensionPath)))
 			.catch((error) => {
 				this.emitExtensionError(
 					registered.extensionPath,
 					"shortcut.execute",
 					error instanceof Error ? error.message : String(error),
 				);
-			})
-			.finally(() => {
-				if (this.inFlightShortcuts.get(key) === controller) {
-					this.inFlightShortcuts.delete(key);
-				}
 			});
 	}
 
@@ -1610,8 +1553,6 @@ export class LeanRunner {
 		this.inFlightTools.clear();
 		for (const controller of this.inFlightProviders.values()) controller.abort();
 		this.inFlightProviders.clear();
-		for (const controller of this.inFlightShortcuts.values()) controller.abort();
-		this.inFlightShortcuts.clear();
 		this.client.dispose(reason);
 	}
 }

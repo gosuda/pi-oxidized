@@ -324,8 +324,8 @@ pub trait SessionHost: Send + Sync + 'static {
     /// Cycle the active model in the given direction.
     fn cycle_model(&self, forward: bool) -> BoxFuture<'_, Result<(), String>>;
 
-    /// Reload extensions / resources / keybindings and return nonfatal notices.
-    fn reload(&self) -> BoxFuture<'_, Result<Vec<String>, String>>;
+    /// Reload extensions / resources / keybindings.
+    fn reload(&self) -> BoxFuture<'_, Result<(), String>>;
 
     /// Returns the full transcript for the current session (used on rebind).
     fn messages(&self) -> Vec<pi_agent::AgentMessage>;
@@ -1939,14 +1939,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         if self.pending_extension_dialog.is_some() {
             self.cancel_extension_dialog().await;
         }
-        match self.session.reload().await {
-            Ok(diagnostics) => {
-                for diagnostic in diagnostics {
-                    self.push_notice("reload", diagnostic);
-                }
-            }
-            Err(error) => self.last_error = Some(error),
-        }
+        self.record_err(self.session.reload().await);
         self.rebind_extension_channels().await;
         if let Ok(Some(dark)) = self.input.requery_background(self.tui.outer_mut()).await {
             self.tui.capabilities_mut().set_dark_background(Some(dark));
@@ -3285,14 +3278,8 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             }
             UiControl::SetTitle { title } => {
                 // Best-effort OSC 0 title; terminals that ignore it are fine.
-                // Sanitize at the sink: drop every control scalar (C0, DEL,
-                // C1, ESC, BEL, CR, LF) and cap the payload at 256 UTF-8
-                // bytes without splitting a multibyte scalar, so an
-                // attacker-controlled title cannot terminate the fixed OSC
-                // wrapper or inject another escape sequence.
                 let title = title.unwrap_or_default();
-                let sanitized = sanitize_title(&title);
-                let _ = write!(self.tui.outer_mut(), "\x1b]0;{sanitized}\x07");
+                let _ = write!(self.tui.outer_mut(), "\x1b]0;{title}\x07");
             }
             UiControl::PasteToEditor { text } => {
                 let _ = self.paste_text(&text);
@@ -5131,20 +5118,9 @@ impl SessionHost for AgentSessionHost {
         })
     }
 
-    fn reload(&self) -> BoxFuture<'_, Result<Vec<String>, String>> {
+    fn reload(&self) -> BoxFuture<'_, Result<(), String>> {
         let session = self.read_session();
-        Box::pin(async move {
-            session
-                .reload()
-                .await
-                .map(|diagnostics| {
-                    diagnostics
-                        .into_iter()
-                        .map(|diagnostic| diagnostic.to_string())
-                        .collect()
-                })
-                .map_err(|error| error.to_string())
-        })
+        Box::pin(async move { session.reload().await.map_err(|e| e.to_string()) })
     }
 
     fn messages(&self) -> Vec<pi_agent::AgentMessage> {
@@ -6309,33 +6285,6 @@ fn decode_terminal_input(data: String) -> UiEvent {
     key.map_or(UiEvent::Paste(data), UiEvent::Key)
 }
 
-/// Maximum UTF-8 byte length of the payload written inside the fixed OSC 0
-/// title wrapper. The wrapper itself (`ESC ] 0 ;` … `BEL`) is not counted.
-const TITLE_PAYLOAD_MAX_BYTES: usize = 256;
-
-/// Sanitize an extension-supplied terminal title for the fixed OSC 0 sink.
-///
-/// Iterates Unicode scalar values once and drops every `char::is_control()`
-/// value (covering C0, DEL, C1, ESC, BEL, CR, LF), so attacker-controlled
-/// controls cannot terminate the wrapper or introduce a new escape sequence.
-/// Stops before the next scalar would exceed a 256-byte UTF-8 cap, never
-/// splitting a multibyte scalar. Returns the sanitized payload only; the
-/// caller wraps it with the fixed `ESC ] 0 ;` introducer and `BEL` terminator.
-fn sanitize_title(title: &str) -> String {
-    let mut out = String::with_capacity(title.len().min(TITLE_PAYLOAD_MAX_BYTES));
-    for scalar in title.chars() {
-        if scalar.is_control() {
-            continue;
-        }
-        let len = scalar.len_utf8();
-        if out.len() + len > TITLE_PAYLOAD_MAX_BYTES {
-            break;
-        }
-        out.push(scalar);
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -6368,7 +6317,6 @@ mod tests {
         compacts: Mutex<Vec<Option<String>>>,
         cycles: Mutex<u32>,
         reloads: Mutex<u32>,
-        reload_diagnostics: Mutex<Vec<String>>,
         bashes: Mutex<Vec<(String, bool)>>,
         new_sessions: Mutex<u32>,
         forks: Mutex<Vec<String>>,
@@ -6676,11 +6624,11 @@ mod tests {
             })
         }
 
-        fn reload(&self) -> BoxFuture<'_, Result<Vec<String>, String>> {
+        fn reload(&self) -> BoxFuture<'_, Result<(), String>> {
             let log = Arc::clone(&self.log);
             Box::pin(async move {
                 *log.reloads.lock().await += 1;
-                Ok(log.reload_diagnostics.lock().await.clone())
+                Ok(())
             })
         }
 
@@ -8976,38 +8924,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn interactive_reload_surfaces_nonfatal_extension_diagnostics() {
-        let (mut rt, log) = make_runtime();
-        *log.reload_diagnostics.lock().await = vec![
-            "Extension \"/ext/load.ts\" error: load failed".to_owned(),
-            "Extension \"/ext/provider.ts\" error: provider failed".to_owned(),
-        ];
-
-        let outcome = rt.dispatch_action(ViewAction::Reload).await;
-
-        assert_eq!(outcome, ActionOutcome::Repaint);
-        assert!(rt.last_error.is_none());
-        let notices = rt
-            .view
-            .messages
-            .iter()
-            .filter_map(|message| match message {
-                MessageView::Custom(custom) if custom.custom_type == "reload" => {
-                    Some(custom.text.as_str())
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            notices,
-            vec![
-                "Extension \"/ext/load.ts\" error: load failed",
-                "Extension \"/ext/provider.ts\" error: provider failed",
-            ]
-        );
-    }
-
-    #[tokio::test]
     async fn reload_guarded_while_streaming_and_compacting() -> TestResult {
         let (mut rt, log) = try_make_runtime()?;
         rt.session
@@ -9492,143 +9408,5 @@ mod tests {
                 .map(|status| status.message.as_str()),
             Some("Deploying…")
         );
-    }
-
-    /// Build a runtime backed by a captured [`SharedWriter`] so a test can
-    /// inspect the raw bytes written by the OSC 0 title sink.
-    fn make_runtime_with_captured_writer() -> (
-        InteractiveRuntime<SharedWriter, FakeHost>,
-        Arc<ActionLog>,
-        SharedWriter,
-    ) {
-        let writer = SharedWriter::new();
-        let captured = writer.clone();
-        let tui = Tui::new(
-            writer,
-            Size::new(80, 24),
-            Position::ORIGIN,
-            8,
-            TerminalCapabilities::default(),
-        )
-        .expect("tui construction");
-        let (_tx, rx) = mpsc::unbounded_channel::<UiEvent>();
-        let input = TerminalInput::mock(rx);
-        let (host, log) = FakeHost::new();
-        let mut rt = InteractiveRuntime::new(
-            tui,
-            input,
-            Arc::new(host),
-            &InteractiveRuntimeOptions::default(),
-        );
-        let _ = rt.paint_now();
-        (rt, log, captured)
-    }
-
-    #[test]
-    fn sanitize_title_drops_all_control_scalars() {
-        // C0 (ESC, BEL, CR, LF), DEL, and a C1 control (U+009B CSI) are all
-        // removed; visible text survives verbatim.
-        let input = "safe\x07\x1b]52;c;payload\x1b\\\r\n\u{009b}after";
-        let sanitized = sanitize_title(input);
-        assert_eq!(sanitized, "safe]52;c;payload\\after");
-        assert!(!sanitized.contains('\x07'));
-        assert!(!sanitized.contains('\x1b'));
-        assert!(!sanitized.contains('\r'));
-        assert!(!sanitized.contains('\n'));
-        assert!(!sanitized.contains('\u{009b}'));
-    }
-
-    #[test]
-    fn sanitize_title_caps_utf8_bytes_without_splitting_multibyte() {
-        // Each 'é' is two UTF-8 bytes; 128 of them is exactly 256 bytes and
-        // must be retained. Adding one more 'é' would exceed the cap, so the
-        // 129th scalar is dropped whole (no split).
-        let exact: String = "é".repeat(128);
-        assert_eq!(exact.len(), 256);
-        assert_eq!(sanitize_title(&exact), exact);
-
-        let over = format!("{}é", exact);
-        let sanitized = sanitize_title(&over);
-        assert_eq!(sanitized.len(), 256);
-        assert_eq!(sanitized, exact);
-
-        // A 3-byte scalar that would straddle the boundary is dropped whole.
-        // 85 'é' (170 bytes) + one '中' (3 bytes) = 173 bytes; fill the rest
-        // with 'é' up to 254 bytes, then a '中' (3 bytes) would make 257 and
-        // must be dropped entirely.
-        let mut near_cap = "é".repeat(85);
-        near_cap.push('中'); // 173 bytes
-        let remaining = (TITLE_PAYLOAD_MAX_BYTES - near_cap.len()) / 2; // 41 'é' → 82 bytes → 255
-        near_cap.push_str(&"é".repeat(remaining)); // 255 bytes
-        // Next 3-byte '中' would make 258 > 256: dropped whole.
-        let input = format!("{}中", near_cap);
-        let sanitized = sanitize_title(&input);
-        assert_eq!(sanitized.len(), 255);
-        assert_eq!(sanitized, near_cap);
-        assert!(!sanitized.contains('中'));
-    }
-
-    #[tokio::test]
-    async fn extension_title_sink_strips_injection_and_wraps_in_fixed_osc() {
-        let (mut rt, _log, captured) = make_runtime_with_captured_writer();
-        let before = captured.snapshot();
-        rt.handle_extension_ui_control(UiControl::SetTitle {
-            title: Some("safe\x07\x1b]52;c;evil\x1b\\\r\n".to_owned()),
-        })
-        .await;
-        let written = &captured.snapshot()[before.len()..];
-        // Fixed OSC 0 introducer + BEL terminator, sanitized payload only.
-        assert_eq!(written, b"\x1b]0;safe]52;c;evil\\\x07");
-        // No attacker-controlled ESC or BEL survives in the payload region
-        // between the introducer and the terminator.
-        let payload = &written[4..written.len() - 1];
-        assert!(
-            !payload.contains(&0x1b) && !payload.contains(&0x07),
-            "no ESC/BEL may survive inside the sanitized payload"
-        );
-    }
-
-    #[tokio::test]
-    async fn extension_title_sink_caps_payload_at_256_bytes() {
-        let (mut rt, _log, captured) = make_runtime_with_captured_writer();
-        let before = captured.snapshot();
-        // 300 'é' scalars = 600 UTF-8 bytes; only 128 fit (256 bytes).
-        let big = "é".repeat(300);
-        rt.handle_extension_ui_control(UiControl::SetTitle { title: Some(big) })
-            .await;
-        let written = &captured.snapshot()[before.len()..];
-        // Wrapper: ESC ] 0 ; (4 bytes) + payload + BEL (1 byte).
-        assert_eq!(written.len(), 4 + 256 + 1);
-        assert_eq!(&written[..4], b"\x1b]0;");
-        assert_eq!(written[written.len() - 1], 0x07);
-        let payload = &written[4..written.len() - 1];
-        assert_eq!(payload.len(), 256);
-        assert_eq!(
-            String::from_utf8_lossy(payload).as_ref(),
-            "é".repeat(128).as_str()
-        );
-    }
-
-    #[tokio::test]
-    async fn extension_title_sink_none_emits_empty_payload() {
-        let (mut rt, _log, captured) = make_runtime_with_captured_writer();
-        let before = captured.snapshot();
-        rt.handle_extension_ui_control(UiControl::SetTitle { title: None })
-            .await;
-        let written = &captured.snapshot()[before.len()..];
-        assert_eq!(written, b"\x1b]0;\x07");
-    }
-
-    #[tokio::test]
-    async fn extension_title_sink_c1_controls_removed() {
-        let (mut rt, _log, captured) = make_runtime_with_captured_writer();
-        let before = captured.snapshot();
-        // U+009B (CSI) and U+0085 (NEL) are C1 controls and must be dropped.
-        rt.handle_extension_ui_control(UiControl::SetTitle {
-            title: Some("a\u{009b}b\u{0085}c".to_owned()),
-        })
-        .await;
-        let written = &captured.snapshot()[before.len()..];
-        assert_eq!(written, b"\x1b]0;abc\x07");
     }
 }

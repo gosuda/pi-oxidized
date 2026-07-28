@@ -22,9 +22,7 @@
 //! `emit` self-gates on handler presence, so the gate would only suppress
 //! correct emissions.
 
-use crate::core::extension_host::{
-    ExtensionHostDiagnostic, HostExtensionRunner, SessionBridgeEvent,
-};
+use crate::core::extension_host::{HostExtensionRunner, SessionBridgeEvent};
 use crate::core::messages::CustomMessageContent;
 use crate::core::resources::{
     ResourceLoader, SlashCommandInfo, SlashCommandSource, SyntheticSourceInfoOptions,
@@ -368,64 +366,75 @@ impl AgentSession {
         format!("extension:{base}")
     }
 
-    /// Reload extensions with a prepare/commit transaction.
+    /// Reload extensions.
     ///
-    /// A concrete replacement is fully started and has preserved flags applied
-    /// while the old runner remains live. Only successful preparation crosses
-    /// the lifecycle boundary, commits providers, reaps the old transport, and
-    /// swaps handles. Nonfatal endpoint diagnostics are returned to the caller.
+    /// Mirrors TS `reload`:
+    /// 1. Capture previous flag values (preserved across the swap).
+    /// 2. Emit `session_shutdown{reload}` on the old runner (self-gated on
+    ///    handler presence; host errors isolated).
+    /// 3. When a concrete host is present: sequential restart-and-rewire
+    ///    (await old transport reap exactly once, re-register providers,
+    ///    restore flags, swap runner, refresh tools).
+    /// 4. Emit `session_start{reload}` on the post-swap runner.
+    /// 5. Reload base resources and re-discover extension resources.
     ///
     /// # Errors
     ///
-    /// Returns [`ExtensionBindError`] on host preparation or resource-discovery
-    /// failure. A preparation error leaves the old host installed and live.
-    pub async fn reload(&self) -> Result<Vec<ExtensionHostDiagnostic>, ExtensionBindError> {
+    /// Returns [`ExtensionBindError`] on host restart or resource-discovery
+    /// failure.
+    pub async fn reload(&self) -> Result<(), ExtensionBindError> {
         let runner = self.hooks.runner();
         let previous_flag_values = runner.get_flag_values();
 
-        if let Some(host) = self.host_extension_runner() {
-            let runtime = self.model_runtime().ok_or_else(|| {
-                ExtensionBindError::HostRestart("model runtime unavailable".to_owned())
-            })?;
-            let prepared = host
-                .prepare_restart(previous_flag_values)
-                .await
-                .map_err(|error| ExtensionBindError::HostRestart(error.to_string()))?;
-
-            let _ = runner
-                .emit(AgentSessionEvent::SessionShutdown {
-                    reason: SessionShutdownReason::Reload,
-                    target_session_file: None,
-                })
-                .await;
-            let result = host.commit_restart(&runtime, prepared).await;
-            let diagnostics = result.diagnostics;
-            let new_host = result.runner;
-            self.hooks.set_runner(
-                Arc::clone(&new_host) as Arc<dyn super::extension_runner::ExtensionRunner>
-            );
-            self.set_host_extension_runner(Some(new_host));
-            self.refresh_tool_registry(&super::tools::RefreshToolRegistryOptions {
-                active_tool_names: None,
-                include_all_extension_tools: true,
-            });
-            self.bind_session_bridge().await;
-            self.emit_session_start_reload().await;
-            self.extend_resources_from_extensions(SessionStartReason::Reload.as_str())
-                .await?;
-            return Ok(diagnostics);
-        }
-
+        // Lifecycle event on the old host. Emit self-gates on handler
+        // presence; host transport reaping is handled below regardless.
         let _ = runner
             .emit(AgentSessionEvent::SessionShutdown {
                 reason: SessionShutdownReason::Reload,
                 target_session_file: None,
             })
             .await;
+
+        if let Some(host) = self.host_extension_runner() {
+            let Some(runtime) = self.model_runtime() else {
+                // No runtime to re-register providers against: still reap the
+                // old host so dispose paths stay single-reap clean.
+                host.shutdown_once().await;
+                self.set_host_extension_runner(None);
+                self.hooks
+                    .set_runner(Arc::new(super::extension_runner::NullExtensionRunner));
+                self.emit_session_start_reload().await;
+                self.extend_resources_from_extensions(SessionStartReason::Reload.as_str())
+                    .await?;
+                return Ok(());
+            };
+            let new_host = host
+                .restart_and_rewire(&runtime, previous_flag_values)
+                .await
+                .map_err(|error| ExtensionBindError::HostRestart(error.to_string()))?;
+            // Swap trait runner + concrete host handle without downcast.
+            self.hooks.set_runner(
+                Arc::clone(&new_host) as Arc<dyn super::extension_runner::ExtensionRunner>
+            );
+            self.set_host_extension_runner(Some(new_host));
+            // Refresh tools so newly registered extension tools replace the old set.
+            self.refresh_tool_registry(&super::tools::RefreshToolRegistryOptions {
+                active_tool_names: None,
+                include_all_extension_tools: true,
+            });
+            // Re-claim the fresh host's session-action bridge.
+            self.bind_session_bridge().await;
+            self.emit_session_start_reload().await;
+            self.extend_resources_from_extensions(SessionStartReason::Reload.as_str())
+                .await?;
+            return Ok(());
+        }
+
+        // Trait-only / test path (no concrete host).
         self.emit_session_start_reload().await;
         self.extend_resources_from_extensions(SessionStartReason::Reload.as_str())
             .await?;
-        Ok(Vec::new())
+        Ok(())
     }
 
     /// Emit `session_start{reload}` on the current (post-swap) runner.
@@ -1923,74 +1932,6 @@ mod tests {
             .await?;
         session.invoke_extension_shutdown_handler();
         assert!(called.load(Ordering::SeqCst));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn failed_restart_prepare_keeps_old_runner_provider_and_transport_live() -> TestResult {
-        let runner = Arc::new(TestRunner::new());
-        runner.has_shutdown.store(true, Ordering::SeqCst);
-        runner
-            .flag_values
-            .lock()
-            .map_err(|_| io::Error::other("flag values mutex poisoned"))?
-            .insert("invalid".to_owned(), serde_json::json!(7));
-        let directory = tempfile::tempdir()?;
-        let host = HostExtensionRunner::start_with_cwd_and_trust(
-            vec![
-                directory
-                    .path()
-                    .join("missing")
-                    .to_string_lossy()
-                    .into_owned(),
-            ],
-            directory.path().to_string_lossy(),
-            false,
-        )
-        .await?;
-        let mut config = AgentSessionConfig::test_config(Arc::new(StubProvider), test_model())?;
-        config.extension_runner = Some(Arc::clone(&runner) as Arc<dyn ExtensionRunner>);
-        config.host_extension_runner = Some(Arc::clone(&host));
-        let session = AgentSession::new(config)?;
-
-        let error = session
-            .reload()
-            .await
-            .expect_err("prepare must reject number flag");
-
-        assert!(error.to_string().contains("unsupported value"));
-        assert!(locked_clone(&runner.calls, "calls")?.is_empty());
-        let retained = session
-            .host_extension_runner()
-            .ok_or_else(|| io::Error::other("old host handle was removed"))?;
-        assert!(Arc::ptr_eq(&retained, &host));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn reload_returns_structured_host_diagnostics() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        let missing = directory
-            .path()
-            .join("missing")
-            .to_string_lossy()
-            .into_owned();
-        let host = HostExtensionRunner::start_with_cwd_and_trust(
-            vec![missing.clone()],
-            directory.path().to_string_lossy(),
-            false,
-        )
-        .await?;
-        let mut config = AgentSessionConfig::test_config(Arc::new(StubProvider), test_model())?;
-        config.extension_runner = Some(Arc::clone(&host) as Arc<dyn ExtensionRunner>);
-        config.host_extension_runner = Some(host);
-        let session = AgentSession::new(config)?;
-
-        let diagnostics = session.reload().await?;
-
-        assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].path, missing);
-        assert!(diagnostics[0].message.contains("does not exist"));
         Ok(())
     }
 }

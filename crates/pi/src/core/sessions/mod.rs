@@ -333,14 +333,6 @@ impl SessionManager {
         Ok(())
     }
 
-    /// Rebind the already-open session after its file was atomically moved.
-    ///
-    /// The caller owns the move and has already validated the file, so this must
-    /// not re-read or rewrite it.
-    pub(crate) fn rebind_session_file_after_atomic_move(&mut self, session_file: String) {
-        self.session_file = Some(session_file);
-    }
-
     /// Start a new in-memory session (optionally with a deferred file path).
     ///
     /// Returns the session file path when persisting, else `None`.
@@ -1683,31 +1675,6 @@ mod tests {
         let header: Value = serde_json::from_str(lines[0])?;
         assert_eq!(header["type"], "session");
         assert_eq!(header["version"], 3);
-        Ok(())
-    }
-
-    #[test]
-    fn atomic_move_path_rebind_persists_to_final_file() -> TestResult {
-        let dir = tempdir()?;
-        let mut source =
-            SessionManager::create(path_str(dir.path())?, Some(path_str(dir.path())?), None)?;
-        let source_file = source.get_session_file().ok_or("source file")?.to_owned();
-        source.append_message(&user_agent("before move", 1))?;
-        source.append_message(&assistant_agent("persist source", 2))?;
-
-        let staged = dir.path().join("import.tmp");
-        let final_file = dir.path().join("imported.jsonl");
-        fs::rename(&source_file, &staged)?;
-        let mut reopened =
-            SessionManager::open(path_str(&staged)?, Some(path_str(dir.path())?), None)?;
-        fs::rename(&staged, &final_file)?;
-        reopened.rebind_session_file_after_atomic_move(path_str(&final_file)?.to_owned());
-
-        reopened.append_message(&user_agent("after move", 3))?;
-
-        assert_eq!(reopened.get_session_file(), Some(path_str(&final_file)?));
-        assert!(!staged.exists());
-        assert!(fs::read_to_string(&final_file)?.contains("after move"));
         Ok(())
     }
 

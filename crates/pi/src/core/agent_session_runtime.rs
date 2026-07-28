@@ -20,8 +20,6 @@
 //!    `session_start{new|resume|fork}` after the old host received its
 //!    `session_shutdown` in step 4.
 
-use std::fs::{self, File, OpenOptions};
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
@@ -194,9 +192,6 @@ pub enum AgentSessionRuntimeError {
     /// File transfer error during import.
     #[error("{0}")]
     Transfer(String),
-    /// An external import would replace an existing session with the same basename.
-    #[error("A session already exists at {0}")]
-    ImportCollision(String),
     /// Factory failed to build the replacement runtime.
     #[error("runtime replacement failed: {0}")]
     Factory(String),
@@ -565,133 +560,59 @@ impl AgentSessionRuntime {
             sm.get_session_dir().to_owned()
         };
         if !Path::new(&session_dir).exists() {
-            fs::create_dir_all(&session_dir)
-                .map_err(|error| AgentSessionRuntimeError::Transfer(error.to_string()))?;
+            std::fs::create_dir_all(&session_dir)
+                .map_err(|e| AgentSessionRuntimeError::Transfer(e.to_string()))?;
         }
 
         let file_name = Path::new(&resolved).file_name().map_or_else(
             || "imported.jsonl".to_owned(),
             |name| name.to_string_lossy().into_owned(),
         );
-        let destination = Path::new(&session_dir).join(&file_name);
-        let destination_text = destination.to_string_lossy().into_owned();
-        let resolved_canonical = fs::canonicalize(&resolved)
-            .map_err(|error| AgentSessionRuntimeError::Transfer(error.to_string()))?;
-        let destination_exists = fs::symlink_metadata(&destination).is_ok();
-        let same_file = destination_exists
-            && fs::canonicalize(&destination)
-                .is_ok_and(|canonical| canonical == resolved_canonical);
-        if destination_exists && !same_file {
-            return Err(AgentSessionRuntimeError::ImportCollision(destination_text));
-        }
+        let destination = Path::new(&session_dir)
+            .join(&file_name)
+            .to_string_lossy()
+            .into_owned();
 
         let before = self
-            .emit_before_switch(SessionStartReason::Resume, Some(&destination_text))
+            .emit_before_switch(SessionStartReason::Resume, Some(&destination))
             .await;
         if before.cancelled {
             return Ok(before);
         }
 
-        if same_file {
-            let session_manager =
-                SessionManager::open(&destination_text, Some(&session_dir), cwd_override)?;
-            self.assert_cwd(&session_manager)?;
-            let new_cwd = session_manager.get_cwd().to_owned();
-            let target_session_file = session_manager.get_session_file().map(str::to_owned);
-            let result = self
-                .factory
-                .create(CreateAgentSessionRuntimeOptions {
-                    cwd: new_cwd,
-                    agent_dir: self.agent_dir(),
-                    session_manager,
-                    start_reason: SessionStartReason::Resume,
-                    previous_session_file: self.session_file_for_teardown().await,
-                })
-                .await?;
-            self.teardown_current(
-                SessionShutdownReason::Resume,
-                target_session_file.as_deref(),
-            )
-            .await;
-            self.apply(result);
-            self.finish_session_replacement(None).await;
-            return Ok(SwitchOutcome { cancelled: false });
+        let previous_session_file = self.session_file_for_teardown().await;
+        let dest_canonical = std::fs::canonicalize(&destination).map_or_else(
+            |_| destination.clone(),
+            |path| path.to_string_lossy().into_owned(),
+        );
+        let resolved_canonical = std::fs::canonicalize(&resolved).map_or_else(
+            |_| resolved.clone(),
+            |path| path.to_string_lossy().into_owned(),
+        );
+        if dest_canonical != resolved_canonical {
+            std::fs::copy(&resolved, &destination)
+                .map_err(|e| AgentSessionRuntimeError::Transfer(e.to_string()))?;
         }
 
-        let staged_path = loop {
-            let candidate =
-                Path::new(&session_dir).join(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
-            let mut staged = match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&candidate)
-            {
-                Ok(file) => file,
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(error) => {
-                    return Err(AgentSessionRuntimeError::Transfer(error.to_string()));
-                }
-            };
-            let copied = (|| {
-                let mut source = File::open(&resolved)
-                    .map_err(|error| AgentSessionRuntimeError::Transfer(error.to_string()))?;
-                io::copy(&mut source, &mut staged)
-                    .map_err(|error| AgentSessionRuntimeError::Transfer(error.to_string()))?;
-                staged
-                    .sync_all()
-                    .map_err(|error| AgentSessionRuntimeError::Transfer(error.to_string()))
-            })();
-            drop(staged);
-            if let Err(error) = copied {
-                let _ = fs::remove_file(&candidate);
-                return Err(error);
-            }
-            break candidate;
-        };
-        let staged_text = staged_path.to_string_lossy().into_owned();
-        let session_manager =
-            match SessionManager::open(&staged_text, Some(&session_dir), cwd_override) {
-                Ok(session_manager) => session_manager,
-                Err(error) => {
-                    let _ = fs::remove_file(&staged_path);
-                    return Err(error.into());
-                }
-            };
-        if let Err(error) = self.assert_cwd(&session_manager) {
-            let _ = fs::remove_file(&staged_path);
-            return Err(error);
-        }
-
-        let result = match self
+        let session_manager = SessionManager::open(&destination, Some(&session_dir), cwd_override)?;
+        self.assert_cwd(&session_manager)?;
+        let new_cwd = session_manager.get_cwd().to_owned();
+        let target_session_file = session_manager.get_session_file().map(str::to_owned);
+        let result = self
             .factory
             .create(CreateAgentSessionRuntimeOptions {
-                cwd: session_manager.get_cwd().to_owned(),
+                cwd: new_cwd,
                 agent_dir: self.agent_dir(),
                 session_manager,
                 start_reason: SessionStartReason::Resume,
-                previous_session_file: self.session_file_for_teardown().await,
+                previous_session_file,
             })
-            .await
-        {
-            Ok(result) => result,
-            Err(error) => {
-                let _ = fs::remove_file(&staged_path);
-                return Err(error);
-            }
-        };
-        if let Err(error) = fs::rename(&staged_path, &destination) {
-            result.session.dispose().await;
-            let _ = fs::remove_file(&staged_path);
-            return Err(AgentSessionRuntimeError::Transfer(error.to_string()));
-        }
-        let replacement_manager = result.session.session_manager();
-        replacement_manager
-            .lock()
-            .await
-            .rebind_session_file_after_atomic_move(destination_text.clone());
-
-        self.teardown_current(SessionShutdownReason::Resume, Some(&destination_text))
-            .await;
+            .await?;
+        self.teardown_current(
+            SessionShutdownReason::Resume,
+            target_session_file.as_deref(),
+        )
+        .await;
         self.apply(result);
         self.finish_session_replacement(None).await;
         Ok(SwitchOutcome { cancelled: false })
@@ -963,7 +884,7 @@ mod tests {
         }
     }
 
-    /// Factory that produces a fresh session with the supplied session manager.
+    /// Factory that produces a fresh in-memory session per call.
     struct TestFactory {
         calls: Arc<AtomicUsize>,
     }
@@ -984,10 +905,8 @@ mod tests {
         {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
-                let mut config =
-                    AgentSessionConfig::test_config(Arc::new(StubProvider), test_model())
-                        .map_err(|e| AgentSessionRuntimeError::Factory(e.to_string()))?;
-                config.session_manager = options.session_manager;
+                let config = AgentSessionConfig::test_config(Arc::new(StubProvider), test_model())
+                    .map_err(|e| AgentSessionRuntimeError::Factory(e.to_string()))?;
                 let session = AgentSession::new(config)
                     .map_err(|e| AgentSessionRuntimeError::Factory(e.to_string()))?;
                 Ok(CreateAgentSessionRuntimeResult {
@@ -1313,47 +1232,6 @@ mod tests {
         }
     }
 
-    struct FailingReplacementFactory;
-
-    impl CreateAgentSessionRuntimeFactory for FailingReplacementFactory {
-        fn create(
-            &self,
-            _options: CreateAgentSessionRuntimeOptions,
-        ) -> BoxFuture<'_, Result<CreateAgentSessionRuntimeResult, AgentSessionRuntimeError>>
-        {
-            Box::pin(async {
-                Err(AgentSessionRuntimeError::Factory(
-                    "injected replacement failure".to_owned(),
-                ))
-            })
-        }
-    }
-
-    async fn make_persistent_runtime(session_dir: &Path) -> TestResult<AgentSessionRuntime> {
-        let factory = Arc::new(TestFactory::new());
-        let session_manager = SessionManager::create(
-            ".",
-            Some(
-                session_dir
-                    .to_str()
-                    .ok_or("session directory is not UTF-8")?,
-            ),
-            None,
-        )?;
-        Ok(create_agent_session_runtime(factory, ".".into(), ".".into(), session_manager).await?)
-    }
-
-    fn write_import_fixture(path: &Path) -> TestResult {
-        fs::write(
-            path,
-            concat!(
-                r#"{"type":"session","version":3,"id":"imported-session","timestamp":"2026-01-01T00:00:00.000Z","cwd":"."}"#,
-                "\n",
-            ),
-        )?;
-        Ok(())
-    }
-
     async fn make_runtime() -> TestResult<AgentSessionRuntime> {
         let factory = Arc::new(TestFactory::new());
         let session_manager = SessionManager::in_memory(Some("."), None)?;
@@ -1500,124 +1378,6 @@ mod tests {
             return Err(failure("importing a missing JSONL file must fail").into());
         };
         assert!(matches!(err, AgentSessionRuntimeError::ImportNotFound(_)));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn import_collision_never_overwrites_existing_session() -> TestResult {
-        let root = tempfile::tempdir()?;
-        let session_dir = root.path().join("sessions");
-        let source_dir = root.path().join("external");
-        fs::create_dir_all(&source_dir)?;
-        let source = source_dir.join("collision.jsonl");
-        let destination = session_dir.join("collision.jsonl");
-        write_import_fixture(&source)?;
-        fs::create_dir_all(&session_dir)?;
-        fs::write(&destination, b"existing session bytes")?;
-        let runtime = Arc::new(make_persistent_runtime(&session_dir).await?);
-        let original = runtime.session();
-
-        let Err(error) = runtime
-            .import_from_jsonl(source.to_str().ok_or("source path is not UTF-8")?, None)
-            .await
-        else {
-            return Err(failure("basename collision must reject import").into());
-        };
-
-        assert!(matches!(
-            error,
-            AgentSessionRuntimeError::ImportCollision(_)
-        ));
-        assert_eq!(fs::read(&destination)?, b"existing session bytes");
-        assert!(Arc::ptr_eq(&original, &runtime.session()));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn import_factory_failure_removes_stage_and_preserves_existing_session() -> TestResult {
-        let root = tempfile::tempdir()?;
-        let session_dir = root.path().join("sessions");
-        let source_dir = root.path().join("external");
-        fs::create_dir_all(&source_dir)?;
-        let source = source_dir.join("factory-failure.jsonl");
-        write_import_fixture(&source)?;
-        let session_manager = SessionManager::create(
-            ".",
-            Some(
-                session_dir
-                    .to_str()
-                    .ok_or("session directory is not UTF-8")?,
-            ),
-            None,
-        )?;
-        let mut config = AgentSessionConfig::test_config(Arc::new(StubProvider), test_model())?;
-        config.session_manager = session_manager;
-        let original = AgentSession::new(config)?;
-        let runtime = Arc::new(AgentSessionRuntime::new(
-            Arc::clone(&original),
-            AgentSessionRuntimeServices {
-                cwd: PathBuf::from("."),
-                agent_dir: PathBuf::from("."),
-            },
-            Arc::new(FailingReplacementFactory),
-            Vec::new(),
-            None,
-        ));
-
-        let Err(error) = runtime
-            .import_from_jsonl(source.to_str().ok_or("source path is not UTF-8")?, None)
-            .await
-        else {
-            return Err(failure("injected factory failure must reject import").into());
-        };
-
-        assert!(matches!(error, AgentSessionRuntimeError::Factory(_)));
-        assert!(Arc::ptr_eq(&original, &runtime.session()));
-        assert!(!session_dir.join("factory-failure.jsonl").exists());
-        let session_entries = fs::read_dir(&session_dir)?.collect::<Result<Vec<_>, _>>()?;
-        assert!(
-            session_entries
-                .iter()
-                .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp"))
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn successful_import_atomically_publishes_and_rebinds_session_file() -> TestResult {
-        let root = tempfile::tempdir()?;
-        let session_dir = root.path().join("sessions");
-        let source_dir = root.path().join("external");
-        fs::create_dir_all(&source_dir)?;
-        let source = source_dir.join("published.jsonl");
-        write_import_fixture(&source)?;
-        let runtime = Arc::new(make_persistent_runtime(&session_dir).await?);
-
-        let outcome = runtime
-            .import_from_jsonl(source.to_str().ok_or("source path is not UTF-8")?, None)
-            .await?;
-
-        assert!(!outcome.cancelled);
-        let destination = session_dir.join("published.jsonl");
-        let session = runtime.session();
-        let manager = session.session_manager();
-        let mut manager = manager.lock().await;
-        assert_eq!(manager.get_session_file(), destination.to_str());
-        manager.append_message(&pi_agent::AgentMessage::Llm(Box::new(
-            pi_ai::Message::User(pi_ai::UserMessage::new(
-                pi_ai::UserMessageContent::Text("after import".into()),
-                1,
-            )),
-        )))?;
-        drop(manager);
-
-        assert!(fs::read_to_string(&destination)?.contains("after import"));
-        let session_entries = fs::read_dir(&session_dir)?.collect::<Result<Vec<_>, _>>()?;
-        assert!(
-            session_entries
-                .iter()
-                .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp"))
-        );
         Ok(())
     }
 
