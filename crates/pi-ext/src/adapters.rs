@@ -24,7 +24,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style as RatatuiStyle};
 use serde_json::{Map, Value};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use pi_agent::{AgentTool, AgentToolResult, ToolError, ToolExecutionMode, ToolUpdates};
@@ -359,12 +359,17 @@ impl Provider for ExtensionProvider {
 
         // Capacity-64 matches STREAM_EVENT_CAPACITY / host provider channel bound.
         let (tx, rx) = mpsc::channel::<Result<AssistantMessageEvent, ProviderError>>(64);
+        // Terminal cancellation/timeout errors must not block on a saturated
+        // consumer; when the bounded queue cannot take them they travel over
+        // this oneshot, which ProviderStream checks once rx closes.
+        let (terminal_tx, terminal_rx) = oneshot::channel::<ProviderError>();
         let deadline = tokio::time::Instant::now() + timeout;
         tokio::spawn(async move {
+            let mut terminal = Some(terminal_tx);
             let mut handle = tokio::select! {
                 biased;
                 () = cancel.cancelled() => {
-                    let _ = tx.try_send(Err(ProviderError::new("provider stream cancelled")));
+                    deliver_terminal(&tx, &mut terminal, ProviderError::new("provider stream cancelled"));
                     return;
                 }
                 opened = tokio::time::timeout_at(
@@ -377,9 +382,13 @@ impl Provider for ExtensionProvider {
                         return;
                     }
                     Err(_) => {
-                        let _ = tx.try_send(Err(ProviderError::new(format!(
-                            "provider stream timed out after {timeout:?}"
-                        ))));
+                        deliver_terminal(
+                            &tx,
+                            &mut terminal,
+                            ProviderError::new(format!(
+                                "provider stream timed out after {timeout:?}"
+                            )),
+                        );
                         return;
                     }
                 }
@@ -394,9 +403,11 @@ impl Provider for ExtensionProvider {
                 tokio::select! {
                     biased;
                     () = cancel.cancelled() => {
-                        let _ = tx.try_send(Err(ProviderError::new(
-                            "provider stream cancelled",
-                        )));
+                        deliver_terminal(
+                            &tx,
+                            &mut terminal,
+                            ProviderError::new("provider stream cancelled"),
+                        );
                         return;
                     }
                     ev = async {
@@ -439,7 +450,10 @@ impl Provider for ExtensionProvider {
             }
             // tx drops → stream ends.
         });
-        Box::pin(ProviderStream { rx })
+        Box::pin(ProviderStream {
+            rx,
+            terminal: Some(terminal_rx),
+        })
     }
 }
 
@@ -540,16 +554,65 @@ fn decode_provider_stream_event(payload: &Value) -> Option<AssistantMessageEvent
     None
 }
 
+/// Offer a terminal error to the event queue without blocking.
+///
+/// Cancellation and timeout must never wait on a saturated consumer, so the
+/// terminal item uses `try_send`. When the bounded queue cannot take it, the
+/// error is carried out-of-band over `terminal` for [`ProviderStream`] to
+/// surface on close — a full channel can never turn an abort into clean EOF.
+fn deliver_terminal(
+    tx: &mpsc::Sender<Result<AssistantMessageEvent, ProviderError>>,
+    terminal: &mut Option<oneshot::Sender<ProviderError>>,
+    error: ProviderError,
+) {
+    // On failure `try_send` hands back the very `Err(error)` we offered.
+    if let Err(failed) = tx.try_send(Err(error))
+        && let Err(error) = failed.into_inner()
+        && let Some(terminal) = terminal.take()
+    {
+        let _ = terminal.send(error);
+    }
+}
+
 /// Stream wrapper over the driver task's receiver.
+///
+/// Terminal cancellation/timeout errors are offered to the bounded queue
+/// non-blockingly; when the queue is saturated they arrive out-of-band over
+/// `terminal`, checked once `rx` closes, so an abort can never be mistaken
+/// for a clean provider completion.
 struct ProviderStream {
     rx: mpsc::Receiver<Result<AssistantMessageEvent, ProviderError>>,
+    terminal: Option<oneshot::Receiver<ProviderError>>,
 }
 
 impl Stream for ProviderStream {
     type Item = Result<AssistantMessageEvent, ProviderError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
-        self.rx.poll_recv(cx)
+        match self.rx.poll_recv(cx) {
+            Poll::Ready(Some(item)) => Poll::Ready(Some(item)),
+            Poll::Pending => Poll::Pending,
+            // The driver dropped the queue sender. A terminal error that did
+            // not fit the bounded channel arrives out-of-band; an unarmed
+            // oneshot (RecvError) means the provider completed cleanly.
+            Poll::Ready(None) => {
+                let Some(terminal) = self.terminal.as_mut() else {
+                    return Poll::Ready(None);
+                };
+                let result = Pin::new(terminal).poll(cx);
+                match result {
+                    Poll::Ready(Ok(error)) => {
+                        self.terminal = None;
+                        Poll::Ready(Some(Err(error)))
+                    }
+                    Poll::Ready(Err(_)) => {
+                        self.terminal = None;
+                        Poll::Ready(None)
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+        }
     }
 }
 
@@ -1985,6 +2048,78 @@ mod tests {
             .ok_or("cancelled provider stream ended without an error")?;
         assert!(matches!(&item, Err(error) if error.to_string().contains("cancelled")));
         assert_eq!(client.pending_count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn extension_provider_cancel_surfaces_error_when_queue_saturated() -> R {
+        let (client, mut host) = make_pair().await;
+        let provider = ExtensionProvider::new("custom", Arc::new(client));
+        let model = Model {
+            id: "m".to_owned(),
+            name: "M".to_owned(),
+            api: "custom".to_owned(),
+            provider: "custom".to_owned(),
+            ..base_model_defaults()
+        };
+        let cancel = CancellationToken::new();
+        let options = StreamOptions {
+            signal: Some(cancel.clone()),
+            ..StreamOptions::default()
+        };
+        let mut stream = provider.stream(&model, Context::default(), options);
+        let req = host.require_frame(methods::PROVIDER_STREAM).await?;
+
+        // Fill the 64-slot adapter queue while the consumer stays idle: the
+        // driver forwards every event, then parks in its select loop with a
+        // saturated channel.
+        for i in 0..64 {
+            host.write_frame(&Frame::event(
+                req.id,
+                Method::ProviderEvent,
+                text_delta_event(&format!("e{i}")),
+            ))
+            .await?;
+        }
+        // Let the driver drain the host pipe into the bounded queue.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        cancel.cancel();
+        tokio::task::yield_now().await;
+
+        // Drain: all 64 queued events first, then the terminal cancel error,
+        // which cannot fit the full queue and must arrive out-of-band rather
+        // than vanishing into a clean EOF.
+        let mut events = 0;
+        let mut terminal = None;
+        while let Some(item) = tokio::time::timeout(Duration::from_secs(2), stream.next()).await? {
+            match item {
+                Ok(_) => events += 1,
+                Err(error) => {
+                    terminal = Some(error);
+                    break;
+                }
+            }
+        }
+        let terminal =
+            terminal.ok_or("saturated queue swallowed the cancel error into a clean EOF")?;
+        assert!(
+            terminal.to_string().contains("cancelled"),
+            "unexpected terminal error: {terminal}"
+        );
+        // All 64 events were already queued when cancellation fired, so the
+        // error necessarily traveled out-of-band: a queued try_send would
+        // have landed before the 64th event.
+        assert_eq!(
+            events, 64,
+            "expected the full saturated backlog before the terminal error"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), stream.next())
+                .await?
+                .is_none(),
+            "stream must be fused after its terminal error"
+        );
         Ok(())
     }
 
