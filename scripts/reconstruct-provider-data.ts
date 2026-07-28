@@ -550,13 +550,14 @@ function usesRepositoryDefaultPaths(ctx: ReconstructProofContext): boolean {
 	);
 }
 
-async function defaultInversionProof(ctx: ReconstructProofContext): Promise<void> {
+export async function defaultInversionProof(ctx: ReconstructProofContext): Promise<void> {
 	// Fail-fast inversion proof: regenerating the catalog from the
 	// reconstructed files must reproduce the exact catalog text. Normalize
 	// CRLF only because Windows checkout conversion is not generator drift.
 	// Snapshot/restore keeps the generator-owned artifact untouched.
 	// Only valid for repository default paths — see usesRepositoryDefaultPaths.
 	const before = await Bun.file(ctx.catalogPath).bytes();
+	let proofFailure: unknown;
 	try {
 		const regen = Bun.spawnSync(
 			[process.execPath, "run", join(ctx.repoRoot, "scripts/generate-builtin-models.ts")],
@@ -575,8 +576,19 @@ async function defaultInversionProof(ctx: ReconstructProofContext): Promise<void
 				"inversion proof failed: regenerated builtin-models.json differs from the catalog the reconstruction used",
 			);
 		}
+	} catch (error) {
+		proofFailure = error;
+		throw error;
 	} finally {
-		await writeFile(ctx.catalogPath, before);
+		try {
+			await writeFile(ctx.catalogPath, before);
+		} catch (restoreError) {
+			if (proofFailure === undefined) throw restoreError;
+			throw new Error(
+				`inversion proof failed (${errorDetail(proofFailure)}); additionally failed to restore catalog snapshot: ${errorDetail(restoreError)}`,
+				{ cause: proofFailure },
+			);
+		}
 	}
 }
 

@@ -16,6 +16,7 @@ import { fileURLToPath } from "node:url";
 
 import {
 	acquireDataDirectoryLock,
+	defaultInversionProof,
 	recoverStaleLock,
 	reconstructProviderData,
 	releaseDataDirectoryLock,
@@ -628,6 +629,79 @@ describe("reconstructProviderData default inversion proof path gating (P2)", () 
 				process.env.PATH = previousPath;
 			}
 			rmSync(fakeBin, { recursive: true, force: true });
+		}
+	}, 120_000);
+});
+
+describe("defaultInversionProof primary-error preservation (PRRT_kwDOTcPStM6UYj9z)", () => {
+	test("restore failure after proof failure preserves the proof failure as primary", async () => {
+		const root = mkdtempSync(join(tmpdir(), "inversion-proof-preserve-"));
+		const catalogPath = join(root, "builtin-models.json");
+		writeFileSync(catalogPath, '{"alpha":{"model":{"id":"model"}}}\n', "utf8");
+		// Make the catalog file read-only so the finally-block restore fails.
+		chmodSync(catalogPath, 0o444);
+		try {
+			const error = await captureError(
+				defaultInversionProof({
+					// repoRoot without scripts/generate-builtin-models.ts → proof fails.
+					repoRoot: root,
+					catalogPath,
+					providersDir: join(root, "providers"),
+					dataDir: join(root, "providers", "data"),
+				}),
+			);
+
+			const proofOffset = error.message.indexOf("inversion proof failed");
+			const restoreOffset = error.message.indexOf(
+				"additionally failed to restore catalog snapshot",
+			);
+			// Both messages present.
+			expect(proofOffset).toBeGreaterThanOrEqual(0);
+			expect(restoreOffset).toBeGreaterThan(proofOffset);
+			// Causal order: proof failure is the cause, not the restore failure.
+			expect(error.cause).toBeInstanceOf(Error);
+			expect((error.cause as Error).message).toContain("inversion proof failed");
+		} finally {
+			chmodSync(catalogPath, 0o644);
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("restore failure without proof failure surfaces the restore error directly", async () => {
+		const root = mkdtempSync(join(tmpdir(), "inversion-proof-restore-only-"));
+		const catalogPath = join(root, "builtin-models.json");
+		// Write a catalog that the generator will reproduce exactly (proof passes).
+		// Use the real repo so the generator succeeds, but make restore fail.
+		const catalogBefore = readFileSync(REAL_CATALOG_PATH);
+		writeFileSync(catalogPath, catalogBefore);
+		// The proof reads the catalog, runs the generator (which writes to the
+		// REAL path, not our fixture), then compares. Since the generator writes
+		// to the real path and our fixture catalog is identical, the proof passes.
+		// But we need the restore to fail — so make the file read-only AFTER the
+		// initial snapshot read. We achieve this by using a path whose parent
+		// directory becomes read-only. Simpler: just verify the happy path still
+		// restores correctly (no error thrown).
+		chmodSync(catalogPath, 0o444);
+		try {
+			// With a read-only catalog, the initial Bun.file().bytes() succeeds,
+			// the generator runs against real paths (proof passes because content
+			// matches), and the restore writeFile fails. Since proofFailure is
+			// undefined, the restore error is thrown directly.
+			const error = await captureError(
+				defaultInversionProof({
+					repoRoot: REPO_ROOT,
+					catalogPath,
+					providersDir: REAL_PROVIDERS_DIR,
+					dataDir: REAL_DATA_DIR,
+				}),
+			);
+
+			// No "inversion proof failed" wrapper — the raw restore error surfaces.
+			expect(error.message).not.toContain("inversion proof failed");
+			expect(error.message).toMatch(/EACCES|EPERM|read.only/i);
+		} finally {
+			chmodSync(catalogPath, 0o644);
+			rmSync(root, { recursive: true, force: true });
 		}
 	}, 120_000);
 });
