@@ -87,6 +87,14 @@ export type ReconstructProviderDataOptions = {
 	 * never reaped — waiters simply time out at this bound.
 	 */
 	lockAcquireTimeoutMs?: number;
+	/**
+	 * Optional test-observability hook invoked synchronously inside
+	 * `acquireDataDirectoryLock` only when an active-owner inspection returns
+	 * `kind === "wait"`, immediately before the retry sleep. Production callers
+	 * omit it; tests use a deferred barrier to prove a second contender observed
+	 * a held lock before the first owner releases it, without wall-clock sleep.
+	 */
+	onLockWait?: () => void;
 };
 
 export type ReconstructProofContext = {
@@ -394,6 +402,7 @@ export async function recoverStaleLock(
 export async function acquireDataDirectoryLock(
 	dataDir: string,
 	lockAcquireTimeoutMs: number,
+	onLockWait?: () => void,
 ): Promise<DataDirectoryLockHandle> {
 	const lockDir = `${dataDir}.lock`;
 	const token = crypto.randomUUID();
@@ -410,6 +419,7 @@ export async function acquireDataDirectoryLock(
 				throw new Error(`failed to acquire reconstruction lock ${lockDir}: ${errorDetail(error)}`);
 			}
 		}
+		let observedWait = false;
 		if (created) {
 			if (await claimLockDirectory(lockDir, token)) return { lockDir, token };
 			contention =
@@ -421,6 +431,7 @@ export async function acquireDataDirectoryLock(
 				await recoverStaleLock(dataDir, inspection.observedToken);
 			} else if (inspection.kind === "wait") {
 				contention = inspection.detail;
+				observedWait = true;
 			}
 		}
 		const elapsedMs = Date.now() - startedAtMs;
@@ -429,6 +440,7 @@ export async function acquireDataDirectoryLock(
 				`timed out acquiring reconstruction lock ${lockDir} after ${elapsedMs}ms (bound ${lockAcquireTimeoutMs}ms); ${contention}`,
 			);
 		}
+		if (observedWait) onLockWait?.();
 		await Bun.sleep(DATA_DIRECTORY_LOCK_RETRY_MS);
 	}
 }
@@ -635,7 +647,7 @@ export async function reconstructProviderData(
 		expectedBodies.set(provider, encodeProviderModels(models));
 	}
 
-	const lock = await acquireDataDirectoryLock(dataDir, lockAcquireTimeoutMs);
+	const lock = await acquireDataDirectoryLock(dataDir, lockAcquireTimeoutMs, options.onLockWait);
 	let primaryFailure: unknown = undefined;
 	let hasPrimaryFailure = false;
 	try {
