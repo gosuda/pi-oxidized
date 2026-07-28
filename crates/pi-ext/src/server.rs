@@ -61,6 +61,12 @@ const MESSAGE_UPDATE_HANDLER: &str = "message_update";
 /// timeout. Dropping the callback at the deadline stops its work and releases
 /// the request's server permit.
 pub const NATIVE_TERMINAL_INPUT_BUDGET: std::time::Duration = std::time::Duration::from_millis(4);
+/// Server-side deadline for native lifecycle callbacks.
+///
+/// A hook whose future never resolves would retain its semaphore permit
+/// forever, eventually exhausting `max_in_flight`. Dropping the future at
+/// the deadline releases the permit and answers a correlated `timeout` error.
+pub const NATIVE_LIFECYCLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Default bound on concurrently handled requests.
 pub const DEFAULT_MAX_IN_FLIGHT: usize = 64;
@@ -86,6 +92,9 @@ pub struct ServerConfig {
     pub update_capacity: usize,
     /// Bound on the shared outbound frame channel.
     pub outbound_capacity: usize,
+    /// Server-side deadline for native lifecycle callbacks. A hook that never
+    /// resolves is dropped at the deadline so its permit is released.
+    pub lifecycle_deadline: std::time::Duration,
 }
 
 impl Default for ServerConfig {
@@ -94,6 +103,7 @@ impl Default for ServerConfig {
             max_in_flight: DEFAULT_MAX_IN_FLIGHT,
             update_capacity: DEFAULT_UPDATE_CAPACITY,
             outbound_capacity: DEFAULT_OUTBOUND_CAPACITY,
+            lifecycle_deadline: NATIVE_LIFECYCLE_DEADLINE,
         }
     }
 }
@@ -493,6 +503,13 @@ pub trait NativeExtension: Send + Sync + 'static {
         let _ = (event_type, payload, events);
         Box::pin(async { Ok(json!({})) })
     }
+
+    /// Observe a `theme.update` broadcast from the host.
+    ///
+    /// Called when the host pushes the active theme (initial or on change).
+    /// The default is a no-op; extensions emitting styled `uiSlot` content
+    /// override this to track palette, polarity, and generation.
+    fn on_theme_update(&self, _update: crate::protocol::ThemeUpdate) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -774,12 +791,25 @@ where
         })
     };
 
+    let writer_shutdown = CancellationToken::new();
     let writer_task = {
         let writer_dead = writer_dead.clone();
+        let shutdown = writer_shutdown.clone();
         tokio::spawn(async move {
             let mut writer = writer;
             let result: Result<(), ServerError> = async {
-                while let Some(frame) = out_rx.recv().await {
+                loop {
+                    let frame = tokio::select! {
+                        frame = out_rx.recv() => frame,
+                        () = shutdown.cancelled() => {
+                            // Explicit shutdown: close the receiver so the loop
+                            // drains buffered frames then stops, regardless of
+                            // retained event-sink sender clones.
+                            out_rx.close();
+                            out_rx.recv().await
+                        }
+                    };
+                    let Some(frame) = frame else { break };
                     let bytes = match frame {
                         OutboundFrame::Encoded(bytes) => bytes,
                         OutboundFrame::Structured(frame) => {
@@ -817,22 +847,25 @@ where
         writer_task.abort();
     }
 
-    // Teardown: cancel cooperative executions, stop request tasks, then
-    // drop the runtime. The outbound channel closes only after the joined
-    // tasks released their runtime clones and the detached update
-    // forwarders flushed and released their sender clones, so awaiting the
-    // writer below drains every queued frame exactly once.
-    if let Ok(map) = runtime.in_flight.lock() {
-        for entry in map.values() {
-            entry.token.cancel();
-        }
-    }
+    // Teardown: cancel cooperative executions, stop request tasks, drop the
+    // runtime, then signal the writer. The explicit shutdown signal lets the
+    // writer drain buffered frames and stop regardless of retained
+    // event-sink sender clones held by detached background work.
+    runtime
+        .in_flight
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .values()
+        .for_each(|entry| entry.token.cancel());
     tasks.abort_all();
     while let Some(joined) = tasks.join_next().await {
         let _ = joined;
     }
     drop(rejection_tx);
     drop(runtime);
+    // Explicit shutdown signal: the writer drains buffered frames and stops
+    // regardless of retained event-sink sender clones (detached work).
+    writer_shutdown.cancel();
     let _ = rejection_flusher.await;
     let write_result = writer_task.await;
 
@@ -915,6 +948,8 @@ struct ServerRuntime<E: NativeExtension> {
     out_tx: mpsc::Sender<OutboundFrame>,
     /// Bound on queued per-call streaming updates/events.
     update_capacity: usize,
+    /// Server-side deadline for native lifecycle callbacks.
+    lifecycle_deadline: std::time::Duration,
 }
 
 impl<E: NativeExtension> ServerRuntime<E> {
@@ -934,6 +969,7 @@ impl<E: NativeExtension> ServerRuntime<E> {
                 context: Mutex::new(None),
                 out_tx,
                 update_capacity: config.update_capacity,
+                lifecycle_deadline: config.lifecycle_deadline,
             },
             out_rx,
         )
@@ -1029,6 +1065,40 @@ fn validate_hello(frame: &Frame) -> Result<(), ServerError> {
     Ok(())
 }
 
+fn handle_theme_update<E: NativeExtension>(
+    runtime: &ServerRuntime<E>,
+    rejection_tx: &mpsc::Sender<Frame>,
+    payload: &Value,
+) -> Result<(), ServerError> {
+    let Ok(update) = from_payload(payload) else {
+        return Ok(());
+    };
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.extension.on_theme_update(update);
+    }))
+    .is_ok()
+    {
+        return Ok(());
+    }
+
+    let failure = Frame::event(
+        0,
+        Method::ExtensionError,
+        json!({
+            "code": "internal",
+            "message": "native extension theme callback panicked",
+            "retryable": false,
+        }),
+    );
+    match rejection_tx.try_send(failure) {
+        Ok(()) => Ok(()),
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Err(ServerError::OutboundOverflow),
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(ServerError::Io(
+            std::io::Error::other("deferred extension error channel closed"),
+        )),
+    }
+}
+
 /// Dispatch one post-handshake frame.
 fn dispatch_ready<E: NativeExtension>(
     frame: Frame,
@@ -1048,15 +1118,17 @@ fn dispatch_ready<E: NativeExtension>(
                 };
                 let token = kind.map(|kind| {
                     let token = CancellationToken::new();
-                    if let Ok(mut map) = runtime.in_flight.lock() {
-                        map.insert(
+                    runtime
+                        .in_flight
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(
                             frame.id,
                             InFlightEntry {
                                 token: token.clone(),
                                 kind,
                             },
                         );
-                    }
                     token
                 });
                 let runtime = Arc::clone(runtime);
@@ -1091,20 +1163,30 @@ fn dispatch_ready<E: NativeExtension>(
             }
         }
         FrameKind::Event => {
-            let kind = match frame.method.as_str() {
-                methods::TOOL_CANCEL => Some(InFlightKind::Tool),
-                methods::PROVIDER_CANCEL => Some(InFlightKind::Provider),
-                _ => None,
-            };
-            if let Some(kind) = kind
-                && let Some(id) = frame.payload.get("id").and_then(Value::as_u64)
-                && let Ok(map) = runtime.in_flight.lock()
-                && let Some(entry) = map.get(&id)
-                && entry.kind == kind
-            {
-                entry.token.cancel();
+            match frame.method.as_str() {
+                methods::TOOL_CANCEL | methods::PROVIDER_CANCEL => {
+                    let kind = if frame.method == methods::TOOL_CANCEL {
+                        InFlightKind::Tool
+                    } else {
+                        InFlightKind::Provider
+                    };
+                    if let Some(id) = frame.payload.get("id").and_then(Value::as_u64)
+                        && let Some(entry) = runtime
+                            .in_flight
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .get(&id)
+                        && entry.kind == kind
+                    {
+                        entry.token.cancel();
+                    }
+                }
+                crate::protocol::THEME_UPDATE_METHOD => {
+                    handle_theme_update(runtime, rejection_tx, &frame.payload)?;
+                }
+                // Unknown events are fire-and-forget: ignored by design.
+                _ => {}
             }
-            // Unknown events are fire-and-forget: ignored by design.
         }
         // The native endpoint initiates no requests; stray res/error frames
         // carry no correlation state and are ignored.
@@ -1113,8 +1195,48 @@ fn dispatch_ready<E: NativeExtension>(
     Ok(())
 }
 
+fn remove_in_flight<E: NativeExtension>(runtime: &ServerRuntime<E>, id: FrameId) {
+    runtime
+        .in_flight
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&id);
+}
+
 /// Handle one request to a terminal frame and send it.
+///
+/// The dispatch runs in a child task so a panicking extension callback is
+/// caught by the `JoinHandle` instead of silently unwinding the request task.
+/// On panic the server cleans up the in-flight entry and answers with a
+/// correlated `internal` error frame.
 async fn handle_request<E: NativeExtension>(
+    runtime: Arc<ServerRuntime<E>>,
+    frame: Frame,
+    token: Option<CancellationToken>,
+) {
+    let id = frame.id;
+    let method = frame.method.clone();
+    let result = tokio::spawn(handle_request_dispatch(Arc::clone(&runtime), frame, token)).await;
+    if result.is_err() {
+        remove_in_flight(&runtime, id);
+        let _ = runtime
+            .out_tx
+            .send(
+                error_frame(
+                    id,
+                    &method,
+                    "internal",
+                    "extension callback panicked",
+                    false,
+                )
+                .into(),
+            )
+            .await;
+    }
+}
+
+/// Inner dispatch: route one request to its handler and send the terminal frame.
+async fn handle_request_dispatch<E: NativeExtension>(
     runtime: Arc<ServerRuntime<E>>,
     frame: Frame,
     token: Option<CancellationToken>,
@@ -1453,7 +1575,10 @@ async fn handle_render_html<E: NativeExtension>(
 }
 
 /// Lifecycle hook (open method strings): run the advertised handler with a
-/// bounded sink for unsolicited id-`0` events.
+/// bounded sink for unsolicited id-`0` events, under a finite server-side
+/// deadline. A hook that never resolves is dropped at the deadline so its
+/// in-flight permit is released and the peer receives a correlated
+/// `timeout` error instead of the request running forever.
 async fn handle_lifecycle<E: NativeExtension>(
     runtime: &ServerRuntime<E>,
     id: FrameId,
@@ -1468,13 +1593,23 @@ async fn handle_lifecycle<E: NativeExtension>(
     let events = NativeEventSink {
         tx: runtime.out_tx.clone(),
     };
-    match runtime
-        .extension
-        .on_lifecycle(context, event_type.to_owned(), payload, events)
-        .await
+    match tokio::time::timeout(
+        runtime.lifecycle_deadline,
+        runtime
+            .extension
+            .on_lifecycle(context, event_type.to_owned(), payload, events),
+    )
+    .await
     {
-        Ok(value) => res_frame(id, method, value),
-        Err(fault) => fault_frame(id, method, &fault),
+        Ok(Ok(value)) => res_frame(id, method, value),
+        Ok(Err(fault)) => fault_frame(id, method, &fault),
+        Err(_) => error_frame(
+            id,
+            method,
+            "timeout",
+            "lifecycle callback exceeded its server-side deadline",
+            false,
+        ),
     }
 }
 
@@ -1504,17 +1639,13 @@ async fn execute_tool_request<E: NativeExtension>(
     let context = match callback_context(runtime, id, method) {
         Ok(context) => context,
         Err(terminal) => {
-            if let Ok(mut map) = runtime.in_flight.lock() {
-                map.remove(&id);
-            }
+            remove_in_flight(runtime, id);
             let _ = runtime.out_tx.send(terminal.into()).await;
             return;
         }
     };
     let Some(name) = payload.get("name").and_then(Value::as_str) else {
-        if let Ok(mut map) = runtime.in_flight.lock() {
-            map.remove(&id);
-        }
+        remove_in_flight(runtime, id);
         let _ = runtime
             .out_tx
             .send(
@@ -1597,9 +1728,7 @@ async fn execute_tool_request<E: NativeExtension>(
     // The done signal closes the receiver and flushes all updates accepted
     // before completion. Await the flush before publishing the terminal.
     let _ = forwarder.await;
-    if let Ok(mut map) = runtime.in_flight.lock() {
-        map.remove(&id);
-    }
+    remove_in_flight(runtime, id);
 
     let terminal = if token.is_cancelled() {
         error_frame(id, method, "cancelled", "extension tool cancelled", false)
@@ -1627,9 +1756,7 @@ async fn execute_provider_request<E: NativeExtension>(
     let context = match callback_context(runtime, id, method) {
         Ok(context) => context,
         Err(terminal) => {
-            if let Ok(mut map) = runtime.in_flight.lock() {
-                map.remove(&id);
-            }
+            remove_in_flight(runtime, id);
             let _ = runtime.out_tx.send(terminal.into()).await;
             return;
         }
@@ -1698,9 +1825,7 @@ async fn execute_provider_request<E: NativeExtension>(
     // The done signal closes the receiver and flushes all events accepted
     // before completion. Await the flush before publishing the terminal.
     let _ = forwarder.await;
-    if let Ok(mut map) = runtime.in_flight.lock() {
-        map.remove(&id);
-    }
+    remove_in_flight(runtime, id);
 
     let terminal = if invalid.load(Ordering::SeqCst) {
         error_frame(
@@ -1789,6 +1914,7 @@ fn encode_fallback(frame: &Frame) -> Option<Vec<u8>> {
 }
 
 #[cfg(test)]
+#[allow(clippy::panic)]
 mod tests {
     use super::*;
     use crate::client::{HandshakePolicy, HostClient, HostClientError};
@@ -1950,6 +2076,7 @@ mod tests {
         provider_cancel_token: Arc<Mutex<Option<CancellationToken>>>,
         provider_send_failed: Arc<AtomicBool>,
         provider_ticks: Arc<AtomicUsize>,
+        theme_updates: Arc<Mutex<Vec<crate::protocol::ThemeUpdate>>>,
     }
 
     /// Scripted extension used across the server tests.
@@ -1980,6 +2107,7 @@ mod tests {
                 provider_cancel_token: Arc::new(Mutex::new(None)),
                 provider_send_failed: Arc::new(AtomicBool::new(false)),
                 provider_ticks: Arc::new(AtomicUsize::new(0)),
+                theme_updates: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -2005,6 +2133,7 @@ mod tests {
                 provider_cancel_token: Arc::clone(&self.provider_cancel_token),
                 provider_send_failed: Arc::clone(&self.provider_send_failed),
                 provider_ticks: Arc::clone(&self.provider_ticks),
+                theme_updates: Arc::clone(&self.theme_updates),
             }
         }
     }
@@ -2108,7 +2237,11 @@ mod tests {
                         ..ProviderSnapshotEntry::default()
                     },
                 ],
-                handlers: vec!["session_start".to_owned(), "message_update".to_owned()],
+                handlers: vec![
+                    "session_start".to_owned(),
+                    "message_update".to_owned(),
+                    "stall".to_owned(),
+                ],
                 terminal_input: true,
                 extensions: 1,
                 errors: vec![],
@@ -2392,6 +2525,10 @@ mod tests {
         ) -> NativeFuture<Result<Value, ExtensionFault>> {
             let seen = Arc::clone(&self.handles.lifecycle);
             Box::pin(async move {
+                // A hook that never resolves: exercises the server-side deadline.
+                if event_type == "stall" {
+                    std::future::pending::<()>().await;
+                }
                 record(&seen, (event_type.clone(), payload));
                 let _ = events
                     .send(
@@ -2407,6 +2544,10 @@ mod tests {
                     .await;
                 Ok(json!({ "seen": event_type }))
             })
+        }
+
+        fn on_theme_update(&self, update: crate::protocol::ThemeUpdate) {
+            record(&self.handles.theme_updates, update);
         }
     }
 
@@ -2500,6 +2641,124 @@ mod tests {
                     drop(events);
                 });
                 Ok(json!({}))
+            })
+        }
+    }
+
+    /// Lifecycle callback panics: the server must catch the unwind and answer
+    /// a correlated `internal` error instead of going silent.
+    struct PanickingExtension;
+
+    impl NativeExtension for PanickingExtension {
+        fn snapshot(&self) -> RegistrySnapshot {
+            RegistrySnapshot {
+                handlers: vec!["boom".to_owned()],
+                ..RegistrySnapshot::default()
+            }
+        }
+
+        fn prepare_tool(
+            &self,
+            _context: Arc<NativeExtensionContext>,
+            name: String,
+            _args: Value,
+        ) -> NativeFuture<Result<Value, ExtensionFault>> {
+            Box::pin(async move { Err(ExtensionFault::not_found(name)) })
+        }
+
+        fn validate_tool(
+            &self,
+            _context: Arc<NativeExtensionContext>,
+            name: String,
+            _args: Value,
+            _tool_call_id: Option<String>,
+        ) -> NativeFuture<Result<Value, ExtensionFault>> {
+            Box::pin(async move { Err(ExtensionFault::not_found(name)) })
+        }
+
+        fn execute_tool(
+            &self,
+            _context: Arc<NativeExtensionContext>,
+            call: ToolCall,
+            _updates: ToolUpdateSink,
+            _cancel: CancellationToken,
+        ) -> NativeFuture<Result<Value, ExtensionFault>> {
+            Box::pin(async move { Err(ExtensionFault::not_found(call.name)) })
+        }
+
+        fn on_lifecycle(
+            &self,
+            _context: Arc<NativeExtensionContext>,
+            event_type: String,
+            _payload: Value,
+            _events: NativeEventSink,
+        ) -> NativeFuture<Result<Value, ExtensionFault>> {
+            Box::pin(async move {
+                panic!("lifecycle callback exploded: {event_type}");
+            })
+        }
+        fn on_theme_update(&self, _update: crate::protocol::ThemeUpdate) {
+            panic!("theme callback exploded");
+        }
+    }
+
+    /// Lifecycle callback clones the event sink into detached work that
+    /// outlives the callback and retains an outbound sender indefinitely.
+    struct DetachedEventSinkExtension {
+        release: CancellationToken,
+    }
+
+    impl NativeExtension for DetachedEventSinkExtension {
+        fn snapshot(&self) -> RegistrySnapshot {
+            RegistrySnapshot {
+                handlers: vec!["detach".to_owned()],
+                ..RegistrySnapshot::default()
+            }
+        }
+
+        fn prepare_tool(
+            &self,
+            _context: Arc<NativeExtensionContext>,
+            name: String,
+            _args: Value,
+        ) -> NativeFuture<Result<Value, ExtensionFault>> {
+            Box::pin(async move { Err(ExtensionFault::not_found(name)) })
+        }
+
+        fn validate_tool(
+            &self,
+            _context: Arc<NativeExtensionContext>,
+            name: String,
+            _args: Value,
+            _tool_call_id: Option<String>,
+        ) -> NativeFuture<Result<Value, ExtensionFault>> {
+            Box::pin(async move { Err(ExtensionFault::not_found(name)) })
+        }
+
+        fn execute_tool(
+            &self,
+            _context: Arc<NativeExtensionContext>,
+            call: ToolCall,
+            _updates: ToolUpdateSink,
+            _cancel: CancellationToken,
+        ) -> NativeFuture<Result<Value, ExtensionFault>> {
+            Box::pin(async move { Err(ExtensionFault::not_found(call.name)) })
+        }
+
+        fn on_lifecycle(
+            &self,
+            _context: Arc<NativeExtensionContext>,
+            _event_type: String,
+            _payload: Value,
+            events: NativeEventSink,
+        ) -> NativeFuture<Result<Value, ExtensionFault>> {
+            let release = self.release.clone();
+            Box::pin(async move {
+                tokio::spawn(async move {
+                    release.cancelled().await;
+                    drop(events);
+                });
+                Ok(json!({ "detached": true }))
             })
         }
     }
@@ -3822,6 +4081,7 @@ mod tests {
             max_in_flight: 1,
             update_capacity: 4,
             outbound_capacity: 4,
+            ..ServerConfig::default()
         };
         let (mut client, server) = spawn_raw(ext, config);
         client.hello(PROTOCOL_VERSION, "anything").await?;
@@ -4634,6 +4894,7 @@ mod tests {
             max_in_flight: 1,
             update_capacity: 4,
             outbound_capacity: 4,
+            ..ServerConfig::default()
         };
         let (runtime, out_rx) = ServerRuntime::new(ext, config);
         let runtime = Arc::new(runtime);
@@ -4725,6 +4986,7 @@ mod tests {
             max_in_flight: 1,
             update_capacity: 4,
             outbound_capacity: 4,
+            ..ServerConfig::default()
         };
         let (runtime, out_rx) = ServerRuntime::new(ext, config);
         let runtime = Arc::new(runtime);
@@ -4884,6 +5146,7 @@ mod tests {
             max_in_flight: 1,
             update_capacity: 1,
             outbound_capacity: 1,
+            ..ServerConfig::default()
         };
         let (mut client_tx, server_rx) = tokio::io::duplex(64 * 1024);
         let writer_block = Arc::new(AtomicBool::new(false));
@@ -4953,6 +5216,342 @@ mod tests {
             "expected bounded overflow failure, got {joined:?}"
         );
         drop(client_tx);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // PR #2 review regressions
+    // -----------------------------------------------------------------------
+
+    /// A `theme.update` broadcast is delivered to the native theme callback
+    /// instead of being silently discarded as an unknown event.
+    #[tokio::test]
+    async fn theme_update_is_delivered_to_native_callback() -> R {
+        let (ext, handles) = DemoExtension::new();
+        let (mut client, server) = spawn_raw(ext, ServerConfig::default());
+        client.hello(PROTOCOL_VERSION, "anything").await?;
+        let _ack = client.recv().await?;
+        client.load_context().await?;
+
+        client
+            .send(&Frame {
+                id: 0,
+                kind: FrameKind::Event,
+                method: crate::protocol::THEME_UPDATE_METHOD.to_owned(),
+                payload: json!({
+                    "theme": { "colorMode": "truecolor", "fg": {}, "bg": {} },
+                    "terminalTheme": "dark",
+                    "themeMode": "auto",
+                    "themeGeneration": 7,
+                    "themes": [],
+                }),
+            })
+            .await?;
+
+        wait_until(|| {
+            handles
+                .theme_updates
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len()
+                == 1
+        })
+        .await?;
+        {
+            let updates = handles
+                .theme_updates
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(updates[0].theme_generation, 7);
+            assert_eq!(updates[0].terminal_theme, "dark");
+        }
+
+        drop(client);
+        let result = tokio::time::timeout(TIMEOUT, server).await??;
+        assert!(result.is_ok());
+        Ok(())
+    }
+
+    /// A panicking theme callback is isolated and reported without stopping
+    /// the native transport.
+    #[tokio::test]
+    async fn panicking_theme_callback_reports_error_and_keeps_serving() -> R {
+        let (mut client, server) = spawn_raw(PanickingExtension, ServerConfig::default());
+        client.hello(PROTOCOL_VERSION, "anything").await?;
+        let _ack = client.recv().await?;
+        client.load_context().await?;
+
+        client
+            .send(&Frame {
+                id: 0,
+                kind: FrameKind::Event,
+                method: crate::protocol::THEME_UPDATE_METHOD.to_owned(),
+                payload: json!({
+                    "theme": { "colorMode": "truecolor", "fg": {}, "bg": {} },
+                    "terminalTheme": "dark",
+                    "themeMode": "auto",
+                    "themeGeneration": 8,
+                    "themes": [],
+                }),
+            })
+            .await?;
+        let failure = tokio::time::timeout(TIMEOUT, client.recv()).await??;
+        assert_eq!(failure.kind, FrameKind::Event);
+        assert_eq!(failure.method, Method::ExtensionError.as_str());
+        assert_eq!(failure.payload["code"], "internal");
+
+        let sibling = client.request(3, "not_advertised", json!({})).await?;
+        assert_eq!(sibling.kind, FrameKind::Error);
+        assert_eq!(sibling.payload["code"], "unknown_method");
+
+        drop(client);
+        let result = tokio::time::timeout(TIMEOUT, server).await??;
+        assert!(result.is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn theme_panic_report_uses_deferred_queue_under_backpressure() -> R {
+        let config = ServerConfig {
+            outbound_capacity: 1,
+            ..ServerConfig::default()
+        };
+        let (runtime, _out_rx) = ServerRuntime::new(PanickingExtension, config);
+        let runtime = Arc::new(runtime);
+        runtime
+            .out_tx
+            .try_send(Frame::event(0, Method::Notify, json!({})).into())
+            .map_err(|error| format!("fill outbound queue: {error}"))?;
+        let (rejection_tx, mut rejection_rx) = mpsc::channel(1);
+        let mut tasks = JoinSet::new();
+
+        dispatch_ready(
+            Frame {
+                id: 0,
+                kind: FrameKind::Event,
+                method: crate::protocol::THEME_UPDATE_METHOD.to_owned(),
+                payload: json!({
+                    "theme": { "colorMode": "truecolor", "fg": {}, "bg": {} },
+                    "terminalTheme": "dark",
+                    "themeMode": "auto",
+                    "themeGeneration": 9,
+                    "themes": [],
+                }),
+            },
+            &runtime,
+            &rejection_tx,
+            &mut tasks,
+        )?;
+
+        let failure = rejection_rx
+            .try_recv()
+            .map_err(|error| format!("missing deferred theme failure: {error}"))?;
+        assert_eq!(failure.kind, FrameKind::Event);
+        assert_eq!(failure.method, Method::ExtensionError.as_str());
+        assert_eq!(failure.payload["code"], "internal");
+        Ok(())
+    }
+
+    /// A panicking lifecycle callback is caught: the peer receives a
+    /// correlated `internal` error frame and the server keeps serving.
+    #[tokio::test]
+    async fn panicking_callback_answers_correlated_internal_error() -> R {
+        let (mut client, server) = spawn_raw(PanickingExtension, ServerConfig::default());
+        client.hello(PROTOCOL_VERSION, "anything").await?;
+        let _ack = client.recv().await?;
+        client.load_context().await?;
+
+        let response = client
+            .request(2, "boom", json!({ "eventType": "boom", "payload": {} }))
+            .await?;
+        assert_eq!(response.id, 2);
+        assert_eq!(response.kind, FrameKind::Error);
+        assert_eq!(response.payload["code"], "internal");
+
+        // The server is still alive: a sibling request completes normally.
+        let sibling = client.request(3, "not_advertised", json!({})).await?;
+        assert_eq!(sibling.id, 3);
+        assert_eq!(sibling.kind, FrameKind::Error);
+        assert_eq!(sibling.payload["code"], "unknown_method");
+
+        drop(client);
+        let result = tokio::time::timeout(TIMEOUT, server).await??;
+        assert!(result.is_ok());
+        Ok(())
+    }
+
+    /// A lifecycle callback that never resolves is dropped at the server-side
+    /// deadline: the peer gets a correlated `timeout` error and the permit is
+    /// released so a later request still succeeds.
+    #[tokio::test]
+    async fn lifecycle_deadline_drops_stalled_hook_and_releases_permit() -> R {
+        let (ext, _handles) = DemoExtension::new();
+        let config = ServerConfig {
+            max_in_flight: 1,
+            lifecycle_deadline: Duration::from_millis(50),
+            ..ServerConfig::default()
+        };
+        let (mut client, server) = spawn_raw(ext, config);
+        client.hello(PROTOCOL_VERSION, "anything").await?;
+        let _ack = client.recv().await?;
+        client.load_context().await?;
+
+        let started_at = std::time::Instant::now();
+        let response = client
+            .request(2, "stall", json!({ "eventType": "stall", "payload": {} }))
+            .await?;
+        let elapsed = started_at.elapsed();
+        assert_eq!(response.id, 2);
+        assert_eq!(response.kind, FrameKind::Error);
+        assert_eq!(response.payload["code"], "timeout");
+        assert!(
+            elapsed >= Duration::from_millis(50),
+            "hook timed out before its deadline: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "hook exceeded its bounded deadline: {elapsed:?}"
+        );
+
+        // The permit was released: a normal lifecycle hook still runs. The
+        // hook emits an id-0 `uiSlot` event before its terminal response.
+        client
+            .send(&Frame {
+                id: 3,
+                kind: FrameKind::Req,
+                method: "session_start".to_owned(),
+                payload: json!({ "eventType": "session_start", "payload": {} }),
+            })
+            .await?;
+        tokio::time::timeout(TIMEOUT, async {
+            loop {
+                let frame = client.recv().await?;
+                if frame.id == 3 {
+                    assert_eq!(frame.kind, FrameKind::Res);
+                    break Ok::<(), Box<dyn Error>>(());
+                }
+            }
+        })
+        .await??;
+
+        drop(client);
+        let result = tokio::time::timeout(TIMEOUT, server).await??;
+        assert!(result.is_ok());
+        Ok(())
+    }
+
+    /// Writer shutdown completes even when a detached event-sink clone retains
+    /// an outbound sender indefinitely after the callback returns.
+    #[tokio::test]
+    async fn writer_shutdown_completes_despite_retained_event_sink() -> R {
+        let release = CancellationToken::new();
+        let extension = DetachedEventSinkExtension {
+            release: release.clone(),
+        };
+        let (mut client, server) = spawn_raw(extension, ServerConfig::default());
+        client.hello(PROTOCOL_VERSION, "anything").await?;
+        let _ack = client.recv().await?;
+        client.load_context().await?;
+
+        let response = client
+            .request(2, "detach", json!({ "eventType": "detach", "payload": {} }))
+            .await?;
+        assert_eq!(response.id, 2);
+        assert_eq!(response.kind, FrameKind::Res);
+
+        // EOF on stdin: the detached sink still holds an outbound sender, but
+        // the explicit shutdown signal must let serve_io return anyway.
+        drop(client);
+        let result = tokio::time::timeout(TIMEOUT, server).await??;
+        assert!(result.is_ok());
+        // The detached task is still holding its sender; release it for hygiene.
+        release.cancel();
+        Ok(())
+    }
+
+    /// A poisoned `in_flight` lock must not strand a request's cancel token:
+    /// registration recovers the lock, so a later `tool.cancel` still reaches
+    /// the running execution and the peer receives a correlated terminal.
+    #[tokio::test]
+    async fn poisoned_in_flight_lock_still_registers_and_cancels() -> R {
+        let (ext, handles) = DemoExtension::new();
+        let config = ServerConfig {
+            max_in_flight: 1,
+            ..ServerConfig::default()
+        };
+        let (runtime, out_rx) = ServerRuntime::new(ext, config);
+        let runtime = Arc::new(runtime);
+        let probe = Arc::clone(&runtime);
+        let (client_tx, server_rx) = tokio::io::duplex(64 * 1024);
+        let (server_tx, client_rx) = tokio::io::duplex(64 * 1024);
+        let server =
+            tokio::spawn(
+                async move { serve_io_inner(server_rx, server_tx, runtime, out_rx).await },
+            );
+        let mut client = RawClient {
+            write: client_tx,
+            read: BufReader::new(client_rx),
+        };
+        client.hello(PROTOCOL_VERSION, "anything").await?;
+        let _ack = client.recv().await?;
+        client.load_context().await?;
+
+        // Poison the in_flight lock before the request registers its token.
+        let poisoner = {
+            let probe = Arc::clone(&probe);
+            std::thread::spawn(move || {
+                let _guard = probe
+                    .in_flight
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                panic!("poison the in_flight mutex");
+            })
+        };
+        let _ = poisoner.join(); // Err(…) = the expected panic
+        assert!(probe.in_flight.lock().is_err(), "lock must be poisoned");
+
+        // Register under a poisoned lock: recovery must still insert the token.
+        client
+            .send(&Frame {
+                id: 2,
+                kind: FrameKind::Req,
+                method: methods::TOOL_EXECUTE.to_owned(),
+                payload: json!({ "name": "slow", "toolCallId": "t1", "args": {} }),
+            })
+            .await?;
+        tokio::time::timeout(TIMEOUT, handles.started.notified()).await?;
+        wait_until(|| {
+            probe
+                .in_flight
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&2)
+        })
+        .await?;
+
+        // Cancel must find the token through the recovered lock.
+        client
+            .send(&Frame {
+                id: 0,
+                kind: FrameKind::Event,
+                method: methods::TOOL_CANCEL.to_owned(),
+                payload: json!({ "id": 2 }),
+            })
+            .await?;
+        tokio::time::timeout(TIMEOUT, async {
+            loop {
+                let frame = client.recv().await?;
+                if frame.id == 2 && frame.kind == FrameKind::Error {
+                    assert_eq!(frame.payload["code"], "cancelled");
+                    break Ok::<(), Box<dyn Error>>(());
+                }
+            }
+        })
+        .await??;
+
+        drop(client);
+        let result = tokio::time::timeout(TIMEOUT, server).await??;
+        assert!(result.is_ok());
         Ok(())
     }
 }
