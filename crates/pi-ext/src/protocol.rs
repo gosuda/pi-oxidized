@@ -1131,7 +1131,7 @@ pub struct RendererSnapshotEntry {
 }
 
 /// Custom-provider entry in the `extensions.load` snapshot.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderSnapshotEntry {
     /// Provider id.
@@ -1163,6 +1163,31 @@ pub struct ProviderSnapshotEntry {
     /// Registering extension path, used in provider diagnostics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extension_path: Option<String>,
+}
+
+impl fmt::Debug for ProviderSnapshotEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Secret material must never reach logs via `{:?}`: render present
+        // keys and header values as a redaction marker, keep everything else.
+        let redacted_headers = self.headers.as_ref().map(|headers| {
+            headers
+                .keys()
+                .map(|name| (name.as_str(), "<redacted>"))
+                .collect::<BTreeMap<_, _>>()
+        });
+        f.debug_struct("ProviderSnapshotEntry")
+            .field("name", &self.name)
+            .field("stream_simple", &self.stream_simple)
+            .field("base_url", &self.base_url)
+            .field("api", &self.api)
+            .field("display_name", &self.display_name)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("headers", &redacted_headers)
+            .field("auth_header", &self.auth_header)
+            .field("models", &self.models)
+            .field("extension_path", &self.extension_path)
+            .finish()
+    }
 }
 
 /// Per-path extension load diagnostic.
@@ -2659,6 +2684,41 @@ mod tests {
         assert!(payload.get("theme").is_none());
         assert_eq!(from_payload::<ThemeSet>(&payload)?, set);
         Ok(())
+    }
+
+    #[test]
+    fn provider_snapshot_debug_redacts_secrets() {
+        let entry = ProviderSnapshotEntry {
+            name: "my-provider".to_owned(),
+            stream_simple: true,
+            base_url: Some("https://api.example.com".to_owned()),
+            api: Some("openai".to_owned()),
+            display_name: Some("My Provider".to_owned()),
+            api_key: Some("sk-live-super-secret-value".to_owned()),
+            headers: Some(BTreeMap::from([
+                (
+                    "authorization".to_owned(),
+                    "Bearer secret-token-value".to_owned(),
+                ),
+                ("x-request-id".to_owned(), "req-123".to_owned()),
+            ])),
+            auth_header: Some(true),
+            models: None,
+            extension_path: Some("./ext/my-provider".to_owned()),
+        };
+        let debug = format!("{entry:?}");
+        // Secret values never appear.
+        assert!(!debug.contains("sk-live-super-secret-value"));
+        assert!(!debug.contains("secret-token-value"));
+        // Redaction markers identify the hidden fields.
+        assert!(debug.contains(r#"api_key: Some("<redacted>")"#));
+        assert!(debug.contains(r#""authorization": "<redacted>""#));
+        assert!(debug.contains(r#""x-request-id": "<redacted>""#));
+        // Non-secret fields stay intact and useful.
+        assert!(debug.contains("my-provider"));
+        assert!(debug.contains("https://api.example.com"));
+        assert!(debug.contains("My Provider"));
+        assert!(debug.contains("./ext/my-provider"));
     }
 }
 
