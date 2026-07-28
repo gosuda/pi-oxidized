@@ -1367,11 +1367,14 @@ async fn handle_shortcut<E: NativeExtension>(
         Ok(context) => context,
         Err(error) => return error,
     };
-    let key = payload
-        .get("key")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
+    let Some(key) = payload.get("key").and_then(Value::as_str) else {
+        // Missing/null/number/bool/array/object key: answer `handled: false`
+        // without invoking extension code, matching both TypeScript hosts
+        // (`typeof key !== "string"` short-circuit). Valid strings, including
+        // the empty string, still dispatch below.
+        return res_frame(id, method, json!({ "handled": false }));
+    };
+    let key = key.to_owned();
     match runtime.extension.execute_shortcut(context, key).await {
         Ok(handled) => res_frame(id, method, json!({ "handled": handled })),
         Err(fault) => fault_frame(id, method, &fault),
@@ -4138,6 +4141,78 @@ mod tests {
                 &["ctrl+alt+d".to_owned(), "ctrl+alt+z".to_owned()]
             );
         }
+        drop(client);
+        let result = tokio::time::timeout(TIMEOUT, server).await??;
+        assert!(result.is_ok());
+        Ok(())
+    }
+
+    /// Malformed/missing/non-string `key` answers `handled: false` without
+    /// invoking extension code, matching both TypeScript hosts; empty and
+    /// non-empty strings still dispatch.
+    #[tokio::test]
+    async fn shortcut_execute_rejects_non_string_key() -> R {
+        let (ext, handles) = DemoExtension::new();
+        let (mut client, server) = spawn_raw(ext, ServerConfig::default());
+        client.hello(PROTOCOL_VERSION, "anything").await?;
+        let _ack = client.recv().await?;
+        client.load_context().await?;
+
+        // Malformed values: each must yield `handled: false` and never reach
+        // the extension callback.
+        let malformed: &[(u64, Value)] = &[
+            (2u64, json!({})),
+            (3u64, json!({ "key": null })),
+            (4u64, json!({ "key": 42 })),
+            (5u64, json!({ "key": true })),
+            (6u64, json!({ "key": ["ctrl+alt+d"] })),
+            (7u64, json!({ "key": { "key": "ctrl+alt+d" } })),
+        ];
+        for (id, payload) in malformed {
+            let res = client
+                .request(*id, SHORTCUT_EXECUTE_METHOD, payload.clone())
+                .await?;
+            assert_eq!(res.id, *id, "id mismatch for payload {payload}");
+            assert_eq!(
+                res.kind,
+                FrameKind::Res,
+                "non-response for payload {payload}"
+            );
+            assert_eq!(
+                res.payload,
+                json!({ "handled": false }),
+                "payload {payload}"
+            );
+        }
+        {
+            let seen = handles
+                .shortcuts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                seen.is_empty(),
+                "extension callback invoked for malformed key: {seen:?}"
+            );
+        }
+
+        // Valid strings, including the empty string, still dispatch and
+        // preserve the callback result.
+        for (id, key, handled) in [(8u64, "", false), (9u64, "ctrl+alt+d", true)] {
+            let res = client
+                .request(id, SHORTCUT_EXECUTE_METHOD, json!({ "key": key }))
+                .await?;
+            assert_eq!(res.id, id);
+            assert_eq!(res.kind, FrameKind::Res);
+            assert_eq!(res.payload, json!({ "handled": handled }));
+        }
+        {
+            let seen = handles
+                .shortcuts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(seen.as_slice(), &["".to_owned(), "ctrl+alt+d".to_owned()]);
+        }
+
         drop(client);
         let result = tokio::time::timeout(TIMEOUT, server).await??;
         assert!(result.is_ok());

@@ -1530,6 +1530,60 @@ describe("acceptance: registry snapshot and tool/provider bridges", () => {
 		await runPromise.catch(() => void 0);
 	});
 
+	test("tool and provider classify only structured abort errors as cancelled", async () => {
+		const abortClassificationFactory: ExtensionFactory = (pi) => {
+			pi.registerTool({
+				name: "abort_classification",
+				label: "AbortClassification",
+				description: "Distinguishes cancellation-shaped messages from AbortError",
+				parameters: Type.Object({ kind: Type.String() }),
+				async execute(_toolCallId, args) {
+					if (args.kind === "abort") throw new DOMException("aborted", "AbortError");
+					throw new Error("cannot cancel booking");
+				},
+			});
+			pi.registerProvider("abort_classification", {
+				baseUrl: "https://fixture.example",
+				api: "custom",
+				streamSimple(model) {
+					if ((model as { id?: unknown }).id === "abort") {
+						throw new DOMException("aborted", "AbortError");
+					}
+					throw new Error("cannot cancel booking");
+				},
+			});
+		};
+		const { collector, stdin, host, runPromise } = await connectHost([abortClassificationFactory]);
+		const send = (id: number, method: "tool.execute" | "provider.stream", payload: Record<string, unknown>) => {
+			stdin.push(Buffer.from(encodeFrameString({ id, kind: "req", method, payload })));
+		};
+		const error = async (id: number) => {
+			const frame = await collector.awaitFrame((candidate) => candidate.id === id && candidate.kind === "error");
+			return frame.payload as Record<string, unknown>;
+		};
+
+		send(64, "tool.execute", {
+			name: "abort_classification", toolCallId: "message-tool", args: { kind: "message" },
+		});
+		expect(await error(64)).toMatchObject({ code: "extension_error", message: "cannot cancel booking" });
+		send(65, "tool.execute", {
+			name: "abort_classification", toolCallId: "abort-tool", args: { kind: "abort" },
+		});
+		expect(await error(65)).toMatchObject({ code: "cancelled", message: "extension tool cancelled" });
+		send(66, "provider.stream", {
+			providerId: "abort_classification", model: { id: "message" }, context: {}, options: {},
+		});
+		expect(await error(66)).toMatchObject({ code: "extension_error", message: "cannot cancel booking" });
+		send(67, "provider.stream", {
+			providerId: "abort_classification", model: { id: "abort" }, context: {}, options: {},
+		});
+		expect(await error(67)).toMatchObject({ code: "cancelled", message: "provider stream cancelled" });
+
+		stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
+	});
+
 	test("flags.set updates getFlag atomically and preserves values across sets", async () => {
 		const { collector, stdin, host, runPromise } = await connectHost([]);
 		const extensionPath = resolve(import.meta.dirname, "..", "fixtures", "extensions", "control-compat.ts");
@@ -1904,11 +1958,11 @@ describe("extension theme API", () => {
 		};
 	}
 
-	function themeUpdateFrame(): Frame {
+	function themeUpdateFrame(name = "dark"): Frame {
 		return {
 			id: 0, kind: "event", method: "theme.update",
 			payload: {
-				theme: themeWireFor("dark"),
+				theme: themeWireFor(name),
 				terminalTheme: "dark",
 				themeMode: "auto",
 				themeGeneration: 1,
@@ -2007,6 +2061,136 @@ describe("extension theme API", () => {
 		const repushed = collector.frames.filter((f) => f.method === "uiSlot").at(-1);
 		expect((repushed?.payload as Record<string, unknown>)["key"])
 			.toBe((firstSlot.payload as Record<string, unknown>)["key"]);
+
+		stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
+	});
+
+	test("theme.update recreates factory slots with the new theme and disposes the old component once", async () => {
+		const disposed: number[] = [];
+		let factoryCalls = 0;
+		const themeCaptureFactory: ExtensionFactory = (pi) => {
+			pi.on("session_start", (_event, ctx) => {
+				ctx.ui.setWidget("widget.theme-capture", (_tui, theme) => {
+					const instance = factoryCalls++;
+					const rendered = theme.fg("accent", "theme-capture");
+					return {
+						render: () => [rendered],
+						dispose: () => disposed.push(instance),
+					};
+				});
+			});
+		};
+		const { collector, stdin, host, runPromise } = await connectHost([themeCaptureFactory]);
+		await sendSessionStart(stdin, collector);
+		const initial = await collector.awaitFrame((frame) =>
+			frame.method === "uiSlot" && (frame.payload as Record<string, unknown>)["key"] === "widget.theme-capture",
+		);
+		const priorSlotCount = collector.frames.filter((frame) => frame.method === "uiSlot").length;
+		stdin.push(Buffer.from(encodeFrameString(themeUpdateFrame())));
+		const updated = await collector.awaitFrame((frame) =>
+			frame.method === "uiSlot"
+			&& (frame.payload as Record<string, unknown>)["key"] === "widget.theme-capture"
+			&& collector.frames.filter((candidate) => candidate.method === "uiSlot").length > priorSlotCount,
+		);
+		expect((updated.payload as Record<string, unknown>)["generation"])
+			.toBe((initial.payload as Record<string, unknown>)["generation"]);
+		expect((updated.payload as Record<string, unknown>)["runs"])
+			.not.toEqual((initial.payload as Record<string, unknown>)["runs"]);
+		expect(disposed).toEqual([0]);
+
+		stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
+	});
+
+	test("failed factory recreation reports an error and retains the existing slot", async () => {
+		const disposed: string[] = [];
+		const failureFactory: ExtensionFactory = (pi) => {
+			pi.on("session_start", (_event, ctx) => {
+				ctx.ui.setWidget("widget.theme-failure", (_tui, theme) => {
+					if (theme.name === "broken") throw new Error("theme factory failed");
+					const name = String(theme.name);
+					return {
+						render: () => [`factory-${name}`],
+						dispose: () => disposed.push(name),
+					};
+				});
+			});
+		};
+		const { collector, stdin, host, runPromise } = await connectHost([failureFactory]);
+		await sendSessionStart(stdin, collector);
+		const initial = await collector.awaitFrame((frame) =>
+			frame.method === "uiSlot" && (frame.payload as Record<string, unknown>)["key"] === "widget.theme-failure",
+		);
+		(host as unknown as { applyThemeUpdate(update: unknown): void }).applyThemeUpdate(themeUpdateFrame("broken").payload);
+		const error = await collector.awaitFrame((frame) =>
+			frame.method === "extensionError"
+			&& String((frame.payload as Record<string, unknown>)["message"]).includes("theme factory failed"),
+		);
+		expect((error.payload as Record<string, unknown>)["code"]).toBe("extension_error");
+		expect(disposed).toEqual([]);
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 63, kind: "req", method: "render", payload: { key: "widget.theme-failure", width: 80 },
+		})));
+		const rendered = await collector.awaitFrame((frame) => frame.id === 63 && frame.kind === "res");
+		expect((rendered.payload as Record<string, unknown>)["runs"])
+			.toEqual((initial.payload as Record<string, unknown>)["runs"]);
+
+		stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
+	});
+
+	test("stale asynchronous overlay recreations cannot overwrite the newest theme", async () => {
+		const pending: Array<{
+			theme: string;
+			resolve: () => void;
+			done: (result: unknown) => void;
+		}> = [];
+		const disposed: string[] = [];
+		const { promise: initialFactoryStarted, resolve: resolveInitialFactoryStarted } = Promise.withResolvers<void>();
+		const raceFactory: ExtensionFactory = (pi) => {
+			pi.registerCommand("theme-race", {
+				description: "Creates an asynchronous overlay",
+				async handler(_args, ctx) {
+					await ctx.ui.custom((_tui, theme, _keybindings, done) => {
+						const name = String((theme as { name?: unknown }).name ?? "dark");
+						const component = {
+							render: () => [`overlay-${name}`],
+							dispose: () => disposed.push(name),
+						};
+						const { promise, resolve } = Promise.withResolvers<typeof component>();
+						pending.push({ theme: name, resolve: () => resolve(component), done });
+						if (pending.length === 1) resolveInitialFactoryStarted();
+						return promise;
+					});
+				},
+			});
+		};
+		const { collector, stdin, host, runPromise } = await connectHost([raceFactory]);
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 62, kind: "req", method: "command.execute", payload: { command: "theme-race", args: "" },
+		})));
+		await initialFactoryStarted;
+		(host as unknown as { applyThemeUpdate(update: unknown): void }).applyThemeUpdate(themeUpdateFrame("red").payload);
+		(host as unknown as { applyThemeUpdate(update: unknown): void }).applyThemeUpdate(themeUpdateFrame("blue").payload);
+		expect(pending.map((entry) => entry.theme)).toEqual(["dark", "red", "blue"]);
+
+		pending[0]?.resolve();
+		pending[1]?.resolve();
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(collector.frames.some((frame) => frame.method === "uiSlot")).toBe(false);
+		expect(disposed).toEqual(["dark", "red"]);
+
+		pending[2]?.resolve();
+		const latest = await collector.awaitFrame((frame) => frame.method === "uiSlot");
+		expect(JSON.stringify(latest.payload)).toContain("overlay-blue");
+		expect(collector.frames.filter((frame) => frame.method === "uiSlot")).toHaveLength(1);
+		pending[2]?.done("complete");
+		await collector.awaitFrame((frame) => frame.id === 62 && frame.kind === "res");
 
 		stdin.push(null);
 		host.dispose("test");

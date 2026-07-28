@@ -136,13 +136,39 @@ const HostState = {
 type HostState = (typeof HostState)[keyof typeof HostState];
 
 /** State tracked for a keyed UI slot (widget/header/footer/editor/overlay). */
+type SlotComponent = {
+	render(width: number): string[];
+	handleInput?(data: string): void;
+	dispose?(): void;
+};
+
+type SlotFactory = (theme: Theme) => unknown;
+
 interface SlotEntry {
 	generation: number;
-	component: { render(width: number): string[]; handleInput?(data: string): void; dispose?(): void } | null;
+	component: SlotComponent | null;
 	placement: SlotPlacement;
 	focusable: boolean;
 	overlayOptions: OverlayOptions | undefined;
 	width: number;
+	/** Retained only for components that must capture the active theme at construction. */
+	recreate?: SlotFactory;
+	/** Invalidates older asynchronous recreation results. */
+	recreationRevision: number;
+}
+
+function isSlotComponent(value: unknown): value is SlotComponent {
+	return value !== null
+		&& typeof value === "object"
+		&& typeof (value as SlotComponent).render === "function";
+}
+
+/** Message text is extension data; only an actual AbortError denotes cancellation. */
+function isStructuredAbortError(error: unknown): boolean {
+	if (error instanceof Error && error.name === "AbortError") return true;
+	return typeof DOMException === "function"
+		&& error instanceof DOMException
+		&& error.name === "AbortError";
 }
 
 interface RegisteredProviderConfig {
@@ -1320,7 +1346,8 @@ export class ExtensionHost {
 			this.disposeSlot(key);
 			return;
 		}
-		let component: SlotEntry["component"];
+		let component: SlotComponent;
+		let recreate: SlotFactory | undefined;
 		if (Array.isArray(content)) {
 			const lines = content as string[];
 			component = { render: () => lines };
@@ -1337,17 +1364,14 @@ export class ExtensionHost {
 				getAvailableProviderCount: () => 0,
 				onBranchChange: () => () => {},
 			};
+			recreate = (theme) => (content as (...args: unknown[]) => unknown)(tui, theme, footerData);
 			try {
-				component = (content as (...args: unknown[]) => SlotEntry["component"])(
-					tui,
-					this.currentTheme,
-					footerData,
-				);
+				component = recreate(this.currentTheme) as SlotComponent;
 			} catch (err) {
 				this.emitExtensionError("<inline>", "setComponentSlot", String(err));
 				return;
 			}
-			if (component === null || typeof component?.render !== "function") {
+			if (!isSlotComponent(component)) {
 				this.emitExtensionError(
 					"<inline>",
 					"setComponentSlot",
@@ -1366,9 +1390,51 @@ export class ExtensionHost {
 			focusable: false,
 			overlayOptions: undefined,
 			width: 80,
+			recreate,
+			recreationRevision: 0,
 		};
 		this.slots.set(key, entry);
 		this.pushSlot(key, entry, 80);
+	}
+
+	private recreateSlot(key: string, entry: SlotEntry, onInitialFailure?: () => void): void {
+		if (entry.recreate === undefined) {
+			this.pushSlot(key, entry, entry.width);
+			return;
+		}
+		const revision = ++entry.recreationRevision;
+		const isCurrent = () => this.slots.get(key) === entry && entry.recreationRevision === revision;
+		const fail = (err: unknown) => {
+			if (!isCurrent()) return;
+			this.emitExtensionError("<inline>", "theme.update", String(err));
+			onInitialFailure?.();
+		};
+		const install = (replacement: unknown) => {
+			if (!isCurrent()) {
+				if (isSlotComponent(replacement)) replacement.dispose?.();
+				return;
+			}
+			if (!isSlotComponent(replacement)) {
+				fail(`factory for ${key} did not return a component`);
+				return;
+			}
+			const old = entry.component;
+			entry.component = replacement;
+			old?.dispose?.();
+			this.pushSlot(key, entry, entry.width);
+		};
+		let recreated: unknown;
+		try {
+			recreated = entry.recreate(this.currentTheme);
+		} catch (err) {
+			fail(err);
+			return;
+		}
+		if (recreated !== null && typeof recreated === "object" && typeof (recreated as PromiseLike<unknown>).then === "function") {
+			Promise.resolve(recreated).then(install, fail);
+			return;
+		}
+		install(recreated);
 	}
 
 	// -----------------------------------------------------------------------
@@ -1459,25 +1525,28 @@ export class ExtensionHost {
 						if (entry !== undefined) self.pushSlot(key, entry, entry.width);
 					},
 				};
-				Promise.resolve(factory(tui, self.currentTheme, {}, done)).then((component: any) => {
-					if (resolved) {
-						component?.dispose?.();
-						return;
-					}
-					const entry: SlotEntry = {
-						generation: self.nextGeneration++,
-						component,
-						placement: "overlay",
-						focusable: true,
-						overlayOptions: (typeof options?.overlayOptions === "function" ? options.overlayOptions() : options?.overlayOptions) ?? {},
-						width: 80,
-					};
-					self.slots.set(key, entry);
-					self.pushSlot(key, entry, 80);
-				}).catch((err) => {
+				let overlayOptions: OverlayOptions | undefined;
+				try {
+					overlayOptions = (typeof options?.overlayOptions === "function"
+						? options.overlayOptions()
+						: options?.overlayOptions) ?? {};
+				} catch (err) {
 					self.emitExtensionError("<inline>", "custom", String(err));
 					done(undefined);
-				});
+					return promise;
+				}
+				const entry: SlotEntry = {
+					generation: self.nextGeneration++,
+					component: null,
+					placement: "overlay",
+					focusable: true,
+					overlayOptions,
+					width: 80,
+					recreate: (theme) => factory(tui, theme, {}, done),
+					recreationRevision: 0,
+				};
+				self.slots.set(key, entry);
+				self.recreateSlot(key, entry, () => done(undefined));
 				return promise;
 			},
 			editor: (title: string, prefill?: string) =>
@@ -1786,7 +1855,7 @@ export class ExtensionHost {
 		this.terminalTheme = update.terminalTheme === "light" ? "light" : "dark";
 		this.themeMode = typeof update.themeMode === "string" ? update.themeMode : "auto";
 		for (const [key, entry] of this.slots) {
-			this.pushSlot(key, entry, entry.width);
+			this.recreateSlot(key, entry);
 		}
 	}
 
@@ -2037,9 +2106,7 @@ export class ExtensionHost {
 			await this.client.respond(id, "tool.execute" as Method, result);
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
-			const cancelled = controller.signal.aborted
-				|| message.toLowerCase().includes("abort")
-				|| message.toLowerCase().includes("cancel");
+			const cancelled = controller.signal.aborted || isStructuredAbortError(err);
 			await this.client.respondError(id, "tool.execute" as Method, {
 				code: cancelled ? "cancelled" : "extension_error",
 				message: cancelled ? "extension tool cancelled" : message,
@@ -2092,9 +2159,7 @@ export class ExtensionHost {
 			await this.client.respond(id, "provider.stream" as Method, {});
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
-			const cancelled = controller.signal.aborted
-				|| message.toLowerCase().includes("abort")
-				|| message.toLowerCase().includes("cancel");
+			const cancelled = controller.signal.aborted || isStructuredAbortError(err);
 			await this.client.respondError(id, "provider.stream" as Method, {
 				code: cancelled ? "cancelled" : "extension_error",
 				message: cancelled ? "provider stream cancelled" : message,

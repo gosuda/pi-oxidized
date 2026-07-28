@@ -118,7 +118,13 @@ export interface LeanFlag {
 export interface LeanShortcut {
 	readonly key: string;
 	readonly description?: string;
-	readonly handler: (ctx: LeanContext) => void | Promise<void>;
+	readonly handler: (ctx: LeanShortcutContext) => void | Promise<void>;
+}
+
+/** Context for a `shortcut.execute` invocation. */
+export interface LeanShortcutContext extends LeanContext {
+	/** Aborted when the lean runner is disposed. */
+	readonly signal: AbortSignal;
 }
 
 /** Declarative custom provider (mirrors the Mode 1 provider wire shape). */

@@ -37,20 +37,17 @@ export class AssistantDeltaReducer {
 			throw new Error("active assistant content is not an array");
 		}
 		const index = event["contentIndex"];
-		if (
-			typeof index !== "number"
-			|| !Number.isInteger(index)
-			|| index < 0
-			|| index > content.length
-		) {
+		const type = event["type"];
+		const isStart = type === "text_start" || type === "thinking_start" || type === "toolcall_start";
+		const isEnd = type === "text_end" || type === "thinking_end" || type === "toolcall_end";
+		// Only a `*_start` may append at the end of the array. An out-of-order or
+		// malformed `*_end` carrying the append index would otherwise fabricate a
+		// block that was never streamed, which hooks then observe as real content.
+		const limit = isStart ? content.length : content.length - 1;
+		if (typeof index !== "number" || !Number.isInteger(index) || index < 0 || index > limit) {
 			return;
 		}
-		const type = event["type"];
-		if (
-			(type === "text_start" || type === "thinking_start" || type === "toolcall_start"
-				|| type === "text_end" || type === "thinking_end" || type === "toolcall_end")
-			&& isRecord(event["block"])
-		) {
+		if ((isStart || isEnd) && isRecord(event["block"])) {
 			content[index] = structuredClone(event["block"]);
 			if (type === "toolcall_start") this.activeToolArguments.set(index, "");
 			if (type === "toolcall_end") this.activeToolArguments.delete(index);
