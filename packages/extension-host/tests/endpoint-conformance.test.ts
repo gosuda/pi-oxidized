@@ -55,9 +55,17 @@ class EndpointLink {
 	}
 
 	request(id: number, method: string, payload: unknown, timeoutMs = 30_000): Promise<Frame> {
+		// `frames` accumulates for the lifetime of the link, so only frames that
+		// arrive as a consequence of this push may settle this call. A lifetime
+		// scan would latch onto a leftover reply carrying the same id.
+		const before = this.frames.length;
 		this.stdin.push(Buffer.from(encodeFrameString({ id, kind: "req", method, payload })));
-		const existing = this.frames.find((frame) => frame.id === id && frame.kind !== "req");
-		if (existing !== undefined) return Promise.resolve(existing);
+		for (let index = before; index < this.frames.length; index++) {
+			const arrived = this.frames[index];
+			if (arrived !== undefined && arrived.id === id && arrived.kind !== "req") {
+				return Promise.resolve(arrived);
+			}
+		}
 		const { promise, resolve: settle, reject } = Promise.withResolvers<Frame>();
 		let waiter: (typeof this.waiters)[number] | undefined;
 		const timer = setTimeout(() => {
@@ -204,7 +212,16 @@ describe("extension endpoint conformance", () => {
 			);
 			expect(clearTimeoutSpy).not.toHaveBeenCalled();
 			clearTimeoutSpy.mockRestore();
-			expect(await link.request(99, "missing.method", {}, 5)).toMatchObject({ id: 99, kind: "res" });
+
+			// A later call reusing the id must register a fresh waiter and settle
+			// on a new reply; the unclaimed frame above must not satisfy it.
+			const retried = link.request(99, "missing.method", {}, 5);
+			link.output.write(
+				Buffer.from(
+					encodeFrameString({ id: 99, kind: "res", method: "missing.method", payload: { round: 2 } }),
+				),
+			);
+			expect(await retried).toMatchObject({ id: 99, kind: "res", payload: { round: 2 } });
 		} finally {
 			vi.useRealTimers();
 			await link.finish();
