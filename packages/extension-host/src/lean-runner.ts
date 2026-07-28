@@ -114,6 +114,119 @@ function isWhitespaceChar(char: string): boolean {
 	return char === " " || char === "\t" || char === "\n" || char === "\r" || char === "\v" || char === "\f";
 }
 
+const REGEX_PREFIX_KEYWORDS = new Set([
+	"return",
+	"typeof",
+	"case",
+	"default",
+	"delete",
+	"void",
+	"throw",
+	"new",
+	"in",
+	"of",
+	"instanceof",
+	"yield",
+	"await",
+	"do",
+	"else",
+]);
+const REGEX_PREFIX_PUNCTUATORS = new Set([
+	"(",
+	"[",
+	"{",
+	",",
+	";",
+	":",
+	"=",
+	"==",
+	"===",
+	"!=",
+	"!==",
+	"<=",
+	">=",
+	"<<",
+	">>",
+	">>>",
+	"=>",
+	"?",
+	"??",
+	"*",
+	"**",
+	"%",
+	// A regex may be the right operand of division, a relational compare, or
+	// `+`/`-`. Whole-token tracking is what makes `+` and `-` unambiguous here:
+	// `++` and `--` are their own tokens, so the postfix-then-divide reading of
+	// `x++ / 2` is preserved and only a lone `+`/`-` admits a regex.
+	"/",
+	">",
+	"+",
+	"-",
+	"&",
+	"&&",
+	"|",
+	"||",
+	"^",
+	"<",
+	"~",
+	"!",
+	"+=",
+	"-=",
+	"*=",
+	"**=",
+	"/=",
+	"%=",
+	"&=",
+	"&&=",
+	"|=",
+	"||=",
+	"^=",
+	"<<=",
+	">>=",
+	">>>=",
+	"??=",
+]);
+const MULTI_CHARACTER_PUNCTUATORS = [
+	">>>=",
+	"&&=",
+	"||=",
+	"??=",
+	"**=",
+	">>=",
+	"<<=",
+	"===",
+	"!==",
+	"...",
+	">>>",
+	"&&",
+	"||",
+	"??",
+	"**",
+	"==",
+	"!=",
+	"<=",
+	">=",
+	"=>",
+	"++",
+	"--",
+	"<<",
+	">>",
+	"?.",
+	"+=",
+	"-=",
+	"*=",
+	"/=",
+	"%=",
+	"&=",
+	"|=",
+	"^=",
+] as const;
+
+type SignificantToken =
+	| { kind: "identifier" | "keyword"; value: string }
+	| { kind: "punctuator"; value: string }
+	| { kind: "literal"; value: "regex" | "string" | "template" };
+
 /**
  * Extract literal module specifiers from every import form that can load a
  * lean dependency. The same extractor drives direct exclusion and local
@@ -135,8 +248,20 @@ function extractImportSpecifiers(source: string): string[] {
 	let inTemplateRaw = false;
 	// `import`/`export` preceded by `.` is member access (`obj.import(...)`;
 	// `import.meta` is handled on the other side), never an import statement.
-	let lastSignificant = "";
+	let lastSignificant: SignificantToken | undefined;
 	let index = 0;
+
+	const readPunctuator = (from: number): string =>
+		MULTI_CHARACTER_PUNCTUATORS.find((punctuator) => source.startsWith(punctuator, from)) ?? source[from];
+	const recordWord = (word: string, preceded = lastSignificant): void => {
+		lastSignificant = {
+			kind:
+				REGEX_PREFIX_KEYWORDS.has(word) && !(preceded?.kind === "punctuator" && preceded.value === ".")
+					? "keyword"
+					: "identifier",
+			value: word,
+		};
+	};
 
 	const skipLineComment = (from: number): number => {
 		const end = source.indexOf("\n", from);
@@ -169,6 +294,50 @@ function extractImportSpecifiers(source: string): string[] {
 		}
 		return at;
 	};
+	/** Advance past a terminated regular-expression literal, if present. */
+	const skipRegex = (from: number): number | undefined => {
+		let at = from + 1;
+		let inCharacterClass = false;
+		while (at < length) {
+			const char = source[at];
+			if (char === "\\") {
+				at += 2;
+				continue;
+			}
+			if (char === "\n" || char === "\r") return undefined;
+			if (inCharacterClass) {
+				if (char === "]") inCharacterClass = false;
+				at += 1;
+				continue;
+			}
+			if (char === "[") {
+				inCharacterClass = true;
+				at += 1;
+				continue;
+			}
+			if (char !== "/") {
+				at += 1;
+				continue;
+			}
+			at += 1;
+			while (at < length) {
+				const code = source.charCodeAt(at);
+				if ((code < 65 || code > 90) && (code < 97 || code > 122)) break;
+				at += 1;
+			}
+			return at;
+		}
+		return undefined;
+	};
+	/**
+	 * Permit regexes only after punctuation that cannot end an expression.
+	 * Ambiguous punctuation (such as `+`, which may close `x++`) remains
+	 * division so the scanner never hides following real code.
+	 */
+	const canStartRegex = (previous: SignificantToken | undefined): boolean =>
+		previous === undefined
+		|| (previous.kind === "keyword" && REGEX_PREFIX_KEYWORDS.has(previous.value))
+		|| (previous.kind === "punctuator" && REGEX_PREFIX_PUNCTUATORS.has(previous.value));
 	/**
 	 * Record the terminated string literal at `from` as a specifier and
 	 * return the index after its closing quote; undefined otherwise.
@@ -179,7 +348,7 @@ function extractImportSpecifiers(source: string): string[] {
 		const end = skipString(from, quote);
 		if (end <= from + 1 || source[end - 1] !== quote) return undefined;
 		specifiers.push(source.slice(from + 1, end - 1));
-		lastSignificant = quote;
+		lastSignificant = { kind: "literal", value: "string" };
 		return end;
 	};
 	/**
@@ -201,17 +370,26 @@ function extractImportSpecifiers(source: string): string[] {
 				at = source[at + 1] === "/" ? skipLineComment(at + 2) : skipBlockComment(at + 2);
 				continue;
 			}
+			if (char === "/" && canStartRegex(lastSignificant)) {
+				const regexEnd = skipRegex(at);
+				if (regexEnd !== undefined) {
+					at = regexEnd;
+					lastSignificant = { kind: "literal", value: "regex" };
+					continue;
+				}
+			}
 			if (char === '"' || char === "'" || char === "(" || char === ")" || char === "`") return at;
 			if (!isIdentifierCharCode(source.charCodeAt(at))) {
-				lastSignificant = char;
-				at += 1;
+				const punctuator = readPunctuator(at);
+				lastSignificant = { kind: "punctuator", value: punctuator };
+				at += punctuator.length;
 				continue;
 			}
 			const start = at;
 			while (at < length && isIdentifierCharCode(source.charCodeAt(at))) at += 1;
 			const word = source.slice(start, at);
 			if (word === "import" || word === "export") return start;
-			lastSignificant = source[at - 1];
+			recordWord(word);
 			if (word !== "from") continue;
 			const literalEnd = readSpecifier(skipInsignificant(at));
 			if (literalEnd !== undefined) return literalEnd;
@@ -226,12 +404,12 @@ function extractImportSpecifiers(source: string): string[] {
 				index += 2;
 			} else if (char === "`") {
 				inTemplateRaw = false;
-				lastSignificant = "`";
+				lastSignificant = { kind: "literal", value: "template" };
 				index += 1;
 			} else if (char === "$" && source[index + 1] === "{") {
 				templateExpressionDepths.push(0);
 				inTemplateRaw = false;
-				lastSignificant = "{";
+				lastSignificant = { kind: "punctuator", value: "{" };
 				index += 2;
 			} else {
 				index += 1;
@@ -246,20 +424,28 @@ function extractImportSpecifiers(source: string): string[] {
 			index = source[index + 1] === "/" ? skipLineComment(index + 2) : skipBlockComment(index + 2);
 			continue;
 		}
+		if (char === "/" && canStartRegex(lastSignificant)) {
+			const regexEnd = skipRegex(index);
+			if (regexEnd !== undefined) {
+				index = regexEnd;
+				lastSignificant = { kind: "literal", value: "regex" };
+				continue;
+			}
+		}
 		if (char === '"' || char === "'") {
 			index = skipString(index, char);
-			lastSignificant = char;
+			lastSignificant = { kind: "literal", value: "string" };
 			continue;
 		}
 		if (char === "`") {
 			inTemplateRaw = true;
-			lastSignificant = "`";
+			lastSignificant = { kind: "literal", value: "template" };
 			index += 1;
 			continue;
 		}
 		if (char === "{" || char === "}") {
 			index += 1;
-			lastSignificant = char;
+			lastSignificant = { kind: "punctuator", value: char };
 			const top = templateExpressionDepths.length - 1;
 			if (top < 0) continue;
 			if (char === "{") {
@@ -273,16 +459,20 @@ function extractImportSpecifiers(source: string): string[] {
 			continue;
 		}
 		if (!isIdentifierCharCode(source.charCodeAt(index))) {
-			lastSignificant = char;
-			index += 1;
+			const punctuator = readPunctuator(index);
+			lastSignificant = { kind: "punctuator", value: punctuator };
+			index += punctuator.length;
 			continue;
 		}
 		const start = index;
 		while (index < length && isIdentifierCharCode(source.charCodeAt(index))) index += 1;
 		const word = source.slice(start, index);
 		const preceded = lastSignificant;
-		lastSignificant = source[index - 1];
-		if ((word !== "import" && word !== "export") || preceded === ".") continue;
+		recordWord(word, preceded);
+		if (
+			(word !== "import" && word !== "export")
+			|| (preceded?.kind === "punctuator" && preceded.value === ".")
+		) continue;
 		if (word === "export") {
 			index = scanFromClause(index);
 			continue;
@@ -296,7 +486,7 @@ function extractImportSpecifiers(source: string): string[] {
 				index = literalEnd;
 			} else {
 				// Non-literal dynamic import argument: rescan it as code.
-				lastSignificant = "(";
+				lastSignificant = { kind: "punctuator", value: "(" };
 				index = literalStart;
 			}
 			continue;

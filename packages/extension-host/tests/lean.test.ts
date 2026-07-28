@@ -1431,6 +1431,83 @@ describe("lean: surface validation units", () => {
 		}
 	});
 
+	test("lexical import scanner skips regular-expression literals without swallowing division", () => {
+		const cases: Array<[source: string, expected: string | undefined]> = [
+			['const r = /`/; import "jiti";', "jiti"],
+			['const r = /[`/]/; import "jiti";', "jiti"],
+			['const r = /\\//; import "jiti";', "jiti"],
+			['const r = /`/gu; const ready = true; import "jiti";', "jiti"],
+			['const quotient = value / import("jiti") / divisor;', "jiti"],
+		];
+		for (const [source, expected] of cases) {
+			expect(findExcludedImport(source)).toBe(expected);
+		}
+	});
+
+	test("lexical import scanner skips a regex after an unambiguous prefix operator", () => {
+		expect(findExcludedImport('const matched = !/`/.test(value); import "jiti";')).toBe("jiti");
+	});
+
+	test("lexical import scanner skips a regex while scanning an export default clause", () => {
+		expect(findExcludedImport('export default /`/; import "jiti";')).toBe("jiti");
+	});
+
+	test("lexical import scanner recognizes a regex after return", () => {
+		expect(findExcludedImport("function x(){ return /`/.test(x); } import \"jiti\";")).toBe("jiti");
+	});
+
+	test("lexical import scanner recognizes a regex after typeof", () => {
+		expect(findExcludedImport("const x = typeof /`/; import \"jiti\";")).toBe("jiti");
+	});
+
+	test("lexical import scanner recognizes a regex after case", () => {
+		expect(findExcludedImport("switch(x){case /`/: break;} import \"jiti\";")).toBe("jiti");
+	});
+
+	test("lexical import scanner recognizes a regex after an arrow", () => {
+		expect(findExcludedImport("const f = () => /`/.test(x); import \"jiti\";")).toBe("jiti");
+	});
+
+	test("lexical import scanner recognizes a regex as a binary right operand", () => {
+		const cases: Array<[source: string, expected: string | undefined]> = [
+			['a / /`/.source; import("jiti")', "jiti"],
+			['a > /`/.test(x); import("jiti")', "jiti"],
+			['a < /`/.test(x); import("jiti")', "jiti"],
+			['a + /`/.source; import("jiti")', "jiti"],
+			['a - /`/.source; import("jiti")', "jiti"],
+			['const v = +/`/.source; import("jiti")', "jiti"],
+		];
+		for (const [source, expected] of cases) {
+			expect(findExcludedImport(source)).toBe(expected);
+		}
+	});
+
+	test("lexical import scanner keeps increment and decrement as division", () => {
+		// `++`/`--` are single tokens, so the operand before `/` is a value and
+		// the slash divides; only a lone `+`/`-` may be followed by a regex.
+		const cases: Array<[source: string, expected: string | undefined]> = [
+			['const q = x++ / import("jiti") / 2;', "jiti"],
+			['const q = x-- / import("jiti") / 2;', "jiti"],
+			["const q = x++ / 2;", undefined],
+		];
+		for (const [source, expected] of cases) {
+			expect(findExcludedImport(source)).toBe(expected);
+		}
+	});
+
+	test("lexical import scanner keeps keyword-shaped identifiers and members as division", () => {
+		const cases: Array<[source: string, expected: string | undefined]> = [
+			['const myreturn = 4; myreturn / import("jiti") / 2;', "jiti"],
+			['const preturn = 4; preturn / import("jiti") / 2;', "jiti"],
+			["obj.default / 2;", undefined],
+			['obj.default / import("jiti") / 2;', "jiti"],
+			['obj.case / import("jiti") / 2;', "jiti"],
+		];
+		for (const [source, expected] of cases) {
+			expect(findExcludedImport(source)).toBe(expected);
+		}
+	});
+
 	test("parseStreamingJson recovery is bounded to a constant tail", () => {
 		// Recovery boundary inside the 512-char tail: recovered in full.
 		const longText = "x".repeat(600);
