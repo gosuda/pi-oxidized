@@ -715,7 +715,7 @@ async fn apply_flags_to_runner(
 
 /// Apply resolved extension flags to the runner and register its providers on
 /// the model runtime. Returns `None` if flag application failed (the runner is
-/// unregistered and shut down in that case).
+/// shut down in that case; nothing was registered yet).
 async fn finalize_extension_runner(
     extension_runner: Option<Arc<HostExtensionRunner>>,
     applied_flags: &BTreeMap<String, ExtensionFlagValue>,
@@ -733,7 +733,6 @@ async fn finalize_extension_runner(
             diagnostics.push(AgentSessionRuntimeDiagnostic::error(format!(
                 "Extension flags failed to apply: {error}"
             )));
-            runner.unregister_providers_from(model_runtime);
             runner.shutdown_once().await;
             return None;
         }
