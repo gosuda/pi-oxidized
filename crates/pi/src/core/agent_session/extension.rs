@@ -370,6 +370,12 @@ impl AgentSession {
 
     /// Reload extensions with a prepare/commit transaction.
     ///
+    /// The entire transaction runs under `bind_lock`, the same lock that
+    /// serializes `bind_extensions`. Two concurrent reloads (or a reload and a
+    /// bind) cannot interleave: the loser blocks until the winner has finished
+    /// preparation, commit, runner swap, registry refresh, bridge rebinding,
+    /// and resource re-discovery.
+    ///
     /// A concrete replacement is fully started and has preserved flags applied
     /// while the old runner remains live. Only successful preparation crosses
     /// the lifecycle boundary, commits providers, reaps the old transport, and
@@ -380,6 +386,7 @@ impl AgentSession {
     /// Returns [`ExtensionBindError`] on host preparation or resource-discovery
     /// failure. A preparation error leaves the old host installed and live.
     pub async fn reload(&self) -> Result<Vec<ExtensionHostDiagnostic>, ExtensionBindError> {
+        let _reload_guard = self.bind_lock.lock().await;
         let runner = self.hooks.runner();
         let previous_flag_values = runner.get_flag_values();
 
@@ -1655,6 +1662,47 @@ mod tests {
         assert!(
             calls.iter().any(|c| c == "resources_discover:reload"),
             "reload must refresh resources even without bindings, got {calls:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_reloads_serialize_and_do_not_interleave() -> TestResult {
+        // Two overlapping reloads must each run as one atomic transaction.
+        // `emit_delay` widens the overlap window so that, without `bind_lock`
+        // guarding `reload`, the two transactions would interleave
+        // (shutdown/shutdown/start/start/...). With the guard, the log is
+        // exactly two back-to-back, non-interleaved transactions — the losing
+        // reload cannot start until the winner has fully committed and swapped.
+        let runner = Arc::new(TestRunner::new());
+        runner.has_shutdown.store(true, Ordering::SeqCst);
+        runner.has_start.store(true, Ordering::SeqCst);
+        runner.has_resources.store(true, Ordering::SeqCst);
+        *runner
+            .emit_delay
+            .lock()
+            .map_err(|_| io::Error::other("emit delay mutex poisoned"))? =
+            Some(std::time::Duration::from_millis(25));
+        let mut config = AgentSessionConfig::test_config(Arc::new(StubProvider), test_model())?;
+        config.extension_runner = Some(runner.clone() as Arc<dyn ExtensionRunner>);
+        let session = AgentSession::new(config)?;
+
+        let (first, second) = tokio::join!(session.reload(), session.reload());
+        first?;
+        second?;
+
+        let calls = locked_clone(&runner.calls, "calls")?;
+        assert_eq!(
+            calls,
+            vec![
+                "session_shutdown:reload:-".to_owned(),
+                "session_start:reload:-".to_owned(),
+                "resources_discover:reload".to_owned(),
+                "session_shutdown:reload:-".to_owned(),
+                "session_start:reload:-".to_owned(),
+                "resources_discover:reload".to_owned(),
+            ],
+            "concurrent reloads must serialize: two complete, non-interleaved transactions"
         );
         Ok(())
     }

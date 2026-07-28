@@ -16,8 +16,8 @@
 //! Never hold a sync lock across `.await`. Never nest locks out of order:
 //!
 //! 0. `bind_lock` (`tokio::sync::Mutex`) — serializes the entire
-//!    `bind_extensions` lifecycle; held across `.await`. Acquire before any
-//!    `lock_inner()`.
+//!    `bind_extensions` lifecycle and the whole `reload` transaction; held
+//!    across `.await`. Acquire before any `lock_inner()`.
 //! 1. `AgentSessionInner` (`std::sync::Mutex`) — flags, mirror queues, retry
 //!    counters, listener list, pump handle, cancellation slots.
 //! 2. `session_manager` (`tokio::sync::Mutex<SessionManager>`) — single-writer
