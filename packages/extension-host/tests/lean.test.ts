@@ -41,6 +41,7 @@ const TOOL_CALL_REORDER_ENTRY = join(LEAN_FIXTURES, "tool-call-reorder.mjs");
 const TOOL_CALL_VALUE_CHANGE_ENTRY = join(LEAN_FIXTURES, "tool-call-value-change.mjs");
 const TOOL_RESULT_TERMINATE_ONLY_ENTRY = join(LEAN_FIXTURES, "tool-result-terminate-only.mjs");
 const FLOW_CONTROL_ENTRY = join(LEAN_FIXTURES, "flow-control.mjs");
+const FLAG_CONTEXT_ENTRY = join(LEAN_FIXTURES, "flag-context.mjs");
 const PRELOAD = resolve(import.meta.dirname, "fixtures", "lean-forbid-compat-graph.ts");
 
 type Marker = { name: string; value: unknown };
@@ -593,6 +594,7 @@ describe("lean: tool RPCs", () => {
 			Promise.resolve(slow.execute({}, {
 				cwd: PACKAGE_DIR,
 				extensionPath: ECHO_ENTRY,
+				flags: {},
 				toolCallId: "already-aborted",
 				signal: controller.signal,
 				onUpdate: () => {},
@@ -653,6 +655,40 @@ describe("lean: commands, flags, shortcuts, providers", () => {
 		const snapshot = payload(await link.response(24, "extensions.load"));
 		const flags = snapshot["flags"] as Array<Record<string, unknown>>;
 		expect(flags[0]?.["value"]).toBe(true);
+		await link.finish();
+	});
+
+	test("flags.set values reach callbacks through ctx.flags", async () => {
+		const link = new LeanLink({ cwd: PACKAGE_DIR, extensionPaths: [FLAG_CONTEXT_ENTRY] });
+		await link.hello(1);
+		link.request(2, "extensions.load", { extensionPaths: [FLAG_CONTEXT_ENTRY], cwd: PACKAGE_DIR });
+		await link.response(2, "extensions.load");
+
+		// Before any flags.set, callbacks observe the declared defaults.
+		link.request(3, "command.execute", { command: "report-flags", args: "" });
+		await link.response(3, "command.execute");
+		expect(markerLog()).toContainEqual({
+			name: "flags",
+			value: { mode: "quiet", debug: false },
+		});
+
+		// After flags.set, the applied values win over the defaults.
+		link.request(4, "flags.set", { values: { mode: "loud", debug: true } });
+		expect(payload(await link.response(4, "flags.set"))["ok"]).toBe(true);
+		link.request(5, "command.execute", { command: "report-flags", args: "" });
+		await link.response(5, "command.execute");
+		expect(markerLog()).toContainEqual({
+			name: "flags",
+			value: { mode: "loud", debug: true },
+		});
+
+		// tool.execute contexts carry the same effective values.
+		link.request(6, "tool.execute", { name: "flag-tool", toolCallId: "flag-1", args: {}, prepared: true });
+		await link.response(6, "tool.execute");
+		expect(markerLog()).toContainEqual({
+			name: "tool-flags",
+			value: { mode: "loud", debug: true },
+		});
 		await link.finish();
 	});
 

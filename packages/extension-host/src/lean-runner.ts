@@ -828,8 +828,19 @@ export class LeanRunner {
 		}
 	}
 
+	/** Effective flag values: applied `flags.set` wins, then the declared default. */
+	private effectiveFlags(): Record<string, boolean | string> {
+		const flags: Record<string, boolean | string> = {};
+		for (const [name, { flag }] of this.flags) {
+			const applied = this.flagValues.get(name);
+			if (applied !== undefined) flags[name] = applied;
+			else if (flag.default !== undefined) flags[name] = flag.default;
+		}
+		return flags;
+	}
+
 	private hookContext(extensionPath: string): LeanContext {
-		return { cwd: this.cwd, extensionPath };
+		return { cwd: this.cwd, extensionPath, flags: this.effectiveFlags() };
 	}
 
 	// -----------------------------------------------------------------------
@@ -1102,8 +1113,7 @@ export class LeanRunner {
 				? args
 				: await registered.tool.prepare(args, this.hookContext(registered.extensionPath));
 			const result = await registered.tool.execute(prepared, {
-				cwd: this.cwd,
-				extensionPath: registered.extensionPath,
+				...this.hookContext(registered.extensionPath),
 				toolCallId,
 				signal: controller.signal,
 				onUpdate: (partial) => {

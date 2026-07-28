@@ -67,6 +67,12 @@ export interface LeanContext {
 	readonly cwd: string;
 	/** Entry path of the extension that registered this callback. */
 	readonly extensionPath: string;
+	/**
+	 * Effective flag values: each registered flag's applied `flags.set`
+	 * value, falling back to its declared default. Reflects the latest
+	 * `flags.set` at the moment this context was built.
+	 */
+	readonly flags: Readonly<Record<string, boolean | string>>;
 }
 
 /** Context for a `tool.execute` invocation. */
