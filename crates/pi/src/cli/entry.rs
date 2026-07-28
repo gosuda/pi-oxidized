@@ -357,19 +357,43 @@ fn append_session_bootstrap_entries(
         return Ok(());
     }
 
-    let requested_thinking_level = thinking_level_token(thinking_level);
     let entries = session_manager.get_entries();
-    let latest_thinking_level =
-        crate::core::sessions::build_session_path(&entries, crate::core::sessions::LeafRef::Last)
-            .into_iter()
-            .rev()
-            .find_map(|entry| match entry {
-                crate::core::sessions::SessionEntry::ThinkingLevelChange(change) => {
-                    Some(change.thinking_level.as_str())
-                }
-                _ => None,
-            });
-    if latest_thinking_level != Some(requested_thinking_level) {
+    let active_path =
+        crate::core::sessions::build_session_path(&entries, crate::core::sessions::LeafRef::Last);
+
+    // Extract owned snapshots so borrows release before mutation.
+    let latest_model: Option<(String, String)> =
+        active_path.iter().rev().find_map(|entry| match entry {
+            crate::core::sessions::SessionEntry::ModelChange(change) => {
+                Some((change.provider.clone(), change.model_id.clone()))
+            }
+            _ => None,
+        });
+    let latest_thinking_level: Option<String> =
+        active_path.iter().rev().find_map(|entry| match entry {
+            crate::core::sessions::SessionEntry::ThinkingLevelChange(change) => {
+                Some(change.thinking_level.clone())
+            }
+            _ => None,
+        });
+    drop(active_path);
+    drop(entries);
+
+    // Reconcile model: append when the resolved model differs from the latest
+    // persisted model on the active path.
+    if let Some(model) = model {
+        let changed = latest_model
+            .as_ref()
+            .is_none_or(|(p, m)| p != &model.provider || m != &model.id);
+        if changed {
+            session_manager
+                .append_model_change(&model.provider, &model.id)
+                .map_err(|error| error.to_string())?;
+        }
+    }
+
+    let requested_thinking_level = thinking_level_token(thinking_level);
+    if latest_thinking_level.as_deref() != Some(requested_thinking_level) {
         session_manager
             .append_thinking_level_change(requested_thinking_level)
             .map_err(|error| error.to_string())?;
@@ -1328,7 +1352,88 @@ mod tests {
                 .iter()
                 .map(|entry| entry.discriminant())
                 .collect::<Vec<_>>(),
-            ["message", "thinking_level_change"]
+            ["message", "model_change", "thinking_level_change"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resumed_session_persists_changed_model_without_duplicates() -> Result<(), String> {
+        let runtime = ModelRuntime::create_in_memory()
+            .await
+            .map_err(|error| format!("failed to create in-memory model runtime: {error}"))?;
+        let mut models = runtime.get_models(None).into_iter();
+        let model_a = models.next().ok_or("catalog empty")?;
+        let model_b = models
+            .find(|m| m.id != model_a.id || m.provider != model_a.provider)
+            .unwrap_or_else(|| {
+                let mut m = model_a.clone();
+                m.id = format!("{}-alt", m.id);
+                m
+            });
+
+        let mut manager = crate::core::sessions::SessionManager::in_memory(Some("/tmp"), None)
+            .map_err(|error| error.to_string())?;
+        // Simulate a resumed session: message + existing model entry.
+        let msg = pi_agent::AgentMessage::Llm(Box::new(pi_ai::Message::User(
+            pi_ai::UserMessage::new(pi_ai::UserMessageContent::Text("hi".to_owned()), 0),
+        )));
+        manager
+            .append_message(&msg)
+            .map_err(|error| error.to_string())?;
+        manager
+            .append_model_change(&model_a.provider, &model_a.id)
+            .map_err(|error| error.to_string())?;
+
+        let model_changes = |mgr: &crate::core::sessions::SessionManager| -> Vec<(String, String)> {
+            mgr.get_entries()
+                .into_iter()
+                .filter_map(|e| match e {
+                    crate::core::sessions::SessionEntry::ModelChange(c) => {
+                        Some((c.provider.clone(), c.model_id.clone()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // Changed model appends.
+        append_session_bootstrap_entries(&mut manager, Some(&model_b), ModelThinkingLevel::Off)?;
+        assert_eq!(
+            model_changes(&manager),
+            vec![
+                (model_a.provider.clone(), model_a.id.clone()),
+                (model_b.provider.clone(), model_b.id.clone()),
+            ],
+            "changed model must be persisted"
+        );
+
+        // Same model again does NOT duplicate.
+        append_session_bootstrap_entries(&mut manager, Some(&model_b), ModelThinkingLevel::Off)?;
+        assert_eq!(
+            model_changes(&manager).len(),
+            2,
+            "unchanged model must not append"
+        );
+
+        // None model does NOT append.
+        append_session_bootstrap_entries(&mut manager, None, ModelThinkingLevel::Off)?;
+        assert_eq!(
+            model_changes(&manager).len(),
+            2,
+            "no model selected must not append"
+        );
+
+        // Switching back to model_a appends.
+        append_session_bootstrap_entries(&mut manager, Some(&model_a), ModelThinkingLevel::Off)?;
+        assert_eq!(
+            model_changes(&manager),
+            vec![
+                (model_a.provider.clone(), model_a.id.clone()),
+                (model_b.provider.clone(), model_b.id.clone()),
+                (model_a.provider.clone(), model_a.id.clone()),
+            ],
+            "switching back must persist"
         );
         Ok(())
     }
