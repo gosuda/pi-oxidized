@@ -822,6 +822,23 @@ describe("lean: commands, flags, shortcuts, providers", () => {
 		expect(sibling).toEqual({});
 		await link.finish();
 	});
+
+	test("provider.stream fails fast when the lifecycle signal is absent", async () => {
+		// Dynamic import: exercises the real .mjs plugin-loading boundary.
+		const fixture = (await import(ECHO_ENTRY)) as { default: LeanExtension };
+		const provider = fixture.default.providers?.find((p) => p.name === "lean-provider");
+		if (provider?.streamSimple === undefined) throw new Error("provider fixture is missing");
+
+		const streamWithoutSignal = provider.streamSimple as (
+			model: unknown,
+			context: unknown,
+			options: Record<string, unknown>,
+		) => AsyncIterable<unknown>;
+		const stream = streamWithoutSignal({ id: "slow" }, {}, {});
+		await expect((async () => {
+			for await (const _event of stream) { /* drain */ }
+		})()).rejects.toThrow("provider stream requires options.signal");
+	});
 });
 
 // ---------------------------------------------------------------------------

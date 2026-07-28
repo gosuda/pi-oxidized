@@ -101,11 +101,15 @@ export default {
 				if (model?.id === "slow") {
 					await new Promise((_resolve, reject) => {
 						const signal = options?.signal;
-						if (signal?.aborted) {
+						if (signal === undefined) {
+							reject(new Error("provider stream requires options.signal"));
+							return;
+						}
+						if (signal.aborted) {
 							reject(new Error("provider stream aborted"));
 							return;
 						}
-						signal?.addEventListener(
+						signal.addEventListener(
 							"abort",
 							() => reject(new Error("provider stream aborted")),
 							{ once: true },
