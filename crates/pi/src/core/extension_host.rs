@@ -585,7 +585,6 @@ enum PendingKind {
 #[derive(Clone, Copy, Debug)]
 struct PendingRoute {
     endpoint_id: u64,
-    generation: u64,
     local_id: FrameId,
     kind: PendingKind,
 }
@@ -593,7 +592,6 @@ struct PendingRoute {
 #[derive(Clone, Debug)]
 struct SlotRoute {
     endpoint_id: u64,
-    generation: u64,
     local_key: String,
 }
 
@@ -674,7 +672,6 @@ impl AggregateState {
         };
         let route = PendingRoute {
             endpoint_id: endpoint.id,
-            generation: endpoint.reload_generation.load(Ordering::Relaxed),
             local_id,
             kind,
         };
@@ -697,11 +694,11 @@ impl AggregateState {
         routes.remove(&id)
     }
 
-    fn remove_endpoint_routes(&self, endpoint_id: u64, generation: u64) {
+    fn remove_endpoint_routes(&self, endpoint_id: u64) {
         self.pending_routes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(|_, route| route.endpoint_id != endpoint_id || route.generation != generation);
+            .retain(|_, route| route.endpoint_id != endpoint_id);
     }
 
     fn external_slot_key(&self, endpoint_id: u64, local_key: &str) -> String {
@@ -733,7 +730,6 @@ impl AggregateState {
                 external_key,
                 SlotRoute {
                     endpoint_id: endpoint.id,
-                    generation: endpoint.reload_generation.load(Ordering::Relaxed),
                     local_key,
                 },
             );
@@ -766,7 +762,7 @@ impl AggregateState {
             .send(ExtensionUiEvent::Dispose { key: external_key });
     }
 
-    fn dispose_endpoint_slots(&self, endpoint_id: u64, generation: u64) {
+    fn dispose_endpoint_slots(&self, endpoint_id: u64) {
         // Match slot_send / slot_dispose / dispose_all_slots: slots then routes.
         let Ok(mut slots) = self.slots.write() else {
             return;
@@ -775,7 +771,7 @@ impl AggregateState {
             return;
         };
         routes.retain(|key, route| {
-            if route.endpoint_id == endpoint_id && route.generation == generation {
+            if route.endpoint_id == endpoint_id {
                 if let Some(sender) = slots.remove(key) {
                     sender.send_replace(None);
                 }
@@ -820,7 +816,6 @@ struct Endpoint {
     flag_values: RwLock<HashMap<String, Value>>,
     /// Resolved load paths handed to this endpoint's `extensions.load`.
     extension_paths: Vec<String>,
-    reload_generation: AtomicU64,
     disabled: AtomicBool,
     stale: AtomicBool,
     shutdown_done: AtomicBool,
@@ -843,7 +838,6 @@ impl Endpoint {
             snapshot: RwLock::new(snapshot),
             flag_values: RwLock::new(flag_values),
             extension_paths,
-            reload_generation: AtomicU64::new(1),
             disabled: AtomicBool::new(false),
             stale: AtomicBool::new(false),
             shutdown_done: AtomicBool::new(false),
@@ -1434,11 +1428,7 @@ impl HostExtensionRunner {
     fn endpoint_for_route(&self, route: PendingRoute) -> Result<&Arc<Endpoint>, HostClientError> {
         self.endpoints
             .iter()
-            .find(|endpoint| {
-                endpoint.id == route.endpoint_id
-                    && endpoint.reload_generation.load(Ordering::Relaxed) == route.generation
-                    && endpoint.active()
-            })
+            .find(|endpoint| endpoint.id == route.endpoint_id && endpoint.active())
             .ok_or(HostClientError::NotRunning)
     }
 
@@ -1874,7 +1864,6 @@ impl HostExtensionRunner {
                 let endpoint = self.endpoints.first()?;
                 (self.endpoints.len() == 1).then(|| SlotRoute {
                     endpoint_id: endpoint.id,
-                    generation: endpoint.reload_generation.load(Ordering::Relaxed),
                     local_key: request.key.clone(),
                 })
             });
@@ -1884,11 +1873,7 @@ impl HostExtensionRunner {
         let endpoint = self
             .endpoints
             .iter()
-            .find(|endpoint| {
-                endpoint.id == route.endpoint_id
-                    && endpoint.reload_generation.load(Ordering::Relaxed) == route.generation
-                    && endpoint.active()
-            })
+            .find(|endpoint| endpoint.id == route.endpoint_id && endpoint.active())
             .ok_or(HostClientError::NotRunning)?;
         request.key = route.local_key;
         let payload = protocol::to_payload(&request)
@@ -3458,10 +3443,9 @@ impl HostExtensionRunner {
         if endpoint.shutdown_done.load(Ordering::Relaxed) {
             return;
         }
-        let generation = endpoint.reload_generation.load(Ordering::Relaxed);
         endpoint.disabled.store(true, Ordering::Relaxed);
-        aggregate.remove_endpoint_routes(endpoint.id, generation);
-        aggregate.dispose_endpoint_slots(endpoint.id, generation);
+        aggregate.remove_endpoint_routes(endpoint.id);
+        aggregate.dispose_endpoint_slots(endpoint.id);
         let _ = endpoint.client.shutdown().await;
         endpoint.shutdown_done.store(true, Ordering::Relaxed);
     }
