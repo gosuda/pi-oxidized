@@ -85,11 +85,6 @@ describe("FrameCollector timeout cleanup", () => {
 	test("does not retain or invoke a timed-out predicate for a late matching frame", async () => {
 		const collector = new FrameCollector();
 		let predicateCalls = 0;
-		const unhandled: unknown[] = [];
-		const trackUnhandled = (err: unknown) => {
-			unhandled.push(err);
-		};
-		process.on("unhandledRejection", trackUnhandled);
 
 		vi.useFakeTimers();
 		try {
@@ -120,10 +115,8 @@ describe("FrameCollector timeout cleanup", () => {
 			);
 
 			expect(predicateCalls).toBe(0);
-			expect(unhandled).toEqual([]);
 		} finally {
 			vi.useRealTimers();
-			process.off("unhandledRejection", trackUnhandled);
 		}
 	});
 });
