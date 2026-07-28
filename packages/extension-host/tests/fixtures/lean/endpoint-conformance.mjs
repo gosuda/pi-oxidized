@@ -16,8 +16,13 @@ export default {
 				systemPrompt: event.systemPrompt,
 				cwd: event.systemPromptOptions.cwd,
 			});
+			const message = { role: "user", content: "injected" };
+			if (event.prompt === "no-system-prompt") return { message };
+			if (event.prompt === "non-string-system-prompt") {
+				return { message, systemPrompt: null };
+			}
 			return {
-				message: { role: "user", content: "injected" },
+				message,
 				systemPrompt: `${event.systemPrompt}|${event.systemPromptOptions.cwd}`,
 			};
 		},

@@ -1079,7 +1079,7 @@ export class LeanRunner {
 				case "before_agent_start": {
 					// Cross-endpoint folds carry the running prompt in the payload;
 					// the session.update mirror is only the single-endpoint fallback.
-					let systemPrompt =
+					let systemPrompt: unknown =
 						typeof payload["systemPrompt"] === "string"
 							? payload["systemPrompt"]
 							: this.systemPrompt;
@@ -1098,7 +1098,9 @@ export class LeanRunner {
 							if (r["message"] !== undefined && r["message"] !== null) {
 								messages.push(r["message"]);
 							}
-							if (typeof r["systemPrompt"] === "string") {
+							if (r["systemPrompt"] !== undefined) {
+								// Preserve the reference runner's defined-key fold; malformed
+								// values must reach the typed wire boundary instead of being hidden.
 								systemPrompt = r["systemPrompt"];
 								systemPromptModified = true;
 							}
