@@ -756,6 +756,7 @@ export async function reconstructProviderData(
 			if (!hasPrimaryFailure) throw releaseError;
 			throw new Error(
 				`reconstruction failed (${errorDetail(primaryFailure)}); additionally failed to release reconstruction lock: ${errorDetail(releaseError)}`,
+				{ cause: primaryFailure },
 			);
 		}
 	}

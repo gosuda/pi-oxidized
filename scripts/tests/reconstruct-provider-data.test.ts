@@ -318,6 +318,7 @@ describe("reconstructProviderData transaction (Cluster C)", () => {
 			alpha: { model: { id: "model", v: 1 } },
 		};
 		const fixture = makeFixture(catalog);
+		const primaryError = new Error("injected primary reconstruction failure");
 		try {
 			const error = await captureError(
 				reconstructProviderData({
@@ -326,7 +327,7 @@ describe("reconstructProviderData transaction (Cluster C)", () => {
 					providersDir: fixture.providersDir,
 					dataDir: fixture.dataDir,
 					inversionProof: async () => {
-						throw new Error("injected primary reconstruction failure");
+						throw primaryError;
 					},
 					releaseLock: async () => {
 						throw new Error("injected lock release failure");
@@ -338,6 +339,7 @@ describe("reconstructProviderData transaction (Cluster C)", () => {
 			const releaseOffset = error.message.indexOf("injected lock release failure");
 			expect(primaryOffset).toBeGreaterThanOrEqual(0);
 			expect(releaseOffset).toBeGreaterThan(primaryOffset);
+			expect(error.cause).toBe(primaryError);
 		} finally {
 			rmSync(fixture.root, { recursive: true, force: true });
 		}
