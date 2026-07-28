@@ -50,10 +50,15 @@ pub const OUTBOUND_CAPACITY: usize = 128;
 pub const EVENT_CAPACITY: usize = 256;
 /// Default bounded capacity for per-call streaming event channels.
 pub const STREAM_EVENT_CAPACITY: usize = 64;
-/// Provider ingress queues provider-event frames: this capacity bounds frame
-/// count, not bytes. Per-frame payload bytes are independently bounded by
-/// [`crate::protocol::MAX_FRAME_BYTES`].
+/// Provider ingress queues provider-event frames. The frame-count capacity
+/// bounds queue depth; [`PROVIDER_FORWARD_BYTES`] independently bounds the
+/// retained payload bytes so a slow consumer cannot accumulate gigabytes of
+/// near-`MAX_FRAME_BYTES` frames before the count bound trips.
 const PROVIDER_FORWARD_CAPACITY: usize = 16 * STREAM_EVENT_CAPACITY;
+/// Maximum retained payload bytes across queued provider-event frames. One
+/// frame may legally reach [`crate::protocol::MAX_FRAME_BYTES`], so this
+/// budget — not the frame count — is the hard memory bound on ingress.
+const PROVIDER_FORWARD_BYTES: usize = 32 * 1024 * 1024;
 /// Maximum number of correlation ids retained by the cancellation drain.
 /// Overflow remains represented by cancellation state on the existing pending route.
 const CANCELLATION_BACKLOG_CAPACITY: usize = 4;
@@ -63,6 +68,11 @@ pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum retained stderr tail in bytes.
 pub const STDERR_TAIL_BYTES: usize = 16 * 1024;
+
+/// Serialized byte cost of a frame's payload for ingress budget accounting.
+fn frame_payload_bytes(frame: &Frame) -> usize {
+    serde_json::to_vec(&frame.payload).map_or(0, |bytes| bytes.len())
+}
 
 /// Result type for host client operations.
 pub type HostResult<T> = Result<T, HostClientError>;
@@ -173,16 +183,57 @@ impl Drop for PendingRegistration {
     }
 }
 
+struct RetainedBytes {
+    counter: Arc<std::sync::atomic::AtomicUsize>,
+    cost: usize,
+}
+
+impl Drop for RetainedBytes {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(self.cost, Ordering::Relaxed);
+    }
+}
+
+struct QueuedFrame {
+    frame: Frame,
+    retained: Option<RetainedBytes>,
+}
+
+impl QueuedFrame {
+    fn plain(frame: Frame) -> Self {
+        Self {
+            frame,
+            retained: None,
+        }
+    }
+
+    fn retained(frame: Frame, counter: Arc<std::sync::atomic::AtomicUsize>, cost: usize) -> Self {
+        Self {
+            frame,
+            retained: Some(RetainedBytes { counter, cost }),
+        }
+    }
+
+    fn into_frame(self) -> Frame {
+        let Self { frame, retained } = self;
+        drop(retained);
+        frame
+    }
+}
+
 #[derive(Clone)]
 enum PendingStream {
     /// Tool progress is explicitly lossy: stale updates may be discarded.
-    Lossy(mpsc::Sender<Frame>),
+    Lossy(mpsc::Sender<QueuedFrame>),
     /// Provider events enter a bounded per-call forwarding task. Saturation
-    /// fails and cancels only this call rather than blocking the shared reader.
+    /// (frame count or retained payload bytes) fails and cancels only this
+    /// call rather than blocking the shared reader.
     Lossless {
-        ingress: mpsc::Sender<Frame>,
+        ingress: mpsc::Sender<QueuedFrame>,
         cancel_tx: Option<mpsc::Sender<Frame>>,
         cancel_method: &'static str,
+        /// Retained payload-byte budget shared with the ingress sender.
+        bytes: Arc<std::sync::atomic::AtomicUsize>,
     },
 }
 
@@ -359,13 +410,18 @@ pub enum HostClientError {
         /// Frame id.
         id: FrameId,
     },
-    /// A lossless stream's bounded ingress queue was exhausted.
-    #[error("host stream {id} exceeded its {capacity}-event forwarding capacity")]
+    /// A lossless stream's bounded ingress queue was exhausted (frame count
+    /// or retained payload bytes).
+    #[error(
+        "host stream {id} exceeded its forwarding capacity ({capacity} frames / {bytes} bytes)"
+    )]
     StreamOverflow {
         /// Frame id of the overflowing call.
         id: FrameId,
         /// Maximum queued provider events.
         capacity: usize,
+        /// Maximum retained provider payload bytes.
+        bytes: usize,
     },
     /// An explicit stream cancel could not be queued because outbound capacity was full.
     #[error(
@@ -808,10 +864,11 @@ impl HostClient {
         let id = self.next_id();
         let bound = event_bound.clamp(1, STREAM_EVENT_CAPACITY * 8);
         let (terminal_tx, terminal_rx) = oneshot::channel::<FrameResult>();
-        let (stream_tx, stream_rx) = mpsc::channel::<Frame>(bound);
+        let (stream_tx, stream_rx) = mpsc::channel::<QueuedFrame>(bound);
         let cmd_tx = self.cmd_tx.lock().await.clone();
         let stream = if method == "provider.stream" {
-            let (forward_tx, mut forward_rx) = mpsc::channel::<Frame>(PROVIDER_FORWARD_CAPACITY);
+            let (forward_tx, mut forward_rx) =
+                mpsc::channel::<QueuedFrame>(PROVIDER_FORWARD_CAPACITY);
             tokio::spawn(async move {
                 while let Some(frame) = forward_rx.recv().await {
                     if stream_tx.send(frame).await.is_err() {
@@ -819,10 +876,12 @@ impl HostClient {
                     }
                 }
             });
+            let retained_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             PendingStream::Lossless {
                 ingress: forward_tx,
                 cancel_tx: cmd_tx.clone(),
                 cancel_method: "provider.cancel",
+                bytes: retained_bytes,
             }
         } else {
             PendingStream::Lossy(stream_tx)
@@ -964,7 +1023,7 @@ impl HostClient {
 /// Handle for a streaming call.
 pub struct StreamHandle {
     id: FrameId,
-    events: mpsc::Receiver<Frame>,
+    events: mpsc::Receiver<QueuedFrame>,
     terminal: Option<oneshot::Receiver<FrameResult>>,
     shared: Arc<Shared>,
     cmd_tx: Option<mpsc::Sender<Frame>>,
@@ -983,7 +1042,7 @@ impl StreamHandle {
     ///
     /// Returns `None` when the stream closed (terminal resolved or host gone).
     pub async fn next_event(&mut self) -> Option<Frame> {
-        self.events.recv().await
+        self.events.recv().await.map(QueuedFrame::into_frame)
     }
 
     /// Send a cancel control frame for this call to the host.
@@ -1606,28 +1665,40 @@ fn forward_stream_event(shared: &Arc<Shared>, frame: Frame) {
     if let Some(stream) = stream {
         match stream {
             PendingStream::Lossy(stream) => {
-                let _ = stream.try_send(frame);
+                let _ = stream.try_send(QueuedFrame::plain(frame));
             }
             PendingStream::Lossless {
                 ingress,
                 cancel_tx,
                 cancel_method,
-            } => match ingress.try_send(frame) {
-                Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    let _ = cancel_pending(
-                        shared,
-                        id,
-                        cancel_tx,
-                        Some(cancel_method),
-                        Some(HostClientError::StreamOverflow {
+                bytes,
+            } => {
+                let cost = frame_payload_bytes(&frame);
+                let prev = bytes.fetch_add(cost, Ordering::Relaxed);
+                let queued = QueuedFrame::retained(frame, Arc::clone(&bytes), cost);
+                let send = if prev.saturating_add(cost) > PROVIDER_FORWARD_BYTES {
+                    Err(mpsc::error::TrySendError::Full(queued))
+                } else {
+                    ingress.try_send(queued)
+                };
+                match send {
+                    Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        let _ = cancel_pending(
+                            shared,
                             id,
-                            capacity: PROVIDER_FORWARD_CAPACITY,
-                        }),
-                        CancellationRetention::UntilQueued,
-                    );
+                            cancel_tx,
+                            Some(cancel_method),
+                            Some(HostClientError::StreamOverflow {
+                                id,
+                                capacity: PROVIDER_FORWARD_CAPACITY,
+                                bytes: PROVIDER_FORWARD_BYTES,
+                            }),
+                            CancellationRetention::UntilQueued,
+                        );
+                    }
                 }
-            },
+            }
         }
     }
 }
@@ -2921,9 +2992,86 @@ mod tests {
             provider.finish(Duration::from_secs(2)).await,
             Err(HostClientError::StreamOverflow {
                 id,
-                capacity: PROVIDER_FORWARD_CAPACITY
+                capacity: PROVIDER_FORWARD_CAPACITY,
+                ..
             }) if id == provider_request.id
         ));
+        Ok(())
+    }
+    #[tokio::test]
+    async fn provider_stream_payload_bytes_are_bounded_before_frame_capacity() -> R {
+        let (client, mut host) = make_pair().await;
+        let provider = client
+            .open_stream_raw(
+                "provider.stream",
+                serde_json::json!({}),
+                STREAM_EVENT_CAPACITY * 8,
+            )
+            .await?;
+        let request = host.read_frame().await.ok_or("no provider request")?;
+        let chunk = "x".repeat(PROVIDER_FORWARD_BYTES / 4);
+
+        for n in 0..5 {
+            forward_stream_event(
+                &client.shared,
+                Frame::event(
+                    request.id,
+                    Method::ProviderEvent,
+                    serde_json::json!({"n": n, "chunk": chunk.clone()}),
+                ),
+            );
+            tokio::task::yield_now().await;
+        }
+
+        let cancel = tokio::time::timeout(Duration::from_secs(2), host.read_frame())
+            .await?
+            .ok_or("missing provider cancel")?;
+        assert_eq!(cancel.method, "provider.cancel");
+        assert_eq!(cancel.payload["id"], request.id);
+        assert!(matches!(
+            provider.finish(Duration::from_secs(2)).await,
+            Err(HostClientError::StreamOverflow {
+                id,
+                capacity: PROVIDER_FORWARD_CAPACITY,
+                bytes: PROVIDER_FORWARD_BYTES,
+            }) if id == request.id
+        ));
+        Ok(())
+    }
+    #[tokio::test]
+    async fn provider_stream_payload_budget_is_released_when_consumed() -> R {
+        let (client, mut host) = make_pair().await;
+        let mut provider = client
+            .open_stream_raw("provider.stream", serde_json::json!({}), 1)
+            .await?;
+        let request = host.read_frame().await.ok_or("no provider request")?;
+        let chunk = "x".repeat(PROVIDER_FORWARD_BYTES / 4);
+
+        for n in 0..8 {
+            forward_stream_event(
+                &client.shared,
+                Frame::event(
+                    request.id,
+                    Method::ProviderEvent,
+                    serde_json::json!({"n": n, "chunk": chunk.clone()}),
+                ),
+            );
+            let event = tokio::time::timeout(Duration::from_secs(2), provider.next_event())
+                .await?
+                .ok_or("provider event queue closed")?;
+            assert_eq!(event.payload["n"], n);
+        }
+
+        host.write_frame(&Frame::response(
+            request.id,
+            Method::Notify,
+            serde_json::json!({"done": true}),
+        ))
+        .await?;
+        assert_eq!(
+            provider.finish(Duration::from_secs(2)).await?.payload["done"],
+            true
+        );
         Ok(())
     }
 }
