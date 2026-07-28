@@ -23,7 +23,7 @@ test("uses the product matrix timeout for source-pinned session interoperability
 });
 
 test("source-pinned TypeScript pi reopens every generated fixture", async () => {
-	const generated = Bun.spawnSync(["bun", "scripts/generate-session-fixtures.ts"], {
+	const generated = Bun.spawnSync([process.execPath, "scripts/generate-session-fixtures.ts"], {
 		cwd: ROOT,
 		stdout: "pipe",
 		stderr: "pipe",
