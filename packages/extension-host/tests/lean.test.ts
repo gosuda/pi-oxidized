@@ -25,7 +25,7 @@ import {
 	findExcludedImport,
 	LeanRunner,
 } from "../src/lean-runner.ts";
-import { parseStreamingJson } from "../src/assistant-delta.ts";
+import { AssistantDeltaReducer, parseStreamingJson } from "../src/assistant-delta.ts";
 
 const PACKAGE_DIR = resolve(import.meta.dirname, "..");
 const LEAN_FIXTURES = resolve(import.meta.dirname, "fixtures", "lean");
@@ -853,6 +853,165 @@ describe("lean: lifecycle hooks", () => {
 		const cancelled = payload(await link.response(39, "message_update_delta"));
 		expect(cancelled).toEqual({ cancel: true, reason: "stop-from-lean" });
 		await link.finish();
+	});
+});
+
+// ---------------------------------------------------------------------------
+// AssistantDeltaReducer: contentIndex bound at the extension wire boundary
+// ---------------------------------------------------------------------------
+
+describe("lean: AssistantDeltaReducer contentIndex bound", () => {
+	/** Reducer primed with a `start` event so deltas apply against an empty content array. */
+	function freshReducer(): AssistantDeltaReducer {
+		const reducer = new AssistantDeltaReducer();
+		reducer.applyAssistantDelta({ type: "start", meta: { role: "assistant" } });
+		return reducer;
+	}
+
+	/** Active content array (empty when no assistant is seeded), typed for index/key checks. */
+	function contentOf(reducer: AssistantDeltaReducer): unknown[] {
+		const message = reducer.getActiveAssistant() as Record<string, unknown> | undefined;
+		const content = message?.["content"];
+		return Array.isArray(content) ? (content as unknown[]) : [];
+	}
+
+	/** Apply a block event at the given contentIndex against a fresh reducer. */
+	function startBlock(index: unknown, type: string, block: Record<string, unknown>): unknown[] {
+		const reducer = freshReducer();
+		reducer.applyAssistantDelta({ type, meta: {}, contentIndex: index, block });
+		return contentOf(reducer);
+	}
+
+	test("append at contentIndex === content.length is accepted for *_start", () => {
+		const reducer = freshReducer();
+		reducer.applyAssistantDelta({
+			type: "text_start",
+			meta: {},
+			contentIndex: 0,
+			block: { type: "text", text: "" },
+		});
+		expect(contentOf(reducer)).toEqual([{ type: "text", text: "" }]);
+	});
+
+	test("replace at an existing contentIndex keeps block replacement working", () => {
+		const reducer = freshReducer();
+		reducer.applyAssistantDelta({
+			type: "text_start",
+			meta: {},
+			contentIndex: 0,
+			block: { type: "text", text: "draft" },
+		});
+		reducer.applyAssistantDelta({
+			type: "text_end",
+			meta: {},
+			contentIndex: 0,
+			block: { type: "text", text: "final" },
+		});
+		expect(contentOf(reducer)).toEqual([{ type: "text", text: "final" }]);
+	});
+
+	test("streamed text deltas still accumulate at a valid index", () => {
+		const reducer = freshReducer();
+		reducer.applyAssistantDelta({
+			type: "text_start",
+			meta: {},
+			contentIndex: 0,
+			block: { type: "text", text: "" },
+		});
+		reducer.applyAssistantDelta({ type: "text_delta", meta: {}, contentIndex: 0, delta: "hel" });
+		reducer.applyAssistantDelta({ type: "text_delta", meta: {}, contentIndex: 0, delta: "lo" });
+		expect(contentOf(reducer)).toEqual([{ type: "text", text: "hello" }]);
+	});
+
+	test("tool-call argument tracking still works at a valid index", () => {
+		const reducer = freshReducer();
+		reducer.applyAssistantDelta({
+			type: "toolcall_start",
+			meta: {},
+			contentIndex: 0,
+			block: { type: "toolCall", id: "c1", name: "read", arguments: {} },
+		});
+		reducer.applyAssistantDelta({
+			type: "toolcall_delta",
+			meta: {},
+			contentIndex: 0,
+			delta: '{"path":"README',
+		});
+		reducer.applyAssistantDelta({
+			type: "toolcall_delta",
+			meta: {},
+			contentIndex: 0,
+			delta: '.md"}',
+		});
+		expect(contentOf(reducer)).toEqual([
+			{ type: "toolCall", id: "c1", name: "read", arguments: { path: "README.md" } },
+		]);
+	});
+
+	test("ignores a negative contentIndex instead of polluting the array", () => {
+		const content = startBlock(-1, "text_start", { type: "text", text: "" });
+		expect(content).toHaveLength(0);
+		// A negative index would attach a "-1" string key, not an element.
+		expect(Object.keys(content)).toEqual([]);
+	});
+
+	test("ignores a fractional contentIndex", () => {
+		const content = startBlock(0.5, "text_start", { type: "text", text: "" });
+		expect(content).toHaveLength(0);
+		expect(Object.keys(content)).toEqual([]);
+	});
+
+	test("ignores a NaN contentIndex", () => {
+		const content = startBlock(Number.NaN, "text_start", { type: "text", text: "" });
+		expect(content).toHaveLength(0);
+		expect(Object.keys(content)).toEqual([]);
+	});
+
+	test("ignores an Infinity contentIndex", () => {
+		const content = startBlock(Number.POSITIVE_INFINITY, "text_start", { type: "text", text: "" });
+		expect(content).toHaveLength(0);
+		expect(Object.keys(content)).toEqual([]);
+	});
+
+	test("ignores a -Infinity contentIndex", () => {
+		const content = startBlock(Number.NEGATIVE_INFINITY, "text_start", { type: "text", text: "" });
+		expect(content).toHaveLength(0);
+		expect(Object.keys(content)).toEqual([]);
+	});
+
+	test("ignores a contentIndex far past the end", () => {
+		const content = startBlock(5, "text_start", { type: "text", text: "" });
+		expect(content).toHaveLength(0);
+		expect(Object.keys(content)).toEqual([]);
+	});
+
+	test("ignores an out-of-range toolcall_start so the tool-argument map stays clean", () => {
+		// A toolcall_start at a far index would otherwise both append a sparse
+		// block and seed the activeToolArguments map for that bogus index.
+		const reducer = freshReducer();
+		reducer.applyAssistantDelta({
+			type: "toolcall_start",
+			meta: {},
+			contentIndex: 9,
+			block: { type: "toolCall", id: "c9", name: "read", arguments: {} },
+		});
+		const content = contentOf(reducer);
+		expect(content).toHaveLength(0);
+		expect(Object.keys(content)).toEqual([]);
+		// A follow-up delta at the bogus index must find no seeded block.
+		reducer.applyAssistantDelta({
+			type: "toolcall_delta",
+			meta: {},
+			contentIndex: 9,
+			delta: '{"evil":true}',
+		});
+		expect(contentOf(reducer)).toEqual([]);
+	});
+
+	test("ignores a non-number contentIndex (string index still dropped)", () => {
+		const content = startBlock("0", "text_start", { type: "text", text: "" });
+		expect(content).toHaveLength(0);
+		expect(Object.keys(content)).toEqual([]);
 	});
 });
 

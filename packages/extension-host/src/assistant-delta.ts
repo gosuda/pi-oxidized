@@ -37,7 +37,14 @@ export class AssistantDeltaReducer {
 			throw new Error("active assistant content is not an array");
 		}
 		const index = event["contentIndex"];
-		if (typeof index !== "number") return;
+		if (
+			typeof index !== "number"
+			|| !Number.isInteger(index)
+			|| index < 0
+			|| index > content.length
+		) {
+			return;
+		}
 		const type = event["type"];
 		if (
 			(type === "text_start" || type === "thinking_start" || type === "toolcall_start"
