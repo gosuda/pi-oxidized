@@ -1343,8 +1343,11 @@ export class ExtensionHost {
 		if (entry === undefined) return;
 		entry.pendingRecreationTheme = undefined;
 		entry.pendingRecreationFailure = undefined;
+		const initialFailure = entry.initialFailure;
+		entry.initialFailure = undefined;
 		entry.component?.dispose?.();
 		this.slots.delete(key);
+		initialFailure?.();
 		this.client.send({
 			id: 0, kind: "event", method: "disposeSlot",
 			payload: { key, generation: entry.generation },

@@ -2204,6 +2204,49 @@ describe("extension theme API", () => {
 		await runPromise.catch(() => void 0);
 	});
 
+	test("disposing the host settles an initial custom factory still in flight", async () => {
+		const disposed: string[] = [];
+		const { promise: factoryStarted, resolve: markFactoryStarted } =
+			Promise.withResolvers<void>();
+		const { promise: factoryResult, resolve: resolveFactory } =
+			Promise.withResolvers<{ render: () => string[]; dispose: () => void }>();
+		const { promise: customSettled, resolve: markCustomSettled } =
+			Promise.withResolvers<unknown>();
+		const pendingCustomFactory: ExtensionFactory = (pi) => {
+			pi.registerCommand("dispose-pending-custom", {
+				description: "Creates a custom overlay whose initial factory remains pending",
+				async handler(_args, ctx) {
+					const result = await ctx.ui.custom(() => {
+						markFactoryStarted();
+						return factoryResult;
+					});
+					markCustomSettled(result);
+				},
+			});
+		};
+		const { collector, stdin, host, runPromise } = await connectHost([pendingCustomFactory]);
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 65,
+			kind: "req",
+			method: "command.execute",
+			payload: { command: "dispose-pending-custom", args: "" },
+		})));
+		await factoryStarted;
+
+		host.dispose("test");
+		expect(await customSettled).toBeUndefined();
+		resolveFactory({
+			render: () => ["late-overlay"],
+			dispose: () => disposed.push("late"),
+		});
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(disposed).toEqual(["late"]);
+
+		stdin.push(null);
+		await runPromise.catch(() => void 0);
+	});
+
 	test("coalesced newest factory rejection reports once and retains the resolved component", async () => {
 		const pending: Array<{
 			theme: string;
