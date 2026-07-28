@@ -2381,6 +2381,42 @@ describe("extension theme API", () => {
 		host.dispose("test");
 		await runPromise.catch(() => void 0);
 	});
+
+	test("initial async custom component render failure settles the command without leaking", async () => {
+		const disposed: string[] = [];
+		const renderThrowFactory: ExtensionFactory = (pi) => {
+			pi.registerCommand("render-throw", {
+				description: "Creates an async custom overlay whose initial render throws",
+				async handler(_args, ctx) {
+					await ctx.ui.custom(() => {
+						return Promise.resolve({
+							render: () => { throw new Error("initial render exploded"); },
+							dispose: () => disposed.push("exploded"),
+						});
+					});
+				},
+			});
+		};
+		const { collector, stdin, host, runPromise } = await connectHost([renderThrowFactory]);
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 67, kind: "req", method: "command.execute",
+			payload: { command: "render-throw", args: "" },
+		})));
+
+		const error = await collector.awaitFrame((frame) =>
+			frame.method === "extensionError"
+			&& String((frame.payload as Record<string, unknown>)["message"]).includes("initial render exploded"),
+		);
+		expect((error.payload as Record<string, unknown>)["code"]).toBe("extension_error");
+		const command = await collector.awaitFrame((frame) => frame.id === 67 && frame.kind === "res");
+		expect(command.payload).toEqual({ ok: true });
+		expect(disposed).toEqual(["exploded"]);
+		expect(collector.frames.filter((frame) => frame.id === 67 && frame.kind === "res")).toHaveLength(1);
+
+		stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
+	});
 });
 
 // ===========================================================================

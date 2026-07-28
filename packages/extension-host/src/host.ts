@@ -1475,13 +1475,20 @@ export class ExtensionHost {
 				fail(`factory for ${key} did not return a component`);
 				return;
 			}
-			entry.initialFailure = undefined;
 			const old = entry.component;
 			entry.component = replacement;
 			old?.dispose?.();
 			if (this.slots.get(key) === entry && entry.component === replacement) {
-				this.pushSlot(key, entry, entry.width);
+				try {
+					this.pushSlot(key, entry, entry.width);
+				} catch (err) {
+					entry.component?.dispose?.();
+					entry.component = null;
+					fail(err);
+					return;
+				}
 			}
+			entry.initialFailure = undefined;
 		};
 		let recreated: unknown;
 		try {
