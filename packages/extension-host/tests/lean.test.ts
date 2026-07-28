@@ -1408,6 +1408,132 @@ describe("lean: AssistantDeltaReducer contentIndex bound", () => {
 			path: "b.md",
 		});
 	});
+
+	test("text_start below content.length is rejected (no overwrite)", () => {
+		const reducer = freshReducer();
+		reducer.applyAssistantDelta({
+			type: "text_start",
+			meta: {},
+			contentIndex: 0,
+			block: { type: "text", text: "original" },
+		});
+		// A duplicate start at the same index must not replace the existing block.
+		reducer.applyAssistantDelta({
+			type: "text_start",
+			meta: {},
+			contentIndex: 0,
+			block: { type: "text", text: "overwritten" },
+		});
+		expect(contentOf(reducer)).toEqual([{ type: "text", text: "original" }]);
+	});
+
+	test("thinking_start below content.length is rejected (no overwrite)", () => {
+		const reducer = freshReducer();
+		reducer.applyAssistantDelta({
+			type: "thinking_start",
+			meta: {},
+			contentIndex: 0,
+			block: { type: "thinking", thinking: "original" },
+		});
+		reducer.applyAssistantDelta({
+			type: "thinking_start",
+			meta: {},
+			contentIndex: 0,
+			block: { type: "thinking", thinking: "overwritten" },
+		});
+		expect(contentOf(reducer)).toEqual([{ type: "thinking", thinking: "original" }]);
+	});
+
+	test("toolcall_start below content.length is rejected and argument map stays clean", () => {
+		const reducer = freshReducer();
+		reducer.applyAssistantDelta({
+			type: "toolcall_start",
+			meta: {},
+			contentIndex: 0,
+			block: { type: "toolCall", id: "c1", name: "read", arguments: {} },
+		});
+		reducer.applyAssistantDelta({
+			type: "toolcall_delta",
+			meta: {},
+			contentIndex: 0,
+			delta: '{"path":"a.md"}',
+		});
+		// A duplicate toolcall_start at the occupied index must not reset the block
+		// or clear the accumulated argument fragments.
+		reducer.applyAssistantDelta({
+			type: "toolcall_start",
+			meta: {},
+			contentIndex: 0,
+			block: { type: "toolCall", id: "c1-dup", name: "write", arguments: {} },
+		});
+		const block = contentOf(reducer)[0] as Record<string, unknown>;
+		expect(block["id"]).toBe("c1");
+		expect(block["name"]).toBe("read");
+		// Argument tracking survived: the next delta concatenates, not restarts.
+		reducer.applyAssistantDelta({
+			type: "toolcall_delta",
+			meta: {},
+			contentIndex: 0,
+			delta: "",
+		});
+		expect((contentOf(reducer)[0] as Record<string, unknown>)["arguments"]).toEqual({
+			path: "a.md",
+		});
+	});
+
+	test("text_start above content.length is rejected (no gap)", () => {
+		const reducer = freshReducer();
+		reducer.applyAssistantDelta({
+			type: "text_start",
+			meta: {},
+			contentIndex: 0,
+			block: { type: "text", text: "first" },
+		});
+		// Skipping index 1 to append at 2 must leave the array unchanged.
+		reducer.applyAssistantDelta({
+			type: "text_start",
+			meta: {},
+			contentIndex: 2,
+			block: { type: "text", text: "gap" },
+		});
+		expect(contentOf(reducer)).toEqual([{ type: "text", text: "first" }]);
+	});
+
+	test("thinking_start above content.length is rejected (no gap)", () => {
+		const reducer = freshReducer();
+		reducer.applyAssistantDelta({
+			type: "thinking_start",
+			meta: {},
+			contentIndex: 0,
+			block: { type: "thinking", thinking: "first" },
+		});
+		reducer.applyAssistantDelta({
+			type: "thinking_start",
+			meta: {},
+			contentIndex: 2,
+			block: { type: "thinking", thinking: "gap" },
+		});
+		expect(contentOf(reducer)).toEqual([{ type: "thinking", thinking: "first" }]);
+	});
+
+	test("toolcall_start above content.length is rejected (no gap)", () => {
+		const reducer = freshReducer();
+		reducer.applyAssistantDelta({
+			type: "toolcall_start",
+			meta: {},
+			contentIndex: 0,
+			block: { type: "toolCall", id: "c1", name: "read", arguments: {} },
+		});
+		reducer.applyAssistantDelta({
+			type: "toolcall_start",
+			meta: {},
+			contentIndex: 2,
+			block: { type: "toolCall", id: "c2", name: "write", arguments: {} },
+		});
+		expect(contentOf(reducer)).toEqual([
+			{ type: "toolCall", id: "c1", name: "read", arguments: {} },
+		]);
+	});
 });
 
 // ---------------------------------------------------------------------------

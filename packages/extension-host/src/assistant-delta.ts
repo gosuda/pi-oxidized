@@ -40,11 +40,14 @@ export class AssistantDeltaReducer {
 		const type = event["type"];
 		const isStart = type === "text_start" || type === "thinking_start" || type === "toolcall_start";
 		const isEnd = type === "text_end" || type === "thinking_end" || type === "toolcall_end";
-		// Only a `*_start` may append at the end of the array. An out-of-order or
-		// malformed `*_end` carrying the append index would otherwise fabricate a
-		// block that was never streamed, which hooks then observe as real content.
-		const limit = isStart ? content.length : content.length - 1;
-		if (typeof index !== "number" || !Number.isInteger(index) || index < 0 || index > limit) {
+		// A `*_start` must append exactly at the end of the array: a lower index
+		// would silently overwrite an already-streamed block (and reset tool-call
+		// argument tracking), while a higher one would leave a gap. Delta and end
+		// events may only touch blocks that already exist.
+		if (typeof index !== "number" || !Number.isInteger(index) || index < 0) {
+			return;
+		}
+		if (isStart ? index !== content.length : index >= content.length) {
 			return;
 		}
 		if ((isStart || isEnd) && isRecord(event["block"])) {
