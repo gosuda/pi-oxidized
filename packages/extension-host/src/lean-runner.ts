@@ -228,6 +228,60 @@ type SignificantToken =
 	| { kind: "literal"; value: "regex" | "string" | "template" };
 
 /**
+ * Cook a string literal's raw source content (the text between its quotes)
+ * into the value JavaScript would produce, resolving backslash escapes. The
+ * import scanner records specifiers this way so an escaped literal such as
+ * `import("j\u0069ti")` matches the same exclusion — and resolves to the same
+ * path — as the plain `import("jiti")`.
+ */
+function decodeStringEscapes(raw: string): string {
+	let out = "";
+	let at = 0;
+	const length = raw.length;
+	while (at < length) {
+		const char = raw[at];
+		if (char !== "\\") {
+			out += char;
+			at += 1;
+			continue;
+		}
+		const next = raw[at + 1];
+		at += 2;
+		switch (next) {
+			case "n": out += "\n"; break;
+			case "r": out += "\r"; break;
+			case "t": out += "\t"; break;
+			case "b": out += "\b"; break;
+			case "f": out += "\f"; break;
+			case "v": out += "\v"; break;
+			case "0": out += "\0"; break;
+			case "\n": break;
+			case "\r":
+				if (raw[at] === "\n") at += 1;
+				break;
+			case "x":
+				out += String.fromCharCode(Number.parseInt(raw.slice(at, at + 2), 16));
+				at += 2;
+				break;
+			case "u":
+				if (raw[at] === "{") {
+					const close = raw.indexOf("}", at);
+					out += String.fromCodePoint(Number.parseInt(raw.slice(at + 1, close), 16));
+					at = close + 1;
+				} else {
+					out += String.fromCharCode(Number.parseInt(raw.slice(at, at + 4), 16));
+					at += 4;
+				}
+				break;
+			default:
+				out += next;
+				break;
+		}
+	}
+	return out;
+}
+
+/**
  * Extract literal module specifiers from every import form that can load a
  * lean dependency. The same extractor drives direct exclusion and local
  * graph traversal, so minification cannot create a weaker path.
@@ -347,7 +401,7 @@ function extractImportSpecifiers(source: string): string[] {
 		if (quote !== '"' && quote !== "'") return undefined;
 		const end = skipString(from, quote);
 		if (end <= from + 1 || source[end - 1] !== quote) return undefined;
-		specifiers.push(source.slice(from + 1, end - 1));
+		specifiers.push(decodeStringEscapes(source.slice(from + 1, end - 1)));
 		lastSignificant = { kind: "literal", value: "string" };
 		return end;
 	};

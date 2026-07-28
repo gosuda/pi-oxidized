@@ -1733,6 +1733,25 @@ describe("lean: surface validation units", () => {
 		}
 	});
 
+	test("findExcludedImport decodes escaped dynamic-import specifiers", () => {
+		// JavaScript cooks string-literal escapes before evaluating the
+		// specifier, so `import("j\u0069ti")` loads `jiti`. The scanner must
+		// decode the same escapes or the exclusion check sees raw source text.
+		const cases: Array<[source: string, expected: string | undefined]> = [
+			// Unicode escapes, four-digit and braced forms.
+			['const m = await import("j\\u0069ti");', "jiti"],
+			['const m = await import("j\\u{69}ti");', "jiti"],
+			// Hex escapes and a backslash-escaped quote inside the literal.
+			["const m = await import('\\x6aiti');", "jiti"],
+			['import "@earendil-works\\/pi-coding-agent";', "@earendil-works/pi-coding-agent"],
+			// A clean specifier with escapes stays undetected once decoded.
+			['const m = await import("./cl\\u0065an.ts");', undefined],
+		];
+		for (const [source, expected] of cases) {
+			expect(findExcludedImport(source)).toBe(expected);
+		}
+	});
+
 	test("parseStreamingJson tolerates truncated streams", () => {
 		expect(parseStreamingJson('{"a":1,"b":[true,"x"]}')).toEqual({ a: 1, b: [true, "x"] });
 		// Close-and-trim best effort: a truncated array closes empty rather
