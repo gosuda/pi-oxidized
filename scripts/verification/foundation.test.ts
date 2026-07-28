@@ -371,7 +371,8 @@ describe.skipIf(isWindows)("PTY driver", () => {
 				process.writeKeys(payload.subarray(offset, offset + chunkSize));
 			}
 			process.writeKeys("END");
-			// Accepted input must not alias caller-owned storage after writeKeys returns.
+			// writeKeys must own a copy of caller bytes: zeroing the payload
+			// immediately after must not corrupt the queued PTY input.
 			payload.fill(0);
 			const snapshot = await process.waitFor(/HASH:/, { deadlineMs: 15_000, source: "raw" });
 			expect(snapshot.rawText).toContain(`LEN:${payloadSize}`);

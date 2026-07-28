@@ -159,7 +159,9 @@ export class PtyProcess {
 		const outputOffset = this.#rawText.length;
 		let text = "";
 		for (const key of keys) {
-			const bytes = typeof key === "string" ? new TextEncoder().encode(key) : key;
+			// Clone caller-provided bytes at the ownership boundary so queued
+			// writes never alias storage the caller can still mutate.
+			const bytes = typeof key === "string" ? new TextEncoder().encode(key) : Uint8Array.from(key);
 			text += new TextDecoder().decode(bytes);
 			this.#writeTerminal(bytes);
 		}
