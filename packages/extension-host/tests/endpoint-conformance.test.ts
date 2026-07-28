@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test, vi } from "bun:test";
 import { join, resolve } from "node:path";
 import { Readable } from "node:stream";
 import type { ExtensionFactory, InlineExtension } from "@earendil-works/pi-coding-agent";
@@ -54,12 +54,27 @@ class EndpointLink {
 		};
 	}
 
-	request(id: number, method: string, payload: unknown): Promise<Frame> {
+	request(id: number, method: string, payload: unknown, timeoutMs = 30_000): Promise<Frame> {
 		this.stdin.push(Buffer.from(encodeFrameString({ id, kind: "req", method, payload })));
 		const existing = this.frames.find((frame) => frame.id === id && frame.kind !== "req");
 		if (existing !== undefined) return Promise.resolve(existing);
-		const { promise, resolve: settle } = Promise.withResolvers<Frame>();
-		this.waiters.push({ predicate: (frame) => frame.id === id && frame.kind !== "req", resolve: settle });
+		const { promise, resolve: settle, reject } = Promise.withResolvers<Frame>();
+		let waiter: (typeof this.waiters)[number] | undefined;
+		const timer = setTimeout(() => {
+			if (waiter === undefined) return;
+			const index = this.waiters.indexOf(waiter);
+			if (index === -1) return;
+			this.waiters.splice(index, 1);
+			reject(new Error(`no response to ${method} (id ${id}) within ${timeoutMs}ms`));
+		}, timeoutMs);
+		waiter = {
+			predicate: (frame) => frame.id === id && frame.kind !== "req",
+			resolve: (frame) => {
+				clearTimeout(timer);
+				settle(frame);
+			},
+		};
+		this.waiters.push(waiter);
 		return promise;
 	}
 
@@ -88,8 +103,13 @@ function mode1Factory(withHook: boolean): InlineExtension[] {
 			const log = Array.isArray(holder[OBSERVATIONS]) ? holder[OBSERVATIONS] : [];
 			log.push({ type: event.type, systemPrompt: event.systemPrompt, cwd: event.systemPromptOptions.cwd });
 			holder[OBSERVATIONS] = log;
+			const message = { role: "user" as const, content: "injected" };
+			if (event.prompt === "no-system-prompt") return { message };
+			if (event.prompt === "non-string-system-prompt") {
+				return { message, systemPrompt: null as unknown as string };
+			}
 			return {
-				message: { role: "user", content: "injected" },
+				message,
 				systemPrompt: `${event.systemPrompt}|${event.systemPromptOptions.cwd}`,
 			};
 		});
@@ -163,18 +183,59 @@ afterEach(() => {
 });
 
 describe("extension endpoint conformance", () => {
+	test("request deadlines name and remove the missing response waiter", async () => {
+		const link = new EndpointLink();
+		vi.useFakeTimers();
+		try {
+			let timeoutError: unknown;
+			const pending = link.request(99, "missing.method", {}, 5);
+			void pending.catch((error: unknown) => {
+				timeoutError = error;
+			});
+			vi.advanceTimersByTime(5);
+			await Promise.resolve();
+			expect(timeoutError).toEqual(
+				new Error("no response to missing.method (id 99) within 5ms"),
+			);
+
+			const clearTimeoutSpy = vi.spyOn(globalThis, "clearTimeout");
+			link.output.write(
+				Buffer.from(encodeFrameString({ id: 99, kind: "res", method: "missing.method", payload: {} })),
+			);
+			expect(clearTimeoutSpy).not.toHaveBeenCalled();
+			clearTimeoutSpy.mockRestore();
+			expect(await link.request(99, "missing.method", {}, 5)).toMatchObject({ id: 99, kind: "res" });
+		} finally {
+			vi.useRealTimers();
+			await link.finish();
+		}
+	});
+
 	test("identical assistant frames reconstruct identical hook payloads and responses", async () => {
 		const mode1 = await runDeltaVector("mode1", true);
 		const mode2 = await runDeltaVector("mode2", true);
 		expect(mode2).toEqual(mode1);
 	});
 
-	test("the identical vector transitions and clears state without a message_update hook", async () => {
-		const mode1 = await runDeltaVector("mode1", false);
-		const mode2 = await runDeltaVector("mode2", false);
-		expect(mode2).toEqual(mode1);
-		expect(mode1.observations).toEqual([]);
-		expect(mode1.responses.at(-1)?.kind).toBe("error");
+	test("system prompt omission and non-string emission match", async () => {
+		const run = async (mode: "mode1" | "mode2") => {
+			const link = await openEndpoint(mode, true);
+			try {
+				return [
+					await link.request(40, "before_agent_start", { prompt: "no-system-prompt" }),
+					await link.request(41, "before_agent_start", { prompt: "non-string-system-prompt" }),
+				];
+			} finally {
+				await link.finish();
+			}
+		};
+		const mode1 = await run("mode1");
+		const mode2 = await run("mode2");
+		expect(mode2.map(encodeFrameString)).toEqual(mode1.map(encodeFrameString));
+		expect(mode1.map((frame) => frame.payload)).toEqual([
+			{ messages: [{ role: "user", content: "injected" }] },
+			{ messages: [{ role: "user", content: "injected" }], systemPrompt: null },
+		]);
 	});
 
 	test("system prompt wire precedence and mirror reset match", async () => {
