@@ -554,9 +554,14 @@ async fn hook_before_agent_start_injection() -> R {
         "before_agent_start",
         json!({"systemPrompt": "override", "messages": []}),
     );
-    let result = runner.emit_before_agent_start("prompt", None).await?;
+    let result = runner.emit_before_agent_start("prompt", None, None).await?;
     let mapped = result.map(|r| (r.system_prompt, r.messages.len()));
     assert_eq!(mapped, Some((Some("override".to_owned()), 0)));
+    assert_eq!(
+        last_request_payload(&host, "before_agent_start")?["systemPrompt"],
+        Value::Null,
+        "an absent active prompt must retain the optional wire shape"
+    );
     Ok(())
 }
 
@@ -1749,7 +1754,7 @@ async fn aggregate_before_agent_start_threads_prompt_and_messages() -> R {
     hosts[1].set_response("before_agent_start", json!({"systemPrompt":"system-B"}));
     hosts[2].set_response("before_agent_start", Value::Null);
     let before = runner
-        .emit_before_agent_start("prompt", None)
+        .emit_before_agent_start("prompt", None, None)
         .await?
         .ok_or("before_agent_start missing")?;
     assert_eq!(before.system_prompt.as_deref(), Some("system-B"));
@@ -1762,7 +1767,7 @@ async fn aggregate_before_agent_start_threads_prompt_and_messages() -> R {
 }
 
 #[tokio::test]
-async fn aggregate_before_agent_start_accumulates_messages_across_endpoints() -> R {
+async fn aggregate_before_agent_start_seeds_active_prompt_and_accumulates_messages() -> R {
     let (runner, hosts) = make_mutable_hook_runner(&["before_agent_start"]).await?;
     hosts[0].set_response(
         "before_agent_start",
@@ -1774,7 +1779,7 @@ async fn aggregate_before_agent_start_accumulates_messages_across_endpoints() ->
     );
     hosts[2].set_response("before_agent_start", json!({"systemPrompt":"sys"}));
     let before = runner
-        .emit_before_agent_start("prompt", None)
+        .emit_before_agent_start("prompt", None, Some("system-initial".to_owned()))
         .await?
         .ok_or("before_agent_start missing")?;
     assert_eq!(
@@ -1789,6 +1794,11 @@ async fn aggregate_before_agent_start_accumulates_messages_across_endpoints() ->
         c_before["messages"],
         json!([assistant_text("injected-A"), assistant_text("injected-B")]),
         "later endpoints observe the accumulated message list"
+    );
+    let a_before = last_request_payload(&hosts[0], "before_agent_start")?;
+    assert_eq!(
+        a_before["systemPrompt"], "system-initial",
+        "the first endpoint must receive the active prompt seed rather than null"
     );
     runner.shutdown_once().await;
     Ok(())

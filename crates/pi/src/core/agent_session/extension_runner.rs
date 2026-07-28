@@ -127,6 +127,7 @@ pub trait ExtensionRunner: Send + Sync {
         &'a self,
         prompt: &'a str,
         images: Option<Value>,
+        system_prompt: Option<String>,
     ) -> BoxFuture<'a, Result<Option<BeforeAgentStartResult>, ExtensionRunnerError>>;
 
     /// Discover additional resource paths from extensions.
@@ -227,6 +228,7 @@ impl ExtensionRunner for NullExtensionRunner {
         &self,
         _prompt: &str,
         _images: Option<Value>,
+        _system_prompt: Option<String>,
     ) -> BoxFuture<'_, Result<Option<BeforeAgentStartResult>, ExtensionRunnerError>> {
         Box::pin(async { Ok(None) })
     }

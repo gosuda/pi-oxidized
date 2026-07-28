@@ -415,7 +415,11 @@ impl AgentSession {
             serde_json::to_value(&current_images).ok()
         };
         let result = runner
-            .emit_before_agent_start(&expanded_text, images_for_ext)
+            .emit_before_agent_start(
+                &expanded_text,
+                images_for_ext,
+                Some(self.hooks.effective_system_prompt()),
+            )
             .await
             .map_err(|e| PromptError::msg(e.to_string()))?;
         drop(runner);
@@ -1629,6 +1633,7 @@ mod tests {
             &self,
             _: &str,
             _: Option<serde_json::Value>,
+            _: Option<String>,
         ) -> BoxFuture<
             '_,
             Result<

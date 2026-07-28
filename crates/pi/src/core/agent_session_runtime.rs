@@ -1048,6 +1048,7 @@ mod tests {
             &self,
             _prompt: &str,
             _images: Option<serde_json::Value>,
+            _system_prompt: Option<String>,
         ) -> BoxFuture<
             '_,
             Result<

@@ -3073,6 +3073,7 @@ impl ExtensionRunner for HostExtensionRunner {
         &self,
         prompt: &str,
         images: Option<Value>,
+        system_prompt: Option<String>,
     ) -> BoxFuture<
         '_,
         Result<
@@ -3085,7 +3086,7 @@ impl ExtensionRunner for HostExtensionRunner {
         let prompt = prompt.to_owned();
         Box::pin(async move {
             let mut messages = Vec::new();
-            let mut system_prompt: Option<String> = None;
+            let mut system_prompt = system_prompt;
             let mut responded = false;
             for endpoint in endpoints.iter() {
                 if !endpoint.has_handlers("before_agent_start") {
