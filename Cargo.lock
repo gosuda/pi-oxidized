@@ -2749,6 +2749,7 @@ dependencies = [
  "ratatui",
  "regex",
  "reqwest",
+ "rustix",
  "same-file",
  "schemars 1.2.1",
  "semver",
