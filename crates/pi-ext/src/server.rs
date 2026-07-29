@@ -16,10 +16,12 @@
 //! from its `handlers` (requests to `message_update_delta` map onto the
 //! advertised `message_update` key). Request handling is concurrent: the
 //! read loop keeps consuming frames while tool executions and provider
-//! streams run, so cancel frames are observed mid-execution. In-flight
-//! work and per-call update/event channels are bounded; unknown or
-//! unadvertised methods fail closed with a correlated error frame without
-//! affecting other requests.
+//! streams run, so cancel frames are observed mid-execution. Theme broadcasts
+//! likewise never run extension code on the read loop: a bounded latest-wins
+//! slot hands the synchronous observer to a detached worker thread supervised
+//! by an abortable task. In-flight work and per-call update/event channels are
+//! bounded; unknown or unadvertised methods fail closed with a correlated
+//! error frame without affecting other requests.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
@@ -41,8 +43,8 @@ use crate::adapters::methods;
 use crate::protocol::{
     ErrorPayload, FLAGS_SET_METHOD, FlagValueWire, FlagsSetRequest, Frame, FrameDecoder, FrameId,
     FrameKind, Hello, HelloAck, Method, PROTOCOL_VERSION, RegistrySnapshot,
-    SHORTCUT_EXECUTE_METHOD, TerminalInputResult, ToolUpdate, encode_frame, from_payload,
-    to_payload,
+    SHORTCUT_EXECUTE_METHOD, TerminalInputResult, ThemeUpdate, ToolUpdate, encode_frame,
+    from_payload, to_payload,
 };
 
 /// Wire method for the registry snapshot request.
@@ -510,6 +512,16 @@ pub trait NativeExtension: Send + Sync + 'static {
     /// Called when the host pushes the active theme (initial or on change).
     /// The default is a no-op; extensions emitting styled `uiSlot` content
     /// override this to track palette, polarity, and generation.
+    ///
+    /// Runs on a dedicated worker thread, never on the frame read loop and
+    /// never concurrently with itself, so a slow callback cannot stall the
+    /// transport. Updates are coalesced: while one delivery is in flight only
+    /// the newest pending update survives, so intermediate generations may be
+    /// skipped (never reordered, and the newest is always delivered). A
+    /// delivery that outlives the server deadline is reported once and
+    /// abandoned in place; a delivery that panics is contained and reported.
+    /// The implementation may be dropped on this worker thread, so `Drop`
+    /// must not block on the async runtime.
     fn on_theme_update(&self, _update: crate::protocol::ThemeUpdate) {}
 }
 
@@ -926,12 +938,92 @@ struct InFlightEntry {
     kind: InFlightKind,
 }
 
+/// Name of the thread that runs one synchronous theme callback.
+const THEME_WORKER_THREAD: &str = "pi-ext-theme";
+/// Advisory message for a theme callback that unwound.
+const THEME_PANIC_MESSAGE: &str = "native extension theme callback panicked";
+/// Advisory message for a theme callback that missed its per-invocation deadline.
+const THEME_TIMEOUT_MESSAGE: &str =
+    "native extension theme callback exceeded its server-side deadline";
+/// Advisory message for a worker thread the OS refused to create.
+const THEME_WORKER_UNAVAILABLE_MESSAGE: &str = "native extension theme worker thread unavailable";
+
+/// Result of one `on_theme_update` invocation, signalled by the worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThemeOutcome {
+    /// The callback returned normally.
+    Delivered,
+    /// The callback unwound; `catch_unwind` contained it.
+    Panicked,
+}
+
+/// Latest-wins hand-off state shared by the read loop and theme supervisor.
+#[derive(Debug, Default)]
+struct ThemeDispatchState {
+    /// Newest undelivered update; newer snapshots overwrite older ones.
+    pending: Option<ThemeUpdate>,
+    /// True while one supervisor episode owns delivery.
+    active: bool,
+    /// One-way latch for the endpoint's single deadline advisory.
+    stall_reported: bool,
+}
+
+/// Hand-off point between the read loop and the theme worker.
+#[derive(Debug, Default)]
+struct ThemeDispatch {
+    state: Mutex<ThemeDispatchState>,
+}
+
+impl ThemeDispatch {
+    fn lock(&self) -> std::sync::MutexGuard<'_, ThemeDispatchState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Publish `update`; return whether a supervisor episode must start.
+    fn submit(&self, update: ThemeUpdate) -> bool {
+        let mut state = self.lock();
+        state.pending = Some(update);
+        if state.active {
+            return false;
+        }
+        state.active = true;
+        true
+    }
+
+    /// Take the next update, or atomically retire this supervisor episode.
+    fn next(&self) -> Option<ThemeUpdate> {
+        let mut state = self.lock();
+        let next = state.pending.take();
+        if next.is_none() {
+            state.active = false;
+        }
+        next
+    }
+
+    /// Claim the endpoint's single deadline advisory.
+    fn claim_stall_notice(&self) -> bool {
+        let mut state = self.lock();
+        if state.stall_reported {
+            return false;
+        }
+        state.stall_reported = true;
+        true
+    }
+}
+
 /// Shared server state: one per `serve_io`, shared by the read loop and
 /// every spawned request task. Dropping the last `Arc` clone closes the
 /// outbound channel, so the writer drains only after all tasks finish.
+///
+/// The theme worker deliberately holds neither this runtime nor an outbound
+/// sender, so an abandoned theme callback cannot keep the writer alive past
+/// teardown.
 struct ServerRuntime<E: NativeExtension> {
-    /// Extension implementation served by this endpoint.
-    extension: E,
+    /// Extension implementation served by this endpoint. The theme worker
+    /// receives only an `Arc` to this value, never the enclosing runtime.
+    extension: Arc<E>,
     /// Immutable registry snapshot, captured once at startup.
     snapshot: RegistrySnapshot,
     /// Lifecycle allowlist derived from the cached snapshot's `handlers`.
@@ -951,6 +1043,8 @@ struct ServerRuntime<E: NativeExtension> {
     update_capacity: usize,
     /// Server-side deadline for native callbacks without explicit cancellation.
     lifecycle_deadline: std::time::Duration,
+    /// Latest-wins hand-off slot for the synchronous theme callback.
+    theme: Arc<ThemeDispatch>,
 }
 
 impl<E: NativeExtension> ServerRuntime<E> {
@@ -958,6 +1052,7 @@ impl<E: NativeExtension> ServerRuntime<E> {
     /// allowlist from it. Returns the runtime plus the outbound receiver.
     fn new(extension: E, config: ServerConfig) -> (Self, mpsc::Receiver<OutboundFrame>) {
         let (out_tx, out_rx) = mpsc::channel(config.outbound_capacity.max(1));
+        let extension = Arc::new(extension);
         let snapshot = extension.snapshot();
         let handlers = snapshot.handlers.iter().cloned().collect();
         (
@@ -971,6 +1066,7 @@ impl<E: NativeExtension> ServerRuntime<E> {
                 out_tx,
                 update_capacity: config.update_capacity,
                 lifecycle_deadline: config.lifecycle_deadline,
+                theme: Arc::new(ThemeDispatch::default()),
             },
             out_rx,
         )
@@ -1066,37 +1162,98 @@ fn validate_hello(frame: &Frame) -> Result<(), ServerError> {
     Ok(())
 }
 
+/// Decode and publish one `theme.update` without running extension code on
+/// the read loop. Taking `&ServerRuntime<E>` is load-bearing: no clonable
+/// runtime is available to the worker.
 fn handle_theme_update<E: NativeExtension>(
     runtime: &ServerRuntime<E>,
     rejection_tx: &mpsc::Sender<Frame>,
+    tasks: &mut JoinSet<()>,
     payload: &Value,
-) -> Result<(), ServerError> {
-    let Ok(update) = from_payload(payload) else {
-        return Ok(());
+) {
+    let Ok(update) = from_payload::<ThemeUpdate>(payload) else {
+        return;
     };
-    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        runtime.extension.on_theme_update(update);
-    }))
-    .is_ok()
-    {
-        return Ok(());
+    if !runtime.theme.submit(update) {
+        return;
     }
+    tasks.spawn(run_theme_supervisor(
+        Arc::clone(&runtime.extension),
+        Arc::clone(&runtime.theme),
+        rejection_tx.clone(),
+        runtime.lifecycle_deadline,
+    ));
+    while tasks.try_join_next().is_some() {}
+}
 
-    let failure = Frame::event(
+/// Build an uncorrelated advisory for a failed theme delivery.
+fn theme_notice_frame(code: &str, message: &str) -> Frame {
+    Frame::event(
         0,
         Method::ExtensionError,
         json!({
-            "code": "internal",
-            "message": "native extension theme callback panicked",
+            "code": code,
+            "message": message,
             "retryable": false,
         }),
-    );
-    match rejection_tx.try_send(failure) {
-        Ok(()) => Ok(()),
-        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Err(ServerError::OutboundOverflow),
-        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(ServerError::Io(
-            std::io::Error::other("deferred extension error channel closed"),
-        )),
+    )
+}
+
+/// Best-effort reporting through the existing bounded deferred queue.
+fn report_theme_notice(rejection_tx: &mpsc::Sender<Frame>, code: &str, message: &str) {
+    let _ = rejection_tx.try_send(theme_notice_frame(code, message));
+}
+
+/// Drain coalesced updates using one detached worker at a time.
+async fn run_theme_supervisor<E: NativeExtension>(
+    extension: Arc<E>,
+    dispatch: Arc<ThemeDispatch>,
+    rejection_tx: mpsc::Sender<Frame>,
+    deadline: std::time::Duration,
+) {
+    while let Some(update) = dispatch.next() {
+        let (done_tx, mut done_rx) = oneshot::channel::<ThemeOutcome>();
+        let worker_extension = Arc::clone(&extension);
+        let worker = move || {
+            let outcome = if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                worker_extension.on_theme_update(update);
+            }))
+            .is_ok()
+            {
+                ThemeOutcome::Delivered
+            } else {
+                ThemeOutcome::Panicked
+            };
+            drop(worker_extension);
+            let _ = done_tx.send(outcome);
+        };
+        match std::thread::Builder::new()
+            .name(THEME_WORKER_THREAD.to_owned())
+            .spawn(worker)
+        {
+            // Detached deliberately: teardown must never join host callback
+            // code that the server cannot cancel.
+            Ok(handle) => drop(handle),
+            Err(_error) => {
+                report_theme_notice(&rejection_tx, "internal", THEME_WORKER_UNAVAILABLE_MESSAGE);
+                continue;
+            }
+        }
+
+        // A fresh deadline is armed for every invocation. After it expires,
+        // keep waiting on this same worker to preserve single-callback access.
+        let outcome = match tokio::time::timeout(deadline, &mut done_rx).await {
+            Ok(outcome) => outcome,
+            Err(_elapsed) => {
+                if dispatch.claim_stall_notice() {
+                    report_theme_notice(&rejection_tx, "timeout", THEME_TIMEOUT_MESSAGE);
+                }
+                done_rx.await
+            }
+        };
+        if !matches!(outcome, Ok(ThemeOutcome::Delivered)) {
+            report_theme_notice(&rejection_tx, "internal", THEME_PANIC_MESSAGE);
+        }
     }
 }
 
@@ -1183,7 +1340,7 @@ fn dispatch_ready<E: NativeExtension>(
                     }
                 }
                 crate::protocol::THEME_UPDATE_METHOD => {
-                    handle_theme_update(runtime, rejection_tx, &frame.payload)?;
+                    handle_theme_update(runtime, rejection_tx, tasks, &frame.payload);
                 }
                 // Unknown events are fire-and-forget: ignored by design.
                 _ => {}
@@ -2737,6 +2894,100 @@ mod tests {
             _cancel: CancellationToken,
         ) -> NativeFuture<Result<Value, ExtensionFault>> {
             Box::pin(async move { Err(ExtensionFault::not_found(call.name)) })
+        }
+    }
+
+    /// Theme callback that parks until released while recording overlap and
+    /// completed generations.
+    struct BlockingThemeExtension {
+        entered: Arc<AtomicUsize>,
+        delivered: Arc<Mutex<Vec<u64>>>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+        overlapped: Arc<AtomicBool>,
+        inside: Arc<AtomicUsize>,
+    }
+
+    struct BlockingThemeHandles {
+        entered: Arc<AtomicUsize>,
+        delivered: Arc<Mutex<Vec<u64>>>,
+        overlapped: Arc<AtomicBool>,
+    }
+
+    fn blocking_theme_extension() -> (
+        BlockingThemeExtension,
+        BlockingThemeHandles,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let entered = Arc::new(AtomicUsize::new(0));
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let overlapped = Arc::new(AtomicBool::new(false));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        (
+            BlockingThemeExtension {
+                entered: Arc::clone(&entered),
+                delivered: Arc::clone(&delivered),
+                release: Mutex::new(release_rx),
+                overlapped: Arc::clone(&overlapped),
+                inside: Arc::new(AtomicUsize::new(0)),
+            },
+            BlockingThemeHandles {
+                entered,
+                delivered,
+                overlapped,
+            },
+            release_tx,
+        )
+    }
+
+    impl NativeExtension for BlockingThemeExtension {
+        fn snapshot(&self) -> RegistrySnapshot {
+            RegistrySnapshot::default()
+        }
+
+        fn prepare_tool(
+            &self,
+            _context: Arc<NativeExtensionContext>,
+            name: String,
+            _args: Value,
+        ) -> NativeFuture<Result<Value, ExtensionFault>> {
+            Box::pin(async move { Err(ExtensionFault::not_found(name)) })
+        }
+
+        fn validate_tool(
+            &self,
+            _context: Arc<NativeExtensionContext>,
+            name: String,
+            _args: Value,
+            _tool_call_id: Option<String>,
+        ) -> NativeFuture<Result<Value, ExtensionFault>> {
+            Box::pin(async move { Err(ExtensionFault::not_found(name)) })
+        }
+
+        fn execute_tool(
+            &self,
+            _context: Arc<NativeExtensionContext>,
+            call: ToolCall,
+            _updates: ToolUpdateSink,
+            _cancel: CancellationToken,
+        ) -> NativeFuture<Result<Value, ExtensionFault>> {
+            Box::pin(async move { Err(ExtensionFault::not_found(call.name)) })
+        }
+
+        fn on_theme_update(&self, update: crate::protocol::ThemeUpdate) {
+            if self.inside.fetch_add(1, AtomicOrdering::SeqCst) != 0 {
+                self.overlapped.store(true, AtomicOrdering::SeqCst);
+            }
+            self.entered.fetch_add(1, AtomicOrdering::SeqCst);
+            let _ = self
+                .release
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv();
+            self.delivered
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(update.theme_generation);
+            self.inside.fetch_sub(1, AtomicOrdering::SeqCst);
         }
     }
 
@@ -5318,8 +5569,23 @@ mod tests {
     // PR #2 review regressions
     // -----------------------------------------------------------------------
 
-    /// A `theme.update` broadcast is delivered to the native theme callback
-    /// instead of being silently discarded as an unknown event.
+    /// Build a minimal `theme.update` event for one generation.
+    fn theme_frame(generation: u64) -> Frame {
+        Frame {
+            id: 0,
+            kind: FrameKind::Event,
+            method: crate::protocol::THEME_UPDATE_METHOD.to_owned(),
+            payload: json!({
+                "theme": { "colorMode": "truecolor", "fg": {}, "bg": {} },
+                "terminalTheme": "dark",
+                "themeMode": "auto",
+                "themeGeneration": generation,
+                "themes": [],
+            }),
+        }
+    }
+
+    /// A `theme.update` broadcast is delivered to the native theme callback.
     #[tokio::test]
     async fn theme_update_is_delivered_to_native_callback() -> R {
         let (ext, handles) = DemoExtension::new();
@@ -5327,21 +5593,7 @@ mod tests {
         client.hello(PROTOCOL_VERSION, "anything").await?;
         let _ack = client.recv().await?;
         client.load_context().await?;
-
-        client
-            .send(&Frame {
-                id: 0,
-                kind: FrameKind::Event,
-                method: crate::protocol::THEME_UPDATE_METHOD.to_owned(),
-                payload: json!({
-                    "theme": { "colorMode": "truecolor", "fg": {}, "bg": {} },
-                    "terminalTheme": "dark",
-                    "themeMode": "auto",
-                    "themeGeneration": 7,
-                    "themes": [],
-                }),
-            })
-            .await?;
+        client.send(&theme_frame(7)).await?;
 
         wait_until(|| {
             handles
@@ -5367,8 +5619,169 @@ mod tests {
         Ok(())
     }
 
-    /// A panicking theme callback is isolated and reported without stopping
-    /// the native transport.
+    /// A parked callback leaves both sibling RPC dispatch and EOF teardown
+    /// available to the read loop.
+    #[tokio::test]
+    async fn theme_callback_does_not_block_read_loop_or_eof() -> R {
+        let (ext, handles, release_tx) = blocking_theme_extension();
+        let (mut client, server) = spawn_raw(ext, ServerConfig::default());
+        client.hello(PROTOCOL_VERSION, "anything").await?;
+        let _ack = client.recv().await?;
+        client.load_context().await?;
+        client.send(&theme_frame(1)).await?;
+        wait_until(|| handles.entered.load(AtomicOrdering::SeqCst) == 1).await?;
+
+        let sibling = client.request(3, "not_advertised", json!({})).await?;
+        assert_eq!(sibling.kind, FrameKind::Error);
+        assert_eq!(sibling.payload["code"], "unknown_method");
+
+        drop(client);
+        let result = tokio::time::timeout(TIMEOUT, server).await??;
+        assert!(result.is_ok());
+        assert!(
+            handles
+                .delivered
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "teardown must finish while the callback remains parked"
+        );
+        drop(release_tx);
+        Ok(())
+    }
+
+    /// A burst retains only the newest pending snapshot and never overlaps
+    /// callback access to `&self`.
+    #[tokio::test]
+    async fn theme_updates_coalesce_to_newest_without_overlap() -> R {
+        let (ext, handles, release_tx) = blocking_theme_extension();
+        let (mut client, server) = spawn_raw(ext, ServerConfig::default());
+        client.hello(PROTOCOL_VERSION, "anything").await?;
+        let _ack = client.recv().await?;
+        client.load_context().await?;
+        client.send(&theme_frame(1)).await?;
+        wait_until(|| handles.entered.load(AtomicOrdering::SeqCst) == 1).await?;
+        for generation in 2..=4 {
+            client.send(&theme_frame(generation)).await?;
+        }
+        let barrier = client.request(3, "not_advertised", json!({})).await?;
+        assert_eq!(barrier.payload["code"], "unknown_method");
+
+        drop(release_tx);
+        wait_until(|| {
+            handles
+                .delivered
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len()
+                == 2
+        })
+        .await?;
+        assert_eq!(
+            *handles
+                .delivered
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![1, 4]
+        );
+        assert_eq!(handles.entered.load(AtomicOrdering::SeqCst), 2);
+        assert!(!handles.overlapped.load(AtomicOrdering::SeqCst));
+
+        drop(client);
+        let result = tokio::time::timeout(TIMEOUT, server).await??;
+        assert!(result.is_ok());
+        Ok(())
+    }
+
+    /// A callback deadline is reported once, after which the supervisor keeps
+    /// waiting on the same worker and continues serving transport traffic.
+    #[tokio::test]
+    async fn stalled_theme_callback_reports_timeout_once() -> R {
+        let (ext, handles, release_tx) = blocking_theme_extension();
+        let config = ServerConfig {
+            lifecycle_deadline: Duration::from_millis(30),
+            ..ServerConfig::default()
+        };
+        let (mut client, server) = spawn_raw(ext, config);
+        client.hello(PROTOCOL_VERSION, "anything").await?;
+        let _ack = client.recv().await?;
+        client.load_context().await?;
+        client.send(&theme_frame(1)).await?;
+        wait_until(|| handles.entered.load(AtomicOrdering::SeqCst) == 1).await?;
+
+        let timeout_notice = client.recv().await?;
+        assert_eq!(timeout_notice.method, Method::ExtensionError.as_str());
+        assert_eq!(timeout_notice.payload["code"], "timeout");
+
+        client.send(&theme_frame(2)).await?;
+        client.send(&theme_frame(3)).await?;
+        let barrier = client.request(3, "not_advertised", json!({})).await?;
+        assert_eq!(barrier.payload["code"], "unknown_method");
+        release_tx
+            .send(())
+            .map_err(|error| format!("release first theme callback: {error}"))?;
+        wait_until(|| handles.entered.load(AtomicOrdering::SeqCst) == 2).await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let sibling = client.request(4, "not_advertised", json!({})).await?;
+        assert_eq!(sibling.id, 4, "a second timeout notice was queued");
+        assert_eq!(sibling.payload["code"], "unknown_method");
+        assert!(!handles.overlapped.load(AtomicOrdering::SeqCst));
+
+        drop(release_tx);
+        wait_until(|| {
+            handles
+                .delivered
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_slice()
+                == [1, 3]
+        })
+        .await?;
+        drop(client);
+        let result = tokio::time::timeout(TIMEOUT, server).await??;
+        assert!(result.is_ok());
+        Ok(())
+    }
+
+    /// Each callback gets a fresh deadline rather than sharing one cumulative
+    /// timer across the supervisor episode.
+    #[tokio::test]
+    async fn theme_deadline_is_per_invocation() -> R {
+        let (ext, handles, release_tx) = blocking_theme_extension();
+        let dispatch = Arc::new(ThemeDispatch::default());
+        let (rejection_tx, mut rejection_rx) = mpsc::channel(1);
+        let first = from_payload::<ThemeUpdate>(&theme_frame(1).payload)?;
+        assert!(dispatch.submit(first));
+        let supervisor = tokio::spawn(run_theme_supervisor(
+            Arc::new(ext),
+            Arc::clone(&dispatch),
+            rejection_tx,
+            Duration::from_millis(250),
+        ));
+        wait_until(|| handles.entered.load(AtomicOrdering::SeqCst) == 1).await?;
+        let second = from_payload::<ThemeUpdate>(&theme_frame(2).payload)?;
+        assert!(!dispatch.submit(second));
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        release_tx
+            .send(())
+            .map_err(|error| format!("release first theme callback: {error}"))?;
+        wait_until(|| handles.entered.load(AtomicOrdering::SeqCst) == 2).await?;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        release_tx
+            .send(())
+            .map_err(|error| format!("release second theme callback: {error}"))?;
+        tokio::time::timeout(TIMEOUT, supervisor).await??;
+
+        assert!(
+            rejection_rx.try_recv().is_err(),
+            "healthy per-invocation durations must not trigger a cumulative timeout"
+        );
+        Ok(())
+    }
+
+    /// A panicking theme callback is isolated and reported per invocation.
     #[tokio::test]
     async fn panicking_theme_callback_reports_error_and_keeps_serving() -> R {
         let (mut client, server) = spawn_raw(PanickingExtension, ServerConfig::default());
@@ -5376,25 +5789,13 @@ mod tests {
         let _ack = client.recv().await?;
         client.load_context().await?;
 
-        client
-            .send(&Frame {
-                id: 0,
-                kind: FrameKind::Event,
-                method: crate::protocol::THEME_UPDATE_METHOD.to_owned(),
-                payload: json!({
-                    "theme": { "colorMode": "truecolor", "fg": {}, "bg": {} },
-                    "terminalTheme": "dark",
-                    "themeMode": "auto",
-                    "themeGeneration": 8,
-                    "themes": [],
-                }),
-            })
-            .await?;
-        let failure = tokio::time::timeout(TIMEOUT, client.recv()).await??;
-        assert_eq!(failure.kind, FrameKind::Event);
-        assert_eq!(failure.method, Method::ExtensionError.as_str());
-        assert_eq!(failure.payload["code"], "internal");
-
+        for generation in [8, 9] {
+            client.send(&theme_frame(generation)).await?;
+            let failure = client.recv().await?;
+            assert_eq!(failure.kind, FrameKind::Event);
+            assert_eq!(failure.method, Method::ExtensionError.as_str());
+            assert_eq!(failure.payload["code"], "internal");
+        }
         let sibling = client.request(3, "not_advertised", json!({})).await?;
         assert_eq!(sibling.kind, FrameKind::Error);
         assert_eq!(sibling.payload["code"], "unknown_method");
@@ -5405,45 +5806,86 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn theme_panic_report_uses_deferred_queue_under_backpressure() -> R {
-        let config = ServerConfig {
-            outbound_capacity: 1,
-            ..ServerConfig::default()
-        };
-        let (runtime, _out_rx) = ServerRuntime::new(PanickingExtension, config);
+    /// Panic reporting never waits for space in the bounded deferred queue.
+    #[tokio::test]
+    async fn theme_panic_notice_is_dropped_when_deferred_queue_is_full() -> R {
+        let (runtime, _out_rx) = ServerRuntime::new(PanickingExtension, ServerConfig::default());
         let runtime = Arc::new(runtime);
-        runtime
-            .out_tx
-            .try_send(Frame::event(0, Method::Notify, json!({})).into())
-            .map_err(|error| format!("fill outbound queue: {error}"))?;
         let (rejection_tx, mut rejection_rx) = mpsc::channel(1);
+        rejection_tx
+            .try_send(Frame::event(0, Method::Notify, json!({})))
+            .map_err(|error| format!("fill deferred queue: {error}"))?;
         let mut tasks = JoinSet::new();
 
-        dispatch_ready(
-            Frame {
-                id: 0,
-                kind: FrameKind::Event,
-                method: crate::protocol::THEME_UPDATE_METHOD.to_owned(),
-                payload: json!({
-                    "theme": { "colorMode": "truecolor", "fg": {}, "bg": {} },
-                    "terminalTheme": "dark",
-                    "themeMode": "auto",
-                    "themeGeneration": 9,
-                    "themes": [],
-                }),
-            },
-            &runtime,
-            &rejection_tx,
-            &mut tasks,
-        )?;
-
-        let failure = rejection_rx
+        dispatch_ready(theme_frame(9), &runtime, &rejection_tx, &mut tasks)?;
+        let joined = tokio::time::timeout(TIMEOUT, tasks.join_next())
+            .await?
+            .ok_or("missing theme supervisor")?;
+        assert!(joined.is_ok());
+        let queued = rejection_rx
             .try_recv()
-            .map_err(|error| format!("missing deferred theme failure: {error}"))?;
-        assert_eq!(failure.kind, FrameKind::Event);
-        assert_eq!(failure.method, Method::ExtensionError.as_str());
-        assert_eq!(failure.payload["code"], "internal");
+            .map_err(|error| format!("missing prefilled advisory: {error}"))?;
+        assert_eq!(queued.method, Method::Notify.as_str());
+        assert!(rejection_rx.try_recv().is_err());
+        Ok(())
+    }
+
+    /// Runtime destruction must not wait for the detached OS worker.
+    #[test]
+    fn stalled_theme_worker_does_not_wedge_current_thread_runtime_drop() -> R {
+        let (client_tx, server_rx) = tokio::io::duplex(64 * 1024);
+        let (server_tx, client_rx) = tokio::io::duplex(64 * 1024);
+        let (ext, handles, release_tx) = blocking_theme_extension();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = done_tx.send(Err(ServerError::Io(error)));
+                    return;
+                }
+            };
+            let result =
+                runtime.block_on(serve_io(server_rx, server_tx, ext, ServerConfig::default()));
+            // `spawn_blocking` would make this wait for the parked callback.
+            drop(runtime);
+            let _ = done_tx.send(result);
+        });
+
+        let client_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        client_runtime.block_on(async {
+            let mut client = RawClient {
+                write: client_tx,
+                read: BufReader::new(client_rx),
+            };
+            client.hello(PROTOCOL_VERSION, "anything").await?;
+            let _ack = client.recv().await?;
+            client.load_context().await?;
+            client.send(&theme_frame(1)).await?;
+            wait_until(|| handles.entered.load(AtomicOrdering::SeqCst) == 1).await?;
+            drop(client);
+            Ok::<(), Box<dyn Error>>(())
+        })?;
+        drop(client_runtime);
+
+        let result = match done_rx.recv_timeout(TIMEOUT) {
+            Ok(result) => result,
+            Err(_timeout) => {
+                drop(release_tx);
+                let _ = worker.join();
+                return Err("runtime drop waited for the parked theme worker".into());
+            }
+        };
+        assert!(result.is_ok());
+        drop(release_tx);
+        worker
+            .join()
+            .map_err(|_| "theme runtime worker thread panicked")?;
         Ok(())
     }
 
