@@ -123,43 +123,220 @@ interface RecoveryBoundary {
 }
 
 function recoverStreamingJsonTail(text: string): Record<string, unknown> | undefined {
-	const boundaries = collectRecoveryBoundaries(text);
-	for (const boundary of boundaries.reverse()) {
-		try {
-			const parsed: unknown = JSON.parse(closeAtBoundary(text, boundary));
-			return isRecord(parsed) ? parsed : {};
-		} catch {
-			// Try the next shorter recovery boundary.
-		}
+	const boundary = collectRecoveryBoundary(text);
+	if (boundary === undefined) return undefined;
+	try {
+		const parsed: unknown = JSON.parse(closeAtBoundary(text, boundary));
+		return isRecord(parsed) ? parsed : {};
+	} catch {
+		return undefined;
 	}
-	return undefined;
 }
 
-function collectRecoveryBoundaries(text: string): RecoveryBoundary[] {
-	const boundaries: RecoveryBoundary[] = [];
+type RecoveryPhase =
+	| "keyOrEnd"
+	| "keyRequired"
+	| "colon"
+	| "value"
+	| "valueOrEnd"
+	| "valueRequired"
+	| "commaOrEnd";
+
+interface RecoveryFrame {
+	readonly node: OpenContainerNode;
+	readonly parent: RecoveryFrame | undefined;
+	readonly kind: "object" | "array";
+	phase: RecoveryPhase;
+}
+
+/** Finds the furthest tail position that can be made valid by closing JSON. */
+function collectRecoveryBoundary(text: string): RecoveryBoundary | undefined {
 	const firstCandidate = Math.max(1, text.length - MAX_STREAMING_JSON_RECOVERY_CHARS);
-	let inString = false;
-	let escaped = false;
-	let stack: OpenContainerNode | undefined;
-	for (let index = 0; index < text.length; index++) {
-		if (index >= firstCandidate) boundaries.push({ end: index, inString, escaped, stack });
-		const char = text[index];
-		if (inString) {
-			if (escaped) escaped = false;
-			else if (char === "\\") escaped = true;
-			else if (char === '"') inString = false;
+	let root: "value" | "done" = "value";
+	let stack: RecoveryFrame | undefined;
+	let lastBoundary: RecoveryBoundary | undefined;
+
+	const canClose = (): boolean => {
+		if (root !== "done") return false;
+		for (let frame = stack; frame !== undefined; frame = frame.parent) {
+			if (
+				frame.phase !== "keyOrEnd" &&
+				frame.phase !== "valueOrEnd" &&
+				frame.phase !== "commaOrEnd"
+			) {
+				return false;
+			}
+		}
+		return true;
+	};
+
+	const rememberBoundary = (end: number): void => {
+		if (end >= firstCandidate && canClose()) {
+			lastBoundary = { end, inString: false, escaped: false, stack: stack?.node };
+		}
+	};
+
+	const stringBoundary = (end: number): RecoveryBoundary | undefined =>
+		end >= firstCandidate
+			? { end, inString: true, escaped: false, stack: stack?.node }
+			: lastBoundary;
+
+	const valueExpected = (): boolean =>
+		stack === undefined
+			? root === "value"
+			: stack.kind === "object"
+				? stack.phase === "value"
+				: stack.phase === "valueOrEnd" || stack.phase === "valueRequired";
+
+	const completeValue = (): boolean => {
+		if (stack === undefined) {
+			if (root !== "value") return false;
+			root = "done";
+			return true;
+		}
+		if (!valueExpected()) return false;
+		stack.phase = "commaOrEnd";
+		return true;
+	};
+
+	const openContainer = (kind: RecoveryFrame["kind"]): boolean => {
+		if (!completeValue()) return false;
+		const node: OpenContainerNode = {
+			close: kind === "object" ? "}" : "]",
+			parent: stack?.node,
+		};
+		stack = {
+			node,
+			parent: stack,
+			kind,
+			phase: kind === "object" ? "keyOrEnd" : "valueOrEnd",
+		};
+		return true;
+	};
+
+	for (let index = 0; index < text.length; ) {
+		const char = text.charAt(index);
+		if (isJsonWhitespace(char)) {
+			index += 1;
+			rememberBoundary(index);
 			continue;
 		}
-		if (char === '"') inString = true;
-		else if (char === "{") stack = { close: "}", parent: stack };
-		else if (char === "[") stack = { close: "]", parent: stack };
-		else if (char === "}" || char === "]") {
-			if (stack === undefined || stack.close !== char) return boundaries;
-			stack = stack.parent;
+		if (char === "{" || char === "[") {
+			if (!openContainer(char === "{" ? "object" : "array")) return lastBoundary;
+			index += 1;
+			rememberBoundary(index);
+			continue;
 		}
+		if (char === "}" || char === "]") {
+			if (
+				stack === undefined ||
+				(stack.kind === "object" ? char !== "}" : char !== "]") ||
+				(stack.phase !== "keyOrEnd" &&
+					stack.phase !== "valueOrEnd" &&
+					stack.phase !== "commaOrEnd")
+			) {
+				return lastBoundary;
+			}
+			stack = stack.parent;
+			index += 1;
+			rememberBoundary(index);
+			continue;
+		}
+		if (char === ",") {
+			if (stack === undefined || stack.phase !== "commaOrEnd") return lastBoundary;
+			stack.phase = stack.kind === "object" ? "keyRequired" : "valueRequired";
+			index += 1;
+			continue;
+		}
+		if (char === ":") {
+			if (stack?.kind !== "object" || stack.phase !== "colon") return lastBoundary;
+			stack.phase = "value";
+			index += 1;
+			continue;
+		}
+		if (char === '"') {
+			const isKey = stack?.kind === "object" &&
+				(stack.phase === "keyOrEnd" || stack.phase === "keyRequired");
+			if (!isKey && !valueExpected()) return lastBoundary;
+			let escaped = false;
+			let unicodeDigits = 0;
+			let cursor = index + 1;
+			for (; cursor < text.length; cursor += 1) {
+				const stringChar = text.charAt(cursor);
+				if (unicodeDigits > 0) {
+					if (!isHexDigit(stringChar)) {
+						return isKey ? lastBoundary : stringBoundary(cursor + unicodeDigits - 6);
+					}
+					unicodeDigits -= 1;
+					continue;
+				}
+				if (escaped) {
+					if (stringChar === "u") unicodeDigits = 4;
+					else if (!'"\\/bfnrt'.includes(stringChar)) return isKey ? lastBoundary : stringBoundary(cursor - 1);
+					escaped = false;
+					continue;
+				}
+				if (stringChar === "\\") {
+					escaped = true;
+					continue;
+				}
+				if (stringChar === '"') break;
+				if (stringChar.charCodeAt(0) < 0x20) return isKey ? lastBoundary : stringBoundary(cursor);
+			}
+			if (cursor === text.length) {
+				if (unicodeDigits > 0) {
+					return isKey ? lastBoundary : stringBoundary(cursor + unicodeDigits - 6);
+				}
+				if (isKey) return lastBoundary;
+				return { end: cursor, inString: true, escaped, stack: stack?.node };
+			}
+			if (isKey) stack!.phase = "colon";
+			else if (!completeValue()) return lastBoundary;
+			index = cursor + 1;
+			rememberBoundary(index);
+			continue;
+		}
+		if (!valueExpected()) return lastBoundary;
+		let cursor = index;
+		while (cursor < text.length && !isScalarDelimiter(text.charAt(cursor))) cursor += 1;
+		const scalarEnd = findCompleteJsonScalarEnd(text, index, cursor);
+		if (scalarEnd === undefined) return lastBoundary;
+		if (!completeValue()) return lastBoundary;
+		rememberBoundary(scalarEnd);
+		if (scalarEnd !== cursor) return lastBoundary;
+		index = cursor;
 	}
-	boundaries.push({ end: text.length, inString, escaped, stack });
-	return boundaries;
+	return lastBoundary;
+}
+
+function isJsonWhitespace(char: string): boolean {
+	return char === " " || char === "\t" || char === "\r" || char === "\n";
+}
+
+function isScalarDelimiter(char: string): boolean {
+	return isJsonWhitespace(char) || char === "," || char === "}" || char === "]";
+}
+
+function isCompleteJsonScalar(value: string): boolean {
+	return (
+		value === "true" ||
+		value === "false" ||
+		value === "null" ||
+		/^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(value)
+	);
+}
+
+function findCompleteJsonScalarEnd(text: string, start: number, end: number): number | undefined {
+	const value = text.slice(start, end);
+	if (isCompleteJsonScalar(value)) return end;
+	const literal = /^(?:true|false|null)/.exec(value)?.[0];
+	const number = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/.exec(value)?.[0];
+	const prefix = literal ?? number;
+	return prefix === undefined ? undefined : start + prefix.length;
+}
+
+function isHexDigit(char: string): boolean {
+	return /[0-9a-fA-F]/.test(char);
 }
 
 function closeAtBoundary(text: string, boundary: RecoveryBoundary): string {

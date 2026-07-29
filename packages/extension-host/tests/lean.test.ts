@@ -5,7 +5,7 @@
  * and load-time proofs that lean selection never evaluates host.ts,
  * builtins, virtual-modules, or the upstream package graph.
  */
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test, vi } from "bun:test";
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
@@ -2019,6 +2019,7 @@ describe("lean: surface validation units", () => {
 		// than dropping the key (documented tolerant behavior).
 		expect(parseStreamingJson('{"a":1,"b":[tru')).toEqual({ a: 1, b: [] });
 		expect(parseStreamingJson('{"a":"hel')).toEqual({ a: "hel" });
+		expect(parseStreamingJson('{"a":truex')).toEqual({ a: true });
 		expect(parseStreamingJson("garbage")).toEqual({});
 		expect(parseStreamingJson(undefined)).toEqual({});
 	});
@@ -2140,6 +2141,19 @@ describe("lean: surface validation units", () => {
 		expect(parseStreamingJson('{"a":1}]')).toEqual({ a: 1 });
 		// A trailing unescaped backslash is dropped before closing the string.
 		expect(parseStreamingJson('{"a":"x\\')).toEqual({ a: "x" });
+		// A large valid prefix with a hostile tail must recover without reparsing
+		// hundreds of near-identical prefixes. The strict parse and one recovery
+		// parse are observable; elapsed time is not.
+		const parseSpy = vi.spyOn(JSON, "parse");
+		const payload = "x".repeat(100_000);
+		try {
+			expect(parseStreamingJson(`{"payload":"${payload}","broken":${"!".repeat(500)}`)).toEqual({
+				payload,
+			});
+			expect(parseSpy).toHaveBeenCalledTimes(2);
+		} finally {
+			parseSpy.mockRestore();
+		}
 		// No full-input backwards retries: 100k of garbage returns cheaply.
 		expect(parseStreamingJson("z".repeat(100_000))).toEqual({});
 	});
