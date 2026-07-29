@@ -99,15 +99,90 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  */
 const EXCLUDED_SPECIFIER = /^(?:@earendil-works\/(?:pi-coding-agent|pi-agent-core|pi-ai|pi-tui(?!-protocol))|@mariozechner\/|jiti(?:\/|$)|typebox(?:\/|$)|.*\/(?:host|virtual-modules)\.ts$)/;
 
-/** ASCII identifier alphabet; enough to token-split `import`/`export`. */
-function isIdentifierCharCode(code: number): boolean {
+function isAsciiIdentifierStartCode(code: number): boolean {
 	return (
 		(code >= 97 && code <= 122) // a-z
 		|| (code >= 65 && code <= 90) // A-Z
-		|| (code >= 48 && code <= 57) // 0-9
 		|| code === 95 // _
 		|| code === 36 // $
 	);
+}
+
+
+const IDENTIFIER_START = /^[$_\p{ID_Start}]$/u;
+const IDENTIFIER_CONTINUE = /^[$_\u200C\u200D\p{ID_Continue}]$/u;
+
+interface IdentifierEscape {
+	char: string;
+	next: number;
+}
+
+interface IdentifierName {
+	word: string;
+	end: number;
+	malformedEscape: boolean;
+}
+
+/** Decode one valid Unicode escape in an IdentifierName without throwing. */
+function decodeIdentifierEscape(source: string, from: number): IdentifierEscape | undefined {
+	if (source[from] !== "\\" || source[from + 1] !== "u") return undefined;
+	const digitsStart = from + 2;
+	let digits: string;
+	let next: number;
+	if (source[digitsStart] === "{") {
+		const close = source.indexOf("}", digitsStart + 1);
+		if (close === -1) return undefined;
+		digits = source.slice(digitsStart + 1, close);
+		next = close + 1;
+		if (!/^[0-9A-Fa-f]{1,6}$/.test(digits)) return undefined;
+	} else {
+		digits = source.slice(digitsStart, digitsStart + 4);
+		next = digitsStart + 4;
+		if (!/^[0-9A-Fa-f]{4}$/.test(digits)) return undefined;
+	}
+	const codePoint = Number.parseInt(digits, 16);
+	if (codePoint > 0x10_FFFF || (codePoint >= 0xD800 && codePoint <= 0xDFFF)) return undefined;
+	return { char: String.fromCodePoint(codePoint), next };
+}
+
+/**
+ * Read one complete IdentifierName, cooking escapes before comparing loader
+ * names. Raw Unicode and escaped code points share the same start/continue
+ * rules so a suffix such as `π\u0072equire` cannot split into a false bare
+ * `require` token.
+ */
+function readCookedIdentifier(source: string, from: number): IdentifierName | undefined {
+	let at = from;
+	let word = "";
+	while (at < source.length) {
+		const codePoint = source.codePointAt(at);
+		if (codePoint === undefined) break;
+		const char = String.fromCodePoint(codePoint);
+		const validRaw = word.length === 0
+			? codePoint <= 0x7F
+				? isAsciiIdentifierStartCode(codePoint)
+				: IDENTIFIER_START.test(char)
+			: codePoint <= 0x7F
+				? isAsciiIdentifierStartCode(codePoint) || (codePoint >= 48 && codePoint <= 57)
+				: IDENTIFIER_CONTINUE.test(char);
+		if (validRaw) {
+			word += char;
+			at += char.length;
+			continue;
+		}
+		if (source[at] !== "\\" || source[at + 1] !== "u") break;
+		const escaped = decodeIdentifierEscape(source, at);
+		if (escaped === undefined) {
+			return { word, end: Math.min(at + 2, source.length), malformedEscape: true };
+		}
+		const validEscape = word.length === 0
+			? IDENTIFIER_START.test(escaped.char)
+			: IDENTIFIER_CONTINUE.test(escaped.char);
+		if (!validEscape) return { word, end: escaped.next, malformedEscape: true };
+		word += escaped.char;
+		at = escaped.next;
+	}
+	return word.length === 0 ? undefined : { word, end: at, malformedEscape: false };
 }
 
 function isWhitespaceChar(char: string): boolean {
@@ -221,6 +296,7 @@ const MULTI_CHARACTER_PUNCTUATORS = [
 	"|=",
 	"^=",
 ] as const;
+const MEMBER_PUNCTUATORS: Readonly<Record<string, true>> = { ".": true, "?.": true, "#": true };
 
 type SignificantToken =
 	| { kind: "identifier" | "keyword"; value: string }
@@ -310,19 +386,17 @@ function scanModuleLoads(source: string): ModuleLoadScan {
 	/** Object-brace depth of each open `${...}` expression, innermost last. */
 	const templateExpressionDepths: number[] = [];
 	let inTemplateRaw = false;
-	// `import`/`export` preceded by `.` is member access (`obj.import(...)`;
-	// `import.meta` is handled on the other side), never an import statement.
+	// Loader-shaped names after a member punctuator are property names, never
+	// import statements or regex-prefix keywords.
 	let lastSignificant: SignificantToken | undefined;
 	let index = 0;
 
 	const readPunctuator = (from: number): string =>
 		MULTI_CHARACTER_PUNCTUATORS.find((punctuator) => source.startsWith(punctuator, from)) ?? source[from];
 	const recordWord = (word: string, preceded = lastSignificant): void => {
+		const member = preceded?.kind === "punctuator" && MEMBER_PUNCTUATORS[preceded.value] === true;
 		lastSignificant = {
-			kind:
-				REGEX_PREFIX_KEYWORDS.has(word) && !(preceded?.kind === "punctuator" && preceded.value === ".")
-					? "keyword"
-					: "identifier",
+			kind: REGEX_PREFIX_KEYWORDS.has(word) && !member ? "keyword" : "identifier",
 			value: word,
 		};
 	};
@@ -443,15 +517,21 @@ function scanModuleLoads(source: string): ModuleLoadScan {
 				}
 			}
 			if (char === '"' || char === "'" || char === "(" || char === ")" || char === "`") return at;
-			if (!isIdentifierCharCode(source.charCodeAt(at))) {
+			const start = at;
+			const identifier = readCookedIdentifier(source, at);
+			if (identifier === undefined) {
 				const punctuator = readPunctuator(at);
 				lastSignificant = { kind: "punctuator", value: punctuator };
 				at += punctuator.length;
 				continue;
 			}
-			const start = at;
-			while (at < length && isIdentifierCharCode(source.charCodeAt(at))) at += 1;
-			const word = source.slice(start, at);
+			if (identifier.malformedEscape) {
+				unsupported ??= "malformed escaped identifier";
+				at = identifier.end;
+				continue;
+			}
+			const word = identifier.word;
+			at = identifier.end;
 			if (word === "import" || word === "export") return start;
 			recordWord(word);
 			if (word !== "from") continue;
@@ -522,19 +602,23 @@ function scanModuleLoads(source: string): ModuleLoadScan {
 			}
 			continue;
 		}
-		if (!isIdentifierCharCode(source.charCodeAt(index))) {
+		const identifier = readCookedIdentifier(source, index);
+		if (identifier === undefined) {
 			const punctuator = readPunctuator(index);
 			lastSignificant = { kind: "punctuator", value: punctuator };
 			index += punctuator.length;
 			continue;
 		}
-		const start = index;
-		while (index < length && isIdentifierCharCode(source.charCodeAt(index))) index += 1;
-		const word = source.slice(start, index);
+		if (identifier.malformedEscape) {
+			unsupported ??= "malformed escaped identifier";
+			index = identifier.end;
+			continue;
+		}
+		const word = identifier.word;
+		index = identifier.end;
 		const preceded = lastSignificant;
 		recordWord(word, preceded);
-		const isMember = preceded?.kind === "punctuator"
-			&& (preceded.value === "." || preceded.value === "?.");
+		const isMember = preceded?.kind === "punctuator" && MEMBER_PUNCTUATORS[preceded.value] === true;
 		// Bun exposes bare `require` in ESM. Keep this check lexical and
 		// fail closed: proving a shadowed binding would require a full parser.
 		if (word === "require" && !isMember) {

@@ -378,6 +378,47 @@ describe("lean: extensions.load registry", () => {
 		}
 	});
 
+	test("rejects escaped bare require before extension evaluation", async () => {
+		const directory = await mkdtemp(join(PACKAGE_DIR, ".test-lean-escaped-require-"));
+		const escapedRequireEntry = join(directory, "escaped-require.mjs");
+		const malformedRequireEntry = join(directory, "malformed-require.mjs");
+		const holder = globalThis as Record<string, unknown>;
+		const link = new LeanLink({ cwd: directory, extensionPaths: [] });
+		try {
+			await Promise.all([
+				writeFile(
+					escapedRequireEntry,
+					'globalThis.__leanEscapedRequireEvaluated = true; \\u{72}equire("jiti"); export default { name: "escaped-require" };',
+				),
+				writeFile(
+					malformedRequireEntry,
+					'globalThis.__leanMalformedRequireEvaluated = true; \\uZZZZequire("jiti"); export default { name: "malformed-require" };',
+				),
+			]);
+			await link.hello(1);
+			link.request(2, "extensions.load", {
+				extensionPaths: [escapedRequireEntry, malformedRequireEntry],
+				cwd: directory,
+			});
+			const response = payload(await link.response(2, "extensions.load"));
+			const errors = new Map(
+				(response["errors"] as Array<{ path: string; error: string }>).map(
+					(error) => [error.path, error.error],
+				),
+			);
+			expect(response["extensions"]).toBe(0);
+			expect(errors.get(escapedRequireEntry)).toContain('excluded import "jiti"');
+			expect(errors.get(malformedRequireEntry)).toContain("unsupported malformed escaped identifier");
+			expect(holder["__leanEscapedRequireEvaluated"]).toBeUndefined();
+			expect(holder["__leanMalformedRequireEvaluated"]).toBeUndefined();
+		} finally {
+			delete holder["__leanEscapedRequireEvaluated"];
+			delete holder["__leanMalformedRequireEvaluated"];
+			await link.finish();
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
+
 	test("finds excluded imports through Bun extensionless and directory-index local paths", async () => {
 		const directory = await mkdtemp(join(PACKAGE_DIR, ".test-lean-extensionless-import-"));
 		const extensionlessEntry = join(directory, "extensionless.mjs");
@@ -1973,6 +2014,26 @@ describe("lean: surface validation units", () => {
 			['import "@earendil-works\\/pi-coding-agent";', "@earendil-works/pi-coding-agent"],
 			// A clean specifier with escapes stays undetected once decoded.
 			['const m = await import("./cl\\u0065an.ts");', undefined],
+		];
+		for (const [source, expected] of cases) {
+			expect(findExcludedImport(source)).toBe(expected);
+		}
+	});
+
+	test("findExcludedImport cooks escaped loader identifiers without mistaking lexical non-loads", () => {
+		const cases: Array<[source: string, expected: string | undefined]> = [
+			['\\u0072equire("jiti");', "jiti"],
+			['\\u{72}equire("jiti");', "jiti"],
+			['\\u0069mport("jiti");', "jiti"],
+			['import { x } \\u0066rom "jiti";', "jiti"],
+			['ordinaryRequire("jiti");', undefined],
+			['module.require("jiti");', undefined],
+			['module.\\u0072equire("jiti");', undefined],
+			['this.#\\u0072equire("jiti");', undefined],
+			['const π\\u0072equire = (value) => value; π\\u0072equire("jiti");', undefined],
+			['obj?.\\u006Ff / require("jiti") / divisor;', "jiti"],
+			['// \\u0072equire("jiti");', undefined],
+			['"\\u0072equire(\"jiti\")";', undefined],
 		];
 		for (const [source, expected] of cases) {
 			expect(findExcludedImport(source)).toBe(expected);
