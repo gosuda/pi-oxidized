@@ -117,6 +117,7 @@ jobs:
       # Bun's terminal spawn is POSIX-only. The Windows leg still runs every
       # non-PTY script test; Linux and macOS run PTY + interactive smoke tests.
       - name: JS checks and scripts tests
+        shell: bash
         run: |
           bun run check
           bun test scripts
