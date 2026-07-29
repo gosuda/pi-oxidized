@@ -452,14 +452,7 @@ impl ExtensionRuntimeSet {
 
     /// Remove each first-owned provider once.
     pub fn unregister_providers_from(&self, runtime: &ModelRuntime) {
-        let mut seen = HashSet::new();
-        for endpoint in self.endpoints().iter() {
-            for name in endpoint.runner.provider_configs().into_keys() {
-                if seen.insert(name.clone()) {
-                    runtime.unregister_provider(&name);
-                }
-            }
-        }
+        unregister_endpoint_providers(&self.endpoints(), runtime);
     }
 
     /// Aggregate registry with existing first-wins semantics.
@@ -855,7 +848,8 @@ impl ExtensionRuntimeSet {
     ///
     /// # Errors
     ///
-    /// Returns an error when the runtime is no longer reloadable or a replacement endpoint fails to start.
+    /// Returns an error when the runtime is no longer reloadable, a replacement endpoint fails to
+    /// start, or a replacement provider cannot be registered.
     pub async fn restart_and_rewire(
         &self,
         runtime: &ModelRuntime,
@@ -915,13 +909,23 @@ impl ExtensionRuntimeSet {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        unregister_generation_providers(&old, runtime);
+        let registrations = register_generation_providers(&next, runtime);
+        if let Some((path, Err(error))) = registrations
+            .iter()
+            .find(|(_path, outcome)| outcome.is_err())
+        {
+            unregister_generation_providers(&next, runtime);
+            let _ = register_generation_providers(&old, runtime);
+            stop_generation(&next).await;
+            return Err(HostStartError::Load(format!("{path}: {error}")));
+        }
+
         self.aggregate.dispose_all_slots();
         self.aggregate.clear_routes();
         for endpoint in old.endpoints.iter() {
             endpoint.runner.invalidate();
         }
-        self.unregister_providers_from(runtime);
-        let _ = register_generation_providers(&next, runtime);
 
         {
             let mut generation = self
@@ -1719,6 +1723,10 @@ fn register_generation_providers(
     register_endpoint_providers(&generation.endpoints, runtime)
 }
 
+fn unregister_generation_providers(generation: &Generation, runtime: &ModelRuntime) {
+    unregister_endpoint_providers(&generation.endpoints, runtime);
+}
+
 fn register_endpoint_providers(
     endpoints: &[Endpoint],
     runtime: &ModelRuntime,
@@ -1746,6 +1754,17 @@ fn register_endpoint_providers(
         }
     }
     results
+}
+
+fn unregister_endpoint_providers(endpoints: &[Endpoint], runtime: &ModelRuntime) {
+    let mut seen = HashSet::new();
+    for endpoint in endpoints {
+        for name in endpoint.runner.provider_configs().into_keys() {
+            if seen.insert(name.clone()) {
+                runtime.unregister_provider(&name);
+            }
+        }
+    }
 }
 
 async fn apply_flags_to_generation(
@@ -2089,6 +2108,38 @@ mod tests {
             "handlers": handlers,
             "terminalInput": handlers.contains(&"terminalInput"),
         })
+    }
+
+    #[cfg(unix)]
+    fn write_native_snapshot_host(directory: &std::path::Path, snapshot: Value) -> TestResult {
+        let executable = directory.join("replacement");
+        let hello = String::from_utf8(pi_ext::protocol::encode_frame(&Frame {
+            id: 1,
+            kind: FrameKind::Res,
+            method: "hello".to_owned(),
+            payload: serde_json::to_value(HelloAck::local())?,
+        })?)?;
+        let load = String::from_utf8(pi_ext::protocol::encode_frame(&Frame {
+            id: 2,
+            kind: FrameKind::Res,
+            method: "extensions.load".to_owned(),
+            payload: snapshot,
+        })?)?;
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\n\
+                 IFS= read -r request || exit 10\n\
+                 printf '%s' '{hello}'\n\
+                 IFS= read -r request || exit 11\n\
+                 printf '%s' '{load}'\n\
+                 while IFS= read -r request; do :; done\n"
+            ),
+        )?;
+        let mut permissions = std::fs::metadata(&executable)?.permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        std::fs::set_permissions(executable, permissions)?;
+        Ok(())
     }
 
     fn slot_frame(key: &str, text: &str) -> Frame {
@@ -2563,6 +2614,95 @@ mod tests {
         replacement_host
             .wait_for_response(protocol::SESSION_SET_MODEL_METHOD, 8)
             .await?;
+        set.shutdown_once().await;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_set_provider_registration_failure_keeps_old_generation_and_provider()
+    -> TestResult {
+        let old_provider = json!({
+            "name": "old-provider",
+            "baseUrl": "https://old.example/v1",
+            "api": "openai-completions",
+            "models": [{
+                "id": "old-model",
+                "name": "Old model",
+                "api": "openai-completions",
+                "baseUrl": "https://old.example/v1",
+                "reasoning": false
+            }]
+        });
+        let (runner, host) = make_runner(json!({
+            "providers": [old_provider],
+            "handlers": ["input"],
+            "terminalInput": false
+        }))
+        .await?;
+        let directory = tempfile::tempdir()?;
+        write_native_snapshot_host(
+            directory.path(),
+            json!({
+                "providers": [
+                    {
+                        "name": "replacement-provider",
+                        "baseUrl": "https://replacement.example/v1",
+                        "api": "openai-completions",
+                        "models": [{
+                            "id": "replacement-model",
+                            "name": "Replacement model",
+                            "api": "openai-completions",
+                            "baseUrl": "https://replacement.example/v1",
+                            "reasoning": false
+                        }]
+                    },
+                    {
+                        "name": "invalid-provider",
+                        "models": [{"id": "invalid-model", "reasoning": false}]
+                    }
+                ]
+            }),
+        )?;
+        std::fs::write(
+            directory.path().join("pi-extension.json"),
+            r#"{"runtime":"native","entry":"replacement"}"#,
+        )?;
+
+        let (generation, pending) = generation_from_endpoints(
+            1,
+            vec![Endpoint {
+                index: 0,
+                label: "<old>".to_owned(),
+                runner,
+            }],
+        );
+        let set = Arc::new(ExtensionRuntimeSet::from_generation(
+            generation,
+            vec![directory.path().to_string_lossy().into_owned()],
+            String::new(),
+            false,
+        ));
+        set.start_bridges(pending);
+        let runtime = ModelRuntime::create_in_memory().await?;
+        assert!(
+            set.register_providers_on(&runtime)
+                .into_iter()
+                .all(|(_path, result)| result.is_ok())
+        );
+
+        assert!(
+            set.restart_and_rewire(&runtime, HashMap::new())
+                .await
+                .is_err()
+        );
+        assert_eq!(set.reload_generation(), 1);
+        assert!(set.is_active());
+        assert!(runtime.get_model("old-provider", "old-model").is_some());
+        assert_eq!(runtime.get_registered_provider_ids(), ["old-provider"]);
+        let result = set.emit_input("original", None, "user", None).await?;
+        assert!(!result.handled);
+        host.wait_for_request("input").await?;
         set.shutdown_once().await;
         Ok(())
     }
