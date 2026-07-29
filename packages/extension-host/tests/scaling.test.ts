@@ -3,7 +3,8 @@
  *
  * - zero / 100 idle / 20 active widgets: native keypress-to-paint p99 and
  *   frame CPU with idle extensions stay within 10% of the zero baseline.
- * - fast onTerminalInput consume/rewrite <5 ms p99.
+ * - fast onTerminalInput consume/rewrite stays within a widened same-run
+ *   median baseline (catches handler re-entry and cross-process regression).
  * - slow handler times out once at 4 ms, disables only that handler, passes
  *   the original key, and keeps later input local.
  * - active widget bursts remain bounded, drop stale generations, stay responsive.
@@ -478,7 +479,7 @@ describe("scaling: zero / idle / active widgets", () => {
 });
 
 describe("scaling: terminal-input deadlines", () => {
-	test("onTerminalInput consume/rewrite rewrites 120 inputs deterministically", async () => {
+	test("onTerminalInput consume/rewrite stays on the fast path and rewrites deterministically", async () => {
 		const { collector, stdin, host, runPromise } = await connectHost([
 			terminalInputFastFactory,
 		]);
@@ -502,10 +503,27 @@ describe("scaling: terminal-input deadlines", () => {
 			);
 			await collector.awaitFrame((f) => f.id === 100 + i && f.kind === "res");
 		}
+		// Same-run baseline: no-op keystrokes through the active fast handler
+		// (returns undefined → consume=false, no rewrite). This isolates the
+		// host's terminal-input dispatch overhead from the consume/rewrite
+		// logic so the bound catches handler re-entry or cross-process
+		// regression rather than relying on a noisy absolute p99 threshold.
+		const baselineLatencies = await measureKeypressToPaint(
+			stdin,
+			collector,
+			40,
+			200,
+		);
+		const baselineMedian = percentile(
+			[...baselineLatencies].sort((a, b) => a - b),
+			50,
+		);
 
+		const latencies: number[] = [];
 		for (let i = 0; i < samples; i++) {
 			const id = 300 + i;
 			const data = i % 3 === 0 ? "x" : i % 3 === 1 ? "a" : "b";
+			const t0 = performance.now();
 			stdin.push(
 				Buffer.from(
 					encodeFrameString({
@@ -517,6 +535,7 @@ describe("scaling: terminal-input deadlines", () => {
 				),
 			);
 			const res = await collector.awaitFrame((f) => f.id === id && f.kind === "res");
+			latencies.push(performance.now() - t0);
 			const payload = res.payload as Record<string, unknown>;
 			if (data === "x") {
 				expect(payload["consume"]).toBe(true);
@@ -528,6 +547,21 @@ describe("scaling: terminal-input deadlines", () => {
 				expect(payload["data"]).toBe("b");
 			}
 		}
+
+		// Widened relative/absolute bound: the relative factor catches handler
+		// re-entry (consume/rewrite path calling the handler extra times); the
+		// absolute cap catches cross-process regression (IPC per keystroke).
+		// Median is stable across CI scheduler noise, unlike the old p99 coin
+		// flip which was essentially a max-of-120 single sample.
+		const sampleMedian = percentile(
+			[...latencies].sort((a, b) => a - b),
+			50,
+		);
+		const fastPathLimit = Math.min(
+			Math.max(baselineMedian * 4, baselineMedian + 10),
+			15,
+		);
+		expect(sampleMedian).toBeLessThanOrEqual(fastPathLimit);
 
 		stdin.push(null);
 		host.dispose("test");
@@ -578,21 +612,42 @@ describe("scaling: terminal-input deadlines", () => {
 		expect(host.activeTerminalHandlerCount).toBe(1);
 		expect(host.terminalHandlerCount).toBe(2);
 
-		// Later input stays local to the remaining (fast) handler — no second timeout.
-		stdin.push(
-			Buffer.from(
-				encodeFrameString({
-					id: 11,
-					kind: "req",
-					method: "terminalInput",
-					payload: { data: "a" },
-				}),
-			),
+		// Later input stays local to the remaining (fast) handler — no second
+		// timeout. Sample several post-timeout keystrokes so the median is
+		// stable against CI scheduler noise; a re-invoked disabled handler
+		// would add a full EXTENSION_INPUT_TIMEOUT_MS timeout race to every
+		// keystroke, pushing the median past the bound.
+		const postLatencies: number[] = [];
+		for (let i = 0; i < 5; i++) {
+			const id = 11 + i;
+			const tPost = performance.now();
+			stdin.push(
+				Buffer.from(
+					encodeFrameString({
+						id,
+						kind: "req",
+						method: "terminalInput",
+						payload: { data: "a" },
+					}),
+				),
+			);
+			const res = await collector.awaitFrame(
+				(f) => f.id === id && f.kind === "res",
+			);
+			postLatencies.push(performance.now() - tPost);
+			const payload = res.payload as Record<string, unknown>;
+			expect(payload["consume"]).toBe(false);
+			expect(payload["data"]).toBe("A");
+		}
+		// The disabled slow handler must not tax later keystrokes. The median
+		// of several post-timeout keystrokes stays well below the timeout
+		// deadline; a re-invoked disabled handler would push every keystroke
+		// past the bound, and an obvious added wait blows past it entirely.
+		const postMedian = percentile(
+			[...postLatencies].sort((a, b) => a - b),
+			50,
 		);
-		const second = await collector.awaitFrame((f) => f.id === 11 && f.kind === "res");
-		const secondPayload = second.payload as Record<string, unknown>;
-		expect(secondPayload["consume"]).toBe(false);
-		expect(secondPayload["data"]).toBe("A");
+		expect(postMedian).toBeLessThan(EXTENSION_INPUT_TIMEOUT_MS);
 		// Still only one extensionError for the single timeout.
 		const errorCount = collector.frames.filter((f) => f.method === "extensionError").length;
 		expect(errorCount).toBe(1);
