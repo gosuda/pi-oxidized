@@ -271,6 +271,84 @@ describe("ChildHost request write failure", () => {
 	}, 30_000);
 });
 
+describe("ChildHost async stdin EPIPE", () => {
+	test("owns the stdin error so the pending request rejects cleanly and the process stays alive", async () => {
+		const root = resolve(process.cwd(), "packages", "extension-host");
+		const tempDir = mkdtempSync(join(tmpdir(), "lean-scaling-stdin-epipe-"));
+		const scriptPath = join(tempDir, "stdin-epipe-host.mjs");
+		// A child that stays alive — the EPIPE is simulated on the parent side
+		// to deterministically exercise the async stdin error path without
+		// depending on OS pipe-buffer timing.
+		writeFileSync(scriptPath, ["setInterval(() => {}, 1_000);"].join("\n"), "utf8");
+
+		const unhandled: unknown[] = [];
+		const trackUnhandled = (err: unknown) => {
+			unhandled.push(err);
+		};
+		process.on("unhandledRejection", trackUnhandled);
+		const uncaught: unknown[] = [];
+		const trackUncaught = (err: unknown) => {
+			uncaught.push(err);
+		};
+		process.on("uncaughtException", trackUncaught);
+
+		const host = new ChildHost({
+			hostCwd: root,
+			hostEntry: scriptPath,
+			lean: false,
+			extensionPath: resolve(root, "tests", "fixtures", "lean", "echo.mjs"),
+		});
+
+		const child = Reflect.get(host, "child");
+		if (typeof child !== "object" || child === null) {
+			throw new Error("ChildHost child is unavailable");
+		}
+		const stdin = Reflect.get(child, "stdin");
+		if (typeof stdin !== "object" || stdin === null) {
+			throw new Error("ChildHost stdin is unavailable");
+		}
+		const originalWrite = Reflect.get(stdin, "write");
+		if (typeof originalWrite !== "function") {
+			throw new Error("ChildHost stdin.write is unavailable");
+		}
+
+		const pendingWaiters = (): unknown[] => {
+			const waiters = Reflect.get(host, "waiters");
+			if (!Array.isArray(waiters)) throw new Error("ChildHost waiters are unavailable");
+			return waiters;
+		};
+
+		// Replace stdin.write to surface an async EPIPE — exactly what the OS
+		// does when a child closes its read end mid-write: the sync write call
+		// returns, and the error fires as a later 'error' event on the stream.
+		// Without the stdin error listener this rethrows as an uncaught
+		// exception and kills the benchmark process.
+		Reflect.set(stdin, "write", () => {
+			setImmediate(() => {
+				stdin.emit("error", Object.assign(new Error("write EPIPE"), { code: "EPIPE" }));
+			});
+			return true;
+		});
+
+		try {
+			await expect(host.request("hello", {}, 60_000)).rejects.toThrow(
+				/host child stdin write failed: write EPIPE/,
+			);
+			expect(pendingWaiters()).toHaveLength(0);
+			// Let the event loop drain so any stray async errors surface.
+			await new Promise<void>((resolveImmediate) => setImmediate(resolveImmediate));
+			expect(unhandled).toEqual([]);
+			expect(uncaught).toEqual([]);
+		} finally {
+			Reflect.set(stdin, "write", originalWrite);
+			process.off("unhandledRejection", trackUnhandled);
+			process.off("uncaughtException", trackUncaught);
+			await host.close();
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	}, 30_000);
+});
+
 describe("ChildHost malformed stdout", () => {
 	test("rejects every pending waiter promptly on malformed NDJSON", async () => {
 		const root = resolve(process.cwd(), "packages", "extension-host");

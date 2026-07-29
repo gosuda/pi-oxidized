@@ -171,6 +171,8 @@ export class ChildHost {
 	private resolveExit: (() => void) | undefined;
 	private fatalError: Error | undefined;
 	private pumping = true;
+	/** True once we intentionally end stdin or SIGKILL the child; marks in-flight write errors as expected. */
+	private tearingDown = false;
 	private readonly maxRetainedFrames: number;
 
 	constructor(spec: HostSpec) {
@@ -187,6 +189,17 @@ export class ChildHost {
 			stdio: ["pipe", "pipe", "pipe"],
 		});
 		this.child.stdout.on("data", (chunk: Buffer) => this.onData(chunk));
+		// A killed/wedged child turns in-flight writes into async EPIPE/close
+		// events on stdin. Without a listener the stream rethrows and kills the
+		// harness; own them explicitly: expected races (after teardown/exit) are
+		// dropped, a live-child write failure is routed through failAll so the
+		// pending request rejects cleanly instead of crashing the process.
+		this.child.stdin.on("error", (err: NodeJS.ErrnoException) => {
+			if (this.tearingDown || this.exited || this.fatalError !== undefined) return;
+			this.failAll(
+				new Error(`host child stdin write failed: ${err.message}`),
+			);
+		});
 		this.child.stderr.on("data", (chunk: Buffer) => {
 			this.stderrTail = (this.stderrTail + chunk.toString()).slice(-4096);
 		});
@@ -271,6 +284,7 @@ export class ChildHost {
 
 	/** Best-effort SIGKILL so a hostile/wedged child cannot keep feeding stdout. */
 	private reapChild(): void {
+		this.tearingDown = true;
 		if (this.exited) return;
 		try {
 			this.child.kill("SIGKILL");
@@ -373,6 +387,7 @@ export class ChildHost {
 	/** End stdin, then reap: graceful exit first, SIGKILL after the grace window. */
 	async close(graceMs = 2_000): Promise<void> {
 		if (!this.exited) {
+			this.tearingDown = true;
 			try {
 				this.child.stdin.end();
 			} catch {
@@ -402,6 +417,7 @@ export class ChildHost {
 		}
 		this.child.stdout.removeAllListeners();
 		this.child.stderr.removeAllListeners();
+		this.child.stdin.removeAllListeners();
 		this.failAll(new Error("host child closed"));
 	}
 }
