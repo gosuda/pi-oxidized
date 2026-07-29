@@ -207,10 +207,27 @@ pub(super) fn extension_source_infos(
         .collect()
 }
 
+/// Remove transcript messages explicitly excluded from provider context.
+///
+/// The flag is product metadata on custom transcript messages, not a
+/// role-specific behavior: every custom role that sets `excludeFromContext`
+/// must be absent from provider context and context-token estimates.
+pub(super) fn retain_context_visible_messages(messages: &mut Vec<AgentMessage>) {
+    messages.retain(|message| {
+        !matches!(
+            message,
+            AgentMessage::Custom(custom)
+                if custom.payload.get("excludeFromContext")
+                    == Some(&serde_json::Value::Bool(true))
+        )
+    });
+}
+
 /// Build the product-owned context converter for every constructed session.
 fn product_convert_to_llm_hook() -> pi_agent::ConvertToLlm {
-    Arc::new(|messages| {
+    Arc::new(|mut messages| {
         Box::pin(async move {
+            retain_context_visible_messages(&mut messages);
             crate::core::messages::convert_to_llm(&messages)
                 .map_err(|error| pi_agent::AgentLoopError::message(error.to_string()))
         })
@@ -1950,7 +1967,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn product_converter_keeps_visible_bash_and_excludes_hidden_bash()
+    async fn excluded_bash_result_remains_in_transcript_and_session_history()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let provider = Arc::new(MockProvider(Vec::new()));
+        let session = AgentSession::new(AgentSessionConfig::test_config(provider, test_model())?)?;
+        session
+            .record_bash_result(
+                "printf hidden",
+                super::bash::BashResult {
+                    output: "hidden".to_owned(),
+                    exit_code: Some(0),
+                    cancelled: false,
+                    truncated: false,
+                    full_output_path: None,
+                },
+                &super::bash::ExecuteBashOptions {
+                    exclude_from_context: true,
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        let messages = session.messages();
+        assert_eq!(messages.len(), 1);
+        let AgentMessage::Custom(message) = &messages[0] else {
+            return Err("expected persisted bash custom message".into());
+        };
+        assert_eq!(message.role, "bashExecution");
+        assert_eq!(
+            message.payload.get("excludeFromContext"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert_eq!(session.session_manager.lock().await.get_entries().len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn product_converter_keeps_visible_messages_and_excludes_hidden_custom_messages()
     -> Result<(), Box<dyn std::error::Error>> {
         let contexts = Arc::new(Mutex::new(Vec::new()));
         let provider = Arc::new(ContextRecordingProvider {
@@ -1983,6 +2036,13 @@ mod tests {
         config.messages = vec![
             bash_message("echo visible", "visible", false),
             bash_message("echo hidden", "hidden", true),
+            AgentMessage::Custom(pi_agent::CustomAgentMessage::new(
+                "custom",
+                serde_json::Map::from_iter([(
+                    "excludeFromContext".to_owned(),
+                    serde_json::Value::Bool(true),
+                )]),
+            )),
         ];
         let session = AgentSession::new(config)?;
 

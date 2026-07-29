@@ -529,7 +529,9 @@ impl AgentSession {
         self.agent.replace_messages(new_messages);
 
         // Estimate post-compaction tokens.
-        let estimated_after = compaction::estimate_context_tokens(&self.agent.transcript()).tokens;
+        let mut messages = self.agent.transcript();
+        super::retain_context_visible_messages(&mut messages);
+        let estimated_after = compaction::estimate_context_tokens(&messages).tokens;
         result.estimated_tokens_after = Some(estimated_after);
 
         // Extension session_compact after-event (best-effort via CompactionEnd).
@@ -731,7 +733,8 @@ impl AgentSession {
         }
 
         // Estimate from the transcript.
-        let messages = self.agent.transcript();
+        let mut messages = self.agent.transcript();
+        super::retain_context_visible_messages(&mut messages);
         let estimate = compaction::estimate_context_tokens(&messages);
         if estimate.last_usage_index.is_none() {
             return 0;
@@ -1246,6 +1249,54 @@ mod tests {
             thinking_level_str(ModelThinkingLevel::High),
             Some("high".to_owned())
         );
+    }
+
+    #[tokio::test]
+    async fn threshold_estimate_ignores_excluded_bash_results() -> TestResult {
+        let anchor_usage = Usage {
+            input: 100,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0,
+            cache_write1h: None,
+            reasoning: None,
+            total_tokens: 100,
+            cost: UsageCost::default(),
+        };
+        let bash_result = |exclude_from_context| {
+            let mut payload = Map::from_iter([
+                ("command".to_owned(), Value::String(String::new())),
+                ("output".to_owned(), Value::String("x".repeat(400))),
+            ]);
+            if exclude_from_context {
+                payload.insert("excludeFromContext".to_owned(), Value::Bool(true));
+            }
+            pi_agent::AgentMessage::Custom(pi_agent::CustomAgentMessage::new(
+                "bashExecution",
+                payload,
+            ))
+        };
+        let excluded = make_session(
+            8_192,
+            summary_stream_fn("summary"),
+            vec![
+                assistant_with_usage("anchor", anchor_usage.clone(), StopReason::Stop),
+                bash_result(true),
+            ],
+        )?;
+        let included = make_session(
+            8_192,
+            summary_stream_fn("summary"),
+            vec![
+                assistant_with_usage("anchor", anchor_usage, StopReason::Stop),
+                bash_result(false),
+            ],
+        )?;
+        let overflow = assistant_overflow_message();
+
+        assert_eq!(excluded.threshold_context_tokens(&overflow, None), 100);
+        assert_eq!(included.threshold_context_tokens(&overflow, None), 200);
+        Ok(())
     }
 
     // -- integration tests for compaction flow ----------------------------
