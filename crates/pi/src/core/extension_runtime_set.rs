@@ -103,6 +103,16 @@ impl Generation {
         }
         self.endpoints.get(id.position)
     }
+    fn has_one_active_compat_endpoint(&self) -> bool {
+        let mut active = self
+            .endpoints
+            .iter()
+            .filter(|endpoint| endpoint.runner.is_active());
+        matches!(active.next(), Some(endpoint) if endpoint.kind == EndpointKind::TsCompat && active.next().is_none())
+    }
+    fn is_single_compat_replacement(&self) -> bool {
+        self.endpoints.len() == 1 && self.endpoints[0].kind == EndpointKind::TsCompat
+    }
 }
 
 struct GenerationLease {
@@ -196,18 +206,7 @@ impl PublishedRuntimeState {
     }
 
     fn reloadable(&self) -> bool {
-        if self.stale || self.shutdown_done {
-            return false;
-        }
-        let mut active = self
-            .generation
-            .endpoints
-            .iter()
-            .filter(|endpoint| endpoint.runner.is_active());
-        matches!(
-            active.next(),
-            Some(endpoint) if endpoint.kind == EndpointKind::TsCompat && active.next().is_none()
-        )
+        !self.stale && !self.shutdown_done && self.generation.has_one_active_compat_endpoint()
     }
 
     fn allocate_route(&mut self, endpoint: EndpointId, local: FrameId) -> Option<FrameId> {
@@ -484,6 +483,7 @@ impl ExtensionRuntimeSet {
         let _ = self.try_cutover(next, pending).await;
     }
 
+    #[cfg(test)]
     async fn try_cutover(
         &self,
         next: Generation,
@@ -987,13 +987,12 @@ impl ExtensionRuntimeSet {
                 first.path, first.message
             )));
         }
-        if next.endpoints.len() > 1 {
+        if !next.is_single_compat_replacement() {
             stop_generation(&next).await;
             return Err(HostStartError::Load(
                 "extension runtime is not reloadable".to_owned(),
             ));
         }
-
         let flags = match encode_flags(preserved_flags) {
             Ok(flags) => flags,
             Err(error) => {
@@ -1005,33 +1004,45 @@ impl ExtensionRuntimeSet {
             stop_generation(&next).await;
             return Err(HostStartError::FlagSync(error.to_string()));
         }
-
         if let Err((path, error)) = validate_generation_providers(&next) {
             stop_generation(&next).await;
             return Err(HostStartError::Load(format!("{path}: {error}")));
         }
-
-        let old = Arc::clone(&self.state().generation);
-        unregister_endpoint_providers(&old.endpoints, runtime);
-        let registrations = register_endpoint_providers(&next.endpoints, runtime);
-        if let Some((path, Err(error))) = registrations
-            .iter()
-            .find(|(_path, outcome)| outcome.is_err())
-        {
-            unregister_endpoint_providers(&next.endpoints, runtime);
-            let _ = register_endpoint_providers(&old.endpoints, runtime);
-            stop_generation(&next).await;
-            return Err(HostStartError::Load(format!("{path}: {error}")));
+        let next = Arc::new(next);
+        let old = {
+            let mut state = self.state();
+            if state.reloadable() {
+                let old = Arc::clone(&state.generation);
+                unregister_endpoint_providers(&old.endpoints, runtime);
+                let registrations = register_endpoint_providers(&next.endpoints, runtime);
+                if let Some((path, Err(error))) = registrations
+                    .iter()
+                    .find(|(_path, outcome)| outcome.is_err())
+                {
+                    unregister_endpoint_providers(&next.endpoints, runtime);
+                    let _ = register_endpoint_providers(&old.endpoints, runtime);
+                    Err(format!("{path}: {error}"))
+                } else {
+                    Ok(state.replace_generation(Arc::clone(&next), &pending, &self.channels))
+                }
+            } else {
+                Err("extension runtime was invalidated during reload".to_owned())
+            }
+        };
+        let old = match old {
+            Ok(old) => old,
+            Err(message) => {
+                stop_generation(&next).await;
+                return Err(HostStartError::Load(message));
+            }
+        };
+        self.start_bridges(&next, pending);
+        drain_leases(&old).await;
+        for endpoint in old.endpoints.iter() {
+            endpoint.runner.invalidate();
         }
-
-        if let Err(next) = self.try_cutover(next, pending).await {
-            unregister_endpoint_providers(&next.endpoints, runtime);
-            let _ = register_endpoint_providers(&old.endpoints, runtime);
-            stop_generation(&next).await;
-            return Err(HostStartError::Load(
-                "extension runtime was invalidated during reload".to_owned(),
-            ));
-        }
+        abort_bridges(&old);
+        stop_generation(&old).await;
         Ok(())
     }
 
@@ -3112,7 +3123,7 @@ pub(crate) mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn prepared_multi_endpoint_replacement_is_reaped_without_publication() -> TestResult {
+    async fn native_manifest_builds_multi_endpoint_replacement_without_publication() -> TestResult {
         let (old, old_host) = make_runner(snapshot(&["input"])).await?;
         let directory = tempfile::tempdir()?;
         write_native_snapshot_host(directory.path(), snapshot(&[]))?;
@@ -3306,26 +3317,86 @@ pub(crate) mod tests {
         Ok(())
     }
     #[tokio::test]
-    async fn compat_only_reload_rejects_lone_native_endpoint() -> TestResult {
+    async fn current_reload_admission_covers_every_active_endpoint_class() -> TestResult {
         let (compat, _compat_host) = make_runner(snapshot(&["input"])).await?;
         let compat_set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, compat)]);
         assert!(compat_set.can_reload());
-
+        let (stale_compat, _stale_compat_host) = make_runner(snapshot(&["input"])).await?;
+        let stale_set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, stale_compat)]);
+        stale_set.invalidate();
+        assert!(!stale_set.can_reload());
+        let (inactive_compat, _inactive_compat_host) = make_runner(snapshot(&["input"])).await?;
+        inactive_compat.invalidate();
+        let inactive_set =
+            ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, inactive_compat)]);
+        assert!(!inactive_set.can_reload());
         let (native, _native_host) = make_runner(snapshot(&["input"])).await?;
         let native_set = ExtensionRuntimeSet::bind(vec![(EndpointKind::Native, native)]);
         assert!(!native_set.can_reload());
-
-        let (mixed_compat, _mixed_compat_host) = make_runner(snapshot(&["input"])).await?;
-        let (mixed_native, _mixed_native_host) = make_runner(snapshot(&["input"])).await?;
-        let mixed_set = ExtensionRuntimeSet::bind(vec![
-            (EndpointKind::TsCompat, mixed_compat),
-            (EndpointKind::Native, mixed_native),
+        let (first, _first_host) = make_runner(snapshot(&["input"])).await?;
+        let (second, _second_host) = make_runner(snapshot(&["input"])).await?;
+        let multi_set = ExtensionRuntimeSet::bind(vec![
+            (EndpointKind::TsCompat, first),
+            (EndpointKind::Native, second),
         ]);
-        assert!(!mixed_set.can_reload());
-
-        compat_set.shutdown_once().await;
+        assert!(!multi_set.can_reload());
+        let (active_compat, _active_compat_host) = make_runner(snapshot(&["input"])).await?;
+        let (inactive_native, _inactive_native_host) = make_runner(snapshot(&["input"])).await?;
+        inactive_native.invalidate();
+        let compat_with_inactive_sibling = ExtensionRuntimeSet::bind(vec![
+            (EndpointKind::TsCompat, active_compat),
+            (EndpointKind::Native, inactive_native),
+        ]);
+        assert!(compat_with_inactive_sibling.can_reload());
+        {
+            let runtime = ModelRuntime::create_in_memory().await?;
+            let provider_epoch = runtime.provider_mutation_epoch();
+            for set in [&stale_set, &inactive_set, &native_set, &multi_set] {
+                assert!(
+                    set.restart_and_rewire(&runtime, HashMap::new())
+                        .await
+                        .is_err()
+                );
+                assert_eq!(set.reload_generation(), 1);
+                assert_eq!(runtime.provider_mutation_epoch(), provider_epoch);
+            }
+            compat_set.shutdown_once().await;
+        }
+        stale_set.shutdown_once().await;
+        inactive_set.shutdown_once().await;
         native_set.shutdown_once().await;
-        mixed_set.shutdown_once().await;
+        multi_set.shutdown_once().await;
+        compat_with_inactive_sibling.shutdown_once().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prepared_reload_admission_requires_one_compat_endpoint() -> TestResult {
+        let (compat, _compat_host) = make_runner(snapshot(&[])).await?;
+        let (compat_generation, _) = generation_from_endpoints(
+            2,
+            vec![(EndpointKind::TsCompat, "<compat>".to_owned(), compat)],
+        );
+        assert!(compat_generation.is_single_compat_replacement());
+        stop_generation(&compat_generation).await;
+        let (native, _native_host) = make_runner(snapshot(&[])).await?;
+        let (native_generation, _) = generation_from_endpoints(
+            2,
+            vec![(EndpointKind::Native, "<native>".to_owned(), native)],
+        );
+        assert!(!native_generation.is_single_compat_replacement());
+        stop_generation(&native_generation).await;
+        let (first, _first_host) = make_runner(snapshot(&[])).await?;
+        let (second, _second_host) = make_runner(snapshot(&[])).await?;
+        let (multi_generation, _) = generation_from_endpoints(
+            2,
+            vec![
+                (EndpointKind::TsCompat, "<compat>".to_owned(), first),
+                (EndpointKind::Native, "<native>".to_owned(), second),
+            ],
+        );
+        assert!(!multi_generation.is_single_compat_replacement());
+        stop_generation(&multi_generation).await;
         Ok(())
     }
 }
