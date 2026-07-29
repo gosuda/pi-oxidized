@@ -2077,7 +2077,7 @@ mod tests {
     /// Build a test runtime, optionally binding a host extension runner.
     /// Propagates typed construction errors instead of panicking.
     fn build_test_runtime(
-        runner: Option<Arc<crate::core::extension_host::HostExtensionRunner>>,
+        runner: Option<Arc<crate::core::extension_runtime_set::ExtensionRuntimeSet>>,
     ) -> Result<Arc<AgentSessionRuntime>, String> {
         let cwd = std::env::current_dir().map_err(|e| format!("current_dir: {e}"))?;
         let mut config = crate::core::agent_session::AgentSessionConfig::test_config(
@@ -2208,6 +2208,10 @@ mod tests {
         let runner = crate::core::extension_host::HostExtensionRunner::connect(client, vec![])
             .await
             .map_err(|e| format!("HostExtensionRunner::connect: {e}"))?;
+        let runner = crate::core::extension_runtime_set::ExtensionRuntimeSet::bind(vec![(
+            crate::core::extension_runtime_set::EndpointKind::TsCompat,
+            runner,
+        )]);
 
         let runtime_with_runner = build_test_runtime(Some(runner))?;
         let flags = collect_extension_flags(&runtime_with_runner);

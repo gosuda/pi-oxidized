@@ -118,7 +118,7 @@ pub struct AgentSessionConfig {
     /// Extension runner (defaults to [`NullExtensionRunner`]).
     pub extension_runner: Option<Arc<dyn ExtensionRunner>>,
     /// Concrete host runner retained for reload/restart (no trait downcast).
-    pub host_extension_runner: Option<Arc<crate::core::extension_host::HostExtensionRunner>>,
+    pub host_extension_runner: Option<Arc<crate::core::extension_runtime_set::ExtensionRuntimeSet>>,
     /// Typed model/auth runtime used by model selection and compaction.
     pub model_runtime: Option<Arc<ModelRuntime>>,
     /// Optional compaction stream override for tests and headless integrations.
@@ -395,7 +395,7 @@ pub struct AgentSession {
     pub(super) inner: Mutex<AgentSessionInner>,
     /// Concrete host runner for reload (optional; no trait downcast).
     pub(super) host_extension_runner:
-        std::sync::RwLock<Option<Arc<crate::core::extension_host::HostExtensionRunner>>>,
+        std::sync::RwLock<Option<Arc<crate::core::extension_runtime_set::ExtensionRuntimeSet>>>,
     /// Typed model runtime shared across product-owned session boundaries.
     pub(super) model_runtime: Option<Arc<ModelRuntime>>,
     /// Optional compaction-only stream override.

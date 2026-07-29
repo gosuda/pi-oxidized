@@ -65,7 +65,8 @@ use crate::core::agent_session::events::AgentSessionEvent;
 use crate::core::agent_session::extension_runner::ExtensionRunner;
 use crate::core::agent_session::prompt::{PromptOptions, StreamingBehavior};
 use crate::core::agent_session_runtime::{ForkOutcome, SwitchOutcome};
-use crate::core::extension_host::{ExtensionUiEvent, HostExtensionRunner};
+use crate::core::extension_host::ExtensionUiEvent;
+use crate::core::extension_runtime_set::ExtensionRuntimeSet;
 use crate::core::platform::external_editor::{EditOutcome, edit_text_in_external_editor};
 use pi_ext::client::{HostUiRequest, HostUiResponse};
 use pi_ext::protocol::{
@@ -328,7 +329,7 @@ pub trait SessionHost: Send + Sync + 'static {
     fn messages(&self) -> Vec<pi_agent::AgentMessage>;
 
     /// Concrete extension host for interactive UI bridging, when enabled.
-    fn host_extension_runner(&self) -> Option<Arc<HostExtensionRunner>> {
+    fn host_extension_runner(&self) -> Option<Arc<ExtensionRuntimeSet>> {
         None
     }
 
@@ -1035,7 +1036,7 @@ pub struct InteractiveRuntime<W: Write, S: SessionHost> {
     /// while rapid highlight changes coalesce into one update.
     theme_push_pending: bool,
     pending_ui_reinject: Vec<UiEvent>,
-    extension_runner: Option<Arc<HostExtensionRunner>>,
+    extension_runner: Option<Arc<ExtensionRuntimeSet>>,
     extension_events: Option<tokio::sync::broadcast::Receiver<ExtensionUiEvent>>,
     extension_requests: Option<mpsc::Receiver<HostUiRequest>>,
     extension_slots: std::collections::HashMap<String, ProjectedExtensionSlot>,
@@ -3658,10 +3659,13 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             .extension_runner
             .as_ref()
             .map(|runner| runner.subscribe_ui());
-        self.extension_requests = self
-            .extension_runner
-            .as_ref()
-            .and_then(|runner| runner.take_ui_requests());
+        if let Some(runner) = &self.extension_runner {
+            if let Some(requests) = runner.take_ui_requests() {
+                self.extension_requests = Some(requests);
+            }
+        } else {
+            self.extension_requests = None;
+        }
         self.pending_extension_dialog = None;
         self.extension_slots.clear();
         self.focused_extension_slot = None;
@@ -5100,7 +5104,7 @@ impl SessionHost for AgentSessionHost {
         self.read_session().messages()
     }
 
-    fn host_extension_runner(&self) -> Option<Arc<HostExtensionRunner>> {
+    fn host_extension_runner(&self) -> Option<Arc<ExtensionRuntimeSet>> {
         self.read_session().host_extension_runner()
     }
 

@@ -9,6 +9,8 @@ pub mod config_value;
 pub mod experimental;
 pub mod export_html;
 pub mod extension_host;
+pub(crate) mod extension_manifest;
+pub mod extension_runtime_set;
 pub mod keybindings;
 pub mod lockfile;
 pub mod messages;

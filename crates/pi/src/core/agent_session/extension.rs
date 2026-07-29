@@ -11,9 +11,9 @@
 //! - emitting the stored `session_start` event exactly once per session
 //!   instance on the first `bind_extensions` call (under `bind_lock`)
 //! - extension-driven resource discovery (skills/prompts/themes)
-//! - reload (emits `session_shutdown{reload}` on the old host, preserves flag
-//!   values, restarts the host, re-emits `session_start{reload}` on the new
-//!   host, then re-discovers resources)
+//! - reload (emits `session_shutdown{reload}`, preserves flag values, swaps the
+//!   runtime facade's generation, re-emits `session_start{reload}`, then
+//!   re-discovers resources)
 //! - the replaced-session context handed to `withSession` after runtime swap
 //! - extension error isolation (host errors never abort the session)
 //!
@@ -22,7 +22,8 @@
 //! `emit` self-gates on handler presence, so the gate would only suppress
 //! correct emissions.
 
-use crate::core::extension_host::{HostExtensionRunner, SessionBridgeEvent};
+use crate::core::extension_host::SessionBridgeEvent;
+use crate::core::extension_runtime_set::ExtensionRuntimeSet;
 use crate::core::messages::CustomMessageContent;
 use crate::core::resources::{
     ResourceLoader, SlashCommandInfo, SlashCommandSource, SyntheticSourceInfoOptions,
@@ -321,10 +322,10 @@ impl AgentSession {
     /// 1. Capture previous flag values (preserved across the swap).
     /// 2. Emit `session_shutdown{reload}` on the old runner (self-gated on
     ///    handler presence; host errors isolated).
-    /// 3. When a concrete host is present: sequential restart-and-rewire
-    ///    (await old transport reap exactly once, re-register providers,
-    ///    restore flags, swap runner, refresh tools).
-    /// 4. Emit `session_start{reload}` on the post-swap runner.
+    /// 3. When a concrete runtime set is present: build and publish a complete
+    ///    replacement generation, re-register providers, restore flags, and
+    ///    refresh tools without replacing the stable facade.
+    /// 4. Emit `session_start{reload}` on the replacement generation.
     /// 5. Reload base resources and re-discover extension resources.
     ///
     /// # Errors
@@ -357,22 +358,14 @@ impl AgentSession {
                     .await?;
                 return Ok(());
             };
-            let new_host = host
-                .restart_and_rewire(&runtime, previous_flag_values)
+            host.restart_and_rewire(&runtime, previous_flag_values)
                 .await
                 .map_err(|error| ExtensionBindError::HostRestart(error.to_string()))?;
-            // Swap trait runner + concrete host handle without downcast.
-            self.hooks.set_runner(
-                Arc::clone(&new_host) as Arc<dyn super::extension_runner::ExtensionRunner>
-            );
-            self.set_host_extension_runner(Some(new_host));
-            // Refresh tools so newly registered extension tools replace the old set.
+            // Refresh tools after the facade atomically publishes its replacement generation.
             self.refresh_tool_registry(&super::tools::RefreshToolRegistryOptions {
                 active_tool_names: None,
                 include_all_extension_tools: true,
             });
-            // Re-claim the fresh host's session-action bridge.
-            self.bind_session_bridge().await;
             self.emit_session_start_reload().await;
             self.extend_resources_from_extensions(SessionStartReason::Reload.as_str())
                 .await?;
@@ -512,9 +505,7 @@ impl AgentSession {
 
     /// Concrete host runner handle (no trait downcast).
     #[must_use]
-    pub fn host_extension_runner(
-        &self,
-    ) -> Option<Arc<crate::core::extension_host::HostExtensionRunner>> {
+    pub fn host_extension_runner(&self) -> Option<Arc<ExtensionRuntimeSet>> {
         self.host_extension_runner
             .read()
             .ok()
@@ -522,10 +513,7 @@ impl AgentSession {
     }
 
     /// Replace the concrete host runner handle (reload path).
-    pub fn set_host_extension_runner(
-        &self,
-        runner: Option<Arc<crate::core::extension_host::HostExtensionRunner>>,
-    ) {
+    pub fn set_host_extension_runner(&self, runner: Option<Arc<ExtensionRuntimeSet>>) {
         if let Ok(mut guard) = self.host_extension_runner.write() {
             *guard = runner;
         }
@@ -654,7 +642,7 @@ impl AgentSession {
     /// [`AgentSession::report_extension_error`]; nothing aborts the session.
     async fn apply_session_bridge_event(
         self: &Arc<Self>,
-        host: &Arc<HostExtensionRunner>,
+        host: &Arc<ExtensionRuntimeSet>,
         event: SessionBridgeEvent,
     ) {
         match event {

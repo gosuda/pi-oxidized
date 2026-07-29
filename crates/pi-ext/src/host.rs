@@ -39,6 +39,8 @@ pub enum HostSource {
     Env(PathBuf),
     /// Discovered beside the running binary.
     InstalledAsset(PathBuf),
+    /// Selected by an extension manifest.
+    NativeExtension(PathBuf),
 }
 
 /// A resolved, spawn-ready host program.

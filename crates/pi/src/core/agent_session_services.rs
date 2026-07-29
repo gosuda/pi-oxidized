@@ -15,7 +15,7 @@ use pi_ext::protocol::FlagValueWire;
 use thiserror::Error;
 
 use super::config::{get_agent_dir, get_docs_path, resolve_path};
-use super::extension_host::HostExtensionRunner;
+use super::extension_runtime_set::ExtensionRuntimeSet;
 use super::model_runtime::{
     CreateModelRuntimeOptions, ModelRuntime, ModelRuntimeError, ProviderConfigInput,
 };
@@ -266,7 +266,7 @@ pub struct AgentSessionServices {
     ///
     /// `None` when no extension paths were discovered, discovery was disabled,
     /// or host start failed (degraded to diagnostics only).
-    pub extension_runner: Option<Arc<HostExtensionRunner>>,
+    pub extension_runner: Option<Arc<ExtensionRuntimeSet>>,
 }
 
 impl AgentSessionServices {
@@ -371,7 +371,7 @@ pub struct CreateAgentSessionResult {
     /// Session-start metadata forwarded from the creation options.
     pub session_start_event: Option<crate::core::agent_session::SessionStartEvent>,
     /// Concrete host runner moved out of services (if any).
-    pub extension_runner: Option<Arc<HostExtensionRunner>>,
+    pub extension_runner: Option<Arc<ExtensionRuntimeSet>>,
 }
 
 /// Failures from services / session factory operations.
@@ -652,7 +652,7 @@ async fn start_extension_phase(
     project_trusted: bool,
     diagnostics: &mut Vec<AgentSessionRuntimeDiagnostic>,
 ) -> (
-    Option<Arc<HostExtensionRunner>>,
+    Option<Arc<ExtensionRuntimeSet>>,
     BTreeMap<String, ExtensionFlagType>,
 ) {
     if discovery.disables(ResourceDiscoveryPolicy::EXTENSIONS) {
@@ -673,40 +673,31 @@ async fn start_extension_phase(
     if paths.is_empty() {
         return (None, BTreeMap::new());
     }
-    match HostExtensionRunner::start_with_cwd_and_trust(
-        paths,
-        cwd.to_string_lossy().into_owned(),
-        project_trusted,
-    )
-    .await
-    {
-        Ok(runner) => {
-            for (path, message) in runner.load_errors() {
-                diagnostics.push(AgentSessionRuntimeDiagnostic::error(format!(
-                    "Extension \"{path}\" error: {message}"
-                )));
-            }
-            for (path, outcome) in runner.register_providers_on(model_runtime) {
-                if let Err(error) = outcome {
-                    diagnostics.push(AgentSessionRuntimeDiagnostic::error(format!(
-                        "Extension \"{path}\" error: {error}"
-                    )));
-                }
-            }
-            let flags = runner.registered_flag_types();
-            (Some(runner), flags)
-        }
-        Err(error) => {
+    let started =
+        ExtensionRuntimeSet::start(paths, cwd.to_string_lossy().into_owned(), project_trusted)
+            .await;
+    for diagnostic in started.diagnostics {
+        diagnostics.push(AgentSessionRuntimeDiagnostic::error(format!(
+            "Extension \"{}\" error: {}",
+            diagnostic.path, diagnostic.message
+        )));
+    }
+    let Some(runner) = started.set else {
+        return (None, BTreeMap::new());
+    };
+    for (path, outcome) in runner.register_providers_on(model_runtime) {
+        if let Err(error) = outcome {
             diagnostics.push(AgentSessionRuntimeDiagnostic::error(format!(
-                "Extension host failed to start: {error}"
+                "Extension \"{path}\" error: {error}"
             )));
-            (None, BTreeMap::new())
         }
     }
+    let flags = runner.registered_flag_types();
+    (Some(runner), flags)
 }
 
 async fn apply_flags_to_runner(
-    runner: &HostExtensionRunner,
+    runner: &ExtensionRuntimeSet,
     applied_flags: &BTreeMap<String, ExtensionFlagValue>,
 ) -> Result<(), pi_ext::client::HostClientError> {
     let values = applied_flags

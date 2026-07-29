@@ -1911,7 +1911,7 @@ async fn forward_session_bridge(inner: &Arc<Inner>, event: SessionBridgeEvent) {
     }
 }
 
-fn default_ui_response(request: &HostUiRequest) -> HostUiResponse {
+pub(crate) fn default_ui_response(request: &HostUiRequest) -> HostUiResponse {
     match request {
         HostUiRequest::Select { id, .. } => HostUiResponse::Select {
             id: *id,
