@@ -2501,6 +2501,11 @@ async fn runtime_set_preserves_first_owned_registry_and_hook_fold_order() -> R {
 async fn runtime_set_correlated_routes_return_to_same_id_on_each_origin() -> R {
     use crate::core::extension_host::SessionBridgeEvent;
 
+    const FIRST_LOCAL: u64 = 7;
+    const FIRST_MODEL: &str = "model-alpha";
+    const SECOND_LOCAL: u64 = 9;
+    const SECOND_MODEL: &str = "model-beta";
+
     let snapshot = json!({
         "tools": [],
         "commands": [],
@@ -2517,30 +2522,52 @@ async fn runtime_set_correlated_routes_return_to_same_id_on_each_origin() -> R {
         (EndpointKind::TsCompat, second),
     ]);
     let mut bridge = set.take_session_bridge().ok_or("session bridge missing")?;
-    for host in [&first_host, &second_host] {
-        host.emit(Frame {
-            id: 1,
+
+    first_host
+        .emit(Frame {
+            id: FIRST_LOCAL,
             kind: FrameKind::Req,
             method: "session.setModel".to_owned(),
-            payload: json!({"model": {"id": "gpt-x", "provider": "openai"}}),
+            payload: json!({"model": {"id": FIRST_MODEL, "provider": "openai"}}),
         })
         .await;
-    }
-    let mut routed = Vec::new();
+    second_host
+        .emit(Frame {
+            id: SECOND_LOCAL,
+            kind: FrameKind::Req,
+            method: "session.setModel".to_owned(),
+            payload: json!({"model": {"id": SECOND_MODEL, "provider": "openai"}}),
+        })
+        .await;
+
+    let mut expected = HashMap::new();
     for _ in 0..2 {
         let event = tokio::time::timeout(Duration::from_millis(500), bridge.recv())
             .await?
             .ok_or("session bridge closed")?;
-        let SessionBridgeEvent::SetModel { id, .. } = event else {
+        let SessionBridgeEvent::SetModel { id, request } = event else {
             return Err("unexpected session bridge event".into());
         };
-        routed.push(id);
+        let model_id = request.model["id"]
+            .as_str()
+            .ok_or("setModel model id missing")?;
+        let success = match model_id {
+            FIRST_MODEL => true,
+            SECOND_MODEL => false,
+            other => return Err(format!("unexpected model id: {other}").into()),
+        };
+        expected.insert(id, success);
     }
-    assert_ne!(routed[0], routed[1]);
-    for id in routed {
-        set.respond_set_model(id, true).await?;
+    assert_eq!(expected.len(), 2, "routed ids must be distinct");
+
+    for (id, success) in &expected {
+        set.respond_set_model(*id, *success).await?;
     }
-    for host in [&first_host, &second_host] {
+
+    for (host, local, expected_success) in [
+        (&first_host, FIRST_LOCAL, true),
+        (&second_host, SECOND_LOCAL, false),
+    ] {
         host.wait_for_request("session.setModel").await?;
         let response = host
             .requests
@@ -2550,18 +2577,20 @@ async fn runtime_set_correlated_routes_return_to_same_id_on_each_origin() -> R {
                 requests
                     .iter()
                     .find(|frame| {
-                        frame.method == "session.setModel" && frame.kind == FrameKind::Res
+                        frame.method == "session.setModel"
+                            && frame.kind == FrameKind::Res
+                            && frame.id == local
                     })
                     .cloned()
             })
             .ok_or("setModel response missing")?;
-        assert_eq!(response.id, 1);
-        assert_eq!(response.payload["success"], true);
+        assert_eq!(response.id, local);
+        assert_eq!(response.payload["success"], expected_success);
     }
+
     set.shutdown_once().await;
     Ok(())
 }
-
 #[tokio::test]
 async fn runtime_set_terminal_input_uses_completed_replies_under_one_deadline() -> R {
     let snapshot = json!({
