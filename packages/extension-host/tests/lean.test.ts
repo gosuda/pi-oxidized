@@ -8,7 +8,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { Readable } from "node:stream";
@@ -328,6 +328,84 @@ describe("lean: extensions.load registry", () => {
 			expect(errors.get(minified)).toContain('excluded import "jiti"');
 			expect(errors.get(transitive)).toContain('excluded import "jiti"');
 			expect(errors.get(cyclic)).toContain('excluded import "typebox"');
+		} finally {
+			await link.finish();
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
+
+	test("checks literal require, rejects computed loads, and permits a shadowed require", async () => {
+		const directory = await mkdtemp(join(PACKAGE_DIR, ".test-lean-opaque-import-"));
+		const requireEntry = join(directory, "require.mjs");
+		const computedEntry = join(directory, "computed.mjs");
+		const shadowedEntry = join(directory, "shadowed.mjs");
+		const holder = globalThis as Record<string, unknown>;
+		const link = new LeanLink({ cwd: directory, extensionPaths: [] });
+		try {
+			await Promise.all([
+				writeFile(
+					requireEntry,
+					'globalThis.__leanUnsupportedModuleLoadEvaluated = true; require("jiti"); export default { name: "require" };',
+				),
+				writeFile(
+					computedEntry,
+					'globalThis.__leanUnsupportedModuleLoadEvaluated = true; const name = "jiti"; await import(name); export default { name: "computed" };',
+				),
+				writeFile(
+					shadowedEntry,
+					'const require = (value) => value; export default { name: require("shadowed") };',
+				),
+			]);
+			await link.hello(1);
+			link.request(2, "extensions.load", {
+				extensionPaths: [requireEntry, computedEntry, shadowedEntry],
+				cwd: directory,
+			});
+			const response = payload(await link.response(2, "extensions.load"));
+			const errors = new Map(
+				(response["errors"] as Array<{ path: string; error: string }>).map(
+					(error) => [error.path, error.error],
+				),
+			);
+			expect(response["extensions"]).toBe(1);
+			expect(errors.get(requireEntry)).toContain('excluded import "jiti"');
+			expect(errors.get(computedEntry)).toContain("unsupported computed import(...)");
+			expect(errors.has(shadowedEntry)).toBe(false);
+			expect(holder["__leanUnsupportedModuleLoadEvaluated"]).toBeUndefined();
+		} finally {
+			delete holder["__leanUnsupportedModuleLoadEvaluated"];
+			await link.finish();
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
+
+	test("finds excluded imports through Bun extensionless and directory-index local paths", async () => {
+		const directory = await mkdtemp(join(PACKAGE_DIR, ".test-lean-extensionless-import-"));
+		const extensionlessEntry = join(directory, "extensionless.mjs");
+		const directoryEntry = join(directory, "directory.mjs");
+		const link = new LeanLink({ cwd: directory, extensionPaths: [] });
+		try {
+			await mkdir(join(directory, "nested"));
+			await Promise.all([
+				writeFile(extensionlessEntry, 'import "./dep"; export default { name: "extensionless" };'),
+				writeFile(join(directory, "dep.mjs"), 'import "jiti";'),
+				writeFile(directoryEntry, 'import "./nested"; export default { name: "directory" };'),
+				writeFile(join(directory, "nested", "index.mjs"), 'import "typebox";'),
+			]);
+			await link.hello(1);
+			link.request(2, "extensions.load", {
+				extensionPaths: [extensionlessEntry, directoryEntry],
+				cwd: directory,
+			});
+			const response = payload(await link.response(2, "extensions.load"));
+			const errors = new Map(
+				(response["errors"] as Array<{ path: string; error: string }>).map(
+					(error) => [error.path, error.error],
+				),
+			);
+			expect(response["extensions"]).toBe(0);
+			expect(errors.get(extensionlessEntry)).toContain('excluded import "jiti"');
+			expect(errors.get(directoryEntry)).toContain('excluded import "typebox"');
 		} finally {
 			await link.finish();
 			await rm(directory, { recursive: true, force: true });
@@ -1929,6 +2007,10 @@ describe("lean: surface validation units", () => {
 		for (const [source, expected] of cases) {
 			expect(findExcludedImport(source)).toBe(expected);
 		}
+	});
+
+	test("findExcludedImport advances through an unterminated braced Unicode escape", () => {
+		expect(findExcludedImport('import "j\\u{";')).toBeUndefined();
 	});
 
 	test("parseStreamingJson tolerates truncated streams", () => {

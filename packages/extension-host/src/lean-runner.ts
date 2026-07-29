@@ -16,8 +16,8 @@
  * `compatibilityVersion`.
  */
 
-import { readFile } from "node:fs/promises";
-import { isAbsolute, resolve } from "node:path";
+import { readFile, stat } from "node:fs/promises";
+import { isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
 	COMPATIBILITY_VERSION,
@@ -227,6 +227,11 @@ type SignificantToken =
 	| { kind: "punctuator"; value: string }
 	| { kind: "literal"; value: "regex" | "string" | "template" };
 
+interface ModuleLoadScan {
+	specifiers: string[];
+	unsupported: string | undefined;
+}
+
 /**
  * Cook a string literal's raw source content (the text between its quotes)
  * into the value JavaScript would produce, resolving backslash escapes. The
@@ -266,6 +271,10 @@ function decodeStringEscapes(raw: string): string {
 			case "u":
 				if (raw[at] === "{") {
 					const close = raw.indexOf("}", at);
+					if (close === -1) {
+						out += "u";
+						break;
+					}
 					out += String.fromCodePoint(Number.parseInt(raw.slice(at + 1, close), 16));
 					at = close + 1;
 				} else {
@@ -294,8 +303,9 @@ function decodeStringEscapes(raw: string): string {
  * `import(...)` calls are recognized only in code, and whitespace or
  * inline comments may separate `import`, `(`, and the quoted literal.
  */
-function extractImportSpecifiers(source: string): string[] {
+function scanModuleLoads(source: string): ModuleLoadScan {
 	const specifiers: string[] = [];
+	let unsupported: string | undefined;
 	const length = source.length;
 	/** Object-brace depth of each open `${...}` expression, innermost last. */
 	const templateExpressionDepths: number[] = [];
@@ -523,10 +533,26 @@ function extractImportSpecifiers(source: string): string[] {
 		const word = source.slice(start, index);
 		const preceded = lastSignificant;
 		recordWord(word, preceded);
-		if (
-			(word !== "import" && word !== "export")
-			|| (preceded?.kind === "punctuator" && preceded.value === ".")
-		) continue;
+		const isMember = preceded?.kind === "punctuator"
+			&& (preceded.value === "." || preceded.value === "?.");
+		// Bun exposes bare `require` in ESM. Keep this check lexical and
+		// fail closed: proving a shadowed binding would require a full parser.
+		if (word === "require" && !isMember) {
+			const next = skipInsignificant(index);
+			if (source[next] === "(") {
+				const literalStart = skipInsignificant(next + 1);
+				const literalEnd = readSpecifier(literalStart);
+				if (literalEnd !== undefined) {
+					index = literalEnd;
+				} else {
+					unsupported ??= "computed require(...)";
+					lastSignificant = { kind: "punctuator", value: "(" };
+					index = literalStart;
+				}
+				continue;
+			}
+		}
+		if ((word !== "import" && word !== "export") || isMember) continue;
 		if (word === "export") {
 			index = scanFromClause(index);
 			continue;
@@ -539,7 +565,7 @@ function extractImportSpecifiers(source: string): string[] {
 			if (literalEnd !== undefined) {
 				index = literalEnd;
 			} else {
-				// Non-literal dynamic import argument: rescan it as code.
+				unsupported ??= "computed import(...)";
 				lastSignificant = { kind: "punctuator", value: "(" };
 				index = literalStart;
 			}
@@ -556,7 +582,12 @@ function extractImportSpecifiers(source: string): string[] {
 		}
 		index = scanFromClause(next);
 	}
-	return specifiers;
+	return { specifiers, unsupported };
+}
+
+/** Extract literal ESM specifiers without treating unsupported forms as imports. */
+function extractImportSpecifiers(source: string): string[] {
+	return scanModuleLoads(source).specifiers;
 }
 
 /** Detect an excluded direct specifier without evaluating the module. */
@@ -564,7 +595,19 @@ export function findExcludedImport(source: string): string | undefined {
 	return extractImportSpecifiers(source).find((specifier) => EXCLUDED_SPECIFIER.test(specifier));
 }
 
-function resolveLocalSpecifier(importer: string, specifier: string): string | undefined {
+const BUN_LOCAL_IMPORT_EXTENSIONS = [
+	".tsx",
+	".jsx",
+	".ts",
+	".mts",
+	".js",
+	".mjs",
+	".cjs",
+	".cts",
+	".json",
+] as const;
+
+async function resolveLocalSpecifier(importer: string, specifier: string): Promise<string | undefined> {
 	if (
 		!specifier.startsWith("./")
 		&& !specifier.startsWith("../")
@@ -575,21 +618,41 @@ function resolveLocalSpecifier(importer: string, specifier: string): string | un
 	}
 	const resolved = new URL(specifier, pathToFileURL(importer));
 	if (resolved.protocol !== "file:") return undefined;
-	return fileURLToPath(resolved);
+	const path = fileURLToPath(resolved);
+	const candidates = specifier.endsWith("/")
+		? BUN_LOCAL_IMPORT_EXTENSIONS.map((extension) => join(path, `index${extension}`))
+		: [
+			path,
+			...BUN_LOCAL_IMPORT_EXTENSIONS.map((extension) => `${path}${extension}`),
+			...BUN_LOCAL_IMPORT_EXTENSIONS.map((extension) => join(path, `index${extension}`)),
+		];
+	for (const candidate of candidates) {
+		try {
+			if ((await stat(candidate)).isFile()) return candidate;
+		} catch {
+			// Let the runtime report an unresolved local module as it did before graph scanning.
+		}
+	}
+	return path;
 }
 
-/** Walk every literal local dependency once before evaluating the entry. */
-async function findExcludedImportInGraph(entry: string): Promise<string | undefined> {
+type ModuleLoadViolation =
+	| { kind: "excluded"; specifier: string }
+	| { kind: "unsupported"; form: string };
+
+/** Walk every local dependency whose module-loading form is statically provable. */
+async function findModuleLoadViolationInGraph(entry: string): Promise<ModuleLoadViolation | undefined> {
 	const pending = [entry];
 	const visited = new Set<string>();
 	while (pending.length > 0) {
 		const current = pending.pop();
 		if (current === undefined || visited.has(current)) continue;
 		visited.add(current);
-		const source = await readFile(current, "utf8");
-		for (const specifier of extractImportSpecifiers(source)) {
-			if (EXCLUDED_SPECIFIER.test(specifier)) return specifier;
-			const local = resolveLocalSpecifier(current, specifier);
+		const scan = scanModuleLoads(await readFile(current, "utf8"));
+		if (scan.unsupported !== undefined) return { kind: "unsupported", form: scan.unsupported };
+		for (const specifier of scan.specifiers) {
+			if (EXCLUDED_SPECIFIER.test(specifier)) return { kind: "excluded", specifier };
+			const local = await resolveLocalSpecifier(current, specifier);
 			if (local !== undefined && !visited.has(local)) pending.push(local);
 		}
 	}
@@ -776,11 +839,16 @@ export class LeanRunner {
 			);
 		}
 		const absolute = isAbsolute(entryPath) ? entryPath : resolve(cwd, entryPath);
-		const excluded = await findExcludedImportInGraph(absolute);
-		if (excluded !== undefined) {
+		const violation = await findModuleLoadViolationInGraph(absolute);
+		if (violation?.kind === "excluded") {
 			throw new Error(
-				`excluded import "${excluded}" in lean entry: the upstream module graph ` +
+				`excluded import "${violation.specifier}" in lean entry: the upstream module graph ` +
 					"is unavailable in lean mode; prebundle the entry instead",
+			);
+		}
+		if (violation?.kind === "unsupported") {
+			throw new Error(
+				`unsupported ${violation.form} in lean entry: module loading must use literal ESM imports`,
 			);
 		}
 		// Dynamic import is required: the entry specifier is runtime-selected
