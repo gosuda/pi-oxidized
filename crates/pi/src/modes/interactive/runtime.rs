@@ -6318,6 +6318,7 @@ mod tests {
         cancel_fork: Arc<std::sync::atomic::AtomicBool>,
         cancel_switch: Arc<std::sync::atomic::AtomicBool>,
         fork_selected_text: Arc<std::sync::Mutex<Option<String>>>,
+        extension_runner: Option<Arc<ExtensionRuntimeSet>>,
     }
 
     impl FakeHost {
@@ -6336,6 +6337,7 @@ mod tests {
                 cancel_fork: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 cancel_switch: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 fork_selected_text: Arc::new(std::sync::Mutex::new(None)),
+                extension_runner: None,
             };
             (host, log)
         }
@@ -6381,6 +6383,10 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone()
+        }
+
+        fn host_extension_runner(&self) -> Option<Arc<ExtensionRuntimeSet>> {
+            self.extension_runner.clone()
         }
 
         fn theme_settings(&self) -> (Option<String>, ThemeMode) {
@@ -7991,6 +7997,60 @@ mod tests {
             .collect::<String>();
         assert!(visible.contains("Verification confirm prompt"));
         assert!(visible.contains("Choose Yes"));
+    }
+
+    #[tokio::test]
+    async fn rebind_extension_channels_preserves_requests_across_same_source_reload() -> TestResult
+    {
+        let runner = ExtensionRuntimeSet::bind(Vec::new());
+        let writer = SharedWriter::new();
+        let caps = TerminalCapabilities::default();
+        let tui = Tui::new(writer, Size::new(80, 24), Position::ORIGIN, 8, caps)
+            .map_err(|error| error.to_string())?;
+        let (_tx, rx) = mpsc::unbounded_channel::<UiEvent>();
+        let input = TerminalInput::mock(rx);
+        let (mut host, _log) = FakeHost::new();
+        host.extension_runner = Some(runner);
+        let options = InteractiveRuntimeOptions {
+            size: (80, 24),
+            ..InteractiveRuntimeOptions::default()
+        };
+        let mut rt = InteractiveRuntime::new(tui, input, Arc::new(host), &options);
+        let (request_tx, request_rx) = mpsc::channel(1);
+        rt.extension_requests = Some(request_rx);
+
+        // Product reload rebinds this same source after the session refresh.
+        assert_eq!(
+            rt.dispatch_action(ViewAction::Reload).await,
+            ActionOutcome::Repaint
+        );
+        assert!(rt.extension_requests.is_some());
+        assert_eq!(
+            rt.dispatch_action(ViewAction::Reload).await,
+            ActionOutcome::Repaint
+        );
+        assert!(rt.extension_requests.is_some());
+
+        request_tx
+            .send(HostUiRequest::Confirm {
+                id: 41,
+                request: pi_ext::protocol::ConfirmRequest {
+                    title: "Still connected".to_owned(),
+                    message: "Receive after rebind".to_owned(),
+                    options_meta: pi_ext::protocol::DialogOptions::default(),
+                },
+            })
+            .await
+            .map_err(|_| "preserved receiver disconnected".to_owned())?;
+        let received = rt
+            .extension_requests
+            .as_mut()
+            .ok_or_else(|| "receiver missing after second rebind".to_owned())?
+            .recv()
+            .await
+            .ok_or_else(|| "request channel closed after second rebind".to_owned())?;
+        assert!(matches!(received, HostUiRequest::Confirm { id: 41, .. }));
+        Ok(())
     }
 
     #[test]
