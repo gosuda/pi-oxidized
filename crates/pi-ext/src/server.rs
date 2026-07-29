@@ -61,9 +61,9 @@ const MESSAGE_UPDATE_HANDLER: &str = "message_update";
 /// timeout. Dropping the callback at the deadline stops its work and releases
 /// the request's server permit.
 pub const NATIVE_TERMINAL_INPUT_BUDGET: std::time::Duration = std::time::Duration::from_millis(4);
-/// Server-side deadline for native lifecycle callbacks.
+/// Server-side deadline for native callbacks without explicit cancellation.
 ///
-/// A hook whose future never resolves would retain its semaphore permit
+/// A callback whose future never resolves would retain its semaphore permit
 /// forever, eventually exhausting `max_in_flight`. Dropping the future at
 /// the deadline releases the permit and answers a correlated `timeout` error.
 pub const NATIVE_LIFECYCLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
@@ -92,8 +92,8 @@ pub struct ServerConfig {
     pub update_capacity: usize,
     /// Bound on the shared outbound frame channel.
     pub outbound_capacity: usize,
-    /// Server-side deadline for native lifecycle callbacks. A hook that never
-    /// resolves is dropped at the deadline so its permit is released.
+    /// Server-side deadline for native callbacks without explicit cancellation.
+    /// A callback that never resolves is dropped so its permit is released.
     pub lifecycle_deadline: std::time::Duration,
 }
 
@@ -948,7 +948,7 @@ struct ServerRuntime<E: NativeExtension> {
     out_tx: mpsc::Sender<OutboundFrame>,
     /// Bound on queued per-call streaming updates/events.
     update_capacity: usize,
-    /// Server-side deadline for native lifecycle callbacks.
+    /// Server-side deadline for native callbacks without explicit cancellation.
     lifecycle_deadline: std::time::Duration,
 }
 
@@ -1350,6 +1350,25 @@ fn callback_context<E: NativeExtension>(
     })
 }
 
+/// Await a non-cancellable extension callback under the shared server deadline.
+async fn await_callback<T>(
+    deadline: std::time::Duration,
+    callback: NativeFuture<Result<T, ExtensionFault>>,
+) -> Result<Result<T, ExtensionFault>, tokio::time::error::Elapsed> {
+    tokio::time::timeout(deadline, callback).await
+}
+
+/// Convert an expired callback deadline into the normal correlated error frame.
+fn callback_timeout_frame(id: FrameId, method: &str) -> Frame {
+    error_frame(
+        id,
+        method,
+        "timeout",
+        "extension callback exceeded its server-side deadline",
+        false,
+    )
+}
+
 /// `tool.prepare`: run the extension's argument preparation.
 async fn handle_prepare<E: NativeExtension>(
     runtime: &ServerRuntime<E>,
@@ -1371,13 +1390,17 @@ async fn handle_prepare<E: NativeExtension>(
         );
     };
     let args = payload.get("args").cloned().unwrap_or(Value::Null);
-    match runtime
-        .extension
-        .prepare_tool(context, name.to_owned(), args)
-        .await
+    match await_callback(
+        runtime.lifecycle_deadline,
+        runtime
+            .extension
+            .prepare_tool(context, name.to_owned(), args),
+    )
+    .await
     {
-        Ok(args) => res_frame(id, method, json!({ "args": args })),
-        Err(fault) => fault_frame(id, method, &fault),
+        Ok(Ok(args)) => res_frame(id, method, json!({ "args": args })),
+        Ok(Err(fault)) => fault_frame(id, method, &fault),
+        Err(_) => callback_timeout_frame(id, method),
     }
 }
 
@@ -1406,13 +1429,17 @@ async fn handle_validate<E: NativeExtension>(
         .get("toolCallId")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    match runtime
-        .extension
-        .validate_tool(context, name.to_owned(), args, tool_call_id)
-        .await
+    match await_callback(
+        runtime.lifecycle_deadline,
+        runtime
+            .extension
+            .validate_tool(context, name.to_owned(), args, tool_call_id),
+    )
+    .await
     {
-        Ok(args) => res_frame(id, method, json!({ "args": args })),
-        Err(fault) => fault_frame(id, method, &fault),
+        Ok(Ok(args)) => res_frame(id, method, json!({ "args": args })),
+        Ok(Err(fault)) => fault_frame(id, method, &fault),
+        Err(_) => callback_timeout_frame(id, method),
     }
 }
 
@@ -1438,13 +1465,15 @@ async fn handle_command<E: NativeExtension>(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
-    match runtime
-        .extension
-        .execute_command(context, command, args)
-        .await
+    match await_callback(
+        runtime.lifecycle_deadline,
+        runtime.extension.execute_command(context, command, args),
+    )
+    .await
     {
-        Ok(()) => res_frame(id, method, json!({ "ok": true })),
-        Err(fault) => fault_frame(id, method, &fault),
+        Ok(Ok(())) => res_frame(id, method, json!({ "ok": true })),
+        Ok(Err(fault)) => fault_frame(id, method, &fault),
+        Err(_) => callback_timeout_frame(id, method),
     }
 }
 
@@ -1471,9 +1500,15 @@ async fn handle_flags_set<E: NativeExtension>(
             );
         }
     };
-    match runtime.extension.set_flags(context, request.values).await {
-        Ok(ok) => res_frame(id, method, json!({ "ok": ok })),
-        Err(fault) => fault_frame(id, method, &fault),
+    match await_callback(
+        runtime.lifecycle_deadline,
+        runtime.extension.set_flags(context, request.values),
+    )
+    .await
+    {
+        Ok(Ok(ok)) => res_frame(id, method, json!({ "ok": ok })),
+        Ok(Err(fault)) => fault_frame(id, method, &fault),
+        Err(_) => callback_timeout_frame(id, method),
     }
 }
 
@@ -1497,9 +1532,15 @@ async fn handle_shortcut<E: NativeExtension>(
         return res_frame(id, method, json!({ "handled": false }));
     };
     let key = key.to_owned();
-    match runtime.extension.execute_shortcut(context, key).await {
-        Ok(handled) => res_frame(id, method, json!({ "handled": handled })),
-        Err(fault) => fault_frame(id, method, &fault),
+    match await_callback(
+        runtime.lifecycle_deadline,
+        runtime.extension.execute_shortcut(context, key),
+    )
+    .await
+    {
+        Ok(Ok(handled)) => res_frame(id, method, json!({ "handled": handled })),
+        Ok(Err(fault)) => fault_frame(id, method, &fault),
+        Err(_) => callback_timeout_frame(id, method),
     }
 }
 
@@ -1564,13 +1605,17 @@ async fn handle_render_html<E: NativeExtension>(
         .unwrap_or_default()
         .to_owned();
     let body = payload.get("payload").cloned().unwrap_or(Value::Null);
-    match runtime
-        .extension
-        .render_tool_html(context, tool_name, phase, body)
-        .await
+    match await_callback(
+        runtime.lifecycle_deadline,
+        runtime
+            .extension
+            .render_tool_html(context, tool_name, phase, body),
+    )
+    .await
     {
-        Ok(value) => res_frame(id, method, value),
-        Err(fault) => fault_frame(id, method, &fault),
+        Ok(Ok(value)) => res_frame(id, method, value),
+        Ok(Err(fault)) => fault_frame(id, method, &fault),
+        Err(_) => callback_timeout_frame(id, method),
     }
 }
 
@@ -1593,7 +1638,7 @@ async fn handle_lifecycle<E: NativeExtension>(
     let events = NativeEventSink {
         tx: runtime.out_tx.clone(),
     };
-    match tokio::time::timeout(
+    match await_callback(
         runtime.lifecycle_deadline,
         runtime
             .extension
@@ -1603,13 +1648,7 @@ async fn handle_lifecycle<E: NativeExtension>(
     {
         Ok(Ok(value)) => res_frame(id, method, value),
         Ok(Err(fault)) => fault_frame(id, method, &fault),
-        Err(_) => error_frame(
-            id,
-            method,
-            "timeout",
-            "lifecycle callback exceeded its server-side deadline",
-            false,
-        ),
+        Err(_) => callback_timeout_frame(id, method),
     }
 }
 
@@ -2369,6 +2408,9 @@ mod tests {
         ) -> NativeFuture<Result<(), ExtensionFault>> {
             let commands = Arc::clone(&self.handles.commands);
             Box::pin(async move {
+                if command == "stall" {
+                    std::future::pending::<()>().await;
+                }
                 if command == "demo" {
                     commands
                         .lock()
@@ -2511,6 +2553,9 @@ mod tests {
             let renders = Arc::clone(&self.handles.renders);
             Box::pin(async move {
                 let _ = payload;
+                if tool_name == "stall" {
+                    std::future::pending::<()>().await;
+                }
                 record(&renders, (tool_name.clone(), phase.clone()));
                 Ok(json!({ "html": format!("<b>{tool_name}:{phase}</b>") }))
             })
@@ -5433,6 +5478,114 @@ mod tests {
             }
         })
         .await??;
+
+        drop(client);
+        let result = tokio::time::timeout(TIMEOUT, server).await??;
+        assert!(result.is_ok());
+        Ok(())
+    }
+
+    /// A stalled command times out under the shared callback deadline and frees
+    /// the sole permit for the next command.
+    #[tokio::test]
+    async fn command_deadline_drops_stalled_callback_and_releases_permit() -> R {
+        let (ext, _handles) = DemoExtension::new();
+        let config = ServerConfig {
+            max_in_flight: 1,
+            lifecycle_deadline: Duration::from_millis(50),
+            ..ServerConfig::default()
+        };
+        let (mut client, server) = spawn_raw(ext, config);
+        client.hello(PROTOCOL_VERSION, "anything").await?;
+        let _ack = client.recv().await?;
+        client.load_context().await?;
+
+        let started_at = std::time::Instant::now();
+        let response = client
+            .request(
+                2,
+                COMMAND_EXECUTE_METHOD,
+                json!({ "command": "stall", "args": "" }),
+            )
+            .await?;
+        let elapsed = started_at.elapsed();
+        assert_eq!(response.id, 2);
+        assert_eq!(response.method, COMMAND_EXECUTE_METHOD);
+        assert_eq!(response.kind, FrameKind::Error);
+        assert_eq!(response.payload["code"], "timeout");
+        assert!(
+            elapsed >= Duration::from_millis(50),
+            "command timed out before its deadline: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "command exceeded its bounded deadline: {elapsed:?}"
+        );
+
+        let next = client
+            .request(
+                3,
+                COMMAND_EXECUTE_METHOD,
+                json!({ "command": "demo", "args": "after-timeout" }),
+            )
+            .await?;
+        assert_eq!(next.id, 3);
+        assert_eq!(next.kind, FrameKind::Res);
+        assert_eq!(next.payload["ok"], true);
+
+        drop(client);
+        let result = tokio::time::timeout(TIMEOUT, server).await??;
+        assert!(result.is_ok());
+        Ok(())
+    }
+
+    /// Rendering has no cancellation token either, so its stalled callback
+    /// must also time out and free capacity for the next render.
+    #[tokio::test]
+    async fn render_deadline_drops_stalled_callback_and_releases_permit() -> R {
+        let (ext, _handles) = DemoExtension::new();
+        let config = ServerConfig {
+            max_in_flight: 1,
+            lifecycle_deadline: Duration::from_millis(50),
+            ..ServerConfig::default()
+        };
+        let (mut client, server) = spawn_raw(ext, config);
+        client.hello(PROTOCOL_VERSION, "anything").await?;
+        let _ack = client.recv().await?;
+        client.load_context().await?;
+
+        let started_at = std::time::Instant::now();
+        let response = client
+            .request(
+                2,
+                TOOL_RENDER_HTML_METHOD,
+                json!({ "toolName": "stall", "phase": "call", "payload": {} }),
+            )
+            .await?;
+        let elapsed = started_at.elapsed();
+        assert_eq!(response.id, 2);
+        assert_eq!(response.method, TOOL_RENDER_HTML_METHOD);
+        assert_eq!(response.kind, FrameKind::Error);
+        assert_eq!(response.payload["code"], "timeout");
+        assert!(
+            elapsed >= Duration::from_millis(50),
+            "render timed out before its deadline: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "render exceeded its bounded deadline: {elapsed:?}"
+        );
+
+        let next = client
+            .request(
+                3,
+                TOOL_RENDER_HTML_METHOD,
+                json!({ "toolName": "echo", "phase": "call", "payload": {} }),
+            )
+            .await?;
+        assert_eq!(next.id, 3);
+        assert_eq!(next.kind, FrameKind::Res);
+        assert_eq!(next.payload["html"], "<b>echo:call</b>");
 
         drop(client);
         let result = tokio::time::timeout(TIMEOUT, server).await??;
