@@ -2417,6 +2417,146 @@ describe("extension theme API", () => {
 		host.dispose("test");
 		await runPromise.catch(() => void 0);
 	});
+	test("synchronous factory recreation continues when the old dispose throws", async () => {
+		const disposed: string[] = [];
+		const errors: string[] = [];
+		let factoryCalls = 0;
+		const throwingDisposeFactory: ExtensionFactory = (pi) => {
+			pi.on("session_start", (_event, ctx) => {
+				ctx.ui.setWidget("widget.throw-dispose-sync", (_tui, theme) => {
+					const instance = `sync-${factoryCalls++}`;
+					const rendered = String(theme.name);
+					return {
+						render: () => [rendered],
+						dispose: () => {
+							disposed.push(instance);
+							throw new Error("sync dispose exploded");
+						},
+					};
+				});
+			});
+		};
+		const { collector, stdin, host, runPromise } = await connectHost([throwingDisposeFactory]);
+		await sendSessionStart(stdin, collector);
+		const initial = await collector.awaitFrame((frame) =>
+			frame.method === "uiSlot"
+			&& (frame.payload as Record<string, unknown>)["key"] === "widget.throw-dispose-sync",
+		);
+		const priorSlotCount = collector.frames.filter((frame) => frame.method === "uiSlot").length;
+
+		stdin.push(Buffer.from(encodeFrameString(themeUpdateFrame("recreated"))));
+
+		const updated = await collector.awaitFrame((frame) =>
+			frame.method === "uiSlot"
+			&& (frame.payload as Record<string, unknown>)["key"] === "widget.throw-dispose-sync"
+			&& collector.frames.filter((candidate) => candidate.method === "uiSlot").length > priorSlotCount,
+		);
+		// Replacement was installed and rendered with the new theme.
+		expect((updated.payload as Record<string, unknown>)["generation"])
+			.toBe((initial.payload as Record<string, unknown>)["generation"]);
+		expect(disposed).toEqual(["sync-0"]);
+
+		// Exactly one error reported for the disposal failure — no host termination.
+		for (const frame of collector.frames) {
+			if (frame.method === "extensionError") {
+				errors.push(String((frame.payload as Record<string, unknown>)["message"]));
+			}
+		}
+		expect(errors).toHaveLength(1);
+		expect(errors[0]).toContain("sync dispose exploded");
+		expect(host.isDisposed).toBe(false);
+
+		stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
+	});
+
+	test("asynchronous factory recreation continues when the old dispose throws", async () => {
+		const disposed: string[] = [];
+		const errors: string[] = [];
+		const { promise: initialFactoryStarted, resolve: resolveInitialFactoryStarted } = Promise.withResolvers<void>();
+		const { promise: recreationFactoryStarted, resolve: resolveRecreationFactoryStarted } = Promise.withResolvers<void>();
+		const pending: Array<{
+			theme: string;
+			resolve: (component: { render: () => string[]; dispose: () => void }) => void;
+			done: (result: unknown) => void;
+		}> = [];
+		const throwingDisposeAsyncFactory: ExtensionFactory = (pi) => {
+			pi.registerCommand("throw-dispose-async", {
+				description: "Async overlay whose old dispose throws during recreation",
+				async handler(_args, ctx) {
+					await ctx.ui.custom((_tui, theme, _keybindings, done) => {
+						const name = String((theme as { name?: unknown }).name ?? "dark");
+						const instance = {
+							render: () => [`overlay-${name}`],
+							dispose: () => {
+								disposed.push(name);
+							},
+						};
+						const { promise, resolve } = Promise.withResolvers<typeof instance>();
+						pending.push({ theme: name, resolve, done });
+						if (pending.length === 1) resolveInitialFactoryStarted();
+						if (pending.length === 2) resolveRecreationFactoryStarted();
+						return promise;
+					});
+				},
+			});
+		};
+		const { collector, stdin, host, runPromise } = await connectHost([throwingDisposeAsyncFactory]);
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 68, kind: "req", method: "command.execute",
+			payload: { command: "throw-dispose-async", args: "" },
+		})));
+		await initialFactoryStarted;
+		pending[0]?.resolve({
+			render: () => ["overlay-dark"],
+			dispose: () => {
+				disposed.push("dark");
+				throw new Error("async dispose exploded");
+			},
+		});
+		const initial = await collector.awaitFrame((frame) => frame.method === "uiSlot");
+		const priorSlotCount = collector.frames.filter((frame) => frame.method === "uiSlot").length;
+
+		stdin.push(Buffer.from(encodeFrameString(themeUpdateFrame("recreated"))));
+		await recreationFactoryStarted;
+
+		// Resolve the async recreation; old dispose throws but installation continues.
+		const recreationEntry = pending[1];
+		if (recreationEntry === undefined) throw new Error("recreation factory not started");
+		recreationEntry.resolve({
+			render: () => [`overlay-${recreationEntry.theme}`],
+			dispose: () => {
+				disposed.push(recreationEntry.theme);
+			},
+		});
+		const updated = await collector.awaitFrame((frame) =>
+			frame.method === "uiSlot"
+			&& collector.frames.filter((candidate) => candidate.method === "uiSlot").length > priorSlotCount,
+		);
+		expect(JSON.stringify(updated.payload)).toContain("overlay-recreated");
+		expect(disposed).toEqual(["dark"]);
+
+		// Exactly one error for the disposal failure — no host termination, no stranded promise.
+		for (const frame of collector.frames) {
+			if (frame.method === "extensionError") {
+				errors.push(String((frame.payload as Record<string, unknown>)["message"]));
+			}
+		}
+		expect(errors).toHaveLength(1);
+		expect(errors[0]).toContain("async dispose exploded");
+		expect(host.isDisposed).toBe(false);
+
+		// The custom command settles exactly once.
+		recreationEntry.done("complete");
+		const command = await collector.awaitFrame((frame) => frame.id === 68 && frame.kind === "res");
+		expect(command.payload).toEqual({ ok: true });
+		expect(collector.frames.filter((frame) => frame.id === 68 && frame.kind === "res")).toHaveLength(1);
+
+		stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
+	});
 });
 
 // ===========================================================================

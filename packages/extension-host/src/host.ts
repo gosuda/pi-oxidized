@@ -1345,8 +1345,12 @@ export class ExtensionHost {
 		entry.pendingRecreationFailure = undefined;
 		const initialFailure = entry.initialFailure;
 		entry.initialFailure = undefined;
-		entry.component?.dispose?.();
 		this.slots.delete(key);
+		try {
+			entry.component?.dispose?.();
+		} catch (error) {
+			this.emitExtensionError("<inline>", "disposeSlot", String(error));
+		}
 		initialFailure?.();
 		this.client.send({
 			id: 0, kind: "event", method: "disposeSlot",
@@ -1477,7 +1481,11 @@ export class ExtensionHost {
 			}
 			const old = entry.component;
 			entry.component = replacement;
-			old?.dispose?.();
+			try {
+				old?.dispose?.();
+			} catch (err) {
+				onFailure(err);
+			}
 			if (this.slots.get(key) === entry && entry.component === replacement) {
 				try {
 					this.pushSlot(key, entry, entry.width);
