@@ -77,6 +77,30 @@ function mergedEnvironment(overrides: PtyCommand["env"]): Record<string, string>
 	return result;
 }
 
+/**
+ * Write to a Bun terminal without leaking close-race failures. Real write
+ * failures are reported through `onError`; teardown races are ignored.
+ */
+export function writeTerminalSafe(
+	terminal: { readonly closed: boolean; write(data: string | Uint8Array): number | Promise<number> },
+	data: string | Uint8Array,
+	onError: (error: unknown) => void = () => {},
+): void {
+	if (terminal.closed || data.length === 0) return;
+	try {
+		// Bun queues the complete argument even when it reports zero
+		// synchronous progress. Retrying would duplicate accepted bytes.
+		const result = terminal.write(data);
+		if (result instanceof Promise) {
+			void result.catch((error: unknown) => {
+				if (!terminal.closed) onError(error);
+			});
+		}
+	} catch (error) {
+		if (!terminal.closed) onError(error);
+	}
+}
+
 export class PtyProcess {
 	readonly #startedAt = performance.now();
 	readonly #chunks: PtyChunk[] = [];
@@ -90,6 +114,8 @@ export class PtyProcess {
 	#exitCode: number | null = null;
 	#version = 0;
 	#listeners = new Set<() => void>();
+	readonly #terminalWriteFailure = Promise.withResolvers<void>();
+	#terminalWriteError: { readonly cause: unknown } | undefined;
 
 	constructor(command: PtyCommand) {
 		if (process.platform === "win32") {
@@ -156,6 +182,7 @@ export class PtyProcess {
 
 	writeKeys(...keys: readonly (string | Uint8Array)[]): void {
 		if (this.exited) throw new Error(`PTY process ${this.pid} has exited`);
+		this.#throwIfTerminalWriteFailed();
 		const outputOffset = this.#rawText.length;
 		let text = "";
 		for (const key of keys) {
@@ -164,6 +191,7 @@ export class PtyProcess {
 			const bytes = typeof key === "string" ? new TextEncoder().encode(key) : Uint8Array.from(key);
 			text += new TextDecoder().decode(bytes);
 			this.#writeTerminal(bytes);
+			this.#throwIfTerminalWriteFailed();
 		}
 		this.#writes.push({ text, outputOffset });
 	}
@@ -213,6 +241,7 @@ export class PtyProcess {
 		if (!(options.deadlineMs > 0)) throw new Error("PTY wait deadline must be positive");
 		const deadline = performance.now() + options.deadlineMs;
 		for (;;) {
+			this.#throwIfTerminalWriteFailed();
 			const snapshot = this.snapshot();
 			let matched: boolean;
 			if (pattern instanceof RegExp) {
@@ -239,11 +268,17 @@ export class PtyProcess {
 	}
 
 	async waitForExit(deadlineMs: number): Promise<number> {
+		this.#throwIfTerminalWriteFailed();
 		if (this.#exitCode !== null) return this.#exitCode;
 		const deadline = Promise.withResolvers<null>();
 		const deadlineTimer = setTimeout(() => deadline.resolve(null), deadlineMs);
-		const code = await Promise.race([this.#completed, deadline.promise]);
+		const code = await Promise.race([
+			this.#completed,
+			deadline.promise,
+			this.#terminalWriteFailure.promise.then(() => null),
+		]);
 		clearTimeout(deadlineTimer);
+		this.#throwIfTerminalWriteFailed();
 		if (code === null) throw new Error(`PTY process did not exit within ${deadlineMs}ms`);
 		return code;
 	}
@@ -252,11 +287,21 @@ export class PtyProcess {
 		if (this.#exitCode !== null) return this.#exitCode;
 		this.#signalTree("SIGTERM");
 		try {
-			return await this.waitForExit(graceMs);
+			return await this.#waitForProcessExit(graceMs);
 		} catch {
 			this.#signalTree("SIGKILL");
-			return await this.waitForExit(graceMs);
+			return await this.#waitForProcessExit(graceMs);
 		}
+	}
+
+	async #waitForProcessExit(deadlineMs: number): Promise<number> {
+		if (this.#exitCode !== null) return this.#exitCode;
+		const deadline = Promise.withResolvers<null>();
+		const deadlineTimer = setTimeout(() => deadline.resolve(null), deadlineMs);
+		const code = await Promise.race([this.#completed, deadline.promise]);
+		clearTimeout(deadlineTimer);
+		if (code === null) throw new Error(`PTY process did not exit within ${deadlineMs}ms`);
+		return code;
 	}
 
 	#receive(bytes: Uint8Array): void {
@@ -291,14 +336,20 @@ export class PtyProcess {
 
 	#writeTerminal(data: string | Uint8Array): void {
 		const terminal = this.#process.terminal;
-		if (!terminal || terminal.closed || data.length === 0) return;
-		try {
-			// Bun queues the complete argument even when it reports zero
-			// synchronous progress. Retrying would duplicate accepted bytes.
-			void terminal.write(data);
-		} catch {
-			// The child already closed its side of the terminal.
-		}
+		if (!terminal) return;
+		writeTerminalSafe(terminal, data, (error) => {
+			if (this.#terminalWriteError !== undefined) return;
+			this.#terminalWriteError = { cause: error };
+			this.#terminalWriteFailure.resolve();
+			this.#notify();
+		});
+	}
+
+	#throwIfTerminalWriteFailed(): void {
+		if (this.#terminalWriteError === undefined) return;
+		const { cause } = this.#terminalWriteError;
+		const detail = cause instanceof Error ? cause.message : String(cause);
+		throw new Error(`PTY terminal write failed: ${detail}`, { cause });
 	}
 
 	#answerTerminalQueries(): void {
