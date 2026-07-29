@@ -392,6 +392,20 @@ pub struct ExtensionRuntimeSet {
     load_cwd: String,
     project_trusted: bool,
     reload_lock: tokio::sync::Mutex<()>,
+    #[cfg(test)]
+    test_prepared_reload: StdMutex<Option<TestPreparedReload>>,
+}
+
+#[cfg(test)]
+enum TestPreparedReload {
+    Replacement {
+        generation: Generation,
+        pending: PendingBridges,
+    },
+    ReplacementThenInvalidation {
+        generation: Generation,
+        pending: PendingBridges,
+    },
 }
 
 impl ExtensionRuntimeSet {
@@ -446,6 +460,8 @@ impl ExtensionRuntimeSet {
             load_cwd,
             project_trusted,
             reload_lock: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            test_prepared_reload: StdMutex::new(None),
         }
     }
 
@@ -476,6 +492,81 @@ impl ExtensionRuntimeSet {
 
     fn lease(&self) -> GenerationLease {
         self.state().lease()
+    }
+
+    #[cfg(test)]
+    fn inject_prepared_replacement_for_reload(
+        &self,
+        generation: Generation,
+        pending: PendingBridges,
+    ) {
+        let mut prepared = self
+            .test_prepared_reload
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            prepared.is_none(),
+            "reload test preparation was already injected"
+        );
+        *prepared = Some(TestPreparedReload::Replacement {
+            generation,
+            pending,
+        });
+    }
+
+    #[cfg(test)]
+    fn inject_prepared_replacement_then_invalidation_for_reload(
+        &self,
+        generation: Generation,
+        pending: PendingBridges,
+    ) {
+        let mut prepared = self
+            .test_prepared_reload
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            prepared.is_none(),
+            "reload test preparation was already injected"
+        );
+        *prepared = Some(TestPreparedReload::ReplacementThenInvalidation {
+            generation,
+            pending,
+        });
+    }
+
+    async fn build_reload_generation(
+        &self,
+        id: u64,
+        plans: Vec<EndpointPlan>,
+    ) -> (
+        Option<Generation>,
+        PendingBridges,
+        Vec<ExtensionSetDiagnostic>,
+    ) {
+        #[cfg(test)]
+        {
+            let prepared = self
+                .test_prepared_reload
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(prepared) = prepared {
+                return match prepared {
+                    TestPreparedReload::Replacement {
+                        generation,
+                        pending,
+                    } => (Some(generation), pending, Vec::new()),
+                    TestPreparedReload::ReplacementThenInvalidation {
+                        generation,
+                        pending,
+                    } => {
+                        self.invalidate();
+                        (Some(generation), pending, Vec::new())
+                    }
+                };
+            }
+        }
+        build_generation(id, plans, &self.load_cwd, self.project_trusted, true).await
     }
 
     #[cfg(test)]
@@ -971,8 +1062,7 @@ impl ExtensionRuntimeSet {
             .reload_generation()
             .checked_add(1)
             .ok_or_else(|| HostStartError::Load("extension generation exhausted".to_owned()))?;
-        let (next, pending, diagnostics) =
-            build_generation(next_id, plans, &self.load_cwd, self.project_trusted, true).await;
+        let (next, pending, diagnostics) = self.build_reload_generation(next_id, plans).await;
         let Some(next) = next else {
             let message = diagnostics.first().map_or_else(
                 || "no extension endpoint started".to_owned(),
@@ -3360,6 +3450,58 @@ pub(crate) mod tests {
                 assert_eq!(set.reload_generation(), 1);
                 assert_eq!(runtime.provider_mutation_epoch(), provider_epoch);
             }
+
+            let (native_replacement, native_replacement_host) = make_runner(snapshot(&[])).await?;
+            let (native_replacement, native_pending) = generation_from_endpoints(
+                2,
+                vec![(
+                    EndpointKind::Native,
+                    "<native-replacement>".to_owned(),
+                    native_replacement,
+                )],
+            );
+            compat_with_inactive_sibling
+                .inject_prepared_replacement_for_reload(native_replacement, native_pending);
+            assert!(
+                compat_with_inactive_sibling
+                    .restart_and_rewire(&runtime, HashMap::new())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(compat_with_inactive_sibling.reload_generation(), 1);
+            assert!(compat_with_inactive_sibling.is_active());
+            assert_eq!(runtime.provider_mutation_epoch(), provider_epoch);
+            assert!(runtime.get_registered_provider_ids().is_empty());
+            native_replacement_host.wait_for_exit().await?;
+            assert_eq!(native_replacement_host.exit_count(), 1);
+
+            let (replacement, replacement_host) = make_runner(snapshot(&[])).await?;
+            let (replacement, replacement_pending) = generation_from_endpoints(
+                2,
+                vec![(
+                    EndpointKind::TsCompat,
+                    "<replacement>".to_owned(),
+                    replacement,
+                )],
+            );
+            compat_with_inactive_sibling.inject_prepared_replacement_then_invalidation_for_reload(
+                replacement,
+                replacement_pending,
+            );
+            assert!(
+                compat_with_inactive_sibling
+                    .restart_and_rewire(&runtime, HashMap::new())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(replacement_host.request_count("flags.set"), 1);
+            assert_eq!(compat_with_inactive_sibling.reload_generation(), 1);
+            assert!(!compat_with_inactive_sibling.is_active());
+            assert_eq!(runtime.provider_mutation_epoch(), provider_epoch);
+            assert!(runtime.get_registered_provider_ids().is_empty());
+            replacement_host.wait_for_exit().await?;
+            assert_eq!(replacement_host.exit_count(), 1);
+
             compat_set.shutdown_once().await;
         }
         stale_set.shutdown_once().await;
@@ -3379,6 +3521,7 @@ pub(crate) mod tests {
         );
         assert!(compat_generation.is_single_compat_replacement());
         stop_generation(&compat_generation).await;
+
         let (native, _native_host) = make_runner(snapshot(&[])).await?;
         let (native_generation, _) = generation_from_endpoints(
             2,
@@ -3386,6 +3529,7 @@ pub(crate) mod tests {
         );
         assert!(!native_generation.is_single_compat_replacement());
         stop_generation(&native_generation).await;
+
         let (first, _first_host) = make_runner(snapshot(&[])).await?;
         let (second, _second_host) = make_runner(snapshot(&[])).await?;
         let (multi_generation, _) = generation_from_endpoints(
@@ -3397,6 +3541,186 @@ pub(crate) mod tests {
         );
         assert!(!multi_generation.is_single_compat_replacement());
         stop_generation(&multi_generation).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prepared_native_reload_rejects_before_mutating_published_state() -> TestResult {
+        let old_provider = json!({
+            "name": "old-provider",
+            "baseUrl": "https://old.example/v1",
+            "api": "openai-completions",
+            "models": [{
+                "id": "old-model",
+                "name": "Old model",
+                "api": "openai-completions",
+                "baseUrl": "https://old.example/v1",
+                "reasoning": false
+            }]
+        });
+        let replacement_provider = json!({
+            "name": "replacement-provider",
+            "baseUrl": "https://replacement.example/v1",
+            "api": "openai-completions",
+            "models": [{
+                "id": "replacement-model",
+                "name": "Replacement model",
+                "api": "openai-completions",
+                "baseUrl": "https://replacement.example/v1",
+                "reasoning": false
+            }]
+        });
+        let (old, old_host) = make_runner(json!({
+            "providers": [old_provider],
+            "handlers": ["input"],
+            "terminalInput": false
+        }))
+        .await?;
+        let (replacement, replacement_host) = make_runner(json!({
+            "providers": [replacement_provider],
+            "handlers": [],
+            "terminalInput": false
+        }))
+        .await?;
+        let (generation, pending) =
+            generation_from_endpoints(1, vec![(EndpointKind::TsCompat, "<old>".to_owned(), old)]);
+        let set = Arc::new(ExtensionRuntimeSet::from_generation(
+            generation,
+            Vec::new(),
+            String::new(),
+            false,
+        ));
+        set.install(pending);
+        let runtime = ModelRuntime::create_in_memory().await?;
+        assert!(
+            set.register_providers_on(&runtime)
+                .into_iter()
+                .all(|(_path, result)| result.is_ok())
+        );
+        let provider_epoch = runtime.provider_mutation_epoch();
+        let (replacement, pending) = generation_from_endpoints(
+            2,
+            vec![(
+                EndpointKind::Native,
+                "<replacement>".to_owned(),
+                replacement,
+            )],
+        );
+        set.inject_prepared_replacement_for_reload(replacement, pending);
+
+        assert!(
+            set.restart_and_rewire(&runtime, HashMap::new())
+                .await
+                .is_err()
+        );
+        assert_eq!(replacement_host.request_count("flags.set"), 0);
+        assert_eq!(set.reload_generation(), 1);
+        assert!(set.is_active());
+        assert_eq!(runtime.provider_mutation_epoch(), provider_epoch);
+        assert_eq!(runtime.get_registered_provider_ids(), ["old-provider"]);
+        assert!(runtime.get_model("old-provider", "old-model").is_some());
+        assert!(
+            runtime
+                .get_registered_provider_config("replacement-provider")
+                .is_none()
+        );
+        replacement_host.wait_for_exit().await?;
+        assert_eq!(replacement_host.exit_count(), 1);
+        let result = set.emit_input("original", None, "user", None).await?;
+        assert!(!result.handled);
+        old_host.wait_for_request("input").await?;
+
+        set.shutdown_once().await;
+        old_host.wait_for_exit().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalidation_before_publication_keeps_provider_map_and_reaps_replacement() -> TestResult
+    {
+        let old_provider = json!({
+            "name": "old-provider",
+            "baseUrl": "https://old.example/v1",
+            "api": "openai-completions",
+            "models": [{
+                "id": "old-model",
+                "name": "Old model",
+                "api": "openai-completions",
+                "baseUrl": "https://old.example/v1",
+                "reasoning": false
+            }]
+        });
+        let replacement_provider = json!({
+            "name": "replacement-provider",
+            "baseUrl": "https://replacement.example/v1",
+            "api": "openai-completions",
+            "models": [{
+                "id": "replacement-model",
+                "name": "Replacement model",
+                "api": "openai-completions",
+                "baseUrl": "https://replacement.example/v1",
+                "reasoning": false
+            }]
+        });
+        let (old, old_host) = make_runner(json!({
+            "providers": [old_provider],
+            "handlers": ["input"],
+            "terminalInput": false
+        }))
+        .await?;
+        let (replacement, replacement_host) = make_runner(json!({
+            "providers": [replacement_provider],
+            "handlers": [],
+            "terminalInput": false
+        }))
+        .await?;
+        let (generation, pending) =
+            generation_from_endpoints(1, vec![(EndpointKind::TsCompat, "<old>".to_owned(), old)]);
+        let set = Arc::new(ExtensionRuntimeSet::from_generation(
+            generation,
+            Vec::new(),
+            String::new(),
+            false,
+        ));
+        set.install(pending);
+        let runtime = ModelRuntime::create_in_memory().await?;
+        assert!(
+            set.register_providers_on(&runtime)
+                .into_iter()
+                .all(|(_path, result)| result.is_ok())
+        );
+        let provider_epoch = runtime.provider_mutation_epoch();
+        let (replacement, pending) = generation_from_endpoints(
+            2,
+            vec![(
+                EndpointKind::TsCompat,
+                "<replacement>".to_owned(),
+                replacement,
+            )],
+        );
+        set.inject_prepared_replacement_then_invalidation_for_reload(replacement, pending);
+
+        assert!(
+            set.restart_and_rewire(&runtime, HashMap::new())
+                .await
+                .is_err()
+        );
+        assert_eq!(replacement_host.request_count("flags.set"), 1);
+        assert_eq!(set.reload_generation(), 1);
+        assert!(!set.is_active());
+        assert_eq!(runtime.provider_mutation_epoch(), provider_epoch);
+        assert_eq!(runtime.get_registered_provider_ids(), ["old-provider"]);
+        assert!(runtime.get_model("old-provider", "old-model").is_some());
+        assert!(
+            runtime
+                .get_registered_provider_config("replacement-provider")
+                .is_none()
+        );
+        replacement_host.wait_for_exit().await?;
+        assert_eq!(replacement_host.exit_count(), 1);
+
+        set.shutdown_once().await;
+        old_host.wait_for_exit().await?;
         Ok(())
     }
 }
