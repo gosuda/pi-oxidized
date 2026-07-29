@@ -1,7 +1,9 @@
 //! Classifies discovered extension paths and validates directory manifests.
 
 use std::fs;
+use std::fs::File;
 use std::io;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use serde::Deserialize;
@@ -58,6 +60,15 @@ pub enum ManifestError {
         #[source]
         source: io::Error,
     },
+    /// The manifest file exceeds the maximum allowed size.
+    #[error(
+        "extension manifest {path} is too large: {actual_size} bytes exceeds the {limit}-byte limit"
+    )]
+    ManifestTooLarge {
+        path: PathBuf,
+        actual_size: u64,
+        limit: u64,
+    },
     /// The manifest is not valid under the strict schema.
     #[error("invalid extension manifest {path}: {source}")]
     ParseManifest {
@@ -98,6 +109,7 @@ pub enum ManifestError {
 }
 
 const MANIFEST_FILE_NAME: &str = "pi-extension.json";
+const MANIFEST_BYTE_LIMIT: u64 = 64 * 1024;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -129,13 +141,13 @@ pub fn classify(discovered: &str) -> Result<ClassifiedExtension, ManifestError> 
     }
 
     let manifest_path = discovered_path.join(MANIFEST_FILE_NAME);
-    match fs::metadata(&manifest_path) {
+    let metadata = match fs::metadata(&manifest_path) {
         Ok(metadata) if !metadata.is_file() => {
             return Err(ManifestError::ManifestNotFile {
                 path: manifest_path,
             });
         }
-        Ok(_) => {}
+        Ok(metadata) => metadata,
         Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(compat(discovered)),
         Err(source) => {
             return Err(ManifestError::InspectManifest {
@@ -143,19 +155,16 @@ pub fn classify(discovered: &str) -> Result<ClassifiedExtension, ManifestError> 
                 source,
             });
         }
-    }
+    };
 
+    let manifest_bytes = read_manifest_bounded(&manifest_path, metadata.len())?;
     let manifest =
-        fs::read_to_string(&manifest_path).map_err(|source| ManifestError::ReadManifest {
-            path: manifest_path.clone(),
-            source,
+        serde_json::from_slice::<DirectoryManifest>(&manifest_bytes).map_err(|source| {
+            ManifestError::ParseManifest {
+                path: manifest_path,
+                source,
+            }
         })?;
-    let manifest = serde_json::from_str::<DirectoryManifest>(&manifest).map_err(|source| {
-        ManifestError::ParseManifest {
-            path: manifest_path,
-            source,
-        }
-    })?;
 
     if !is_safe_relative_entry(&manifest.entry) {
         return Err(ManifestError::UnsafeEntry {
@@ -207,12 +216,54 @@ fn compat(discovered: &str) -> ClassifiedExtension {
 }
 
 fn is_safe_relative_entry(entry: &str) -> bool {
+    // Reject Windows absolute and separator forms on every host so a manifest
+    // cannot smuggle drive letters, UNC shares, or backslash separators past
+    // the component check on targets where `Path` does not parse them.
+    if entry.contains('\\') {
+        return false;
+    }
+    let bytes = entry.as_bytes();
+    let has_drive_prefix = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    if has_drive_prefix || entry.starts_with("//") {
+        return false;
+    }
     !Path::new(entry).components().any(|component| {
         matches!(
             component,
             Component::Prefix(_) | Component::RootDir | Component::ParentDir
         )
     })
+}
+
+fn read_manifest_bounded(path: &Path, declared_len: u64) -> Result<Vec<u8>, ManifestError> {
+    if declared_len > MANIFEST_BYTE_LIMIT {
+        return Err(ManifestError::ManifestTooLarge {
+            path: path.to_path_buf(),
+            actual_size: declared_len,
+            limit: MANIFEST_BYTE_LIMIT,
+        });
+    }
+    let mut file = File::open(path).map_err(|source| ManifestError::ReadManifest {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut buffer = Vec::new();
+    file.by_ref()
+        .take(MANIFEST_BYTE_LIMIT + 1)
+        .read_to_end(&mut buffer)
+        .map_err(|source| ManifestError::ReadManifest {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let actual_size = buffer.len() as u64;
+    if actual_size > MANIFEST_BYTE_LIMIT {
+        return Err(ManifestError::ManifestTooLarge {
+            path: path.to_path_buf(),
+            actual_size,
+            limit: MANIFEST_BYTE_LIMIT,
+        });
+    }
+    Ok(buffer)
 }
 
 fn canonicalize_entry(path: &Path) -> Result<PathBuf, ManifestError> {
@@ -378,18 +429,101 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(windows)]
     #[test]
-    fn manifest_rejects_drive_prefixed_entry() -> TestResult {
+    fn manifest_rejects_windows_absolute_entries_on_every_host() -> TestResult {
         let temp = tempdir()?;
         let extension = temp.path().join("extension");
         fs::create_dir(&extension)?;
-        write_manifest(&extension, "ts-compat", "C:/outside.ts")?;
+        let discovered = extension.to_str().ok_or("non-UTF-8 temp path")?;
 
+        // Each entry is written as valid JSON with backslashes properly escaped
+        // so the rejection comes from `is_safe_relative_entry`, not the parser.
+        let cases: [(&str, &str); 5] = [
+            (
+                "C:/outside.ts",
+                r#"{"runtime":"ts-compat","entry":"C:/outside.ts"}"#,
+            ),
+            (
+                "C:outside.ts",
+                r#"{"runtime":"ts-compat","entry":"C:outside.ts"}"#,
+            ),
+            (
+                r"C:\outside.ts",
+                r#"{"runtime":"ts-compat","entry":"C:\\outside.ts"}"#,
+            ),
+            (
+                r"\outside.ts",
+                r#"{"runtime":"ts-compat","entry":"\\outside.ts"}"#,
+            ),
+            (
+                r"sub\plugin.ts",
+                r#"{"runtime":"ts-compat","entry":"sub\\plugin.ts"}"#,
+            ),
+        ];
+        for (entry, manifest) in cases {
+            fs::write(extension.join(MANIFEST_FILE_NAME), manifest)?;
+            assert!(
+                matches!(classify(discovered), Err(ManifestError::UnsafeEntry { .. })),
+                "entry {entry:?} should be rejected as unsafe"
+            );
+        }
+
+        // UNC shares expressed with forward slashes are also rejected.
+        fs::write(
+            extension.join(MANIFEST_FILE_NAME),
+            r#"{"runtime":"ts-compat","entry":"//server/share/plugin.ts"}"#,
+        )?;
         assert!(matches!(
-            classify(extension.to_str().ok_or("non-UTF-8 temp path")?),
+            classify(discovered),
             Err(ManifestError::UnsafeEntry { .. })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_rejects_oversize_file() -> TestResult {
+        let temp = tempdir()?;
+        let extension = temp.path().join("extension");
+        fs::create_dir(&extension)?;
+        fs::write(extension.join("plugin.ts"), "")?;
+
+        let base = r#"{"runtime":"ts-compat","entry":"plugin.ts"}"#;
+        let limit = usize::try_from(MANIFEST_BYTE_LIMIT)?;
+        let padding = limit + 1 - base.len();
+        fs::write(
+            extension.join(MANIFEST_FILE_NAME),
+            format!("{}{}", base, " ".repeat(padding)),
+        )?;
+
+        let discovered = extension.to_str().ok_or("non-UTF-8 temp path")?;
+        let result = classify(discovered);
+        let Err(ManifestError::ManifestTooLarge {
+            actual_size, limit, ..
+        }) = result
+        else {
+            return Err(format!("expected ManifestTooLarge, got {result:?}").into());
+        };
+        assert_eq!(limit, MANIFEST_BYTE_LIMIT);
+        assert_eq!(actual_size, MANIFEST_BYTE_LIMIT + 1);
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_accepts_up_to_byte_limit() -> TestResult {
+        let temp = tempdir()?;
+        let extension = temp.path().join("extension");
+        fs::create_dir(&extension)?;
+        fs::write(extension.join("plugin.ts"), "")?;
+
+        let base = r#"{"runtime":"ts-compat","entry":"plugin.ts"}"#;
+        let limit = usize::try_from(MANIFEST_BYTE_LIMIT)?;
+        let padding = limit - base.len();
+        let bounded = format!("{}{}", base, " ".repeat(padding));
+        assert_eq!(bounded.len(), limit);
+        fs::write(extension.join(MANIFEST_FILE_NAME), &bounded)?;
+
+        let discovered = extension.to_str().ok_or("non-UTF-8 temp path")?;
+        assert_eq!(classify(discovered)?.runtime, ExtensionRuntime::TsCompat);
         Ok(())
     }
 
