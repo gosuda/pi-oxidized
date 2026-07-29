@@ -194,6 +194,18 @@ impl PublishedRuntimeState {
         }
     }
 
+    fn reloadable(&self) -> bool {
+        !self.stale
+            && !self.shutdown_done
+            && self
+                .generation
+                .endpoints
+                .iter()
+                .filter(|endpoint| endpoint.runner.is_active())
+                .count()
+                == 1
+    }
+
     fn allocate_route(&mut self, endpoint: EndpointId, local: FrameId) -> Option<FrameId> {
         self.generation.endpoint(endpoint)?;
         loop {
@@ -463,11 +475,24 @@ impl ExtensionRuntimeSet {
         self.state().lease()
     }
 
+    #[cfg(test)]
     async fn cutover(&self, next: Generation, pending: PendingBridges) {
+        let _ = self.try_cutover(next, pending).await;
+    }
+
+    async fn try_cutover(
+        &self,
+        next: Generation,
+        pending: PendingBridges,
+    ) -> Result<(), Arc<Generation>> {
         let next = Arc::new(next);
-        let old = self
-            .state()
-            .replace_generation(Arc::clone(&next), &pending, &self.channels);
+        let old = {
+            let mut state = self.state();
+            if state.stale {
+                return Err(next);
+            }
+            state.replace_generation(Arc::clone(&next), &pending, &self.channels)
+        };
         self.start_bridges(&next, pending);
         drain_leases(&old).await;
         for endpoint in old.endpoints.iter() {
@@ -475,6 +500,7 @@ impl ExtensionRuntimeSet {
         }
         abort_bridges(&old);
         stop_generation(&old).await;
+        Ok(())
     }
 
     fn install(&self, pending: PendingBridges) {
@@ -614,6 +640,12 @@ impl ExtensionRuntimeSet {
     #[must_use]
     pub fn is_running(&self) -> bool {
         self.lease().is_running()
+    }
+
+    /// Whether the published generation supports a live reload.
+    #[must_use]
+    pub(crate) fn can_reload(&self) -> bool {
+        self.state().reloadable()
     }
 
     /// Synchronize flags to all active endpoints; siblings are attempted after an error.
@@ -918,13 +950,10 @@ impl ExtensionRuntimeSet {
         preserved_flags: HashMap<String, Value>,
     ) -> Result<(), HostStartError> {
         let _reload = self.reload_lock.lock().await;
-        {
-            let state = self.state();
-            if state.shutdown_done || state.stale {
-                return Err(HostStartError::Load(
-                    "extension runtime is not reloadable".to_owned(),
-                ));
-            }
+        if !self.state().reloadable() {
+            return Err(HostStartError::Load(
+                "extension runtime is not reloadable".to_owned(),
+            ));
         }
         let (classified, diagnostics) = classify_paths(&self.discovered_paths);
         if let Some(first) = diagnostics.first() {
@@ -953,6 +982,12 @@ impl ExtensionRuntimeSet {
                 "{}: {}",
                 first.path, first.message
             )));
+        }
+        if next.endpoints.len() > 1 {
+            stop_generation(&next).await;
+            return Err(HostStartError::Load(
+                "extension runtime is not reloadable".to_owned(),
+            ));
         }
 
         let flags = match encode_flags(preserved_flags) {
@@ -985,7 +1020,14 @@ impl ExtensionRuntimeSet {
             return Err(HostStartError::Load(format!("{path}: {error}")));
         }
 
-        self.cutover(next, pending).await;
+        if let Err(next) = self.try_cutover(next, pending).await {
+            unregister_endpoint_providers(&next.endpoints, runtime);
+            let _ = register_endpoint_providers(&old.endpoints, runtime);
+            stop_generation(&next).await;
+            return Err(HostStartError::Load(
+                "extension runtime was invalidated during reload".to_owned(),
+            ));
+        }
         Ok(())
     }
 
@@ -2978,6 +3020,82 @@ pub(crate) mod tests {
         old_host.wait_for_exit().await?;
         assert_eq!(old_host.exit_count(), 1);
         assert!(!old_runner.is_active());
+        set.shutdown_once().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn single_endpoint_publication_remains_reloadable() -> TestResult {
+        let (old, _old_host) = make_runner(snapshot(&["input"])).await?;
+        let set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, old)]);
+        let (replacement, _replacement_host) = make_runner(snapshot(&["input"])).await?;
+        let (next, pending) =
+            generation_from_endpoints(2, vec![("<replacement>".to_owned(), replacement)]);
+
+        assert!(set.can_reload());
+        assert!(set.try_cutover(next, pending).await.is_ok());
+        assert_eq!(set.reload_generation(), 2);
+        assert!(set.can_reload());
+
+        set.shutdown_once().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalidation_refuses_single_endpoint_publication_and_reaps_replacement() -> TestResult
+    {
+        let (old, _) = make_runner(snapshot(&[])).await?;
+        let set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, old)]);
+        let (replacement, replacement_host) = make_runner(snapshot(&[])).await?;
+        let (next, pending) =
+            generation_from_endpoints(2, vec![("<replacement>".to_owned(), replacement)]);
+
+        set.invalidate();
+        let Err(next) = set.try_cutover(next, pending).await else {
+            return Err(std::io::Error::other("stale publication succeeded").into());
+        };
+        stop_generation(&next).await;
+        replacement_host.wait_for_exit().await?;
+        assert_eq!(set.reload_generation(), 1);
+        assert!(!set.can_reload());
+
+        set.shutdown_once().await;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepared_multi_endpoint_replacement_is_reaped_without_publication() -> TestResult {
+        let (old, old_host) = make_runner(snapshot(&["input"])).await?;
+        let directory = tempfile::tempdir()?;
+        write_native_snapshot_host(directory.path(), snapshot(&[]))?;
+        std::fs::write(
+            directory.path().join("pi-extension.json"),
+            r#"{"runtime":"native","entry":"replacement"}"#,
+        )?;
+        let (generation, pending) = generation_from_endpoints(1, vec![("<old>".to_owned(), old)]);
+        let set = Arc::new(ExtensionRuntimeSet::from_generation(
+            generation,
+            vec![directory.path().to_string_lossy().into_owned()],
+            String::new(),
+            false,
+        ));
+        set.install(pending);
+        let runtime = ModelRuntime::create_in_memory().await?;
+        let provider_epoch = runtime.provider_mutation_epoch();
+
+        assert!(
+            set.restart_and_rewire(&runtime, HashMap::new())
+                .await
+                .is_err()
+        );
+        assert_eq!(runtime.provider_mutation_epoch(), provider_epoch);
+        assert_eq!(set.reload_generation(), 1);
+        assert!(set.is_active());
+        let result = set.emit_input("original", None, "user", None).await?;
+        assert!(!result.handled);
+        old_host.wait_for_request("input").await?;
+
         set.shutdown_once().await;
         Ok(())
     }

@@ -333,6 +333,13 @@ impl AgentSession {
     /// Returns [`ExtensionBindError`] on host restart or resource-discovery
     /// failure.
     pub async fn reload(&self) -> Result<(), ExtensionBindError> {
+        let host = self.host_extension_runner();
+        if host.as_ref().is_some_and(|host| !host.can_reload()) {
+            return Err(ExtensionBindError::HostRestart(
+                "extension runtime is not reloadable".to_owned(),
+            ));
+        }
+
         let runner = self.hooks.runner();
         let previous_flag_values = runner.get_flag_values();
 
@@ -345,7 +352,7 @@ impl AgentSession {
             })
             .await;
 
-        if let Some(host) = self.host_extension_runner() {
+        if let Some(host) = host {
             let Some(runtime) = self.model_runtime() else {
                 // No runtime to re-register providers against: still reap the
                 // old host so dispose paths stay single-reap clean.
@@ -1452,6 +1459,49 @@ mod tests {
         host.wait_for_request("session_start").await?;
         assert_eq!(host.request_count("session_shutdown"), 1);
         assert_eq!(host.request_count("session_start"), 1);
+        assert!(runtime_set.is_active());
+
+        runtime_set.shutdown_once().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reload_rejects_multiple_endpoints_before_old_lifecycle_shutdown() -> TestResult {
+        let (first, first_host) =
+            crate::core::extension_runtime_set::tests::make_runner(serde_json::json!({
+                "handlers": ["session_shutdown"],
+                "terminalInput": false
+            }))
+            .await?;
+        let (second, second_host) =
+            crate::core::extension_runtime_set::tests::make_runner(serde_json::json!({
+                "handlers": ["session_shutdown"],
+                "terminalInput": false
+            }))
+            .await?;
+        let runtime_set = crate::core::extension_runtime_set::ExtensionRuntimeSet::bind(vec![
+            (
+                crate::core::extension_runtime_set::EndpointKind::TsCompat,
+                first,
+            ),
+            (
+                crate::core::extension_runtime_set::EndpointKind::Native,
+                second,
+            ),
+        ]);
+        let runtime = Arc::new(crate::core::model_runtime::ModelRuntime::create_in_memory().await?);
+        let mut config = AgentSessionConfig::test_config(Arc::new(StubProvider), test_model())?;
+        config.extension_runner = Some(runtime_set.clone());
+        config.host_extension_runner = Some(runtime_set.clone());
+        config.model_runtime = Some(runtime);
+        let session = AgentSession::new(config)?;
+
+        assert!(matches!(
+            session.reload().await,
+            Err(ExtensionBindError::HostRestart(_))
+        ));
+        assert_eq!(first_host.request_count("session_shutdown"), 0);
+        assert_eq!(second_host.request_count("session_shutdown"), 0);
         assert!(runtime_set.is_active());
 
         runtime_set.shutdown_once().await;
