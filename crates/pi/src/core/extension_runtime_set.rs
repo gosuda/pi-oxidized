@@ -2,8 +2,8 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, RwLock, Weak};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 
 use futures::future::BoxFuture;
@@ -49,7 +49,7 @@ pub enum EndpointKind {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct EndpointPlan {
-    index: usize,
+    position: usize,
     kind: EndpointKind,
     entries: Vec<String>,
     diagnostic_paths: Vec<String>,
@@ -74,9 +74,15 @@ pub struct ExtensionSetStart {
     pub diagnostics: Vec<ExtensionSetDiagnostic>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct EndpointId {
+    generation: u64,
+    position: usize,
+}
+
 #[derive(Clone)]
 struct Endpoint {
-    index: usize,
+    id: EndpointId,
     label: String,
     runner: Arc<HostExtensionRunner>,
 }
@@ -85,6 +91,52 @@ struct Generation {
     id: u64,
     endpoints: Arc<[Endpoint]>,
     bridges: StdMutex<Vec<tokio::task::JoinHandle<()>>>,
+    leases: AtomicUsize,
+    drained: tokio::sync::Notify,
+}
+
+impl Generation {
+    fn endpoint(&self, id: EndpointId) -> Option<&Endpoint> {
+        if id.generation != self.id {
+            return None;
+        }
+        self.endpoints.get(id.position)
+    }
+}
+
+struct GenerationLease {
+    generation: Arc<Generation>,
+    stale: bool,
+}
+
+impl GenerationLease {
+    fn endpoints(&self) -> &[Endpoint] {
+        &self.generation.endpoints
+    }
+
+    fn is_active(&self) -> bool {
+        !self.stale
+            && self
+                .endpoints()
+                .iter()
+                .any(|endpoint| endpoint.runner.is_active())
+    }
+
+    fn is_running(&self) -> bool {
+        !self.stale
+            && self
+                .endpoints()
+                .iter()
+                .any(|endpoint| endpoint.runner.is_running())
+    }
+}
+
+impl Drop for GenerationLease {
+    fn drop(&mut self) {
+        if self.generation.leases.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.generation.drained.notify_one();
+        }
+    }
 }
 
 struct PendingEndpointBridges {
@@ -98,11 +150,10 @@ struct PendingEndpointBridges {
     slots: Vec<SanitizedSlot>,
 }
 
-/// Every relay for one endpoint shares this generation-tagged routing identity.
+/// Every relay for one endpoint shares this stable routing identity.
 struct EndpointRelayContext {
-    generation_id: u64,
-    generation: Weak<RwLock<Arc<Generation>>>,
-    aggregate: Arc<Aggregate>,
+    state: Weak<StdMutex<PublishedRuntimeState>>,
+    channels: Arc<FacadeChannels>,
     endpoint: Endpoint,
 }
 
@@ -110,12 +161,174 @@ type PendingBridges = Vec<PendingEndpointBridges>;
 
 #[derive(Clone, Copy)]
 struct CorrelationRoute {
-    generation: u64,
-    endpoint: usize,
+    endpoint: EndpointId,
     local: FrameId,
 }
 
-struct Aggregate {
+struct PublishedRuntimeState {
+    generation: Arc<Generation>,
+    slots: HashMap<String, BTreeMap<EndpointId, SanitizedSlot>>,
+    routes: HashMap<FrameId, CorrelationRoute>,
+    next_route_id: FrameId,
+    stale: bool,
+    shutdown_done: bool,
+}
+
+impl PublishedRuntimeState {
+    fn new(generation: Arc<Generation>) -> Self {
+        Self {
+            generation,
+            slots: HashMap::new(),
+            routes: HashMap::new(),
+            next_route_id: 1,
+            stale: false,
+            shutdown_done: false,
+        }
+    }
+
+    fn lease(&self) -> GenerationLease {
+        self.generation.leases.fetch_add(1, Ordering::Relaxed);
+        GenerationLease {
+            generation: Arc::clone(&self.generation),
+            stale: self.stale,
+        }
+    }
+
+    fn allocate_route(&mut self, endpoint: EndpointId, local: FrameId) -> Option<FrameId> {
+        self.generation.endpoint(endpoint)?;
+        loop {
+            let id = self.next_route_id;
+            self.next_route_id = self.next_route_id.wrapping_add(1);
+            if id == 0 || self.routes.contains_key(&id) {
+                continue;
+            }
+            self.routes.insert(id, CorrelationRoute { endpoint, local });
+            return Some(id);
+        }
+    }
+
+    fn release_route(&mut self, id: FrameId) {
+        self.routes.remove(&id);
+    }
+
+    fn claim_route(&mut self, id: FrameId) -> Option<(GenerationLease, Endpoint, FrameId)> {
+        let route = *self.routes.get(&id)?;
+        let endpoint = self.generation.endpoint(route.endpoint)?.clone();
+        self.routes.remove(&id);
+        Some((self.lease(), endpoint, route.local))
+    }
+
+    fn record_slot(
+        &mut self,
+        endpoint: EndpointId,
+        slot: SanitizedSlot,
+        channels: &FacadeChannels,
+    ) {
+        if self.generation.endpoint(endpoint).is_none() {
+            return;
+        }
+        let owners = self.slots.entry(slot.key.clone()).or_default();
+        owners.insert(endpoint, slot.clone());
+        if owners.last_key_value().map(|(owner, _)| *owner) == Some(endpoint) {
+            let _ = channels.ui_tx.send(ExtensionUiEvent::Slot(slot));
+        }
+    }
+
+    fn dispose_slot(&mut self, endpoint: EndpointId, key: String, channels: &FacadeChannels) {
+        if self.generation.endpoint(endpoint).is_none() {
+            return;
+        }
+        let Some(owners) = self.slots.get_mut(&key) else {
+            return;
+        };
+        let was_owner = owners.last_key_value().map(|(owner, _)| *owner) == Some(endpoint);
+        owners.remove(&endpoint);
+        if !was_owner {
+            return;
+        }
+        let event = if let Some((_, fallback)) = owners.last_key_value() {
+            ExtensionUiEvent::Slot(fallback.clone())
+        } else {
+            self.slots.remove(&key);
+            ExtensionUiEvent::Dispose { key }
+        };
+        let _ = channels.ui_tx.send(event);
+    }
+
+    fn slot_owner(&self, key: &str) -> Option<(GenerationLease, Endpoint)> {
+        let endpoint = *self.slots.get(key)?.last_key_value()?.0;
+        Some((self.lease(), self.generation.endpoint(endpoint)?.clone()))
+    }
+
+    fn current_slots(&self) -> Vec<SanitizedSlot> {
+        let mut slots = self
+            .slots
+            .values()
+            .filter_map(|owners| owners.last_key_value().map(|(_, slot)| slot.clone()))
+            .collect::<Vec<_>>();
+        slots.sort_by(|left, right| left.key.cmp(&right.key));
+        slots
+    }
+
+    fn slot_keys(&self) -> Vec<String> {
+        self.slots.keys().cloned().collect()
+    }
+
+    fn publish_initial_slots(&mut self, pending: &PendingBridges, channels: &FacadeChannels) {
+        for pending_endpoint in pending {
+            for slot in &pending_endpoint.slots {
+                self.record_slot(pending_endpoint.endpoint.id, slot.clone(), channels);
+            }
+        }
+    }
+
+    fn replace_generation(
+        &mut self,
+        next: Arc<Generation>,
+        pending: &PendingBridges,
+        channels: &FacadeChannels,
+    ) -> Arc<Generation> {
+        let old = std::mem::replace(&mut self.generation, next);
+        let mut keys = self.slots.keys().cloned().collect::<Vec<_>>();
+        keys.sort();
+        self.slots.clear();
+        self.routes.clear();
+        for key in keys {
+            let _ = channels.ui_tx.send(ExtensionUiEvent::Dispose { key });
+        }
+        self.publish_initial_slots(pending, channels);
+        old
+    }
+
+    fn quiesce(&mut self, channels: &FacadeChannels) -> Arc<Generation> {
+        self.stale = true;
+        let mut keys = self.slots.keys().cloned().collect::<Vec<_>>();
+        keys.sort();
+        self.slots.clear();
+        self.routes.clear();
+        for key in keys {
+            let _ = channels.ui_tx.send(ExtensionUiEvent::Dispose { key });
+        }
+        Arc::clone(&self.generation)
+    }
+
+    fn invalidate(&mut self, channels: &FacadeChannels) -> Option<Arc<Generation>> {
+        if self.stale {
+            return None;
+        }
+        Some(self.quiesce(channels))
+    }
+
+    fn begin_shutdown(&mut self, channels: &FacadeChannels) -> Option<Arc<Generation>> {
+        if self.shutdown_done {
+            return None;
+        }
+        self.shutdown_done = true;
+        Some(self.quiesce(channels))
+    }
+}
+
+struct FacadeChannels {
     tool_updates_tx: broadcast::Sender<ToolUpdate>,
     provider_events_tx: broadcast::Sender<ProviderEvent>,
     errors_tx: broadcast::Sender<ExtensionErrorEvent>,
@@ -124,15 +337,9 @@ struct Aggregate {
     ui_requests_rx: StdMutex<Option<mpsc::Receiver<HostUiRequest>>>,
     session_bridge_tx: mpsc::Sender<SessionBridgeEvent>,
     session_bridge_rx: StdMutex<Option<mpsc::Receiver<SessionBridgeEvent>>>,
-    slots: StdMutex<HashMap<String, BTreeMap<usize, SanitizedSlot>>>,
-    next_route_id: AtomicU64,
-    routes: StdMutex<HashMap<FrameId, CorrelationRoute>>,
-    stale: AtomicBool,
-    shutdown_done: AtomicBool,
-    shutdown_lock: tokio::sync::Mutex<()>,
 }
 
-impl Aggregate {
+impl FacadeChannels {
     fn new() -> Self {
         let (tool_updates_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let (provider_events_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
@@ -149,57 +356,9 @@ impl Aggregate {
             ui_requests_rx: StdMutex::new(Some(ui_requests_rx)),
             session_bridge_tx,
             session_bridge_rx: StdMutex::new(Some(session_bridge_rx)),
-            slots: StdMutex::new(HashMap::new()),
-            next_route_id: AtomicU64::new(1),
-            routes: StdMutex::new(HashMap::new()),
-            stale: AtomicBool::new(false),
-            shutdown_done: AtomicBool::new(false),
-            shutdown_lock: tokio::sync::Mutex::new(()),
         }
     }
 
-    fn route(&self, generation: u64, endpoint: usize, local: FrameId) -> FrameId {
-        let mut routes = self
-            .routes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        loop {
-            let id = self.next_route_id.fetch_add(1, Ordering::Relaxed);
-            if id == 0 || routes.contains_key(&id) {
-                continue;
-            }
-            routes.insert(
-                id,
-                CorrelationRoute {
-                    generation,
-                    endpoint,
-                    local,
-                },
-            );
-            return id;
-        }
-    }
-
-    fn take_route(&self, id: FrameId) -> Option<CorrelationRoute> {
-        self.routes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&id)
-    }
-
-    fn remove_routes_for(&self, generation: u64, endpoint: usize) {
-        self.routes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(|_, route| route.generation != generation || route.endpoint != endpoint);
-    }
-
-    fn clear_routes(&self) {
-        self.routes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
-    }
     fn publish_error(&self, code: &str, message: String, data: Option<Value>) {
         let _ = self.errors_tx.send(ExtensionErrorEvent {
             code: code.to_owned(),
@@ -208,74 +367,16 @@ impl Aggregate {
             data,
         });
     }
-
-    fn slot(&self, endpoint: usize, slot: SanitizedSlot) {
-        let publish = {
-            let mut slots = self
-                .slots
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let owners = slots.entry(slot.key.clone()).or_default();
-            owners.insert(endpoint, slot.clone());
-            owners.keys().next_back().copied() == Some(endpoint)
-        };
-        if publish {
-            let _ = self.ui_tx.send(ExtensionUiEvent::Slot(slot));
-        }
-    }
-
-    fn dispose(&self, endpoint: usize, key: String) {
-        let event = {
-            let mut slots = self
-                .slots
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(owners) = slots.get_mut(&key) else {
-                return;
-            };
-            let was_owner = owners.keys().next_back().copied() == Some(endpoint);
-            owners.remove(&endpoint);
-            if !was_owner {
-                None
-            } else if let Some((_, fallback)) = owners.last_key_value() {
-                Some(ExtensionUiEvent::Slot(fallback.clone()))
-            } else {
-                slots.remove(&key);
-                Some(ExtensionUiEvent::Dispose { key })
-            }
-        };
-        if let Some(event) = event {
-            let _ = self.ui_tx.send(event);
-        }
-    }
-
-    fn dispose_all_slots(&self) {
-        let keys = {
-            let mut slots = self
-                .slots
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut keys = slots.keys().cloned().collect::<Vec<_>>();
-            keys.sort();
-            slots.clear();
-            keys
-        };
-        for key in keys {
-            let _ = self.ui_tx.send(ExtensionUiEvent::Dispose { key });
-        }
-    }
 }
 
 /// Stable facade whose published endpoint generation can be replaced in place.
 pub struct ExtensionRuntimeSet {
-    generation: Arc<RwLock<Arc<Generation>>>,
-    aggregate: Arc<Aggregate>,
+    state: Arc<StdMutex<PublishedRuntimeState>>,
+    channels: Arc<FacadeChannels>,
     discovered_paths: Vec<String>,
     load_cwd: String,
     project_trusted: bool,
     reload_lock: tokio::sync::Mutex<()>,
-    #[cfg(test)]
-    after_replacement_published_before_old_retired: StdMutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 impl ExtensionRuntimeSet {
@@ -308,7 +409,7 @@ impl ExtensionRuntimeSet {
             load_cwd,
             project_trusted,
         ));
-        set.start_bridges(pending);
+        set.install(pending);
         ExtensionSetStart {
             set: Some(set),
             diagnostics,
@@ -322,14 +423,14 @@ impl ExtensionRuntimeSet {
         project_trusted: bool,
     ) -> Self {
         Self {
-            generation: Arc::new(RwLock::new(Arc::new(generation))),
-            aggregate: Arc::new(Aggregate::new()),
+            state: Arc::new(StdMutex::new(PublishedRuntimeState::new(Arc::new(
+                generation,
+            )))),
+            channels: Arc::new(FacadeChannels::new()),
             discovered_paths,
             load_cwd,
             project_trusted,
             reload_lock: tokio::sync::Mutex::new(()),
-            #[cfg(test)]
-            after_replacement_published_before_old_retired: StdMutex::new(None),
         }
     }
 
@@ -339,11 +440,7 @@ impl ExtensionRuntimeSet {
         let endpoints = endpoints
             .into_iter()
             .enumerate()
-            .map(|(index, (_kind, runner))| Endpoint {
-                index,
-                label: format!("<test:{index}>"),
-                runner,
-            })
+            .map(|(index, (_kind, runner))| (format!("<test:{index}>"), runner))
             .collect::<Vec<_>>();
         let (generation, pending) = generation_from_endpoints(1, endpoints);
         let set = Arc::new(Self::from_generation(
@@ -352,45 +449,27 @@ impl ExtensionRuntimeSet {
             String::new(),
             false,
         ));
-        set.start_bridges(pending);
+        set.install(pending);
         set
     }
 
-    fn endpoints(&self) -> Arc<[Endpoint]> {
-        self.generation
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .endpoints
-            .clone()
-    }
-
-    /// Publish a prepared generation before any caller can retire its predecessor.
-    fn publish_replacement(&self, next: Generation, pending: PendingBridges) -> Arc<Generation> {
-        let old = {
-            let mut generation = self
-                .generation
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            // Facade readers and relays synchronize on this pointer swap.
-            std::mem::replace(&mut *generation, Arc::new(next))
-        };
-        self.aggregate.dispose_all_slots();
-        self.aggregate.clear_routes();
-        self.start_bridges(pending);
-        old
-    }
-
-    async fn restart_and_rewire_cutover(&self, next: Generation, pending: PendingBridges) {
-        let old = self.publish_replacement(next, pending);
-        #[cfg(test)]
-        if let Some(observer) = self
-            .after_replacement_published_before_old_retired
+    fn state(&self) -> std::sync::MutexGuard<'_, PublishedRuntimeState> {
+        self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-        {
-            observer();
-        }
+    }
+
+    fn lease(&self) -> GenerationLease {
+        self.state().lease()
+    }
+
+    async fn cutover(&self, next: Generation, pending: PendingBridges) {
+        let next = Arc::new(next);
+        let old = self
+            .state()
+            .replace_generation(Arc::clone(&next), &pending, &self.channels);
+        self.start_bridges(&next, pending);
+        drain_leases(&old).await;
         for endpoint in old.endpoints.iter() {
             endpoint.runner.invalidate();
         }
@@ -398,10 +477,17 @@ impl ExtensionRuntimeSet {
         stop_generation(&old).await;
     }
 
-    fn start_bridges(&self, pending: PendingBridges) {
-        let generation_id = self.reload_generation();
-        let mut handles = Vec::new();
+    fn install(&self, pending: PendingBridges) {
+        let generation = {
+            let mut state = self.state();
+            state.publish_initial_slots(&pending, &self.channels);
+            Arc::clone(&state.generation)
+        };
+        self.start_bridges(&generation, pending);
+    }
 
+    fn start_bridges(&self, generation: &Arc<Generation>, pending: PendingBridges) {
+        let mut handles = Vec::new();
         for pending_endpoint in pending {
             let PendingEndpointBridges {
                 endpoint,
@@ -411,17 +497,13 @@ impl ExtensionRuntimeSet {
                 ui,
                 ui_requests,
                 session_bridge,
-                slots,
+                slots: _,
             } = pending_endpoint;
             let context = EndpointRelayContext {
-                generation_id,
-                generation: Arc::downgrade(&self.generation),
-                aggregate: Arc::clone(&self.aggregate),
+                state: Arc::downgrade(&self.state),
+                channels: Arc::clone(&self.channels),
                 endpoint,
             };
-            for slot in slots {
-                context.aggregate.slot(context.endpoint.index, slot);
-            }
             handles.extend(spawn_broadcast_relays(
                 &context,
                 tool_updates,
@@ -433,30 +515,19 @@ impl ExtensionRuntimeSet {
                 handles.push(handle);
             }
         }
-
-        let generation = self
-            .generation
-            .read()
+        generation
+            .bridges
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        if generation.id == generation_id {
-            generation
-                .bridges
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .extend(handles);
-        } else {
-            for handle in handles {
-                handle.abort();
-            }
-        }
+            .extend(handles);
     }
 
     /// Registered flag types, first endpoint wins.
     #[must_use]
     pub fn registered_flag_types(&self) -> BTreeMap<String, ExtensionFlagType> {
+        let lease = self.lease();
         let mut flags = BTreeMap::new();
-        for endpoint in self.endpoints().iter() {
+        for endpoint in lease.endpoints() {
             for (name, kind) in endpoint.runner.registered_flag_types() {
                 flags.entry(name).or_insert(kind);
             }
@@ -467,8 +538,9 @@ impl ExtensionRuntimeSet {
     /// Registered custom providers, first endpoint wins.
     #[must_use]
     pub fn providers(&self) -> HashMap<String, ExtensionProvider> {
+        let lease = self.lease();
         let mut providers = HashMap::new();
-        for endpoint in self.endpoints().iter() {
+        for endpoint in lease.endpoints() {
             for (name, provider) in endpoint.runner.providers() {
                 providers.entry(name).or_insert(provider);
             }
@@ -482,19 +554,22 @@ impl ExtensionRuntimeSet {
         &self,
         runtime: &ModelRuntime,
     ) -> Vec<(String, Result<(), ModelRuntimeError>)> {
-        register_endpoint_providers(&self.endpoints(), runtime)
+        let lease = self.lease();
+        register_endpoint_providers(lease.endpoints(), runtime)
     }
 
     /// Remove each first-owned provider once.
     pub fn unregister_providers_from(&self, runtime: &ModelRuntime) {
-        unregister_endpoint_providers(&self.endpoints(), runtime);
+        let lease = self.lease();
+        unregister_endpoint_providers(lease.endpoints(), runtime);
     }
 
     /// Aggregate registry with existing first-wins semantics.
     #[must_use]
     pub fn registry(&self) -> Registry {
+        let lease = self.lease();
         let mut aggregate = Registry::new();
-        for endpoint in self.endpoints().iter() {
+        for endpoint in lease.endpoints() {
             let registry = endpoint.runner.registry();
             for item in registry.tools() {
                 aggregate.register_tool(item.clone());
@@ -521,7 +596,9 @@ impl ExtensionRuntimeSet {
     /// Raw shortcut registrations in endpoint order; product filtering remains last-wins.
     #[must_use]
     pub fn raw_shortcuts(&self) -> Vec<ShortcutRegistration> {
-        self.endpoints()
+        let lease = self.lease();
+        lease
+            .endpoints()
             .iter()
             .flat_map(|endpoint| endpoint.runner.raw_shortcuts())
             .collect()
@@ -530,20 +607,13 @@ impl ExtensionRuntimeSet {
     /// Current published generation id.
     #[must_use]
     pub fn reload_generation(&self) -> u64 {
-        self.generation
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .id
+        self.lease().generation.id
     }
 
     /// Whether any non-stale endpoint transport is running.
     #[must_use]
     pub fn is_running(&self) -> bool {
-        !self.aggregate.stale.load(Ordering::Relaxed)
-            && self
-                .endpoints()
-                .iter()
-                .any(|endpoint| endpoint.runner.is_running())
+        self.lease().is_running()
     }
 
     /// Synchronize flags to all active endpoints; siblings are attempted after an error.
@@ -555,8 +625,9 @@ impl ExtensionRuntimeSet {
         &self,
         values: &BTreeMap<String, FlagValueWire>,
     ) -> Result<(), HostClientError> {
+        let lease = self.lease();
         let mut first_error = None;
-        for endpoint in self.endpoints().iter() {
+        for endpoint in lease.endpoints() {
             if !endpoint.runner.is_active() {
                 continue;
             }
@@ -579,8 +650,8 @@ impl ExtensionRuntimeSet {
         key: impl Into<String>,
     ) -> Result<ShortcutExecuteResponse, HostClientError> {
         let key = key.into();
-        let endpoints = self.endpoints();
-        for endpoint in endpoints.iter().rev() {
+        let lease = self.lease();
+        for endpoint in lease.endpoints().iter().rev() {
             if endpoint
                 .runner
                 .raw_shortcuts()
@@ -602,18 +673,7 @@ impl ExtensionRuntimeSet {
         &self,
         request: UiEventRequest,
     ) -> Result<UiEventResponse, HostClientError> {
-        let owner = self
-            .aggregate
-            .slots
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&request.key)
-            .and_then(|owners| owners.keys().next_back().copied());
-        let Some(owner) = owner else {
-            return Ok(UiEventResponse { delivered: false });
-        };
-        let endpoints = self.endpoints();
-        let Some(endpoint) = endpoints.get(owner) else {
+        let Some((_lease, endpoint)) = self.state().slot_owner(&request.key) else {
             return Ok(UiEventResponse { delivered: false });
         };
         endpoint.runner.send_ui_event(request).await
@@ -622,52 +682,38 @@ impl ExtensionRuntimeSet {
     /// Currently live effective slot keys.
     #[must_use]
     pub fn slot_keys(&self) -> Vec<String> {
-        self.aggregate
-            .slots
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .keys()
-            .cloned()
-            .collect()
+        self.state().slot_keys()
     }
 
     /// Current last-owner slot per key, sorted by key.
     #[must_use]
     pub fn current_slots(&self) -> Vec<SanitizedSlot> {
-        let mut slots = self
-            .aggregate
-            .slots
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .values()
-            .filter_map(|owners| owners.last_key_value().map(|(_, slot)| slot.clone()))
-            .collect::<Vec<_>>();
-        slots.sort_by(|left, right| left.key.cmp(&right.key));
-        slots
+        self.state().current_slots()
     }
 
     /// Subscribe to aggregate tool updates.
     #[must_use]
     pub fn subscribe_tool_updates(&self) -> broadcast::Receiver<ToolUpdate> {
-        self.aggregate.tool_updates_tx.subscribe()
+        self.channels.tool_updates_tx.subscribe()
     }
 
     /// Subscribe to aggregate provider events.
     #[must_use]
     pub fn subscribe_provider_events(&self) -> broadcast::Receiver<ProviderEvent> {
-        self.aggregate.provider_events_tx.subscribe()
+        self.channels.provider_events_tx.subscribe()
     }
 
     /// Subscribe to aggregate extension errors.
     #[must_use]
     pub fn subscribe_errors(&self) -> broadcast::Receiver<ExtensionErrorEvent> {
-        self.aggregate.errors_tx.subscribe()
+        self.channels.errors_tx.subscribe()
     }
 
     /// Whether any active endpoint handles terminal input.
     #[must_use]
     pub fn has_terminal_input_handlers(&self) -> bool {
-        self.endpoints().iter().any(|endpoint| {
+        let lease = self.lease();
+        lease.endpoints().iter().any(|endpoint| {
             endpoint.runner.is_active() && endpoint.runner.has_terminal_input_handlers()
         })
     }
@@ -681,11 +727,10 @@ impl ExtensionRuntimeSet {
         &self,
         data: &str,
     ) -> Result<protocol::TerminalInputResult, HostClientError> {
-        let endpoints = self.endpoints();
+        let lease = self.lease();
         let mut pending = FuturesUnordered::new();
-        for endpoint in endpoints.iter() {
+        for (index, endpoint) in lease.endpoints().iter().enumerate() {
             if endpoint.runner.is_active() && endpoint.runner.has_terminal_input_handlers() {
-                let index = endpoint.index;
                 let runner = Arc::clone(&endpoint.runner);
                 let data = data.to_owned();
                 pending.push(async move { (index, runner.terminal_input(&data).await) });
@@ -695,7 +740,7 @@ impl ExtensionRuntimeSet {
             return Ok(protocol::TerminalInputResult::default());
         }
         let deadline = tokio::time::Instant::now() + TERMINAL_INPUT_DEADLINE;
-        let mut replies = vec![None; endpoints.len()];
+        let mut replies = vec![None; lease.endpoints().len()];
         while !pending.is_empty() {
             match tokio::time::timeout_at(deadline, pending.next()).await {
                 Ok(Some((index, Ok(reply)))) => replies[index] = Some(reply),
@@ -723,13 +768,15 @@ impl ExtensionRuntimeSet {
     /// Subscribe to aggregate UI activity.
     #[must_use]
     pub fn subscribe_ui(&self) -> broadcast::Receiver<ExtensionUiEvent> {
-        self.aggregate.ui_tx.subscribe()
+        self.channels.ui_tx.subscribe()
     }
 
     /// Highest endpoint theme generation.
     #[must_use]
     pub fn theme_generation(&self) -> u64 {
-        self.endpoints()
+        let lease = self.lease();
+        lease
+            .endpoints()
             .iter()
             .map(|endpoint| endpoint.runner.theme_generation())
             .max()
@@ -738,7 +785,8 @@ impl ExtensionRuntimeSet {
 
     /// Broadcast a theme update to all active endpoints.
     pub async fn push_theme_update(&self, update: &ThemeUpdate) {
-        for endpoint in self.endpoints().iter() {
+        let lease = self.lease();
+        for endpoint in lease.endpoints() {
             endpoint.runner.push_theme_update(update).await;
         }
     }
@@ -746,7 +794,7 @@ impl ExtensionRuntimeSet {
     /// Claim the persistent facade UI-request receiver once.
     #[must_use]
     pub fn take_ui_requests(&self) -> Option<mpsc::Receiver<HostUiRequest>> {
-        self.aggregate
+        self.channels
             .ui_requests_rx
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -759,41 +807,26 @@ impl ExtensionRuntimeSet {
     ///
     /// Returns an error when the response route is stale or missing, or its host rejects it.
     pub async fn respond_ui(&self, response: HostUiResponse) -> Result<(), HostClientError> {
-        let generation = self
-            .generation
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        let route = self
-            .aggregate
-            .take_route(ui_response_id(&response))
-            .filter(|route| route.generation == generation.id)
-            .ok_or(HostClientError::NotRunning)?;
-        let endpoint = generation
-            .endpoints
-            .get(route.endpoint)
-            .cloned()
-            .ok_or(HostClientError::NotRunning)?;
+        let Some((_lease, endpoint, local)) = self.state().claim_route(ui_response_id(&response))
+        else {
+            return Err(HostClientError::NotRunning);
+        };
         endpoint
             .runner
-            .respond_ui(map_ui_response_id(response, route.local))
+            .respond_ui(map_ui_response_id(response, local))
             .await
     }
 
     /// Whether this facade has at least one active endpoint.
     #[must_use]
     pub fn is_active(&self) -> bool {
-        !self.aggregate.stale.load(Ordering::Relaxed)
-            && self
-                .endpoints()
-                .iter()
-                .any(|endpoint| endpoint.runner.is_active())
+        self.lease().is_active()
     }
 
     /// Claim the persistent facade session bridge once.
     #[must_use]
     pub fn take_session_bridge(&self) -> Option<mpsc::Receiver<SessionBridgeEvent>> {
-        self.aggregate
+        self.channels
             .session_bridge_rx
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -810,25 +843,10 @@ impl ExtensionRuntimeSet {
         id: FrameId,
         success: bool,
     ) -> Result<(), HostClientError> {
-        let generation = self
-            .generation
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        let route = self
-            .aggregate
-            .take_route(id)
-            .filter(|route| route.generation == generation.id)
-            .ok_or(HostClientError::NotRunning)?;
-        let endpoint = generation
-            .endpoints
-            .get(route.endpoint)
-            .cloned()
-            .ok_or(HostClientError::NotRunning)?;
-        endpoint
-            .runner
-            .respond_set_model(route.local, success)
-            .await
+        let Some((_lease, endpoint, local)) = self.state().claim_route(id) else {
+            return Err(HostClientError::NotRunning);
+        };
+        endpoint.runner.respond_set_model(local, success).await
     }
 
     /// Route a correlated compaction response to its originating endpoint.
@@ -841,34 +859,24 @@ impl ExtensionRuntimeSet {
         id: FrameId,
         outcome: Result<Value, String>,
     ) -> Result<(), HostClientError> {
-        let generation = self
-            .generation
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        let route = self
-            .aggregate
-            .take_route(id)
-            .filter(|route| route.generation == generation.id)
-            .ok_or(HostClientError::NotRunning)?;
-        let endpoint = generation
-            .endpoints
-            .get(route.endpoint)
-            .cloned()
-            .ok_or(HostClientError::NotRunning)?;
-        endpoint.runner.respond_compact(route.local, outcome).await
+        let Some((_lease, endpoint, local)) = self.state().claim_route(id) else {
+            return Err(HostClientError::NotRunning);
+        };
+        endpoint.runner.respond_compact(local, outcome).await
     }
 
     /// Broadcast mirrored session state.
     pub async fn push_session_state(&self, state: &SessionStateWire) {
-        for endpoint in self.endpoints().iter() {
+        let lease = self.lease();
+        for endpoint in lease.endpoints() {
             endpoint.runner.push_session_state(state).await;
         }
     }
 
     /// Broadcast mirrored UI state.
     pub async fn push_ui_state(&self, state: &UiStateWire) {
-        for endpoint in self.endpoints().iter() {
+        let lease = self.lease();
+        for endpoint in lease.endpoints() {
             endpoint.runner.push_ui_state(state).await;
         }
     }
@@ -880,7 +888,8 @@ impl ExtensionRuntimeSet {
         tool_name: &str,
         payload: &Value,
     ) -> Option<String> {
-        for endpoint in self.endpoints().iter() {
+        let lease = self.lease();
+        for endpoint in lease.endpoints() {
             if endpoint
                 .runner
                 .registry()
@@ -909,12 +918,13 @@ impl ExtensionRuntimeSet {
         preserved_flags: HashMap<String, Value>,
     ) -> Result<(), HostStartError> {
         let _reload = self.reload_lock.lock().await;
-        if self.aggregate.shutdown_done.load(Ordering::Relaxed)
-            || self.aggregate.stale.load(Ordering::Relaxed)
         {
-            return Err(HostStartError::Load(
-                "extension runtime is not reloadable".to_owned(),
-            ));
+            let state = self.state();
+            if state.shutdown_done || state.stale {
+                return Err(HostStartError::Load(
+                    "extension runtime is not reloadable".to_owned(),
+                ));
+            }
         }
         let (classified, diagnostics) = classify_paths(&self.discovered_paths);
         if let Some(first) = diagnostics.first() {
@@ -962,64 +972,50 @@ impl ExtensionRuntimeSet {
             return Err(HostStartError::Load(format!("{path}: {error}")));
         }
 
-        let old = self
-            .generation
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        unregister_generation_providers(&old, runtime);
-        let registrations = register_generation_providers(&next, runtime);
+        let old = Arc::clone(&self.state().generation);
+        unregister_endpoint_providers(&old.endpoints, runtime);
+        let registrations = register_endpoint_providers(&next.endpoints, runtime);
         if let Some((path, Err(error))) = registrations
             .iter()
             .find(|(_path, outcome)| outcome.is_err())
         {
-            unregister_generation_providers(&next, runtime);
-            let _ = register_generation_providers(&old, runtime);
+            unregister_endpoint_providers(&next.endpoints, runtime);
+            let _ = register_endpoint_providers(&old.endpoints, runtime);
             stop_generation(&next).await;
             return Err(HostStartError::Load(format!("{path}: {error}")));
         }
 
-        self.restart_and_rewire_cutover(next, pending).await;
+        self.cutover(next, pending).await;
         Ok(())
     }
 
     /// Invalidate all endpoints and synchronously dispose product-visible slots.
     pub fn invalidate(&self) {
-        if self.aggregate.stale.swap(true, Ordering::Relaxed) {
+        let Some(generation) = self.state().invalidate(&self.channels) else {
             return;
-        }
-        for endpoint in self.endpoints().iter() {
+        };
+        for endpoint in generation.endpoints.iter() {
             endpoint.runner.invalidate();
         }
-        self.aggregate.dispose_all_slots();
-        self.aggregate.clear_routes();
     }
 
     /// Gracefully stop every endpoint exactly once.
     pub async fn shutdown_once(&self) {
         let _reload = self.reload_lock.lock().await;
-        let _shutdown = self.aggregate.shutdown_lock.lock().await;
-        if self.aggregate.shutdown_done.load(Ordering::Relaxed) {
+        let Some(generation) = self.state().begin_shutdown(&self.channels) else {
             return;
-        }
-        self.aggregate.stale.store(true, Ordering::Relaxed);
-        let generation = self
-            .generation
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+        };
+        drain_leases(&generation).await;
         stop_generation(&generation).await;
-        self.aggregate.dispose_all_slots();
-        self.aggregate.clear_routes();
         abort_bridges(&generation);
-        self.aggregate.shutdown_done.store(true, Ordering::Relaxed);
     }
 }
 
 impl ExtensionRunner for ExtensionRuntimeSet {
     fn has_handlers(&self, event: &str) -> bool {
-        self.is_active()
-            && self
+        let lease = self.lease();
+        lease.is_active()
+            && lease
                 .endpoints()
                 .iter()
                 .any(|endpoint| endpoint.runner.has_handlers(event))
@@ -1029,9 +1025,9 @@ impl ExtensionRunner for ExtensionRuntimeSet {
         &self,
         event: AgentSessionEvent,
     ) -> BoxFuture<'_, Result<Option<CancelResult>, ExtensionRunnerError>> {
-        let endpoints = self.endpoints();
+        let lease = self.lease();
         Box::pin(async move {
-            for endpoint in endpoints.iter() {
+            for endpoint in lease.endpoints() {
                 if let Some(result) = endpoint.runner.emit(event.clone()).await?
                     && result.cancel
                 {
@@ -1046,9 +1042,9 @@ impl ExtensionRunner for ExtensionRuntimeSet {
         &'a self,
         event: &'a AssistantMessageEvent,
     ) -> BoxFuture<'a, Result<Option<CancelResult>, ExtensionRunnerError>> {
-        let endpoints = self.endpoints();
+        let lease = self.lease();
         Box::pin(async move {
-            for endpoint in endpoints.iter() {
+            for endpoint in lease.endpoints() {
                 if let Some(result) = endpoint.runner.emit_message_update_delta(event).await?
                     && result.cancel
                 {
@@ -1063,11 +1059,11 @@ impl ExtensionRunner for ExtensionRuntimeSet {
         &self,
         message: AgentMessage,
     ) -> BoxFuture<'_, Result<Option<AgentMessage>, ExtensionRunnerError>> {
-        let endpoints = self.endpoints();
+        let lease = self.lease();
         Box::pin(async move {
             let mut current = message;
             let mut changed = false;
-            for endpoint in endpoints.iter() {
+            for endpoint in lease.endpoints() {
                 if let Some(replacement) = endpoint.runner.emit_message_end(current.clone()).await?
                 {
                     current = replacement;
@@ -1084,9 +1080,9 @@ impl ExtensionRunner for ExtensionRuntimeSet {
         tool_call_id: &'a str,
         input: Map<String, Value>,
     ) -> BoxFuture<'a, Result<Option<BeforeToolCallResult>, ExtensionRunnerError>> {
-        let endpoints = self.endpoints();
+        let lease = self.lease();
         Box::pin(async move {
-            for endpoint in endpoints.iter() {
+            for endpoint in lease.endpoints() {
                 if let Some(result) = endpoint
                     .runner
                     .emit_tool_call(tool_name, tool_call_id, input.clone())
@@ -1109,14 +1105,14 @@ impl ExtensionRunner for ExtensionRuntimeSet {
         details: Value,
         is_error: bool,
     ) -> BoxFuture<'a, Result<Option<AfterToolCallResult>, ExtensionRunnerError>> {
-        let endpoints = self.endpoints();
+        let lease = self.lease();
         Box::pin(async move {
             let mut current_content = content;
             let mut current_details = details;
             let mut current_error = is_error;
             let mut output = AfterToolCallResult::default();
             let mut changed = false;
-            for endpoint in endpoints.iter() {
+            for endpoint in lease.endpoints() {
                 if let Some(result) = endpoint
                     .runner
                     .emit_tool_result(
@@ -1161,13 +1157,13 @@ impl ExtensionRunner for ExtensionRuntimeSet {
         source: &'a str,
         streaming_behavior: Option<&'a str>,
     ) -> BoxFuture<'a, Result<InputTransformResult, ExtensionRunnerError>> {
-        let endpoints = self.endpoints();
+        let lease = self.lease();
         Box::pin(async move {
             let mut current_text = text.to_owned();
             let mut current_images = images;
             let mut text_changed = false;
             let mut images_changed = false;
-            for endpoint in endpoints.iter() {
+            for endpoint in lease.endpoints() {
                 let result = endpoint
                     .runner
                     .emit_input(
@@ -1202,12 +1198,12 @@ impl ExtensionRunner for ExtensionRuntimeSet {
         prompt: &'a str,
         images: Option<Value>,
     ) -> BoxFuture<'a, Result<Option<BeforeAgentStartResult>, ExtensionRunnerError>> {
-        let endpoints = self.endpoints();
+        let lease = self.lease();
         Box::pin(async move {
             let mut messages = Vec::new();
             let mut system_prompt = None;
             let mut changed = false;
-            for endpoint in endpoints.iter() {
+            for endpoint in lease.endpoints() {
                 if let Some(result) = endpoint
                     .runner
                     .emit_before_agent_start(prompt, images.clone())
@@ -1232,10 +1228,10 @@ impl ExtensionRunner for ExtensionRuntimeSet {
         cwd: &'a str,
         reason: &'a str,
     ) -> BoxFuture<'a, Result<ResourceExtensionPaths, ExtensionRunnerError>> {
-        let endpoints = self.endpoints();
+        let lease = self.lease();
         Box::pin(async move {
             let mut aggregate = ResourceExtensionPaths::default();
-            for endpoint in endpoints.iter() {
+            for endpoint in lease.endpoints() {
                 let paths = endpoint.runner.emit_resources_discover(cwd, reason).await?;
                 aggregate.skill_paths.extend(paths.skill_paths);
                 aggregate.prompt_paths.extend(paths.prompt_paths);
@@ -1246,9 +1242,10 @@ impl ExtensionRunner for ExtensionRuntimeSet {
     }
 
     fn get_registered_commands(&self) -> Vec<String> {
+        let lease = self.lease();
         let mut seen = HashSet::new();
         let mut commands = Vec::new();
-        for endpoint in self.endpoints().iter() {
+        for endpoint in lease.endpoints() {
             for command in endpoint.runner.get_registered_commands() {
                 if seen.insert(command.clone()) {
                     commands.push(command);
@@ -1263,9 +1260,9 @@ impl ExtensionRunner for ExtensionRuntimeSet {
         name: &'a str,
         args: &'a str,
     ) -> BoxFuture<'a, Result<bool, ExtensionRunnerError>> {
-        let endpoints = self.endpoints();
+        let lease = self.lease();
         Box::pin(async move {
-            for endpoint in endpoints.iter() {
+            for endpoint in lease.endpoints() {
                 if endpoint
                     .runner
                     .registry()
@@ -1281,8 +1278,9 @@ impl ExtensionRunner for ExtensionRuntimeSet {
     }
 
     fn get_all_registered_tools(&self) -> HashMap<String, Arc<dyn AgentTool>> {
+        let lease = self.lease();
         let mut tools = HashMap::new();
-        for endpoint in self.endpoints().iter() {
+        for endpoint in lease.endpoints() {
             for (name, tool) in endpoint.runner.get_all_registered_tools() {
                 tools.entry(name).or_insert(tool);
             }
@@ -1291,8 +1289,9 @@ impl ExtensionRunner for ExtensionRuntimeSet {
     }
 
     fn get_flag_values(&self) -> HashMap<String, Value> {
+        let lease = self.lease();
         let mut flags = HashMap::new();
-        for endpoint in self.endpoints().iter() {
+        for endpoint in lease.endpoints() {
             for (name, value) in endpoint.runner.get_flag_values() {
                 flags.entry(name).or_insert(value);
             }
@@ -1305,7 +1304,7 @@ impl ExtensionRunner for ExtensionRuntimeSet {
     }
 
     fn emit_error(&self, message: String) {
-        self.aggregate
+        self.channels
             .publish_error("extension_error", message, None);
     }
 }
@@ -1343,7 +1342,7 @@ fn plan_endpoints(classified: &[ClassifiedExtension]) -> Vec<EndpointPlan> {
             continue;
         }
         plans.push(EndpointPlan {
-            index: 0,
+            position: 0,
             kind,
             entries: vec![extension.entry.clone()],
             diagnostic_paths: vec![extension.discovered.clone()],
@@ -1360,7 +1359,7 @@ fn plan_endpoints(classified: &[ClassifiedExtension]) -> Vec<EndpointPlan> {
         plans.insert(
             0,
             EndpointPlan {
-                index: 0,
+                position: 0,
                 kind: EndpointKind::TsCompat,
                 entries: Vec::new(),
                 diagnostic_paths: Vec::new(),
@@ -1369,8 +1368,8 @@ fn plan_endpoints(classified: &[ClassifiedExtension]) -> Vec<EndpointPlan> {
             },
         );
     }
-    for (index, plan) in plans.iter_mut().enumerate() {
-        plan.index = index;
+    for (position, plan) in plans.iter_mut().enumerate() {
+        plan.position = position;
     }
     plans
 }
@@ -1415,12 +1414,12 @@ async fn build_generation(
         };
         let cwd = load_cwd.to_owned();
         starts.push(async move {
-            let index = plan.index;
+            let position = plan.position;
             let result = match spec {
                 Ok(spec) => start_endpoint(plan.clone(), spec, cwd, project_trusted).await,
                 Err(message) => Err(message),
             };
-            (index, plan, result)
+            (position, plan, result)
         });
     }
 
@@ -1428,7 +1427,7 @@ async fn build_generation(
     while let Some(result) = starts.next().await {
         results.push(result);
     }
-    results.sort_by_key(|(index, _, _)| *index);
+    results.sort_by_key(|(position, _, _)| *position);
 
     let mut endpoints = Vec::new();
     let mut diagnostics = Vec::new();
@@ -1445,11 +1444,7 @@ async fn build_generation(
                         .unwrap_or(path);
                     diagnostics.push(ExtensionSetDiagnostic { path, message });
                 }
-                endpoints.push(Endpoint {
-                    index: plan.index,
-                    label: plan.label,
-                    runner,
-                });
+                endpoints.push((plan.label, runner));
             }
             Err(message) => {
                 let paths = if plan.diagnostic_paths.is_empty() {
@@ -1466,8 +1461,8 @@ async fn build_generation(
     }
 
     if all_or_nothing && !diagnostics.is_empty() {
-        for endpoint in &endpoints {
-            endpoint.runner.shutdown_once().await;
+        for (_, endpoint) in &endpoints {
+            endpoint.shutdown_once().await;
         }
         return (None, Vec::new(), diagnostics);
     }
@@ -1501,11 +1496,20 @@ async fn start_endpoint(
 
 fn generation_from_endpoints(
     id: u64,
-    mut endpoints: Vec<Endpoint>,
+    endpoints: Vec<(String, Arc<HostExtensionRunner>)>,
 ) -> (Generation, PendingBridges) {
-    for (index, endpoint) in endpoints.iter_mut().enumerate() {
-        endpoint.index = index;
-    }
+    let endpoints = endpoints
+        .into_iter()
+        .enumerate()
+        .map(|(position, (label, runner))| Endpoint {
+            id: EndpointId {
+                generation: id,
+                position,
+            },
+            label,
+            runner,
+        })
+        .collect::<Vec<_>>();
     let pending = endpoints
         .iter()
         .cloned()
@@ -1525,46 +1529,48 @@ fn generation_from_endpoints(
             id,
             endpoints: endpoints.into(),
             bridges: StdMutex::new(Vec::new()),
+            leases: AtomicUsize::new(0),
+            drained: tokio::sync::Notify::new(),
         },
         pending,
     )
 }
 
 fn spawn_broadcast_relay<T, F>(
-    generation: u64,
-    published_generation: Weak<RwLock<Arc<Generation>>>,
-    aggregate: Arc<Aggregate>,
+    state: Weak<StdMutex<PublishedRuntimeState>>,
+    endpoint: EndpointId,
+    channels: Arc<FacadeChannels>,
     label: String,
     mut receiver: broadcast::Receiver<T>,
     publish: F,
 ) -> tokio::task::JoinHandle<()>
 where
     T: Clone + Send + 'static,
-    F: Fn(&Aggregate, T) + Send + 'static,
+    F: Fn(&mut PublishedRuntimeState, &FacadeChannels, T) + Send + 'static,
 {
     tokio::spawn(async move {
         loop {
             match receiver.recv().await {
                 Ok(item) => {
-                    let Some(generation_lock) = published_generation.upgrade() else {
+                    let Some(state) = state.upgrade() else {
                         break;
                     };
-                    let published = generation_lock
-                        .read()
+                    let mut state = state
+                        .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if published.id == generation {
-                        publish(&aggregate, item);
+                    if state.generation.endpoint(endpoint).is_some() {
+                        publish(&mut state, &channels, item);
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(count)) => {
-                    let Some(generation_lock) = published_generation.upgrade() else {
+                    let Some(state) = state.upgrade() else {
                         break;
                     };
-                    let published = generation_lock
-                        .read()
+                    let state = state
+                        .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if published.id == generation {
-                        aggregate.publish_error(
+                    if state.generation.endpoint(endpoint).is_some() {
+                        channels.publish_error(
                             "extension_event_lagged",
                             format!("extension {label:?} relay lagged by {count} events"),
                             None,
@@ -1584,44 +1590,43 @@ fn spawn_broadcast_relays(
     provider_events: broadcast::Receiver<ProviderEvent>,
     errors: broadcast::Receiver<ExtensionErrorEvent>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
-    let generation_id = context.generation_id;
-    let published_generation = &context.generation;
-    let aggregate = &context.aggregate;
+    let state = &context.state;
+    let channels = &context.channels;
     let label = &context.endpoint.label;
-    let index = context.endpoint.index;
+    let endpoint = context.endpoint.id;
     let error_runner = Arc::clone(&context.endpoint.runner);
     vec![
         spawn_broadcast_relay(
-            generation_id,
-            Weak::clone(published_generation),
-            Arc::clone(aggregate),
+            Weak::clone(state),
+            endpoint,
+            Arc::clone(channels),
             label.clone(),
             tool_updates,
-            |aggregate, item| {
-                let _ = aggregate.tool_updates_tx.send(item);
+            |_state, channels, item| {
+                let _ = channels.tool_updates_tx.send(item);
             },
         ),
         spawn_broadcast_relay(
-            generation_id,
-            Weak::clone(published_generation),
-            Arc::clone(aggregate),
+            Weak::clone(state),
+            endpoint,
+            Arc::clone(channels),
             label.clone(),
             provider_events,
-            |aggregate, item| {
-                let _ = aggregate.provider_events_tx.send(item);
+            |_state, channels, item| {
+                let _ = channels.provider_events_tx.send(item);
             },
         ),
         spawn_broadcast_relay(
-            generation_id,
-            Weak::clone(published_generation),
-            Arc::clone(aggregate),
+            Weak::clone(state),
+            endpoint,
+            Arc::clone(channels),
             label.clone(),
             errors,
-            move |aggregate, item| {
+            move |state, channels, item| {
                 if !error_runner.is_active() {
-                    aggregate.remove_routes_for(generation_id, index);
+                    state.routes.retain(|_, route| route.endpoint != endpoint);
                 }
-                let _ = aggregate.errors_tx.send(item);
+                let _ = channels.errors_tx.send(item);
             },
         ),
     ]
@@ -1633,41 +1638,42 @@ fn spawn_ui_relays(
     mut ui: broadcast::Receiver<ExtensionUiEvent>,
     ui_requests: Option<mpsc::Receiver<HostUiRequest>>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
-    let generation_id = context.generation_id;
-    let ui_generation = Weak::clone(&context.generation);
-    let ui_aggregate = Arc::clone(&context.aggregate);
+    let ui_state = Weak::clone(&context.state);
+    let ui_channels = Arc::clone(&context.channels);
     let ui_label = context.endpoint.label.clone();
-    let index = context.endpoint.index;
+    let endpoint = context.endpoint.id;
     let mut handles = vec![tokio::spawn(async move {
         loop {
             match ui.recv().await {
                 Ok(event) => {
-                    let Some(generation_lock) = ui_generation.upgrade() else {
+                    let Some(state) = ui_state.upgrade() else {
                         break;
                     };
-                    let published = generation_lock
-                        .read()
+                    let mut state = state
+                        .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if published.id != generation_id {
-                        continue;
-                    }
                     match event {
-                        ExtensionUiEvent::Slot(slot) => ui_aggregate.slot(index, slot),
-                        ExtensionUiEvent::Dispose { key } => ui_aggregate.dispose(index, key),
-                        other => {
-                            let _ = ui_aggregate.ui_tx.send(other);
+                        ExtensionUiEvent::Slot(slot) => {
+                            state.record_slot(endpoint, slot, &ui_channels);
                         }
+                        ExtensionUiEvent::Dispose { key } => {
+                            state.dispose_slot(endpoint, key, &ui_channels);
+                        }
+                        other if state.generation.endpoint(endpoint).is_some() => {
+                            let _ = ui_channels.ui_tx.send(other);
+                        }
+                        _ => {}
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(count)) => {
-                    let Some(generation_lock) = ui_generation.upgrade() else {
+                    let Some(state) = ui_state.upgrade() else {
                         break;
                     };
-                    let published = generation_lock
-                        .read()
+                    let state = state
+                        .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if published.id == generation_id {
-                        ui_aggregate.publish_error(
+                    if state.generation.endpoint(endpoint).is_some() {
+                        ui_channels.publish_error(
                             "extension_event_lagged",
                             format!("extension {ui_label:?} UI relay lagged by {count} events"),
                             None,
@@ -1680,38 +1686,31 @@ fn spawn_ui_relays(
     })];
 
     if let Some(mut requests) = ui_requests {
-        let request_generation = Weak::clone(&context.generation);
-        let request_aggregate = Arc::clone(&context.aggregate);
+        let request_state = Weak::clone(&context.state);
+        let request_channels = Arc::clone(&context.channels);
         let runner = Arc::clone(&context.endpoint.runner);
         handles.push(tokio::spawn(async move {
             while let Some(request) = requests.recv().await {
                 let fallback = request.clone();
-                let Some(generation_lock) = request_generation.upgrade() else {
+                let Some(state) = request_state.upgrade() else {
                     break;
                 };
                 let send_failed = {
-                    let published = generation_lock
-                        .read()
+                    let mut state = state
+                        .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if published.id == generation_id {
-                        let local_id = request.id();
-                        let routed_id = request_aggregate.route(generation_id, index, local_id);
-                        let routed = map_ui_request_id(request, routed_id);
-                        let send_failed =
-                            request_aggregate.ui_requests_tx.try_send(routed).is_err();
-                        if send_failed {
-                            request_aggregate.take_route(routed_id);
-                        }
-                        Some(send_failed)
-                    } else {
-                        None
-                    }
+                    state
+                        .allocate_route(endpoint, request.id())
+                        .map(|routed_id| {
+                            let routed = map_ui_request_id(request, routed_id);
+                            let failed = request_channels.ui_requests_tx.try_send(routed).is_err();
+                            if failed {
+                                state.release_route(routed_id);
+                            }
+                            failed
+                        })
                 };
-                let Some(send_failed) = send_failed else {
-                    let _ = runner.respond_ui(default_ui_response(&fallback)).await;
-                    continue;
-                };
-                if send_failed {
+                if send_failed.unwrap_or(true) {
                     let _ = runner.respond_ui(default_ui_response(&fallback)).await;
                 }
             }
@@ -1726,68 +1725,62 @@ fn spawn_session_relay(
     session_bridge: Option<mpsc::Receiver<SessionBridgeEvent>>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let mut session = session_bridge?;
-    let generation_id = context.generation_id;
-    let session_generation = Weak::clone(&context.generation);
-    let session_aggregate = Arc::clone(&context.aggregate);
+    let state = Weak::clone(&context.state);
+    let channels = Arc::clone(&context.channels);
     let runner = Arc::clone(&context.endpoint.runner);
-    let index = context.endpoint.index;
+    let endpoint = context.endpoint.id;
     Some(tokio::spawn(async move {
         while let Some(event) = session.recv().await {
             let fallback = event.clone();
-            let Some(generation_lock) = session_generation.upgrade() else {
+            let Some(state) = state.upgrade() else {
                 break;
             };
             let send_failed = {
-                let published = generation_lock
-                    .read()
+                let mut state = state
+                    .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if published.id == generation_id {
+                if state.generation.endpoint(endpoint).is_none() {
+                    None
+                } else {
                     let (routed, route_id) = match event {
                         SessionBridgeEvent::SetModel { id, request } => {
-                            let routed_id = session_aggregate.route(generation_id, index, id);
+                            let routed_id = state.allocate_route(endpoint, id);
                             (
-                                SessionBridgeEvent::SetModel {
-                                    id: routed_id,
-                                    request,
-                                },
-                                Some(routed_id),
+                                routed_id.map(|id| SessionBridgeEvent::SetModel { id, request }),
+                                routed_id,
                             )
                         }
                         SessionBridgeEvent::Compact { id, request } => {
-                            let routed_id = session_aggregate.route(generation_id, index, id);
+                            let routed_id = state.allocate_route(endpoint, id);
                             (
-                                SessionBridgeEvent::Compact {
-                                    id: routed_id,
-                                    request,
-                                },
-                                Some(routed_id),
+                                routed_id.map(|id| SessionBridgeEvent::Compact { id, request }),
+                                routed_id,
                             )
                         }
                         SessionBridgeEvent::Command(command) => {
-                            (SessionBridgeEvent::Command(command), None)
+                            (Some(SessionBridgeEvent::Command(command)), None)
                         }
                     };
-                    let send_failed = session_aggregate
-                        .session_bridge_tx
-                        .try_send(routed)
-                        .is_err();
-                    if send_failed && let Some(route_id) = route_id {
-                        session_aggregate.take_route(route_id);
-                    }
-                    Some(send_failed)
-                } else {
-                    None
+                    routed.map(|routed| {
+                        let failed = channels.session_bridge_tx.try_send(routed).is_err();
+                        if failed && let Some(route_id) = route_id {
+                            state.release_route(route_id);
+                        }
+                        failed
+                    })
                 }
             };
-            let Some(send_failed) = send_failed else {
-                answer_unclaimed_session(&runner, fallback).await;
-                continue;
-            };
-            if send_failed {
+            if send_failed.unwrap_or(true) {
                 answer_unclaimed_session(&runner, fallback).await;
             }
         }
     }))
+}
+
+async fn drain_leases(generation: &Generation) {
+    while generation.leases.load(Ordering::Acquire) != 0 {
+        generation.drained.notified().await;
+    }
 }
 
 async fn stop_generation(generation: &Generation) {
@@ -1824,17 +1817,6 @@ fn validate_generation_providers(
         }
     }
     Ok(())
-}
-
-fn register_generation_providers(
-    generation: &Generation,
-    runtime: &ModelRuntime,
-) -> Vec<(String, Result<(), ModelRuntimeError>)> {
-    register_endpoint_providers(&generation.endpoints, runtime)
-}
-
-fn unregister_generation_providers(generation: &Generation, runtime: &ModelRuntime) {
-    unregister_endpoint_providers(&generation.endpoints, runtime);
 }
 
 fn register_endpoint_providers(
@@ -1976,6 +1958,7 @@ pub(crate) mod tests {
     struct FakeHostState {
         frames: StdMutex<Vec<Frame>>,
         exits: AtomicUsize,
+        parked_methods: StdMutex<HashMap<String, mpsc::Sender<FrameId>>>,
     }
 
     #[derive(Clone)]
@@ -1999,6 +1982,16 @@ pub(crate) mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert(method.to_owned());
+        }
+
+        fn park_method(&self, method: &str) -> mpsc::Receiver<FrameId> {
+            let (tx, rx) = mpsc::channel(1);
+            self.state
+                .parked_methods
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(method.to_owned(), tx);
+            rx
         }
 
         async fn emit(&self, frame: Frame) {
@@ -2094,6 +2087,13 @@ pub(crate) mod tests {
     pub(crate) async fn make_runner(
         snapshot: Value,
     ) -> TestResult<(Arc<HostExtensionRunner>, FakeHost)> {
+        make_runner_with_hook_timeout(snapshot, Duration::from_millis(200)).await
+    }
+
+    async fn make_runner_with_hook_timeout(
+        snapshot: Value,
+        hook_timeout: Duration,
+    ) -> TestResult<(Arc<HostExtensionRunner>, FakeHost)> {
         let (client_to_host, host_read) = tokio::io::duplex(64 * 1024);
         let (host_write, client_read) = tokio::io::duplex(64 * 1024);
         let (error_write, _error_read) = tokio::io::duplex(4096);
@@ -2108,6 +2108,7 @@ pub(crate) mod tests {
         let state = Arc::new(FakeHostState {
             frames: StdMutex::new(Vec::new()),
             exits: AtomicUsize::new(0),
+            parked_methods: StdMutex::new(HashMap::new()),
         });
         let (commands, command_rx) = mpsc::channel(32);
         tokio::spawn(fake_host_task(
@@ -2124,7 +2125,7 @@ pub(crate) mod tests {
             Vec::new(),
             "/workspace",
             false,
-            Duration::from_millis(200),
+            hook_timeout,
         )
         .await?;
         Ok((
@@ -2174,6 +2175,19 @@ pub(crate) mod tests {
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .push(frame.clone());
+                            if frame.kind == FrameKind::Req {
+                                let parked = state
+                                    .parked_methods
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .get(&frame.method)
+                                    .cloned();
+                                if let Some(sender) = parked {
+                                    let _ = sender.try_send(frame.id);
+                                    line.clear();
+                                    continue;
+                                }
+                            }
                             if frame.kind == FrameKind::Req
                                 && !dropped_methods
                                     .lock()
@@ -2271,14 +2285,14 @@ pub(crate) mod tests {
         }
     }
 
-    async fn wait_for_slot_text(set: &ExtensionRuntimeSet, expected: &str) -> TestResult {
+    async fn wait_for_slot_text(set: &ExtensionRuntimeSet, text: &str) -> TestResult {
         tokio::time::timeout(TEST_TIMEOUT, async {
             loop {
                 if set.current_slots().first().is_some_and(|slot| {
                     slot.lines
                         .first()
                         .and_then(|line| line.first())
-                        .is_some_and(|run| run.text == expected)
+                        .is_some_and(|run| run.text == text)
                 }) {
                     return;
                 }
@@ -2286,7 +2300,24 @@ pub(crate) mod tests {
             }
         })
         .await
-        .map_err(|_| format!("slot did not become {expected}"))?;
+        .map_err(|_| format!("slot did not become {text}"))?;
+        Ok(())
+    }
+
+    async fn wait_for_dispose(
+        receiver: &mut broadcast::Receiver<ExtensionUiEvent>,
+        key: &str,
+    ) -> TestResult {
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            loop {
+                if let ExtensionUiEvent::Dispose { key: disposed } = receiver.recv().await?
+                    && disposed == key
+                {
+                    return Ok::<_, broadcast::error::RecvError>(());
+                }
+            }
+        })
+        .await??;
         Ok(())
     }
 
@@ -2386,7 +2417,7 @@ pub(crate) mod tests {
         let (generation, pending, diagnostics) = build_generation(
             1,
             vec![EndpointPlan {
-                index: 0,
+                position: 0,
                 kind: EndpointKind::Native,
                 entries: vec![executable_path.clone()],
                 diagnostic_paths: vec![executable_path.clone()],
@@ -2405,11 +2436,11 @@ pub(crate) mod tests {
             load_cwd,
             false,
         ));
-        set.start_bridges(pending);
+        set.install(pending);
 
-        let endpoints = set.endpoints();
-        let endpoint_count = endpoints.len();
-        let command_registered = endpoints.first().is_some_and(|endpoint| {
+        let lease = set.lease();
+        let endpoint_count = lease.endpoints().len();
+        let command_registered = lease.endpoints().first().is_some_and(|endpoint| {
             endpoint
                 .runner
                 .registry()
@@ -2417,6 +2448,7 @@ pub(crate) mod tests {
                 .iter()
                 .any(|command| command.name == COMMAND)
         });
+        drop(lease);
         set.shutdown_once().await;
 
         assert!(
@@ -2429,50 +2461,6 @@ pub(crate) mod tests {
             "native endpoint registry lost {COMMAND}"
         );
         Ok(())
-    }
-
-    #[test]
-    fn correlation_routes_preserve_full_local_ids_and_are_claimed_once() -> Result<(), &'static str>
-    {
-        let aggregate = Aggregate::new();
-        let id = aggregate.route(7, 2, FrameId::MAX);
-        let route = aggregate.take_route(id).ok_or("route")?;
-        assert_eq!(route.generation, 7);
-        assert_eq!(route.endpoint, 2);
-        assert_eq!(route.local, FrameId::MAX);
-        assert!(aggregate.take_route(id).is_none());
-        Ok(())
-    }
-
-    #[test]
-    fn slot_owner_falls_back_in_endpoint_order() {
-        let aggregate = Aggregate::new();
-        let slot0 = SanitizedSlot {
-            key: "shared".to_owned(),
-            ..SanitizedSlot::default()
-        };
-        let slot1 = slot0.clone();
-        aggregate.slot(0, slot0.clone());
-        aggregate.slot(1, slot1);
-        aggregate.dispose(1, "shared".to_owned());
-        assert_eq!(
-            aggregate
-                .slots
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get("shared")
-                .and_then(|owners| owners.last_key_value())
-                .map(|(index, _)| *index),
-            Some(0)
-        );
-        aggregate.dispose(0, "shared".to_owned());
-        assert!(
-            aggregate
-                .slots
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_empty()
-        );
     }
 
     #[tokio::test]
@@ -2672,19 +2660,12 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn runtime_set_restart_cutover_publishes_before_retiring_old_generation() -> TestResult {
         let (first, _first_host) = make_runner(snapshot(&[])).await?;
-        let old_runner = Arc::clone(&first);
         let set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, first)]);
         let mut ui_requests = set.take_ui_requests().ok_or("ui bridge missing")?;
         let mut session_bridge = set.take_session_bridge().ok_or("session bridge missing")?;
         let (replacement, replacement_host) = make_runner(snapshot(&[])).await?;
-        let (next, mut pending) = generation_from_endpoints(
-            2,
-            vec![Endpoint {
-                index: 0,
-                label: "<replacement>".to_owned(),
-                runner: replacement,
-            }],
-        );
+        let (next, mut pending) =
+            generation_from_endpoints(2, vec![("<replacement>".to_owned(), replacement)]);
         let (ui_tx, ui) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         pending[0].ui = ui;
         assert!(
@@ -2701,26 +2682,8 @@ pub(crate) mod tests {
                 .is_ok()
         );
 
-        let observed_order = Arc::new(AtomicBool::new(false));
-        let observed_order_in_cutover = Arc::clone(&observed_order);
-        let published_generation = Arc::clone(&set.generation);
-        *set.after_replacement_published_before_old_retired
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
-            assert_eq!(
-                published_generation
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .id,
-                2
-            );
-            assert!(old_runner.is_active());
-            observed_order_in_cutover.store(true, Ordering::Relaxed);
-        }));
+        set.cutover(next, pending).await;
 
-        set.restart_and_rewire_cutover(next, pending).await;
-
-        assert!(observed_order.load(Ordering::Relaxed));
         assert_eq!(set.reload_generation(), 2);
         assert!(set.is_active());
         wait_for_slot_text(&set, "buffered").await?;
@@ -2756,6 +2719,265 @@ pub(crate) mod tests {
         replacement_host
             .wait_for_response(protocol::SESSION_SET_MODEL_METHOD, 8)
             .await?;
+        set.shutdown_once().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cutover_lets_a_hook_leased_before_publish_finish_on_the_old_endpoint() -> TestResult {
+        let (old, old_host) =
+            make_runner_with_hook_timeout(snapshot(&["input"]), HOOK_TIMEOUT).await?;
+        let mut parked = old_host.park_method("input");
+        let set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, old)]);
+        old_host.emit(slot_frame("old", "old")).await;
+        wait_for_slot_text(&set, "old").await?;
+        let mut ui = set.subscribe_ui();
+
+        let caller_set = Arc::clone(&set);
+        let caller =
+            tokio::spawn(
+                async move { caller_set.emit_input("original", None, "user", None).await },
+            );
+        let request_id = parked.recv().await.ok_or("parked hook closed")?;
+        let (replacement, _) = make_runner(snapshot(&[])).await?;
+        let (next, pending) =
+            generation_from_endpoints(2, vec![("<replacement>".to_owned(), replacement)]);
+        let cutover_set = Arc::clone(&set);
+        let cutover = tokio::spawn(async move { cutover_set.cutover(next, pending).await });
+        wait_for_dispose(&mut ui, "old").await?;
+
+        assert_eq!(set.reload_generation(), 2);
+        assert_eq!(old_host.request_count("shutdown"), 0);
+        old_host
+            .emit(Frame {
+                id: request_id,
+                kind: FrameKind::Res,
+                method: "input".to_owned(),
+                payload: json!({"action": "transform", "text": "old-result"}),
+            })
+            .await;
+        let result = caller.await??;
+        assert_eq!(result.text.as_deref(), Some("old-result"));
+        cutover.await?;
+        set.shutdown_once().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cutover_drops_a_slot_event_from_the_previous_generation() -> TestResult {
+        let (old, old_host) =
+            make_runner_with_hook_timeout(snapshot(&["input"]), HOOK_TIMEOUT).await?;
+        let mut parked = old_host.park_method("input");
+        let set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, old)]);
+        old_host.emit(slot_frame("old", "old")).await;
+        wait_for_slot_text(&set, "old").await?;
+        let mut ui = set.subscribe_ui();
+        let caller_set = Arc::clone(&set);
+        let caller =
+            tokio::spawn(
+                async move { caller_set.emit_input("original", None, "user", None).await },
+            );
+        let request_id = parked.recv().await.ok_or("parked hook closed")?;
+        let (replacement, _) = make_runner(snapshot(&[])).await?;
+        let (next, pending) =
+            generation_from_endpoints(2, vec![("<replacement>".to_owned(), replacement)]);
+        let cutover_set = Arc::clone(&set);
+        let cutover = tokio::spawn(async move { cutover_set.cutover(next, pending).await });
+        wait_for_dispose(&mut ui, "old").await?;
+
+        old_host.emit(slot_frame("late", "late")).await;
+        old_host
+            .emit(Frame {
+                id: request_id,
+                kind: FrameKind::Res,
+                method: "input".to_owned(),
+                payload: json!({"action": "continue"}),
+            })
+            .await;
+        caller.await??;
+        cutover.await?;
+        assert!(!set.slot_keys().iter().any(|key| key == "late"));
+        assert!(!set.current_slots().iter().any(|slot| slot.key == "late"));
+        assert!(ui.try_recv().is_err());
+        set.shutdown_once().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retired_relays_answer_locally_and_publish_nothing() -> TestResult {
+        let (old, old_host) =
+            make_runner_with_hook_timeout(snapshot(&["input"]), HOOK_TIMEOUT).await?;
+        let mut parked = old_host.park_method("input");
+        let set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, old)]);
+        old_host.emit(slot_frame("old", "old")).await;
+        wait_for_slot_text(&set, "old").await?;
+        let mut ui = set.subscribe_ui();
+        let mut ui_requests = set.take_ui_requests().ok_or("ui bridge missing")?;
+        let mut session = set.take_session_bridge().ok_or("session bridge missing")?;
+        let mut tools = set.subscribe_tool_updates();
+        let caller_set = Arc::clone(&set);
+        let caller =
+            tokio::spawn(
+                async move { caller_set.emit_input("original", None, "user", None).await },
+            );
+        let request_id = parked.recv().await.ok_or("parked hook closed")?;
+        let (replacement, _) = make_runner(snapshot(&[])).await?;
+        let (next, pending) =
+            generation_from_endpoints(2, vec![("<replacement>".to_owned(), replacement)]);
+        let cutover_set = Arc::clone(&set);
+        let cutover = tokio::spawn(async move { cutover_set.cutover(next, pending).await });
+        wait_for_dispose(&mut ui, "old").await?;
+
+        old_host
+            .emit(Frame {
+                id: 41,
+                kind: FrameKind::Req,
+                method: "select".to_owned(),
+                payload: json!({"title": "Pick", "options": ["a"]}),
+            })
+            .await;
+        old_host
+            .emit(Frame {
+                id: 42,
+                kind: FrameKind::Req,
+                method: protocol::SESSION_SET_MODEL_METHOD.to_owned(),
+                payload: json!({"model": {"provider": "p", "id": "m"}}),
+            })
+            .await;
+        old_host
+            .emit(Frame {
+                id: 0,
+                kind: FrameKind::Event,
+                method: "toolUpdate".to_owned(),
+                payload: json!({"toolCallId": "c1", "toolName": "t", "partialResult": {"content": []}}),
+            })
+            .await;
+        old_host.wait_for_response("select", 41).await?;
+        old_host
+            .wait_for_response(protocol::SESSION_SET_MODEL_METHOD, 42)
+            .await?;
+        assert!(ui_requests.try_recv().is_err());
+        assert!(session.try_recv().is_err());
+        assert!(tools.try_recv().is_err());
+        assert!(matches!(
+            set.respond_ui(HostUiResponse::Select { id: 1, value: None })
+                .await,
+            Err(HostClientError::NotRunning)
+        ));
+
+        old_host
+            .emit(Frame {
+                id: request_id,
+                kind: FrameKind::Res,
+                method: "input".to_owned(),
+                payload: json!({"action": "continue"}),
+            })
+            .await;
+        caller.await??;
+        cutover.await?;
+        set.shutdown_once().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_reused_endpoint_position_never_retargets_an_old_slot_or_route() -> TestResult {
+        let (old_first, _) = make_runner(snapshot(&[])).await?;
+        let (old_owner, old_host) = make_runner(snapshot(&[])).await?;
+        let set = ExtensionRuntimeSet::bind(vec![
+            (EndpointKind::TsCompat, old_first),
+            (EndpointKind::Native, old_owner),
+        ]);
+        old_host.emit(slot_frame("old-key", "old")).await;
+        wait_for_slot_text(&set, "old").await?;
+        let mut requests = set.take_ui_requests().ok_or("ui bridge missing")?;
+        old_host
+            .emit(Frame {
+                id: FrameId::MAX,
+                kind: FrameKind::Req,
+                method: "select".to_owned(),
+                payload: json!({"title": "Pick", "options": ["a"]}),
+            })
+            .await;
+        let old_route = requests.recv().await.ok_or("ui route missing")?.id();
+
+        let (new_first, _) = make_runner(snapshot(&[])).await?;
+        let (new_owner, new_host) = make_runner(snapshot(&[])).await?;
+        let (next, pending) = generation_from_endpoints(
+            2,
+            vec![
+                ("<new-first>".to_owned(), new_first),
+                ("<new-owner>".to_owned(), new_owner),
+            ],
+        );
+        set.cutover(next, pending).await;
+
+        assert!(matches!(
+            set.respond_ui(HostUiResponse::Select {
+                id: old_route,
+                value: None
+            })
+            .await,
+            Err(HostClientError::NotRunning)
+        ));
+        assert_eq!(new_host.request_count("select"), 0);
+        assert!(
+            !set.send_ui_event(UiEventRequest {
+                key: "old-key".to_owned(),
+                generation: 1,
+                event: protocol::UiEventWire::Key {
+                    code: "x".to_owned(),
+                    modifiers: protocol::KeyModifiersWire::default(),
+                    kind: protocol::KeyEventKindWire::Press,
+                },
+                data: None,
+            })
+            .await?
+            .delivered
+        );
+        assert_eq!(new_host.request_count("uiEvent"), 0);
+        set.shutdown_once().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn old_endpoints_are_retired_only_after_their_leases_drain() -> TestResult {
+        let (old, old_host) =
+            make_runner_with_hook_timeout(snapshot(&["input"]), HOOK_TIMEOUT).await?;
+        let old_runner = Arc::clone(&old);
+        let mut parked = old_host.park_method("input");
+        let set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, old)]);
+        old_host.emit(slot_frame("old", "old")).await;
+        wait_for_slot_text(&set, "old").await?;
+        let mut ui = set.subscribe_ui();
+        let caller_set = Arc::clone(&set);
+        let caller =
+            tokio::spawn(
+                async move { caller_set.emit_input("original", None, "user", None).await },
+            );
+        let request_id = parked.recv().await.ok_or("parked hook closed")?;
+        let (replacement, _) = make_runner(snapshot(&[])).await?;
+        let (next, pending) =
+            generation_from_endpoints(2, vec![("<replacement>".to_owned(), replacement)]);
+        let cutover_set = Arc::clone(&set);
+        let cutover = tokio::spawn(async move { cutover_set.cutover(next, pending).await });
+        wait_for_dispose(&mut ui, "old").await?;
+
+        assert_eq!(old_host.request_count("shutdown"), 0);
+        assert_eq!(old_host.exit_count(), 0);
+        assert!(old_runner.is_active());
+        old_host
+            .emit(Frame {
+                id: request_id,
+                kind: FrameKind::Res,
+                method: "input".to_owned(),
+                payload: json!({"action": "continue"}),
+            })
+            .await;
+        caller.await??;
+        cutover.await?;
+        old_host.wait_for_exit().await?;
+        assert_eq!(old_host.exit_count(), 1);
+        assert!(!old_runner.is_active());
         set.shutdown_once().await;
         Ok(())
     }
@@ -2810,21 +3032,15 @@ pub(crate) mod tests {
             r#"{"runtime":"native","entry":"replacement"}"#,
         )?;
 
-        let (generation, pending) = generation_from_endpoints(
-            1,
-            vec![Endpoint {
-                index: 0,
-                label: "<old>".to_owned(),
-                runner,
-            }],
-        );
+        let (generation, pending) =
+            generation_from_endpoints(1, vec![("<old>".to_owned(), runner)]);
         let set = Arc::new(ExtensionRuntimeSet::from_generation(
             generation,
             vec![directory.path().to_string_lossy().into_owned()],
             String::new(),
             false,
         ));
-        set.start_bridges(pending);
+        set.install(pending);
         let runtime = ModelRuntime::create_in_memory().await?;
         assert!(
             set.register_providers_on(&runtime)
@@ -2874,21 +3090,15 @@ pub(crate) mod tests {
             directory.path().join("pi-extension.json"),
             r#"{"runtime":"native","entry":"replacement"}"#,
         )?;
-        let (generation, pending) = generation_from_endpoints(
-            1,
-            vec![Endpoint {
-                index: 0,
-                label: "<old>".to_owned(),
-                runner,
-            }],
-        );
+        let (generation, pending) =
+            generation_from_endpoints(1, vec![("<old>".to_owned(), runner)]);
         let set = Arc::new(ExtensionRuntimeSet::from_generation(
             generation,
             vec![directory.path().to_string_lossy().into_owned()],
             String::new(),
             false,
         ));
-        set.start_bridges(pending);
+        set.install(pending);
         let runtime = ModelRuntime::create_in_memory().await?;
 
         assert!(
