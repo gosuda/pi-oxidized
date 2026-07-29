@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 import {
+	FIXTURE_GENERATION_ARGS,
 	reopenWithSourcePinnedTypescript,
 	SESSION_INTEROP_TIMEOUT_MS,
 } from "../verification/session-interop.ts";
@@ -20,6 +21,12 @@ test("uses the product matrix timeout for source-pinned session interoperability
 	};
 	const command = matrix.rows.find((row) => row.id === "session-v1-v2-v3-interop")?.commands[0];
 	expect(command?.timeoutMs).toBe(SESSION_INTEROP_TIMEOUT_MS);
+});
+
+test("fixture generation uses the current Bun runtime via process.execPath, not a PATH-resolved bun", () => {
+	expect(FIXTURE_GENERATION_ARGS[0]).toBe(process.execPath);
+	expect(FIXTURE_GENERATION_ARGS[0]).not.toBe("bun");
+	expect(FIXTURE_GENERATION_ARGS[1]).toBe("scripts/generate-session-fixtures.ts");
 });
 
 test("source-pinned TypeScript pi reopens every generated fixture", async () => {

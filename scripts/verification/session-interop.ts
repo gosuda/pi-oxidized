@@ -17,6 +17,11 @@ const REFERENCE_UUID = join(REFERENCE_ROOT, "packages/agent/src/harness/session/
 const REFERENCE_AI_TYPES = join(REFERENCE_ROOT, "packages/ai/src/types.ts");
 
 export const SESSION_INTEROP_TIMEOUT_MS = 900_000;
+/**
+ * Fixture generation runs under the same Bun runtime as the verifier itself
+ * (process.execPath), not a PATH-resolved "bun" that may differ.
+ */
+export const FIXTURE_GENERATION_ARGS = [process.execPath, "scripts/generate-session-fixtures.ts"] as const;
 
 interface SessionManagerLike {
 	getHeader(): Record<string, unknown> | null;
@@ -135,7 +140,7 @@ export async function reopenWithSourcePinnedTypescript(
 
 async function main(): Promise<void> {
 	await rm(OUTPUT, { recursive: true, force: true });
-	await run(["bun", "scripts/generate-session-fixtures.ts"]);
+	await run([...FIXTURE_GENERATION_ARGS]);
 	await run(
 		[
 			"cargo",
