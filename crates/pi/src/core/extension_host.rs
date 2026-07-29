@@ -2603,7 +2603,7 @@ impl EventPump<'_> {
             .aggregate
             .insert_route(self.endpoint, local_id, PendingKind::Ui);
         let request = retag_ui_request(request, aggregate_id);
-        if self.aggregate.ui_requests_tx.send(request).await.is_err() {
+        if self.aggregate.ui_requests_tx.try_send(request).is_err() {
             let _ = self.aggregate.take_route(aggregate_id, PendingKind::Ui);
             let _ = self
                 .endpoint
@@ -2983,14 +2983,25 @@ impl ExtensionRunner for HostExtensionRunner {
             "event": compact_message_update_event(event),
         });
         Box::pin(async move {
-            for endpoint in endpoints.iter() {
-                if !endpoint.has_handlers("message_update") {
-                    continue;
-                }
-                match endpoint
-                    .hook_request(MESSAGE_UPDATE_DELTA_METHOD, payload.clone())
-                    .await
-                {
+            let results = futures::future::join_all(
+                endpoints
+                    .iter()
+                    .filter(|endpoint| endpoint.has_handlers("message_update"))
+                    .map(|endpoint| {
+                        let payload = payload.clone();
+                        async move {
+                            (
+                                endpoint,
+                                endpoint
+                                    .hook_request(MESSAGE_UPDATE_DELTA_METHOD, payload)
+                                    .await,
+                            )
+                        }
+                    }),
+            )
+            .await;
+            for (endpoint, result) in results {
+                match result {
                     Ok(frame) => {
                         if let Some(wire) =
                             serde_json::from_value::<Option<CancelWire>>(frame.payload)

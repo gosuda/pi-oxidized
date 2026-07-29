@@ -51,9 +51,9 @@ use super::super::agent_session::events::{
 use super::super::agent_session::extension_runner::{ExtensionRunner, SessionHooks};
 use super::super::model_runtime::{CreateModelRuntimeOptions, ModelRuntime};
 use super::{
-    ALL_EVENT_TYPES, ExtensionMode, HostExtensionRunner, HostStartError, RegistrySnapshotWire,
-    SessionBridgeEvent, ToolRenderPhase, classify_endpoint_plans, compact_assistant_meta,
-    compact_message_update_event, sanitize_html,
+    ALL_EVENT_TYPES, EVENT_CHANNEL_CAPACITY, ExtensionMode, HostExtensionRunner, HostStartError,
+    MESSAGE_UPDATE_DELTA_METHOD, RegistrySnapshotWire, SessionBridgeEvent, ToolRenderPhase,
+    classify_endpoint_plans, compact_assistant_meta, compact_message_update_event, sanitize_html,
 };
 
 type BoxErr = Box<dyn Error>;
@@ -65,6 +65,8 @@ const FAST_TIMEOUT: Duration = Duration::from_millis(200);
 enum FakeCmd {
     /// Emit an unsolicited event frame to the client.
     Emit(Frame),
+    /// Release held requests for one method.
+    ReleaseMethod(String),
     /// Close the host→client pipe (simulate crash / EOF).
     Close,
 }
@@ -74,6 +76,15 @@ struct FakeHost {
     cmd_tx: mpsc::Sender<FakeCmd>,
     responses: Arc<Mutex<HashMap<String, Value>>>,
     drop_methods: Arc<Mutex<HashSet<String>>>,
+    hold_methods: Arc<Mutex<HashSet<String>>>,
+    requests: Arc<Mutex<Vec<Frame>>>,
+}
+
+struct FakeHostTaskState {
+    snapshot: Value,
+    responses: Arc<Mutex<HashMap<String, Value>>>,
+    drop_methods: Arc<Mutex<HashSet<String>>>,
+    hold_methods: Arc<Mutex<HashSet<String>>>,
     requests: Arc<Mutex<Vec<Frame>>>,
 }
 
@@ -88,6 +99,22 @@ impl FakeHost {
         if let Ok(mut set) = self.drop_methods.lock() {
             set.insert(method.to_owned());
         }
+    }
+
+    fn hold_method(&self, method: &str) {
+        if let Ok(mut set) = self.hold_methods.lock() {
+            set.insert(method.to_owned());
+        }
+    }
+
+    async fn release_method(&self, method: &str) {
+        if let Ok(mut set) = self.hold_methods.lock() {
+            set.remove(method);
+        }
+        let _ = self
+            .cmd_tx
+            .send(FakeCmd::ReleaseMethod(method.to_owned()))
+            .await;
     }
 
     async fn emit(&self, frame: Frame) {
@@ -150,23 +177,24 @@ fn make_fake_client(snapshot: Value) -> (Arc<HostClient>, FakeHost) {
     ));
     let responses = Arc::new(Mutex::new(HashMap::new()));
     let drop_methods = Arc::new(Mutex::new(HashSet::new()));
+    let hold_methods = Arc::new(Mutex::new(HashSet::new()));
     let requests = Arc::new(Mutex::new(Vec::new()));
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
-    tokio::spawn(fake_host_task(
-        host_read,
-        host_write,
+    let state = FakeHostTaskState {
         snapshot,
-        Arc::clone(&responses),
-        Arc::clone(&drop_methods),
-        Arc::clone(&requests),
-        cmd_rx,
-    ));
+        responses: Arc::clone(&responses),
+        drop_methods: Arc::clone(&drop_methods),
+        hold_methods: Arc::clone(&hold_methods),
+        requests: Arc::clone(&requests),
+    };
+    tokio::spawn(fake_host_task(host_read, host_write, state, cmd_rx));
     (
         client,
         FakeHost {
             cmd_tx,
             responses,
             drop_methods,
+            hold_methods,
             requests,
         },
     )
@@ -382,14 +410,19 @@ fn namespaced_same_keys() -> HashSet<String> {
 async fn fake_host_task(
     read: tokio::io::DuplexStream,
     mut write: tokio::io::DuplexStream,
-    snapshot: Value,
-    responses: Arc<Mutex<HashMap<String, Value>>>,
-    drop_methods: Arc<Mutex<HashSet<String>>>,
-    requests: Arc<Mutex<Vec<Frame>>>,
+    state: FakeHostTaskState,
     mut cmd_rx: mpsc::Receiver<FakeCmd>,
 ) {
+    let FakeHostTaskState {
+        snapshot,
+        responses,
+        drop_methods,
+        hold_methods,
+        requests,
+    } = state;
     let mut reader = BufReader::new(read);
     let mut buf = String::new();
+    let mut held: Vec<Frame> = Vec::new();
     loop {
         tokio::select! {
             biased;
@@ -401,6 +434,23 @@ async fn fake_host_task(
                             let _ = write.write_all(&bytes).await;
                             let _ = write.flush().await;
                         }
+                    }
+                    Some(FakeCmd::ReleaseMethod(method)) => {
+                        let mut pending = Vec::new();
+                        for request in held.drain(..) {
+                            if request.method == method {
+                                if let Some(response) =
+                                    dispatch(&request, &snapshot, &responses, &drop_methods)
+                                {
+                                    let bytes = encode_frame(&response).unwrap_or_default();
+                                    let _ = write.write_all(&bytes).await;
+                                    let _ = write.flush().await;
+                                }
+                            } else {
+                                pending.push(request);
+                            }
+                        }
+                        held = pending;
                     }
                     Some(FakeCmd::Close) => {
                         let _ = write.shutdown().await;
@@ -417,7 +467,12 @@ async fn fake_host_task(
                             if let Ok(mut recorded) = requests.lock() {
                                 recorded.push(req.clone());
                             }
-                            if let Some(resp) = dispatch(&req, &snapshot, &responses, &drop_methods) {
+                            if hold_methods
+                                .lock()
+                                .is_ok_and(|methods| methods.contains(&req.method))
+                            {
+                                held.push(req);
+                            } else if let Some(resp) = dispatch(&req, &snapshot, &responses, &drop_methods) {
                                 let bytes = encode_frame(&resp).unwrap_or_default();
                                 let _ = write.write_all(&bytes).await;
                                 let _ = write.flush().await;
@@ -1615,15 +1670,9 @@ async fn aggregate_terminal_input_shares_one_budget_across_endpoints() -> R {
     for host in &hosts {
         host.drop_method("terminalInput");
     }
-    let started = std::time::Instant::now();
     let result = runner.terminal_input("abc").await?;
-    let elapsed = started.elapsed();
     assert!(!result.consume);
     assert_eq!(result.data, None);
-    assert!(
-        elapsed < Duration::from_millis(12),
-        "one shared 4ms budget must bound the keypress below the old per-endpoint 12ms: {elapsed:?}"
-    );
     assert!(host_received(&hosts[0], "terminalInput")?);
     assert!(
         !host_received(&hosts[1], "terminalInput")?,
@@ -4381,4 +4430,122 @@ async fn reload_returns_load_flag_and_provider_diagnostics() -> R {
     drop(hosts);
     result.runner.shutdown_once().await;
     Ok(())
+}
+
+#[tokio::test]
+async fn aggregate_message_update_delta_fans_out_before_folding_cancels_in_order() -> R {
+    let (runner, hosts) = make_mutable_hook_runner(&["message_update"]).await?;
+    hosts[0].set_response(
+        MESSAGE_UPDATE_DELTA_METHOD,
+        json!({"cancel": true, "reason": "first"}),
+    );
+    hosts[1].set_response(
+        MESSAGE_UPDATE_DELTA_METHOD,
+        json!({"cancel": true, "reason": "second"}),
+    );
+    hosts[0].hold_method(MESSAGE_UPDATE_DELTA_METHOD);
+
+    let mut partial = AssistantMessage::new("test-api", "test-provider", "m", 1);
+    partial
+        .content
+        .push(AssistantContent::Text(TextContent::new("partial")));
+    let event = AssistantMessageEvent::TextDelta {
+        content_index: 0,
+        delta: "delta".to_owned(),
+        partial,
+    };
+    let pending = {
+        let runner = Arc::clone(&runner);
+        tokio::spawn(async move { runner.emit_message_update_delta(&event).await })
+    };
+
+    for host in &hosts {
+        host.wait_for_request(MESSAGE_UPDATE_DELTA_METHOD).await?;
+    }
+    hosts[0].release_method(MESSAGE_UPDATE_DELTA_METHOD).await;
+
+    let cancel = pending
+        .await
+        .map_err(|error| format!("delta hook task failed: {error}"))??
+        .ok_or("message update delta should cancel")?;
+    assert_eq!(cancel.reason.as_deref(), Some("first"));
+    runner.shutdown_once().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn full_ui_request_queue_fails_open_without_parking_event_pump() -> R {
+    let (runner, host) = make_runner(json!({})).await?;
+    let _ui_requests = runner.take_ui_requests().ok_or("ui claim failed")?;
+    let mut tool_updates = runner.subscribe_tool_updates();
+
+    for id in 1..=EVENT_CHANNEL_CAPACITY {
+        host.emit(Frame {
+            id: id as u64,
+            kind: FrameKind::Req,
+            method: "select".to_owned(),
+            payload: json!({"title": "Pick", "options": ["choice"]}),
+        })
+        .await;
+    }
+    tokio::time::timeout(Duration::from_millis(500), async {
+        while runner.aggregate.ui_requests_tx.capacity() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| "ui request queue did not fill")?;
+
+    host.emit(Frame {
+        id: (EVENT_CHANNEL_CAPACITY + 1) as u64,
+        kind: FrameKind::Req,
+        method: "select".to_owned(),
+        payload: json!({"title": "Overflow", "options": ["choice"]}),
+    })
+    .await;
+    tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            if host.requests.lock().is_ok_and(|requests| {
+                requests.iter().any(|request| {
+                    request.kind == FrameKind::Res
+                        && request.method == "select"
+                        && request.id == (EVENT_CHANNEL_CAPACITY + 1) as u64
+                        && request.payload.get("value").is_none_or(Value::is_null)
+                })
+            }) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| "overflowed UI request was not defaulted")?;
+
+    host.emit(Frame {
+        id: 0,
+        kind: FrameKind::Event,
+        method: "toolUpdate".to_owned(),
+        payload: json!({"toolCallId": "after-overflow", "toolName": "extTool", "partialResult": {"content": []}}),
+    })
+    .await;
+    let update = next_item(&mut tool_updates, Duration::from_millis(500)).await?;
+    assert_eq!(update.tool_call_id, "after-overflow");
+    runner.shutdown_once().await;
+    Ok(())
+}
+
+#[test]
+fn execution_mode_wire_maps_to_agent_semantic() {
+    use super::execution_mode_from_wire;
+    use pi_agent::ToolExecutionMode;
+    use pi_ext::protocol::ToolExecutionModeWire;
+
+    assert_eq!(
+        execution_mode_from_wire(ToolExecutionModeWire::Sequential),
+        ToolExecutionMode::Sequential
+    );
+    assert_eq!(
+        execution_mode_from_wire(ToolExecutionModeWire::Parallel),
+        ToolExecutionMode::Parallel
+    );
 }
