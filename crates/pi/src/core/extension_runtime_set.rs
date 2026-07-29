@@ -196,17 +196,18 @@ impl PublishedRuntimeState {
     }
 
     fn reloadable(&self) -> bool {
-        !self.stale
-            && !self.shutdown_done
-            && self
-                .generation
-                .endpoints
-                .iter()
-                .filter(|endpoint| {
-                    endpoint.runner.is_active() && endpoint.kind == EndpointKind::TsCompat
-                })
-                .count()
-                == 1
+        if self.stale || self.shutdown_done {
+            return false;
+        }
+        let mut active = self
+            .generation
+            .endpoints
+            .iter()
+            .filter(|endpoint| endpoint.runner.is_active());
+        matches!(
+            active.next(),
+            Some(endpoint) if endpoint.kind == EndpointKind::TsCompat && active.next().is_none()
+        )
     }
 
     fn allocate_route(&mut self, endpoint: EndpointId, local: FrameId) -> Option<FrameId> {
@@ -3314,8 +3315,17 @@ pub(crate) mod tests {
         let native_set = ExtensionRuntimeSet::bind(vec![(EndpointKind::Native, native)]);
         assert!(!native_set.can_reload());
 
+        let (mixed_compat, _mixed_compat_host) = make_runner(snapshot(&["input"])).await?;
+        let (mixed_native, _mixed_native_host) = make_runner(snapshot(&["input"])).await?;
+        let mixed_set = ExtensionRuntimeSet::bind(vec![
+            (EndpointKind::TsCompat, mixed_compat),
+            (EndpointKind::Native, mixed_native),
+        ]);
+        assert!(!mixed_set.can_reload());
+
         compat_set.shutdown_once().await;
         native_set.shutdown_once().await;
+        mixed_set.shutdown_once().await;
         Ok(())
     }
 }
