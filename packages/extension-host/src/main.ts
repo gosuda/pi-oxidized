@@ -2,21 +2,29 @@
  * Extension host entrypoint. Reads JSONL protocol frames from stdin, writes
  * structured frames to stdout (protocol only), and stderr for logs.
  *
- * Usage:  pi-extension-host [--cwd <dir>] [--extension <path>]...
+ * Usage:  pi-extension-host [--cwd <dir>] [--extension <path>]... [--no-builtins]
  *
  * The Rust binary spawns this process and drives it via the JSONL protocol.
  */
 
 import { ExtensionHost } from "./host.ts";
-import { builtInExtensions } from "@earendil-works/pi-coding-agent/builtins";
 
-function parseArgs(argv: string[]): { cwd: string; extensionPaths: string[] } {
+export interface HostArgs {
+	cwd: string;
+	extensionPaths: string[];
+	noBuiltins: boolean;
+}
+
+export function parseArgs(argv: string[]): HostArgs {
 	let cwd = process.cwd();
 	const extensionPaths: string[] = [];
+	let noBuiltins = false;
 	for (let i = 2; i < argv.length; i++) {
 		const arg = argv[i];
 		if (arg === undefined) continue;
-		if (arg === "--cwd" || arg === "-C") {
+		if (arg === "--no-builtins") {
+			noBuiltins = true;
+		} else if (arg === "--cwd" || arg === "-C") {
 			const next = argv[i + 1];
 			if (next !== undefined) {
 				cwd = next;
@@ -30,7 +38,15 @@ function parseArgs(argv: string[]): { cwd: string; extensionPaths: string[] } {
 			}
 		}
 	}
-	return { cwd, extensionPaths };
+	return { cwd, extensionPaths, noBuiltins };
+}
+
+export async function loadRunOptions(argv: string[]) {
+	const { cwd, extensionPaths, noBuiltins } = parseArgs(argv);
+	const factories = noBuiltins
+		? []
+		: (await import("@earendil-works/pi-coding-agent/builtins")).builtInExtensions;
+	return { cwd, extensionPaths, factories };
 }
 
 /** Wrap process.stdout as a ByteWritable (protocol frames only). */
@@ -41,12 +57,14 @@ class StdoutSink {
 }
 
 async function main(): Promise<void> {
-	const { cwd, extensionPaths } = parseArgs(process.argv);
+	const { cwd, extensionPaths, factories } = await loadRunOptions(process.argv);
 	const host = new ExtensionHost(process.stdin, new StdoutSink());
-	await host.run({ cwd, extensionPaths, factories: builtInExtensions });
+	await host.run({ cwd, extensionPaths, factories });
 }
 
-main().catch((err) => {
-	console.error("[host] uncaught:", err);
-	process.exit(1);
-});
+if (import.meta.main) {
+	main().catch((err) => {
+		console.error("[host] uncaught:", err);
+		process.exit(1);
+	});
+}

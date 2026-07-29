@@ -22,11 +22,10 @@ import { ExtensionRunner } from "@earendil-works/pi-coding-agent";
 import { ExtensionHost, createEventBus } from "../src/host.ts";
 import { COMPATIBILITY_VERSION } from "../src/version.ts";
 import { createExtensionJiti } from "../src/virtual-modules.ts";
+import { loadRunOptions, parseArgs } from "../src/main.ts";
 
 import hooksFactory from "../fixtures/extensions/hooks.ts";
 import toolFactory from "../fixtures/extensions/tool.ts";
-
-
 
 /** Collecting ByteWritable that signals on first write (no Writable dependency). */
 class PipeWritable {
@@ -129,6 +128,27 @@ describe("host: hello handshake", () => {
 
 		await runPromise.catch(() => void 0);
 		expect(host.isDisposed).toBe(true);
+	});
+});
+
+describe("host: built-in options", () => {
+	test("defaults to compat mode with built-ins", async () => {
+		const options = await loadRunOptions(["bun", "pi-extension-host"]);
+		expect(options.factories.length).toBeGreaterThan(0);
+	});
+
+	test("parses --no-builtins in any argument position", async () => {
+		const argv = [
+			"bun", "pi-extension-host", "--extension", "first.mjs",
+			"-C", "/project", "--no-builtins", "-e", "second.mjs",
+		];
+		expect(parseArgs(argv)).toEqual({
+			cwd: "/project",
+			extensionPaths: ["first.mjs", "second.mjs"],
+			noBuiltins: true,
+		});
+		const options = await loadRunOptions(argv);
+		expect(options.factories).toEqual([]);
 	});
 });
 
