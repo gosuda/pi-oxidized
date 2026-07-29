@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, RwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock, Weak};
 use std::time::Duration;
 
 use futures::future::BoxFuture;
@@ -101,7 +101,7 @@ struct PendingEndpointBridges {
 /// Every relay for one endpoint shares this generation-tagged routing identity.
 struct EndpointRelayContext {
     generation_id: u64,
-    current_generation: Arc<AtomicU64>,
+    generation: Weak<RwLock<Arc<Generation>>>,
     aggregate: Arc<Aggregate>,
     endpoint: Endpoint,
 }
@@ -268,13 +268,14 @@ impl Aggregate {
 
 /// Stable facade whose published endpoint generation can be replaced in place.
 pub struct ExtensionRuntimeSet {
-    generation: RwLock<Arc<Generation>>,
-    current_generation: Arc<AtomicU64>,
+    generation: Arc<RwLock<Arc<Generation>>>,
     aggregate: Arc<Aggregate>,
     discovered_paths: Vec<String>,
     load_cwd: String,
     project_trusted: bool,
     reload_lock: tokio::sync::Mutex<()>,
+    #[cfg(test)]
+    after_replacement_published_before_old_retired: StdMutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 impl ExtensionRuntimeSet {
@@ -320,15 +321,15 @@ impl ExtensionRuntimeSet {
         load_cwd: String,
         project_trusted: bool,
     ) -> Self {
-        let id = generation.id;
         Self {
-            generation: RwLock::new(Arc::new(generation)),
-            current_generation: Arc::new(AtomicU64::new(id)),
+            generation: Arc::new(RwLock::new(Arc::new(generation))),
             aggregate: Arc::new(Aggregate::new()),
             discovered_paths,
             load_cwd,
             project_trusted,
             reload_lock: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            after_replacement_published_before_old_retired: StdMutex::new(None),
         }
     }
 
@@ -365,22 +366,36 @@ impl ExtensionRuntimeSet {
 
     /// Publish a prepared generation before any caller can retire its predecessor.
     fn publish_replacement(&self, next: Generation, pending: PendingBridges) -> Arc<Generation> {
-        let next_id = next.id;
         let old = {
             let mut generation = self
                 .generation
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            // The pointer swap is the facade's cutover linearization point.
-            let old = std::mem::replace(&mut *generation, Arc::new(next));
-            self.current_generation.store(next_id, Ordering::Release);
-            old
+            // Facade readers and relays synchronize on this pointer swap.
+            std::mem::replace(&mut *generation, Arc::new(next))
         };
-        // Drop product-visible state and old request routes after their relay tag changed.
         self.aggregate.dispose_all_slots();
         self.aggregate.clear_routes();
         self.start_bridges(pending);
         old
+    }
+
+    async fn restart_and_rewire_cutover(&self, next: Generation, pending: PendingBridges) {
+        let old = self.publish_replacement(next, pending);
+        #[cfg(test)]
+        if let Some(observer) = self
+            .after_replacement_published_before_old_retired
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            observer();
+        }
+        for endpoint in old.endpoints.iter() {
+            endpoint.runner.invalidate();
+        }
+        abort_bridges(&old);
+        stop_generation(&old).await;
     }
 
     fn start_bridges(&self, pending: PendingBridges) {
@@ -400,7 +415,7 @@ impl ExtensionRuntimeSet {
             } = pending_endpoint;
             let context = EndpointRelayContext {
                 generation_id,
-                current_generation: Arc::clone(&self.current_generation),
+                generation: Arc::downgrade(&self.generation),
                 aggregate: Arc::clone(&self.aggregate),
                 endpoint,
             };
@@ -515,7 +530,10 @@ impl ExtensionRuntimeSet {
     /// Current published generation id.
     #[must_use]
     pub fn reload_generation(&self) -> u64 {
-        self.current_generation.load(Ordering::Acquire)
+        self.generation
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .id
     }
 
     /// Whether any non-stale endpoint transport is running.
@@ -961,12 +979,7 @@ impl ExtensionRuntimeSet {
             return Err(HostStartError::Load(format!("{path}: {error}")));
         }
 
-        let old = self.publish_replacement(next, pending);
-        for endpoint in old.endpoints.iter() {
-            endpoint.runner.invalidate();
-        }
-        abort_bridges(&old);
-        stop_generation(&old).await;
+        self.restart_and_rewire_cutover(next, pending).await;
         Ok(())
     }
 
@@ -1519,7 +1532,7 @@ fn generation_from_endpoints(
 
 fn spawn_broadcast_relay<T, F>(
     generation: u64,
-    current_generation: Arc<AtomicU64>,
+    published_generation: Weak<RwLock<Arc<Generation>>>,
     aggregate: Arc<Aggregate>,
     label: String,
     mut receiver: broadcast::Receiver<T>,
@@ -1533,12 +1546,24 @@ where
         loop {
             match receiver.recv().await {
                 Ok(item) => {
-                    if current_generation.load(Ordering::Acquire) == generation {
+                    let Some(generation_lock) = published_generation.upgrade() else {
+                        break;
+                    };
+                    let published = generation_lock
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if published.id == generation {
                         publish(&aggregate, item);
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(count)) => {
-                    if current_generation.load(Ordering::Acquire) == generation {
+                    let Some(generation_lock) = published_generation.upgrade() else {
+                        break;
+                    };
+                    let published = generation_lock
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if published.id == generation {
                         aggregate.publish_error(
                             "extension_event_lagged",
                             format!("extension {label:?} relay lagged by {count} events"),
@@ -1560,7 +1585,7 @@ fn spawn_broadcast_relays(
     errors: broadcast::Receiver<ExtensionErrorEvent>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let generation_id = context.generation_id;
-    let current_generation = &context.current_generation;
+    let published_generation = &context.generation;
     let aggregate = &context.aggregate;
     let label = &context.endpoint.label;
     let index = context.endpoint.index;
@@ -1568,7 +1593,7 @@ fn spawn_broadcast_relays(
     vec![
         spawn_broadcast_relay(
             generation_id,
-            Arc::clone(current_generation),
+            Weak::clone(published_generation),
             Arc::clone(aggregate),
             label.clone(),
             tool_updates,
@@ -1578,7 +1603,7 @@ fn spawn_broadcast_relays(
         ),
         spawn_broadcast_relay(
             generation_id,
-            Arc::clone(current_generation),
+            Weak::clone(published_generation),
             Arc::clone(aggregate),
             label.clone(),
             provider_events,
@@ -1588,7 +1613,7 @@ fn spawn_broadcast_relays(
         ),
         spawn_broadcast_relay(
             generation_id,
-            Arc::clone(current_generation),
+            Weak::clone(published_generation),
             Arc::clone(aggregate),
             label.clone(),
             errors,
@@ -1609,7 +1634,7 @@ fn spawn_ui_relays(
     ui_requests: Option<mpsc::Receiver<HostUiRequest>>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let generation_id = context.generation_id;
-    let ui_generation = Arc::clone(&context.current_generation);
+    let ui_generation = Weak::clone(&context.generation);
     let ui_aggregate = Arc::clone(&context.aggregate);
     let ui_label = context.endpoint.label.clone();
     let index = context.endpoint.index;
@@ -1617,7 +1642,13 @@ fn spawn_ui_relays(
         loop {
             match ui.recv().await {
                 Ok(event) => {
-                    if ui_generation.load(Ordering::Acquire) != generation_id {
+                    let Some(generation_lock) = ui_generation.upgrade() else {
+                        break;
+                    };
+                    let published = generation_lock
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if published.id != generation_id {
                         continue;
                     }
                     match event {
@@ -1629,7 +1660,13 @@ fn spawn_ui_relays(
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(count)) => {
-                    if ui_generation.load(Ordering::Acquire) == generation_id {
+                    let Some(generation_lock) = ui_generation.upgrade() else {
+                        break;
+                    };
+                    let published = generation_lock
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if published.id == generation_id {
                         ui_aggregate.publish_error(
                             "extension_event_lagged",
                             format!("extension {ui_label:?} UI relay lagged by {count} events"),
@@ -1643,21 +1680,38 @@ fn spawn_ui_relays(
     })];
 
     if let Some(mut requests) = ui_requests {
-        let request_generation = Arc::clone(&context.current_generation);
+        let request_generation = Weak::clone(&context.generation);
         let request_aggregate = Arc::clone(&context.aggregate);
         let runner = Arc::clone(&context.endpoint.runner);
         handles.push(tokio::spawn(async move {
             while let Some(request) = requests.recv().await {
                 let fallback = request.clone();
-                let local_id = request.id();
-                if request_generation.load(Ordering::Acquire) != generation_id {
-                    let _ = runner.respond_ui(default_ui_response(&request)).await;
+                let Some(generation_lock) = request_generation.upgrade() else {
+                    break;
+                };
+                let send_failed = {
+                    let published = generation_lock
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if published.id == generation_id {
+                        let local_id = request.id();
+                        let routed_id = request_aggregate.route(generation_id, index, local_id);
+                        let routed = map_ui_request_id(request, routed_id);
+                        let send_failed =
+                            request_aggregate.ui_requests_tx.try_send(routed).is_err();
+                        if send_failed {
+                            request_aggregate.take_route(routed_id);
+                        }
+                        Some(send_failed)
+                    } else {
+                        None
+                    }
+                };
+                let Some(send_failed) = send_failed else {
+                    let _ = runner.respond_ui(default_ui_response(&fallback)).await;
                     continue;
-                }
-                let routed_id = request_aggregate.route(generation_id, index, local_id);
-                let routed = map_ui_request_id(request, routed_id);
-                if request_aggregate.ui_requests_tx.try_send(routed).is_err() {
-                    request_aggregate.take_route(routed_id);
+                };
+                if send_failed {
                     let _ = runner.respond_ui(default_ui_response(&fallback)).await;
                 }
             }
@@ -1673,50 +1727,63 @@ fn spawn_session_relay(
 ) -> Option<tokio::task::JoinHandle<()>> {
     let mut session = session_bridge?;
     let generation_id = context.generation_id;
-    let session_generation = Arc::clone(&context.current_generation);
+    let session_generation = Weak::clone(&context.generation);
     let session_aggregate = Arc::clone(&context.aggregate);
     let runner = Arc::clone(&context.endpoint.runner);
     let index = context.endpoint.index;
     Some(tokio::spawn(async move {
         while let Some(event) = session.recv().await {
-            if session_generation.load(Ordering::Acquire) != generation_id {
-                answer_unclaimed_session(&runner, event).await;
-                continue;
-            }
             let fallback = event.clone();
-            let (routed, route_id) = match event {
-                SessionBridgeEvent::SetModel { id, request } => {
-                    let routed_id = session_aggregate.route(generation_id, index, id);
-                    (
-                        SessionBridgeEvent::SetModel {
-                            id: routed_id,
-                            request,
-                        },
-                        Some(routed_id),
-                    )
-                }
-                SessionBridgeEvent::Compact { id, request } => {
-                    let routed_id = session_aggregate.route(generation_id, index, id);
-                    (
-                        SessionBridgeEvent::Compact {
-                            id: routed_id,
-                            request,
-                        },
-                        Some(routed_id),
-                    )
-                }
-                SessionBridgeEvent::Command(command) => {
-                    (SessionBridgeEvent::Command(command), None)
+            let Some(generation_lock) = session_generation.upgrade() else {
+                break;
+            };
+            let send_failed = {
+                let published = generation_lock
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if published.id == generation_id {
+                    let (routed, route_id) = match event {
+                        SessionBridgeEvent::SetModel { id, request } => {
+                            let routed_id = session_aggregate.route(generation_id, index, id);
+                            (
+                                SessionBridgeEvent::SetModel {
+                                    id: routed_id,
+                                    request,
+                                },
+                                Some(routed_id),
+                            )
+                        }
+                        SessionBridgeEvent::Compact { id, request } => {
+                            let routed_id = session_aggregate.route(generation_id, index, id);
+                            (
+                                SessionBridgeEvent::Compact {
+                                    id: routed_id,
+                                    request,
+                                },
+                                Some(routed_id),
+                            )
+                        }
+                        SessionBridgeEvent::Command(command) => {
+                            (SessionBridgeEvent::Command(command), None)
+                        }
+                    };
+                    let send_failed = session_aggregate
+                        .session_bridge_tx
+                        .try_send(routed)
+                        .is_err();
+                    if send_failed && let Some(route_id) = route_id {
+                        session_aggregate.take_route(route_id);
+                    }
+                    Some(send_failed)
+                } else {
+                    None
                 }
             };
-            if session_aggregate
-                .session_bridge_tx
-                .try_send(routed)
-                .is_err()
-            {
-                if let Some(route_id) = route_id {
-                    session_aggregate.take_route(route_id);
-                }
+            let Some(send_failed) = send_failed else {
+                answer_unclaimed_session(&runner, fallback).await;
+                continue;
+            };
+            if send_failed {
                 answer_unclaimed_session(&runner, fallback).await;
             }
         }
@@ -2603,8 +2670,9 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_set_publishes_replacement_before_retiring_old_generation() -> TestResult {
+    async fn runtime_set_restart_cutover_publishes_before_retiring_old_generation() -> TestResult {
         let (first, _first_host) = make_runner(snapshot(&[])).await?;
+        let old_runner = Arc::clone(&first);
         let set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, first)]);
         let mut ui_requests = set.take_ui_requests().ok_or("ui bridge missing")?;
         let mut session_bridge = set.take_session_bridge().ok_or("session bridge missing")?;
@@ -2633,11 +2701,28 @@ pub(crate) mod tests {
                 .is_ok()
         );
 
-        let old = set.publish_replacement(next, pending);
+        let observed_order = Arc::new(AtomicBool::new(false));
+        let observed_order_in_cutover = Arc::clone(&observed_order);
+        let published_generation = Arc::clone(&set.generation);
+        *set.after_replacement_published_before_old_retired
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
+            assert_eq!(
+                published_generation
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .id,
+                2
+            );
+            assert!(old_runner.is_active());
+            observed_order_in_cutover.store(true, Ordering::Relaxed);
+        }));
 
+        set.restart_and_rewire_cutover(next, pending).await;
+
+        assert!(observed_order.load(Ordering::Relaxed));
         assert_eq!(set.reload_generation(), 2);
         assert!(set.is_active());
-        assert!(old.endpoints[0].runner.is_active());
         wait_for_slot_text(&set, "buffered").await?;
 
         replacement_host
@@ -2671,11 +2756,6 @@ pub(crate) mod tests {
         replacement_host
             .wait_for_response(protocol::SESSION_SET_MODEL_METHOD, 8)
             .await?;
-        for endpoint in old.endpoints.iter() {
-            endpoint.runner.invalidate();
-        }
-        abort_bridges(&old);
-        stop_generation(&old).await;
         set.shutdown_once().await;
         Ok(())
     }
