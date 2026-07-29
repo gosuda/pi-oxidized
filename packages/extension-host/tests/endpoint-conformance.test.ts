@@ -101,16 +101,10 @@ function mode1Factory(withHook: boolean): InlineExtension[] {
 	if (!withHook) return [];
 	const factory: ExtensionFactory = (pi) => {
 		pi.on("message_update", (event) => {
-			const holder = globalThis as Record<string, unknown>;
-			const log = Array.isArray(holder[OBSERVATIONS]) ? holder[OBSERVATIONS] : [];
-			log.push(structuredClone(event));
-			holder[OBSERVATIONS] = log;
+			observe(event);
 		});
 		pi.on("before_agent_start", (event) => {
-			const holder = globalThis as Record<string, unknown>;
-			const log = Array.isArray(holder[OBSERVATIONS]) ? holder[OBSERVATIONS] : [];
-			log.push({ type: event.type, systemPrompt: event.systemPrompt, cwd: event.systemPromptOptions.cwd });
-			holder[OBSERVATIONS] = log;
+			observe({ type: event.type, systemPrompt: event.systemPrompt, cwd: event.systemPromptOptions.cwd });
 			const message = { role: "user" as const, content: "injected" };
 			if (event.prompt === "no-system-prompt") return { message };
 			if (event.prompt === "non-string-system-prompt") {
@@ -120,6 +114,52 @@ function mode1Factory(withHook: boolean): InlineExtension[] {
 				message,
 				systemPrompt: `${event.systemPrompt}|${event.systemPromptOptions.cwd}`,
 			};
+		});
+		pi.on("tool_call", (event) => {
+			observe({ type: event.type, toolName: event.toolName, toolCallId: event.toolCallId, input: event.input });
+			event.input["fromHook"] = "tool-call";
+		});
+		pi.on("tool_result", (event) => {
+			observe({
+				type: event.type,
+				toolName: event.toolName,
+				toolCallId: event.toolCallId,
+				input: event.input,
+				content: event.content,
+				details: event.details,
+				isError: event.isError,
+			});
+			return {
+				content: [{ type: "text", text: "rewritten tool result" }],
+				details: { fromHook: true },
+				isError: true,
+				terminate: true,
+			};
+		});
+		pi.on("message_end", (event) => {
+			observe({ type: event.type, message: event.message });
+			return { message: { role: "assistant", content: [{ type: "text", text: "rewritten message" }] } };
+		});
+		pi.on("input", (event) => {
+			const input = event as typeof event & { type: string; text: string; images?: unknown };
+			observe({ type: input.type, text: input.text, images: input.images, source: input.source });
+			return { action: "transform", text: `${input.text} rewritten` };
+		});
+		pi.on("resources_discover" as string, (...args: unknown[]) => {
+			const [event] = args as [{ type: string; cwd: string; reason: string }];
+			observe({ type: event.type, cwd: event.cwd, reason: event.reason });
+			return { skillPaths: ["/skills"], promptPaths: ["/prompts"], themePaths: ["/themes"] };
+		});
+		pi.on("session_before_tree" as string, (...args: unknown[]) => {
+			const [event] = args as [{ type: string }];
+			observe({ type: event.type });
+			return { cancel: true, reason: "endpoint conformance" };
+		});
+		pi.registerShortcut("ctrl+shift+e", {
+			handler() {
+				observe({ type: "shortcut", key: "ctrl+shift+e" });
+				return new Promise<void>((resolve) => setImmediate(resolve));
+			},
 		});
 	};
 	return [{ name: "endpoint-conformance", factory }];
@@ -152,6 +192,20 @@ const META = {
 	timestamp: 1,
 };
 
+function observe(value: unknown): void {
+	const holder = globalThis as Record<string, unknown>;
+	const log = Array.isArray(holder[OBSERVATIONS]) ? holder[OBSERVATIONS] : [];
+	log.push(structuredClone(value));
+	holder[OBSERVATIONS] = log;
+}
+
+function normalizeExtensionOrigins<T>(value: T): T {
+	return JSON.parse(JSON.stringify(
+		value,
+		(key, nested) => key === "extensionPath" ? "<extension>" : nested,
+	)) as T;
+}
+
 async function runDeltaVector(mode: "mode1" | "mode2", withHook: boolean) {
 	(globalThis as Record<string, unknown>)[OBSERVATIONS] = [];
 	const link = await openEndpoint(mode, withHook);
@@ -165,21 +219,44 @@ async function runDeltaVector(mode: "mode1" | "mode2", withHook: boolean) {
 			{ type: "done", reason: "stop", final },
 		];
 		const responses: Array<{ kind: string; method: string; payload: unknown }> = [];
-		for (const [index, event] of events.entries()) {
-			const frame = await link.request(10 + index, "message_update_delta", {
-				type: "message_update_delta",
-				event,
-			});
+		const request = async (id: number, method: string, payload: unknown) => {
+			const frame = await link.request(id, method, payload);
 			responses.push({ kind: frame.kind, method: frame.method, payload: frame.payload });
+		};
+		for (const [index, event] of events.entries()) {
+			await request(10 + index, "message_update_delta", { type: "message_update_delta", event });
 		}
-		const late = await link.request(20, "message_update_delta", {
+		await request(20, "message_update_delta", {
 			type: "message_update_delta",
 			event: { type: "text_delta", meta: META, contentIndex: 0, delta: "late" },
 		});
-		responses.push({ kind: late.kind, method: late.method, payload: late.payload });
+		await request(21, "before_agent_start", { prompt: "vector", systemPrompt: "vector prompt" });
+		await request(22, "tool_call", { toolName: "demo", toolCallId: "call-1", input: { value: 1 } });
+		await request(23, "tool_result", {
+			toolName: "demo",
+			toolCallId: "call-1",
+			input: { value: 1 },
+			content: [{ type: "text", text: "original tool result" }],
+			details: { original: true },
+			isError: false,
+		});
+		await request(24, "message_end", { role: "assistant", content: [{ type: "text", text: "original message" }] });
+		await request(25, "input", { text: "original input", source: "user" });
+		await request(26, "resources_discover", { cwd: CWD, reason: "startup" });
+		await request(27, "session_before_tree", {});
+		const shortcuts = await Promise.all([
+			link.request(28, "shortcut.execute", { key: "ctrl+shift+e" }),
+			link.request(29, "shortcut.execute", { key: "ctrl+shift+e" }),
+		]);
+		for (const frame of shortcuts) {
+			responses.push({ kind: frame.kind, method: frame.method, payload: frame.payload });
+		}
+		await new Promise<void>((resolve) => setImmediate(resolve));
 		return {
-			responses,
-			observations: structuredClone((globalThis as Record<string, unknown>)[OBSERVATIONS] ?? []),
+			responses: normalizeExtensionOrigins(responses),
+			observations: normalizeExtensionOrigins(
+				structuredClone((globalThis as Record<string, unknown>)[OBSERVATIONS] ?? []) as unknown[],
+			),
 		};
 	} finally {
 		await link.finish();
@@ -231,6 +308,15 @@ describe("extension endpoint conformance", () => {
 	test("identical assistant frames reconstruct identical hook payloads and responses", async () => {
 		const mode1 = await runDeltaVector("mode1", true);
 		const mode2 = await runDeltaVector("mode2", true);
+		expect(mode1.responses).toContainEqual({
+			kind: "res",
+			method: "session_before_tree",
+			payload: { cancel: true, reason: "endpoint conformance" },
+		});
+		const shortcuts = mode1.observations.filter((observation) =>
+			JSON.stringify(observation) === JSON.stringify({ type: "shortcut", key: "ctrl+shift+e" }),
+		);
+		expect(shortcuts).toHaveLength(2);
 		expect(mode2).toEqual(mode1);
 	});
 

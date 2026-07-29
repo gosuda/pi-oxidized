@@ -182,7 +182,6 @@ export interface LeanToolResultHookResult {
 	readonly content?: unknown;
 	readonly details?: unknown;
 	readonly isError?: boolean;
-	readonly terminate?: boolean;
 }
 
 export interface LeanMessageEndEvent {

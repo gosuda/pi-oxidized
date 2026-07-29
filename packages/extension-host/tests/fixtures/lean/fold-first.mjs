@@ -32,13 +32,11 @@ export default {
 				content: event.content,
 				details: event.details,
 				isError: event.isError,
-				terminate: event.terminate,
 			});
 			return {
 				content: [...(event.content ?? []), "first"],
 				details: { ...(event.details ?? {}), first: true },
 				isError: true,
-				terminate: true,
 			};
 		},
 		message_end: (event) => {

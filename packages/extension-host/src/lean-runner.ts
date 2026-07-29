@@ -696,8 +696,8 @@ export class LeanRunner {
 	private readonly inFlightTools = new Map<number, AbortController>();
 	/** In-flight provider.stream AbortControllers keyed by request id. */
 	private readonly inFlightProviders = new Map<number, AbortController>();
-	/** Active shortcut handlers keyed by their resolved shortcut key. */
-	private readonly inFlightShortcuts = new Map<string, AbortController>();
+	/** Aborts every shortcut handler when this runner is disposed. */
+	private readonly shortcutAbortController = new AbortController();
 	/** System prompt mirrored from `session.update` control events. */
 	private systemPrompt = "";
 	/** Active assistant snapshot reconstructed from compact Rust updates. */
@@ -1311,25 +1311,11 @@ export class LeanRunner {
 			await this.client.respond(id, "shortcut.execute", { handled: false });
 			return;
 		}
-		const active = this.inFlightShortcuts.get(key);
-		if (active !== undefined) {
-			await this.client.respond(id, "shortcut.execute", { handled: true });
-			return;
-		}
-		const controller = new AbortController();
-		this.inFlightShortcuts.set(key, controller);
-		try {
-			await this.client.respond(id, "shortcut.execute", { handled: true });
-		} catch (error) {
-			if (this.inFlightShortcuts.get(key) === controller) {
-				this.inFlightShortcuts.delete(key);
-			}
-			throw error;
-		}
+		await this.client.respond(id, "shortcut.execute", { handled: true });
 		void Promise.resolve()
 			.then(() => registered.shortcut.handler({
 				...this.hookContext(registered.extensionPath),
-				signal: controller.signal,
+				signal: this.shortcutAbortController.signal,
 			}))
 			.catch((error) => {
 				this.emitExtensionError(
@@ -1337,11 +1323,6 @@ export class LeanRunner {
 					"shortcut.execute",
 					error instanceof Error ? error.message : String(error),
 				);
-			})
-			.finally(() => {
-				if (this.inFlightShortcuts.get(key) === controller) {
-					this.inFlightShortcuts.delete(key);
-				}
 			});
 	}
 
@@ -1444,12 +1425,6 @@ export class LeanRunner {
 						if (r["isError"] !== undefined) {
 							current["isError"] = r["isError"];
 							response["isError"] = r["isError"];
-						}
-						// Explicit `terminate` folds exactly like the other fields:
-						// omission retains the running value, a later explicit wins.
-						if (r["terminate"] !== undefined) {
-							current["terminate"] = r["terminate"];
-							response["terminate"] = r["terminate"];
 						}
 					});
 					await this.client.respond(id, eventType as Method, response);
@@ -1742,8 +1717,7 @@ export class LeanRunner {
 		this.inFlightTools.clear();
 		for (const controller of this.inFlightProviders.values()) controller.abort();
 		this.inFlightProviders.clear();
-		for (const controller of this.inFlightShortcuts.values()) controller.abort();
-		this.inFlightShortcuts.clear();
+		this.shortcutAbortController.abort();
 		this.client.dispose(reason);
 	}
 }

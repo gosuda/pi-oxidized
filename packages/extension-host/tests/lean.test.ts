@@ -39,7 +39,6 @@ const MESSAGE_UPDATE_CANCEL_ENTRY = join(LEAN_FIXTURES, "message-update-cancel.m
 const TOOL_CALL_NOOP_ENTRY = join(LEAN_FIXTURES, "tool-call-noop.mjs");
 const TOOL_CALL_REORDER_ENTRY = join(LEAN_FIXTURES, "tool-call-reorder.mjs");
 const TOOL_CALL_VALUE_CHANGE_ENTRY = join(LEAN_FIXTURES, "tool-call-value-change.mjs");
-const TOOL_RESULT_TERMINATE_ONLY_ENTRY = join(LEAN_FIXTURES, "tool-result-terminate-only.mjs");
 const FLOW_CONTROL_ENTRY = join(LEAN_FIXTURES, "flow-control.mjs");
 const FLAG_CONTEXT_ENTRY = join(LEAN_FIXTURES, "flag-context.mjs");
 const PRELOAD = resolve(import.meta.dirname, "fixtures", "lean-forbid-compat-graph.ts");
@@ -790,14 +789,14 @@ describe("lean: commands, flags, shortcuts, providers", () => {
 		await link.finish();
 	});
 
-	test("shortcut single-flights matching keys while distinct keys overlap", async () => {
+	test("shortcut.execute runs concurrent matching keys without single-flight", async () => {
 		const started = Promise.withResolvers<void>();
 		const pending: Array<ReturnType<typeof Promise.withResolvers<void>>> = [];
 		const seen: string[] = [];
 		(globalThis as Record<string, unknown>).__leanFlow = {
 			shortcut: (key: string) => {
 				seen.push(key);
-				if (seen.length === 2) started.resolve();
+				if (seen.length === 3) started.resolve();
 				const wait = Promise.withResolvers<void>();
 				pending.push(wait);
 				return wait.promise;
@@ -810,22 +809,29 @@ describe("lean: commands, flags, shortcuts, providers", () => {
 		link.request(3, "shortcut.execute", { key: "ctrl+repeat" });
 		link.request(4, "shortcut.execute", { key: "ctrl+repeat" });
 		link.request(5, "shortcut.execute", { key: "ctrl+other" });
-		await Promise.all([
+		// Parity with Mode 1: every concurrent shortcut call is handled and
+		// responds, including duplicate keys — no lean-only single-flight.
+		const responses = await Promise.all([
 			link.response(3, "shortcut.execute"),
 			link.response(4, "shortcut.execute"),
 			link.response(5, "shortcut.execute"),
 		]);
+		for (const res of responses) {
+			expect(payload(res)["handled"]).toBe(true);
+		}
 		await started.promise;
-		expect(seen.sort()).toEqual(["other", "repeat"]);
+		expect(seen.sort()).toEqual(["other", "repeat", "repeat"]);
 		for (const wait of pending) wait.resolve();
 		await link.finish();
 	});
 
-	test("shortcut disposal aborts the active handler and clears its entry", async () => {
+	test("shortcut disposal aborts the active handler and drops future work", async () => {
 		const started = Promise.withResolvers<void>();
 		const aborted = Promise.withResolvers<void>();
+		const invocations: string[] = [];
 		(globalThis as Record<string, unknown>).__leanFlow = {
-			shortcut: (_key: string, signal: AbortSignal) => {
+			shortcut: (key: string, signal: AbortSignal) => {
+				invocations.push(key);
 				started.resolve();
 				return new Promise<void>((resolve) => {
 					signal.addEventListener("abort", () => {
@@ -842,9 +848,24 @@ describe("lean: commands, flags, shortcuts, providers", () => {
 		link.request(3, "shortcut.execute", { key: "ctrl+repeat" });
 		await link.response(3, "shortcut.execute");
 		await started.promise;
+		expect(invocations).toEqual(["repeat"]);
+		// Disposal aborts the in-flight handler through the runner's single
+		// shared lifetime cancellation signal — the lean-only
+		// inFlightShortcuts map is gone, so the contract is now the one
+		// shortcutAbortController every handler receives.
 		link.runner.dispose();
 		await aborted.promise;
-		expect((link.runner as unknown as { inFlightShortcuts: Map<string, AbortController> }).inFlightShortcuts.size).toBe(0);
+		expect(link.runner.isDisposed).toBe(true);
+		// Future shortcut work is rejected by the disposed runner: onInbound
+		// drops every frame in the DISPOSED state, so the handler is never
+		// invoked again even though the inbound frame is delivered. The
+		// readLoop is a real async stream pump, and we are asserting the
+		// *absence* of a handler invocation — there is no positive signal to
+		// await, so a short real delay is the only deterministic-enough probe
+		// (fake timers cannot drive the platform stream pump here).
+		link.request(4, "shortcut.execute", { key: "ctrl+repeat" });
+		await new Promise<void>((resolve) => setTimeout(resolve, 10));
+		expect(invocations).toEqual(["repeat"]);
 		await link.finish();
 	});
 
@@ -1693,7 +1714,6 @@ describe("lean: ordered folds", () => {
 			content: ["base", "first", "second"],
 			details: { origin: "base", first: true },
 			isError: false,
-			terminate: true,
 		});
 		expect(markerLog()).toContainEqual({
 			name: "first.tool_result",
@@ -1705,61 +1725,11 @@ describe("lean: ordered folds", () => {
 				content: ["base", "first"],
 				details: { origin: "base", first: true },
 				isError: true,
-				terminate: true,
 			},
 		});
 		await link.finish();
 	});
 
-	test("tool_result: later explicit terminate:false overrides prior true", async () => {
-		const terminateFalseEntry = join(LEAN_FIXTURES, "fold-terminate-false.mjs");
-		const link = new LeanLink({ cwd: PACKAGE_DIR, extensionPaths: [] });
-		await link.hello(1);
-		link.request(2, "extensions.load", {
-			extensionPaths: [FOLD_FIRST_ENTRY, terminateFalseEntry],
-			cwd: PACKAGE_DIR,
-		});
-		await link.response(2, "extensions.load");
-		link.request(45, "tool_result", {
-			toolName: "echo",
-			toolCallId: "call-terminate-false",
-			input: {},
-			content: [],
-			details: {},
-			isError: false,
-		});
-		const res = payload(await link.response(45, "tool_result"));
-		expect(res["terminate"]).toBe(false);
-		expect(markerLog()).toContainEqual({
-			name: "second.tool_result",
-			value: expect.objectContaining({ terminate: true }),
-		});
-		await link.finish();
-	});
-
-	test("tool_result: terminate-only hook omits unchanged content and details", async () => {
-		const link = new LeanLink({ cwd: PACKAGE_DIR, extensionPaths: [] });
-		await link.hello(1);
-		link.request(2, "extensions.load", {
-			extensionPaths: [TOOL_RESULT_TERMINATE_ONLY_ENTRY],
-			cwd: PACKAGE_DIR,
-		});
-		await link.response(2, "extensions.load");
-		link.request(47, "tool_result", {
-			toolName: "echo",
-			toolCallId: "call-terminate-only",
-			input: {},
-			content: [{ type: "text", text: "keep-me" }],
-			details: { origin: "payload" },
-			isError: false,
-		});
-		const res = payload(await link.response(47, "tool_result"));
-		expect(res).toEqual({ terminate: true });
-		expect(Object.hasOwn(res, "content")).toBe(false);
-		expect(Object.hasOwn(res, "details")).toBe(false);
-		expect(Object.hasOwn(res, "isError")).toBe(false);
-		await link.finish();
-	});
 
 	test("tool_result rejects malformed input before dispatching hooks", async () => {
 		const link = await foldLink();

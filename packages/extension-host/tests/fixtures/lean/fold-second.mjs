@@ -2,8 +2,8 @@
  * Ordered-fold fixture (second in load order). Its recorded values are the
  * regression witness: they must show the first fixture's modifications,
  * not the original payload. Transform results deliberately omit fields
- * (input images, tool_result details, tool_result terminate) to prove
- * running values survive partial updates.
+ * (input images and tool_result details) to prove running values survive
+ * partial updates.
  */
 
 function mark(name, value) {
@@ -30,10 +30,8 @@ export default {
 				content: event.content,
 				details: event.details,
 				isError: event.isError,
-				terminate: event.terminate,
 			});
-			// details and terminate omitted on purpose: the first fixture's
-			// running values survive.
+			// details omitted on purpose: the running value survives.
 			return {
 				content: [...(event.content ?? []), "second"],
 				isError: false,
