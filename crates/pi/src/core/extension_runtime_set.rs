@@ -904,6 +904,11 @@ impl ExtensionRuntimeSet {
             return Err(HostStartError::FlagSync(error.to_string()));
         }
 
+        if let Err((path, error)) = validate_generation_providers(&next) {
+            stop_generation(&next).await;
+            return Err(HostStartError::Load(format!("{path}: {error}")));
+        }
+
         let old = self
             .generation
             .read()
@@ -1716,6 +1721,24 @@ fn abort_bridges(generation: &Generation) {
     }
 }
 
+fn validate_generation_providers(
+    generation: &Generation,
+) -> Result<(), (String, ModelRuntimeError)> {
+    let mut seen = HashSet::new();
+    for endpoint in generation.endpoints.iter() {
+        let paths = endpoint.runner.provider_extension_paths();
+        for (name, config) in endpoint.runner.provider_configs() {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            let path = paths.get(&name).cloned().unwrap_or_else(|| name.clone());
+            ModelRuntime::validate_provider_registration(&name, &config)
+                .map_err(|error| (path, error))?;
+        }
+    }
+    Ok(())
+}
+
 fn register_generation_providers(
     generation: &Generation,
     runtime: &ModelRuntime,
@@ -1844,7 +1867,7 @@ async fn answer_unclaimed_session(runner: &HostExtensionRunner, event: SessionBr
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::error::Error;
     use std::sync::atomic::AtomicUsize;
@@ -1868,7 +1891,7 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct FakeHost {
+    pub(crate) struct FakeHost {
         commands: mpsc::Sender<FakeCommand>,
         responses: Arc<StdMutex<HashMap<String, Value>>>,
         dropped_methods: Arc<StdMutex<HashSet<String>>>,
@@ -1898,7 +1921,7 @@ mod tests {
             let _ = self.commands.send(FakeCommand::Close).await;
         }
 
-        async fn wait_for_request(&self, method: &str) -> TestResult {
+        pub(crate) async fn wait_for_request(&self, method: &str) -> TestResult {
             tokio::time::timeout(TEST_TIMEOUT, async {
                 loop {
                     if self
@@ -1942,7 +1965,7 @@ mod tests {
             Ok(())
         }
 
-        fn request_count(&self, method: &str) -> usize {
+        pub(crate) fn request_count(&self, method: &str) -> usize {
             self.state
                 .frames
                 .lock()
@@ -1980,7 +2003,9 @@ mod tests {
         }
     }
 
-    async fn make_runner(snapshot: Value) -> TestResult<(Arc<HostExtensionRunner>, FakeHost)> {
+    pub(crate) async fn make_runner(
+        snapshot: Value,
+    ) -> TestResult<(Arc<HostExtensionRunner>, FakeHost)> {
         let (client_to_host, host_read) = tokio::io::duplex(64 * 1024);
         let (host_write, client_read) = tokio::io::duplex(64 * 1024);
         let (error_write, _error_read) = tokio::io::duplex(4096);
@@ -2620,8 +2645,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn runtime_set_provider_registration_failure_keeps_old_generation_and_provider()
-    -> TestResult {
+    async fn runtime_set_provider_validation_failure_keeps_live_state_untouched() -> TestResult {
         let old_provider = json!({
             "name": "old-provider",
             "baseUrl": "https://old.example/v1",
@@ -2690,16 +2714,32 @@ mod tests {
                 .into_iter()
                 .all(|(_path, result)| result.is_ok())
         );
+        let provider_epoch = runtime.provider_mutation_epoch();
 
         assert!(
             set.restart_and_rewire(&runtime, HashMap::new())
                 .await
                 .is_err()
         );
+        assert_eq!(
+            runtime.provider_mutation_epoch(),
+            provider_epoch,
+            "replacement validation must not publish any provider-map mutation"
+        );
         assert_eq!(set.reload_generation(), 1);
         assert!(set.is_active());
         assert!(runtime.get_model("old-provider", "old-model").is_some());
         assert_eq!(runtime.get_registered_provider_ids(), ["old-provider"]);
+        assert!(
+            runtime
+                .get_registered_provider_config("replacement-provider")
+                .is_none()
+        );
+        assert!(
+            runtime
+                .get_registered_provider_config("invalid-provider")
+                .is_none()
+        );
         let result = set.emit_input("original", None, "user", None).await?;
         assert!(!result.handled);
         host.wait_for_request("input").await?;

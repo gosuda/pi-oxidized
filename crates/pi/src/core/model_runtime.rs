@@ -314,6 +314,8 @@ struct ModelRuntimeInner {
     settings_manager: Option<Arc<Mutex<SettingsManager>>>,
     config: Mutex<ModelsJsonConfig>,
     extension_providers: Mutex<HashMap<String, ProviderConfigInput>>,
+    #[cfg(test)]
+    provider_mutation_epoch: std::sync::atomic::AtomicUsize,
     /// Extension stream handlers keyed by provider id.
     ///
     /// Selected only when the registered config `api` exactly matches the
@@ -407,6 +409,8 @@ impl ModelRuntime {
                 settings_manager,
                 config: Mutex::new(config),
                 extension_providers: Mutex::new(HashMap::new()),
+                #[cfg(test)]
+                provider_mutation_epoch: std::sync::atomic::AtomicUsize::new(0),
                 extension_stream_providers: Mutex::new(HashMap::new()),
                 composition_errors: Mutex::new(HashMap::new()),
                 provider_models: Mutex::new(HashMap::new()),
@@ -676,6 +680,21 @@ impl ModelRuntime {
             .collect()
     }
 
+    /// Validate an extension provider registration without publishing it.
+    pub(crate) fn validate_provider_registration(
+        provider_id: &str,
+        config: &ProviderConfigInput,
+    ) -> Result<(), ModelRuntimeError> {
+        validate_extension_provider(provider_id, config)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn provider_mutation_epoch(&self) -> usize {
+        self.inner
+            .provider_mutation_epoch
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Register or re-register an extension provider.
     ///
     /// Re-registration merges defined values over the previous registration and
@@ -691,7 +710,11 @@ impl ModelRuntime {
         config: impl std::borrow::Borrow<ProviderConfigInput>,
     ) -> Result<(), ModelRuntimeError> {
         let config = config.borrow();
-        validate_extension_provider(provider_id, config)?;
+        Self::validate_provider_registration(provider_id, config)?;
+        #[cfg(test)]
+        self.inner
+            .provider_mutation_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         {
             let mut extensions = lock(&self.inner.extension_providers);
             let previous = extensions.get(provider_id).cloned().unwrap_or_default();
@@ -719,6 +742,10 @@ impl ModelRuntime {
 
     /// Unregister an extension provider and recompose.
     pub fn unregister_provider(&self, provider_id: &str) {
+        #[cfg(test)]
+        self.inner
+            .provider_mutation_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         lock(&self.inner.extension_providers).remove(provider_id);
         // Config and custom stream handlers are independent registrations, but
         // dropping the provider config also drops any stream handler bound to
