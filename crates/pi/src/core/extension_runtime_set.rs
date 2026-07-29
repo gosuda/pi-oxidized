@@ -363,6 +363,26 @@ impl ExtensionRuntimeSet {
             .clone()
     }
 
+    /// Publish a prepared generation before any caller can retire its predecessor.
+    fn publish_replacement(&self, next: Generation, pending: PendingBridges) -> Arc<Generation> {
+        let next_id = next.id;
+        let old = {
+            let mut generation = self
+                .generation
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // The pointer swap is the facade's cutover linearization point.
+            let old = std::mem::replace(&mut *generation, Arc::new(next));
+            self.current_generation.store(next_id, Ordering::Release);
+            old
+        };
+        // Drop product-visible state and old request routes after their relay tag changed.
+        self.aggregate.dispose_all_slots();
+        self.aggregate.clear_routes();
+        self.start_bridges(pending);
+        old
+    }
+
     fn start_bridges(&self, pending: PendingBridges) {
         let generation_id = self.reload_generation();
         let mut handles = Vec::new();
@@ -721,13 +741,18 @@ impl ExtensionRuntimeSet {
     ///
     /// Returns an error when the response route is stale or missing, or its host rejects it.
     pub async fn respond_ui(&self, response: HostUiResponse) -> Result<(), HostClientError> {
+        let generation = self
+            .generation
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let route = self
             .aggregate
             .take_route(ui_response_id(&response))
-            .filter(|route| route.generation == self.reload_generation())
+            .filter(|route| route.generation == generation.id)
             .ok_or(HostClientError::NotRunning)?;
-        let endpoint = self
-            .endpoints()
+        let endpoint = generation
+            .endpoints
             .get(route.endpoint)
             .cloned()
             .ok_or(HostClientError::NotRunning)?;
@@ -767,13 +792,18 @@ impl ExtensionRuntimeSet {
         id: FrameId,
         success: bool,
     ) -> Result<(), HostClientError> {
+        let generation = self
+            .generation
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let route = self
             .aggregate
             .take_route(id)
-            .filter(|route| route.generation == self.reload_generation())
+            .filter(|route| route.generation == generation.id)
             .ok_or(HostClientError::NotRunning)?;
-        let endpoint = self
-            .endpoints()
+        let endpoint = generation
+            .endpoints
             .get(route.endpoint)
             .cloned()
             .ok_or(HostClientError::NotRunning)?;
@@ -793,13 +823,18 @@ impl ExtensionRuntimeSet {
         id: FrameId,
         outcome: Result<Value, String>,
     ) -> Result<(), HostClientError> {
+        let generation = self
+            .generation
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let route = self
             .aggregate
             .take_route(id)
-            .filter(|route| route.generation == self.reload_generation())
+            .filter(|route| route.generation == generation.id)
             .ok_or(HostClientError::NotRunning)?;
-        let endpoint = self
-            .endpoints()
+        let endpoint = generation
+            .endpoints
             .get(route.endpoint)
             .cloned()
             .ok_or(HostClientError::NotRunning)?;
@@ -926,25 +961,10 @@ impl ExtensionRuntimeSet {
             return Err(HostStartError::Load(format!("{path}: {error}")));
         }
 
-        self.aggregate.dispose_all_slots();
-        self.aggregate.clear_routes();
+        let old = self.publish_replacement(next, pending);
         for endpoint in old.endpoints.iter() {
             endpoint.runner.invalidate();
         }
-
-        {
-            let mut generation = self
-                .generation
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *generation = Arc::new(next);
-        }
-        self.current_generation.store(next_id, Ordering::Release);
-        // Close the quarantine race: an old bridge may have drained an already
-        // queued item after the pre-swap cleanup but before observing this tag.
-        self.aggregate.dispose_all_slots();
-        self.aggregate.clear_routes();
-        self.start_bridges(pending);
         abort_bridges(&old);
         stop_generation(&old).await;
         Ok(())
@@ -1873,6 +1893,7 @@ pub(crate) mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use pi_ext::protocol::{Frame, FrameKind, HelloAck};
+    use pi_ext::sanitize::{SanitizedRun, SanitizedSlot};
     use serde_json::json;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -2582,13 +2603,13 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_set_keeps_claimed_bridges_across_generation_swap() -> TestResult {
+    async fn runtime_set_publishes_replacement_before_retiring_old_generation() -> TestResult {
         let (first, _first_host) = make_runner(snapshot(&[])).await?;
         let set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, first)]);
         let mut ui_requests = set.take_ui_requests().ok_or("ui bridge missing")?;
         let mut session_bridge = set.take_session_bridge().ok_or("session bridge missing")?;
         let (replacement, replacement_host) = make_runner(snapshot(&[])).await?;
-        let (next, pending) = generation_from_endpoints(
+        let (next, mut pending) = generation_from_endpoints(
             2,
             vec![Endpoint {
                 index: 0,
@@ -2596,17 +2617,28 @@ pub(crate) mod tests {
                 runner: replacement,
             }],
         );
-        let old = {
-            let mut generation = set
-                .generation
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            std::mem::replace(&mut *generation, Arc::new(next))
-        };
-        set.current_generation.store(2, Ordering::Release);
-        set.start_bridges(pending);
-        abort_bridges(&old);
-        stop_generation(&old).await;
+        let (ui_tx, ui) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        pending[0].ui = ui;
+        assert!(
+            ui_tx
+                .send(ExtensionUiEvent::Slot(SanitizedSlot {
+                    key: "buffered".to_owned(),
+                    height: 1,
+                    lines: vec![vec![SanitizedRun {
+                        text: "buffered".to_owned(),
+                        ..SanitizedRun::default()
+                    }]],
+                    ..SanitizedSlot::default()
+                }))
+                .is_ok()
+        );
+
+        let old = set.publish_replacement(next, pending);
+
+        assert_eq!(set.reload_generation(), 2);
+        assert!(set.is_active());
+        assert!(old.endpoints[0].runner.is_active());
+        wait_for_slot_text(&set, "buffered").await?;
 
         replacement_host
             .emit(Frame {
@@ -2639,6 +2671,11 @@ pub(crate) mod tests {
         replacement_host
             .wait_for_response(protocol::SESSION_SET_MODEL_METHOD, 8)
             .await?;
+        for endpoint in old.endpoints.iter() {
+            endpoint.runner.invalidate();
+        }
+        abort_bridges(&old);
+        stop_generation(&old).await;
         set.shutdown_once().await;
         Ok(())
     }
