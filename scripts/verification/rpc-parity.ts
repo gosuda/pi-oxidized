@@ -83,7 +83,7 @@ export function deriveRpcCommandTypes(source: string): string[] {
 	assert(end !== -1, "authoritative RpcCommand union has no top-level terminator");
 	const block = source.slice(start + marker.length, end);
 	const types: string[] = [];
-	for (const match of block.matchAll(/type:\s*"([a-z0-9_]+)"/g)) {
+	for (const match of block.matchAll(/type:\s*"([a-zA-Z0-9_]+)"/g)) {
 		const type = match[1];
 		if (type !== undefined && !types.includes(type)) types.push(type);
 	}

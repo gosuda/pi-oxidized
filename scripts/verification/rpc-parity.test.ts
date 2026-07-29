@@ -52,6 +52,15 @@ test("derivation is scoped to the RpcCommand union, not the whole file", () => {
 	expect(deriveRpcCommandTypes(source)).toEqual(["alpha", "beta"]);
 });
 
+test("derivation captures camelCase and uppercase discriminants, not just lowercase", () => {
+	const source =
+		'export type RpcCommand =\n' +
+		'\t| { id?: string; type: "switchSession" }\n' +
+		'\t| { id?: string; type: "GetState" }\n' +
+		'\t| { id?: string; type: "lowercase_one" };\n';
+	expect(deriveRpcCommandTypes(source)).toEqual(["switchSession", "GetState", "lowercase_one"]);
+});
+
 test("scenario covers every authoritative command exactly", () => {
 	const derived = deriveRpcCommandTypes(readFileSync(AUTHORITATIVE_RPC_TYPES_PATH, "utf8"));
 	const scenario = buildScenario();
