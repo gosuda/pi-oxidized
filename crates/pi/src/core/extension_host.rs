@@ -828,6 +828,9 @@ struct Endpoint {
     /// Resolved load paths handed to this endpoint's `extensions.load`.
     extension_paths: Vec<String>,
     disabled: AtomicBool,
+    /// Terminal input is optional and can be permanently disabled without
+    /// taking down this endpoint's other extension surfaces.
+    terminal_input_disabled: AtomicBool,
     stale: AtomicBool,
     shutdown_done: AtomicBool,
     shutdown_lock: tokio::sync::Mutex<()>,
@@ -850,6 +853,7 @@ impl Endpoint {
             flag_values: RwLock::new(flag_values),
             extension_paths,
             disabled: AtomicBool::new(false),
+            terminal_input_disabled: AtomicBool::new(false),
             stale: AtomicBool::new(false),
             shutdown_done: AtomicBool::new(false),
             shutdown_lock: tokio::sync::Mutex::new(()),
@@ -869,6 +873,21 @@ impl Endpoint {
         !self.disabled.load(Ordering::Relaxed) && !self.stale.load(Ordering::Relaxed)
     }
 
+    fn has_terminal_input_handler(&self) -> bool {
+        self.active()
+            && !self.terminal_input_disabled.load(Ordering::Relaxed)
+            && self
+                .snapshot
+                .read()
+                .is_ok_and(|snapshot| snapshot.terminal_input)
+    }
+
+    /// Disable terminal input exactly once. Returns whether this caller won
+    /// the transition and must publish its corresponding error notice.
+    fn try_disable_terminal_input(&self) -> bool {
+        !self.terminal_input_disabled.swap(true, Ordering::Relaxed)
+    }
+
     async fn hook_request(
         &self,
         method: &str,
@@ -883,17 +902,20 @@ impl Endpoint {
     }
 
     fn report_host_error(&self, aggregate: &AggregateState, err: &HostClientError) {
-        let fatal = matches!(
-            err,
-            HostClientError::Closed { .. }
-                | HostClientError::Protocol { .. }
-                | HostClientError::NotRunning
-        );
-        if fatal {
+        if fatal_host_error(err) {
             self.disabled.store(true, Ordering::Relaxed);
         }
         aggregate.publish_error(error_code(err), &err.to_string(), None);
     }
+}
+
+fn fatal_host_error(err: &HostClientError) -> bool {
+    matches!(
+        err,
+        HostClientError::Closed { .. }
+            | HostClientError::Protocol { .. }
+            | HostClientError::NotRunning
+    )
 }
 
 fn error_code(err: &HostClientError) -> &'static str {
@@ -1957,13 +1979,9 @@ impl HostExtensionRunner {
     #[must_use]
     /// Return whether any active endpoint handles terminal input.
     pub fn has_terminal_input_handlers(&self) -> bool {
-        self.endpoints.iter().any(|endpoint| {
-            endpoint.active()
-                && endpoint
-                    .snapshot
-                    .read()
-                    .is_ok_and(|snapshot| snapshot.terminal_input)
-        })
+        self.endpoints
+            .iter()
+            .any(|endpoint| endpoint.has_terminal_input_handler())
     }
 
     /// Fold terminal input rewrites in endpoint order and stop when consumed.
@@ -1973,25 +1991,26 @@ impl HostExtensionRunner {
     /// dispatch (later endpoints stay uncontacted), and the remainder is
     /// handed to that endpoint's request.
     ///
+    /// A terminal-input RPC or decode failure disables terminal input only for
+    /// that endpoint and fails open for the key. A timeout only proves the
+    /// first eligible endpoint faulty; a later timeout may just exhaust the
+    /// shared aggregate deadline and stays eligible.
+    ///
     /// # Errors
     ///
-    /// With a single endpoint, returns the `terminalInput` RPC failure; with
-    /// multiple endpoints, per-endpoint failures are isolated and reported as
-    /// `extension_error` events instead.
+    /// Endpoint failures are reported and folded fail-open, so this
+    /// implementation currently returns only `Ok`; the result shape is kept
+    /// for the extension-runner transport contract.
     pub async fn terminal_input(
         &self,
         data: &str,
     ) -> Result<protocol::TerminalInputResult, HostClientError> {
         let mut current = data.to_owned();
         let mut transformed = false;
+        let mut first_eligible = true;
         let deadline = tokio::time::Instant::now() + Duration::from_millis(4);
         for endpoint in self.endpoints.iter() {
-            if !endpoint.active()
-                || !endpoint
-                    .snapshot
-                    .read()
-                    .is_ok_and(|snapshot| snapshot.terminal_input)
-            {
+            if !endpoint.has_terminal_input_handler() {
                 continue;
             }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -2011,6 +2030,8 @@ impl HostExtensionRunner {
                         |error| HostClientError::Payload(format!("decode terminalInput: {error}")),
                     )
                 });
+            let latch_timeout = first_eligible;
+            first_eligible = false;
             match result {
                 Ok(result) => {
                     if let Some(data) = result.data {
@@ -2024,7 +2045,17 @@ impl HostExtensionRunner {
                         });
                     }
                 }
-                Err(error) if self.endpoints.len() == 1 => return Err(error),
+                Err(error)
+                    if !matches!(&error, HostClientError::Timeout { .. }) || latch_timeout =>
+                {
+                    if fatal_host_error(&error) {
+                        endpoint.disabled.store(true, Ordering::Relaxed);
+                    }
+                    if endpoint.try_disable_terminal_input() {
+                        self.aggregate
+                            .publish_error(error_code(&error), &error.to_string(), None);
+                    }
+                }
                 Err(error) => endpoint.report_host_error(&self.aggregate, &error),
             }
         }
@@ -2046,7 +2077,7 @@ impl HostExtensionRunner {
         self.aggregate.theme_generation.load(Ordering::Relaxed)
     }
 
-    /// Broadcast a theme update to every active endpoint in order.
+    /// Broadcast a theme update to every active host.
     pub async fn push_theme_update(&self, update: &ThemeUpdate) {
         self.aggregate
             .theme_generation

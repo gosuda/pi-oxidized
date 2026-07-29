@@ -101,6 +101,12 @@ impl FakeHost {
         }
     }
 
+    fn restore_method(&self, method: &str) {
+        if let Ok(mut set) = self.drop_methods.lock() {
+            set.remove(method);
+        }
+    }
+
     fn hold_method(&self, method: &str) {
         if let Ok(mut set) = self.hold_methods.lock() {
             set.insert(method.to_owned());
@@ -252,6 +258,16 @@ fn host_received(host: &FakeHost, method: &str) -> Result<bool, BoxErr> {
         .map_err(|_| "request lock poisoned")?
         .iter()
         .any(|frame| frame.method == method))
+}
+
+fn host_request_count(host: &FakeHost, method: &str) -> Result<usize, BoxErr> {
+    Ok(host
+        .requests
+        .lock()
+        .map_err(|_| "request lock poisoned")?
+        .iter()
+        .filter(|frame| frame.method == method)
+        .count())
 }
 
 /// Assert that a host did not receive any of the supplied methods.
@@ -1681,6 +1697,126 @@ async fn aggregate_terminal_input_shares_one_budget_across_endpoints() -> R {
     assert!(
         !host_received(&hosts[2], "terminalInput")?,
         "an expired shared budget must leave later endpoints uncontacted"
+    );
+    runner.shutdown_once().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_input_first_endpoint_timeout_disables_once_and_fails_open() -> R {
+    let (runner, host) = make_runner(json!({"terminalInput": true})).await?;
+    host.drop_method("terminalInput");
+    let mut errors = runner.subscribe_errors();
+
+    let first = runner.terminal_input("first").await?;
+    assert!(!first.consume);
+    assert_eq!(first.data, None);
+    assert_eq!(
+        next_error(&mut errors, Duration::from_millis(500))
+            .await?
+            .code,
+        "extension_timeout"
+    );
+    assert!(
+        !runner.has_terminal_input_handlers(),
+        "the native caller must bypass an endpoint whose terminal input is disabled"
+    );
+
+    let started = std::time::Instant::now();
+    let later = runner.terminal_input("later").await?;
+    assert!(
+        started.elapsed() < Duration::from_millis(4),
+        "a disabled terminal-input endpoint must fail open without another RPC deadline"
+    );
+    assert!(!later.consume);
+    assert_eq!(later.data, None);
+    assert_eq!(host_request_count(&host, "terminalInput")?, 1);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), errors.recv())
+            .await
+            .is_err(),
+        "the terminal-input disable notice must be emitted once"
+    );
+    runner.shutdown_once().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_input_later_budget_timeout_stays_eligible() -> R {
+    let snapshot = || json!({"terminalInput": true});
+    let (runner, hosts) =
+        make_aggregate_runner(vec![(0, snapshot(), "compat-a"), (1, snapshot(), "lean-b")]).await?;
+    hosts[1].drop_method("terminalInput");
+    let mut errors = runner.subscribe_errors();
+
+    let first = runner.terminal_input("first").await?;
+    assert!(!first.consume);
+    assert_eq!(first.data, None);
+    assert_eq!(
+        next_error(&mut errors, Duration::from_millis(500))
+            .await?
+            .code,
+        "extension_timeout"
+    );
+    assert_eq!(host_request_count(&hosts[0], "terminalInput")?, 1);
+    assert_eq!(host_request_count(&hosts[1], "terminalInput")?, 1);
+
+    hosts[1].restore_method("terminalInput");
+    hosts[1].set_response("terminalInput", json!({"consume": true}));
+    let second = runner.terminal_input("second").await?;
+    assert!(second.consume, "the later endpoint must remain eligible");
+    assert_eq!(host_request_count(&hosts[0], "terminalInput")?, 2);
+    assert_eq!(host_request_count(&hosts[1], "terminalInput")?, 2);
+    assert!(runner.has_terminal_input_handlers());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), errors.recv())
+            .await
+            .is_err(),
+        "a successful retry after a budget-limited timeout must not emit a disable notice"
+    );
+    runner.shutdown_once().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_input_later_decode_failure_disables_only_that_endpoint() -> R {
+    let snapshot = || json!({"terminalInput": true});
+    let (runner, hosts) = make_aggregate_runner(vec![
+        (0, snapshot(), "compat-a"),
+        (1, snapshot(), "lean-b"),
+        (2, snapshot(), "compat-c"),
+    ])
+    .await?;
+    hosts[0].set_response("terminalInput", json!({"data": "rewritten"}));
+    hosts[1].set_response("terminalInput", json!({"consume": "invalid"}));
+    hosts[2].set_response("terminalInput", json!({"consume": true}));
+    let mut errors = runner.subscribe_errors();
+
+    let first = runner.terminal_input("first").await?;
+    assert!(first.consume);
+    assert_eq!(first.data.as_deref(), Some("rewritten"));
+    assert_eq!(
+        next_error(&mut errors, Duration::from_millis(500))
+            .await?
+            .code,
+        "extension_payload"
+    );
+
+    let second = runner.terminal_input("second").await?;
+    assert!(second.consume);
+    assert_eq!(second.data.as_deref(), Some("rewritten"));
+    assert_eq!(host_request_count(&hosts[0], "terminalInput")?, 2);
+    assert_eq!(
+        host_request_count(&hosts[1], "terminalInput")?,
+        1,
+        "a decode-failed endpoint must never receive a later keypress"
+    );
+    assert_eq!(host_request_count(&hosts[2], "terminalInput")?, 2);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), errors.recv())
+            .await
+            .is_err(),
+        "the terminal-input disable notice must be emitted once"
     );
     runner.shutdown_once().await;
     Ok(())
