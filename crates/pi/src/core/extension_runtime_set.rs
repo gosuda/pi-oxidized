@@ -1,6 +1,7 @@
 //! Stable product facade over an ordered set of extension host endpoints.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
@@ -55,6 +56,39 @@ struct EndpointPlan {
     diagnostic_paths: Vec<String>,
     builtins: bool,
     label: String,
+}
+
+#[derive(Clone, Copy)]
+enum GenerationBuildPolicy {
+    BestEffortStart,
+    RequireAllEndpointStarts,
+}
+
+struct GenerationBuild {
+    generation: Option<Generation>,
+    pending: PendingBridges,
+    diagnostics: Vec<ExtensionSetDiagnostic>,
+    endpoint_start_failure: Option<ExtensionSetDiagnostic>,
+}
+
+type EndpointStartOutcome = (
+    usize,
+    EndpointPlan,
+    Result<Arc<HostExtensionRunner>, String>,
+);
+
+struct PreparedEndpoint {
+    position: usize,
+    kind: EndpointKind,
+    label: String,
+    runner: Arc<HostExtensionRunner>,
+}
+
+struct GenerationStarts {
+    endpoints: Vec<PreparedEndpoint>,
+    diagnostics: Vec<ExtensionSetDiagnostic>,
+    endpoint_start_failure: Option<ExtensionSetDiagnostic>,
+    failed_builtins_owner: Option<EndpointPlan>,
 }
 
 /// One path-scoped startup or load failure. Other paths may remain active.
@@ -129,6 +163,12 @@ impl GenerationLease {
         }
     }
 
+    fn live_endpoints(&self) -> impl DoubleEndedIterator<Item = &Endpoint> {
+        self.endpoints()
+            .iter()
+            .filter(|endpoint| endpoint.runner.is_active())
+    }
+
     fn is_active(&self) -> bool {
         self.endpoints()
             .iter()
@@ -180,6 +220,8 @@ struct PublishedRuntimeState {
     generation: Arc<Generation>,
     slots: HashMap<String, BTreeMap<EndpointId, SanitizedSlot>>,
     routes: HashMap<FrameId, CorrelationRoute>,
+    retired: BTreeSet<EndpointId>,
+    provider_runtime: Option<ModelRuntime>,
     next_route_id: FrameId,
     stale: bool,
     shutdown_done: bool,
@@ -191,6 +233,8 @@ impl PublishedRuntimeState {
             generation,
             slots: HashMap::new(),
             routes: HashMap::new(),
+            retired: BTreeSet::new(),
+            provider_runtime: None,
             next_route_id: 1,
             stale: false,
             shutdown_done: false,
@@ -208,8 +252,98 @@ impl PublishedRuntimeState {
         }
     }
 
+    fn is_current_generation_endpoint(&self, endpoint: EndpointId) -> bool {
+        self.generation.endpoint(endpoint).is_some()
+    }
+
     fn accepts_relay(&self, endpoint: EndpointId) -> bool {
-        !self.stale && !self.shutdown_done && self.generation.endpoint(endpoint).is_some()
+        !self.stale
+            && !self.shutdown_done
+            && !self.retired.contains(&endpoint)
+            && self
+                .generation
+                .endpoint(endpoint)
+                .is_some_and(|endpoint| endpoint.runner.is_active())
+    }
+
+    fn retire_endpoint(&mut self, endpoint: EndpointId, channels: &FacadeChannels) -> bool {
+        if self.stale
+            || self.shutdown_done
+            || !self.is_current_generation_endpoint(endpoint)
+            || self.retired.contains(&endpoint)
+        {
+            return false;
+        }
+
+        let dead_provider_names = self
+            .generation
+            .endpoint(endpoint)
+            .map(|dead| {
+                dead.runner
+                    .provider_configs()
+                    .into_keys()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let owned_provider_names = dead_provider_names
+            .into_iter()
+            .filter(|name| {
+                self.generation
+                    .endpoints
+                    .iter()
+                    .filter(|candidate| !self.retired.contains(&candidate.id))
+                    .find(|candidate| candidate.runner.provider_configs().contains_key(name))
+                    .is_some_and(|owner| owner.id == endpoint)
+            })
+            .collect::<Vec<_>>();
+
+        self.retired.insert(endpoint);
+        self.routes.retain(|_, route| route.endpoint != endpoint);
+
+        let mut keys = self.slots.keys().cloned().collect::<Vec<_>>();
+        keys.sort();
+        for key in keys {
+            let Some(owners) = self.slots.get_mut(&key) else {
+                continue;
+            };
+            let old_owner = owners.last_key_value().map(|(owner, _)| *owner);
+            owners.remove(&endpoint);
+            if old_owner != Some(endpoint) {
+                continue;
+            }
+            if let Some((_, fallback)) = owners.last_key_value() {
+                let _ = channels
+                    .ui_tx
+                    .send(ExtensionUiEvent::Slot(fallback.clone()));
+            } else {
+                self.slots.remove(&key);
+                let _ = channels.ui_tx.send(ExtensionUiEvent::Dispose { key });
+            }
+        }
+
+        if let Some(runtime) = self.provider_runtime.clone() {
+            for name in owned_provider_names {
+                runtime.unregister_provider(&name);
+                let fallback = self.generation.endpoints.iter().find(|candidate| {
+                    !self.retired.contains(&candidate.id)
+                        && candidate.runner.is_active()
+                        && candidate.runner.provider_configs().contains_key(&name)
+                });
+                if let Some(fallback) = fallback {
+                    let (path, outcome) = register_endpoint_provider(fallback, &name, &runtime);
+                    if let Err(error) = outcome {
+                        channels.publish_error(
+                            "extension_provider_rewire_failed",
+                            format!(
+                                "Extension {path:?} provider {name:?} failed to rewire: {error}"
+                            ),
+                            None,
+                        );
+                    }
+                }
+            }
+        }
+        true
     }
 
     fn reloadable(&self) -> bool {
@@ -316,6 +450,7 @@ impl PublishedRuntimeState {
         channels: &FacadeChannels,
     ) -> Arc<Generation> {
         let old = std::mem::replace(&mut self.generation, next);
+        self.retired.clear();
         let mut keys = self.slots.keys().cloned().collect::<Vec<_>>();
         keys.sort();
         self.slots.clear();
@@ -329,6 +464,7 @@ impl PublishedRuntimeState {
 
     fn quiesce(&mut self, channels: &FacadeChannels) -> Arc<Generation> {
         self.stale = true;
+        self.provider_runtime = None;
         let mut keys = self.slots.keys().cloned().collect::<Vec<_>>();
         keys.sort();
         self.slots.clear();
@@ -414,6 +550,11 @@ enum TestPreparedReload {
         generation: Generation,
         pending: PendingBridges,
     },
+    ReplacementWithDiagnostics {
+        generation: Generation,
+        pending: PendingBridges,
+        diagnostics: Vec<ExtensionSetDiagnostic>,
+    },
     ReplacementThenInvalidation {
         generation: Generation,
         pending: PendingBridges,
@@ -435,8 +576,19 @@ impl ExtensionRuntimeSet {
         }
         let (classified, mut diagnostics) = classify_paths(&discovered_paths);
         let plans = plan_endpoints(&classified);
-        let (generation, pending, mut build_diagnostics) =
-            build_generation(1, plans, &load_cwd, project_trusted, false).await;
+        let GenerationBuild {
+            generation,
+            pending,
+            diagnostics: mut build_diagnostics,
+            endpoint_start_failure: _,
+        } = build_generation(
+            1,
+            plans,
+            &load_cwd,
+            project_trusted,
+            GenerationBuildPolicy::BestEffortStart,
+        )
+        .await;
         diagnostics.append(&mut build_diagnostics);
         let Some(generation) = generation else {
             return ExtensionSetStart {
@@ -527,6 +679,28 @@ impl ExtensionRuntimeSet {
     }
 
     #[cfg(test)]
+    fn inject_prepared_replacement_with_diagnostics_for_reload(
+        &self,
+        generation: Generation,
+        pending: PendingBridges,
+        diagnostics: Vec<ExtensionSetDiagnostic>,
+    ) {
+        let mut prepared = self
+            .test_prepared_reload
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            prepared.is_none(),
+            "reload test preparation was already injected"
+        );
+        *prepared = Some(TestPreparedReload::ReplacementWithDiagnostics {
+            generation,
+            pending,
+            diagnostics,
+        });
+    }
+
+    #[cfg(test)]
     fn inject_prepared_replacement_then_invalidation_for_reload(
         &self,
         generation: Generation,
@@ -546,15 +720,7 @@ impl ExtensionRuntimeSet {
         });
     }
 
-    async fn build_reload_generation(
-        &self,
-        id: u64,
-        plans: Vec<EndpointPlan>,
-    ) -> (
-        Option<Generation>,
-        PendingBridges,
-        Vec<ExtensionSetDiagnostic>,
-    ) {
+    async fn build_reload_generation(&self, id: u64, plans: Vec<EndpointPlan>) -> GenerationBuild {
         #[cfg(test)]
         {
             let prepared = self
@@ -567,18 +733,45 @@ impl ExtensionRuntimeSet {
                     TestPreparedReload::Replacement {
                         generation,
                         pending,
-                    } => (Some(generation), pending, Vec::new()),
+                    } => GenerationBuild {
+                        generation: Some(generation),
+                        pending,
+                        diagnostics: Vec::new(),
+                        endpoint_start_failure: None,
+                    },
+                    TestPreparedReload::ReplacementWithDiagnostics {
+                        generation,
+                        pending,
+                        diagnostics,
+                    } => GenerationBuild {
+                        generation: Some(generation),
+                        pending,
+                        diagnostics,
+                        endpoint_start_failure: None,
+                    },
                     TestPreparedReload::ReplacementThenInvalidation {
                         generation,
                         pending,
                     } => {
                         self.invalidate();
-                        (Some(generation), pending, Vec::new())
+                        GenerationBuild {
+                            generation: Some(generation),
+                            pending,
+                            diagnostics: Vec::new(),
+                            endpoint_start_failure: None,
+                        }
                     }
                 };
             }
         }
-        build_generation(id, plans, &self.load_cwd, self.project_trusted, true).await
+        build_generation(
+            id,
+            plans,
+            &self.load_cwd,
+            self.project_trusted,
+            GenerationBuildPolicy::RequireAllEndpointStarts,
+        )
+        .await
     }
 
     #[cfg(test)]
@@ -660,7 +853,7 @@ impl ExtensionRuntimeSet {
     pub fn registered_flag_types(&self) -> BTreeMap<String, ExtensionFlagType> {
         let lease = self.lease();
         let mut flags = BTreeMap::new();
-        for endpoint in lease.endpoints() {
+        for endpoint in lease.live_endpoints() {
             for (name, kind) in endpoint.runner.registered_flag_types() {
                 flags.entry(name).or_insert(kind);
             }
@@ -673,7 +866,7 @@ impl ExtensionRuntimeSet {
     pub fn providers(&self) -> HashMap<String, ExtensionProvider> {
         let lease = self.lease();
         let mut providers = HashMap::new();
-        for endpoint in lease.endpoints() {
+        for endpoint in lease.live_endpoints() {
             for (name, provider) in endpoint.runner.providers() {
                 providers.entry(name).or_insert(provider);
             }
@@ -687,14 +880,22 @@ impl ExtensionRuntimeSet {
         &self,
         runtime: &ModelRuntime,
     ) -> Vec<(String, Result<(), ModelRuntimeError>)> {
-        let lease = self.lease();
-        register_endpoint_providers(lease.endpoints(), runtime)
+        let mut state = self.state();
+        let results = register_endpoint_providers(
+            state.generation.endpoints.iter().filter(|endpoint| {
+                !state.retired.contains(&endpoint.id) && endpoint.runner.is_active()
+            }),
+            runtime,
+        );
+        state.provider_runtime = Some(runtime.clone());
+        results
     }
 
     /// Remove each first-owned provider once.
     pub fn unregister_providers_from(&self, runtime: &ModelRuntime) {
-        let lease = self.lease();
-        unregister_endpoint_providers(lease.endpoints(), runtime);
+        let mut state = self.state();
+        unregister_endpoint_providers(&state.generation.endpoints, runtime);
+        state.provider_runtime = None;
     }
 
     /// Aggregate registry with existing first-wins semantics.
@@ -702,7 +903,7 @@ impl ExtensionRuntimeSet {
     pub fn registry(&self) -> Registry {
         let lease = self.lease();
         let mut aggregate = Registry::new();
-        for endpoint in lease.endpoints() {
+        for endpoint in lease.live_endpoints() {
             let registry = endpoint.runner.registry();
             for item in registry.tools() {
                 aggregate.register_tool(item.clone());
@@ -731,8 +932,7 @@ impl ExtensionRuntimeSet {
     pub fn raw_shortcuts(&self) -> Vec<ShortcutRegistration> {
         let lease = self.lease();
         lease
-            .endpoints()
-            .iter()
+            .live_endpoints()
             .flat_map(|endpoint| endpoint.runner.raw_shortcuts())
             .collect()
     }
@@ -766,10 +966,7 @@ impl ExtensionRuntimeSet {
     ) -> Result<(), HostClientError> {
         let lease = self.lease();
         let mut first_error = None;
-        for endpoint in lease.endpoints() {
-            if !endpoint.runner.is_active() {
-                continue;
-            }
+        for endpoint in lease.live_endpoints() {
             if let Err(error) = endpoint.runner.apply_flag_values(values).await
                 && first_error.is_none()
             {
@@ -790,7 +987,7 @@ impl ExtensionRuntimeSet {
     ) -> Result<ShortcutExecuteResponse, HostClientError> {
         let key = key.into();
         let lease = self.lease();
-        for endpoint in lease.endpoints().iter().rev() {
+        for endpoint in lease.live_endpoints().rev() {
             if endpoint
                 .runner
                 .raw_shortcuts()
@@ -852,7 +1049,7 @@ impl ExtensionRuntimeSet {
     #[must_use]
     pub fn has_terminal_input_handlers(&self) -> bool {
         let lease = self.lease();
-        lease.endpoints().iter().any(|endpoint| {
+        lease.live_endpoints().any(|endpoint| {
             endpoint.runner.is_active() && endpoint.runner.has_terminal_input_handlers()
         })
     }
@@ -868,8 +1065,8 @@ impl ExtensionRuntimeSet {
     ) -> Result<protocol::TerminalInputResult, HostClientError> {
         let lease = self.lease();
         let mut pending = FuturesUnordered::new();
-        for (index, endpoint) in lease.endpoints().iter().enumerate() {
-            if endpoint.runner.is_active() && endpoint.runner.has_terminal_input_handlers() {
+        for (index, endpoint) in lease.live_endpoints().enumerate() {
+            if endpoint.runner.has_terminal_input_handlers() {
                 let runner = Arc::clone(&endpoint.runner);
                 let data = data.to_owned();
                 pending.push(async move { (index, runner.terminal_input(&data).await) });
@@ -915,8 +1112,7 @@ impl ExtensionRuntimeSet {
     pub fn theme_generation(&self) -> u64 {
         let lease = self.lease();
         lease
-            .endpoints()
-            .iter()
+            .live_endpoints()
             .map(|endpoint| endpoint.runner.theme_generation())
             .max()
             .unwrap_or(0)
@@ -925,9 +1121,11 @@ impl ExtensionRuntimeSet {
     /// Broadcast a theme update to all active endpoints.
     pub async fn push_theme_update(&self, update: &ThemeUpdate) {
         let lease = self.lease();
-        for endpoint in lease.endpoints() {
-            endpoint.runner.push_theme_update(update).await;
+        let mut sends = FuturesUnordered::new();
+        for endpoint in lease.live_endpoints() {
+            sends.push(endpoint.runner.push_theme_update(update));
         }
+        while sends.next().await.is_some() {}
     }
 
     /// Claim the persistent facade UI-request receiver once.
@@ -1007,17 +1205,21 @@ impl ExtensionRuntimeSet {
     /// Broadcast mirrored session state.
     pub async fn push_session_state(&self, state: &SessionStateWire) {
         let lease = self.lease();
-        for endpoint in lease.endpoints() {
-            endpoint.runner.push_session_state(state).await;
+        let mut sends = FuturesUnordered::new();
+        for endpoint in lease.live_endpoints() {
+            sends.push(endpoint.runner.push_session_state(state));
         }
+        while sends.next().await.is_some() {}
     }
 
     /// Broadcast mirrored UI state.
     pub async fn push_ui_state(&self, state: &UiStateWire) {
         let lease = self.lease();
-        for endpoint in lease.endpoints() {
-            endpoint.runner.push_ui_state(state).await;
+        let mut sends = FuturesUnordered::new();
+        for endpoint in lease.live_endpoints() {
+            sends.push(endpoint.runner.push_ui_state(state));
         }
+        while sends.next().await.is_some() {}
     }
 
     /// Render with the first endpoint owning the tool renderer.
@@ -1028,7 +1230,7 @@ impl ExtensionRuntimeSet {
         payload: &Value,
     ) -> Option<String> {
         let lease = self.lease();
-        for endpoint in lease.endpoints() {
+        for endpoint in lease.live_endpoints() {
             if endpoint
                 .runner
                 .registry()
@@ -1062,33 +1264,25 @@ impl ExtensionRuntimeSet {
                 "extension runtime is not reloadable".to_owned(),
             ));
         }
-        let (classified, diagnostics) = classify_paths(&self.discovered_paths);
-        if let Some(first) = diagnostics.first() {
-            return Err(HostStartError::Load(format!(
-                "{}: {}",
-                first.path, first.message
-            )));
-        }
+        let (classified, _classification_diagnostics) = classify_paths(&self.discovered_paths);
         let plans = plan_endpoints(&classified);
         let next_id = self
             .reload_generation()
             .checked_add(1)
             .ok_or_else(|| HostStartError::Load("extension generation exhausted".to_owned()))?;
-        let (next, pending, diagnostics) = self.build_reload_generation(next_id, plans).await;
+        let GenerationBuild {
+            generation: next,
+            pending,
+            diagnostics: _load_diagnostics,
+            endpoint_start_failure,
+        } = self.build_reload_generation(next_id, plans).await;
         let Some(next) = next else {
-            let message = diagnostics.first().map_or_else(
+            let message = endpoint_start_failure.map_or_else(
                 || "no extension endpoint started".to_owned(),
-                |d| format!("{}: {}", d.path, d.message),
+                |diagnostic| format!("{}: {}", diagnostic.path, diagnostic.message),
             );
             return Err(HostStartError::Load(message));
         };
-        if let Some(first) = diagnostics.first() {
-            stop_generation(&next).await;
-            return Err(HostStartError::Load(format!(
-                "{}: {}",
-                first.path, first.message
-            )));
-        }
         if !next.is_single_compat_replacement() {
             stop_generation(&next).await;
             return Err(HostStartError::Load(
@@ -1116,15 +1310,26 @@ impl ExtensionRuntimeSet {
             if state.reloadable() {
                 let old = Arc::clone(&state.generation);
                 unregister_endpoint_providers(&old.endpoints, runtime);
-                let registrations = register_endpoint_providers(&next.endpoints, runtime);
+                let registrations = register_endpoint_providers(
+                    next.endpoints
+                        .iter()
+                        .filter(|endpoint| endpoint.runner.is_active()),
+                    runtime,
+                );
                 if let Some((path, Err(error))) = registrations
                     .iter()
                     .find(|(_path, outcome)| outcome.is_err())
                 {
                     unregister_endpoint_providers(&next.endpoints, runtime);
-                    let _ = register_endpoint_providers(&old.endpoints, runtime);
+                    let _ = register_endpoint_providers(
+                        old.endpoints.iter().filter(|endpoint| {
+                            !state.retired.contains(&endpoint.id) && endpoint.runner.is_active()
+                        }),
+                        runtime,
+                    );
                     Err(format!("{path}: {error}"))
                 } else {
+                    state.provider_runtime = Some(runtime.clone());
                     Ok(state.replace_generation(Arc::clone(&next), &pending, &self.channels))
                 }
             } else {
@@ -1175,8 +1380,7 @@ impl ExtensionRunner for ExtensionRuntimeSet {
         let lease = self.lease();
         lease.is_active()
             && lease
-                .endpoints()
-                .iter()
+                .live_endpoints()
                 .any(|endpoint| endpoint.runner.has_handlers(event))
     }
 
@@ -1186,7 +1390,7 @@ impl ExtensionRunner for ExtensionRuntimeSet {
     ) -> BoxFuture<'_, Result<Option<CancelResult>, ExtensionRunnerError>> {
         let lease = self.lease();
         Box::pin(async move {
-            for endpoint in lease.endpoints() {
+            for endpoint in lease.live_endpoints() {
                 if let Some(result) = endpoint.runner.emit(event.clone()).await?
                     && result.cancel
                 {
@@ -1203,7 +1407,7 @@ impl ExtensionRunner for ExtensionRuntimeSet {
     ) -> BoxFuture<'a, Result<Option<CancelResult>, ExtensionRunnerError>> {
         let lease = self.lease();
         Box::pin(async move {
-            for endpoint in lease.endpoints() {
+            for endpoint in lease.live_endpoints() {
                 if let Some(result) = endpoint.runner.emit_message_update_delta(event).await?
                     && result.cancel
                 {
@@ -1222,7 +1426,7 @@ impl ExtensionRunner for ExtensionRuntimeSet {
         Box::pin(async move {
             let mut current = message;
             let mut changed = false;
-            for endpoint in lease.endpoints() {
+            for endpoint in lease.live_endpoints() {
                 if let Some(replacement) = endpoint.runner.emit_message_end(current.clone()).await?
                 {
                     current = replacement;
@@ -1241,7 +1445,7 @@ impl ExtensionRunner for ExtensionRuntimeSet {
     ) -> BoxFuture<'a, Result<Option<BeforeToolCallResult>, ExtensionRunnerError>> {
         let lease = self.lease();
         Box::pin(async move {
-            for endpoint in lease.endpoints() {
+            for endpoint in lease.live_endpoints() {
                 if let Some(result) = endpoint
                     .runner
                     .emit_tool_call(tool_name, tool_call_id, input.clone())
@@ -1271,7 +1475,7 @@ impl ExtensionRunner for ExtensionRuntimeSet {
             let mut current_error = is_error;
             let mut output = AfterToolCallResult::default();
             let mut changed = false;
-            for endpoint in lease.endpoints() {
+            for endpoint in lease.live_endpoints() {
                 if let Some(result) = endpoint
                     .runner
                     .emit_tool_result(
@@ -1300,7 +1504,7 @@ impl ExtensionRunner for ExtensionRuntimeSet {
                         changed = true;
                     }
                     if let Some(terminate) = result.terminate {
-                        output.terminate = Some(terminate);
+                        output.terminate = Some(output.terminate.unwrap_or(false) || terminate);
                         changed = true;
                     }
                 }
@@ -1322,7 +1526,7 @@ impl ExtensionRunner for ExtensionRuntimeSet {
             let mut current_images = images;
             let mut text_changed = false;
             let mut images_changed = false;
-            for endpoint in lease.endpoints() {
+            for endpoint in lease.live_endpoints() {
                 let result = endpoint
                     .runner
                     .emit_input(
@@ -1362,7 +1566,7 @@ impl ExtensionRunner for ExtensionRuntimeSet {
             let mut messages = Vec::new();
             let mut system_prompt = None;
             let mut changed = false;
-            for endpoint in lease.endpoints() {
+            for endpoint in lease.live_endpoints() {
                 if let Some(result) = endpoint
                     .runner
                     .emit_before_agent_start(prompt, images.clone())
@@ -1390,7 +1594,7 @@ impl ExtensionRunner for ExtensionRuntimeSet {
         let lease = self.lease();
         Box::pin(async move {
             let mut aggregate = ResourceExtensionPaths::default();
-            for endpoint in lease.endpoints() {
+            for endpoint in lease.live_endpoints() {
                 let paths = endpoint.runner.emit_resources_discover(cwd, reason).await?;
                 aggregate.skill_paths.extend(paths.skill_paths);
                 aggregate.prompt_paths.extend(paths.prompt_paths);
@@ -1404,7 +1608,7 @@ impl ExtensionRunner for ExtensionRuntimeSet {
         let lease = self.lease();
         let mut seen = HashSet::new();
         let mut commands = Vec::new();
-        for endpoint in lease.endpoints() {
+        for endpoint in lease.live_endpoints() {
             for command in endpoint.runner.get_registered_commands() {
                 if seen.insert(command.clone()) {
                     commands.push(command);
@@ -1421,7 +1625,7 @@ impl ExtensionRunner for ExtensionRuntimeSet {
     ) -> BoxFuture<'a, Result<bool, ExtensionRunnerError>> {
         let lease = self.lease();
         Box::pin(async move {
-            for endpoint in lease.endpoints() {
+            for endpoint in lease.live_endpoints() {
                 if endpoint
                     .runner
                     .registry()
@@ -1439,7 +1643,7 @@ impl ExtensionRunner for ExtensionRuntimeSet {
     fn get_all_registered_tools(&self) -> HashMap<String, Arc<dyn AgentTool>> {
         let lease = self.lease();
         let mut tools = HashMap::new();
-        for endpoint in lease.endpoints() {
+        for endpoint in lease.live_endpoints() {
             for (name, tool) in endpoint.runner.get_all_registered_tools() {
                 tools.entry(name).or_insert(tool);
             }
@@ -1450,7 +1654,7 @@ impl ExtensionRunner for ExtensionRuntimeSet {
     fn get_flag_values(&self) -> HashMap<String, Value> {
         let lease = self.lease();
         let mut flags = HashMap::new();
-        for endpoint in lease.endpoints() {
+        for endpoint in lease.live_endpoints() {
             for (name, value) in endpoint.runner.get_flag_values() {
                 flags.entry(name).or_insert(value);
             }
@@ -1510,22 +1714,19 @@ fn plan_endpoints(classified: &[ClassifiedExtension]) -> Vec<EndpointPlan> {
         });
     }
     if plans.is_empty() {
-        return plans;
-    }
-    if plans[0].kind == EndpointKind::TsCompat {
-        plans[0].builtins = true;
-    } else {
-        plans.insert(
-            0,
-            EndpointPlan {
-                position: 0,
-                kind: EndpointKind::TsCompat,
-                entries: Vec::new(),
-                diagnostic_paths: Vec::new(),
-                builtins: true,
-                label: "<builtins>".to_owned(),
-            },
-        );
+        plans.push(EndpointPlan {
+            position: 0,
+            kind: EndpointKind::TsCompat,
+            entries: Vec::new(),
+            diagnostic_paths: Vec::new(),
+            builtins: true,
+            label: "<builtins>".to_owned(),
+        });
+    } else if let Some(compat) = plans
+        .iter_mut()
+        .find(|plan| plan.kind == EndpointKind::TsCompat)
+    {
+        compat.builtins = true;
     }
     for (position, plan) in plans.iter_mut().enumerate() {
         plan.position = position;
@@ -1533,64 +1734,68 @@ fn plan_endpoints(classified: &[ClassifiedExtension]) -> Vec<EndpointPlan> {
     plans
 }
 
+fn endpoint_host_spec(
+    plan: &EndpointPlan,
+    ts_spec: Option<&Result<HostSpec, host::HostError>>,
+) -> Result<HostSpec, String> {
+    match plan.kind {
+        EndpointKind::Native => plan.entries.first().map(PathBuf::from).map_or_else(
+            || Err("native endpoint plan is missing its executable".to_owned()),
+            |program| {
+                Ok(HostSpec {
+                    source: HostSource::NativeExtension(program.clone()),
+                    program,
+                    args: Vec::new(),
+                })
+            },
+        ),
+        EndpointKind::TsCompat => match ts_spec {
+            Some(Ok(spec)) => {
+                let mut spec = spec.clone();
+                if !plan.builtins {
+                    spec.args.push("--no-builtins".to_owned());
+                }
+                Ok(spec)
+            }
+            Some(Err(error)) => Err(error.to_string()),
+            None => Err("compatibility endpoint plan has no resolved host".to_owned()),
+        },
+    }
+}
+
+fn resolve_typescript_host(plans: &[EndpointPlan]) -> Option<Result<HostSpec, host::HostError>> {
+    plans
+        .iter()
+        .any(|plan| plan.kind != EndpointKind::Native)
+        .then(host::resolve_host)
+}
+
 async fn build_generation(
     id: u64,
     plans: Vec<EndpointPlan>,
     load_cwd: &str,
     project_trusted: bool,
-    all_or_nothing: bool,
-) -> (
-    Option<Generation>,
-    PendingBridges,
-    Vec<ExtensionSetDiagnostic>,
-) {
-    let needs_typescript = plans.iter().any(|plan| plan.kind != EndpointKind::Native);
-    let ts_spec = needs_typescript.then(host::resolve_host);
-    let mut starts = FuturesUnordered::new();
-    for plan in plans {
-        let spec = match plan.kind {
-            EndpointKind::Native => plan.entries.first().map(PathBuf::from).map_or_else(
-                || Err("native endpoint plan is missing its executable".to_owned()),
-                |program| {
-                    Ok(HostSpec {
-                        source: HostSource::NativeExtension(program.clone()),
-                        program,
-                        args: Vec::new(),
-                    })
-                },
-            ),
-            EndpointKind::TsCompat => match &ts_spec {
-                Some(Ok(spec)) => {
-                    let mut spec = spec.clone();
-                    if !plan.builtins {
-                        spec.args.push("--no-builtins".to_owned());
-                    }
-                    Ok(spec)
-                }
-                Some(Err(error)) => Err(error.to_string()),
-                None => Err("compatibility endpoint plan has no resolved host".to_owned()),
-            },
-        };
-        let cwd = load_cwd.to_owned();
-        starts.push(async move {
-            let position = plan.position;
-            let result = match spec {
-                Ok(spec) => start_endpoint(plan.clone(), spec, cwd, project_trusted).await,
-                Err(message) => Err(message),
-            };
-            (position, plan, result)
-        });
-    }
+    policy: GenerationBuildPolicy,
+) -> GenerationBuild {
+    let ts_spec = resolve_typescript_host(&plans);
+    build_generation_with_starter(
+        id,
+        plans,
+        load_cwd,
+        project_trusted,
+        policy,
+        ts_spec,
+        start_endpoint,
+    )
+    .await
+}
 
-    let mut results = Vec::new();
-    while let Some(result) = starts.next().await {
-        results.push(result);
-    }
-    results.sort_by_key(|(position, _, _)| *position);
-
+fn collect_generation_starts(results: Vec<EndpointStartOutcome>) -> GenerationStarts {
     let mut endpoints = Vec::new();
     let mut diagnostics = Vec::new();
-    for (_, plan, result) in results {
+    let mut endpoint_start_failure = None;
+    let mut failed_builtins_owner = None;
+    for (position, plan, result) in results {
         match result {
             Ok(runner) => {
                 for (path, message) in runner.load_errors() {
@@ -1603,33 +1808,154 @@ async fn build_generation(
                         .unwrap_or(path);
                     diagnostics.push(ExtensionSetDiagnostic { path, message });
                 }
-                endpoints.push((plan.kind, plan.label, runner));
+                endpoints.push(PreparedEndpoint {
+                    position,
+                    kind: plan.kind,
+                    label: plan.label,
+                    runner,
+                });
             }
             Err(message) => {
+                if plan.builtins {
+                    failed_builtins_owner = Some(plan.clone());
+                }
                 let paths = if plan.diagnostic_paths.is_empty() {
                     vec![plan.label]
                 } else {
                     plan.diagnostic_paths
                 };
-                diagnostics.extend(paths.into_iter().map(|path| ExtensionSetDiagnostic {
-                    path,
-                    message: message.clone(),
-                }));
+                for path in paths {
+                    let diagnostic = ExtensionSetDiagnostic {
+                        path,
+                        message: message.clone(),
+                    };
+                    if endpoint_start_failure.is_none() {
+                        endpoint_start_failure = Some(diagnostic.clone());
+                    }
+                    diagnostics.push(diagnostic);
+                }
             }
         }
     }
+    GenerationStarts {
+        endpoints,
+        diagnostics,
+        endpoint_start_failure,
+        failed_builtins_owner,
+    }
+}
 
-    if all_or_nothing && !diagnostics.is_empty() {
-        for (_, _, endpoint) in &endpoints {
-            endpoint.shutdown_once().await;
+async fn build_generation_with_starter<Starter, StartFuture>(
+    id: u64,
+    plans: Vec<EndpointPlan>,
+    load_cwd: &str,
+    project_trusted: bool,
+    policy: GenerationBuildPolicy,
+    ts_spec: Option<Result<HostSpec, host::HostError>>,
+    starter: Starter,
+) -> GenerationBuild
+where
+    Starter: Fn(EndpointPlan, HostSpec, String, bool) -> StartFuture + Clone,
+    StartFuture: Future<Output = Result<Arc<HostExtensionRunner>, String>>,
+{
+    let mut starts = FuturesUnordered::new();
+    for plan in plans {
+        let spec = endpoint_host_spec(&plan, ts_spec.as_ref());
+        let cwd = load_cwd.to_owned();
+        let starter = starter.clone();
+        starts.push(async move {
+            let position = plan.position;
+            let result = match spec {
+                Ok(spec) => starter(plan.clone(), spec, cwd, project_trusted).await,
+                Err(message) => Err(message),
+            };
+            (position, plan, result)
+        });
+    }
+
+    let mut results = Vec::new();
+    while let Some(result) = starts.next().await {
+        results.push(result);
+    }
+    results.sort_by_key(|(position, _, _)| *position);
+    let GenerationStarts {
+        mut endpoints,
+        mut diagnostics,
+        endpoint_start_failure,
+        failed_builtins_owner,
+    } = collect_generation_starts(results);
+
+    if matches!(policy, GenerationBuildPolicy::RequireAllEndpointStarts)
+        && endpoint_start_failure.is_some()
+    {
+        let mut stops = endpoints
+            .iter()
+            .map(|endpoint| endpoint.runner.shutdown_once())
+            .collect::<FuturesUnordered<_>>();
+        while stops.next().await.is_some() {}
+        return GenerationBuild {
+            generation: None,
+            pending: Vec::new(),
+            diagnostics,
+            endpoint_start_failure,
+        };
+    }
+
+    if matches!(policy, GenerationBuildPolicy::BestEffortStart)
+        && !endpoints.is_empty()
+        && let Some(owner) = failed_builtins_owner
+    {
+        let fallback = EndpointPlan {
+            position: owner.position,
+            kind: EndpointKind::TsCompat,
+            entries: Vec::new(),
+            diagnostic_paths: Vec::new(),
+            builtins: true,
+            label: "<builtins>".to_owned(),
+        };
+        let result = match endpoint_host_spec(&fallback, ts_spec.as_ref()) {
+            Ok(spec) => starter(fallback.clone(), spec, load_cwd.to_owned(), project_trusted).await,
+            Err(message) => Err(message),
+        };
+        match result {
+            Ok(runner) => {
+                for (path, message) in runner.load_errors() {
+                    diagnostics.push(ExtensionSetDiagnostic { path, message });
+                }
+                endpoints.push(PreparedEndpoint {
+                    position: fallback.position,
+                    kind: fallback.kind,
+                    label: fallback.label,
+                    runner,
+                });
+            }
+            Err(message) => diagnostics.push(ExtensionSetDiagnostic {
+                path: fallback.label,
+                message: format!("built-ins fallback after {} failed: {message}", owner.label),
+            }),
         }
-        return (None, Vec::new(), diagnostics);
     }
+
     if endpoints.is_empty() {
-        return (None, Vec::new(), diagnostics);
+        return GenerationBuild {
+            generation: None,
+            pending: Vec::new(),
+            diagnostics,
+            endpoint_start_failure,
+        };
     }
+    endpoints.sort_by_key(|endpoint| endpoint.position);
+    let endpoints = endpoints
+        .into_iter()
+        .map(|endpoint| (endpoint.kind, endpoint.label, endpoint.runner))
+        .collect();
     let (generation, pending) = generation_from_endpoints(id, endpoints);
-    (Some(generation), pending, diagnostics)
+    GenerationBuild {
+        generation: Some(generation),
+        pending,
+        diagnostics,
+        endpoint_start_failure,
+    }
 }
 
 async fn start_endpoint(
@@ -1776,18 +2102,13 @@ fn spawn_broadcast_relays(
                 let _ = channels.provider_events_tx.send(item);
             },
         ),
-        spawn_broadcast_relay(
+        spawn_fatal_error_relay(
             Weak::clone(state),
             endpoint,
+            error_runner,
             Arc::clone(channels),
             label.clone(),
             errors,
-            move |state, channels, item| {
-                if !error_runner.is_active() {
-                    state.routes.retain(|_, route| route.endpoint != endpoint);
-                }
-                let _ = channels.errors_tx.send(item);
-            },
         ),
     ]
 }
@@ -1982,30 +2303,39 @@ fn validate_generation_providers(
     Ok(())
 }
 
-fn register_endpoint_providers(
-    endpoints: &[Endpoint],
+fn register_endpoint_provider(
+    endpoint: &Endpoint,
+    name: &str,
+    runtime: &ModelRuntime,
+) -> (String, Result<(), ModelRuntimeError>) {
+    let configs = endpoint.runner.provider_configs();
+    let paths = endpoint.runner.provider_extension_paths();
+    let path = paths.get(name).cloned().unwrap_or_else(|| name.to_owned());
+    let Some(config) = configs.get(name) else {
+        return (path, Ok(()));
+    };
+    let outcome = runtime.register_provider(name, config);
+    if outcome.is_ok()
+        && endpoint.runner.stream_provider_ids().contains(name)
+        && let Some(adapter) = endpoint.runner.providers().remove(name)
+    {
+        runtime.register_extension_stream_provider(name.to_owned(), Arc::new(adapter));
+    }
+    (path, outcome)
+}
+
+fn register_endpoint_providers<'a>(
+    endpoints: impl IntoIterator<Item = &'a Endpoint>,
     runtime: &ModelRuntime,
 ) -> Vec<(String, Result<(), ModelRuntimeError>)> {
     let mut seen = HashSet::new();
     let mut results = Vec::new();
     for endpoint in endpoints {
-        let configs = endpoint.runner.provider_configs();
-        let stream_ids = endpoint.runner.stream_provider_ids();
-        let paths = endpoint.runner.provider_extension_paths();
-        let mut adapters = endpoint.runner.providers();
-        for (name, config) in configs {
+        for name in endpoint.runner.provider_configs().into_keys() {
             if !seen.insert(name.clone()) {
                 continue;
             }
-            let path = paths.get(&name).cloned().unwrap_or_else(|| name.clone());
-            let outcome = runtime.register_provider(&name, config);
-            if outcome.is_ok()
-                && stream_ids.contains(&name)
-                && let Some(adapter) = adapters.remove(&name)
-            {
-                runtime.register_extension_stream_provider(name, Arc::new(adapter));
-            }
-            results.push((path, outcome));
+            results.push(register_endpoint_provider(endpoint, &name, runtime));
         }
     }
     results
@@ -2098,6 +2428,73 @@ async fn answer_unclaimed_session(runner: &HostExtensionRunner, event: SessionBr
     }
 }
 
+fn spawn_fatal_error_relay(
+    state: Weak<StdMutex<PublishedRuntimeState>>,
+    endpoint: EndpointId,
+    runner: Arc<HostExtensionRunner>,
+    channels: Arc<FacadeChannels>,
+    label: String,
+    mut receiver: broadcast::Receiver<ExtensionErrorEvent>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut forward_first_fatal = false;
+        if !runner.is_active()
+            && let Some(state) = state.upgrade()
+        {
+            forward_first_fatal = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retire_endpoint(endpoint, &channels);
+        }
+        loop {
+            match receiver.recv().await {
+                Ok(item) => {
+                    let Some(state) = state.upgrade() else {
+                        break;
+                    };
+                    let mut state = state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let retired_now =
+                        !runner.is_active() && state.retire_endpoint(endpoint, &channels);
+                    if forward_first_fatal || retired_now || state.accepts_relay(endpoint) {
+                        let _ = channels.errors_tx.send(item);
+                        forward_first_fatal = false;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(count)) => {
+                    let Some(state) = state.upgrade() else {
+                        break;
+                    };
+                    let mut state = state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if !runner.is_active() {
+                        state.retire_endpoint(endpoint, &channels);
+                    } else if state.accepts_relay(endpoint) {
+                        channels.publish_error(
+                            "extension_event_lagged",
+                            format!("extension {label:?} relay lagged by {count} events"),
+                            None,
+                        );
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    if !runner.is_active()
+                        && let Some(state) = state.upgrade()
+                    {
+                        state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .retire_endpoint(endpoint, &channels);
+                    }
+                    break;
+                }
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -2112,10 +2509,14 @@ pub(crate) mod tests {
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
-    const TEST_TIMEOUT: Duration = Duration::from_millis(500);
+    const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
     enum FakeCommand {
         Emit(Frame),
+        PauseReads {
+            paused: tokio::sync::oneshot::Sender<()>,
+            release: tokio::sync::oneshot::Receiver<()>,
+        },
         Close,
     }
 
@@ -2160,6 +2561,43 @@ pub(crate) mod tests {
 
         async fn emit(&self, frame: Frame) {
             let _ = self.commands.send(FakeCommand::Emit(frame)).await;
+        }
+
+        async fn wait_for_frame(&self, method: &str) -> TestResult {
+            tokio::time::timeout(TEST_TIMEOUT, async {
+                loop {
+                    if self
+                        .state
+                        .frames
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .iter()
+                        .any(|frame| frame.method == method)
+                    {
+                        return;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .map_err(|_| format!("fake host did not receive {method}"))?;
+            Ok(())
+        }
+
+        async fn pause_reads(&self) -> TestResult<tokio::sync::oneshot::Sender<()>> {
+            let (paused_tx, paused_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            self.commands
+                .send(FakeCommand::PauseReads {
+                    paused: paused_tx,
+                    release: release_rx,
+                })
+                .await
+                .map_err(|_| "fake host command channel closed")?;
+            tokio::time::timeout(TEST_TIMEOUT, paused_rx)
+                .await
+                .map_err(|_| "fake host did not pause reads")??;
+            Ok(release_tx)
         }
 
         async fn close(&self) {
@@ -2324,6 +2762,7 @@ pub(crate) mod tests {
         let stdin = child.stdin.take().ok_or("blocking child stdin missing")?;
         let stdout = child.stdout.take().ok_or("blocking child stdout missing")?;
         let stderr = child.stderr.take().ok_or("blocking child stderr missing")?;
+        // The child writes JSONL to stderr because libtest owns its stdout.
         let client = Arc::new(HostClient::connect_boxed(
             Box::new(stdin),
             Box::new(stderr),
@@ -2394,6 +2833,10 @@ pub(crate) mod tests {
                             let _ = write.write_all(&bytes).await;
                             let _ = write.flush().await;
                         }
+                    }
+                    Some(FakeCommand::PauseReads { paused, release }) => {
+                        let _ = paused.send(());
+                        let _ = release.await;
                     }
                     Some(FakeCommand::Close) => {
                         let _ = write.shutdown().await;
@@ -2564,6 +3007,222 @@ pub(crate) mod tests {
         }
     }
 
+    fn test_endpoint_plan(
+        position: usize,
+        kind: EndpointKind,
+        label: &str,
+        builtins: bool,
+    ) -> EndpointPlan {
+        EndpointPlan {
+            position,
+            kind,
+            entries: vec![format!("{label}.entry")],
+            diagnostic_paths: vec![label.to_owned()],
+            builtins,
+            label: label.to_owned(),
+        }
+    }
+
+    fn test_typescript_host_spec() -> HostSpec {
+        HostSpec {
+            source: HostSource::Env(PathBuf::from("/test/bun")),
+            program: PathBuf::from("/test/bun"),
+            args: Vec::new(),
+        }
+    }
+
+    async fn shutdown_generation(generation: &Generation) {
+        let mut stops = generation
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.runner.shutdown_once())
+            .collect::<FuturesUnordered<_>>();
+        while stops.next().await.is_some() {}
+    }
+
+    #[tokio::test]
+    async fn best_effort_replaces_failed_builtins_owner_with_builtins_only_fallback() -> TestResult
+    {
+        let starts = Arc::new(StdMutex::new(Vec::new()));
+        let starter = {
+            let starts = Arc::clone(&starts);
+            move |plan: EndpointPlan, _: HostSpec, _: String, _: bool| {
+                let starts = Arc::clone(&starts);
+                async move {
+                    starts
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push((
+                            plan.position,
+                            plan.label.clone(),
+                            plan.entries.clone(),
+                            plan.builtins,
+                        ));
+                    if plan.label == "owner" {
+                        return Err("owner failed".to_owned());
+                    }
+                    let registry = if plan.label == "<builtins>" {
+                        let mut registry = snapshot(&[]);
+                        registry["errors"] = json!([{
+                            "path": "<builtin:test>",
+                            "error": "builtin load failed"
+                        }]);
+                        registry
+                    } else {
+                        snapshot(&[])
+                    };
+                    make_runner(registry)
+                        .await
+                        .map(|(runner, _)| runner)
+                        .map_err(|error| error.to_string())
+                }
+            }
+        };
+        let build = build_generation_with_starter(
+            1,
+            vec![
+                test_endpoint_plan(0, EndpointKind::Native, "native", false),
+                test_endpoint_plan(1, EndpointKind::TsCompat, "owner", true),
+                test_endpoint_plan(2, EndpointKind::TsCompat, "secondary", false),
+            ],
+            "/workspace",
+            false,
+            GenerationBuildPolicy::BestEffortStart,
+            Some(Ok(test_typescript_host_spec())),
+            starter,
+        )
+        .await;
+
+        assert_eq!(
+            build.diagnostics,
+            [
+                ExtensionSetDiagnostic {
+                    path: "owner".to_owned(),
+                    message: "owner failed".to_owned(),
+                },
+                ExtensionSetDiagnostic {
+                    path: "<builtin:test>".to_owned(),
+                    message: "builtin load failed".to_owned(),
+                },
+            ]
+        );
+        let generation = build.generation.ok_or("fallback generation missing")?;
+        assert_eq!(
+            generation
+                .endpoints
+                .iter()
+                .map(|endpoint| endpoint.label.as_str())
+                .collect::<Vec<_>>(),
+            ["native", "<builtins>", "secondary"]
+        );
+        let starts = starts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(starts.len(), 4, "a healthy sibling was restarted");
+        assert_eq!(
+            starts
+                .iter()
+                .filter(|(_, _, entries, _)| entries == &["owner.entry"])
+                .count(),
+            1,
+            "the failed owner was restarted"
+        );
+        assert!(starts.iter().any(|(_, label, entries, builtins)| {
+            label == "secondary" && entries == &["secondary.entry"] && !*builtins
+        }));
+        assert!(starts.iter().any(|(_, label, entries, builtins)| {
+            label == "<builtins>" && entries.is_empty() && *builtins
+        }));
+        drop(starts);
+        shutdown_generation(&generation).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn best_effort_keeps_survivors_when_builtins_fallback_fails() -> TestResult {
+        let starts = Arc::new(StdMutex::new(Vec::new()));
+        let starter = {
+            let starts = Arc::clone(&starts);
+            move |plan: EndpointPlan, _: HostSpec, _: String, _: bool| {
+                let starts = Arc::clone(&starts);
+                async move {
+                    starts
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push((plan.label.clone(), plan.entries.clone(), plan.builtins));
+                    match plan.label.as_str() {
+                        "owner" => Err("owner failed".to_owned()),
+                        "<builtins>" => Err("fallback failed".to_owned()),
+                        _ => make_runner(snapshot(&[]))
+                            .await
+                            .map(|(runner, _)| runner)
+                            .map_err(|error| error.to_string()),
+                    }
+                }
+            }
+        };
+        let build = build_generation_with_starter(
+            1,
+            vec![
+                test_endpoint_plan(0, EndpointKind::Native, "native", false),
+                test_endpoint_plan(1, EndpointKind::TsCompat, "owner", true),
+                test_endpoint_plan(2, EndpointKind::TsCompat, "secondary", false),
+            ],
+            "/workspace",
+            false,
+            GenerationBuildPolicy::BestEffortStart,
+            Some(Ok(test_typescript_host_spec())),
+            starter,
+        )
+        .await;
+
+        assert_eq!(
+            build.diagnostics,
+            [
+                ExtensionSetDiagnostic {
+                    path: "owner".to_owned(),
+                    message: "owner failed".to_owned(),
+                },
+                ExtensionSetDiagnostic {
+                    path: "<builtins>".to_owned(),
+                    message: "built-ins fallback after owner failed: fallback failed".to_owned(),
+                },
+            ]
+        );
+        let generation = build.generation.ok_or("survivor generation missing")?;
+        assert_eq!(
+            generation
+                .endpoints
+                .iter()
+                .map(|endpoint| endpoint.label.as_str())
+                .collect::<Vec<_>>(),
+            ["native", "secondary"]
+        );
+        let starts = starts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(starts.len(), 4, "a healthy sibling was restarted");
+        assert_eq!(
+            starts
+                .iter()
+                .filter(|(_, entries, _)| entries == &["owner.entry"])
+                .count(),
+            1,
+            "the failed owner was restarted"
+        );
+        assert!(starts.iter().any(|(label, entries, builtins)| {
+            label == "secondary" && entries == &["secondary.entry"] && !*builtins
+        }));
+        assert!(starts.iter().any(|(label, entries, builtins)| {
+            label == "<builtins>" && entries.is_empty() && *builtins
+        }));
+        drop(starts);
+        shutdown_generation(&generation).await;
+        Ok(())
+    }
+
     #[test]
     fn manifestless_compat_entries_stay_one_builtin_endpoint() {
         let plans = plan_endpoints(&[
@@ -2593,22 +3252,28 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn native_first_gets_exactly_one_builtin_compat_prefix() {
+    fn native_first_attaches_builtins_to_first_compat_group() {
         let plans = plan_endpoints(&[
             classified(ExtensionRuntime::Native, "native"),
             classified(ExtensionRuntime::TsCompat, "plugin.ts"),
         ]);
-        assert_eq!(plans.len(), 3);
-        assert_eq!(plans[0].label, "<builtins>");
-        assert!(plans[0].entries.is_empty());
-        assert!(plans[0].builtins);
-        assert_eq!(plans.iter().filter(|plan| plan.builtins).count(), 1);
-        assert!(!plans[2].builtins);
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].entries, ["native"]);
+        assert!(!plans[0].builtins);
+        assert_eq!(plans[1].entries, ["plugin.ts"]);
+        assert!(plans[1].builtins);
     }
 
     #[test]
-    fn empty_discovery_does_not_start_a_builtin_host() {
-        assert!(plan_endpoints(&[]).is_empty());
+    fn native_only_plan_does_not_start_bun_for_builtins() {
+        let plans = plan_endpoints(&[classified(ExtensionRuntime::Native, "native")]);
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].kind, EndpointKind::Native);
+        assert!(!plans[0].builtins);
+        assert!(
+            resolve_typescript_host(&plans).is_none(),
+            "native-only plans must not resolve the Bun compatibility host"
+        );
     }
 
     #[cfg(unix)]
@@ -2649,7 +3314,12 @@ pub(crate) mod tests {
 
         let executable_path = executable.to_string_lossy().into_owned();
         let load_cwd = directory.path().to_string_lossy().into_owned();
-        let (generation, pending, diagnostics) = build_generation(
+        let GenerationBuild {
+            generation,
+            pending,
+            diagnostics,
+            endpoint_start_failure: _,
+        } = build_generation(
             1,
             vec![EndpointPlan {
                 position: 0,
@@ -2661,7 +3331,7 @@ pub(crate) mod tests {
             }],
             &load_cwd,
             false,
-            false,
+            GenerationBuildPolicy::BestEffortStart,
         )
         .await;
         let generation = generation.ok_or("native endpoint did not start")?;
@@ -3589,26 +4259,31 @@ pub(crate) mod tests {
     async fn current_reload_admission_covers_every_active_endpoint_class() -> TestResult {
         let (compat, _compat_host) = make_runner(snapshot(&["input"])).await?;
         let compat_set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, compat)]);
-        assert!(compat_set.can_reload());
+        assert!(compat_set.can_reload(), "active compat");
+
         let (stale_compat, _stale_compat_host) = make_runner(snapshot(&["input"])).await?;
         let stale_set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, stale_compat)]);
         stale_set.invalidate();
-        assert!(!stale_set.can_reload());
+        assert!(!stale_set.can_reload(), "stale facade");
+
         let (inactive_compat, _inactive_compat_host) = make_runner(snapshot(&["input"])).await?;
         inactive_compat.invalidate();
         let inactive_set =
             ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, inactive_compat)]);
-        assert!(!inactive_set.can_reload());
+        assert!(!inactive_set.can_reload(), "inactive compat");
+
         let (native, _native_host) = make_runner(snapshot(&["input"])).await?;
         let native_set = ExtensionRuntimeSet::bind(vec![(EndpointKind::Native, native)]);
-        assert!(!native_set.can_reload());
+        assert!(!native_set.can_reload(), "native-only");
+
         let (first, _first_host) = make_runner(snapshot(&["input"])).await?;
         let (second, _second_host) = make_runner(snapshot(&["input"])).await?;
         let multi_set = ExtensionRuntimeSet::bind(vec![
             (EndpointKind::TsCompat, first),
             (EndpointKind::Native, second),
         ]);
-        assert!(!multi_set.can_reload());
+        assert!(!multi_set.can_reload(), "multi-endpoint");
+
         let (active_compat, _active_compat_host) = make_runner(snapshot(&["input"])).await?;
         let (inactive_native, _inactive_native_host) = make_runner(snapshot(&["input"])).await?;
         inactive_native.invalidate();
@@ -3616,78 +4291,130 @@ pub(crate) mod tests {
             (EndpointKind::TsCompat, active_compat),
             (EndpointKind::Native, inactive_native),
         ]);
-        assert!(compat_with_inactive_sibling.can_reload());
-        {
-            let runtime = ModelRuntime::create_in_memory().await?;
-            let provider_epoch = runtime.provider_mutation_epoch();
-            for set in [&stale_set, &inactive_set, &native_set, &multi_set] {
-                assert!(
-                    set.restart_and_rewire(&runtime, HashMap::new())
-                        .await
-                        .is_err()
-                );
-                assert_eq!(set.reload_generation(), 1);
-                assert_eq!(runtime.provider_mutation_epoch(), provider_epoch);
-            }
+        assert!(
+            compat_with_inactive_sibling.can_reload(),
+            "active compat + inactive sibling"
+        );
 
-            let (native_replacement, native_replacement_host) = make_runner(snapshot(&[])).await?;
-            let (native_replacement, native_pending) = generation_from_endpoints(
-                2,
-                vec![(
-                    EndpointKind::Native,
-                    "<native-replacement>".to_owned(),
-                    native_replacement,
-                )],
-            );
-            compat_with_inactive_sibling
-                .inject_prepared_replacement_for_reload(native_replacement, native_pending);
-            assert!(
-                compat_with_inactive_sibling
-                    .restart_and_rewire(&runtime, HashMap::new())
-                    .await
-                    .is_err()
-            );
-            assert_eq!(compat_with_inactive_sibling.reload_generation(), 1);
-            assert!(compat_with_inactive_sibling.is_active());
-            assert_eq!(runtime.provider_mutation_epoch(), provider_epoch);
-            assert!(runtime.get_registered_provider_ids().is_empty());
-            native_replacement_host.wait_for_exit().await?;
-            assert_eq!(native_replacement_host.exit_count(), 1);
-
-            let (replacement, replacement_host) = make_runner(snapshot(&[])).await?;
-            let (replacement, replacement_pending) = generation_from_endpoints(
-                2,
-                vec![(
-                    EndpointKind::TsCompat,
-                    "<replacement>".to_owned(),
-                    replacement,
-                )],
-            );
-            compat_with_inactive_sibling.inject_prepared_replacement_then_invalidation_for_reload(
-                replacement,
-                replacement_pending,
-            );
-            assert!(
-                compat_with_inactive_sibling
-                    .restart_and_rewire(&runtime, HashMap::new())
-                    .await
-                    .is_err()
-            );
-            assert_eq!(replacement_host.request_count("flags.set"), 1);
-            assert_eq!(compat_with_inactive_sibling.reload_generation(), 1);
-            assert!(!compat_with_inactive_sibling.is_active());
-            assert_eq!(runtime.provider_mutation_epoch(), provider_epoch);
-            assert!(runtime.get_registered_provider_ids().is_empty());
-            replacement_host.wait_for_exit().await?;
-            assert_eq!(replacement_host.exit_count(), 1);
-
-            compat_set.shutdown_once().await;
-        }
+        compat_set.shutdown_once().await;
         stale_set.shutdown_once().await;
         inactive_set.shutdown_once().await;
         native_set.shutdown_once().await;
         multi_set.shutdown_once().await;
         compat_with_inactive_sibling.shutdown_once().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reload_rejects_every_invalid_current_runtime_class() -> TestResult {
+        let (stale_compat, _stale_host) = make_runner(snapshot(&["input"])).await?;
+        let stale_set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, stale_compat)]);
+        stale_set.invalidate();
+
+        let (inactive_compat, _inactive_host) = make_runner(snapshot(&["input"])).await?;
+        inactive_compat.invalidate();
+        let inactive_set =
+            ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, inactive_compat)]);
+
+        let (native, _native_host) = make_runner(snapshot(&["input"])).await?;
+        let native_set = ExtensionRuntimeSet::bind(vec![(EndpointKind::Native, native)]);
+
+        let (first, _first_host) = make_runner(snapshot(&["input"])).await?;
+        let (second, _second_host) = make_runner(snapshot(&["input"])).await?;
+        let multi_set = ExtensionRuntimeSet::bind(vec![
+            (EndpointKind::TsCompat, first),
+            (EndpointKind::Native, second),
+        ]);
+
+        let runtime = ModelRuntime::create_in_memory().await?;
+        let provider_epoch = runtime.provider_mutation_epoch();
+        for (scenario, set) in [
+            ("stale facade", &stale_set),
+            ("inactive compat", &inactive_set),
+            ("native-only", &native_set),
+            ("multi-endpoint", &multi_set),
+        ] {
+            assert!(
+                set.restart_and_rewire(&runtime, HashMap::new())
+                    .await
+                    .is_err(),
+                "{scenario}"
+            );
+            assert_eq!(set.reload_generation(), 1, "{scenario}");
+            assert_eq!(
+                runtime.provider_mutation_epoch(),
+                provider_epoch,
+                "{scenario}"
+            );
+        }
+
+        stale_set.shutdown_once().await;
+        inactive_set.shutdown_once().await;
+        native_set.shutdown_once().await;
+        multi_set.shutdown_once().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reload_rejects_invalid_prepared_runtime_classes() -> TestResult {
+        let (active_compat, _active_host) = make_runner(snapshot(&["input"])).await?;
+        let (inactive_native, _inactive_host) = make_runner(snapshot(&["input"])).await?;
+        inactive_native.invalidate();
+        let set = ExtensionRuntimeSet::bind(vec![
+            (EndpointKind::TsCompat, active_compat),
+            (EndpointKind::Native, inactive_native),
+        ]);
+        let runtime = ModelRuntime::create_in_memory().await?;
+        let provider_epoch = runtime.provider_mutation_epoch();
+
+        let (native_replacement, native_host) = make_runner(snapshot(&[])).await?;
+        let (native_replacement, native_pending) = generation_from_endpoints(
+            2,
+            vec![(
+                EndpointKind::Native,
+                "<native-replacement>".to_owned(),
+                native_replacement,
+            )],
+        );
+        set.inject_prepared_replacement_for_reload(native_replacement, native_pending);
+        assert!(
+            set.restart_and_rewire(&runtime, HashMap::new())
+                .await
+                .is_err(),
+            "prepared native"
+        );
+        assert_eq!(set.reload_generation(), 1, "prepared native");
+        assert!(set.is_active(), "prepared native");
+        assert_eq!(runtime.provider_mutation_epoch(), provider_epoch);
+        assert!(runtime.get_registered_provider_ids().is_empty());
+        native_host.wait_for_exit().await?;
+        assert_eq!(native_host.exit_count(), 1);
+
+        let (replacement, replacement_host) = make_runner(snapshot(&[])).await?;
+        let (replacement, pending) = generation_from_endpoints(
+            2,
+            vec![(
+                EndpointKind::TsCompat,
+                "<replacement>".to_owned(),
+                replacement,
+            )],
+        );
+        set.inject_prepared_replacement_then_invalidation_for_reload(replacement, pending);
+        assert!(
+            set.restart_and_rewire(&runtime, HashMap::new())
+                .await
+                .is_err(),
+            "prepared then invalidated"
+        );
+        assert_eq!(replacement_host.request_count("flags.set"), 1);
+        assert_eq!(set.reload_generation(), 1, "prepared then invalidated");
+        assert!(!set.is_active(), "prepared then invalidated");
+        assert_eq!(runtime.provider_mutation_epoch(), provider_epoch);
+        assert!(runtime.get_registered_provider_ids().is_empty());
+        replacement_host.wait_for_exit().await?;
+        assert_eq!(replacement_host.exit_count(), 1);
+
+        set.shutdown_once().await;
         Ok(())
     }
 
@@ -3698,7 +4425,10 @@ pub(crate) mod tests {
             2,
             vec![(EndpointKind::TsCompat, "<compat>".to_owned(), compat)],
         );
-        assert!(compat_generation.is_single_compat_replacement());
+        assert!(
+            compat_generation.is_single_compat_replacement(),
+            "prepared compat"
+        );
         stop_generation(&compat_generation).await;
 
         let (native, _native_host) = make_runner(snapshot(&[])).await?;
@@ -3706,7 +4436,10 @@ pub(crate) mod tests {
             2,
             vec![(EndpointKind::Native, "<native>".to_owned(), native)],
         );
-        assert!(!native_generation.is_single_compat_replacement());
+        assert!(
+            !native_generation.is_single_compat_replacement(),
+            "prepared native"
+        );
         stop_generation(&native_generation).await;
 
         let (first, _first_host) = make_runner(snapshot(&[])).await?;
@@ -3718,7 +4451,10 @@ pub(crate) mod tests {
                 (EndpointKind::Native, "<native>".to_owned(), second),
             ],
         );
-        assert!(!multi_generation.is_single_compat_replacement());
+        assert!(
+            !multi_generation.is_single_compat_replacement(),
+            "prepared multi-endpoint"
+        );
         stop_generation(&multi_generation).await;
         Ok(())
     }
@@ -3900,6 +4636,488 @@ pub(crate) mod tests {
 
         set.shutdown_once().await;
         old_host.wait_for_exit().await?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn runtime_feedback_empty_discovery_stays_hostless() {
+        let started = ExtensionRuntimeSet::start(Vec::new(), String::new(), false).await;
+        assert!(
+            started.set.is_none(),
+            "empty discovery started an extension host"
+        );
+        assert!(started.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn runtime_feedback_all_failed_classifications_plan_builtins() {
+        let missing = "/definitely/missing/runtime-feedback-extension";
+        let (classified, diagnostics) = classify_paths(&[missing.to_owned()]);
+        assert!(classified.is_empty());
+        assert_eq!(diagnostics.len(), 1);
+        let plans = plan_endpoints(&classified);
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].kind, EndpointKind::TsCompat);
+        assert!(plans[0].builtins);
+        assert!(plans[0].entries.is_empty());
+        assert_eq!(plans[0].label, "<builtins>");
+    }
+
+    #[test]
+    fn runtime_feedback_secondary_compat_argv_orders_no_builtins_after_script() -> TestResult {
+        let plans = plan_endpoints(&[
+            classified(ExtensionRuntime::TsCompat, "first.ts"),
+            classified(ExtensionRuntime::Native, "/native"),
+            classified(ExtensionRuntime::TsCompat, "second.ts"),
+        ]);
+        let resolved = Ok(HostSpec {
+            source: HostSource::Env(PathBuf::from("/bun")),
+            program: PathBuf::from("/bun"),
+            args: vec!["/bundle/pi-extension-host.js".to_owned()],
+        });
+        let specs = plans
+            .iter()
+            .map(|plan| endpoint_host_spec(plan, Some(&resolved)))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            specs[0].args,
+            ["/bundle/pi-extension-host.js"],
+            "built-ins compatibility host argv changed"
+        );
+        assert!(
+            specs[1].args.is_empty(),
+            "native host gained compatibility argv"
+        );
+        assert_eq!(
+            specs[2].args,
+            ["/bundle/pi-extension-host.js", "--no-builtins"],
+            "secondary compatibility flag must follow the Bun script argument"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_feedback_reload_skips_classification_and_load_diagnostics() -> TestResult {
+        let (old, old_host) = make_runner(snapshot(&["input"])).await?;
+        let (replacement, replacement_host) = make_runner(snapshot(&["input"])).await?;
+        replacement_host.set_response("flags.set", json!({"ok": true}));
+        let (generation, pending) =
+            generation_from_endpoints(1, vec![(EndpointKind::TsCompat, "<old>".to_owned(), old)]);
+        let set = Arc::new(ExtensionRuntimeSet::from_generation(
+            generation,
+            vec!["/definitely/missing/reload-diagnostic".to_owned()],
+            String::new(),
+            false,
+        ));
+        set.install(pending);
+        let (replacement, pending) = generation_from_endpoints(
+            2,
+            vec![(
+                EndpointKind::TsCompat,
+                "<replacement>".to_owned(),
+                replacement,
+            )],
+        );
+        set.inject_prepared_replacement_with_diagnostics_for_reload(
+            replacement,
+            pending,
+            vec![ExtensionSetDiagnostic {
+                path: "broken-sibling.ts".to_owned(),
+                message: "load failed".to_owned(),
+            }],
+        );
+        let runtime = ModelRuntime::create_in_memory().await?;
+        set.restart_and_rewire(&runtime, HashMap::new()).await?;
+        assert_eq!(set.reload_generation(), 2);
+        assert!(set.is_active());
+        old_host.wait_for_exit().await?;
+        set.shutdown_once().await;
+        replacement_host.wait_for_exit().await?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_feedback_spawned_replacement_failure_is_transactional() -> TestResult {
+        let (old, old_host) = make_runner(snapshot(&["input"])).await?;
+        let set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, old)]);
+        let old_generation = set.reload_generation();
+
+        let directory = tempfile::tempdir()?;
+        write_native_snapshot_host(directory.path(), snapshot(&[]))?;
+        let healthy = directory.path().join("replacement");
+        let failing = directory.path().join("failing");
+        let marker = directory.path().join("spawned");
+        std::fs::write(
+            &failing,
+            format!(
+                "#!/bin/sh\nprintf spawned > '{}'\nexit 7\n",
+                marker.display()
+            ),
+        )?;
+        let mut permissions = std::fs::metadata(&failing)?.permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        std::fs::set_permissions(&failing, permissions)?;
+        let plans = vec![
+            EndpointPlan {
+                position: 0,
+                kind: EndpointKind::Native,
+                entries: vec![healthy.to_string_lossy().into_owned()],
+                diagnostic_paths: vec!["healthy".to_owned()],
+                builtins: false,
+                label: "healthy".to_owned(),
+            },
+            EndpointPlan {
+                position: 1,
+                kind: EndpointKind::Native,
+                entries: vec![failing.to_string_lossy().into_owned()],
+                diagnostic_paths: vec!["failing".to_owned()],
+                builtins: false,
+                label: "failing".to_owned(),
+            },
+        ];
+        let build = build_generation(
+            2,
+            plans,
+            &directory.path().to_string_lossy(),
+            false,
+            GenerationBuildPolicy::RequireAllEndpointStarts,
+        )
+        .await;
+        assert!(marker.exists(), "failing replacement was never spawned");
+        assert!(build.generation.is_none());
+        assert!(build.pending.is_empty());
+        assert!(build.endpoint_start_failure.is_some());
+        assert_eq!(set.reload_generation(), old_generation);
+        assert!(set.is_active(), "published old generation was disturbed");
+        set.shutdown_once().await;
+        old_host.wait_for_exit().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_feedback_or_folds_tool_result_terminate() -> TestResult {
+        let (first, first_host) = make_runner(snapshot(&["tool_result"])).await?;
+        let (second, second_host) = make_runner(snapshot(&["tool_result"])).await?;
+        first_host.set_response("tool_result", json!({"terminate": true}));
+        second_host.set_response("tool_result", json!({"terminate": false}));
+        let set = ExtensionRuntimeSet::bind(vec![
+            (EndpointKind::TsCompat, first),
+            (EndpointKind::Native, second),
+        ]);
+        let result = set
+            .emit_tool_result(
+                "tool",
+                "call",
+                Map::new(),
+                Vec::<ToolResultContent>::new(),
+                Value::Null,
+                false,
+            )
+            .await?
+            .ok_or("tool result fold returned no change")?;
+        assert_eq!(
+            result.terminate,
+            Some(true),
+            "later false overwrote an earlier true terminate"
+        );
+        set.shutdown_once().await;
+        first_host.wait_for_exit().await?;
+        second_host.wait_for_exit().await?;
+        Ok(())
+    }
+
+    async fn wait_for_retirement(set: &ExtensionRuntimeSet, endpoint: EndpointId) -> TestResult {
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            loop {
+                if set.state().retired.contains(&endpoint) {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "endpoint was not retired")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_feedback_fatal_endpoint_retires_slots_routes_and_registry() -> TestResult {
+        let (live, live_host) = make_runner(json!({
+            "tools": [],
+            "commands": [{"name": "live"}],
+            "shortcuts": [],
+            "renderers": [],
+            "handlers": [],
+            "terminalInput": false
+        }))
+        .await?;
+        let (dead, dead_host) = make_runner(json!({
+            "tools": [],
+            "commands": [{"name": "dead"}],
+            "shortcuts": [],
+            "renderers": [],
+            "handlers": [],
+            "terminalInput": false
+        }))
+        .await?;
+        let (generation, mut pending) = generation_from_endpoints(
+            1,
+            vec![
+                (EndpointKind::TsCompat, "<live>".to_owned(), live),
+                (EndpointKind::Native, "<dead>".to_owned(), dead),
+            ],
+        );
+        pending[0].slots = vec![SanitizedSlot {
+            key: "shared".to_owned(),
+            lines: vec![vec![SanitizedRun {
+                text: "live".to_owned(),
+                ..SanitizedRun::default()
+            }]],
+            ..SanitizedSlot::default()
+        }];
+        pending[1].slots = vec![
+            SanitizedSlot {
+                key: "shared".to_owned(),
+                lines: vec![vec![SanitizedRun {
+                    text: "dead".to_owned(),
+                    ..SanitizedRun::default()
+                }]],
+                ..SanitizedSlot::default()
+            },
+            SanitizedSlot {
+                key: "dead-only".to_owned(),
+                ..SanitizedSlot::default()
+            },
+        ];
+        let dead_id = pending[1].endpoint.id;
+        let set = Arc::new(ExtensionRuntimeSet::from_generation(
+            generation,
+            Vec::new(),
+            String::new(),
+            false,
+        ));
+        set.install(pending);
+        let route = set
+            .state()
+            .allocate_route(dead_id, 77)
+            .ok_or("route allocation failed")?;
+        assert!(
+            set.registry()
+                .commands()
+                .iter()
+                .any(|item| item.name == "dead")
+        );
+
+        dead_host.close().await;
+        wait_for_retirement(&set, dead_id).await?;
+        assert!(!set.state().routes.contains_key(&route));
+        assert!(
+            !set.registry()
+                .commands()
+                .iter()
+                .any(|item| item.name == "dead"),
+            "dead endpoint remained in aggregate registry"
+        );
+        assert!(
+            set.registry()
+                .commands()
+                .iter()
+                .any(|item| item.name == "live")
+        );
+        assert_eq!(set.slot_keys(), ["shared"]);
+        assert_eq!(
+            set.current_slots()[0].lines[0][0].text,
+            "live",
+            "live fallback slot was not promoted"
+        );
+        dead_host.close().await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            set.slot_keys(),
+            ["shared"],
+            "duplicate fatal signal mutated slots"
+        );
+        set.shutdown_once().await;
+        live_host.wait_for_exit().await?;
+        Ok(())
+    }
+
+    fn shared_provider(base_url: &str) -> Value {
+        json!({
+            "name": "shared-provider",
+            "baseUrl": base_url,
+            "api": "openai-completions",
+            "models": [{
+                "id": "shared-model",
+                "name": "Shared model",
+                "api": "openai-completions",
+                "baseUrl": base_url,
+                "reasoning": false
+            }]
+        })
+    }
+
+    #[tokio::test]
+    async fn runtime_feedback_fatal_endpoint_promotes_provider_owner_once() -> TestResult {
+        let (owner, owner_host) = make_runner(json!({
+            "providers": [shared_provider("https://owner.example/v1")],
+            "handlers": [],
+            "terminalInput": false
+        }))
+        .await?;
+        let (fallback, fallback_host) = make_runner(json!({
+            "providers": [shared_provider("https://fallback.example/v1")],
+            "handlers": [],
+            "terminalInput": false
+        }))
+        .await?;
+        let set = ExtensionRuntimeSet::bind(vec![
+            (EndpointKind::TsCompat, owner),
+            (EndpointKind::Native, fallback),
+        ]);
+        let runtime = ModelRuntime::create_in_memory().await?;
+        assert!(
+            set.register_providers_on(&runtime)
+                .into_iter()
+                .all(|(_, result)| result.is_ok())
+        );
+        let epoch = runtime.provider_mutation_epoch();
+        let owner_id = EndpointId {
+            generation: 1,
+            position: 0,
+        };
+        owner_host.close().await;
+        wait_for_retirement(&set, owner_id).await?;
+        let config = runtime
+            .get_registered_provider_config("shared-provider")
+            .ok_or("fallback provider was not registered")?;
+        assert_eq!(
+            config.base_url.as_deref(),
+            Some("https://fallback.example/v1")
+        );
+        assert_eq!(runtime.provider_mutation_epoch(), epoch + 2);
+        owner_host.close().await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            runtime.provider_mutation_epoch(),
+            epoch + 2,
+            "duplicate fatal signal rewired provider twice"
+        );
+        set.shutdown_once().await;
+        fallback_host.wait_for_exit().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_feedback_fatal_non_owner_preserves_provider_owner() -> TestResult {
+        let (owner, owner_host) = make_runner(json!({
+            "providers": [shared_provider("https://owner.example/v1")],
+            "handlers": [],
+            "terminalInput": false
+        }))
+        .await?;
+        let (duplicate, duplicate_host) = make_runner(json!({
+            "providers": [shared_provider("https://duplicate.example/v1")],
+            "handlers": [],
+            "terminalInput": false
+        }))
+        .await?;
+        let set = ExtensionRuntimeSet::bind(vec![
+            (EndpointKind::TsCompat, owner),
+            (EndpointKind::Native, duplicate),
+        ]);
+        let runtime = ModelRuntime::create_in_memory().await?;
+        assert!(
+            set.register_providers_on(&runtime)
+                .into_iter()
+                .all(|(_, result)| result.is_ok())
+        );
+        let epoch = runtime.provider_mutation_epoch();
+        let duplicate_id = EndpointId {
+            generation: 1,
+            position: 1,
+        };
+        duplicate_host.close().await;
+        wait_for_retirement(&set, duplicate_id).await?;
+        let config = runtime
+            .get_registered_provider_config("shared-provider")
+            .ok_or("first provider owner was removed")?;
+        assert_eq!(config.base_url.as_deref(), Some("https://owner.example/v1"));
+        assert_eq!(
+            runtime.provider_mutation_epoch(),
+            epoch,
+            "retiring a duplicate provider mutated effective ownership"
+        );
+        set.shutdown_once().await;
+        owner_host.wait_for_exit().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_feedback_state_broadcasts_do_not_head_of_line_block() -> TestResult {
+        let (first, first_host) = make_runner(snapshot(&[])).await?;
+        let (second, second_host) = make_runner(snapshot(&[])).await?;
+        let first_runner = Arc::clone(&first);
+        let set = ExtensionRuntimeSet::bind(vec![
+            (EndpointKind::TsCompat, first),
+            (EndpointKind::Native, second),
+        ]);
+        let release = first_host.pause_reads().await?;
+
+        first_runner
+            .push_ui_state(&UiStateWire {
+                editor_text: "x".repeat(1024 * 1024),
+                tools_expanded: false,
+            })
+            .await;
+        let filled = Arc::new(AtomicUsize::new(0));
+        let fill_count = Arc::clone(&filled);
+        let fill_runner = Arc::clone(&first_runner);
+        let fill = tokio::spawn(async move {
+            let queued = UiStateWire {
+                editor_text: "queued".to_owned(),
+                tools_expanded: false,
+            };
+            for _ in 0..=pi_ext::client::OUTBOUND_CAPACITY {
+                fill_runner.push_ui_state(&queued).await;
+                fill_count.fetch_add(1, Ordering::Release);
+            }
+        });
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            while filled.load(Ordering::Acquire) < pi_ext::client::OUTBOUND_CAPACITY {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "first endpoint outbound queue did not fill")?;
+        assert!(
+            !fill.is_finished(),
+            "saturation send must wait for first endpoint capacity"
+        );
+
+        let broadcast_set = Arc::clone(&set);
+        let broadcast = tokio::spawn(async move {
+            broadcast_set
+                .push_ui_state(&UiStateWire {
+                    editor_text: "broadcast".to_owned(),
+                    tools_expanded: false,
+                })
+                .await;
+        });
+        second_host.wait_for_frame("ui.state").await?;
+        release
+            .send(())
+            .map_err(|()| "paused fake host already released")?;
+        tokio::time::timeout(TEST_TIMEOUT, fill)
+            .await
+            .map_err(|_| "outbound saturation did not drain")??;
+        tokio::time::timeout(TEST_TIMEOUT, broadcast)
+            .await
+            .map_err(|_| "state broadcast did not complete")??;
+        first_host.wait_for_frame("ui.state").await?;
+        set.shutdown_once().await;
+        first_host.wait_for_exit().await?;
+        second_host.wait_for_exit().await?;
         Ok(())
     }
 }
