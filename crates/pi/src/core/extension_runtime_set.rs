@@ -117,34 +117,34 @@ impl Generation {
 
 struct GenerationLease {
     generation: Arc<Generation>,
-    stale: bool,
+    counted: bool,
 }
 
 impl GenerationLease {
     fn endpoints(&self) -> &[Endpoint] {
-        &self.generation.endpoints
+        if self.counted {
+            &self.generation.endpoints
+        } else {
+            &[]
+        }
     }
 
     fn is_active(&self) -> bool {
-        !self.stale
-            && self
-                .endpoints()
-                .iter()
-                .any(|endpoint| endpoint.runner.is_active())
+        self.endpoints()
+            .iter()
+            .any(|endpoint| endpoint.runner.is_active())
     }
 
     fn is_running(&self) -> bool {
-        !self.stale
-            && self
-                .endpoints()
-                .iter()
-                .any(|endpoint| endpoint.runner.is_running())
+        self.endpoints()
+            .iter()
+            .any(|endpoint| endpoint.runner.is_running())
     }
 }
 
 impl Drop for GenerationLease {
     fn drop(&mut self) {
-        if self.generation.leases.fetch_sub(1, Ordering::AcqRel) == 1 {
+        if self.counted && self.generation.leases.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.generation.drained.notify_one();
         }
     }
@@ -198,11 +198,18 @@ impl PublishedRuntimeState {
     }
 
     fn lease(&self) -> GenerationLease {
-        self.generation.leases.fetch_add(1, Ordering::Relaxed);
+        let counted = !self.stale && !self.shutdown_done;
+        if counted {
+            self.generation.leases.fetch_add(1, Ordering::Relaxed);
+        }
         GenerationLease {
             generation: Arc::clone(&self.generation),
-            stale: self.stale,
+            counted,
         }
+    }
+
+    fn accepts_relay(&self, endpoint: EndpointId) -> bool {
+        !self.stale && !self.shutdown_done && self.generation.endpoint(endpoint).is_some()
     }
 
     fn reloadable(&self) -> bool {
@@ -210,7 +217,9 @@ impl PublishedRuntimeState {
     }
 
     fn allocate_route(&mut self, endpoint: EndpointId, local: FrameId) -> Option<FrameId> {
-        self.generation.endpoint(endpoint)?;
+        if !self.accepts_relay(endpoint) {
+            return None;
+        }
         loop {
             let id = self.next_route_id;
             self.next_route_id = self.next_route_id.wrapping_add(1);
@@ -239,7 +248,7 @@ impl PublishedRuntimeState {
         slot: SanitizedSlot,
         channels: &FacadeChannels,
     ) {
-        if self.generation.endpoint(endpoint).is_none() {
+        if !self.accepts_relay(endpoint) {
             return;
         }
         let owners = self.slots.entry(slot.key.clone()).or_default();
@@ -250,7 +259,7 @@ impl PublishedRuntimeState {
     }
 
     fn dispose_slot(&mut self, endpoint: EndpointId, key: String, channels: &FacadeChannels) {
-        if self.generation.endpoint(endpoint).is_none() {
+        if !self.accepts_relay(endpoint) {
             return;
         }
         let Some(owners) = self.slots.get_mut(&key) else {
@@ -272,6 +281,9 @@ impl PublishedRuntimeState {
 
     fn slot_owner(&self, key: &str) -> Option<(GenerationLease, Endpoint)> {
         let endpoint = *self.slots.get(key)?.last_key_value()?.0;
+        if !self.accepts_relay(endpoint) {
+            return None;
+        }
         Some((self.lease(), self.generation.endpoint(endpoint)?.clone()))
     }
 
@@ -1706,7 +1718,7 @@ where
                     let mut state = state
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if state.generation.endpoint(endpoint).is_some() {
+                    if state.accepts_relay(endpoint) {
                         publish(&mut state, &channels, item);
                     }
                 }
@@ -1717,7 +1729,7 @@ where
                     let state = state
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if state.generation.endpoint(endpoint).is_some() {
+                    if state.accepts_relay(endpoint) {
                         channels.publish_error(
                             "extension_event_lagged",
                             format!("extension {label:?} relay lagged by {count} events"),
@@ -1807,7 +1819,7 @@ fn spawn_ui_relays(
                         ExtensionUiEvent::Dispose { key } => {
                             state.dispose_slot(endpoint, key, &ui_channels);
                         }
-                        other if state.generation.endpoint(endpoint).is_some() => {
+                        other if state.accepts_relay(endpoint) => {
                             let _ = ui_channels.ui_tx.send(other);
                         }
                         _ => {}
@@ -1820,7 +1832,7 @@ fn spawn_ui_relays(
                     let state = state
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if state.generation.endpoint(endpoint).is_some() {
+                    if state.accepts_relay(endpoint) {
                         ui_channels.publish_error(
                             "extension_event_lagged",
                             format!("extension {ui_label:?} UI relay lagged by {count} events"),
@@ -1887,9 +1899,7 @@ fn spawn_session_relay(
                 let mut state = state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if state.generation.endpoint(endpoint).is_none() {
-                    None
-                } else {
+                if state.accepts_relay(endpoint) {
                     let (routed, route_id) = match event {
                         SessionBridgeEvent::SetModel { id, request } => {
                             let routed_id = state.allocate_route(endpoint, id);
@@ -1916,6 +1926,8 @@ fn spawn_session_relay(
                         }
                         failed
                     })
+                } else {
+                    None
                 }
             };
             if send_failed.unwrap_or(true) {
@@ -1932,9 +1944,12 @@ async fn drain_leases(generation: &Generation) {
 }
 
 async fn stop_generation(generation: &Generation) {
-    for endpoint in generation.endpoints.iter() {
-        endpoint.runner.shutdown_once().await;
-    }
+    let mut stops = generation
+        .endpoints
+        .iter()
+        .map(|endpoint| endpoint.runner.shutdown_once())
+        .collect::<FuturesUnordered<_>>();
+    while stops.next().await.is_some() {}
 }
 
 fn abort_bridges(generation: &Generation) {
@@ -2087,6 +2102,7 @@ async fn answer_unclaimed_session(runner: &HostExtensionRunner, event: SessionBr
 pub(crate) mod tests {
     use super::*;
     use std::error::Error;
+    use std::io::{BufRead, Write};
     use std::sync::atomic::AtomicUsize;
 
     use pi_ext::protocol::{Frame, FrameKind, HelloAck};
@@ -2285,6 +2301,77 @@ pub(crate) mod tests {
                 state,
             },
         ))
+    }
+
+    async fn make_blocking_shutdown_runner() -> TestResult<Arc<HostExtensionRunner>> {
+        let test_name = format!(
+            "{}::blocking_shutdown_child",
+            module_path!()
+                .split_once("::")
+                .map_or(module_path!(), |(_, path)| path)
+        );
+        let mut child = tokio::process::Command::new(std::env::current_exe()?)
+            .arg("--exact")
+            .arg(test_name)
+            .arg("--ignored")
+            .arg("--nocapture")
+            .env("PI_BLOCKING_SHUTDOWN_CHILD", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+        let stdin = child.stdin.take().ok_or("blocking child stdin missing")?;
+        let stdout = child.stdout.take().ok_or("blocking child stdout missing")?;
+        let stderr = child.stderr.take().ok_or("blocking child stderr missing")?;
+        let client = Arc::new(HostClient::connect_boxed(
+            Box::new(stdin),
+            Box::new(stderr),
+            Box::new(stdout),
+            Some(child),
+        ));
+        Ok(HostExtensionRunner::connect_with_cwd_and_trust(
+            client,
+            Vec::new(),
+            "/workspace",
+            false,
+            Duration::from_millis(200),
+        )
+        .await?)
+    }
+
+    #[test]
+    #[ignore = "spawned as a child process by the concurrent shutdown test"]
+    fn blocking_shutdown_child() -> TestResult {
+        if std::env::var_os("PI_BLOCKING_SHUTDOWN_CHILD").is_none() {
+            return Ok(());
+        }
+        let mut input = std::io::BufReader::new(std::io::stdin().lock());
+        let mut output = std::io::stderr().lock();
+        let mut line = String::new();
+
+        input.read_line(&mut line)?;
+        let hello = pi_ext::protocol::decode_frame_str(&line)?;
+        output.write_all(&pi_ext::protocol::encode_frame(&Frame {
+            id: hello.id,
+            kind: FrameKind::Res,
+            method: hello.method,
+            payload: serde_json::to_value(HelloAck::local())?,
+        })?)?;
+        output.flush()?;
+
+        line.clear();
+        input.read_line(&mut line)?;
+        let load = pi_ext::protocol::decode_frame_str(&line)?;
+        output.write_all(&pi_ext::protocol::encode_frame(&Frame {
+            id: load.id,
+            kind: FrameKind::Res,
+            method: load.method,
+            payload: snapshot(&[]),
+        })?)?;
+        output.flush()?;
+        std::thread::sleep(Duration::from_mins(1));
+        Ok(())
     }
 
     async fn fake_host_task(
@@ -3406,6 +3493,98 @@ pub(crate) mod tests {
         set.shutdown_once().await;
         Ok(())
     }
+    #[tokio::test(flavor = "current_thread")]
+    async fn invalidation_hides_a_buffered_relay_event() -> TestResult {
+        let (runner, _host) = make_runner(snapshot(&[])).await?;
+        let set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, runner)]);
+        let endpoint = set.state().generation.endpoints[0].clone();
+        let (ui_tx, ui_rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let context = EndpointRelayContext {
+            state: Arc::downgrade(&set.state),
+            channels: Arc::clone(&set.channels),
+            endpoint,
+        };
+        let handles = spawn_ui_relays(&context, ui_rx, None);
+        let mut published = set.subscribe_ui();
+
+        assert!(
+            ui_tx
+                .send(ExtensionUiEvent::Slot(SanitizedSlot {
+                    key: "buffered".to_owned(),
+                    ..SanitizedSlot::default()
+                }))
+                .is_ok()
+        );
+        set.invalidate();
+        tokio::task::yield_now().await;
+
+        assert!(set.current_slots().is_empty());
+        assert!(matches!(
+            published.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        for handle in handles {
+            handle.abort();
+        }
+        set.shutdown_once().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_refuses_new_leases_without_extending_the_draining_generation() -> TestResult {
+        let (runner, host) = make_runner(snapshot(&["input"])).await?;
+        let set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, runner)]);
+        let generation = Arc::clone(&set.state().generation);
+        let draining = set.lease();
+
+        let shutdown_set = Arc::clone(&set);
+        let shutdown = tokio::spawn(async move { shutdown_set.shutdown_once().await });
+        while !set.state().shutdown_done {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(generation.leases.load(Ordering::Acquire), 1);
+        let rejected = set.lease();
+        assert!(rejected.endpoints().is_empty());
+        assert_eq!(generation.leases.load(Ordering::Acquire), 1);
+        assert!(
+            !set.emit_input("after shutdown", None, "user", None)
+                .await?
+                .handled
+        );
+        assert_eq!(host.request_count("input"), 0);
+        drop(rejected);
+        drop(draining);
+        shutdown.await?;
+        assert_eq!(generation.leases.load(Ordering::Acquire), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_starts_every_endpoint_before_waiting_for_any() -> TestResult {
+        let first = make_blocking_shutdown_runner().await?;
+        let second = make_blocking_shutdown_runner().await?;
+        let first_runner = Arc::clone(&first);
+        let second_runner = Arc::clone(&second);
+        let (generation, _) = generation_from_endpoints(
+            1,
+            vec![
+                (EndpointKind::TsCompat, "<first>".to_owned(), first),
+                (EndpointKind::Native, "<second>".to_owned(), second),
+            ],
+        );
+
+        let stop = tokio::spawn(async move { stop_generation(&generation).await });
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            while first_runner.is_running() || second_runner.is_running() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "not every endpoint began shutdown before the first child blocked reaping")?;
+        stop.await?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn current_reload_admission_covers_every_active_endpoint_class() -> TestResult {
         let (compat, _compat_host) = make_runner(snapshot(&["input"])).await?;
