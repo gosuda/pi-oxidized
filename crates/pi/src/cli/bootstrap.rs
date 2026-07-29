@@ -1359,6 +1359,7 @@ mod tests {
         /// Models exposed by the runtime's model catalog. Empty yields an empty
         /// availability list for `--list-models` tests.
         models: Vec<pi_ai::Model>,
+        diagnostics: Vec<crate::core::agent_session_services::AgentSessionRuntimeDiagnostic>,
     }
 
     #[derive(Clone)]
@@ -1504,6 +1505,7 @@ mod tests {
             ));
             let succeed = self.succeed;
             let models = self.models.clone();
+            let diagnostics = self.diagnostics.clone();
             Box::pin(async move {
                 if !succeed {
                     return Err("__fake_factory_unavailable__".to_owned());
@@ -1523,7 +1525,7 @@ mod tests {
                         agent_dir: PathBuf::from(options.agent_dir),
                     },
                     Arc::new(StubRuntimeFactory),
-                    Vec::new(),
+                    diagnostics,
                     None,
                 );
                 Ok(RuntimeHandle {
@@ -2255,6 +2257,42 @@ mod tests {
             lock_recover(&host_errors).is_empty(),
             "fake host reported errors: {:?}",
             lock_recover(&host_errors).clone()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_feedback_runtime_warning_does_not_exit_bootstrap() -> Result<(), String> {
+        let io = Arc::new(FakeIo::new());
+        let warning = "surviving extension generation warning";
+        let factory = Arc::new(FakeFactory {
+            succeed: true,
+            diagnostics: vec![
+                crate::core::agent_session_services::AgentSessionRuntimeDiagnostic::warning(
+                    warning,
+                ),
+            ],
+            ..FakeFactory::default()
+        });
+        let pkg_out = CapturedOutput::default();
+        let pkg = FakePackageHandler::default();
+        let outcome = run_bootstrap(BootstrapInputs {
+            args: args_vec(&["--print", "hello"]),
+            io: &io,
+            factory: &factory,
+            package_handler: &pkg,
+            package_output: &pkg_out,
+        })
+        .await;
+        assert!(
+            matches!(outcome, BootstrapOutcome::Dispatch { .. }),
+            "runtime warning incorrectly took an exit path"
+        );
+        assert!(
+            io.stderr_lines()
+                .iter()
+                .any(|line| line.contains(&format!("Warning: {warning}"))),
+            "runtime warning was not printed to stderr"
         );
         Ok(())
     }

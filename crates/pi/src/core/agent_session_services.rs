@@ -15,7 +15,7 @@ use pi_ext::protocol::FlagValueWire;
 use thiserror::Error;
 
 use super::config::{get_agent_dir, get_docs_path, resolve_path};
-use super::extension_runtime_set::ExtensionRuntimeSet;
+use super::extension_runtime_set::{ExtensionRuntimeSet, ExtensionSetStart};
 use super::model_runtime::{
     CreateModelRuntimeOptions, ModelRuntime, ModelRuntimeError, ProviderConfigInput,
 };
@@ -644,6 +644,25 @@ fn extension_discovery_diagnostics(
         .collect()
 }
 
+fn record_extension_start(
+    started: ExtensionSetStart,
+    diagnostics: &mut Vec<AgentSessionRuntimeDiagnostic>,
+) -> Option<Arc<ExtensionRuntimeSet>> {
+    let generation_survived = started.set.is_some();
+    for diagnostic in started.diagnostics {
+        let message = format!(
+            "Extension \"{}\" error: {}",
+            diagnostic.path, diagnostic.message
+        );
+        diagnostics.push(if generation_survived {
+            AgentSessionRuntimeDiagnostic::warning(message)
+        } else {
+            AgentSessionRuntimeDiagnostic::error(message)
+        });
+    }
+    started.set
+}
+
 async fn start_extension_phase(
     loader: &DefaultResourceLoader,
     discovery: ResourceDiscoveryPolicy,
@@ -676,13 +695,7 @@ async fn start_extension_phase(
     let started =
         ExtensionRuntimeSet::start(paths, cwd.to_string_lossy().into_owned(), project_trusted)
             .await;
-    for diagnostic in started.diagnostics {
-        diagnostics.push(AgentSessionRuntimeDiagnostic::error(format!(
-            "Extension \"{}\" error: {}",
-            diagnostic.path, diagnostic.message
-        )));
-    }
-    let Some(runner) = started.set else {
+    let Some(runner) = record_extension_start(started, diagnostics) else {
         return (None, BTreeMap::new());
     };
     for (path, outcome) in runner.register_providers_on(model_runtime) {
@@ -1600,5 +1613,45 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn runtime_feedback_extension_start_diagnostics_follow_generation_survival() {
+        let diagnostic = super::super::extension_runtime_set::ExtensionSetDiagnostic {
+            path: "broken.ts".to_owned(),
+            message: "load failed".to_owned(),
+        };
+        let surviving = ExtensionRuntimeSet::bind(Vec::new());
+        let mut diagnostics = Vec::new();
+        let returned = record_extension_start(
+            ExtensionSetStart {
+                set: Some(Arc::clone(&surviving)),
+                diagnostics: vec![diagnostic.clone()],
+            },
+            &mut diagnostics,
+        );
+        assert!(returned.is_some());
+        assert_eq!(
+            diagnostics,
+            vec![AgentSessionRuntimeDiagnostic::warning(
+                "Extension \"broken.ts\" error: load failed"
+            )]
+        );
+
+        diagnostics.clear();
+        let returned = record_extension_start(
+            ExtensionSetStart {
+                set: None,
+                diagnostics: vec![diagnostic],
+            },
+            &mut diagnostics,
+        );
+        assert!(returned.is_none());
+        assert_eq!(
+            diagnostics,
+            vec![AgentSessionRuntimeDiagnostic::error(
+                "Extension \"broken.ts\" error: load failed"
+            )]
+        );
     }
 }
