@@ -15,7 +15,6 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::str;
 
-use pi_agent::ToolExecutionMode;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
@@ -1017,6 +1016,19 @@ pub enum FlagValueWire {
     String(String),
 }
 
+/// Execution strategy serialized in an `extensions.load` tool snapshot.
+///
+/// This wire enum is intentionally independent of `pi_agent` so changes to
+/// agent scheduling semantics cannot silently alter the extension protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolExecutionModeWire {
+    /// Execute calls one by one in source order.
+    Sequential,
+    /// Preflight calls then execute permitted calls concurrently.
+    Parallel,
+}
+
 /// Tool entry in the `extensions.load` snapshot.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1034,7 +1046,7 @@ pub struct ToolSnapshotEntry {
     pub parameters: Value,
     /// Optional execution-mode override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub execution_mode: Option<ToolExecutionMode>,
+    pub execution_mode: Option<ToolExecutionModeWire>,
 }
 
 /// Slash-command entry in the `extensions.load` snapshot.
@@ -2608,6 +2620,37 @@ mod tests {
             encoded["errors"][0],
             serde_json::json!({"path": "/bad.ts", "error": "broken"})
         );
+        Ok(())
+    }
+
+    #[test]
+    fn tool_execution_mode_wire_serialization_is_pinned() -> TestResult {
+        for (mode, expected) in [
+            (
+                ToolExecutionModeWire::Sequential,
+                serde_json::json!("sequential"),
+            ),
+            (
+                ToolExecutionModeWire::Parallel,
+                serde_json::json!("parallel"),
+            ),
+        ] {
+            let tool: ToolSnapshotEntry = serde_json::from_value(serde_json::json!({
+                "name": "tool",
+                "executionMode": expected.clone(),
+            }))?;
+            assert_eq!(tool.execution_mode, Some(mode));
+            assert_eq!(
+                serde_json::to_value(tool)?,
+                serde_json::json!({
+                    "name": "tool",
+                    "label": "",
+                    "description": "",
+                    "parameters": {},
+                    "executionMode": expected,
+                })
+            );
+        }
         Ok(())
     }
 

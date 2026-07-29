@@ -22,7 +22,9 @@ use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::Duration;
 
 use futures::future::BoxFuture;
-use pi_agent::{AfterToolCallResult, AgentMessage, AgentTool, BeforeToolCallResult};
+use pi_agent::{
+    AfterToolCallResult, AgentMessage, AgentTool, BeforeToolCallResult, ToolExecutionMode,
+};
 use pi_ai::{AssistantMessage, AssistantMessageEvent, ToolResultContent};
 use pi_ext::adapters::{
     self, CommandRegistration, ExtensionAgentTool, ExtensionProvider, FlagRegistration,
@@ -38,8 +40,8 @@ use pi_ext::protocol::{
     FlagsSetResponse, FrameId, NotifyRequest, ProviderEvent, ProviderSnapshotEntry,
     RegistrySnapshot as RegistrySnapshotWire, SessionCommand, SessionCompactRequest,
     SessionSetModelRequest, SessionStateWire, ShortcutExecuteRequest, ShortcutExecuteResponse,
-    ThemeSet, ThemeUpdate, ToolUpdate, UiControl, UiEventRequest, UiEventResponse, UiSlot,
-    UiStateWire,
+    ThemeSet, ThemeUpdate, ToolExecutionModeWire, ToolUpdate, UiControl, UiEventRequest,
+    UiEventResponse, UiSlot, UiStateWire,
 };
 use pi_ext::sanitize::{SanitizedSlot, sanitize_slot};
 use serde::{Deserialize, Serialize};
@@ -389,6 +391,15 @@ fn register_snapshot_provider(provider: ProviderSnapshotEntry, snapshot: &mut Re
     }
 }
 
+/// Maps the wire-local `extensions.load` execution mode to the agent-local
+/// semantic enum at the registry snapshot boundary.
+fn execution_mode_from_wire(mode: ToolExecutionModeWire) -> ToolExecutionMode {
+    match mode {
+        ToolExecutionModeWire::Sequential => ToolExecutionMode::Sequential,
+        ToolExecutionModeWire::Parallel => ToolExecutionMode::Parallel,
+    }
+}
+
 fn build_snapshot(wire: RegistrySnapshotWire, client: &Arc<HostClient>) -> RegistrySnapshot {
     let mut snapshot = RegistrySnapshot {
         terminal_input: wire.terminal_input,
@@ -401,7 +412,7 @@ fn build_snapshot(wire: RegistrySnapshotWire, client: &Arc<HostClient>) -> Regis
             label: tool.label,
             description: tool.description,
             parameters: tool.parameters,
-            execution_mode: tool.execution_mode,
+            execution_mode: tool.execution_mode.map(execution_mode_from_wire),
         };
         // First registration wins (host already dedups; this is the Rust-side
         // trust boundary for a duplicated name).
