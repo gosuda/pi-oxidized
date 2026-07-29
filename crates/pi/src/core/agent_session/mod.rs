@@ -1940,7 +1940,7 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .iter()
-                .all(|entry| !entry.starts_with("shutdown:")),
+                .all(|entry| entry != "ext:session_shutdown"),
             "runtime teardown owns the single reason-specific shutdown event"
         );
         Ok(())
