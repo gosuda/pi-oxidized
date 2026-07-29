@@ -52,10 +52,10 @@ pub const EVENT_CAPACITY: usize = 256;
 pub const STREAM_EVENT_CAPACITY: usize = 64;
 /// Provider ingress queues provider-event frames. The frame-count capacity
 /// bounds queue depth; [`PROVIDER_FORWARD_BYTES`] independently bounds the
-/// retained payload bytes so a slow consumer cannot accumulate gigabytes of
+/// retained wire bytes so a slow consumer cannot accumulate gigabytes of
 /// near-`MAX_FRAME_BYTES` frames before the count bound trips.
 const PROVIDER_FORWARD_CAPACITY: usize = 16 * STREAM_EVENT_CAPACITY;
-/// Maximum retained payload bytes across queued provider-event frames. One
+/// Maximum retained wire bytes across queued provider-event frames. One
 /// frame may legally reach [`crate::protocol::MAX_FRAME_BYTES`], so this
 /// budget — not the frame count — is the hard memory bound on ingress.
 const PROVIDER_FORWARD_BYTES: usize = 32 * 1024 * 1024;
@@ -68,11 +68,6 @@ pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum retained stderr tail in bytes.
 pub const STDERR_TAIL_BYTES: usize = 16 * 1024;
-
-/// Serialized byte cost of a frame's payload for ingress budget accounting.
-fn frame_payload_bytes(frame: &Frame) -> usize {
-    serde_json::to_vec(&frame.payload).map_or(0, |bytes| bytes.len())
-}
 
 /// Result type for host client operations.
 pub type HostResult<T> = Result<T, HostClientError>;
@@ -226,13 +221,13 @@ enum PendingStream {
     /// Tool progress is explicitly lossy: stale updates may be discarded.
     Lossy(mpsc::Sender<QueuedFrame>),
     /// Provider events enter a bounded per-call forwarding task. Saturation
-    /// (frame count or retained payload bytes) fails and cancels only this
+    /// (frame count or retained wire bytes) fails and cancels only this
     /// call rather than blocking the shared reader.
     Lossless {
         ingress: mpsc::Sender<QueuedFrame>,
         cancel_tx: Option<mpsc::Sender<Frame>>,
         cancel_method: &'static str,
-        /// Retained payload-byte budget shared with the ingress sender.
+        /// Retained wire-byte budget shared with the ingress sender.
         bytes: Arc<std::sync::atomic::AtomicUsize>,
     },
 }
@@ -420,7 +415,7 @@ pub enum HostClientError {
         id: FrameId,
         /// Maximum queued provider events.
         capacity: usize,
-        /// Maximum retained provider payload bytes.
+        /// Maximum retained provider wire bytes.
         bytes: usize,
     },
     /// An explicit stream cancel could not be queued because outbound capacity was full.
@@ -1193,10 +1188,10 @@ async fn reader_task(stdout: Box<dyn AsyncRead + Unpin + Send>, shared: Arc<Shar
                 let _ = shared.events.send(HostEvent::Eof);
                 break;
             }
-            Ok(n) => match decoder.push(&buf[..n]) {
+            Ok(n) => match decoder.push_with_wire_bytes(&buf[..n]) {
                 Ok(frames) => {
                     for frame in frames {
-                        dispatch(&shared, frame);
+                        dispatch_decoded(&shared, frame);
                     }
                 }
                 Err(e) => {
@@ -1497,7 +1492,16 @@ fn cancel_pending(
     }
 }
 
+#[cfg(test)]
 fn dispatch(shared: &Arc<Shared>, frame: Frame) {
+    dispatch_with_wire_bytes(shared, frame, 0);
+}
+
+fn dispatch_decoded(shared: &Arc<Shared>, decoded: crate::protocol::DecodedFrame) {
+    dispatch_with_wire_bytes(shared, decoded.frame, decoded.wire_bytes);
+}
+
+fn dispatch_with_wire_bytes(shared: &Arc<Shared>, frame: Frame, wire_bytes: usize) {
     if let Err(e) = frame.validate(false) {
         let _ = shared.events.send(HostEvent::ProtocolError(e.to_string()));
         return;
@@ -1523,7 +1527,7 @@ fn dispatch(shared: &Arc<Shared>, frame: Frame) {
             if id == 0 {
                 forward_event(shared, frame);
             } else {
-                forward_stream_event(shared, frame);
+                forward_stream_event(shared, frame, wire_bytes);
             }
         }
         FrameKind::Req => {
@@ -1652,7 +1656,7 @@ fn forward_event(shared: &Shared, frame: Frame) {
     }
 }
 
-fn forward_stream_event(shared: &Arc<Shared>, frame: Frame) {
+fn forward_stream_event(shared: &Arc<Shared>, frame: Frame, wire_bytes: usize) {
     let id = frame.id;
     let stream = if let Ok(pending) = shared.pending.lock() {
         pending
@@ -1673,7 +1677,7 @@ fn forward_stream_event(shared: &Arc<Shared>, frame: Frame) {
                 cancel_method,
                 bytes,
             } => {
-                let cost = frame_payload_bytes(&frame);
+                let cost = wire_bytes;
                 let prev = bytes.fetch_add(cost, Ordering::Relaxed);
                 let queued = QueuedFrame::retained(frame, Arc::clone(&bytes), cost);
                 let send = if prev.saturating_add(cost) > PROVIDER_FORWARD_BYTES {
@@ -1825,7 +1829,71 @@ mod tests {
 
     type R = Result<(), Box<dyn Error>>;
 
+    fn provider_retained_bytes(
+        client: &HostClient,
+        id: FrameId,
+    ) -> Result<Arc<std::sync::atomic::AtomicUsize>, Box<dyn Error>> {
+        let pending = client
+            .shared
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pending
+            .get(&id)
+            .and_then(|entry| match &entry.stream {
+                Some(PendingStream::Lossless { bytes, .. }) => Some(Arc::clone(bytes)),
+                _ => None,
+            })
+            .ok_or_else(|| format!("missing provider wire-byte budget for stream {id}").into())
+    }
+
+    async fn wait_for_retained_bytes(bytes: &std::sync::atomic::AtomicUsize, expected: usize) -> R {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if bytes.load(Ordering::Relaxed) == expected {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        Ok(())
+    }
+
     use crate::test_support::make_pair;
+
+    #[tokio::test]
+    async fn decoded_non_provider_dispatch_is_unchanged() -> R {
+        let (client, mut host) = make_pair().await;
+        let client = Arc::new(client);
+        let request_client = Arc::clone(&client);
+        let request = tokio::spawn(async move {
+            request_client
+                .request_raw(
+                    "ordinary.call",
+                    serde_json::json!({}),
+                    Duration::from_secs(2),
+                )
+                .await
+        });
+        let outbound = host.read_frame().await.ok_or("no ordinary request")?;
+        let response = Frame::response(
+            outbound.id,
+            Method::Notify,
+            serde_json::json!({"done": true}),
+        );
+        let wire_bytes = crate::protocol::encode_frame(&response)?.len();
+        dispatch_decoded(
+            &client.shared,
+            crate::protocol::DecodedFrame {
+                frame: response,
+                wire_bytes,
+            },
+        );
+
+        assert_eq!(request.await??.payload["done"], true);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn handshake_succeeds() -> R {
@@ -2999,7 +3067,7 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
-    async fn provider_stream_payload_bytes_are_bounded_before_frame_capacity() -> R {
+    async fn provider_stream_wire_bytes_are_bounded_before_frame_capacity() -> R {
         let (client, mut host) = make_pair().await;
         let provider = client
             .open_stream_raw(
@@ -3009,16 +3077,18 @@ mod tests {
             )
             .await?;
         let request = host.read_frame().await.ok_or("no provider request")?;
-        let chunk = "x".repeat(PROVIDER_FORWARD_BYTES / 4);
+        let chunk = "x".repeat(PROVIDER_FORWARD_BYTES / 8 - 512);
 
-        for n in 0..5 {
-            forward_stream_event(
+        for n in 0..9 {
+            let frame = Frame::event(
+                request.id,
+                Method::ProviderEvent,
+                serde_json::json!({"n": n, "chunk": chunk.clone()}),
+            );
+            let wire_bytes = crate::protocol::encode_frame(&frame)?.len();
+            dispatch_decoded(
                 &client.shared,
-                Frame::event(
-                    request.id,
-                    Method::ProviderEvent,
-                    serde_json::json!({"n": n, "chunk": chunk.clone()}),
-                ),
+                crate::protocol::DecodedFrame { frame, wire_bytes },
             );
             tokio::task::yield_now().await;
         }
@@ -3039,27 +3109,32 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
-    async fn provider_stream_payload_budget_is_released_when_consumed() -> R {
+    async fn provider_stream_wire_budget_is_released_when_consumed() -> R {
         let (client, mut host) = make_pair().await;
         let mut provider = client
             .open_stream_raw("provider.stream", serde_json::json!({}), 1)
             .await?;
         let request = host.read_frame().await.ok_or("no provider request")?;
-        let chunk = "x".repeat(PROVIDER_FORWARD_BYTES / 4);
+        let bytes = provider_retained_bytes(&client, request.id)?;
+        let chunk = "x".repeat(PROVIDER_FORWARD_BYTES / 8 - 512);
 
         for n in 0..8 {
-            forward_stream_event(
-                &client.shared,
-                Frame::event(
-                    request.id,
-                    Method::ProviderEvent,
-                    serde_json::json!({"n": n, "chunk": chunk.clone()}),
-                ),
+            let frame = Frame::event(
+                request.id,
+                Method::ProviderEvent,
+                serde_json::json!({"n": n, "chunk": chunk.clone()}),
             );
+            let wire_bytes = crate::protocol::encode_frame(&frame)?.len();
+            dispatch_decoded(
+                &client.shared,
+                crate::protocol::DecodedFrame { frame, wire_bytes },
+            );
+            wait_for_retained_bytes(&bytes, wire_bytes).await?;
             let event = tokio::time::timeout(Duration::from_secs(2), provider.next_event())
                 .await?
                 .ok_or("provider event queue closed")?;
             assert_eq!(event.payload["n"], n);
+            wait_for_retained_bytes(&bytes, 0).await?;
         }
 
         host.write_frame(&Frame::response(
@@ -3072,6 +3147,30 @@ mod tests {
             provider.finish(Duration::from_secs(2)).await?.payload["done"],
             true
         );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn provider_stream_wire_budget_is_released_when_dropped() -> R {
+        let (client, mut host) = make_pair().await;
+        let provider = client
+            .open_stream_raw("provider.stream", serde_json::json!({}), 1)
+            .await?;
+        let request = host.read_frame().await.ok_or("no provider request")?;
+        let bytes = provider_retained_bytes(&client, request.id)?;
+        let frame = Frame::event(
+            request.id,
+            Method::ProviderEvent,
+            serde_json::json!({"chunk": "retained"}),
+        );
+        let wire_bytes = crate::protocol::encode_frame(&frame)?.len();
+        dispatch_decoded(
+            &client.shared,
+            crate::protocol::DecodedFrame { frame, wire_bytes },
+        );
+        wait_for_retained_bytes(&bytes, wire_bytes).await?;
+
+        drop(provider);
+        wait_for_retained_bytes(&bytes, 0).await?;
         Ok(())
     }
 }

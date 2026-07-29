@@ -192,6 +192,19 @@ pub type FrameId = u64;
 
 /// Result type for protocol encode/decode/validation operations.
 pub type Result<T, E = ProtocolError> = std::result::Result<T, E>;
+
+/// A decoded frame together with the number of bytes it occupied on the wire.
+///
+/// `wire_bytes` includes the JSONL delimiter when one was present, and includes
+/// the CR in a CRLF delimiter. It therefore conservatively accounts for every
+/// input byte retained after decoding.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecodedFrame {
+    /// The decoded protocol frame.
+    pub frame: Frame,
+    /// Original JSONL frame length in bytes.
+    pub wire_bytes: usize,
+}
 /// Protocol encode, decode, validation, or handshake failure.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ProtocolError {
@@ -1922,6 +1935,29 @@ impl FrameDecoder {
     /// buffered data only when the error was per-line; oversize clears the
     /// current line buffer.
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<Frame>> {
+        self.push_impl(chunk, |frame, _| frame)
+    }
+
+    /// Push bytes and return complete frames with their original wire lengths.
+    ///
+    /// This preserves the decoder's byte accounting for consumers that retain
+    /// decoded frames, without reparsing or reserializing their payloads.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::push`].
+    pub fn push_with_wire_bytes(&mut self, chunk: &[u8]) -> Result<Vec<DecodedFrame>> {
+        self.push_impl(chunk, |frame, wire_bytes| DecodedFrame {
+            frame,
+            wire_bytes,
+        })
+    }
+
+    fn push_impl<T>(
+        &mut self,
+        chunk: &[u8],
+        mut output: impl FnMut(Frame, usize) -> T,
+    ) -> Result<Vec<T>> {
         let mut out = Vec::new();
         let mut offset = 0usize;
         while offset < chunk.len() {
@@ -1935,12 +1971,13 @@ impl FrameDecoder {
                 }
                 self.buf
                     .extend_from_slice(&chunk[offset..line_end_in_chunk]);
+                let wire_bytes = self.buf.len() + 1;
                 // Strip one trailing CR for CRLF.
                 if self.buf.last() == Some(&b'\r') {
                     self.buf.pop();
                 }
                 let line = std::mem::take(&mut self.buf);
-                out.push(decode_frame_line(&line)?);
+                out.push(output(decode_frame_line(&line)?, wire_bytes));
                 offset = line_end_in_chunk + 1;
             } else {
                 let pending = self.buf.len() + (chunk.len() - offset);
@@ -2326,6 +2363,21 @@ mod tests {
         let got = decoder.push(&line)?;
         assert_eq!(got.first(), Some(&frame));
         assert_eq!(got.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn decoder_preserves_complete_wire_length() -> TestResult {
+        let frame = sample_hello_req()?;
+        let mut line = serde_json::to_vec(&frame)?;
+        line.extend_from_slice(b"\r\n");
+        let split = line.len() / 2;
+        let mut decoder = FrameDecoder::new();
+        assert!(decoder.push_with_wire_bytes(&line[..split])?.is_empty());
+        let frames = decoder.push_with_wire_bytes(&line[split..])?;
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].frame, frame);
+        assert_eq!(frames[0].wire_bytes, line.len());
         Ok(())
     }
 
