@@ -141,6 +141,28 @@ pub enum ExtensionBindError {
     /// Host restart after reload failed.
     #[error("extension host restart failed: {0}")]
     HostRestart(String),
+    /// Resource discovery failed after the replacement host was committed.
+    #[error("extension resource discovery failed after committed restart: {source}")]
+    PostCommitResourceDiscovery {
+        /// Diagnostics emitted while starting the committed replacement host.
+        diagnostics: Vec<ExtensionHostDiagnostic>,
+        /// The resource discovery failure.
+        #[source]
+        source: Box<ExtensionBindError>,
+    },
+}
+
+fn finish_committed_restart(
+    diagnostics: Vec<ExtensionHostDiagnostic>,
+    resource_discovery: Result<(), ExtensionBindError>,
+) -> Result<Vec<ExtensionHostDiagnostic>, ExtensionBindError> {
+    match resource_discovery {
+        Ok(()) => Ok(diagnostics),
+        Err(source) => Err(ExtensionBindError::PostCommitResourceDiscovery {
+            diagnostics,
+            source: Box::new(source),
+        }),
+    }
 }
 
 fn extension_command_source_info(
@@ -149,17 +171,26 @@ fn extension_command_source_info(
 ) -> crate::core::resources::SourceInfo {
     let command_path = std::fs::canonicalize(path).ok();
     if let Some(command_path) = command_path.as_ref()
-        && let Some((_, source_info)) = source_infos
+        && let Some(source_info) = source_infos
             .iter()
-            .filter_map(|(source_path, source_info)| {
-                let source_path = std::fs::canonicalize(source_path)
+            .filter_map(|(original_key, source_info)| {
+                let source_path = std::fs::canonicalize(original_key)
                     .or_else(|_| std::fs::canonicalize(&source_info.path))
                     .ok()?;
-                command_path
-                    .starts_with(&source_path)
-                    .then_some((source_path.components().count(), source_info))
+                command_path.starts_with(&source_path).then_some((
+                    source_path.components().count(),
+                    source_path,
+                    original_key,
+                    source_info,
+                ))
             })
-            .max_by_key(|(depth, _)| *depth)
+            .max_by(|left, right| {
+                left.0
+                    .cmp(&right.0)
+                    .then_with(|| left.1.cmp(&right.1))
+                    .then_with(|| left.2.cmp(right.2))
+            })
+            .map(|(_, _, _, source_info)| source_info)
     {
         let mut source_info = source_info.clone();
         source_info.path = command_path.to_string_lossy().into_owned();
@@ -384,7 +415,9 @@ impl AgentSession {
     /// # Errors
     ///
     /// Returns [`ExtensionBindError`] on host preparation or resource-discovery
-    /// failure. A preparation error leaves the old host installed and live.
+    /// failure. A preparation error leaves the old host installed and live. If
+    /// discovery fails after commit, the returned error retains the committed
+    /// replacement's startup diagnostics.
     pub async fn reload(&self) -> Result<Vec<ExtensionHostDiagnostic>, ExtensionBindError> {
         let _reload_guard = self.bind_lock.lock().await;
         let runner = self.hooks.runner();
@@ -418,9 +451,11 @@ impl AgentSession {
             });
             self.bind_session_bridge().await;
             self.emit_session_start_reload().await;
-            self.extend_resources_from_extensions(SessionStartReason::Reload.as_str())
-                .await?;
-            return Ok(diagnostics);
+            return finish_committed_restart(
+                diagnostics,
+                self.extend_resources_from_extensions(SessionStartReason::Reload.as_str())
+                    .await,
+            );
         }
 
         let _ = runner
@@ -942,7 +977,7 @@ fn user_message_parts(content: &Value) -> (String, Vec<ImageContent>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::agent_session::extension_runner::ExtensionRunner;
+    use crate::core::agent_session::extension_runner::{ExtensionRunner, ExtensionRunnerError};
     use crate::core::agent_session::{AgentSession, AgentSessionConfig};
     use crate::core::model_runtime::{CreateModelRuntimeOptions, ModelRuntime};
     use futures::future::BoxFuture;
@@ -1121,6 +1156,69 @@ mod tests {
         assert_eq!(resolved.scope, SourceScope::User);
         assert_eq!(resolved.origin, SourceOrigin::Package);
         assert_eq!(resolved.base_dir.as_deref(), owner.to_str());
+        Ok(())
+    }
+
+    #[test]
+    fn extension_command_source_info_breaks_canonical_ties_by_original_key() -> TestResult {
+        use crate::core::resources::{SourceInfo, SourceOrigin, SourceScope, path_to_string};
+
+        let temp = tempfile::tempdir()?;
+        let extension_root = temp.path().join("extension");
+        let command = extension_root.join("command.mjs");
+        std::fs::create_dir_all(&extension_root)?;
+        std::fs::write(&command, "")?;
+        let extension_root = path_to_string(&std::fs::canonicalize(extension_root)?);
+        let command = path_to_string(&std::fs::canonicalize(command)?);
+        let metadata = |source: &str| SourceInfo {
+            path: extension_root.clone(),
+            source: source.to_owned(),
+            scope: SourceScope::User,
+            origin: SourceOrigin::TopLevel,
+            base_dir: None,
+        };
+
+        for entries in [
+            [("first", metadata("first")), ("second", metadata("second"))],
+            [("second", metadata("second")), ("first", metadata("first"))],
+        ] {
+            let source_infos = entries
+                .into_iter()
+                .map(|(key, info)| (key.to_owned(), info))
+                .collect::<HashMap<_, _>>();
+            let resolved = extension_command_source_info(&command, &source_infos);
+            assert_eq!(resolved.source, "second");
+            assert_eq!(resolved.path, command);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn committed_restart_discovery_failure_retains_diagnostics_and_source() -> TestResult {
+        let diagnostics = vec![ExtensionHostDiagnostic {
+            path: "broken-extension.ts".to_owned(),
+            message: "startup warning".to_owned(),
+        }];
+        let Err(error) = finish_committed_restart(
+            diagnostics.clone(),
+            Err(ExtensionBindError::ResourceDiscover(
+                ExtensionRunnerError::Failed("discovery failed".to_owned()),
+            )),
+        ) else {
+            return Err("discovery failure must be returned".into());
+        };
+
+        let ExtensionBindError::PostCommitResourceDiscovery {
+            diagnostics: returned_diagnostics,
+            source,
+        } = error
+        else {
+            return Err(
+                format!("expected committed-restart discovery error, got {error:?}").into(),
+            );
+        };
+        assert_eq!(returned_diagnostics, diagnostics);
+        assert!(source.to_string().contains("discovery failed"));
         Ok(())
     }
 
