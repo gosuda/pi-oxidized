@@ -96,12 +96,22 @@ pub enum ManifestError {
         #[source]
         source: io::Error,
     },
+    /// The canonical manifest entry could not be inspected.
+    #[error("could not inspect manifest entry {path}: {source}")]
+    InspectEntry {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
     /// The canonical manifest entry is not a regular file.
     #[error("manifest entry is not a file: {path}")]
     EntryNotFile { path: PathBuf },
     /// Canonicalization showed that the entry leaves its manifest directory.
     #[error("manifest entry {entry} escapes extension directory {directory}")]
     EntryEscapesDirectory { entry: PathBuf, directory: PathBuf },
+    /// The canonical manifest entry is not valid UTF-8.
+    #[error("manifest entry is not valid UTF-8: {path}")]
+    EntryNotUtf8 { path: PathBuf },
     /// A native extension lacks every Unix execute permission bit.
     #[cfg(unix)]
     #[error("native extension entry is not executable: {path}")]
@@ -186,7 +196,7 @@ pub fn classify(discovered: &str) -> Result<ClassifiedExtension, ManifestError> 
     }
 
     if !fs::metadata(&entry)
-        .map_err(|source| ManifestError::CanonicalizeEntry {
+        .map_err(|source| ManifestError::InspectEntry {
             path: entry.clone(),
             source,
         })?
@@ -200,10 +210,18 @@ pub fn classify(discovered: &str) -> Result<ClassifiedExtension, ManifestError> 
         return Err(ManifestError::NativeEntryNotExecutable { path: entry });
     }
 
+    let entry =
+        entry
+            .into_os_string()
+            .into_string()
+            .map_err(|os_string| ManifestError::EntryNotUtf8 {
+                path: os_string.into(),
+            })?;
+
     Ok(ClassifiedExtension {
         runtime: manifest.runtime,
         discovered: discovered.to_owned(),
-        entry: entry.to_string_lossy().into_owned(),
+        entry,
     })
 }
 
@@ -285,7 +303,7 @@ fn canonicalize_entry(path: &Path) -> Result<PathBuf, ManifestError> {
 fn is_executable(path: &Path) -> Result<bool, ManifestError> {
     use std::os::unix::fs::PermissionsExt;
 
-    let metadata = fs::metadata(path).map_err(|source| ManifestError::CanonicalizeEntry {
+    let metadata = fs::metadata(path).map_err(|source| ManifestError::InspectEntry {
         path: path.to_path_buf(),
         source,
     })?;
@@ -584,5 +602,73 @@ mod tests {
         fs::set_permissions(&entry, fs::Permissions::from_mode(0o100))?;
         assert_eq!(classify(discovered)?.runtime, ExtensionRuntime::Native);
         Ok(())
+    }
+
+    #[test]
+    fn manifest_rejects_directory_manifest_path() -> TestResult {
+        let temp = tempdir()?;
+        let extension = temp.path().join("extension");
+        fs::create_dir(&extension)?;
+        // The manifest path exists but is a directory, not a regular file.
+        fs::create_dir(extension.join(MANIFEST_FILE_NAME))?;
+        let discovered = extension.to_str().ok_or("non-UTF-8 temp path")?;
+        assert!(matches!(
+            classify(discovered),
+            Err(ManifestError::ManifestNotFile { .. })
+        ));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_rejects_non_utf8_canonical_entry() -> TestResult {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir()?;
+        let extension = temp.path().join("extension");
+        fs::create_dir(&extension)?;
+
+        // Create a subdirectory whose name is invalid UTF-8 (0xFF). A symlink
+        // with a UTF-8 name inside the extension directory points at a file
+        // inside it, so canonicalization resolves to a non-UTF-8 path that is
+        // still within the extension directory (passes the escape check).
+        let non_utf8_dir = extension.join(OsString::from_vec(vec![0xFF]));
+        fs::create_dir(&non_utf8_dir)?;
+        let target = non_utf8_dir.join("plugin.ts");
+        fs::write(&target, "")?;
+        symlink(&target, extension.join("link.ts"))?;
+        write_manifest(&extension, "ts-compat", "link.ts")?;
+
+        let discovered = extension.to_str().ok_or("non-UTF-8 temp path")?;
+        assert!(matches!(
+            classify(discovered),
+            Err(ManifestError::EntryNotUtf8 { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn inspect_entry_error_classifies_distinctly_from_canonicalize() {
+        // `InspectEntry` is a defensive variant for metadata failures on an
+        // already-canonicalized entry. In practice `fs::canonicalize` stats
+        // the target, so a metadata call immediately after cannot fail without
+        // a TOCTOU race. Verify the variant is wired with a distinct label so
+        // metadata inspection failures are never misreported as canonicalization
+        // failures.
+        let err = ManifestError::InspectEntry {
+            path: Path::new("/tmp/plugin.ts").to_path_buf(),
+            source: io::Error::from(io::ErrorKind::PermissionDenied),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("could not inspect manifest entry"),
+            "InspectEntry message should describe inspection, got: {msg}"
+        );
+        assert!(
+            !msg.contains("could not canonicalize"),
+            "InspectEntry must not be labeled as canonicalization, got: {msg}"
+        );
     }
 }
