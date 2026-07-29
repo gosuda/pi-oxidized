@@ -18,13 +18,16 @@
 //! 0. `bind_lock` (`tokio::sync::Mutex`) — serializes the entire
 //!    `bind_extensions` lifecycle and the whole `reload` transaction; held
 //!    across `.await`. Acquire before any `lock_inner()`.
-//! 1. `AgentSessionInner` (`std::sync::Mutex`) — flags, mirror queues, retry
+//! 1. `extension_source_infos` (`std::sync::Mutex`) — brief blocking snapshot
+//!    of extension path provenance. `apply_resource_snapshot` acquires this
+//!    before `lock_inner()`; never hold across `.await`.
+//! 2. `AgentSessionInner` (`std::sync::Mutex`) — flags, mirror queues, retry
 //!    counters, listener list, pump handle, cancellation slots.
-//! 2. `session_manager` (`tokio::sync::Mutex<SessionManager>`) — single-writer
+//! 3. `session_manager` (`tokio::sync::Mutex<SessionManager>`) — single-writer
 //!    async mutex; event pump and public mutators share it. Documented as the
 //!    sole writer of the append-only session tree for this session.
-//! 3. `SessionHooks` `RwLocks` (`runner` → `system_prompt` → `tools`) — only one
-//!    at a time, never nested with (1) or (2).
+//! 4. `SessionHooks` `RwLocks` (`runner` → `system_prompt` → `tools`) — only one
+//!    at a time, never nested with (2) or (3).
 //!
 //! Public listeners are invoked without holding any lock.
 
@@ -455,7 +458,9 @@ pub struct AgentSession {
     /// Resource loader for extension-discovered skills, prompts, and themes.
     pub(super) resource_loader: Option<AsyncMutex<crate::core::resources::DefaultResourceLoader>>,
     /// ResourceLoader-resolved provenance for extension paths, keyed by both
-    /// configured and resolved paths for host command lookup.
+    /// configured and resolved paths for host command lookup. Acquire before
+    /// `lock_inner()`; never hold across `.await` (see lock order in module
+    /// docs).
     pub(super) extension_source_infos:
         Mutex<std::collections::HashMap<String, crate::core::resources::SourceInfo>>,
     /// Self handle for pump (set after construction).
