@@ -27,6 +27,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use futures::FutureExt;
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -1205,10 +1206,8 @@ fn remove_in_flight<E: NativeExtension>(runtime: &ServerRuntime<E>, id: FrameId)
 
 /// Handle one request to a terminal frame and send it.
 ///
-/// The dispatch runs in a child task so a panicking extension callback is
-/// caught by the `JoinHandle` instead of silently unwinding the request task.
-/// On panic the server cleans up the in-flight entry and answers with a
-/// correlated `internal` error frame.
+/// The dispatch stays in the request task so server teardown aborts it. Panics
+/// are caught here and reported as a correlated `internal` error frame.
 async fn handle_request<E: NativeExtension>(
     runtime: Arc<ServerRuntime<E>>,
     frame: Frame,
@@ -1216,7 +1215,10 @@ async fn handle_request<E: NativeExtension>(
 ) {
     let id = frame.id;
     let method = frame.method.clone();
-    let result = tokio::spawn(handle_request_dispatch(Arc::clone(&runtime), frame, token)).await;
+    let result =
+        std::panic::AssertUnwindSafe(handle_request_dispatch(Arc::clone(&runtime), frame, token))
+            .catch_unwind()
+            .await;
     if result.is_err() {
         remove_in_flight(&runtime, id);
         let _ = runtime
@@ -2687,6 +2689,54 @@ mod tests {
                 });
                 Ok(json!({}))
             })
+        }
+    }
+
+    /// A blocked preflight callback whose drop records server teardown.
+    struct BlockingPrepareExtension {
+        started: Arc<Notify>,
+        stopped: Arc<AtomicBool>,
+    }
+
+    impl NativeExtension for BlockingPrepareExtension {
+        fn snapshot(&self) -> RegistrySnapshot {
+            RegistrySnapshot::default()
+        }
+
+        fn prepare_tool(
+            &self,
+            _context: Arc<NativeExtensionContext>,
+            _name: String,
+            args: Value,
+        ) -> NativeFuture<Result<Value, ExtensionFault>> {
+            let started = Arc::clone(&self.started);
+            let stopped = Arc::clone(&self.stopped);
+            Box::pin(async move {
+                let _drop_flag = DropFlag(stopped);
+                started.notify_one();
+                std::future::pending::<()>().await;
+                Ok(args)
+            })
+        }
+
+        fn validate_tool(
+            &self,
+            _context: Arc<NativeExtensionContext>,
+            name: String,
+            _args: Value,
+            _tool_call_id: Option<String>,
+        ) -> NativeFuture<Result<Value, ExtensionFault>> {
+            Box::pin(async move { Err(ExtensionFault::not_found(name)) })
+        }
+
+        fn execute_tool(
+            &self,
+            _context: Arc<NativeExtensionContext>,
+            call: ToolCall,
+            _updates: ToolUpdateSink,
+            _cancel: CancellationToken,
+        ) -> NativeFuture<Result<Value, ExtensionFault>> {
+            Box::pin(async move { Err(ExtensionFault::not_found(call.name)) })
         }
     }
 
@@ -5422,6 +5472,40 @@ mod tests {
         drop(client);
         let result = tokio::time::timeout(TIMEOUT, server).await??;
         assert!(result.is_ok());
+        Ok(())
+    }
+
+    /// Server teardown aborts a blocked callback rather than leaving detached
+    /// work alive after the transport closes.
+    #[tokio::test]
+    async fn teardown_drops_blocked_callback() -> R {
+        let started = Arc::new(Notify::new());
+        let stopped = Arc::new(AtomicBool::new(false));
+        let extension = BlockingPrepareExtension {
+            started: Arc::clone(&started),
+            stopped: Arc::clone(&stopped),
+        };
+        let (mut client, server) = spawn_raw(extension, ServerConfig::default());
+        client.hello(PROTOCOL_VERSION, "anything").await?;
+        let _ack = client.recv().await?;
+        client.load_context().await?;
+        client
+            .send(&Frame {
+                id: 2,
+                kind: FrameKind::Req,
+                method: methods::TOOL_PREPARE.to_owned(),
+                payload: json!({ "name": "blocked", "args": {} }),
+            })
+            .await?;
+        tokio::time::timeout(TIMEOUT, started.notified()).await?;
+
+        drop(client);
+        let result = tokio::time::timeout(TIMEOUT, server).await??;
+        assert!(result.is_ok());
+        assert!(
+            stopped.load(AtomicOrdering::SeqCst),
+            "server teardown must drop the blocked callback future"
+        );
         Ok(())
     }
 
