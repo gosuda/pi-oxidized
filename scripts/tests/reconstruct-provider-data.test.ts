@@ -669,30 +669,30 @@ describe("defaultInversionProof primary-error preservation (PRRT_kwDOTcPStM6UYj9
 
 	test("restore failure without proof failure surfaces the restore error directly", async () => {
 		const root = mkdtempSync(join(tmpdir(), "inversion-proof-restore-only-"));
-		const catalogPath = join(root, "builtin-models.json");
-		// Write a catalog that the generator will reproduce exactly (proof passes).
-		// Use the real repo so the generator succeeds, but make restore fail.
-		const catalogBefore = readFileSync(REAL_CATALOG_PATH);
-		writeFileSync(catalogPath, catalogBefore);
-		// The proof reads the catalog, runs the generator (which writes to the
-		// REAL path, not our fixture), then compares. Since the generator writes
-		// to the real path and our fixture catalog is identical, the proof passes.
-		// But we need the restore to fail — so make the file read-only AFTER the
-		// initial snapshot read. We achieve this by using a path whose parent
-		// directory becomes read-only. Simpler: just verify the happy path still
-		// restores correctly (no error thrown).
+		const providersDir = join(root, "providers");
+		const dataDir = join(providersDir, "data");
+		const catalogPath = join(root, "crates", "pi-ai", "data", "builtin-models.json");
+		const generatorPath = join(root, "scripts", "generate-builtin-models.ts");
+
+		mkdirSync(dirname(catalogPath), { recursive: true });
+		mkdirSync(dirname(generatorPath), { recursive: true });
+		writeFileSync(catalogPath, '{"alpha":{"model":{"id":"model"}}}\n', "utf8");
+		// No-op fixture generator: exits cleanly so the inversion proof succeeds.
+		writeFileSync(
+			generatorPath,
+			"// Fixture generator: does nothing so the inversion proof succeeds.\nprocess.exit(0);\n",
+			"utf8",
+		);
+
+		// Make the catalog read-only so the snapshot restore in the finally block fails.
 		chmodSync(catalogPath, 0o444);
 		try {
-			// With a read-only catalog, the initial Bun.file().bytes() succeeds,
-			// the generator runs against real paths (proof passes because content
-			// matches), and the restore writeFile fails. Since proofFailure is
-			// undefined, the restore error is thrown directly.
 			const error = await captureError(
 				defaultInversionProof({
-					repoRoot: REPO_ROOT,
+					repoRoot: root,
 					catalogPath,
-					providersDir: REAL_PROVIDERS_DIR,
-					dataDir: REAL_DATA_DIR,
+					providersDir,
+					dataDir,
 				}),
 			);
 
@@ -703,7 +703,7 @@ describe("defaultInversionProof primary-error preservation (PRRT_kwDOTcPStM6UYj9
 			chmodSync(catalogPath, 0o644);
 			rmSync(root, { recursive: true, force: true });
 		}
-	}, 120_000);
+	});
 });
 
 const LOCK_OWNER_FILE = "owner.json";
