@@ -83,6 +83,7 @@ struct EndpointId {
 #[derive(Clone)]
 struct Endpoint {
     id: EndpointId,
+    kind: EndpointKind,
     label: String,
     runner: Arc<HostExtensionRunner>,
 }
@@ -201,7 +202,9 @@ impl PublishedRuntimeState {
                 .generation
                 .endpoints
                 .iter()
-                .filter(|endpoint| endpoint.runner.is_active())
+                .filter(|endpoint| {
+                    endpoint.runner.is_active() && endpoint.kind == EndpointKind::TsCompat
+                })
                 .count()
                 == 1
     }
@@ -452,7 +455,7 @@ impl ExtensionRuntimeSet {
         let endpoints = endpoints
             .into_iter()
             .enumerate()
-            .map(|(index, (_kind, runner))| (format!("<test:{index}>"), runner))
+            .map(|(index, (kind, runner))| (kind, format!("<test:{index}>"), runner))
             .collect::<Vec<_>>();
         let (generation, pending) = generation_from_endpoints(1, endpoints);
         let set = Arc::new(Self::from_generation(
@@ -1486,7 +1489,7 @@ async fn build_generation(
                         .unwrap_or(path);
                     diagnostics.push(ExtensionSetDiagnostic { path, message });
                 }
-                endpoints.push((plan.label, runner));
+                endpoints.push((plan.kind, plan.label, runner));
             }
             Err(message) => {
                 let paths = if plan.diagnostic_paths.is_empty() {
@@ -1503,7 +1506,7 @@ async fn build_generation(
     }
 
     if all_or_nothing && !diagnostics.is_empty() {
-        for (_, endpoint) in &endpoints {
+        for (_, _, endpoint) in &endpoints {
             endpoint.shutdown_once().await;
         }
         return (None, Vec::new(), diagnostics);
@@ -1538,16 +1541,17 @@ async fn start_endpoint(
 
 fn generation_from_endpoints(
     id: u64,
-    endpoints: Vec<(String, Arc<HostExtensionRunner>)>,
+    endpoints: Vec<(EndpointKind, String, Arc<HostExtensionRunner>)>,
 ) -> (Generation, PendingBridges) {
     let endpoints = endpoints
         .into_iter()
         .enumerate()
-        .map(|(position, (label, runner))| Endpoint {
+        .map(|(position, (kind, label, runner))| Endpoint {
             id: EndpointId {
                 generation: id,
                 position,
             },
+            kind,
             label,
             runner,
         })
@@ -2706,8 +2710,14 @@ pub(crate) mod tests {
         let mut ui_requests = set.take_ui_requests().ok_or("ui bridge missing")?;
         let mut session_bridge = set.take_session_bridge().ok_or("session bridge missing")?;
         let (replacement, replacement_host) = make_runner(snapshot(&[])).await?;
-        let (next, mut pending) =
-            generation_from_endpoints(2, vec![("<replacement>".to_owned(), replacement)]);
+        let (next, mut pending) = generation_from_endpoints(
+            2,
+            vec![(
+                EndpointKind::TsCompat,
+                "<replacement>".to_owned(),
+                replacement,
+            )],
+        );
         let (ui_tx, ui) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         pending[0].ui = ui;
         assert!(
@@ -2782,8 +2792,14 @@ pub(crate) mod tests {
             );
         let request_id = parked.recv().await.ok_or("parked hook closed")?;
         let (replacement, _) = make_runner(snapshot(&[])).await?;
-        let (next, pending) =
-            generation_from_endpoints(2, vec![("<replacement>".to_owned(), replacement)]);
+        let (next, pending) = generation_from_endpoints(
+            2,
+            vec![(
+                EndpointKind::TsCompat,
+                "<replacement>".to_owned(),
+                replacement,
+            )],
+        );
         let cutover_set = Arc::clone(&set);
         let cutover = tokio::spawn(async move { cutover_set.cutover(next, pending).await });
         wait_for_dispose(&mut ui, "old").await?;
@@ -2821,8 +2837,14 @@ pub(crate) mod tests {
             );
         let request_id = parked.recv().await.ok_or("parked hook closed")?;
         let (replacement, _) = make_runner(snapshot(&[])).await?;
-        let (next, pending) =
-            generation_from_endpoints(2, vec![("<replacement>".to_owned(), replacement)]);
+        let (next, pending) = generation_from_endpoints(
+            2,
+            vec![(
+                EndpointKind::TsCompat,
+                "<replacement>".to_owned(),
+                replacement,
+            )],
+        );
         let cutover_set = Arc::clone(&set);
         let cutover = tokio::spawn(async move { cutover_set.cutover(next, pending).await });
         wait_for_dispose(&mut ui, "old").await?;
@@ -2864,8 +2886,14 @@ pub(crate) mod tests {
             );
         let request_id = parked.recv().await.ok_or("parked hook closed")?;
         let (replacement, _) = make_runner(snapshot(&[])).await?;
-        let (next, pending) =
-            generation_from_endpoints(2, vec![("<replacement>".to_owned(), replacement)]);
+        let (next, pending) = generation_from_endpoints(
+            2,
+            vec![(
+                EndpointKind::TsCompat,
+                "<replacement>".to_owned(),
+                replacement,
+            )],
+        );
         let cutover_set = Arc::clone(&set);
         let cutover = tokio::spawn(async move { cutover_set.cutover(next, pending).await });
         wait_for_dispose(&mut ui, "old").await?;
@@ -2947,8 +2975,8 @@ pub(crate) mod tests {
         let (next, pending) = generation_from_endpoints(
             2,
             vec![
-                ("<new-first>".to_owned(), new_first),
-                ("<new-owner>".to_owned(), new_owner),
+                (EndpointKind::TsCompat, "<new-first>".to_owned(), new_first),
+                (EndpointKind::Native, "<new-owner>".to_owned(), new_owner),
             ],
         );
         set.cutover(next, pending).await;
@@ -2998,8 +3026,14 @@ pub(crate) mod tests {
             );
         let request_id = parked.recv().await.ok_or("parked hook closed")?;
         let (replacement, _) = make_runner(snapshot(&[])).await?;
-        let (next, pending) =
-            generation_from_endpoints(2, vec![("<replacement>".to_owned(), replacement)]);
+        let (next, pending) = generation_from_endpoints(
+            2,
+            vec![(
+                EndpointKind::TsCompat,
+                "<replacement>".to_owned(),
+                replacement,
+            )],
+        );
         let cutover_set = Arc::clone(&set);
         let cutover = tokio::spawn(async move { cutover_set.cutover(next, pending).await });
         wait_for_dispose(&mut ui, "old").await?;
@@ -3029,8 +3063,14 @@ pub(crate) mod tests {
         let (old, _old_host) = make_runner(snapshot(&["input"])).await?;
         let set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, old)]);
         let (replacement, _replacement_host) = make_runner(snapshot(&["input"])).await?;
-        let (next, pending) =
-            generation_from_endpoints(2, vec![("<replacement>".to_owned(), replacement)]);
+        let (next, pending) = generation_from_endpoints(
+            2,
+            vec![(
+                EndpointKind::TsCompat,
+                "<replacement>".to_owned(),
+                replacement,
+            )],
+        );
 
         assert!(set.can_reload());
         assert!(set.try_cutover(next, pending).await.is_ok());
@@ -3047,8 +3087,14 @@ pub(crate) mod tests {
         let (old, _) = make_runner(snapshot(&[])).await?;
         let set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, old)]);
         let (replacement, replacement_host) = make_runner(snapshot(&[])).await?;
-        let (next, pending) =
-            generation_from_endpoints(2, vec![("<replacement>".to_owned(), replacement)]);
+        let (next, pending) = generation_from_endpoints(
+            2,
+            vec![(
+                EndpointKind::TsCompat,
+                "<replacement>".to_owned(),
+                replacement,
+            )],
+        );
 
         set.invalidate();
         let Err(next) = set.try_cutover(next, pending).await else {
@@ -3073,7 +3119,8 @@ pub(crate) mod tests {
             directory.path().join("pi-extension.json"),
             r#"{"runtime":"native","entry":"replacement"}"#,
         )?;
-        let (generation, pending) = generation_from_endpoints(1, vec![("<old>".to_owned(), old)]);
+        let (generation, pending) =
+            generation_from_endpoints(1, vec![(EndpointKind::TsCompat, "<old>".to_owned(), old)]);
         let set = Arc::new(ExtensionRuntimeSet::from_generation(
             generation,
             vec![directory.path().to_string_lossy().into_owned()],
@@ -3150,8 +3197,10 @@ pub(crate) mod tests {
             r#"{"runtime":"native","entry":"replacement"}"#,
         )?;
 
-        let (generation, pending) =
-            generation_from_endpoints(1, vec![("<old>".to_owned(), runner)]);
+        let (generation, pending) = generation_from_endpoints(
+            1,
+            vec![(EndpointKind::TsCompat, "<old>".to_owned(), runner)],
+        );
         let set = Arc::new(ExtensionRuntimeSet::from_generation(
             generation,
             vec![directory.path().to_string_lossy().into_owned()],
@@ -3208,8 +3257,10 @@ pub(crate) mod tests {
             directory.path().join("pi-extension.json"),
             r#"{"runtime":"native","entry":"replacement"}"#,
         )?;
-        let (generation, pending) =
-            generation_from_endpoints(1, vec![("<old>".to_owned(), runner)]);
+        let (generation, pending) = generation_from_endpoints(
+            1,
+            vec![(EndpointKind::TsCompat, "<old>".to_owned(), runner)],
+        );
         let set = Arc::new(ExtensionRuntimeSet::from_generation(
             generation,
             vec![directory.path().to_string_lossy().into_owned()],
@@ -3251,6 +3302,20 @@ pub(crate) mod tests {
 
         // A second facade shutdown also returns cleanly.
         set.shutdown_once().await;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn compat_only_reload_rejects_lone_native_endpoint() -> TestResult {
+        let (compat, _compat_host) = make_runner(snapshot(&["input"])).await?;
+        let compat_set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, compat)]);
+        assert!(compat_set.can_reload());
+
+        let (native, _native_host) = make_runner(snapshot(&["input"])).await?;
+        let native_set = ExtensionRuntimeSet::bind(vec![(EndpointKind::Native, native)]);
+        assert!(!native_set.can_reload());
+
+        compat_set.shutdown_once().await;
+        native_set.shutdown_once().await;
         Ok(())
     }
 }
