@@ -3607,6 +3607,10 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     }
 
     fn project_extension_slot(&mut self, slot: SanitizedSlot) {
+        let overlay_was_open = self
+            .extension_slots
+            .get(&slot.key)
+            .is_some_and(|existing| existing.placement == SlotPlacement::Overlay);
         self.dispose_extension_slot(&slot.key);
         let non_capturing = slot
             .overlay_options
@@ -3638,7 +3642,11 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                     lines: Vec::new(),
                 });
                 self.view.extension_overlay_slot = Some(slot.clone());
-                self.pending_reanchor = Some(ReanchorCause::OverlayOpen);
+                if !overlay_was_open {
+                    // Only the open transition diffs against unrelated rows;
+                    // updates diff against the overlay's own previous frame.
+                    self.pending_reanchor = Some(ReanchorCause::OverlayOpen);
+                }
             }
             SlotPlacement::Header
             | SlotPlacement::AboveEditor
