@@ -51,4 +51,6 @@ nix = { version = "=0.31.3", default-features = false, features = ["signal"] }
 
 [dev-dependencies]
 insta = { version = "=1.48.0", features = ["filters"] }
+# test-util enables tokio::time::pause/advance for the spinner runtime test.
+tokio = { version = "=1.52.4", default-features = false, features = ["test-util"] }
 tempfile = "=3.27.0"

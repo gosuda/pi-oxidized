@@ -28,15 +28,25 @@ pub fn build_status(status: &SessionStatus, th: &ResolvedTheme) -> Box<dyn Compo
 /// The status message text (ports each indicator's label builder).
 #[must_use]
 pub fn status_message(status: &SessionStatus, th: &ResolvedTheme) -> String {
-    let cancel = "(Esc to cancel)";
+    let cancel = th.fg(ThemeColor::Dim, " · esc to cancel");
     match status.kind {
-        StatusKind::Working => th.fg(ThemeColor::Muted, &format!("{} {cancel}", status.message)),
-        StatusKind::Retry => th.fg(ThemeColor::Muted, &format!("Retrying… {cancel}")),
+        StatusKind::Working => {
+            let elapsed = if status.elapsed_secs == 0 {
+                String::new()
+            } else {
+                format!(" {}s", status.elapsed_secs)
+            };
+            th.fg(
+                ThemeColor::Muted,
+                &format!("{}{elapsed}{cancel}", status.message),
+            )
+        }
+        StatusKind::Retry => th.fg(ThemeColor::Muted, &format!("Retrying…{cancel}")),
         StatusKind::Compaction => {
-            th.fg(ThemeColor::Muted, &format!("Compacting context… {cancel}"))
+            th.fg(ThemeColor::Muted, &format!("Compacting context…{cancel}"))
         }
         StatusKind::BranchSummary => {
-            th.fg(ThemeColor::Muted, &format!("Summarizing branch… {cancel}"))
+            th.fg(ThemeColor::Muted, &format!("Summarizing branch…{cancel}"))
         }
     }
 }

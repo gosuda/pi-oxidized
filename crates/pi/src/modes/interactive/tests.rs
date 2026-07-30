@@ -145,6 +145,7 @@ fn loading_state_snapshot() {
     state.status = Some(SessionStatus {
         kind: StatusKind::Working,
         frame: 0,
+        elapsed_secs: 0,
         message: "Working…".to_owned(),
     });
     insta::assert_snapshot!("loading_state_widths", triple_plain(&state));
@@ -174,6 +175,7 @@ fn streaming_state_snapshot() {
     state.status = Some(SessionStatus {
         kind: StatusKind::Working,
         frame: 3,
+        elapsed_secs: 0,
         message: "Working…".to_owned(),
     });
     let partial = assistant_text("Generating a response…");
@@ -189,6 +191,7 @@ fn compact_state_snapshot() {
     state.status = Some(SessionStatus {
         kind: StatusKind::Compaction,
         frame: 0,
+        elapsed_secs: 0,
         message: "Compacting context…".to_owned(),
     });
     state
@@ -206,9 +209,31 @@ fn retry_state_snapshot() {
     state.status = Some(SessionStatus {
         kind: StatusKind::Retry,
         frame: 5,
+        elapsed_secs: 0,
         message: "Retrying…".to_owned(),
     });
     insta::assert_snapshot!("retry_state_widths", triple_plain(&state));
+}
+
+#[test]
+fn status_spinner_frame_and_elapsed_render() {
+    let mut state = base_state();
+    state.status = Some(SessionStatus {
+        kind: StatusKind::Working,
+        frame: 3,
+        elapsed_secs: 12,
+        message: "Working…".to_owned(),
+    });
+    let buf = render_view(&state, 80, 60);
+    let plain = snapshot_buffer_plain(&buf, 80, 60).join("\n");
+    assert!(
+        plain.contains(pi_tui::components::DEFAULT_LOADER_FRAMES[3]),
+        "status line must render spinner frame 3 (⠸): {plain}"
+    );
+    assert!(
+        plain.contains("12s"),
+        "status line must show the elapsed-seconds counter: {plain}"
+    );
 }
 
 #[test]
@@ -233,6 +258,7 @@ fn queue_state_snapshot() {
     state.status = Some(SessionStatus {
         kind: StatusKind::Working,
         frame: 0,
+        elapsed_secs: 0,
         message: "Working…".to_owned(),
     });
     state.pending = PendingQueue {

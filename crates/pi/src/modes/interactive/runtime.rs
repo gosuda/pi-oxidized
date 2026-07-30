@@ -102,6 +102,10 @@ pub const DRAW_TIMEOUT: Duration = Duration::from_secs(5);
 /// Background coalescing window for streaming / tool / plugin updates.
 pub const BACKGROUND_COALESCE_WINDOW: Duration = Duration::from_millis(16);
 
+/// Spinner tick cadence; matches `DEFAULT_INTERVAL_MS` (`loader.rs`), the
+/// interval the braille `Loader` frames were designed for.
+const SPINNER_TICK: Duration = Duration::from_millis(80);
+
 /// Bound on the runtime's incoming event channel. Matches the agent crate's
 /// extension-queue capacity so a lagging consumer surfaces backpressure early.
 pub const EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -1020,6 +1024,11 @@ pub struct InteractiveRuntime<W: Write, S: SessionHost> {
     partial: watch::Receiver<Option<Arc<AssistantMessage>>>,
     prompt_operations: PromptOperations,
     coalesce_deadline: Option<Instant>,
+    /// When the current status phase began; `None` while no status is shown.
+    /// Tokio's `Instant` so the paused test clock drives `elapsed_secs`.
+    spinner_started: Option<tokio::time::Instant>,
+    /// Braille spinner frame counter, advanced every [`SPINNER_TICK`].
+    spinner_frame: usize,
     pending_settle: Option<Vec<SettledBlock>>,
     shutdown: Arc<Notify>,
     exited: bool,
@@ -1260,6 +1269,8 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             partial,
             prompt_operations: PromptOperations::new(),
             coalesce_deadline: None,
+            spinner_started: None,
+            spinner_frame: 0,
             pending_settle: None,
             shutdown: Arc::new(Notify::new()),
             exited: false,
@@ -1549,6 +1560,11 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                         && self.handle_prompt_completion(completion)
                     {
                         self.refresh_footer().await;
+                    }
+                }
+                () = tokio::time::sleep(SPINNER_TICK), if self.view.status.is_some() => {
+                    if self.tick_status_indicator() {
+                        self.arm_coalescer();
                     }
                 }
                 () = tokio::time::sleep(coalesce_wait) => {
@@ -2352,6 +2368,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         self.set_status(SessionStatus {
             kind: StatusKind::Working,
             frame: 0,
+            elapsed_secs: 0,
             message: "Aborting…".to_owned(),
         });
         self.record_err(self.session.abort().await);
@@ -2418,6 +2435,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                     self.set_status(SessionStatus {
                         kind: StatusKind::Working,
                         frame: 0,
+                        elapsed_secs: 0,
                         message: "Copied last assistant message".to_owned(),
                     });
                 } else {
@@ -2427,6 +2445,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             Ok(_) => self.set_status(SessionStatus {
                 kind: StatusKind::Working,
                 frame: 0,
+                elapsed_secs: 0,
                 message: "No assistant text to copy".to_owned(),
             }),
             Err(error) => self.last_error = Some(error),
@@ -3219,6 +3238,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                         self.set_status(SessionStatus {
                             kind: StatusKind::Working,
                             frame: 0,
+                            elapsed_secs: 0,
                             message,
                         });
                     }
@@ -3844,7 +3864,38 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     }
 
     fn set_status(&mut self, status: SessionStatus) {
+        // A phase change restarts the spinner clock so the new status counts
+        // up from 0s instead of inheriting the previous phase's elapsed time.
+        let kind_changed = self
+            .view
+            .status
+            .as_ref()
+            .is_none_or(|current| current.kind != status.kind);
+        if kind_changed {
+            self.spinner_started = None;
+            self.spinner_frame = 0;
+        }
         self.view.status = Some(status);
+    }
+
+    /// Advance the status spinner one frame and refresh its elapsed-seconds
+    /// counter. Called on every [`SPINNER_TICK`] while a status is visible.
+    /// Returns `false` when nothing changed, so the caller can skip scheduling
+    /// a repaint for idle sub-second ticks.
+    fn tick_status_indicator(&mut self) -> bool {
+        let Some(status) = self.view.status.as_mut() else {
+            return false;
+        };
+        let started = *self.spinner_started.get_or_insert_with(tokio::time::Instant::now);
+        let elapsed_secs = started.elapsed().as_secs();
+        self.spinner_frame =
+            (self.spinner_frame + 1) % pi_tui::components::DEFAULT_LOADER_FRAMES.len();
+        if status.frame == self.spinner_frame && status.elapsed_secs == elapsed_secs {
+            return false;
+        }
+        status.frame = self.spinner_frame;
+        status.elapsed_secs = elapsed_secs;
+        true
     }
 
     /// Record an async session-action error into `last_error` so the UI can
@@ -4038,6 +4089,7 @@ fn working_start_status(view: &ViewState) -> Option<SessionStatus> {
     Some(SessionStatus {
         kind: StatusKind::Working,
         frame: 0,
+        elapsed_secs: 0,
         message: view
             .working_message
             .clone()
@@ -4059,16 +4111,19 @@ fn project_snapshot(
         SessionActivity::Compacting => Some(SessionStatus {
             kind: StatusKind::Compaction,
             frame: 0,
+            elapsed_secs: 0,
             message: "Compacting…".to_owned(),
         }),
         SessionActivity::Retrying => Some(SessionStatus {
             kind: StatusKind::Retry,
             frame: 0,
+            elapsed_secs: 0,
             message: "Retrying…".to_owned(),
         }),
         SessionActivity::Summarizing => Some(SessionStatus {
             kind: StatusKind::BranchSummary,
             frame: 0,
+            elapsed_secs: 0,
             message: "Summarizing…".to_owned(),
         }),
         SessionActivity::Idle => None,
@@ -4216,6 +4271,7 @@ fn project_event(view: &mut ViewState, event: &AgentSessionEvent) {
             view.status = Some(SessionStatus {
                 kind: StatusKind::Retry,
                 frame: 0,
+                elapsed_secs: 0,
                 message: format!(
                     "Retrying ({}/{}) in {}s",
                     attempt,
@@ -4348,6 +4404,7 @@ fn project_compaction_start(
     view.status = Some(SessionStatus {
         kind: StatusKind::Compaction,
         frame: 0,
+        elapsed_secs: 0,
         message: message.to_owned(),
     });
 }
@@ -7675,6 +7732,36 @@ mod tests {
         Ok(())
     }
 
+    /// The paused-clock counterpart to the frozen-spinner regression: with a
+    /// status visible, each [`SPINNER_TICK`] must advance `view.status.frame`,
+    /// and a full second of ticks must surface in `elapsed_secs`.
+    #[tokio::test(start_paused = true)]
+    async fn spinner_tick_advances_status_frame() -> Result<(), String> {
+        let (mut rt, _log) = try_make_runtime()?;
+        rt.view.status = Some(SessionStatus {
+            kind: StatusKind::Working,
+            frame: 0,
+            elapsed_secs: 0,
+            message: "Working…".to_owned(),
+        });
+        let frames = pi_tui::components::DEFAULT_LOADER_FRAMES.len();
+        for expected in 1..=2_usize {
+            tokio::time::advance(SPINNER_TICK).await;
+            assert!(rt.tick_status_indicator(), "tick {expected} reported no change");
+            let status = rt.view.status.as_ref().ok_or("status vanished")?;
+            assert_eq!(status.frame, expected % frames);
+        }
+        // 13 more ticks cross the 1-second boundary (15 × 80 ms = 1.2 s).
+        for _ in 0..13 {
+            tokio::time::advance(SPINNER_TICK).await;
+            rt.tick_status_indicator();
+        }
+        let status = rt.view.status.as_ref().ok_or("status vanished")?;
+        assert_eq!(status.elapsed_secs, 1);
+        assert_eq!(status.frame, 15 % frames);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn plain_enter_submits_via_on_submit_channel() -> Result<(), String> {
         let (mut rt, log) = try_make_runtime()?;
@@ -9158,6 +9245,7 @@ mod tests {
         rt.view.status = Some(SessionStatus {
             kind: StatusKind::Working,
             frame: 0,
+            elapsed_secs: 0,
             message: "Working…".to_owned(),
         });
         rt.handle_extension_ui_control(UiControl::SetWorkingVisible { visible: false })
