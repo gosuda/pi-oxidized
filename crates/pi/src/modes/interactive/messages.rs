@@ -339,7 +339,8 @@ pub fn build_user(
 
 /// Build the component stack for a tool execution block.
 ///
-/// Looks up `renderers` for the tool name; falls back to a JSON dump header.
+/// Looks up `renderers` for the tool name; unknown tools fall back to a
+/// one-line name + args summary header.
 /// Call/result renderers return pre-styled lines, wrapped here in `Text`.
 #[must_use]
 pub fn build_tool(
@@ -355,7 +356,7 @@ pub fn build_tool(
         ToolPhase::Error => ("┃", ThemeColor::Error),
     };
     let mut column = ColumnStack::new();
-    // Call header (renderer or JSON fallback).
+    // Call header (renderer or one-line summary fallback).
     let header_lines: Vec<String> = if let Some(renderer) = renderers.get(&view.renderer) {
         renderer
             .render_call_lines(&view.state.call, view.state.expanded)
@@ -365,8 +366,8 @@ pub fn build_tool(
             ThemeColor::ToolTitle,
             &format!("▶ {}", view.state.call.name),
         );
-        let args = serde_json::to_string_pretty(&view.state.call.raw_args).unwrap_or_default();
-        vec![title, theme.fg(ThemeColor::ToolOutput, &args)]
+        let args = theme.fg(ThemeColor::ToolOutput, &view.state.call.args_summary);
+        vec![title, args]
     };
     if !header_lines.is_empty() {
         column.push(Box::new(Text::with_padding(header_lines.join("\n"), 0, 0)));

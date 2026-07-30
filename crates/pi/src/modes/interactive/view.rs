@@ -143,8 +143,7 @@ fn compose_inner(state: &ViewState) -> ComposedView {
 
 /// Build the chat container from all message view-models.
 fn build_chat(state: &ViewState, md_theme: &MarkdownTheme) -> Box<dyn Component> {
-    let renderers: BTreeMap<String, Box<dyn super::tool_renderer::CustomToolRenderer>> =
-        BTreeMap::new();
+    let renderers = super::tool_renderers::builtin_tool_renderers();
     let mut stack = messages::ColumnStack::new();
     for msg in &state.messages {
         let comps = build_message(msg, &renderers, md_theme, &state.theme);
@@ -153,13 +152,21 @@ fn build_chat(state: &ViewState, md_theme: &MarkdownTheme) -> Box<dyn Component>
         }
     }
     if state.messages.is_empty() && !state.streaming {
-        // Empty-state hint.
+        // Empty-state hint: discoverability beats a bare sentence (C7).
         stack.push(Box::new(Text::with_padding(
             state.theme.fg(
                 super::theme::ThemeColor::Dim,
-                "No messages yet. Type below to begin.",
+                "Type a message, or / for commands.",
             ),
-            1,
+            messages::CONTENT_INDENT,
+            0,
+        )));
+        stack.push(Box::new(Text::with_padding(
+            state.theme.fg(
+                super::theme::ThemeColor::Dim,
+                "? shortcuts · ctrl+o expand tools · shift+tab thinking",
+            ),
+            messages::CONTENT_INDENT,
             0,
         )));
     }

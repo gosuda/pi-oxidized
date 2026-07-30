@@ -496,6 +496,45 @@ fn tool_message_renders_call_and_result() {
     );
 }
 
+#[test]
+fn tool_signature_not_json_for_builtin_tools() {
+    use crate::modes::interactive::messages::ToolMessageView;
+    use crate::modes::interactive::tool_renderer::{
+        ToolCallView, ToolPhase, ToolResultView, ToolState,
+    };
+    let mut state = base_state();
+    state.messages.push(StateMessageView::Tool(ToolMessageView {
+        renderer: "edit".to_owned(),
+        state: ToolState {
+            call: ToolCallView {
+                name: "edit".to_owned(),
+                id: "call_1".to_owned(),
+                args_summary: "path: src/main.rs".to_owned(),
+                raw_args: serde_json::json!({"path": "src/main.rs", "old": "a", "new": "b"}),
+            },
+            result: Some(ToolResultView {
+                text: "Successfully replaced 1 block(s) in src/main.rs.".to_owned(),
+                truncated: false,
+                full_output_path: None,
+                images: Vec::new(),
+                error: None,
+            }),
+            expanded: false,
+            phase: ToolPhase::Success,
+        },
+    }));
+    let buf = render_view(&state, 80, 30);
+    let plain = snapshot_buffer_plain(&buf, 80, 30).join("\n");
+    assert!(
+        plain.contains("edit src/main.rs"),
+        "built-in renderer must print a typed signature: {plain}"
+    );
+    assert!(
+        !plain.contains("\"path\":"),
+        "raw JSON args must not appear: {plain}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Focus / overlay / selector
 // ---------------------------------------------------------------------------
