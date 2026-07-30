@@ -91,12 +91,28 @@ fn arg_u64(call: &ToolCallView, key: &str) -> Option<u64> {
     call.raw_args.get(key).and_then(Value::as_u64)
 }
 
+/// Collapse newlines and other control characters in `s` to single spaces.
+///
+/// Tails are tool-supplied argument text (paths, patterns). An embedded `\n`
+/// or `\r` would otherwise forge extra terminal rows and break the one-line
+/// signature contract every header promises; tab is preserved (it never starts
+/// a new row). The result is always a single physical line.
+fn sanitize_single_line(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() && c != '\t' { ' ' } else { c })
+        .collect()
+}
+
 /// Verb (`ToolTitle`) + optional argument tail (`ToolOutput`) as one header line.
+///
+/// The tail is sanitized here — the single chokepoint every renderer flows
+/// through — so no tool argument can forge extra rows.
 fn header_line(verb: &str, tail: Option<String>) -> Vec<String> {
     let theme = theme::current();
     let mut line = theme.fg(ThemeColor::ToolTitle, verb);
     if let Some(tail) = tail {
-        line.push_str(&theme.fg(ThemeColor::ToolOutput, &format!(" {tail}")));
+        let safe = sanitize_single_line(&tail);
+        line.push_str(&theme.fg(ThemeColor::ToolOutput, &format!(" {safe}")));
     }
     vec![line]
 }
@@ -105,15 +121,24 @@ fn header_line(verb: &str, tail: Option<String>) -> Vec<String> {
 // Per-tool renderers
 // ---------------------------------------------------------------------------
 
-/// `read {path}` and, when both `offset` and `limit` are numbers,
-/// `read {path}:{offset}-{offset+limit}`.
+/// `read {path}`, and — when `offset` and `limit` are both numbers with a
+/// non-zero `limit` — `read {path}:{offset}-{offset+limit-1}` (inclusive end,
+/// computed with saturating arithmetic so oversized args never panic).
 struct ReadRenderer;
 
 impl CustomToolRenderer for ReadRenderer {
     fn render_call_lines(&self, call: &ToolCallView, _expanded: bool) -> Option<Vec<String>> {
         let tail = arg_str(call, "path").map(|path| {
+            // `offset + limit` is the exclusive end; the signature shows the
+            // inclusive last line, `offset + limit - 1`. A zero-line read
+            // (limit 0) has no meaningful end, so it falls back to path-only.
+            // Saturating arithmetic keeps adversarial oversized args from
+            // panicking in debug builds (CodeRabbit overflow finding).
             match (arg_u64(call, "offset"), arg_u64(call, "limit")) {
-                (Some(offset), Some(limit)) => format!("{path}:{offset}-{}", offset + limit),
+                (Some(offset), Some(limit)) if limit >= 1 => {
+                    let end = offset.saturating_add(limit).saturating_sub(1);
+                    format!("{path}:{offset}-{end}")
+                }
                 _ => path.to_owned(),
             }
         });
@@ -241,5 +266,113 @@ fn search_tail(call: &ToolCallView) -> Option<String> {
     match arg_str(call, "path") {
         Some(path) if !path.is_empty() => Some(format!("{pattern} in {path}")),
         _ => Some(pattern.to_owned()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ReadRenderer, header_line, sanitize_single_line};
+    use crate::modes::interactive::tool_renderer::{CustomToolRenderer, ToolCallView, line_plain};
+    use serde_json::{Map, Value, json};
+
+    /// Build a `read` call view with optional `offset`/`limit`.
+    fn read_call(path: &str, offset: Option<u64>, limit: Option<u64>) -> ToolCallView {
+        let mut raw = Map::new();
+        raw.insert("path".to_owned(), json!(path));
+        if let Some(o) = offset {
+            raw.insert("offset".to_owned(), json!(o));
+        }
+        if let Some(l) = limit {
+            raw.insert("limit".to_owned(), json!(l));
+        }
+        ToolCallView {
+            name: "read".to_owned(),
+            id: "call_1".to_owned(),
+            args_summary: String::new(),
+            raw_args: Value::Object(raw),
+        }
+    }
+
+    // --- Item 1: inclusive read range -------------------------------------
+
+    #[test]
+    fn read_range_uses_inclusive_end() -> Result<(), String> {
+        // offset=5, limit=3 reads lines 5, 6, 7 -> signature `x.rs:5-7`,
+        // not the off-by-one `x.rs:5-8`.
+        let call = read_call("x.rs", Some(5), Some(3));
+        let lines = ReadRenderer
+            .render_call_lines(&call, false)
+            .ok_or("read always renders")?;
+        assert_eq!(lines.len(), 1);
+        let plain = line_plain(&lines[0]);
+        assert!(
+            plain.contains("read x.rs:5-7"),
+            "inclusive end (offset+limit-1) expected, got: {plain:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn read_range_zero_limit_falls_back_to_path_only() -> Result<(), String> {
+        // A zero-line read has no meaningful range; show just the path.
+        let call = read_call("x.rs", Some(5), Some(0));
+        let lines = ReadRenderer
+            .render_call_lines(&call, false)
+            .ok_or("read always renders")?;
+        let plain = line_plain(&lines[0]);
+        assert!(
+            plain.contains("read x.rs"),
+            "path-only fallback expected, got: {plain:?}"
+        );
+        assert!(
+            !plain.contains(':'),
+            "a zero-line read must not fabricate a range, got: {plain:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn read_range_oversized_args_do_not_panic() -> Result<(), String> {
+        // Adversarial JSON: offset+limit overflows u64. Saturating math must
+        // keep this panic-free (was a debug-build panic per CodeRabbit).
+        let call = read_call("big.rs", Some(u64::MAX), Some(u64::MAX));
+        let lines = ReadRenderer
+            .render_call_lines(&call, false)
+            .ok_or("read always renders")?;
+        assert_eq!(lines.len(), 1);
+        assert!(
+            line_plain(&lines[0]).contains("big.rs"),
+            "path still rendered under saturating end"
+        );
+        Ok(())
+    }
+
+    // --- Item 2: newline-forged rows --------------------------------------
+
+    #[test]
+    fn header_collapses_newline_in_tail_to_one_line() {
+        // A tool path carrying `\n` must render as one line with the newline
+        // turned into a space, never as two forged terminal rows.
+        let lines = header_line("read", Some("a\nb".to_owned()));
+        assert_eq!(lines.len(), 1, "tail with newline must stay one line");
+        let raw = &lines[0];
+        assert!(
+            !raw.contains('\n') && !raw.contains('\r'),
+            "no raw newlines may reach the terminal: {raw:?}"
+        );
+        let plain = line_plain(raw);
+        assert!(
+            plain.contains("a b"),
+            "newline collapsed to a space expected, got: {plain:?}"
+        );
+    }
+
+    #[test]
+    fn sanitize_replaces_control_chars_preserves_tab() {
+        assert_eq!(sanitize_single_line("a\nb"), "a b");
+        assert_eq!(sanitize_single_line("a\rb"), "a b");
+        assert_eq!(sanitize_single_line("a\x00b"), "a b");
+        // Tab never starts a new row, so it is preserved verbatim.
+        assert_eq!(sanitize_single_line("a\tb"), "a\tb");
     }
 }

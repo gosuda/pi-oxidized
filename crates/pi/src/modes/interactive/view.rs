@@ -201,6 +201,20 @@ fn build_status_section(state: &ViewState) -> Box<dyn Component> {
     }
 }
 
+/// Choose the prompt marker glyph and theme color for `text`.
+///
+/// WHY: the live editor render path (`InteractiveRoot::render`) and the
+/// pure-view [`build_editor_section`] must show the same `❯ `/`$ ` prefix;
+/// centralizing the choice keeps both paths in sync when the bash-mode rule
+/// changes. Returns the 2-column glyph and the slot the caller colors it with.
+pub(super) fn editor_prompt_marker(text: &str) -> (&'static str, super::theme::ThemeColor) {
+    if text.starts_with('!') {
+        ("$ ", super::theme::ThemeColor::BashMode)
+    } else {
+        ("❯ ", super::theme::ThemeColor::Accent)
+    }
+}
+
 /// Build the editor area (input, or a selector replacing it, or a progress block).
 fn build_editor_section(state: &ViewState) -> Box<dyn Component> {
     // Progress overlays (compaction/retry/auth/bash) replace the editor.
@@ -217,15 +231,15 @@ fn build_editor_section(state: &ViewState) -> Box<dyn Component> {
     } else {
         editor.text.clone()
     };
-    let marker = if editor.text.starts_with('!') {
-        state.theme.fg(super::theme::ThemeColor::BashMode, "$ ")
-    } else {
-        state.theme.fg(super::theme::ThemeColor::Accent, "❯ ")
-    };
+    let (marker_glyph, marker_color) = editor_prompt_marker(&editor.text);
+    let marker = state.theme.fg(marker_color, marker_glyph);
     let paste_marker = editor.paste_marker.as_deref().unwrap_or("");
+    // padding_x 0 places the marker glyph at column 0 (so the `❯ `/`$ ` pair
+    // occupies columns 0-1) and the text at column 2, matching the live editor
+    // render path's shifted Rect (D3 shared left edge).
     Box::new(Text::with_padding(
         format!("{marker}{display}{paste_marker}"),
-        1,
+        0,
         0,
     ))
 }

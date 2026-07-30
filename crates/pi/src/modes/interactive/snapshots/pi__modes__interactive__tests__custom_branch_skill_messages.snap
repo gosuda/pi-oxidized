@@ -21,7 +21,7 @@ expression: triple_plain(&state)
 │ Invoked commit    
 │ skill             
                     
- ❯ Type a message…  
+❯ Type a message…   
 ~/projects/pi (main)
 • refactor          
 1.2k in · 567 out · 
@@ -76,7 +76,7 @@ medium
 │ [skill:commit]                                                                
 │ Invoked commit skill                                                          
                                                                                 
- ❯ Type a message…                                                              
+❯ Type a message…                                                               
 ~/projects/pi (main) • refactor                                                 
 1.2k in · 567 out · $0.012 · 42% of 200k (auto)           claude-sonnet • medium
                                                                                 
@@ -138,6 +138,6 @@ medium
 │ [skill:commit]                                                                                                                                                
 │ Invoked commit skill                                                                                                                                          
                                                                                                                                                                 
- ❯ Type a message…                                                                                                                                              
+❯ Type a message…                                                                                                                                               
 ~/projects/pi (main) • refactor                                                                                                                                 
 1.2k in · 567 out · $0.012 · 42% of 200k (auto)           claude-sonnet • medium

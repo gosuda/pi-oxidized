@@ -18,7 +18,7 @@ expression: triple_plain(&state)
   ⠋ Compacting      
   context… · esc    
   to cancel         
- ❯ Type a message…  
+❯ Type a message…   
 ~/projects/pi (main)
 • refactor          
 1.2k in · 567 out · 
@@ -71,7 +71,7 @@ medium
 │ Earlier discussion covered the theme system and footer layout.                
                                                                                 
   ⠋ Compacting context… · esc to cancel                                         
- ❯ Type a message…                                                              
+❯ Type a message…                                                               
 ~/projects/pi (main) • refactor                                                 
 1.2k in · 567 out · $0.012 · 42% of 200k (auto)           claude-sonnet • medium
                                                                                 
@@ -133,6 +133,6 @@ medium
 │ Earlier discussion covered the theme system and footer layout.                                                                                                
                                                                                                                                                                 
   ⠋ Compacting context… · esc to cancel                                                                                                                         
- ❯ Type a message…                                                                                                                                              
+❯ Type a message…                                                                                                                                               
 ~/projects/pi (main) • refactor                                                                                                                                 
 1.2k in · 567 out · $0.012 · 42% of 200k (auto)           claude-sonnet • medium

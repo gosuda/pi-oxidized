@@ -776,6 +776,31 @@ impl InteractiveRoot {
     fn editor_mut(&mut self) -> &mut Editor {
         &mut self.editor
     }
+
+    /// Render the live editor with its prompt marker visible.
+    ///
+    /// WHY: `build_with_chat` drops the composed editor section and renders the
+    /// live `Editor` in its place, so the `❯ `/`$ ` marker built by the pure
+    /// view never reaches interactive users. Painting the marker into the two
+    /// columns to the left of the editor and shifting the editor's Rect right
+    /// by 2 makes the marker visible and lands the editor's left edge at column
+    /// 2 (D3 shared left edge). The editor computes its cursor position
+    /// relative to the Rect it renders into, so the shift keeps cursor math
+    /// correct; only the first editor row carries the marker glyph.
+    fn render_editor_with_marker(&mut self, area: Rect, buf: &mut Buffer) {
+        let (glyph, color) = {
+            let text = self.editor.get_text();
+            super::view::editor_prompt_marker(&text)
+        };
+        if area.width >= 2 {
+            let colored = super::theme::current().fg(color, glyph);
+            pi_tui::components::util::paint_line(area.x, area.y, 2, buf, &colored);
+            let shifted = Rect::new(area.x + 2, area.y, area.width - 2, area.height);
+            self.editor.render(shifted, buf);
+        } else {
+            self.editor.render(area, buf);
+        }
+    }
 }
 
 fn visible_suffix(heights: &[u16], available: u16) -> (usize, u16) {
@@ -922,7 +947,7 @@ impl Component for InteractiveRoot {
                         selector.render(body_area, buf);
                     }
                 } else {
-                    self.editor.render(body_area, buf);
+                    self.render_editor_with_marker(body_area, buf);
                 }
             }
             y = y.saturating_add(height);
@@ -1029,6 +1054,20 @@ pub struct InteractiveRuntime<W: Write, S: SessionHost> {
     spinner_started: Option<tokio::time::Instant>,
     /// Braille spinner frame counter, advanced every [`SPINNER_TICK`].
     spinner_frame: usize,
+    /// Persisted next-tick deadline for the spinner `select!` arm.
+    ///
+    /// WHY: `tokio::select!` drops the losing future each loop turn, so a
+    /// fresh `sleep(SPINNER_TICK)` recreated every turn can be starved by
+    /// busier arms and never fire. Storing the deadline keeps it alive across
+    /// turns so the spinner ticks at a steady cadence.
+    spinner_deadline: Option<tokio::time::Instant>,
+    /// Kind the current spinner clock belongs to; `None` while no status.
+    ///
+    /// WHY: `set_status` was the only reset point and is easily bypassed (the
+    /// host replaces `view.status` directly), so the elapsed clock could
+    /// leak across unrelated status kinds. `tick_status_indicator` reads this
+    /// to reset the clock on any kind change as the single, unbypassable point.
+    spinner_kind: Option<StatusKind>,
     /// Cause for re-anchoring the next paint (full rows, no cell diff);
     /// set when an extension overlay opens over unrelated content so its
     /// first frame cannot be fragmented by the diff.
@@ -1278,6 +1317,8 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             spinner_started: None,
             pending_reanchor: None,
             spinner_frame: 0,
+            spinner_deadline: None,
+            spinner_kind: None,
             pending_settle: None,
             shutdown: Arc::new(Notify::new()),
             exited: false,
@@ -1479,6 +1520,9 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     /// # Errors
     ///
     /// Returns [`io::Error`] only when a terminal write fails irrecoverably.
+    // A flat `select!` event loop: one arm per event source. Splitting arms
+    // into methods would hide the loop's shape without removing any behaviour.
+    #[allow(clippy::too_many_lines)]
     pub async fn run(&mut self) -> io::Result<InteractiveExit> {
         if !self.initialize_run().await {
             return Ok(self.exit_kind);
@@ -1503,6 +1547,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             }
 
             let coalesce_wait = self.coalesce_wait(Instant::now());
+            let (spinner_active, spinner_deadline) = self.arm_spinner_deadline();
 
             tokio::select! {
                 biased;
@@ -1564,7 +1609,10 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                         self.refresh_footer().await;
                     }
                 }
-                () = tokio::time::sleep(SPINNER_TICK), if self.view.status.is_some() => {
+                () = tokio::time::sleep_until(spinner_deadline), if spinner_active => {
+                    // Advance from the fired deadline (not `now`) so the cadence
+                    // does not drift under load; the next turn reuses this value.
+                    self.spinner_deadline = Some(spinner_deadline + SPINNER_TICK);
                     if self.tick_status_indicator() {
                         self.arm_coalescer();
                     }
@@ -1596,6 +1644,24 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             .map_or(Duration::from_hours(1), |deadline| {
                 deadline.saturating_duration_since(now)
             })
+    }
+
+    /// Persist the spinner tick deadline across loop turns. `select!` drops
+    /// the losing future each turn, so a fresh `sleep(SPINNER_TICK)` recreated
+    /// every turn can be starved by busier arms and never fire; the stored
+    /// deadline (see `spinner_deadline`) keeps it alive. When no status is
+    /// visible the deadline is cleared so a stale value cannot fire after the
+    /// status ends.
+    fn arm_spinner_deadline(&mut self) -> (bool, tokio::time::Instant) {
+        if self.view.status.is_some() {
+            let deadline = *self
+                .spinner_deadline
+                .get_or_insert_with(|| tokio::time::Instant::now() + SPINNER_TICK);
+            (true, deadline)
+        } else {
+            self.spinner_deadline = None;
+            (false, tokio::time::Instant::now())
+        }
     }
 
     /// Per-turn epilogue: flush a pending theme push (previews/restores mark
@@ -3607,10 +3673,19 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     }
 
     fn project_extension_slot(&mut self, slot: SanitizedSlot) {
-        let overlay_was_open = self
-            .extension_slots
-            .get(&slot.key)
-            .is_some_and(|existing| existing.placement == SlotPlacement::Overlay);
+        // Compute whether the previous frame already showed this exact overlay
+        // BEFORE dispose wipes `view.extension_overlay_slot`. A republish with
+        // a different height/anchor/width reshapes the overlay over rows whose
+        // previous content is unrelated, so it must re-anchor just like an open.
+        let same_geometry = self
+            .view
+            .extension_overlay_slot
+            .as_ref()
+            .is_some_and(|prev| {
+                prev.key == slot.key
+                    && prev.height == slot.height
+                    && prev.overlay_options == slot.overlay_options
+            });
         self.dispose_extension_slot(&slot.key);
         let non_capturing = slot
             .overlay_options
@@ -3642,9 +3717,10 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                     lines: Vec::new(),
                 });
                 self.view.extension_overlay_slot = Some(slot.clone());
-                if !overlay_was_open {
-                    // Only the open transition diffs against unrelated rows;
-                    // updates diff against the overlay's own previous frame.
+                if !same_geometry {
+                    // An open OR a reshape covers rows whose previous content
+                    // is unrelated; re-anchor so the first frame is not
+                    // fragmented by the cell diff (codex PRRT …VM-tM).
                     self.pending_reanchor = Some(ReanchorCause::OverlayOpen);
                 }
             }
@@ -3883,17 +3959,10 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     }
 
     fn set_status(&mut self, status: SessionStatus) {
-        // A phase change restarts the spinner clock so the new status counts
-        // up from 0s instead of inheriting the previous phase's elapsed time.
-        let kind_changed = self
-            .view
-            .status
-            .as_ref()
-            .is_none_or(|current| current.kind != status.kind);
-        if kind_changed {
-            self.spinner_started = None;
-            self.spinner_frame = 0;
-        }
+        // Only assign here. The spinner clock restart on a kind change lives in
+        // `tick_status_indicator` — the single point every status transition
+        // funnels through, including direct `view.status` replacements that
+        // bypass this method (CodeRabbit PRRT …VMIm).
         self.view.status = Some(status);
     }
 
@@ -3903,8 +3972,19 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     /// a repaint for idle sub-second ticks.
     fn tick_status_indicator(&mut self) -> bool {
         let Some(status) = self.view.status.as_mut() else {
+            // No status: drop the clock so the next status starts fresh.
+            self.spinner_kind = None;
             return false;
         };
+        // Reset the elapsed clock + frame whenever the status kind changes.
+        // WHY: `set_status` is easily bypassed (the host writes `view.status`
+        // directly), so this is the unbypassable point that guarantees a new
+        // kind counts up from 0s instead of inheriting a prior phase's time.
+        if self.spinner_kind != Some(status.kind) {
+            self.spinner_started = None;
+            self.spinner_frame = 0;
+            self.spinner_kind = Some(status.kind);
+        }
         let started = *self
             .spinner_started
             .get_or_insert_with(tokio::time::Instant::now);
@@ -4034,6 +4114,10 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         let saved_editor = std::mem::replace(&mut self.editor, Editor::with_defaults());
         let saved_selector = self.active_selector.take();
         let mut root = self.build_root(saved_editor, saved_selector);
+        // A resize reanchor already repaints full rows, so a queued overlay-open
+        // reanchor is subsumed — drop it or the next normal frame does an extra,
+        // unrelated full-row reanchor (CodeRabbit review body).
+        self.pending_reanchor = None;
         let result = self
             .tui
             .commit(Txn::Reanchor(ReanchorCause::Resize), &mut root);
@@ -4863,13 +4947,25 @@ fn tool_result_view(
     result: &pi_agent::AgentToolResult,
     is_error: bool,
 ) -> super::tool_renderer::ToolResultView {
+    // The Edit tool stores the numbered diff in `details["diff"]` while
+    // `content` carries only the "Successfully replaced …" sentence. The diff
+    // is display-oriented and strictly more informative, so prefer it when
+    // present; EditRenderer routes this text through `diff_lines`, whose
+    // leading-marker colourization recognizes the numbered `+`/`-` lines.
     let mut text = String::new();
-    for content in &result.content {
-        if let pi_ai::ToolResultContent::Text(t) = content {
-            if !text.is_empty() {
-                text.push('\n');
+    if let Some(diff) = result.details.get("diff").and_then(|v| v.as_str())
+        && !diff.is_empty()
+    {
+        text.push_str(diff);
+    }
+    if text.is_empty() {
+        for content in &result.content {
+            if let pi_ai::ToolResultContent::Text(t) = content {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(&t.text);
             }
-            text.push_str(&t.text);
         }
     }
     super::tool_renderer::ToolResultView {
@@ -7790,6 +7886,81 @@ mod tests {
         Ok(())
     }
 
+    /// T2: the persisted spinner deadline advances by exactly one
+    /// [`SPINNER_TICK`] per tick, so a `select!` arm that recreates its sleep
+    /// every turn cannot starve the cadence. (Select starvation itself is not
+    /// unit-testable; this harness pins the deadline-advance invariant the
+    /// fix relies on — see `spinner_deadline`.)
+    #[tokio::test(start_paused = true)]
+    async fn spinner_deadline_advances_one_tick_per_frame() -> Result<(), String> {
+        let (mut rt, _log) = try_make_runtime()?;
+        rt.view.status = Some(SessionStatus {
+            kind: StatusKind::Working,
+            frame: 0,
+            elapsed_secs: 0,
+            message: "Working…".to_owned(),
+        });
+        // Seed the deadline the way the run loop does, then simulate ticks.
+        rt.spinner_deadline = Some(tokio::time::Instant::now() + SPINNER_TICK);
+        let mut expected = rt.spinner_deadline.ok_or("deadline seeded")?;
+        for tick in 1..=2_usize {
+            tokio::time::advance(SPINNER_TICK).await;
+            // Mirrors the run-loop arm body: advance from the fired deadline.
+            let fired = rt
+                .spinner_deadline
+                .ok_or("deadline persists across turns")?;
+            rt.spinner_deadline = Some(fired + SPINNER_TICK);
+            assert!(
+                rt.tick_status_indicator(),
+                "tick {tick} should report a change"
+            );
+            expected += SPINNER_TICK;
+            assert_eq!(rt.spinner_deadline, Some(expected));
+        }
+        Ok(())
+    }
+
+    /// T3+T6: replacing `view.status` with a different kind resets the spinner
+    /// clock inside `tick_status_indicator` (the single, unbypassable point),
+    /// so a new phase counts up from 0s even when `set_status` is bypassed.
+    #[tokio::test(start_paused = true)]
+    async fn spinner_clock_resets_on_kind_change_in_tick() -> Result<(), String> {
+        let (mut rt, _log) = try_make_runtime()?;
+        rt.view.status = Some(SessionStatus {
+            kind: StatusKind::Working,
+            frame: 0,
+            elapsed_secs: 0,
+            message: "Working…".to_owned(),
+        });
+        // Run the Working clock past the 1-second boundary (15 × 80 ms).
+        for _ in 0..15 {
+            tokio::time::advance(SPINNER_TICK).await;
+            rt.tick_status_indicator();
+        }
+        let working = rt.view.status.as_ref().ok_or("status vanished")?;
+        assert_eq!(working.elapsed_secs, 1, "Working clock should reach 1s");
+
+        // Host bypasses `set_status` and writes a different kind directly.
+        rt.view.status = Some(SessionStatus {
+            kind: StatusKind::Retry,
+            frame: 9,
+            elapsed_secs: 5,
+            message: "Retrying…".to_owned(),
+        });
+        tokio::time::advance(SPINNER_TICK).await;
+        assert!(
+            rt.tick_status_indicator(),
+            "tick after kind change should report a change"
+        );
+        let status = rt.view.status.as_ref().ok_or("status vanished")?;
+        assert_eq!(
+            status.elapsed_secs, 0,
+            "clock must restart for the new kind"
+        );
+        assert_eq!(status.frame, 1, "frame must restart at 1 for the new kind");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn plain_enter_submits_via_on_submit_channel() -> Result<(), String> {
         let (mut rt, log) = try_make_runtime()?;
@@ -8080,6 +8251,102 @@ mod tests {
             .ok_or_else(|| "structured overlay was not projected".to_owned())?;
         assert_eq!(projected.lines[0][0].style.link.as_ref(), Some(&link));
         Ok(())
+    }
+
+    /// T7: republishing the same overlay key with a different geometry
+    /// re-anchors (its reshaped rows cover unrelated previous content), while
+    /// an identical-geometry republish does not (codex PRRT …VM-tM).
+    #[test]
+    fn overlay_reshape_republish_reanchors() {
+        let (mut rt, _log) = make_runtime();
+        let overlay = |height: u16, options: Option<pi_ext::protocol::OverlaySpec>| {
+            // `sanitize_slot` derives the slot height from the run-line count,
+            // so emit one run line per requested row.
+            let runs = (0..height)
+                .map(|_| {
+                    vec![pi_ext::protocol::StyledRun {
+                        text: "term".to_owned(),
+                        style: pi_ext::protocol::Style::default(),
+                    }]
+                })
+                .collect::<Vec<_>>();
+            pi_ext::sanitize::sanitize_slot(&pi_ext::protocol::UiSlot {
+                key: "overlay.term".to_owned(),
+                generation: 1,
+                placement: SlotPlacement::Overlay,
+                height,
+                runs,
+                focusable: false,
+                cursor: None,
+                overlay_options: options,
+            })
+        };
+        rt.project_extension_slot(overlay(3, None));
+        assert_eq!(
+            rt.pending_reanchor,
+            Some(ReanchorCause::OverlayOpen),
+            "overlay open must queue a reanchor"
+        );
+        rt.pending_reanchor = None;
+
+        // Same key, identical geometry: no reanchor.
+        rt.project_extension_slot(overlay(3, None));
+        assert_eq!(
+            rt.pending_reanchor, None,
+            "identical-geometry republish must not reanchor"
+        );
+
+        // Same key, different height: reanchor (reshape over unrelated rows).
+        rt.project_extension_slot(overlay(5, None));
+        assert_eq!(
+            rt.pending_reanchor,
+            Some(ReanchorCause::OverlayOpen),
+            "reshaped overlay must reanchor"
+        );
+    }
+
+    /// B1: a resize reanchor (`commit_reanchor`) subsumes any queued
+    /// overlay-open reanchor, so the next normal frame does not do an extra,
+    /// unrelated full-row reanchor.
+    #[test]
+    fn commit_reanchor_clears_stale_pending_reanchor() -> TestResult {
+        let (mut rt, _log) = make_runtime();
+        rt.pending_reanchor = Some(ReanchorCause::OverlayOpen);
+        rt.commit_reanchor()
+            .map_err(|e| format!("commit_reanchor failed: {e}"))?;
+        assert_eq!(
+            rt.pending_reanchor, None,
+            "resize reanchor must subsume the queued overlay reanchor"
+        );
+        Ok(())
+    }
+
+    /// T4: when an edit result carries the numbered diff in
+    /// `details["diff"]`, that diff becomes the rendered text (it is strictly
+    /// more informative than the "Successfully replaced …" sentence in
+    /// `content`). Falls back to `content` when no diff detail exists.
+    #[test]
+    fn tool_result_view_prefers_diff_detail() {
+        let with_diff = pi_agent::AgentToolResult {
+            content: vec![pi_ai::ToolResultContent::Text(TextContent::new(
+                "Successfully replaced 2 lines",
+            ))],
+            details: serde_json::json!({ "diff": "+1 added\n-2 removed\n 3 ctx" }),
+            ..Default::default()
+        };
+        let view = tool_result_view(&with_diff, false);
+        assert_eq!(view.text, "+1 added\n-2 removed\n 3 ctx");
+
+        // No diff detail: fall back to the content sentence.
+        let without_diff = pi_agent::AgentToolResult {
+            content: vec![pi_ai::ToolResultContent::Text(TextContent::new(
+                "Successfully replaced 2 lines",
+            ))],
+            details: serde_json::json!({}),
+            ..Default::default()
+        };
+        let view = tool_result_view(&without_diff, false);
+        assert_eq!(view.text, "Successfully replaced 2 lines");
     }
 
     #[tokio::test]
@@ -8414,6 +8681,45 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
         assert!(visible.contains("EDITOR_VISIBLE"));
+    }
+
+    /// T1: the live editor render path must paint the prompt marker — the
+    /// regression was that `build_with_chat` dropped the composed editor
+    /// section so interactive users never saw `❯`/`$`. Empty/normal input
+    /// shows `❯`; bash-mode input (`!`-prefixed) shows `$`.
+    #[test]
+    fn live_editor_renders_prompt_marker() {
+        let view = ViewState::empty();
+        let editor = Editor::with_defaults();
+        let mut root = InteractiveRoot::build(&view, editor, None);
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buffer = Buffer::empty(area);
+        root.render(area, &mut buffer);
+        let visible = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(
+            visible.contains('❯'),
+            "live editor must paint the ❯ marker: {visible}"
+        );
+
+        // Bash-mode input flips the marker to `$`.
+        let mut bash_editor = Editor::with_defaults();
+        bash_editor.set_text("!ls");
+        let mut bash_root = InteractiveRoot::build(&view, bash_editor, None);
+        let mut bash_buffer = Buffer::empty(area);
+        bash_root.render(area, &mut bash_buffer);
+        let bash_visible = bash_buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(
+            bash_visible.contains('$'),
+            "bash-mode live editor must paint the $ marker: {bash_visible}"
+        );
     }
 
     #[tokio::test]

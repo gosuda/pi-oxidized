@@ -14,7 +14,7 @@ expression: triple_plain(&state)
 │     Finished      
 │ release           
                     
- ❯ Type a message…  
+❯ Type a message…   
 ~/projects/pi (main)
 • refactor          
 1.2k in · 567 out · 
@@ -71,7 +71,7 @@ medium
 │    Compiling pi v0.1.0                                                        
 │     Finished release                                                          
                                                                                 
- ❯ Type a message…                                                              
+❯ Type a message…                                                               
 ~/projects/pi (main) • refactor                                                 
 1.2k in · 567 out · $0.012 · 42% of 200k (auto)           claude-sonnet • medium
                                                                                 
@@ -133,6 +133,6 @@ medium
 │    Compiling pi v0.1.0                                                                                                                                        
 │     Finished release                                                                                                                                          
                                                                                                                                                                 
- ❯ Type a message…                                                                                                                                              
+❯ Type a message…                                                                                                                                               
 ~/projects/pi (main) • refactor                                                                                                                                 
 1.2k in · 567 out · $0.012 · 42% of 200k (auto)           claude-sonnet • medium

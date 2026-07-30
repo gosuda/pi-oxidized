@@ -12,7 +12,7 @@ expression: triple_plain(&state)
   Error: provider   
   returned 500      
                     
- ❯ Type a message…  
+❯ Type a message…   
 ~/projects/pi (main)
 • refactor          
 1.2k in · 567 out · 
@@ -70,7 +70,7 @@ medium
   partial response before failure                                               
   Error: provider returned 500                                                  
                                                                                 
- ❯ Type a message…                                                              
+❯ Type a message…                                                               
 ~/projects/pi (main) • refactor                                                 
 1.2k in · 567 out · $0.012 · 42% of 200k (auto)           claude-sonnet • medium
                                                                                 
@@ -132,6 +132,6 @@ medium
   partial response before failure                                                                                                                               
   Error: provider returned 500                                                                                                                                  
                                                                                                                                                                 
- ❯ Type a message…                                                                                                                                              
+❯ Type a message…                                                                                                                                               
 ~/projects/pi (main) • refactor                                                                                                                                 
 1.2k in · 567 out · $0.012 · 42% of 200k (auto)           claude-sonnet • medium

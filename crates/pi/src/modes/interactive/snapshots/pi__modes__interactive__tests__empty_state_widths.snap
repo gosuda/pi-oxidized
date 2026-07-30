@@ -15,7 +15,7 @@ expression: triple_plain(&state)
   shift+tab         
   thinking          
                     
- ❯ Type a message…  
+❯ Type a message…   
 ~/projects/pi (main)
 • refactor          
 1.2k in · 567 out · 
@@ -69,7 +69,7 @@ medium
   Type a message, or / for commands.                                            
   ? shortcuts · ctrl+o expand tools · shift+tab thinking                        
                                                                                 
- ❯ Type a message…                                                              
+❯ Type a message…                                                               
 ~/projects/pi (main) • refactor                                                 
 1.2k in · 567 out · $0.012 · 42% of 200k (auto)           claude-sonnet • medium
                                                                                 
@@ -131,6 +131,6 @@ medium
   Type a message, or / for commands.                                                                                                                            
   ? shortcuts · ctrl+o expand tools · shift+tab thinking                                                                                                        
                                                                                                                                                                 
- ❯ Type a message…                                                                                                                                              
+❯ Type a message…                                                                                                                                               
 ~/projects/pi (main) • refactor                                                                                                                                 
 1.2k in · 567 out · $0.012 · 42% of 200k (auto)           claude-sonnet • medium
