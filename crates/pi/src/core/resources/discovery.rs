@@ -1834,6 +1834,10 @@ fn collect_nonrecursive_entries(dir: &Path, file_pred: impl Fn(&str) -> bool) ->
 }
 
 fn resolve_extension_entries(dir: &Path) -> Option<Vec<String>> {
+    let manifest_file = dir.join("pi-extension.json");
+    if manifest_file.exists() {
+        return Some(vec![path_to_string(dir)]);
+    }
     let package_json = dir.join("package.json");
     if package_json.exists()
         && let Some(manifest) = read_pi_manifest(dir)
@@ -2636,6 +2640,53 @@ mod tests {
         let resolver = PackagePathResolver::new(&cwd, &agent, &manager);
         let path = resolver.npm_install_path("legacy-pkg", SourceScope::User)?;
         assert_eq!(path, global_root.join("legacy-pkg"));
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn collect_auto_extension_recognizes_manifest_directory() -> TestResult {
+        let root = temp_root("ext-manifest")?;
+        let ext = root.join("manifest-ext");
+        fs::create_dir_all(&ext)?;
+        fs::write(
+            ext.join("pi-extension.json"),
+            r#"{"runtime":"native","entry":"entry"}"#,
+        )?;
+        let entries = collect_auto_extension_entries(&root);
+        assert_eq!(entries, vec![path_to_string(&ext)]);
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn collect_auto_extension_keeps_invalid_manifest_for_diagnostics() -> TestResult {
+        let root = temp_root("ext-invalid-manifest")?;
+        let ext = root.join("manifest-ext");
+        fs::create_dir_all(ext.join("pi-extension.json"))?;
+        let entries = collect_auto_extension_entries(&root);
+        assert_eq!(entries, vec![path_to_string(&ext)]);
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn collect_auto_extension_prefers_manifest_to_legacy_entries() -> TestResult {
+        let root = temp_root("ext-manifest-precedence")?;
+        let ext = root.join("manifest-ext");
+        fs::create_dir_all(&ext)?;
+        fs::write(
+            ext.join("pi-extension.json"),
+            r#"{"runtime":"native","entry":"native"}"#,
+        )?;
+        fs::write(ext.join("index.ts"), "export default {}")?;
+        fs::write(ext.join("legacy.ts"), "export default {}")?;
+        fs::write(
+            ext.join("package.json"),
+            r#"{"pi":{"extensions":["legacy.ts"]}}"#,
+        )?;
+        let entries = collect_auto_extension_entries(&root);
+        assert_eq!(entries, vec![path_to_string(&ext)]);
         let _ = fs::remove_dir_all(root);
         Ok(())
     }

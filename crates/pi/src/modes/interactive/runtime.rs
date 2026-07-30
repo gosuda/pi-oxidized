@@ -65,7 +65,8 @@ use crate::core::agent_session::events::AgentSessionEvent;
 use crate::core::agent_session::extension_runner::ExtensionRunner;
 use crate::core::agent_session::prompt::{PromptOptions, StreamingBehavior};
 use crate::core::agent_session_runtime::{ForkOutcome, SwitchOutcome};
-use crate::core::extension_host::{ExtensionUiEvent, HostExtensionRunner};
+use crate::core::extension_host::ExtensionUiEvent;
+use crate::core::extension_runtime_set::ExtensionRuntimeSet;
 use crate::core::platform::external_editor::{EditOutcome, edit_text_in_external_editor};
 use pi_ext::client::{HostUiRequest, HostUiResponse};
 use pi_ext::protocol::{
@@ -328,7 +329,7 @@ pub trait SessionHost: Send + Sync + 'static {
     fn messages(&self) -> Vec<pi_agent::AgentMessage>;
 
     /// Concrete extension host for interactive UI bridging, when enabled.
-    fn host_extension_runner(&self) -> Option<Arc<HostExtensionRunner>> {
+    fn host_extension_runner(&self) -> Option<Arc<ExtensionRuntimeSet>> {
         None
     }
 
@@ -1035,9 +1036,10 @@ pub struct InteractiveRuntime<W: Write, S: SessionHost> {
     /// while rapid highlight changes coalesce into one update.
     theme_push_pending: bool,
     pending_ui_reinject: Vec<UiEvent>,
-    extension_runner: Option<Arc<HostExtensionRunner>>,
+    extension_runner: Option<Arc<ExtensionRuntimeSet>>,
     extension_events: Option<tokio::sync::broadcast::Receiver<ExtensionUiEvent>>,
     extension_requests: Option<mpsc::Receiver<HostUiRequest>>,
+    extension_registry_changes: Option<watch::Receiver<u64>>,
     extension_slots: std::collections::HashMap<String, ProjectedExtensionSlot>,
     focused_extension_slot: Option<String>,
     effective_extension_shortcuts: Vec<EffectiveExtensionShortcut>,
@@ -1221,16 +1223,14 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         let extension_events = extension_runner
             .as_ref()
             .map(|runner| runner.subscribe_ui());
+        let (extension_registry_changes, effective_extension_shortcuts) =
+            subscribe_and_snapshot_shortcuts(extension_runner.as_ref());
         let extension_requests = extension_runner
             .as_ref()
             .and_then(|runner| runner.take_ui_requests());
         let initial_extension_slots = extension_runner
             .as_ref()
             .map_or_else(Vec::new, |runner| runner.current_slots());
-        let effective_extension_shortcuts =
-            extension_runner.as_ref().map_or_else(Vec::new, |runner| {
-                build_effective_extension_shortcuts(&runner.raw_shortcuts())
-            });
         view.extension_shortcuts = shortcut_hints(&effective_extension_shortcuts);
 
         let (submit_tx, submit_rx) = mpsc::unbounded_channel::<String>();
@@ -1272,6 +1272,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             extension_runner,
             extension_events,
             extension_requests,
+            extension_registry_changes,
             extension_slots: std::collections::HashMap::new(),
             focused_extension_slot: None,
             effective_extension_shortcuts,
@@ -1520,11 +1521,11 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                     }
                 }
                 extension_event = recv_extension_event(&mut self.extension_events) => {
-                    if let Some(extension_event) = extension_event {
-                        self.handle_extension_event(extension_event).await;
-                    } else {
-                        self.extension_events = None;
-                    }
+                    self.handle_extension_stream_event(extension_event).await;
+                }
+                registry_changed =
+                    wait_extension_registry_change(&mut self.extension_registry_changes) => {
+                    self.handle_extension_registry_change(registry_changed);
                 }
                 extension_request = recv_extension_request(&mut self.extension_requests) => {
                     if let Some(extension_request) = extension_request {
@@ -3149,6 +3150,14 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         self.arm_coalescer();
     }
 
+    async fn handle_extension_stream_event(&mut self, event: Option<ExtensionUiEvent>) {
+        if let Some(event) = event {
+            self.handle_extension_event(event).await;
+        } else {
+            self.extension_events = None;
+        }
+    }
+
     async fn handle_extension_event(&mut self, event: ExtensionUiEvent) {
         match event {
             ExtensionUiEvent::Notify(notification) => {
@@ -3650,6 +3659,10 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             self.cancel_extension_dialog().await;
         }
         self.extension_runner = self.session.host_extension_runner();
+        let (registry_changes, shortcuts) =
+            subscribe_and_snapshot_shortcuts(self.extension_runner.as_ref());
+        self.extension_registry_changes = registry_changes;
+        self.effective_extension_shortcuts = shortcuts;
         let current_slots = self
             .extension_runner
             .as_ref()
@@ -3658,20 +3671,17 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             .extension_runner
             .as_ref()
             .map(|runner| runner.subscribe_ui());
-        self.extension_requests = self
-            .extension_runner
-            .as_ref()
-            .and_then(|runner| runner.take_ui_requests());
+        if let Some(runner) = &self.extension_runner {
+            if let Some(requests) = runner.take_ui_requests() {
+                self.extension_requests = Some(requests);
+            }
+        } else {
+            self.extension_requests = None;
+        }
         self.pending_extension_dialog = None;
         self.extension_slots.clear();
         self.focused_extension_slot = None;
         self.view.extension_overlay_slot = None;
-        self.effective_extension_shortcuts = self
-            .extension_runner
-            .as_ref()
-            .map_or_else(Vec::new, |runner| {
-                build_effective_extension_shortcuts(&runner.raw_shortcuts())
-            });
         self.view.extension_shortcuts = shortcut_hints(&self.effective_extension_shortcuts);
         self.view.widgets_above.clear();
         self.view.widgets_below.clear();
@@ -3686,6 +3696,25 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         for slot in current_slots {
             self.project_extension_slot(slot);
         }
+    }
+
+    fn handle_extension_registry_change(&mut self, channel_open: bool) {
+        if !channel_open {
+            self.extension_registry_changes = None;
+            return;
+        }
+        self.refresh_extension_shortcuts();
+        self.arm_coalescer();
+    }
+
+    fn refresh_extension_shortcuts(&mut self) {
+        self.effective_extension_shortcuts = self
+            .extension_runner
+            .as_ref()
+            .map_or_else(Vec::new, |runner| {
+                build_effective_extension_shortcuts(&runner.raw_shortcuts())
+            });
+        self.view.extension_shortcuts = shortcut_hints(&self.effective_extension_shortcuts);
     }
 
     fn route_extension_input(&mut self, event: &UiEvent) -> bool {
@@ -5100,7 +5129,7 @@ impl SessionHost for AgentSessionHost {
         self.read_session().messages()
     }
 
-    fn host_extension_runner(&self) -> Option<Arc<HostExtensionRunner>> {
+    fn host_extension_runner(&self) -> Option<Arc<ExtensionRuntimeSet>> {
         self.read_session().host_extension_runner()
     }
 
@@ -6062,6 +6091,13 @@ async fn recv_extension_request(
     }
 }
 
+async fn wait_extension_registry_change(receiver: &mut Option<watch::Receiver<u64>>) -> bool {
+    match receiver {
+        Some(receiver) => receiver.changed().await.is_ok(),
+        None => std::future::pending().await,
+    }
+}
+
 async fn wait_extension_deadline(deadline: Option<Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await,
@@ -6107,6 +6143,19 @@ const RESERVED_EXTENSION_SHORTCUTS: &[&str] = &[
     "enter",
     "ctrl+k",
 ];
+
+fn subscribe_and_snapshot_shortcuts(
+    runner: Option<&Arc<ExtensionRuntimeSet>>,
+) -> (
+    Option<watch::Receiver<u64>>,
+    Vec<EffectiveExtensionShortcut>,
+) {
+    let changes = runner.map(|runner| runner.subscribe_registry_changes());
+    let shortcuts = runner.map_or_else(Vec::new, |runner| {
+        build_effective_extension_shortcuts(&runner.raw_shortcuts())
+    });
+    (changes, shortcuts)
+}
 
 fn build_effective_extension_shortcuts(
     registrations: &[pi_ext::adapters::ShortcutRegistration],
@@ -6314,6 +6363,7 @@ mod tests {
         cancel_fork: Arc<std::sync::atomic::AtomicBool>,
         cancel_switch: Arc<std::sync::atomic::AtomicBool>,
         fork_selected_text: Arc<std::sync::Mutex<Option<String>>>,
+        extension_runner: Option<Arc<ExtensionRuntimeSet>>,
     }
 
     impl FakeHost {
@@ -6332,6 +6382,7 @@ mod tests {
                 cancel_fork: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 cancel_switch: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 fork_selected_text: Arc::new(std::sync::Mutex::new(None)),
+                extension_runner: None,
             };
             (host, log)
         }
@@ -6377,6 +6428,10 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone()
+        }
+
+        fn host_extension_runner(&self) -> Option<Arc<ExtensionRuntimeSet>> {
+            self.extension_runner.clone()
         }
 
         fn theme_settings(&self) -> (Option<String>, ThemeMode) {
@@ -7989,6 +8044,140 @@ mod tests {
         assert!(visible.contains("Choose Yes"));
     }
 
+    #[tokio::test]
+    async fn rebind_extension_channels_preserves_requests_across_same_source_reload() -> TestResult
+    {
+        let runner = ExtensionRuntimeSet::bind(Vec::new());
+        let writer = SharedWriter::new();
+        let caps = TerminalCapabilities::default();
+        let tui = Tui::new(writer, Size::new(80, 24), Position::ORIGIN, 8, caps)
+            .map_err(|error| error.to_string())?;
+        let (_tx, rx) = mpsc::unbounded_channel::<UiEvent>();
+        let input = TerminalInput::mock(rx);
+        let (mut host, _log) = FakeHost::new();
+        host.extension_runner = Some(runner);
+        let options = InteractiveRuntimeOptions {
+            size: (80, 24),
+            ..InteractiveRuntimeOptions::default()
+        };
+        let mut rt = InteractiveRuntime::new(tui, input, Arc::new(host), &options);
+        let (request_tx, request_rx) = mpsc::channel(1);
+        rt.extension_requests = Some(request_rx);
+
+        // Product reload rebinds this same source after the session refresh.
+        assert_eq!(
+            rt.dispatch_action(ViewAction::Reload).await,
+            ActionOutcome::Repaint
+        );
+        assert!(rt.extension_requests.is_some());
+        assert_eq!(
+            rt.dispatch_action(ViewAction::Reload).await,
+            ActionOutcome::Repaint
+        );
+        assert!(rt.extension_requests.is_some());
+
+        request_tx
+            .send(HostUiRequest::Confirm {
+                id: 41,
+                request: pi_ext::protocol::ConfirmRequest {
+                    title: "Still connected".to_owned(),
+                    message: "Receive after rebind".to_owned(),
+                    options_meta: pi_ext::protocol::DialogOptions::default(),
+                },
+            })
+            .await
+            .map_err(|_| "preserved receiver disconnected".to_owned())?;
+        let received = rt
+            .extension_requests
+            .as_mut()
+            .ok_or_else(|| "receiver missing after second rebind".to_owned())?
+            .recv()
+            .await
+            .ok_or_else(|| "request channel closed after second rebind".to_owned())?;
+        assert!(matches!(received, HostUiRequest::Confirm { id: 41, .. }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn endpoint_retirement_refreshes_extension_shortcuts() -> TestResult {
+        let (live, _live_host) =
+            crate::core::extension_runtime_set::tests::make_runner(serde_json::json!({
+                "shortcuts": [
+                    {"key": "ctrl+y", "description": "live", "extensionPath": "live.ts"}
+                ]
+            }))
+            .await
+            .map_err(|error| error.to_string())?;
+        let (dead, dead_host) =
+            crate::core::extension_runtime_set::tests::make_runner(serde_json::json!({
+                "shortcuts": [
+                    {"key": "ctrl+y", "description": "dead", "extensionPath": "dead.ts"},
+                    {"key": "ctrl+e", "description": "dead-only", "extensionPath": "dead.ts"}
+                ]
+            }))
+            .await
+            .map_err(|error| error.to_string())?;
+        let runner = ExtensionRuntimeSet::bind(vec![
+            (
+                crate::core::extension_runtime_set::EndpointKind::TsCompat,
+                live,
+            ),
+            (
+                crate::core::extension_runtime_set::EndpointKind::Native,
+                dead,
+            ),
+        ]);
+        let writer = SharedWriter::new();
+        let tui = Tui::new(
+            writer,
+            Size::new(80, 24),
+            Position::ORIGIN,
+            8,
+            TerminalCapabilities::default(),
+        )
+        .map_err(|error| error.to_string())?;
+        let (_tx, rx) = mpsc::unbounded_channel::<UiEvent>();
+        let input = TerminalInput::mock(rx);
+        let (mut host, _log) = FakeHost::new();
+        host.extension_runner = Some(runner.clone());
+        let mut rt = InteractiveRuntime::new(
+            tui,
+            input,
+            Arc::new(host),
+            &InteractiveRuntimeOptions {
+                size: (80, 24),
+                ..InteractiveRuntimeOptions::default()
+            },
+        );
+        assert!(rt.effective_extension_shortcuts.iter().any(|shortcut| {
+            shortcut.key == "ctrl+e" && shortcut.description.as_deref() == Some("dead-only")
+        }));
+        assert!(rt.effective_extension_shortcuts.iter().any(|shortcut| {
+            shortcut.key == "ctrl+y" && shortcut.description.as_deref() == Some("dead")
+        }));
+
+        dead_host.close().await;
+        let changed = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_extension_registry_change(&mut rt.extension_registry_changes),
+        )
+        .await
+        .map_err(|_| "registry revision did not arrive".to_owned())?;
+        assert!(changed, "registry revision channel closed");
+        rt.refresh_extension_shortcuts();
+
+        assert!(
+            rt.effective_extension_shortcuts
+                .iter()
+                .all(|shortcut| shortcut.key != "ctrl+e"),
+            "dead unique shortcut remained cached"
+        );
+        assert!(rt.effective_extension_shortcuts.iter().any(|shortcut| {
+            shortcut.key == "ctrl+y" && shortcut.description.as_deref() == Some("live")
+        }));
+        runner.shutdown_once().await;
+        Ok(())
+    }
     #[test]
     fn extension_slot_update_and_dispose_projects_live_widgets() {
         let (mut rt, _log) = make_runtime();

@@ -11,9 +11,9 @@
 //! - emitting the stored `session_start` event exactly once per session
 //!   instance on the first `bind_extensions` call (under `bind_lock`)
 //! - extension-driven resource discovery (skills/prompts/themes)
-//! - reload (emits `session_shutdown{reload}` on the old host, preserves flag
-//!   values, restarts the host, re-emits `session_start{reload}` on the new
-//!   host, then re-discovers resources)
+//! - reload (emits `session_shutdown{reload}`, preserves flag values, swaps the
+//!   runtime facade's generation, re-emits `session_start{reload}`, then
+//!   re-discovers resources)
 //! - the replaced-session context handed to `withSession` after runtime swap
 //! - extension error isolation (host errors never abort the session)
 //!
@@ -22,7 +22,8 @@
 //! `emit` self-gates on handler presence, so the gate would only suppress
 //! correct emissions.
 
-use crate::core::extension_host::{HostExtensionRunner, SessionBridgeEvent};
+use crate::core::extension_host::SessionBridgeEvent;
+use crate::core::extension_runtime_set::ExtensionRuntimeSet;
 use crate::core::messages::CustomMessageContent;
 use crate::core::resources::{
     ResourceLoader, SlashCommandInfo, SlashCommandSource, SyntheticSourceInfoOptions,
@@ -321,10 +322,10 @@ impl AgentSession {
     /// 1. Capture previous flag values (preserved across the swap).
     /// 2. Emit `session_shutdown{reload}` on the old runner (self-gated on
     ///    handler presence; host errors isolated).
-    /// 3. When a concrete host is present: sequential restart-and-rewire
-    ///    (await old transport reap exactly once, re-register providers,
-    ///    restore flags, swap runner, refresh tools).
-    /// 4. Emit `session_start{reload}` on the post-swap runner.
+    /// 3. When a concrete runtime set is present: build and publish a complete
+    ///    replacement generation, re-register providers, restore flags, and
+    ///    refresh tools without replacing the stable facade.
+    /// 4. Emit `session_start{reload}` on the replacement generation.
     /// 5. Reload base resources and re-discover extension resources.
     ///
     /// # Errors
@@ -332,6 +333,13 @@ impl AgentSession {
     /// Returns [`ExtensionBindError`] on host restart or resource-discovery
     /// failure.
     pub async fn reload(&self) -> Result<(), ExtensionBindError> {
+        let host = self.host_extension_runner();
+        if host.as_ref().is_some_and(|host| !host.can_reload()) {
+            return Err(ExtensionBindError::HostRestart(
+                "extension runtime is not reloadable".to_owned(),
+            ));
+        }
+
         let runner = self.hooks.runner();
         let previous_flag_values = runner.get_flag_values();
 
@@ -344,7 +352,7 @@ impl AgentSession {
             })
             .await;
 
-        if let Some(host) = self.host_extension_runner() {
+        if let Some(host) = host {
             let Some(runtime) = self.model_runtime() else {
                 // No runtime to re-register providers against: still reap the
                 // old host so dispose paths stay single-reap clean.
@@ -357,22 +365,18 @@ impl AgentSession {
                     .await?;
                 return Ok(());
             };
-            let new_host = host
+            if let Err(error) = host
                 .restart_and_rewire(&runtime, previous_flag_values)
                 .await
-                .map_err(|error| ExtensionBindError::HostRestart(error.to_string()))?;
-            // Swap trait runner + concrete host handle without downcast.
-            self.hooks.set_runner(
-                Arc::clone(&new_host) as Arc<dyn super::extension_runner::ExtensionRunner>
-            );
-            self.set_host_extension_runner(Some(new_host));
-            // Refresh tools so newly registered extension tools replace the old set.
+            {
+                self.emit_session_start_reload().await;
+                return Err(ExtensionBindError::HostRestart(error.to_string()));
+            }
+            // Refresh tools after the facade atomically publishes its replacement generation.
             self.refresh_tool_registry(&super::tools::RefreshToolRegistryOptions {
                 active_tool_names: None,
                 include_all_extension_tools: true,
             });
-            // Re-claim the fresh host's session-action bridge.
-            self.bind_session_bridge().await;
             self.emit_session_start_reload().await;
             self.extend_resources_from_extensions(SessionStartReason::Reload.as_str())
                 .await?;
@@ -512,9 +516,7 @@ impl AgentSession {
 
     /// Concrete host runner handle (no trait downcast).
     #[must_use]
-    pub fn host_extension_runner(
-        &self,
-    ) -> Option<Arc<crate::core::extension_host::HostExtensionRunner>> {
+    pub fn host_extension_runner(&self) -> Option<Arc<ExtensionRuntimeSet>> {
         self.host_extension_runner
             .read()
             .ok()
@@ -522,10 +524,7 @@ impl AgentSession {
     }
 
     /// Replace the concrete host runner handle (reload path).
-    pub fn set_host_extension_runner(
-        &self,
-        runner: Option<Arc<crate::core::extension_host::HostExtensionRunner>>,
-    ) {
+    pub fn set_host_extension_runner(&self, runner: Option<Arc<ExtensionRuntimeSet>>) {
         if let Ok(mut guard) = self.host_extension_runner.write() {
             *guard = runner;
         }
@@ -654,7 +653,7 @@ impl AgentSession {
     /// [`AgentSession::report_extension_error`]; nothing aborts the session.
     async fn apply_session_bridge_event(
         self: &Arc<Self>,
-        host: &Arc<HostExtensionRunner>,
+        host: &Arc<ExtensionRuntimeSet>,
         event: SessionBridgeEvent,
     ) {
         match event {
@@ -1436,6 +1435,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_concrete_reload_restarts_old_session_lifecycle() -> TestResult {
+        let (runner, host) =
+            crate::core::extension_runtime_set::tests::make_runner(serde_json::json!({
+                "handlers": ["session_start", "session_shutdown"],
+                "terminalInput": false
+            }))
+            .await?;
+        let runtime_set = crate::core::extension_runtime_set::ExtensionRuntimeSet::bind(vec![(
+            crate::core::extension_runtime_set::EndpointKind::TsCompat,
+            runner,
+        )]);
+        let runtime = Arc::new(crate::core::model_runtime::ModelRuntime::create_in_memory().await?);
+        let mut config = AgentSessionConfig::test_config(Arc::new(StubProvider), test_model())?;
+        config.extension_runner = Some(runtime_set.clone());
+        config.host_extension_runner = Some(runtime_set.clone());
+        config.model_runtime = Some(runtime);
+        let session = AgentSession::new(config)?;
+
+        let result = session.reload().await;
+        assert!(matches!(result, Err(ExtensionBindError::HostRestart(_))));
+        host.wait_for_request("session_shutdown").await?;
+        host.wait_for_request("session_start").await?;
+        assert_eq!(host.request_count("session_shutdown"), 1);
+        assert_eq!(host.request_count("session_start"), 1);
+        assert!(runtime_set.is_active());
+
+        runtime_set.shutdown_once().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reload_rejects_multiple_endpoints_before_old_lifecycle_shutdown() -> TestResult {
+        let (first, first_host) =
+            crate::core::extension_runtime_set::tests::make_runner(serde_json::json!({
+                "handlers": ["session_shutdown"],
+                "terminalInput": false
+            }))
+            .await?;
+        let (second, second_host) =
+            crate::core::extension_runtime_set::tests::make_runner(serde_json::json!({
+                "handlers": ["session_shutdown"],
+                "terminalInput": false
+            }))
+            .await?;
+        let runtime_set = crate::core::extension_runtime_set::ExtensionRuntimeSet::bind(vec![
+            (
+                crate::core::extension_runtime_set::EndpointKind::TsCompat,
+                first,
+            ),
+            (
+                crate::core::extension_runtime_set::EndpointKind::Native,
+                second,
+            ),
+        ]);
+        let runtime = Arc::new(crate::core::model_runtime::ModelRuntime::create_in_memory().await?);
+        let mut config = AgentSessionConfig::test_config(Arc::new(StubProvider), test_model())?;
+        config.extension_runner = Some(runtime_set.clone());
+        config.host_extension_runner = Some(runtime_set.clone());
+        config.model_runtime = Some(runtime);
+        let session = AgentSession::new(config)?;
+
+        assert!(matches!(
+            session.reload().await,
+            Err(ExtensionBindError::HostRestart(_))
+        ));
+        assert_eq!(first_host.request_count("session_shutdown"), 0);
+        assert_eq!(second_host.request_count("session_shutdown"), 0);
+        assert!(runtime_set.is_active());
+
+        runtime_set.shutdown_once().await;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn reload_rediscovers_resources_without_bindings() -> TestResult {
         let runner = Arc::new(TestRunner::new());
         runner.has_shutdown.store(true, Ordering::SeqCst);
@@ -1717,6 +1790,55 @@ mod tests {
             .await?;
         session.invoke_extension_shutdown_handler();
         assert!(called.load(Ordering::SeqCst));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn endpoint_retirement_refreshes_the_session_tool_registry() -> TestResult {
+        let (dead, dead_host) = crate::core::extension_runtime_set::tests::make_runner(json!({
+            "tools": [
+                {"name": "shared", "label": "dead", "description": "", "parameters": {}},
+                {"name": "dead-only", "label": "dead", "description": "", "parameters": {}}
+            ]
+        }))
+        .await?;
+        let (live, _live_host) = crate::core::extension_runtime_set::tests::make_runner(json!({
+            "tools": [
+                {"name": "shared", "label": "live", "description": "", "parameters": {}}
+            ]
+        }))
+        .await?;
+        let runtime = ExtensionRuntimeSet::bind(vec![
+            (
+                crate::core::extension_runtime_set::EndpointKind::TsCompat,
+                dead,
+            ),
+            (
+                crate::core::extension_runtime_set::EndpointKind::Native,
+                live,
+            ),
+        ]);
+        let mut config = AgentSessionConfig::test_config(Arc::new(StubProvider), test_model())?;
+        config.extension_runner = Some(runtime.clone());
+        config.host_extension_runner = Some(runtime);
+        let session = AgentSession::new(config)?;
+        let initial_shared = session.get_tool("shared").ok_or("shared tool missing")?;
+        assert!(session.get_tool("dead-only").is_some());
+
+        dead_host.close().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let promoted = session
+                    .get_tool("shared")
+                    .is_some_and(|tool| !Arc::ptr_eq(&tool, &initial_shared));
+                if session.get_tool("dead-only").is_none() && promoted {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        session.dispose().await;
         Ok(())
     }
 }

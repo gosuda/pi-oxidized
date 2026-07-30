@@ -118,7 +118,7 @@ pub struct AgentSessionConfig {
     /// Extension runner (defaults to [`NullExtensionRunner`]).
     pub extension_runner: Option<Arc<dyn ExtensionRunner>>,
     /// Concrete host runner retained for reload/restart (no trait downcast).
-    pub host_extension_runner: Option<Arc<crate::core::extension_host::HostExtensionRunner>>,
+    pub host_extension_runner: Option<Arc<crate::core::extension_runtime_set::ExtensionRuntimeSet>>,
     /// Typed model/auth runtime used by model selection and compaction.
     pub model_runtime: Option<Arc<ModelRuntime>>,
     /// Optional compaction stream override for tests and headless integrations.
@@ -395,7 +395,7 @@ pub struct AgentSession {
     pub(super) inner: Mutex<AgentSessionInner>,
     /// Concrete host runner for reload (optional; no trait downcast).
     pub(super) host_extension_runner:
-        std::sync::RwLock<Option<Arc<crate::core::extension_host::HostExtensionRunner>>>,
+        std::sync::RwLock<Option<Arc<crate::core::extension_runtime_set::ExtensionRuntimeSet>>>,
     /// Typed model runtime shared across product-owned session boundaries.
     pub(super) model_runtime: Option<Arc<ModelRuntime>>,
     /// Optional compaction-only stream override.
@@ -408,6 +408,8 @@ pub struct AgentSession {
     pub(super) resource_loader: Option<AsyncMutex<crate::core::resources::DefaultResourceLoader>>,
     /// Self handle for pump (set after construction).
     pub(super) self_handle: Mutex<Option<std::sync::Weak<AgentSession>>>,
+    /// Stops the weak extension-registry observer on dispose or drop.
+    extension_registry_cancel: CancellationToken,
     /// Serializes the whole `bind_extensions` lifecycle (record → emit →
     /// discover). Lives on the session (not `AgentSessionInner`) because it
     /// is held across `.await`; acquire it before any `lock_inner()`, never
@@ -519,6 +521,7 @@ impl AgentSession {
             prompt_templates: Mutex::new(config.prompt_templates),
             resource_loader: config.resource_loader.map(AsyncMutex::new),
             self_handle: Mutex::new(None),
+            extension_registry_cancel: CancellationToken::new(),
             bind_lock: AsyncMutex::new(()),
         });
 
@@ -535,6 +538,7 @@ impl AgentSession {
         if let Ok(mut guard) = session.self_handle.lock() {
             *guard = Some(Arc::downgrade(&session));
         }
+        session.spawn_extension_registry_observer();
         let pump = session.spawn_event_pump();
         session.store_pump(pump);
 
@@ -1009,6 +1013,7 @@ impl AgentSession {
                 token.cancel();
             }
         }
+        self.extension_registry_cancel.cancel();
         self.disconnect_from_agent();
         self.agent.abort();
         self.agent.wait_for_idle().await;
@@ -1074,6 +1079,41 @@ impl AgentSession {
             .clone()
     }
 
+    fn spawn_extension_registry_observer(self: &Arc<Self>) {
+        let Some(mut registry_changes) = self
+            .host_extension_runner()
+            .map(|runner| runner.subscribe_registry_changes())
+        else {
+            return;
+        };
+        self.refresh_tool_registry(&tools::RefreshToolRegistryOptions {
+            active_tool_names: None,
+            include_all_extension_tools: true,
+        });
+        let session = Arc::downgrade(self);
+        let cancel = self.extension_registry_cancel.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = cancel.cancelled() => break,
+                    update = registry_changes.changed() => {
+                        if update.is_err() {
+                            break;
+                        }
+                        let Some(session) = session.upgrade() else {
+                            break;
+                        };
+                        session.refresh_tool_registry(&tools::RefreshToolRegistryOptions {
+                            active_tool_names: None,
+                            include_all_extension_tools: true,
+                        });
+                        drop(session);
+                    }
+                }
+            }
+        });
+    }
+
     /// Set auto-retry enabled.
     ///
     /// Updates the runtime cache used by `prepare_retry` / `will_retry` and the
@@ -1099,6 +1139,12 @@ impl AgentSession {
     /// Set follow-up mode on the agent.
     pub fn set_follow_up_mode(&self, mode: QueueMode) {
         self.agent.set_follow_up_mode(mode);
+    }
+}
+
+impl Drop for AgentSession {
+    fn drop(&mut self) {
+        self.extension_registry_cancel.cancel();
     }
 }
 

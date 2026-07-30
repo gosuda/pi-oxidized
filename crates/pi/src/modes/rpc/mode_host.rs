@@ -24,7 +24,7 @@ use crate::core::agent_session_runtime::{
     SwitchSessionOptions,
 };
 use crate::core::compaction::CompactionResult;
-use crate::core::extension_host::HostExtensionRunner;
+use crate::core::extension_runtime_set::ExtensionRuntimeSet;
 use crate::core::resources::{SlashCommandInfo, SlashCommandSource};
 use crate::core::sessions::{SessionEntry, SessionTreeNode};
 
@@ -410,7 +410,7 @@ impl RpcSessionHost for Arc<AgentSessionRuntime> {
         })
     }
 
-    fn host_extension_runner(&self) -> Option<Arc<HostExtensionRunner>> {
+    fn host_extension_runner(&self) -> Option<Arc<ExtensionRuntimeSet>> {
         self.session().host_extension_runner()
     }
 

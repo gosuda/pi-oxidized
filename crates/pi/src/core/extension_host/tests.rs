@@ -43,6 +43,7 @@ use super::super::agent_session::events::{
     AgentSessionEvent, SessionShutdownReason as ShutdownReason,
 };
 use super::super::agent_session::extension_runner::{ExtensionRunner, SessionHooks};
+use super::super::extension_runtime_set::{EndpointKind, ExtensionRuntimeSet};
 use super::super::model_runtime::{CreateModelRuntimeOptions, ModelRuntime};
 use super::{
     ALL_EVENT_TYPES, HostExtensionRunner, HostStartError, ToolRenderPhase,
@@ -2384,13 +2385,15 @@ export default function bridgeObserver(pi) {{
     let runner =
         HostExtensionRunner::spawn_from(&spec, vec![extension_path.to_string_lossy().into_owned()])
             .await?;
+    let runtime_set =
+        ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, Arc::clone(&runner))]);
 
     let mut config = crate::core::agent_session::AgentSessionConfig::test_config(
         Arc::new(StubProvider),
         pi_agent::state::default_model(),
     )?;
-    config.extension_runner = Some(Arc::clone(&runner) as Arc<dyn ExtensionRunner>);
-    config.host_extension_runner = Some(Arc::clone(&runner));
+    config.extension_runner = Some(Arc::clone(&runtime_set) as Arc<dyn ExtensionRunner>);
+    config.host_extension_runner = Some(Arc::clone(&runtime_set));
     let session = crate::core::agent_session::AgentSession::new(config)?;
 
     // Real pre-bind state the mirror must carry into the session_start hook.
@@ -2408,7 +2411,7 @@ export default function bridgeObserver(pi) {{
     );
 
     // Host → Rust: the bridged command mutates the real session.
-    assert!(runner.execute_command("renameSession", "").await?);
+    assert!(runtime_set.execute_command("renameSession", "").await?);
     let renamed = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if session.session_name().await.as_deref() == Some("renamed-by-ext") {
@@ -2423,6 +2426,261 @@ export default function bridgeObserver(pi) {{
         "bridged setSessionName must reach the session"
     );
 
-    runner.shutdown_once().await;
+    runtime_set.shutdown_once().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_set_preserves_first_owned_registry_and_hook_fold_order() -> R {
+    let snapshot = |label: &str| {
+        json!({
+            "tools": [{
+                "name": "sharedTool",
+                "label": label,
+                "description": label,
+                "parameters": {"type": "object"}
+            }],
+            "commands": [{"name": "sharedCommand"}],
+            "shortcuts": [{"key": "ctrl+x"}],
+            "flags": [{"name": "sharedFlag", "type": "string", "default": label}],
+            "renderers": [],
+            "providers": [],
+            "handlers": ["message_end"]
+        })
+    };
+    let (first, first_host) = make_runner(snapshot("first")).await?;
+    let (second, second_host) = make_runner(snapshot("second")).await?;
+    first_host.set_response(
+        "message_end",
+        json!({"message": assistant_text("first replacement")}),
+    );
+    second_host.set_response(
+        "message_end",
+        json!({"message": assistant_text("second replacement")}),
+    );
+    let set = ExtensionRuntimeSet::bind(vec![
+        (EndpointKind::TsCompat, first),
+        (EndpointKind::TsCompat, second),
+    ]);
+
+    assert_eq!(set.registry().tools()[0].label, "first");
+    assert_eq!(set.registry().commands().len(), 1);
+    assert_eq!(
+        set.get_registered_commands(),
+        vec!["sharedCommand".to_owned()]
+    );
+    assert_eq!(set.raw_shortcuts().len(), 2);
+    let result = set
+        .emit_message_end(assistant_text("original"))
+        .await?
+        .ok_or("message_end replacement missing")?;
+    assert_eq!(
+        serde_json::to_value(result)?,
+        serde_json::to_value(assistant_text("second replacement"))?
+    );
+    let second_request = second_host
+        .requests
+        .lock()
+        .ok()
+        .and_then(|requests| {
+            requests
+                .iter()
+                .find(|frame| frame.method == "message_end")
+                .cloned()
+        })
+        .ok_or("second message_end request missing")?;
+    assert_eq!(
+        second_request.payload,
+        serde_json::to_value(assistant_text("first replacement"))?
+    );
+    set.shutdown_once().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_set_correlated_routes_return_to_same_id_on_each_origin() -> R {
+    use crate::core::extension_host::SessionBridgeEvent;
+
+    const FIRST_LOCAL: u64 = 7;
+    const FIRST_MODEL: &str = "model-alpha";
+    const SECOND_LOCAL: u64 = 9;
+    const SECOND_MODEL: &str = "model-beta";
+
+    let snapshot = json!({
+        "tools": [],
+        "commands": [],
+        "shortcuts": [],
+        "flags": [],
+        "renderers": [],
+        "providers": [],
+        "handlers": []
+    });
+    let (first, first_host) = make_runner(snapshot.clone()).await?;
+    let (second, second_host) = make_runner(snapshot).await?;
+    let set = ExtensionRuntimeSet::bind(vec![
+        (EndpointKind::TsCompat, first),
+        (EndpointKind::TsCompat, second),
+    ]);
+    let mut bridge = set.take_session_bridge().ok_or("session bridge missing")?;
+
+    first_host
+        .emit(Frame {
+            id: FIRST_LOCAL,
+            kind: FrameKind::Req,
+            method: "session.setModel".to_owned(),
+            payload: json!({"model": {"id": FIRST_MODEL, "provider": "openai"}}),
+        })
+        .await;
+    second_host
+        .emit(Frame {
+            id: SECOND_LOCAL,
+            kind: FrameKind::Req,
+            method: "session.setModel".to_owned(),
+            payload: json!({"model": {"id": SECOND_MODEL, "provider": "openai"}}),
+        })
+        .await;
+
+    let mut expected = HashMap::new();
+    for _ in 0..2 {
+        let event = tokio::time::timeout(Duration::from_millis(500), bridge.recv())
+            .await?
+            .ok_or("session bridge closed")?;
+        let SessionBridgeEvent::SetModel { id, request } = event else {
+            return Err("unexpected session bridge event".into());
+        };
+        let model_id = request.model["id"]
+            .as_str()
+            .ok_or("setModel model id missing")?;
+        let success = match model_id {
+            FIRST_MODEL => true,
+            SECOND_MODEL => false,
+            other => return Err(format!("unexpected model id: {other}").into()),
+        };
+        expected.insert(id, success);
+    }
+    assert_eq!(expected.len(), 2, "routed ids must be distinct");
+
+    for (id, success) in &expected {
+        set.respond_set_model(*id, *success).await?;
+    }
+
+    for (host, local, expected_success) in [
+        (&first_host, FIRST_LOCAL, true),
+        (&second_host, SECOND_LOCAL, false),
+    ] {
+        host.wait_for_request("session.setModel").await?;
+        let response = host
+            .requests
+            .lock()
+            .ok()
+            .and_then(|requests| {
+                requests
+                    .iter()
+                    .find(|frame| {
+                        frame.method == "session.setModel"
+                            && frame.kind == FrameKind::Res
+                            && frame.id == local
+                    })
+                    .cloned()
+            })
+            .ok_or("setModel response missing")?;
+        assert_eq!(response.id, local);
+        assert_eq!(response.payload["success"], expected_success);
+    }
+
+    set.shutdown_once().await;
+    Ok(())
+}
+#[tokio::test]
+async fn runtime_set_terminal_input_uses_completed_replies_under_one_deadline() -> R {
+    let snapshot = json!({
+        "tools": [],
+        "commands": [],
+        "shortcuts": [],
+        "flags": [],
+        "renderers": [],
+        "providers": [],
+        "handlers": [],
+        "terminalInput": true
+    });
+    let (slow, slow_host) = make_runner(snapshot.clone()).await?;
+    let (fast, fast_host) = make_runner(snapshot).await?;
+    slow_host.drop_method("terminalInput");
+    fast_host.set_response(
+        "terminalInput",
+        json!({"consume": false, "data": "rewritten"}),
+    );
+    let set = ExtensionRuntimeSet::bind(vec![
+        (EndpointKind::TsCompat, slow),
+        (EndpointKind::TsCompat, fast),
+    ]);
+
+    let result = set
+        .terminal_input_within("original", Duration::from_millis(500))
+        .await?;
+    assert!(!result.consume);
+    assert_eq!(result.data.as_deref(), Some("rewritten"));
+    slow_host.wait_for_request("terminalInput").await?;
+    fast_host.wait_for_request("terminalInput").await?;
+    set.shutdown_once().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_set_endpoint_failure_leaves_sibling_hooks_live() -> R {
+    let (failed, failed_host) = make_runner(full_snapshot()).await?;
+    let (live, live_host) = make_runner(full_snapshot()).await?;
+    live_host.set_response(
+        "message_end",
+        json!({"message": assistant_text("live replacement")}),
+    );
+    let set = ExtensionRuntimeSet::bind(vec![
+        (EndpointKind::TsCompat, failed),
+        (EndpointKind::TsCompat, live),
+    ]);
+    let mut errors = set.subscribe_errors();
+    failed_host.close().await;
+    let error = next_error(&mut errors, Duration::from_millis(500)).await?;
+    assert!(!error.retryable);
+
+    let replacement = set
+        .emit_message_end(assistant_text("original"))
+        .await?
+        .ok_or("live sibling replacement missing")?;
+    assert_eq!(
+        serde_json::to_value(replacement)?,
+        serde_json::to_value(assistant_text("live replacement"))?
+    );
+    set.shutdown_once().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_set_shutdown_event_reaches_every_endpoint_without_reap_duplication() -> R {
+    let (first, first_host) = make_runner(full_snapshot()).await?;
+    let (second, second_host) = make_runner(full_snapshot()).await?;
+    let set = ExtensionRuntimeSet::bind(vec![
+        (EndpointKind::TsCompat, first),
+        (EndpointKind::TsCompat, second),
+    ]);
+
+    set.emit(AgentSessionEvent::SessionShutdown {
+        reason: ShutdownReason::Quit,
+        target_session_file: None,
+    })
+    .await?;
+    set.shutdown_once().await;
+    set.shutdown_once().await;
+
+    for host in [&first_host, &second_host] {
+        host.wait_for_request("session_shutdown").await?;
+        let count = host.requests.lock().map_or(0, |requests| {
+            requests
+                .iter()
+                .filter(|frame| frame.method == "session_shutdown")
+                .count()
+        });
+        assert_eq!(count, 1);
+    }
     Ok(())
 }

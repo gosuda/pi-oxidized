@@ -47,7 +47,8 @@ use crate::core::agent_session::extension::{ExtensionBindings, ExtensionMode};
 use crate::core::agent_session::prompt::PreflightCallback;
 use crate::core::agent_session_runtime::{ForkOutcome, ForkPosition};
 use crate::core::compaction::CompactionResult;
-use crate::core::extension_host::{ExtensionUiEvent, HostExtensionRunner};
+use crate::core::extension_host::ExtensionUiEvent;
+use crate::core::extension_runtime_set::ExtensionRuntimeSet;
 use crate::core::output_guard as output_guard_mod;
 use crate::core::sessions::SessionEntry;
 
@@ -370,7 +371,7 @@ pub trait RpcSessionHost: Send + Sync {
         bindings: ExtensionBindings,
     ) -> BoxFuture<'static, Result<(), String>>;
     /// Current concrete extension host, when this session uses one.
-    fn host_extension_runner(&self) -> Option<Arc<HostExtensionRunner>> {
+    fn host_extension_runner(&self) -> Option<Arc<ExtensionRuntimeSet>> {
         None
     }
 
@@ -591,7 +592,7 @@ impl ServerState {
 }
 
 async fn run_extension_dialog_bridge(
-    runner: Arc<HostExtensionRunner>,
+    runner: Arc<ExtensionRuntimeSet>,
     mut requests: mpsc::Receiver<HostUiRequest>,
     proxy: ExtensionUiProxy,
     write_tx: mpsc::UnboundedSender<WriteMessage>,
@@ -616,7 +617,7 @@ async fn run_extension_dialog_bridge(
 }
 
 async fn bridge_extension_dialog(
-    runner: Arc<HostExtensionRunner>,
+    runner: Arc<ExtensionRuntimeSet>,
     request: HostUiRequest,
     proxy: ExtensionUiProxy,
     write_tx: mpsc::UnboundedSender<WriteMessage>,
@@ -716,7 +717,7 @@ fn map_rpc_ui_response(
 }
 
 async fn run_extension_event_bridge(
-    runner: Arc<HostExtensionRunner>,
+    runner: Arc<ExtensionRuntimeSet>,
     write_tx: mpsc::UnboundedSender<WriteMessage>,
     cancel: CancellationToken,
 ) {
@@ -1689,7 +1690,7 @@ mod tests {
         disposed: Arc<AtomicBool>,
         events_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<AgentSessionEvent>>>>,
         bindings: Arc<Mutex<Option<ExtensionBindings>>>,
-        extension_runner: Arc<Mutex<Option<Arc<HostExtensionRunner>>>>,
+        extension_runner: Arc<Mutex<Option<Arc<ExtensionRuntimeSet>>>>,
     }
 
     impl FakeRpcHost {
@@ -1704,7 +1705,7 @@ mod tests {
             }
         }
 
-        fn set_extension_runner(&self, runner: Arc<HostExtensionRunner>) {
+        fn set_extension_runner(&self, runner: Arc<ExtensionRuntimeSet>) {
             *self.extension_runner.lock().unwrap() = Some(runner);
         }
         fn rec(&self, name: &str) {
@@ -1929,7 +1930,7 @@ mod tests {
             *self.bindings.lock().unwrap() = Some(bindings);
             Box::pin(async { Ok(()) })
         }
-        fn host_extension_runner(&self) -> Option<Arc<HostExtensionRunner>> {
+        fn host_extension_runner(&self) -> Option<Arc<ExtensionRuntimeSet>> {
             self.extension_runner.lock().unwrap().clone()
         }
         fn dispose(&self) -> BoxFuture<'static, ()> {
@@ -2489,7 +2490,7 @@ mod tests {
     }
 
     async fn make_rpc_extension_runner()
-    -> Result<(Arc<HostExtensionRunner>, RpcHostPeer), Box<dyn std::error::Error>> {
+    -> Result<(Arc<ExtensionRuntimeSet>, RpcHostPeer), Box<dyn std::error::Error>> {
         let (client_stdout, host_stdout) = tokio::io::duplex(64 * 1024);
         let (host_stdin, client_stdin) = tokio::io::duplex(64 * 1024);
         let client = Arc::new(HostClient::connect_boxed(
@@ -2500,7 +2501,7 @@ mod tests {
         ));
         let connect_client = Arc::clone(&client);
         let connect = tokio::spawn(async move {
-            HostExtensionRunner::connect_with_cwd_and_trust(
+            crate::core::extension_host::HostExtensionRunner::connect_with_cwd_and_trust(
                 connect_client,
                 Vec::new(),
                 "/workspace",
@@ -2538,7 +2539,14 @@ mod tests {
             }),
         ))
         .await?;
-        Ok((connect.await??, peer))
+        let runner = connect.await??;
+        Ok((
+            ExtensionRuntimeSet::bind(vec![(
+                crate::core::extension_runtime_set::EndpointKind::TsCompat,
+                runner,
+            )]),
+            peer,
+        ))
     }
 
     #[tokio::test]
