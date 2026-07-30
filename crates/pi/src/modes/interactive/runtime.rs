@@ -1029,6 +1029,10 @@ pub struct InteractiveRuntime<W: Write, S: SessionHost> {
     spinner_started: Option<tokio::time::Instant>,
     /// Braille spinner frame counter, advanced every [`SPINNER_TICK`].
     spinner_frame: usize,
+    /// Cause for re-anchoring the next paint (full rows, no cell diff);
+    /// set when an extension overlay opens over unrelated content so its
+    /// first frame cannot be fragmented by the diff.
+    pending_reanchor: Option<ReanchorCause>,
     pending_settle: Option<Vec<SettledBlock>>,
     shutdown: Arc<Notify>,
     exited: bool,
@@ -1212,7 +1216,9 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     ///
     /// Never. Construction is infallible.
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
+    // A flat channel-and-field initialization list; splitting it would add
+    // indirection without hiding any behaviour.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub fn new(
         tui: Tui<W>,
         input: TerminalInput,
@@ -1270,6 +1276,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             prompt_operations: PromptOperations::new(),
             coalesce_deadline: None,
             spinner_started: None,
+            pending_reanchor: None,
             spinner_frame: 0,
             pending_settle: None,
             shutdown: Arc::new(Notify::new()),
@@ -1495,12 +1502,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 continue;
             }
 
-            let now = Instant::now();
-            let coalesce_wait = self
-                .coalesce_deadline
-                .map_or(Duration::from_hours(1), |deadline| {
-                    deadline.saturating_duration_since(now)
-                });
+            let coalesce_wait = self.coalesce_wait(Instant::now());
 
             tokio::select! {
                 biased;
@@ -1586,6 +1588,14 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         }
 
         Ok(self.finish_run().await)
+    }
+
+    /// Time until the coalescer deadline, or effectively-forever when idle.
+    fn coalesce_wait(&self, now: Instant) -> Duration {
+        self.coalesce_deadline
+            .map_or(Duration::from_hours(1), |deadline| {
+                deadline.saturating_duration_since(now)
+            })
     }
 
     /// Per-turn epilogue: flush a pending theme push (previews/restores mark
@@ -3628,6 +3638,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                     lines: Vec::new(),
                 });
                 self.view.extension_overlay_slot = Some(slot.clone());
+                self.pending_reanchor = Some(ReanchorCause::OverlayOpen);
             }
             SlotPlacement::Header
             | SlotPlacement::AboveEditor
@@ -3886,7 +3897,9 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         let Some(status) = self.view.status.as_mut() else {
             return false;
         };
-        let started = *self.spinner_started.get_or_insert_with(tokio::time::Instant::now);
+        let started = *self
+            .spinner_started
+            .get_or_insert_with(tokio::time::Instant::now);
         let elapsed_secs = started.elapsed().as_secs();
         self.spinner_frame =
             (self.spinner_frame + 1) % pi_tui::components::DEFAULT_LOADER_FRAMES.len();
@@ -3989,7 +4002,11 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         let saved_editor = std::mem::replace(&mut self.editor, Editor::with_defaults());
         let saved_selector = self.active_selector.take();
         let mut root = self.build_root(saved_editor, saved_selector);
-        let result = self.tui.commit(Txn::Frame, &mut root);
+        let txn = self
+            .pending_reanchor
+            .take()
+            .map_or(Txn::Frame, Txn::Reanchor);
+        let result = self.tui.commit(txn, &mut root);
         self.recover_root(root);
         self.ensure_editor_on_submit();
         result
@@ -7747,7 +7764,10 @@ mod tests {
         let frames = pi_tui::components::DEFAULT_LOADER_FRAMES.len();
         for expected in 1..=2_usize {
             tokio::time::advance(SPINNER_TICK).await;
-            assert!(rt.tick_status_indicator(), "tick {expected} reported no change");
+            assert!(
+                rt.tick_status_indicator(),
+                "tick {expected} reported no change"
+            );
             let status = rt.view.status.as_ref().ok_or("status vanished")?;
             assert_eq!(status.frame, expected % frames);
         }

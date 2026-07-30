@@ -37,6 +37,9 @@ pub enum ReanchorCause {
     ScrollbackInvalidate,
     /// Suspend/resume redraw.
     Resume,
+    /// An overlay opened over rows that still hold unrelated content, so a
+    /// cell diff against them would fragment the overlay's first paint.
+    OverlayOpen,
 }
 
 /// Settled content moved into terminal scrollback via `insert_before`.
