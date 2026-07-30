@@ -3608,28 +3608,6 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn runtime_set_restart_cutover_publishes_before_retiring_old_generation() -> TestResult {
-        let (first, _first_host) = make_runner(snapshot(&[])).await?;
-        let set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, first)]);
-        let mut ui_requests = set.take_ui_requests().ok_or("ui bridge missing")?;
-        let mut session_bridge = set.take_session_bridge().ok_or("session bridge missing")?;
-        let (replacement, replacement_host) = make_runner(snapshot(&[])).await?;
-        let (next, mut pending) = generation_from_endpoints(
-            2,
-            vec![(
-                EndpointKind::TsCompat,
-                "<replacement>".to_owned(),
-                replacement,
-            )],
-        );
-        let (ui_tx, ui) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
-        pending[0].ui = ui;
-        assert!(
-            ui_tx
-                .send(ExtensionUiEvent::Slot(SanitizedSlot {
-                    key: "buffered".to_owned(),
-                    height: 1,
     /// Retiring an endpoint that is still active (transport never closed) must
     /// centrally quarantine it: the runner is invalidated so every `is_active`
     /// consumer — registry, shortcuts, and dispatch — excludes it without
@@ -3762,6 +3740,28 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn runtime_set_restart_cutover_publishes_before_retiring_old_generation() -> TestResult {
+        let (first, _first_host) = make_runner(snapshot(&[])).await?;
+        let set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, first)]);
+        let mut ui_requests = set.take_ui_requests().ok_or("ui bridge missing")?;
+        let mut session_bridge = set.take_session_bridge().ok_or("session bridge missing")?;
+        let (replacement, replacement_host) = make_runner(snapshot(&[])).await?;
+        let (next, mut pending) = generation_from_endpoints(
+            2,
+            vec![(
+                EndpointKind::TsCompat,
+                "<replacement>".to_owned(),
+                replacement,
+            )],
+        );
+        let (ui_tx, ui) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        pending[0].ui = ui;
+        assert!(
+            ui_tx
+                .send(ExtensionUiEvent::Slot(SanitizedSlot {
+                    key: "buffered".to_owned(),
+                    height: 1,
                     lines: vec![vec![SanitizedRun {
                         text: "buffered".to_owned(),
                         ..SanitizedRun::default()
