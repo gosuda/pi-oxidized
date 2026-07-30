@@ -6,6 +6,7 @@ expression: triple_plain(&state)
   pi v0.1.0  •      
   type a message    
   to begin          
+                    
 │ Hello! Can you    
 │ explain this code?
                     
@@ -62,10 +63,10 @@ medium
                     
                     
                     
-                    
 
 ===== width 80 =====
   pi v0.1.0  •  type a message to begin                                         
+                                                                                
 │ Hello! Can you explain this code?                                             
                                                                                 
   Let me consider the structure.                                                
@@ -124,10 +125,10 @@ medium
                                                                                 
                                                                                 
                                                                                 
-                                                                                
 
 ===== width 160 =====
   pi v0.1.0  •  type a message to begin                                                                                                                         
+                                                                                                                                                                
 │ Hello! Can you explain this code?                                                                                                                             
                                                                                                                                                                 
   Let me consider the structure.                                                                                                                                

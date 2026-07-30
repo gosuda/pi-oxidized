@@ -334,7 +334,10 @@ pub fn build_user(
         user_text_style(),
         user_markdown_options(),
     );
-    railed("│", ThemeColor::BorderAccent, theme, md)
+    let mut stack = ColumnStack::new();
+    stack.push(Box::new(Spacer::new(1)));
+    stack.push(railed("│", ThemeColor::BorderAccent, theme, md));
+    Box::new(stack)
 }
 
 /// Build the component stack for a tool execution block.

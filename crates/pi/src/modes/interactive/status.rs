@@ -33,23 +33,25 @@ pub fn build_status(status: &SessionStatus, th: &ResolvedTheme) -> Box<dyn Compo
 #[must_use]
 pub fn status_message(status: &SessionStatus, th: &ResolvedTheme) -> String {
     let cancel = th.fg(ThemeColor::Dim, " · esc to cancel");
+    let elapsed = if status.elapsed_secs == 0 {
+        String::new()
+    } else {
+        format!(" {}s", status.elapsed_secs)
+    };
     match status.kind {
-        StatusKind::Working => {
-            let elapsed = if status.elapsed_secs == 0 {
-                String::new()
-            } else {
-                format!(" {}s", status.elapsed_secs)
-            };
-            th.fg(
-                ThemeColor::Muted,
-                &format!("{}{elapsed}{cancel}", status.message),
-            )
-        }
-        StatusKind::Retry => th.fg(ThemeColor::Muted, &format!("Retrying…{cancel}")),
-        StatusKind::Compaction => th.fg(ThemeColor::Muted, &format!("Compacting context…{cancel}")),
-        StatusKind::BranchSummary => {
-            th.fg(ThemeColor::Muted, &format!("Summarizing branch…{cancel}"))
-        }
+        StatusKind::Working => th.fg(
+            ThemeColor::Muted,
+            &format!("{}{elapsed}{cancel}", status.message),
+        ),
+        StatusKind::Retry => th.fg(ThemeColor::Muted, &format!("Retrying…{elapsed}{cancel}")),
+        StatusKind::Compaction => th.fg(
+            ThemeColor::Muted,
+            &format!("Compacting context…{elapsed}{cancel}"),
+        ),
+        StatusKind::BranchSummary => th.fg(
+            ThemeColor::Muted,
+            &format!("Summarizing branch…{elapsed}{cancel}"),
+        ),
     }
 }
 

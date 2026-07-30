@@ -107,7 +107,7 @@ fn render_location_line(data: &FooterData, th: &ResolvedTheme, width: usize) -> 
     truncate_to_width(
         &th.fg(ThemeColor::Dim, &pwd),
         width,
-        &th.fg(ThemeColor::Dim, "..."),
+        &th.fg(ThemeColor::Dim, "…"),
         false,
     )
 }
@@ -220,9 +220,10 @@ fn extension_status_line(data: &FooterData, th: &ResolvedTheme) -> Option<String
 
 /// Compose the two-column stats line (left stats, right-aligned model).
 ///
-/// Drops whole left segments by ascending keep-priority until the row fits;
-/// the right side is never dropped — it is ellipsis-truncated only when it
-/// alone exceeds `width`.
+/// Drops whole left segments by ascending keep-priority until the row fits,
+/// down to an empty left side; when even the right side alone exceeds
+/// `width`, it is ellipsis-truncated. Every return path yields a single
+/// non-wrapping line with visible width <= `width`.
 fn compose_stats_line(
     mut segments: Vec<(u8, String)>,
     right_side: &str,
@@ -245,7 +246,7 @@ fn compose_stats_line(
             + parts.len().saturating_sub(1) * 3;
         left_width + 2 + right_width <= width
     };
-    while segments.len() > 1 && !left_fits(&segments) {
+    while !segments.is_empty() && !left_fits(&segments) {
         let Some((drop_idx, _)) = segments
             .iter()
             .enumerate()
@@ -264,8 +265,8 @@ fn compose_stats_line(
         let right_dim = th.fg(ThemeColor::Dim, &format!("{pad}{right_side}"));
         return format!("{left_dim}{right_dim}");
     }
-    // Right side is never dropped; it is ellipsis-truncated when it (or the
-    // remaining single left segment) still overflows.
+    // Right side is never dropped; when it still overflows after every left
+    // segment is gone, it is ellipsis-truncated to `width`.
     let ellipsis = th.fg(ThemeColor::Dim, "…");
     let truncated = truncate_to_width(right_side, width, &ellipsis, false);
     th.fg(ThemeColor::Dim, &truncated)
@@ -357,6 +358,41 @@ mod tests {
         assert!(
             visible_width(&stats) <= 12,
             "line must fit width 12, got: {stats:?}"
+        );
+    }
+
+    /// At width 20 with every counter populated, the ladder may drop all
+    /// left segments; the composed line stays a single non-wrapping row.
+    #[test]
+    fn footer_ladder_single_row_at_width_20() {
+        let data = FooterData {
+            total_input: 1234,
+            total_output: 567,
+            total_cache_read: 8900,
+            total_cache_write: 1000,
+            cache_hit_rate: Some(89.9),
+            total_cost: 0.012,
+            context_window: 200_000,
+            context_percent: Some(42.5),
+            model_id: "claude-sonnet".to_owned(),
+            thinking_level: pi_ai::ModelThinkingLevel::Medium,
+            flags: FooterFlags {
+                reasoning: true,
+                ..FooterFlags::default()
+            },
+            ..FooterData::default()
+        };
+        let th = theme::dark();
+        let lines = render_footer_lines(&data, &th, 20);
+        let stats = strip_ansi(&lines[1]);
+        assert!(
+            !stats.contains('\n'),
+            "stats line must be a single row, got: {stats:?}"
+        );
+        assert!(
+            visible_width(&stats) <= 20,
+            "stats line must fit width 20, got width {}: {stats:?}",
+            visible_width(&stats)
         );
     }
 }
