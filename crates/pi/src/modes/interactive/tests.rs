@@ -535,6 +535,41 @@ fn tool_signature_not_json_for_builtin_tools() {
     );
 }
 
+#[test]
+fn tool_error_uses_heavy_rail_glyph() {
+    use crate::modes::interactive::messages::ToolMessageView;
+    use crate::modes::interactive::tool_renderer::{
+        ToolCallView, ToolPhase, ToolResultView, ToolState,
+    };
+    let mut state = base_state();
+    state.messages.push(StateMessageView::Tool(ToolMessageView {
+        renderer: "bash".to_owned(),
+        state: ToolState {
+            call: ToolCallView {
+                name: "bash".to_owned(),
+                id: "call_1".to_owned(),
+                args_summary: "command: false".to_owned(),
+                raw_args: serde_json::json!({"command": "false"}),
+            },
+            result: Some(ToolResultView {
+                text: "exit status 1".to_owned(),
+                truncated: false,
+                full_output_path: None,
+                images: Vec::new(),
+                error: Some("exit status 1".to_owned()),
+            }),
+            expanded: false,
+            phase: ToolPhase::Error,
+        },
+    }));
+    let buf = render_view(&state, 80, 30);
+    let rows = snapshot_buffer_plain(&buf, 80, 30);
+    assert!(
+        rows.iter().any(|row| row.starts_with("┃ ")),
+        "an errored tool block must carry the heavy rail glyph (D5): {rows:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Focus / overlay / selector
 // ---------------------------------------------------------------------------
