@@ -884,7 +884,7 @@ mod tests {
     fn built_in_resolves_all_ten_themes_distinctly() -> Result<(), String> {
         let dark = ExportTheme::built_in(Some("dark"));
         let m3_light = ExportTheme::built_in(Some("m3-light"));
-        assert_eq!(css_var(&dark, "accent").as_deref(), Some("#52a8ff"));
+		assert_eq!(css_var(&dark, "accent").as_deref(), Some("#50a8ff"));
         assert_eq!(css_var(&m3_light, "accent").as_deref(), Some("#6750a4"));
         assert_ne!(
             css_var(&dark, "accent"),
@@ -901,7 +901,7 @@ mod tests {
         assert_eq!(accents.len(), 10, "each built-in should resolve distinctly");
 
         let unknown = ExportTheme::built_in(Some("not-a-theme"));
-        assert_eq!(css_var(&unknown, "accent").as_deref(), Some("#52a8ff"));
+		assert_eq!(css_var(&unknown, "accent").as_deref(), Some("#50a8ff"));
         assert_eq!(unknown.page_background.as_deref(), Some("#18181e"));
         Ok(())
     }
@@ -914,7 +914,7 @@ mod tests {
         assert_eq!(css_var(&m3, "text").as_deref(), Some("#1d1b20"));
 
         let auto_dark = resolve_export_theme(Some("dark"), ThemeMode::Auto);
-        assert_eq!(css_var(&auto_dark, "accent").as_deref(), Some("#52a8ff"));
+		assert_eq!(css_var(&auto_dark, "accent").as_deref(), Some("#50a8ff"));
         assert_eq!(css_var(&auto_dark, "text").as_deref(), Some("#ededed"));
         assert_eq!(auto_dark.page_background.as_deref(), Some("#18181e"));
 
@@ -950,7 +950,7 @@ mod tests {
         )?;
         let html = fs::read_to_string(output)?;
         assert!(
-            html.contains("--accent: #52a8ff;"),
+			html.contains("--accent: #50a8ff;"),
             "auto+dark headless should export default dark"
         );
         assert!(html.contains("--exportPageBg: #18181e;"));

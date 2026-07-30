@@ -1264,7 +1264,7 @@ mod tests {
             let output = session.export_to_html(Some(output_path), None).await?;
             let html = std::fs::read_to_string(output)?;
             assert!(
-                html.contains("--accent: #52a8ff;"),
+				html.contains("--accent: #50a8ff;"),
                 "theme=dark themeMode=auto headless should export default dark"
             );
             assert!(

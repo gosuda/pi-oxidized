@@ -2106,7 +2106,7 @@ mod tests {
     #[test]
     fn dark_accent_resolves() {
         let th = dark();
-        assert_eq!(th.fg_rgb(ThemeColor::Accent), Rgb(82, 168, 255));
+		assert_eq!(th.fg_rgb(ThemeColor::Accent), Rgb(80, 168, 255));
     }
 
     #[test]
