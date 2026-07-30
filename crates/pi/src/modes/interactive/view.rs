@@ -205,13 +205,9 @@ fn build_status_section(state: &ViewState) -> Box<dyn Component> {
 fn build_editor_section(state: &ViewState) -> Box<dyn Component> {
     // Progress overlays (compaction/retry/auth/bash) replace the editor.
     if state.focus == FocusArea::Selector {
-        // Selectors are rendered as overlays in `build_overlay`; here we show
-        // a thin placeholder so the editor slot keeps its height contract.
-        return Box::new(Text::with_padding(
-            state.theme.fg(super::theme::ThemeColor::Dim, "…"),
-            0,
-            0,
-        ));
+        // Selectors are rendered as overlays in `build_overlay`; here we keep
+        // a blank row so the editor slot keeps its height contract (C11).
+        return Box::new(pi_tui::components::Spacer::new(1));
     }
     let editor = &state.editor;
     let display = if editor.text.is_empty() {
@@ -221,8 +217,17 @@ fn build_editor_section(state: &ViewState) -> Box<dyn Component> {
     } else {
         editor.text.clone()
     };
-    let marker = editor.paste_marker.as_deref().unwrap_or("");
-    Box::new(Text::with_padding(format!("{display}{marker}"), 1, 0))
+    let marker = if editor.text.starts_with('!') {
+        state.theme.fg(super::theme::ThemeColor::BashMode, "$ ")
+    } else {
+        state.theme.fg(super::theme::ThemeColor::Accent, "❯ ")
+    };
+    let paste_marker = editor.paste_marker.as_deref().unwrap_or("");
+    Box::new(Text::with_padding(
+        format!("{marker}{display}{paste_marker}"),
+        1,
+        0,
+    ))
 }
 
 /// Build a vertical widget stack from pre-rendered slot lines.
