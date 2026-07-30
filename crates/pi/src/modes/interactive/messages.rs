@@ -369,7 +369,10 @@ pub fn build_tool(
             ThemeColor::ToolTitle,
             &format!("▶ {}", view.state.call.name),
         );
-        let args = theme.fg(ThemeColor::ToolOutput, &view.state.call.args_summary);
+        let args = theme.fg(
+            ThemeColor::ToolOutput,
+            &super::tool_renderers::sanitize_single_line(&view.state.call.args_summary),
+        );
         vec![title, args]
     };
     if !header_lines.is_empty() {
@@ -657,5 +660,89 @@ impl Component for ColumnStack {
         for c in &mut self.children {
             c.invalidate();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use pi_tui::component::Component;
+    use ratatui::buffer::{Buffer, CellDiffOption};
+    use ratatui::layout::Rect;
+
+    use super::{ColumnStack, ToolMessageView, build_tool};
+    use crate::modes::interactive::theme;
+    use crate::modes::interactive::tool_renderer::{
+        CustomToolRenderer, ToolCallView, ToolPhase, ToolState,
+    };
+
+    /// Plain-text cell symbols for a buffer region. ANSI is parsed into cell
+    /// style (never the symbol), and wide-cell fillers are skipped — so joining
+    /// symbols yields the visible text. This mirrors pi-tui's test-only
+    /// `snapshot_area`, which is `#[cfg(test)]`-gated and thus unavailable to
+    /// dependents.
+    fn snapshot_plain(buf: &Buffer, width: u16, height: u16) -> Vec<String> {
+        let mut out = Vec::with_capacity(usize::from(height));
+        for y in 0..height {
+            let mut line = String::new();
+            let mut x = 0u16;
+            while x < width {
+                match buf.cell((x, y)) {
+                    Some(cell) if cell.diff_option == CellDiffOption::Skip => {}
+                    Some(cell) => line.push_str(cell.symbol()),
+                    None => line.push(' '),
+                }
+                x = x.saturating_add(1);
+            }
+            out.push(line);
+        }
+        out
+    }
+
+    /// Unknown/extension tools fall back to a `▶ {name} {args}` header built
+    /// straight from `args_summary`. A multiline summary must collapse to one
+    /// physical row — the same sanitization the built-in headers use — so it
+    /// cannot dump a whole prompt or file body across many terminal rows.
+    #[test]
+    fn unknown_tool_multiline_args_collapse_to_one_row() {
+        let view = ToolMessageView {
+            renderer: "mcp__ext".to_owned(),
+            state: ToolState {
+                call: ToolCallView {
+                    name: "mcp__ext".to_owned(),
+                    id: "call_1".to_owned(),
+                    args_summary: "line1\nline2".to_owned(),
+                    raw_args: serde_json::json!({"body": "line1\nline2"}),
+                },
+                result: None,
+                expanded: false,
+                phase: ToolPhase::Pending,
+            },
+        };
+        let th = theme::dark();
+        let renderers: BTreeMap<String, Box<dyn CustomToolRenderer>> = BTreeMap::new();
+        let mut stack = ColumnStack::new();
+        for component in build_tool(&view, &renderers, &th) {
+            stack.push(component);
+        }
+        // Render into a fresh buffer; once sanitized, the multiline summary
+        // must occupy exactly one row.
+        let width = 40u16;
+        let height = stack.measure(width).max(1);
+        let area = Rect::new(0, 0, width, height);
+        let mut buf = Buffer::empty(area);
+        stack.render(area, &mut buf);
+        let rows = snapshot_plain(&buf, width, height);
+        let summary_rows: Vec<&String> = rows.iter().filter(|row| row.contains("line2")).collect();
+        assert_eq!(
+            summary_rows.len(),
+            1,
+            "multiline args must collapse to one row: {rows:?}"
+        );
+        assert!(
+            summary_rows[0].contains("line1"),
+            "the single summary row must carry the joined text: {rows:?}"
+        );
     }
 }

@@ -71,10 +71,21 @@ impl Component for Rail {
         self.draw_glyph(area, buf);
         let mut y = area.y;
         for child in &mut self.children {
+            // pi-tui components render into shared buffers, so a component
+            // must never paint outside its assigned Rect. Clamp each child to
+            // the rows remaining inside `area` and stop once none are left,
+            // so a parent that hands Rail a rectangle shorter than its
+            // measured children cannot let a child overwrite the components
+            // below it.
+            let remaining = area.bottom().saturating_sub(y);
+            if remaining == 0 {
+                break;
+            }
             let h = child.measure(content_width);
             if h == 0 {
                 continue;
             }
+            let h = h.min(remaining);
             let child_area = Rect::new(area.x.saturating_add(RAIL_WIDTH), y, content_width, h);
             child.render(child_area, buf);
             y = y.saturating_add(h);
@@ -154,5 +165,27 @@ mod tests {
         assert_eq!(rail.measure(40), 0);
         let snap = render_snapshot(&mut rail, 40);
         assert!(snap.is_empty());
+    }
+    #[test]
+    fn clips_children_to_assigned_area() {
+        use ratatui::buffer::Buffer;
+        // Children measuring taller than the assigned area must be clipped:
+        // nothing may paint at or below `area.bottom()` into the shared
+        // buffer. Render into a buffer taller than the area so any overflow
+        // shows up as non-default cells below the rail.
+        let mut rail = Rail::with_glyph("|", str::to_owned);
+        rail.add_child(Text::with_padding("a\nb\nc\nd", 0, 0));
+        let area = Rect::new(0, 0, 10, 2);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 10, 6));
+        rail.render(area, &mut buf);
+        for y in area.bottom()..6 {
+            for x in 0..10 {
+                assert_eq!(
+                    buf.cell((x, y)).map(ratatui::buffer::Cell::symbol),
+                    Some(" "),
+                    "row {y} (>= area.bottom) must stay default/empty"
+                );
+            }
+        }
     }
 }

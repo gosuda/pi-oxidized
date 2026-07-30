@@ -97,7 +97,7 @@ fn arg_u64(call: &ToolCallView, key: &str) -> Option<u64> {
 /// or `\r` would otherwise forge extra terminal rows and break the one-line
 /// signature contract every header promises; tab is preserved (it never starts
 /// a new row). The result is always a single physical line.
-fn sanitize_single_line(s: &str) -> String {
+pub(super) fn sanitize_single_line(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_control() && c != '\t' { ' ' } else { c })
         .collect()
