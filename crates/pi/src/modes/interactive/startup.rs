@@ -8,6 +8,7 @@
 use pi_tui::component::Component;
 use pi_tui::components::{Markdown, Spacer, Text};
 
+use super::messages::CONTENT_INDENT;
 use super::state::{LoadedResource, ShortcutHint, StartupDiagnostics};
 use super::theme::{self, MarkdownOptions, MarkdownTheme, ResolvedTheme, ThemeColor};
 use crate::core::settings::ThemeMode;
@@ -29,7 +30,7 @@ pub fn build_resources(resources: &[LoadedResource], th: &ResolvedTheme) -> Box<
             th.fg(ThemeColor::Accent, &format!("[{}]", r.kind)),
             th.fg(ThemeColor::Muted, &r.label),
         );
-        stack.push(Box::new(Text::with_padding(line, 1, 0)));
+        stack.push(Box::new(Text::with_padding(line, CONTENT_INDENT, 0)));
     }
     Box::new(stack)
 }
@@ -59,7 +60,7 @@ pub fn build_diagnostics(
             th.fg(ThemeColor::Dim, &format!("{}: ", d.source)),
             d.message,
         );
-        stack.push(Box::new(Text::with_padding(line, 1, 0)));
+        stack.push(Box::new(Text::with_padding(line, CONTENT_INDENT, 0)));
     }
     Box::new(stack)
 }
@@ -121,7 +122,7 @@ pub fn build_first_time_setup_with_selection(
     let mut stack = super::messages::ColumnStack::new();
     stack.push(Box::new(Text::with_padding(
         theme::bold(&th.fg(ThemeColor::Accent, "Welcome to pi")),
-        1,
+        CONTENT_INDENT,
         0,
     )));
     let body = match step {
@@ -134,7 +135,7 @@ pub fn build_first_time_setup_with_selection(
     };
     stack.push(Box::new(Markdown::new(
         body,
-        1,
+        CONTENT_INDENT,
         0,
         md_theme,
         theme::default_text_style(),
@@ -164,7 +165,11 @@ pub fn build_first_time_setup_with_selection(
         } else {
             ThemeColor::Muted
         };
-        stack.push(Box::new(Text::with_padding(th.fg(color, &line), 1, 0)));
+        stack.push(Box::new(Text::with_padding(
+            th.fg(color, &line),
+            CONTENT_INDENT,
+            0,
+        )));
     }
 
     if let Some(family) = family {
@@ -174,7 +179,7 @@ pub fn build_first_time_setup_with_selection(
                 ThemeColor::Dim,
                 &format!("Selected family: {family} · mode: {mode_label}"),
             ),
-            1,
+            CONTENT_INDENT,
             0,
         )));
     }
@@ -195,7 +200,7 @@ pub fn build_shortcut_overlay(
     let mut stack = super::messages::ColumnStack::new();
     stack.push(Box::new(Text::with_padding(
         theme::bold(&th.fg(ThemeColor::Accent, "Keyboard shortcuts")),
-        1,
+        CONTENT_INDENT,
         0,
     )));
     push_shortcut_hints(&mut stack, hints, th);
@@ -203,7 +208,7 @@ pub fn build_shortcut_overlay(
         stack.push(Box::new(Spacer::new(1)));
         stack.push(Box::new(Text::with_padding(
             theme::bold(&th.fg(ThemeColor::Accent, "Extensions")),
-            1,
+            CONTENT_INDENT,
             0,
         )));
         push_shortcut_hints(&mut stack, extension_hints, th);
@@ -269,7 +274,7 @@ pub fn build_changelog(
     let mut stack = super::messages::ColumnStack::new();
     stack.push(Box::new(Markdown::new(
         markdown,
-        1,
+        CONTENT_INDENT,
         0,
         md_theme,
         theme::default_text_style(),

@@ -10,17 +10,33 @@ use std::collections::BTreeMap;
 
 use pi_ai::{AssistantContent, AssistantMessage, StopReason};
 use pi_tui::component::Component;
-use pi_tui::components::{Markdown, Padded, Spacer, Text};
+use pi_tui::components::{Markdown, Rail, Spacer, Text};
 
 use super::theme::{
-    self, MarkdownOptions, MarkdownTheme, ResolvedTheme, ThemeBg, ThemeColor, user_markdown_options,
+    self, MarkdownOptions, MarkdownTheme, ResolvedTheme, ThemeColor, user_markdown_options,
 };
 use super::tool_renderer::{ToolPhase, ToolState};
-/// Default output padding for assistant/user content blocks (matches reference).
-pub const OUTPUT_PAD: u16 = 1;
+/// Shared left-edge indent for unrailed content (column 2; D3).
+pub const CONTENT_INDENT: u16 = 2;
 
-/// Collapsed bash/tool preview line count (ports `PREVIEW_LINES`).
-pub const BASH_PREVIEW_LINES: usize = 20;
+/// Collapsed preview line count for every tool and bash body.
+pub const TOOL_PREVIEW_LINES: usize = 12;
+
+/// Wrap an event block in a one-cell gutter rail (D1/D2/D5).
+///
+/// The colour is captured by value so the paint closure is `Send + 'static`;
+/// `theme.fg` already returns an owned `String`.
+fn railed(
+    glyph: &str,
+    color: ThemeColor,
+    theme: &ResolvedTheme,
+    child: impl Component + 'static,
+) -> Box<dyn Component> {
+    let theme_snapshot = theme.clone();
+    let mut rail = Rail::with_glyph(glyph, move |s: &str| theme_snapshot.fg(color, s));
+    rail.add_child(child);
+    Box::new(rail)
+}
 /// One chat message view-model.
 #[derive(Clone, Debug)]
 pub enum MessageView {
@@ -183,7 +199,7 @@ fn push_assistant_content_blocks(
                 if !t.text.trim().is_empty() {
                     out.push(Box::new(Markdown::new(
                         t.text.trim(),
-                        OUTPUT_PAD,
+                        CONTENT_INDENT,
                         0,
                         md_theme.clone(),
                         theme::default_text_style(),
@@ -239,13 +255,13 @@ fn push_thinking_components(
                 ThemeColor::ThinkingText,
                 &theme::italic(&view.hidden_thinking_label),
             ),
-            OUTPUT_PAD,
+            CONTENT_INDENT,
             0,
         )));
     } else {
         out.push(Box::new(Markdown::new(
             blocks.join("\n\n"),
-            OUTPUT_PAD,
+            CONTENT_INDENT,
             0,
             md_theme.clone(),
             thinking_text_style(),
@@ -268,13 +284,12 @@ fn push_assistant_stop_reason(
         .any(|c| matches!(c, AssistantContent::ToolCall(_)));
     match message.stop_reason {
         StopReason::Length => {
-            out.push(Box::new(Spacer::new(1)));
             out.push(Box::new(Text::with_padding(
                 theme.fg(
                     ThemeColor::Error,
                     "Error: Model stopped because it reached the maximum output token limit. The response may be incomplete.",
                 ),
-                OUTPUT_PAD,
+                CONTENT_INDENT,
                 0,
             )));
         }
@@ -283,10 +298,9 @@ fn push_assistant_stop_reason(
                 Some(e) if e != "Request was aborted" => e.to_owned(),
                 _ => "Operation aborted".to_owned(),
             };
-            out.push(Box::new(Spacer::new(1)));
             out.push(Box::new(Text::with_padding(
                 theme.fg(ThemeColor::Error, &msg),
-                OUTPUT_PAD,
+                CONTENT_INDENT,
                 0,
             )));
         }
@@ -295,10 +309,9 @@ fn push_assistant_stop_reason(
                 .error_message
                 .clone()
                 .unwrap_or_else(|| "Unknown error".to_owned());
-            out.push(Box::new(Spacer::new(1)));
             out.push(Box::new(Text::with_padding(
                 theme.fg(ThemeColor::Error, &format!("Error: {msg}")),
-                OUTPUT_PAD,
+                CONTENT_INDENT,
                 0,
             )));
         }
@@ -306,16 +319,13 @@ fn push_assistant_stop_reason(
     }
 }
 
-/// Build the component for a user message (Box + Markdown on userMessageBg).
+/// Build the component for a user message (railed gutter, no background slab).
 #[must_use]
 pub fn build_user(
     view: &UserMessageView,
     md_theme: &MarkdownTheme,
     theme: &ResolvedTheme,
 ) -> Box<dyn Component> {
-    let mut box_ = Padded::with_padding(OUTPUT_PAD, 1);
-    let bg = theme.bg_ansi(ThemeBg::UserMessageBg);
-    box_.set_bg(Some(move |line: &str| format!("{bg}{line}\x1b[49m")));
     let md = Markdown::new(
         view.text.as_str(),
         0,
@@ -324,8 +334,7 @@ pub fn build_user(
         user_text_style(),
         user_markdown_options(),
     );
-    box_.add_child(md);
-    Box::new(box_)
+    railed("│", ThemeColor::BorderAccent, theme, md)
 }
 
 /// Build the component stack for a tool execution block.
@@ -340,14 +349,12 @@ pub fn build_tool(
 ) -> Vec<Box<dyn Component>> {
     let mut out: Vec<Box<dyn Component>> = Vec::new();
     out.push(Box::new(Spacer::new(1)));
-    let phase_bg = match view.state.phase {
-        ToolPhase::Pending => ThemeBg::ToolPendingBg,
-        ToolPhase::Success => ThemeBg::ToolSuccessBg,
-        ToolPhase::Error => ThemeBg::ToolErrorBg,
+    let (glyph, rail_color) = match view.state.phase {
+        ToolPhase::Pending => ("│", ThemeColor::Muted),
+        ToolPhase::Success => ("│", ThemeColor::Success),
+        ToolPhase::Error => ("┃", ThemeColor::Error),
     };
-    let mut shell = Padded::with_padding(OUTPUT_PAD, 0);
-    let bg = theme.bg_ansi(phase_bg);
-    shell.set_bg(Some(move |line: &str| format!("{bg}{line}\x1b[49m")));
+    let mut column = ColumnStack::new();
     // Call header (renderer or JSON fallback).
     let header_lines: Vec<String> = if let Some(renderer) = renderers.get(&view.renderer) {
         renderer
@@ -362,7 +369,7 @@ pub fn build_tool(
         vec![title, theme.fg(ThemeColor::ToolOutput, &args)]
     };
     if !header_lines.is_empty() {
-        shell.add_child(Text::with_padding(header_lines.join("\n"), 0, 0));
+        column.push(Box::new(Text::with_padding(header_lines.join("\n"), 0, 0)));
     }
     // Result body.
     if let Some(result) = view.state.result.as_ref() {
@@ -372,32 +379,32 @@ pub fn build_tool(
             super::tool_renderer::default_result_lines(result)
         };
         if !body_lines.is_empty() {
-            shell.add_child(Text::with_padding(
+            column.push(Box::new(Text::with_padding(
                 theme.fg(ThemeColor::ToolOutput, &body_lines.join("\n")),
                 0,
                 0,
-            ));
+            )));
         }
     }
-    out.push(Box::new(shell));
+    out.push(railed(glyph, rail_color, theme, column));
     out
 }
 
-/// Build the bash execution component (bordered run UI with preview/expand).
+/// Build the bash execution component (railed gutter with preview/expand).
 #[must_use]
 pub fn build_bash(view: &BashMessageView, theme: &ResolvedTheme) -> Box<dyn Component> {
     let mut out: Vec<Box<dyn Component>> = Vec::new();
     let cmd_line = theme.fg(ThemeColor::BashMode, &format!("$ {}", view.command));
-    out.push(Box::new(Text::with_padding(cmd_line, OUTPUT_PAD, 0)));
+    out.push(Box::new(Text::with_padding(cmd_line, 0, 0)));
     let body = if view.expanded {
         view.output.clone()
     } else {
-        preview_lines(&view.output, BASH_PREVIEW_LINES)
+        preview_lines(&view.output, TOOL_PREVIEW_LINES)
     };
     if !body.is_empty() {
         out.push(Box::new(Text::with_padding(
             theme.fg(ThemeColor::ToolOutput, &body),
-            OUTPUT_PAD,
+            0,
             0,
         )));
     }
@@ -410,55 +417,58 @@ pub fn build_bash(view: &BashMessageView, theme: &ResolvedTheme) -> Box<dyn Comp
                 ThemeColor::Dim,
                 &format!("[truncated — full output: {path}]"),
             ),
-            OUTPUT_PAD,
+            0,
             0,
         )));
     }
     if view.cancelled {
         out.push(Box::new(Text::with_padding(
             theme.fg(ThemeColor::Warning, "(cancelled)"),
-            OUTPUT_PAD,
+            0,
             0,
         )));
     } else if let Some(code) = view.exit_code.filter(|&code| code != 0) {
         out.push(Box::new(Text::with_padding(
             theme.fg(ThemeColor::Error, &format!("exit {code}")),
-            OUTPUT_PAD,
+            0,
             0,
         )));
     }
-    let mut stack = ColumnStack::new();
+    let mut column = ColumnStack::new();
     for c in out {
-        stack.push(c);
+        column.push(c);
     }
-    let _ = theme;
+    let mut stack = ColumnStack::new();
+    stack.push(Box::new(Spacer::new(1)));
+    stack.push(railed("│", ThemeColor::BashMode, theme, column));
     Box::new(stack)
 }
 
-/// Build the custom-message component (purple label box).
+/// Build the custom-message component (railed gutter, no background slab).
 #[must_use]
 pub fn build_custom(
     view: &CustomMessageView,
     md_theme: &MarkdownTheme,
     theme: &ResolvedTheme,
 ) -> Box<dyn Component> {
-    let mut box_ = Padded::with_padding(OUTPUT_PAD, 1);
-    let bg = theme.bg_ansi(ThemeBg::CustomMessageBg);
-    box_.set_bg(Some(move |line: &str| format!("{bg}{line}\x1b[49m")));
     let label = theme.fg(
         ThemeColor::CustomMessageLabel,
         &format!("[{}]", view.custom_type),
     );
-    box_.add_child(Text::with_padding(label, 0, 0));
-    box_.add_child(Markdown::new(
+    let mut column = ColumnStack::new();
+    column.push(Box::new(Text::with_padding(label, 0, 0)));
+    column.push(Box::new(Markdown::new(
         view.text.as_str(),
         0,
         0,
         md_theme.clone(),
         custom_text_style(),
         MarkdownOptions::default(),
-    ));
-    Box::new(box_)
+    )));
+    let mut stack = ColumnStack::new();
+    stack.push(Box::new(Spacer::new(1)));
+    stack.push(railed("│", ThemeColor::CustomMessageLabel, theme, column));
+    Box::new(stack)
 }
 
 /// Build the compaction-summary component (collapsible).
@@ -468,20 +478,23 @@ pub fn build_compaction(
     md_theme: &MarkdownTheme,
     theme: &ResolvedTheme,
 ) -> Box<dyn Component> {
-    let mut stack = ColumnStack::new();
     let label = theme.fg(
         ThemeColor::Accent,
         &format!("⌁ Compacted context (was {} tokens)", view.tokens_before),
     );
-    stack.push(Box::new(Text::with_padding(label, OUTPUT_PAD, 0)));
-    stack.push(Box::new(Markdown::new(
+    let mut column = ColumnStack::new();
+    column.push(Box::new(Text::with_padding(label, 0, 0)));
+    column.push(Box::new(Markdown::new(
         view.summary.as_str(),
-        OUTPUT_PAD,
+        0,
         0,
         md_theme.clone(),
         theme::default_text_style(),
         MarkdownOptions::default(),
     )));
+    let mut stack = ColumnStack::new();
+    stack.push(Box::new(Spacer::new(1)));
+    stack.push(railed("│", ThemeColor::BorderMuted, theme, column));
     Box::new(stack)
 }
 
@@ -492,20 +505,23 @@ pub fn build_branch(
     md_theme: &MarkdownTheme,
     theme: &ResolvedTheme,
 ) -> Box<dyn Component> {
-    let mut stack = ColumnStack::new();
     let label = theme.fg(
         ThemeColor::Accent,
         &format!("↶ Branch summary (from {})", view.from_id),
     );
-    stack.push(Box::new(Text::with_padding(label, OUTPUT_PAD, 0)));
-    stack.push(Box::new(Markdown::new(
+    let mut column = ColumnStack::new();
+    column.push(Box::new(Text::with_padding(label, 0, 0)));
+    column.push(Box::new(Markdown::new(
         view.summary.as_str(),
-        OUTPUT_PAD,
+        0,
         0,
         md_theme.clone(),
         theme::default_text_style(),
         MarkdownOptions::default(),
     )));
+    let mut stack = ColumnStack::new();
+    stack.push(Box::new(Spacer::new(1)));
+    stack.push(railed("│", ThemeColor::BorderMuted, theme, column));
     Box::new(stack)
 }
 
@@ -516,23 +532,24 @@ pub fn build_skill(
     md_theme: &MarkdownTheme,
     theme: &ResolvedTheme,
 ) -> Box<dyn Component> {
-    let mut box_ = Padded::with_padding(OUTPUT_PAD, 1);
-    let bg = theme.bg_ansi(ThemeBg::CustomMessageBg);
-    box_.set_bg(Some(move |line: &str| format!("{bg}{line}\x1b[49m")));
     let label = theme.fg(
         ThemeColor::CustomMessageLabel,
         &format!("[skill:{}]", view.name),
     );
-    box_.add_child(Text::with_padding(label, 0, 0));
-    box_.add_child(Markdown::new(
+    let mut column = ColumnStack::new();
+    column.push(Box::new(Text::with_padding(label, 0, 0)));
+    column.push(Box::new(Markdown::new(
         view.text.as_str(),
         0,
         0,
         md_theme.clone(),
         custom_text_style(),
         MarkdownOptions::default(),
-    ));
-    Box::new(box_)
+    )));
+    let mut stack = ColumnStack::new();
+    stack.push(Box::new(Spacer::new(1)));
+    stack.push(railed("│", ThemeColor::Accent, theme, column));
+    Box::new(stack)
 }
 
 /// Take the first `n` lines of `text` for a collapsed preview.

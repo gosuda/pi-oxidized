@@ -4,7 +4,7 @@
 //! Wraps pi-tui's `Loader` braille spinner with a kind + message.
 
 use pi_tui::component::Component;
-use pi_tui::components::Loader;
+use pi_tui::components::{Loader, Padded};
 
 use super::state::{SessionStatus, StatusKind};
 use super::theme::{self, ResolvedTheme, ThemeColor};
@@ -22,7 +22,11 @@ pub fn build_status(status: &SessionStatus, th: &ResolvedTheme) -> Box<dyn Compo
     let message_fn = move |s: &str| theme::current().fg(ThemeColor::Muted, s);
     let mut loader = Loader::new(spinner_fn, message_fn, status_message(status, th), None);
     loader.set_frame_index(status.frame);
-    Box::new(loader)
+    // Loader self-indents one column inside pi-tui; the product adds the
+    // missing column so the status line shares the column-2 left edge.
+    let mut padded = Padded::with_padding(1, 0);
+    padded.add_child(loader);
+    Box::new(padded)
 }
 
 /// The status message text (ports each indicator's label builder).
@@ -69,12 +73,12 @@ pub fn compaction_message(reason: super::state::CompactionReason) -> String {
     }
 }
 
-/// Idle status renders two blank lines (ports `IdleStatus`).
+/// Idle status renders one blank line above the editor (D4 already leaves a
+/// blank row after the last turn; two more would read as a gap, not grouping).
 #[must_use]
 pub fn build_idle(width: u16) -> Box<dyn Component> {
     let _ = width;
     let mut stack = super::messages::ColumnStack::new();
-    stack.push(Box::new(pi_tui::components::Spacer::new(1)));
     stack.push(Box::new(pi_tui::components::Spacer::new(1)));
     Box::new(stack)
 }

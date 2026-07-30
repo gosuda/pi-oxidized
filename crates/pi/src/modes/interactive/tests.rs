@@ -282,6 +282,93 @@ fn queue_state_snapshot() {
 }
 
 // ---------------------------------------------------------------------------
+// Rail + shared left edge (Step 2)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rail_not_slab_for_user_block() {
+    let mut state = base_state();
+    state.messages.push(StateMessageView::User(UserMessageView {
+        text: "hello rail".to_owned(),
+    }));
+    let buf = render_view(&state, 80, 30);
+    let rows = snapshot_buffer_plain(&buf, 80, 30);
+    let rail_rows: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(i, row)| row.starts_with('│').then_some(i))
+        .collect();
+    assert!(
+        !rail_rows.is_empty(),
+        "user block must draw the rail glyph at column 0: {rows:?}"
+    );
+    assert!(
+        rail_rows.iter().all(|&i| rows[i].contains("hello rail")),
+        "every railed row must carry user content: {rows:?}"
+    );
+
+    // No background slab: the rail rows must carry no non-default cell
+    // background, so their ANSI snapshot contains no background SGR.
+    let ansi = snapshot_buffer_ansi(&buf, 80, 30, ColorMode::Truecolor);
+    for i in rail_rows {
+        assert!(
+            !ansi[i].contains("\x1b[48;"),
+            "user block row must not paint a background (UserMessageBg slab): {:?}",
+            ansi[i]
+        );
+    }
+}
+
+#[test]
+fn shared_left_edge_at_column_two() {
+    let mut state = base_state();
+    state.resources.push(LoadedResource {
+        kind: "skill".to_owned(),
+        label: "commit".to_owned(),
+    });
+    state.messages.push(StateMessageView::User(UserMessageView {
+        text: "user turn".to_owned(),
+    }));
+    state
+        .messages
+        .push(StateMessageView::Assistant(AssistantMessageView {
+            message: assistant_text("assistant prose"),
+            hide_thinking: false,
+            hidden_thinking_label: "Thinking…".to_owned(),
+            streaming: false,
+        }));
+    state.pending = PendingQueue {
+        steering: vec![PendingMessage {
+            kind: PendingKind::Steering,
+            text: "pending steer".to_owned(),
+        }],
+        follow_up: Vec::new(),
+        follow_up_mode: QueueMode::All,
+    };
+    let buf = render_view(&state, 80, 30);
+    let rows = snapshot_buffer_plain(&buf, 80, 30);
+    // D3 exempts the bottom chrome: the editor keeps its 1-column padding
+    // (Step 4) and footer lines 1-2 keep their column-0 layout (Step 6).
+    let non_blank: Vec<usize> = (0..rows.len())
+        .filter(|&i| !rows[i].trim().is_empty())
+        .collect();
+    let transcript = &non_blank[..non_blank.len().saturating_sub(3)];
+    let off_edge: Vec<(usize, &str)> = transcript
+        .iter()
+        .map(|&i| (i, rows[i].as_str()))
+        .filter(|(_, row)| {
+            let railed = row.starts_with("│ ") || row.starts_with("┃ ");
+            let indented = row.starts_with("  ") && !row.starts_with("   ");
+            !railed && !indented
+        })
+        .collect();
+    assert!(
+        off_edge.is_empty(),
+        "every transcript row must start at the shared column-2 edge, via rail or indent (D3): {off_edge:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Message + tool content
 // ---------------------------------------------------------------------------
 
