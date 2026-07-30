@@ -107,7 +107,7 @@ mod tests {
 
     #[test]
     fn rail_glyph_on_every_row() {
-        let mut rail = Rail::with_glyph("|", |s| s.to_owned());
+        let mut rail = Rail::with_glyph("|", str::to_owned);
         rail.add_child(Text::with_padding("one\ntwo\nthree", 0, 0));
         let snap = render_snapshot(&mut rail, 40);
         assert_eq!(snap.len(), 3);
@@ -123,7 +123,7 @@ mod tests {
     fn measure_matches_child_at_reduced_width() {
         let mut child = Text::with_padding("one\ntwo\nthree", 0, 0);
         let child_height = child.measure(38);
-        let mut rail = Rail::with_glyph("|", |s| s.to_owned());
+        let mut rail = Rail::with_glyph("|", str::to_owned);
         rail.add_child(Text::with_padding("one\ntwo\nthree", 0, 0));
         assert_eq!(rail.measure(40), child_height);
     }
@@ -131,7 +131,7 @@ mod tests {
     #[test]
     fn width_one_draws_glyph_without_child() {
         use ratatui::buffer::Buffer;
-        let mut rail = Rail::with_glyph("|", |s| s.to_owned());
+        let mut rail = Rail::with_glyph("|", str::to_owned);
         rail.add_child(Text::with_padding("hi", 0, 0));
         assert_eq!(rail.measure(1), 0);
         // Defensive: even if a caller violates the contract and hands render a
@@ -140,13 +140,16 @@ mod tests {
         let mut buf = Buffer::empty(area);
         rail.render(area, &mut buf);
         for row in 0..2 {
-            assert_eq!(buf.cell((0, row)).map(|c| c.symbol()), Some("|"));
+            assert_eq!(
+                buf.cell((0, row)).map(ratatui::buffer::Cell::symbol),
+                Some("|")
+            );
         }
     }
 
     #[test]
     fn zero_height_child_draws_nothing() {
-        let mut rail = Rail::with_glyph("|", |s| s.to_owned());
+        let mut rail = Rail::with_glyph("|", str::to_owned);
         rail.add_child(Text::with_padding("", 0, 0));
         assert_eq!(rail.measure(40), 0);
         let snap = render_snapshot(&mut rail, 40);

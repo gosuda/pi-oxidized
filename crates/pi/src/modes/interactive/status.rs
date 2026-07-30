@@ -46,9 +46,7 @@ pub fn status_message(status: &SessionStatus, th: &ResolvedTheme) -> String {
             )
         }
         StatusKind::Retry => th.fg(ThemeColor::Muted, &format!("Retrying…{cancel}")),
-        StatusKind::Compaction => {
-            th.fg(ThemeColor::Muted, &format!("Compacting context…{cancel}"))
-        }
+        StatusKind::Compaction => th.fg(ThemeColor::Muted, &format!("Compacting context…{cancel}")),
         StatusKind::BranchSummary => {
             th.fg(ThemeColor::Muted, &format!("Summarizing branch…{cancel}"))
         }

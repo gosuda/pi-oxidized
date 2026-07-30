@@ -246,11 +246,13 @@ fn compose_stats_line(
         left_width + 2 + right_width <= width
     };
     while segments.len() > 1 && !left_fits(&segments) {
-        let (drop_idx, _) = segments
+        let Some((drop_idx, _)) = segments
             .iter()
             .enumerate()
             .min_by_key(|(_, (priority, _))| *priority)
-            .expect("segments is non-empty");
+        else {
+            break;
+        };
         segments.remove(drop_idx);
     }
     let left = join_left(&segments);

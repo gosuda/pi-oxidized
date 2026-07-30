@@ -45,17 +45,14 @@ pub fn builtin_tool_renderers() -> &'static BTreeMap<String, Box<dyn CustomToolR
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-/// Collapse to TOOL_PREVIEW_LINES unless expanded, appending a hint row.
+/// Collapse to [`TOOL_PREVIEW_LINES`] unless expanded, appending a hint row.
 fn collapse(lines: Vec<String>, expanded: bool, theme: &ResolvedTheme) -> Vec<String> {
     if expanded || lines.len() <= TOOL_PREVIEW_LINES {
         return lines;
     }
     let hidden = lines.len() - TOOL_PREVIEW_LINES;
     let mut out: Vec<String> = lines.into_iter().take(TOOL_PREVIEW_LINES).collect();
-    out.push(theme.fg(
-        ThemeColor::Dim,
-        &format!("… {hidden} more lines · ctrl+o"),
-    ));
+    out.push(theme.fg(ThemeColor::Dim, &format!("… {hidden} more lines · ctrl+o")));
     out
 }
 
@@ -79,7 +76,7 @@ fn diff_lines(text: &str, theme: &ResolvedTheme) -> Vec<String> {
 }
 
 /// Result body for the default-collapsed tools: verbatim lines plus
-/// spill/error tails, capped at TOOL_PREVIEW_LINES with a hint.
+/// spill/error tails, capped at [`TOOL_PREVIEW_LINES`] with a hint.
 fn default_collapsed(result: &ToolResultView, expanded: bool) -> Vec<String> {
     collapse(default_result_lines(result), expanded, &theme::current())
 }
@@ -94,7 +91,7 @@ fn arg_u64(call: &ToolCallView, key: &str) -> Option<u64> {
     call.raw_args.get(key).and_then(Value::as_u64)
 }
 
-/// Verb (ToolTitle) + optional argument tail (ToolOutput) as one header line.
+/// Verb (`ToolTitle`) + optional argument tail (`ToolOutput`) as one header line.
 fn header_line(verb: &str, tail: Option<String>) -> Vec<String> {
     let theme = theme::current();
     let mut line = theme.fg(ThemeColor::ToolTitle, verb);
@@ -114,9 +111,11 @@ struct ReadRenderer;
 
 impl CustomToolRenderer for ReadRenderer {
     fn render_call_lines(&self, call: &ToolCallView, _expanded: bool) -> Option<Vec<String>> {
-        let tail = arg_str(call, "path").map(|path| match (arg_u64(call, "offset"), arg_u64(call, "limit")) {
-            (Some(offset), Some(limit)) => format!("{path}:{offset}-{}", offset + limit),
-            _ => path.to_owned(),
+        let tail = arg_str(call, "path").map(|path| {
+            match (arg_u64(call, "offset"), arg_u64(call, "limit")) {
+                (Some(offset), Some(limit)) => format!("{path}:{offset}-{}", offset + limit),
+                _ => path.to_owned(),
+            }
         });
         Some(header_line("read", tail))
     }
@@ -126,7 +125,7 @@ impl CustomToolRenderer for ReadRenderer {
     }
 }
 
-/// `$ {command}`, first line only, styled BashMode.
+/// `$ {command}`, first line only, styled `BashMode`.
 struct BashRenderer;
 
 impl CustomToolRenderer for BashRenderer {
@@ -152,7 +151,10 @@ struct EditRenderer;
 
 impl CustomToolRenderer for EditRenderer {
     fn render_call_lines(&self, call: &ToolCallView, _expanded: bool) -> Option<Vec<String>> {
-        Some(header_line("edit", arg_str(call, "path").map(str::to_owned)))
+        Some(header_line(
+            "edit",
+            arg_str(call, "path").map(str::to_owned),
+        ))
     }
 
     fn render_result_lines(&self, result: &ToolResultView, expanded: bool) -> Vec<String> {
@@ -181,7 +183,10 @@ struct WriteRenderer;
 
 impl CustomToolRenderer for WriteRenderer {
     fn render_call_lines(&self, call: &ToolCallView, _expanded: bool) -> Option<Vec<String>> {
-        Some(header_line("write", arg_str(call, "path").map(str::to_owned)))
+        Some(header_line(
+            "write",
+            arg_str(call, "path").map(str::to_owned),
+        ))
     }
 
     fn render_result_lines(&self, result: &ToolResultView, expanded: bool) -> Vec<String> {
@@ -233,11 +238,8 @@ impl CustomToolRenderer for LsRenderer {
 /// qualifier when `path` is a non-empty string.
 fn search_tail(call: &ToolCallView) -> Option<String> {
     let pattern = arg_str(call, "pattern")?;
-    let mut tail = pattern.to_owned();
-    if let Some(path) = arg_str(call, "path")
-        && !path.is_empty()
-    {
-        tail.push_str(&format!(" in {path}"));
+    match arg_str(call, "path") {
+        Some(path) if !path.is_empty() => Some(format!("{pattern} in {path}")),
+        _ => Some(pattern.to_owned()),
     }
-    Some(tail)
 }

@@ -146,7 +146,7 @@ fn build_chat(state: &ViewState, md_theme: &MarkdownTheme) -> Box<dyn Component>
     let renderers = super::tool_renderers::builtin_tool_renderers();
     let mut stack = messages::ColumnStack::new();
     for msg in &state.messages {
-        let comps = build_message(msg, &renderers, md_theme, &state.theme);
+        let comps = build_message(msg, renderers, md_theme, &state.theme);
         for c in comps {
             stack.push(c);
         }
