@@ -1373,13 +1373,33 @@ impl HostExtensionRunner {
         &self,
         data: &str,
     ) -> Result<protocol::TerminalInputResult, HostClientError> {
+        self.terminal_input_within(data, Duration::from_millis(4))
+            .await
+    }
+
+    /// Deadline-injectable terminal-input request.
+    ///
+    /// Production callers go through [`Self::terminal_input`] (4 ms); the
+    /// facade aggregate fan-out forwards a shared deadline here so tests can
+    /// exercise the full routing path with a generous deadline instead of
+    /// racing the host transport under the production 4 ms budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostClientError`] when the host transport is down, `deadline`
+    /// elapses, or the response payload cannot be decoded.
+    pub(crate) async fn terminal_input_within(
+        &self,
+        data: &str,
+        deadline: Duration,
+    ) -> Result<protocol::TerminalInputResult, HostClientError> {
         let frame = self
             .inner
             .client
             .request(
                 protocol::Method::TerminalInput,
                 serde_json::json!({ "data": data }),
-                Duration::from_millis(4),
+                deadline,
             )
             .await?;
         protocol::from_payload(&frame.payload)

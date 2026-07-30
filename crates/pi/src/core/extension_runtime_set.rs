@@ -1087,22 +1087,44 @@ impl ExtensionRuntimeSet {
         &self,
         data: &str,
     ) -> Result<protocol::TerminalInputResult, HostClientError> {
+        self.terminal_input_within(data, TERMINAL_INPUT_DEADLINE)
+            .await
+    }
+
+    /// Deadline-injectable terminal-input fan-out for tests.
+    ///
+    /// Fans the original data to every participant under one shared deadline,
+    /// forwarding that deadline to each endpoint request so a generous test
+    /// deadline exercises the full routing path instead of racing the host
+    /// transport under the production 4 ms budget. Production callers use
+    /// [`Self::terminal_input`] (4 ms).
+    ///
+    /// # Errors
+    ///
+    /// Never returns `Err`; unavailable and late endpoint responses are represented in the result.
+    pub(crate) async fn terminal_input_within(
+        &self,
+        data: &str,
+        deadline: Duration,
+    ) -> Result<protocol::TerminalInputResult, HostClientError> {
         let lease = self.lease();
         let mut pending = FuturesUnordered::new();
         for (index, endpoint) in lease.live_endpoints().enumerate() {
             if endpoint.runner.has_terminal_input_handlers() {
                 let runner = Arc::clone(&endpoint.runner);
                 let data = data.to_owned();
-                pending.push(async move { (index, runner.terminal_input(&data).await) });
+                pending.push(async move {
+                    (index, runner.terminal_input_within(&data, deadline).await)
+                });
             }
         }
         if pending.is_empty() {
             return Ok(protocol::TerminalInputResult::default());
         }
-        let deadline = tokio::time::Instant::now() + TERMINAL_INPUT_DEADLINE;
+        let cutoff = tokio::time::Instant::now() + deadline;
         let mut replies = vec![None; lease.endpoints().len()];
         while !pending.is_empty() {
-            match tokio::time::timeout_at(deadline, pending.next()).await {
+            match tokio::time::timeout_at(cutoff, pending.next()).await {
                 Ok(Some((index, Ok(reply)))) => replies[index] = Some(reply),
                 Ok(Some((_index, Err(_)))) => {}
                 Ok(None) | Err(_) => break,

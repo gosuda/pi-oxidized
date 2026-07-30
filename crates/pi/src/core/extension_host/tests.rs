@@ -2615,7 +2615,9 @@ async fn runtime_set_terminal_input_uses_completed_replies_under_one_deadline() 
         (EndpointKind::TsCompat, fast),
     ]);
 
-    let result = set.terminal_input("original").await?;
+    let result = set
+        .terminal_input_within("original", Duration::from_millis(500))
+        .await?;
     assert!(!result.consume);
     assert_eq!(result.data.as_deref(), Some("rewritten"));
     slow_host.wait_for_request("terminalInput").await?;
