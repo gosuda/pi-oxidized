@@ -291,8 +291,12 @@ impl PublishedRuntimeState {
                 self.generation
                     .endpoints
                     .iter()
-                    .filter(|candidate| !self.retired.contains(&candidate.id))
-                    .find(|candidate| candidate.runner.provider_configs().contains_key(name))
+                    .find(|candidate| {
+                        (candidate.id == endpoint
+                            || (!self.retired.contains(&candidate.id)
+                                && candidate.runner.is_active()))
+                            && candidate.runner.provider_configs().contains_key(name)
+                    })
                     .is_some_and(|owner| owner.id == endpoint)
             })
             .collect::<Vec<_>>();
@@ -342,6 +346,9 @@ impl PublishedRuntimeState {
                     }
                 }
             }
+        }
+        if let Some(dead) = self.generation.endpoint(endpoint) {
+            dead.runner.invalidate();
         }
         channels.publish_registry_change();
         true
@@ -3601,6 +3608,138 @@ pub(crate) mod tests {
                 .send(ExtensionUiEvent::Slot(SanitizedSlot {
                     key: "buffered".to_owned(),
                     height: 1,
+    /// Retiring an endpoint that is still active (transport never closed) must
+    /// centrally quarantine it: the runner is invalidated so every `is_active`
+    /// consumer — registry, shortcuts, and dispatch — excludes it without
+    /// waiting for a fatal relay.
+    #[tokio::test]
+    async fn retiring_an_active_endpoint_excludes_it_from_registry_shortcuts_and_dispatch()
+    -> TestResult {
+        let first_snapshot = json!({
+            "tools": [{"name": "sharedTool", "label": "doomed", "description": "", "parameters": {}}],
+            "commands": [{"name": "sharedCommand"}],
+            "renderers": [{"type": "tool", "name": "sharedTool"}],
+            "shortcuts": [{"key": "ctrl+a"}],
+        });
+        let second_snapshot = json!({
+            "tools": [{"name": "sharedTool", "label": "survivor", "description": "", "parameters": {}}],
+            "commands": [{"name": "sharedCommand"}],
+            "renderers": [{"type": "tool", "name": "sharedTool"}],
+            "shortcuts": [{"key": "ctrl+b"}],
+        });
+        let (first, first_host) = make_runner(first_snapshot).await?;
+        let (second, second_host) = make_runner(second_snapshot).await?;
+        let first_runner = Arc::clone(&first);
+        let set = ExtensionRuntimeSet::bind(vec![
+            (EndpointKind::TsCompat, first),
+            (EndpointKind::TsCompat, second),
+        ]);
+
+        // First-wins: the still-active doomed endpoint owns the published surfaces.
+        assert_eq!(set.registry().tools()[0].label, "doomed");
+        assert_eq!(set.raw_shortcuts().len(), 2);
+        assert!(first_runner.is_active());
+
+        // Manually retire the still-active first endpoint; its transport stays open.
+        {
+            let mut state = set.state();
+            let doomed = state.generation.endpoints[0].id;
+            assert!(state.retire_endpoint(doomed, &set.channels));
+        }
+
+        // Retirement centrally invalidates the runner even without transport shutdown.
+        assert!(
+            !first_runner.is_active(),
+            "retirement must quarantine the runner, not only the published state"
+        );
+        // Registry and shortcuts now reflect only the surviving endpoint.
+        assert_eq!(set.registry().tools()[0].label, "survivor");
+        assert_eq!(set.raw_shortcuts().len(), 1);
+        // Dispatch routes to the survivor and never reaches the retired endpoint.
+        second_host.set_response("command.execute", json!({"ok": true}));
+        first_host.set_response("command.execute", json!({"ok": false}));
+        assert!(set.execute_command("sharedCommand", "").await?);
+        second_host.wait_for_request("command.execute").await?;
+        assert_eq!(first_host.request_count("command.execute"), 0);
+        set.shutdown_once().await;
+        Ok(())
+    }
+
+    /// When a crashed-but-not-retired endpoint sits ahead of the retired owner
+    /// in iteration order, the provider-owner filter must still recognize the
+    /// retiring owner and rewire to the surviving active duplicate instead of
+    /// leaving the provider orphaned on the crashed-first endpoint.
+    #[tokio::test]
+    async fn retiring_an_owner_rewires_provider_to_a_surviving_active_duplicate() -> TestResult {
+        let (crashed, _crashed_host) = make_runner(json!({
+            "providers": [shared_provider("https://crashed.example/v1")],
+            "handlers": [],
+            "terminalInput": false
+        }))
+        .await?;
+        let (owner, _owner_host) = make_runner(json!({
+            "providers": [shared_provider("https://owner.example/v1")],
+            "handlers": [],
+            "terminalInput": false
+        }))
+        .await?;
+        let (duplicate, _duplicate_host) = make_runner(json!({
+            "providers": [shared_provider("https://dup.example/v1")],
+            "handlers": [],
+            "terminalInput": false
+        }))
+        .await?;
+        let crashed_runner = Arc::clone(&crashed);
+        let set = ExtensionRuntimeSet::bind(vec![
+            (EndpointKind::TsCompat, crashed),
+            (EndpointKind::TsCompat, owner),
+            (EndpointKind::TsCompat, duplicate),
+        ]);
+        let runtime = ModelRuntime::create_in_memory().await?;
+        assert!(
+            set.register_providers_on(&runtime)
+                .into_iter()
+                .all(|(_path, result)| result.is_ok())
+        );
+        // First-wins registration: the crashed-first endpoint holds the provider.
+        assert_eq!(
+            runtime
+                .get_registered_provider_config("shared-provider")
+                .ok_or("shared-provider not registered")?
+                .base_url
+                .as_deref(),
+            Some("https://crashed.example/v1")
+        );
+
+        // The crashed-first endpoint goes inactive WITHOUT being retired (no relay raced).
+        crashed_runner.invalidate();
+        assert!(!crashed_runner.is_active());
+
+        let owner_id = EndpointId {
+            generation: 1,
+            position: 1,
+        };
+        let epoch = runtime.provider_mutation_epoch();
+        {
+            let mut state = set.state();
+            assert!(state.retire_endpoint(owner_id, &set.channels));
+        }
+
+        // The surviving active duplicate is now the registered owner (rewired off
+        // the retired owner), not left unregistered or orphaned on the crashed endpoint.
+        let config = runtime
+            .get_registered_provider_config("shared-provider")
+            .ok_or("surviving active duplicate was left unregistered")?;
+        assert_eq!(config.base_url.as_deref(), Some("https://dup.example/v1"));
+        assert_eq!(
+            runtime.provider_mutation_epoch(),
+            epoch + 2,
+            "retirement must unregister then rewire the provider"
+        );
+        set.shutdown_once().await;
+        Ok(())
+    }
+
                     lines: vec![vec![SanitizedRun {
                         text: "buffered".to_owned(),
                         ..SanitizedRun::default()
