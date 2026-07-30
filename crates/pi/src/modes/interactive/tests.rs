@@ -145,6 +145,7 @@ fn loading_state_snapshot() {
     state.status = Some(SessionStatus {
         kind: StatusKind::Working,
         frame: 0,
+        elapsed_secs: 0,
         message: "Working…".to_owned(),
     });
     insta::assert_snapshot!("loading_state_widths", triple_plain(&state));
@@ -174,6 +175,7 @@ fn streaming_state_snapshot() {
     state.status = Some(SessionStatus {
         kind: StatusKind::Working,
         frame: 3,
+        elapsed_secs: 0,
         message: "Working…".to_owned(),
     });
     let partial = assistant_text("Generating a response…");
@@ -189,6 +191,7 @@ fn compact_state_snapshot() {
     state.status = Some(SessionStatus {
         kind: StatusKind::Compaction,
         frame: 0,
+        elapsed_secs: 0,
         message: "Compacting context…".to_owned(),
     });
     state
@@ -206,9 +209,31 @@ fn retry_state_snapshot() {
     state.status = Some(SessionStatus {
         kind: StatusKind::Retry,
         frame: 5,
+        elapsed_secs: 0,
         message: "Retrying…".to_owned(),
     });
     insta::assert_snapshot!("retry_state_widths", triple_plain(&state));
+}
+
+#[test]
+fn status_spinner_frame_and_elapsed_render() {
+    let mut state = base_state();
+    state.status = Some(SessionStatus {
+        kind: StatusKind::Working,
+        frame: 3,
+        elapsed_secs: 12,
+        message: "Working…".to_owned(),
+    });
+    let buf = render_view(&state, 80, 60);
+    let plain = snapshot_buffer_plain(&buf, 80, 60).join("\n");
+    assert!(
+        plain.contains(pi_tui::components::DEFAULT_LOADER_FRAMES[3]),
+        "status line must render spinner frame 3 (⠸): {plain}"
+    );
+    assert!(
+        plain.contains("12s"),
+        "status line must show the elapsed-seconds counter: {plain}"
+    );
 }
 
 #[test]
@@ -233,6 +258,7 @@ fn queue_state_snapshot() {
     state.status = Some(SessionStatus {
         kind: StatusKind::Working,
         frame: 0,
+        elapsed_secs: 0,
         message: "Working…".to_owned(),
     });
     state.pending = PendingQueue {
@@ -253,6 +279,93 @@ fn queue_state_snapshot() {
         follow_up_mode: QueueMode::All,
     };
     insta::assert_snapshot!("queue_state_widths", triple_plain(&state));
+}
+
+// ---------------------------------------------------------------------------
+// Rail + shared left edge (Step 2)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rail_not_slab_for_user_block() {
+    let mut state = base_state();
+    state.messages.push(StateMessageView::User(UserMessageView {
+        text: "hello rail".to_owned(),
+    }));
+    let buf = render_view(&state, 80, 30);
+    let rows = snapshot_buffer_plain(&buf, 80, 30);
+    let rail_rows: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(i, row)| row.starts_with('│').then_some(i))
+        .collect();
+    assert!(
+        !rail_rows.is_empty(),
+        "user block must draw the rail glyph at column 0: {rows:?}"
+    );
+    assert!(
+        rail_rows.iter().all(|&i| rows[i].contains("hello rail")),
+        "every railed row must carry user content: {rows:?}"
+    );
+
+    // No background slab: the rail rows must carry no non-default cell
+    // background, so their ANSI snapshot contains no background SGR.
+    let ansi = snapshot_buffer_ansi(&buf, 80, 30, ColorMode::Truecolor);
+    for i in rail_rows {
+        assert!(
+            !ansi[i].contains("\x1b[48;"),
+            "user block row must not paint a background (UserMessageBg slab): {:?}",
+            ansi[i]
+        );
+    }
+}
+
+#[test]
+fn shared_left_edge_at_column_two() {
+    let mut state = base_state();
+    state.resources.push(LoadedResource {
+        kind: "skill".to_owned(),
+        label: "commit".to_owned(),
+    });
+    state.messages.push(StateMessageView::User(UserMessageView {
+        text: "user turn".to_owned(),
+    }));
+    state
+        .messages
+        .push(StateMessageView::Assistant(AssistantMessageView {
+            message: assistant_text("assistant prose"),
+            hide_thinking: false,
+            hidden_thinking_label: "Thinking…".to_owned(),
+            streaming: false,
+        }));
+    state.pending = PendingQueue {
+        steering: vec![PendingMessage {
+            kind: PendingKind::Steering,
+            text: "pending steer".to_owned(),
+        }],
+        follow_up: Vec::new(),
+        follow_up_mode: QueueMode::All,
+    };
+    let buf = render_view(&state, 80, 30);
+    let rows = snapshot_buffer_plain(&buf, 80, 30);
+    // D3 exempts the bottom chrome: the editor keeps its 1-column padding
+    // (Step 4) and footer lines 1-2 keep their column-0 layout (Step 6).
+    let non_blank: Vec<usize> = (0..rows.len())
+        .filter(|&i| !rows[i].trim().is_empty())
+        .collect();
+    let transcript = &non_blank[..non_blank.len().saturating_sub(3)];
+    let off_edge: Vec<(usize, &str)> = transcript
+        .iter()
+        .map(|&i| (i, rows[i].as_str()))
+        .filter(|(_, row)| {
+            let railed = row.starts_with("│ ") || row.starts_with("┃ ");
+            let indented = row.starts_with("  ") && !row.starts_with("   ");
+            !railed && !indented
+        })
+        .collect();
+    assert!(
+        off_edge.is_empty(),
+        "every transcript row must start at the shared column-2 edge, via rail or indent (D3): {off_edge:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -380,6 +493,80 @@ fn tool_message_renders_call_and_result() {
     assert!(
         plain.contains("pub fn main"),
         "tool result body must render: {plain}"
+    );
+}
+
+#[test]
+fn tool_signature_not_json_for_builtin_tools() {
+    use crate::modes::interactive::messages::ToolMessageView;
+    use crate::modes::interactive::tool_renderer::{
+        ToolCallView, ToolPhase, ToolResultView, ToolState,
+    };
+    let mut state = base_state();
+    state.messages.push(StateMessageView::Tool(ToolMessageView {
+        renderer: "edit".to_owned(),
+        state: ToolState {
+            call: ToolCallView {
+                name: "edit".to_owned(),
+                id: "call_1".to_owned(),
+                args_summary: "path: src/main.rs".to_owned(),
+                raw_args: serde_json::json!({"path": "src/main.rs", "old": "a", "new": "b"}),
+            },
+            result: Some(ToolResultView {
+                text: "Successfully replaced 1 block(s) in src/main.rs.".to_owned(),
+                truncated: false,
+                full_output_path: None,
+                images: Vec::new(),
+                error: None,
+            }),
+            expanded: false,
+            phase: ToolPhase::Success,
+        },
+    }));
+    let buf = render_view(&state, 80, 30);
+    let plain = snapshot_buffer_plain(&buf, 80, 30).join("\n");
+    assert!(
+        plain.contains("edit src/main.rs"),
+        "built-in renderer must print a typed signature: {plain}"
+    );
+    assert!(
+        !plain.contains("\"path\":"),
+        "raw JSON args must not appear: {plain}"
+    );
+}
+
+#[test]
+fn tool_error_uses_heavy_rail_glyph() {
+    use crate::modes::interactive::messages::ToolMessageView;
+    use crate::modes::interactive::tool_renderer::{
+        ToolCallView, ToolPhase, ToolResultView, ToolState,
+    };
+    let mut state = base_state();
+    state.messages.push(StateMessageView::Tool(ToolMessageView {
+        renderer: "bash".to_owned(),
+        state: ToolState {
+            call: ToolCallView {
+                name: "bash".to_owned(),
+                id: "call_1".to_owned(),
+                args_summary: "command: false".to_owned(),
+                raw_args: serde_json::json!({"command": "false"}),
+            },
+            result: Some(ToolResultView {
+                text: "exit status 1".to_owned(),
+                truncated: false,
+                full_output_path: None,
+                images: Vec::new(),
+                error: Some("exit status 1".to_owned()),
+            }),
+            expanded: false,
+            phase: ToolPhase::Error,
+        },
+    }));
+    let buf = render_view(&state, 80, 30);
+    let rows = snapshot_buffer_plain(&buf, 80, 30);
+    assert!(
+        rows.iter().any(|row| row.starts_with("┃ ")),
+        "an errored tool block must carry the heavy rail glyph (D5): {rows:?}"
     );
 }
 

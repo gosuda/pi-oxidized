@@ -82,9 +82,9 @@ pub fn build_footer(
 #[must_use]
 pub fn render_footer_lines(data: &FooterData, th: &ResolvedTheme, width: usize) -> Vec<String> {
     let pwd_line = render_location_line(data, th, width);
-    let stats = token_status(data, th);
+    let segments = stats_segments(data, th);
     let model = model_status(data);
-    let stats_line = compose_stats_line(&stats, &model, th, width);
+    let stats_line = compose_stats_line(segments, &model, th, width);
     let mut lines = vec![pwd_line, stats_line];
 
     if let Some(statuses) = extension_status_line(data, th) {
@@ -107,46 +107,48 @@ fn render_location_line(data: &FooterData, th: &ResolvedTheme, width: usize) -> 
     truncate_to_width(
         &th.fg(ThemeColor::Dim, &pwd),
         width,
-        &th.fg(ThemeColor::Dim, "..."),
+        &th.fg(ThemeColor::Dim, "…"),
         false,
     )
 }
 
-fn token_status(data: &FooterData, th: &ResolvedTheme) -> String {
-    let mut parts = Vec::new();
+/// Build the left-side stats segments as `(keep-priority, text)` pairs.
+///
+/// Higher priority survives longer when `compose_stats_line` drops segments to
+/// fit `width`; the raw R/W counters stay in `FooterData` because the hit rate
+/// and HTML export still consume them.
+fn stats_segments(data: &FooterData, th: &ResolvedTheme) -> Vec<(u8, String)> {
+    let mut parts: Vec<(u8, String)> = Vec::new();
     if data.total_input > 0 {
-        parts.push(format!("↑{}", format_tokens(data.total_input)));
+        parts.push((1, format!("{} in", format_tokens(data.total_input))));
     }
     if data.total_output > 0 {
-        parts.push(format!("↓{}", format_tokens(data.total_output)));
-    }
-    if data.total_cache_read > 0 {
-        parts.push(format!("R{}", format_tokens(data.total_cache_read)));
-    }
-    if data.total_cache_write > 0 {
-        parts.push(format!("W{}", format_tokens(data.total_cache_write)));
+        parts.push((2, format!("{} out", format_tokens(data.total_output))));
     }
     if let Some(rate) = data
         .cache_hit_rate
         .filter(|_| data.total_cache_read > 0 || data.total_cache_write > 0)
     {
-        parts.push(format!("CH{rate:.1}%"));
+        parts.push((0, format!("{rate:.0}% cached")));
     }
     let subscription = data.flags.billing == BillingMode::Subscription;
     if data.total_cost > 0.0 || subscription {
         let suffix = if subscription { " (sub)" } else { "" };
-        parts.push(format!("${:.3}{suffix}", data.total_cost));
+        parts.push((3, format!("${:.3}{suffix}", data.total_cost)));
     }
 
-    parts.push(context_status(data, th));
+    parts.push((4, context_status(data, th)));
     if data.flags.experimental {
-        parts.push(format!(
-            "{} {}",
-            th.fg(ThemeColor::Dim, "•"),
-            theme::bold(&th.fg(ThemeColor::Warning, "xp"))
+        parts.push((
+            1,
+            format!(
+                "{} {}",
+                th.fg(ThemeColor::Dim, "•"),
+                theme::bold(&th.fg(ThemeColor::Warning, "xp"))
+            ),
         ));
     }
-    parts.join(" ")
+    parts
 }
 
 fn context_status(data: &FooterData, th: &ResolvedTheme) -> String {
@@ -156,10 +158,16 @@ fn context_status(data: &FooterData, th: &ResolvedTheme) -> String {
         ""
     };
     let context_display = data.context_percent.map_or_else(
-        || format!("?/{}{}", format_tokens(data.context_window), auto_indicator),
+        || {
+            format!(
+                "? of {}{}",
+                format_tokens(data.context_window),
+                auto_indicator
+            )
+        },
         |pct| {
             format!(
-                "{pct:.1}%/{}{}",
+                "{pct:.0}% of {}{}",
                 format_tokens(data.context_window),
                 auto_indicator
             )
@@ -211,39 +219,57 @@ fn extension_status_line(data: &FooterData, th: &ResolvedTheme) -> Option<String
 }
 
 /// Compose the two-column stats line (left stats, right-aligned model).
+///
+/// Drops whole left segments by ascending keep-priority until the row fits,
+/// down to an empty left side; when even the right side alone exceeds
+/// `width`, it is ellipsis-truncated. Every return path yields a single
+/// non-wrapping line with visible width <= `width`.
 fn compose_stats_line(
-    stats_left: &str,
+    mut segments: Vec<(u8, String)>,
     right_side: &str,
     th: &ResolvedTheme,
     width: usize,
 ) -> String {
-    let stats_width = visible_width(stats_left);
+    let join_left = |parts: &[(u8, String)]| {
+        parts
+            .iter()
+            .map(|(_, text)| text.as_str())
+            .collect::<Vec<_>>()
+            .join(" · ")
+    };
     let right_width = visible_width(right_side);
-    let total_needed = stats_width.saturating_add(2).saturating_add(right_width);
-    if total_needed <= width {
-        let padding = width
-            .saturating_sub(stats_width)
-            .saturating_sub(right_width);
-        let pad = " ".repeat(padding);
-        let left_dim = th.fg(ThemeColor::Dim, stats_left);
-        let right_dim = th.fg(ThemeColor::Dim, &format!("{pad}{right_side}"));
-        format!("{left_dim}{right_dim}")
-    } else {
-        let avail_for_right = width.saturating_sub(stats_width).saturating_sub(2);
-        if avail_for_right > 0 {
-            let truncated = truncate_to_width(right_side, avail_for_right, "", false);
-            let pad = " ".repeat(
-                width
-                    .saturating_sub(stats_width)
-                    .saturating_sub(visible_width(&truncated)),
-            );
-            let left_dim = th.fg(ThemeColor::Dim, stats_left);
-            let right_dim = th.fg(ThemeColor::Dim, &format!("{pad}{truncated}"));
-            format!("{left_dim}{right_dim}")
-        } else {
-            th.fg(ThemeColor::Dim, stats_left)
-        }
+    let left_fits = |parts: &[(u8, String)]| {
+        let left_width = parts
+            .iter()
+            .map(|(_, text)| visible_width(text))
+            .sum::<usize>()
+            + parts.len().saturating_sub(1) * 3;
+        left_width + 2 + right_width <= width
+    };
+    while !segments.is_empty() && !left_fits(&segments) {
+        let Some((drop_idx, _)) = segments
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, (priority, _))| *priority)
+        else {
+            break;
+        };
+        segments.remove(drop_idx);
     }
+    let left = join_left(&segments);
+    let left_width = visible_width(&left);
+    if left_width + 2 + right_width <= width {
+        let padding = width.saturating_sub(left_width).saturating_sub(right_width);
+        let pad = " ".repeat(padding);
+        let left_dim = th.fg(ThemeColor::Dim, &left);
+        let right_dim = th.fg(ThemeColor::Dim, &format!("{pad}{right_side}"));
+        return format!("{left_dim}{right_dim}");
+    }
+    // Right side is never dropped; when it still overflows after every left
+    // segment is gone, it is ellipsis-truncated to `width`.
+    let ellipsis = th.fg(ThemeColor::Dim, "…");
+    let truncated = truncate_to_width(right_side, width, &ellipsis, false);
+    th.fg(ThemeColor::Dim, &truncated)
 }
 
 /// Lowercase thinking-level label.
@@ -256,5 +282,117 @@ fn thinking_label(level: pi_ai::ModelThinkingLevel) -> &'static str {
         pi_ai::ModelThinkingLevel::High => "high",
         pi_ai::ModelThinkingLevel::Xhigh => "xhigh",
         pi_ai::ModelThinkingLevel::Max => "max",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pi_tui::components::util::strip_ansi;
+    use pi_tui::text::visible_width;
+
+    use super::*;
+    use crate::modes::interactive::state::{FooterData, FooterFlags};
+    use crate::modes::interactive::theme;
+
+    /// Verification §3 footer-ladder: at width 40 with every counter
+    /// populated, the lowest-priority `cached` segment is dropped while the
+    /// model segment survives intact on the right.
+    #[test]
+    fn footer_ladder_drops_cached_keeps_model() {
+        let data = FooterData {
+            total_input: 1234,
+            total_output: 567,
+            total_cache_read: 8900,
+            total_cache_write: 1000,
+            cache_hit_rate: Some(89.9),
+            total_cost: 0.012,
+            context_window: 200_000,
+            context_percent: Some(42.5),
+            model_id: "claude-sonnet".to_owned(),
+            thinking_level: pi_ai::ModelThinkingLevel::Medium,
+            flags: FooterFlags {
+                reasoning: true,
+                ..FooterFlags::default()
+            },
+            ..FooterData::default()
+        };
+        let th = theme::dark();
+        let lines = render_footer_lines(&data, &th, 40);
+        let stats = strip_ansi(&lines[1]);
+        assert!(
+            !stats.contains("cached"),
+            "width 40 must drop the cached segment, got: {stats:?}"
+        );
+        assert!(
+            stats.contains("claude-sonnet"),
+            "model segment must survive intact, got: {stats:?}"
+        );
+        assert!(
+            stats.contains("medium"),
+            "thinking label must survive intact, got: {stats:?}"
+        );
+        assert!(
+            visible_width(&stats) <= 40,
+            "line must fit width 40, got: {stats:?}"
+        );
+    }
+
+    /// The right side is never dropped: when the model segment alone exceeds
+    /// the width it is ellipsis-truncated rather than omitted.
+    #[test]
+    fn footer_ladder_truncates_right_with_ellipsis() {
+        let data = FooterData {
+            context_window: 200_000,
+            context_percent: Some(42.5),
+            model_id: "a-very-long-model-identifier-that-overflows".to_owned(),
+            flags: FooterFlags::default(),
+            ..FooterData::default()
+        };
+        let th = theme::dark();
+        let lines = render_footer_lines(&data, &th, 12);
+        let stats = strip_ansi(&lines[1]);
+        assert!(
+            stats.contains('…'),
+            "overflowing right side must be ellipsis-truncated, got: {stats:?}"
+        );
+        assert!(
+            visible_width(&stats) <= 12,
+            "line must fit width 12, got: {stats:?}"
+        );
+    }
+
+    /// At width 20 with every counter populated, the ladder may drop all
+    /// left segments; the composed line stays a single non-wrapping row.
+    #[test]
+    fn footer_ladder_single_row_at_width_20() {
+        let data = FooterData {
+            total_input: 1234,
+            total_output: 567,
+            total_cache_read: 8900,
+            total_cache_write: 1000,
+            cache_hit_rate: Some(89.9),
+            total_cost: 0.012,
+            context_window: 200_000,
+            context_percent: Some(42.5),
+            model_id: "claude-sonnet".to_owned(),
+            thinking_level: pi_ai::ModelThinkingLevel::Medium,
+            flags: FooterFlags {
+                reasoning: true,
+                ..FooterFlags::default()
+            },
+            ..FooterData::default()
+        };
+        let th = theme::dark();
+        let lines = render_footer_lines(&data, &th, 20);
+        let stats = strip_ansi(&lines[1]);
+        assert!(
+            !stats.contains('\n'),
+            "stats line must be a single row, got: {stats:?}"
+        );
+        assert!(
+            visible_width(&stats) <= 20,
+            "stats line must fit width 20, got width {}: {stats:?}",
+            visible_width(&stats)
+        );
     }
 }

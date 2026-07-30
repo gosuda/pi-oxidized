@@ -277,6 +277,8 @@ pub struct SessionStatus {
     pub kind: StatusKind,
     /// Spinner frame index into the braille set.
     pub frame: usize,
+    /// Whole seconds since this status phase began; 0 suppresses the counter.
+    pub elapsed_secs: u64,
     /// Status message text.
     pub message: String,
 }
@@ -587,6 +589,7 @@ impl ViewState {
         s.status = Some(SessionStatus {
             kind: StatusKind::Working,
             frame: 0,
+            elapsed_secs: 0,
             message: "Working…".to_owned(),
         });
         s.messages.push(MessageView::streaming_assistant(partial));

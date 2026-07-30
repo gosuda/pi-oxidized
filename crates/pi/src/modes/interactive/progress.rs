@@ -8,6 +8,7 @@
 use pi_tui::component::Component;
 use pi_tui::components::{Loader, Spacer, Text};
 
+use super::messages::CONTENT_INDENT;
 use super::state::{
     AuthProgress, BashProgress, CompactionProgress, OAuthStage, PendingKind, PendingQueue,
     RetryProgress,
@@ -27,14 +28,14 @@ pub fn build_pending(queue: &PendingQueue, th: &ResolvedTheme) -> Box<dyn Compon
     for msg in &queue.steering {
         stack.push(Box::new(Text::with_padding(
             pending_line(PendingKind::Steering, &msg.text, th),
-            1,
+            CONTENT_INDENT,
             0,
         )));
     }
     for msg in &queue.follow_up {
         stack.push(Box::new(Text::with_padding(
             pending_line(PendingKind::FollowUp, &msg.text, th),
-            1,
+            CONTENT_INDENT,
             0,
         )));
     }
@@ -45,7 +46,7 @@ pub fn build_pending(queue: &PendingQueue, th: &ResolvedTheme) -> Box<dyn Compon
         };
         stack.push(Box::new(Text::with_padding(
             th.fg(ThemeColor::Dim, mode),
-            1,
+            CONTENT_INDENT,
             0,
         )));
     }
@@ -84,12 +85,12 @@ pub fn build_auth_progress(progress: &AuthProgress, th: &ResolvedTheme) -> Box<d
     match progress.stage {
         OAuthStage::Failed => Box::new(Text::with_padding(
             th.fg(ThemeColor::Error, &auth_stage_message(progress, th)),
-            1,
+            CONTENT_INDENT,
             0,
         )),
         OAuthStage::Done => Box::new(Text::with_padding(
             th.fg(ThemeColor::Success, &auth_stage_message(progress, th)),
-            1,
+            CONTENT_INDENT,
             0,
         )),
         _ => Box::new(loader),

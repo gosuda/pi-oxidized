@@ -526,6 +526,7 @@ mod tests {
         v.status = Some(SessionStatus {
             kind: StatusKind::Working,
             frame: 0,
+            elapsed_secs: 0,
             message: "Working".to_owned(),
         });
         let assistant = AssistantMessage::new("anthropic", "test", "test", 0);
@@ -548,6 +549,7 @@ mod tests {
         v.status = Some(SessionStatus {
             kind,
             frame: 0,
+            elapsed_secs: 0,
             message: "x".to_owned(),
         });
         v

@@ -143,23 +143,30 @@ fn compose_inner(state: &ViewState) -> ComposedView {
 
 /// Build the chat container from all message view-models.
 fn build_chat(state: &ViewState, md_theme: &MarkdownTheme) -> Box<dyn Component> {
-    let renderers: BTreeMap<String, Box<dyn super::tool_renderer::CustomToolRenderer>> =
-        BTreeMap::new();
+    let renderers = super::tool_renderers::builtin_tool_renderers();
     let mut stack = messages::ColumnStack::new();
     for msg in &state.messages {
-        let comps = build_message(msg, &renderers, md_theme, &state.theme);
+        let comps = build_message(msg, renderers, md_theme, &state.theme);
         for c in comps {
             stack.push(c);
         }
     }
     if state.messages.is_empty() && !state.streaming {
-        // Empty-state hint.
+        // Empty-state hint: discoverability beats a bare sentence (C7).
         stack.push(Box::new(Text::with_padding(
             state.theme.fg(
                 super::theme::ThemeColor::Dim,
-                "No messages yet. Type below to begin.",
+                "Type a message, or / for commands.",
             ),
-            1,
+            messages::CONTENT_INDENT,
+            0,
+        )));
+        stack.push(Box::new(Text::with_padding(
+            state.theme.fg(
+                super::theme::ThemeColor::Dim,
+                "? shortcuts · ctrl+o expand tools · shift+tab thinking",
+            ),
+            messages::CONTENT_INDENT,
             0,
         )));
     }
@@ -194,17 +201,27 @@ fn build_status_section(state: &ViewState) -> Box<dyn Component> {
     }
 }
 
+/// Choose the prompt marker glyph and theme color for `text`.
+///
+/// WHY: the live editor render path (`InteractiveRoot::render`) and the
+/// pure-view [`build_editor_section`] must show the same `❯ `/`$ ` prefix;
+/// centralizing the choice keeps both paths in sync when the bash-mode rule
+/// changes. Returns the 2-column glyph and the slot the caller colors it with.
+pub(super) fn editor_prompt_marker(text: &str) -> (&'static str, super::theme::ThemeColor) {
+    if text.starts_with('!') {
+        ("$ ", super::theme::ThemeColor::BashMode)
+    } else {
+        ("❯ ", super::theme::ThemeColor::Accent)
+    }
+}
+
 /// Build the editor area (input, or a selector replacing it, or a progress block).
 fn build_editor_section(state: &ViewState) -> Box<dyn Component> {
     // Progress overlays (compaction/retry/auth/bash) replace the editor.
     if state.focus == FocusArea::Selector {
-        // Selectors are rendered as overlays in `build_overlay`; here we show
-        // a thin placeholder so the editor slot keeps its height contract.
-        return Box::new(Text::with_padding(
-            state.theme.fg(super::theme::ThemeColor::Dim, "…"),
-            0,
-            0,
-        ));
+        // Selectors are rendered as overlays in `build_overlay`; here we keep
+        // a blank row so the editor slot keeps its height contract (C11).
+        return Box::new(pi_tui::components::Spacer::new(1));
     }
     let editor = &state.editor;
     let display = if editor.text.is_empty() {
@@ -214,8 +231,17 @@ fn build_editor_section(state: &ViewState) -> Box<dyn Component> {
     } else {
         editor.text.clone()
     };
-    let marker = editor.paste_marker.as_deref().unwrap_or("");
-    Box::new(Text::with_padding(format!("{display}{marker}"), 1, 0))
+    let (marker_glyph, marker_color) = editor_prompt_marker(&editor.text);
+    let marker = state.theme.fg(marker_color, marker_glyph);
+    let paste_marker = editor.paste_marker.as_deref().unwrap_or("");
+    // padding_x 0 places the marker glyph at column 0 (so the `❯ `/`$ ` pair
+    // occupies columns 0-1) and the text at column 2, matching the live editor
+    // render path's shifted Rect (D3 shared left edge).
+    Box::new(Text::with_padding(
+        format!("{marker}{display}{paste_marker}"),
+        0,
+        0,
+    ))
 }
 
 /// Build a vertical widget stack from pre-rendered slot lines.

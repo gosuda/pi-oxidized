@@ -7,6 +7,7 @@
 use pi_tui::component::Component;
 use pi_tui::components::{Markdown, Spacer, Text};
 
+use super::messages::CONTENT_INDENT;
 use super::state::HeaderData;
 use super::theme::{self, MarkdownOptions, MarkdownTheme, ResolvedTheme, ThemeColor};
 
@@ -26,11 +27,11 @@ pub fn build_header(
         &format!("{} v{}", data.app_name, data.version),
     ));
     if data.expanded {
-        stack.push(Box::new(Text::with_padding(logo, 1, 0)));
+        stack.push(Box::new(Text::with_padding(logo, CONTENT_INDENT, 0)));
         let hints = expanded_hints(th);
         stack.push(Box::new(Markdown::new(
             hints,
-            1,
+            CONTENT_INDENT,
             0,
             md_theme,
             theme::default_text_style(),
@@ -45,7 +46,7 @@ pub fn build_header(
         };
         stack.push(Box::new(Text::with_padding(
             th.fg(ThemeColor::Dim, &compact),
-            1,
+            CONTENT_INDENT,
             0,
         )));
     }
