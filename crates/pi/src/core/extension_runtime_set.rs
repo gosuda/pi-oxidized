@@ -20,7 +20,7 @@ use pi_ext::protocol::{
 };
 use pi_ext::sanitize::SanitizedSlot;
 use serde_json::{Map, Value};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 
 use super::agent_session::events::AgentSessionEvent;
 use super::agent_session::extension_runner::{
@@ -343,6 +343,7 @@ impl PublishedRuntimeState {
                 }
             }
         }
+        channels.publish_registry_change();
         true
     }
 
@@ -459,6 +460,7 @@ impl PublishedRuntimeState {
             let _ = channels.ui_tx.send(ExtensionUiEvent::Dispose { key });
         }
         self.publish_initial_slots(pending, channels);
+        channels.publish_registry_change();
         old
     }
 
@@ -472,6 +474,7 @@ impl PublishedRuntimeState {
         for key in keys {
             let _ = channels.ui_tx.send(ExtensionUiEvent::Dispose { key });
         }
+        channels.publish_registry_change();
         Arc::clone(&self.generation)
     }
 
@@ -500,6 +503,7 @@ struct FacadeChannels {
     ui_requests_rx: StdMutex<Option<mpsc::Receiver<HostUiRequest>>>,
     session_bridge_tx: mpsc::Sender<SessionBridgeEvent>,
     session_bridge_rx: StdMutex<Option<mpsc::Receiver<SessionBridgeEvent>>>,
+    registry_revision_tx: watch::Sender<u64>,
 }
 
 impl FacadeChannels {
@@ -510,6 +514,7 @@ impl FacadeChannels {
         let (ui_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let (ui_requests_tx, ui_requests_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let (session_bridge_tx, session_bridge_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        let (registry_revision_tx, _) = watch::channel(0_u64);
         Self {
             tool_updates_tx,
             provider_events_tx,
@@ -519,7 +524,13 @@ impl FacadeChannels {
             ui_requests_rx: StdMutex::new(Some(ui_requests_rx)),
             session_bridge_tx,
             session_bridge_rx: StdMutex::new(Some(session_bridge_rx)),
+            registry_revision_tx,
         }
+    }
+
+    fn publish_registry_change(&self) {
+        self.registry_revision_tx
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
 
     fn publish_error(&self, code: &str, message: String, data: Option<Value>) {
@@ -1043,6 +1054,12 @@ impl ExtensionRuntimeSet {
     #[must_use]
     pub fn subscribe_errors(&self) -> broadcast::Receiver<ExtensionErrorEvent> {
         self.channels.errors_tx.subscribe()
+    }
+
+    /// Subscribe to aggregate extension registry changes.
+    #[must_use]
+    pub(crate) fn subscribe_registry_changes(&self) -> watch::Receiver<u64> {
+        self.channels.registry_revision_tx.subscribe()
     }
 
     /// Whether any active endpoint handles terminal input.
@@ -2600,7 +2617,7 @@ pub(crate) mod tests {
             Ok(release_tx)
         }
 
-        async fn close(&self) {
+        pub(crate) async fn close(&self) {
             let _ = self.commands.send(FakeCommand::Close).await;
         }
 
@@ -4908,8 +4925,11 @@ pub(crate) mod tests {
                 .any(|item| item.name == "dead")
         );
 
+        let mut registry_changes = set.subscribe_registry_changes();
+        let revision = *registry_changes.borrow_and_update();
         dead_host.close().await;
         wait_for_retirement(&set, dead_id).await?;
+        assert_ne!(*registry_changes.borrow_and_update(), revision);
         assert!(!set.state().routes.contains_key(&route));
         assert!(
             !set.registry()

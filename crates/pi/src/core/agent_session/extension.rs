@@ -1792,4 +1792,53 @@ mod tests {
         assert!(called.load(Ordering::SeqCst));
         Ok(())
     }
+
+    #[tokio::test]
+    async fn endpoint_retirement_refreshes_the_session_tool_registry() -> TestResult {
+        let (dead, dead_host) = crate::core::extension_runtime_set::tests::make_runner(json!({
+            "tools": [
+                {"name": "shared", "label": "dead", "description": "", "parameters": {}},
+                {"name": "dead-only", "label": "dead", "description": "", "parameters": {}}
+            ]
+        }))
+        .await?;
+        let (live, _live_host) = crate::core::extension_runtime_set::tests::make_runner(json!({
+            "tools": [
+                {"name": "shared", "label": "live", "description": "", "parameters": {}}
+            ]
+        }))
+        .await?;
+        let runtime = ExtensionRuntimeSet::bind(vec![
+            (
+                crate::core::extension_runtime_set::EndpointKind::TsCompat,
+                dead,
+            ),
+            (
+                crate::core::extension_runtime_set::EndpointKind::Native,
+                live,
+            ),
+        ]);
+        let mut config = AgentSessionConfig::test_config(Arc::new(StubProvider), test_model())?;
+        config.extension_runner = Some(runtime.clone());
+        config.host_extension_runner = Some(runtime);
+        let session = AgentSession::new(config)?;
+        let initial_shared = session.get_tool("shared").ok_or("shared tool missing")?;
+        assert!(session.get_tool("dead-only").is_some());
+
+        dead_host.close().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let promoted = session
+                    .get_tool("shared")
+                    .is_some_and(|tool| !Arc::ptr_eq(&tool, &initial_shared));
+                if session.get_tool("dead-only").is_none() && promoted {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        session.dispose().await;
+        Ok(())
+    }
 }

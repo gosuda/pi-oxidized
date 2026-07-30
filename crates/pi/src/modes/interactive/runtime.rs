@@ -1039,6 +1039,7 @@ pub struct InteractiveRuntime<W: Write, S: SessionHost> {
     extension_runner: Option<Arc<ExtensionRuntimeSet>>,
     extension_events: Option<tokio::sync::broadcast::Receiver<ExtensionUiEvent>>,
     extension_requests: Option<mpsc::Receiver<HostUiRequest>>,
+    extension_registry_changes: Option<watch::Receiver<u64>>,
     extension_slots: std::collections::HashMap<String, ProjectedExtensionSlot>,
     focused_extension_slot: Option<String>,
     effective_extension_shortcuts: Vec<EffectiveExtensionShortcut>,
@@ -1222,16 +1223,14 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         let extension_events = extension_runner
             .as_ref()
             .map(|runner| runner.subscribe_ui());
+        let (extension_registry_changes, effective_extension_shortcuts) =
+            subscribe_and_snapshot_shortcuts(extension_runner.as_ref());
         let extension_requests = extension_runner
             .as_ref()
             .and_then(|runner| runner.take_ui_requests());
         let initial_extension_slots = extension_runner
             .as_ref()
             .map_or_else(Vec::new, |runner| runner.current_slots());
-        let effective_extension_shortcuts =
-            extension_runner.as_ref().map_or_else(Vec::new, |runner| {
-                build_effective_extension_shortcuts(&runner.raw_shortcuts())
-            });
         view.extension_shortcuts = shortcut_hints(&effective_extension_shortcuts);
 
         let (submit_tx, submit_rx) = mpsc::unbounded_channel::<String>();
@@ -1273,6 +1272,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             extension_runner,
             extension_events,
             extension_requests,
+            extension_registry_changes,
             extension_slots: std::collections::HashMap::new(),
             focused_extension_slot: None,
             effective_extension_shortcuts,
@@ -1521,11 +1521,11 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                     }
                 }
                 extension_event = recv_extension_event(&mut self.extension_events) => {
-                    if let Some(extension_event) = extension_event {
-                        self.handle_extension_event(extension_event).await;
-                    } else {
-                        self.extension_events = None;
-                    }
+                    self.handle_extension_stream_event(extension_event).await;
+                }
+                registry_changed =
+                    wait_extension_registry_change(&mut self.extension_registry_changes) => {
+                    self.handle_extension_registry_change(registry_changed);
                 }
                 extension_request = recv_extension_request(&mut self.extension_requests) => {
                     if let Some(extension_request) = extension_request {
@@ -3150,6 +3150,14 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         self.arm_coalescer();
     }
 
+    async fn handle_extension_stream_event(&mut self, event: Option<ExtensionUiEvent>) {
+        if let Some(event) = event {
+            self.handle_extension_event(event).await;
+        } else {
+            self.extension_events = None;
+        }
+    }
+
     async fn handle_extension_event(&mut self, event: ExtensionUiEvent) {
         match event {
             ExtensionUiEvent::Notify(notification) => {
@@ -3651,6 +3659,10 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             self.cancel_extension_dialog().await;
         }
         self.extension_runner = self.session.host_extension_runner();
+        let (registry_changes, shortcuts) =
+            subscribe_and_snapshot_shortcuts(self.extension_runner.as_ref());
+        self.extension_registry_changes = registry_changes;
+        self.effective_extension_shortcuts = shortcuts;
         let current_slots = self
             .extension_runner
             .as_ref()
@@ -3670,12 +3682,6 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         self.extension_slots.clear();
         self.focused_extension_slot = None;
         self.view.extension_overlay_slot = None;
-        self.effective_extension_shortcuts = self
-            .extension_runner
-            .as_ref()
-            .map_or_else(Vec::new, |runner| {
-                build_effective_extension_shortcuts(&runner.raw_shortcuts())
-            });
         self.view.extension_shortcuts = shortcut_hints(&self.effective_extension_shortcuts);
         self.view.widgets_above.clear();
         self.view.widgets_below.clear();
@@ -3690,6 +3696,25 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         for slot in current_slots {
             self.project_extension_slot(slot);
         }
+    }
+
+    fn handle_extension_registry_change(&mut self, channel_open: bool) {
+        if !channel_open {
+            self.extension_registry_changes = None;
+            return;
+        }
+        self.refresh_extension_shortcuts();
+        self.arm_coalescer();
+    }
+
+    fn refresh_extension_shortcuts(&mut self) {
+        self.effective_extension_shortcuts = self
+            .extension_runner
+            .as_ref()
+            .map_or_else(Vec::new, |runner| {
+                build_effective_extension_shortcuts(&runner.raw_shortcuts())
+            });
+        self.view.extension_shortcuts = shortcut_hints(&self.effective_extension_shortcuts);
     }
 
     fn route_extension_input(&mut self, event: &UiEvent) -> bool {
@@ -6066,6 +6091,13 @@ async fn recv_extension_request(
     }
 }
 
+async fn wait_extension_registry_change(receiver: &mut Option<watch::Receiver<u64>>) -> bool {
+    match receiver {
+        Some(receiver) => receiver.changed().await.is_ok(),
+        None => std::future::pending().await,
+    }
+}
+
 async fn wait_extension_deadline(deadline: Option<Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await,
@@ -6111,6 +6143,19 @@ const RESERVED_EXTENSION_SHORTCUTS: &[&str] = &[
     "enter",
     "ctrl+k",
 ];
+
+fn subscribe_and_snapshot_shortcuts(
+    runner: Option<&Arc<ExtensionRuntimeSet>>,
+) -> (
+    Option<watch::Receiver<u64>>,
+    Vec<EffectiveExtensionShortcut>,
+) {
+    let changes = runner.map(|runner| runner.subscribe_registry_changes());
+    let shortcuts = runner.map_or_else(Vec::new, |runner| {
+        build_effective_extension_shortcuts(&runner.raw_shortcuts())
+    });
+    (changes, shortcuts)
+}
 
 fn build_effective_extension_shortcuts(
     registrations: &[pi_ext::adapters::ShortcutRegistration],
@@ -8053,6 +8098,86 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn endpoint_retirement_refreshes_extension_shortcuts() -> TestResult {
+        let (live, _live_host) =
+            crate::core::extension_runtime_set::tests::make_runner(serde_json::json!({
+                "shortcuts": [
+                    {"key": "ctrl+y", "description": "live", "extensionPath": "live.ts"}
+                ]
+            }))
+            .await
+            .map_err(|error| error.to_string())?;
+        let (dead, dead_host) =
+            crate::core::extension_runtime_set::tests::make_runner(serde_json::json!({
+                "shortcuts": [
+                    {"key": "ctrl+y", "description": "dead", "extensionPath": "dead.ts"},
+                    {"key": "ctrl+e", "description": "dead-only", "extensionPath": "dead.ts"}
+                ]
+            }))
+            .await
+            .map_err(|error| error.to_string())?;
+        let runner = ExtensionRuntimeSet::bind(vec![
+            (
+                crate::core::extension_runtime_set::EndpointKind::TsCompat,
+                live,
+            ),
+            (
+                crate::core::extension_runtime_set::EndpointKind::Native,
+                dead,
+            ),
+        ]);
+        let writer = SharedWriter::new();
+        let tui = Tui::new(
+            writer,
+            Size::new(80, 24),
+            Position::ORIGIN,
+            8,
+            TerminalCapabilities::default(),
+        )
+        .map_err(|error| error.to_string())?;
+        let (_tx, rx) = mpsc::unbounded_channel::<UiEvent>();
+        let input = TerminalInput::mock(rx);
+        let (mut host, _log) = FakeHost::new();
+        host.extension_runner = Some(runner.clone());
+        let mut rt = InteractiveRuntime::new(
+            tui,
+            input,
+            Arc::new(host),
+            &InteractiveRuntimeOptions {
+                size: (80, 24),
+                ..InteractiveRuntimeOptions::default()
+            },
+        );
+        assert!(rt.effective_extension_shortcuts.iter().any(|shortcut| {
+            shortcut.key == "ctrl+e" && shortcut.description.as_deref() == Some("dead-only")
+        }));
+        assert!(rt.effective_extension_shortcuts.iter().any(|shortcut| {
+            shortcut.key == "ctrl+y" && shortcut.description.as_deref() == Some("dead")
+        }));
+
+        dead_host.close().await;
+        let changed = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_extension_registry_change(&mut rt.extension_registry_changes),
+        )
+        .await
+        .map_err(|_| "registry revision did not arrive".to_owned())?;
+        assert!(changed, "registry revision channel closed");
+        rt.refresh_extension_shortcuts();
+
+        assert!(
+            rt.effective_extension_shortcuts
+                .iter()
+                .all(|shortcut| shortcut.key != "ctrl+e"),
+            "dead unique shortcut remained cached"
+        );
+        assert!(rt.effective_extension_shortcuts.iter().any(|shortcut| {
+            shortcut.key == "ctrl+y" && shortcut.description.as_deref() == Some("live")
+        }));
+        runner.shutdown_once().await;
+        Ok(())
+    }
     #[test]
     fn extension_slot_update_and_dispose_projects_live_widgets() {
         let (mut rt, _log) = make_runtime();
