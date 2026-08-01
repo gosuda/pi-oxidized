@@ -325,6 +325,74 @@ async fn load_reports_all_33_handlers_and_registry_surfaces() -> R {
 }
 
 #[tokio::test]
+async fn native_boolean_flag_default_decodes_and_preserves_typed_fallback() -> R {
+    let snapshot = json!({
+        "flags": [
+            {
+                "name": "verbose",
+                "type": "boolean",
+                "default": false,
+                "extensionPath": "native://demo"
+            },
+            {
+                "name": "mode",
+                "type": "string",
+                "default": "quiet",
+                "extensionPath": "native://demo"
+            }
+        ],
+        "handlers": [],
+    });
+    let (runner, _host) = make_runner(snapshot).await?;
+
+    assert_eq!(
+        runner.get_flag_values().get("verbose"),
+        Some(&Value::Bool(false))
+    );
+    assert_eq!(
+        runner.get_flag_values().get("mode"),
+        Some(&Value::String("quiet".to_owned()))
+    );
+
+    let registry = runner.registry();
+    let flags = registry.flags();
+    let verbose = flags
+        .iter()
+        .find(|flag| flag.name == "verbose")
+        .ok_or("missing verbose flag registration")?;
+    assert_eq!(verbose.kind, pi_ext::adapters::FlagKind::Boolean);
+    assert_eq!(verbose.default.as_deref(), Some("false"));
+
+    let mode = flags
+        .iter()
+        .find(|flag| flag.name == "mode")
+        .ok_or("missing mode flag registration")?;
+    assert_eq!(mode.kind, pi_ext::adapters::FlagKind::String);
+    assert_eq!(mode.default.as_deref(), Some("quiet"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_flag_default_yields_to_host_resolved_value() -> R {
+    let snapshot = json!({
+        "flags": [{
+            "name": "verbose",
+            "type": "boolean",
+            "default": false,
+            "value": true,
+            "extensionPath": "native://demo"
+        }],
+        "handlers": [],
+    });
+    let (runner, _host) = make_runner(snapshot).await?;
+    assert_eq!(
+        runner.get_flag_values().get("verbose"),
+        Some(&Value::Bool(true))
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn hook_tool_call_maps_typed_block_result() -> R {
     let (runner, host) = make_runner(full_snapshot()).await?;
     host.set_response(

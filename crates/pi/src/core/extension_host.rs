@@ -258,13 +258,28 @@ struct FlagWire {
     description: Option<String>,
     #[serde(default, rename = "type")]
     kind: Option<String>,
+    /// Native and TypeScript hosts emit boolean or string defaults (`FlagValueWire`).
     #[serde(default)]
-    default: Option<String>,
+    default: Option<FlagValueWire>,
     /// Currently resolved value (from CLI / settings), if any.
     #[serde(default)]
     value: Option<Value>,
     #[serde(default)]
     extension_path: Option<String>,
+}
+
+fn flag_value_wire_to_json(value: &FlagValueWire) -> Value {
+    match value {
+        FlagValueWire::Boolean(value) => Value::Bool(*value),
+        FlagValueWire::String(value) => Value::String(value.clone()),
+    }
+}
+
+fn flag_value_wire_to_legacy_default(value: &FlagValueWire) -> String {
+    match value {
+        FlagValueWire::Boolean(value) => value.to_string(),
+        FlagValueWire::String(value) => value.clone(),
+    }
 }
 
 /// Wire form of [`RendererRegistration`].
@@ -449,14 +464,17 @@ fn build_snapshot(wire: RegistrySnapshotWire, client: &Arc<HostClient>) -> Regis
                 Some("boolean") => adapters::FlagKind::Boolean,
                 _ => adapters::FlagKind::String,
             },
-            default: flag.default.clone(),
+            default: flag
+                .default
+                .as_ref()
+                .map(flag_value_wire_to_legacy_default),
             extension_path: flag.extension_path,
         }) {
             // First-wins: prefer the host-resolved value, fall back to default.
             let value = flag
                 .value
                 .clone()
-                .or_else(|| flag.default.map(Value::String))
+                .or_else(|| flag.default.as_ref().map(flag_value_wire_to_json))
                 .unwrap_or_else(|| Value::String(String::new()));
             snapshot.flag_values.insert(flag.name, value);
         }
