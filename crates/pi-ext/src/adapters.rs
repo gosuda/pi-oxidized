@@ -216,7 +216,7 @@ impl AgentTool for ExtensionAgentTool {
                 tokio::select! {
                     biased;
                     () = cancel.cancelled() => {
-                        let _ = stream.cancel(methods::TOOL_CANCEL).await;
+                        let _ = stream.cancel(methods::TOOL_CANCEL);
                         return Err(ToolError::new("extension tool cancelled"));
                     }
                     ev = stream.next_event() => match ev {
@@ -327,7 +327,7 @@ impl Provider for ExtensionProvider {
                 tokio::select! {
                     biased;
                     () = cancel.cancelled() => {
-                        let _ = handle.cancel(methods::PROVIDER_CANCEL).await;
+                        let _ = handle.cancel(methods::PROVIDER_CANCEL);
                         let _ = tx
                             .send(Err(ProviderError::new("provider stream cancelled")))
                             .await;
