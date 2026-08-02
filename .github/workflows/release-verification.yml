@@ -32,6 +32,19 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
+      - name: Checkout TypeScript reference (pinned)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          repository: earendil-works/pi
+          ref: 956074697fc0f59e8a9787717e76d5bb0ee7bc72
+          path: .references/pi
+          persist-credentials: false
+
+      - name: Verify reference pin
+        shell: bash
+        run: |
+          test "$(git -C .references/pi rev-parse HEAD)" = "956074697fc0f59e8a9787717e76d5bb0ee7bc72"
+
       - name: Set up QEMU for aarch64 Linux
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         id: qemu
@@ -59,8 +72,9 @@ jobs:
           grep -q '^enabled' /proc/sys/fs/binfmt_misc/qemu-aarch64
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
+          toolchain: 1.97.1
           targets: ${{ matrix.target }}
 
       - name: Set up Bun
@@ -76,16 +90,90 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      - name: Reconstruct reference provider data (offline)
+        run: bun run scripts/reconstruct-provider-data.ts
+
+      - name: Install reference dependencies
+        run: npm ci --ignore-scripts --prefix .references/pi
+
+      - name: Prepare interactive script test prerequisites
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          cargo build -p pi --locked
+          case "${RUNNER_OS}-${RUNNER_ARCH}" in
+            Linux-X64) host_target=bun-linux-x64-baseline ;;
+            macOS-X64) host_target=bun-darwin-x64-baseline ;;
+            macOS-ARM64) host_target=bun-darwin-arm64 ;;
+            *) echo "unsupported test-host runner: ${RUNNER_OS}-${RUNNER_ARCH}" >&2; exit 1 ;;
+          esac
+          (
+            cd packages/extension-host
+            bun install --frozen-lockfile
+            mkdir -p dist
+            bun build ./src/main.ts --compile --minify --compile-autoload-tsconfig --compile-autoload-package-json --target "$host_target" --outfile dist/pi-extension-host
+          )
+
+      # Bun's terminal spawn is POSIX-only. The Windows leg still runs every
+      # non-PTY script test; Linux and macOS run PTY + interactive smoke tests.
       - name: JS checks and scripts tests
+        shell: bash
         run: |
           bun run check
           bun test scripts
+
+      # The full correctness and same-machine performance signal runs once;
+      # the remaining four jobs stay focused on target-specific packaging.
+      - name: Generate Rust test fixtures
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: bun run scripts/generate-tool-schemas.ts
+
+      - name: Rust quality and tests
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          cargo fmt --all --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --all-targets --no-fail-fast --locked
+
+      - name: Install cargo-deny
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf  # v2.85.2
+        with:
+          tool: cargo-deny@0.20.2
+
+      - name: Security and advisory audit (cargo-deny)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo deny check
+
+      - name: Full compatibility matrix
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: bun run verify:compatibility
+
+      - name: Upload extension scaling artifact
+        if: always() && matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: extension-scaling-${{ matrix.target }}
+          path: target/bench/extension-scaling.json
+          overwrite: true
+
+      - name: Upload compatibility performance evidence
+        if: always() && matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: compatibility-performance-${{ matrix.target }}
+          path: |
+            target/verification/compat-matrix/result.json
+            target/bench/performance-comparison.json
+          if-no-files-found: warn
+          overwrite: true
 
       - name: Build and Package (First Pass)
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
           AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+          QEMU_LD_PREFIX: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && '/usr/aarch64-linux-gnu' || '' }}
         run: bun run scripts/package-release.ts --target ${{ matrix.target }} --out dist/pass1
 
       - name: Build and Package (Second Pass)
@@ -93,6 +181,7 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
           AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+          QEMU_LD_PREFIX: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && '/usr/aarch64-linux-gnu' || '' }}
         run: bun run scripts/package-release.ts --target ${{ matrix.target }} --out dist/pass2
 
       - name: Verify Determinism
