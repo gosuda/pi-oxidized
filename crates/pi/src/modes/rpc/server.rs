@@ -280,6 +280,8 @@ pub trait RpcSessionHost: Send + Sync {
     fn set_thinking_level(&self, level: ModelThinkingLevel) -> BoxFuture<'static, bool>;
     /// Cycle to the next thinking level.
     fn cycle_thinking_level(&self) -> BoxFuture<'static, Option<ModelThinkingLevel>>;
+    /// List thinking levels supported by the current model.
+    fn get_available_thinking_levels(&self) -> BoxFuture<'static, Vec<ModelThinkingLevel>>;
 
     // ---- Queue modes ----
     /// Set steering queue drain mode.
@@ -497,6 +499,15 @@ impl ServerState {
         if self.write_tx.send(WriteMessage::Drain(done_tx)).is_ok() {
             let _ = done_rx.await;
         }
+    }
+
+    /// Rebind after session replacement, clearing any pending signal flag first.
+    pub(crate) async fn rebind_host<H>(&self, host: &H)
+    where
+        H: RpcSessionHost + ?Sized,
+    {
+        self.needs_rebind.store(false, Ordering::SeqCst);
+        self.rebind(host).await;
     }
 
     /// Rebind extensions + subscriptions on the current session.
@@ -863,7 +874,7 @@ where
             match host.new_session(parent_session.clone()).await {
                 Ok(cancelled) => {
                     if !cancelled {
-                        state.rebind(host).await;
+                        state.rebind_host(host).await;
                     }
                     Some(RpcResponse::ok_data(
                         id,
@@ -957,6 +968,15 @@ where
             ))
         }
 
+        RpcCommand::GetAvailableThinkingLevels { .. } => {
+            let levels = host.get_available_thinking_levels().await;
+            Some(RpcResponse::ok_data(
+                id,
+                "get_available_thinking_levels",
+                RpcResponseData::AvailableThinkingLevels { levels },
+            ))
+        }
+
         RpcCommand::SetSteeringMode { mode, .. } => {
             host.set_steering_mode(*mode).await;
             Some(RpcResponse::ok(id, "set_steering_mode"))
@@ -1036,7 +1056,7 @@ where
             match host.switch_session(session_path.clone()).await {
                 Ok(cancelled) => {
                     if !cancelled {
-                        state.rebind(host).await;
+                        state.rebind_host(host).await;
                     }
                     Some(RpcResponse::ok_data(
                         id,
@@ -1052,7 +1072,7 @@ where
             match host.fork(entry_id.clone(), ForkPosition::Before).await {
                 Ok(outcome) => {
                     if !outcome.cancelled {
-                        state.rebind(host).await;
+                        state.rebind_host(host).await;
                     }
                     Some(RpcResponse::ok_data(
                         id,
@@ -1078,7 +1098,7 @@ where
                 Some(leaf_id) => match host.fork(leaf_id, ForkPosition::At).await {
                     Ok(outcome) => {
                         if !outcome.cancelled {
-                            state.rebind(host).await;
+                            state.rebind_host(host).await;
                         }
                         Some(RpcResponse::ok_data(
                             id,
@@ -1602,6 +1622,7 @@ mod tests {
         commands: Vec<RpcSlashCommand>,
         cycle_model_result: Option<ModelCycleResult>,
         cycle_thinking_result: Option<ModelThinkingLevel>,
+        available_thinking_levels: Vec<ModelThinkingLevel>,
         set_thinking_result: bool,
         compact_result: Option<Result<CompactionResult, String>>,
         bash_result: Option<Result<BashResult, String>>,
@@ -1619,6 +1640,7 @@ mod tests {
                 commands: vec![],
                 cycle_model_result: None,
                 cycle_thinking_result: None,
+                available_thinking_levels: vec![ModelThinkingLevel::Off],
                 set_thinking_result: true,
                 compact_result: None,
                 bash_result: None,
@@ -1786,6 +1808,11 @@ mod tests {
             self.rec("cycle_thinking_level");
             let cfg = Arc::clone(&self.cfg);
             Box::pin(async move { cfg.lock().unwrap().cycle_thinking_result })
+        }
+        fn get_available_thinking_levels(&self) -> BoxFuture<'static, Vec<ModelThinkingLevel>> {
+            self.rec("get_available_thinking_levels");
+            let cfg = Arc::clone(&self.cfg);
+            Box::pin(async move { cfg.lock().unwrap().available_thinking_levels.clone() })
         }
         fn set_steering_mode(&self, _m: QueueMode) -> BoxFuture<'static, ()> {
             self.rec("set_steering_mode");

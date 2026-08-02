@@ -218,6 +218,11 @@ impl RpcSessionHost for Arc<AgentSessionRuntime> {
         Box::pin(async move { session.cycle_thinking_level().await })
     }
 
+    fn get_available_thinking_levels(&self) -> BoxFuture<'static, Vec<ModelThinkingLevel>> {
+        let session = self.session();
+        Box::pin(async move { session.available_thinking_levels() })
+    }
+
     fn set_steering_mode(&self, mode: QueueMode) -> BoxFuture<'static, ()> {
         let session = self.session();
         Box::pin(async move {
