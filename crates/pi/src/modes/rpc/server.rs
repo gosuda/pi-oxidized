@@ -310,6 +310,7 @@ pub trait RpcSessionHost: Send + Sync {
         &self,
         command: String,
         exclude_from_context: Option<bool>,
+        id: Option<String>,
     ) -> BoxFuture<'static, Result<BashResult, String>>;
     /// Abort a running bash command.
     fn abort_bash(&self) -> BoxFuture<'static, ()>;
@@ -1018,7 +1019,10 @@ where
             command: cmd,
             exclude_from_context,
             ..
-        } => match host.execute_bash(cmd.clone(), *exclude_from_context).await {
+        } => match host
+            .execute_bash(cmd.clone(), *exclude_from_context, id.clone())
+            .await
+        {
             Ok(result) => Some(RpcResponse::ok_data(
                 id,
                 "bash",
@@ -1626,6 +1630,7 @@ mod tests {
         set_thinking_result: bool,
         compact_result: Option<Result<CompactionResult, String>>,
         bash_result: Option<Result<BashResult, String>>,
+        bash_id: Option<Option<String>>,
         fork_outcome: Result<ForkOutcome, String>,
         leaf_id: Option<String>,
         prompt_error: Option<String>,
@@ -1644,6 +1649,7 @@ mod tests {
                 set_thinking_result: true,
                 compact_result: None,
                 bash_result: None,
+                bash_id: None,
                 fork_outcome: Ok(ForkOutcome::default()),
                 leaf_id: Some("leaf1".into()),
                 prompt_error: None,
@@ -1852,15 +1858,16 @@ mod tests {
             &self,
             _c: String,
             _e: Option<bool>,
+            id: Option<String>,
         ) -> BoxFuture<'static, Result<BashResult, String>> {
             self.rec("bash");
             let cfg = Arc::clone(&self.cfg);
             Box::pin(async move {
-                cfg.lock()
-                    .unwrap()
-                    .bash_result
-                    .clone()
-                    .unwrap_or(Ok(test_bash_result()))
+                let mut g = cfg.lock().unwrap();
+                if g.bash_id.is_none() {
+                    g.bash_id = Some(id);
+                }
+                g.bash_result.clone().unwrap_or(Ok(test_bash_result()))
             })
         }
         fn abort_bash(&self) -> BoxFuture<'static, ()> {
@@ -2035,6 +2042,21 @@ mod tests {
         assert!(!lines.is_empty(), "expected at least one response line");
         let resp: Value = serde_json::from_str(&lines[0]).unwrap();
         (resp, sink_clone)
+    }
+
+    async fn dispatch_with_host(
+        cmd_json: &str,
+        cfg: FakeConfig,
+    ) -> (Value, BufferSink, FakeRpcHost) {
+        let host = FakeRpcHost::new(cfg);
+        let sink = BufferSink::new();
+        let (state, sink_clone, mut write_rx) = make_state(sink);
+        process_input_line(cmd_json, &host, &state).await;
+        drain(&sink_clone, &mut write_rx).await;
+        let lines = sink_clone.stdout_lines();
+        assert!(!lines.is_empty(), "expected at least one response line");
+        let resp: Value = serde_json::from_str(&lines[0]).unwrap();
+        (resp, sink_clone, host)
     }
 
     async fn dispatch_no_response(
@@ -2344,12 +2366,18 @@ mod tests {
 
     #[tokio::test]
     async fn bash_returns_result() {
-        let (r, _) = dispatch(
+        let (r, _, host) = dispatch_with_host(
             r#"{"type":"bash","id":"b1","command":"echo hi"}"#,
             FakeConfig::default(),
         )
         .await;
         assert_eq!(r["data"]["output"], "done");
+        // The RPC request id must reach ExecuteBashOptions.id so that
+        // bash_execution_update events correlate with the originating request.
+        assert_eq!(
+            host.cfg.lock().unwrap().bash_id,
+            Some(Some("b1".to_string()))
+        );
     }
 
     #[tokio::test]

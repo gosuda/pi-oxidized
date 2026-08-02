@@ -2405,19 +2405,48 @@ export class ExtensionHost {
 	 * `switchSession` / `reload` are correlated bridge requests (same pattern
 	 * as `session.setModel` / `session.compact`). Non-serializable callbacks
 	 * (`setup`, `withSession`) stay host-side and run after a non-cancelled
-	 * replacement using a fresh `createCommandContext()`.
+	 * replacement: `setup` (newSession only) receives the replacement
+	 * SessionManager proxy; `withSession` receives a real
+	 * `ReplacedSessionContext` built from `createCommandContext()` with
+	 * working `sendMessage` / `sendUserMessage` bridged to Rust.
 	 */
 	private createCommandContextActions(): ExtensionCommandContextActions {
 		const self = this;
 		const cancelledOf = (frame: Frame): boolean =>
 			(frame.payload as Record<string, unknown>)["cancelled"] === true;
 
+		const createReplacedSessionContext = (runner: ExtensionRunner): ReplacedSessionContext => {
+			const base = runner.createCommandContext();
+			const context = Object.defineProperties(
+				{},
+				Object.getOwnPropertyDescriptors(base),
+			) as ReplacedSessionContext;
+			context.sendMessage = (message, options) => {
+				self.sendSessionCommand({
+					action: "sendMessage",
+					message: {
+						customType: message.customType,
+						content: message.content,
+						display: message.display,
+						details: message.details,
+					},
+					options,
+				});
+				return Promise.resolve();
+			};
+			context.sendUserMessage = (content, options) => {
+				self.sendSessionCommand({ action: "sendUserMessage", content, options });
+				return Promise.resolve();
+			};
+			return context;
+		};
+
 		const afterReplacement = async (
 			cancelled: boolean,
 			withSession?: (ctx: ReplacedSessionContext) => Promise<void>,
 		): Promise<{ cancelled: boolean }> => {
 			if (!cancelled && withSession !== undefined && self.runner !== undefined) {
-				await withSession(self.runner.createCommandContext() as ReplacedSessionContext);
+				await withSession(createReplacedSessionContext(self.runner));
 			}
 			return { cancelled };
 		};
@@ -2435,7 +2464,11 @@ export class ExtensionHost {
 					{ parentSession: options?.parentSession },
 					{ timeoutMs: EXTENSION_HOOK_TIMEOUT_MS },
 				);
-				return afterReplacement(cancelledOf(frame), options?.withSession);
+				const cancelled = cancelledOf(frame);
+				if (!cancelled && options?.setup !== undefined) {
+					await options.setup(self.createSessionManagerProxy());
+				}
+				return afterReplacement(cancelled, options?.withSession);
 			},
 			fork: async (entryId, options) => {
 				const frame = await self.client.request(

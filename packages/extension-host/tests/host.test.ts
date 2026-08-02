@@ -27,6 +27,7 @@ import { loadRunOptions, parseArgs } from "../src/main.ts";
 import hooksFactory from "../fixtures/extensions/hooks.ts";
 import toolFactory from "../fixtures/extensions/tool.ts";
 import commandContextFactory from "../fixtures/extensions/command-context.ts";
+import replacedSessionFactory from "../fixtures/extensions/replaced-session.ts";
 
 /** Collecting ByteWritable that signals on first write (no Writable dependency). */
 class PipeWritable {
@@ -458,6 +459,150 @@ describe("host: command context + mirrored session state", () => {
 		expect(report["waitForIdleOk"]).toBe(true);
 		expect(report["contextUsage"]).toEqual({ tokens: 10, contextWindow: 1000, percent: 1 });
 		expect(report["scopedModels"]).toEqual([{ model: { id: "m1", provider: "p" } }]);
+
+		await teardown(connected);
+	});
+});
+
+describe("host: newSession setup + withSession + ReplacedSessionContext", () => {
+	function sessionUpdate(stdin: Readable, idle: boolean): void {
+		push(stdin, {
+			id: 0, kind: "event", method: "session.update",
+			payload: {
+				thinkingLevel: "medium",
+				activeTools: [],
+				allTools: [],
+				commands: [],
+				isIdle: idle,
+				hasPendingMessages: false,
+				contextUsage: { tokens: 10, contextWindow: 1000, percent: 1 },
+				scopedModels: [],
+				systemPrompt: "",
+			},
+		});
+	}
+
+	test("newSession: setup runs before withSession on non-cancelled replacement", async () => {
+		const connected = await connectHost([replacedSessionFactory]);
+		const { collector, stdin } = connected;
+
+		sessionUpdate(stdin, true);
+
+		// Respond to session.newSession with cancelled:false so setup + withSession run.
+		void collector
+			.awaitFrame((f) => f.kind === "req" && f.method === "session.newSession")
+			.then((request) => {
+				push(stdin, {
+					id: request.id, kind: "res", method: "session.newSession",
+					payload: { cancelled: false },
+				});
+			});
+
+		push(stdin, {
+			id: 50, kind: "req", method: "command.execute",
+			payload: { command: "replacedSessionProbe", args: "" },
+		});
+
+		const notify = await collector.awaitFrame((f) => f.method === "notify");
+		await collector.awaitFrame((f) => f.id === 50 && f.kind === "res");
+
+		const report = JSON.parse(String(payloadOf(notify)["message"])) as Record<string, unknown>;
+		expect(report["setupOrder"]).toEqual(["setup", "withSession"]);
+		expect(report["setupReceived"]).toBe(true);
+		expect(report["newSessionResult"]).toEqual({ cancelled: false });
+		expect(report["withSessionSendMessage"]).toBe("function");
+		expect(report["withSessionSendUserMessage"]).toBe("function");
+
+		// sendMessage and sendUserMessage bridge to Rust as session.command events.
+		const commandEvents = collector.frames.filter(
+			(f) => f.kind === "event" && f.method === "session.command",
+		);
+		expect(commandEvents.length).toBeGreaterThanOrEqual(2);
+		const actions = commandEvents.map((f) => payloadOf(f)["action"]);
+		expect(actions).toContain("sendMessage");
+		expect(actions).toContain("sendUserMessage");
+
+		await teardown(connected);
+	});
+
+	test("newSession: setup and withSession do NOT run when replacement is cancelled", async () => {
+		const connected = await connectHost([replacedSessionFactory]);
+		const { collector, stdin } = connected;
+
+		sessionUpdate(stdin, true);
+
+		void collector
+			.awaitFrame((f) => f.kind === "req" && f.method === "session.newSession")
+			.then((request) => {
+				push(stdin, {
+					id: request.id, kind: "res", method: "session.newSession",
+					payload: { cancelled: true },
+				});
+			});
+
+		push(stdin, {
+			id: 51, kind: "req", method: "command.execute",
+			payload: { command: "replacedSessionCancel", args: "" },
+		});
+
+		const notify = await collector.awaitFrame((f) => f.method === "notify");
+		await collector.awaitFrame((f) => f.id === 51 && f.kind === "res");
+
+		const report = JSON.parse(String(payloadOf(notify)["message"])) as Record<string, unknown>;
+		expect(report["setupRanOnCancel"]).toEqual([]);
+		expect(report["newSessionResult"]).toEqual({ cancelled: true });
+
+		await teardown(connected);
+	});
+
+	test("withSession: sendMessage and sendUserMessage produce bridge session.command frames", async () => {
+		const connected = await connectHost([replacedSessionFactory]);
+		const { collector, stdin } = connected;
+
+		sessionUpdate(stdin, true);
+
+		void collector
+			.awaitFrame((f) => f.kind === "req" && f.method === "session.newSession")
+			.then((request) => {
+				push(stdin, {
+					id: request.id, kind: "res", method: "session.newSession",
+					payload: { cancelled: false },
+				});
+			});
+
+		push(stdin, {
+			id: 52, kind: "req", method: "command.execute",
+			payload: { command: "replacedSessionProbe", args: "" },
+		});
+
+		// Wait for the command to complete; by then sendMessage/sendUserMessage
+		// have fired session.command events through the bridge.
+		await collector.awaitFrame((f) => f.method === "notify");
+		await collector.awaitFrame((f) => f.id === 52 && f.kind === "res");
+
+		const sendMessageFrame = collector.frames.find(
+			(f) =>
+				f.kind === "event" &&
+				f.method === "session.command" &&
+				payloadOf(f)["action"] === "sendMessage",
+		);
+		const sendUserMessageFrame = collector.frames.find(
+			(f) =>
+				f.kind === "event" &&
+				f.method === "session.command" &&
+				payloadOf(f)["action"] === "sendUserMessage",
+		);
+		expect(sendMessageFrame).toBeDefined();
+		expect(sendUserMessageFrame).toBeDefined();
+
+		const smPayload = sendMessageFrame ? payloadOf(sendMessageFrame) : {};
+		expect(smPayload["message"]).toMatchObject({
+			customType: "test-custom",
+			content: "hello",
+		});
+
+		const sumPayload = sendUserMessageFrame ? payloadOf(sendUserMessageFrame) : {};
+		expect(sumPayload["content"]).toBe("user hello");
 
 		await teardown(connected);
 	});

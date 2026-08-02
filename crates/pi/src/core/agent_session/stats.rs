@@ -107,6 +107,32 @@ impl AgentSession {
         let mut cost = 0f64;
 
         for entry in &entries {
+            // Persisted summary entries (compaction / branch_summary) carry
+            // their own LLM usage from the summarization call. Include it in
+            // token/cost totals so they reflect what was actually billed
+            // (TypeScript `addUsageToTotals` on `entry.usage`).
+            match entry {
+                SessionEntry::Compaction(c) => {
+                    if let Some(usage) = &c.usage {
+                        input = input.saturating_add(usage.input);
+                        output = output.saturating_add(usage.output);
+                        cache_read = cache_read.saturating_add(usage.cache_read);
+                        cache_write = cache_write.saturating_add(usage.cache_write);
+                        cost += usage.cost.total;
+                    }
+                }
+                SessionEntry::BranchSummary(b) => {
+                    if let Some(usage) = &b.usage {
+                        input = input.saturating_add(usage.input);
+                        output = output.saturating_add(usage.output);
+                        cache_read = cache_read.saturating_add(usage.cache_read);
+                        cache_write = cache_write.saturating_add(usage.cache_write);
+                        cost += usage.cost.total;
+                    }
+                }
+                _ => {}
+            }
+
             let SessionEntry::Message(message_entry) = entry else {
                 continue;
             };
@@ -273,6 +299,67 @@ fn model_context_window(model: &Model) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::agent_session::{AgentSession, AgentSessionConfig};
+    use futures::stream::{self, BoxStream, StreamExt};
+    use pi_ai::{
+        AssistantMessageEvent, Context, Model, ModelCost, ModelInput, Provider, ProviderError,
+        StreamOptions, Usage, UsageCost,
+    };
+    use std::sync::Arc;
+
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    fn test_model() -> Model {
+        Model {
+            id: "m".to_owned(),
+            name: "m".to_owned(),
+            api: "test-api".to_owned(),
+            provider: "test-provider".to_owned(),
+            base_url: String::new(),
+            reasoning: false,
+            thinking_level_map: None,
+            input: vec![ModelInput::Text],
+            cost: ModelCost::default(),
+            context_window: 8_192,
+            max_tokens: 1_024,
+            headers: None,
+            compat: None,
+            extra: std::collections::BTreeMap::new(),
+        }
+    }
+
+    #[derive(Clone)]
+    struct StubProvider;
+
+    impl Provider for StubProvider {
+        fn stream(
+            &self,
+            _model: &Model,
+            _context: Context,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, Result<AssistantMessageEvent, ProviderError>> {
+            stream::empty().boxed()
+        }
+    }
+
+    fn make_session() -> TestResult<Arc<AgentSession>> {
+        let config = AgentSessionConfig::test_config(Arc::new(StubProvider), test_model())?;
+        AgentSession::new(config).map_err(Into::into)
+    }
+
+    fn summary_usage(input: u64, output: u64, cost_total: f64) -> Usage {
+        Usage {
+            input,
+            output,
+            cache_read: input / 2,
+            cache_write: output / 2,
+            cost: UsageCost {
+                total: cost_total,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn context_usage_tokens_when_window_zero_is_none() {
@@ -298,5 +385,58 @@ mod tests {
         // The aggregation path uses saturating_add; just sanity-check that
         // the helper struct accepts extreme values without panic.
         assert_eq!(totals.input, u64::MAX);
+    }
+
+    /// Totals must include persisted `usage` on `compaction` and
+    /// `branch_summary` entries, not just assistant messages.
+    #[tokio::test]
+    async fn stats_include_compaction_and_branch_summary_usage() -> TestResult {
+        let session = make_session()?;
+        let compaction_usage = summary_usage(100, 200, 0.03);
+        let branch_usage = summary_usage(10, 20, 0.01);
+
+        {
+            let mut sm = session.session_manager.lock().await;
+            sm.append_compaction(
+                "compaction summary",
+                "kept1",
+                1000,
+                None,
+                None,
+                Some(compaction_usage),
+            )?;
+            sm.branch_with_summary(None, "branch summary", None, None, Some(branch_usage))?;
+        }
+
+        let stats = session.get_session_stats().await;
+
+        // Compaction: input=100, output=200, cache_read=50, cache_write=100, cost=0.03
+        // Branch:     input=10,  output=20,  cache_read=5,  cache_write=10,  cost=0.01
+        // Totals:     input=110, output=220, cache_read=55, cache_write=110, cost=0.04
+        assert_eq!(
+            stats.tokens.input, 110,
+            "input should include both summary usages"
+        );
+        assert_eq!(
+            stats.tokens.output, 220,
+            "output should include both summary usages"
+        );
+        assert_eq!(
+            stats.tokens.cache_read, 55,
+            "cache_read should include both summary usages"
+        );
+        assert_eq!(
+            stats.tokens.cache_write, 110,
+            "cache_write should include both summary usages"
+        );
+        assert!(
+            (stats.cost - 0.04).abs() < f64::EPSILON,
+            "cost should include both summary usages, got {}",
+            stats.cost
+        );
+        // No message entries → message counts unchanged.
+        assert_eq!(stats.total_messages, 0);
+        assert_eq!(stats.assistant_messages, 0);
+        Ok(())
     }
 }
