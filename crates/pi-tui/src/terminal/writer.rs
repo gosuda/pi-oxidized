@@ -15,10 +15,11 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 
 use crate::component::Component;
 use crate::frame::{FrameAnnotations, with_annotations};
+use crate::image::delete_kitty_image;
 use crate::terminal::backend::{
     GuardedBackend, audit_bytes, encode_full_row_prefix, wrap_synchronized,
 };
-use crate::terminal::caps::{TerminalCapabilities, kitty_delete_id};
+use crate::terminal::caps::TerminalCapabilities;
 use crate::terminal::sink::FrameSink;
 
 const SYNC_OUTPUT_END: &[u8] = b"\x1b[?2026l";
@@ -329,7 +330,7 @@ impl<W: Write> Tui<W> {
             }
         }
         for id in self.state.live_kitty_ids.difference(&next_ids) {
-            payload.extend_from_slice(&kitty_delete_id(*id));
+            payload.extend_from_slice(delete_kitty_image(*id).as_bytes());
         }
         for region in raw_regions {
             payload.extend_from_slice(b"\x1b7");
@@ -436,7 +437,7 @@ impl<W: Write> Tui<W> {
 
         let mut payload_prefix = Vec::new();
         for id in &self.state.live_kitty_ids {
-            payload_prefix.extend_from_slice(&kitty_delete_id(*id));
+            payload_prefix.extend_from_slice(delete_kitty_image(*id).as_bytes());
         }
         self.state.live_kitty_ids.clear();
         if !payload_prefix.is_empty() {
@@ -620,7 +621,7 @@ impl TransactionRecorder {
             }
             SimulatedTxn::Reanchor { rows } => {
                 for id in &self.live_kitty {
-                    payload.extend_from_slice(&kitty_delete_id(*id));
+                    payload.extend_from_slice(delete_kitty_image(*id).as_bytes());
                 }
                 self.live_kitty.clear();
                 for row in 0..rows.min(self.viewport_height) {
@@ -856,9 +857,9 @@ mod tests {
         assert_eq!(report.clear_3j, 0);
         assert_eq!(report.sync_begin, 1);
         assert_eq!(report.sync_end, 1);
-        let delete = kitty_delete_id(9);
-        let delete_pos = find_subslice(bytes, &delete)
-            .ok_or_else(|| io::Error::other("missing Kitty delete"))?;
+        let delete = b"\x1b_Ga=d,d=I,i=9,q=2\x1b\\";
+        let delete_pos = find_subslice(bytes, delete)
+            .ok_or_else(|| io::Error::other("missing canonical Kitty q=2 delete"))?;
         let el2_pos =
             find_subslice(bytes, b"\x1b[2K").ok_or_else(|| io::Error::other("missing EL2"))?;
         assert!(delete_pos < el2_pos);
