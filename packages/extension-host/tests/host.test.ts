@@ -146,6 +146,7 @@ describe("host: built-in options", () => {
 			cwd: "/project",
 			extensionPaths: ["first.mjs", "second.mjs"],
 			noBuiltins: true,
+			lean: false,
 		});
 		const options = await loadRunOptions(argv);
 		expect(options.factories).toEqual([]);

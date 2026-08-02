@@ -155,4 +155,23 @@ export default (pi) => pi.registerTool(tool);
 			expect.objectContaining({ name: "bundled" }),
 		]));
 	});
+
+	test("loads an extension importing pi-ai image exports through the root alias", async () => {
+		const fixturePath = resolve(
+			import.meta.dirname,
+			"..",
+			"fixtures",
+			"extensions",
+			"pi-ai-images-import.ts",
+		);
+		const result = await loadExtension(hostPath, outsideCwd, fixturePath);
+		expect(result["errors"]).toEqual([]);
+		expect(result["extensions"]).toBe(1);
+		expect(result["tools"]).toEqual(expect.arrayContaining([
+			expect.objectContaining({
+				name: "piAiImagesProbe",
+				description: "generate=true;models=true;api=true",
+			}),
+		]));
+	});
 });
