@@ -14,6 +14,9 @@
 //!   `oneshot::Receiver`; the reader dispatches matched responses.
 //! - **Cancel / timeout.** Every call has a deadline; cancellation keeps its
 //!   pending route until its control frame queues or the transport closes.
+//!   Each pending route carries a monotonic generation so a delayed
+//!   background cancel cleanup cannot remove a newer entry reusing the same
+//!   frame id.
 //! - **Bounded event broadcast.** Unsolicited events fan out through a
 //!   `broadcast` channel with a fixed capacity.
 //! - **Stderr capture.** A tail is retained for crash diagnostics.
@@ -72,6 +75,10 @@ struct PendingEntry {
     stream: Option<mpsc::Sender<Frame>>,
     /// True once cancellation delivery owns this correlation id.
     cancelling: bool,
+    /// Monotonic generation assigned by `insert_pending`. Delayed background
+    /// cancel cleanup matches it so a newer entry reusing the same frame id
+    /// is not removed underneath a stale cancellation.
+    generation: u64,
 }
 
 /// Outcome of asking the outbound writer to cancel a pending route.
@@ -175,6 +182,9 @@ struct Shared {
     events: broadcast::Sender<HostEvent>,
     /// Monotonic request id allocator.
     next_id: AtomicU64,
+    /// Monotonic generation stamped onto each `PendingEntry` so a delayed
+    /// background cancel cleanup cannot remove a newer same-id entry.
+    next_pending_generation: AtomicU64,
     /// Retained stderr tail (most recent `STDERR_TAIL_BYTES` bytes).
     stderr: StdMutex<String>,
     /// Cleared once the reader or writer observes end-of-stream.
@@ -357,6 +367,7 @@ impl HostClient {
             slot_generations: StdMutex::new(HashMap::new()),
             events: events_tx,
             next_id: AtomicU64::new(1),
+            next_pending_generation: AtomicU64::new(1),
             stderr: StdMutex::new(String::new()),
             running: AtomicBool::new(true),
         });
@@ -461,12 +472,13 @@ impl HostClient {
         }
         let id = self.next_id();
         let (tx, rx) = oneshot::channel::<FrameResult>();
-        self.insert_pending(
+        let generation = self.insert_pending(
             id,
             PendingEntry {
                 terminal: Some(tx),
                 stream: None,
                 cancelling: false,
+                generation: 0,
             },
         );
         let frame = Frame {
@@ -490,6 +502,7 @@ impl HostClient {
                     let _ = cancel_pending(
                         &self.shared,
                         id,
+                        generation,
                         self.cmd_tx.lock().await.clone(),
                         Some(control_method),
                         None,
@@ -648,12 +661,13 @@ impl HostClient {
         let bound = event_bound.clamp(1, STREAM_EVENT_CAPACITY * 8);
         let (terminal_tx, terminal_rx) = oneshot::channel::<FrameResult>();
         let (stream_tx, stream_rx) = mpsc::channel::<Frame>(bound);
-        self.insert_pending(
+        let generation = self.insert_pending(
             id,
             PendingEntry {
                 terminal: Some(terminal_tx),
                 stream: Some(stream_tx),
                 cancelling: false,
+                generation: 0,
             },
         );
         let frame = Frame {
@@ -668,6 +682,7 @@ impl HostClient {
         }
         Ok(StreamHandle {
             id,
+            generation,
             events: stream_rx,
             terminal: Some(terminal_rx),
             shared: Arc::clone(&self.shared),
@@ -741,10 +756,16 @@ impl HostClient {
         Ok(resp.height)
     }
 
-    fn insert_pending(&self, id: FrameId, entry: PendingEntry) {
+    fn insert_pending(&self, id: FrameId, mut entry: PendingEntry) -> u64 {
+        let generation = self
+            .shared
+            .next_pending_generation
+            .fetch_add(1, Ordering::Relaxed);
+        entry.generation = generation;
         if let Ok(mut pending) = self.shared.pending.lock() {
             pending.insert(id, entry);
         }
+        generation
     }
 
     /// Graceful shutdown: close stdin, wait the grace period, then kill + reap.
@@ -775,6 +796,7 @@ impl HostClient {
 /// Handle for a streaming call.
 pub struct StreamHandle {
     id: FrameId,
+    generation: u64,
     events: mpsc::Receiver<Frame>,
     terminal: Option<oneshot::Receiver<FrameResult>>,
     shared: Arc<Shared>,
@@ -806,6 +828,7 @@ impl StreamHandle {
         match cancel_pending(
             &self.shared,
             self.id,
+            self.generation,
             self.cmd_tx.clone(),
             Some(control_method),
             None,
@@ -858,6 +881,7 @@ impl Drop for StreamHandle {
         let _ = cancel_pending(
             &self.shared,
             self.id,
+            self.generation,
             self.cmd_tx.clone(),
             self.cancel_method,
             None,
@@ -1045,9 +1069,9 @@ fn take_active_pending(shared: &Shared, id: FrameId) -> Option<PendingEntry> {
     }
 }
 
-fn remove_cancelling_pending(shared: &Shared, id: FrameId) {
+fn remove_cancelling_pending(shared: &Shared, id: FrameId, generation: u64) {
     if let Ok(mut pending) = shared.pending.lock()
-        && pending.get(&id).is_some_and(|entry| entry.cancelling)
+        && pending.get(&id).is_some_and(|entry| entry.cancelling && entry.generation == generation)
     {
         pending.remove(&id);
     }
@@ -1059,6 +1083,7 @@ fn remove_cancelling_pending(shared: &Shared, id: FrameId) {
 fn cancel_pending(
     shared: &Arc<Shared>,
     id: FrameId,
+    generation: u64,
     cmd_tx: Option<mpsc::Sender<Frame>>,
     control_method: Option<&str>,
     terminal_error: Option<HostClientError>,
@@ -1067,7 +1092,9 @@ fn cancel_pending(
         let Some(entry) = pending.get_mut(&id) else {
             return CancellationStart::AlreadyCancelling;
         };
-        if entry.cancelling {
+        // A missing or generation-mismatched route is already gone or replaced
+        // by a newer same-id entry; never cancel the wrong generation.
+        if entry.generation != generation || entry.cancelling {
             return CancellationStart::AlreadyCancelling;
         }
         entry.cancelling = true;
@@ -1087,13 +1114,13 @@ fn cancel_pending(
     }
 
     let (Some(tx), Some(control_method)) = (cmd_tx, control_method) else {
-        remove_cancelling_pending(shared, id);
+        remove_cancelling_pending(shared, id, generation);
         return CancellationStart::NotRunning;
     };
     let cancel = cancel_frame(id, control_method);
     match tx.try_send(cancel) {
         Ok(()) => {
-            remove_cancelling_pending(shared, id);
+            remove_cancelling_pending(shared, id, generation);
             CancellationStart::Queued
         }
         Err(mpsc::error::TrySendError::Full(cancel)) => {
@@ -1101,12 +1128,12 @@ fn cancel_pending(
             let shared = Arc::clone(shared);
             runtime.spawn(async move {
                 let _ = tx.send(cancel).await;
-                remove_cancelling_pending(&shared, id);
+                remove_cancelling_pending(&shared, id, generation);
             });
             CancellationStart::QueuedInBackground
         }
         Err(mpsc::error::TrySendError::Closed(_)) => {
-            remove_cancelling_pending(shared, id);
+            remove_cancelling_pending(shared, id, generation);
             CancellationStart::Closed
         }
     }
@@ -1748,6 +1775,103 @@ mod tests {
         })
         .await
         .map_err(|_| "pending route was not released after cancellation queued")?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn background_cancel_does_not_remove_replaced_pending_under_same_id() -> R {
+        let (client, _host) = make_pair().await;
+        let (mut stalled, _original) = client.stall_outbound_for_test().await;
+        let stream = client
+            .open_stream_raw("provider.stream", serde_json::json!({}), 2)
+            .await?;
+        let id = stream.id();
+        let shared = Arc::clone(&stream.shared);
+        let old_generation = stream.generation;
+
+        // The request already occupies the one-slot writer queue. Dropping the
+        // stream retains its correlation state while its cancel waits on the
+        // saturated channel (background send path).
+        drop(stream);
+        assert!(
+            shared
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&id)
+                .is_some_and(|entry| entry.cancelling && entry.generation == old_generation),
+            "the pending route remains cancellation-owned by the old generation"
+        );
+
+        // Replace the pending route under the same frame id with a fresh,
+        // non-cancelling entry carrying a newer generation.
+        let new_generation = shared
+            .next_pending_generation
+            .fetch_add(1, Ordering::Relaxed);
+        {
+            let mut pending = shared
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pending.insert(
+                id,
+                PendingEntry {
+                    terminal: None,
+                    stream: None,
+                    cancelling: false,
+                    generation: new_generation,
+                },
+            );
+        }
+
+        // Drain the stalled channel: first the original request, then the
+        // cancel the background send queued. The background cleanup runs
+        // after its send completes.
+        let request = tokio::time::timeout(Duration::from_millis(100), stalled.recv())
+            .await
+            .map_err(|_| "missing queued stream request")?
+            .ok_or("missing queued stream request")?;
+        assert_eq!(request.id, id);
+
+        let cancel = tokio::time::timeout(Duration::from_millis(100), stalled.recv())
+            .await
+            .map_err(|_| "queued cancellation did not reach the writer")?
+            .ok_or("queued cancellation did not reach the writer")?;
+        assert_eq!(cancel.method, "provider.cancel");
+        assert_eq!(cancel.payload["id"], id);
+
+        // Give the background cleanup task a chance to run after its send
+        // completed; it must NOT remove the newer-generation entry.
+        tokio::time::timeout(Duration::from_millis(100), async {
+            for _ in 0..100 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "cleanup yield loop timed out")?;
+
+        let (survives, surviving_gen, cancelling) = {
+            let pending = shared
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let entry = pending.get(&id);
+            (entry.is_some(), entry.map(|e| e.generation), entry.map(|e| e.cancelling))
+        };
+        assert!(
+            survives,
+            "newer same-id pending entry was removed by stale cleanup"
+        );
+        assert_eq!(
+            surviving_gen,
+            Some(new_generation),
+            "surviving entry is the replacement, not the cancelled one"
+        );
+        assert_eq!(
+            cancelling,
+            Some(false),
+            "replacement entry must not be marked cancelling"
+        );
         Ok(())
     }
 
