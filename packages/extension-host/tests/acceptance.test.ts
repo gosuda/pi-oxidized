@@ -41,6 +41,7 @@ import themeApiFactory from "../fixtures/extensions/theme-api.ts";
 
 const noopContextActions: ExtensionContextActions = {
 	getModel: () => undefined,
+	getScopedModels: () => [],
 	isIdle: () => true,
 	isProjectTrusted: () => true,
 	getSignal: () => undefined,

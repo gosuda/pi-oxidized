@@ -26,6 +26,7 @@ import { loadRunOptions, parseArgs } from "../src/main.ts";
 
 import hooksFactory from "../fixtures/extensions/hooks.ts";
 import toolFactory from "../fixtures/extensions/tool.ts";
+import commandContextFactory from "../fixtures/extensions/command-context.ts";
 
 /** Collecting ByteWritable that signals on first write (no Writable dependency). */
 class PipeWritable {
@@ -70,6 +71,7 @@ function decodeChunks(chunks: Uint8Array[]): Frame[] {
 /** Minimal context-actions stub for runner construction in tests. */
 const noopContextActions: ExtensionContextActions = {
 	getModel: () => undefined,
+	getScopedModels: () => [],
 	isIdle: () => true,
 	isProjectTrusted: () => true,
 	getSignal: () => undefined,
@@ -261,5 +263,202 @@ describe("host: loads real example extensions via jiti", () => {
 	test("widget-placement.ts registers session_start handler", async () => {
 		const result = await loadViaJiti("widget-placement.ts");
 		expect(result.handlers).toContain("session_start");
+	});
+});
+
+/** ByteWritable that decodes frames and lets tests await them by predicate. */
+class FrameCollector {
+	readonly frames: Frame[] = [];
+	private readonly waiters: Array<{
+		predicate: (f: Frame) => boolean;
+		resolve: (f: Frame) => void;
+	}> = [];
+	private buf = "";
+
+	write(chunk: Uint8Array): void {
+		this.buf += new TextDecoder().decode(chunk);
+		const lines = this.buf.split("\n");
+		this.buf = lines.pop() ?? "";
+		for (const line of lines) {
+			if (line.trim().length > 0) {
+				const frame = JSON.parse(line) as Frame;
+				this.frames.push(frame);
+				for (let i = this.waiters.length - 1; i >= 0; i--) {
+					if (this.waiters[i]?.predicate(frame)) {
+						this.waiters[i]?.resolve(frame);
+						this.waiters.splice(i, 1);
+					}
+				}
+			}
+		}
+	}
+
+	awaitFrame(predicate: (f: Frame) => boolean): Promise<Frame> {
+		const existing = this.frames.find(predicate);
+		if (existing !== undefined) return Promise.resolve(existing);
+		const { promise, resolve: resolveWaiter } = Promise.withResolvers<Frame>();
+		this.waiters.push({ predicate, resolve: resolveWaiter });
+		return promise;
+	}
+}
+
+interface Connected {
+	collector: FrameCollector;
+	stdin: Readable;
+	host: ExtensionHost;
+	runPromise: Promise<void>;
+}
+
+async function connectHost(factories: ExtensionFactory[]): Promise<Connected> {
+	const collector = new FrameCollector();
+	const stdin = new Readable({ read() {} });
+	const host = new ExtensionHost(stdin, collector);
+	const runPromise = host.run({ cwd: process.cwd(), factories, extensionPaths: [] });
+
+	stdin.push(Buffer.from(encodeFrameString({
+		id: 1, kind: "req", method: "hello",
+		payload: { protocolVersion: PROTOCOL_VERSION, compatibilityVersion: COMPATIBILITY_VERSION },
+	})));
+	await collector.awaitFrame((f) => f.id === 1 && f.kind === "res");
+	return { collector, stdin, host, runPromise };
+}
+
+function push(stdin: Readable, frame: Frame): void {
+	stdin.push(Buffer.from(encodeFrameString(frame)));
+}
+
+async function teardown(connected: Connected): Promise<void> {
+	connected.stdin.push(null);
+	connected.host.dispose("test");
+	await connected.runPromise.catch(() => void 0);
+}
+
+function payloadOf(frame: Frame): Record<string, unknown> {
+	return frame.payload as Record<string, unknown>;
+}
+
+describe("host: command context + mirrored session state", () => {
+	test("getContextUsage and scopedModels round-trip from session.update", async () => {
+		const connected = await connectHost([commandContextFactory]);
+		const { collector, stdin } = connected;
+
+		const usage = { tokens: 2400, contextWindow: 128000, percent: 1.9 };
+		const scopedModels = [
+			{ model: { id: "gpt-x", provider: "openai" }, thinkingLevel: "high" },
+		];
+
+		// Keep the session busy so waitForIdle parks until we push idle.
+		push(stdin, {
+			id: 0, kind: "event", method: "session.update",
+			payload: {
+				thinkingLevel: "high",
+				activeTools: [],
+				allTools: [],
+				commands: [],
+				isIdle: false,
+				hasPendingMessages: false,
+				contextUsage: usage,
+				scopedModels,
+				systemPrompt: "probe",
+			},
+		});
+
+		void collector
+			.awaitFrame((f) => f.kind === "req" && f.method === "session.newSession")
+			.then((request) => {
+				expect(payloadOf(request)["parentSession"]).toBe("parent-1");
+				push(stdin, {
+					id: request.id, kind: "res", method: "session.newSession",
+					payload: { cancelled: false },
+				});
+			});
+
+		push(stdin, {
+			id: 40, kind: "req", method: "command.execute",
+			payload: { command: "commandContextProbe", args: "" },
+		});
+
+		// Resolve waitForIdle via the session.update bridge.
+		push(stdin, {
+			id: 0, kind: "event", method: "session.update",
+			payload: {
+				thinkingLevel: "high",
+				activeTools: [],
+				allTools: [],
+				commands: [],
+				isIdle: true,
+				hasPendingMessages: false,
+				contextUsage: usage,
+				scopedModels,
+				systemPrompt: "probe",
+			},
+		});
+
+		const notify = await collector.awaitFrame((f) => f.method === "notify");
+		await collector.awaitFrame((f) => f.id === 40 && f.kind === "res");
+
+		const report = JSON.parse(String(payloadOf(notify)["message"])) as Record<string, unknown>;
+		expect(report["contextUsage"]).toEqual(usage);
+		expect(report["scopedModels"]).toEqual(scopedModels);
+		expect(report["hasWaitForIdle"]).toBe(true);
+		expect(report["hasNewSession"]).toBe(true);
+		expect(report["waitForIdleOk"]).toBe(true);
+		expect(report["newSession"]).toEqual({ cancelled: false });
+
+		const newSessionReq = collector.frames.find(
+			(f) => f.kind === "req" && f.method === "session.newSession",
+		);
+		expect(newSessionReq).toBeDefined();
+		expect(payloadOf(newSessionReq!)["parentSession"]).toBe("parent-1");
+
+		await teardown(connected);
+	});
+
+	test("command handler waitForIdle / newSession stubs hit the bridge", async () => {
+		const connected = await connectHost([commandContextFactory]);
+		const { collector, stdin } = connected;
+
+		push(stdin, {
+			id: 0, kind: "event", method: "session.update",
+			payload: {
+				thinkingLevel: "medium",
+				activeTools: [],
+				allTools: [],
+				commands: [],
+				isIdle: true,
+				hasPendingMessages: false,
+				contextUsage: { tokens: 10, contextWindow: 1000, percent: 1 },
+				scopedModels: [{ model: { id: "m1", provider: "p" } }],
+				systemPrompt: "",
+			},
+		});
+
+		const bridgeCalls: string[] = [];
+		void collector
+			.awaitFrame((f) => f.kind === "req" && f.method === "session.newSession")
+			.then((request) => {
+				bridgeCalls.push("session.newSession");
+				push(stdin, {
+					id: request.id, kind: "res", method: "session.newSession",
+					payload: { cancelled: true },
+				});
+			});
+
+		push(stdin, {
+			id: 41, kind: "req", method: "command.execute",
+			payload: { command: "commandContextProbe", args: "" },
+		});
+
+		const notify = await collector.awaitFrame((f) => f.method === "notify");
+		await collector.awaitFrame((f) => f.id === 41 && f.kind === "res");
+
+		const report = JSON.parse(String(payloadOf(notify)["message"])) as Record<string, unknown>;
+		expect(bridgeCalls).toEqual(["session.newSession"]);
+		expect(report["newSession"]).toEqual({ cancelled: true });
+		expect(report["waitForIdleOk"]).toBe(true);
+		expect(report["contextUsage"]).toEqual({ tokens: 10, contextWindow: 1000, percent: 1 });
+		expect(report["scopedModels"]).toEqual([{ model: { id: "m1", provider: "p" } }]);
+
+		await teardown(connected);
 	});
 });

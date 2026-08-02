@@ -33,12 +33,14 @@ import {
 import type {
 	Extension,
 	ExtensionActions,
+	ExtensionCommandContextActions,
 	ExtensionContextActions,
 	ExtensionFactory,
 	ExtensionRuntime,
 	ExtensionUIContext,
 	InlineExtension,
 	ProviderConfig,
+	ReplacedSessionContext,
 	ToolDefinition,
 	Theme,
 } from "@earendil-works/pi-coding-agent";
@@ -245,6 +247,8 @@ interface SessionStatePayload {
 	allTools: Array<{ name: string; description: string; parameters: unknown; source?: string }>;
 	commands: Array<{ name: string; description?: string; source: string }>;
 	model?: Record<string, unknown>;
+	/** Models scoped to this session (`--models` / `enabledModels`). */
+	scopedModels: Array<Record<string, unknown>>;
 	isIdle: boolean;
 	hasPendingMessages: boolean;
 	contextUsage?: Record<string, unknown>;
@@ -258,6 +262,7 @@ function initialSessionState(): SessionStatePayload {
 		activeTools: [],
 		allTools: [],
 		commands: [],
+		scopedModels: [],
 		isIdle: true,
 		hasPendingMessages: false,
 		systemPrompt: "",
@@ -516,6 +521,8 @@ export class ExtensionHost {
 	private uiState = { editorText: "", toolsExpanded: false };
 	/** Abort controller for the current agent turn (`ctx.getSignal`). */
 	private turnAbort: AbortController | undefined;
+	/** Resolvers waiting for the next idle transition (`ctx.waitForIdle`). */
+	private readonly idleWaiters: Array<() => void> = [];
 	/** Extension statuses set via `ui.setStatus` (served to custom footers). */
 	private readonly extensionStatuses = new Map<string, string>();
 
@@ -1159,7 +1166,7 @@ export class ExtensionHost {
 		}
 
 		try {
-			await cmd.handler(args, this.runner.createContext());
+			await cmd.handler(args, this.runner.createCommandContext());
 			await this.client.respond(id, "command.execute" as Method, { ok: true });
 		} catch (err) {
 			await this.client.respondError(id, "command.execute" as Method, {
@@ -1735,6 +1742,7 @@ export class ExtensionHost {
 				},
 			},
 		);
+		this.runner.bindCommandContext(this.createCommandContextActions());
 		this.runner.setUIContext(this.createUIContext(), "tui");
 		this.runner.onError((error) => {
 			this.emitExtensionError(error.extensionPath, error.event, error.error);
@@ -1892,6 +1900,10 @@ export class ExtensionHost {
 		this.sessionState = { ...initialSessionState(), ...update };
 		if (wasIdle && !this.sessionState.isIdle) {
 			this.turnAbort = new AbortController();
+		}
+		if (this.sessionState.isIdle && this.idleWaiters.length > 0) {
+			const waiters = this.idleWaiters.splice(0);
+			for (const resolve of waiters) resolve();
 		}
 	}
 
@@ -2347,6 +2359,7 @@ export class ExtensionHost {
 		const self = this;
 		return {
 			getModel: () => self.sessionState.model,
+			getScopedModels: () => self.sessionState.scopedModels ?? [],
 			isIdle: () => self.sessionState.isIdle,
 			isProjectTrusted: () => self.projectTrusted,
 			getSignal: () => self.turnAbort?.signal,
@@ -2381,6 +2394,87 @@ export class ExtensionHost {
 			},
 			getSystemPrompt: () => self.sessionState.systemPrompt,
 		} as unknown as ExtensionContextActions;
+	}
+
+	/**
+	 * `ExtensionCommandContextActions` for interactive command handlers.
+	 *
+	 * Mirrors reference `runner.bindCommandContext` wiring in interactive /
+	 * print / rpc modes: `waitForIdle` is host-local (resolves on the next
+	 * idle `session.update`), while `newSession` / `fork` / `navigateTree` /
+	 * `switchSession` / `reload` are correlated bridge requests (same pattern
+	 * as `session.setModel` / `session.compact`). Non-serializable callbacks
+	 * (`setup`, `withSession`) stay host-side and run after a non-cancelled
+	 * replacement using a fresh `createCommandContext()`.
+	 */
+	private createCommandContextActions(): ExtensionCommandContextActions {
+		const self = this;
+		const cancelledOf = (frame: Frame): boolean =>
+			(frame.payload as Record<string, unknown>)["cancelled"] === true;
+
+		const afterReplacement = async (
+			cancelled: boolean,
+			withSession?: (ctx: ReplacedSessionContext) => Promise<void>,
+		): Promise<{ cancelled: boolean }> => {
+			if (!cancelled && withSession !== undefined && self.runner !== undefined) {
+				await withSession(self.runner.createCommandContext() as ReplacedSessionContext);
+			}
+			return { cancelled };
+		};
+
+		return {
+			waitForIdle: () => {
+				if (self.sessionState.isIdle) return Promise.resolve();
+				return new Promise<void>((resolve) => {
+					self.idleWaiters.push(resolve);
+				});
+			},
+			newSession: async (options) => {
+				const frame = await self.client.request(
+					"session.newSession" as Method,
+					{ parentSession: options?.parentSession },
+					{ timeoutMs: EXTENSION_HOOK_TIMEOUT_MS },
+				);
+				return afterReplacement(cancelledOf(frame), options?.withSession);
+			},
+			fork: async (entryId, options) => {
+				const frame = await self.client.request(
+					"session.fork" as Method,
+					{ entryId, position: options?.position },
+					{ timeoutMs: EXTENSION_HOOK_TIMEOUT_MS },
+				);
+				return afterReplacement(cancelledOf(frame), options?.withSession);
+			},
+			navigateTree: async (targetId, options) => {
+				const frame = await self.client.request(
+					"session.navigateTree" as Method,
+					{
+						targetId,
+						summarize: options?.summarize,
+						customInstructions: options?.customInstructions,
+						replaceInstructions: options?.replaceInstructions,
+						label: options?.label,
+					},
+					{ timeoutMs: EXTENSION_HOOK_TIMEOUT_MS },
+				);
+				return { cancelled: cancelledOf(frame) };
+			},
+			switchSession: async (sessionPath, options) => {
+				const frame = await self.client.request(
+					"session.switchSession" as Method,
+					{ sessionPath },
+					{ timeoutMs: EXTENSION_HOOK_TIMEOUT_MS },
+				);
+				return afterReplacement(cancelledOf(frame), options?.withSession);
+			},
+			reload: async () => {
+				await self.client.request(
+					"session.reload" as Method,
+					{},
+					{ timeoutMs: EXTENSION_HOOK_TIMEOUT_MS },
+				);
+			},
+		};
 	}
 
 	// Escape hatch: SessionManager is a 1600-line reference class; Proxy routes

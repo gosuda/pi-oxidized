@@ -61,6 +61,7 @@ declare module "@earendil-works/pi-coding-agent" {
 		hasUI: boolean;
 		cwd: string;
 		readonly model: unknown;
+		readonly scopedModels: readonly unknown[];
 		readonly signal: AbortSignal | undefined;
 		isIdle(): boolean;
 		isProjectTrusted(): boolean;
@@ -74,6 +75,61 @@ declare module "@earendil-works/pi-coding-agent" {
 			onError?: (error: Error) => void;
 		}): void;
 		getSystemPrompt(): string;
+	}
+
+	export interface ExtensionCommandContext extends ExtensionContext {
+		getSystemPromptOptions?(): BuildSystemPromptOptions;
+		waitForIdle(): Promise<void>;
+		newSession(options?: {
+			parentSession?: string;
+			setup?: (sessionManager: unknown) => Promise<void>;
+			withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
+		}): Promise<{ cancelled: boolean }>;
+		fork(
+			entryId: string,
+			options?: { position?: "before" | "at"; withSession?: (ctx: ReplacedSessionContext) => Promise<void> },
+		): Promise<{ cancelled: boolean }>;
+		navigateTree(
+			targetId: string,
+			options?: {
+				summarize?: boolean;
+				customInstructions?: string;
+				replaceInstructions?: boolean;
+				label?: string;
+			},
+		): Promise<{ cancelled: boolean }>;
+		switchSession(
+			sessionPath: string,
+			options?: { withSession?: (ctx: ReplacedSessionContext) => Promise<void> },
+		): Promise<{ cancelled: boolean }>;
+		reload(): Promise<void>;
+	}
+
+	/**
+	 * Fresh command-capable context bound to the replacement session after a
+	 * session switch. Passed to `withSession()` callbacks on `newSession()`,
+	 * `fork()`, and `switchSession()`.
+	 */
+	export interface ReplacedSessionContext extends ExtensionCommandContext {
+		sendMessage(
+			message: { customType: string; content: unknown; display?: boolean; details?: unknown },
+			options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
+		): Promise<void>;
+		sendUserMessage(
+			content: unknown,
+			options?: { deliverAs?: "steer" | "followUp" },
+		): Promise<void>;
+	}
+
+	export interface BuildSystemPromptOptions {
+		customPrompt?: string;
+		selectedTools?: string[];
+		toolSnippets?: Record<string, string>;
+		promptGuidelines?: string[];
+		appendSystemPrompt?: string;
+		cwd: string;
+		contextFiles?: Array<{ path: string; content: string }>;
+		skills?: unknown[];
 	}
 
 	export type ToolExecutionMode = "sequential" | "parallel";
@@ -168,7 +224,7 @@ declare module "@earendil-works/pi-coding-agent" {
 		name: string;
 		sourceInfo: SourceInfo;
 		description?: string;
-		handler: (args: string, ctx: ExtensionContext) => Promise<void>;
+		handler: (args: string, ctx: ExtensionCommandContext) => Promise<void>;
 	}
 
 	export interface ExtensionFlag {
@@ -228,6 +284,48 @@ declare module "@earendil-works/pi-coding-agent" {
 	export interface MessageEndEvent { type: "message_end"; message: unknown }
 	export interface ContextEvent { type: "context"; messages: unknown[] }
 	export interface InputEvent { type: "input"; source: string }
+	export interface ToolCallEvent {
+		type: "tool_call";
+		toolName: string;
+		toolCallId: string;
+		input: Record<string, unknown>;
+	}
+	export interface ToolResultEvent {
+		type: "tool_result";
+		toolName: string;
+		toolCallId: string;
+		input: Record<string, unknown>;
+		content: unknown[];
+		details?: unknown;
+		isError: boolean;
+		usage?: unknown;
+	}
+	export interface BeforeAgentStartEvent {
+		type: "before_agent_start";
+		prompt: string;
+		images?: unknown[];
+		systemPrompt: string;
+		systemPromptOptions: BuildSystemPromptOptions;
+	}
+	export interface ToolCallEventResult {
+		block?: boolean;
+		reason?: string;
+	}
+	export interface ToolResultEventResult {
+		content?: unknown[];
+		details?: unknown;
+		isError?: boolean;
+		usage?: unknown;
+	}
+	export interface BeforeAgentStartEventResult {
+		message?: unknown;
+		systemPrompt?: string;
+	}
+	/** Combined result from all before_agent_start handlers (runner aggregate). */
+	export interface BeforeAgentStartCombinedResult {
+		messages?: NonNullable<BeforeAgentStartEventResult["message"]>[];
+		systemPrompt?: string;
+	}
 	export interface TurnStartEvent { type: "turn_start"; turnIndex: number }
 	export interface ToolExecutionStartEvent { type: "tool_execution_start"; toolName: string }
 
@@ -265,6 +363,8 @@ declare module "@earendil-works/pi-coding-agent" {
 		on(event: "message_end", handler: ExtensionHandler<MessageEndEvent, { message?: unknown }>): void;
 		on(event: "context", handler: ExtensionHandler<ContextEvent, { messages?: unknown[] }>): void;
 		on(event: "input", handler: ExtensionHandler<InputEvent, { action: string; text?: string }>): void;
+		on(event: "tool_call", handler: ExtensionHandler<ToolCallEvent, ToolCallEventResult>): void;
+		on(event: "tool_result", handler: ExtensionHandler<ToolResultEvent, ToolResultEventResult>): void;
 		on(event: "turn_start", handler: ExtensionHandler<TurnStartEvent>): void;
 		on(event: "tool_execution_start", handler: ExtensionHandler<ToolExecutionStartEvent>): void;
 		on(event: string, handler: (...args: unknown[]) => unknown): void;
@@ -313,6 +413,7 @@ declare module "@earendil-works/pi-coding-agent" {
 
 	export interface ExtensionContextActions {
 		getModel: () => unknown;
+		getScopedModels: () => readonly unknown[];
 		isIdle: () => boolean;
 		isProjectTrusted: () => boolean;
 		getSignal: () => AbortSignal | undefined;
@@ -322,6 +423,33 @@ declare module "@earendil-works/pi-coding-agent" {
 		getContextUsage: () => unknown;
 		compact: (options?: unknown) => void;
 		getSystemPrompt: () => string;
+	}
+
+	export interface ExtensionCommandContextActions {
+		waitForIdle: () => Promise<void>;
+		newSession: (options?: {
+			parentSession?: string;
+			setup?: (sessionManager: unknown) => Promise<void>;
+			withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
+		}) => Promise<{ cancelled: boolean }>;
+		fork: (
+			entryId: string,
+			options?: { position?: "before" | "at"; withSession?: (ctx: ReplacedSessionContext) => Promise<void> },
+		) => Promise<{ cancelled: boolean }>;
+		navigateTree: (
+			targetId: string,
+			options?: {
+				summarize?: boolean;
+				customInstructions?: string;
+				replaceInstructions?: boolean;
+				label?: string;
+			},
+		) => Promise<{ cancelled: boolean }>;
+		switchSession: (
+			sessionPath: string,
+			options?: { withSession?: (ctx: ReplacedSessionContext) => Promise<void> },
+		) => Promise<{ cancelled: boolean }>;
+		reload: () => Promise<void>;
 	}
 
 	export interface ExtensionRuntime {
@@ -347,7 +475,7 @@ declare module "@earendil-works/pi-coding-agent" {
 				unregisterProvider?: (name: string) => void;
 			},
 		): void;
-		bindCommandContext(actions?: unknown): void;
+		bindCommandContext(actions?: ExtensionCommandContextActions): void;
 		setUIContext(uiContext?: unknown, mode?: ExtensionMode): void;
 		onError(listener: ExtensionErrorListener): () => void;
 		emit(event: unknown): Promise<unknown>;
@@ -355,6 +483,14 @@ declare module "@earendil-works/pi-coding-agent" {
 		emitInput(text: string, images: unknown, source: string, streamingBehavior?: string): Promise<{ action: string; text?: string }>;
 		emitMessageEnd(event: unknown): Promise<unknown>;
 		emitResourcesDiscover(cwd: string, reason: string): Promise<unknown>;
+		emitToolCall(event: ToolCallEvent): Promise<ToolCallEventResult | undefined>;
+		emitToolResult(event: ToolResultEvent): Promise<ToolResultEventResult | undefined>;
+		emitBeforeAgentStart(
+			prompt: string,
+			images: unknown[] | undefined,
+			systemPrompt: string,
+			systemPromptOptions: BuildSystemPromptOptions,
+		): Promise<BeforeAgentStartCombinedResult | undefined>;
 		getCommand(name: string): ResolvedCommand | undefined;
 		getRegisteredCommands(): ResolvedCommand[];
 		getToolDefinition(toolName: string): ToolDefinition | undefined;
@@ -366,6 +502,7 @@ declare module "@earendil-works/pi-coding-agent" {
 		invalidate(message?: string): void;
 		shutdown(): void;
 		createContext(): ExtensionContext;
+		createCommandContext(): ExtensionCommandContext;
 	}
 
 	export function createExtensionRuntime(): ExtensionRuntime;
