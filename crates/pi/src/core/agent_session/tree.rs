@@ -17,7 +17,7 @@ use pi_ai::{AssistantContent, Message, StopReason};
 use tokio_util::sync::CancellationToken;
 
 use super::AgentSession;
-use super::events::AgentSessionEvent;
+use super::events::{AgentSessionEvent, SummarizationRetrySource};
 use crate::core::compaction::{
     GenerateBranchSummaryOptions, SummarizeStreamFn, collect_entries_for_branch_summary,
     generate_branch_summary,
@@ -275,6 +275,7 @@ impl AgentSession {
         // Run default summarizer when requested.
         let mut summary_text: Option<String> = None;
         let mut summary_details: Option<serde_json::Value> = None;
+        let mut summary_usage: Option<pi_ai::Usage> = None;
         let mut from_extension = false;
         if preparation.user_wants_summary
             && !preparation.entries_to_summarize.is_empty()
@@ -295,6 +296,10 @@ impl AgentSession {
                 replace_instructions: preparation.replace_instructions,
                 reserve_tokens: Some(reserve_tokens),
                 stream_fn: Arc::clone(stream_fn),
+                retry: Some(self.summarization_retry_policy()),
+                retry_callbacks: Some(
+                    self.summarization_retry_callbacks(SummarizationRetrySource::BranchSummary),
+                ),
             };
             let result = generate_branch_summary(&preparation.entries_to_summarize, opts)
                 .await
@@ -310,6 +315,7 @@ impl AgentSession {
                 return Err(TreeError::Summarization(err));
             }
             summary_text = result.summary;
+            summary_usage = result.usage;
             summary_details = Some(serde_json::json!({
                 "readFiles": result.read_files.unwrap_or_default(),
                 "modifiedFiles": result.modified_files.unwrap_or_default(),
@@ -330,6 +336,7 @@ impl AgentSession {
                     text,
                     summary_details.clone(),
                     from_extension.then_some(true),
+                    summary_usage.clone(),
                 )?;
                 if let Some(l) = preparation.label.as_deref() {
                     let _ = sm.append_label_change(&id, Some(l));

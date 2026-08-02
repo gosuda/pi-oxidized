@@ -76,6 +76,8 @@ pub struct ExecuteBashOptions {
     /// Custom operations backend (TypeScript `BashOperations`). Defaults to
     /// local shell execution using the settings-configured `shellPath`.
     pub operations: Option<Arc<dyn BashOperations>>,
+    /// Optional execution id forwarded to `bash_execution_update` events.
+    pub id: Option<String>,
 }
 
 impl std::fmt::Debug for ExecuteBashOptions {
@@ -83,6 +85,7 @@ impl std::fmt::Debug for ExecuteBashOptions {
         f.debug_struct("ExecuteBashOptions")
             .field("exclude_from_context", &self.exclude_from_context)
             .field("operations", &self.operations.as_ref().map(|_| "Some(..)"))
+            .field("id", &self.id)
             .finish()
     }
 }
@@ -123,12 +126,26 @@ impl AgentSession {
             _ => command.to_owned(),
         };
 
+        let id = options.id.clone();
+        let weak_self = self.upgrade_self();
+        let mut original = on_chunk;
+        let wrapped_on_chunk = Some(move |delta: &str| {
+            if let Some(cb) = original.as_mut() {
+                cb(delta);
+            }
+            if let Some(arc) = weak_self.as_ref().and_then(|w| w.upgrade()) {
+                arc.emit_public(super::events::AgentSessionEvent::BashExecutionUpdate {
+                    id: id.clone(),
+                    delta: delta.to_owned(),
+                });
+            }
+        });
         let result = run_bash(
             self.cwd.clone(),
             resolved.clone(),
             shell_path,
             options.operations.clone(),
-            on_chunk,
+            wrapped_on_chunk,
             token.clone(),
         )
         .await;
@@ -450,4 +467,194 @@ where
         }
     });
     (updates, rx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::agent_session::AgentSessionConfig;
+    use crate::core::agent_session::events::AgentSessionEvent;
+    use crate::core::tools::bash::BashOperations;
+    use futures::future::BoxFuture;
+    use pi_ai::{Model, ModelCost, ModelInput, Provider, ProviderError, StreamOptions};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    fn test_model() -> Model {
+        Model {
+            id: "m".to_owned(),
+            name: "m".to_owned(),
+            api: "test-api".to_owned(),
+            provider: "test-provider".to_owned(),
+            base_url: String::new(),
+            reasoning: false,
+            thinking_level_map: None,
+            input: vec![ModelInput::Text],
+            cost: ModelCost::default(),
+            context_window: 4096,
+            max_tokens: 1024,
+            headers: None,
+            compat: None,
+            extra: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn mock_provider() -> Arc<dyn Provider> {
+        struct NoopProvider;
+        impl Provider for NoopProvider {
+            fn stream(
+                &self,
+                _model: &Model,
+                _ctx: pi_ai::Context,
+                _opts: StreamOptions,
+            ) -> futures::stream::BoxStream<
+                'static,
+                Result<pi_ai::AssistantMessageEvent, ProviderError>,
+            > {
+                Box::pin(futures::stream::iter(Vec::new()))
+            }
+        }
+        Arc::new(NoopProvider)
+    }
+
+    /// A `BashOperations` that emits one chunk then exits 0.
+    struct ChunkedOps {
+        output: String,
+    }
+
+    impl BashOperations for ChunkedOps {
+        fn exec(
+            &self,
+            _command: String,
+            _cwd: PathBuf,
+            mut on_data: Box<dyn FnMut(Vec<u8>) + Send>,
+            _cancel: CancellationToken,
+            _timeout: Option<f64>,
+            _env: HashMap<String, String>,
+        ) -> BoxFuture<'static, Result<Option<i32>, pi_agent::ToolError>> {
+            let output = self.output.clone();
+            Box::pin(async move {
+                on_data(output.into_bytes());
+                Ok(Some(0))
+            })
+        }
+    }
+
+    fn make_session() -> TestResult<Arc<AgentSession>> {
+        let provider = mock_provider();
+        let config = AgentSessionConfig::test_config(provider, test_model())?;
+        Ok(AgentSession::new(config)?)
+    }
+
+    #[tokio::test]
+    async fn bash_execution_update_emitted_with_id() -> TestResult {
+        let session = make_session()?;
+        let events = Arc::new(Mutex::new(Vec::<AgentSessionEvent>::new()));
+        let ev_clone = Arc::clone(&events);
+        let _unsub = session.subscribe(move |event| {
+            ev_clone
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(event.clone());
+        });
+
+        let ops = Arc::new(ChunkedOps {
+            output: "hello world".to_owned(),
+        });
+        let options = ExecuteBashOptions {
+            id: Some("bash-1".to_owned()),
+            operations: Some(ops),
+            ..Default::default()
+        };
+        let _ = session.execute_bash("echo hello", None::<fn(&str)>, options).await;
+
+        let updates: Vec<AgentSessionEvent> = events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|e| matches!(e, AgentSessionEvent::BashExecutionUpdate { .. }))
+            .cloned()
+            .collect();
+        assert!(!updates.is_empty(), "should emit at least one update");
+        let first = updates.first().unwrap();
+        match first {
+            AgentSessionEvent::BashExecutionUpdate { id, delta } => {
+                assert_eq!(id.as_deref(), Some("bash-1"));
+                assert!(delta.contains("hello"));
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bash_execution_update_emitted_without_id() -> TestResult {
+        let session = make_session()?;
+        let events = Arc::new(Mutex::new(Vec::<AgentSessionEvent>::new()));
+        let ev_clone = Arc::clone(&events);
+        let _unsub = session.subscribe(move |event| {
+            ev_clone
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(event.clone());
+        });
+
+        let ops = Arc::new(ChunkedOps {
+            output: "test output".to_owned(),
+        });
+        let options = ExecuteBashOptions {
+            id: None,
+            operations: Some(ops),
+            ..Default::default()
+        };
+        let _ = session.execute_bash("echo test", None::<fn(&str)>, options).await;
+
+        let updates: Vec<AgentSessionEvent> = events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|e| matches!(e, AgentSessionEvent::BashExecutionUpdate { .. }))
+            .cloned()
+            .collect();
+        assert!(!updates.is_empty(), "should emit at least one update");
+        let first = updates.first().unwrap();
+        match first {
+            AgentSessionEvent::BashExecutionUpdate { id, delta } => {
+                assert!(id.is_none(), "id should be None when not provided");
+                assert!(delta.contains("test"));
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bash_execution_update_still_calls_original_callback() -> TestResult {
+        let session = make_session()?;
+        let received = Arc::new(Mutex::new(Vec::<String>::new()));
+        let recv_clone = Arc::clone(&received);
+        let on_chunk = move |delta: &str| {
+            recv_clone
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(delta.to_owned());
+        };
+
+        let ops = Arc::new(ChunkedOps {
+            output: "callback test".to_owned(),
+        });
+        let options = ExecuteBashOptions {
+            id: Some("cb-1".to_owned()),
+            operations: Some(ops),
+            ..Default::default()
+        };
+        let _ = session.execute_bash("echo callback", Some(on_chunk), options).await;
+        let chunks = received
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(chunks[0].contains("callback"));
+        Ok(())
+    }
 }

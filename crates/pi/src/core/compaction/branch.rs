@@ -5,7 +5,6 @@
 
 use std::collections::BTreeMap;
 
-use futures::StreamExt;
 use pi_agent::AgentMessage;
 use pi_ai::{
     AssistantContent, AssistantMessage, AssistantMessageEvent, Context, Message, Model, StopReason,
@@ -22,7 +21,8 @@ use crate::core::messages::{
 use crate::core::sessions::{SessionEntry, SessionManager};
 
 use super::{
-    CompactionError, FileOperations, SUMMARIZATION_SYSTEM_PROMPT, SummarizeStreamFn,
+    CompactionError, FileOperations, SUMMARIZATION_SYSTEM_PROMPT, SummarizationRetryCallbacks,
+    SummarizationRetryPolicy, SummarizeStreamFn, complete_summarization,
     compute_file_lists, create_file_ops, estimate_tokens, extract_file_ops_from_message,
     format_file_operations, serialize_conversation,
 };
@@ -43,7 +43,7 @@ pub const BRANCH_SUMMARY_PREAMBLE: &str = "The user explored a different convers
 pub const BRANCH_SUMMARY_PROMPT: &str = "Create a structured summary of this conversation branch for context when returning later.\n\nUse this EXACT format:\n\n## Goal\n[What was the user trying to accomplish in this branch?]\n\n## Constraints & Preferences\n- [Any constraints, preferences, or requirements mentioned]\n- [Or \"(none)\" if none were mentioned]\n\n## Progress\n### Done\n- [x] [Completed tasks/changes]\n\n### In Progress\n- [ ] [Work that was started but not finished]\n\n### Blocked\n- [Issues preventing progress, if any]\n\n## Key Decisions\n- **[Decision]**: [Brief rationale]\n\n## Next Steps\n1. [What should happen next to continue this work]\n\nKeep each section concise. Preserve exact file paths, function names, and error messages.";
 
 /// Result of [`generate_branch_summary`].
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BranchSummaryResult {
     /// Generated summary text (with preamble + file ops).
@@ -61,6 +61,9 @@ pub struct BranchSummaryResult {
     /// Error message when summarization failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// LLM usage from the branch-summary call, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<pi_ai::Usage>,
 }
 
 /// Details stored on a branch-summary entry for cumulative file tracking.
@@ -113,6 +116,10 @@ pub struct GenerateBranchSummaryOptions {
     pub reserve_tokens: Option<u64>,
     /// Injected summarizer stream.
     pub stream_fn: SummarizeStreamFn,
+    /// Retry policy for the standalone summarization request.
+    pub retry: Option<SummarizationRetryPolicy>,
+    /// Lifecycle callbacks for transient summarization retries.
+    pub retry_callbacks: Option<SummarizationRetryCallbacks>,
 }
 
 /// Collect entries that should be summarized when navigating from one position
@@ -287,53 +294,6 @@ fn ensure_not_cancelled(signal: &CancellationToken) -> Result<(), CompactionErro
     }
 }
 
-async fn complete_summarization(
-    model: &Model,
-    context: Context,
-    options: StreamOptions,
-    stream_fn: &SummarizeStreamFn,
-) -> Result<AssistantMessage, CompactionError> {
-    if options
-        .signal
-        .as_ref()
-        .is_some_and(CancellationToken::is_cancelled)
-    {
-        return Err(CompactionError::Cancelled);
-    }
-
-    let mut stream = stream_fn(model.clone(), context, options).await;
-    let mut last = None;
-    while let Some(item) = stream.next().await {
-        match item {
-            Ok(AssistantMessageEvent::Done { message, .. }) => return Ok(message),
-            Ok(AssistantMessageEvent::Error { error, .. }) => return Ok(error),
-            Ok(other) => {
-                if let Some(partial) = event_partial(&other) {
-                    last = Some(partial.clone());
-                }
-            }
-            Err(err) => return Err(CompactionError::Provider(err)),
-        }
-    }
-    last.ok_or_else(|| CompactionError::SummarizationFailed("Unknown error".to_owned()))
-}
-
-fn event_partial(event: &AssistantMessageEvent) -> Option<&AssistantMessage> {
-    match event {
-        AssistantMessageEvent::Start { partial }
-        | AssistantMessageEvent::TextStart { partial, .. }
-        | AssistantMessageEvent::TextDelta { partial, .. }
-        | AssistantMessageEvent::TextEnd { partial, .. }
-        | AssistantMessageEvent::ThinkingStart { partial, .. }
-        | AssistantMessageEvent::ThinkingDelta { partial, .. }
-        | AssistantMessageEvent::ThinkingEnd { partial, .. }
-        | AssistantMessageEvent::ToolCallStart { partial, .. }
-        | AssistantMessageEvent::ToolCallDelta { partial, .. }
-        | AssistantMessageEvent::ToolCallEnd { partial, .. } => Some(partial),
-        AssistantMessageEvent::Done { .. } | AssistantMessageEvent::Error { .. } => None,
-    }
-}
-
 fn assistant_text(message: &AssistantMessage) -> String {
     message
         .content
@@ -435,6 +395,8 @@ pub async fn generate_branch_summary(
         },
         request_options,
         &options.stream_fn,
+        options.retry.as_ref(),
+        options.retry_callbacks.as_ref(),
     )
     .await?;
 
@@ -474,6 +436,7 @@ pub async fn generate_branch_summary(
         modified_files: Some(modified_files),
         aborted: None,
         error: None,
+        usage: Some(response.usage),
     })
 }
 
@@ -711,6 +674,8 @@ mod tests {
                     replace_instructions: false,
                     reserve_tokens: Some(16_384),
                     stream_fn: Arc::clone(&stream_fn),
+                    retry: None,
+                    retry_callbacks: None,
                 },
             )
             .await,
@@ -744,6 +709,8 @@ mod tests {
                     replace_instructions: true,
                     reserve_tokens: None,
                     stream_fn,
+                    retry: None,
+                    retry_callbacks: None,
                 },
             )
             .await,

@@ -93,7 +93,11 @@ impl TextRenderer {
             | AgentSessionEvent::SessionInfoChanged { .. }
             | AgentSessionEvent::ThinkingLevelChanged { .. }
             | AgentSessionEvent::AutoRetryStart { .. }
-            | AgentSessionEvent::AutoRetryEnd { .. } => {}
+            | AgentSessionEvent::AutoRetryEnd { .. }
+            | AgentSessionEvent::SummarizationRetryScheduled { .. }
+            | AgentSessionEvent::SummarizationRetryAttemptStart { .. }
+            | AgentSessionEvent::SummarizationRetryFinished
+            | AgentSessionEvent::BashExecutionUpdate { .. } => {}
         }
     }
 

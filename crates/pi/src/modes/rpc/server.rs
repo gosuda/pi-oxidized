@@ -1977,6 +1977,7 @@ mod tests {
             estimated_tokens_after: Some(500),
             details: None,
             from_hook: None,
+            usage: None,
         }
     }
     fn test_bash_result() -> BashResult {

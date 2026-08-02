@@ -231,6 +231,9 @@ pub struct CompactionEntry {
     /// `true` when produced by an extension hook.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_hook: Option<bool>,
+    /// LLM usage from the summarization call(s), when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<pi_ai::Usage>,
     /// Unknown sibling fields.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -258,6 +261,9 @@ pub struct BranchSummaryEntry {
     /// `true` when produced by an extension hook.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_hook: Option<bool>,
+    /// LLM usage from the branch-summary call, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<pi_ai::Usage>,
     /// Unknown sibling fields.
     #[serde(flatten)]
     pub extra: Map<String, Value>,

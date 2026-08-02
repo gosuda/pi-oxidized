@@ -35,15 +35,16 @@ use tokio_util::sync::CancellationToken;
 
 use crate::core::compaction::{
     self, BeforeCompactResult, CompactOptions, CompactionError, CompactionResult,
-    CompactionSettings, SummarizeStreamFn, preparation_none_error, prepare_compaction,
-    should_compact,
+    CompactionSettings, SummarizationRetryCallbacks, SummarizationRetryPolicy,
+    SummarizeStreamFn, preparation_none_error,
+    prepare_compaction, should_compact,
 };
 use crate::core::model_runtime::ModelRuntimeAuthOverrides;
 use crate::core::sessions::{CompactionEntry, SessionEntry, get_latest_compaction_entry};
 use crate::core::settings::ResolvedCompactionSettings;
 
 use super::AgentSession;
-use super::events::{AgentSessionEvent, CompactionReason};
+use super::events::{AgentSessionEvent, CompactionReason, SummarizationRetrySource};
 use super::extension_runner::ExtensionRunner;
 
 // ---------------------------------------------------------------------------
@@ -462,6 +463,10 @@ impl AgentSession {
 
         // Run the pure engine.
         let thinking_level = thinking_level_str(self.thinking_level());
+        let retry = self.summarization_retry_policy();
+        let retry_callbacks = self.summarization_retry_callbacks(
+            SummarizationRetrySource::Compaction { reason },
+        );
 
         let result = compaction::compact(
             &preparation,
@@ -474,6 +479,8 @@ impl AgentSession {
                 thinking_level: thinking_level.as_deref(),
                 stream_fn: inputs.stream_fn.clone(),
                 env: inputs.env.clone(),
+                retry: Some(retry),
+                retry_callbacks: Some(retry_callbacks),
                 hooks: None,
             },
         )
@@ -511,6 +518,7 @@ impl AgentSession {
                     tokens_before_i64,
                     details,
                     if from_hook { Some(true) } else { None },
+                    result.usage.clone(),
                 )
                 .map_err(|err| {
                     CompactionError::SummarizationFailed(format!(
@@ -752,6 +760,48 @@ impl AgentSession {
         }
 
         estimate.tokens
+    }
+
+    /// Resolve the settings retry policy for one summarization request.
+    pub(super) fn summarization_retry_policy(&self) -> SummarizationRetryPolicy {
+        let retry = self.lock_settings().get_retry_settings();
+        SummarizationRetryPolicy {
+            enabled: retry.enabled,
+            max_retries: u32::try_from(retry.max_retries).unwrap_or(u32::MAX),
+            base_delay_ms: retry.base_delay_ms,
+        }
+    }
+
+    /// Emit the TypeScript-compatible retry lifecycle for one summary source.
+    pub(super) fn summarization_retry_callbacks(
+        &self,
+        source: SummarizationRetrySource,
+    ) -> SummarizationRetryCallbacks {
+        let weak = self.upgrade_self();
+        let scheduled_weak = weak.clone();
+        let attempt_weak = weak.clone();
+        SummarizationRetryCallbacks {
+            on_retry_scheduled: Some(Arc::new(move |attempt, max_attempts, delay_ms, error_message| {
+                if let Some(session) = scheduled_weak.as_ref().and_then(std::sync::Weak::upgrade) {
+                    session.emit_public(AgentSessionEvent::SummarizationRetryScheduled {
+                        attempt,
+                        max_attempts,
+                        delay_ms,
+                        error_message,
+                    });
+                }
+            })),
+            on_retry_attempt_start: Some(Arc::new(move || {
+                if let Some(session) = attempt_weak.as_ref().and_then(std::sync::Weak::upgrade) {
+                    session.emit_public(AgentSessionEvent::SummarizationRetryAttemptStart { source });
+                }
+            })),
+            on_retry_finished: Some(Arc::new(move || {
+                if let Some(session) = weak.as_ref().and_then(std::sync::Weak::upgrade) {
+                    session.emit_public(AgentSessionEvent::SummarizationRetryFinished);
+                }
+            })),
+        }
     }
 }
 
@@ -1400,14 +1450,24 @@ mod tests {
 
         sleep(std::time::Duration::from_millis(50)).await;
 
-        // Collect compaction_end events.
+        // Collect compaction_end events and confirm the deterministic error did not retry.
         let mut end_events = Vec::new();
+        let mut retry_events = Vec::new();
         while let Ok(Some(event)) = timeout(std::time::Duration::from_millis(100), rx.recv()).await
         {
             if event.type_name() == "compaction_end" {
-                end_events.push(event);
+                end_events.push(event.clone());
+            }
+            if matches!(
+                event,
+                AgentSessionEvent::SummarizationRetryScheduled { .. }
+                    | AgentSessionEvent::SummarizationRetryAttemptStart { .. }
+                    | AgentSessionEvent::SummarizationRetryFinished
+            ) {
+                retry_events.push(event);
             }
         }
+        assert!(retry_events.is_empty());
         assert!(!end_events.is_empty(), "should emit compaction_end");
         let Some(AgentSessionEvent::CompactionEnd { error_message, .. }) = end_events.first()
         else {
@@ -1426,6 +1486,68 @@ mod tests {
     async fn manual_compact_custom_instructions_passed_to_summary() -> TestResult {
         let session = session_with_history(8_192, summary_stream_fn("## Goal\nSummary")).await?;
         session.compact(Some("Focus on file changes")).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manual_compact_transient_summary_error_emits_retry_lifecycle() -> TestResult {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stream_fn: SummarizeStreamFn = Arc::new({
+            let attempts = Arc::clone(&attempts);
+            move |_model, _ctx, _opts| {
+                let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async move {
+                    let mut message = AssistantMessage::new("a", "p", "m", 1);
+                    if attempt == 0 {
+                        message.stop_reason = StopReason::Error;
+                        message.error_message = Some("provider overloaded".to_owned());
+                    } else {
+                        message.content = vec![AssistantContent::Text(TextContent::new("recovered"))];
+                        message.stop_reason = StopReason::Stop;
+                    }
+                    let stream = stream::iter(vec![Ok(AssistantMessageEvent::Done {
+                        reason: DoneReason::Stop,
+                        message,
+                    })]);
+                    Box::pin(stream)
+                        as Pin<
+                            Box<
+                                dyn futures::Stream<
+                                        Item = Result<AssistantMessageEvent, ProviderError>,
+                                    > + Send,
+                            >,
+                        >
+                })
+            }
+        });
+        let session = session_with_history(8_192, stream_fn).await?;
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let _unsub = session.subscribe(move |event| {
+            if matches!(
+                event,
+                AgentSessionEvent::SummarizationRetryScheduled { .. }
+                    | AgentSessionEvent::SummarizationRetryAttemptStart { .. }
+                    | AgentSessionEvent::SummarizationRetryFinished
+            ) {
+                let _ = tx.send(event.type_name().to_owned());
+            }
+        });
+
+        let result = session.compact(None).await?;
+        assert_eq!(result.summary.contains("recovered"), true);
+        assert!(attempts.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert_eq!(
+            events,
+            [
+                "summarization_retry_scheduled",
+                "summarization_retry_attempt_start",
+                "summarization_retry_finished",
+            ]
+        );
         Ok(())
     }
 

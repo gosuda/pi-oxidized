@@ -723,6 +723,7 @@ impl SessionManager {
         tokens_before: i64,
         details: Option<Value>,
         from_hook: Option<bool>,
+        usage: Option<pi_ai::Usage>,
     ) -> Result<String, SessionError> {
         let id = self.next_id();
         let mut value = serde_json::json!({
@@ -743,6 +744,11 @@ impl SessionManager {
             && let Some(obj) = value.as_object_mut()
         {
             obj.insert("fromHook".to_owned(), Value::Bool(fh));
+        }
+        if let Some(u) = usage
+            && let Some(obj) = value.as_object_mut()
+        {
+            obj.insert("usage".to_owned(), serde_json::to_value(u)?);
         }
         let entry: SessionEntry = serde_json::from_value(value)?;
         self.append_entry(entry)
@@ -1019,6 +1025,7 @@ impl SessionManager {
         summary: &str,
         details: Option<Value>,
         from_hook: Option<bool>,
+        usage: Option<pi_ai::Usage>,
     ) -> Result<String, SessionError> {
         if let Some(id) = branch_from_id {
             if !self.by_id.contains_key(id) {
@@ -1047,6 +1054,11 @@ impl SessionManager {
             && let Some(obj) = value.as_object_mut()
         {
             obj.insert("fromHook".to_owned(), Value::Bool(fh));
+        }
+        if let Some(u) = usage
+            && let Some(obj) = value.as_object_mut()
+        {
+            obj.insert("usage".to_owned(), serde_json::to_value(u)?);
         }
         let entry: SessionEntry = serde_json::from_value(value)?;
         self.append_entry(entry)
@@ -1601,7 +1613,7 @@ fn sync_parent_directory(_parent: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pi_ai::{Message, TextContent, UserMessage, UserMessageContent};
+    use pi_ai::{Message, TextContent, Usage, UsageCost, UserMessage, UserMessageContent};
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -2067,7 +2079,7 @@ mod tests {
         sm.append_message(&assistant_agent("r1", 2))?;
         let id3 = sm.append_message(&user_agent("second", 3))?;
         sm.append_message(&assistant_agent("r2", 4))?;
-        sm.append_compaction("Summary of first two turns", &id3, 1000, None, None)?;
+        sm.append_compaction("Summary of first two turns", &id3, 1000, None, None, None)?;
         sm.append_message(&user_agent("third", 5))?;
         sm.append_message(&assistant_agent("r3", 6))?;
 
@@ -2090,6 +2102,68 @@ mod tests {
         let ctx = sm.build_session_context()?;
         assert_eq!(ctx.messages[0].role(), "compactionSummary");
         assert_eq!(ctx.messages.len(), 5);
+        Ok(())
+    }
+
+    #[test]
+    fn summary_entries_persist_optional_usage_and_accept_null() -> TestResult {
+        let usage = Usage {
+            input: 10,
+            output: 5,
+            cache_read: 2,
+            cache_write: 1,
+            cache_write1h: Some(3),
+            reasoning: Some(4),
+            total_tokens: 18,
+            cost: UsageCost {
+                input: 0.1,
+                output: 0.2,
+                cache_read: 0.03,
+                cache_write: 0.04,
+                total: 0.37,
+            },
+        };
+        let mut sm = SessionManager::in_memory(Some("/tmp"), None)?;
+        let root = sm.append_message(&user_agent("root", 1))?;
+        let compaction_id = sm.append_compaction(
+            "summary",
+            &root,
+            18,
+            None,
+            None,
+            Some(usage.clone()),
+        )?;
+        let compaction = sm.get_entry(&compaction_id).ok_or("compaction entry")?;
+        assert_eq!(serde_json::to_value(compaction)?["usage"], serde_json::to_value(&usage)?);
+
+        let branch_id = sm.branch_with_summary(
+            Some(&compaction_id),
+            "branch",
+            None,
+            None,
+            Some(usage.clone()),
+        )?;
+        let branch = sm.get_entry(&branch_id).ok_or("branch entry")?;
+        assert_eq!(serde_json::to_value(branch)?["usage"], serde_json::to_value(&usage)?);
+
+        let absent_id = sm.branch_with_summary(Some(&branch_id), "no usage", None, None, None)?;
+        let absent = sm.get_entry(&absent_id).ok_or("absent usage entry")?;
+        assert!(serde_json::to_value(absent)?.get("usage").is_none());
+
+        let legacy: SessionEntry = serde_json::from_value(json!({
+            "type": "compaction",
+            "id": "legacy",
+            "parentId": null,
+            "timestamp": "2025-01-01T00:00:00.000Z",
+            "summary": "legacy",
+            "firstKeptEntryId": "root",
+            "tokensBefore": 0,
+            "usage": null
+        }))?;
+        match legacy {
+            SessionEntry::Compaction(entry) => assert!(entry.usage.is_none()),
+            other => return Err(format!("expected compaction, got {other:?}").into()),
+        }
         Ok(())
     }
 

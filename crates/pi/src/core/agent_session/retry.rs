@@ -270,7 +270,7 @@ const RETRYABLE_STATUS_CODES: &[&str] = &["429", "500", "502", "503", "504", "52
 /// Non-retryable: auth failures, context overflow, and provider limit/billing
 /// errors (overflow is caught by [`is_context_overflow`] first, but this
 /// function is also safe to call directly).
-fn is_retryable_assistant_error(message: &AssistantMessage) -> bool {
+pub(crate) fn is_retryable_assistant_error(message: &AssistantMessage) -> bool {
     if message.stop_reason != StopReason::Error {
         return false;
     }

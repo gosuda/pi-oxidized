@@ -1072,7 +1072,7 @@ impl AgentSession {
             .is_some_and(|p| p.active.load(std::sync::atomic::Ordering::SeqCst))
     }
 
-    fn upgrade_self(&self) -> Option<std::sync::Weak<AgentSession>> {
+    pub(super) fn upgrade_self(&self) -> Option<std::sync::Weak<AgentSession>> {
         self.self_handle
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
