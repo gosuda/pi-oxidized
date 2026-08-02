@@ -110,6 +110,53 @@ const SPINNER_TICK: Duration = Duration::from_millis(80);
 /// extension-queue capacity so a lagging consumer surfaces backpressure early.
 pub const EVENT_CHANNEL_CAPACITY: usize = 256;
 
+/// Maximum UTF-8 bytes of sanitized terminal title payload (OSC 0).
+pub(crate) const MAX_TERMINAL_TITLE_BYTES: usize = 256;
+
+/// OSC 0 set-icon-name-and-window-title introducer (`ESC ] 0 ;`).
+const OSC0_SET_TITLE_PREFIX: &[u8] = b"\x1b]0;";
+
+/// BEL terminates an OSC sequence.
+const OSC_BEL: u8 = 0x07;
+
+/// Sanitize extension-supplied terminal title text for OSC 0 emission.
+///
+/// Drops every [`char::is_control`] scalar and stops before the sanitized
+/// payload would exceed [`MAX_TERMINAL_TITLE_BYTES`] UTF-8 bytes, never
+/// splitting a scalar.
+#[must_use]
+pub(crate) fn sanitize_terminal_title(title: &str) -> String {
+    let mut out = String::new();
+    let mut byte_len = 0usize;
+    for ch in title.chars() {
+        if ch.is_control() {
+            continue;
+        }
+        let ch_len = ch.len_utf8();
+        if byte_len + ch_len > MAX_TERMINAL_TITLE_BYTES {
+            break;
+        }
+        out.push(ch);
+        byte_len += ch_len;
+    }
+    out
+}
+
+/// Encode a safe OSC 0 set-title sequence for `title`.
+///
+/// Only the sanitized payload is written between the fixed introducer and
+/// BEL terminator; hostile control/C1 bytes cannot break the sink.
+#[must_use]
+pub(crate) fn encode_osc0_set_title(title: &str) -> Vec<u8> {
+    let sanitized = sanitize_terminal_title(title);
+    let mut sequence = Vec::with_capacity(OSC0_SET_TITLE_PREFIX.len() + sanitized.len() + 1);
+    sequence.extend_from_slice(OSC0_SET_TITLE_PREFIX);
+    sequence.extend_from_slice(sanitized.as_bytes());
+    sequence.push(OSC_BEL);
+    sequence
+}
+
+
 // ---------------------------------------------------------------------------
 // SessionHost trait
 // ---------------------------------------------------------------------------
@@ -3414,9 +3461,8 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 self.chat_dirty = true;
             }
             UiControl::SetTitle { title } => {
-                // Best-effort OSC 0 title; terminals that ignore it are fine.
-                let title = title.unwrap_or_default();
-                let _ = write!(self.tui.outer_mut(), "\x1b]0;{title}\x07");
+                let sequence = encode_osc0_set_title(title.as_deref().unwrap_or(""));
+                let _ = self.tui.outer_mut().write_all(&sequence);
             }
             UiControl::PasteToEditor { text } => {
                 let _ = self.paste_text(&text);
@@ -9831,4 +9877,75 @@ mod tests {
             Some("Deploying…")
         );
     }
+
+    /// T3: hostile OSC/title bytes are stripped and the sink sees fixed framing.
+    #[test]
+    fn sanitize_terminal_title_strips_raw_controls() {
+        let title = "safe\x07\x1b]1;evil\x07\r\n\x0cmiddle";
+        assert_eq!(sanitize_terminal_title(title), "safe]1;evilmiddle");
+    }
+
+    #[test]
+    fn sanitize_terminal_title_strips_c1_controls() {
+        let title = "before\u{009b}after\u{0085}end";
+        assert_eq!(sanitize_terminal_title(title), "beforeafterend");
+    }
+
+    #[test]
+    fn sanitize_terminal_title_respects_utf8_byte_cap_without_splitting_scalar() {
+        let one_byte = "a".repeat(MAX_TERMINAL_TITLE_BYTES);
+        assert_eq!(sanitize_terminal_title(&one_byte).len(), MAX_TERMINAL_TITLE_BYTES);
+        assert_eq!(sanitize_terminal_title(&format!("{one_byte}x")).len(), MAX_TERMINAL_TITLE_BYTES);
+
+        let emoji = "\u{1f642}"; // 4 UTF-8 bytes
+        let max_emojis = emoji.repeat(MAX_TERMINAL_TITLE_BYTES / emoji.len());
+        assert_eq!(sanitize_terminal_title(&max_emojis), max_emojis);
+        assert_eq!(
+            sanitize_terminal_title(&format!("{max_emojis}a")).len(),
+            MAX_TERMINAL_TITLE_BYTES
+        );
+
+        let prefix = "a".repeat(MAX_TERMINAL_TITLE_BYTES - 1);
+        assert_eq!(sanitize_terminal_title(&format!("{prefix}{emoji}")), prefix);
+    }
+
+    #[test]
+    fn encode_osc0_set_title_uses_fixed_framing_and_valid_payload() {
+        let hostile = "pi\x07\x1b]1;break\x07\u{009b}ok";
+        let sequence = encode_osc0_set_title(hostile);
+        assert_eq!(&sequence[..4], b"\x1b]0;");
+        assert_eq!(sequence.last().copied(), Some(OSC_BEL));
+        let payload = &sequence[4..sequence.len() - 1];
+        assert_eq!(payload, b"pi]1;breakok");
+        assert!(payload.len() <= MAX_TERMINAL_TITLE_BYTES);
+        assert!(std::str::from_utf8(payload).is_ok());
+        assert!(!pi_ext::sanitize::contains_control_bytes(payload));
+        assert_eq!(sequence.iter().filter(|&&b| b == OSC_BEL).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn set_title_control_writes_sanitized_osc0() -> Result<(), String> {
+        let writer = SharedWriter::new();
+        let sink = writer.clone();
+        let caps = TerminalCapabilities::default();
+        let tui = Tui::new(writer, Size::new(80, 24), Position::ORIGIN, 8, caps)
+            .map_err(|error| format!("tui construction: {error}"))?;
+        let (_tx, rx) = mpsc::unbounded_channel::<UiEvent>();
+        let input = TerminalInput::mock(rx);
+        let (host, _log) = FakeHost::new();
+        let options = InteractiveRuntimeOptions {
+            size: (80, 24),
+            ..InteractiveRuntimeOptions::default()
+        };
+        let mut rt = InteractiveRuntime::new(tui, input, Arc::new(host), &options);
+        let before = sink.snapshot().len();
+        rt.handle_extension_ui_control(UiControl::SetTitle {
+            title: Some("safe\x07\x1b]1;evil\x07\u{009b}ok".to_owned()),
+        })
+        .await;
+        let written = &sink.snapshot()[before..];
+        assert_eq!(written, encode_osc0_set_title("safe\x07\x1b]1;evil\x07\u{009b}ok"));
+        Ok(())
+    }
+
 }
