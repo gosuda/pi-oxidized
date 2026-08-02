@@ -298,7 +298,6 @@ fn model_context_window(model: &Model) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::core::agent_session::{AgentSession, AgentSessionConfig};
     use futures::stream::{self, BoxStream, StreamExt};
     use pi_ai::{
@@ -361,30 +360,55 @@ mod tests {
         }
     }
 
-    #[test]
-    fn context_usage_tokens_when_window_zero_is_none() {
-        // Direct constructor test: a zero context window means we cannot
-        // estimate; the public getter returns `None`.
-        let usage = ContextUsage {
-            tokens: Some(100),
-            context_window: 0,
-            percent: None,
+    /// A zero context-window model means `get_context_usage` cannot estimate
+    /// and must return `None` (TypeScript `getContextUsage` early return).
+    #[tokio::test]
+    async fn context_usage_tokens_when_window_zero_is_none() -> TestResult {
+        let mut model = test_model();
+        model.context_window = 0;
+        let session = {
+            let config = AgentSessionConfig::test_config(Arc::new(StubProvider), model)?;
+            AgentSession::new(config)?
         };
-        assert_eq!(usage.context_window, 0);
+        // No compaction, no assistant entries — but the zero window alone
+        // forces `None` before any branch inspection.
+        assert!(session.get_context_usage().await.is_none());
+        Ok(())
     }
 
-    #[test]
-    fn token_totals_saturate_instead_of_overflow() {
-        let totals = SessionTokenTotals {
-            input: u64::MAX,
-            output: 1,
-            cache_read: 0,
-            cache_write: 0,
-            total: 0,
-        };
-        // The aggregation path uses saturating_add; just sanity-check that
-        // the helper struct accepts extreme values without panic.
-        assert_eq!(totals.input, u64::MAX);
+    /// Two compaction usages whose input sums exceed `u64::MAX` must saturate
+    /// at `u64::MAX` rather than overflowing (TypeScript saturating-add path).
+    #[tokio::test]
+    async fn token_totals_saturate_instead_of_overflow() -> TestResult {
+        let session = make_session()?;
+        // Each compaction carries input = u64::MAX; the aggregation path
+        // uses `saturating_add`, so the total clamps at `u64::MAX`.
+        let overflow_usage = summary_usage(u64::MAX, 0, 0.0);
+        {
+            let mut sm = session.session_manager.lock().await;
+            sm.append_compaction(
+                "first compaction",
+                "kept1",
+                1000,
+                None,
+                None,
+                Some(overflow_usage.clone()),
+            )?;
+            sm.append_compaction(
+                "second compaction",
+                "kept2",
+                2000,
+                None,
+                None,
+                Some(overflow_usage),
+            )?;
+        }
+        let stats = session.get_session_stats().await;
+        assert_eq!(
+            stats.tokens.input, u64::MAX,
+            "input must saturate at u64::MAX, not overflow"
+        );
+        Ok(())
     }
 
     /// Totals must include persisted `usage` on `compaction` and

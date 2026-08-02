@@ -1,5 +1,6 @@
 /**
  * Replaced-session fixture: exercises newSession setup/withSession ordering,
+ * the narrow SessionManager bridge (supported mutation + unsupported throw),
  * cancel behaviour, and sendMessage/sendUserMessage on ReplacedSessionContext.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -16,21 +17,40 @@ export default function replacedSessionExtension(pi: ExtensionAPI): void {
 				parentSession: "parent-1",
 				setup: async (sessionManager) => {
 					setupOrder.push("setup");
-					// sessionManager is a proxy; record that it was received.
+					// sessionManager is the narrow bridge proxy.
 					report["setupReceived"] = sessionManager !== undefined;
+
+					// Supported mutations route through the bridge and await wire delivery.
+					// Neither operation fabricates the reference SessionManager entry ID.
+					await sessionManager.appendCustomEntry("setup-custom", { from: "setup" });
+					await sessionManager.appendSessionInfo("setup-session");
+
+					// This is the one SessionManager getter mirrored by the host.
+					report["setupSessionName"] = sessionManager.getSessionName();
+					// Unsupported method must throw at runtime (the narrow
+					// bridge proxy rejects it); the type is the full
+					// SessionManager surface, so no type error is expected.
+					try {
+						sessionManager.getEntries();
+						report["unsupportedThrew"] = false;
+					} catch (e) {
+						report["unsupportedThrew"] = true;
+						report["unsupportedMessage"] = (e as Error).message;
+					}
 				},
 				withSession: async (replacedCtx) => {
 					setupOrder.push("withSession");
 					report["withSessionSendMessage"] = typeof replacedCtx.sendMessage;
 					report["withSessionSendUserMessage"] = typeof replacedCtx.sendUserMessage;
 
-					// Exercise sendMessage and sendUserMessage — these bridge to Rust
-					// via sendSessionCommand (fire-and-forget session.command event).
+					// Exercise sendMessage and sendUserMessage — these bridge to
+					// Rust via sendSessionCommand and await the wire write.
 					await replacedCtx.sendMessage({
 						customType: "test-custom",
 						content: "hello",
 					});
 					await replacedCtx.sendUserMessage("user hello");
+					report["withSessionSendsDone"] = true;
 				},
 			});
 

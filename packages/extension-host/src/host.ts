@@ -1991,11 +1991,11 @@ export class ExtensionHost {
 		}).catch(() => void 0);
 	}
 
-	/** Fire-and-forget `session.command` action to Rust. */
-	private sendSessionCommand(payload: Record<string, unknown>): void {
-		this.client.send({
+	/** Bridge a `session.command` action to Rust; awaits the wire write. */
+	private async sendSessionCommand(payload: Record<string, unknown>): Promise<void> {
+		await this.client.send({
 			id: 0, kind: "event", method: "session.command" as Method, payload,
-		}).catch(() => void 0);
+		});
 	}
 
 	/** Fire-and-forget `ui.control` data-surface control to Rust. */
@@ -2264,7 +2264,7 @@ export class ExtensionHost {
 		const self = this;
 		return {
 			sendMessage: (message: Record<string, unknown>, options?: Record<string, unknown>) => {
-				self.sendSessionCommand({
+				void self.sendSessionCommand({
 					action: "sendMessage",
 					message: {
 						customType: message["customType"],
@@ -2273,21 +2273,21 @@ export class ExtensionHost {
 						details: message["details"],
 					},
 					options,
-				});
+				}).catch(() => void 0);
 			},
 			sendUserMessage: (content: unknown, options?: Record<string, unknown>) => {
-				self.sendSessionCommand({ action: "sendUserMessage", content, options });
+				void self.sendSessionCommand({ action: "sendUserMessage", content, options }).catch(() => void 0);
 			},
 			appendEntry: (customType: string, data?: unknown) => {
-				self.sendSessionCommand({ action: "appendEntry", customType, data });
+				void self.sendSessionCommand({ action: "appendEntry", customType, data }).catch(() => void 0);
 			},
 			setSessionName: (name: string) => {
 				self.sessionState.sessionName = name;
-				self.sendSessionCommand({ action: "setSessionName", name });
+				void self.sendSessionCommand({ action: "setSessionName", name }).catch(() => void 0);
 			},
 			getSessionName: () => self.sessionState.sessionName,
 			setLabel: (entryId: string, label: string | undefined) => {
-				self.sendSessionCommand({ action: "setLabel", entryId, label });
+				void self.sendSessionCommand({ action: "setLabel", entryId, label }).catch(() => void 0);
 			},
 			getActiveTools: () => [...self.sessionState.activeTools],
 			getAllTools: () =>
@@ -2299,10 +2299,10 @@ export class ExtensionHost {
 				})),
 			setActiveTools: (toolNames: string[]) => {
 				self.sessionState.activeTools = [...toolNames];
-				self.sendSessionCommand({ action: "setActiveTools", toolNames });
+				void self.sendSessionCommand({ action: "setActiveTools", toolNames }).catch(() => void 0);
 			},
 			refreshTools: () => {
-				self.sendSessionCommand({ action: "refreshTools" });
+				void self.sendSessionCommand({ action: "refreshTools" }).catch(() => void 0);
 			},
 			getCommands: () =>
 				self.sessionState.commands.map((command) => ({
@@ -2330,7 +2330,7 @@ export class ExtensionHost {
 			getThinkingLevel: () => self.sessionState.thinkingLevel,
 			setThinkingLevel: (level: string) => {
 				self.sessionState.thinkingLevel = level;
-				self.sendSessionCommand({ action: "setThinkingLevel", level });
+				void self.sendSessionCommand({ action: "setThinkingLevel", level }).catch(() => void 0);
 			},
 		} as unknown as ExtensionActions;
 	}
@@ -2365,11 +2365,11 @@ export class ExtensionHost {
 			getSignal: () => self.turnAbort?.signal,
 			abort: () => {
 				self.turnAbort?.abort();
-				self.sendSessionCommand({ action: "abort" });
+				void self.sendSessionCommand({ action: "abort" }).catch(() => void 0);
 			},
 			hasPendingMessages: () => self.sessionState.hasPendingMessages,
 			shutdown: () => {
-				self.sendSessionCommand({ action: "shutdown" });
+				void self.sendSessionCommand({ action: "shutdown" }).catch(() => void 0);
 			},
 			getContextUsage: () => self.sessionState.contextUsage,
 			compact: (options?: {
@@ -2421,8 +2421,8 @@ export class ExtensionHost {
 				{},
 				Object.getOwnPropertyDescriptors(base),
 			) as ReplacedSessionContext;
-			context.sendMessage = (message, options) => {
-				self.sendSessionCommand({
+			context.sendMessage = async (message, options) => {
+				await self.sendSessionCommand({
 					action: "sendMessage",
 					message: {
 						customType: message.customType,
@@ -2432,11 +2432,9 @@ export class ExtensionHost {
 					},
 					options,
 				});
-				return Promise.resolve();
 			};
-			context.sendUserMessage = (content, options) => {
-				self.sendSessionCommand({ action: "sendUserMessage", content, options });
-				return Promise.resolve();
+			context.sendUserMessage = async (content, options) => {
+				await self.sendSessionCommand({ action: "sendUserMessage", content, options });
 			};
 			return context;
 		};
@@ -2510,10 +2508,39 @@ export class ExtensionHost {
 		};
 	}
 
-	// Escape hatch: SessionManager is a 1600-line reference class; Proxy routes
-	// any property access to a no-op. Rust owns the real session state.
+	// Honest narrow bridge: SessionManager is a 1600-line reference class the
+	// host cannot instantiate. Rust owns the real session tree. Only matching
+	// SessionManager mutations route through `session.command`; each returns
+	// the write-delivery Promise rather than a fabricated synchronous entry ID.
+	// The uncorrelated wire therefore cannot support ID-dependent chaining.
+	// Its one mirrored getter is `getSessionName`. Every other SessionManager
+	// method fails explicitly instead of silently no-op-ing.
 	private createSessionManagerProxy(): ConstructorParameters<typeof ExtensionRunner>[3] {
-		return new Proxy({}, { get: () => () => undefined }) as unknown as ConstructorParameters<typeof ExtensionRunner>[3];
+		const self = this;
+		const unsupported = (method: string) => () => {
+			throw new Error(
+				`SessionManager method '${method}' is not supported via the extension bridge`,
+			);
+		};
+		return new Proxy({}, {
+			get(_target, prop) {
+				if (typeof prop !== "string") return undefined;
+				switch (prop) {
+					case "appendCustomEntry":
+						return (customType: string, data?: unknown) =>
+							self.sendSessionCommand({ action: "appendEntry", customType, data });
+					case "appendSessionInfo":
+						return async (name: string) => {
+							await self.sendSessionCommand({ action: "setSessionName", name });
+							self.sessionState.sessionName = name;
+						};
+					case "getSessionName":
+						return () => self.sessionState.sessionName;
+					default:
+						return unsupported(prop);
+				}
+			},
+		}) as unknown as ConstructorParameters<typeof ExtensionRunner>[3];
 	}
 
 	// Escape hatch: ModelRegistry wraps a runtime the host doesn't own.

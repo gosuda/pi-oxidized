@@ -8,6 +8,7 @@ import { Readable } from "node:stream";
 import {
 	PROTOCOL_VERSION,
 	encodeFrameString,
+	type ByteWritable,
 	type Frame,
 } from "@earendil-works/pi-tui-protocol";
 import type {
@@ -276,6 +277,8 @@ class FrameCollector {
 	}> = [];
 	private buf = "";
 
+	protected beforeFrame(_frame: Frame): void {}
+
 	write(chunk: Uint8Array): void {
 		this.buf += new TextDecoder().decode(chunk);
 		const lines = this.buf.split("\n");
@@ -283,6 +286,7 @@ class FrameCollector {
 		for (const line of lines) {
 			if (line.trim().length > 0) {
 				const frame = JSON.parse(line) as Frame;
+				this.beforeFrame(frame);
 				this.frames.push(frame);
 				for (let i = this.waiters.length - 1; i >= 0; i--) {
 					if (this.waiters[i]?.predicate(frame)) {
@@ -464,6 +468,24 @@ describe("host: command context + mirrored session state", () => {
 	});
 });
 
+/** Writable that throws on a chosen `session.command` action. */
+class FailingOnSessionCommand extends FrameCollector {
+	failedAction: string | undefined;
+	private failAction: string | undefined;
+
+	protected override beforeFrame(frame: Frame): void {
+		const action = frame.kind === "event" && frame.method === "session.command"
+			? payloadOf(frame)["action"]
+			: undefined;
+		if (this.failAction !== undefined && action === this.failAction) {
+			this.failedAction = String(action);
+			throw new Error(`transport write failed (${action})`);
+		}
+	}
+
+	armFailure(action: string): void { this.failAction = action; }
+}
+
 describe("host: newSession setup + withSession + ReplacedSessionContext", () => {
 	function sessionUpdate(stdin: Readable, idle: boolean): void {
 		push(stdin, {
@@ -512,15 +534,69 @@ describe("host: newSession setup + withSession + ReplacedSessionContext", () => 
 		expect(report["newSessionResult"]).toEqual({ cancelled: false });
 		expect(report["withSessionSendMessage"]).toBe("function");
 		expect(report["withSessionSendUserMessage"]).toBe("function");
+		// Narrow bridge: unsupported SessionManager method throws (no silent no-op).
+		expect(report["unsupportedThrew"]).toBe(true);
+		expect(typeof report["unsupportedMessage"]).toBe("string");
+		expect(String(report["unsupportedMessage"])).toContain("is not supported");
+		// appendSessionInfo updates the one mirrored SessionManager getter.
+		expect(report["setupSessionName"]).toBe("setup-session");
+		// withSession sends awaited the wire write to completion.
+		expect(report["withSessionSendsDone"]).toBe(true);
 
-		// sendMessage and sendUserMessage bridge to Rust as session.command events.
+		// Setup mutations and withSession sends bridge to Rust as session.command events.
 		const commandEvents = collector.frames.filter(
 			(f) => f.kind === "event" && f.method === "session.command",
 		);
-		expect(commandEvents.length).toBeGreaterThanOrEqual(2);
+		expect(commandEvents.length).toBeGreaterThanOrEqual(4);
 		const actions = commandEvents.map((f) => payloadOf(f)["action"]);
 		expect(actions).toContain("sendMessage");
 		expect(actions).toContain("sendUserMessage");
+		// The two setup mutations must emit their exact bridge payloads before
+		// either withSession send helper runs; neither returns a fabricated ID.
+		const appendEntryIdx = actions.indexOf("appendEntry");
+		const setSessionNameIdx = actions.indexOf("setSessionName");
+		const sendMessageIdx = actions.indexOf("sendMessage");
+		const sendUserMessageIdx = actions.indexOf("sendUserMessage");
+		const appendEntryFrame = commandEvents.find(
+			(f) => payloadOf(f)["action"] === "appendEntry",
+		);
+		const setSessionNameFrame = commandEvents.find(
+			(f) => payloadOf(f)["action"] === "setSessionName",
+		);
+		expect(appendEntryFrame).toBeDefined();
+		expect(setSessionNameFrame).toBeDefined();
+		if (appendEntryFrame !== undefined) {
+			expect(payloadOf(appendEntryFrame)).toMatchObject({
+				action: "appendEntry",
+				customType: "setup-custom",
+				data: { from: "setup" },
+			});
+		}
+		if (setSessionNameFrame !== undefined) {
+			expect(payloadOf(setSessionNameFrame)).toMatchObject({
+				action: "setSessionName",
+				name: "setup-session",
+			});
+		}
+		expect(appendEntryIdx).toBeGreaterThanOrEqual(0);
+		expect(setSessionNameIdx).toBeGreaterThan(appendEntryIdx);
+		expect(sendMessageIdx).toBeGreaterThan(setSessionNameIdx);
+		expect(sendUserMessageIdx).toBeGreaterThan(sendMessageIdx);
+		// The command.execute response (id:50) must land AFTER both withSession
+		// send helper frames: the sends now await the wire write, so the
+		// command handler cannot complete until they have been emitted.
+		const commandResIdx = collector.frames.findIndex(
+			(f) => f.id === 50 && f.kind === "res",
+		);
+		expect(commandResIdx).toBeGreaterThanOrEqual(0);
+		const sendUserMessageFrameIdx = collector.frames.findIndex(
+			(f) =>
+				f.kind === "event" &&
+				f.method === "session.command" &&
+				payloadOf(f)["action"] === "sendUserMessage",
+		);
+		expect(sendUserMessageFrameIdx).toBeGreaterThanOrEqual(0);
+		expect(commandResIdx).toBeGreaterThan(sendUserMessageFrameIdx);
 
 		await teardown(connected);
 	});
@@ -605,5 +681,66 @@ describe("host: newSession setup + withSession + ReplacedSessionContext", () => 
 		expect(sumPayload["content"]).toBe("user hello");
 
 		await teardown(connected);
+	});
+
+	async function assertSendFailureRejectsCommand(
+		failedAction: "sendMessage" | "sendUserMessage",
+		requestId: number,
+	): Promise<void> {
+		const stdout = new FailingOnSessionCommand();
+		const stdin = new Readable({ read() {} });
+		const host = new ExtensionHost(stdin, stdout);
+		const runPromise = host.run({
+			cwd: process.cwd(), factories: [replacedSessionFactory], extensionPaths: [],
+		});
+
+		try {
+			stdin.push(Buffer.from(encodeFrameString({
+				id: 1, kind: "req", method: "hello",
+				payload: {
+					protocolVersion: PROTOCOL_VERSION,
+					compatibilityVersion: COMPATIBILITY_VERSION,
+				},
+			})));
+			await stdout.awaitFrame((f) => f.id === 1 && f.kind === "res");
+			sessionUpdate(stdin, true);
+
+			void stdout
+				.awaitFrame((f) => f.kind === "req" && f.method === "session.newSession")
+				.then((request) => {
+					push(stdin, {
+						id: request.id, kind: "res", method: "session.newSession",
+						payload: { cancelled: false },
+					});
+				});
+
+			// Setup's appendEntry succeeds; fail the selected actual
+			// ReplacedSessionContext helper write instead.
+			stdout.armFailure(failedAction);
+			push(stdin, {
+				id: requestId, kind: "req", method: "command.execute",
+				payload: { command: "replacedSessionProbe", args: "" },
+			});
+
+			const errorRes = await stdout.awaitFrame(
+				(f) => f.id === requestId && f.kind === "error",
+			);
+			const errPayload = payloadOf(errorRes);
+			expect(stdout.failedAction).toBe(failedAction);
+			expect(errPayload["code"]).toBeDefined();
+			expect(typeof errPayload["message"]).toBe("string");
+		} finally {
+			stdin.push(null);
+			host.dispose("test");
+			await runPromise.catch(() => void 0);
+		}
+	}
+
+	test("withSession: sendMessage delivery failure rejects the command path", async () => {
+		await assertSendFailureRejectsCommand("sendMessage", 60);
+	});
+
+	test("withSession: sendUserMessage delivery failure rejects the command path", async () => {
+		await assertSendFailureRejectsCommand("sendUserMessage", 61);
 	});
 });
