@@ -156,7 +156,6 @@ pub(crate) fn encode_osc0_set_title(title: &str) -> Vec<u8> {
     sequence
 }
 
-
 // ---------------------------------------------------------------------------
 // SessionHost trait
 // ---------------------------------------------------------------------------
@@ -9969,8 +9968,14 @@ mod tests {
     #[test]
     fn sanitize_terminal_title_respects_utf8_byte_cap_without_splitting_scalar() {
         let one_byte = "a".repeat(MAX_TERMINAL_TITLE_BYTES);
-        assert_eq!(sanitize_terminal_title(&one_byte).len(), MAX_TERMINAL_TITLE_BYTES);
-        assert_eq!(sanitize_terminal_title(&format!("{one_byte}x")).len(), MAX_TERMINAL_TITLE_BYTES);
+        assert_eq!(
+            sanitize_terminal_title(&one_byte).len(),
+            MAX_TERMINAL_TITLE_BYTES
+        );
+        assert_eq!(
+            sanitize_terminal_title(&format!("{one_byte}x")).len(),
+            MAX_TERMINAL_TITLE_BYTES
+        );
 
         let emoji = "\u{1f642}"; // 4 UTF-8 bytes
         let max_emojis = emoji.repeat(MAX_TERMINAL_TITLE_BYTES / emoji.len());
@@ -10019,8 +10024,10 @@ mod tests {
         })
         .await;
         let written = &sink.snapshot()[before..];
-        assert_eq!(written, encode_osc0_set_title("safe\x07\x1b]1;evil\x07\u{009b}ok"));
+        assert_eq!(
+            written,
+            encode_osc0_set_title("safe\x07\x1b]1;evil\x07\u{009b}ok")
+        );
         Ok(())
     }
-
 }

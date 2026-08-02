@@ -86,7 +86,6 @@ pub const DEFAULT_OUTBOUND_CAPACITY: usize = 128;
 // unchanged; JSON shape remains camelCase-compatible with the host wire.
 // ---------------------------------------------------------------------------
 
-
 fn empty_object() -> Value {
     Value::Object(serde_json::Map::new())
 }
@@ -174,7 +173,6 @@ pub struct FlagSnapshotEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<FlagValueWire>,
 }
-
 
 /// Renderer entry in the `extensions.load` snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -295,8 +293,6 @@ pub struct RegistrySnapshot {
     #[serde(default)]
     pub errors: Vec<LoadErrorEntry>,
 }
-
-
 
 /// Boxed extension future returned by [`NativeExtension`] methods.
 pub type NativeFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;

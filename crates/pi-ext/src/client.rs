@@ -1071,7 +1071,9 @@ fn take_active_pending(shared: &Shared, id: FrameId) -> Option<PendingEntry> {
 
 fn remove_cancelling_pending(shared: &Shared, id: FrameId, generation: u64) {
     if let Ok(mut pending) = shared.pending.lock()
-        && pending.get(&id).is_some_and(|entry| entry.cancelling && entry.generation == generation)
+        && pending
+            .get(&id)
+            .is_some_and(|entry| entry.cancelling && entry.generation == generation)
     {
         pending.remove(&id);
     }
@@ -1856,7 +1858,11 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let entry = pending.get(&id);
-            (entry.is_some(), entry.map(|e| e.generation), entry.map(|e| e.cancelling))
+            (
+                entry.is_some(),
+                entry.map(|e| e.generation),
+                entry.map(|e| e.cancelling),
+            )
         };
         assert!(
             survives,

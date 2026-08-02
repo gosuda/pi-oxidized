@@ -927,7 +927,9 @@ async fn retry_summarization_call<F>(
 where
     F: FnMut() -> Pin<Box<dyn Future<Output = Result<AssistantMessage, CompactionError>> + Send>>,
 {
-    let max_retries = policy.filter(|policy| policy.enabled).map_or(0, |policy| policy.max_retries);
+    let max_retries = policy
+        .filter(|policy| policy.enabled)
+        .map_or(0, |policy| policy.max_retries);
     let mut attempt = 0_u32;
     let mut retried = false;
 
@@ -936,7 +938,9 @@ where
             Ok(response) => response,
             Err(error) => {
                 if retried {
-                    if let Some(callback) = callbacks.and_then(|callbacks| callbacks.on_retry_finished.as_ref()) {
+                    if let Some(callback) =
+                        callbacks.and_then(|callbacks| callbacks.on_retry_finished.as_ref())
+                    {
                         callback();
                     }
                 }
@@ -946,7 +950,9 @@ where
 
         if response.stop_reason == StopReason::Aborted {
             if retried {
-                if let Some(callback) = callbacks.and_then(|callbacks| callbacks.on_retry_finished.as_ref()) {
+                if let Some(callback) =
+                    callbacks.and_then(|callbacks| callbacks.on_retry_finished.as_ref())
+                {
                     callback();
                 }
             }
@@ -958,7 +964,9 @@ where
             || !crate::core::agent_session::retry::is_retryable_assistant_error(&response)
         {
             if retried {
-                if let Some(callback) = callbacks.and_then(|callbacks| callbacks.on_retry_finished.as_ref()) {
+                if let Some(callback) =
+                    callbacks.and_then(|callbacks| callbacks.on_retry_finished.as_ref())
+                {
                     callback();
                 }
             }
@@ -979,7 +987,9 @@ where
             })
             .unwrap_or(0);
 
-        if let Some(callback) = callbacks.and_then(|callbacks| callbacks.on_retry_scheduled.as_ref()) {
+        if let Some(callback) =
+            callbacks.and_then(|callbacks| callbacks.on_retry_scheduled.as_ref())
+        {
             callback(attempt, max_retries, delay_ms, error_message);
         }
 
@@ -993,7 +1003,9 @@ where
             false
         };
         if cancelled {
-            if let Some(callback) = callbacks.and_then(|callbacks| callbacks.on_retry_finished.as_ref()) {
+            if let Some(callback) =
+                callbacks.and_then(|callbacks| callbacks.on_retry_finished.as_ref())
+            {
                 callback();
             }
             let mut aborted = response;
@@ -1002,7 +1014,9 @@ where
             return Ok(aborted);
         }
 
-        if let Some(callback) = callbacks.and_then(|callbacks| callbacks.on_retry_attempt_start.as_ref()) {
+        if let Some(callback) =
+            callbacks.and_then(|callbacks| callbacks.on_retry_attempt_start.as_ref())
+        {
             callback();
         }
     }

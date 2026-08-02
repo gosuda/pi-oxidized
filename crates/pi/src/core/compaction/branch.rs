@@ -22,9 +22,9 @@ use crate::core::sessions::{SessionEntry, SessionManager};
 
 use super::{
     CompactionError, FileOperations, SUMMARIZATION_SYSTEM_PROMPT, SummarizationRetryCallbacks,
-    SummarizationRetryPolicy, SummarizeStreamFn, complete_summarization,
-    compute_file_lists, create_file_ops, estimate_tokens, extract_file_ops_from_message,
-    format_file_operations, serialize_conversation,
+    SummarizationRetryPolicy, SummarizeStreamFn, complete_summarization, compute_file_lists,
+    create_file_ops, estimate_tokens, extract_file_ops_from_message, format_file_operations,
+    serialize_conversation,
 };
 
 /// Default max tokens for branch summary generation.

@@ -2125,16 +2125,13 @@ mod tests {
         };
         let mut sm = SessionManager::in_memory(Some("/tmp"), None)?;
         let root = sm.append_message(&user_agent("root", 1))?;
-        let compaction_id = sm.append_compaction(
-            "summary",
-            &root,
-            18,
-            None,
-            None,
-            Some(usage.clone()),
-        )?;
+        let compaction_id =
+            sm.append_compaction("summary", &root, 18, None, None, Some(usage.clone()))?;
         let compaction = sm.get_entry(&compaction_id).ok_or("compaction entry")?;
-        assert_eq!(serde_json::to_value(compaction)?["usage"], serde_json::to_value(&usage)?);
+        assert_eq!(
+            serde_json::to_value(compaction)?["usage"],
+            serde_json::to_value(&usage)?
+        );
 
         let branch_id = sm.branch_with_summary(
             Some(&compaction_id),
@@ -2144,7 +2141,10 @@ mod tests {
             Some(usage.clone()),
         )?;
         let branch = sm.get_entry(&branch_id).ok_or("branch entry")?;
-        assert_eq!(serde_json::to_value(branch)?["usage"], serde_json::to_value(&usage)?);
+        assert_eq!(
+            serde_json::to_value(branch)?["usage"],
+            serde_json::to_value(&usage)?
+        );
 
         let absent_id = sm.branch_with_summary(Some(&branch_id), "no usage", None, None, None)?;
         let absent = sm.get_entry(&absent_id).ok_or("absent usage entry")?;
@@ -2463,4 +2463,3 @@ mod tests {
         Ok(())
     }
 }
-

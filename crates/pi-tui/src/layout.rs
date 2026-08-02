@@ -182,7 +182,9 @@ impl<'de> Deserialize<'de> for OverlayMargin {
             type Value = OverlayMargin;
 
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("a margin number or an object with optional top/right/bottom/left sides")
+                f.write_str(
+                    "a margin number or an object with optional top/right/bottom/left sides",
+                )
             }
 
             fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
@@ -217,7 +219,12 @@ impl<'de> Deserialize<'de> for OverlayMargin {
                         }
                     }
                 }
-                Ok(OverlayMargin { top, right, bottom, left })
+                Ok(OverlayMargin {
+                    top,
+                    right,
+                    bottom,
+                    left,
+                })
             }
         }
 

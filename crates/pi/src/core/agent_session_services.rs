@@ -15,7 +15,9 @@ use pi_ext::protocol::FlagValueWire;
 use thiserror::Error;
 
 use super::config::{get_agent_dir, get_docs_path, resolve_path};
-use super::extension_runtime_set::{ExtensionRuntimeSet, ExtensionSetDiagnostic, ExtensionSetStart};
+use super::extension_runtime_set::{
+    ExtensionRuntimeSet, ExtensionSetDiagnostic, ExtensionSetStart,
+};
 use super::model_runtime::{
     CreateModelRuntimeOptions, ModelRuntime, ModelRuntimeError, ProviderConfigInput,
 };
@@ -514,11 +516,11 @@ pub async fn create_agent_session_services_with_trust(
     diagnostics.extend(flag_diagnostics);
     if let Some(runner) = extension_runner.as_deref() {
         match apply_flags_to_runner(runner, &applied_flags).await {
-            Ok(flag_diagnostics) => diagnostics.extend(
-                flag_diagnostics
-                    .into_iter()
-                    .map(|diagnostic| AgentSessionRuntimeDiagnostic::warning(diagnostic.to_string())),
-            ),
+            Ok(flag_diagnostics) => {
+                diagnostics.extend(flag_diagnostics.into_iter().map(|diagnostic| {
+                    AgentSessionRuntimeDiagnostic::warning(diagnostic.to_string())
+                }))
+            }
             Err(error) => {
                 diagnostics.push(AgentSessionRuntimeDiagnostic::error(format!(
                     "Extension flags failed to apply: {error}"

@@ -568,7 +568,9 @@ mod tests {
             operations: Some(ops),
             ..Default::default()
         };
-        let _ = session.execute_bash("echo hello", None::<fn(&str)>, options).await;
+        let _ = session
+            .execute_bash("echo hello", None::<fn(&str)>, options)
+            .await;
 
         let updates: Vec<AgentSessionEvent> = events
             .lock()
@@ -609,7 +611,9 @@ mod tests {
             operations: Some(ops),
             ..Default::default()
         };
-        let _ = session.execute_bash("echo test", None::<fn(&str)>, options).await;
+        let _ = session
+            .execute_bash("echo test", None::<fn(&str)>, options)
+            .await;
 
         let updates: Vec<AgentSessionEvent> = events
             .lock()
@@ -650,7 +654,9 @@ mod tests {
             operations: Some(ops),
             ..Default::default()
         };
-        let _ = session.execute_bash("echo callback", Some(on_chunk), options).await;
+        let _ = session
+            .execute_bash("echo callback", Some(on_chunk), options)
+            .await;
         let chunks = received
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);

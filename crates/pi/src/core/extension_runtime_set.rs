@@ -2104,7 +2104,9 @@ where
                             .entries
                             .iter()
                             .position(|entry| entry == &path)
-                            .and_then(|entry_index| promotion_plan.diagnostic_paths.get(entry_index))
+                            .and_then(|entry_index| {
+                                promotion_plan.diagnostic_paths.get(entry_index)
+                            })
                             .cloned()
                             .unwrap_or(path);
                         diagnostics.push(ExtensionSetDiagnostic { path, message });
@@ -3213,7 +3215,6 @@ pub(crate) mod tests {
         }
     }
 
-
     fn probe_preserved_flags() -> HashMap<String, Value> {
         HashMap::from([("probe".to_owned(), Value::Bool(true))])
     }
@@ -3436,7 +3437,6 @@ pub(crate) mod tests {
         Ok(())
     }
 
-
     #[tokio::test]
     async fn builtins_owner_failure_promotes_first_surviving_compat() -> TestResult {
         let starts = Arc::new(StdMutex::new(Vec::new()));
@@ -3542,8 +3542,8 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn multi_endpoint_flag_failures_are_path_qualified_and_do_not_abort_siblings() -> TestResult
-    {
+    async fn multi_endpoint_flag_failures_are_path_qualified_and_do_not_abort_siblings()
+    -> TestResult {
         let (first, first_host) = make_runner(snapshot(&[])).await?;
         let (second, second_host) = make_runner(snapshot(&[])).await?;
         first_host.set_response("flags.set", json!({"ok": false}));
@@ -3555,7 +3555,9 @@ pub(crate) mod tests {
         let values = BTreeMap::from([("demo".to_owned(), FlagValueWire::Boolean(true))]);
         let diagnostics = set.apply_flag_values(&values).await?;
         assert!(
-            diagnostics.iter().any(|diagnostic| diagnostic.path.contains("test:")),
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.path.contains("test:")),
             "expected path-qualified flag diagnostics: {diagnostics:?}"
         );
         assert!(

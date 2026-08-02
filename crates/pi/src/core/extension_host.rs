@@ -464,10 +464,7 @@ fn build_snapshot(wire: RegistrySnapshotWire, client: &Arc<HostClient>) -> Regis
                 Some("boolean") => adapters::FlagKind::Boolean,
                 _ => adapters::FlagKind::String,
             },
-            default: flag
-                .default
-                .as_ref()
-                .map(flag_value_wire_to_legacy_default),
+            default: flag.default.as_ref().map(flag_value_wire_to_legacy_default),
             extension_path: flag.extension_path,
         }) {
             // First-wins: prefer the host-resolved value, fall back to default.

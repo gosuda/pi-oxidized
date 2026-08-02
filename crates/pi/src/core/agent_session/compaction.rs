@@ -35,9 +35,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::core::compaction::{
     self, BeforeCompactResult, CompactOptions, CompactionError, CompactionResult,
-    CompactionSettings, SummarizationRetryCallbacks, SummarizationRetryPolicy,
-    SummarizeStreamFn, preparation_none_error,
-    prepare_compaction, should_compact,
+    CompactionSettings, SummarizationRetryCallbacks, SummarizationRetryPolicy, SummarizeStreamFn,
+    preparation_none_error, prepare_compaction, should_compact,
 };
 use crate::core::model_runtime::ModelRuntimeAuthOverrides;
 use crate::core::sessions::{CompactionEntry, SessionEntry, get_latest_compaction_entry};
@@ -464,9 +463,8 @@ impl AgentSession {
         // Run the pure engine.
         let thinking_level = thinking_level_str(self.thinking_level());
         let retry = self.summarization_retry_policy();
-        let retry_callbacks = self.summarization_retry_callbacks(
-            SummarizationRetrySource::Compaction { reason },
-        );
+        let retry_callbacks =
+            self.summarization_retry_callbacks(SummarizationRetrySource::Compaction { reason });
 
         let result = compaction::compact(
             &preparation,
@@ -781,19 +779,24 @@ impl AgentSession {
         let scheduled_weak = weak.clone();
         let attempt_weak = weak.clone();
         SummarizationRetryCallbacks {
-            on_retry_scheduled: Some(Arc::new(move |attempt, max_attempts, delay_ms, error_message| {
-                if let Some(session) = scheduled_weak.as_ref().and_then(std::sync::Weak::upgrade) {
-                    session.emit_public(AgentSessionEvent::SummarizationRetryScheduled {
-                        attempt,
-                        max_attempts,
-                        delay_ms,
-                        error_message,
-                    });
-                }
-            })),
+            on_retry_scheduled: Some(Arc::new(
+                move |attempt, max_attempts, delay_ms, error_message| {
+                    if let Some(session) =
+                        scheduled_weak.as_ref().and_then(std::sync::Weak::upgrade)
+                    {
+                        session.emit_public(AgentSessionEvent::SummarizationRetryScheduled {
+                            attempt,
+                            max_attempts,
+                            delay_ms,
+                            error_message,
+                        });
+                    }
+                },
+            )),
             on_retry_attempt_start: Some(Arc::new(move || {
                 if let Some(session) = attempt_weak.as_ref().and_then(std::sync::Weak::upgrade) {
-                    session.emit_public(AgentSessionEvent::SummarizationRetryAttemptStart { source });
+                    session
+                        .emit_public(AgentSessionEvent::SummarizationRetryAttemptStart { source });
                 }
             })),
             on_retry_finished: Some(Arc::new(move || {
@@ -1502,7 +1505,8 @@ mod tests {
                         message.stop_reason = StopReason::Error;
                         message.error_message = Some("provider overloaded".to_owned());
                     } else {
-                        message.content = vec![AssistantContent::Text(TextContent::new("recovered"))];
+                        message.content =
+                            vec![AssistantContent::Text(TextContent::new("recovered"))];
                         message.stop_reason = StopReason::Stop;
                     }
                     let stream = stream::iter(vec![Ok(AssistantMessageEvent::Done {

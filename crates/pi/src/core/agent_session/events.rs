@@ -676,10 +676,7 @@ mod tests {
         assert_eq!(value, json!({"type": "session_info_changed"}));
         assert!(value.get("name").is_none());
         // Round-trip: None deserializes back.
-        assert_eq!(
-            serde_json::from_value::<AgentSessionEvent>(value)?,
-            event
-        );
+        assert_eq!(serde_json::from_value::<AgentSessionEvent>(value)?, event);
         Ok(())
     }
 
@@ -693,10 +690,7 @@ mod tests {
             value,
             json!({"type": "session_info_changed", "name": "hello"})
         );
-        assert_eq!(
-            serde_json::from_value::<AgentSessionEvent>(value)?,
-            event
-        );
+        assert_eq!(serde_json::from_value::<AgentSessionEvent>(value)?, event);
         Ok(())
     }
 
@@ -728,10 +722,7 @@ mod tests {
                 "errorMessage": "overloaded"
             })
         );
-        assert_eq!(
-            serde_json::from_value::<AgentSessionEvent>(value)?,
-            event
-        );
+        assert_eq!(serde_json::from_value::<AgentSessionEvent>(value)?, event);
         Ok(())
     }
 
@@ -748,10 +739,7 @@ mod tests {
                 "source": "branchSummary"
             })
         );
-        assert_eq!(
-            serde_json::from_value::<AgentSessionEvent>(value)?,
-            event
-        );
+        assert_eq!(serde_json::from_value::<AgentSessionEvent>(value)?, event);
         Ok(())
     }
 
@@ -790,10 +778,7 @@ mod tests {
             serde_json::to_value(&overflow)?["reason"],
             json!("overflow")
         );
-        assert_eq!(
-            serde_json::from_value::<AgentSessionEvent>(value)?,
-            event
-        );
+        assert_eq!(serde_json::from_value::<AgentSessionEvent>(value)?, event);
         Ok(())
     }
 
@@ -802,10 +787,7 @@ mod tests {
         let event = AgentSessionEvent::SummarizationRetryFinished;
         let value = serde_json::to_value(&event)?;
         assert_eq!(value, json!({"type": "summarization_retry_finished"}));
-        assert_eq!(
-            serde_json::from_value::<AgentSessionEvent>(value)?,
-            event
-        );
+        assert_eq!(serde_json::from_value::<AgentSessionEvent>(value)?, event);
         Ok(())
     }
 
@@ -824,10 +806,7 @@ mod tests {
                 "delta": "hello\n"
             })
         );
-        assert_eq!(
-            serde_json::from_value::<AgentSessionEvent>(value)?,
-            event
-        );
+        assert_eq!(serde_json::from_value::<AgentSessionEvent>(value)?, event);
         Ok(())
     }
 
@@ -846,10 +825,7 @@ mod tests {
             })
         );
         assert!(value.get("id").is_none());
-        assert_eq!(
-            serde_json::from_value::<AgentSessionEvent>(value)?,
-            event
-        );
+        assert_eq!(serde_json::from_value::<AgentSessionEvent>(value)?, event);
         Ok(())
     }
 }

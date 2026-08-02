@@ -592,11 +592,9 @@ fn serialize_rpc_command<S: Serializer>(
         RpcCommand::CycleThinkingLevel { id } => {
             serialize_type_only(serializer, id.as_deref(), "cycle_thinking_level")
         }
-        RpcCommand::GetAvailableThinkingLevels { id } => serialize_type_only(
-            serializer,
-            id.as_deref(),
-            "get_available_thinking_levels",
-        ),
+        RpcCommand::GetAvailableThinkingLevels { id } => {
+            serialize_type_only(serializer, id.as_deref(), "get_available_thinking_levels")
+        }
         RpcCommand::SetSteeringMode { id, mode } => {
             serialize_queue_mode(serializer, id.as_deref(), "set_steering_mode", *mode)
         }

@@ -1499,7 +1499,9 @@ mod tests {
         assert_eq!(runtime.provider_mutation_epoch(), provider_epoch);
         assert_eq!(runtime.get_registered_provider_ids(), ["old-provider"]);
         assert!(runtime.get_model("old-provider", "old-model").is_some());
-        let result = runtime_set.emit_input("original", None, "user", None).await?;
+        let result = runtime_set
+            .emit_input("original", None, "user", None)
+            .await?;
         assert!(!result.handled);
         host.wait_for_request("input").await?;
 

@@ -68,13 +68,11 @@ impl CreateAgentSessionRuntimeFactory for TestFactory {
     fn create(
         &self,
         options: CreateAgentSessionRuntimeOptions,
-    ) -> BoxFuture<'_, Result<CreateAgentSessionRuntimeResult, AgentSessionRuntimeError>>
-    {
+    ) -> BoxFuture<'_, Result<CreateAgentSessionRuntimeResult, AgentSessionRuntimeError>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
-            let mut config =
-                AgentSessionConfig::test_config(Arc::new(StubProvider), test_model())
-                    .map_err(|e| AgentSessionRuntimeError::Factory(e.to_string()))?;
+            let mut config = AgentSessionConfig::test_config(Arc::new(StubProvider), test_model())
+                .map_err(|e| AgentSessionRuntimeError::Factory(e.to_string()))?;
             config.session_manager = options.session_manager;
             let session = AgentSession::new(config)
                 .map_err(|e| AgentSessionRuntimeError::Factory(e.to_string()))?;
@@ -156,10 +154,7 @@ impl crate::core::agent_session::ExtensionRunner for EmitRecordingRunner {
         message: pi_agent::AgentMessage,
     ) -> BoxFuture<
         '_,
-        Result<
-            Option<pi_agent::AgentMessage>,
-            crate::core::agent_session::ExtensionRunnerError,
-        >,
+        Result<Option<pi_agent::AgentMessage>, crate::core::agent_session::ExtensionRunnerError>,
     > {
         Box::pin(async move { Ok(Some(message)) })
     }
@@ -294,18 +289,17 @@ impl CreateAgentSessionRuntimeFactory for RecordingFactory {
     fn create(
         &self,
         options: CreateAgentSessionRuntimeOptions,
-    ) -> BoxFuture<'_, Result<CreateAgentSessionRuntimeResult, AgentSessionRuntimeError>>
-    {
+    ) -> BoxFuture<'_, Result<CreateAgentSessionRuntimeResult, AgentSessionRuntimeError>> {
         if let Ok(mut g) = self.reasons.lock() {
             g.push(options.start_reason);
         }
         Box::pin(async move {
-            let mut config =
-                AgentSessionConfig::test_config(Arc::new(StubProvider), test_model())
-                    .map_err(|e| AgentSessionRuntimeError::Factory(e.to_string()))?;
+            let mut config = AgentSessionConfig::test_config(Arc::new(StubProvider), test_model())
+                .map_err(|e| AgentSessionRuntimeError::Factory(e.to_string()))?;
             config.session_manager = options.session_manager;
-            config.extension_runner = Some(Arc::clone(&self.runner)
-                as Arc<dyn crate::core::agent_session::ExtensionRunner>);
+            config.extension_runner =
+                Some(Arc::clone(&self.runner)
+                    as Arc<dyn crate::core::agent_session::ExtensionRunner>);
             let session = AgentSession::new(config)
                 .map_err(|e| AgentSessionRuntimeError::Factory(e.to_string()))?;
             Ok(CreateAgentSessionRuntimeResult {
@@ -346,8 +340,7 @@ impl CreateAgentSessionRuntimeFactory for GatedTestFactory {
     fn create(
         &self,
         options: CreateAgentSessionRuntimeOptions,
-    ) -> BoxFuture<'_, Result<CreateAgentSessionRuntimeResult, AgentSessionRuntimeError>>
-    {
+    ) -> BoxFuture<'_, Result<CreateAgentSessionRuntimeResult, AgentSessionRuntimeError>> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
             if call > 0 {
@@ -424,13 +417,11 @@ impl CreateAgentSessionRuntimeFactory for PreparationGatedFactory {
     fn create(
         &self,
         options: CreateAgentSessionRuntimeOptions,
-    ) -> BoxFuture<'_, Result<CreateAgentSessionRuntimeResult, AgentSessionRuntimeError>>
-    {
+    ) -> BoxFuture<'_, Result<CreateAgentSessionRuntimeResult, AgentSessionRuntimeError>> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
-            let mut config =
-                AgentSessionConfig::test_config(Arc::new(StubProvider), test_model())
-                    .map_err(|e| AgentSessionRuntimeError::Factory(e.to_string()))?;
+            let mut config = AgentSessionConfig::test_config(Arc::new(StubProvider), test_model())
+                .map_err(|e| AgentSessionRuntimeError::Factory(e.to_string()))?;
             config.session_manager = options.session_manager;
             let session = AgentSession::new(config)
                 .map_err(|e| AgentSessionRuntimeError::Factory(e.to_string()))?;
@@ -472,8 +463,7 @@ impl CreateAgentSessionRuntimeFactory for FailingReplacementFactory {
     fn create(
         &self,
         _options: CreateAgentSessionRuntimeOptions,
-    ) -> BoxFuture<'_, Result<CreateAgentSessionRuntimeResult, AgentSessionRuntimeError>>
-    {
+    ) -> BoxFuture<'_, Result<CreateAgentSessionRuntimeResult, AgentSessionRuntimeError>> {
         Box::pin(async {
             Err(AgentSessionRuntimeError::Factory(
                 "injected replacement failure".to_owned(),
@@ -1028,8 +1018,7 @@ async fn import_factory_failure_removes_stage_and_preserves_existing_session() -
 }
 
 #[tokio::test]
-async fn import_stage_unlink_failure_keeps_published_session_and_reports_warning() -> TestResult
-{
+async fn import_stage_unlink_failure_keeps_published_session_and_reports_warning() -> TestResult {
     let root = tempfile::tempdir()?;
     let session_dir = root.path().join("sessions");
     let source_dir = root.path().join("external");
@@ -1232,15 +1221,10 @@ async fn replacement_serialized_concurrent_new_sessions() -> TestResult {
     }
 
     gates[first_call - 1].add_permits(1);
-    let second_call =
-        tokio::time::timeout(std::time::Duration::from_secs(1), entered_rx.recv())
-            .await
-            .map_err(|_| {
-                io::Error::other("timed out waiting for second replacement factory entry")
-            })?
-            .ok_or_else(|| {
-                io::Error::other("replacement factory entry channel closed early")
-            })?;
+    let second_call = tokio::time::timeout(std::time::Duration::from_secs(1), entered_rx.recv())
+        .await
+        .map_err(|_| io::Error::other("timed out waiting for second replacement factory entry"))?
+        .ok_or_else(|| io::Error::other("replacement factory entry channel closed early"))?;
     assert_eq!(second_call, 2);
     gates[second_call - 1].add_permits(1);
 
