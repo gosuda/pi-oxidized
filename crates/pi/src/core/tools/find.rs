@@ -470,8 +470,46 @@ mod tests {
     use super::*;
     use std::fs;
 
+    use proptest::prelude::*;
     use serde_json::json;
     use tempfile::tempdir;
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 8, .. ProptestConfig::default() })]
+        #[test]
+        fn gitignore_rules_hide_only_their_matching_tree(root_ignores_build in any::<bool>(), nested_ignores_file in any::<bool>()) {
+            let result: Result<Vec<String>, String> = (|| {
+                let dir = tempdir().map_err(|error| error.to_string())?;
+                fs::create_dir_all(dir.path().join("build")).map_err(|error| error.to_string())?;
+                fs::create_dir_all(dir.path().join("nested")).map_err(|error| error.to_string())?;
+                fs::write(dir.path().join("visible.txt"), "visible").map_err(|error| error.to_string())?;
+                fs::write(dir.path().join("build/generated.txt"), "generated").map_err(|error| error.to_string())?;
+                fs::write(dir.path().join("nested/kept.txt"), "kept").map_err(|error| error.to_string())?;
+                fs::write(dir.path().join("nested/ignored.txt"), "ignored").map_err(|error| error.to_string())?;
+                fs::write(dir.path().join(".gitignore"), if root_ignores_build { "build/\n" } else { "" }).map_err(|error| error.to_string())?;
+                fs::write(dir.path().join("nested/.gitignore"), if nested_ignores_file { "ignored.txt\n" } else { "" }).map_err(|error| error.to_string())?;
+
+                let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|error| error.to_string())?;
+                let text = runtime.block_on(async {
+                    let tool = FindTool::new(dir.path());
+                    let tool_result = run(&tool, &json!({"pattern": "**/*.txt", "path": dir.path().to_string_lossy()})).await.map_err(|error| error.to_string())?;
+                    Ok::<_, String>(text_of(&tool_result))
+                })?;
+                let mut actual = text.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('[')).map(str::to_owned).collect::<Vec<_>>();
+                actual.sort();
+                Ok(actual)
+            })();
+            let error = result.as_ref().err().map_or("", String::as_str);
+            prop_assert!(result.is_ok(), "{error}");
+            let actual = result.unwrap_or_default();
+            let mut expected = vec!["nested/kept.txt".to_owned(), "visible.txt".to_owned()];
+            if !root_ignores_build { expected.push("build/generated.txt".to_owned()); }
+            if !nested_ignores_file { expected.push("nested/ignored.txt".to_owned()); }
+            expected.sort();
+
+            prop_assert_eq!(actual, expected);
+        }
+    }
 
     fn fixture_schema() -> Result<Value, serde_json::Error> {
         let text = include_str!(

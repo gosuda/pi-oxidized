@@ -362,6 +362,7 @@ pub fn truncate_line_with(line: &str, max_chars: usize) -> TruncatedLine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn head(content: &str, max_lines: usize, max_bytes: usize) -> TruncationResult {
         truncate_head(
@@ -381,6 +382,45 @@ mod tests {
                 max_bytes: Some(max_bytes),
             },
         )
+    }
+
+    proptest! {
+        #[test]
+        fn head_truncation_respects_byte_and_line_limits(
+            lines in prop::collection::vec("(?:[a-z]|é|界){1,12}", 0..16),
+            max_lines in 0_usize..16,
+            max_bytes in 1_usize..96,
+        ) {
+            let content = lines.join("\n");
+            let result = truncate_head(&content, TruncationOptions {
+                max_lines: Some(max_lines),
+                max_bytes: Some(max_bytes),
+            });
+
+            prop_assert_eq!(result.output_bytes, result.content.len());
+            prop_assert_eq!(result.output_lines, split_lines_for_counting(&result.content).len());
+            prop_assert!(result.output_bytes <= max_bytes);
+            prop_assert!(result.output_lines <= max_lines);
+            prop_assert!(content.starts_with(&result.content));
+        }
+
+        #[test]
+        fn tail_truncation_respects_byte_and_line_limits(
+            lines in prop::collection::vec("(?:[a-z]|é|界){1,12}", 0..16),
+            max_lines in 0_usize..16,
+            max_bytes in 1_usize..96,
+        ) {
+            let content = lines.join("\n");
+            let result = truncate_tail(&content, TruncationOptions {
+                max_lines: Some(max_lines),
+                max_bytes: Some(max_bytes),
+            });
+
+            prop_assert_eq!(result.output_bytes, result.content.len());
+            prop_assert!(result.output_bytes <= max_bytes);
+            prop_assert!(result.output_lines <= max_lines);
+            prop_assert!(content.ends_with(&result.content));
+        }
     }
 
     #[test]

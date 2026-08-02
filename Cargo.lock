@@ -2745,6 +2745,7 @@ dependencies = [
  "pi-ai",
  "pi-ext",
  "pi-tui",
+ "proptest",
  "ratatui",
  "regex",
  "reqwest",

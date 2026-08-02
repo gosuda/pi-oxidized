@@ -918,6 +918,69 @@ fn collapse_ops(ops: &[Op]) -> Vec<DiffPart> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn multi_edit_order_is_invariant(ids in prop::collection::vec(0_u8..32, 2..8)) {
+            let original = ids.iter().fold(String::new(), |mut content, id| {
+                content.push('[');
+                content.push_str(&id.to_string());
+                content.push(']');
+                content
+            });
+            let edits = ids.iter().enumerate().map(|(index, id)| Edit {
+                old_text: format!("[{id}]"),
+                new_text: format!("[{}]", ids[(index + 1) % ids.len()]),
+            }).collect::<Vec<_>>();
+            prop_assume!(ids.iter().collect::<std::collections::HashSet<_>>().len() == ids.len());
+
+            let forward = apply_edits_to_normalized_content(&original, &edits, "f.txt").map_err(TestCaseError::fail)?;
+            let mut reversed = edits.clone();
+            reversed.reverse();
+            let backward = apply_edits_to_normalized_content(&original, &reversed, "f.txt").map_err(TestCaseError::fail)?;
+
+            prop_assert_eq!(forward.new_content, backward.new_content);
+        }
+
+        #[test]
+        fn overlapping_edits_are_rejected(length in 3_usize..24) {
+            let original = "abcdefghijklmnopqrstuvw"[..length].to_owned();
+            let first = original[..length - 1].to_owned();
+            let second = original[1..].to_owned();
+            let result = apply_edits_to_normalized_content(&original, &[
+                Edit { old_text: first, new_text: "first".into() },
+                Edit { old_text: second, new_text: "second".into() },
+            ], "f.txt");
+
+            let error = result.as_ref().err().map_or("", String::as_str);
+            prop_assert!(result.is_err());
+            prop_assert!(error.contains("overlap"));
+        }
+
+        #[test]
+        fn line_endings_round_trip(lines in prop::collection::vec("[a-z]{0,8}", 2..12), crlf in any::<bool>()) {
+            let ending = if crlf { LineEnding::Crlf } else { LineEnding::Lf };
+            let content = lines.join(ending.as_str());
+            let normalized = normalize_to_lf(&content);
+
+            prop_assert_eq!(detect_line_ending(&content), ending);
+            prop_assert_eq!(restore_line_endings(&normalized, ending), content);
+        }
+
+        #[test]
+        fn fuzzy_matching_accepts_nfkc_and_smart_punctuation(word in "[A-Za-z0-9]{1,20}") {
+            let fullwidth = word.chars().map(|ch| char::from_u32(ch as u32 + 0xFEE0).unwrap_or(ch)).collect::<String>();
+            let original = format!("“{fullwidth}”\u{00A0}–\n");
+            let old_text = format!("\"{word}\" -\n");
+            let result = apply_edits_to_normalized_content(&original, &[Edit {
+                old_text,
+                new_text: "updated\n".into(),
+            }], "f.txt").map_err(TestCaseError::fail)?;
+
+            prop_assert_eq!(result.new_content, "updated\n");
+        }
+    }
 
     #[test]
     fn strip_bom_detects_prefix() {
