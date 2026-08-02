@@ -2135,4 +2135,258 @@ mod tests {
         assert_eq!(err.to_string(), "Entry nonexistent not found");
         Ok(())
     }
+
+    #[test]
+    fn generated_cross_version_session_interoperability() -> TestResult {
+        fn fixture_files(
+            root: &Path,
+            files: &mut Vec<PathBuf>,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            for entry in fs::read_dir(root)? {
+                let path = entry?.path();
+                if path.is_dir() {
+                    fixture_files(&path, files)?;
+                } else if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+                    files.push(path);
+                }
+            }
+            Ok(())
+        }
+        fn tree_ids(nodes: &[SessionTreeNode], ids: &mut Vec<String>) {
+            for node in nodes {
+                if let Some(id) = node.entry.id() {
+                    ids.push(id.to_owned());
+                }
+                tree_ids(&node.children, ids);
+            }
+        }
+
+        let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.agent-tasks/pi-rust-rewrite/fixtures/sessions");
+        // The verification harness sets PI_SESSION_INTEROP_OUTPUT so TypeScript
+        // can reopen the Rust-produced files afterwards. When unset (plain
+        // `cargo test`), fall back to a fresh per-run directory under the crate
+        // temp area so the proof is self-contained and free of stale content.
+        let _output_guard;
+        let output_root: PathBuf = match std::env::var_os("PI_SESSION_INTEROP_OUTPUT") {
+            Some(dir) => {
+                _output_guard = None;
+                PathBuf::from(dir)
+            }
+            None => {
+                let tmp_base = std::env::var_os("CARGO_TARGET_TMPDIR")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(std::env::temp_dir);
+                let guard = tempfile::tempdir_in(&tmp_base)?;
+                let path = guard.path().to_path_buf();
+                _output_guard = Some(guard);
+                path
+            }
+        };
+        fs::create_dir_all(&output_root)?;
+        let mut fixtures = Vec::new();
+        fixture_files(&fixture_root, &mut fixtures)?;
+        fixtures.sort();
+        assert_eq!(
+            fixtures.len(),
+            9,
+            "run scripts/generate-session-fixtures.ts before this proof"
+        );
+
+        let mut saw_v1 = false;
+        let mut saw_v2 = false;
+        let mut saw_v3 = false;
+        let mut saw_unknown = false;
+        for fixture in fixtures {
+            let expected_path = fixture.with_extension("expected.json");
+            let expected: Value = serde_json::from_slice(&fs::read(&expected_path)?)?;
+            let fixture_name = expected["fixture"].as_str().ok_or("fixture name")?;
+            match expected["formatVersion"].as_u64().ok_or("format version")? {
+                1 => saw_v1 = true,
+                2 => saw_v2 = true,
+                3 => saw_v3 = true,
+                version => return Err(format!("unexpected fixture version {version}").into()),
+            }
+
+            let relative = fixture.strip_prefix(&fixture_root)?;
+            let scenario_dir = output_root.join(relative).with_extension("");
+            fs::create_dir_all(&scenario_dir)?;
+            let continued = scenario_dir.join("continued.jsonl");
+            fs::copy(&fixture, &continued)?;
+            let mut session =
+                SessionManager::open(path_str(&continued)?, Some(path_str(&scenario_dir)?), None)?;
+            let migrated_prefix = fs::read(&continued)?;
+
+            let header = session.get_header().ok_or("header")?;
+            assert_eq!(
+                header.version,
+                Some(CURRENT_SESSION_VERSION),
+                "{fixture_name}: header version"
+            );
+            assert_eq!(
+                header.id.as_deref(),
+                expected["sessionId"].as_str(),
+                "{fixture_name}: header id"
+            );
+            let entries: Vec<Value> = session
+                .get_entries()
+                .into_iter()
+                .map(serde_json::to_value)
+                .collect::<Result<_, _>>()?;
+            let expected_entries = expected["entries"].as_array().ok_or("expected entries")?;
+            assert_eq!(
+                entries.len(),
+                expected_entries.len(),
+                "{fixture_name}: entry count"
+            );
+            let mut expected_to_actual = HashMap::new();
+            for (actual, expected_entry) in entries.iter().zip(expected_entries) {
+                assert_eq!(
+                    actual["type"], expected_entry["type"],
+                    "{fixture_name}: entry type"
+                );
+                let expected_id = expected_entry["id"].as_str().ok_or("expected entry id")?;
+                let actual_id = actual["id"].as_str().ok_or("actual entry id")?;
+                if let Some(expected_message) = expected_entry.get("message") {
+                    let actual_message = actual.get("message").ok_or("actual message")?;
+                    for key in ["role", "content", "api", "provider", "model", "stopReason"] {
+                        if !expected_message[key].is_null() {
+                            assert_eq!(
+                                actual_message[key], expected_message[key],
+                                "{fixture_name}: message {key}"
+                            );
+                        }
+                    }
+                }
+                expected_to_actual.insert(expected_id.to_owned(), actual_id.to_owned());
+            }
+            assert_eq!(
+                session.get_leaf_id(),
+                expected["leaf"]
+                    .as_str()
+                    .and_then(|id| expected_to_actual.get(id).map(String::as_str)),
+                "{fixture_name}: leaf",
+            );
+            assert_eq!(
+                session.get_session_name(),
+                expected["name"].as_str().map(str::to_owned),
+                "{fixture_name}: name"
+            );
+            for (id, label) in expected["labels"].as_object().ok_or("labels")? {
+                assert_eq!(
+                    session.get_label(expected_to_actual.get(id).ok_or("label target")?),
+                    label.as_str(),
+                    "{fixture_name}: label {id}",
+                );
+            }
+            let mut actual_tree = Vec::new();
+            tree_ids(&session.get_tree(), &mut actual_tree);
+            let mut expected_tree = Vec::new();
+            fn expected_tree_ids(value: &Value, ids: &mut Vec<String>) {
+                for node in value.as_array().into_iter().flatten() {
+                    if let Some(id) = node
+                        .get("entry")
+                        .and_then(|entry| entry.get("id"))
+                        .and_then(Value::as_str)
+                    {
+                        ids.push(id.to_owned());
+                    }
+                    if let Some(children) = node.get("children") {
+                        expected_tree_ids(children, ids);
+                    }
+                }
+            }
+            expected_tree_ids(&expected["tree"], &mut expected_tree);
+            let actual_tree_as_expected: Vec<String> = actual_tree
+                .into_iter()
+                .map(|actual| {
+                    expected_to_actual
+                        .iter()
+                        .find_map(|(expected, mapped)| {
+                            (*mapped == actual).then_some((*expected).to_owned())
+                        })
+                        .ok_or("tree entry")
+                })
+                .collect::<Result<_, _>>()?;
+            assert_eq!(
+                actual_tree_as_expected, expected_tree,
+                "{fixture_name}: tree"
+            );
+            let context = session.build_session_context()?;
+            let expected_context = expected["context"]["messages"]
+                .as_array()
+                .ok_or("context messages")?;
+            let actual_context: Vec<Value> = context
+                .messages
+                .iter()
+                .map(serde_json::to_value)
+                .collect::<Result<_, _>>()?;
+            assert_eq!(
+                actual_context.len(),
+                expected_context.len(),
+                "{fixture_name}: context"
+            );
+            for (actual, expected_message) in actual_context.iter().zip(expected_context) {
+                assert_eq!(
+                    actual["role"], expected_message["role"],
+                    "{fixture_name}: context role"
+                );
+                assert_eq!(
+                    actual["content"], expected_message["content"],
+                    "{fixture_name}: context content"
+                );
+            }
+            assert_eq!(
+                session
+                    .get_entries()
+                    .iter()
+                    .filter(|entry| entry.discriminant() == "compaction")
+                    .count(),
+                expected["entries"]
+                    .as_array()
+                    .ok_or("expected entries")?
+                    .iter()
+                    .filter(|entry| entry["type"] == "compaction")
+                    .count(),
+                "{fixture_name}: compaction",
+            );
+            saw_unknown |= entries.iter().any(|entry| entry["type"] == "future_thing");
+
+            session.append_message(&assistant_agent("Rust interop continuation", 42))?;
+            let continued_bytes = fs::read(&continued)?;
+            assert!(
+                continued_bytes.starts_with(&migrated_prefix),
+                "{fixture_name}: continuation rewrote history"
+            );
+            let leaf = session.get_leaf_id().ok_or("continued leaf")?.to_owned();
+            let forked = SessionManager::fork_from(
+                path_str(&continued)?,
+                path_str(&scenario_dir)?,
+                Some(path_str(&scenario_dir)?),
+                None,
+            )?;
+            let forked_file = forked.get_session_file().ok_or("forked file")?;
+            assert!(
+                Path::new(forked_file).exists(),
+                "{fixture_name}: fork output missing"
+            );
+            let cloned_file = session
+                .create_branched_session(&leaf)?
+                .ok_or("cloned file")?;
+            assert!(
+                Path::new(&cloned_file).exists(),
+                "{fixture_name}: clone output missing"
+            );
+        }
+        assert!(
+            saw_v1 && saw_v2 && saw_v3,
+            "fixture set must cover v1/v2/v3"
+        );
+        assert!(
+            saw_unknown,
+            "fixture set must preserve opaque future entries"
+        );
+        Ok(())
+    }
 }
+
