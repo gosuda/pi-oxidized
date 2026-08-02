@@ -15,7 +15,7 @@ use pi_ext::protocol::FlagValueWire;
 use thiserror::Error;
 
 use super::config::{get_agent_dir, get_docs_path, resolve_path};
-use super::extension_runtime_set::{ExtensionRuntimeSet, ExtensionSetStart};
+use super::extension_runtime_set::{ExtensionRuntimeSet, ExtensionSetDiagnostic, ExtensionSetStart};
 use super::model_runtime::{
     CreateModelRuntimeOptions, ModelRuntime, ModelRuntimeError, ProviderConfigInput,
 };
@@ -512,15 +512,22 @@ pub async fn create_agent_session_services_with_trust(
     let (flag_diagnostics, applied_flags) =
         apply_extension_flag_values(extension_flag_values.unwrap_or_default(), &registered_flags);
     diagnostics.extend(flag_diagnostics);
-    if let Some(runner) = extension_runner.as_deref()
-        && let Err(error) = apply_flags_to_runner(runner, &applied_flags).await
-    {
-        diagnostics.push(AgentSessionRuntimeDiagnostic::error(format!(
-            "Extension flags failed to apply: {error}"
-        )));
-        runner.unregister_providers_from(&foundation.model_runtime);
-        runner.shutdown_once().await;
-        extension_runner = None;
+    if let Some(runner) = extension_runner.as_deref() {
+        match apply_flags_to_runner(runner, &applied_flags).await {
+            Ok(flag_diagnostics) => diagnostics.extend(
+                flag_diagnostics
+                    .into_iter()
+                    .map(|diagnostic| AgentSessionRuntimeDiagnostic::warning(diagnostic.to_string())),
+            ),
+            Err(error) => {
+                diagnostics.push(AgentSessionRuntimeDiagnostic::error(format!(
+                    "Extension flags failed to apply: {error}"
+                )));
+                runner.unregister_providers_from(&foundation.model_runtime);
+                runner.shutdown_once().await;
+                extension_runner = None;
+            }
+        }
     }
 
     for registration in pending_provider_registrations {
@@ -650,10 +657,7 @@ fn record_extension_start(
 ) -> Option<Arc<ExtensionRuntimeSet>> {
     let generation_survived = started.set.is_some();
     for diagnostic in started.diagnostics {
-        let message = format!(
-            "Extension \"{}\" error: {}",
-            diagnostic.path, diagnostic.message
-        );
+        let message = diagnostic.to_string();
         diagnostics.push(if generation_survived {
             AgentSessionRuntimeDiagnostic::warning(message)
         } else {
@@ -712,7 +716,7 @@ async fn start_extension_phase(
 async fn apply_flags_to_runner(
     runner: &ExtensionRuntimeSet,
     applied_flags: &BTreeMap<String, ExtensionFlagValue>,
-) -> Result<(), pi_ext::client::HostClientError> {
+) -> Result<Vec<ExtensionSetDiagnostic>, pi_ext::client::HostClientError> {
     let values = applied_flags
         .iter()
         .map(|(name, value)| {

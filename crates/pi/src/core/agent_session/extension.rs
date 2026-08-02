@@ -23,7 +23,7 @@
 //! correct emissions.
 
 use crate::core::extension_host::SessionBridgeEvent;
-use crate::core::extension_runtime_set::ExtensionRuntimeSet;
+use crate::core::extension_runtime_set::{ExtensionRuntimeSet, ExtensionSetDiagnostic};
 use crate::core::messages::CustomMessageContent;
 use crate::core::resources::{
     ResourceLoader, SlashCommandInfo, SlashCommandSource, SyntheticSourceInfoOptions,
@@ -320,28 +320,61 @@ impl AgentSession {
     ///
     /// Mirrors TS `reload`:
     /// 1. Capture previous flag values (preserved across the swap).
-    /// 2. Emit `session_shutdown{reload}` on the old runner (self-gated on
-    ///    handler presence; host errors isolated).
-    /// 3. When a concrete runtime set is present: build and publish a complete
-    ///    replacement generation, re-register providers, restore flags, and
-    ///    refresh tools without replacing the stable facade.
+    /// 2. Prepare a concrete runtime replacement before notifying the old generation.
+    /// 3. Emit `session_shutdown{reload}` only after preparation succeeds, then
+    ///    commit the replacement and re-register providers without replacing the
+    ///    stable facade.
     /// 4. Emit `session_start{reload}` on the replacement generation.
     /// 5. Reload base resources and re-discover extension resources.
     ///
     /// # Errors
     ///
-    /// Returns [`ExtensionBindError`] on host restart or resource-discovery
-    /// failure.
-    pub async fn reload(&self) -> Result<(), ExtensionBindError> {
+    /// Returns [`ExtensionBindError`] on host preparation or resource-discovery
+    /// failure. Non-fatal extension diagnostics are returned after a successful
+    /// reload.
+    pub async fn reload(&self) -> Result<Vec<ExtensionSetDiagnostic>, ExtensionBindError> {
         let host = self.host_extension_runner();
+        let runner = self.hooks.runner();
+        let previous_flag_values = runner.get_flag_values();
+
+        if let (Some(host), Some(runtime)) = (host.as_ref(), self.model_runtime()) {
+            let prepared = host
+                .prepare_reload(previous_flag_values)
+                .await
+                .map_err(|error| ExtensionBindError::HostRestart(error.to_string()))?;
+
+            // Lifecycle event on the old host. Emit self-gates on handler
+            // presence; the prepared replacement is not published until commit.
+            let _ = runner
+                .emit(AgentSessionEvent::SessionShutdown {
+                    reason: SessionShutdownReason::Reload,
+                    target_session_file: None,
+                })
+                .await;
+
+            let reload = host.commit_reload(&runtime, prepared).await;
+            if !reload.committed {
+                return Err(ExtensionBindError::HostRestart(
+                    "extension runtime was invalidated during reload".to_owned(),
+                ));
+            }
+            let diagnostics = reload.diagnostics;
+            // Refresh tools after the facade atomically publishes its replacement generation.
+            self.refresh_tool_registry(&super::tools::RefreshToolRegistryOptions {
+                active_tool_names: None,
+                include_all_extension_tools: true,
+            });
+            self.emit_session_start_reload().await;
+            self.extend_resources_from_extensions(SessionStartReason::Reload.as_str())
+                .await?;
+            return Ok(diagnostics);
+        }
+
         if host.as_ref().is_some_and(|host| !host.can_reload()) {
             return Err(ExtensionBindError::HostRestart(
                 "extension runtime is not reloadable".to_owned(),
             ));
         }
-
-        let runner = self.hooks.runner();
-        let previous_flag_values = runner.get_flag_values();
 
         // Lifecycle event on the old host. Emit self-gates on handler
         // presence; host transport reaping is handled below regardless.
@@ -353,41 +386,23 @@ impl AgentSession {
             .await;
 
         if let Some(host) = host {
-            let Some(runtime) = self.model_runtime() else {
-                // No runtime to re-register providers against: still reap the
-                // old host so dispose paths stay single-reap clean.
-                host.shutdown_once().await;
-                self.set_host_extension_runner(None);
-                self.hooks
-                    .set_runner(Arc::new(super::extension_runner::NullExtensionRunner));
-                self.emit_session_start_reload().await;
-                self.extend_resources_from_extensions(SessionStartReason::Reload.as_str())
-                    .await?;
-                return Ok(());
-            };
-            if let Err(error) = host
-                .restart_and_rewire(&runtime, previous_flag_values)
-                .await
-            {
-                self.emit_session_start_reload().await;
-                return Err(ExtensionBindError::HostRestart(error.to_string()));
-            }
-            // Refresh tools after the facade atomically publishes its replacement generation.
-            self.refresh_tool_registry(&super::tools::RefreshToolRegistryOptions {
-                active_tool_names: None,
-                include_all_extension_tools: true,
-            });
+            // No runtime to re-register providers against: still reap the
+            // old host so dispose paths stay single-reap clean.
+            host.shutdown_once().await;
+            self.set_host_extension_runner(None);
+            self.hooks
+                .set_runner(Arc::new(super::extension_runner::NullExtensionRunner));
             self.emit_session_start_reload().await;
             self.extend_resources_from_extensions(SessionStartReason::Reload.as_str())
                 .await?;
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         // Trait-only / test path (no concrete host).
         self.emit_session_start_reload().await;
         self.extend_resources_from_extensions(SessionStartReason::Reload.as_str())
             .await?;
-        Ok(())
+        Ok(Vec::new())
     }
 
     /// Emit `session_start{reload}` on the current (post-swap) runner.
@@ -1435,10 +1450,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_concrete_reload_restarts_old_session_lifecycle() -> TestResult {
+    async fn failed_restart_prepare_keeps_old_runner_provider_and_transport_live() -> TestResult {
+        let old_provider = serde_json::json!({
+            "name": "old-provider",
+            "baseUrl": "https://old.example/v1",
+            "api": "openai-completions",
+            "models": [{
+                "id": "old-model",
+                "name": "Old model",
+                "api": "openai-completions",
+                "baseUrl": "https://old.example/v1",
+                "reasoning": false
+            }]
+        });
         let (runner, host) =
             crate::core::extension_runtime_set::tests::make_runner(serde_json::json!({
-                "handlers": ["session_start", "session_shutdown"],
+                "providers": [old_provider],
+                "handlers": ["input", "session_start", "session_shutdown"],
                 "terminalInput": false
             }))
             .await?;
@@ -1447,19 +1475,33 @@ mod tests {
             runner,
         )]);
         let runtime = Arc::new(crate::core::model_runtime::ModelRuntime::create_in_memory().await?);
+        assert!(
+            runtime_set
+                .register_providers_on(&runtime)
+                .into_iter()
+                .all(|(_path, outcome)| outcome.is_ok())
+        );
+        let provider_epoch = runtime.provider_mutation_epoch();
         let mut config = AgentSessionConfig::test_config(Arc::new(StubProvider), test_model())?;
         config.extension_runner = Some(runtime_set.clone());
         config.host_extension_runner = Some(runtime_set.clone());
-        config.model_runtime = Some(runtime);
+        config.model_runtime = Some(Arc::clone(&runtime));
         let session = AgentSession::new(config)?;
 
-        let result = session.reload().await;
-        assert!(matches!(result, Err(ExtensionBindError::HostRestart(_))));
-        host.wait_for_request("session_shutdown").await?;
-        host.wait_for_request("session_start").await?;
-        assert_eq!(host.request_count("session_shutdown"), 1);
-        assert_eq!(host.request_count("session_start"), 1);
+        assert!(matches!(
+            session.reload().await,
+            Err(ExtensionBindError::HostRestart(_))
+        ));
+        assert_eq!(host.request_count("session_shutdown"), 0);
+        assert_eq!(host.request_count("session_start"), 0);
+        assert_eq!(runtime_set.reload_generation(), 1);
         assert!(runtime_set.is_active());
+        assert_eq!(runtime.provider_mutation_epoch(), provider_epoch);
+        assert_eq!(runtime.get_registered_provider_ids(), ["old-provider"]);
+        assert!(runtime.get_model("old-provider", "old-model").is_some());
+        let result = runtime_set.emit_input("original", None, "user", None).await?;
+        assert!(!result.handled);
+        host.wait_for_request("input").await?;
 
         runtime_set.shutdown_once().await;
         Ok(())

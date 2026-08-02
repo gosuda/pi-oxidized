@@ -374,7 +374,7 @@ pub trait SessionHost: Send + Sync + 'static {
     fn cycle_model(&self, forward: bool) -> BoxFuture<'_, Result<(), String>>;
 
     /// Reload extensions / resources / keybindings.
-    fn reload(&self) -> BoxFuture<'_, Result<(), String>>;
+    fn reload(&self) -> BoxFuture<'_, Result<Vec<String>, String>>;
 
     /// Returns the full transcript for the current session (used on rebind).
     fn messages(&self) -> Vec<pi_agent::AgentMessage>;
@@ -2129,7 +2129,14 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         if self.pending_extension_dialog.is_some() {
             self.cancel_extension_dialog().await;
         }
-        self.record_err(self.session.reload().await);
+        match self.session.reload().await {
+            Ok(messages) => {
+                for message in messages {
+                    self.push_notice("reload", message);
+                }
+            }
+            Err(error) => self.last_error = Some(error),
+        }
         self.rebind_extension_channels().await;
         if let Ok(Some(dark)) = self.input.requery_background(self.tui.outer_mut()).await {
             self.tui.capabilities_mut().set_dark_background(Some(dark));
@@ -4432,7 +4439,11 @@ fn project_event(view: &mut ViewState, event: &AgentSessionEvent) {
         | Event::SessionBeforeFork { .. }
         | Event::SessionStart { .. }
         | Event::SessionShutdown { .. }
-        | Event::ModelSelect { .. } => {}
+        | Event::ModelSelect { .. }
+        | Event::SummarizationRetryScheduled { .. }
+        | Event::SummarizationRetryAttemptStart { .. }
+        | Event::SummarizationRetryFinished
+        | Event::BashExecutionUpdate { .. } => {}
         Event::MessageStart { message } => project_message_start(view, message),
         Event::MessageUpdate { message, .. } => {
             project_assistant_message(view, message, false);
@@ -5398,9 +5409,15 @@ impl SessionHost for AgentSessionHost {
         })
     }
 
-    fn reload(&self) -> BoxFuture<'_, Result<(), String>> {
+    fn reload(&self) -> BoxFuture<'_, Result<Vec<String>, String>> {
         let session = self.read_session();
-        Box::pin(async move { session.reload().await.map_err(|e| e.to_string()) })
+        Box::pin(async move {
+            let diagnostics = session.reload().await.map_err(|error| error.to_string())?;
+            Ok(diagnostics
+                .into_iter()
+                .map(|diagnostic| diagnostic.to_string())
+                .collect())
+        })
     }
 
     fn messages(&self) -> Vec<pi_agent::AgentMessage> {
@@ -6641,6 +6658,7 @@ mod tests {
         cancel_fork: Arc<std::sync::atomic::AtomicBool>,
         cancel_switch: Arc<std::sync::atomic::AtomicBool>,
         fork_selected_text: Arc<std::sync::Mutex<Option<String>>>,
+        reload_diagnostics: Arc<std::sync::Mutex<Vec<String>>>,
         extension_runner: Option<Arc<ExtensionRuntimeSet>>,
     }
 
@@ -6660,6 +6678,7 @@ mod tests {
                 cancel_fork: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 cancel_switch: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 fork_selected_text: Arc::new(std::sync::Mutex::new(None)),
+                reload_diagnostics: Arc::new(std::sync::Mutex::new(Vec::new())),
                 extension_runner: None,
             };
             (host, log)
@@ -6697,6 +6716,13 @@ mod tests {
                 .fork_selected_text
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = text;
+        }
+
+        fn set_reload_diagnostics(&self, diagnostics: Vec<String>) {
+            *self
+                .reload_diagnostics
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = diagnostics;
         }
     }
 
@@ -6875,11 +6901,15 @@ mod tests {
             })
         }
 
-        fn reload(&self) -> BoxFuture<'_, Result<(), String>> {
+        fn reload(&self) -> BoxFuture<'_, Result<Vec<String>, String>> {
             let log = Arc::clone(&self.log);
+            let diagnostics = Arc::clone(&self.reload_diagnostics);
             Box::pin(async move {
                 *log.reloads.lock().await += 1;
-                Ok(())
+                Ok(diagnostics
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone())
             })
         }
 
@@ -8602,6 +8632,51 @@ mod tests {
         assert!(rt.pending_extension_dialog.is_none());
         assert_eq!(rt.editor.get_text(), "draft prompt");
         assert_eq!(rt.view.editor.placeholder, "Type a message…");
+    }
+
+    #[tokio::test]
+    async fn interactive_reload_surfaces_nonfatal_extension_diagnostics() -> TestResult {
+        let writer = SharedWriter::new();
+        let caps = TerminalCapabilities::default();
+        let tui = Tui::new(writer, Size::new(80, 24), Position::ORIGIN, 8, caps)
+            .map_err(|error| error.to_string())?;
+        let (_tx, rx) = mpsc::unbounded_channel::<UiEvent>();
+        let input = TerminalInput::mock(rx);
+        let (host, _log) = FakeHost::new();
+        host.set_reload_diagnostics(vec![
+            "Extension \"first.ts\" error: flag rejected".to_owned(),
+            "Extension \"second.ts\" error: provider rejected".to_owned(),
+        ]);
+        let options = InteractiveRuntimeOptions {
+            size: (80, 24),
+            ..InteractiveRuntimeOptions::default()
+        };
+        let mut runtime = InteractiveRuntime::new(tui, input, Arc::new(host), &options);
+
+        assert_eq!(
+            runtime.dispatch_action(ViewAction::Reload).await,
+            ActionOutcome::Repaint
+        );
+        let notices = runtime
+            .view
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                MessageView::Custom(custom) if custom.custom_type == "reload" => {
+                    Some(custom.text.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            notices,
+            [
+                "Extension \"first.ts\" error: flag rejected",
+                "Extension \"second.ts\" error: provider rejected",
+            ]
+        );
+        assert!(runtime.last_error.is_none());
+        Ok(())
     }
 
     #[tokio::test]
