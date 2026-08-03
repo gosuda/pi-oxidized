@@ -51,6 +51,8 @@ const EXPECTED_PROVIDER_IDS = [
 	"opencode",
 	"opencode-go",
 	"openrouter",
+	"qwen-token-plan",
+	"qwen-token-plan-cn",
 	"together",
 	"vercel-ai-gateway",
 	"xai",

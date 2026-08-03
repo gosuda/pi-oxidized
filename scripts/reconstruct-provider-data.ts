@@ -14,6 +14,7 @@
  * previous live tree (if any) is retained as a unique sibling backup until the
  * inversion proof succeeds.
  */
+import { createHash } from "node:crypto";
 import {
 	access,
 	mkdir,
@@ -38,6 +39,7 @@ const DATA_DIRECTORY_LOCK_RETRY_MS = 10;
 const DEFAULT_LOCK_ACQUIRE_TIMEOUT_MS = 10_000;
 const LOCK_INITIALIZING_GRACE_MS = 30_000;
 const LOCK_OWNER_FILE = "owner.json";
+const DATA_MANIFEST_FILE = ".manifest.json";
 const LOCK_OWNER_VERSION = 1;
 type FileSystemError = Error & { code?: string };
 
@@ -130,12 +132,90 @@ function sortDeep(value: unknown): unknown {
 	return sorted;
 }
 
-function encodeProviderModels(models: Record<string, unknown>): string {
-	return `${JSON.stringify(sortDeep(models), null, "\t")}\n`;
+function groupProviderModels(
+	provider: string,
+	models: Record<string, unknown>,
+): Record<string, Record<string, unknown>> {
+	const groups = Object.create(null) as Record<string, Record<string, unknown>>;
+	for (const [modelId, value] of Object.entries(models)) {
+		if (value === null || typeof value !== "object" || Array.isArray(value)) {
+			throw new Error(`catalog model "${provider}/${modelId}" must be an object`);
+		}
+		const model = value as Record<string, unknown>;
+		const api = model["api"];
+		if (typeof api !== "string" || api.length === 0) {
+			throw new Error(`catalog model "${provider}/${modelId}" must have a non-empty api`);
+		}
+		const group = groups[api] ?? (groups[api] = Object.create(null) as Record<string, unknown>);
+		group[modelId] = model;
+	}
+	return groups;
+}
+
+function encodeProviderModels(provider: string, models: Record<string, unknown>): string {
+	return `${JSON.stringify(sortDeep(groupProviderModels(provider, models)), null, "\t")}\n`;
+}
+
+function rebuildProviderManifest(
+	catalog: ProviderCatalog,
+	bodies: ReadonlyMap<string, string>,
+	previous: Uint8Array,
+): Uint8Array {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(previous));
+	} catch (error) {
+		throw new Error(
+			`provider manifest is not valid UTF-8 JSON: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+		throw new Error("provider manifest must contain a JSON object");
+	}
+	const generatedAt = (parsed as Record<string, unknown>)["generatedAt"];
+	if (typeof generatedAt !== "string" || Number.isNaN(Date.parse(generatedAt))) {
+		throw new Error("provider manifest has an invalid generation timestamp");
+	}
+
+	const structure = Object.create(null) as Record<string, Record<string, string>>;
+	for (const provider of Object.keys(catalog).sort()) {
+		const models = catalog[provider];
+		if (models === undefined) throw new Error(`catalog lost provider "${provider}"`);
+		const providerStructure = Object.create(null) as Record<string, string>;
+		for (const [api, group] of Object.entries(groupProviderModels(provider, models))) {
+			for (const modelId of Object.keys(group)) providerStructure[modelId] = api;
+		}
+		structure[provider] = providerStructure;
+	}
+
+	const files = Object.create(null) as Record<string, string>;
+	for (const [provider, body] of [...bodies.entries()].sort(([left], [right]) =>
+		left < right ? -1 : left > right ? 1 : 0
+	)) {
+		files[`${provider}.json`] = createHash("sha256").update(body).digest("hex");
+	}
+	const structureHash = createHash("sha256")
+		.update(JSON.stringify(sortDeep(structure)))
+		.digest("hex");
+	const manifest = {
+		schemaVersion: 3,
+		generatedAt,
+		structureHash,
+		files,
+	};
+	return new TextEncoder().encode(`${JSON.stringify(manifest)}\n`);
 }
 
 function setKey(values: Iterable<string>): string {
 	return [...values].sort().join("\0");
+}
+
+function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
+	if (left.byteLength !== right.byteLength) return false;
+	for (let index = 0; index < left.byteLength; index += 1) {
+		if (left[index] !== right[index]) return false;
+	}
+	return true;
 }
 
 async function pathExists(path: string): Promise<boolean> {
@@ -146,6 +226,7 @@ async function pathExists(path: string): Promise<boolean> {
 		return false;
 	}
 }
+
 
 function uniqueSibling(dataDir: string, kind: "staging" | "backup"): string {
 	return `${dataDir}.${kind}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2, 10)}`;
@@ -501,9 +582,12 @@ async function validateStagingDirectory(
 	stagingDir: string,
 	expectedProviders: string[],
 	catalog: ProviderCatalog,
+	expectedManifest: Uint8Array | null,
 ): Promise<void> {
 	const stagedNames = await readdir(stagingDir);
-	const expectedNames = expectedProviders.map((id) => `${id}.json`).sort();
+	const expectedNames = expectedProviders.map((id) => `${id}.json`);
+	if (expectedManifest !== null) expectedNames.push(DATA_MANIFEST_FILE);
+	expectedNames.sort();
 	const actualNames = [...stagedNames].sort();
 	if (setKey(actualNames) !== setKey(expectedNames)) {
 		throw new Error(
@@ -529,11 +613,18 @@ async function validateStagingDirectory(
 		if (models === undefined) {
 			throw new Error(`catalog lost provider "${provider}" during staging validation`);
 		}
-		const expected = encodeProviderModels(models);
+		const expected = encodeProviderModels(provider, models);
 		if (raw !== expected) {
 			throw new Error(
 				`staged ${fileName} is not exact sorted catalog content for provider "${provider}"`,
 			);
+		}
+	}
+
+	if (expectedManifest !== null) {
+		const actualManifest = await Bun.file(join(stagingDir, DATA_MANIFEST_FILE)).bytes();
+		if (!bytesEqual(actualManifest, expectedManifest)) {
+			throw new Error("staged provider manifest changed during reconstruction");
 		}
 	}
 }
@@ -656,7 +747,7 @@ export async function reconstructProviderData(
 		if (models === null || typeof models !== "object" || Array.isArray(models)) {
 			throw new Error(`catalog provider "${provider}" must be a model object map`);
 		}
-		expectedBodies.set(provider, encodeProviderModels(models));
+		expectedBodies.set(provider, encodeProviderModels(provider, models));
 	}
 
 	const lock = await acquireDataDirectoryLock(dataDir, lockAcquireTimeoutMs, options.onLockWait);
@@ -664,6 +755,13 @@ export async function reconstructProviderData(
 	let hasPrimaryFailure = false;
 	try {
 		const hadLive = await pathExists(dataDir);
+		const manifestPath = join(dataDir, DATA_MANIFEST_FILE);
+		const previousManifest = await pathExists(manifestPath)
+			? await Bun.file(manifestPath).bytes()
+			: null;
+		const manifestBody = previousManifest === null
+			? null
+			: rebuildProviderManifest(catalog, expectedBodies, previousManifest);
 		const stagingDir = uniqueSibling(dataDir, "staging");
 		let backupDir: string | null = null;
 		let published = false;
@@ -679,8 +777,11 @@ export async function reconstructProviderData(
 				}
 				await writeFile(join(stagingDir, `${provider}.json`), body, "utf8");
 			}
+			if (manifestBody !== null) {
+				await writeFile(join(stagingDir, DATA_MANIFEST_FILE), manifestBody);
+			}
 
-			await validateStagingDirectory(stagingDir, wrappers, catalog);
+			await validateStagingDirectory(stagingDir, wrappers, catalog, manifestBody);
 
 			if (hadLive) {
 				const candidate = uniqueSibling(dataDir, "backup");

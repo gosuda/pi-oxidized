@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import {
 	chmodSync,
@@ -41,13 +42,29 @@ type Fixture = {
 	dataDir: string;
 };
 
+function withFixtureApis(catalog: ProviderCatalog): ProviderCatalog {
+	const normalized = Object.create(null) as ProviderCatalog;
+	for (const [provider, models] of Object.entries(catalog)) {
+		const providerModels = Object.create(null) as Record<string, unknown>;
+		for (const [modelId, value] of Object.entries(models)) {
+			const model = asRecord(value);
+			providerModels[modelId] = Object.assign(Object.create(null), model, {
+				api: typeof model.api === "string" ? model.api : "test-api",
+			});
+		}
+		normalized[provider] = providerModels;
+	}
+	return normalized;
+}
+
 function makeFixture(catalog: ProviderCatalog): Fixture {
 	const root = mkdtempSync(join(tmpdir(), "reconstruct-provider-data-"));
 	const providersDir = join(root, "providers");
 	const dataDir = join(providersDir, "data");
 	const catalogPath = join(root, "builtin-models.json");
+	const fixtureCatalog = withFixtureApis(catalog);
 	mkdirSync(providersDir, { recursive: true });
-	writeFileSync(catalogPath, `${JSON.stringify(catalog, null, 2)}\n`, "utf8");
+	writeFileSync(catalogPath, `${JSON.stringify(fixtureCatalog, null, 2)}\n`, "utf8");
 	for (const provider of Object.keys(catalog).sort()) {
 		writeFileSync(join(providersDir, `${provider}.models.ts`), "// fixture wrapper\n", "utf8");
 	}
@@ -125,13 +142,58 @@ describe("reconstructProviderData transaction (Cluster C)", () => {
 			expect(result.providers).toEqual(["alpha", "beta"]);
 			expect(readdirSync(fixture.dataDir).sort()).toEqual(["alpha.json", "beta.json"]);
 			expect(readFileSync(join(fixture.dataDir, "alpha.json"), "utf8")).toBe(
-				`${JSON.stringify({ "m-a": { id: "m-a", nested: { a: 2, b: 1 } } }, null, "\t")}\n`,
+				`${JSON.stringify({ "test-api": { "m-a": { api: "test-api", id: "m-a", nested: { a: 2, b: 1 } } } }, null, "\t")}\n`,
 			);
 			expect(siblingArtifacts(fixture.providersDir)).toEqual([]);
 		} finally {
 			rmSync(fixture.root, { recursive: true, force: true });
 		}
 	});
+
+	test("rebuilds provider manifest hashes while preserving its generation timestamp", async () => {
+		const catalog: ProviderCatalog = {
+			alpha: { model: { api: "test-api", id: "model" } },
+		};
+		const fixture = makeFixture(catalog);
+		const generatedAt = "2026-08-03T00:00:00.000Z";
+		const staleManifest = `${JSON.stringify({
+			schemaVersion: 3,
+			generatedAt,
+			structureHash: "stale",
+			files: { "alpha.json": "stale" },
+		})}\n`;
+		try {
+			seedLiveData(fixture.dataDir, {
+				".manifest.json": staleManifest,
+				"alpha.json": '{"stale":true}\n',
+			});
+			await reconstructProviderData({
+				repoRoot: fixture.root,
+				catalogPath: fixture.catalogPath,
+				providersDir: fixture.providersDir,
+				dataDir: fixture.dataDir,
+				inversionProof: noopProof,
+			});
+
+			const providerBody = readFileSync(join(fixture.dataDir, "alpha.json"), "utf8");
+			const manifest = asRecord(
+				JSON.parse(readFileSync(join(fixture.dataDir, ".manifest.json"), "utf8")),
+			);
+			const files = asRecord(manifest.files);
+			expect(manifest.generatedAt).toBe(generatedAt);
+			expect(manifest.structureHash).toBe(
+				createHash("sha256")
+					.update(JSON.stringify({ alpha: { model: "test-api" } }))
+					.digest("hex"),
+			);
+			expect(files["alpha.json"]).toBe(
+				createHash("sha256").update(providerBody).digest("hex"),
+			);
+		} finally {
+			rmSync(fixture.root, { recursive: true, force: true });
+		}
+	});
+
 
 	test("round-trips nested __proto__ model maps through reconstruction and inversion", async () => {
 		const catalog = JSON.parse(
@@ -147,9 +209,10 @@ describe("reconstructProviderData transaction (Cluster C)", () => {
 				inversionProof: noopProof,
 			});
 
-			const providerModels = asRecord(
+			const providerGroups = asRecord(
 				JSON.parse(readFileSync(join(fixture.dataDir, "alpha.json"), "utf8")),
 			);
+			const providerModels = asRecord(providerGroups["test-api"]);
 			expect(Object.hasOwn(providerModels, "__proto__")).toBe(true);
 			const reconstructedModel = asRecord(providerModels["__proto__"]);
 			const reconstructedNested = asRecord(reconstructedModel.nested);
@@ -197,7 +260,7 @@ describe("reconstructProviderData transaction (Cluster C)", () => {
 
 			expect(readdirSync(fixture.dataDir).sort()).toEqual(["keep.json"]);
 			expect(readFileSync(join(fixture.dataDir, "keep.json"), "utf8")).toBe(
-				`${JSON.stringify({ model: { id: "model" } }, null, "\t")}\n`,
+				`${JSON.stringify({ "test-api": { model: { api: "test-api", id: "model" } } }, null, "\t")}\n`,
 			);
 			expect(siblingArtifacts(fixture.providersDir)).toEqual([]);
 		} finally {
@@ -414,7 +477,7 @@ describe("reconstructProviderData transaction (Cluster C)", () => {
 			expectSnapshotsEqual(snapshotDir(fixture.dataDir), new Map([
 				[
 					"alpha.json",
-					`${JSON.stringify({ model: { id: "model", version: 2 } }, null, "\t")}\n`,
+					`${JSON.stringify({ "test-api": { model: { api: "test-api", id: "model", version: 2 } } }, null, "\t")}\n`,
 				],
 			]));
 			expect(siblingArtifacts(fixture.providersDir)).toEqual([]);
@@ -484,7 +547,7 @@ describe("reconstructProviderData transaction (Cluster C)", () => {
 			// not roll back to the stale pre-publish snapshot.
 			expect([...after!.keys()]).toEqual(["alpha.json"]);
 			expect(after!.get("alpha.json")).toBe(
-				`${JSON.stringify({ model: { id: "model", v: 2 } }, null, "\t")}\n`,
+				`${JSON.stringify({ "test-api": { model: { api: "test-api", id: "model", v: 2 } } }, null, "\t")}\n`,
 			);
 			expect(after!.get("stale.json")).toBeUndefined();
 			expect(before!.has("stale.json")).toBe(true);
@@ -523,6 +586,7 @@ describe("reconstructProviderData transaction (Cluster C)", () => {
 
 	test("repeat-run is content-idempotent against the real checkout tree", async () => {
 		const catalogBefore = readFileSync(REAL_CATALOG_PATH);
+		const dataBefore = snapshotDir(REAL_DATA_DIR);
 		const first = await reconstructProviderData({
 			repoRoot: REPO_ROOT,
 			catalogPath: REAL_CATALOG_PATH,
@@ -530,9 +594,16 @@ describe("reconstructProviderData transaction (Cluster C)", () => {
 			dataDir: REAL_DATA_DIR,
 		});
 		const afterFirst = snapshotDir(REAL_DATA_DIR);
-		expect(afterFirst).not.toBeNull();
-		const expectedNames = first.providers.map((id) => `${id}.json`).sort();
-		expect([...afterFirst!.keys()].sort()).toEqual(expectedNames);
+		if (afterFirst === null) throw new Error("expected reconstructed provider data");
+		const expectedNames = first.providers.map((id) => `${id}.json`);
+		if (dataBefore?.has(".manifest.json") === true) expectedNames.push(".manifest.json");
+		expectedNames.sort();
+		expect([...afterFirst.keys()].sort()).toEqual(expectedNames);
+		if (dataBefore?.has(".manifest.json") === true) {
+			const beforeManifest = asRecord(JSON.parse(dataBefore.get(".manifest.json") ?? ""));
+			const afterManifest = asRecord(JSON.parse(afterFirst.get(".manifest.json") ?? ""));
+			expect(afterManifest.generatedAt).toBe(beforeManifest.generatedAt);
+		}
 
 		const second = await reconstructProviderData({
 			repoRoot: REPO_ROOT,
