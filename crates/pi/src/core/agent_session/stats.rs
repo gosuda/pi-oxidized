@@ -405,7 +405,8 @@ mod tests {
         }
         let stats = session.get_session_stats().await;
         assert_eq!(
-            stats.tokens.input, u64::MAX,
+            stats.tokens.input,
+            u64::MAX,
             "input must saturate at u64::MAX, not overflow"
         );
         Ok(())

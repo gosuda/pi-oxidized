@@ -189,9 +189,6 @@ impl AgentSession {
             return Err(ModelError::NoAuth(model.provider.clone(), model.id.clone()));
         }
         let previous = self.model();
-        if models_are_equal(&previous, &model) {
-            return Ok(());
-        }
         let thinking = self.thinking_level_for_model_switch(None);
         // Durable append first: live state, settings, and events publish only
         // model changes the session file actually holds.
@@ -463,7 +460,7 @@ impl AgentSession {
 }
 
 /// Wire string for a thinking level (matches TypeScript `ThinkingLevel` union).
-fn level_str(level: ModelThinkingLevel) -> &'static str {
+pub(crate) fn level_str(level: ModelThinkingLevel) -> &'static str {
     match level {
         ModelThinkingLevel::Off => "off",
         ModelThinkingLevel::Minimal => "minimal",

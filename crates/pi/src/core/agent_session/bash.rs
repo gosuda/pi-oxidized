@@ -133,7 +133,7 @@ impl AgentSession {
             if let Some(cb) = original.as_mut() {
                 cb(delta);
             }
-            if let Some(arc) = weak_self.as_ref().and_then(|w| w.upgrade()) {
+            if let Some(arc) = weak_self.as_ref().and_then(std::sync::Weak::upgrade) {
                 arc.emit_public(super::events::AgentSessionEvent::BashExecutionUpdate {
                     id: id.clone(),
                     delta: delta.to_owned(),
@@ -214,13 +214,12 @@ impl AgentSession {
             return Ok(());
         }
 
-        // Persist immediately.
-        let mut manager = self.session_manager.lock().await;
-        let id = manager.append_message(&agent_message)?;
-        drop(manager);
-        if let Some(entry) = self.session_manager.lock().await.get_entry(&id).cloned() {
-            self.emit_public(super::events::AgentSessionEvent::EntryAppended { entry });
-        }
+        // TypeScript persists bash messages without publishing entry_appended.
+        self.session_manager
+            .lock()
+            .await
+            .append_message(&agent_message)?;
+        self.agent.push_message(agent_message);
         Ok(())
     }
 
@@ -257,19 +256,16 @@ impl AgentSession {
                     "bashExecution",
                     bash_execution_payload(&message),
                 ));
-            let entry = {
-                let mut manager = self.session_manager.lock().await;
-                let id = manager.append_message(&agent_message)?;
-                manager.get_entry(&id).cloned()
-            };
+            self.session_manager
+                .lock()
+                .await
+                .append_message(&agent_message)?;
+            self.agent.push_message(agent_message);
             {
                 let mut inner = self.lock_inner();
                 if inner.pending_bash_messages.first() == Some(&message) {
                     inner.pending_bash_messages.remove(0);
                 }
-            }
-            if let Some(entry) = entry {
-                self.emit_public(super::events::AgentSessionEvent::EntryAppended { entry });
             }
         }
     }
@@ -435,6 +431,7 @@ where
 {
     use std::sync::Mutex;
     let callback: Arc<Mutex<Option<F>>> = Arc::new(Mutex::new(on_chunk));
+    let previous = Arc::new(Mutex::new(String::new()));
     let (tx, rx) = tokio::sync::mpsc::channel::<()>(64);
     let tx = Arc::new(Mutex::new(Some(tx)));
     let updates = pi_agent::ToolUpdates::new(move |result| {
@@ -449,17 +446,28 @@ where
         if text.is_empty() {
             return;
         }
+        let delta = {
+            let Ok(mut previous) = previous.lock() else {
+                return;
+            };
+            if *previous == text {
+                return;
+            }
+            let delta = text
+                .strip_prefix(previous.as_str())
+                .unwrap_or(text)
+                .to_owned();
+            previous.clear();
+            previous.push_str(text);
+            delta
+        };
         let Some(mut cb) = callback.lock().ok().and_then(|mut g| g.take()) else {
             return;
         };
-        cb(text);
-        // Re-store the callback so future partials can use it.
+        cb(&delta);
         if let Ok(mut guard) = callback.lock() {
             *guard = Some(cb);
         }
-        // Notify the receiver that a partial arrived. Best-effort send: if the
-        // channel is full we drop the signal because the receiver only needs
-        // to know *that* activity happened, not how many chunks.
         if let Ok(tx_guard) = tx.lock()
             && let Some(tx) = tx_guard.as_ref()
         {
@@ -579,8 +587,7 @@ mod tests {
             .filter(|e| matches!(e, AgentSessionEvent::BashExecutionUpdate { .. }))
             .cloned()
             .collect();
-        assert!(!updates.is_empty(), "should emit at least one update");
-        let first = updates.first().unwrap();
+        let first = updates.first().ok_or("should emit at least one update")?;
         match first {
             AgentSessionEvent::BashExecutionUpdate { id, delta } => {
                 assert_eq!(id.as_deref(), Some("bash-1"));
@@ -622,8 +629,7 @@ mod tests {
             .filter(|e| matches!(e, AgentSessionEvent::BashExecutionUpdate { .. }))
             .cloned()
             .collect();
-        assert!(!updates.is_empty(), "should emit at least one update");
-        let first = updates.first().unwrap();
+        let first = updates.first().ok_or("should emit at least one update")?;
         match first {
             AgentSessionEvent::BashExecutionUpdate { id, delta } => {
                 assert!(id.is_none(), "id should be None when not provided");
@@ -662,5 +668,33 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(chunks[0].contains("callback"));
         Ok(())
+    }
+    #[test]
+    fn chunk_channel_converts_cumulative_snapshots_to_deltas() {
+        let received = Arc::new(Mutex::new(Vec::<String>::new()));
+        let received_clone = Arc::clone(&received);
+        let (updates, _rx) = make_chunk_channel(Some(move |delta: &str| {
+            received_clone
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(delta.to_owned());
+        }));
+        let partial = |text: &str| pi_agent::AgentToolResult {
+            content: vec![pi_ai::ToolResultContent::Text(pi_ai::TextContent::new(
+                text,
+            ))],
+            details: serde_json::Value::Null,
+            added_tool_names: None,
+            terminate: None,
+        };
+
+        updates.send(partial("one"));
+        updates.send(partial("one"));
+        updates.send(partial("onetwo"));
+
+        let received = received
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(received.as_slice(), ["one", "two"]);
     }
 }
