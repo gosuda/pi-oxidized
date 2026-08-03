@@ -339,6 +339,28 @@ impl LockGuard {
         &self.lock_path
     }
 
+    /// Verify that this guard still owns the lock directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LockError::Io`] when the path vanished, changed identity, or
+    /// cannot be inspected.
+    pub fn check_ownership(&self) -> Result<(), LockError> {
+        match still_our_lock(&self.lock_path, &self.identity) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(LockError::Io {
+                target: self.target.clone(),
+                lock_path: self.lock_path.clone(),
+                source: io::Error::other("lock ownership was lost"),
+            }),
+            Err(source) => Err(LockError::Io {
+                target: self.target.clone(),
+                lock_path: self.lock_path.clone(),
+                source,
+            }),
+        }
+    }
+
     /// Explicitly release the lock. Equivalent to dropping the guard.
     ///
     /// # Errors

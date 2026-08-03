@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod catalog;
 pub mod estimate;
+pub mod lockfile;
 pub mod models_store;
 pub mod provider;
 pub mod providers;

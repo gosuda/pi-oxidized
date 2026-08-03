@@ -1,9 +1,9 @@
 //! Whole-file locked credential storage for `auth.json`.
 //!
-//! [`FileLockBackend`] serializes multi-process readers/writers with an `fs4`
-//! exclusive lock held across the full read-modify-write critical section,
-//! including async modify callbacks (for example OAuth refresh). The data file
-//! is replaced atomically via a same-directory [`tempfile::NamedTempFile`].
+//! [`FileLockBackend`] uses the same `${path}.lock` directory protocol as
+//! TypeScript `proper-lockfile`, held across each read-modify-write transaction
+//! and async refresh callback. Data commits remain same-directory atomic
+//! replacements through [`tempfile::NamedTempFile`].
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -16,6 +16,8 @@ use fs4::{FileExt, TryLockError};
 use futures::future::BoxFuture;
 use tempfile::Builder;
 
+use crate::lockfile::{LockError, LockGuard, LockOptions};
+
 use super::config_value::resolve_config_value;
 use super::error::{AuthError, StoreError};
 use super::types::{ApiKeyCredential, Credential, CredentialInfo, CredentialStore};
@@ -23,8 +25,14 @@ use super::types::{ApiKeyCredential, Credential, CredentialInfo, CredentialStore
 /// Pretty-printed empty credential map written when seeding a missing file.
 const EMPTY_JSON: &str = "{}";
 
-/// Maximum exclusive-lock acquisition attempts (mirrors proper-lockfile retries).
-const LOCK_ATTEMPTS: u32 = 10;
+/// Synchronous acquisition attempts used by the TypeScript authority.
+const SYNC_LOCK_ATTEMPTS: u32 = 10;
+
+/// Async retries after the initial acquisition attempt.
+const ASYNC_LOCK_RETRIES: u32 = 10;
+
+/// Delay between synchronous lock attempts.
+const SYNC_LOCK_DELAY: Duration = Duration::from_millis(20);
 
 /// Initial async backoff between lock attempts.
 const LOCK_MIN_DELAY: Duration = Duration::from_millis(100);
@@ -32,10 +40,13 @@ const LOCK_MIN_DELAY: Duration = Duration::from_millis(100);
 /// Cap for exponential lock-retry backoff.
 const LOCK_MAX_DELAY: Duration = Duration::from_secs(10);
 
+/// TypeScript async auth storage declares a 30-second stale threshold.
+const ASYNC_LOCK_STALE: Duration = Duration::from_secs(30);
+
 /// Shared file-backed JSON map with exclusive locking and atomic replace.
 ///
-/// The lock is taken on a sibling `${path}.lock` file so the data file can be
-/// replaced with `rename` without releasing multi-process mutual exclusion.
+/// The lock is a sibling `${path}.lock` directory, so replacing the data file
+/// never releases cross-process mutual exclusion.
 #[derive(Clone, Debug)]
 pub struct FileLockBackend {
     path: PathBuf,
@@ -101,17 +112,15 @@ impl FileLockBackend {
         F: FnOnce(Option<&str>) -> Result<(T, Option<String>), StoreError>,
     {
         self.ensure_parent_dir()?;
-        let lock_file = self.open_lock_file()?;
-        acquire_lock_sync(&lock_file)?;
-        let _guard = LockGuard { file: &lock_file };
-        self.check_lock_identity(&lock_file)?;
+        let guard = self.acquire_sync_lock()?;
+        Self::check_lock_identity(&guard)?;
         self.ensure_data_file()?;
         let current = self.read_data_file()?;
         let (result, next) = f(current.as_deref())?;
-        self.check_lock_identity(&lock_file)?;
+        Self::check_lock_identity(&guard)?;
         if let Some(next) = next {
             self.atomic_write(&next)?;
-            self.check_lock_identity(&lock_file)?;
+            Self::check_lock_identity(&guard)?;
         }
         Ok(result)
     }
@@ -132,16 +141,14 @@ impl FileLockBackend {
         F: FnOnce(Option<&str>) -> Result<(T, Option<String>), StoreError>,
     {
         self.ensure_parent_dir()?;
-        let lock_file = self.open_lock_file()?;
-        acquire_lock_sync(&lock_file)?;
-        let _guard = LockGuard { file: &lock_file };
-        self.check_lock_identity(&lock_file)?;
+        let guard = self.acquire_sync_lock()?;
+        Self::check_lock_identity(&guard)?;
         let current = self.read_data_file()?;
         let (result, next) = f(current.as_deref())?;
-        self.check_lock_identity(&lock_file)?;
+        Self::check_lock_identity(&guard)?;
         if let Some(next) = next {
             self.atomic_write(&next)?;
-            self.check_lock_identity(&lock_file)?;
+            Self::check_lock_identity(&guard)?;
         }
         Ok(result)
     }
@@ -161,21 +168,15 @@ impl FileLockBackend {
         Fut: Future<Output = Result<(T, Option<String>), StoreError>>,
     {
         self.ensure_parent_dir()?;
-        let lock_file = self.open_lock_file()?;
-        acquire_lock_async(&lock_file, || {
-            #[cfg(test)]
-            self.notify_lock_contention();
-        })
-        .await?;
-        let _guard = LockGuard { file: &lock_file };
-        self.check_lock_identity(&lock_file)?;
+        let guard = self.acquire_async_lock().await?;
+        Self::check_lock_identity(&guard)?;
         self.ensure_data_file()?;
         let current = self.read_data_file()?;
         let (result, next) = f(current).await?;
-        self.check_lock_identity(&lock_file)?;
+        Self::check_lock_identity(&guard)?;
         if let Some(next) = next {
             self.atomic_write(&next)?;
-            self.check_lock_identity(&lock_file)?;
+            Self::check_lock_identity(&guard)?;
         }
         Ok(result)
     }
@@ -191,21 +192,15 @@ impl FileLockBackend {
         Commit: FnOnce(C) -> Result<(), StoreError>,
     {
         self.ensure_parent_dir()?;
-        let lock_file = self.open_lock_file()?;
-        acquire_lock_async(&lock_file, || {
-            #[cfg(test)]
-            self.notify_lock_contention();
-        })
-        .await?;
-        let _guard = LockGuard { file: &lock_file };
-        self.check_lock_identity(&lock_file)?;
+        let guard = self.acquire_async_lock().await?;
+        Self::check_lock_identity(&guard)?;
         self.ensure_data_file()?;
         let current = self.read_data_file()?;
         let (result, next, committed) = f(current).await?;
-        self.check_lock_identity(&lock_file)?;
+        Self::check_lock_identity(&guard)?;
         if let Some(next) = next {
             self.atomic_write(&next)?;
-            self.check_lock_identity(&lock_file)?;
+            Self::check_lock_identity(&guard)?;
         }
         commit(committed)?;
         Ok(result)
@@ -230,27 +225,83 @@ impl FileLockBackend {
         self.atomic_write(EMPTY_JSON)
     }
 
-    fn open_lock_file(&self) -> Result<File, StoreError> {
-        let lock_path = self.lock_path();
-        if let Some(parent) = parent_dir(&lock_path)
-            && !parent.exists()
-        {
-            create_dir_all_secure(parent)?;
+    fn acquire_sync_lock(&self) -> Result<LockGuard, StoreError> {
+        let target = absolute_lock_target(&self.path)?;
+        let options = LockOptions::new().attempts(1);
+        for attempt in 1..=SYNC_LOCK_ATTEMPTS {
+            let legacy = match acquire_legacy_locks(std::slice::from_ref(&target)) {
+                Ok(guards) => guards,
+                Err(LegacyLockError::Contended) if attempt < SYNC_LOCK_ATTEMPTS => {
+                    std::thread::sleep(SYNC_LOCK_DELAY);
+                    continue;
+                }
+                Err(LegacyLockError::Contended) => {
+                    return Err(StoreError::message(
+                        "Failed to acquire legacy auth storage lock",
+                    ));
+                }
+                Err(LegacyLockError::Store(error)) => return Err(error),
+            };
+            match LockGuard::acquire_with(&target, &options) {
+                Ok(guard) => {
+                    drop(legacy);
+                    return Ok(guard);
+                }
+                Err(LockError::Contended { .. }) if attempt < SYNC_LOCK_ATTEMPTS => {
+                    drop(legacy);
+                    std::thread::sleep(SYNC_LOCK_DELAY);
+                }
+                Err(error) => {
+                    drop(legacy);
+                    return Err(lock_error_to_store(&error));
+                }
+            }
         }
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(|error| {
-                StoreError::message(format!(
-                    "Failed to open auth storage lock {}: {error}",
-                    lock_path.display()
-                ))
-            })?;
-        set_owner_secret_mode(&lock_path)?;
-        Ok(file)
+        Err(StoreError::message("Failed to acquire auth storage lock"))
+    }
+
+    async fn acquire_async_lock(&self) -> Result<LockGuard, StoreError> {
+        let unresolved = absolute_lock_target(&self.path)?;
+        let target = canonical_lock_target(&self.path)?;
+        let legacy_targets = [unresolved, target.clone()];
+        let options = LockOptions::new().attempts(1).stale(ASYNC_LOCK_STALE);
+        let mut delay = LOCK_MIN_DELAY;
+        for retry in 0..=ASYNC_LOCK_RETRIES {
+            let legacy = match acquire_legacy_locks(&legacy_targets) {
+                Ok(guards) => guards,
+                Err(LegacyLockError::Contended) if retry < ASYNC_LOCK_RETRIES => {
+                    #[cfg(test)]
+                    self.notify_lock_contention();
+                    sleep_with_jitter(delay, retry).await;
+                    delay = delay.saturating_mul(2).min(LOCK_MAX_DELAY);
+                    continue;
+                }
+                Err(LegacyLockError::Contended) => {
+                    return Err(StoreError::message(
+                        "Failed to acquire legacy auth storage lock",
+                    ));
+                }
+                Err(LegacyLockError::Store(error)) => return Err(error),
+            };
+            match LockGuard::acquire_with(&target, &options) {
+                Ok(guard) => {
+                    drop(legacy);
+                    return Ok(guard);
+                }
+                Err(LockError::Contended { .. }) if retry < ASYNC_LOCK_RETRIES => {
+                    drop(legacy);
+                    #[cfg(test)]
+                    self.notify_lock_contention();
+                    sleep_with_jitter(delay, retry).await;
+                    delay = delay.saturating_mul(2).min(LOCK_MAX_DELAY);
+                }
+                Err(error) => {
+                    drop(legacy);
+                    return Err(lock_error_to_store(&error));
+                }
+            }
+        }
+        Err(StoreError::message("Failed to acquire auth storage lock"))
     }
 
     fn read_data_file(&self) -> Result<Option<String>, StoreError> {
@@ -339,18 +390,10 @@ impl FileLockBackend {
         Ok(())
     }
 
-    fn check_lock_identity(&self, lock_file: &File) -> Result<(), StoreError> {
-        let path = self.lock_path();
-        let Ok(path_meta) = fs::metadata(&path) else {
-            return Err(StoreError::message("Auth storage lock was compromised"));
-        };
-        let handle_meta = lock_file
-            .metadata()
-            .map_err(|_| StoreError::message("Auth storage lock was compromised"))?;
-        if !same_file_identity(&path_meta, &handle_meta) {
-            return Err(StoreError::message("Auth storage lock was compromised"));
-        }
-        Ok(())
+    fn check_lock_identity(guard: &LockGuard) -> Result<(), StoreError> {
+        guard
+            .check_ownership()
+            .map_err(|_| StoreError::message("Auth storage lock was compromised"))
     }
 }
 
@@ -610,62 +653,160 @@ fn same_file_identity(a: &fs::Metadata, b: &fs::Metadata) -> bool {
     }
 }
 
-fn acquire_lock_sync(file: &File) -> Result<(), StoreError> {
-    for attempt in 1..=LOCK_ATTEMPTS {
-        match FileExt::try_lock(file) {
-            Ok(()) => return Ok(()),
-            Err(TryLockError::WouldBlock) if attempt < LOCK_ATTEMPTS => {
-                std::thread::sleep(Duration::from_millis(20));
+fn absolute_lock_target(path: &Path) -> Result<PathBuf, StoreError> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(path))
+        .map_err(|error| {
+            StoreError::message(format!(
+                "Failed to resolve auth storage path {}: {error}",
+                path.display()
+            ))
+        })
+}
+
+fn canonical_lock_target(path: &Path) -> Result<PathBuf, StoreError> {
+    if path.exists() {
+        return fs::canonicalize(path).map_err(|error| {
+            StoreError::message(format!(
+                "Failed to resolve auth storage path {}: {error}",
+                path.display()
+            ))
+        });
+    }
+    let parent = parent_dir(path).unwrap_or_else(|| Path::new("."));
+    let parent = fs::canonicalize(parent).map_err(|error| {
+        StoreError::message(format!(
+            "Failed to resolve auth storage directory {}: {error}",
+            parent.display()
+        ))
+    })?;
+    let Some(file_name) = path.file_name() else {
+        return Err(StoreError::message(format!(
+            "Auth storage path {} has no file name",
+            path.display()
+        )));
+    };
+    Ok(parent.join(file_name))
+}
+
+async fn sleep_with_jitter(delay: Duration, retry: u32) {
+    let jitter = Duration::from_millis(u64::from((retry + 1).saturating_mul(7) % 37));
+    tokio::time::sleep(delay.saturating_add(jitter)).await;
+}
+
+fn acquire_legacy_locks(targets: &[PathBuf]) -> Result<Vec<LegacyLockGuard>, LegacyLockError> {
+    let mut lock_paths: Vec<PathBuf> = targets.iter().map(|path| lock_path_for(path)).collect();
+    lock_paths.sort();
+    lock_paths.dedup();
+
+    let mut guards = Vec::new();
+    for lock_path in lock_paths {
+        let metadata = match fs::symlink_metadata(&lock_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(legacy_store_error(format!(
+                    "Failed to inspect auth storage lock {}: {error}",
+                    lock_path.display()
+                )));
             }
-            Err(TryLockError::WouldBlock) => {
-                return Err(StoreError::message("Failed to acquire auth storage lock"));
-            }
+        };
+        if metadata.is_dir() {
+            continue;
+        }
+        if !metadata.is_file() {
+            return Err(legacy_store_error(format!(
+                "Auth storage lock {} is neither a file nor a directory",
+                lock_path.display()
+            )));
+        }
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|error| {
+                legacy_store_error(format!(
+                    "Failed to open legacy auth storage lock {}: {error}",
+                    lock_path.display()
+                ))
+            })?;
+        match FileExt::try_lock(&file) {
+            Ok(()) => guards.push(LegacyLockGuard {
+                path: lock_path,
+                file,
+            }),
+            Err(TryLockError::WouldBlock) => return Err(LegacyLockError::Contended),
             Err(TryLockError::Error(error)) => {
-                return Err(StoreError::message(format!(
-                    "Failed to acquire auth storage lock: {error}"
+                return Err(legacy_store_error(format!(
+                    "Failed to acquire legacy auth storage lock: {error}"
                 )));
             }
         }
     }
-    Err(StoreError::message("Failed to acquire auth storage lock"))
+
+    for guard in &guards {
+        guard.check_identity()?;
+    }
+    for guard in &guards {
+        fs::remove_file(&guard.path).map_err(|error| {
+            legacy_store_error(format!(
+                "Failed to migrate legacy auth storage lock {}: {error}",
+                guard.path.display()
+            ))
+        })?;
+    }
+    Ok(guards)
 }
 
-async fn acquire_lock_async(
-    file: &File,
-    mut on_contention: impl FnMut(),
-) -> Result<(), StoreError> {
-    let mut delay = LOCK_MIN_DELAY;
-    for attempt in 1..=LOCK_ATTEMPTS {
-        match FileExt::try_lock(file) {
-            Ok(()) => return Ok(()),
-            Err(TryLockError::WouldBlock) if attempt < LOCK_ATTEMPTS => {
-                on_contention();
-                // Light jitter from attempt count keeps retries desynchronized
-                // without introducing an extra RNG dependency here.
-                let jitter = Duration::from_millis(u64::from(attempt.saturating_mul(7) % 37));
-                tokio::time::sleep(delay.saturating_add(jitter)).await;
-                delay = delay.saturating_mul(2).min(LOCK_MAX_DELAY);
-            }
-            Err(TryLockError::WouldBlock) => {
-                return Err(StoreError::message("Failed to acquire auth storage lock"));
-            }
-            Err(TryLockError::Error(error)) => {
-                return Err(StoreError::message(format!(
-                    "Failed to acquire auth storage lock: {error}"
-                )));
-            }
+fn legacy_store_error(message: String) -> LegacyLockError {
+    LegacyLockError::Store(StoreError::message(message))
+}
+
+enum LegacyLockError {
+    Contended,
+    Store(StoreError),
+}
+
+fn lock_error_to_store(error: &LockError) -> StoreError {
+    StoreError::message(format!("Failed to acquire auth storage lock: {error}"))
+}
+
+struct LegacyLockGuard {
+    path: PathBuf,
+    file: File,
+}
+
+impl LegacyLockGuard {
+    fn check_identity(&self) -> Result<(), LegacyLockError> {
+        let path_metadata = fs::metadata(&self.path).map_err(|error| {
+            legacy_store_error(format!(
+                "Failed to recheck legacy auth storage lock {}: {error}",
+                self.path.display()
+            ))
+        })?;
+        let held_metadata = self.file.metadata().map_err(|error| {
+            legacy_store_error(format!(
+                "Failed to inspect legacy auth storage lock {}: {error}",
+                self.path.display()
+            ))
+        })?;
+        if same_file_identity(&path_metadata, &held_metadata) {
+            Ok(())
+        } else {
+            Err(legacy_store_error(
+                "Legacy auth storage lock was replaced during migration".to_owned(),
+            ))
         }
     }
-    Err(StoreError::message("Failed to acquire auth storage lock"))
 }
 
-struct LockGuard<'a> {
-    file: &'a File,
-}
-
-impl Drop for LockGuard<'_> {
+impl Drop for LegacyLockGuard {
     fn drop(&mut self) {
-        let _ = FileExt::unlock(self.file);
+        let _ = FileExt::unlock(&self.file);
     }
 }
 
@@ -1056,14 +1197,7 @@ mod tests {
         let mut backend = FileLockBackend::new(&path);
         let contention = Arc::new(tokio::sync::Notify::new());
         backend.lock_contention = Some(Arc::clone(&contention));
-        let lock_path = backend.lock_path();
-        let lock_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)?;
-        FileExt::lock(&lock_file)?;
+        let guard = LockGuard::acquire(&path)?;
 
         let task_backend = backend.clone();
         let task = tokio::spawn(async move {
@@ -1080,12 +1214,88 @@ mod tests {
         let durable =
             serialize_storage_data(&BTreeMap::from([("openai".to_owned(), api_key("durable"))]))?;
         fs::write(&path, &durable)?;
-        FileExt::unlock(&lock_file)?;
+        drop(guard);
 
         let observed = task.await??;
         assert_eq!(observed.as_deref(), Some(durable.as_str()));
         assert_eq!(fs::read_to_string(path)?, durable);
         drop(dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_file_lock_is_migrated_to_directory_protocol() -> TestResult {
+        let (_dir, path) = temp_auth_path()?;
+        fs::create_dir_all(path.parent().ok_or("auth path must have a parent")?)?;
+        let backend = FileLockBackend::new(&path);
+        let lock_path = backend.lock_path();
+        fs::write(&lock_path, [])?;
+
+        backend
+            .with_lock_async(|content| {
+                assert!(lock_path.is_dir(), "active lock must be a directory");
+                async move { Ok::<_, StoreError>((content, None)) }
+            })
+            .await?;
+
+        assert!(
+            !lock_path.exists(),
+            "released directory lock must be removed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn held_legacy_file_lock_is_not_unlinked() -> TestResult {
+        let (_dir, path) = temp_auth_path()?;
+        fs::create_dir_all(path.parent().ok_or("auth path must have a parent")?)?;
+        let backend = FileLockBackend::new(&path);
+        let lock_path = backend.lock_path();
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        FileExt::lock(&lock_file)?;
+
+        let result = backend.with_lock_sync(|content| Ok((content.map(str::to_owned), None)));
+        assert!(result.is_err(), "a live legacy holder must block migration");
+        assert!(lock_path.is_file(), "live legacy lock must remain intact");
+        FileExt::unlock(&lock_file)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn async_acquire_waits_for_live_legacy_holder() -> TestResult {
+        let (_dir, path) = temp_auth_path()?;
+        fs::create_dir_all(path.parent().ok_or("auth path must have a parent")?)?;
+        let mut backend = FileLockBackend::new(&path);
+        let contention = Arc::new(tokio::sync::Notify::new());
+        backend.lock_contention = Some(Arc::clone(&contention));
+        let lock_path = backend.lock_path();
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        FileExt::lock(&lock_file)?;
+
+        let task = tokio::spawn(async move {
+            backend
+                .with_lock_async(|content| async move { Ok::<_, StoreError>((content, None)) })
+                .await
+        });
+        contention.notified().await;
+        assert!(lock_path.is_file(), "live legacy lock must stay intact");
+        FileExt::unlock(&lock_file)?;
+
+        task.await??;
+        assert!(
+            !lock_path.exists(),
+            "migrated directory lock must be released"
+        );
         Ok(())
     }
 
