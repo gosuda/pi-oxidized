@@ -29,9 +29,13 @@ export const VERIFICATION_SHORTCUT = "ctrl+shift+x";
 export const VERIFICATION_DIALOG_COMMAND = "verification-dialogs";
 export const VERIFICATION_CUSTOM_UI_COMMAND = "verification-custom-ui";
 export const VERIFICATION_FLAG_COMMAND = "verification-observe-flag";
+export const VERIFICATION_SESSION_REPLACEMENT_COMMAND = "verification-session-replacement";
 
 const COMPATIBILITY_INSTANCE = `${process.pid}:${Date.now()}`;
 let compatibilitySequence = 0;
+type ReplacementSetupSessionManager = {
+	appendCustomEntry(customType: string, data?: unknown): Promise<void>;
+};
 
 function recordCompatibility(stage: string, value: unknown): void {
 	const path = process.env[ENV.compatibilityPath];
@@ -247,8 +251,47 @@ export default function verificationExtension(pi: ExtensionAPI): void {
 		handler: async () => {
 			recordCompatibility("flag_observation.before", { flag: VERIFICATION_PROFILE_FLAG });
 			recordCompatibility("flag_observation.after", { value: pi.getFlag(VERIFICATION_PROFILE_FLAG) ?? null });
+			recordCompatibility("replacement.post.before", {});
+			try {
+				pi.sendMessage({
+					customType: "verification-post-replacement",
+					content: "verification post replacement",
+					display: false,
+				});
+				recordCompatibility("replacement.post", {});
+			} catch (error) {
+				recordCompatibility("replacement.post.error", {
+					message: error instanceof Error ? error.message : String(error),
+				});
+				throw error;
+			}
 		},
 	});
+
+	pi.registerCommand(VERIFICATION_SESSION_REPLACEMENT_COMMAND, {
+		description: "Exercise real session replacement lifecycle",
+		handler: async (_args, ctx) => {
+			recordCompatibility("replacement.before", { command: VERIFICATION_SESSION_REPLACEMENT_COMMAND });
+			const result = await ctx.newSession({
+				setup: async (sessionManager) => {
+					const manager = sessionManager as ReplacementSetupSessionManager;
+					await manager.appendCustomEntry("verification-replacement-setup", { source: "setup" });
+					recordCompatibility("replacement.setup", { source: "setup" });
+				},
+				withSession: async (replacementCtx) => {
+					recordCompatibility("replacement.withSession.before", {});
+					await replacementCtx.sendMessage({
+						customType: "verification-replacement-with-session",
+						content: "verification replacement withSession",
+						display: false,
+					});
+					recordCompatibility("replacement.withSession.after", {});
+				},
+			});
+			recordCompatibility("replacement.after", { cancelled: result.cancelled });
+		},
+	});
+
 
 	pi.registerCommand(VERIFICATION_DIALOG_COMMAND, {
 		description: "Exercise real extension dialogs",

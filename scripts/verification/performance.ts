@@ -1201,11 +1201,6 @@ async function main(): Promise<void> {
 	artifact.machine = machineMetadata();
 	const ticksPerSecond = clockTicksPerSecond();
 	const python = requiredExecutable("python3");
-	const sourceBefore = {
-		rust: sourceFingerprint(RUST_SOURCE_ROOTS),
-		typescript: sourceFingerprint(TYPESCRIPT_SOURCE_ROOTS),
-	};
-	artifact.build.sourceFingerprints = { before: sourceBefore };
 	artifact.harness = {
 		ptyDriver: "scripts/verification/pty.ts PtyProcess",
 		processTreeCpuSource: "/proc/<pid>/stat plus /proc/<pid>/task/*/children rooted at PtyProcess.pid",
@@ -1228,6 +1223,15 @@ async function main(): Promise<void> {
 	};
 
 	await buildProducts();
+
+	// The authority build materializes generated model catalogs. Fingerprint
+	// after that intentional build step so the guard detects only source drift
+	// during measurement.
+	const sourceBefore = {
+		rust: sourceFingerprint(RUST_SOURCE_ROOTS),
+		typescript: sourceFingerprint(TYPESCRIPT_SOURCE_ROOTS),
+	};
+	artifact.build.sourceFingerprints = { before: sourceBefore };
 
 	const versionSamples = await collectVersionSamples(python, ticksPerSecond);
 	const versionSummary = {
