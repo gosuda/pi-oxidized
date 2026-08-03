@@ -1,5 +1,6 @@
 //! Markdown renderer using pulldown-cmark with theme hooks and streaming fence trim.
 
+use std::ops::Range;
 use std::sync::Arc;
 
 use pulldown_cmark::{CodeBlockKind, CowStr, Event, Options, Parser, Tag, TagEnd};
@@ -352,14 +353,15 @@ fn render_markdown(
     parser_options.insert(Options::ENABLE_STRIKETHROUGH);
     parser_options.insert(Options::ENABLE_TASKLISTS);
 
-    let mut renderer = MarkdownRenderer::new(width, theme, options, &apply_default);
-    for event in Parser::new_ext(text, parser_options) {
-        renderer.consume(event);
+    let mut renderer = MarkdownRenderer::new(text, width, theme, options, &apply_default);
+    for (event, range) in Parser::new_ext(text, parser_options).into_offset_iter() {
+        renderer.consume(event, range);
     }
     renderer.finish()
 }
 
 struct MarkdownRenderer<'a> {
+    source: &'a str,
     width: usize,
     theme: &'a MarkdownTheme,
     options: &'a MarkdownOptions,
@@ -369,6 +371,9 @@ struct MarkdownRenderer<'a> {
     lists: Vec<ListState>,
     heading: Option<u8>,
     quote_depth: usize,
+    /// One segment buffer per open blockquote depth.
+    quote_stack: Vec<Vec<ItemSegment>>,
+    pending_paragraph_end: Option<usize>,
     code_lang: Option<String>,
     code_body: String,
     in_code: bool,
@@ -382,12 +387,14 @@ struct MarkdownRenderer<'a> {
 
 impl<'a> MarkdownRenderer<'a> {
     fn new(
+        source: &'a str,
         width: usize,
         theme: &'a MarkdownTheme,
         options: &'a MarkdownOptions,
         apply_default: &'a dyn Fn(&str) -> String,
     ) -> Self {
         Self {
+            source,
             width,
             theme,
             options,
@@ -397,6 +404,8 @@ impl<'a> MarkdownRenderer<'a> {
             lists: Vec::new(),
             heading: None,
             quote_depth: 0,
+            quote_stack: Vec::new(),
+            pending_paragraph_end: None,
             code_lang: None,
             code_body: String::new(),
             in_code: false,
@@ -408,9 +417,10 @@ impl<'a> MarkdownRenderer<'a> {
             strike: 0,
         }
     }
-    fn consume(&mut self, event: Event<'_>) {
+
+    fn consume(&mut self, event: Event<'_>, range: Range<usize>) {
         if is_list_event(&event) {
-            self.consume_list(&event);
+            self.consume_list(&event, range);
             return;
         }
         match event {
@@ -419,7 +429,7 @@ impl<'a> MarkdownRenderer<'a> {
             )
             | Event::End(
                 TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::BlockQuote(_) | TagEnd::CodeBlock,
-            ) => self.consume_block(event),
+            ) => self.consume_block(event, range),
             Event::Start(Tag::Table(_) | Tag::TableHead | Tag::TableRow | Tag::TableCell)
             | Event::End(
                 TagEnd::Table | TagEnd::TableHead | TagEnd::TableRow | TagEnd::TableCell,
@@ -444,31 +454,80 @@ impl<'a> MarkdownRenderer<'a> {
         }
     }
 
-    fn consume_block(&mut self, event: Event<'_>) {
+    fn consume_block(&mut self, event: Event<'_>, range: Range<usize>) {
+        if matches!(&event, Event::Start(_)) {
+            self.pending_paragraph_end = None;
+        }
         match event {
-            Event::Start(Tag::Paragraph) => self.inline.clear(),
+            Event::Start(Tag::Paragraph) => {
+                if let Some(list) = self.lists.last_mut() {
+                    list.loose = true;
+                }
+                self.inline.clear();
+            }
             Event::End(TagEnd::Paragraph) => {
-                self.flush_inline(None);
-                self.lines.push(String::new());
+                let quote_is_inside_item = self.quote_depth
+                    > self
+                        .lists
+                        .last()
+                        .map_or(0, |list| list.quote_depth_at_start);
+                if quote_is_inside_item {
+                    self.flush_inline_to_quote();
+                } else if self.lists.is_empty() {
+                    self.flush_inline(None);
+                    self.lines.push(String::new());
+                    self.pending_paragraph_end = Some(range.end);
+                } else {
+                    self.flush_inline_to_segment();
+                }
             }
             Event::Start(Tag::Heading { level, .. }) => {
+                if !self.lists.is_empty() && !self.inline.is_empty() {
+                    self.flush_inline_to_segment();
+                }
                 self.inline.clear();
                 self.heading = Some(level as u8);
             }
             Event::End(TagEnd::Heading(_)) => {
-                self.flush_inline(self.heading);
-                self.heading = None;
-                self.lines.push(String::new());
-            }
-            Event::Start(Tag::BlockQuote(_)) => self.quote_depth += 1,
-            Event::End(TagEnd::BlockQuote(_)) => {
-                self.quote_depth = self.quote_depth.saturating_sub(1);
-                if self.quote_depth == 0 {
-                    rewrite_quote_borders(&mut self.lines, self.theme, self.width);
+                if self.quote_depth > 0 || !self.lists.is_empty() {
+                    let heading = self.heading.take();
+                    self.flush_heading_to_segment(heading);
+                } else {
+                    self.flush_inline(self.heading);
+                    self.heading = None;
                     self.lines.push(String::new());
                 }
             }
-            Event::Start(Tag::CodeBlock(kind)) => self.start_code_block(kind),
+            Event::Start(Tag::BlockQuote(_)) => {
+                if !self.lists.is_empty() && !self.inline.is_empty() {
+                    self.flush_inline_to_segment();
+                }
+                self.quote_depth += 1;
+                self.quote_stack.push(Vec::new());
+            }
+            Event::End(TagEnd::BlockQuote(_)) => {
+                let segments = self.quote_stack.pop().unwrap_or_default();
+                self.quote_depth = self.quote_stack.len();
+                let quote_belongs_to_item = self
+                    .lists
+                    .last()
+                    .is_some_and(|list| list.quote_depth_at_start == self.quote_depth);
+                if quote_belongs_to_item {
+                    self.push_list_segment(ItemSegment::Quote(segments));
+                } else if self.quote_depth > 0 {
+                    self.push_quote_segment(ItemSegment::Quote(segments));
+                } else {
+                    self.lines
+                        .extend(self.render_quoted_segments(segments, self.width));
+                    self.lines.push(String::new());
+                }
+            }
+            Event::Start(Tag::CodeBlock(kind)) => {
+                if !self.lists.is_empty() && !self.inline.is_empty() {
+                    self.flush_inline_to_segment();
+                }
+                self.start_code_block(kind);
+            }
             Event::End(TagEnd::CodeBlock) => self.finish_code_block(),
             _ => {}
         }
@@ -486,22 +545,26 @@ impl<'a> MarkdownRenderer<'a> {
     fn finish_code_block(&mut self) {
         self.in_code = false;
         let lang = self.code_lang.take();
+        let body = std::mem::take(&mut self.code_body);
+        if self.quote_depth > 0 || !self.lists.is_empty() {
+            self.push_list_segment(ItemSegment::Code { lang, body });
+            return;
+        }
         let fence = format!("```{}", lang.as_deref().unwrap_or(""));
         self.lines.push((self.theme.code_block_border)(&fence));
         let indent = &self.theme.code_block_indent;
         if let Some(highlight) = &self.theme.highlight_code {
             self.lines.extend(
-                highlight(&self.code_body, lang.as_deref())
+                highlight(&body, lang.as_deref())
                     .into_iter()
                     .map(|line| format!("{indent}{line}")),
             );
         } else {
             self.lines.extend(
-                self.code_body
-                    .split('\n')
+                body.split('\n')
                     .map(|line| format!("{indent}{}", (self.theme.code_block)(line))),
             );
-            if self.code_body.ends_with('\n')
+            if body.ends_with('\n')
                 && self.lines.last().is_some_and(|last| {
                     last == indent || last == &format!("{indent}{}", (self.theme.code_block)(""))
                 })
@@ -511,7 +574,6 @@ impl<'a> MarkdownRenderer<'a> {
         }
         self.lines.push((self.theme.code_block_border)("```"));
         self.lines.push(String::new());
-        self.code_body.clear();
     }
 
     fn consume_inline(&mut self, event: Event<'_>) {
@@ -583,18 +645,53 @@ impl<'a> MarkdownRenderer<'a> {
         self.link_text.clear();
     }
 
-    fn consume_list(&mut self, event: &Event<'_>) {
+    fn consume_list(&mut self, event: &Event<'_>, range: Range<usize>) {
         match event {
-            Event::Start(Tag::List(start)) => self.lists.push(ListState {
-                ordered: start.is_some(),
-                next_index: start.unwrap_or(1),
-                task: None,
-                loose: true,
-            }),
-            Event::Start(Tag::Item) => self.inline.clear(),
-            Event::End(TagEnd::List(_)) => {
-                self.lists.pop();
+            Event::Start(Tag::List(start)) => {
+                if self.lists.is_empty()
+                    && self.quote_depth == 0
+                    && self.pending_paragraph_end.take().is_some()
+                    && self.lines.last().is_some_and(String::is_empty)
+                {
+                    let newline_count = self.source[..range.start.min(self.source.len())]
+                        .chars()
+                        .rev()
+                        .take_while(|ch| ch.is_whitespace())
+                        .filter(|ch| *ch == '\n')
+                        .count();
+                    if newline_count < 2 {
+                        self.lines.pop();
+                    }
+                } else {
+                    self.pending_paragraph_end = None;
+                }
+                // Flush pending inline into parent item before nesting.
+                if !self.lists.is_empty() && !self.inline.is_empty() {
+                    self.flush_inline_to_segment();
+                }
+                let ordered = start.is_some();
+                self.lists.push(ListState {
+                    ordered,
+                    next_index: start.unwrap_or(1),
+                    task: None,
+                    loose: false,
+                    source_marker: None,
+                    quote_depth_at_start: self.quote_depth,
+                    segments: Vec::new(),
+                    finished_items: Vec::new(),
+                    range: range.clone(),
+                });
             }
+            Event::Start(Tag::Item) => {
+                if let Some(list) = self.lists.last_mut() {
+                    list.segments.clear();
+                    list.task = None;
+                    let item_src = &self.source[range.start..range.end.min(self.source.len())];
+                    list.source_marker = extract_source_marker(item_src, list.ordered);
+                }
+                self.inline.clear();
+            }
+            Event::End(TagEnd::List(_)) => self.finish_list(range),
             Event::End(TagEnd::Item) => self.finish_list_item(),
             Event::TaskListMarker(checked) => {
                 if let Some(list) = self.lists.last_mut() {
@@ -602,40 +699,369 @@ impl<'a> MarkdownRenderer<'a> {
                 }
             }
             Event::Rule => {
-                self.lines
-                    .push((self.theme.hr)(&"─".repeat(self.width.min(80))));
-                self.lines.push(String::new());
+                self.pending_paragraph_end = None;
+                let line = (self.theme.hr)(&"─".repeat(self.width.min(80)));
+                if self.quote_depth > 0 {
+                    self.push_list_segment(ItemSegment::Lines(vec![line]));
+                } else if self.lists.is_empty() {
+                    self.lines.push(line);
+                    self.lines.push(String::new());
+                } else {
+                    self.push_list_segment(ItemSegment::Lines(vec![line]));
+                }
             }
             _ => {}
         }
     }
 
+    #[allow(clippy::expect_used)]
+    fn finish_list(&mut self, range: Range<usize>) {
+        let is_top_level = self.lists.len() == 1;
+        let finished = {
+            let list = self
+                .lists
+                .last_mut()
+                .expect("End(List) without matching Start(List)");
+            let items = std::mem::take(&mut list.finished_items);
+            let loose = list.loose;
+            let quote_depth_at_start = list.quote_depth_at_start;
+            let mut out: Vec<String> = Vec::new();
+            let count = items.len();
+            for (i, item_lines) in items.into_iter().enumerate() {
+                out.extend(item_lines);
+                if loose && i + 1 < count {
+                    out.push(String::new());
+                }
+            }
+            (out, loose, quote_depth_at_start)
+        };
+
+        self.lists.pop();
+
+        if is_top_level && self.quote_depth > 0 {
+            self.push_quote_segment(ItemSegment::Nested(finished.0));
+        } else if is_top_level {
+            self.lines.extend(finished.0);
+            // Space-between-lists parity: if the list source range ends with `\n\n`,
+            // push a blank line.
+            if range.end <= self.source.len() {
+                let tail = &self.source[range.start..range.end];
+                if tail.ends_with("\n\n") {
+                    self.lines.push(String::new());
+                }
+            }
+        } else if self
+            .lists
+            .last()
+            .is_some_and(|parent| finished.2 > parent.quote_depth_at_start)
+        {
+            self.push_quote_segment(ItemSegment::Nested(finished.0));
+        } else if let Some(parent) = self.lists.last_mut() {
+            // Nested list end: flatten child items into the parent item.
+            parent.segments.push(ItemSegment::Nested(finished.0));
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn finish_list_item(&mut self) {
-        let parent_depth = self.lists.len().saturating_sub(1);
-        let indent = list_indent(&self.lists[..parent_depth]);
+        // Flush any pending inline as a final Text segment for tight items.
+        self.flush_inline_to_segment();
+
+        let depth = self.lists.len().saturating_sub(1);
+        let indent = "    ".repeat(depth);
+
+        let (first_prefix, continuation_prefix, item_width, segments) = {
+            let Some(list) = self.lists.last_mut() else {
+                return;
+            };
+
+            let bullet = take_marker(
+                list.ordered,
+                list.next_index,
+                list.source_marker.as_deref(),
+                self.options.preserve_ordered_list_markers,
+            );
+            let task = list.task.take().unwrap_or_default();
+            let marker = format!("{bullet}{task}");
+            let first_prefix = format!("{indent}{}", (self.theme.list_bullet)(&marker));
+            let continuation_prefix = format!("{indent}{}", " ".repeat(visible_width(&marker)));
+            let item_width = self
+                .width
+                .saturating_sub(visible_width(&first_prefix))
+                .max(1);
+
+            let segments = std::mem::take(&mut list.segments);
+            list.source_marker = None;
+            if list.ordered {
+                list.next_index = list.next_index.saturating_add(1);
+            }
+            (first_prefix, continuation_prefix, item_width, segments)
+        };
+
+        let mut composed: Vec<String> = Vec::new();
+        let mut rendered_any = false;
+
+        for seg in segments {
+            match seg {
+                ItemSegment::Text(text) => {
+                    let styled = if text.is_empty() {
+                        text
+                    } else {
+                        (self.apply_default)(&text)
+                    };
+                    emit_wrapped(
+                        &mut composed,
+                        &mut rendered_any,
+                        &first_prefix,
+                        &continuation_prefix,
+                        &styled,
+                        item_width,
+                    );
+                }
+                ItemSegment::Blank => {
+                    if rendered_any {
+                        composed.push(continuation_prefix.clone());
+                    }
+                }
+                ItemSegment::Nested(lines) => {
+                    for line in lines {
+                        composed.push(line);
+                        rendered_any = true;
+                    }
+                }
+                ItemSegment::Quote(segments) => {
+                    for line in self.render_quoted_segments(segments, item_width) {
+                        let prefix = if rendered_any {
+                            &continuation_prefix
+                        } else {
+                            &first_prefix
+                        };
+                        composed.push(format!("{prefix}{line}"));
+                        rendered_any = true;
+                    }
+                }
+                ItemSegment::Code { lang, body } => {
+                    for line in self.code_block_logical_lines(lang.as_deref(), &body) {
+                        emit_wrapped(
+                            &mut composed,
+                            &mut rendered_any,
+                            &first_prefix,
+                            &continuation_prefix,
+                            &line,
+                            item_width,
+                        );
+                    }
+                }
+                ItemSegment::Lines(lines) => {
+                    for line in lines {
+                        emit_wrapped(
+                            &mut composed,
+                            &mut rendered_any,
+                            &first_prefix,
+                            &continuation_prefix,
+                            &line,
+                            item_width,
+                        );
+                    }
+                }
+                ItemSegment::Table(table) => {
+                    for line in render_table(&table, item_width, self.theme) {
+                        emit_wrapped(
+                            &mut composed,
+                            &mut rendered_any,
+                            &first_prefix,
+                            &continuation_prefix,
+                            &line,
+                            item_width,
+                        );
+                    }
+                }
+            }
+        }
+
+        if !rendered_any {
+            composed.push(first_prefix);
+        }
+
+        if let Some(list) = self.lists.last_mut() {
+            list.finished_items.push(composed);
+        }
+    }
+
+    /// Flush pending `inline` into a Text segment on the current list item.
+    /// If there are already segments and inline is non-empty, insert a Blank
+    /// separator to mark loose multi-paragraph content.
+    fn flush_inline_to_segment(&mut self) {
         let Some(list) = self.lists.last_mut() else {
             return;
         };
-        let marker = list.take_marker(self.options.preserve_ordered_list_markers);
-        let task = list.task.take().unwrap_or_default();
-        let body = std::mem::take(&mut self.inline);
-        let body = if body.is_empty() {
-            String::new()
-        } else {
-            (self.apply_default)(&body)
-        };
-        self.lines.push(format!(
-            "{indent}{}{body}",
-            (self.theme.list_bullet)(&format!("{marker}{task}"))
-        ));
-        if list.ordered {
-            list.next_index = list.next_index.saturating_add(1);
+        if self.inline.is_empty() {
+            return;
         }
+        if !list.segments.is_empty() {
+            list.loose = true;
+            list.segments.push(ItemSegment::Blank);
+        }
+        let text = std::mem::take(&mut self.inline);
+        list.segments.push(ItemSegment::Text(text));
+    }
+
+    fn flush_inline_to_quote(&mut self) {
+        if self.inline.is_empty() {
+            return;
+        }
+        let text = std::mem::take(&mut self.inline);
+        self.push_quote_segment(ItemSegment::Text(text));
+    }
+
+    fn push_quote_segment(&mut self, segment: ItemSegment) {
+        let Some(quote) = self.quote_stack.last_mut() else {
+            return;
+        };
+        let omit_separator = quote.is_empty()
+            || matches!(quote.last(), Some(ItemSegment::Blank))
+            || matches!(
+                (quote.last(), &segment),
+                (Some(ItemSegment::Text(_)), ItemSegment::Nested(_))
+            );
+        if !omit_separator {
+            quote.push(ItemSegment::Blank);
+        }
+        quote.push(segment);
+    }
+
+    fn render_quoted_segments(&self, segments: Vec<ItemSegment>, width: usize) -> Vec<String> {
+        let border = (self.theme.quote_border)("│ ");
+        let content_width = width.saturating_sub(visible_width("│ ")).max(1);
+        let quote_style = |text: &str| (self.theme.quote)(&(self.theme.italic)(text));
+        let styled_sentinel = quote_style("\0");
+        let style_prefix = styled_sentinel
+            .find('\0')
+            .map_or("", |index| &styled_sentinel[..index]);
+        let reset_with_style =
+            (!style_prefix.is_empty()).then(|| format!("\u{1b}[0m{style_prefix}"));
+        let mut lines = Vec::new();
+
+        for segment in segments {
+            match segment {
+                ItemSegment::Text(text) => lines.push(text),
+                ItemSegment::Blank => lines.push(String::new()),
+                ItemSegment::Nested(nested) | ItemSegment::Lines(nested) => {
+                    lines.extend(nested);
+                }
+                ItemSegment::Quote(nested) => {
+                    lines.extend(self.render_quoted_segments(nested, content_width));
+                }
+                ItemSegment::Code { lang, body } => {
+                    lines.extend(self.code_block_logical_lines(lang.as_deref(), &body));
+                }
+                ItemSegment::Table(table) => {
+                    lines.extend(render_table(&table, content_width, self.theme));
+                }
+            }
+        }
+
+        lines
+            .into_iter()
+            .flat_map(|line| {
+                let line = match &reset_with_style {
+                    Some(reset) => line.replace("\u{1b}[0m", reset),
+                    None => line,
+                };
+                let styled = quote_style(&line);
+                wrap_text_with_ansi(&styled, content_width)
+                    .into_iter()
+                    .map(|wrapped| format!("{border}{wrapped}"))
+            })
+            .collect()
+    }
+
+    fn flush_heading_to_segment(&mut self, heading: Option<u8>) {
+        if self.inline.is_empty() && heading.is_none() {
+            return;
+        }
+        let raw = std::mem::take(&mut self.inline);
+        let text = self.style_heading_text(raw, heading);
+        self.push_list_segment(ItemSegment::Lines(vec![text]));
+    }
+
+    fn push_list_segment(&mut self, segment: ItemSegment) {
+        let quote_is_inside_item = self.quote_depth
+            > self
+                .lists
+                .last()
+                .map_or(0, |list| list.quote_depth_at_start);
+        if quote_is_inside_item {
+            self.push_quote_segment(segment);
+            return;
+        }
+        let Some(list) = self.lists.last_mut() else {
+            return;
+        };
+        if !list.segments.is_empty() {
+            list.loose = true;
+            list.segments.push(ItemSegment::Blank);
+        }
+        list.segments.push(segment);
+    }
+
+    fn style_heading_text(&self, mut text: String, heading: Option<u8>) -> String {
+        if let Some(level) = heading {
+            let style = |value: &str| {
+                if level == 1 {
+                    (self.theme.heading)(&(self.theme.bold)(&(self.theme.underline)(value)))
+                } else {
+                    (self.theme.heading)(&(self.theme.bold)(value))
+                }
+            };
+            if level >= 3 {
+                text = format!(
+                    "{}{}",
+                    style(&format!("{} ", "#".repeat(level.into()))),
+                    text
+                );
+            } else {
+                text = style(&text);
+            }
+        }
+        text
+    }
+
+    fn code_block_logical_lines(&self, lang: Option<&str>, body: &str) -> Vec<String> {
+        let mut logical = Vec::new();
+        let fence = format!("```{}", lang.unwrap_or(""));
+        logical.push((self.theme.code_block_border)(&fence));
+        let indent = &self.theme.code_block_indent;
+        if let Some(highlight) = &self.theme.highlight_code {
+            logical.extend(
+                highlight(body, lang)
+                    .into_iter()
+                    .map(|line| format!("{indent}{line}")),
+            );
+        } else {
+            logical.extend(
+                body.split('\n')
+                    .map(|line| format!("{indent}{}", (self.theme.code_block)(line))),
+            );
+            if body.ends_with('\n')
+                && logical.last().is_some_and(|last| {
+                    last == indent || last == &format!("{indent}{}", (self.theme.code_block)(""))
+                })
+            {
+                logical.pop();
+            }
+        }
+        logical.push((self.theme.code_block_border)("```"));
+        logical
     }
 
     fn consume_table(&mut self, event: Event<'_>) {
         match event {
             Event::Start(Tag::Table(alignments)) => {
+                self.pending_paragraph_end = None;
+                if !self.lists.is_empty() && !self.inline.is_empty() {
+                    self.flush_inline_to_segment();
+                }
                 self.table = Some(TableBuilder {
                     alignments: alignments.len(),
                     headers: Vec::new(),
@@ -646,9 +1072,13 @@ impl<'a> MarkdownRenderer<'a> {
             }
             Event::End(TagEnd::Table) => {
                 if let Some(table) = self.table.take() {
-                    self.lines
-                        .extend(render_table(&table, self.width, self.theme));
-                    self.lines.push(String::new());
+                    if self.quote_depth > 0 || !self.lists.is_empty() {
+                        self.push_list_segment(ItemSegment::Table(table));
+                    } else {
+                        self.lines
+                            .extend(render_table(&table, self.width, self.theme));
+                        self.lines.push(String::new());
+                    }
                 }
             }
             Event::Start(Tag::TableHead) => self.set_table_head(true),
@@ -713,13 +1143,7 @@ impl<'a> MarkdownRenderer<'a> {
             text = (self.apply_default)(&text);
         }
 
-        let indent = list_indent(&self.lists);
-        if let Some(list) = self.lists.last() {
-            self.lines.push(format!(
-                "{indent}{}{text}",
-                (self.theme.list_bullet)(&list.current_marker())
-            ));
-        } else if self.quote_depth > 0 {
+        if self.quote_depth > 0 {
             self.lines
                 .push((self.theme.quote)(&(self.theme.italic)(&text)));
         } else {
@@ -729,7 +1153,11 @@ impl<'a> MarkdownRenderer<'a> {
 
     fn finish(mut self) -> Vec<String> {
         if !self.inline.is_empty() {
-            self.flush_inline(self.heading);
+            if self.lists.is_empty() {
+                self.flush_inline(self.heading);
+            } else {
+                self.flush_inline_to_segment();
+            }
         }
         while self.lines.last().is_some_and(String::is_empty) {
             self.lines.pop();
@@ -738,6 +1166,7 @@ impl<'a> MarkdownRenderer<'a> {
         self.lines
     }
 }
+
 fn is_list_event(event: &Event<'_>) -> bool {
     matches!(
         event,
@@ -753,58 +1182,137 @@ struct ListState {
     ordered: bool,
     next_index: u64,
     task: Option<String>,
-    #[allow(dead_code)]
     loose: bool,
+    quote_depth_at_start: usize,
+    source_marker: Option<String>,
+    segments: Vec<ItemSegment>,
+    finished_items: Vec<Vec<String>>,
+    #[allow(dead_code)]
+    range: Range<usize>,
 }
 
-impl ListState {
-    fn current_marker(&self) -> String {
-        if self.ordered {
-            format!("{}. ", self.next_index)
+/// A segment of content within a list item.
+#[derive(Clone)]
+enum ItemSegment {
+    Text(String),
+    Blank,
+    Nested(Vec<String>),
+    /// Blockquote content deferred for item-width wrapping and border.
+    Quote(Vec<ItemSegment>),
+    /// Fenced/indented code deferred for item-width wrapping.
+    Code {
+        lang: Option<String>,
+        body: String,
+    },
+    /// Pre-styled block lines (headings/tables) wrapped at item width.
+    Lines(Vec<String>),
+    /// Table deferred for item-width rendering.
+    Table(TableBuilder),
+}
+
+/// Compose the bullet marker for a list item.
+///
+/// When `preserve` is true, use the source-extracted marker if available;
+/// otherwise normalize to `N. ` for ordered lists and `- ` for unordered.
+fn take_marker(
+    ordered: bool,
+    next_index: u64,
+    source_marker: Option<&str>,
+    preserve: bool,
+) -> String {
+    if preserve && let Some(marker) = source_marker {
+        return marker.to_owned();
+    }
+    if ordered {
+        format!("{next_index}. ")
+    } else {
+        "- ".to_owned()
+    }
+}
+
+/// Extract the source list marker from the beginning of an item's source slice.
+///
+/// Ordered: `^(?: {0,3})(\d{1,9}[.)])[ \t]+` → `"{capture} "`
+/// Unordered: `^(?: {0,3})([-+*])(?:[ \t]+|(?=\r?\n|$))` → `"{capture} "`
+///
+/// Returns `None` when the source does not exact-match so callers can fall back
+/// to normalized `N. `/`- ` markers via [`take_marker`].
+fn extract_source_marker(item_src: &str, ordered: bool) -> Option<String> {
+    let bytes = item_src.as_bytes();
+    let mut pos = 0;
+    // Skip up to 3 leading spaces.
+    while pos < bytes.len() && bytes[pos] == b' ' && pos < 3 {
+        pos += 1;
+    }
+    if ordered {
+        // \d{1,9}
+        let digits_start = pos;
+        while pos < bytes.len() && bytes[pos].is_ascii_digit() && pos - digits_start < 9 {
+            pos += 1;
+        }
+        let num_digits = pos - digits_start;
+        if num_digits == 0 || num_digits > 9 {
+            return None;
+        }
+        // [.)]
+        if pos >= bytes.len() || (bytes[pos] != b'.' && bytes[pos] != b')') {
+            return None;
+        }
+        let punct = bytes[pos];
+        pos += 1;
+        // [ \t]+
+        if pos >= bytes.len() || (bytes[pos] != b' ' && bytes[pos] != b'\t') {
+            return None;
+        }
+        // `pos` points at the first whitespace after digits+punct.
+        let capture = &item_src[digits_start..pos - 1];
+        Some(format!("{capture}{} ", punct as char))
+    } else {
+        // [-+*]
+        if pos >= bytes.len() {
+            return None;
+        }
+        let ch = bytes[pos];
+        if ch != b'-' && ch != b'+' && ch != b'*' {
+            return None;
+        }
+        pos += 1;
+        // (?:[ \t]+|(?=\r?\n|$)) — bare CR is invalid; CRLF is ok.
+        if pos < bytes.len() && (bytes[pos] == b' ' || bytes[pos] == b'\t') {
+            // marker followed by spaces/tabs
+        } else if pos < bytes.len() && bytes[pos] == b'\n' {
+            // LF
+        } else if pos + 1 < bytes.len() && bytes[pos] == b'\r' && bytes[pos + 1] == b'\n' {
+            // CRLF
+        } else if pos == bytes.len() {
+            // EOF
         } else {
-            "- ".to_owned()
+            return None;
         }
-    }
-
-    fn take_marker(&self, _preserve: bool) -> String {
-        self.current_marker()
+        Some(format!("{} ", ch as char))
     }
 }
 
-fn list_indent(stack: &[ListState]) -> String {
-    "    ".repeat(stack.len().saturating_sub(1))
-}
-
-fn rewrite_quote_borders(lines: &mut Vec<String>, theme: &MarkdownTheme, width: usize) {
-    // Walk backwards over non-empty lines until blank; prefix with quote border.
-    let mut i = lines.len();
-    while i > 0 {
-        i -= 1;
-        if lines[i].is_empty() {
-            break;
-        }
-        // Avoid double-prefixing.
-        if lines[i].starts_with('│') {
-            continue;
-        }
-        let content_width = width.saturating_sub(2).max(1);
-        let styled = lines[i].clone();
-        let mut rebuilt = Vec::new();
-        for w in wrap_text_with_ansi(&styled, content_width) {
-            rebuilt.push(format!("{}{w}", (theme.quote_border)("│ ")));
-        }
-        if rebuilt.is_empty() {
-            lines[i].clone_from(&(theme.quote_border)("│ "));
+fn emit_wrapped(
+    composed: &mut Vec<String>,
+    rendered_any: &mut bool,
+    first_prefix: &str,
+    continuation_prefix: &str,
+    text: &str,
+    item_width: usize,
+) {
+    for wrapped in wrap_text_with_ansi(text, item_width) {
+        let prefix = if *rendered_any {
+            continuation_prefix
         } else {
-            lines[i].clone_from(&rebuilt[0]);
-            for extra in rebuilt.into_iter().skip(1) {
-                i += 1;
-                lines.insert(i, extra);
-            }
-        }
+            first_prefix
+        };
+        composed.push(format!("{prefix}{wrapped}"));
+        *rendered_any = true;
     }
 }
 
+#[derive(Clone)]
 struct TableBuilder {
     #[allow(dead_code)]
     alignments: usize,
@@ -1032,6 +1540,411 @@ mod tests {
     use super::*;
     use crate::components::util::{render_snapshot, strip_ansi};
 
+    fn plain(text: &str, width: u16, opts: MarkdownOptions) -> Vec<String> {
+        let mut m = Markdown::new(
+            text,
+            0,
+            0,
+            MarkdownTheme::default(),
+            DefaultTextStyle::default(),
+            opts,
+        );
+        render_snapshot(&mut m, width)
+            .into_iter()
+            .map(|l| strip_ansi(&l).trim_end().to_string())
+            .collect()
+    }
+
+    fn plain_default(text: &str, width: u16) -> Vec<String> {
+        plain(text, width, MarkdownOptions::default())
+    }
+
+    fn plain_preserve(text: &str, width: u16) -> Vec<String> {
+        plain(
+            text,
+            width,
+            MarkdownOptions {
+                preserve_ordered_list_markers: true,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn tight_task_list() {
+        let lines = plain_default("- [ ] beep\n- [x] boop", 80);
+        assert_eq!(lines, vec!["- [ ] beep", "- [x] boop"]);
+    }
+
+    #[test]
+    fn loose_task_list() {
+        let lines = plain_default("- [ ] loose a\n\n- [x] loose b", 80);
+        assert_eq!(lines, vec!["- [ ] loose a", "", "- [x] loose b"]);
+    }
+
+    #[test]
+    fn loose_ordered_paragraphs() {
+        let src = "1. Lorem ipsum dolor sit amet.\n\n   Ut enim ad minim veniam.\n\n2. Duis aute irure dolor.\n\n   Excepteur sint occaecat cupidatat.\n\n3. Beep boop";
+        let lines = plain_default(src, 80);
+        assert_eq!(
+            lines,
+            vec![
+                "1. Lorem ipsum dolor sit amet.",
+                "",
+                "   Ut enim ad minim veniam.",
+                "",
+                "2. Duis aute irure dolor.",
+                "",
+                "   Excepteur sint occaecat cupidatat.",
+                "",
+                "3. Beep boop",
+            ]
+        );
+    }
+
+    #[test]
+    fn nested_list() {
+        let src = "- Item 1\n  - Nested 1.1\n  - Nested 1.2\n- Item 2";
+        let lines = plain_default(src, 80);
+        assert_eq!(
+            lines,
+            vec![
+                "- Item 1",
+                "    - Nested 1.1",
+                "    - Nested 1.2",
+                "- Item 2",
+            ]
+        );
+    }
+
+    #[test]
+    fn deeply_nested_list() {
+        let src = "- Level 1\n  - Level 2\n    - Level 3\n      - Level 4";
+        let lines = plain_default(src, 80);
+        assert_eq!(
+            lines,
+            vec![
+                "- Level 1",
+                "    - Level 2",
+                "        - Level 3",
+                "            - Level 4",
+            ]
+        );
+    }
+
+    #[test]
+    fn ordered_nested_list() {
+        let src = "1. First\n   1. Nested first\n   2. Nested second\n2. Second";
+        let lines = plain_default(src, 80);
+        assert_eq!(
+            lines,
+            vec![
+                "1. First",
+                "    1. Nested first",
+                "    2. Nested second",
+                "2. Second",
+            ]
+        );
+    }
+
+    #[test]
+    fn mixed_nested_list() {
+        let src = "1. Ordered item\n   - Unordered nested\n   - Another nested\n2. Second ordered\n   - More nested";
+        let lines = plain_default(src, 80);
+        assert_eq!(
+            lines,
+            vec![
+                "1. Ordered item",
+                "    - Unordered nested",
+                "    - Another nested",
+                "2. Second ordered",
+                "    - More nested",
+            ]
+        );
+    }
+
+    #[test]
+    fn narrow_wrap_unordered() {
+        let lines = plain_default("- alpha beta gamma delta epsilon", 20);
+        assert_eq!(lines, vec!["- alpha beta gamma", "  delta epsilon"]);
+    }
+
+    #[test]
+    fn narrow_wrap_ordered() {
+        let lines = plain_default("1. alpha beta gamma delta epsilon", 20);
+        assert_eq!(lines, vec!["1. alpha beta gamma", "   delta epsilon"]);
+    }
+
+    #[test]
+    fn narrow_wrap_multidigit() {
+        let lines = plain_default("10. alpha beta gamma delta epsilon", 21);
+        assert_eq!(lines, vec!["10. alpha beta gamma", "    delta epsilon"]);
+    }
+
+    #[test]
+    fn narrow_wrap_nested_unordered_parent() {
+        let src = "- parent\n  - alpha beta gamma delta epsilon";
+        let lines = plain_default(src, 24);
+        assert_eq!(
+            lines,
+            vec!["- parent", "    - alpha beta gamma", "      delta epsilon"]
+        );
+    }
+
+    #[test]
+    fn narrow_wrap_nested_ordered_parent() {
+        let src = "1. parent\n   - alpha beta gamma delta epsilon";
+        let lines = plain_default(src, 24);
+        assert_eq!(
+            lines,
+            vec!["1. parent", "    - alpha beta gamma", "      delta epsilon"]
+        );
+    }
+
+    #[test]
+    fn preserve_source_markers() {
+        let src = "  4. forth\n  3. third\n\n10) ten\n7) seven\n\n+ plus\n* star\n- minus\n+";
+        let lines = plain_preserve(src, 80);
+        assert_eq!(
+            lines,
+            vec![
+                "4. forth", "3. third", "", "10) ten", "7) seven", "", "+ plus", "* star",
+                "- minus", "+",
+            ]
+        );
+    }
+
+    #[test]
+    fn disabled_preservation_normalizes() {
+        let lines = plain_default("1. alpha\n1. beta\n1. gamma", 80);
+        assert_eq!(lines, vec!["1. alpha", "2. beta", "3. gamma"]);
+    }
+
+    #[test]
+    fn task_markers_with_preserved_bullets() {
+        let src = "+ [ ] beep\n* [x] boop";
+        let lines = plain_preserve(src, 80);
+        assert_eq!(lines, vec!["+ [ ] beep", "* [x] boop"]);
+    }
+
+    #[test]
+    fn preserve_nested_source_markers() {
+        // Non-default markers at both parent (+) and nested (4)/7)) depths.
+        // Blank line after the parent paragraph is required for CommonMark to
+        // accept an ordered nested list under an unordered item.
+        let src = "+ parent\n\n  4) nested four\n  7) nested seven\n* sibling";
+        let lines = plain_preserve(src, 80);
+        assert_eq!(
+            lines,
+            vec![
+                "+ parent",
+                "    4) nested four",
+                "    7) nested seven",
+                "* sibling",
+            ]
+        );
+    }
+
+    #[test]
+    fn list_blockquote_wrap() {
+        let lines = plain_default("- > alpha beta gamma delta epsilon zeta", 24);
+        assert_eq!(
+            lines,
+            vec!["- │ alpha beta gamma", "  │ delta epsilon zeta"]
+        );
+    }
+
+    #[test]
+    fn list_blockquote_keeps_nested_blocks_quoted() {
+        let src = "- > before\n  >\n  > - nested";
+        let lines = plain_default(src, 40);
+        assert!(
+            lines
+                .iter()
+                .filter(|line| !line.trim().is_empty())
+                .all(|line| line.contains('│')),
+            "{lines:?}"
+        );
+        assert!(lines.iter().any(|line| line.contains("nested")));
+    }
+
+    #[test]
+    fn blockquote_keeps_block_children_quoted() {
+        let src = "> before\n>\n> - nested\n>\n> ---\n>\n> ```ts\n> code\n> ```";
+        let lines = plain_default(src, 40);
+        assert!(
+            lines
+                .iter()
+                .filter(|line| !line.trim().is_empty())
+                .all(|line| line.contains('│')),
+            "{lines:?}"
+        );
+        assert!(lines.iter().any(|line| line.contains("nested")));
+        assert!(lines.iter().any(|line| line.contains('─')));
+        assert!(lines.iter().any(|line| line.contains("code")));
+    }
+
+    #[test]
+    fn blockquote_list_keeps_loose_item_text_with_its_marker() {
+        let lines = plain_default("> - a\n>\n> - b", 40);
+        let visible = lines
+            .iter()
+            .map(|line| line.trim_end())
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(visible, ["│ - a", "│", "│ - b"]);
+    }
+
+    #[test]
+    fn blockquote_separates_paragraph_blocks() {
+        let lines = plain_default("> a\n>\n> b", 40);
+        assert!(
+            lines.windows(3).any(|window| {
+                window[0].trim_end() == "│ a"
+                    && window[1].trim_end() == "│"
+                    && window[2].trim_end() == "│ b"
+            }),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn nested_blockquote_keeps_inner_border() {
+        let lines = plain_default("> outer\n> > inner", 40);
+        assert!(
+            lines.iter().any(|line| line.contains("│ │ inner")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn quote_inside_quoted_list_item_stays_with_marker() {
+        let lines = plain_default("> - > quoted", 40);
+        assert!(
+            lines.iter().any(|line| line.contains("- │ quoted")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn interrupting_list_has_no_spurious_paragraph_gap() {
+        let lines = plain_default("para\n- item", 40);
+        assert!(
+            lines
+                .windows(2)
+                .any(|window| window[0] == "para" && window[1] == "- item"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn list_after_source_blank_keeps_paragraph_gap() {
+        let lines = plain_default("para\n\n- item", 40);
+        assert!(
+            lines.windows(3).any(|window| {
+                window[0] == "para" && window[1].is_empty() && window[2] == "- item"
+            }),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn blockquote_styles_every_block_line_and_reapplies_after_reset() {
+        fn quote_style(text: &str) -> String {
+            format!("\u{1b}[3m{text}\u{1b}[0m")
+        }
+        let theme = MarkdownTheme {
+            quote: quote_style,
+            ..MarkdownTheme::default()
+        };
+        let options = MarkdownOptions::default();
+        let apply_default = |text: &str| text.to_owned();
+        let renderer = MarkdownRenderer::new("", 40, &theme, &options, &apply_default);
+        let lines = renderer.render_quoted_segments(
+            vec![ItemSegment::Nested(vec![
+                "nested \u{1b}[0mchild".to_owned(),
+            ])],
+            40,
+        );
+        assert_eq!(
+            lines,
+            vec!["│ \u{1b}[3mnested \u{1b}[0m\u{1b}[3mchild\u{1b}[0m"]
+        );
+        let wrapped = renderer.render_quoted_segments(
+            vec![ItemSegment::Nested(vec![
+                "alpha beta gamma delta".to_owned(),
+            ])],
+            12,
+        );
+        assert!(wrapped.len() > 1, "{wrapped:?}");
+        assert!(
+            wrapped.iter().all(|line| line.starts_with("│ \u{1b}[3m")),
+            "{wrapped:?}"
+        );
+        assert!(
+            wrapped
+                .last()
+                .is_some_and(|line| line.ends_with("\u{1b}[0m")),
+            "{wrapped:?}"
+        );
+    }
+
+    #[test]
+    fn list_rule_stays_inside_item() {
+        let src = "- before\n\n  ---\n\n  after";
+        let lines = plain_default(src, 40);
+        let mut saw_before = false;
+        let mut saw_rule = false;
+        for line in &lines {
+            saw_before |= line.contains("before");
+            if line.contains('─') {
+                assert!(saw_before, "{lines:?}");
+                assert!(line.starts_with("  "), "{lines:?}");
+                saw_rule = true;
+            }
+        }
+        assert!(saw_before, "{lines:?}");
+        assert!(saw_rule, "{lines:?}");
+    }
+
+    #[test]
+    fn top_level_rule_is_rendered() {
+        let lines = plain_default("---", 40);
+        assert_eq!(lines, vec!["─".repeat(40)]);
+    }
+
+    #[test]
+    fn list_code_block_wrap() {
+        let src = "- ```ts\n  alpha beta gamma delta epsilon zeta\n  ```";
+        let lines = plain_default(src, 24);
+        assert_eq!(
+            lines,
+            vec![
+                "- ```ts",
+                "    alpha beta gamma",
+                "  delta epsilon zeta",
+                "  ```",
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_source_marker_crlf_and_fallback() {
+        assert_eq!(extract_source_marker("+\r\n", false).as_deref(), Some("+ "));
+        assert_eq!(extract_source_marker("+\n", false).as_deref(), Some("+ "));
+        assert_eq!(extract_source_marker("+", false).as_deref(), Some("+ "));
+        // Bare CR is not a valid unordered marker terminator.
+        assert_eq!(extract_source_marker("+\r", false), None);
+        // Malformed ordered markers fall back via None (take_marker normalizes).
+        assert_eq!(extract_source_marker("abc", true), None);
+        assert_eq!(extract_source_marker("4.x", true), None);
+        assert_eq!(extract_source_marker("4. ok", true).as_deref(), Some("4. "));
+        assert_eq!(
+            extract_source_marker("10) ok", true).as_deref(),
+            Some("10) ")
+        );
+    }
+
     fn md(text: &str) -> Markdown {
         Markdown::new(
             text,
@@ -1150,5 +2063,14 @@ mod tests {
         m.set_text("# Hello\n\nworld");
         let h2 = m.measure(40);
         assert!(h2 >= h1);
+    }
+
+    #[test]
+    fn list_table_task_marker_item_width() {
+        // Task markers are wider than the old depth-based approximation (`width - 2`);
+        // at width 14 the true item width (8) selects narrow table fallback, not grid.
+        let src = "- [ ] task\n\n  | A | B |\n  | --- | --- |\n  | 1 | 2 |\n";
+        let lines = plain_default(src, 14);
+        assert_eq!(lines, vec!["- [ ] task", "", "", "      1 | 2"]);
     }
 }
