@@ -22,26 +22,38 @@
 //! `emit` self-gates on handler presence, so the gate would only suppress
 //! correct emissions.
 
-use crate::core::extension_host::SessionBridgeEvent;
-use crate::core::extension_runtime_set::{ExtensionRuntimeSet, ExtensionSetDiagnostic};
+use crate::core::agent_session_runtime::{
+    AgentSessionRuntime, AgentSessionRuntimeError, ForkPosition, NewSessionOptions,
+    PrepareReplacementOutcome, PreparedReplacement, SwitchSessionOptions,
+};
+use crate::core::extension_host::{HOOK_TIMEOUT, SessionBridgeEvent};
+use crate::core::extension_runtime_set::{
+    ExtensionRuntimeSet, ExtensionSetDiagnostic, PendingReadyOp,
+};
 use crate::core::messages::CustomMessageContent;
 use crate::core::resources::{
-    ResourceLoader, SlashCommandInfo, SlashCommandSource, SyntheticSourceInfoOptions,
-    create_synthetic_source_info,
+    ResourceLoader, SlashCommandInfo, SlashCommandSource, SourceInfo, SourceOrigin, SourceScope,
+    SyntheticSourceInfoOptions, create_synthetic_source_info,
 };
 use pi_ai::{ImageContent, Model, ModelThinkingLevel};
-use pi_ext::protocol::{SessionCommand, SessionCommandInfoWire, SessionStateWire, SessionToolWire};
+use pi_ext::protocol::{
+    self, SessionCommand, SessionCommandInfoWire, SessionForkPosition, SessionNavigateTreeResponse,
+    SessionStateWire, SessionToolWire,
+};
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use super::prompt::{CustomMessageInput, DeliverAs};
 use super::tools::RefreshToolRegistryOptions;
+use super::tree::NavigateTreeOptions;
 
 use super::AgentSession;
 use super::events::{
     AgentSessionEvent, SessionShutdownReason, SessionStartEvent, SessionStartReason,
 };
 
+const REPLACEMENT_READY_TIMEOUT: Duration = HOOK_TIMEOUT;
 /// Mode the session is bound to (mirrors `AppMode` minus `Interactive`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExtensionMode {
@@ -338,13 +350,32 @@ impl AgentSession {
         let previous_flag_values = runner.get_flag_values();
 
         if let (Some(host), Some(runtime)) = (host.as_ref(), self.model_runtime()) {
+            let reload_guard = host.reload_lock().lock().await;
+            if host.is_pending_busy() {
+                return Err(ExtensionBindError::HostRestart(
+                    "session replacement in progress".to_owned(),
+                ));
+            }
             let prepared = host
                 .prepare_reload(previous_flag_values)
                 .await
                 .map_err(|error| ExtensionBindError::HostRestart(error.to_string()))?;
+            let token = host.next_replacement_token();
+            let ready_rx = host
+                .install_pending(
+                    token.clone(),
+                    PendingReadyOp::Reload {
+                        prepared,
+                        model_runtime: runtime,
+                    },
+                )
+                .map_err(|_| {
+                    ExtensionBindError::HostRestart("session replacement in progress".to_owned())
+                })?;
+            drop(reload_guard);
 
-            // Lifecycle event on the old host. Emit self-gates on handler
-            // presence; the prepared replacement is not published until commit.
+            // Never hold reload_lock across a host callback: a reload hook may
+            // synchronously attempt another session operation.
             let _ = runner
                 .emit(AgentSessionEvent::SessionShutdown {
                     reason: SessionShutdownReason::Reload,
@@ -352,14 +383,32 @@ impl AgentSession {
                 })
                 .await;
 
-            let reload = host.commit_reload(&runtime, prepared).await;
+            if !host.complete_ready(&token) {
+                drop(ready_rx);
+                return Err(ExtensionBindError::HostRestart(
+                    "extension runtime was invalidated during reload".to_owned(),
+                ));
+            }
+            drop(ready_rx);
+            let Some(PendingReadyOp::Reload {
+                prepared,
+                model_runtime,
+            }) = host.take_finalizing(&token)
+            else {
+                return Err(ExtensionBindError::HostRestart(
+                    "extension runtime was invalidated during reload".to_owned(),
+                ));
+            };
+            let reload_guard = host.reload_lock().lock().await;
+            let reload = host.commit_reload(&model_runtime, prepared).await;
+            let _ = host.finish_finalize(&token);
             if !reload.committed {
                 return Err(ExtensionBindError::HostRestart(
                     "extension runtime was invalidated during reload".to_owned(),
                 ));
             }
             let diagnostics = reload.diagnostics;
-            // Refresh tools after the facade atomically publishes its replacement generation.
+            drop(reload_guard);
             self.refresh_tool_registry(&super::tools::RefreshToolRegistryOptions {
                 active_tool_names: None,
                 include_all_extension_tools: true,
@@ -439,23 +488,43 @@ impl AgentSession {
         if let Some(host) = self.host_extension_runner() {
             for command in host.registry().commands() {
                 extension_names.insert(command.name.clone());
-                let path = command
+                let discovered_source = command
                     .source
-                    .clone()
-                    .unwrap_or_else(|| "<extension>".to_owned());
-                commands.push(SlashCommandInfo {
-                    name: command.name.clone(),
-                    description: command.description.clone(),
-                    source: SlashCommandSource::Extension,
-                    source_info: create_synthetic_source_info(
-                        path,
+                    .as_deref()
+                    .and_then(|source| host.command_source_info(source));
+                let host_source = command.source_info.clone().map(|info| SourceInfo {
+                    path: info.path,
+                    source: info.source,
+                    scope: match info.scope {
+                        pi_ext::adapters::CommandSourceScope::User => SourceScope::User,
+                        pi_ext::adapters::CommandSourceScope::Project => SourceScope::Project,
+                        pi_ext::adapters::CommandSourceScope::Temporary => SourceScope::Temporary,
+                    },
+                    origin: match info.origin {
+                        pi_ext::adapters::CommandSourceOrigin::Package => SourceOrigin::Package,
+                        pi_ext::adapters::CommandSourceOrigin::TopLevel => SourceOrigin::TopLevel,
+                    },
+                    base_dir: info.base_dir,
+                });
+                let source_info = discovered_source.or(host_source).unwrap_or_else(|| {
+                    create_synthetic_source_info(
+                        command
+                            .source
+                            .clone()
+                            .unwrap_or_else(|| "<extension>".to_owned()),
                         SyntheticSourceInfoOptions {
                             source: "extension".to_owned(),
                             scope: None,
                             origin: None,
                             base_dir: None,
                         },
-                    ),
+                    )
+                });
+                commands.push(SlashCommandInfo {
+                    name: command.name.clone(),
+                    description: command.description.clone(),
+                    source: SlashCommandSource::Extension,
+                    source_info,
                 });
             }
         }
@@ -563,12 +632,36 @@ impl AgentSession {
         let Some(host) = self.host_extension_runner() else {
             return;
         };
+        let Some(session) = self.upgrade_self() else {
+            return;
+        };
+        host.bind_session_target(session.clone());
+        self.bind_session_mirror(Arc::clone(&host), session.clone())
+            .await;
+
         let Some(mut bridge_rx) = host.take_session_bridge() else {
             return;
         };
-        let Some(weak) = self.upgrade_self() else {
-            return;
-        };
+        tokio::spawn(async move {
+            while let Some(item) = bridge_rx.recv().await {
+                let target = host
+                    .pending_replacement_target()
+                    .or_else(|| host.session_target());
+                let Some(target) = target else {
+                    break;
+                };
+                target.apply_session_bridge_event(&host, item).await;
+                let state = target.session_state_wire().await;
+                host.push_session_state(&state).await;
+            }
+        });
+    }
+
+    async fn bind_session_mirror(
+        &self,
+        host: Arc<ExtensionRuntimeSet>,
+        session: std::sync::Weak<AgentSession>,
+    ) {
         let (dirty_tx, mut dirty_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
         let unsubscribe = self.subscribe(move |event| {
             if matches!(
@@ -585,33 +678,20 @@ impl AgentSession {
                 let _ = dirty_tx.send(());
             }
         });
-        // Awaited: the mirror must be warm before session_start is emitted.
+        // Awaited: lifecycle handlers must observe the new session state.
         let state = self.session_state_wire().await;
         host.push_session_state(&state).await;
         tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    item = bridge_rx.recv() => {
-                        let Some(item) = item else { break };
-                        let Some(session) = weak.upgrade() else { break };
-                        session.apply_session_bridge_event(&host, item).await;
-                        let state = session.session_state_wire().await;
-                        host.push_session_state(&state).await;
-                    }
-                    ping = dirty_rx.recv() => {
-                        if ping.is_none() {
-                            break;
-                        }
-                        // Coalesce bursts into one push.
-                        while dirty_rx.try_recv().is_ok() {}
-                        if !host.is_active() {
-                            break;
-                        }
-                        let Some(session) = weak.upgrade() else { break };
-                        let state = session.session_state_wire().await;
-                        host.push_session_state(&state).await;
-                    }
+            while dirty_rx.recv().await.is_some() {
+                while dirty_rx.try_recv().is_ok() {}
+                if !host.is_active() {
+                    break;
                 }
+                let Some(session) = session.upgrade() else {
+                    break;
+                };
+                let state = session.session_state_wire().await;
+                host.push_session_state(&state).await;
             }
             unsubscribe();
         });
@@ -692,8 +772,6 @@ impl AgentSession {
                 }
             }
             SessionBridgeEvent::Compact { id, request } => {
-                // Compaction can be slow; run it off the bridge loop so other
-                // commands (abort included) stay responsive.
                 let session = Arc::clone(self);
                 let host = Arc::clone(host);
                 tokio::spawn(async move {
@@ -710,6 +788,551 @@ impl AgentSession {
                     }
                 });
             }
+            SessionBridgeEvent::NewSession { id, request } => {
+                let session = Arc::clone(self);
+                let host = Arc::clone(host);
+                tokio::spawn(async move {
+                    session.handle_bridge_new_session(host, id, request).await;
+                });
+            }
+            SessionBridgeEvent::Fork { id, request } => {
+                let session = Arc::clone(self);
+                let host = Arc::clone(host);
+                tokio::spawn(async move {
+                    session.handle_bridge_fork(host, id, request).await;
+                });
+            }
+            SessionBridgeEvent::NavigateTree { id, request } => {
+                let session = Arc::clone(self);
+                let host = Arc::clone(host);
+                tokio::spawn(async move {
+                    session.handle_bridge_navigate_tree(host, id, request).await;
+                });
+            }
+            SessionBridgeEvent::SwitchSession { id, request } => {
+                let session = Arc::clone(self);
+                let host = Arc::clone(host);
+                tokio::spawn(async move {
+                    session
+                        .handle_bridge_switch_session(host, id, request)
+                        .await;
+                });
+            }
+            SessionBridgeEvent::Reload { id } => {
+                let session = Arc::clone(self);
+                let host = Arc::clone(host);
+                tokio::spawn(async move {
+                    session.handle_bridge_reload(host, id).await;
+                });
+            }
+            SessionBridgeEvent::ReplacementReady { token } => {
+                let _ = host.complete_ready(&token);
+            }
+        }
+    }
+
+    async fn handle_bridge_new_session(
+        self: &Arc<Self>,
+        host: Arc<ExtensionRuntimeSet>,
+        id: protocol::FrameId,
+        request: protocol::SessionNewSessionRequest,
+    ) {
+        if host.is_pending_busy() {
+            self.respond_bridge_busy(&host, id, protocol::SESSION_NEW_SESSION_METHOD)
+                .await;
+            return;
+        }
+        let Some(runtime) = self.runtime_handle() else {
+            self.respond_bridge_error(
+                &host,
+                id,
+                protocol::SESSION_NEW_SESSION_METHOD,
+                "session runtime is unavailable",
+            )
+            .await;
+            return;
+        };
+        let replacement_lock = runtime.replacement_lock();
+        let guard = replacement_lock.lock().await;
+        let prepared = runtime
+            .prepare_new_session(NewSessionOptions {
+                parent_session: request.parent_session,
+            })
+            .await;
+        match prepared {
+            Ok(PrepareReplacementOutcome::Cancelled) => {
+                drop(guard);
+                if let Err(error) = host.respond_new_session(id, true, None).await {
+                    self.report_extension_error(format!("newSession response: {error}"));
+                }
+            }
+            Ok(PrepareReplacementOutcome::Prepared(prepared)) => {
+                let installed = install_bridge_replacement(&host, prepared);
+                drop(guard);
+                let (token, ready_rx) = match installed {
+                    Ok(installed) => installed,
+                    Err(prepared) => {
+                        runtime.abort_prepared_replacement(prepared).await;
+                        self.respond_bridge_busy(&host, id, protocol::SESSION_NEW_SESSION_METHOD)
+                            .await;
+                        return;
+                    }
+                };
+                if let Err(error) = host.respond_new_session(id, false, Some(&token)).await {
+                    abort_bridge_pending(&host, &runtime, &token).await;
+                    self.report_extension_error(format!("newSession response: {error}"));
+                    return;
+                }
+                self.await_bridge_replacement(host, runtime, token, ready_rx, "newSession")
+                    .await;
+            }
+            Err(error) => {
+                drop(guard);
+                self.respond_bridge_runtime_error(
+                    &host,
+                    id,
+                    protocol::SESSION_NEW_SESSION_METHOD,
+                    error,
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn handle_bridge_fork(
+        self: &Arc<Self>,
+        host: Arc<ExtensionRuntimeSet>,
+        id: protocol::FrameId,
+        request: protocol::SessionForkRequest,
+    ) {
+        if host.is_pending_busy() {
+            self.respond_bridge_busy(&host, id, protocol::SESSION_FORK_METHOD)
+                .await;
+            return;
+        }
+        let Some(runtime) = self.runtime_handle() else {
+            self.respond_bridge_error(
+                &host,
+                id,
+                protocol::SESSION_FORK_METHOD,
+                "session runtime is unavailable",
+            )
+            .await;
+            return;
+        };
+        let position = match request.position.unwrap_or(SessionForkPosition::Before) {
+            SessionForkPosition::Before => ForkPosition::Before,
+            SessionForkPosition::At => ForkPosition::At,
+        };
+        let replacement_lock = runtime.replacement_lock();
+        let guard = replacement_lock.lock().await;
+        let prepared = runtime.prepare_fork(&request.entry_id, position).await;
+        match prepared {
+            Ok((PrepareReplacementOutcome::Cancelled, _)) => {
+                drop(guard);
+                if let Err(error) = host.respond_fork(id, true, None, None).await {
+                    self.report_extension_error(format!("fork response: {error}"));
+                }
+            }
+            Ok((PrepareReplacementOutcome::Prepared(prepared), selected_text)) => {
+                let installed = install_bridge_replacement(&host, prepared);
+                drop(guard);
+                let (token, ready_rx) = match installed {
+                    Ok(installed) => installed,
+                    Err(prepared) => {
+                        runtime.abort_prepared_replacement(prepared).await;
+                        self.respond_bridge_busy(&host, id, protocol::SESSION_FORK_METHOD)
+                            .await;
+                        return;
+                    }
+                };
+                if let Err(error) = host
+                    .respond_fork(id, false, selected_text.as_deref(), Some(&token))
+                    .await
+                {
+                    abort_bridge_pending(&host, &runtime, &token).await;
+                    self.report_extension_error(format!("fork response: {error}"));
+                    return;
+                }
+                self.await_bridge_replacement(host, runtime, token, ready_rx, "fork")
+                    .await;
+            }
+            Err(error) => {
+                drop(guard);
+                self.respond_bridge_runtime_error(&host, id, protocol::SESSION_FORK_METHOD, error)
+                    .await;
+            }
+        }
+    }
+
+    async fn handle_bridge_switch_session(
+        self: &Arc<Self>,
+        host: Arc<ExtensionRuntimeSet>,
+        id: protocol::FrameId,
+        request: protocol::SessionSwitchSessionRequest,
+    ) {
+        if host.is_pending_busy() {
+            self.respond_bridge_busy(&host, id, protocol::SESSION_SWITCH_SESSION_METHOD)
+                .await;
+            return;
+        }
+        let Some(runtime) = self.runtime_handle() else {
+            self.respond_bridge_error(
+                &host,
+                id,
+                protocol::SESSION_SWITCH_SESSION_METHOD,
+                "session runtime is unavailable",
+            )
+            .await;
+            return;
+        };
+        let replacement_lock = runtime.replacement_lock();
+        let guard = replacement_lock.lock().await;
+        let prepared = runtime
+            .prepare_switch_session(&request.session_path, SwitchSessionOptions::default())
+            .await;
+        match prepared {
+            Ok(PrepareReplacementOutcome::Cancelled) => {
+                drop(guard);
+                if let Err(error) = host.respond_switch_session(id, true, None).await {
+                    self.report_extension_error(format!("switchSession response: {error}"));
+                }
+            }
+            Ok(PrepareReplacementOutcome::Prepared(prepared)) => {
+                let installed = install_bridge_replacement(&host, prepared);
+                drop(guard);
+                let (token, ready_rx) = match installed {
+                    Ok(installed) => installed,
+                    Err(prepared) => {
+                        runtime.abort_prepared_replacement(prepared).await;
+                        self.respond_bridge_busy(
+                            &host,
+                            id,
+                            protocol::SESSION_SWITCH_SESSION_METHOD,
+                        )
+                        .await;
+                        return;
+                    }
+                };
+                if let Err(error) = host.respond_switch_session(id, false, Some(&token)).await {
+                    abort_bridge_pending(&host, &runtime, &token).await;
+                    self.report_extension_error(format!("switchSession response: {error}"));
+                    return;
+                }
+                self.await_bridge_replacement(host, runtime, token, ready_rx, "switchSession")
+                    .await;
+            }
+            Err(error) => {
+                drop(guard);
+                self.respond_bridge_runtime_error(
+                    &host,
+                    id,
+                    protocol::SESSION_SWITCH_SESSION_METHOD,
+                    error,
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn handle_bridge_navigate_tree(
+        self: &Arc<Self>,
+        host: Arc<ExtensionRuntimeSet>,
+        id: protocol::FrameId,
+        request: protocol::SessionNavigateTreeRequest,
+    ) {
+        if self.is_disposed() {
+            let _ = host
+                .respond_navigate_tree(id, Err("session replaced".to_owned()))
+                .await;
+            return;
+        }
+        let runtime = self.runtime_handle();
+        let _lifecycle_guard = if let Some(runtime) = runtime.as_ref() {
+            Some(runtime.lifecycle_gate().read().await)
+        } else {
+            None
+        };
+        if self.is_disposed() {
+            let _ = host
+                .respond_navigate_tree(id, Err("session replaced".to_owned()))
+                .await;
+            return;
+        }
+
+        let options = NavigateTreeOptions {
+            summarize: request.summarize.unwrap_or(false),
+            custom_instructions: request.custom_instructions,
+            replace_instructions: request.replace_instructions.unwrap_or(false),
+            label: request.label,
+        };
+        let outcome = if options.summarize {
+            match self.resolve_summarization_inputs().await {
+                Ok((auth, summarizer)) => {
+                    self.navigate_tree(&request.target_id, options, auth, Some(&summarizer))
+                        .await
+                }
+                Err(error) => {
+                    let _ = host.respond_navigate_tree(id, Err(error.to_string())).await;
+                    return;
+                }
+            }
+        } else {
+            self.navigate_tree(
+                &request.target_id,
+                options,
+                super::tree::SummarizationAuth::default(),
+                None,
+            )
+            .await
+        };
+        let outcome = match outcome {
+            Ok(result) => {
+                let summary_entry = match result.summary_entry.map(serde_json::to_value).transpose()
+                {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        let _ = host
+                            .respond_navigate_tree(
+                                id,
+                                Err(format!("encode navigateTree summary: {error}")),
+                            )
+                            .await;
+                        return;
+                    }
+                };
+                Ok(SessionNavigateTreeResponse {
+                    cancelled: result.cancelled,
+                    editor_text: result.editor_text,
+                    aborted: result.aborted.then_some(true),
+                    summary_entry,
+                })
+            }
+            Err(error) => Err(error.to_string()),
+        };
+        if let Err(error) = host.respond_navigate_tree(id, outcome).await {
+            self.report_extension_error(format!("navigateTree response: {error}"));
+        }
+    }
+
+    async fn handle_bridge_reload(
+        self: &Arc<Self>,
+        host: Arc<ExtensionRuntimeSet>,
+        id: protocol::FrameId,
+    ) {
+        if host.is_pending_busy() {
+            self.respond_bridge_busy(&host, id, protocol::SESSION_RELOAD_METHOD)
+                .await;
+            return;
+        }
+        let Some(model_runtime) = self.model_runtime() else {
+            self.respond_bridge_error(
+                &host,
+                id,
+                protocol::SESSION_RELOAD_METHOD,
+                "model runtime is unavailable",
+            )
+            .await;
+            return;
+        };
+        let flags = self.hooks.runner().get_flag_values();
+        let reload_guard = host.reload_lock().lock().await;
+        if host.is_pending_busy() {
+            drop(reload_guard);
+            self.respond_bridge_busy(&host, id, protocol::SESSION_RELOAD_METHOD)
+                .await;
+            return;
+        }
+        if !host.can_reload() {
+            drop(reload_guard);
+            self.respond_bridge_error(
+                &host,
+                id,
+                protocol::SESSION_RELOAD_METHOD,
+                "extension runtime is not reloadable",
+            )
+            .await;
+            return;
+        }
+        let prepared = match host.prepare_reload(flags).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                drop(reload_guard);
+                self.respond_bridge_error(
+                    &host,
+                    id,
+                    protocol::SESSION_RELOAD_METHOD,
+                    &error.to_string(),
+                )
+                .await;
+                return;
+            }
+        };
+        let token = host.next_replacement_token();
+        let Ok(ready_rx) = host.install_pending(
+            token.clone(),
+            PendingReadyOp::Reload {
+                prepared,
+                model_runtime,
+            },
+        ) else {
+            drop(reload_guard);
+            self.respond_bridge_busy(&host, id, protocol::SESSION_RELOAD_METHOD)
+                .await;
+            return;
+        };
+        drop(reload_guard);
+        if let Err(error) = host.respond_reload(id, Ok(Some(&token))).await {
+            let _ = host.abort_pending(&token);
+            self.report_extension_error(format!("reload response: {error}"));
+            return;
+        }
+        self.await_bridge_reload(host, token, ready_rx).await;
+    }
+
+    async fn await_bridge_replacement(
+        self: &Arc<Self>,
+        host: Arc<ExtensionRuntimeSet>,
+        runtime: Arc<AgentSessionRuntime>,
+        token: String,
+        ready_rx: tokio::sync::oneshot::Receiver<()>,
+        operation: &'static str,
+    ) {
+        match tokio::time::timeout(REPLACEMENT_READY_TIMEOUT, ready_rx).await {
+            Ok(Ok(())) => {
+                let Some(op) = host.take_finalizing(&token) else {
+                    self.report_extension_error(format!(
+                        "{operation}: replacement ready state was lost"
+                    ));
+                    return;
+                };
+                match pending_replacement(op) {
+                    Ok(prepared) => {
+                        // Keep the old facade's buffered bridge commands routed
+                        // while teardown drains its finalizing state.
+                        host.bind_session_target(Arc::downgrade(&prepared.result.session));
+                        runtime.finalize_replacement(prepared).await;
+                        let _ = host.finish_finalize(&token);
+                    }
+                    Err(op) => {
+                        drop(op);
+                        let _ = host.finish_finalize(&token);
+                        self.report_extension_error(format!(
+                            "{operation}: replacement ready state had the wrong operation"
+                        ));
+                    }
+                }
+            }
+            Ok(Err(_)) => {
+                abort_bridge_pending(&host, &runtime, &token).await;
+                self.report_extension_error(format!(
+                    "{operation}: replacement ready wait ended before completion"
+                ));
+            }
+            Err(_) => {
+                abort_bridge_pending(&host, &runtime, &token).await;
+                self.report_extension_error(format!("{operation}: replacement ready timed out"));
+            }
+        }
+    }
+
+    async fn await_bridge_reload(
+        self: &Arc<Self>,
+        host: Arc<ExtensionRuntimeSet>,
+        token: String,
+        ready_rx: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        match tokio::time::timeout(REPLACEMENT_READY_TIMEOUT, ready_rx).await {
+            Ok(Ok(())) => {
+                let Some(PendingReadyOp::Reload {
+                    prepared,
+                    model_runtime,
+                }) = host.take_finalizing(&token)
+                else {
+                    self.report_extension_error("reload: replacement ready state was lost");
+                    return;
+                };
+                let _ = self
+                    .hooks
+                    .runner()
+                    .emit(AgentSessionEvent::SessionShutdown {
+                        reason: SessionShutdownReason::Reload,
+                        target_session_file: None,
+                    })
+                    .await;
+                let reload_guard = host.reload_lock().lock().await;
+                let reload = host.commit_reload(&model_runtime, prepared).await;
+                let _ = host.finish_finalize(&token);
+                drop(reload_guard);
+                if !reload.committed {
+                    self.report_extension_error(
+                        "reload: extension runtime was invalidated before commit",
+                    );
+                    return;
+                }
+                self.refresh_tool_registry(&RefreshToolRegistryOptions {
+                    active_tool_names: None,
+                    include_all_extension_tools: true,
+                });
+                for diagnostic in reload.diagnostics {
+                    self.report_extension_error(diagnostic.to_string());
+                }
+                self.emit_session_start_reload().await;
+                if let Err(error) = self
+                    .extend_resources_from_extensions(SessionStartReason::Reload.as_str())
+                    .await
+                {
+                    self.report_extension_error(format!("reload resources: {error}"));
+                }
+            }
+            Ok(Err(_)) => {
+                let _ = host.abort_pending(&token);
+                self.report_extension_error(
+                    "reload: replacement ready wait ended before completion",
+                );
+            }
+            Err(_) => {
+                let _ = host.abort_pending(&token);
+                self.report_extension_error("reload: replacement ready timed out");
+            }
+        }
+    }
+
+    async fn respond_bridge_runtime_error(
+        &self,
+        host: &ExtensionRuntimeSet,
+        id: protocol::FrameId,
+        method: &str,
+        error: AgentSessionRuntimeError,
+    ) {
+        if matches!(error, AgentSessionRuntimeError::ReplacementBusy) {
+            self.respond_bridge_busy(host, id, method).await;
+        } else {
+            self.respond_bridge_error(host, id, method, &error.to_string())
+                .await;
+        }
+    }
+
+    async fn respond_bridge_busy(
+        &self,
+        host: &ExtensionRuntimeSet,
+        id: protocol::FrameId,
+        method: &str,
+    ) {
+        if let Err(error) = host.respond_replacement_busy(id, method).await {
+            self.report_extension_error(format!("{method} busy response: {error}"));
+        }
+    }
+
+    async fn respond_bridge_error(
+        &self,
+        host: &ExtensionRuntimeSet,
+        id: protocol::FrameId,
+        method: &str,
+        message: &str,
+    ) {
+        if let Err(error) = host.respond_session_error(id, method, message).await {
+            self.report_extension_error(format!("{method} error response: {error}"));
         }
     }
 
@@ -803,6 +1426,71 @@ impl AgentSession {
             SessionCommand::Abort => self.abort().await,
             SessionCommand::Shutdown => self.invoke_extension_shutdown_handler(),
         }
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn install_bridge_replacement(
+    host: &ExtensionRuntimeSet,
+    prepared: PreparedReplacement,
+) -> Result<(String, tokio::sync::oneshot::Receiver<()>), PreparedReplacement> {
+    let token = host.next_replacement_token();
+    let PreparedReplacement {
+        result,
+        reason,
+        target_session_file,
+    } = prepared;
+    match host.install_pending(
+        token.clone(),
+        PendingReadyOp::Replacement {
+            result,
+            reason,
+            target_session_file,
+        },
+    ) {
+        Ok(ready_rx) => Ok((token, ready_rx)),
+        Err(PendingReadyOp::Replacement {
+            result,
+            reason,
+            target_session_file,
+        }) => Err(PreparedReplacement {
+            result,
+            reason,
+            target_session_file,
+        }),
+        Err(PendingReadyOp::Reload { .. }) => {
+            unreachable!("installed replacement returned a reload operation")
+        }
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn pending_replacement(op: PendingReadyOp) -> Result<PreparedReplacement, PendingReadyOp> {
+    match op {
+        PendingReadyOp::Replacement {
+            result,
+            reason,
+            target_session_file,
+        } => Ok(PreparedReplacement {
+            result,
+            reason,
+            target_session_file,
+        }),
+        reload @ PendingReadyOp::Reload { .. } => Err(reload),
+    }
+}
+
+async fn abort_bridge_pending(
+    host: &ExtensionRuntimeSet,
+    runtime: &AgentSessionRuntime,
+    token: &str,
+) {
+    let Some(op) = host.abort_pending(token) else {
+        return;
+    };
+    match pending_replacement(op) {
+        Ok(prepared) => runtime.abort_prepared_replacement(prepared).await,
+        Err(op) => drop(op),
     }
 }
 

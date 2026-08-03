@@ -40,6 +40,7 @@
 use std::fmt::Debug;
 use std::io::{self, Write};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
@@ -1108,6 +1109,46 @@ struct DisplayPreferences {
 /// The caller owns the [`pi_tui::terminal::guard::TerminalGuard`] so it can
 /// outlive the runtime and write restore bytes on process exit even if the
 /// runtime itself panics.
+struct SessionRebindSignal {
+    next_generation: AtomicU64,
+    pending_generation: AtomicU64,
+    tx: mpsc::UnboundedSender<u64>,
+}
+
+impl SessionRebindSignal {
+    fn new(tx: mpsc::UnboundedSender<u64>) -> Self {
+        Self {
+            next_generation: AtomicU64::new(1),
+            pending_generation: AtomicU64::new(0),
+            tx,
+        }
+    }
+
+    fn begin(&self) {
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        self.pending_generation.store(generation, Ordering::Release);
+    }
+
+    fn pending(&self) -> u64 {
+        self.pending_generation.load(Ordering::Acquire)
+    }
+
+    fn signal_completion(&self) {
+        let generation = self.pending();
+        if generation != 0 {
+            let _ = self.tx.send(generation);
+        }
+    }
+
+    fn claim(&self, generation: u64) -> bool {
+        self.pending_generation
+            .compare_exchange(generation, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+}
+
+/// Interactive terminal event loop and rendered session state.
+#[allow(clippy::struct_excessive_bools)]
 pub struct InteractiveRuntime<W: Write, S: SessionHost> {
     tui: Tui<W>,
     input: TerminalInput,
@@ -1118,6 +1159,11 @@ pub struct InteractiveRuntime<W: Write, S: SessionHost> {
     input_state: InputState,
     events: EventSubscription,
     partial: watch::Receiver<Option<Arc<AssistantMessage>>>,
+    /// Generation handshake for bridge-driven replacement channel closure.
+    session_rebind_signal: Arc<SessionRebindSignal>,
+    session_rebind_rx: mpsc::UnboundedReceiver<u64>,
+    session_events_closed_for_rebind: bool,
+    session_rebind_channel_closed: bool,
     prompt_operations: PromptOperations,
     coalesce_deadline: Option<Instant>,
     /// When the current status phase began; `None` while no status is shown.
@@ -1370,6 +1416,8 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         let (theme_preview_tx, theme_preview_rx) = mpsc::unbounded_channel::<String>();
         let (extension_select_tx, extension_select_rx) = mpsc::unbounded_channel::<String>();
         let (extension_action_tx, extension_action_rx) = mpsc::unbounded_channel();
+        let (session_rebind_tx, session_rebind_rx) = mpsc::unbounded_channel();
+        let session_rebind_signal = Arc::new(SessionRebindSignal::new(session_rebind_tx));
 
         let editor = build_initial_editor(options, submit_tx.clone());
         let agent_dir = crate::core::config::get_agent_dir();
@@ -1385,6 +1433,10 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             mapper: super::input::InputMapper::with_keybindings(keybindings),
             input_state: InputState::new(options.double_escape),
             events,
+            session_rebind_signal,
+            session_rebind_rx,
+            session_events_closed_for_rebind: false,
+            session_rebind_channel_closed: false,
             partial,
             prompt_operations: PromptOperations::new(),
             coalesce_deadline: None,
@@ -1641,15 +1693,27 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                         self.exited = true;
                     }
                 }
-                ev = self.events.rx.recv() => {
+                ev = self.events.rx.recv(), if !self.session_events_closed_for_rebind => {
                     if let Some(event) = ev {
                         self.handle_session_event(&event);
                         if event_refreshes_footer(&event) {
                             self.refresh_footer().await;
                         }
+                    } else if self.session_rebind_signal.pending() != 0 {
+                        self.session_events_closed_for_rebind = true;
                     } else {
                         self.exit_kind = InteractiveExit::SessionEnded;
                         self.exited = true;
+                    }
+                }
+                generation = self.session_rebind_rx.recv(), if !self.session_rebind_channel_closed => {
+                    match generation {
+                        Some(generation) => {
+                            self.handle_session_rebind_completion(generation).await;
+                        }
+                        None => {
+                            self.session_rebind_channel_closed = true;
+                        }
                     }
                 }
                 extension_event = recv_extension_event(&mut self.extension_events) => {
@@ -1671,7 +1735,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 ), if self.pending_extension_dialog.as_ref().and_then(|dialog| dialog.deadline).is_some() => {
                     self.cancel_extension_dialog().await;
                 }
-                changed = self.partial.changed() => {
+                changed = self.partial.changed(), if !self.session_events_closed_for_rebind => {
                     if changed.is_ok() {
                         self.handle_partial_update();
                     }
@@ -4032,6 +4096,14 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         }
     }
 
+    async fn handle_session_rebind_completion(&mut self, generation: u64) {
+        if !self.session_rebind_signal.claim(generation) {
+            return;
+        }
+        self.rebind_session_channels().await;
+        self.session_events_closed_for_rebind = false;
+    }
+
     /// Rebind event/partial subscriptions and reload the transcript after a
     /// session replacement. Used by production rebind callback and tests.
     pub async fn rebind_session_channels(&mut self) {
@@ -6181,13 +6253,19 @@ pub async fn run_interactive_mode(
         })
         .await;
 
-    // Rebind callback keeps AgentSessionHost's cached session Arc current and
-    // binds the replacement session (emitting its stored
-    // session_start{new|resume|fork}).
+    // Resolve the startup theme from settings + the just-probed terminal
+    // polarity (replaces the static dark default).
+    options.theme = startup_theme(host_arc.as_ref(), options.terminal_theme);
+    let mut rt = InteractiveRuntime::new(tui, input, host_arc, &options);
+    // Bridge replacements dispose the old session from a task outside this
+    // loop. Mark that closure before teardown, then rebind after the host
+    // points at the replacement.
     {
-        let host_for_rebind = Arc::clone(&host_arc);
+        let host_for_rebind = Arc::clone(&rt.session);
+        let rebind_signal = Arc::clone(&rt.session_rebind_signal);
         runtime.set_rebind_session(Some(Arc::new(move |_session| {
             let host_for_rebind = Arc::clone(&host_for_rebind);
+            let rebind_signal = Arc::clone(&rebind_signal);
             Box::pin(async move {
                 host_for_rebind.refresh();
                 let _ = host_for_rebind
@@ -6197,14 +6275,16 @@ pub async fn run_interactive_mode(
                         ..Default::default()
                     })
                     .await;
+                rebind_signal.signal_completion();
             })
         })));
     }
-
-    // Resolve the startup theme from settings + the just-probed terminal
-    // polarity (replaces the static dark default).
-    options.theme = startup_theme(host_arc.as_ref(), options.terminal_theme);
-    let mut rt = InteractiveRuntime::new(tui, input, host_arc, &options);
+    {
+        let rebind_signal = Arc::clone(&rt.session_rebind_signal);
+        runtime.set_before_session_replacement(Some(Arc::new(move || {
+            rebind_signal.begin();
+        })));
+    }
 
     // Reset extension-owned UI on every session invalidation (ports upstream
     // `setBeforeSessionInvalidate(() => resetExtensionUI())`). The synchronous
@@ -6264,7 +6344,7 @@ pub async fn run_interactive_mode(
     drop(rt);
     runtime.set_rebind_session(None);
     runtime.set_before_session_invalidate(None);
-
+    runtime.set_before_session_replacement(None);
     // 7. Guard restores on Drop. Convert exit kind to a process exit code.
     let code = match exit {
         InteractiveExit::Clean
@@ -9990,6 +10070,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::naive_bytecount)]
     fn encode_osc0_set_title_uses_fixed_framing_and_valid_payload() {
         let hostile = "pi\x07\x1b]1;break\x07\u{009b}ok";
         let sequence = encode_osc0_set_title(hostile);

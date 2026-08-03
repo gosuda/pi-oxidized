@@ -226,6 +226,44 @@ pub enum HostEvent {
         /// Compact request payload.
         request: crate::protocol::SessionCompactRequest,
     },
+    /// Correlated `ctx.newSession` request awaiting [`HostClient::respond_new_session`].
+    NewSessionRequest {
+        /// Original host correlation id.
+        id: FrameId,
+        /// New-session request payload.
+        request: crate::protocol::SessionNewSessionRequest,
+    },
+    /// Correlated `ctx.fork` request awaiting [`HostClient::respond_fork`].
+    ForkRequest {
+        /// Original host correlation id.
+        id: FrameId,
+        /// Fork request payload.
+        request: crate::protocol::SessionForkRequest,
+    },
+    /// Correlated `ctx.navigateTree` request awaiting [`HostClient::respond_navigate_tree`].
+    NavigateTreeRequest {
+        /// Original host correlation id.
+        id: FrameId,
+        /// Navigate-tree request payload.
+        request: crate::protocol::SessionNavigateTreeRequest,
+    },
+    /// Correlated `ctx.switchSession` request awaiting [`HostClient::respond_switch_session`].
+    SwitchSessionRequest {
+        /// Original host correlation id.
+        id: FrameId,
+        /// Switch-session request payload.
+        request: crate::protocol::SessionSwitchSessionRequest,
+    },
+    /// Correlated `ctx.reload` request awaiting [`HostClient::respond_reload`].
+    ReloadRequest {
+        /// Original host correlation id.
+        id: FrameId,
+    },
+    /// Host finished a ready-gated replacement (`session.replacementReady`).
+    ReplacementReady {
+        /// Token previously returned on a replacement response.
+        token: String,
+    },
     /// Extension fire-and-forget UI control (`ui.setStatus`, …).
     UiControl(crate::protocol::UiControl),
     /// Untyped / unrecognized frame.
@@ -606,6 +644,225 @@ impl HostClient {
             },
         };
         self.send_frame(frame).await
+    }
+
+    /// Answer a correlated `session.newSession` request from the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns a payload or transport error when the response cannot be
+    /// encoded or sent.
+    pub async fn respond_new_session(
+        &self,
+        id: FrameId,
+        cancelled: bool,
+        token: Option<&str>,
+    ) -> HostResult<()> {
+        let payload = serde_json::to_value(crate::protocol::SessionNewSessionResponse {
+            cancelled,
+            replacement_token: token.map(str::to_owned),
+        })
+        .map_err(|error| {
+            HostClientError::Payload(format!("encode newSession response: {error}"))
+        })?;
+        self.send_frame(Frame {
+            id,
+            kind: FrameKind::Res,
+            method: crate::protocol::SESSION_NEW_SESSION_METHOD.to_owned(),
+            payload,
+        })
+        .await
+    }
+
+    /// Answer a correlated `session.fork` request from the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns a payload or transport error when the response cannot be
+    /// encoded or sent.
+    pub async fn respond_fork(
+        &self,
+        id: FrameId,
+        cancelled: bool,
+        selected_text: Option<&str>,
+        token: Option<&str>,
+    ) -> HostResult<()> {
+        let payload = serde_json::to_value(crate::protocol::SessionForkResponse {
+            cancelled,
+            selected_text: selected_text.map(str::to_owned),
+            replacement_token: token.map(str::to_owned),
+        })
+        .map_err(|error| HostClientError::Payload(format!("encode fork response: {error}")))?;
+        self.send_frame(Frame {
+            id,
+            kind: FrameKind::Res,
+            method: crate::protocol::SESSION_FORK_METHOD.to_owned(),
+            payload,
+        })
+        .await
+    }
+
+    /// Answer a correlated `session.switchSession` request from the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns a payload or transport error when the response cannot be
+    /// encoded or sent.
+    pub async fn respond_switch_session(
+        &self,
+        id: FrameId,
+        cancelled: bool,
+        token: Option<&str>,
+    ) -> HostResult<()> {
+        let payload = serde_json::to_value(crate::protocol::SessionSwitchSessionResponse {
+            cancelled,
+            replacement_token: token.map(str::to_owned),
+        })
+        .map_err(|error| {
+            HostClientError::Payload(format!("encode switchSession response: {error}"))
+        })?;
+        self.send_frame(Frame {
+            id,
+            kind: FrameKind::Res,
+            method: crate::protocol::SESSION_SWITCH_SESSION_METHOD.to_owned(),
+            payload,
+        })
+        .await
+    }
+
+    /// Answer a correlated `session.navigateTree` request from the host.
+    ///
+    /// Success sends the typed navigation result; failure sends an
+    /// `extension_error` frame the host surfaces to the extension.
+    ///
+    /// # Errors
+    ///
+    /// Returns a payload or transport error when the response cannot be
+    /// encoded or sent.
+    pub async fn respond_navigate_tree(
+        &self,
+        id: FrameId,
+        outcome: Result<crate::protocol::SessionNavigateTreeResponse, String>,
+    ) -> HostResult<()> {
+        let frame = match outcome {
+            Ok(result) => Frame {
+                id,
+                kind: FrameKind::Res,
+                method: crate::protocol::SESSION_NAVIGATE_TREE_METHOD.to_owned(),
+                payload: serde_json::to_value(result).map_err(|error| {
+                    HostClientError::Payload(format!("encode navigateTree response: {error}"))
+                })?,
+            },
+            Err(message) => Frame {
+                id,
+                kind: FrameKind::Error,
+                method: crate::protocol::SESSION_NAVIGATE_TREE_METHOD.to_owned(),
+                payload: serde_json::to_value(crate::protocol::ErrorPayload::new(
+                    "extension_error",
+                    &message,
+                ))
+                .map_err(|error| {
+                    HostClientError::Payload(format!("encode navigateTree error: {error}"))
+                })?,
+            },
+        };
+        self.send_frame(frame).await
+    }
+
+    /// Answer a correlated `session.reload` request from the host.
+    ///
+    /// Success sends an optional ready-gate token; failure sends an
+    /// `extension_error` frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns a payload or transport error when the response cannot be
+    /// encoded or sent.
+    pub async fn respond_reload(
+        &self,
+        id: FrameId,
+        outcome: Result<Option<&str>, String>,
+    ) -> HostResult<()> {
+        let frame = match outcome {
+            Ok(token) => Frame {
+                id,
+                kind: FrameKind::Res,
+                method: crate::protocol::SESSION_RELOAD_METHOD.to_owned(),
+                payload: serde_json::to_value(crate::protocol::SessionReloadResponse {
+                    replacement_token: token.map(str::to_owned),
+                })
+                .map_err(|error| {
+                    HostClientError::Payload(format!("encode reload response: {error}"))
+                })?,
+            },
+            Err(message) => Frame {
+                id,
+                kind: FrameKind::Error,
+                method: crate::protocol::SESSION_RELOAD_METHOD.to_owned(),
+                payload: serde_json::to_value(crate::protocol::ErrorPayload::new(
+                    "extension_error",
+                    &message,
+                ))
+                .map_err(|error| {
+                    HostClientError::Payload(format!("encode reload error: {error}"))
+                })?,
+            },
+        };
+        self.send_frame(frame).await
+    }
+
+    /// Reject a correlated replacement request because another is pending.
+    ///
+    /// # Errors
+    ///
+    /// Returns a payload or transport error when the error frame cannot be
+    /// encoded or sent.
+    pub async fn respond_replacement_busy(&self, id: FrameId, method: &str) -> HostResult<()> {
+        let payload = serde_json::to_value(crate::protocol::ErrorPayload {
+            code: "replacement_busy".to_owned(),
+            message: "session replacement in progress".to_owned(),
+            retryable: true,
+            data: None,
+        })
+        .map_err(|error| {
+            HostClientError::Payload(format!("encode replacement_busy error: {error}"))
+        })?;
+        self.send_frame(Frame {
+            id,
+            kind: FrameKind::Error,
+            method: method.to_owned(),
+            payload,
+        })
+        .await
+    }
+
+    /// Reject a correlated session request with a non-retryable `extension_error`.
+    ///
+    /// Used for unclaimed newSession/fork/switchSession (and any other session
+    /// method that needs a correlated failure without a typed success helper).
+    ///
+    /// # Errors
+    ///
+    /// Returns a payload or transport error when the error frame cannot be
+    /// encoded or sent.
+    pub async fn respond_session_error(
+        &self,
+        id: FrameId,
+        method: &str,
+        message: &str,
+    ) -> HostResult<()> {
+        let payload = serde_json::to_value(crate::protocol::ErrorPayload::new(
+            "extension_error",
+            message,
+        ))
+        .map_err(|error| HostClientError::Payload(format!("encode session error: {error}")))?;
+        self.send_frame(Frame {
+            id,
+            kind: FrameKind::Error,
+            method: method.to_owned(),
+            payload,
+        })
+        .await
     }
 
     /// Send a fire-and-forget event frame (id 0) with an open method string.
@@ -1141,6 +1398,7 @@ fn cancel_pending(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn dispatch(shared: &Shared, frame: Frame) {
     if let Err(e) = frame.validate(false) {
         let _ = shared.events.send(HostEvent::ProtocolError(e.to_string()));
@@ -1194,6 +1452,65 @@ fn dispatch(shared: &Shared, frame: Frame) {
                             id: frame.id,
                             request,
                         });
+                    }
+                    Err(_) => {
+                        let _ = shared.events.send(HostEvent::Raw(frame));
+                    }
+                }
+            } else if frame.method == crate::protocol::SESSION_NEW_SESSION_METHOD {
+                match from_payload::<crate::protocol::SessionNewSessionRequest>(&frame.payload) {
+                    Ok(request) => {
+                        let _ = shared.events.send(HostEvent::NewSessionRequest {
+                            id: frame.id,
+                            request,
+                        });
+                    }
+                    Err(_) => {
+                        let _ = shared.events.send(HostEvent::Raw(frame));
+                    }
+                }
+            } else if frame.method == crate::protocol::SESSION_FORK_METHOD {
+                match from_payload::<crate::protocol::SessionForkRequest>(&frame.payload) {
+                    Ok(request) => {
+                        let _ = shared.events.send(HostEvent::ForkRequest {
+                            id: frame.id,
+                            request,
+                        });
+                    }
+                    Err(_) => {
+                        let _ = shared.events.send(HostEvent::Raw(frame));
+                    }
+                }
+            } else if frame.method == crate::protocol::SESSION_NAVIGATE_TREE_METHOD {
+                match from_payload::<crate::protocol::SessionNavigateTreeRequest>(&frame.payload) {
+                    Ok(request) => {
+                        let _ = shared.events.send(HostEvent::NavigateTreeRequest {
+                            id: frame.id,
+                            request,
+                        });
+                    }
+                    Err(_) => {
+                        let _ = shared.events.send(HostEvent::Raw(frame));
+                    }
+                }
+            } else if frame.method == crate::protocol::SESSION_SWITCH_SESSION_METHOD {
+                match from_payload::<crate::protocol::SessionSwitchSessionRequest>(&frame.payload) {
+                    Ok(request) => {
+                        let _ = shared.events.send(HostEvent::SwitchSessionRequest {
+                            id: frame.id,
+                            request,
+                        });
+                    }
+                    Err(_) => {
+                        let _ = shared.events.send(HostEvent::Raw(frame));
+                    }
+                }
+            } else if frame.method == crate::protocol::SESSION_RELOAD_METHOD {
+                match from_payload::<crate::protocol::SessionReloadRequest>(&frame.payload) {
+                    Ok(_request) => {
+                        let _ = shared
+                            .events
+                            .send(HostEvent::ReloadRequest { id: frame.id });
                     }
                     Err(_) => {
                         let _ = shared.events.send(HostEvent::Raw(frame));
@@ -1290,6 +1607,17 @@ fn forward_event(shared: &Shared, frame: Frame) {
         match from_payload::<crate::protocol::UiControl>(&frame.payload) {
             Ok(control) => {
                 let _ = shared.events.send(HostEvent::UiControl(control));
+            }
+            Err(_) => {
+                let _ = shared.events.send(HostEvent::Raw(frame));
+            }
+        }
+    } else if method == crate::protocol::SESSION_REPLACEMENT_READY_METHOD {
+        match from_payload::<crate::protocol::SessionReplacementReadyEvent>(&frame.payload) {
+            Ok(ready) => {
+                let _ = shared
+                    .events
+                    .send(HostEvent::ReplacementReady { token: ready.token });
             }
             Err(_) => {
                 let _ = shared.events.send(HostEvent::Raw(frame));

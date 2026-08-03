@@ -31,8 +31,11 @@ import {
 	createExtensionRuntime,
 } from "@earendil-works/pi-coding-agent";
 import type {
+	BranchSummaryEntry,
+	SessionManagerSetupBridge,
 	Extension,
 	ExtensionActions,
+	ExtensionCommandContext,
 	ExtensionCommandContextActions,
 	ExtensionContextActions,
 	ExtensionFactory,
@@ -44,6 +47,7 @@ import type {
 	ToolDefinition,
 	Theme,
 } from "@earendil-works/pi-coding-agent";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { EventEmitter } from "node:events";
 import { validateToolArguments } from "@earendil-works/pi-ai/compat";
 import { parseStreamingJson } from "@earendil-works/pi-ai/utils/json-parse.ts";
@@ -100,6 +104,10 @@ export const ALL_EVENT_TYPES = [
 
 /** Hook timeout: mutable lifecycle hooks must respond within 30 s. */
 export const EXTENSION_HOOK_TIMEOUT_MS = 30_000;
+
+const STALE_COMMAND_CONTEXT_MESSAGE =
+	"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().";
+
 /** Input timeout: terminal-input consume/rewrite must respond within 4 ms. */
 export const EXTENSION_INPUT_TIMEOUT_MS = 4;
 /** Bound on the sequential terminal-input actor queue (plan capacity-64). */
@@ -525,6 +533,12 @@ export class ExtensionHost {
 	private readonly idleWaiters: Array<() => void> = [];
 	/** Extension statuses set via `ui.setStatus` (served to custom footers). */
 	private readonly extensionStatuses = new Map<string, string>();
+	/**
+	 * Per-command.execute replacement-token scope. Tokens are captured from
+	 * ready-gated session responses and emitted as `session.replacementReady`
+	 * only from that command's finally path — never via a global slot.
+	 */
+	private readonly commandScope = new AsyncLocalStorage<{ tokens: string[] }>();
 
 	constructor(stdin: ByteReadable, stdout: ByteWritable) {
 		const onFrame: FrameHandler = (frame) => this.onInbound(frame);
@@ -620,24 +634,6 @@ export class ExtensionHost {
 		const eventBus = createEventBus();
 		const errors: Array<{ path: string; error: string }> = [];
 
-		for (const [index, input] of opts.factories.entries()) {
-			const isNamed = typeof input !== "function";
-			const factory = isNamed ? input.factory : input;
-			const extensionPath = `<inline:${isNamed ? input.name : index + 1}>`;
-			try {
-				const ext = await loadExtensionFromFactory(
-					factory, opts.cwd, eventBus, this.runtime, extensionPath,
-				);
-				ext.hidden = isNamed ? input.hidden ?? false : false;
-				this.extensions.push(ext);
-			} catch (err) {
-				errors.push({
-					path: extensionPath,
-					error: err instanceof Error ? err.message : String(err),
-				});
-			}
-		}
-
 		for (const extPath of opts.extensionPaths) {
 			try {
 				const jiti = createExtensionJiti();
@@ -656,6 +652,24 @@ export class ExtensionHost {
 			} catch (err) {
 				errors.push({
 					path: extPath,
+					error: err instanceof Error ? err.message : String(err),
+				});
+			}
+		}
+
+		for (const [index, input] of opts.factories.entries()) {
+			const isNamed = typeof input !== "function";
+			const factory = isNamed ? input.factory : input;
+			const extensionPath = `<inline:${isNamed ? input.name : index + 1}>`;
+			try {
+				const ext = await loadExtensionFromFactory(
+					factory, opts.cwd, eventBus, this.runtime, extensionPath,
+				);
+				ext.hidden = isNamed ? input.hidden ?? false : false;
+				this.extensions.push(ext);
+			} catch (err) {
+				errors.push({
+					path: extensionPath,
 					error: err instanceof Error ? err.message : String(err),
 				});
 			}
@@ -1118,6 +1132,7 @@ export class ExtensionHost {
 		this.projectTrusted = projectTrusted;
 
 		const eventBus = createEventBus();
+		const loadedExtensions: Extension[] = [];
 
 		for (const extPath of paths) {
 			try {
@@ -1133,7 +1148,7 @@ export class ExtensionHost {
 				const ext = await loadExtensionFromFactory(
 					module as ExtensionFactory, cwd, eventBus, this.runtime, extPath,
 				);
-				this.extensions.push(ext);
+				loadedExtensions.push(ext);
 				loadedCount++;
 			} catch (err) {
 				errors.push({
@@ -1142,6 +1157,7 @@ export class ExtensionHost {
 				});
 			}
 		}
+		this.extensions.unshift(...loadedExtensions);
 
 		// Rebuild so newly loaded tools/providers/handlers bind without killing siblings.
 		this.rebuildRunner(cwd);
@@ -1157,16 +1173,20 @@ export class ExtensionHost {
 		const commandName = (p["command"] ?? p["name"]) as string;
 		const args = (p["args"] as string) ?? "";
 
-		const cmd = this.runner?.getCommand(commandName);
-		if (!cmd || !this.runner) {
+		const runner = this.runner;
+		const cmd = runner?.getCommand(commandName);
+		if (!runner || !cmd) {
 			await this.client.respondError(id, "command.execute" as Method, {
 				code: "not_found", message: `Command not found: ${commandName}`, retryable: false,
 			});
 			return;
 		}
 
+		const scope = { tokens: [] as string[] };
 		try {
-			await cmd.handler(args, this.runner.createCommandContext());
+			await this.commandScope.run(scope, async () => {
+				await cmd.handler(args, this.createCommandContext(runner));
+			});
 			await this.client.respond(id, "command.execute" as Method, { ok: true });
 		} catch (err) {
 			await this.client.respondError(id, "command.execute" as Method, {
@@ -1174,6 +1194,18 @@ export class ExtensionHost {
 				message: err instanceof Error ? err.message : String(err),
 				retryable: false,
 			});
+		} finally {
+			// After the command.execute res/error write: writeChain orders ready
+			// after the response and any session.command frames from the handler.
+			// Emit even when the handler threw after a successful replacement.
+			for (const token of scope.tokens) {
+				await this.client.send({
+					id: 0,
+					kind: "event",
+					method: "session.replacementReady",
+					payload: { token },
+				});
+			}
 		}
 	}
 
@@ -1710,14 +1742,14 @@ export class ExtensionHost {
 		if (this.runtime === undefined) return;
 		// Keep captured providers across rebuild: late-loaded extensions register
 		// via the live callback before rebuild, and pending is already drained.
-		this.runner = new ExtensionRunner(
+		const runner = new ExtensionRunner(
 			this.extensions,
 			this.runtime,
 			cwd,
 			this.createSessionManagerProxy(),
 			this.createModelRegistryProxy(),
 		);
-		this.runner.bindCore(
+		runner.bindCore(
 			this.createExtensionActions(),
 			this.createContextActions(),
 			{
@@ -1742,11 +1774,12 @@ export class ExtensionHost {
 				},
 			},
 		);
-		this.runner.bindCommandContext(this.createCommandContextActions());
-		this.runner.setUIContext(this.createUIContext(), "tui");
-		this.runner.onError((error) => {
+		runner.bindCommandContext(this.createCommandContextActions(runner));
+		runner.setUIContext(this.createUIContext(), "tui");
+		runner.onError((error) => {
 			this.emitExtensionError(error.extensionPath, error.event, error.error);
 		});
+		this.runner = runner;
 	}
 
 	/** Full RegistrySnapshotWire for Rust HostExtensionRunner::load. */
@@ -1782,6 +1815,7 @@ export class ExtensionHost {
 			name: cmd.invocationName,
 			description: cmd.description,
 			source: cmd.sourceInfo.path,
+			sourceInfo: cmd.sourceInfo,
 		}));
 
 		const shortcuts: Array<Record<string, unknown>> = [];
@@ -2410,17 +2444,33 @@ export class ExtensionHost {
 	 * `ReplacedSessionContext` built from `createCommandContext()` with
 	 * working `sendMessage` / `sendUserMessage` bridged to Rust.
 	 */
-	private createCommandContextActions(): ExtensionCommandContextActions {
+	private createCommandContextActions(
+		ownerRunner: ExtensionRunner,
+		markStale?: () => void,
+		assertFresh?: () => void,
+	): ExtensionCommandContextActions {
 		const self = this;
+		/**
+		 * Per-command staleness guard: reject when this command context was marked
+		 * stale at token capture, or when the active runner has been replaced
+		 * since bind. Lives inside each action closure so methods captured before
+		 * token capture still recheck on call — without a whole-runner
+		 * invalidate() or generation registry.
+		 */
+		const guardActive = (): void => {
+			if (assertFresh !== undefined) {
+				assertFresh();
+				return;
+			}
+			if (self.runner !== ownerRunner) {
+				throw new Error(STALE_COMMAND_CONTEXT_MESSAGE);
+			}
+		};
 		const cancelledOf = (frame: Frame): boolean =>
 			(frame.payload as Record<string, unknown>)["cancelled"] === true;
 
 		const createReplacedSessionContext = (runner: ExtensionRunner): ReplacedSessionContext => {
-			const base = runner.createCommandContext();
-			const context = Object.defineProperties(
-				{},
-				Object.getOwnPropertyDescriptors(base),
-			) as ReplacedSessionContext;
+			const context = self.createCommandContext(runner) as ReplacedSessionContext;
 			context.sendMessage = async (message, options) => {
 				await self.sendSessionCommand({
 					action: "sendMessage",
@@ -2449,36 +2499,63 @@ export class ExtensionHost {
 			return { cancelled };
 		};
 
+		const captureReplacementToken = (
+			payload: Record<string, unknown>,
+			cancelled: boolean,
+		): void => {
+			if (cancelled) return;
+			const token = payload["replacementToken"];
+			if (typeof token !== "string") return;
+			// Authors must await replacement calls so the token stays scoped to the
+			// initiating command.execute. Fire-and-forget drops the token and Rust
+			// timeout-aborts the pending replacement.
+			self.commandScope.getStore()?.tokens.push(token);
+			markStale?.();
+		};
+
 		return {
 			waitForIdle: () => {
+				guardActive();
 				if (self.sessionState.isIdle) return Promise.resolve();
 				return new Promise<void>((resolve) => {
 					self.idleWaiters.push(resolve);
 				});
 			},
 			newSession: async (options) => {
+				guardActive();
 				const frame = await self.client.request(
-					"session.newSession" as Method,
+					"session.newSession",
 					{ parentSession: options?.parentSession },
 					{ timeoutMs: EXTENSION_HOOK_TIMEOUT_MS },
 				);
+				const payload = frame.payload as Record<string, unknown>;
 				const cancelled = cancelledOf(frame);
+				captureReplacementToken(payload, cancelled);
 				if (!cancelled && options?.setup !== undefined) {
 					await options.setup(self.createSessionManagerProxy());
 				}
 				return afterReplacement(cancelled, options?.withSession);
 			},
 			fork: async (entryId, options) => {
+				guardActive();
 				const frame = await self.client.request(
-					"session.fork" as Method,
+					"session.fork",
 					{ entryId, position: options?.position },
 					{ timeoutMs: EXTENSION_HOOK_TIMEOUT_MS },
 				);
-				return afterReplacement(cancelledOf(frame), options?.withSession);
+				const payload = frame.payload as Record<string, unknown>;
+				const cancelled = cancelledOf(frame);
+				captureReplacementToken(payload, cancelled);
+				const result = await afterReplacement(cancelled, options?.withSession);
+				return {
+					cancelled: result.cancelled,
+					selectedText: payload["selectedText"] as string | undefined,
+				};
 			},
 			navigateTree: async (targetId, options) => {
+				guardActive();
 				const frame = await self.client.request(
-					"session.navigateTree" as Method,
+					"session.navigateTree",
 					{
 						targetId,
 						summarize: options?.summarize,
@@ -2488,24 +2565,73 @@ export class ExtensionHost {
 					},
 					{ timeoutMs: EXTENSION_HOOK_TIMEOUT_MS },
 				);
-				return { cancelled: cancelledOf(frame) };
+				const payload = frame.payload as Record<string, unknown>;
+				return {
+					cancelled: cancelledOf(frame),
+					editorText: payload["editorText"] as string | undefined,
+					aborted: payload["aborted"] as boolean | undefined,
+					summaryEntry: payload["summaryEntry"] as BranchSummaryEntry | undefined,
+				};
 			},
 			switchSession: async (sessionPath, options) => {
+				guardActive();
 				const frame = await self.client.request(
-					"session.switchSession" as Method,
+					"session.switchSession",
 					{ sessionPath },
 					{ timeoutMs: EXTENSION_HOOK_TIMEOUT_MS },
 				);
-				return afterReplacement(cancelledOf(frame), options?.withSession);
+				const payload = frame.payload as Record<string, unknown>;
+				const cancelled = cancelledOf(frame);
+				captureReplacementToken(payload, cancelled);
+				return afterReplacement(cancelled, options?.withSession);
 			},
 			reload: async () => {
-				await self.client.request(
-					"session.reload" as Method,
+				guardActive();
+				const frame = await self.client.request(
+					"session.reload",
 					{},
 					{ timeoutMs: EXTENSION_HOOK_TIMEOUT_MS },
 				);
+				const payload = frame.payload as Record<string, unknown>;
+				// Reload has no cancelled flag; capture any token and strip from extension view.
+				captureReplacementToken(payload, false);
 			},
 		};
+	}
+
+	private createCommandContext(runner: ExtensionRunner): ExtensionCommandContext {
+		let stale = false;
+		const guard = (): void => {
+			if (stale || this.runner !== runner) {
+				throw new Error(STALE_COMMAND_CONTEXT_MESSAGE);
+			}
+		};
+		// Pass guard into action closures so pre-captured methods recheck stale.
+		const actions = this.createCommandContextActions(runner, () => {
+			stale = true;
+		}, guard);
+
+		return new Proxy(runner.createCommandContext(), {
+			get(target, property, receiver) {
+				guard();
+				switch (property) {
+					case "waitForIdle":
+						return actions.waitForIdle;
+					case "newSession":
+						return actions.newSession;
+					case "fork":
+						return actions.fork;
+					case "navigateTree":
+						return actions.navigateTree;
+					case "switchSession":
+						return actions.switchSession;
+					case "reload":
+						return actions.reload;
+					default:
+						return Reflect.get(target, property, receiver);
+				}
+			},
+		});
 	}
 
 	// Honest narrow bridge: SessionManager is a 1600-line reference class the
@@ -2515,7 +2641,7 @@ export class ExtensionHost {
 	// The uncorrelated wire therefore cannot support ID-dependent chaining.
 	// Its one mirrored getter is `getSessionName`. Every other SessionManager
 	// method fails explicitly instead of silently no-op-ing.
-	private createSessionManagerProxy(): ConstructorParameters<typeof ExtensionRunner>[3] {
+	private createSessionManagerProxy(): SessionManagerSetupBridge {
 		const self = this;
 		const unsupported = (method: string) => () => {
 			throw new Error(
@@ -2540,7 +2666,7 @@ export class ExtensionHost {
 						return unsupported(prop);
 				}
 			},
-		}) as unknown as ConstructorParameters<typeof ExtensionRunner>[3];
+		}) as SessionManagerSetupBridge;
 	}
 
 	// Escape hatch: ModelRegistry wraps a runtime the host doesn't own.

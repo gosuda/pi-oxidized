@@ -5,6 +5,14 @@
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
+/** Minimal structural setup surface needed by this fixture's `setup` callback. */
+type SessionManagerSetup = {
+	appendCustomEntry(customType: string, data?: unknown): Promise<void>;
+	appendSessionInfo(name: string): Promise<void>;
+	getSessionName(): string | undefined;
+	getEntries(): unknown;
+};
+
 export default function replacedSessionExtension(pi: ExtensionAPI): void {
 	pi.registerCommand("replacedSessionProbe", {
 		description: "Exercise newSession setup + withSession + sendMessage/sendUserMessage",
@@ -15,7 +23,7 @@ export default function replacedSessionExtension(pi: ExtensionAPI): void {
 			const setupOrder: string[] = [];
 			const result = await ctx.newSession({
 				parentSession: "parent-1",
-				setup: async (sessionManager) => {
+				setup: async (sessionManager: SessionManagerSetup) => {
 					setupOrder.push("setup");
 					// sessionManager is the narrow bridge proxy.
 					report["setupReceived"] = sessionManager !== undefined;
@@ -27,9 +35,8 @@ export default function replacedSessionExtension(pi: ExtensionAPI): void {
 
 					// This is the one SessionManager getter mirrored by the host.
 					report["setupSessionName"] = sessionManager.getSessionName();
-					// Unsupported method must throw at runtime (the narrow
-					// bridge proxy rejects it); the type is the full
-					// SessionManager surface, so no type error is expected.
+					// Unsupported methods are on the minimal bridge surface for probe
+					// coverage but throw at runtime when invoked.
 					try {
 						sessionManager.getEntries();
 						report["unsupportedThrew"] = false;

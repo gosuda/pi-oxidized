@@ -20,19 +20,22 @@
 //!    `session_start{new|resume|fork}` after the old host received its
 //!    `session_shutdown` in step 4.
 
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock, Weak};
 
 use futures::future::BoxFuture;
-use tokio::sync::Mutex as AsyncMutex;
+use pi_ai::Model;
+use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
 
 use crate::core::agent_session::events::{
     AgentSessionEvent, SessionBeforeForkPosition, SessionBeforeSwitchReason, SessionShutdownReason,
     SessionStartReason,
 };
 use crate::core::agent_session::{AgentSession, ReplacedSessionContext};
+use crate::core::agent_session_services::ExtensionFlagValue;
 use crate::core::session_transfer::SessionImportFileNotFoundError;
 use crate::core::sessions::{
     NewSessionOptions as SessionManagerNewSessionOptions, SessionError, SessionManager,
@@ -74,6 +77,12 @@ pub struct CreateAgentSessionRuntimeOptions {
     pub start_reason: SessionStartReason,
     /// Previous session file (for `session_start.previousSessionFile`).
     pub previous_session_file: Option<String>,
+    /// Current model to preserve for a replacement, when available.
+    pub model: Option<Model>,
+    /// Live extension flag values snapshotted from the current session's
+    /// runner before teardown. Only Bool/String values are carried; other
+    /// JSON types are rejected at snapshot time.
+    pub extension_flag_values: BTreeMap<String, ExtensionFlagValue>,
 }
 
 /// Result returned by [`CreateAgentSessionRuntimeFactory::create`].
@@ -119,6 +128,9 @@ pub type RebindSessionCallback =
 /// before the old session is invalidated (host UI teardown that must not
 /// yield to the event loop).
 pub type BeforeSessionInvalidateCallback = Arc<dyn Fn() + Send + Sync>;
+/// Synchronous callback invoked immediately before a bridge replacement starts
+/// tearing down the current session.
+pub type BeforeSessionReplacementCallback = Arc<dyn Fn() + Send + Sync>;
 
 // ---------------------------------------------------------------------------
 // Outcomes / options
@@ -164,6 +176,21 @@ pub struct SwitchSessionOptions {
     pub cwd_override: Option<String>,
 }
 
+/// Result of preparing a replacement without tearing down the current session.
+pub(crate) enum PrepareReplacementOutcome {
+    /// A cancellable extension hook rejected the operation.
+    Cancelled,
+    /// A replacement is ready to install or abort.
+    Prepared(PreparedReplacement),
+}
+
+/// A fully constructed replacement that has not touched the current session.
+pub(crate) struct PreparedReplacement {
+    pub(crate) result: CreateAgentSessionRuntimeResult,
+    pub(crate) reason: SessionShutdownReason,
+    pub(crate) target_session_file: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -200,6 +227,9 @@ pub enum AgentSessionRuntimeError {
     /// Factory failed to build the replacement runtime.
     #[error("runtime replacement failed: {0}")]
     Factory(String),
+    /// Another replacement is waiting for its host command to finish.
+    #[error("session replacement in progress")]
+    ReplacementBusy,
 }
 
 // ---------------------------------------------------------------------------
@@ -225,8 +255,13 @@ pub struct AgentSessionRuntime {
     model_fallback_message: RwLock<Option<String>>,
     rebind_session: RwLock<Option<RebindSessionCallback>>,
     before_session_invalidate: RwLock<Option<BeforeSessionInvalidateCallback>>,
+    before_session_replacement: RwLock<Option<BeforeSessionReplacementCallback>>,
+    /// Weak self used to link every current session back to this runtime.
+    self_handle: StdMutex<Option<Weak<AgentSessionRuntime>>>,
     /// Serializes all replacement operations (new / switch / fork / import / dispose).
     replacement_lock: Arc<AsyncMutex<()>>,
+    /// Excludes old-session tree navigation while teardown and apply run.
+    lifecycle_gate: AsyncRwLock<()>,
     #[cfg(test)]
     import_commit_gate: RwLock<Option<Arc<tokio::sync::Semaphore>>>,
     #[cfg(test)]
@@ -254,7 +289,10 @@ impl AgentSessionRuntime {
             model_fallback_message: RwLock::new(model_fallback_message),
             rebind_session: RwLock::new(None),
             before_session_invalidate: RwLock::new(None),
+            before_session_replacement: RwLock::new(None),
+            self_handle: StdMutex::new(None),
             replacement_lock: Arc::new(AsyncMutex::new(())),
+            lifecycle_gate: AsyncRwLock::new(()),
             #[cfg(test)]
             import_commit_gate: RwLock::new(None),
             #[cfg(test)]
@@ -268,6 +306,39 @@ impl AgentSessionRuntime {
     #[must_use]
     pub fn session(&self) -> Arc<AgentSession> {
         self.read_session()
+    }
+
+    /// Link this runtime to its current session and all future replacements.
+    pub fn link(self: &Arc<Self>) {
+        let handle = Arc::downgrade(self);
+        *self
+            .self_handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle.clone());
+        self.read_session().set_runtime_handle(handle);
+    }
+
+    /// Replacement mutex used to make prepare plus facade-slot install atomic.
+    pub(crate) fn replacement_lock(&self) -> Arc<AsyncMutex<()>> {
+        Arc::clone(&self.replacement_lock)
+    }
+
+    /// Lifecycle gate used by tree navigation to exclude replacement teardown.
+    pub(crate) fn lifecycle_gate(&self) -> &AsyncRwLock<()> {
+        &self.lifecycle_gate
+    }
+
+    /// Reject operations while the attached facade owns a pending replacement.
+    pub(crate) fn check_no_pending(&self) -> Result<(), AgentSessionRuntimeError> {
+        let busy = self
+            .read_session()
+            .host_extension_runner()
+            .is_some_and(|host| host.is_pending_busy());
+        if busy {
+            Err(AgentSessionRuntimeError::ReplacementBusy)
+        } else {
+            Ok(())
+        }
     }
 
     /// Effective cwd.
@@ -321,6 +392,15 @@ impl AgentSessionRuntime {
             *g = callback;
         }
     }
+    /// Set the callback invoked only for bridge replacement finalization.
+    pub fn set_before_session_replacement(
+        &self,
+        callback: Option<BeforeSessionReplacementCallback>,
+    ) {
+        if let Ok(mut g) = self.before_session_replacement.write() {
+            *g = callback;
+        }
+    }
 
     // ----- Replacement operations ----------------------------------------
 
@@ -335,13 +415,33 @@ impl AgentSessionRuntime {
         options: SwitchSessionOptions,
     ) -> Result<SwitchOutcome, AgentSessionRuntimeError> {
         let _guard = self.replacement_lock.lock().await;
+        match self.prepare_switch_session(session_path, options).await? {
+            PrepareReplacementOutcome::Cancelled => Ok(SwitchOutcome { cancelled: true }),
+            PrepareReplacementOutcome::Prepared(prepared) => {
+                self.finalize_replacement_locked(prepared).await;
+                Ok(SwitchOutcome { cancelled: false })
+            }
+        }
+    }
+
+    /// Prepare a session switch without tearing down the current session.
+    ///
+    /// The caller must hold [`Self::replacement_lock`] until it installs the
+    /// prepared operation in the facade's pending slot.
+    pub(crate) async fn prepare_switch_session(
+        &self,
+        session_path: &str,
+        options: SwitchSessionOptions,
+    ) -> Result<PrepareReplacementOutcome, AgentSessionRuntimeError> {
+        self.check_no_pending()?;
         let before = self
             .emit_before_switch(SessionStartReason::Resume, Some(session_path))
             .await;
         if before.cancelled {
-            return Ok(before);
+            return Ok(PrepareReplacementOutcome::Cancelled);
         }
 
+        let extension_flag_values = self.snapshot_extension_flag_values()?;
         let previous_session_file = self.session_file_for_teardown().await;
         let session_manager =
             SessionManager::open(session_path, None, options.cwd_override.as_deref())?;
@@ -351,21 +451,20 @@ impl AgentSessionRuntime {
         let result = self
             .factory
             .create(CreateAgentSessionRuntimeOptions {
-                cwd: new_cwd.clone(),
+                cwd: new_cwd,
                 agent_dir: self.agent_dir(),
                 session_manager,
+                model: Some(self.read_session().model()),
                 start_reason: SessionStartReason::Resume,
                 previous_session_file,
+                extension_flag_values,
             })
             .await?;
-        self.teardown_current(
-            SessionShutdownReason::Resume,
-            target_session_file.as_deref(),
-        )
-        .await;
-        self.apply(result);
-        self.finish_session_replacement(None).await;
-        Ok(SwitchOutcome { cancelled: false })
+        Ok(PrepareReplacementOutcome::Prepared(PreparedReplacement {
+            result,
+            reason: SessionShutdownReason::Resume,
+            target_session_file,
+        }))
     }
 
     /// Start a new session in the current cwd.
@@ -378,11 +477,30 @@ impl AgentSessionRuntime {
         options: NewSessionOptions,
     ) -> Result<SwitchOutcome, AgentSessionRuntimeError> {
         let _guard = self.replacement_lock.lock().await;
+        match self.prepare_new_session(options).await? {
+            PrepareReplacementOutcome::Cancelled => Ok(SwitchOutcome { cancelled: true }),
+            PrepareReplacementOutcome::Prepared(prepared) => {
+                self.finalize_replacement_locked(prepared).await;
+                Ok(SwitchOutcome { cancelled: false })
+            }
+        }
+    }
+
+    /// Prepare a new session without tearing down the current session.
+    ///
+    /// The caller must hold [`Self::replacement_lock`] until it installs the
+    /// prepared operation in the facade's pending slot.
+    pub(crate) async fn prepare_new_session(
+        &self,
+        options: NewSessionOptions,
+    ) -> Result<PrepareReplacementOutcome, AgentSessionRuntimeError> {
+        self.check_no_pending()?;
         let before = self.emit_before_switch(SessionStartReason::New, None).await;
         if before.cancelled {
-            return Ok(before);
+            return Ok(PrepareReplacementOutcome::Cancelled);
         }
 
+        let extension_flag_values = self.snapshot_extension_flag_values()?;
         let previous_session_file = self.session_file_for_teardown().await;
         let cwd = self.cwd();
         let session_manager = {
@@ -413,18 +531,20 @@ impl AgentSessionRuntime {
         let result = self
             .factory
             .create(CreateAgentSessionRuntimeOptions {
-                cwd: cwd.clone(),
+                cwd,
                 agent_dir: self.agent_dir(),
                 session_manager,
+                model: Some(self.read_session().model()),
                 start_reason: SessionStartReason::New,
                 previous_session_file,
+                extension_flag_values,
             })
             .await?;
-        self.teardown_current(SessionShutdownReason::New, target_session_file.as_deref())
-            .await;
-        self.apply(result);
-        self.finish_session_replacement(None).await;
-        Ok(SwitchOutcome { cancelled: false })
+        Ok(PrepareReplacementOutcome::Prepared(PreparedReplacement {
+            result,
+            reason: SessionShutdownReason::New,
+            target_session_file,
+        }))
     }
 
     /// Fork the session at `entry_id`.
@@ -449,12 +569,35 @@ impl AgentSessionRuntime {
         position: ForkPosition,
     ) -> Result<ForkOutcome, AgentSessionRuntimeError> {
         let _guard = self.replacement_lock.lock().await;
-        let before = self.emit_before_fork(entry_id, position).await;
-        if before.cancelled {
-            return Ok(ForkOutcome {
+        let (outcome, selected_text) = self.prepare_fork(entry_id, position).await?;
+        match outcome {
+            PrepareReplacementOutcome::Cancelled => Ok(ForkOutcome {
                 cancelled: true,
                 selected_text: None,
-            });
+            }),
+            PrepareReplacementOutcome::Prepared(prepared) => {
+                self.finalize_replacement_locked(prepared).await;
+                Ok(ForkOutcome {
+                    cancelled: false,
+                    selected_text,
+                })
+            }
+        }
+    }
+
+    /// Prepare a fork without tearing down the current session.
+    ///
+    /// The caller must hold [`Self::replacement_lock`] until it installs the
+    /// prepared operation in the facade's pending slot.
+    pub(crate) async fn prepare_fork(
+        &self,
+        entry_id: &str,
+        position: ForkPosition,
+    ) -> Result<(PrepareReplacementOutcome, Option<String>), AgentSessionRuntimeError> {
+        self.check_no_pending()?;
+        let before = self.emit_before_fork(entry_id, position).await;
+        if before.cancelled {
+            return Ok((PrepareReplacementOutcome::Cancelled, None));
         }
 
         let (target_leaf_id, selected_text) = {
@@ -481,11 +624,10 @@ impl AgentSessionRuntime {
             }
         };
 
+        let extension_flag_values = self.snapshot_extension_flag_values()?;
         let previous_session_file = self.session_file_for_teardown().await;
         let cwd = self.cwd();
         let agent_dir = self.agent_dir();
-
-        // Build the new session manager.
         let session = self.read_session();
         let sm = session.session_manager();
         let sm_guard = sm.lock().await;
@@ -518,10 +660,8 @@ impl AgentSessionRuntime {
                 }
             }
         } else {
-            // In-memory: cannot extract the mutated manager from the live Arc.
-            // Fall back to a fresh in-memory manager with parent linkage.
             let opts = match target_leaf_id.as_deref() {
-                Some(_) => None, // branch state lost for in-memory (documented)
+                Some(_) => None,
                 None => Some(SessionManagerNewSessionOptions {
                     id: None,
                     parent_session: previous_session_file.clone(),
@@ -540,18 +680,49 @@ impl AgentSessionRuntime {
                 cwd: new_cwd,
                 agent_dir,
                 session_manager,
+                model: Some(self.read_session().model()),
                 start_reason: SessionStartReason::Fork,
                 previous_session_file,
+                extension_flag_values,
             })
             .await?;
-        self.teardown_current(SessionShutdownReason::Fork, target_session_file.as_deref())
+        Ok((
+            PrepareReplacementOutcome::Prepared(PreparedReplacement {
+                result,
+                reason: SessionShutdownReason::Fork,
+                target_session_file,
+            }),
+            selected_text,
+        ))
+    }
+
+    /// Finalize a prepared replacement after its host command reports ready.
+    pub(crate) async fn finalize_replacement(&self, prepared: PreparedReplacement) {
+        let _guard = self.replacement_lock.lock().await;
+        if let Ok(callback) = self.before_session_replacement.read()
+            && let Some(callback) = callback.clone()
+        {
+            callback();
+        }
+        self.finalize_replacement_locked(prepared).await;
+    }
+
+    async fn finalize_replacement_locked(&self, prepared: PreparedReplacement) {
+        let _lifecycle_guard = self.lifecycle_gate.write().await;
+        let PreparedReplacement {
+            result,
+            reason,
+            target_session_file,
+        } = prepared;
+        self.teardown_current(reason, target_session_file.as_deref())
             .await;
         self.apply(result);
         self.finish_session_replacement(None).await;
-        Ok(ForkOutcome {
-            cancelled: false,
-            selected_text,
-        })
+    }
+
+    /// Dispose a prepared target without changing the current session.
+    pub(crate) async fn abort_prepared_replacement(&self, prepared: PreparedReplacement) {
+        prepared.result.session.dispose().await;
     }
 
     /// Import a JSONL session file and switch to it.
@@ -566,6 +737,7 @@ impl AgentSessionRuntime {
         cwd_override: Option<&str>,
     ) -> Result<SwitchOutcome, AgentSessionRuntimeError> {
         let replacement_guard = Arc::clone(&self.replacement_lock).lock_owned().await;
+        self.check_no_pending()?;
         let resolved = crate::core::config::resolve_path(input_path)
             .to_string_lossy()
             .into_owned();
@@ -747,6 +919,32 @@ impl AgentSessionRuntime {
         self.read_session().session_file().await
     }
 
+    /// Snapshot live extension flag values from the current session's runner.
+    ///
+    /// Only JSON `Bool` and `String` values are converted to
+    /// [`ExtensionFlagValue`]; `Null`, `Number`, `Array`, and `Object` are
+    /// rejected with [`AgentSessionRuntimeError::Factory`] so the caller
+    /// aborts before tearing down the current session.
+    fn snapshot_extension_flag_values(
+        &self,
+    ) -> Result<BTreeMap<String, ExtensionFlagValue>, AgentSessionRuntimeError> {
+        let live = self.read_session().hooks().runner().get_flag_values();
+        let mut snapshot = BTreeMap::new();
+        for (name, value) in live {
+            let converted = match value {
+                serde_json::Value::Bool(b) => ExtensionFlagValue::Bool(b),
+                serde_json::Value::String(s) => ExtensionFlagValue::Str(s),
+                other => {
+                    return Err(AgentSessionRuntimeError::Factory(format!(
+                        "extension flag \"--{name}\" has unsupported live value type: {other}"
+                    )));
+                }
+            };
+            snapshot.insert(name, converted);
+        }
+        Ok(snapshot)
+    }
+
     /// Emit `session_before_switch` (cancellable) when handlers are registered.
     async fn emit_before_switch(
         &self,
@@ -826,8 +1024,9 @@ impl AgentSessionRuntime {
                 target_session_file: target_session_file.map(str::to_owned),
             })
             .await;
-        // Pre-invalidate callback (host UI teardown, sync). Falls back to the
-        // session-bound shutdown handler when no runtime-level callback exists.
+        // Pre-invalidate callbacks reset mode-owned UI during replacement.
+        // The session shutdown handler is a process-exit request, so only
+        // invoke it for final runtime disposal.
         let runtime_cb = self
             .before_session_invalidate
             .read()
@@ -835,7 +1034,7 @@ impl AgentSessionRuntime {
             .and_then(|g| g.clone());
         if let Some(cb) = runtime_cb {
             cb();
-        } else {
+        } else if reason == SessionShutdownReason::Quit {
             session.invoke_extension_shutdown_handler();
         }
         // dispose always awaits host process reap exactly once when bound.
@@ -844,6 +1043,14 @@ impl AgentSessionRuntime {
 
     /// Apply the factory result: swap session + services + diagnostics.
     fn apply(&self, result: CreateAgentSessionRuntimeResult) {
+        let runtime_handle = self
+            .self_handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(handle) = runtime_handle {
+            result.session.set_runtime_handle(handle);
+        }
         if let Ok(mut g) = self.session.write() {
             *g = result.session;
         }
@@ -890,6 +1097,7 @@ impl AgentSessionRuntime {
         session_dir: &str,
         cwd_override: Option<&str>,
     ) -> Result<CreateAgentSessionRuntimeResult, AgentSessionRuntimeError> {
+        let extension_flag_values = self.snapshot_extension_flag_values()?;
         let session_manager = SessionManager::open(session_file, Some(session_dir), cwd_override)?;
         self.assert_cwd(&session_manager)?;
         let new_cwd = session_manager.get_cwd().to_owned();
@@ -898,8 +1106,10 @@ impl AgentSessionRuntime {
                 cwd: new_cwd.clone(),
                 agent_dir: self.agent_dir(),
                 session_manager,
+                model: Some(self.read_session().model()),
                 start_reason: SessionStartReason::Resume,
                 previous_session_file: self.session_file_for_teardown().await,
+                extension_flag_values,
             })
             .await
     }
@@ -1149,23 +1359,27 @@ pub async fn create_agent_session_runtime(
     cwd: String,
     agent_dir: String,
     session_manager: SessionManager,
-) -> Result<AgentSessionRuntime, AgentSessionRuntimeError> {
+) -> Result<Arc<AgentSessionRuntime>, AgentSessionRuntimeError> {
     let result = factory
         .create(CreateAgentSessionRuntimeOptions {
             cwd,
             agent_dir,
             session_manager,
+            model: None,
             start_reason: SessionStartReason::Startup,
             previous_session_file: None,
+            extension_flag_values: BTreeMap::new(),
         })
         .await?;
-    Ok(AgentSessionRuntime::new(
+    let runtime = Arc::new(AgentSessionRuntime::new(
         result.session,
         result.services,
         factory,
         result.diagnostics,
         result.model_fallback_message,
-    ))
+    ));
+    runtime.link();
+    Ok(runtime)
 }
 
 // ---------------------------------------------------------------------------

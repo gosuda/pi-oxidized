@@ -60,10 +60,40 @@ use super::types::{
     RpcSessionTreeNode, RpcSlashCommand, SessionStats, StreamingBehavior,
 };
 
-/// Serialize a value as a JSONL line, falling back to an empty string on
-/// serialization failure (our types are infallible serializers).
+/// Serialize one RPC wire value, normalizing native compact user text to the
+/// block array used by the TypeScript authority.
 fn to_jsonl<T: Serialize>(value: &T) -> String {
-    serialize_json_line(value).unwrap_or_default()
+    let Ok(mut wire) = serde_json::to_value(value) else {
+        return String::new();
+    };
+    normalize_user_message_content(&mut wire);
+    serialize_json_line(&wire).unwrap_or_default()
+}
+
+fn normalize_user_message_content(value: &mut Value) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                normalize_user_message_content(value);
+            }
+        }
+        Value::Object(fields) => {
+            if fields.get("details").is_some_and(Value::is_null) {
+                fields.remove("details");
+            }
+            if fields.get("role").and_then(Value::as_str) == Some("user")
+                && let Some(content) = fields.get_mut("content")
+                && let Value::String(text) = content
+            {
+                let text = std::mem::take(text);
+                *content = serde_json::json!([{ "type": "text", "text": text }]);
+            }
+            for value in fields.values_mut() {
+                normalize_user_message_content(value);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1630,6 +1660,8 @@ mod tests {
         set_thinking_result: bool,
         compact_result: Option<Result<CompactionResult, String>>,
         bash_result: Option<Result<BashResult, String>>,
+        // Tri-state: None = execute_bash uncalled; Some(None) = id omitted/null; Some(Some) = id value.
+        #[allow(clippy::option_option)]
         bash_id: Option<Option<String>>,
         fork_outcome: Result<ForkOutcome, String>,
         leaf_id: Option<String>,
@@ -2997,6 +3029,30 @@ mod tests {
     // -----------------------------------------------------------------------
     // ExtensionErrorOutput serialization
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn rpc_jsonl_normalizes_user_text_to_content_blocks() {
+        let line = to_jsonl(&serde_json::json!({
+            "type": "message_start",
+            "message": {
+                "role": "user",
+                "content": "hello",
+                "timestamp": 1
+            }
+        }));
+        let parsed: Value = serde_json::from_str(&line).expect("valid RPC JSONL");
+        assert_eq!(
+            parsed["message"]["content"],
+            serde_json::json!([{ "type": "text", "text": "hello" }])
+        );
+
+        let line = to_jsonl(&serde_json::json!({
+            "type": "tool_execution_end",
+            "result": { "content": [], "details": null }
+        }));
+        let parsed: Value = serde_json::from_str(&line).expect("valid RPC JSONL");
+        assert!(parsed["result"].get("details").is_none());
+    }
 
     #[tokio::test]
     async fn extension_error_serializes() {

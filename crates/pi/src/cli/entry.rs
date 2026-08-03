@@ -38,6 +38,7 @@ use crate::cli::bootstrap::{
     RuntimeHandle, run_bootstrap,
 };
 use crate::cli::package_manager_cli::{ListedPackage, ListedScope, PackageHandler, PackageOutput};
+use crate::core::agent_session::model::level_str;
 use crate::core::agent_session_runtime::{
     AgentSessionRuntime, AgentSessionRuntimeServices, CreateAgentSessionRuntimeFactory,
     CreateAgentSessionRuntimeOptions, CreateAgentSessionRuntimeResult,
@@ -45,7 +46,8 @@ use crate::core::agent_session_runtime::{
 use crate::core::agent_session_services::{
     AgentSessionRuntimeDiagnostic, AgentSessionServices, AgentSessionServicesError,
     CreateAgentSessionResult, CreateAgentSessionServicesOptions, ExtensionFlagValue,
-    create_agent_session_from_services, create_agent_session_services_with_trust,
+    ResourceLoaderServiceOptions, create_agent_session_from_services,
+    create_agent_session_services_with_trust,
 };
 use crate::core::config::get_agent_dir;
 use crate::core::model_resolver::{
@@ -55,6 +57,7 @@ use crate::core::model_resolver::{
 use crate::core::model_runtime::ModelRuntime;
 use crate::core::package_manager::{PackageManager, PackageManagerOptions, Scope};
 use crate::core::resources::ResourceLoader;
+use crate::core::sessions::SessionManager;
 use crate::core::settings::{SettingsManager, SettingsManagerCreateOptions};
 use crate::core::system_prompt::{BuildSystemPromptOptions, build_system_prompt};
 use crate::core::trust::{
@@ -446,6 +449,20 @@ fn extension_flag_values(args: &crate::cli::args::Args) -> BTreeMap<String, Exte
         })
         .collect()
 }
+fn resource_loader_options(args: &crate::cli::args::Args) -> ResourceLoaderServiceOptions {
+    ResourceLoaderServiceOptions {
+        no_extensions: args.no_extensions,
+        no_skills: args.no_skills,
+        no_prompt_templates: args.no_prompt_templates,
+        no_themes: args.no_themes,
+        no_context_files: args.no_context_files,
+        system_prompt: args.system_prompt.clone(),
+        append_system_prompt: (!args.append_system_prompt.is_empty())
+            .then(|| args.append_system_prompt.clone()),
+        additional_extension_paths: args.extensions.clone(),
+        ..Default::default()
+    }
+}
 
 fn no_tools_mode(
     args: &crate::cli::args::Args,
@@ -469,20 +486,7 @@ async fn create_runtime_services(
             cwd: PathBuf::from(cwd),
             agent_dir: Some(PathBuf::from(agent_dir)),
             extension_flag_values: Some(extension_flag_values(args)),
-            resource_loader_options: Some(
-                crate::core::agent_session_services::ResourceLoaderServiceOptions {
-                    no_extensions: args.no_extensions,
-                    no_skills: args.no_skills,
-                    no_prompt_templates: args.no_prompt_templates,
-                    no_themes: args.no_themes,
-                    no_context_files: args.no_context_files,
-                    system_prompt: args.system_prompt.clone(),
-                    append_system_prompt: (!args.append_system_prompt.is_empty())
-                        .then(|| args.append_system_prompt.clone()),
-                    additional_extension_paths: args.extensions.clone(),
-                    ..Default::default()
-                },
-            ),
+            resource_loader_options: Some(resource_loader_options(args)),
             ..Default::default()
         },
         args.project_trust_override,
@@ -580,6 +584,43 @@ fn build_session_inputs(
     });
     (settings_manager, tools, system_prompt)
 }
+fn initialize_session_metadata(
+    manager: &mut SessionManager,
+    has_existing_session: bool,
+    has_saved_thinking_level: bool,
+    result: &CreateAgentSessionResult,
+) -> Result<(), String> {
+    if !has_existing_session {
+        if let Some(model) = result.model.as_ref() {
+            manager
+                .append_model_change(&model.provider, &model.id)
+                .map_err(|error| error.to_string())?;
+        }
+    } else if has_saved_thinking_level {
+        return Ok(());
+    }
+    manager
+        .append_thinking_level_change(level_str(result.thinking_level))
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+async fn finish_session_diagnostics(
+    api_key: Option<&str>,
+    result: &mut CreateAgentSessionResult,
+    mut diagnostics: Vec<AgentSessionRuntimeDiagnostic>,
+) -> Result<(), String> {
+    apply_cli_api_key(
+        api_key,
+        result.model.as_ref(),
+        &result.model_runtime,
+        &mut diagnostics,
+    )
+    .await?;
+    result.diagnostics.splice(0..0, diagnostics);
+    Ok(())
+}
+
 /// Runtime factory backed by real product services.
 struct RealRuntimeFactory;
 
@@ -592,8 +633,8 @@ impl RuntimeFactory for RealRuntimeFactory {
             let cwd = options.cwd.clone();
             let agent_dir = options.agent_dir.clone();
             let parsed = options.parsed;
-            let session_context = options
-                .session_manager
+            let mut session_manager = options.session_manager;
+            let session_context = session_manager
                 .build_session_context()
                 .map_err(|error| error.to_string())?;
             let RestoredSession {
@@ -602,6 +643,7 @@ impl RuntimeFactory for RealRuntimeFactory {
                 saved_thinking_level,
                 messages: existing_messages,
             } = restore_session(session_context);
+            let has_saved_thinking_level = saved_thinking_level.is_some();
 
             let services = create_runtime_services(&cwd, &agent_dir, &parsed).await?;
             let project_trusted = services.settings_manager().is_project_trusted();
@@ -610,7 +652,7 @@ impl RuntimeFactory for RealRuntimeFactory {
             let ResolvedModels {
                 cli: cli_resolved,
                 scope,
-                diagnostics: mut pre_session_diagnostics,
+                diagnostics: pre_session_diagnostics,
             } = resolve_models(&parsed, &services.model_runtime).await;
 
             let resources = session_resources(&services.resource_loader);
@@ -646,16 +688,18 @@ impl RuntimeFactory for RealRuntimeFactory {
             )
             .await
             .map_err(|e: AgentSessionServicesError| format!("{e}"))?;
-            apply_cli_api_key(
+            initialize_session_metadata(
+                &mut session_manager,
+                has_existing_session,
+                has_saved_thinking_level,
+                &session_result,
+            )?;
+            finish_session_diagnostics(
                 parsed.api_key.as_deref(),
-                session_result.model.as_ref(),
-                &session_result.model_runtime,
-                &mut pre_session_diagnostics,
+                &mut session_result,
+                pre_session_diagnostics,
             )
             .await?;
-            session_result
-                .diagnostics
-                .splice(0..0, pre_session_diagnostics);
 
             let (settings_manager, tools, system_prompt) = build_session_inputs(
                 &cwd,
@@ -668,7 +712,7 @@ impl RuntimeFactory for RealRuntimeFactory {
 
             let built = build_session(SessionBuildOptions {
                 cwd: cwd.clone(),
-                session_manager: options.session_manager,
+                session_manager,
                 settings_manager,
                 session_result,
                 tools,
@@ -677,7 +721,7 @@ impl RuntimeFactory for RealRuntimeFactory {
                 skills: resources.skills,
                 prompt_templates: resources.prompt_templates,
             })?;
-            let runtime = AgentSessionRuntime::new(
+            let runtime = Arc::new(AgentSessionRuntime::new(
                 built.session,
                 AgentSessionRuntimeServices {
                     cwd: PathBuf::from(&cwd),
@@ -685,14 +729,15 @@ impl RuntimeFactory for RealRuntimeFactory {
                 },
                 Arc::new(RealReplacementFactory {
                     project_trust_override: parsed.project_trust_override,
+                    api_key: parsed.api_key.clone(),
+                    resource_loader_options: resource_loader_options(&parsed),
                 }),
                 built.diagnostics,
                 built.model_fallback_message,
-            );
+            ));
+            runtime.link();
 
-            Ok(RuntimeHandle {
-                runtime: Arc::new(runtime),
-            })
+            Ok(RuntimeHandle { runtime })
         })
     }
 
@@ -705,8 +750,9 @@ impl RuntimeFactory for RealRuntimeFactory {
 #[derive(Clone)]
 struct RealReplacementFactory {
     project_trust_override: Option<bool>,
+    api_key: Option<String>,
+    resource_loader_options: ResourceLoaderServiceOptions,
 }
-
 impl CreateAgentSessionRuntimeFactory for RealReplacementFactory {
     fn create(
         &self,
@@ -718,16 +764,20 @@ impl CreateAgentSessionRuntimeFactory for RealReplacementFactory {
             crate::core::agent_session_runtime::AgentSessionRuntimeError,
         >,
     > {
-        let cwd = options.cwd.clone();
-        let agent_dir = options.agent_dir.clone();
-        let session_context = options
-            .session_manager
-            .build_session_context()
-            .map_err(|error| {
-                crate::core::agent_session_runtime::AgentSessionRuntimeError::Factory(
-                    error.to_string(),
-                )
-            });
+        let CreateAgentSessionRuntimeOptions {
+            cwd,
+            agent_dir,
+            session_manager,
+            start_reason,
+            previous_session_file,
+            model: requested_model,
+            extension_flag_values,
+        } = options;
+        let api_key = self.api_key.clone();
+        let resource_loader_options = self.resource_loader_options.clone();
+        let session_context = session_manager.build_session_context().map_err(|error| {
+            crate::core::agent_session_runtime::AgentSessionRuntimeError::Factory(error.to_string())
+        });
         Box::pin(async move {
             let session_context = session_context?;
             let RestoredSession {
@@ -740,6 +790,8 @@ impl CreateAgentSessionRuntimeFactory for RealReplacementFactory {
                 CreateAgentSessionServicesOptions {
                     cwd: PathBuf::from(&cwd),
                     agent_dir: Some(PathBuf::from(&agent_dir)),
+                    extension_flag_values: Some(extension_flag_values),
+                    resource_loader_options: Some(resource_loader_options),
                     ..Default::default()
                 },
                 self.project_trust_override,
@@ -751,20 +803,30 @@ impl CreateAgentSessionRuntimeFactory for RealReplacementFactory {
                 ))
             })?;
             let project_trusted = services.settings_manager().is_project_trusted();
+            if let (Some(api_key), Some(model)) = (api_key.as_deref(), requested_model.as_ref()) {
+                services
+                    .model_runtime
+                    .set_runtime_api_key(&model.provider, api_key)
+                    .await
+                    .map_err(|error| {
+                        crate::core::agent_session_runtime::AgentSessionRuntimeError::Factory(
+                            format!("set replacement API key: {error}"),
+                        )
+                    })?;
+            }
             let resources = session_resources(&services.resource_loader);
-
             let session_result = create_agent_session_from_services(
                 crate::core::agent_session_services::CreateAgentSessionFromServicesOptions {
                     services,
-                    model: None,
+                    model: requested_model,
                     thinking_level,
                     scoped_models: Vec::new(),
                     tools: None,
                     exclude_tools: None,
                     no_tools: None,
                     session_start_event: Some(crate::core::agent_session::SessionStartEvent {
-                        reason: options.start_reason,
-                        previous_session_file: options.previous_session_file.clone(),
+                        reason: start_reason,
+                        previous_session_file,
                     }),
                     saved_session_model,
                     has_existing_session,
@@ -781,7 +843,7 @@ impl CreateAgentSessionRuntimeFactory for RealReplacementFactory {
                 &cwd,
                 &agent_dir,
                 project_trusted,
-                options.session_manager,
+                session_manager,
                 session_result,
                 resources,
                 existing_messages,

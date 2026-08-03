@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 
@@ -20,13 +20,15 @@ use pi_ext::protocol::{
 };
 use pi_ext::sanitize::SanitizedSlot;
 use serde_json::{Map, Value};
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
-use super::agent_session::events::AgentSessionEvent;
+use super::agent_session::AgentSession;
+use super::agent_session::events::{AgentSessionEvent, SessionShutdownReason};
 use super::agent_session::extension_runner::{
     BeforeAgentStartResult, CancelResult, ExtensionRunner, ExtensionRunnerError,
     InputTransformResult,
 };
+use super::agent_session_runtime::CreateAgentSessionRuntimeResult;
 use super::agent_session_services::ExtensionFlagType;
 use super::extension_host::{
     EVENT_CHANNEL_CAPACITY, ExtensionUiEvent, HOOK_TIMEOUT, HostExtensionRunner, HostStartError,
@@ -34,7 +36,7 @@ use super::extension_host::{
 };
 use super::extension_manifest::{ClassifiedExtension, ExtensionRuntime, classify};
 use super::model_runtime::{ModelRuntime, ModelRuntimeError};
-use super::resources::ResourceExtensionPaths;
+use super::resources::{ResourceExtensionPaths, SourceInfo};
 
 /// One aggregate deadline shared by every terminal-input endpoint request.
 pub const TERMINAL_INPUT_DEADLINE: Duration = Duration::from_millis(4);
@@ -58,6 +60,7 @@ struct EndpointPlan {
     label: String,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 enum GenerationBuildPolicy {
     BestEffortStart,
@@ -108,14 +111,13 @@ impl std::fmt::Display for ExtensionSetDiagnostic {
 }
 
 /// Prepared replacement held between prepare and commit of a reload.
-pub(crate) struct PreparedReload<'a> {
-    reload_guard: Option<tokio::sync::MutexGuard<'a, ()>>,
+pub(crate) struct PreparedReload {
     generation: Option<Generation>,
     pending: PendingBridges,
     diagnostics: Vec<ExtensionSetDiagnostic>,
 }
 
-impl Drop for PreparedReload<'_> {
+impl Drop for PreparedReload {
     fn drop(&mut self) {
         if let Some(generation) = self.generation.take() {
             abort_bridges(&generation);
@@ -127,6 +129,49 @@ impl Drop for PreparedReload<'_> {
             }
         }
     }
+}
+
+/// Prepared resources owned by the facade while a replacement waits for host readiness.
+pub(crate) enum PendingReadyOp {
+    /// A fully-created session runtime waiting to replace the current runtime.
+    Replacement {
+        /// New runtime state. It is neither applied nor disposed before the ready decision.
+        result: CreateAgentSessionRuntimeResult,
+        /// Shutdown reason emitted by the old session during finalization.
+        reason: SessionShutdownReason,
+        /// Session file that will replace the old session file, when known.
+        target_session_file: Option<String>,
+    },
+    /// A prepared extension generation waiting to replace the published generation.
+    Reload {
+        /// Unpublished extension generation.
+        prepared: PreparedReload,
+        /// Provider registry receiving the committed generation.
+        model_runtime: Arc<ModelRuntime>,
+    },
+}
+
+impl PendingReadyOp {
+    fn replacement_target(&self) -> Option<Arc<AgentSession>> {
+        match self {
+            Self::Replacement { result, .. } => Some(Arc::clone(&result.session)),
+            Self::Reload { .. } => None,
+        }
+    }
+}
+
+enum PendingReadyState {
+    None,
+    Pending {
+        op: PendingReadyOp,
+        token: String,
+        ready_tx: oneshot::Sender<()>,
+    },
+    Finalizing {
+        op: Option<PendingReadyOp>,
+        token: String,
+        replacement_target: Option<Arc<AgentSession>>,
+    },
 }
 
 /// Outcome of a committed extension-runtime reload.
@@ -544,6 +589,7 @@ struct FacadeChannels {
     ui_requests_rx: StdMutex<Option<mpsc::Receiver<HostUiRequest>>>,
     session_bridge_tx: mpsc::Sender<SessionBridgeEvent>,
     session_bridge_rx: StdMutex<Option<mpsc::Receiver<SessionBridgeEvent>>>,
+    session_target: StdMutex<Weak<AgentSession>>,
     registry_revision_tx: watch::Sender<u64>,
 }
 
@@ -565,6 +611,7 @@ impl FacadeChannels {
             ui_requests_rx: StdMutex::new(Some(ui_requests_rx)),
             session_bridge_tx,
             session_bridge_rx: StdMutex::new(Some(session_bridge_rx)),
+            session_target: StdMutex::new(Weak::new()),
             registry_revision_tx,
         }
     }
@@ -589,9 +636,12 @@ pub struct ExtensionRuntimeSet {
     state: Arc<StdMutex<PublishedRuntimeState>>,
     channels: Arc<FacadeChannels>,
     discovered_paths: Vec<String>,
+    command_source_infos: StdMutex<HashMap<String, SourceInfo>>,
     load_cwd: String,
     project_trusted: bool,
     reload_lock: tokio::sync::Mutex<()>,
+    pending_ready: StdMutex<PendingReadyState>,
+    next_replacement_token_id: AtomicU64,
     #[cfg(test)]
     test_prepared_reload: StdMutex<Option<TestPreparedReload>>,
     #[cfg(test)]
@@ -679,14 +729,37 @@ impl ExtensionRuntimeSet {
             )))),
             channels: Arc::new(FacadeChannels::new()),
             discovered_paths,
+            command_source_infos: StdMutex::new(HashMap::new()),
             load_cwd,
             project_trusted,
             reload_lock: tokio::sync::Mutex::new(()),
+            pending_ready: StdMutex::new(PendingReadyState::None),
+            next_replacement_token_id: AtomicU64::new(1),
             #[cfg(test)]
             test_prepared_reload: StdMutex::new(None),
             #[cfg(test)]
             test_abort_prepare_after_flags: StdMutex::new(false),
         }
+    }
+
+    /// Install resource-loader provenance for command-owning extension paths.
+    pub fn set_command_source_infos(&self, infos: impl IntoIterator<Item = (String, SourceInfo)>) {
+        let mut current = self
+            .command_source_infos
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        current.clear();
+        current.extend(infos);
+    }
+
+    /// Resolve resource-loader provenance for one command-owning path.
+    #[must_use]
+    pub fn command_source_info(&self, path: &str) -> Option<SourceInfo> {
+        self.command_source_infos
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(path)
+            .cloned()
     }
 
     /// Bind pre-built single-endpoint runners (focused fake-host tests).
@@ -716,6 +789,176 @@ impl ExtensionRuntimeSet {
 
     fn lease(&self) -> GenerationLease {
         self.state().lease()
+    }
+    fn pending_ready(&self) -> std::sync::MutexGuard<'_, PendingReadyState> {
+        self.pending_ready
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Mint a facade-scoped replacement token safe to serialize across JavaScript.
+    #[must_use]
+    #[allow(clippy::expect_used)]
+    pub(crate) fn next_replacement_token(&self) -> String {
+        self.next_replacement_token_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .expect("replacement token space exhausted")
+            .to_string()
+    }
+
+    /// Install the sole ready-gated operation before its success response is written.
+    ///
+    /// On conflict, ownership of `op` is returned to the caller for explicit cleanup.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn install_pending(
+        &self,
+        token: String,
+        op: PendingReadyOp,
+    ) -> Result<oneshot::Receiver<()>, PendingReadyOp> {
+        let mut state = self.pending_ready();
+        if !matches!(*state, PendingReadyState::None) {
+            return Err(op);
+        }
+        let (ready_tx, ready_rx) = oneshot::channel();
+        *state = PendingReadyState::Pending {
+            op,
+            token,
+            ready_tx,
+        };
+        Ok(ready_rx)
+    }
+
+    /// Correlate a host-ready event and advance its operation into finalization.
+    ///
+    /// Returns false for stale/mismatched tokens and for a waiter that was already dropped.
+    pub(crate) fn complete_ready(&self, token: &str) -> bool {
+        let mut state = self.pending_ready();
+        let current = std::mem::replace(&mut *state, PendingReadyState::None);
+        let (op, pending_token, ready_tx) = match current {
+            PendingReadyState::Pending {
+                op,
+                token,
+                ready_tx,
+            } => (op, token, ready_tx),
+            other => {
+                *state = other;
+                return false;
+            }
+        };
+        if pending_token != token {
+            *state = PendingReadyState::Pending {
+                op,
+                token: pending_token,
+                ready_tx,
+            };
+            return false;
+        }
+        let replacement_target = op.replacement_target();
+        *state = PendingReadyState::Finalizing {
+            op: Some(op),
+            token: pending_token,
+            replacement_target,
+        };
+        if ready_tx.send(()).is_ok() {
+            return true;
+        }
+        let drained = match std::mem::replace(&mut *state, PendingReadyState::None) {
+            PendingReadyState::Finalizing { op, .. } => op,
+            PendingReadyState::None | PendingReadyState::Pending { .. } => None,
+        };
+        drop(state);
+        if let Some(op) = drained {
+            discard_pending_ready_op(op);
+        }
+        false
+    }
+
+    /// Transfer a token-correlated operation to its finalizer while retaining slot ownership.
+    pub(crate) fn take_finalizing(&self, token: &str) -> Option<PendingReadyOp> {
+        let mut state = self.pending_ready();
+        match &mut *state {
+            PendingReadyState::Finalizing {
+                op,
+                token: pending_token,
+                ..
+            } if pending_token == token => op.take(),
+            PendingReadyState::None
+            | PendingReadyState::Pending { .. }
+            | PendingReadyState::Finalizing { .. } => None,
+        }
+    }
+
+    /// Release the finalizing slot after the transferred operation was applied.
+    pub(crate) fn finish_finalize(&self, token: &str) -> bool {
+        let mut state = self.pending_ready();
+        let finished = matches!(
+            &*state,
+            PendingReadyState::Finalizing {
+                op: None,
+                token: pending_token,
+                ..
+            } if pending_token == token
+        );
+        if finished {
+            *state = PendingReadyState::None;
+        }
+        finished
+    }
+
+    /// Abort an operation that has not been transferred to a finalizer.
+    #[must_use]
+    pub(crate) fn abort_pending(&self, token: &str) -> Option<PendingReadyOp> {
+        let mut state = self.pending_ready();
+        let matches = match &*state {
+            PendingReadyState::Pending {
+                token: pending_token,
+                ..
+            }
+            | PendingReadyState::Finalizing {
+                token: pending_token,
+                op: Some(_),
+                ..
+            } => pending_token == token,
+            PendingReadyState::None | PendingReadyState::Finalizing { op: None, .. } => false,
+        };
+        if !matches {
+            return None;
+        }
+        match std::mem::replace(&mut *state, PendingReadyState::None) {
+            PendingReadyState::Pending { op, .. } => Some(op),
+            PendingReadyState::Finalizing { op, .. } => op,
+            PendingReadyState::None => None,
+        }
+    }
+
+    /// Drain any facade-owned prepared resources and wake a pending waiter.
+    #[must_use]
+    pub(crate) fn drain_pending(&self) -> Option<PendingReadyOp> {
+        match std::mem::replace(&mut *self.pending_ready(), PendingReadyState::None) {
+            PendingReadyState::Pending { op, .. } => Some(op),
+            PendingReadyState::Finalizing { op, .. } => op,
+            PendingReadyState::None => None,
+        }
+    }
+
+    /// Session that receives commands during the response-before-finalize window.
+    #[must_use]
+    pub(crate) fn pending_replacement_target(&self) -> Option<Arc<AgentSession>> {
+        match &*self.pending_ready() {
+            PendingReadyState::Pending { op, .. } => op.replacement_target(),
+            PendingReadyState::Finalizing {
+                replacement_target, ..
+            } => replacement_target.clone(),
+            PendingReadyState::None => None,
+        }
+    }
+
+    /// Whether a ready-gated operation is pending or finalizing.
+    #[must_use]
+    pub(crate) fn is_pending_busy(&self) -> bool {
+        !matches!(*self.pending_ready(), PendingReadyState::None)
     }
 
     #[cfg(test)]
@@ -1301,6 +1544,25 @@ impl ExtensionRuntimeSet {
             .take()
     }
 
+    /// Bind the session that receives facade commands after ready finalization.
+    pub(crate) fn bind_session_target(&self, session: Weak<AgentSession>) {
+        *self
+            .channels
+            .session_target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = session;
+    }
+
+    /// Current facade command target, if its session is still live.
+    #[must_use]
+    pub(crate) fn session_target(&self) -> Option<Arc<AgentSession>> {
+        self.channels
+            .session_target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .upgrade()
+    }
+
     /// Route a correlated model response to its originating endpoint.
     ///
     /// # Errors
@@ -1331,6 +1593,138 @@ impl ExtensionRuntimeSet {
             return Err(HostClientError::NotRunning);
         };
         endpoint.runner.respond_compact(local, outcome).await
+    }
+
+    /// Route a correlated new-session response to its originating endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the response route is stale or its host rejects it.
+    pub async fn respond_new_session(
+        &self,
+        id: FrameId,
+        cancelled: bool,
+        token: Option<&str>,
+    ) -> Result<(), HostClientError> {
+        let Some((_lease, endpoint, local)) = self.state().claim_route(id) else {
+            return Err(HostClientError::NotRunning);
+        };
+        endpoint
+            .runner
+            .respond_new_session(local, cancelled, token)
+            .await
+    }
+
+    /// Route a correlated fork response to its originating endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the response route is stale or its host rejects it.
+    pub async fn respond_fork(
+        &self,
+        id: FrameId,
+        cancelled: bool,
+        selected_text: Option<&str>,
+        token: Option<&str>,
+    ) -> Result<(), HostClientError> {
+        let Some((_lease, endpoint, local)) = self.state().claim_route(id) else {
+            return Err(HostClientError::NotRunning);
+        };
+        endpoint
+            .runner
+            .respond_fork(local, cancelled, selected_text, token)
+            .await
+    }
+
+    /// Route a correlated tree-navigation response to its originating endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the response route is stale or its host rejects it.
+    pub async fn respond_navigate_tree(
+        &self,
+        id: FrameId,
+        outcome: Result<protocol::SessionNavigateTreeResponse, String>,
+    ) -> Result<(), HostClientError> {
+        let Some((_lease, endpoint, local)) = self.state().claim_route(id) else {
+            return Err(HostClientError::NotRunning);
+        };
+        endpoint.runner.respond_navigate_tree(local, outcome).await
+    }
+
+    /// Route a correlated switch-session response to its originating endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the response route is stale or its host rejects it.
+    pub async fn respond_switch_session(
+        &self,
+        id: FrameId,
+        cancelled: bool,
+        token: Option<&str>,
+    ) -> Result<(), HostClientError> {
+        let Some((_lease, endpoint, local)) = self.state().claim_route(id) else {
+            return Err(HostClientError::NotRunning);
+        };
+        endpoint
+            .runner
+            .respond_switch_session(local, cancelled, token)
+            .await
+    }
+
+    /// Route a correlated reload response to its originating endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the response route is stale or its host rejects it.
+    pub async fn respond_reload(
+        &self,
+        id: FrameId,
+        outcome: Result<Option<&str>, String>,
+    ) -> Result<(), HostClientError> {
+        let Some((_lease, endpoint, local)) = self.state().claim_route(id) else {
+            return Err(HostClientError::NotRunning);
+        };
+        endpoint.runner.respond_reload(local, outcome).await
+    }
+
+    /// Route a deterministic busy rejection to the request's originating endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the response route is stale or its host rejects it.
+    pub async fn respond_replacement_busy(
+        &self,
+        id: FrameId,
+        method: &str,
+    ) -> Result<(), HostClientError> {
+        let Some((_lease, endpoint, local)) = self.state().claim_route(id) else {
+            return Err(HostClientError::NotRunning);
+        };
+        endpoint
+            .runner
+            .respond_replacement_busy(local, method)
+            .await
+    }
+
+    /// Route an `extension_error` response to the request's originating endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the response route is stale or its host rejects it.
+    pub async fn respond_session_error(
+        &self,
+        id: FrameId,
+        method: &str,
+        message: &str,
+    ) -> Result<(), HostClientError> {
+        let Some((_lease, endpoint, local)) = self.state().claim_route(id) else {
+            return Err(HostClientError::NotRunning);
+        };
+        endpoint
+            .runner
+            .respond_session_error(local, method, message)
+            .await
     }
 
     /// Broadcast mirrored session state.
@@ -1377,8 +1771,17 @@ impl ExtensionRuntimeSet {
         }
         None
     }
+    /// Short-lived serialization lock for reload prepare or commit phases.
+    ///
+    /// Callers must not hold this lock while awaiting a host callback.
+    #[must_use]
+    pub(crate) fn reload_lock(&self) -> &tokio::sync::Mutex<()> {
+        &self.reload_lock
+    }
 
     /// Prepare a reload replacement without mutating published providers or bridges.
+    ///
+    /// The caller must hold [`Self::reload_lock`] for this preparation phase.
     ///
     /// # Errors
     ///
@@ -1387,8 +1790,7 @@ impl ExtensionRuntimeSet {
     pub(crate) async fn prepare_reload(
         &self,
         preserved_flags: HashMap<String, Value>,
-    ) -> Result<PreparedReload<'_>, HostStartError> {
-        let reload_guard = self.reload_lock.lock().await;
+    ) -> Result<PreparedReload, HostStartError> {
         if !self.state().reloadable() {
             return Err(HostStartError::Load(
                 "extension runtime is not reloadable".to_owned(),
@@ -1445,18 +1847,18 @@ impl ExtensionRuntimeSet {
             ));
         }
         Ok(PreparedReload {
-            reload_guard: Some(reload_guard),
             generation: Some(next),
             pending,
             diagnostics,
         })
     }
 
-    /// Commit a prepared reload, swapping providers and generations best-effort.
+    /// Commit a prepared reload after validating all replacement providers.
+    #[allow(clippy::expect_used)]
     pub(crate) async fn commit_reload(
         &self,
         runtime: &ModelRuntime,
-        mut prepared: PreparedReload<'_>,
+        mut prepared: PreparedReload,
     ) -> ReloadResult {
         let next = prepared
             .generation
@@ -1464,7 +1866,18 @@ impl ExtensionRuntimeSet {
             .expect("prepared reload missing generation");
         let pending = std::mem::take(&mut prepared.pending);
         let mut diagnostics = std::mem::take(&mut prepared.diagnostics);
-        let _reload_guard = prepared.reload_guard.take();
+
+        if let Err((path, error)) = validate_generation_providers(&next) {
+            diagnostics.push(ExtensionSetDiagnostic {
+                path,
+                message: error.to_string(),
+            });
+            stop_generation(&next).await;
+            return ReloadResult {
+                diagnostics,
+                committed: false,
+            };
+        }
 
         let next = Arc::new(next);
         let old = {
@@ -1517,17 +1930,22 @@ impl ExtensionRuntimeSet {
     /// # Errors
     ///
     /// Returns an error when prepare fails. Commit itself always returns diagnostics.
-    pub async fn restart_and_rewire(
+    #[allow(dead_code)]
+    pub(crate) async fn restart_and_rewire(
         &self,
         runtime: &ModelRuntime,
         preserved_flags: HashMap<String, Value>,
     ) -> Result<ReloadResult, HostStartError> {
+        let _reload = self.reload_lock().lock().await;
         let prepared = self.prepare_reload(preserved_flags).await?;
         Ok(self.commit_reload(runtime, prepared).await)
     }
 
     /// Invalidate all endpoints and synchronously dispose product-visible slots.
     pub fn invalidate(&self) {
+        if let Some(op) = self.drain_pending() {
+            discard_pending_ready_op(op);
+        }
         let Some(generation) = self.state().invalidate(&self.channels) else {
             return;
         };
@@ -1538,7 +1956,10 @@ impl ExtensionRuntimeSet {
 
     /// Gracefully stop every endpoint exactly once.
     pub async fn shutdown_once(&self) {
-        let _reload = self.reload_lock.lock().await;
+        let _reload = self.reload_lock().lock().await;
+        if let Some(op) = self.drain_pending() {
+            discard_pending_ready_op(op);
+        }
         let Some(generation) = self.state().begin_shutdown(&self.channels) else {
             return;
         };
@@ -2019,6 +2440,7 @@ fn collect_generation_starts(results: Vec<EndpointStartOutcome>) -> GenerationSt
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn build_generation_with_starter<Starter, StartFuture>(
     id: u64,
     plans: Vec<EndpointPlan>,
@@ -2078,59 +2500,55 @@ where
     if matches!(policy, GenerationBuildPolicy::BestEffortStart)
         && !endpoints.is_empty()
         && failed_builtins_owner.is_some()
-    {
-        if let Some(index) = endpoints
+        && let Some(index) = endpoints
             .iter()
             .position(|endpoint| endpoint.kind == EndpointKind::TsCompat && !endpoint.plan.builtins)
-        {
-            let mut promotion_plan = endpoints[index].plan.clone();
-            promotion_plan.builtins = true;
-            let result = match endpoint_host_spec(&promotion_plan, ts_spec.as_ref()) {
-                Ok(spec) => {
-                    starter(
-                        promotion_plan.clone(),
-                        spec,
-                        load_cwd.to_owned(),
-                        project_trusted,
-                    )
-                    .await
+    {
+        let mut promotion_plan = endpoints[index].plan.clone();
+        promotion_plan.builtins = true;
+        let result = match endpoint_host_spec(&promotion_plan, ts_spec.as_ref()) {
+            Ok(spec) => {
+                starter(
+                    promotion_plan.clone(),
+                    spec,
+                    load_cwd.to_owned(),
+                    project_trusted,
+                )
+                .await
+            }
+            Err(message) => Err(message),
+        };
+        match result {
+            Ok(runner) => {
+                for (path, message) in runner.load_errors() {
+                    let path = promotion_plan
+                        .entries
+                        .iter()
+                        .position(|entry| entry == &path)
+                        .and_then(|entry_index| promotion_plan.diagnostic_paths.get(entry_index))
+                        .cloned()
+                        .unwrap_or(path);
+                    diagnostics.push(ExtensionSetDiagnostic { path, message });
                 }
-                Err(message) => Err(message),
-            };
-            match result {
-                Ok(runner) => {
-                    for (path, message) in runner.load_errors() {
-                        let path = promotion_plan
-                            .entries
-                            .iter()
-                            .position(|entry| entry == &path)
-                            .and_then(|entry_index| {
-                                promotion_plan.diagnostic_paths.get(entry_index)
-                            })
-                            .cloned()
-                            .unwrap_or(path);
-                        diagnostics.push(ExtensionSetDiagnostic { path, message });
-                    }
-                    let position = endpoints[index].position;
-                    let old = std::mem::replace(
-                        &mut endpoints[index],
-                        PreparedEndpoint {
-                            position,
-                            kind: promotion_plan.kind,
-                            label: promotion_plan.label.clone(),
-                            runner,
-                            plan: promotion_plan,
-                        },
-                    );
-                    old.runner.shutdown_once().await;
-                }
-                Err(message) => {
-                    let label = endpoints[index].label.clone();
-                    diagnostics.push(ExtensionSetDiagnostic {
-                        path: label.clone(),
-                        message: format!("builtins promotion failed for {label}: {message}"),
-                    });
-                }
+                let position = endpoints[index].position;
+                let old = std::mem::replace(
+                    &mut endpoints[index],
+                    PreparedEndpoint {
+                        position,
+                        kind: promotion_plan.kind,
+                        label: promotion_plan.label.clone(),
+                        runner,
+                        plan: promotion_plan,
+                    },
+                );
+                old.runner.shutdown_once().await;
+            }
+            Err(message) => {
+                let label = endpoints[index].label.clone();
+                diagnostics.push(ExtensionSetDiagnostic {
+                    path: label.clone(),
+                    message: format!("builtins promotion failed for {label}: {message}"),
+                });
             }
         }
     }
@@ -2435,8 +2853,48 @@ fn spawn_session_relay(
                                 routed_id,
                             )
                         }
+                        SessionBridgeEvent::NewSession { id, request } => {
+                            let routed_id = state.allocate_route(endpoint, id);
+                            (
+                                routed_id.map(|id| SessionBridgeEvent::NewSession { id, request }),
+                                routed_id,
+                            )
+                        }
+                        SessionBridgeEvent::Fork { id, request } => {
+                            let routed_id = state.allocate_route(endpoint, id);
+                            (
+                                routed_id.map(|id| SessionBridgeEvent::Fork { id, request }),
+                                routed_id,
+                            )
+                        }
+                        SessionBridgeEvent::NavigateTree { id, request } => {
+                            let routed_id = state.allocate_route(endpoint, id);
+                            (
+                                routed_id
+                                    .map(|id| SessionBridgeEvent::NavigateTree { id, request }),
+                                routed_id,
+                            )
+                        }
+                        SessionBridgeEvent::SwitchSession { id, request } => {
+                            let routed_id = state.allocate_route(endpoint, id);
+                            (
+                                routed_id
+                                    .map(|id| SessionBridgeEvent::SwitchSession { id, request }),
+                                routed_id,
+                            )
+                        }
+                        SessionBridgeEvent::Reload { id } => {
+                            let routed_id = state.allocate_route(endpoint, id);
+                            (
+                                routed_id.map(|id| SessionBridgeEvent::Reload { id }),
+                                routed_id,
+                            )
+                        }
                         SessionBridgeEvent::Command(command) => {
                             (Some(SessionBridgeEvent::Command(command)), None)
+                        }
+                        SessionBridgeEvent::ReplacementReady { token } => {
+                            (Some(SessionBridgeEvent::ReplacementReady { token }), None)
                         }
                     };
                     routed.map(|routed| {
@@ -2455,6 +2913,16 @@ fn spawn_session_relay(
             }
         }
     }))
+}
+fn discard_pending_ready_op(op: PendingReadyOp) {
+    match op {
+        PendingReadyOp::Replacement { result, .. } => {
+            tokio::spawn(async move {
+                result.session.dispose().await;
+            });
+        }
+        PendingReadyOp::Reload { .. } => {}
+    }
 }
 
 async fn drain_leases(generation: &Generation) {
@@ -2632,7 +3100,40 @@ async fn answer_unclaimed_session(runner: &HostExtensionRunner, event: SessionBr
                 .respond_compact(id, Err("no active session".to_owned()))
                 .await;
         }
-        SessionBridgeEvent::Command(_) => {}
+        SessionBridgeEvent::NewSession { id, .. } => {
+            let _ = runner
+                .respond_session_error(
+                    id,
+                    protocol::SESSION_NEW_SESSION_METHOD,
+                    "no active session",
+                )
+                .await;
+        }
+        SessionBridgeEvent::Fork { id, .. } => {
+            let _ = runner
+                .respond_session_error(id, protocol::SESSION_FORK_METHOD, "no active session")
+                .await;
+        }
+        SessionBridgeEvent::NavigateTree { id, .. } => {
+            let _ = runner
+                .respond_navigate_tree(id, Err("no active session".to_owned()))
+                .await;
+        }
+        SessionBridgeEvent::SwitchSession { id, .. } => {
+            let _ = runner
+                .respond_session_error(
+                    id,
+                    protocol::SESSION_SWITCH_SESSION_METHOD,
+                    "no active session",
+                )
+                .await;
+        }
+        SessionBridgeEvent::Reload { id } => {
+            let _ = runner
+                .respond_reload(id, Err("no active session".to_owned()))
+                .await;
+        }
+        SessionBridgeEvent::Command(_) | SessionBridgeEvent::ReplacementReady { .. } => {}
     }
 }
 
@@ -2705,6 +3206,7 @@ fn spawn_fatal_error_relay(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #![allow(clippy::expect_used)]
     use super::*;
     use std::error::Error;
     use std::io::{BufRead, Write};
@@ -2718,6 +3220,81 @@ pub(crate) mod tests {
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+    #[tokio::test]
+    async fn pending_ready_slot_correlates_one_operation_through_finalizing() -> TestResult {
+        let (generation, _) = generation_from_endpoints(1, Vec::new());
+        let set =
+            ExtensionRuntimeSet::from_generation(generation, Vec::new(), String::new(), false);
+        let runtime = Arc::new(ModelRuntime::create_in_memory().await?);
+        let token = set.next_replacement_token();
+        let ready = set
+            .install_pending(
+                token.clone(),
+                PendingReadyOp::Reload {
+                    prepared: PreparedReload {
+                        generation: None,
+                        pending: Vec::new(),
+                        diagnostics: Vec::new(),
+                    },
+                    model_runtime: Arc::clone(&runtime),
+                },
+            )
+            .map_err(|_| "initial pending install was rejected")?;
+
+        assert!(set.is_pending_busy());
+        assert!(
+            set.install_pending(
+                set.next_replacement_token(),
+                PendingReadyOp::Reload {
+                    prepared: PreparedReload {
+                        generation: None,
+                        pending: Vec::new(),
+                        diagnostics: Vec::new(),
+                    },
+                    model_runtime: runtime,
+                },
+            )
+            .is_err()
+        );
+        assert!(!set.complete_ready("stale-token"));
+        assert!(set.complete_ready(&token));
+        ready.await?;
+        let finalizing = set
+            .take_finalizing(&token)
+            .ok_or("ready operation was not finalizing")?;
+        assert!(matches!(finalizing, PendingReadyOp::Reload { .. }));
+        assert!(set.is_pending_busy());
+        assert!(set.finish_finalize(&token));
+        assert!(!set.is_pending_busy());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_pending_ready_and_wakes_waiter() -> TestResult {
+        let (generation, _) = generation_from_endpoints(1, Vec::new());
+        let set =
+            ExtensionRuntimeSet::from_generation(generation, Vec::new(), String::new(), false);
+        let token = set.next_replacement_token();
+        let ready = set
+            .install_pending(
+                token,
+                PendingReadyOp::Reload {
+                    prepared: PreparedReload {
+                        generation: None,
+                        pending: Vec::new(),
+                        diagnostics: Vec::new(),
+                    },
+                    model_runtime: Arc::new(ModelRuntime::create_in_memory().await?),
+                },
+            )
+            .map_err(|_| "pending install was rejected")?;
+
+        set.shutdown_once().await;
+
+        assert!(ready.await.is_err());
+        assert!(!set.is_pending_busy());
+        Ok(())
+    }
 
     enum FakeCommand {
         Emit(Frame),
@@ -3817,10 +4394,11 @@ pub(crate) mod tests {
             "missing provider diagnostic: {:?}",
             result.diagnostics
         );
-        assert_eq!(set.reload_generation(), 2);
-        old_host.wait_for_exit().await?;
-        set.shutdown_once().await;
+        assert!(!result.committed);
+        assert_eq!(set.reload_generation(), 1);
         replacement_host.wait_for_exit().await?;
+        set.shutdown_once().await;
+        old_host.wait_for_exit().await?;
         Ok(())
     }
 
@@ -4808,11 +5386,26 @@ pub(crate) mod tests {
         let result = set
             .restart_and_rewire(&runtime, HashMap::new())
             .await
-            .expect("provider registration failures are nonfatal at commit");
+            .expect("replacement preparation succeeds before provider validation");
+        assert!(!result.committed);
         assert!(
             !result.diagnostics.is_empty(),
             "expected provider diagnostics: {:?}",
             result.diagnostics
+        );
+        assert_eq!(set.reload_generation(), 1);
+        assert_eq!(runtime.provider_mutation_epoch(), provider_epoch);
+        assert!(
+            runtime
+                .get_registered_provider_config("old-provider")
+                .is_some(),
+            "old provider must remain published"
+        );
+        assert!(
+            runtime
+                .get_registered_provider_config("replacement-provider")
+                .is_none(),
+            "replacement provider must not publish"
         );
         assert!(
             runtime
@@ -4820,15 +5413,8 @@ pub(crate) mod tests {
                 .is_none(),
             "invalid provider must not publish"
         );
-        assert!(
-            set.reload_generation() > 1
-                || runtime.provider_mutation_epoch() > provider_epoch
-                || runtime
-                    .get_registered_provider_config("replacement-provider")
-                    .is_some()
-        );
-        let _ = host;
         set.shutdown_once().await;
+        host.wait_for_exit().await?;
         Ok(())
     }
 

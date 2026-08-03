@@ -519,7 +519,7 @@ pub async fn create_agent_session_services_with_trust(
             Ok(flag_diagnostics) => {
                 diagnostics.extend(flag_diagnostics.into_iter().map(|diagnostic| {
                     AgentSessionRuntimeDiagnostic::warning(diagnostic.to_string())
-                }))
+                }));
             }
             Err(error) => {
                 diagnostics.push(AgentSessionRuntimeDiagnostic::error(format!(
@@ -683,9 +683,8 @@ async fn start_extension_phase(
     if discovery.disables(ResourceDiscoveryPolicy::EXTENSIONS) {
         return (None, BTreeMap::new());
     }
-    let paths = loader
-        .get_extensions()
-        .paths
+    let extension_infos = loader.get_extensions().paths.clone();
+    let paths = extension_infos
         .iter()
         .map(|info| {
             if info.resolved_path.is_empty() {
@@ -704,6 +703,10 @@ async fn start_extension_phase(
     let Some(runner) = record_extension_start(started, diagnostics) else {
         return (None, BTreeMap::new());
     };
+    runner.set_command_source_infos(extension_infos.into_iter().flat_map(|info| {
+        let source = info.source_info;
+        [(info.path, source.clone()), (info.resolved_path, source)]
+    }));
     for (path, outcome) in runner.register_providers_on(model_runtime) {
         if let Err(error) = outcome {
             diagnostics.push(AgentSessionRuntimeDiagnostic::error(format!(
@@ -735,8 +738,10 @@ async fn apply_flags_to_runner(
 /// Validate and apply extension CLI flag values.
 ///
 /// Unknown flags produce a single error diagnostic with the exact
-/// `Unknown option[s]: --a, --b` wording. Boolean flags ignore provided string
-/// values and store `true`. String flags require a string value.
+/// `Unknown option[s]: --a, --b` wording. Boolean flags preserve the
+/// provided boolean value (including `false`); a string value for a
+/// declared boolean flag is rejected with a diagnostic and not applied.
+/// String flags require a string value.
 #[must_use]
 pub fn apply_extension_flag_values(
     extension_flag_values: BTreeMap<String, ExtensionFlagValue>,
@@ -759,9 +764,16 @@ pub fn apply_extension_flag_values(
             continue;
         };
         match flag_type {
-            ExtensionFlagType::Boolean => {
-                applied.insert(name, ExtensionFlagValue::Bool(true));
-            }
+            ExtensionFlagType::Boolean => match value {
+                ExtensionFlagValue::Bool(b) => {
+                    applied.insert(name, ExtensionFlagValue::Bool(b));
+                }
+                ExtensionFlagValue::Str(_) => {
+                    diagnostics.push(AgentSessionRuntimeDiagnostic::error(format!(
+                        "Extension flag \"--{name}\" does not take a value"
+                    )));
+                }
+            },
             ExtensionFlagType::String => match value {
                 ExtensionFlagValue::Str(text) => {
                     applied.insert(name, ExtensionFlagValue::Str(text));

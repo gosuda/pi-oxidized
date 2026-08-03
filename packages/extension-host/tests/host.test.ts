@@ -29,6 +29,8 @@ import hooksFactory from "../fixtures/extensions/hooks.ts";
 import toolFactory from "../fixtures/extensions/tool.ts";
 import commandContextFactory from "../fixtures/extensions/command-context.ts";
 import replacedSessionFactory from "../fixtures/extensions/replaced-session.ts";
+import replacementReadyFactory from "../fixtures/extensions/replacement-ready.ts";
+import staleCtxFactory, { resetCapturedCtx } from "../fixtures/extensions/stale-ctx.ts";
 
 /** Collecting ByteWritable that signals on first write (no Writable dependency). */
 class PipeWritable {
@@ -742,5 +744,523 @@ describe("host: newSession setup + withSession + ReplacedSessionContext", () => 
 
 	test("withSession: sendUserMessage delivery failure rejects the command path", async () => {
 		await assertSendFailureRejectsCommand("sendUserMessage", 61);
+	});
+});
+
+
+describe("host: session.replacementReady + passthrough fields", () => {
+	function sessionUpdate(stdin: Readable, idle: boolean): void {
+		push(stdin, {
+			id: 0, kind: "event", method: "session.update",
+			payload: {
+				thinkingLevel: "medium",
+				activeTools: [],
+				allTools: [],
+				commands: [],
+				isIdle: idle,
+				hasPendingMessages: false,
+				contextUsage: { tokens: 10, contextWindow: 1000, percent: 1 },
+				scopedModels: [],
+				systemPrompt: "",
+			},
+		});
+	}
+
+	test("newSession: emits session.replacementReady after command.execute res and strips token", async () => {
+		const connected = await connectHost([replacementReadyFactory]);
+		const { collector, stdin } = connected;
+		sessionUpdate(stdin, true);
+
+		void collector
+			.awaitFrame((f) => f.kind === "req" && f.method === "session.newSession")
+			.then((request) => {
+				push(stdin, {
+					id: request.id, kind: "res", method: "session.newSession",
+					payload: { cancelled: false, replacementToken: "tok-ns-1" },
+				});
+			});
+
+		push(stdin, {
+			id: 70, kind: "req", method: "command.execute",
+			payload: { command: "replacementReadyProbe", args: "" },
+		});
+
+		const notify = await collector.awaitFrame((f) => f.method === "notify");
+		const commandRes = await collector.awaitFrame((f) => f.id === 70 && f.kind === "res");
+		const ready = await collector.awaitFrame(
+			(f) => f.kind === "event" && f.method === "session.replacementReady",
+		);
+
+		const report = JSON.parse(String(payloadOf(notify)["message"])) as Record<string, unknown>;
+		expect(report["newSession"]).toEqual({ cancelled: false });
+		expect(report["hasToken"]).toBe(false);
+		expect(payloadOf(ready)).toEqual({ token: "tok-ns-1" });
+
+		const readyIdx = collector.frames.indexOf(ready);
+		const resIdx = collector.frames.indexOf(commandRes);
+		expect(readyIdx).toBeGreaterThan(resIdx);
+
+		await teardown(connected);
+	});
+
+	test("newSession cancelled: does not emit session.replacementReady", async () => {
+		const connected = await connectHost([replacementReadyFactory]);
+		const { collector, stdin } = connected;
+		sessionUpdate(stdin, true);
+
+		void collector
+			.awaitFrame((f) => f.kind === "req" && f.method === "session.newSession")
+			.then((request) => {
+				push(stdin, {
+					id: request.id, kind: "res", method: "session.newSession",
+					payload: { cancelled: true, replacementToken: "tok-should-drop" },
+				});
+			});
+
+		push(stdin, {
+			id: 71, kind: "req", method: "command.execute",
+			payload: { command: "replacementReadyCancel", args: "" },
+		});
+
+		await collector.awaitFrame((f) => f.method === "notify");
+		await collector.awaitFrame((f) => f.id === 71 && f.kind === "res");
+		// Give the finally path a tick to emit if it were going to.
+		await Promise.resolve();
+		const readyFrames = collector.frames.filter(
+			(f) => f.kind === "event" && f.method === "session.replacementReady",
+		);
+		expect(readyFrames).toEqual([]);
+
+		await teardown(connected);
+	});
+
+	test("handler throw after replacement still emits session.replacementReady", async () => {
+		const connected = await connectHost([replacementReadyFactory]);
+		const { collector, stdin } = connected;
+		sessionUpdate(stdin, true);
+
+		void collector
+			.awaitFrame((f) => f.kind === "req" && f.method === "session.newSession")
+			.then((request) => {
+				push(stdin, {
+					id: request.id, kind: "res", method: "session.newSession",
+					payload: { cancelled: false, replacementToken: "tok-throw-1" },
+				});
+			});
+
+		push(stdin, {
+			id: 72, kind: "req", method: "command.execute",
+			payload: { command: "replacementReadyThrow", args: "" },
+		});
+
+		const errorRes = await collector.awaitFrame((f) => f.id === 72 && f.kind === "error");
+		const ready = await collector.awaitFrame(
+			(f) => f.kind === "event" && f.method === "session.replacementReady",
+		);
+		expect(payloadOf(errorRes)["message"]).toContain("post-replacement boom");
+		expect(payloadOf(ready)).toEqual({ token: "tok-throw-1" });
+		expect(collector.frames.filter(
+			(frame) => frame.kind === "event" && frame.method === "session.replacementReady",
+		)).toHaveLength(1);
+		expect(collector.frames.indexOf(ready)).toBeGreaterThan(collector.frames.indexOf(errorRes));
+
+		await teardown(connected);
+	});
+
+	test("reload: emits session.replacementReady after command.execute res", async () => {
+		const connected = await connectHost([replacementReadyFactory]);
+		const { collector, stdin } = connected;
+		sessionUpdate(stdin, true);
+
+		void collector
+			.awaitFrame((f) => f.kind === "req" && f.method === "session.reload")
+			.then((request) => {
+				push(stdin, {
+					id: request.id, kind: "res", method: "session.reload",
+					payload: { replacementToken: "tok-reload-1" },
+				});
+			});
+
+		push(stdin, {
+			id: 73, kind: "req", method: "command.execute",
+			payload: { command: "replacementReadyReload", args: "" },
+		});
+
+		const commandRes = await collector.awaitFrame((f) => f.id === 73 && f.kind === "res");
+		const ready = await collector.awaitFrame(
+			(f) => f.kind === "event" && f.method === "session.replacementReady",
+		);
+		expect(payloadOf(ready)).toEqual({ token: "tok-reload-1" });
+		expect(collector.frames.indexOf(ready)).toBeGreaterThan(collector.frames.indexOf(commandRes));
+
+		await teardown(connected);
+	});
+
+	test("fork: passes selectedText through and strips replacementToken", async () => {
+		const connected = await connectHost([replacementReadyFactory]);
+		const { collector, stdin } = connected;
+		sessionUpdate(stdin, true);
+
+		void collector
+			.awaitFrame((f) => f.kind === "req" && f.method === "session.fork")
+			.then((request) => {
+				expect(payloadOf(request)).toMatchObject({ entryId: "entry-1", position: "at" });
+				push(stdin, {
+					id: request.id, kind: "res", method: "session.fork",
+					payload: {
+						cancelled: false,
+						selectedText: "picked text",
+						replacementToken: "tok-fork-1",
+					},
+				});
+			});
+
+		push(stdin, {
+			id: 74, kind: "req", method: "command.execute",
+			payload: { command: "forkPassthroughProbe", args: "" },
+		});
+
+		const notify = await collector.awaitFrame((f) => f.method === "notify");
+		await collector.awaitFrame((f) => f.id === 74 && f.kind === "res");
+		const ready = await collector.awaitFrame(
+			(f) => f.kind === "event" && f.method === "session.replacementReady",
+		);
+
+		const report = JSON.parse(String(payloadOf(notify)["message"])) as Record<string, unknown>;
+		expect(report["fork"]).toEqual({ cancelled: false, selectedText: "picked text" });
+		expect(report["hasToken"]).toBe(false);
+		expect(payloadOf(ready)).toEqual({ token: "tok-fork-1" });
+
+		await teardown(connected);
+	});
+
+	test("navigateTree: passes editorText/aborted/summaryEntry and does not emit ready", async () => {
+		const connected = await connectHost([replacementReadyFactory]);
+		const { collector, stdin } = connected;
+		sessionUpdate(stdin, true);
+
+		const summaryEntry = {
+			type: "branch_summary",
+			id: "bs-1",
+			parentId: "p-1",
+			timestamp: "2026-01-01T00:00:00.000Z",
+			fromId: "from-1",
+			summary: "branch left behind",
+		};
+
+		void collector
+			.awaitFrame((f) => f.kind === "req" && f.method === "session.navigateTree")
+			.then((request) => {
+				expect(payloadOf(request)).toMatchObject({ targetId: "leaf-1", summarize: true });
+				push(stdin, {
+					id: request.id, kind: "res", method: "session.navigateTree",
+					payload: {
+						cancelled: false,
+						editorText: "draft",
+						aborted: true,
+						summaryEntry,
+					},
+				});
+			});
+
+		push(stdin, {
+			id: 75, kind: "req", method: "command.execute",
+			payload: { command: "navigateTreePassthroughProbe", args: "" },
+		});
+
+		const notify = await collector.awaitFrame((f) => f.method === "notify");
+		await collector.awaitFrame((f) => f.id === 75 && f.kind === "res");
+		await Promise.resolve();
+
+		const report = JSON.parse(String(payloadOf(notify)["message"])) as Record<string, unknown>;
+		expect(report["navigateTree"]).toEqual({
+			cancelled: false,
+			editorText: "draft",
+			aborted: true,
+			summaryEntry,
+		});
+		expect(report["hasToken"]).toBe(false);
+		expect(
+			collector.frames.filter((f) => f.kind === "event" && f.method === "session.replacementReady"),
+		).toEqual([]);
+
+		await teardown(connected);
+	});
+
+	test("concurrent commands cannot cross-emit each other's replacement token", async () => {
+		const connected = await connectHost([replacementReadyFactory]);
+		const { collector, stdin } = connected;
+		// Keep idle waiters parked until the replacement command has captured its token.
+		sessionUpdate(stdin, false);
+
+		const newSessionReq = collector.awaitFrame(
+			(f) => f.kind === "req" && f.method === "session.newSession",
+		);
+
+		// Start the idle peer first so it is in-flight under a different ALS scope.
+		push(stdin, {
+			id: 76, kind: "req", method: "command.execute",
+			payload: { command: "concurrentIdleProbe", args: "" },
+		});
+		push(stdin, {
+			id: 77, kind: "req", method: "command.execute",
+			payload: { command: "replacementReadyProbe", args: "" },
+		});
+
+		const request = await newSessionReq;
+		push(stdin, {
+			id: request.id, kind: "res", method: "session.newSession",
+			payload: { cancelled: false, replacementToken: "tok-owner" },
+		});
+		// Release the idle peer only after the owner captured its token.
+		sessionUpdate(stdin, true);
+
+		await collector.awaitFrame((f) => f.id === 76 && f.kind === "res");
+		const ownerRes = await collector.awaitFrame((f) => f.id === 77 && f.kind === "res");
+		const ready = await collector.awaitFrame(
+			(f) => f.kind === "event" && f.method === "session.replacementReady",
+		);
+		const readyFrames = collector.frames.filter(
+			(f) => f.kind === "event" && f.method === "session.replacementReady",
+		);
+		expect(readyFrames).toHaveLength(1);
+		expect(payloadOf(ready)).toEqual({ token: "tok-owner" });
+		const ownerResIdx = collector.frames.indexOf(ownerRes);
+		const readyIdx = collector.frames.indexOf(ready);
+		expect(readyIdx).toBeGreaterThan(ownerResIdx);
+
+		await teardown(connected);
+	});
+});
+
+describe("host: per-command replacement staleness", () => {
+	const staleContextMessage =
+		"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().";
+
+	function setIdle(stdin: Readable): void {
+		push(stdin, {
+			id: 0, kind: "event", method: "session.update",
+			payload: {
+				thinkingLevel: "medium",
+				activeTools: [],
+				allTools: [],
+				commands: [],
+				isIdle: true,
+				hasPendingMessages: false,
+				contextUsage: { tokens: 10, contextWindow: 1000, percent: 1 },
+				scopedModels: [],
+				systemPrompt: "",
+			},
+		});
+	}
+
+	for (const replacement of [
+		{
+			name: "newSession",
+			command: "staleNewSession",
+			method: "session.newSession",
+			payload: { cancelled: false, replacementToken: "token-new" },
+		},
+		{
+			name: "fork",
+			command: "staleFork",
+			method: "session.fork",
+			payload: { cancelled: false, selectedText: "picked", replacementToken: "token-fork" },
+		},
+		{
+			name: "switchSession",
+			command: "staleSwitchSession",
+			method: "session.switchSession",
+			payload: { cancelled: false, replacementToken: "token-switch" },
+		},
+		{
+			name: "reload",
+			command: "staleReload",
+			method: "session.reload",
+			payload: { replacementToken: "token-reload" },
+		},
+	]) {
+		test(`${replacement.name} stales only its initiating command context at token capture`, async () => {
+			const connected = await connectHost([staleCtxFactory]);
+			const { collector, stdin } = connected;
+			setIdle(stdin);
+
+			const replacementRequest = collector.awaitFrame(
+				(frame) => frame.kind === "req" && frame.method === replacement.method,
+			);
+			push(stdin, {
+				id: 100, kind: "req", method: "command.execute",
+				payload: { command: replacement.command, args: "" },
+			});
+			const request = await replacementRequest;
+			push(stdin, {
+				id: request.id, kind: "res", method: replacement.method,
+				payload: replacement.payload,
+			});
+
+			const error = await collector.awaitFrame((frame) => frame.id === 100 && frame.kind === "error");
+			const ready = await collector.awaitFrame(
+				(frame) => frame.kind === "event" && frame.method === "session.replacementReady",
+			);
+			expect(payloadOf(error)["message"]).toBe(staleContextMessage);
+			expect(payloadOf(ready)).toEqual({ token: replacement.payload.replacementToken });
+			expect(collector.frames.filter((frame) => frame.kind === "req" && frame.method === replacement.method)).toHaveLength(1);
+			expect(collector.frames.filter(
+			(frame) => frame.kind === "event" && frame.method === "session.replacementReady",
+		)).toHaveLength(1);
+			expect(collector.frames.indexOf(ready)).toBeGreaterThan(collector.frames.indexOf(error));
+
+			// The stale bit belongs to this handler context, not the runner.
+			push(stdin, {
+				id: 101, kind: "req", method: "command.execute",
+				payload: { command: "activeCtxWorks", args: "" },
+			});
+			const notify = await collector.awaitFrame(
+				(frame) => frame.kind === "event" && frame.method === "notify",
+			);
+			const activeResult = await collector.awaitFrame(
+				(frame) => frame.id === 101 && frame.kind === "res",
+			);
+			expect(JSON.parse(String(payloadOf(notify)["message"]))).toEqual({ active: true });
+			expect(payloadOf(activeResult)).toEqual({ ok: true });
+
+			await teardown(connected);
+		});
+	}
+
+	test("a cancelled replacement leaves its initiating context usable", async () => {
+		const connected = await connectHost([staleCtxFactory]);
+		const { collector, stdin } = connected;
+		setIdle(stdin);
+
+		void collector.awaitFrame((frame) => frame.kind === "req" && frame.method === "session.newSession")
+			.then((request) => {
+				push(stdin, {
+					id: request.id, kind: "res", method: "session.newSession",
+					payload: { cancelled: true, replacementToken: "ignored-token" },
+				});
+			});
+		push(stdin, {
+			id: 110, kind: "req", method: "command.execute",
+			payload: { command: "cancelledCtxRemainsUsable", args: "" },
+		});
+
+		const notify = await collector.awaitFrame((frame) => frame.kind === "event" && frame.method === "notify");
+		const result = await collector.awaitFrame((frame) => frame.id === 110 && frame.kind === "res");
+		expect(JSON.parse(String(payloadOf(notify)["message"]))).toEqual({ cancelled: true, stillUsable: true });
+		expect(payloadOf(result)).toEqual({ ok: true });
+		expect(collector.frames.filter(
+			(frame) => frame.kind === "event" && frame.method === "session.replacementReady",
+		)).toHaveLength(0);
+
+		await teardown(connected);
+	});
+
+	test("setup and withSession use fresh replacement state before ready finalization", async () => {
+		const connected = await connectHost([staleCtxFactory]);
+		const { collector, stdin } = connected;
+		setIdle(stdin);
+
+		void collector.awaitFrame((frame) => frame.kind === "req" && frame.method === "session.newSession")
+			.then((request) => {
+				push(stdin, {
+					id: request.id, kind: "res", method: "session.newSession",
+					payload: { cancelled: false, replacementToken: "fresh-context-token" },
+				});
+			});
+		push(stdin, {
+			id: 120, kind: "req", method: "command.execute",
+			payload: { command: "withSessionUsesFreshContext", args: "" },
+		});
+
+		const error = await collector.awaitFrame((frame) => frame.id === 120 && frame.kind === "error");
+		const ready = await collector.awaitFrame(
+			(frame) => frame.kind === "event" && frame.method === "session.replacementReady",
+		);
+		const sessionCommands = collector.frames.filter(
+			(frame) => frame.kind === "event" && frame.method === "session.command",
+		);
+		expect(sessionCommands.map((frame) => payloadOf(frame)["action"])).toEqual([
+			"setSessionName",
+			"sendUserMessage",
+		]);
+		expect(payloadOf(error)["message"]).toBe(staleContextMessage);
+		expect(payloadOf(ready)).toEqual({ token: "fresh-context-token" });
+		expect(collector.frames.indexOf(ready)).toBeGreaterThan(collector.frames.indexOf(error));
+		expect(collector.frames.filter(
+			(frame) => frame.kind === "event" && frame.method === "session.replacementReady",
+		)).toHaveLength(1);
+
+		await teardown(connected);
+	});
+
+	test("method captured before newSession rechecks stale guard on call", async () => {
+		const connected = await connectHost([staleCtxFactory]);
+		const { collector, stdin } = connected;
+		setIdle(stdin);
+
+		void collector.awaitFrame((frame) => frame.kind === "req" && frame.method === "session.newSession")
+			.then((request) => {
+				push(stdin, {
+					id: request.id, kind: "res", method: "session.newSession",
+					payload: { cancelled: false, replacementToken: "captured-method-token" },
+				});
+			});
+		push(stdin, {
+			id: 125, kind: "req", method: "command.execute",
+			payload: { command: "capturedMethodStalesAfterNewSession", args: "" },
+		});
+
+		const error = await collector.awaitFrame((frame) => frame.id === 125 && frame.kind === "error");
+		const ready = await collector.awaitFrame(
+			(frame) => frame.kind === "event" && frame.method === "session.replacementReady",
+		);
+		const newSessionReqs = collector.frames.filter(
+			(frame) => frame.kind === "req" && frame.method === "session.newSession",
+		);
+		const sessionCommands = collector.frames.filter(
+			(frame) => frame.kind === "event" && frame.method === "session.command",
+		);
+		// Captured waitForIdle must not trigger another session request after replacement.
+		expect(newSessionReqs).toHaveLength(1);
+		// withSession still ran against a fresh context.
+		expect(sessionCommands.map((frame) => payloadOf(frame)["action"])).toEqual([
+			"sendUserMessage",
+		]);
+		expect(payloadOf(error)["message"]).toBe(staleContextMessage);
+		expect(payloadOf(ready)).toEqual({ token: "captured-method-token" });
+		expect(collector.frames.indexOf(ready)).toBeGreaterThan(collector.frames.indexOf(error));
+		expect(collector.frames.filter(
+			(frame) => frame.kind === "event" && frame.method === "session.replacementReady",
+		)).toHaveLength(1);
+
+		await teardown(connected);
+	});
+
+	test("captured ctx throws after runner rebuild", async () => {
+		resetCapturedCtx();
+		const connected = await connectHost([staleCtxFactory]);
+		const { collector, stdin } = connected;
+
+		push(stdin, {
+			id: 130, kind: "req", method: "command.execute",
+			payload: { command: "captureCtx", args: "" },
+		});
+		await collector.awaitFrame((frame) => frame.id === 130 && frame.kind === "res");
+
+		push(stdin, {
+			id: 131, kind: "req", method: "extensions.load",
+			payload: { extensionPaths: [], cwd: process.cwd() },
+		});
+		await collector.awaitFrame((frame) => frame.id === 131 && frame.kind === "res");
+
+		push(stdin, {
+			id: 132, kind: "req", method: "command.execute",
+			payload: { command: "useStaleCtx", args: "" },
+		});
+		const error = await collector.awaitFrame((frame) => frame.id === 132 && frame.kind === "error");
+		expect(payloadOf(error)["message"]).toBe(staleContextMessage);
+
+		await teardown(connected);
 	});
 });

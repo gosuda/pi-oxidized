@@ -868,6 +868,45 @@ pub fn tui_overlay_spec(spec: &crate::protocol::OverlaySpec) -> pi_tui::layout::
 // Registration records
 // ---------------------------------------------------------------------------
 
+/// Source scope for an extension command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CommandSourceScope {
+    /// User-level resource.
+    User,
+    /// Project-level resource.
+    Project,
+    /// CLI or synthetic resource.
+    Temporary,
+}
+
+/// Source origin for an extension command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CommandSourceOrigin {
+    /// Package-owned resource.
+    Package,
+    /// Top-level path or inline factory.
+    TopLevel,
+}
+
+/// Provenance for an extension command.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandSourceInfo {
+    /// Absolute or synthetic path.
+    pub path: String,
+    /// Discovery source label.
+    pub source: String,
+    /// User, project, or temporary scope.
+    pub scope: CommandSourceScope,
+    /// Package or top-level origin.
+    pub origin: CommandSourceOrigin,
+    /// Optional source base directory.
+    #[serde(default)]
+    pub base_dir: Option<String>,
+}
+
 /// A registered custom command.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommandRegistration {
@@ -877,6 +916,8 @@ pub struct CommandRegistration {
     pub description: Option<String>,
     /// Owning extension path.
     pub source: Option<String>,
+    /// Full command provenance when supplied by the host.
+    pub source_info: Option<CommandSourceInfo>,
 }
 
 /// A registered keyboard shortcut.
@@ -1838,11 +1879,13 @@ mod tests {
             name: "c".to_owned(),
             description: None,
             source: None,
+            source_info: None,
         }));
         assert!(!registry.register_command(CommandRegistration {
             name: "c".to_owned(),
             description: None,
             source: None,
+            source_info: None,
         }));
 
         assert!(registry.register_provider(ProviderRegistration {

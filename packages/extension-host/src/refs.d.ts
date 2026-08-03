@@ -77,18 +77,39 @@ declare module "@earendil-works/pi-coding-agent" {
 		getSystemPrompt(): string;
 	}
 
+	/**
+	 * Narrow SessionManager surface passed to `newSession({ setup })`.
+	 * Mirrors `ExtensionHost.createSessionManagerProxy()` — only supported
+	 * bridge methods; unsupported SessionManager APIs throw at runtime.
+	 */
+	export interface SessionManagerSetupBridge {
+		appendCustomEntry(customType: string, data?: unknown): Promise<void>;
+		appendSessionInfo(name: string): Promise<void>;
+		getSessionName(): string | undefined;
+		getEntries(): unknown;
+	}
+	export interface BranchSummaryEntry {
+		type: "branch_summary";
+		id: string;
+		parentId: string | null;
+		timestamp: string;
+		fromId: string;
+		summary: string;
+		details?: unknown;
+	}
+
 	export interface ExtensionCommandContext extends ExtensionContext {
 		getSystemPromptOptions?(): BuildSystemPromptOptions;
 		waitForIdle(): Promise<void>;
 		newSession(options?: {
 			parentSession?: string;
-			setup?: (sessionManager: unknown) => Promise<void>;
+			setup?: (sessionManager: SessionManagerSetupBridge) => Promise<void>;
 			withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
 		}): Promise<{ cancelled: boolean }>;
 		fork(
 			entryId: string,
 			options?: { position?: "before" | "at"; withSession?: (ctx: ReplacedSessionContext) => Promise<void> },
-		): Promise<{ cancelled: boolean }>;
+		): Promise<{ cancelled: boolean; selectedText?: string }>;
 		navigateTree(
 			targetId: string,
 			options?: {
@@ -97,7 +118,12 @@ declare module "@earendil-works/pi-coding-agent" {
 				replaceInstructions?: boolean;
 				label?: string;
 			},
-		): Promise<{ cancelled: boolean }>;
+		): Promise<{
+			cancelled: boolean;
+			editorText?: string;
+			aborted?: boolean;
+			summaryEntry?: BranchSummaryEntry;
+		}>;
 		switchSession(
 			sessionPath: string,
 			options?: { withSession?: (ctx: ReplacedSessionContext) => Promise<void> },
@@ -429,13 +455,13 @@ declare module "@earendil-works/pi-coding-agent" {
 		waitForIdle: () => Promise<void>;
 		newSession: (options?: {
 			parentSession?: string;
-			setup?: (sessionManager: unknown) => Promise<void>;
+			setup?: (sessionManager: SessionManagerSetupBridge) => Promise<void>;
 			withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
 		}) => Promise<{ cancelled: boolean }>;
 		fork: (
 			entryId: string,
 			options?: { position?: "before" | "at"; withSession?: (ctx: ReplacedSessionContext) => Promise<void> },
-		) => Promise<{ cancelled: boolean }>;
+		) => Promise<{ cancelled: boolean; selectedText?: string }>;
 		navigateTree: (
 			targetId: string,
 			options?: {
@@ -444,7 +470,12 @@ declare module "@earendil-works/pi-coding-agent" {
 				replaceInstructions?: boolean;
 				label?: string;
 			},
-		) => Promise<{ cancelled: boolean }>;
+		) => Promise<{
+			cancelled: boolean;
+			editorText?: string;
+			aborted?: boolean;
+			summaryEntry?: BranchSummaryEntry;
+		}>;
 		switchSession: (
 			sessionPath: string,
 			options?: { withSession?: (ctx: ReplacedSessionContext) => Promise<void> },

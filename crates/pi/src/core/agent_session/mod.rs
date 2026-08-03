@@ -65,6 +65,7 @@ use pi_ai::{AssistantMessage, Model, ModelThinkingLevel, Provider};
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio_util::sync::CancellationToken;
 
+use crate::core::agent_session_runtime::AgentSessionRuntime;
 use crate::core::model_runtime::ModelRuntime;
 use crate::core::sessions::{SessionError, SessionManager};
 use crate::core::settings::SettingsManager;
@@ -408,6 +409,8 @@ pub struct AgentSession {
     pub(super) resource_loader: Option<AsyncMutex<crate::core::resources::DefaultResourceLoader>>,
     /// Self handle for pump (set after construction).
     pub(super) self_handle: Mutex<Option<std::sync::Weak<AgentSession>>>,
+    /// Runtime owning this session, when the session participates in replacement.
+    runtime_handle: Mutex<Option<std::sync::Weak<AgentSessionRuntime>>>,
     /// Stops the weak extension-registry observer on dispose or drop.
     extension_registry_cancel: CancellationToken,
     /// Serializes the whole `bind_extensions` lifecycle (record → emit →
@@ -521,6 +524,7 @@ impl AgentSession {
             prompt_templates: Mutex::new(config.prompt_templates),
             resource_loader: config.resource_loader.map(AsyncMutex::new),
             self_handle: Mutex::new(None),
+            runtime_handle: Mutex::new(None),
             extension_registry_cancel: CancellationToken::new(),
             bind_lock: AsyncMutex::new(()),
         });
@@ -567,6 +571,24 @@ impl AgentSession {
         Arc::clone(&self.hooks)
     }
 
+    /// Link this session to the runtime that owns its replacement lifecycle.
+    pub fn set_runtime_handle(&self, handle: std::sync::Weak<AgentSessionRuntime>) {
+        *self
+            .runtime_handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
+    }
+
+    /// Owning runtime, when this session was created through a linked runtime.
+    #[must_use]
+    pub fn runtime_handle(&self) -> Option<Arc<AgentSessionRuntime>> {
+        self.runtime_handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+    }
+
     /// Session manager async mutex (single-writer).
     #[must_use]
     pub fn session_manager(&self) -> Arc<AsyncMutex<SessionManager>> {
@@ -596,6 +618,12 @@ impl AgentSession {
     pub fn is_idle(&self) -> bool {
         let inner = self.lock_inner();
         !inner.is_agent_run_active && !self.agent.state().is_streaming
+    }
+
+    /// Whether disposal has started for this session.
+    #[must_use]
+    pub fn is_disposed(&self) -> bool {
+        self.lock_inner().disposed
     }
 
     /// Whether session-level auto-compaction is in progress.
