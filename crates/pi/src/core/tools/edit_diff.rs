@@ -655,14 +655,20 @@ pub fn generate_diff_string(
     new_content: &str,
     context_lines: usize,
 ) -> DiffStringResult {
-    let old_lines = split_lines_keep_trailing_empty(old_content);
-    let new_lines = split_lines_keep_trailing_empty(new_content);
+    let mut old_lines = split_lines_keep_trailing_empty(old_content);
+    let mut new_lines = split_lines_keep_trailing_empty(new_content);
     let line_num_width = old_lines
         .len()
         .max(new_lines.len())
         .max(1)
         .to_string()
         .len();
+    if old_lines.last() == Some(&"") {
+        old_lines.pop();
+    }
+    if new_lines.last() == Some(&"") {
+        new_lines.pop();
+    }
     let parts = collapse_ops(&diff_ops(&old_lines, &new_lines));
     render_diff_parts(&parts, context_lines, line_num_width)
 }
@@ -1209,5 +1215,11 @@ mod tests {
         let result = generate_diff_string("a\nb\nc\n", "a\nB\nc\n", 4);
         assert_eq!(result.first_changed_line, Some(2));
         assert!(result.diff.contains('B'));
+    }
+
+    #[test]
+    fn display_diff_omits_trailing_empty_context_line() {
+        let result = generate_diff_string("verification-before\n", "verification-after\n", 4);
+        assert_eq!(result.diff, "-1 verification-before\n+1 verification-after");
     }
 }
