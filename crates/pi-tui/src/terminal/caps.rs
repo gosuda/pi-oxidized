@@ -272,7 +272,7 @@ fn create_tmux_probe_output() -> io::Result<(PathBuf, File)> {
         ));
         match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(file) => return Ok((path, file)),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error),
         }
     }
@@ -289,22 +289,18 @@ fn create_tmux_probe_output() -> io::Result<(PathBuf, File)> {
 /// conservative and returns `false`. The output file prevents a descendant
 /// retaining stdout from extending the probe past its deadline.
 fn probe_tmux_hyperlinks() -> bool {
-    let (output_path, output_file) = match create_tmux_probe_output() {
-        Ok(output) => output,
-        Err(_) => return false,
+    let Ok((output_path, output_file)) = create_tmux_probe_output() else {
+        return false;
     };
-    let mut child = match Command::new("tmux")
+    let Ok(mut child) = Command::new("tmux")
         .args(["display-message", "-p", "#{client_termfeatures}"])
         .stdin(Stdio::null())
         .stdout(Stdio::from(output_file))
         .stderr(Stdio::null())
         .spawn()
-    {
-        Ok(child) => child,
-        Err(_) => {
-            let _ = fs::remove_file(output_path);
-            return false;
-        }
+    else {
+        let _ = fs::remove_file(output_path);
+        return false;
     };
 
     let deadline = Instant::now() + TMUX_PROBE_TIMEOUT;
@@ -337,7 +333,7 @@ fn probe_tmux_hyperlinks() -> bool {
                         .read_to_end(&mut output)
                 })
                 .is_ok()
-                && output.len() <= TMUX_FEATURES_MAX_BYTES as usize
+                && u64::try_from(output.len()).is_ok_and(|len| len <= TMUX_FEATURES_MAX_BYTES)
                 && String::from_utf8(output).is_ok_and(|features| {
                     features
                         .split(',')
@@ -739,9 +735,12 @@ mod tests {
 
     #[test]
     fn empty_terminal_markers_do_not_grant_or_mask_capabilities() {
+        let probed = std::cell::Cell::new(false);
         let kitty = detect_with(env_from(&[("TMUX", ""), ("KITTY_WINDOW_ID", "1")]), || {
-            panic!("empty TMUX must not run the tmux probe")
+            probed.set(true);
+            false
         });
+        assert!(!probed.get());
         assert_eq!(kitty.images, Some(ImageProtocol::Kitty));
 
         for marker in [
