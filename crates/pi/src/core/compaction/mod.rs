@@ -269,13 +269,15 @@ pub struct SummarizationRetryPolicy {
     pub base_delay_ms: u64,
 }
 
+type RetryScheduledFn = Arc<dyn Fn(u32, u32, u64, String) + Send + Sync>;
+
 /// Synchronous hooks around a summarization retry cycle.
 ///
-/// AgentSession uses these to publish the TypeScript-compatible retry events.
+/// `AgentSession` uses these to publish the TypeScript-compatible retry events.
 #[derive(Clone, Default)]
 pub struct SummarizationRetryCallbacks {
     /// Called before each retry backoff. Arguments are attempt, maximum, delay, error.
-    pub on_retry_scheduled: Option<Arc<dyn Fn(u32, u32, u64, String) + Send + Sync>>,
+    pub on_retry_scheduled: Option<RetryScheduledFn>,
     /// Called after backoff immediately before the retried request.
     pub on_retry_attempt_start: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Called once after at least one retry was scheduled and the cycle ends.
@@ -937,24 +939,22 @@ where
         let response = match produce().await {
             Ok(response) => response,
             Err(error) => {
-                if retried {
-                    if let Some(callback) =
+                if retried
+                    && let Some(callback) =
                         callbacks.and_then(|callbacks| callbacks.on_retry_finished.as_ref())
-                    {
-                        callback();
-                    }
+                {
+                    callback();
                 }
                 return Err(error);
             }
         };
 
         if response.stop_reason == StopReason::Aborted {
-            if retried {
-                if let Some(callback) =
+            if retried
+                && let Some(callback) =
                     callbacks.and_then(|callbacks| callbacks.on_retry_finished.as_ref())
-                {
-                    callback();
-                }
+            {
+                callback();
             }
             return Ok(response);
         }
@@ -963,12 +963,11 @@ where
             || attempt >= max_retries
             || !crate::core::agent_session::retry::is_retryable_assistant_error(&response)
         {
-            if retried {
-                if let Some(callback) =
+            if retried
+                && let Some(callback) =
                     callbacks.and_then(|callbacks| callbacks.on_retry_finished.as_ref())
-                {
-                    callback();
-                }
+            {
+                callback();
             }
             return Ok(response);
         }
@@ -979,13 +978,11 @@ where
             .error_message
             .clone()
             .unwrap_or_else(|| "Unknown error".to_owned());
-        let delay_ms = policy
-            .map(|policy| {
-                let exponent = attempt.saturating_sub(1);
-                let multiplier = 1_u64.checked_shl(exponent).unwrap_or(u64::MAX);
-                policy.base_delay_ms.saturating_mul(multiplier)
-            })
-            .unwrap_or(0);
+        let delay_ms = policy.map_or(0, |policy| {
+            let exponent = attempt.saturating_sub(1);
+            let multiplier = 1_u64.checked_shl(exponent).unwrap_or(u64::MAX);
+            policy.base_delay_ms.saturating_mul(multiplier)
+        });
 
         if let Some(callback) =
             callbacks.and_then(|callbacks| callbacks.on_retry_scheduled.as_ref())

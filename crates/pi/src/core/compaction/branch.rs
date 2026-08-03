@@ -7,8 +7,8 @@ use std::collections::BTreeMap;
 
 use pi_agent::AgentMessage;
 use pi_ai::{
-    AssistantContent, AssistantMessage, AssistantMessageEvent, Context, Message, Model, StopReason,
-    StreamOptions, TextContent, UserContent, UserMessage, UserMessageContent,
+    AssistantContent, AssistantMessage, Context, Message, Model, StopReason, StreamOptions,
+    TextContent, UserContent, UserMessage, UserMessageContent,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -319,6 +319,7 @@ fn now_millis() -> i64 {
 ///
 /// Surfaces cancellation and provider failures; non-abort summarizer errors are
 /// returned as [`BranchSummaryResult::error`] (matching TS soft-error shape).
+#[allow(clippy::too_many_lines)]
 pub async fn generate_branch_summary(
     entries: &[SessionEntry],
     options: GenerateBranchSummaryOptions,
@@ -445,7 +446,7 @@ mod tests {
     use super::*;
     use crate::core::compaction::{CompactionSettings, DEFAULT_COMPACTION_SETTINGS};
     use pi_ai::ProviderError;
-    use pi_ai::{AssistantMessage, ModelInput, TextContent, ToolCall};
+    use pi_ai::{AssistantMessage, AssistantMessageEvent, ModelInput, TextContent, ToolCall};
     use serde_json::{Map, json};
     use std::pin::Pin;
     use std::sync::Arc;

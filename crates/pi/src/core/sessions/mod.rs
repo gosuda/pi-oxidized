@@ -2211,6 +2211,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn generated_cross_version_session_interoperability() -> TestResult {
         fn fixture_files(
             root: &Path,
@@ -2234,6 +2235,20 @@ mod tests {
                 tree_ids(&node.children, ids);
             }
         }
+        fn expected_tree_ids(value: &Value, ids: &mut Vec<String>) {
+            for node in value.as_array().into_iter().flatten() {
+                if let Some(id) = node
+                    .get("entry")
+                    .and_then(|entry| entry.get("id"))
+                    .and_then(Value::as_str)
+                {
+                    ids.push(id.to_owned());
+                }
+                if let Some(children) = node.get("children") {
+                    expected_tree_ids(children, ids);
+                }
+            }
+        }
 
         let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../.agent-tasks/pi-rust-rewrite/fixtures/sessions");
@@ -2242,20 +2257,17 @@ mod tests {
         // `cargo test`), fall back to a fresh per-run directory under the crate
         // temp area so the proof is self-contained and free of stale content.
         let _output_guard;
-        let output_root: PathBuf = match std::env::var_os("PI_SESSION_INTEROP_OUTPUT") {
-            Some(dir) => {
-                _output_guard = None;
-                PathBuf::from(dir)
-            }
-            None => {
-                let tmp_base = std::env::var_os("CARGO_TARGET_TMPDIR")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(std::env::temp_dir);
-                let guard = tempfile::tempdir_in(&tmp_base)?;
-                let path = guard.path().to_path_buf();
-                _output_guard = Some(guard);
-                path
-            }
+        let output_root: PathBuf = if let Some(dir) = std::env::var_os("PI_SESSION_INTEROP_OUTPUT")
+        {
+            _output_guard = None;
+            PathBuf::from(dir)
+        } else {
+            let tmp_base = std::env::var_os("CARGO_TARGET_TMPDIR")
+                .map_or_else(std::env::temp_dir, PathBuf::from);
+            let guard = tempfile::tempdir_in(&tmp_base)?;
+            let path = guard.path().to_path_buf();
+            _output_guard = Some(guard);
+            path
         };
         fs::create_dir_all(&output_root)?;
         let mut fixtures = Vec::new();
@@ -2356,20 +2368,6 @@ mod tests {
             let mut actual_tree = Vec::new();
             tree_ids(&session.get_tree(), &mut actual_tree);
             let mut expected_tree = Vec::new();
-            fn expected_tree_ids(value: &Value, ids: &mut Vec<String>) {
-                for node in value.as_array().into_iter().flatten() {
-                    if let Some(id) = node
-                        .get("entry")
-                        .and_then(|entry| entry.get("id"))
-                        .and_then(Value::as_str)
-                    {
-                        ids.push(id.to_owned());
-                    }
-                    if let Some(children) = node.get("children") {
-                        expected_tree_ids(children, ids);
-                    }
-                }
-            }
             expected_tree_ids(&expected["tree"], &mut expected_tree);
             let actual_tree_as_expected: Vec<String> = actual_tree
                 .into_iter()
@@ -2377,7 +2375,7 @@ mod tests {
                     expected_to_actual
                         .iter()
                         .find_map(|(expected, mapped)| {
-                            (*mapped == actual).then_some((*expected).to_owned())
+                            (*mapped == actual).then_some(expected.clone())
                         })
                         .ok_or("tree entry")
                 })

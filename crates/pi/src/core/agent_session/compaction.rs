@@ -26,10 +26,7 @@ use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use pi_ai::{
-    AssistantMessage, AssistantMessageEvent, Context, Model, ProviderError, StopReason,
-    StreamOptions,
-};
+use pi_ai::{AssistantMessage, AssistantMessageEvent, Model, ProviderError, StopReason};
 use regex::Regex;
 use tokio_util::sync::CancellationToken;
 
@@ -45,6 +42,7 @@ use crate::core::settings::ResolvedCompactionSettings;
 use super::AgentSession;
 use super::events::{AgentSessionEvent, CompactionReason, SummarizationRetrySource};
 use super::extension_runner::ExtensionRunner;
+use super::tree::SummarizationAuth;
 
 // ---------------------------------------------------------------------------
 // Resolved auth + stream source for compaction
@@ -161,7 +159,7 @@ impl AgentSession {
                 let path_entries = self.snapshot_branch_entries().await;
                 let path_refs: Vec<&SessionEntry> = path_entries.iter().collect();
                 let err = preparation_none_error(&path_refs);
-                let message = err.to_string();
+                let message = format!("Compaction failed: {err}");
                 self.emit_public_awaited(&AgentSessionEvent::CompactionEnd {
                     reason: CompactionReason::Manual,
                     result: None,
@@ -566,49 +564,60 @@ impl AgentSession {
     ///
     /// Returns [`CompactionError::SummarizationFailed`] when no model runtime
     /// is configured or auth resolution fails.
-    async fn resolve_compaction_inputs(&self) -> Result<CompactionInputs, CompactionError> {
-        if let Some(runtime) = self.model_runtime_handle() {
-            let model = self.model();
-
-            let auth = runtime
-                .get_auth_for_model(&model, ModelRuntimeAuthOverrides::default())
-                .await
-                .map_err(|err| {
-                    CompactionError::SummarizationFailed(format!("auth resolution failed: {err}"))
-                })?;
-
-            let api_key = auth.as_ref().and_then(|a| a.auth.api_key.clone());
-            let headers = auth.as_ref().and_then(|a| a.auth.headers.clone());
-            let env = auth.and_then(|a| {
-                a.env.map(|provider_env| {
+    /// Resolve model-runtime auth and stream inputs shared by compaction and
+    /// branch summarization.
+    ///
+    /// The test-only [`CompactionStreamHandle`] fallback remains compaction
+    /// specific; tree navigation requires a real model runtime.
+    pub(crate) async fn resolve_summarization_inputs(
+        &self,
+    ) -> Result<(SummarizationAuth, SummarizeStreamFn), CompactionError> {
+        let runtime = self.model_runtime_handle().ok_or_else(|| {
+            CompactionError::SummarizationFailed(
+                "No model runtime configured for compaction".to_owned(),
+            )
+        })?;
+        let model = self.model();
+        let auth = runtime
+            .get_auth_for_model(&model, ModelRuntimeAuthOverrides::default())
+            .await
+            .map_err(|err| {
+                CompactionError::SummarizationFailed(format!("auth resolution failed: {err}"))
+            })?;
+        let auth = SummarizationAuth {
+            api_key: auth.as_ref().and_then(|value| value.auth.api_key.clone()),
+            headers: auth.as_ref().and_then(|value| value.auth.headers.clone()),
+            env: auth.and_then(|value| {
+                value.env.map(|provider_env| {
                     provider_env
                         .into_iter()
                         .collect::<BTreeMap<String, String>>()
                 })
-            });
+            }),
+        };
+        let stream_fn: SummarizeStreamFn = Arc::new(move |model, context, options| {
+            let runtime = Arc::clone(&runtime);
+            Box::pin(async move {
+                runtime.stream_simple(model, context, options)
+                    as Pin<
+                        Box<
+                            dyn futures::Stream<Item = Result<AssistantMessageEvent, ProviderError>>
+                                + Send,
+                        >,
+                    >
+            })
+        });
+        Ok((auth, stream_fn))
+    }
 
-            let stream_fn: SummarizeStreamFn = {
-                let runtime = runtime.clone();
-                Arc::new(move |model: Model, ctx: Context, opts: StreamOptions| {
-                    let runtime = runtime.clone();
-                    Box::pin(async move {
-                        runtime.stream_simple(model, ctx, opts)
-                            as Pin<
-                                Box<
-                                    dyn futures::Stream<
-                                            Item = Result<AssistantMessageEvent, ProviderError>,
-                                        > + Send,
-                                >,
-                            >
-                    })
-                })
-            };
-
+    async fn resolve_compaction_inputs(&self) -> Result<CompactionInputs, CompactionError> {
+        if self.model_runtime_handle().is_some() {
+            let (auth, stream_fn) = self.resolve_summarization_inputs().await?;
             return Ok(CompactionInputs {
                 stream_fn,
-                api_key,
-                headers,
-                env,
+                api_key: auth.api_key,
+                headers: auth.headers,
+                env: auth.env,
             });
         }
 
@@ -1538,7 +1547,7 @@ mod tests {
         });
 
         let result = session.compact(None).await?;
-        assert_eq!(result.summary.contains("recovered"), true);
+        assert!(result.summary.contains("recovered"));
         assert!(attempts.load(std::sync::atomic::Ordering::SeqCst) >= 2);
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
