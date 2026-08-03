@@ -515,7 +515,7 @@ mod tests {
             bottom: 3,
             left: 4,
         };
-        let out = serde_json::to_value(&m)?;
+        let out = serde_json::to_value(m)?;
         assert_eq!(out["top"], 1);
         assert_eq!(out["right"], 2);
         assert_eq!(out["bottom"], 3);
