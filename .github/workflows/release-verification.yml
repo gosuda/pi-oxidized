@@ -36,14 +36,14 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           repository: earendil-works/pi
-          ref: 956074697fc0f59e8a9787717e76d5bb0ee7bc72
+          ref: 4488ad55c18f07ae89a489096c90de8667b3adfb
           path: .references/pi
           persist-credentials: false
 
       - name: Verify reference pin
         shell: bash
         run: |
-          test "$(git -C .references/pi rev-parse HEAD)" = "956074697fc0f59e8a9787717e76d5bb0ee7bc72"
+          test "$(git -C .references/pi rev-parse HEAD)" = "4488ad55c18f07ae89a489096c90de8667b3adfb"
 
       - name: Set up QEMU for aarch64 Linux
         if: matrix.target == 'aarch64-unknown-linux-gnu'
