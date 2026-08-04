@@ -373,6 +373,63 @@ async fn native_boolean_flag_default_decodes_and_preserves_typed_fallback() -> R
 }
 
 #[tokio::test]
+async fn unset_boolean_flag_falls_back_to_typed_false() -> R {
+    let snapshot = json!({
+        "flags": [
+            {
+                "name": "verbose",
+                "type": "boolean",
+                "extensionPath": "native://demo"
+            },
+            {
+                "name": "mode",
+                "type": "string",
+                "extensionPath": "native://demo"
+            }
+        ],
+        "handlers": [],
+    });
+    let (runner, _host) = make_runner(snapshot).await?;
+
+    // Boolean flag with no value and no default must be typed false,
+    // not an empty string.
+    assert_eq!(
+        runner.get_flag_values().get("verbose"),
+        Some(&Value::Bool(false))
+    );
+    // String flag with no value and no default stays an empty string.
+    assert_eq!(
+        runner.get_flag_values().get("mode"),
+        Some(&Value::String(String::new()))
+    );
+
+    // The typed fallback survives the restart-and-rewire flag preservation
+    // path: Value::Bool(false) converts to FlagValueWire::Boolean(false) and
+    // back, remaining typed through apply_flag_values.
+    let preserved = runner.get_flag_values();
+    let overlay: BTreeMap<String, FlagValueWire> = preserved
+        .iter()
+        .map(|(name, value)| match value {
+            Value::Bool(b) => Ok((name.clone(), FlagValueWire::Boolean(*b))),
+            Value::String(s) => Ok((name.clone(), FlagValueWire::String(s.clone()))),
+            other => Err(format!("unsupported flag value for {name}: {other}")),
+        })
+        .collect::<Result<_, _>>()?;
+    runner.apply_flag_values(&overlay).await?;
+    assert_eq!(
+        runner.get_flag_values().get("verbose"),
+        Some(&Value::Bool(false)),
+        "boolean fallback must stay typed through apply_flag_values"
+    );
+    assert_eq!(
+        runner.get_flag_values().get("mode"),
+        Some(&Value::String(String::new())),
+        "string fallback must stay typed through apply_flag_values"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn native_flag_default_yields_to_host_resolved_value() -> R {
     let snapshot = json!({
         "flags": [{

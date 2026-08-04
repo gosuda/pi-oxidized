@@ -40,6 +40,7 @@ const DEFAULT_LOCK_ACQUIRE_TIMEOUT_MS = 10_000;
 const LOCK_INITIALIZING_GRACE_MS = 30_000;
 const LOCK_OWNER_FILE = "owner.json";
 const DATA_MANIFEST_FILE = ".manifest.json";
+const MANIFEST_SCHEMA_VERSION = 3;
 const LOCK_OWNER_VERSION = 1;
 type FileSystemError = Error & { code?: string };
 
@@ -104,6 +105,13 @@ export type ReconstructProofContext = {
 	catalogPath: string;
 	providersDir: string;
 	dataDir: string;
+	/**
+	 * Optional override for the catalog snapshot restore in `defaultInversionProof`.
+	 * Defaults to `writeFile` from `node:fs/promises`. Tests inject a failing
+	 * restore here so the error-preservation path is exercised deterministically
+	 * regardless of uid (chmod-based restore failures do not stop root).
+	 */
+	restoreCatalog?: (path: string, data: Uint8Array) => Promise<void>;
 };
 
 export type ReconstructProviderDataResult = {
@@ -176,6 +184,12 @@ function rebuildProviderManifest(
 	if (typeof generatedAt !== "string" || Number.isNaN(Date.parse(generatedAt))) {
 		throw new Error("provider manifest has an invalid generation timestamp");
 	}
+	const previousSchemaVersion = (parsed as Record<string, unknown>)["schemaVersion"];
+	if (previousSchemaVersion !== MANIFEST_SCHEMA_VERSION) {
+		throw new Error(
+			`provider manifest schemaVersion ${String(previousSchemaVersion)} is not supported; this reconstruction emits ${MANIFEST_SCHEMA_VERSION}`,
+		);
+	}
 
 	const structure = Object.create(null) as Record<string, Record<string, string>>;
 	for (const provider of Object.keys(catalog).sort()) {
@@ -198,7 +212,7 @@ function rebuildProviderManifest(
 		.update(JSON.stringify(sortDeep(structure)))
 		.digest("hex");
 	const manifest = {
-		schemaVersion: 3,
+		schemaVersion: MANIFEST_SCHEMA_VERSION,
 		generatedAt,
 		structureHash,
 		files,
@@ -648,6 +662,7 @@ export async function defaultInversionProof(ctx: ReconstructProofContext): Promi
 	// Snapshot/restore keeps the generator-owned artifact untouched.
 	// Only valid for repository default paths — see usesRepositoryDefaultPaths.
 	const before = await Bun.file(ctx.catalogPath).bytes();
+	const restoreCatalog = ctx.restoreCatalog ?? writeFile;
 	let proofFailure: unknown;
 	try {
 		const regen = Bun.spawnSync(
@@ -672,7 +687,7 @@ export async function defaultInversionProof(ctx: ReconstructProofContext): Promi
 		throw error;
 	} finally {
 		try {
-			await writeFile(ctx.catalogPath, before);
+			await restoreCatalog(ctx.catalogPath, before);
 		} catch (restoreError) {
 			if (proofFailure === undefined) throw restoreError;
 			throw new Error(

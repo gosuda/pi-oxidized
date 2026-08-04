@@ -185,10 +185,47 @@ pub(crate) enum PrepareReplacementOutcome {
 }
 
 /// A fully constructed replacement that has not touched the current session.
+///
+/// The `result` field is an [`Option`] so that [`Drop`] can tell whether the
+/// replacement was consumed by finalize / abort. If neither path runs (early
+/// return, `?`, panic-unwind), `Drop` reaps the live session on a background
+/// task — matching the `PreparedReload` guard in `extension_runtime_set.rs`.
 pub(crate) struct PreparedReplacement {
-    pub(crate) result: CreateAgentSessionRuntimeResult,
+    pub(crate) result: Option<CreateAgentSessionRuntimeResult>,
     pub(crate) reason: SessionShutdownReason,
     pub(crate) target_session_file: Option<String>,
+}
+
+/// Spawn resource cleanup even when the caller has no entered Tokio runtime.
+pub(crate) fn spawn_runtime_safe<F>(task_name: &'static str, future: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(future);
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name(task_name.to_owned())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            let Ok(runtime) = runtime else {
+                return;
+            };
+            runtime.block_on(future);
+        });
+}
+
+impl Drop for PreparedReplacement {
+    fn drop(&mut self) {
+        if let Some(result) = self.result.take() {
+            spawn_runtime_safe("prepared-replacement-drop", async move {
+                result.session.dispose().await;
+            });
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -271,7 +308,12 @@ pub struct AgentSessionRuntime {
 }
 
 impl AgentSessionRuntime {
-    /// Construct the runtime from an initial session + services + factory.
+    /// Construct the runtime from an initial session + services + factory and
+    /// link it to its session.
+    ///
+    /// Returns an [`Arc`] whose session already carries the runtime's weak
+    /// handle. Callers cannot forget to [`link`](Self::link) — the link is
+    /// established before the `Arc` leaves this constructor.
     #[must_use]
     pub fn new(
         session: Arc<AgentSession>,
@@ -279,8 +321,8 @@ impl AgentSessionRuntime {
         factory: Arc<dyn CreateAgentSessionRuntimeFactory>,
         diagnostics: Vec<crate::core::agent_session_services::AgentSessionRuntimeDiagnostic>,
         model_fallback_message: Option<String>,
-    ) -> Self {
-        Self {
+    ) -> Arc<Self> {
+        let runtime = Arc::new(Self {
             session: RwLock::new(session),
             services: RwLock::new(services),
             factory,
@@ -299,7 +341,9 @@ impl AgentSessionRuntime {
             import_commit_started: tokio::sync::Notify::new(),
             #[cfg(test)]
             import_commit_finished: tokio::sync::Notify::new(),
-        }
+        });
+        runtime.link();
+        runtime
     }
 
     /// Snapshot of the current session (cheap Arc clone).
@@ -309,7 +353,7 @@ impl AgentSessionRuntime {
     }
 
     /// Link this runtime to its current session and all future replacements.
-    pub fn link(self: &Arc<Self>) {
+    fn link(self: &Arc<Self>) {
         let handle = Arc::downgrade(self);
         *self
             .self_handle
@@ -323,7 +367,8 @@ impl AgentSessionRuntime {
         Arc::clone(&self.replacement_lock)
     }
 
-    /// Lifecycle gate used by tree navigation to exclude replacement teardown.
+    /// Lifecycle gate used by replacement teardown to exclude concurrent navigation.
+    #[allow(dead_code)]
     pub(crate) fn lifecycle_gate(&self) -> &AsyncRwLock<()> {
         &self.lifecycle_gate
     }
@@ -454,14 +499,14 @@ impl AgentSessionRuntime {
                 cwd: new_cwd,
                 agent_dir: self.agent_dir(),
                 session_manager,
-                model: Some(self.read_session().model()),
+                model: None,
                 start_reason: SessionStartReason::Resume,
                 previous_session_file,
                 extension_flag_values,
             })
             .await?;
         Ok(PrepareReplacementOutcome::Prepared(PreparedReplacement {
-            result,
+            result: Some(result),
             reason: SessionShutdownReason::Resume,
             target_session_file,
         }))
@@ -541,7 +586,7 @@ impl AgentSessionRuntime {
             })
             .await?;
         Ok(PrepareReplacementOutcome::Prepared(PreparedReplacement {
-            result,
+            result: Some(result),
             reason: SessionShutdownReason::New,
             target_session_file,
         }))
@@ -688,7 +733,7 @@ impl AgentSessionRuntime {
             .await?;
         Ok((
             PrepareReplacementOutcome::Prepared(PreparedReplacement {
-                result,
+                result: Some(result),
                 reason: SessionShutdownReason::Fork,
                 target_session_file,
             }),
@@ -707,13 +752,13 @@ impl AgentSessionRuntime {
         self.finalize_replacement_locked(prepared).await;
     }
 
-    async fn finalize_replacement_locked(&self, prepared: PreparedReplacement) {
+    async fn finalize_replacement_locked(&self, mut prepared: PreparedReplacement) {
         let _lifecycle_guard = self.lifecycle_gate.write().await;
-        let PreparedReplacement {
-            result,
-            reason,
-            target_session_file,
-        } = prepared;
+        let Some(result) = prepared.result.take() else {
+            return;
+        };
+        let reason = prepared.reason;
+        let target_session_file = prepared.target_session_file.take();
         self.teardown_current(reason, target_session_file.as_deref())
             .await;
         self.apply(result);
@@ -721,8 +766,10 @@ impl AgentSessionRuntime {
     }
 
     /// Dispose a prepared target without changing the current session.
-    pub(crate) async fn abort_prepared_replacement(&self, prepared: PreparedReplacement) {
-        prepared.result.session.dispose().await;
+    pub(crate) async fn abort_prepared_replacement(&self, mut prepared: PreparedReplacement) {
+        if let Some(result) = prepared.result.take() {
+            result.session.dispose().await;
+        }
     }
 
     /// Import a JSONL session file and switch to it.
@@ -769,6 +816,7 @@ impl AgentSessionRuntime {
             let result = self
                 .create_import_replacement(&paths.destination_text, &session_dir, cwd_override)
                 .await?;
+            let _lifecycle_guard = self.lifecycle_gate.write().await;
             self.teardown_current(SessionShutdownReason::Resume, Some(&paths.destination_text))
                 .await;
             self.apply(result);
@@ -856,7 +904,8 @@ impl AgentSessionRuntime {
         replacement_manager
             .lock()
             .await
-            .rebind_session_file_after_atomic_move(destination_text.clone());
+            .rebind_session_file_after_atomic_move(&destination_text);
+        let _lifecycle_guard = self.lifecycle_gate.write().await;
         self.teardown_current(SessionShutdownReason::Resume, Some(&destination_text))
             .await;
         self.apply(result);
@@ -1025,8 +1074,8 @@ impl AgentSessionRuntime {
             })
             .await;
         // Pre-invalidate callbacks reset mode-owned UI during replacement.
-        // The session shutdown handler is a process-exit request, so only
-        // invoke it for final runtime disposal.
+        // The extension shutdown handler is a process-exit request that must
+        // run for final disposal regardless of whether a UI callback is set.
         let runtime_cb = self
             .before_session_invalidate
             .read()
@@ -1034,7 +1083,8 @@ impl AgentSessionRuntime {
             .and_then(|g| g.clone());
         if let Some(cb) = runtime_cb {
             cb();
-        } else if reason == SessionShutdownReason::Quit {
+        }
+        if reason == SessionShutdownReason::Quit {
             session.invoke_extension_shutdown_handler();
         }
         // dispose always awaits host process reap exactly once when bound.
@@ -1106,7 +1156,7 @@ impl AgentSessionRuntime {
                 cwd: new_cwd.clone(),
                 agent_dir: self.agent_dir(),
                 session_manager,
-                model: Some(self.read_session().model()),
+                model: None,
                 start_reason: SessionStartReason::Resume,
                 previous_session_file: self.session_file_for_teardown().await,
                 extension_flag_values,
@@ -1300,7 +1350,10 @@ fn publish_no_replace_with(
         Err(link_error) => match move_noreplace(staged_path, destination) {
             Ok(()) => Ok(ImportPublication::Moved),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(error),
-            Err(_) => Err(link_error),
+            Err(move_error) => Err(io::Error::new(
+                move_error.kind(),
+                format!("link failed ({link_error}); atomic move failed ({move_error})"),
+            )),
         },
     }
 }
@@ -1371,14 +1424,13 @@ pub async fn create_agent_session_runtime(
             extension_flag_values: BTreeMap::new(),
         })
         .await?;
-    let runtime = Arc::new(AgentSessionRuntime::new(
+    let runtime = AgentSessionRuntime::new(
         result.session,
         result.services,
         factory,
         result.diagnostics,
         result.model_fallback_message,
-    ));
-    runtime.link();
+    );
     Ok(runtime)
 }
 

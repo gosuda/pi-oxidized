@@ -56,4 +56,10 @@
 {"id":23,"kind":"req","method":"session.reload","payload":{}}
 {"id":23,"kind":"res","method":"session.reload","payload":{"replacementToken":"tok-3"}}
 {"id":24,"kind":"error","method":"session.newSession","payload":{"code":"replacement_busy","message":"session replacement in progress","retryable":true}}
+{"id":25,"kind":"error","method":"session.setModel","payload":{"code":"extension_error","message":"model not available","retryable":false}}
+{"id":26,"kind":"error","method":"session.compact","payload":{"code":"extension_error","message":"compaction failed","retryable":false}}
+{"id":27,"kind":"error","method":"session.fork","payload":{"code":"replacement_busy","message":"session replacement in progress","retryable":true}}
+{"id":28,"kind":"error","method":"session.navigateTree","payload":{"code":"extension_error","message":"entry not found","retryable":false}}
+{"id":29,"kind":"error","method":"session.switchSession","payload":{"code":"replacement_busy","message":"session replacement in progress","retryable":true}}
+{"id":30,"kind":"error","method":"session.reload","payload":{"code":"extension_error","message":"reload failed","retryable":false}}
 {"id":0,"kind":"event","method":"session.replacementReady","payload":{"token":"tok-1"}}

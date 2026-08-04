@@ -3,7 +3,9 @@
  * loading via the REAL coding-agent loader, and ExtensionRunner hook dispatch.
  */
 import { describe, expect, test } from "bun:test";
-import { resolve } from "node:path";
+import { resolve, join } from "node:path";
+import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { Readable } from "node:stream";
 import {
 	PROTOCOL_VERSION,
@@ -31,6 +33,8 @@ import commandContextFactory from "../fixtures/extensions/command-context.ts";
 import replacedSessionFactory from "../fixtures/extensions/replaced-session.ts";
 import replacementReadyFactory from "../fixtures/extensions/replacement-ready.ts";
 import staleCtxFactory, { resetCapturedCtx } from "../fixtures/extensions/stale-ctx.ts";
+import toolCallReorderFactory from "../fixtures/extensions/tool-call-reorder.ts";
+import sessionManagerProxyFactory from "../fixtures/extensions/session-manager-proxy.ts";
 
 /** Collecting ByteWritable that signals on first write (no Writable dependency). */
 class PipeWritable {
@@ -270,6 +274,7 @@ describe("host: loads real example extensions via jiti", () => {
 	});
 });
 
+
 /** ByteWritable that decodes frames and lets tests await them by predicate. */
 class FrameCollector {
 	readonly frames: Frame[] = [];
@@ -308,6 +313,29 @@ class FrameCollector {
 		return promise;
 	}
 }
+/** FrameCollector whose `write` rejects for a configurable set of methods. */
+class FailingFrameCollector extends FrameCollector {
+	private readonly failMethods: Set<string>;
+	private failCount = 0;
+
+	constructor(failMethods: string[]) {
+		super();
+		this.failMethods = new Set(failMethods);
+	}
+
+	get failedSends(): number { return this.failCount; }
+
+	write(chunk: Uint8Array): void {
+		const text = new TextDecoder().decode(chunk);
+		for (const method of this.failMethods) {
+			if (text.includes(`"method":"${method}"`)) {
+				this.failCount++;
+				throw new Error(`simulated write failure for ${method}`);
+			}
+		}
+		super.write(chunk);
+	}
+}
 
 interface Connected {
 	collector: FrameCollector;
@@ -316,8 +344,10 @@ interface Connected {
 	runPromise: Promise<void>;
 }
 
-async function connectHost(factories: ExtensionFactory[]): Promise<Connected> {
-	const collector = new FrameCollector();
+async function connectHost(
+	factories: ExtensionFactory[],
+	collector: FrameCollector = new FrameCollector(),
+): Promise<Connected> {
 	const stdin = new Readable({ read() {} });
 	const host = new ExtensionHost(stdin, collector);
 	const runPromise = host.run({ cwd: process.cwd(), factories, extensionPaths: [] });
@@ -1260,6 +1290,190 @@ describe("host: per-command replacement staleness", () => {
 		});
 		const error = await collector.awaitFrame((frame) => frame.id === 132 && frame.kind === "error");
 		expect(payloadOf(error)["message"]).toBe(staleContextMessage);
+
+		await teardown(connected);
+	});
+});
+
+describe("host: tool_call key-order-insensitive input comparison", () => {
+	test("tool_call omits input when a hook only reorders object keys", async () => {
+		const connected = await connectHost([toolCallReorderFactory]);
+		const { collector, stdin } = connected;
+
+		push(stdin, {
+			id: 200, kind: "req", method: "tool_call",
+			payload: {
+				toolName: "echo",
+				toolCallId: "call-reorder",
+				input: { z: 3, a: 1, m: 2 },
+			},
+		});
+		const res = await collector.awaitFrame((f) => f.id === 200 && f.kind === "res");
+		const body = payloadOf(res);
+		expect(body["block"]).toBe(false);
+		expect(body["reason"]).toBe("reorder-ack");
+		expect(Object.hasOwn(body, "input")).toBe(false);
+
+		await teardown(connected);
+	});
+});
+
+describe("host: replacementReady write failure is contained", () => {
+	test("failed replacementReady send does not produce a second error frame", async () => {
+		const failing = new FailingFrameCollector(["session.replacementReady"]);
+		const connected = await connectHost([replacementReadyFactory], failing);
+		const { collector, stdin } = connected;
+
+		// Drive idle so the command can proceed.
+		push(stdin, {
+			id: 0, kind: "event", method: "session.update",
+			payload: {
+				thinkingLevel: "medium",
+				activeTools: [],
+				allTools: [],
+				commands: [],
+				isIdle: true,
+				hasPendingMessages: false,
+				contextUsage: { tokens: 10, contextWindow: 1000, percent: 1 },
+				scopedModels: [],
+				systemPrompt: "",
+			},
+		});
+
+		void collector
+			.awaitFrame((f) => f.kind === "req" && f.method === "session.newSession")
+			.then((request) => {
+				push(stdin, {
+					id: request.id, kind: "res", method: "session.newSession",
+					payload: { cancelled: false, replacementToken: "tok-fail-1" },
+				});
+			});
+
+		push(stdin, {
+			id: 210, kind: "req", method: "command.execute",
+			payload: { command: "replacementReadyProbe", args: "" },
+		});
+
+		// The command.execute response must arrive (the handler succeeded).
+		const commandRes = await collector.awaitFrame((f) => f.id === 210 && f.kind === "res");
+		expect(commandRes).toBeDefined();
+
+		// The replacementReady send failed; the error must be contained as an
+		// extensionError event, not a second terminal frame for id 210.
+		const errorEvent = await collector.awaitFrame(
+			(f) => f.kind === "event" && f.method === "extensionError",
+		);
+		expect(payloadOf(errorEvent)["message"]).toContain("session.replacementReady");
+
+		// Exactly one terminal frame for the command.execute request id.
+		const terminalFor210 = collector.frames.filter(
+			(f) => f.id === 210 && (f.kind === "res" || f.kind === "error"),
+		);
+		expect(terminalFor210).toHaveLength(1);
+
+		await teardown(connected);
+	});
+});
+describe("host: protocol extension order", () => {
+	test("initial protocol paths precede builtins and later loads append", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "pr10-precedence-"));
+		const initialPath = join(dir, "initial.ts");
+		const latePath = join(dir, "late.ts");
+		await writeFile(
+			initialPath,
+			'import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";\n' +
+			'export default function initialExt(pi: ExtensionAPI): void {\n' +
+			'  pi.registerCommand("initialCmd", { description: "initial", async handler(_a, ctx) { ctx.ui.notify("initial", "info"); } });\n' +
+			'}\n',
+		);
+		await writeFile(
+			latePath,
+			'import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";\n' +
+			'export default function lateExt(pi: ExtensionAPI): void {\n' +
+			'  pi.registerCommand("lateCmd", { description: "late", async handler(_a, ctx) { ctx.ui.notify("late", "info"); } });\n' +
+			'}\n',
+		);
+		try {
+			const connected = await connectHost([toolFactory]);
+			const { collector, stdin } = connected;
+
+			push(stdin, {
+				id: 219, kind: "req", method: "command.execute",
+				payload: { command: "greet", args: "" },
+			});
+			await collector.awaitFrame((f) => f.id === 219 && f.kind === "res");
+			const [builtin] = connected.host.getExtensions();
+			expect(builtin?.commands.has("greet")).toBe(true);
+
+			push(stdin, {
+				id: 220, kind: "req", method: "extensions.load",
+				payload: { extensionPaths: [initialPath], cwd: process.cwd() },
+			});
+			await collector.awaitFrame((f) => f.id === 220 && f.kind === "res");
+			const afterInitialLoad = connected.host.getExtensions();
+			expect(afterInitialLoad).toHaveLength(2);
+			expect(afterInitialLoad[0]?.commands.has("initialCmd")).toBe(true);
+			expect(afterInitialLoad[1]).toBe(builtin);
+
+			push(stdin, {
+				id: 221, kind: "req", method: "extensions.load",
+				payload: { extensionPaths: [latePath], cwd: process.cwd() },
+			});
+			await collector.awaitFrame((f) => f.id === 221 && f.kind === "res");
+			const afterLateLoad = connected.host.getExtensions();
+			expect(afterLateLoad).toHaveLength(3);
+			expect(afterLateLoad[0]?.commands.has("initialCmd")).toBe(true);
+			expect(afterLateLoad[1]).toBe(builtin);
+			expect(afterLateLoad[2]?.commands.has("lateCmd")).toBe(true);
+
+			await teardown(connected);
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("host: SessionManager proxy is not a thenable", () => {
+	test("awaiting the SessionManager proxy does not throw", async () => {
+		const connected = await connectHost([sessionManagerProxyFactory]);
+		const { collector, stdin } = connected;
+
+		push(stdin, {
+			id: 0, kind: "event", method: "session.update",
+			payload: {
+				thinkingLevel: "medium",
+				activeTools: [],
+				allTools: [],
+				commands: [],
+				isIdle: true,
+				hasPendingMessages: false,
+				contextUsage: { tokens: 10, contextWindow: 1000, percent: 1 },
+				scopedModels: [],
+				systemPrompt: "",
+			},
+		});
+
+		void collector
+			.awaitFrame((f) => f.kind === "req" && f.method === "session.newSession")
+			.then((request) => {
+				push(stdin, {
+					id: request.id, kind: "res", method: "session.newSession",
+					payload: { cancelled: false, replacementToken: "tok-proxy-1" },
+				});
+			});
+
+		push(stdin, {
+			id: 230, kind: "req", method: "command.execute",
+			payload: { command: "sessionManagerThenProbe", args: "" },
+		});
+
+		const notify = await collector.awaitFrame((f) => f.method === "notify");
+		await collector.awaitFrame((f) => f.id === 230 && f.kind === "res");
+
+		const report = JSON.parse(String(payloadOf(notify)["message"])) as Record<string, unknown>;
+		expect(report["setupRan"]).toBe(true);
+		expect(report["managerIsObject"]).toBe(true);
+		expect(report["thenIsUndefined"]).toBe(true);
 
 		await teardown(connected);
 	});

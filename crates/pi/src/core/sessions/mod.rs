@@ -336,9 +336,16 @@ impl SessionManager {
     /// Rebind the already-open session after its file was atomically moved.
     ///
     /// The caller owns the move and has already validated the file, so this must
-    /// not re-read or rewrite it.
-    pub(crate) fn rebind_session_file_after_atomic_move(&mut self, session_file: String) {
-        self.session_file = Some(session_file);
+    /// not re-read or rewrite it. The path is resolved (matching every other
+    /// `session_file` assignment) and the session directory is retargeted to the
+    /// new parent so later `new_session` and `create_branched_session` paths
+    /// follow the moved file instead of the stale original directory.
+    pub(crate) fn rebind_session_file_after_atomic_move(&mut self, session_file: &str) {
+        let resolved = path_to_string(&resolve_path(session_file));
+        self.session_dir = Path::new(&resolved)
+            .parent()
+            .map_or_else(|| ".".to_owned(), path_to_string);
+        self.session_file = Some(resolved);
     }
 
     /// Start a new in-memory session (optionally with a deferred file path).
@@ -1713,13 +1720,47 @@ mod tests {
         let mut reopened =
             SessionManager::open(path_str(&staged)?, Some(path_str(dir.path())?), None)?;
         fs::rename(&staged, &final_file)?;
-        reopened.rebind_session_file_after_atomic_move(path_str(&final_file)?.to_owned());
+        reopened.rebind_session_file_after_atomic_move(path_str(&final_file)?);
 
         reopened.append_message(&user_agent("after move", 3))?;
 
         assert_eq!(reopened.get_session_file(), Some(path_str(&final_file)?));
         assert!(!staged.exists());
         assert!(fs::read_to_string(&final_file)?.contains("after move"));
+        Ok(())
+    }
+
+    #[test]
+    fn atomic_move_rebind_retargets_session_dir() -> TestResult {
+        let dir = tempdir()?;
+        let other = tempdir()?;
+        let mut source =
+            SessionManager::create(path_str(dir.path())?, Some(path_str(dir.path())?), None)?;
+        source.append_message(&user_agent("before move", 1))?;
+        source.append_message(&assistant_agent("persist source", 2))?;
+        let source_file = source.get_session_file().ok_or("source file")?.to_owned();
+
+        // Move the file into a *different* directory than the original
+        // session_dir, then rebind. A later branch must land next to the
+        // moved file, not the stale original directory.
+        let final_file = other.path().join("imported.jsonl");
+        fs::rename(&source_file, &final_file)?;
+        let mut reopened =
+            SessionManager::open(path_str(&final_file)?, Some(path_str(other.path())?), None)?;
+        reopened.rebind_session_file_after_atomic_move(path_str(&final_file)?);
+
+        assert_eq!(reopened.get_session_file(), Some(path_str(&final_file)?));
+        assert_eq!(reopened.get_session_dir(), path_str(other.path())?);
+
+        let leaf = reopened.get_leaf_id().ok_or("leaf")?.to_owned();
+        let branched = reopened
+            .create_branched_session(&leaf)?
+            .ok_or("branched file")?;
+        assert!(
+            Path::new(&branched).starts_with(other.path()),
+            "branch {branched} must follow the retargeted dir, not the original"
+        );
+        assert!(Path::new(&branched).exists());
         Ok(())
     }
 
@@ -2213,6 +2254,10 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn generated_cross_version_session_interoperability() -> TestResult {
+        // The generator writes one `.jsonl` per scenario in
+        // scripts/generate-session-fixtures.ts main(); keep this in sync with
+        // that manifest so adding a fixture updates both sites together.
+        const EXPECTED_FIXTURE_COUNT: usize = 9;
         fn fixture_files(
             root: &Path,
             files: &mut Vec<PathBuf>,
@@ -2271,12 +2316,23 @@ mod tests {
         };
         fs::create_dir_all(&output_root)?;
         let mut fixtures = Vec::new();
+        if !fixture_root.is_dir() {
+            return Err(format!(
+                "session fixture directory not found: {}\n\
+                 run `bun run scripts/generate-session-fixtures.ts` before this proof",
+                fixture_root.display()
+            )
+            .into());
+        }
         fixture_files(&fixture_root, &mut fixtures)?;
         fixtures.sort();
         assert_eq!(
             fixtures.len(),
-            9,
-            "run scripts/generate-session-fixtures.ts before this proof"
+            EXPECTED_FIXTURE_COUNT,
+            "expected {EXPECTED_FIXTURE_COUNT} session fixtures under {}, found {}; \
+             run `bun run scripts/generate-session-fixtures.ts` to regenerate",
+            fixture_root.display(),
+            fixtures.len()
         );
 
         let mut saw_v1 = false;

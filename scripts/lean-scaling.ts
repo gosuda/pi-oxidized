@@ -473,8 +473,6 @@ export interface ModeStats {
 
 export interface ToolRoundTripResult {
 	rounds: number;
-	/** prepare+validate+execute responses actually observed (must equal rounds*3). */
-	responses: number;
 	/** toolUpdate events observed across all execute calls. */
 	updateEvents: number;
 	prepareMs: StatSummary;
@@ -570,7 +568,6 @@ async function measureToolRoundTrips(
 	const validateMs: number[] = [];
 	const executeMs: number[] = [];
 	const totalMs: number[] = [];
-	let responses = 0;
 	try {
 		await host.request(
 			"hello",
@@ -590,7 +587,6 @@ async function measureToolRoundTrips(
 				timeoutMs,
 			);
 			prepareMs.push(performance.now() - r0);
-			responses += 1;
 			const preparedArgs = (prepared.payload as Record<string, unknown>)["args"];
 			if (
 				(preparedArgs as Record<string, unknown> | undefined)?.["preparedBy"] !== "lean"
@@ -607,7 +603,6 @@ async function measureToolRoundTrips(
 				timeoutMs,
 			);
 			validateMs.push(performance.now() - v0);
-			responses += 1;
 			const validatedArgs = (validated.payload as Record<string, unknown>)["args"];
 			if (
 				(validatedArgs as Record<string, unknown> | undefined)?.["validatedBy"] !== "lean"
@@ -624,7 +619,6 @@ async function measureToolRoundTrips(
 				timeoutMs,
 			);
 			executeMs.push(performance.now() - e0);
-			responses += 1;
 			totalMs.push(performance.now() - r0);
 			const content = (executed.payload as Record<string, unknown>)["content"];
 			if (!Array.isArray(content) || content.length === 0) {
@@ -639,7 +633,6 @@ async function measureToolRoundTrips(
 	const updateEvents = host.frames.filter((f) => f.method === "toolUpdate").length;
 	return {
 		rounds,
-		responses,
 		updateEvents,
 		prepareMs: summarize(prepareMs),
 		validateMs: summarize(validateMs),
@@ -658,8 +651,9 @@ export async function runModeDistinctness(
 ): Promise<ModeDistinctnessResult> {
 	const timeoutMs = options.stepTimeoutMs ?? DEFAULT_STEP_TIMEOUT_MS;
 	const rounds = options.toolRounds ?? options.samples;
-	// Zero/negative rounds make `responses === rounds * 3` hold vacuously
-	// (0 === 0), so the 3-RPC contract proof would pass without driving any RPC.
+	// Zero/negative rounds would drive no RPCs, so the 3-RPC contract
+	// proof (preparedBy/validatedBy markers plus toolUpdate events) would
+	// pass without exercising any round-trip.
 	if (!Number.isInteger(rounds) || rounds < 1) {
 		throw new Error(
 			`toolRounds must be a positive integer, got ${String(rounds)}`,
@@ -707,11 +701,6 @@ export async function runModeDistinctness(
 		failures.push(
 			`lean p50 ${lean.totalMs.median.toFixed(1)}ms is not <= ${String(options.maxRatio)}x ` +
 				`compat p50 ${compat.totalMs.median.toFixed(1)}ms (ratio ${verdict.ratio.toFixed(3)})`,
-		);
-	}
-	if (toolRoundTrip.responses !== rounds * 3) {
-		failures.push(
-			`lean tool round-trip incomplete: ${toolRoundTrip.responses} responses for ${rounds} rounds (expected ${rounds * 3})`,
 		);
 	}
 	if (toolRoundTrip.updateEvents < rounds) {

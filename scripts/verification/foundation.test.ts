@@ -17,6 +17,8 @@ import verificationExtension, {
 } from "./extension.ts";
 import { PTY_KEYS, spawnPty } from "./pty.ts";
 
+const isWindows = process.platform === "win32";
+
 interface RegisteredProvider {
 	readonly models?: readonly { readonly id: string }[];
 	readonly streamSimple?: (
@@ -156,7 +158,7 @@ describe("verification extension", () => {
 	}, 15_000);
 });
 
-describe("PTY driver", () => {
+describe.skipIf(isWindows)("PTY driver", () => {
 	test("preserves hostile argv, separates terminal echo, timestamps chunks, and exits cleanly", async () => {
 		const root = temporaryDirectory("pi pty ' $() ");
 		const process = spawnPty({
@@ -253,7 +255,7 @@ async function smokeCli(fixture: CliFixture, sharedDirectory: string): Promise<v
 	}
 }
 
-describe("shared interactive provider smoke", () => {
+describe.skipIf(isWindows)("shared interactive provider smoke", () => {
 	test("drives Rust and TypeScript CLIs with one extension and model", async () => {
 		const rustBinary = resolve("target/debug/pi");
 		const hostBinary = resolve("packages/extension-host/dist/pi-extension-host");

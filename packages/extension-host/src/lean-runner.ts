@@ -95,9 +95,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * Import specifiers a lean entry must never reference. Lean entries are
  * prebundled, so ANY upstream-compat specifier means the entry was built
  * for the wrong mode. `@earendil-works/pi-tui-protocol` stays legal: it is
- * the shared wire package, not the upstream runtime graph.
+ * the shared wire package, not the upstream runtime graph. `node:module`
+ * (and the bare `module` builtin) is excluded too: `createRequire` produces
+ * a loader whose string argument is not a recognized import form, so it
+ * could otherwise bypass the excluded-module graph.
  */
-const EXCLUDED_SPECIFIER = /^(?:@earendil-works\/(?:pi-coding-agent|pi-agent-core|pi-ai|pi-tui(?!-protocol))|@mariozechner\/|jiti(?:\/|$)|typebox(?:\/|$)|.*\/(?:host|virtual-modules)\.ts$)/;
+const EXCLUDED_SPECIFIER = /^(?:@earendil-works\/(?:pi-coding-agent|pi-agent-core|pi-ai|pi-tui(?!-protocol))|@mariozechner\/|jiti(?:\/|$)|typebox(?:\/|$)|(?:node:)?module$|.*\/(?:host|virtual-modules)\.ts$)/;
 
 function isAsciiIdentifierStartCode(code: number): boolean {
 	return (
@@ -633,6 +636,20 @@ function scanModuleLoads(source: string): ModuleLoadScan {
 					lastSignificant = { kind: "punctuator", value: "(" };
 					index = literalStart;
 				}
+				continue;
+			}
+		}
+		// `createRequire` from `node:module` produces a loader whose string
+		// argument is not a recognized import form, so it can load the
+		// excluded compat graph without recording a specifier. Fail closed
+		// on any non-member call so aliasing through a local re-export
+		// cannot reintroduce the same hole.
+		if (word === "createRequire" && !isMember) {
+			const next = skipInsignificant(index);
+			if (source[next] === "(") {
+				unsupported ??= "createRequire loader";
+				lastSignificant = { kind: "punctuator", value: "(" };
+				index = next + 1;
 				continue;
 			}
 		}
@@ -1230,8 +1247,10 @@ export class LeanRunner {
 
 		const controller = new AbortController();
 		let acceptingUpdates = true;
-		let pendingUpdate: unknown;
-		let hasPendingUpdate = false;
+		// Queue every onUpdate in arrival order so lean mode matches the
+		// full-host contract (Mode 1 emits every update); the drain serializes
+		// sends on the single JSONL transport without coalescing intermediates.
+		const pendingUpdates: unknown[] = [];
 		let drain: Promise<void> | undefined;
 		const stopAcceptingUpdates = () => {
 			acceptingUpdates = false;
@@ -1239,9 +1258,8 @@ export class LeanRunner {
 		const drainUpdates = (): void => {
 			if (drain !== undefined) return;
 			drain = (async () => {
-				while (hasPendingUpdate) {
-					const partial = pendingUpdate;
-					hasPendingUpdate = false;
+				while (pendingUpdates.length > 0) {
+					const partial = pendingUpdates.shift() as unknown;
 					try {
 						await this.client.send({
 							id,
@@ -1255,7 +1273,7 @@ export class LeanRunner {
 				}
 			})().finally(() => {
 				drain = undefined;
-				if (acceptingUpdates && hasPendingUpdate) drainUpdates();
+				if (acceptingUpdates && pendingUpdates.length > 0) drainUpdates();
 			});
 		};
 		controller.signal.addEventListener("abort", stopAcceptingUpdates, { once: true });
@@ -1270,8 +1288,7 @@ export class LeanRunner {
 				signal: controller.signal,
 				onUpdate: (partial) => {
 					if (!acceptingUpdates || controller.signal.aborted) return;
-					pendingUpdate = partial;
-					hasPendingUpdate = true;
+					pendingUpdates.push(partial);
 					drainUpdates();
 				},
 			});

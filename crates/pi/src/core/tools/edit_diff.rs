@@ -657,18 +657,18 @@ pub fn generate_diff_string(
 ) -> DiffStringResult {
     let mut old_lines = split_lines_keep_trailing_empty(old_content);
     let mut new_lines = split_lines_keep_trailing_empty(new_content);
-    let line_num_width = old_lines
-        .len()
-        .max(new_lines.len())
-        .max(1)
-        .to_string()
-        .len();
     if old_lines.last() == Some(&"") {
         old_lines.pop();
     }
     if new_lines.last() == Some(&"") {
         new_lines.pop();
     }
+    let line_num_width = old_lines
+        .len()
+        .max(new_lines.len())
+        .max(1)
+        .to_string()
+        .len();
     let parts = collapse_ops(&diff_ops(&old_lines, &new_lines));
     render_diff_parts(&parts, context_lines, line_num_width)
 }
@@ -1221,5 +1221,32 @@ mod tests {
     fn display_diff_omits_trailing_empty_context_line() {
         let result = generate_diff_string("verification-before\n", "verification-after\n", 4);
         assert_eq!(result.diff, "-1 verification-before\n+1 verification-after");
+    }
+
+    #[test]
+    fn display_diff_line_number_width_excludes_trailing_empty() {
+        // Nine newline-terminated lines: split_lines_keep_trailing_empty
+        // yields 10 elements (trailing ""), but only 9 render.  The width
+        // must be computed from the 9 rendered lines so single-digit line
+        // numbers are not padded to width 2.
+        let old = "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\n";
+        let new = old.replace("line 5\n", "LINE 5\n");
+        let result = generate_diff_string(old, &new, 4);
+        // Line 5 must be unpadded (width 1), not "- 5 line 5".
+        assert!(
+            result.diff.contains("-5 line 5"),
+            "expected unpadded '-5 line 5', got:\n{}",
+            result.diff
+        );
+        assert!(
+            result.diff.contains("+5 LINE 5"),
+            "expected unpadded '+5 LINE 5', got:\n{}",
+            result.diff
+        );
+        assert!(
+            !result.diff.contains("- 5 line 5"),
+            "line 5 was padded to width 2:\n{}",
+            result.diff
+        );
     }
 }

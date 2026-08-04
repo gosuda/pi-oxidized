@@ -714,14 +714,13 @@ impl<'a> MarkdownRenderer<'a> {
         }
     }
 
-    #[allow(clippy::expect_used)]
     fn finish_list(&mut self, range: Range<usize>) {
         let is_top_level = self.lists.len() == 1;
         let finished = {
-            let list = self
-                .lists
-                .last_mut()
-                .expect("End(List) without matching Start(List)");
+            let Some(list) = self.lists.last_mut() else {
+                // End(List) without matching Start(List): defensive no-op.
+                return;
+            };
             let items = std::mem::take(&mut list.finished_items);
             let loose = list.loose;
             let quote_depth_at_start = list.quote_depth_at_start;
@@ -931,8 +930,13 @@ impl<'a> MarkdownRenderer<'a> {
     }
 
     fn render_quoted_segments(&self, segments: Vec<ItemSegment>, width: usize) -> Vec<String> {
+        struct Frame {
+            pending: std::vec::IntoIter<ItemSegment>,
+            content_width: usize,
+            raw: Vec<String>,
+        }
         let border = (self.theme.quote_border)("│ ");
-        let content_width = width.saturating_sub(visible_width("│ ")).max(1);
+        let border_w = visible_width("│ ");
         let quote_style = |text: &str| (self.theme.quote)(&(self.theme.italic)(text));
         let styled_sentinel = quote_style("\0");
         let style_prefix = styled_sentinel
@@ -940,40 +944,78 @@ impl<'a> MarkdownRenderer<'a> {
             .map_or("", |index| &styled_sentinel[..index]);
         let reset_with_style =
             (!style_prefix.is_empty()).then(|| format!("\u{1b}[0m{style_prefix}"));
-        let mut lines = Vec::new();
 
-        for segment in segments {
+        // Iterative depth-safe traversal: each stack frame carries its own
+        // `content_width` (shrunk by one border per nesting level) and the
+        // raw lines collected so far. When a `Quote` segment is encountered
+        // we suspend the current frame and push a child frame; when a frame
+        // is exhausted we apply its border/style transform and fold the
+        // bordered lines into the parent, so deeply nested blockquotes no
+        // longer recurse on the call stack.
+        let initial_width = width.saturating_sub(border_w).max(1);
+        let mut stack: Vec<Frame> = vec![Frame {
+            pending: segments.into_iter(),
+            content_width: initial_width,
+            raw: Vec::new(),
+        }];
+
+        while let Some(frame) = stack.last_mut() {
+            let Some(segment) = frame.pending.next() else {
+                // Frame exhausted: style, wrap, and border every raw line at
+                // this frame's content width, then fold into the parent.
+                let content_width = frame.content_width;
+                let reset = reset_with_style.clone();
+                let bordered: Vec<String> = std::mem::take(&mut frame.raw)
+                    .into_iter()
+                    .flat_map(|line| {
+                        let line = match &reset {
+                            Some(reset) => line.replace("\u{1b}[0m", reset),
+                            None => line,
+                        };
+                        let styled = quote_style(&line);
+                        wrap_text_with_ansi(&styled, content_width)
+                            .into_iter()
+                            .map(|wrapped| format!("{border}{wrapped}"))
+                    })
+                    .collect();
+                stack.pop();
+                match stack.last_mut() {
+                    Some(parent) => parent.raw.extend(bordered),
+                    None => return bordered,
+                }
+                continue;
+            };
+
             match segment {
-                ItemSegment::Text(text) => lines.push(text),
-                ItemSegment::Blank => lines.push(String::new()),
+                ItemSegment::Text(text) => frame.raw.push(text),
+                ItemSegment::Blank => frame.raw.push(String::new()),
                 ItemSegment::Nested(nested) | ItemSegment::Lines(nested) => {
-                    lines.extend(nested);
+                    frame.raw.extend(nested);
                 }
                 ItemSegment::Quote(nested) => {
-                    lines.extend(self.render_quoted_segments(nested, content_width));
+                    let child_width = frame.content_width.saturating_sub(border_w).max(1);
+                    stack.push(Frame {
+                        pending: nested.into_iter(),
+                        content_width: child_width,
+                        raw: Vec::new(),
+                    });
                 }
                 ItemSegment::Code { lang, body } => {
-                    lines.extend(self.code_block_logical_lines(lang.as_deref(), &body));
+                    frame
+                        .raw
+                        .extend(self.code_block_logical_lines(lang.as_deref(), &body));
                 }
                 ItemSegment::Table(table) => {
-                    lines.extend(render_table(&table, content_width, self.theme));
+                    frame
+                        .raw
+                        .extend(render_table(&table, frame.content_width, self.theme));
                 }
             }
         }
 
-        lines
-            .into_iter()
-            .flat_map(|line| {
-                let line = match &reset_with_style {
-                    Some(reset) => line.replace("\u{1b}[0m", reset),
-                    None => line,
-                };
-                let styled = quote_style(&line);
-                wrap_text_with_ansi(&styled, content_width)
-                    .into_iter()
-                    .map(|wrapped| format!("{border}{wrapped}"))
-            })
-            .collect()
+        // Unreachable: the initial frame always either returns from the
+        // exhausted branch or is popped with a parent to fold into.
+        Vec::new()
     }
 
     fn flush_heading_to_segment(&mut self, heading: Option<u8>) {
@@ -1082,7 +1124,14 @@ impl<'a> MarkdownRenderer<'a> {
                 }
             }
             Event::Start(Tag::TableHead) => self.set_table_head(true),
-            Event::End(TagEnd::TableHead) => self.set_table_head(false),
+            Event::End(TagEnd::TableHead) => {
+                // pulldown-cmark does not wrap the header row in TableRow
+                // events, so finalize the accumulated cells here before
+                // clearing the in-head flag; otherwise Start(TableRow)
+                // discards the header data.
+                self.finish_table_row();
+                self.set_table_head(false);
+            }
             Event::Start(Tag::TableRow) => {
                 if let Some(table) = self.table.as_mut() {
                     table.current_row.clear();
@@ -2069,8 +2118,35 @@ mod tests {
     fn list_table_task_marker_item_width() {
         // Task markers are wider than the old depth-based approximation (`width - 2`);
         // at width 14 the true item width (8) selects narrow table fallback, not grid.
+        // The header row (`A | B`) is populated from the table head and must appear
+        // in the narrow fallback output alongside the data row.
         let src = "- [ ] task\n\n  | A | B |\n  | --- | --- |\n  | 1 | 2 |\n";
         let lines = plain_default(src, 14);
-        assert_eq!(lines, vec!["- [ ] task", "", "", "      1 | 2"]);
+        assert_eq!(lines, vec!["- [ ] task", "", "      A | B", "      1 | 2"]);
+    }
+
+    #[test]
+    fn deeply_nested_blockquote_does_not_exhaust_stack() {
+        // 200 levels of nesting would overflow the call stack with the old
+        // recursive render_quoted_segments; the iterative traversal handles
+        // it without panic.
+        let src = "> x".repeat(200);
+        let lines = plain_default(&src, 80);
+        assert!(!lines.is_empty(), "should render without panic");
+        // Every visible line must carry at least one quote border.
+        assert!(lines.iter().all(|line| line.contains('│')), "{lines:?}");
+    }
+
+    #[test]
+    fn finish_list_without_start_does_not_panic() {
+        // Internal state where End(List) arrives with no matching Start(List)
+        // must return gracefully, not panic.
+        let theme = MarkdownTheme::default();
+        let options = MarkdownOptions::default();
+        let apply_default = |text: &str| text.to_owned();
+        let mut renderer = MarkdownRenderer::new("", 40, &theme, &options, &apply_default);
+        // Directly invoke finish_list with an empty list stack.
+        renderer.finish_list(0..0);
+        // Should have returned without panicking; nothing to assert on output.
     }
 }

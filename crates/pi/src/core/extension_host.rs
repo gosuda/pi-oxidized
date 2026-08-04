@@ -510,12 +510,16 @@ fn build_snapshot(wire: RegistrySnapshotWire, client: &Arc<HostClient>) -> Regis
             default: flag.default.as_ref().map(flag_value_wire_to_legacy_default),
             extension_path: flag.extension_path,
         }) {
-            // First-wins: prefer the host-resolved value, fall back to default.
+            // First-wins: prefer the host-resolved value, fall back to default,
+            // then to a typed fallback (false for boolean flags, "" for string).
             let value = flag
                 .value
                 .clone()
                 .or_else(|| flag.default.as_ref().map(flag_value_wire_to_json))
-                .unwrap_or_else(|| Value::String(String::new()));
+                .unwrap_or_else(|| match flag.kind.as_deref() {
+                    Some("boolean") => Value::Bool(false),
+                    _ => Value::String(String::new()),
+                });
             snapshot.flag_values.insert(flag.name, value);
         }
     }

@@ -458,10 +458,14 @@ fn try_create_lock(
                     if !is_lock_stale(&meta, stale) {
                         return Err(OnceError::Contended);
                     }
-                    match fs::remove_dir(lock_path) {
-                        Ok(()) => {}
-                        Err(remove_err) if remove_err.kind() == io::ErrorKind::NotFound => {}
-                        Err(remove_err) => return Err(OnceError::Io(remove_err)),
+                    // Identity-safe reclamation: a contender may have reclaimed
+                    // and recreated this path since the staleness check. Only
+                    // remove the directory if it is still the same stale object
+                    // we measured; a fresh replacement must not be deleted.
+                    match reclaim_stale_lock(lock_path, &meta) {
+                        Ok(true) => {}
+                        Ok(false) => return Err(OnceError::Contended),
+                        Err(source) => return Err(OnceError::Io(source)),
                     }
                     // After reclaim, never reclaim again in this attempt chain
                     // (mirrors proper-lockfile's `stale: 0` follow-up).
@@ -487,6 +491,50 @@ fn is_lock_stale(meta: &fs::Metadata, stale: Duration) -> bool {
         Ok(age) => age > stale,
         // Future mtime → not stale.
         Err(_) => false,
+    }
+}
+
+/// Reclaim a stale lock directory only when its identity is unchanged.
+///
+/// `stale_meta` is the metadata captured when the directory at `lock_path` was
+/// judged stale. The path is re-read immediately before removal so a contender
+/// that reclaimed and recreated this path cannot have its fresh lock deleted.
+///
+/// Returns `Ok(true)` when the stale directory was removed (or had already
+/// vanished) and the caller may retry creation, `Ok(false)` when a contender
+/// has replaced it (the caller must treat this as contention), or `Err` for an
+/// intervening I/O failure.
+fn reclaim_stale_lock(lock_path: &Path, stale_meta: &fs::Metadata) -> Result<bool, io::Error> {
+    let still_stale = match fs::metadata(lock_path) {
+        Ok(current) => same_dir_identity(&current, stale_meta),
+        // Vanished between staleness check and removal: a releaser finished.
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(err) => return Err(err),
+    };
+    if !still_stale {
+        // Path now names a different directory: a contender reclaimed it. Do
+        // not delete the replacement lock.
+        return Ok(false);
+    }
+    match fs::remove_dir(lock_path) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(err) => Err(err),
+    }
+}
+
+/// Compare two directory metadata objects for the same filesystem identity.
+fn same_dir_identity(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        a.dev() == b.dev() && a.ino() == b.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        a.len() == b.len()
+            && a.modified().ok() == b.modified().ok()
+            && a.created().ok() == b.created().ok()
     }
 }
 
@@ -736,6 +784,72 @@ mod tests {
             return Err(fail("reclaimed lock missing"));
         }
         drop(guard);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn stale_reclaim_removes_unchanged_stale_directory() -> TestResult {
+        let dir = make_temp_dir()?;
+        let target = dir.join("settings.json");
+        let lock_path = default_lock_path(&absolute_path(&target));
+        fs::create_dir(&lock_path)?;
+        let past = SystemTime::now()
+            .checked_sub(Duration::from_secs(30))
+            .ok_or_else(|| fail("past time underflow"))?;
+        set_file_mtime(&lock_path, FileTime::from_system_time(past))?;
+        let stale_meta = fs::metadata(&lock_path)?;
+
+        match reclaim_stale_lock(&lock_path, &stale_meta) {
+            Ok(true) => {}
+            Ok(false) => return Err(fail("unchanged stale directory must be reclaimed")),
+            Err(err) => return Err(fail(format!("unexpected reclaim error: {err}"))),
+        }
+        if lock_path.exists() {
+            return Err(fail("stale directory must be removed by reclaim"));
+        }
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn stale_reclaim_keeps_replacement_lock_directory() -> TestResult {
+        let dir = make_temp_dir()?;
+        let target = dir.join("settings.json");
+        let lock_path = default_lock_path(&absolute_path(&target));
+        fs::create_dir(&lock_path)?;
+
+        // Age the directory past the stale threshold and capture its identity.
+        let past = SystemTime::now()
+            .checked_sub(Duration::from_secs(30))
+            .ok_or_else(|| fail("past time underflow"))?;
+        set_file_mtime(&lock_path, FileTime::from_system_time(past))?;
+        let stale_meta = fs::metadata(&lock_path)?;
+
+        // A contender reclaims the stale directory and installs a fresh
+        // replacement at the same path, changing its filesystem identity.
+        fs::remove_dir(&lock_path)?;
+        fs::create_dir(&lock_path)?;
+        let replacement = Handle::from_path(&lock_path)?;
+        if same_dir_identity(&fs::metadata(&lock_path)?, &stale_meta) {
+            return Err(fail(
+                "replacement must differ in identity from the stale directory",
+            ));
+        }
+
+        // Reclamation must observe the changed identity and refuse to delete the
+        // contender's fresh lock, reporting contention instead.
+        match reclaim_stale_lock(&lock_path, &stale_meta) {
+            Ok(false) => {}
+            Ok(true) => return Err(fail("reclaim deleted a replacement lock")),
+            Err(err) => return Err(fail(format!("unexpected reclaim error: {err}"))),
+        }
+        if !lock_path.exists() {
+            return Err(fail("replacement lock must survive identity-safe reclaim"));
+        }
+        if Handle::from_path(&lock_path)? != replacement {
+            return Err(fail("replacement lock identity changed after reclaim"));
+        }
         let _ = fs::remove_dir_all(&dir);
         Ok(())
     }

@@ -390,10 +390,13 @@ impl AgentSession {
                 ));
             }
             drop(ready_rx);
-            let Some(PendingReadyOp::Reload {
-                prepared,
-                model_runtime,
-            }) = host.take_finalizing(&token)
+            let Some((
+                PendingReadyOp::Reload {
+                    prepared,
+                    model_runtime,
+                },
+                _finalize_guard,
+            )) = host.take_finalizing(&token)
             else {
                 return Err(ExtensionBindError::HostRestart(
                     "extension runtime was invalidated during reload".to_owned(),
@@ -1047,12 +1050,10 @@ impl AgentSession {
                 .await;
             return;
         }
-        let runtime = self.runtime_handle();
-        let _lifecycle_guard = if let Some(runtime) = runtime.as_ref() {
-            Some(runtime.lifecycle_gate().read().await)
-        } else {
-            None
-        };
+        // Do not hold the lifecycle_gate read lock during the (potentially long)
+        // summarization: it blocks replacement teardown. The branch-summary
+        // cancellation token is cancelled by disposal/replacement, and
+        // navigate_tree_inner checks it before persisting.
         if self.is_disposed() {
             let _ = host
                 .respond_navigate_tree(id, Err("session replaced".to_owned()))
@@ -1200,7 +1201,7 @@ impl AgentSession {
     ) {
         match tokio::time::timeout(REPLACEMENT_READY_TIMEOUT, ready_rx).await {
             Ok(Ok(())) => {
-                let Some(op) = host.take_finalizing(&token) else {
+                let Some((op, _finalize_guard)) = host.take_finalizing(&token) else {
                     self.report_extension_error(format!(
                         "{operation}: replacement ready state was lost"
                     ));
@@ -1208,9 +1209,17 @@ impl AgentSession {
                 };
                 match pending_replacement(op) {
                     Ok(prepared) => {
-                        // Keep the old facade's buffered bridge commands routed
-                        // while teardown drains its finalizing state.
-                        host.bind_session_target(Arc::downgrade(&prepared.result.session));
+                        let Some(result) = prepared.result.as_ref() else {
+                            let _ = host.finish_finalize(&token);
+                            self.report_extension_error(format!(
+                                "{operation}: prepared replacement was already consumed"
+                            ));
+                            return;
+                        };
+                        // Route bridge commands at the replacement session
+                        // before teardown drops the old one, so no command is
+                        // orphaned while teardown drains old state.
+                        host.bind_session_target(Arc::downgrade(&result.session));
                         runtime.finalize_replacement(prepared).await;
                         let _ = host.finish_finalize(&token);
                     }
@@ -1244,10 +1253,13 @@ impl AgentSession {
     ) {
         match tokio::time::timeout(REPLACEMENT_READY_TIMEOUT, ready_rx).await {
             Ok(Ok(())) => {
-                let Some(PendingReadyOp::Reload {
-                    prepared,
-                    model_runtime,
-                }) = host.take_finalizing(&token)
+                let Some((
+                    PendingReadyOp::Reload {
+                        prepared,
+                        model_runtime,
+                    },
+                    _finalize_guard,
+                )) = host.take_finalizing(&token)
                 else {
                     self.report_extension_error("reload: replacement ready state was lost");
                     return;
@@ -1435,11 +1447,12 @@ fn install_bridge_replacement(
     prepared: PreparedReplacement,
 ) -> Result<(String, tokio::sync::oneshot::Receiver<()>), PreparedReplacement> {
     let token = host.next_replacement_token();
-    let PreparedReplacement {
-        result,
-        reason,
-        target_session_file,
-    } = prepared;
+    let mut prepared = prepared;
+    let Some(result) = prepared.result.take() else {
+        return Err(prepared);
+    };
+    let reason = prepared.reason;
+    let target_session_file = prepared.target_session_file.take();
     match host.install_pending(
         token.clone(),
         PendingReadyOp::Replacement {
@@ -1454,7 +1467,7 @@ fn install_bridge_replacement(
             reason,
             target_session_file,
         }) => Err(PreparedReplacement {
-            result,
+            result: Some(result),
             reason,
             target_session_file,
         }),
@@ -1472,7 +1485,7 @@ fn pending_replacement(op: PendingReadyOp) -> Result<PreparedReplacement, Pendin
             reason,
             target_session_file,
         } => Ok(PreparedReplacement {
-            result,
+            result: Some(result),
             reason,
             target_session_file,
         }),

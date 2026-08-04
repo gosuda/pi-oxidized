@@ -276,7 +276,6 @@ impl AgentSession {
         let mut summary_text: Option<String> = None;
         let mut summary_details: Option<serde_json::Value> = None;
         let mut summary_usage: Option<pi_ai::Usage> = None;
-        let mut from_extension = false;
         if preparation.user_wants_summary
             && !preparation.entries_to_summarize.is_empty()
             && let Some(stream_fn) = summarizer
@@ -320,12 +319,22 @@ impl AgentSession {
                 "readFiles": result.read_files.unwrap_or_default(),
                 "modifiedFiles": result.modified_files.unwrap_or_default(),
             }));
-            from_extension = false;
         }
-        let _ = from_extension;
 
         // Determine new leaf id + editor text from the target entry shape.
         let (new_leaf_id, editor_text) = compute_new_leaf_and_editor_text(&target_entry);
+
+        // Abort before persisting if the request was cancelled (host timeout,
+        // session disposal, or replacement teardown). This prevents a timed-out
+        // or replaced navigation from mutating session state after the caller
+        // has moved on.
+        if token.is_cancelled() {
+            return Ok(NavigateTreeResult {
+                cancelled: true,
+                aborted: true,
+                ..Default::default()
+            });
+        }
 
         // Persist leaf change + optional summary under the lock.
         let summary_entry = {
@@ -335,7 +344,7 @@ impl AgentSession {
                     new_leaf_id.as_deref(),
                     text,
                     summary_details.clone(),
-                    from_extension.then_some(true),
+                    None,
                     summary_usage.clone(),
                 )?;
                 if let Some(l) = preparation.label.as_deref() {

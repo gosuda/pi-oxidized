@@ -455,8 +455,7 @@ impl CreateAgentSessionRuntimeFactory for PreparationGatedFactory {
     }
 }
 
-/// Extension runner recording lifecycle `emit` calls (shared across the
-/// sessions a recording factory creates).
+/// Replacement factory that always fails, to exercise rollback paths.
 struct FailingReplacementFactory;
 
 impl CreateAgentSessionRuntimeFactory for FailingReplacementFactory {
@@ -715,6 +714,48 @@ fn import_publication_falls_back_when_hard_links_are_unsupported() -> TestResult
     assert_eq!(method, ImportPublication::Moved);
     assert!(!staged.exists());
     assert_eq!(fs::read(&destination)?, b"session bytes");
+    Ok(())
+}
+
+#[test]
+fn import_publication_preserves_both_link_and_move_errors() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let staged = root.path().join("staged.tmp");
+    let destination = root.path().join("session.jsonl");
+    fs::write(&staged, b"session bytes")?;
+
+    let result = publish_no_replace_with(
+        &staged,
+        &destination,
+        |_, _| Err(io::Error::from_raw_os_error(18)), // EXDEV — cross-device link
+        |_, _| {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "renameat NOREPLACE unavailable",
+            ))
+        },
+    );
+    let Err(error) = result else {
+        return Err("link and move failures unexpectedly published the import".into());
+    };
+
+    let message = error.to_string();
+    assert!(
+        message.contains("link failed"),
+        "diagnostic must mention the link failure: {message}"
+    );
+    assert!(
+        message.contains("atomic move failed"),
+        "diagnostic must mention the move failure: {message}"
+    );
+    assert!(
+        message.contains("NOREPLACE unavailable"),
+        "diagnostic must carry the real move error text: {message}"
+    );
+    assert!(
+        message.contains("cross-device"),
+        "diagnostic must carry the link error text: {message}"
+    );
     Ok(())
 }
 
@@ -984,7 +1025,7 @@ async fn import_factory_failure_removes_stage_and_preserves_existing_session() -
     let mut config = AgentSessionConfig::test_config(Arc::new(StubProvider), test_model())?;
     config.session_manager = session_manager;
     let original = AgentSession::new(config)?;
-    let runtime = Arc::new(AgentSessionRuntime::new(
+    let runtime = AgentSessionRuntime::new(
         Arc::clone(&original),
         AgentSessionRuntimeServices {
             cwd: PathBuf::from("."),
@@ -993,8 +1034,7 @@ async fn import_factory_failure_removes_stage_and_preserves_existing_session() -
         Arc::new(FailingReplacementFactory),
         Vec::new(),
         None,
-    ));
-    runtime.link();
+    );
 
     let Err(error) = runtime
         .import_from_jsonl(source.to_str().ok_or("source path is not UTF-8")?, None)
@@ -1751,6 +1791,7 @@ async fn replacement_rejects_untyped_live_extension_flag_values() -> TestResult 
         serde_json::json!({"k": "v"}),
     ] {
         let (runtime, factory, runner) = make_flag_recording_runtime().await?;
+        let original = runtime.session();
         runner.set_flag("bad", bad_value.clone());
 
         let result = runtime.new_session(NewSessionOptions::default()).await;
@@ -1772,11 +1813,9 @@ async fn replacement_rejects_untyped_live_extension_flag_values() -> TestResult 
             1,
             "factory must not be called after snapshot failure for {bad_value}"
         );
-
-        // Current session must still be installed (not torn down).
-        let session = runtime.session();
+        // Current session must still be installed (exact same Arc).
         assert!(
-            !session.session_manager().lock().await.is_persisted(),
+            Arc::ptr_eq(&original, &runtime.session()),
             "current session must remain installed after snapshot failure for {bad_value}"
         );
     }

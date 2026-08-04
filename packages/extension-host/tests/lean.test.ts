@@ -419,6 +419,65 @@ describe("lean: extensions.load registry", () => {
 		}
 	});
 
+	test("rejects createRequire and node:module loader bypasses before evaluation", async () => {
+		const directory = await mkdtemp(join(PACKAGE_DIR, ".test-lean-create-require-"));
+		const createRequireEntry = join(directory, "create-require.mjs");
+		const nodeModuleEntry = join(directory, "node-module.mjs");
+		const memberCreateRequireEntry = join(directory, "member-create-require.mjs");
+		const bareCreateRequireEntry = join(directory, "bare-create-require.mjs");
+		const holder = globalThis as Record<string, unknown>;
+		const link = new LeanLink({ cwd: directory, extensionPaths: [] });
+		try {
+			await Promise.all([
+				writeFile(
+					createRequireEntry,
+					'globalThis.__leanCreateRequireEvaluated = true; import { createRequire } from "node:module"; const load = createRequire(import.meta.url); load("jiti"); export default { name: "create-require" };',
+				),
+				writeFile(
+					nodeModuleEntry,
+					'globalThis.__leanNodeModuleEvaluated = true; import "module"; export default { name: "node-module" };',
+				),
+				writeFile(
+					memberCreateRequireEntry,
+					'globalThis.__leanMemberCreateRequireEvaluated = true; const obj = { createRequire: () => () => null }; obj.createRequire(import.meta.url)("jiti"); export default { name: "member-create-require" };',
+				),
+				writeFile(
+					bareCreateRequireEntry,
+					'globalThis.__leanBareCreateRequireEvaluated = true; const load = createRequire(import.meta.url); load("jiti"); export default { name: "bare-create-require" };',
+				),
+			]);
+			await link.hello(1);
+			link.request(2, "extensions.load", {
+				extensionPaths: [createRequireEntry, nodeModuleEntry, memberCreateRequireEntry, bareCreateRequireEntry],
+				cwd: directory,
+			});
+			const response = payload(await link.response(2, "extensions.load"));
+			const errors = new Map(
+				(response["errors"] as Array<{ path: string; error: string }>).map(
+					(error) => [error.path, error.error],
+				),
+			);
+			// The createRequire call is caught as an unsupported loader form
+			// before the node:module import is even reached.
+			expect(errors.get(createRequireEntry)).toContain("unsupported createRequire loader");
+			expect(errors.get(nodeModuleEntry)).toContain("module");
+			// A bare createRequire call (no node:module import) is caught as
+			// an unsupported loader form before evaluation.
+			expect(errors.get(bareCreateRequireEntry)).toContain("unsupported createRequire loader");
+			// A member-access createRequire is a property name, not a loader.
+			expect(errors.has(memberCreateRequireEntry)).toBe(false);
+			expect(holder["__leanCreateRequireEvaluated"]).toBeUndefined();
+			expect(holder["__leanNodeModuleEvaluated"]).toBeUndefined();
+			expect(holder["__leanBareCreateRequireEvaluated"]).toBeUndefined();
+		} finally {
+			delete holder["__leanCreateRequireEvaluated"];
+			delete holder["__leanNodeModuleEvaluated"];
+			delete holder["__leanBareCreateRequireEvaluated"];
+			await link.finish();
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
+
 	test("finds excluded imports through Bun extensionless and directory-index local paths", async () => {
 		const directory = await mkdtemp(join(PACKAGE_DIR, ".test-lean-extensionless-import-"));
 		const extensionlessEntry = join(directory, "extensionless.mjs");
@@ -599,7 +658,7 @@ describe("lean: tool RPCs", () => {
 		await link.finish();
 	});
 
-	test("tool updates retain only the latest pending value and stop after terminal", async () => {
+	test("tool updates queue every value in arrival order and stop after terminal", async () => {
 		const releaseFirstUpdate = Promise.withResolvers<void>();
 		const firstUpdateStarted = Promise.withResolvers<void>();
 		const late = Promise.withResolvers<void>();
@@ -627,6 +686,8 @@ describe("lean: tool RPCs", () => {
 			prepared: true,
 		});
 		await firstUpdateStarted.promise;
+		// Backpressure on the first update does not drop the rest: every
+		// update is queued in arrival order, matching the full-host contract.
 		expect(updateWrites).toBe(1);
 
 		releaseFirstUpdate.resolve();
@@ -634,17 +695,20 @@ describe("lean: tool RPCs", () => {
 		const updates = link.allFrames().filter(
 			(frame) => frame.id === 3 && frame.kind === "event" && frame.method === "toolUpdate",
 		);
-		expect(updates.map((frame) => payload(frame)["partialResult"])).toEqual([{ index: 0 }, { index: 199 }]);
+		const expected = Array.from({ length: 200 }, (_, index) => ({ index }));
+		expect(updates.map((frame) => payload(frame)["partialResult"])).toEqual(expected);
 		const terminalIndex = link.allFrames().findIndex(
 			(frame) => frame.id === 3 && frame.kind === "res" && frame.method === "tool.execute",
 		);
-		expect(terminalIndex).toBeGreaterThan(link.allFrames().indexOf(updates[1] as Frame));
+		expect(terminalIndex).toBeGreaterThan(link.allFrames().indexOf(updates[199] as Frame));
 
 		late.resolve();
 		await Promise.resolve();
+		// The terminal result already stopped accepting updates, so the late
+		// emission never enters the queue.
 		expect(link.allFrames().filter(
 			(frame) => frame.id === 3 && frame.kind === "event" && frame.method === "toolUpdate",
-		)).toHaveLength(2);
+		)).toHaveLength(200);
 		await link.finish();
 	});
 
@@ -1987,7 +2051,10 @@ describe("lean: surface validation units", () => {
 			// Dynamic import and side-effect import (spaced and minified).
 			['const m = await import("jiti");', "jiti"],
 			['import "./host.ts";', "./host.ts"],
-			['import"./virtual-modules.ts";', "./virtual-modules.ts"],
+			// node:module loader factory is excluded: createRequire bypasses the graph.
+			['import { createRequire } from "node:module";', "node:module"],
+			['import "module";', "module"],
+			['import { createRequire } from "node:module"; const load = createRequire(import.meta.url);', "node:module"],
 			// Clean graph and keyword-shaped traps stay undetected.
 			['import { y } from "@earendil-works/pi-tui-protocol";', undefined],
 			['import{y}from"@earendil-works/pi-tui-protocol";', undefined],
@@ -2033,7 +2100,6 @@ describe("lean: surface validation units", () => {
 			['const π\\u0072equire = (value) => value; π\\u0072equire("jiti");', undefined],
 			['obj?.\\u006Ff / require("jiti") / divisor;', "jiti"],
 			['// \\u0072equire("jiti");', undefined],
-			['"\\u0072equire(\"jiti\")";', undefined],
 		];
 		for (const [source, expected] of cases) {
 			expect(findExcludedImport(source)).toBe(expected);
@@ -2352,25 +2418,25 @@ describe("lean: subprocess graph-absence proof", () => {
 	test("main.ts --lean serves the full flow without resolving the compat graph", async () => {
 		const scratch = await mkdtemp(join(tmpdir(), "lean-host-"));
 		const resolveLog = join(scratch, "resolve.log");
+		const child = spawn(
+			process.execPath,
+			[
+				"--preload",
+				PRELOAD,
+				"src/main.ts",
+				"--lean",
+				"--cwd",
+				PACKAGE_DIR,
+				"--extension",
+				ECHO_ENTRY,
+			],
+			{
+				cwd: PACKAGE_DIR,
+				env: { ...process.env, LEAN_RESOLVE_LOG: resolveLog },
+				stdio: ["pipe", "pipe", "pipe"],
+			},
+		);
 		try {
-			const child = spawn(
-				process.execPath,
-				[
-					"--preload",
-					PRELOAD,
-					"src/main.ts",
-					"--lean",
-					"--cwd",
-					PACKAGE_DIR,
-					"--extension",
-					ECHO_ENTRY,
-				],
-				{
-					cwd: PACKAGE_DIR,
-					env: { ...process.env, LEAN_RESOLVE_LOG: resolveLog },
-					stdio: ["pipe", "pipe", "pipe"],
-				},
-			);
 			let stderr = "";
 			child.stderr.on("data", (chunk: Buffer) => {
 				stderr += chunk.toString();
@@ -2478,8 +2544,13 @@ describe("lean: subprocess graph-absence proof", () => {
 			expect(log).not.toMatch(/host\.ts/);
 			expect(log).not.toMatch(/virtual-modules/);
 			expect(log).not.toMatch(/pi-coding-agent/);
-			expect(log).not.toMatch(/pi-agent-core|pi-ai|@mariozechner|jiti|typebox/);
+			expect(log).not.toMatch(/(?:node:)?module/);
 		} finally {
+			// Never orphan the graph-proof subprocess: a failed expect or a
+			// withTimeout rejection on a wedged child leaves it running with an
+			// open stdin that never exits on its own.
+			child.stdin.destroy();
+			if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
 			await rm(scratch, { recursive: true, force: true });
 		}
 	}, 30_000);

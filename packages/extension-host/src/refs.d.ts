@@ -8,6 +8,18 @@
  */
 
 declare module "@earendil-works/pi-coding-agent" {
+	/** Bridge-local TUI surface mirroring the observable shape extensions use. */
+	export interface TuiBridge {
+		requestRender(): void;
+	}
+	import type {
+		AssistantMessageEventStream,
+		Context,
+		ImageContent,
+		Model,
+		SimpleStreamOptions,
+		TextContent,
+	} from "@earendil-works/pi-ai";
 	export type ExtensionMode = "tui" | "rpc" | "json" | "print";
 
 	export interface SourceInfo {
@@ -40,7 +52,7 @@ declare module "@earendil-works/pi-coding-agent" {
 		addAutocompleteProvider(factory: unknown): void;
 		setEditorComponent(factory: unknown): void;
 		getEditorComponent(): unknown;
-		custom<T>(factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (result: T) => void) => unknown, options?: unknown): Promise<T>;
+		custom<T>(factory: (tui: TuiBridge, theme: Theme, keybindings: unknown, done: (result: T) => void) => unknown, options?: unknown): Promise<T>;
 		readonly theme: Theme;
 		getAllThemes(): { name: string; path: string | undefined }[];
 		getTheme(name: string): Theme | undefined;
@@ -98,8 +110,18 @@ declare module "@earendil-works/pi-coding-agent" {
 		details?: unknown;
 	}
 
+	/** Bridge-local skill shape mirroring the pinned pi-coding-agent type. */
+	export interface Skill {
+		name: string;
+		description: string;
+		filePath: string;
+		baseDir: string;
+		sourceInfo: SourceInfo;
+		disableModelInvocation: boolean;
+	}
+
 	export interface ExtensionCommandContext extends ExtensionContext {
-		getSystemPromptOptions?(): BuildSystemPromptOptions;
+	getSystemPromptOptions(): BuildSystemPromptOptions;
 		waitForIdle(): Promise<void>;
 		newSession(options?: {
 			parentSession?: string;
@@ -138,11 +160,11 @@ declare module "@earendil-works/pi-coding-agent" {
 	 */
 	export interface ReplacedSessionContext extends ExtensionCommandContext {
 		sendMessage(
-			message: { customType: string; content: unknown; display?: boolean; details?: unknown },
+			message: { customType: string; content: string | (TextContent | ImageContent)[]; display: boolean; details?: unknown },
 			options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 		): Promise<void>;
 		sendUserMessage(
-			content: unknown,
+			content: string | (TextContent | ImageContent)[],
 			options?: { deliverAs?: "steer" | "followUp" },
 		): Promise<void>;
 	}
@@ -155,7 +177,7 @@ declare module "@earendil-works/pi-coding-agent" {
 		appendSystemPrompt?: string;
 		cwd: string;
 		contextFiles?: Array<{ path: string; content: string }>;
-		skills?: unknown[];
+		skills?: Skill[];
 	}
 
 	export type ToolExecutionMode = "sequential" | "parallel";
@@ -287,10 +309,10 @@ declare module "@earendil-works/pi-coding-agent" {
 		apiKey?: string;
 		api?: string;
 		streamSimple?: (
-			model: unknown,
-			context: unknown,
-			options?: Record<string, unknown>,
-		) => AsyncIterable<unknown>;
+			model: Model<string>,
+			context: Context,
+			options?: SimpleStreamOptions,
+		) => AssistantMessageEventStream;
 		headers?: Record<string, string>;
 		authHeader?: boolean;
 		models?: ProviderModelConfig[];
@@ -403,10 +425,10 @@ declare module "@earendil-works/pi-coding-agent" {
 		unregisterProvider(name: string): void;
 		getFlag(name: string): boolean | string | undefined;
 		sendMessage(
-			message: { customType: string; content: unknown; display?: boolean; details?: unknown },
+			message: { customType: string; content: string | (TextContent | ImageContent)[]; display: boolean; details?: unknown },
 			options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 		): void;
-		sendUserMessage(content: unknown, options?: { deliverAs?: "steer" | "followUp" }): void;
+		sendUserMessage(content: string | (TextContent | ImageContent)[], options?: { deliverAs?: "steer" | "followUp" }): void;
 		appendEntry(customType: string, data?: unknown): void;
 		setSessionName(name: string): void;
 		getSessionName(): string | undefined;
@@ -563,6 +585,91 @@ declare module "@earendil-works/pi-ai" {
 	}
 
 	export function createAssistantMessageEventStream(): AssistantMessageEventStream;
+
+	/** Bridge-local content block shapes mirroring the pinned pi-ai types. */
+	export interface TextContent {
+		type: "text";
+		text: string;
+	}
+	export interface ImageContent {
+		type: "image";
+		data: string;
+		mimeType: string;
+	}
+	export interface ThinkingContent {
+		type: "thinking";
+		thinking: string;
+	}
+	export interface ToolCall {
+		type: "toolCall";
+		id: string;
+		name: string;
+		arguments: Record<string, unknown>;
+	}
+	export interface Usage {
+		input: number;
+		output: number;
+		cacheRead: number;
+		cacheWrite: number;
+		totalTokens: number;
+		cost: {
+			input: number;
+			output: number;
+			cacheRead: number;
+			cacheWrite: number;
+			total: number;
+		};
+	}
+	export type StopReason = "stop" | "length" | "toolUse" | "error" | "aborted";
+
+	/** Bridge-local message shapes mirroring the pinned pi-ai types. */
+	export interface AssistantMessage {
+		role: "assistant";
+		content: (TextContent | ThinkingContent | ToolCall)[];
+		api: string;
+		provider: string;
+		model: string;
+		usage: Usage;
+		stopReason: StopReason;
+		errorMessage?: string;
+		timestamp: number;
+	}
+	export interface UserMessage {
+		role: "user";
+		content: string | (TextContent | ImageContent)[];
+		timestamp: number;
+	}
+	export interface ToolResultMessage {
+		role: "toolResult";
+		toolCallId: string;
+		toolName: string;
+		content: (TextContent | ImageContent)[];
+		isError: boolean;
+		timestamp: number;
+	}
+	export type Message = UserMessage | AssistantMessage | ToolResultMessage;
+
+	export interface Context {
+		systemPrompt?: string;
+		messages: Message[];
+		tools?: unknown[];
+	}
+	export interface Model<TApi extends string = string> {
+		id: string;
+		name: string;
+		api: TApi;
+		provider: string;
+		baseUrl: string;
+		reasoning: boolean;
+		input: ("text" | "image")[];
+		cost: unknown;
+		contextWindow: number;
+		maxTokens: number;
+	}
+	export interface SimpleStreamOptions {
+		signal?: AbortSignal;
+		[key: string]: unknown;
+	}
 
 	export function generateImages(
 		model: unknown,

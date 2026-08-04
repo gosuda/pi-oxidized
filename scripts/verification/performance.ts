@@ -202,7 +202,7 @@ interface PerformanceArtifact {
 	};
 }
 
-class HarnessFailure extends Error {
+export class HarnessFailure extends Error {
 	constructor(
 		readonly stage: string,
 		message: string,
@@ -523,13 +523,13 @@ function stripTerminalSequences(text: string): string {
 		.replace(/[\x00-\x1f\x7f]/g, "");
 }
 
-interface FrameObservation {
+export interface FrameObservation {
 	readonly elapsedMs: number;
 	readonly bytes: number;
 	readonly detection: FirstFrameSample["detection"];
 }
 
-function frameObservation(snapshot: PtySnapshot, chunkOffset = 0): FrameObservation | undefined {
+export function frameObservation(snapshot: PtySnapshot, chunkOffset = 0): FrameObservation | undefined {
 	let raw = "";
 	let bytes = 0;
 	for (const chunk of snapshot.chunks.slice(chunkOffset)) {
@@ -747,7 +747,7 @@ const streamingArgs = [
 	"--approve",
 ] as const;
 
-async function terminateAndRequireCleanExit(pty: PtyProcess, label: string): Promise<void> {
+export async function terminateAndRequireCleanExit(pty: PtyProcess, label: string): Promise<void> {
 	if (pty.exited) {
 		const code = await pty.waitForExit(1);
 		if (code !== 0) throw new HarnessFailure(label, `${label} exited ${code}\nPTY tail:\n${tail(pty.snapshot().rawText, 4_000)}`);
@@ -1411,19 +1411,21 @@ async function main(): Promise<void> {
 	process.stdout.write(`check 9 passed; artifact: ${ARTIFACT_PATH}\n`);
 }
 
-try {
-	await main();
-} catch (error) {
-	const failure = error instanceof Error ? error : new Error(String(error));
-	if (!(failure instanceof ThresholdFailure)) {
-		const stage = failure instanceof HarnessFailure ? failure.stage : "unexpected";
-		artifact.pass = false;
-		artifact.blockers = [`${stage}: ${failure.message}`];
-		artifact.failure = { stage, message: failure.message };
-		writeArtifact();
+if (import.meta.main) {
+	try {
+		await main();
+	} catch (error) {
+		const failure = error instanceof Error ? error : new Error(String(error));
+		if (!(failure instanceof ThresholdFailure)) {
+			const stage = failure instanceof HarnessFailure ? failure.stage : "unexpected";
+			artifact.pass = false;
+			artifact.blockers = [`${stage}: ${failure.message}`];
+			artifact.failure = { stage, message: failure.message };
+			writeArtifact();
+		}
+		process.stderr.write(`check 9 failed:\n${failure.message}\nartifact: ${ARTIFACT_PATH}\n`);
+		process.exitCode = 1;
+	} finally {
+		for (const path of temporaryDirectories) rmSync(path, { recursive: true, force: true });
 	}
-	process.stderr.write(`check 9 failed:\n${failure.message}\nartifact: ${ARTIFACT_PATH}\n`);
-	process.exitCode = 1;
-} finally {
-	for (const path of temporaryDirectories) rmSync(path, { recursive: true, force: true });
 }

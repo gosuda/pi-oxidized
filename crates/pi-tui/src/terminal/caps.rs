@@ -5,6 +5,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::process::{self, Command, Stdio};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -85,7 +86,10 @@ impl TerminalCapabilities {
     /// Escape-based probes (Kitty flags, CSI 16t, OSC 11) refine this cache later.
     #[must_use]
     pub fn detect() -> Self {
-        detect_with(|key| env::var(key).ok(), probe_tmux_hyperlinks)
+        detect_with(
+            |key| env::var(key).ok(),
+            || *TMUX_HYPERLINK_CACHE.get_or_init(probe_tmux_hyperlinks),
+        )
     }
 
     /// Apply a Kitty keyboard probe result.
@@ -262,6 +266,7 @@ where
 const TMUX_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 const TMUX_FEATURES_MAX_BYTES: u64 = 4096;
 static NEXT_TMUX_PROBE_OUTPUT: AtomicU64 = AtomicU64::new(0);
+static TMUX_HYPERLINK_CACHE: OnceLock<bool> = OnceLock::new();
 
 fn create_tmux_probe_output() -> io::Result<(PathBuf, File)> {
     for _ in 0..16 {
@@ -347,9 +352,23 @@ fn probe_tmux_hyperlinks() -> bool {
     result
 }
 
+/// Encode a Kitty image deletion by id (`ESC _Ga=d,d=I,i=N ST`).
+#[must_use]
+pub fn kitty_delete_id(id: u32) -> Vec<u8> {
+    format!("\x1b_Ga=d,d=I,i={id}\x1b\\").into_bytes()
+}
+
+/// Encode deletion of every Kitty image (`ESC _Ga=d,d=A ST`).
+#[must_use]
+pub fn kitty_delete_all() -> Vec<u8> {
+    b"\x1b_Ga=d,d=A\x1b\\".to_vec()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ImageProtocol, TerminalCapabilities, detect_with};
+    use super::{
+        ImageProtocol, TerminalCapabilities, detect_with, kitty_delete_all, kitty_delete_id,
+    };
     use std::collections::HashMap;
 
     /// Build an env-lookup closure from a slice of `(key, value)` pairs.
@@ -359,6 +378,16 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         move |key| map.get(key).cloned()
+    }
+
+    #[test]
+    fn kitty_delete_id_format() {
+        assert_eq!(kitty_delete_id(42), b"\x1b_Ga=d,d=I,i=42\x1b\\");
+    }
+
+    #[test]
+    fn kitty_delete_all_format() {
+        assert_eq!(kitty_delete_all(), b"\x1b_Ga=d,d=A\x1b\\");
     }
 
     // -- Authority row 12: unknown --

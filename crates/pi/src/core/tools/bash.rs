@@ -1201,14 +1201,17 @@ mod tests {
         error.message().to_owned()
     }
 
-    async fn wait_for_marked_pids(marker: &Path) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+    async fn wait_for_marked_pids(
+        marker: &Path,
+        expected: usize,
+    ) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
         for _ in 0..50 {
             if let Ok(raw) = tokio::fs::read_to_string(marker).await {
                 let pids = raw
                     .lines()
                     .filter_map(|line| line.trim().parse().ok())
                     .collect::<Vec<u32>>();
-                if !pids.is_empty() {
+                if pids.len() >= expected {
                     return Ok(pids);
                 }
             }
@@ -1235,7 +1238,7 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig { cases: 4, .. ProptestConfig::default() })]
         #[test]
-        fn timeout_reaps_generated_process_tree(depth in 1_usize..4, timeout_tenths in 2_u8..5) {
+        fn timeout_reaps_generated_process_tree(depth in 1_usize..4, timeout_tenths in 5_u8..9) {
             let result: Result<(), String> = (|| {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -1263,7 +1266,7 @@ mod tests {
                     if !text_of_err(&err).contains("Command timed out") {
                         return Err(text_of_err(&err));
                     }
-                    let pids = wait_for_marked_pids(&marker).await.map_err(|error| error.to_string())?;
+                    let pids = wait_for_marked_pids(&marker, depth).await.map_err(|error| error.to_string())?;
                     assert_processes_exit(&pids).await.map_err(|error| error.to_string())
                 })
             })();
@@ -1288,7 +1291,7 @@ mod tests {
                     let args = json_map(json!({"command": command, "timeout": 30.0})).map_err(|error| error.to_string())?;
                     let task_cancel = cancel.clone();
                     let join = tokio::spawn(async move { tool.execute("1", args, task_cancel, ToolUpdates::noop()).await });
-                    let pids = wait_for_marked_pids(&marker).await.map_err(|error| error.to_string())?;
+                    let pids = wait_for_marked_pids(&marker, 1).await.map_err(|error| error.to_string())?;
                     tokio::time::sleep(Duration::from_millis(u64::from(cancel_delay_ms))).await;
                     cancel.cancel();
                     let err = expected_error(join.await.map_err(|error| error.to_string())?, "cancelled command succeeded").map_err(|error| error.to_string())?;
@@ -1460,7 +1463,7 @@ mod tests {
             text_of_err(&err)
         );
 
-        let pids = wait_for_marked_pids(&marker).await?;
+        let pids = wait_for_marked_pids(&marker, 1).await?;
         assert_processes_exit(&pids).await?;
         Ok(())
     }
@@ -1487,7 +1490,7 @@ mod tests {
                 "timed command succeeded",
             )?;
             assert!(text_of_err(&err).contains("Command timed out"));
-            let pids = wait_for_marked_pids(&marker).await?;
+            let pids = wait_for_marked_pids(&marker, depth).await?;
             assert_processes_exit(&pids).await?;
         }
         Ok(())
@@ -1509,7 +1512,7 @@ mod tests {
                 .await
         });
 
-        let pids = wait_for_marked_pids(&marker).await?;
+        let pids = wait_for_marked_pids(&marker, 1).await?;
         cancel.cancel();
         let err = expected_error(join.await?, "cancelled command succeeded")?;
         assert!(

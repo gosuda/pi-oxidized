@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import {
 	chmodSync,
+	cpSync,
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
@@ -34,6 +35,33 @@ const REAL_PROVIDERS_DIR = join(
 	".references/pi/packages/ai/src/providers",
 );
 const REAL_DATA_DIR = join(REAL_PROVIDERS_DIR, "data");
+
+/**
+ * Copy the real provider-data tree into an isolated temp fixture so
+ * reconstruction proofs never mutate the reference checkout. Returns null
+ * when the reference providers directory is not provisioned, so callers can
+ * skip the test rather than writing to the live checkout.
+ */
+function realProvidersFixture(): {
+	root: string;
+	catalogPath: string;
+	providersDir: string;
+	dataDir: string;
+} | null {
+	try {
+		readdirSync(REAL_PROVIDERS_DIR);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+		throw error;
+	}
+	const root = mkdtempSync(join(tmpdir(), "reconstruct-real-copy-"));
+	const providersDir = join(root, "providers");
+	const dataDir = join(providersDir, "data");
+	const catalogPath = join(root, "builtin-models.json");
+	cpSync(REAL_PROVIDERS_DIR, providersDir, { recursive: true });
+	cpSync(REAL_CATALOG_PATH, catalogPath);
+	return { root, catalogPath, providersDir, dataDir };
+}
 
 type Fixture = {
 	root: string;
@@ -86,8 +114,9 @@ function snapshotDir(dir: string): Map<string, string> | null {
 			out.set(name, readFileSync(join(dir, name), "utf8"));
 		}
 		return out;
-	} catch {
-		return null;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+		throw error;
 	}
 }
 
@@ -584,39 +613,47 @@ describe("reconstructProviderData transaction (Cluster C)", () => {
 		}
 	});
 
-	test("repeat-run is content-idempotent against the real checkout tree", async () => {
-		const catalogBefore = readFileSync(REAL_CATALOG_PATH);
-		const dataBefore = snapshotDir(REAL_DATA_DIR);
-		const first = await reconstructProviderData({
-			repoRoot: REPO_ROOT,
-			catalogPath: REAL_CATALOG_PATH,
-			providersDir: REAL_PROVIDERS_DIR,
-			dataDir: REAL_DATA_DIR,
-		});
-		const afterFirst = snapshotDir(REAL_DATA_DIR);
-		if (afterFirst === null) throw new Error("expected reconstructed provider data");
-		const expectedNames = first.providers.map((id) => `${id}.json`);
-		if (dataBefore?.has(".manifest.json") === true) expectedNames.push(".manifest.json");
-		expectedNames.sort();
-		expect([...afterFirst.keys()].sort()).toEqual(expectedNames);
-		if (dataBefore?.has(".manifest.json") === true) {
-			const beforeManifest = asRecord(JSON.parse(dataBefore.get(".manifest.json") ?? ""));
-			const afterManifest = asRecord(JSON.parse(afterFirst.get(".manifest.json") ?? ""));
-			expect(afterManifest.generatedAt).toBe(beforeManifest.generatedAt);
+	test("repeat-run is content-idempotent against a temp copy of the real tree", async () => {
+		const fx = realProvidersFixture();
+		if (fx === null) return; // reference providers dir not provisioned
+		const catalogBefore = readFileSync(fx.catalogPath);
+		const dataBefore = snapshotDir(fx.dataDir);
+		try {
+			const first = await reconstructProviderData({
+				repoRoot: fx.root,
+				catalogPath: fx.catalogPath,
+				providersDir: fx.providersDir,
+				dataDir: fx.dataDir,
+				inversionProof: noopProof,
+			});
+			const afterFirst = snapshotDir(fx.dataDir);
+			if (afterFirst === null) throw new Error("expected reconstructed provider data");
+			const expectedNames = first.providers.map((id) => `${id}.json`);
+			if (dataBefore?.has(".manifest.json") === true) expectedNames.push(".manifest.json");
+			expectedNames.sort();
+			expect([...afterFirst.keys()].sort()).toEqual(expectedNames);
+			if (dataBefore?.has(".manifest.json") === true) {
+				const beforeManifest = asRecord(JSON.parse(dataBefore.get(".manifest.json") ?? ""));
+				const afterManifest = asRecord(JSON.parse(afterFirst.get(".manifest.json") ?? ""));
+				expect(afterManifest.generatedAt).toBe(beforeManifest.generatedAt);
+			}
+
+			const second = await reconstructProviderData({
+				repoRoot: fx.root,
+				catalogPath: fx.catalogPath,
+				providersDir: fx.providersDir,
+				dataDir: fx.dataDir,
+				inversionProof: noopProof,
+			});
+			const afterSecond = snapshotDir(fx.dataDir);
+
+			expect(second.providers).toEqual(first.providers);
+			expectSnapshotsEqual(afterSecond, afterFirst);
+			expect(Buffer.compare(readFileSync(fx.catalogPath), catalogBefore)).toBe(0);
+			expect(siblingArtifacts(fx.providersDir)).toEqual([]);
+		} finally {
+			rmSync(fx.root, { recursive: true, force: true });
 		}
-
-		const second = await reconstructProviderData({
-			repoRoot: REPO_ROOT,
-			catalogPath: REAL_CATALOG_PATH,
-			providersDir: REAL_PROVIDERS_DIR,
-			dataDir: REAL_DATA_DIR,
-		});
-		const afterSecond = snapshotDir(REAL_DATA_DIR);
-
-		expect(second.providers).toEqual(first.providers);
-		expectSnapshotsEqual(afterSecond, afterFirst);
-		expect(Buffer.compare(readFileSync(REAL_CATALOG_PATH), catalogBefore)).toBe(0);
-		expect(siblingArtifacts(REAL_PROVIDERS_DIR)).toEqual([]);
 	}, 120_000);
 });
 
@@ -673,8 +710,18 @@ describe("reconstructProviderData default inversion proof path gating (P2)", () 
 		}
 	});
 
-	test("default-path reconstruction uses the current Bun executable for inversion proof", async () => {
-		const catalogBefore = readFileSync(REAL_CATALOG_PATH);
+	test("default inversion proof uses the current Bun executable, not PATH", async () => {
+		const root = mkdtempSync(join(tmpdir(), "reconstruct-path-decoy-"));
+		const scriptsDir = join(root, "scripts");
+		const catalogPath = join(root, "builtin-models.json");
+		mkdirSync(scriptsDir, { recursive: true });
+		writeFileSync(catalogPath, '{"alpha":{"model":{"id":"model"}}}\n', "utf8");
+		// Fixture generator: exits 0 so the proof succeeds when process.execPath is used.
+		writeFileSync(
+			join(scriptsDir, "generate-builtin-models.ts"),
+			"// Fixture generator: exits cleanly so the inversion proof succeeds.\nprocess.exit(0);\n",
+			"utf8",
+		);
 		const fakeBin = mkdtempSync(join(tmpdir(), "reconstruct-provider-data-fake-bun-"));
 		const fakeBun = join(fakeBin, "bun");
 		writeFileSync(fakeBun, "#!/bin/sh\nexit 97\n", "utf8");
@@ -682,17 +729,15 @@ describe("reconstructProviderData default inversion proof path gating (P2)", () 
 		const previousPath = process.env.PATH;
 		try {
 			process.env.PATH = fakeBin;
-			const result = await reconstructProviderData({
-				repoRoot: REPO_ROOT,
-				catalogPath: REAL_CATALOG_PATH,
-				providersDir: REAL_PROVIDERS_DIR,
-				dataDir: REAL_DATA_DIR,
-				// inversionProof intentionally omitted — default proof must apply.
+			// If the proof used PATH `bun`, the fake would exit 97 and the proof
+			// would fail. process.execPath is absolute, so the real Bun runs the
+			// fixture generator (exit 0) and the proof passes.
+			await defaultInversionProof({
+				repoRoot: root,
+				catalogPath,
+				providersDir: join(root, "providers"),
+				dataDir: join(root, "providers", "data"),
 			});
-			expect(result.written).toBeGreaterThan(0);
-			expect(result.providers.length).toBe(result.written);
-			expect(Buffer.compare(readFileSync(REAL_CATALOG_PATH), catalogBefore)).toBe(0);
-			expect(siblingArtifacts(REAL_PROVIDERS_DIR)).toEqual([]);
 		} finally {
 			if (previousPath === undefined) {
 				delete process.env.PATH;
@@ -700,6 +745,7 @@ describe("reconstructProviderData default inversion proof path gating (P2)", () 
 				process.env.PATH = previousPath;
 			}
 			rmSync(fakeBin, { recursive: true, force: true });
+			rmSync(root, { recursive: true, force: true });
 		}
 	}, 120_000);
 });
@@ -709,8 +755,6 @@ describe("defaultInversionProof primary-error preservation (PRRT_kwDOTcPStM6UYj9
 		const root = mkdtempSync(join(tmpdir(), "inversion-proof-preserve-"));
 		const catalogPath = join(root, "builtin-models.json");
 		writeFileSync(catalogPath, '{"alpha":{"model":{"id":"model"}}}\n', "utf8");
-		// Make the catalog file read-only so the finally-block restore fails.
-		chmodSync(catalogPath, 0o444);
 		try {
 			const error = await captureError(
 				defaultInversionProof({
@@ -719,6 +763,11 @@ describe("defaultInversionProof primary-error preservation (PRRT_kwDOTcPStM6UYj9
 					catalogPath,
 					providersDir: join(root, "providers"),
 					dataDir: join(root, "providers", "data"),
+					// Inject restore failure through the API so the test is
+					// deterministic regardless of uid (chmod 0o444 does not stop root).
+					restoreCatalog: async () => {
+						throw new Error("injected restore failure");
+					},
 				}),
 			);
 
@@ -733,7 +782,6 @@ describe("defaultInversionProof primary-error preservation (PRRT_kwDOTcPStM6UYj9
 			expect(error.cause).toBeInstanceOf(Error);
 			expect((error.cause as Error).message).toContain("inversion proof failed");
 		} finally {
-			chmodSync(catalogPath, 0o644);
 			rmSync(root, { recursive: true, force: true });
 		}
 	});
@@ -755,8 +803,6 @@ describe("defaultInversionProof primary-error preservation (PRRT_kwDOTcPStM6UYj9
 			"utf8",
 		);
 
-		// Make the catalog read-only so the snapshot restore in the finally block fails.
-		chmodSync(catalogPath, 0o444);
 		try {
 			const error = await captureError(
 				defaultInversionProof({
@@ -764,14 +810,18 @@ describe("defaultInversionProof primary-error preservation (PRRT_kwDOTcPStM6UYj9
 					catalogPath,
 					providersDir,
 					dataDir,
+					// Inject restore failure through the API so the test is
+					// deterministic regardless of uid (chmod 0o444 does not stop root).
+					restoreCatalog: async () => {
+						throw new Error("injected restore failure");
+					},
 				}),
 			);
 
 			// No "inversion proof failed" wrapper — the raw restore error surfaces.
 			expect(error.message).not.toContain("inversion proof failed");
-			expect(error.message).toMatch(/EACCES|EPERM|read.only/i);
+			expect(error.message).toContain("injected restore failure");
 		} finally {
-			chmodSync(catalogPath, 0o644);
 			rmSync(root, { recursive: true, force: true });
 		}
 	});
@@ -1045,7 +1095,7 @@ describe("reconstruction data-directory lock stale recovery (N16/N21)", () => {
 		} finally {
 			rmSync(fx.root, { recursive: true, force: true });
 		}
-	});
+	}, 20_000);
 
 	test("invalid metadata inside the initializing grace is waited on, never reaped", async () => {
 		const fx = makeLockFixture();

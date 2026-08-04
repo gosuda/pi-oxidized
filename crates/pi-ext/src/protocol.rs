@@ -2458,6 +2458,17 @@ mod bridge_tests {
                 SESSION_COMMAND_METHOD => {
                     from_payload::<SessionCommand>(&frame.payload)?;
                 }
+                SESSION_SET_MODEL_METHOD
+                | SESSION_COMPACT_METHOD
+                | SESSION_NEW_SESSION_METHOD
+                | SESSION_FORK_METHOD
+                | SESSION_NAVIGATE_TREE_METHOD
+                | SESSION_SWITCH_SESSION_METHOD
+                | SESSION_RELOAD_METHOD
+                    if frame.kind == FrameKind::Error =>
+                {
+                    from_payload::<ErrorPayload>(&frame.payload)?;
+                }
                 SESSION_SET_MODEL_METHOD if frame.kind == FrameKind::Req => {
                     from_payload::<SessionSetModelRequest>(&frame.payload)?;
                 }
@@ -2475,9 +2486,6 @@ mod bridge_tests {
                 }
                 SESSION_NEW_SESSION_METHOD if frame.kind == FrameKind::Res => {
                     from_payload::<SessionNewSessionResponse>(&frame.payload)?;
-                }
-                SESSION_NEW_SESSION_METHOD if frame.kind == FrameKind::Error => {
-                    from_payload::<ErrorPayload>(&frame.payload)?;
                 }
                 SESSION_FORK_METHOD if frame.kind == FrameKind::Req => {
                     from_payload::<SessionForkRequest>(&frame.payload)?;
@@ -2503,9 +2511,6 @@ mod bridge_tests {
                 SESSION_RELOAD_METHOD => {
                     from_payload::<SessionReloadResponse>(&frame.payload)?;
                 }
-                SESSION_REPLACEMENT_READY_METHOD => {
-                    from_payload::<SessionReplacementReadyEvent>(&frame.payload)?;
-                }
                 UI_CONTROL_METHOD => {
                     from_payload::<UiControl>(&frame.payload)?;
                 }
@@ -2522,21 +2527,26 @@ mod bridge_tests {
             (SESSION_UPDATE_METHOD, FrameKind::Event),
             (SESSION_COMMAND_METHOD, FrameKind::Event),
             (SESSION_SET_MODEL_METHOD, FrameKind::Req),
+            (SESSION_SET_MODEL_METHOD, FrameKind::Error),
             (SESSION_SET_MODEL_METHOD, FrameKind::Res),
             (SESSION_COMPACT_METHOD, FrameKind::Req),
+            (SESSION_COMPACT_METHOD, FrameKind::Error),
             (SESSION_COMPACT_METHOD, FrameKind::Res),
             (SESSION_NEW_SESSION_METHOD, FrameKind::Req),
             (SESSION_NEW_SESSION_METHOD, FrameKind::Res),
             (SESSION_NEW_SESSION_METHOD, FrameKind::Error),
             (SESSION_FORK_METHOD, FrameKind::Req),
+            (SESSION_FORK_METHOD, FrameKind::Error),
             (SESSION_FORK_METHOD, FrameKind::Res),
             (SESSION_NAVIGATE_TREE_METHOD, FrameKind::Req),
+            (SESSION_NAVIGATE_TREE_METHOD, FrameKind::Error),
             (SESSION_NAVIGATE_TREE_METHOD, FrameKind::Res),
             (SESSION_SWITCH_SESSION_METHOD, FrameKind::Req),
+            (SESSION_SWITCH_SESSION_METHOD, FrameKind::Error),
             (SESSION_SWITCH_SESSION_METHOD, FrameKind::Res),
             (SESSION_RELOAD_METHOD, FrameKind::Req),
+            (SESSION_RELOAD_METHOD, FrameKind::Error),
             (SESSION_RELOAD_METHOD, FrameKind::Res),
-            (SESSION_REPLACEMENT_READY_METHOD, FrameKind::Event),
             (UI_CONTROL_METHOD, FrameKind::Event),
             (UI_STATE_METHOD, FrameKind::Event),
         ] {

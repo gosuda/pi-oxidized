@@ -18,10 +18,19 @@ export default function commandContextExtension(pi: ExtensionAPI): void {
 			await ctx.waitForIdle();
 			report["waitForIdleOk"] = true;
 
-			const result = await ctx.newSession({ parentSession: "parent-1" });
-			report["newSession"] = result;
+			const result = await ctx.newSession({
+				parentSession: "parent-1",
+				withSession: async (replacedCtx) => {
+					report["newSession"] = { cancelled: false };
+					replacedCtx.ui.notify(JSON.stringify(report), "info");
+				},
+			});
 
-			ctx.ui.notify(JSON.stringify(report), "info");
+			// Retain the original ctx only when replacement is cancelled.
+			if (result.cancelled) {
+				report["newSession"] = result;
+				ctx.ui.notify(JSON.stringify(report), "info");
+			}
 		},
 	});
 }

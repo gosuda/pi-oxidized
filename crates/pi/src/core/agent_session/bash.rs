@@ -423,6 +423,13 @@ fn bash_execution_payload(
 }
 
 /// Build a `ToolUpdates` channel that forwards partial text to `on_chunk`.
+///
+/// The entire sink — delta computation, callback invocation, and notification
+/// — is serialized under a single mutex so concurrent `ToolUpdates::send`
+/// calls deliver deltas and notifications in FIFO order. Without this, the
+/// delta (computed under a `previous` lock) and the callback (invoked under a
+/// separate `callback` lock) can be reordered, causing the consumer to
+/// receive chunks out of order.
 fn make_chunk_channel<F>(
     on_chunk: Option<F>,
 ) -> (pi_agent::ToolUpdates, tokio::sync::mpsc::Receiver<()>)
@@ -430,10 +437,22 @@ where
     F: FnMut(&str) + Send + 'static,
 {
     use std::sync::Mutex;
-    let callback: Arc<Mutex<Option<F>>> = Arc::new(Mutex::new(on_chunk));
-    let previous = Arc::new(Mutex::new(String::new()));
+
+    /// Serialized sink state guarded by one mutex.
+    struct ChunkState<F> {
+        callback: Option<F>,
+        previous: String,
+        tx: Option<tokio::sync::mpsc::Sender<()>>,
+    }
+
     let (tx, rx) = tokio::sync::mpsc::channel::<()>(64);
-    let tx = Arc::new(Mutex::new(Some(tx)));
+    let state = Arc::new(Mutex::new(ChunkState {
+        callback: on_chunk,
+        previous: String::new(),
+        tx: Some(tx),
+    }));
+
+    let state_clone = Arc::clone(&state);
     let updates = pi_agent::ToolUpdates::new(move |result| {
         let text = result
             .content
@@ -446,34 +465,28 @@ where
         if text.is_empty() {
             return;
         }
-        let delta = {
-            let Ok(mut previous) = previous.lock() else {
-                return;
-            };
-            if *previous == text {
-                return;
-            }
-            let delta = text
-                .strip_prefix(previous.as_str())
-                .unwrap_or(text)
-                .to_owned();
-            previous.clear();
-            previous.push_str(text);
-            delta
+        let Ok(mut guard) = state_clone.lock() else {
+            return;
         };
-        let Some(mut cb) = callback.lock().ok().and_then(|mut g| g.take()) else {
+        if guard.previous == text {
+            return;
+        }
+        let delta = text
+            .strip_prefix(guard.previous.as_str())
+            .unwrap_or(text)
+            .to_owned();
+        guard.previous.clear();
+        guard.previous.push_str(text);
+        let Some(mut cb) = guard.callback.take() else {
             return;
         };
         cb(&delta);
-        if let Ok(mut guard) = callback.lock() {
-            *guard = Some(cb);
-        }
-        if let Ok(tx_guard) = tx.lock()
-            && let Some(tx) = tx_guard.as_ref()
-        {
+        guard.callback = Some(cb);
+        if let Some(tx) = guard.tx.as_ref() {
             let _ = tx.try_send(());
         }
     });
+
     (updates, rx)
 }
 
@@ -696,5 +709,68 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(received.as_slice(), ["one", "two"]);
+    }
+
+    #[test]
+    fn chunk_channel_serializes_concurrent_sends_without_loss() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let concurrent = Arc::new(AtomicUsize::new(0));
+        let max_concurrent = Arc::new(AtomicUsize::new(0));
+        let received = Arc::new(Mutex::new(Vec::<String>::new()));
+
+        let concurrent_clone = Arc::clone(&concurrent);
+        let max_clone = Arc::clone(&max_concurrent);
+        let received_clone = Arc::clone(&received);
+
+        let (updates, _rx) = make_chunk_channel(Some(move |delta: &str| {
+            let prev = concurrent_clone.fetch_add(1, Ordering::SeqCst);
+            max_clone.fetch_max(prev + 1, Ordering::SeqCst);
+            // Yield to encourage overlap when the lock is not held.
+            std::thread::yield_now();
+            received_clone
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(delta.to_owned());
+            concurrent_clone.fetch_sub(1, Ordering::SeqCst);
+        }));
+
+        let updates = Arc::new(updates);
+        let partial = |text: &str| pi_agent::AgentToolResult {
+            content: vec![pi_ai::ToolResultContent::Text(pi_ai::TextContent::new(
+                text,
+            ))],
+            details: serde_json::Value::Null,
+            added_tool_names: None,
+            terminate: None,
+        };
+
+        // Fire several sends from different threads simultaneously. The
+        // single-mutex sink must serialize the callback so no two invocations
+        // overlap and every delta is delivered.
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let updates = Arc::clone(&updates);
+            handles.push(std::thread::spawn(move || {
+                updates.send(partial(&format!("chunk-{i}")));
+            }));
+        }
+        for handle in handles {
+            assert!(handle.join().is_ok(), "sender thread panicked");
+        }
+
+        assert_eq!(
+            max_concurrent.load(Ordering::SeqCst),
+            1,
+            "callback must be serialized, not concurrent"
+        );
+        let received = received
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            received.len(),
+            8,
+            "every concurrent delta must be delivered"
+        );
     }
 }

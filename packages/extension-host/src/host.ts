@@ -47,6 +47,7 @@ import type {
 	ToolDefinition,
 	Theme,
 } from "@earendil-works/pi-coding-agent";
+import type { Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { EventEmitter } from "node:events";
 import { validateToolArguments } from "@earendil-works/pi-ai/compat";
@@ -307,7 +308,7 @@ const THEME_FG_SLOTS = [
 
 /** Background slot names in schema order (mirrors Rust `ALL_BG_SLOTS`). */
 const THEME_BG_SLOTS = [
-	"selectedBg", "userMessageBg", "customMessageBg", "toolPendingBg",
+	"selectedBg", "scrollbarThumb", "userMessageBg", "customMessageBg", "toolPendingBg",
 	"toolSuccessBg", "toolErrorBg",
 ] as const;
 
@@ -493,6 +494,7 @@ export class ExtensionHost {
 	private runner: ExtensionRunner | undefined;
 	private runtime: ExtensionRuntime | undefined;
 	private extensions: Extension[] = [];
+	private hasLoadedProtocolExtensions = false;
 	/** Captured custom providers (first registration wins). */
 	private readonly providers = new Map<string, ProviderConfig>();
 	/** In-flight tool.execute AbortControllers keyed by request id. */
@@ -903,7 +905,7 @@ export class ExtensionHost {
 					const response: Record<string, unknown> = {
 						...(isRecord(result) ? result : {}),
 					};
-					if (JSON.stringify(input) !== JSON.stringify(baseline)) {
+					if (!canonicalJsonEqual(input, baseline)) {
 						response["input"] = input;
 					} else {
 						delete response["input"];
@@ -1157,7 +1159,14 @@ export class ExtensionHost {
 				});
 			}
 		}
-		this.extensions.unshift(...loadedExtensions);
+		if (this.hasLoadedProtocolExtensions) {
+			this.extensions.push(...loadedExtensions);
+		} else {
+			// The first JSONL load is startup configuration, equivalent to CLI
+			// extension paths, which load before built-in factories.
+			this.extensions.unshift(...loadedExtensions);
+			this.hasLoadedProtocolExtensions = true;
+		}
 
 		// Rebuild so newly loaded tools/providers/handlers bind without killing siblings.
 		this.rebuildRunner(cwd);
@@ -1199,12 +1208,20 @@ export class ExtensionHost {
 			// after the response and any session.command frames from the handler.
 			// Emit even when the handler threw after a successful replacement.
 			for (const token of scope.tokens) {
-				await this.client.send({
-					id: 0,
-					kind: "event",
-					method: "session.replacementReady",
-					payload: { token },
-				});
+				try {
+					await this.client.send({
+						id: 0,
+						kind: "event",
+						method: "session.replacementReady",
+						payload: { token },
+					});
+				} catch (err) {
+					this.emitExtensionError(
+						"<host>",
+						"session.replacementReady",
+						err instanceof Error ? err.message : String(err),
+					);
+				}
 			}
 		}
 	}
@@ -2237,7 +2254,7 @@ export class ExtensionHost {
 			signal: controller.signal,
 		};
 		try {
-			const stream = config.streamSimple(p["model"], p["context"], options);
+			const stream = config.streamSimple(p["model"] as Model<string>, p["context"] as Context, options as SimpleStreamOptions);
 			for await (const event of stream) {
 				if (controller.signal.aborted) break;
 				// Stream-correlated providerEvent carries the AssistantMessageEvent payload.
@@ -2554,6 +2571,7 @@ export class ExtensionHost {
 			},
 			navigateTree: async (targetId, options) => {
 				guardActive();
+				const summarize = options?.summarize === true;
 				const frame = await self.client.request(
 					"session.navigateTree",
 					{
@@ -2563,7 +2581,10 @@ export class ExtensionHost {
 						replaceInstructions: options?.replaceInstructions,
 						label: options?.label,
 					},
-					{ timeoutMs: EXTENSION_HOOK_TIMEOUT_MS },
+					// Summarized navigation delegates to a provider-backed branch
+					// summary that can legitimately exceed the 30 s hook deadline.
+					// Only non-summarizing navigation stays under the generic timeout.
+					summarize ? {} : { timeoutMs: EXTENSION_HOOK_TIMEOUT_MS },
 				);
 				const payload = frame.payload as Record<string, unknown>;
 				return {
@@ -2651,6 +2672,8 @@ export class ExtensionHost {
 		return new Proxy({}, {
 			get(_target, prop) {
 				if (typeof prop !== "string") return undefined;
+				// Never expose a callable `then`: the proxy must not look like a thenable.
+				if (prop === "then") return undefined;
 				switch (prop) {
 					case "appendCustomEntry":
 						return (customType: string, data?: unknown) =>
@@ -2730,4 +2753,21 @@ export class ExtensionHost {
 
 function isRecord<T extends Record<string, unknown>>(value: unknown): value is T {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Compare JSON-serializable values ignoring object-key insertion order. */
+function canonicalJsonEqual(left: unknown, right: unknown): boolean {
+	return JSON.stringify(canonicalizeJson(left)) === JSON.stringify(canonicalizeJson(right));
+}
+
+function canonicalizeJson(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(canonicalizeJson);
+	if (isRecord(value)) {
+		const sorted = Object.create(null) as Record<string, unknown>;
+		for (const key of Object.keys(value).sort()) {
+			sorted[key] = canonicalizeJson(value[key]);
+		}
+		return sorted;
+	}
+	return value;
 }

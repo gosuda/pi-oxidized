@@ -38,6 +38,29 @@ test("scenario covers every authoritative command exactly", () => {
 	expect(new Set(names).size).toBe(names.length);
 });
 
+test("settle and harvest options compose on the same scenario step without loss", () => {
+	const scenario = buildScenario();
+	// The step helper must spread both settle and harvest onto the step,
+	// not use if/return which silently drops one option.
+	for (const step of scenario) {
+		if (step.settle !== undefined) expect(step.settle).toBe(true);
+		if (step.harvest !== undefined) expect(typeof step.harvest).toBe("function");
+	}
+	// At least one step exercises each option to guard against regression.
+	expect(scenario.some((s) => s.settle === true)).toBe(true);
+	expect(scenario.some((s) => s.harvest !== undefined)).toBe(true);
+});
+
+test("manual RPC correlation ids are ordered from c23 onward with no collisions", () => {
+	const scenario = buildScenario();
+	const names = scenario.map((s) => s.name);
+	expect(new Set(names).size).toBe(names.length);
+	// The last step()-generated step is c22-follow_up; manual steps start at c23.
+	expect(names).toContain("c22-follow_up");
+	expect(names).not.toContain("c22-get_state-harvest");
+	expect(names[scenario.length - 1]).toBe("c40-get_state-final");
+});
+
 test("a newly added authoritative command cannot silently escape", () => {
 	const derived = deriveRpcCommandTypes(readFileSync(AUTHORITATIVE_RPC_TYPES_PATH, "utf8"));
 	const scenario = scenarioCommandTypes(buildScenario());

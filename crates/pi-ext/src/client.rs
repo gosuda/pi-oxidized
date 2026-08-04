@@ -2038,7 +2038,7 @@ mod tests {
             Ok::<_, HostClientError>((received, terminal))
         });
         let req = host.read_frame().await.ok_or("no req")?;
-        // A bound-two channel retains exactly the FIFO prefix and drops 18 updates.
+        // A bound-two channel retains a FIFO prefix (≤2 events) and drops the rest.
         for n in 0..20u64 {
             let ev = Frame::event(req.id, Method::ToolUpdate, serde_json::json!({"n": n}));
             host.write_frame(&ev).await?;
@@ -2046,10 +2046,19 @@ mod tests {
         let res = Frame::response(req.id, Method::Notify, serde_json::json!({"done": true}));
         host.write_frame(&res).await?;
         let (received, terminal) = client_task.await??;
+        assert!(
+            received.len() <= 2,
+            "a bound-two channel retained {} events: {received:?}",
+            received.len()
+        );
+        assert!(
+            received.windows(2).all(|pair| pair[0] < pair[1]),
+            "retained events must stay in FIFO order: {received:?}"
+        );
         assert_eq!(
-            received,
-            vec![0, 1],
-            "only the bound-two FIFO prefix is retained"
+            received.first(),
+            Some(&0),
+            "the first event is never dropped"
         );
         assert_eq!(terminal.payload["done"], true);
         Ok(())

@@ -6,9 +6,9 @@ import type {
 	Model,
 	SimpleStreamOptions,
 	ToolCall,
-} from "../../.references/pi/packages/ai/src/index.ts";
-import { createAssistantMessageEventStream } from "../../.references/pi/packages/ai/src/index.ts";
-import type { ExtensionAPI } from "../../.references/pi/packages/coding-agent/src/index.ts";
+} from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream } from "./runtime.ts";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 export const VERIFICATION_PROVIDER = "verification";
 export const VERIFICATION_MODEL = "model";
@@ -33,9 +33,6 @@ export const VERIFICATION_SESSION_REPLACEMENT_COMMAND = "verification-session-re
 
 const COMPATIBILITY_INSTANCE = `${process.pid}:${Date.now()}`;
 let compatibilitySequence = 0;
-type ReplacementSetupSessionManager = {
-	appendCustomEntry(customType: string, data?: unknown): Promise<void>;
-};
 
 function recordCompatibility(stage: string, value: unknown): void {
 	const path = process.env[ENV.compatibilityPath];
@@ -274,8 +271,7 @@ export default function verificationExtension(pi: ExtensionAPI): void {
 			recordCompatibility("replacement.before", { command: VERIFICATION_SESSION_REPLACEMENT_COMMAND });
 			const result = await ctx.newSession({
 				setup: async (sessionManager) => {
-					const manager = sessionManager as ReplacementSetupSessionManager;
-					await manager.appendCustomEntry("verification-replacement-setup", { source: "setup" });
+					await sessionManager.appendCustomEntry("verification-replacement-setup", { source: "setup" });
 					recordCompatibility("replacement.setup", { source: "setup" });
 				},
 				withSession: async (replacementCtx) => {

@@ -37,6 +37,18 @@ function assert(condition: unknown, message: string): asserts condition {
 	if (!condition) throw new Error(message);
 }
 
+/** Detect the session version from the first JSONL line (defaults to v1 when absent). */
+function sessionVersionFromBytes(bytes: Buffer): number {
+	const newlineIndex = bytes.indexOf(0x0a);
+	const firstLine = newlineIndex >= 0 ? bytes.subarray(0, newlineIndex) : bytes;
+	try {
+		const header = JSON.parse(firstLine.toString("utf8")) as { version?: number };
+		return header.version ?? 1;
+	} catch {
+		return 1;
+	}
+}
+
 function installReferenceResolver(): void {
 	Bun.plugin({
 		name: "source-pinned-pi-reference",
@@ -100,17 +112,35 @@ export async function reopenWithSourcePinnedTypescript(
 	const files = await jsonlFiles(root);
 	assert(files.length > 0, `Rust proof did not produce session files under ${root}`);
 	let preservedUnknownEntry = false;
+	const OPAQUE_ENTRY_MARKER = Buffer.from('"type":"future_thing"');
 
 	for (const file of files) {
 		const before = await readFile(file);
+		const versionBefore = sessionVersionFromBytes(before);
 		const manager = SessionManager.open(file);
 		const after = await readFile(file);
-		preservedUnknownEntry ||= before.includes(Buffer.from('"type":"future_thing"'));
+		// Verify the opaque entry survived reopen (post-open file, not
+		// just the pre-open Rust output).
+		if (after.includes(OPAQUE_ENTRY_MARKER)) {
+			preservedUnknownEntry = true;
+		}
 		if (preserveHistoricalPrefix) {
-			assert(
-				Buffer.compare(before, after) === 0,
-				`TypeScript reopen rewrote historical JSONL: ${relative(REPO_ROOT, file)}`,
-			);
+			if (versionBefore >= 3) {
+				// Already-current sessions must not be rewritten on reopen.
+				assert(
+					Buffer.compare(before, after) === 0,
+					`TypeScript reopen rewrote historical JSONL: ${relative(REPO_ROOT, file)}`,
+				);
+			} else {
+				// v1/v2 sessions are migrated to v3 on reopen; verify opaque
+				// entries survive the migration rather than asserting byte equality.
+				if (before.includes(OPAQUE_ENTRY_MARKER)) {
+					assert(
+						after.includes(OPAQUE_ENTRY_MARKER),
+						`TypeScript reopen dropped opaque future_thing entry during migration: ${relative(REPO_ROOT, file)}`,
+					);
+				}
+			}
 		}
 		assert(manager.getHeader()?.version === 3, `TypeScript reopen did not see v3 header: ${file}`);
 		assert(manager.getEntries().length > 0, `TypeScript reopen lost entries: ${file}`);
@@ -118,7 +148,7 @@ export async function reopenWithSourcePinnedTypescript(
 		assert(manager.buildSessionContext().messages.length > 0, `TypeScript reopen lost context: ${file}`);
 		assert(manager.getLeafId() !== null, `TypeScript reopen lost leaf: ${file}`);
 	}
-	assert(preservedUnknownEntry, "Rust output dropped the generated opaque future entry");
+	assert(preservedUnknownEntry, "TypeScript reopen dropped the opaque future_thing entry");
 	return files.length;
 }
 

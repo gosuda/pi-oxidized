@@ -40,8 +40,9 @@ use crate::cli::bootstrap::{
 use crate::cli::package_manager_cli::{ListedPackage, ListedScope, PackageHandler, PackageOutput};
 use crate::core::agent_session::model::level_str;
 use crate::core::agent_session_runtime::{
-    AgentSessionRuntime, AgentSessionRuntimeServices, CreateAgentSessionRuntimeFactory,
-    CreateAgentSessionRuntimeOptions, CreateAgentSessionRuntimeResult,
+    AgentSessionRuntime, AgentSessionRuntimeError, AgentSessionRuntimeServices,
+    CreateAgentSessionRuntimeFactory, CreateAgentSessionRuntimeOptions,
+    CreateAgentSessionRuntimeResult,
 };
 use crate::core::agent_session_services::{
     AgentSessionRuntimeDiagnostic, AgentSessionServices, AgentSessionServicesError,
@@ -609,7 +610,14 @@ async fn finish_session_diagnostics(
     api_key: Option<&str>,
     result: &mut CreateAgentSessionResult,
     mut diagnostics: Vec<AgentSessionRuntimeDiagnostic>,
-) -> Result<(), String> {
+) -> Result<Option<CliRuntimeApiKey>, String> {
+    let replacement_api_key =
+        api_key
+            .zip(result.model.as_ref())
+            .map(|(value, model)| CliRuntimeApiKey {
+                provider: model.provider.clone(),
+                value: value.to_owned(),
+            });
     apply_cli_api_key(
         api_key,
         result.model.as_ref(),
@@ -618,7 +626,7 @@ async fn finish_session_diagnostics(
     )
     .await?;
     result.diagnostics.splice(0..0, diagnostics);
-    Ok(())
+    Ok(replacement_api_key)
 }
 
 /// Runtime factory backed by real product services.
@@ -694,7 +702,7 @@ impl RuntimeFactory for RealRuntimeFactory {
                 has_saved_thinking_level,
                 &session_result,
             )?;
-            finish_session_diagnostics(
+            let replacement_api_key = finish_session_diagnostics(
                 parsed.api_key.as_deref(),
                 &mut session_result,
                 pre_session_diagnostics,
@@ -721,7 +729,7 @@ impl RuntimeFactory for RealRuntimeFactory {
                 skills: resources.skills,
                 prompt_templates: resources.prompt_templates,
             })?;
-            let runtime = Arc::new(AgentSessionRuntime::new(
+            let runtime = AgentSessionRuntime::new(
                 built.session,
                 AgentSessionRuntimeServices {
                     cwd: PathBuf::from(&cwd),
@@ -729,13 +737,12 @@ impl RuntimeFactory for RealRuntimeFactory {
                 },
                 Arc::new(RealReplacementFactory {
                     project_trust_override: parsed.project_trust_override,
-                    api_key: parsed.api_key.clone(),
+                    api_key: replacement_api_key,
                     resource_loader_options: resource_loader_options(&parsed),
                 }),
                 built.diagnostics,
                 built.model_fallback_message,
-            ));
-            runtime.link();
+            );
 
             Ok(RuntimeHandle { runtime })
         })
@@ -746,24 +753,24 @@ impl RuntimeFactory for RealRuntimeFactory {
     }
 }
 
+#[derive(Clone)]
+struct CliRuntimeApiKey {
+    provider: String,
+    value: String,
+}
+
 /// Replacement factory for runtime swap operations (new/switch/fork).
 #[derive(Clone)]
 struct RealReplacementFactory {
     project_trust_override: Option<bool>,
-    api_key: Option<String>,
+    api_key: Option<CliRuntimeApiKey>,
     resource_loader_options: ResourceLoaderServiceOptions,
 }
 impl CreateAgentSessionRuntimeFactory for RealReplacementFactory {
     fn create(
         &self,
         options: CreateAgentSessionRuntimeOptions,
-    ) -> BoxFuture<
-        '_,
-        Result<
-            CreateAgentSessionRuntimeResult,
-            crate::core::agent_session_runtime::AgentSessionRuntimeError,
-        >,
-    > {
+    ) -> BoxFuture<'_, Result<CreateAgentSessionRuntimeResult, AgentSessionRuntimeError>> {
         let CreateAgentSessionRuntimeOptions {
             cwd,
             agent_dir,
@@ -775,11 +782,17 @@ impl CreateAgentSessionRuntimeFactory for RealReplacementFactory {
         } = options;
         let api_key = self.api_key.clone();
         let resource_loader_options = self.resource_loader_options.clone();
-        let session_context = session_manager.build_session_context().map_err(|error| {
-            crate::core::agent_session_runtime::AgentSessionRuntimeError::Factory(error.to_string())
-        });
         Box::pin(async move {
-            let session_context = session_context?;
+            let (session_context, session_manager) = tokio::task::spawn_blocking(move || {
+                let ctx = session_manager
+                    .build_session_context()
+                    .map_err(|error| AgentSessionRuntimeError::Factory(error.to_string()))?;
+                Ok::<_, AgentSessionRuntimeError>((ctx, session_manager))
+            })
+            .await
+            .map_err(|error| {
+                AgentSessionRuntimeError::Factory(format!("build session context: {error}"))
+            })??;
             let RestoredSession {
                 has_existing_session,
                 saved_session_model,
@@ -797,21 +810,17 @@ impl CreateAgentSessionRuntimeFactory for RealReplacementFactory {
                 self.project_trust_override,
             )
             .await
-            .map_err(|e| {
-                crate::core::agent_session_runtime::AgentSessionRuntimeError::Factory(format!(
-                    "{e}"
-                ))
-            })?;
+            .map_err(|error| AgentSessionRuntimeError::Factory(error.to_string()))?;
             let project_trusted = services.settings_manager().is_project_trusted();
-            if let (Some(api_key), Some(model)) = (api_key.as_deref(), requested_model.as_ref()) {
+            if let Some(api_key) = api_key {
                 services
                     .model_runtime
-                    .set_runtime_api_key(&model.provider, api_key)
+                    .set_runtime_api_key(&api_key.provider, &api_key.value)
                     .await
                     .map_err(|error| {
-                        crate::core::agent_session_runtime::AgentSessionRuntimeError::Factory(
-                            format!("set replacement API key: {error}"),
-                        )
+                        AgentSessionRuntimeError::Factory(format!(
+                            "set replacement API key: {error}"
+                        ))
                     })?;
             }
             let resources = session_resources(&services.resource_loader);
@@ -833,11 +842,7 @@ impl CreateAgentSessionRuntimeFactory for RealReplacementFactory {
                 },
             )
             .await
-            .map_err(|e| {
-                crate::core::agent_session_runtime::AgentSessionRuntimeError::Factory(format!(
-                    "{e}"
-                ))
-            })?;
+            .map_err(|error| AgentSessionRuntimeError::Factory(error.to_string()))?;
 
             let built = assemble_replacement_session(
                 &cwd,
@@ -848,7 +853,7 @@ impl CreateAgentSessionRuntimeFactory for RealReplacementFactory {
                 resources,
                 existing_messages,
             )
-            .map_err(crate::core::agent_session_runtime::AgentSessionRuntimeError::Factory)?;
+            .map_err(AgentSessionRuntimeError::Factory)?;
 
             Ok(CreateAgentSessionRuntimeResult {
                 session: built.session,
@@ -1263,6 +1268,75 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replacement_factory_restores_saved_model_with_cli_runtime_key() -> Result<(), String> {
+        let probe = ModelRuntime::create_in_memory()
+            .await
+            .map_err(|error| format!("create model probe: {error}"))?;
+        let Some(saved_model) = probe
+            .get_models(None)
+            .into_iter()
+            .find(|model| !probe.has_configured_auth(&model.provider))
+        else {
+            return Err("test requires a built-in provider without ambient auth".to_owned());
+        };
+        let root = tempfile::tempdir().map_err(|error| format!("tempdir: {error}"))?;
+        let cwd = root.path().to_string_lossy().into_owned();
+        let agent_dir = root.path().join("agent");
+        std::fs::create_dir_all(&agent_dir)
+            .map_err(|error| format!("create agent dir: {error}"))?;
+        let mut session_manager =
+            SessionManager::in_memory(Some(&cwd), None).map_err(|error| error.to_string())?;
+        session_manager
+            .append_model_change(&saved_model.provider, &saved_model.id)
+            .map_err(|error| error.to_string())?;
+        session_manager
+            .append_message(&pi_agent::AgentMessage::Llm(Box::new(
+                pi_ai::Message::User(pi_ai::UserMessage::new(
+                    pi_ai::UserMessageContent::Text("resume saved model".to_owned()),
+                    1,
+                )),
+            )))
+            .map_err(|error| error.to_string())?;
+        let factory = RealReplacementFactory {
+            project_trust_override: Some(true),
+            api_key: Some(CliRuntimeApiKey {
+                provider: saved_model.provider.clone(),
+                value: "sk-runtime-only".to_owned(),
+            }),
+            resource_loader_options: ResourceLoaderServiceOptions {
+                no_extensions: true,
+                no_skills: true,
+                no_prompt_templates: true,
+                no_themes: true,
+                no_context_files: true,
+                ..ResourceLoaderServiceOptions::default()
+            },
+        };
+
+        let result = factory
+            .create(CreateAgentSessionRuntimeOptions {
+                cwd,
+                agent_dir: agent_dir.to_string_lossy().into_owned(),
+                session_manager,
+                start_reason: crate::core::agent_session::SessionStartReason::Resume,
+                previous_session_file: None,
+                model: None,
+                extension_flag_values: BTreeMap::new(),
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+
+        assert_eq!(result.session.model().provider, saved_model.provider);
+        assert_eq!(result.session.model().id, saved_model.id);
+        assert!(
+            result.model_fallback_message.is_none(),
+            "saved model must not fall back after carried auth"
+        );
+        result.session.dispose().await;
         Ok(())
     }
 

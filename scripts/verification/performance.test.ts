@@ -2,7 +2,8 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { PTY_KEYS, type PtyProcess, type PtySnapshot, spawnPty } from "./pty.ts";
+import { spawnPty } from "./pty.ts";
+import { HarnessFailure, frameObservation, terminateAndRequireCleanExit } from "./performance.ts";
 
 // T33: after capturing the first frame, the performance verifier must send
 // /quit and require a clean process exit. The finally force-kill remains
@@ -29,86 +30,6 @@ function temporaryDirectory(prefix: string): string {
 	const path = mkdtempSync(join(tmpdir(), prefix));
 	temporaryPaths.push(path);
 	return path;
-}
-
-class HarnessFailure extends Error {
-	constructor(
-		readonly stage: string,
-		message: string,
-	) {
-		super(message);
-		this.name = "HarnessFailure";
-	}
-}
-
-function errorMessage(error: Error | string): string {
-	return typeof error === "string" ? error : error.message;
-}
-
-function tail(text: string, maximum = 4_000): string {
-	return text.length <= maximum ? text : text.slice(-maximum);
-}
-
-function stripTerminalSequences(text: string): string {
-	return text
-		.replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "")
-		.replace(/\x1bP[\s\S]*?\x1b\\/g, "")
-		.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
-		.replace(/\x1b[@-_]/g, "")
-		.replace(/[\x00-\x1f\x7f]/g, "");
-}
-
-interface FrameObservation {
-	readonly elapsedMs: number;
-	readonly bytes: number;
-	readonly detection: "synchronized-output" | "row-local-fallback";
-}
-
-function frameObservation(snapshot: PtySnapshot, chunkOffset = 0): FrameObservation | undefined {
-	let raw = "";
-	let bytes = 0;
-	for (const chunk of snapshot.chunks.slice(chunkOffset)) {
-		if (chunk.stream !== "pty") continue;
-		raw += chunk.text;
-		bytes += chunk.bytes.byteLength;
-		const begin = raw.indexOf(SYNC_BEGIN);
-		if (begin >= 0) {
-			if (raw.indexOf(SYNC_END, begin + SYNC_BEGIN.length) >= 0) {
-				return { elapsedMs: chunk.elapsedMs, bytes, detection: "synchronized-output" };
-			}
-			continue;
-		}
-		if (/\x1b\[[0-?]*[ -/]*[@-~]/.test(raw) && stripTerminalSequences(raw).trim().length > 0) {
-			return { elapsedMs: chunk.elapsedMs, bytes, detection: "row-local-fallback" };
-		}
-	}
-	return undefined;
-}
-
-async function requireCleanExitIfSettled(pty: PtyProcess, label: string): Promise<boolean> {
-	if (!pty.exited) return false;
-	const code = await pty.waitForExit(1);
-	if (code !== 0) {
-		throw new HarnessFailure(label, `${label} exited ${code}\nPTY tail:\n${tail(pty.snapshot().rawText)}`);
-	}
-	return true;
-}
-
-async function terminateAndRequireCleanExit(pty: PtyProcess, label: string): Promise<void> {
-	if (await requireCleanExitIfSettled(pty, label)) return;
-	pty.writeKeys("/quit", PTY_KEYS.enter);
-	let code: number;
-	try {
-		code = await pty.waitForExit(10_000);
-	} catch (error) {
-		throw new HarnessFailure(
-			label,
-			`${label} did not exit through /quit: ${errorMessage(error instanceof Error ? error : String(error))}\nPTY tail:\n${tail(pty.snapshot().rawText)}`,
-		);
-	}
-	if (code !== 0) {
-		throw new HarnessFailure(label, `${label} /quit exited ${code}\nPTY tail:\n${tail(pty.snapshot().rawText)}`);
-	}
 }
 
 test.skip("does not run the benchmark when performance verification is imported", () => {
@@ -188,7 +109,7 @@ describe.skipIf(isWindows)("performance first-frame lifecycle", () => {
 		});
 		try {
 			expect(await pty.waitForExit(5_000)).toBe(0);
-			expect(await requireCleanExitIfSettled(pty, "first-frame:settled-clean")).toBe(true);
+			await terminateAndRequireCleanExit(pty, "first-frame:settled-clean");
 		} finally {
 			await pty.terminate();
 		}
@@ -203,7 +124,7 @@ describe.skipIf(isWindows)("performance first-frame lifecycle", () => {
 		});
 		try {
 			expect(await pty.waitForExit(5_000)).toBe(7);
-			await expect(requireCleanExitIfSettled(pty, "first-frame:settled-failure")).rejects.toBeInstanceOf(
+			await expect(terminateAndRequireCleanExit(pty, "first-frame:settled-failure")).rejects.toBeInstanceOf(
 				HarnessFailure,
 			);
 		} finally {

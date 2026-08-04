@@ -1518,7 +1518,7 @@ mod tests {
                 config.model_runtime = Some(build_fake_model_runtime(models).await?);
                 let session = crate::core::agent_session::AgentSession::new(config)
                     .map_err(|e| e.to_string())?;
-                let runtime = Arc::new(AgentSessionRuntime::new(
+                let runtime = AgentSessionRuntime::new(
                     session,
                     crate::core::agent_session_runtime::AgentSessionRuntimeServices {
                         cwd: PathBuf::from(options.cwd),
@@ -1527,8 +1527,7 @@ mod tests {
                     Arc::new(StubRuntimeFactory),
                     diagnostics,
                     None,
-                ));
-                runtime.link();
+                );
                 Ok(RuntimeHandle { runtime })
             })
         }
@@ -2089,7 +2088,7 @@ mod tests {
         config.host_extension_runner = runner;
         let session = crate::core::agent_session::AgentSession::new(config)
             .map_err(|e| format!("AgentSession::new: {e}"))?;
-        let runtime = Arc::new(AgentSessionRuntime::new(
+        let runtime = AgentSessionRuntime::new(
             session,
             crate::core::agent_session_runtime::AgentSessionRuntimeServices {
                 cwd: cwd.clone(),
@@ -2098,8 +2097,7 @@ mod tests {
             Arc::new(StubRuntimeFactory),
             Vec::new(),
             None,
-        ));
-        runtime.link();
+        );
         Ok(runtime)
     }
 

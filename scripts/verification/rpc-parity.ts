@@ -162,14 +162,13 @@ export function buildScenario(): ScenarioStep[] {
 	): ScenarioStep => {
 		sequence += 1;
 		const name = `c${String(sequence).padStart(2, "0")}-${commandType}${options.suffix ?? ""}`;
-		const scenarioStep: ScenarioStep = {
+		return {
 			name,
 			commandType,
 			build: () => ({ id: name, type: commandType, ...fields }),
+			...(options.settle === true ? { settle: true } : {}),
+			...(options.harvest ? { harvest: options.harvest } : {}),
 		};
-		if (options.settle === true) return { ...scenarioStep, settle: true };
-		if (options.harvest) return { ...scenarioStep, harvest: options.harvest };
-		return scenarioStep;
 	};
 
 	const steps: ScenarioStep[] = [
@@ -197,40 +196,40 @@ export function buildScenario(): ScenarioStep[] {
 		step("follow_up", { message: "queued follow-up note" }),
 	];
 
-	sequence = steps.length;
+
 	steps.push({
-		name: "c22-get_state-harvest",
+		name: "c23-get_state-harvest",
 		commandType: "get_state",
-		build: () => ({ id: "c22-get_state-harvest", type: "get_state" }),
+		build: () => ({ id: "c23-get_state-harvest", type: "get_state" }),
 		harvest: (response, state) => {
 			state.sessionFile = requireString(responseData(response, "get_state").sessionFile, "get_state sessionFile");
 		},
 	});
 	steps.push({
-		name: "c23-prompt-flush",
+		name: "c24-prompt-flush",
 		commandType: "prompt",
 		settle: true,
-		build: () => ({ id: "c23-prompt-flush", type: "prompt", message: "Flush the queued messages." }),
+		build: () => ({ id: "c24-prompt-flush", type: "prompt", message: "Flush the queued messages." }),
 	});
 	steps.push({
-		name: "c24-get_last_assistant_text",
+		name: "c25-get_last_assistant_text",
 		commandType: "get_last_assistant_text",
-		build: () => ({ id: "c24-get_last_assistant_text", type: "get_last_assistant_text" }),
+		build: () => ({ id: "c25-get_last_assistant_text", type: "get_last_assistant_text" }),
 	});
 	steps.push({
-		name: "c25-get_messages",
+		name: "c26-get_messages",
 		commandType: "get_messages",
-		build: () => ({ id: "c25-get_messages", type: "get_messages" }),
+		build: () => ({ id: "c26-get_messages", type: "get_messages" }),
 	});
 	steps.push({
-		name: "c26-get_session_stats",
+		name: "c27-get_session_stats",
 		commandType: "get_session_stats",
-		build: () => ({ id: "c26-get_session_stats", type: "get_session_stats" }),
+		build: () => ({ id: "c27-get_session_stats", type: "get_session_stats" }),
 	});
 	steps.push({
-		name: "c27-get_entries",
+		name: "c28-get_entries",
 		commandType: "get_entries",
-		build: () => ({ id: "c27-get_entries", type: "get_entries" }),
+		build: () => ({ id: "c28-get_entries", type: "get_entries" }),
 		harvest: (response, state) => {
 			const entries = responseData(response, "get_entries").entries;
 			assert(Array.isArray(entries) && entries.length > 0, "get_entries must return entries");
@@ -240,23 +239,23 @@ export function buildScenario(): ScenarioStep[] {
 		},
 	});
 	steps.push({
-		name: "c28-get_entries-since",
+		name: "c29-get_entries-since",
 		commandType: "get_entries",
 		build: (state) => ({
-			id: "c28-get_entries-since",
+			id: "c29-get_entries-since",
 			type: "get_entries",
 			since: requireString(state.firstEntryId, "harvested first entry id"),
 		}),
 	});
 	steps.push({
-		name: "c29-get_tree",
+		name: "c30-get_tree",
 		commandType: "get_tree",
-		build: () => ({ id: "c29-get_tree", type: "get_tree" }),
+		build: () => ({ id: "c30-get_tree", type: "get_tree" }),
 	});
 	steps.push({
-		name: "c30-get_fork_messages",
+		name: "c31-get_fork_messages",
 		commandType: "get_fork_messages",
-		build: () => ({ id: "c30-get_fork_messages", type: "get_fork_messages" }),
+		build: () => ({ id: "c31-get_fork_messages", type: "get_fork_messages" }),
 		harvest: (response, state) => {
 			const messages = responseData(response, "get_fork_messages").messages;
 			assert(Array.isArray(messages) && messages.length > 0, "get_fork_messages must return messages");
@@ -266,60 +265,60 @@ export function buildScenario(): ScenarioStep[] {
 		},
 	});
 	steps.push({
-		name: "c31-fork",
+		name: "c32-fork",
 		commandType: "fork",
 		build: (state) => ({
-			id: "c31-fork",
+			id: "c32-fork",
 			type: "fork",
 			entryId: requireString(state.forkEntryId, "harvested fork entry id"),
 		}),
 	});
 	steps.push({
-		name: "c32-get_state-postfork",
+		name: "c33-get_state-postfork",
 		commandType: "get_state",
-		build: () => ({ id: "c32-get_state-postfork", type: "get_state" }),
+		build: () => ({ id: "c33-get_state-postfork", type: "get_state" }),
 	});
 	steps.push({
-		name: "c33-clone",
+		name: "c34-clone",
 		commandType: "clone",
-		build: () => ({ id: "c33-clone", type: "clone" }),
+		build: () => ({ id: "c34-clone", type: "clone" }),
 	});
 	steps.push({
-		name: "c34-new_session",
+		name: "c35-new_session",
 		commandType: "new_session",
-		build: () => ({ id: "c34-new_session", type: "new_session" }),
+		build: () => ({ id: "c35-new_session", type: "new_session" }),
 	});
 	steps.push({
-		name: "c35-switch_session",
+		name: "c36-switch_session",
 		commandType: "switch_session",
 		build: (state) => ({
-			id: "c35-switch_session",
+			id: "c36-switch_session",
 			type: "switch_session",
 			sessionPath: requireString(state.sessionFile, "harvested session file"),
 		}),
 	});
 	steps.push({
-		name: "c36-compact",
+		name: "c37-compact",
 		commandType: "compact",
-		build: () => ({ id: "c36-compact", type: "compact" }),
+		build: () => ({ id: "c37-compact", type: "compact" }),
 	});
 	steps.push({
-		name: "c37-export_html",
+		name: "c38-export_html",
 		commandType: "export_html",
 		build: (state) => ({
-			id: "c37-export_html",
+			id: "c38-export_html",
 			type: "export_html",
 			outputPath: join(state.workDir, "rpc-parity-export.html"),
 		}),
 	});
 	steps.push({
-		name: "c38-unknown-probe",
-		build: () => ({ id: "c38-unknown-probe", type: "rpc_parity_probe", payload: { value: 1 } }),
+		name: "c39-unknown-probe",
+		build: () => ({ id: "c39-unknown-probe", type: "rpc_parity_probe", payload: { value: 1 } }),
 	});
 	steps.push({
-		name: "c39-get_state-final",
+		name: "c40-get_state-final",
 		commandType: "get_state",
-		build: () => ({ id: "c39-get_state-final", type: "get_state" }),
+		build: () => ({ id: "c40-get_state-final", type: "get_state" }),
 	});
 	return steps;
 }
@@ -451,16 +450,32 @@ class TranscriptWaiter {
 		readonly from: number;
 		readonly predicate: (record: JsonObject) => boolean;
 		readonly resolve: (index: number) => void;
+		readonly reject: (error: Error) => void;
+		readonly cancel: () => void;
 	}> = [];
+	private aborted: Error | null = null;
 
 	push(record: JsonObject): void {
 		this.records.push(record);
 		const index = this.records.length - 1;
 		this.waiters = this.waiters.filter((waiter) => {
 			if (index < waiter.from || !waiter.predicate(record)) return true;
+			waiter.cancel();
 			waiter.resolve(index);
 			return false;
 		});
+	}
+
+	/** Immediately reject all pending waiters with `error` and reject future waits. */
+	abort(error: Error): void {
+		if (this.aborted) return;
+		this.aborted = error;
+		const waiters = this.waiters;
+		this.waiters = [];
+		for (const waiter of waiters) {
+			waiter.cancel();
+			waiter.reject(error);
+		}
 	}
 
 	waitFor(
@@ -469,21 +484,27 @@ class TranscriptWaiter {
 		deadlineMs: number,
 		label: string,
 	): Promise<number> {
+		if (this.aborted) return Promise.reject(this.aborted);
 		for (let index = from; index < this.records.length; index++) {
 			const record = this.records[index];
 			if (record !== undefined && predicate(record)) return Promise.resolve(index);
 		}
-		return new Promise((resolvePromise, rejectPromise) => {
-			const timer = setTimeout(() => {
-				this.waiters = this.waiters.filter((waiter) => waiter.resolve !== resolveWrapped);
-				rejectPromise(new Error(`timed out after ${deadlineMs}ms waiting for ${label}`));
-			}, deadlineMs);
-			const resolveWrapped = (index: number): void => {
-				clearTimeout(timer);
-				resolvePromise(index);
-			};
-			this.waiters.push({ from, predicate, resolve: resolveWrapped });
-		});
+		const { promise, resolve: resolveRaw, reject: rejectRaw } = Promise.withResolvers<number>();
+		const timer = setTimeout(() => {
+			this.waiters = this.waiters.filter((waiter) => waiter.resolve !== resolve);
+			rejectRaw(new Error(`timed out after ${deadlineMs}ms waiting for ${label}`));
+		}, deadlineMs);
+		const cancel = (): void => clearTimeout(timer);
+		const resolve = (index: number): void => {
+			cancel();
+			resolveRaw(index);
+		};
+		const reject = (error: Error): void => {
+			cancel();
+			rejectRaw(error);
+		};
+		this.waiters.push({ from, predicate, resolve, reject, cancel });
+		return promise;
 	}
 }
 
@@ -550,26 +571,32 @@ async function driveBinary(label: string, argv: readonly string[], runRoot: stri
 			stderrTail = (stderrTail + decoder.decode(chunk, { stream: true })).slice(-65_536);
 		}
 	})();
+	let pumpError: Error | null = null;
 	const stdoutPump = (async () => {
-		const decoder = new TextDecoder();
-		let buffered = "";
-		for await (const chunk of child.stdout) {
-			buffered += decoder.decode(chunk, { stream: true });
-			let newline = buffered.indexOf("\n");
-			while (newline !== -1) {
-				const line = buffered.slice(0, newline).replace(/\r$/, "").trim();
-				buffered = buffered.slice(newline + 1);
-				newline = buffered.indexOf("\n");
-				if (line.length === 0) continue;
-				let parsed: JsonValue;
-				try {
-					parsed = JSON.parse(line) as JsonValue;
-				} catch (error) {
-					fail(`${label}: non-JSON stdout line: ${line.slice(0, 500)} (${String(error)})`);
+		try {
+			const decoder = new TextDecoder();
+			let buffered = "";
+			for await (const chunk of child.stdout) {
+				buffered += decoder.decode(chunk, { stream: true });
+				let newline = buffered.indexOf("\n");
+				while (newline !== -1) {
+					const line = buffered.slice(0, newline).replace(/\r$/, "").trim();
+					buffered = buffered.slice(newline + 1);
+					newline = buffered.indexOf("\n");
+					if (line.length === 0) continue;
+					let parsed: JsonValue;
+					try {
+						parsed = JSON.parse(line) as JsonValue;
+					} catch (error) {
+						fail(`${label}: non-JSON stdout line: ${line.slice(0, 500)} (${String(error)})`);
+					}
+					assert(isObject(parsed), `${label}: stdout line is not a JSON object`);
+					transcript.push(parsed);
 				}
-				assert(isObject(parsed), `${label}: stdout line is not a JSON object`);
-				transcript.push(parsed);
 			}
+		} catch (error) {
+			pumpError = error instanceof Error ? error : new Error(String(error));
+			transcript.abort(pumpError);
 		}
 	})();
 
@@ -618,6 +645,7 @@ async function driveBinary(label: string, argv: readonly string[], runRoot: stri
 	const exitCode = await child.exited;
 	clearTimeout(exitTimer);
 	await Promise.all([stdoutPump, stderrPump]);
+	if (pumpError) throw pumpError;
 	return { label, runRoot, transcript: transcript.records, exitCode, stderrTail };
 }
 

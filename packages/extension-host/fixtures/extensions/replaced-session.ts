@@ -55,16 +55,25 @@ export default function replacedSessionExtension(pi: ExtensionAPI): void {
 					await replacedCtx.sendMessage({
 						customType: "test-custom",
 						content: "hello",
+						display: true,
 					});
 					await replacedCtx.sendUserMessage("user hello");
 					report["withSessionSendsDone"] = true;
+
+					// Notify through the fresh replacement context; the
+					// original ctx is stale after a successful replacement.
+					report["setupOrder"] = setupOrder;
+					report["newSessionResult"] = { cancelled: false };
+					replacedCtx.ui.notify(JSON.stringify(report), "info");
 				},
 			});
 
-			report["setupOrder"] = setupOrder;
-			report["newSessionResult"] = result;
-
-			ctx.ui.notify(JSON.stringify(report), "info");
+			// Retain the original ctx only when replacement is cancelled.
+			if (result.cancelled) {
+				report["setupOrder"] = setupOrder;
+				report["newSessionResult"] = result;
+				ctx.ui.notify(JSON.stringify(report), "info");
+			}
 		},
 	});
 

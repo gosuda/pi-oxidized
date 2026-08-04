@@ -21,5 +21,5 @@ test("source-pinned TypeScript pi reopens every generated fixture", async () => 
 	const expected = (await readdir(directory, { recursive: true })).filter(
 		(path) => typeof path === "string" && path.endsWith(".jsonl"),
 	).length;
-	expect(await reopenWithSourcePinnedTypescript(directory, { preserveHistoricalPrefix: false })).toBe(expected);
+	expect(await reopenWithSourcePinnedTypescript(directory)).toBe(expected);
 });

@@ -4,6 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PTY_KEYS, spawnPty } from "./pty.ts";
 
+const isWindows = process.platform === "win32";
+
+
 const temporaryPaths: string[] = [];
 
 afterAll(() => {
@@ -16,7 +19,7 @@ function temporaryDirectory(prefix: string): string {
 	return path;
 }
 
-describe("PTY driver", () => {
+describe.skipIf(isWindows)("PTY driver", () => {
 	test("preserves hostile argv, separates terminal echo, timestamps chunks, and exits cleanly", async () => {
 		const root = temporaryDirectory("pi pty ' $() ");
 		const process = spawnPty({

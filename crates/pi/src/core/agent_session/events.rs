@@ -325,8 +325,10 @@ pub enum AgentSessionEvent {
     },
     /// Session display name changed.
     SessionInfoChanged {
-        /// New name (`None` clears; omitted from wire when absent).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// New name (`None` clears the display name). Serialized as
+        /// `"name": null` so consumers can observe clearing; `default`
+        /// still accepts an absent field on deserialize.
+        #[serde(default)]
         name: Option<String>,
     },
     /// Thinking level changed.
@@ -363,6 +365,13 @@ pub enum AgentSessionEvent {
         final_error: Option<String>,
     },
     /// Summarization retry scheduled (backoff about to start).
+    ///
+    /// Intentionally omits `source`: the TypeScript contract keeps
+    /// `summarization_retry_scheduled` source-free and emits `source` only
+    /// with `summarization_retry_attempt_start`. The source is known to the
+    /// caller when scheduling the retry, so it is not repeated here; it
+    /// appears on the attempt-start event to disambiguate which retry path
+    /// is now running after the backoff elapses.
     SummarizationRetryScheduled {
         /// Current retry attempt (1-based).
         attempt: u32,
@@ -670,12 +679,12 @@ mod tests {
     }
 
     #[test]
-    fn session_info_changed_clear_omits_name() -> Result<(), serde_json::Error> {
+    fn session_info_changed_clear_serializes_name_null() -> Result<(), serde_json::Error> {
         let event = AgentSessionEvent::SessionInfoChanged { name: None };
         let value = serde_json::to_value(&event)?;
-        assert_eq!(value, json!({"type": "session_info_changed"}));
-        assert!(value.get("name").is_none());
-        // Round-trip: None deserializes back.
+        // `name: null` must reach consumers so clearing is observable.
+        assert_eq!(value, json!({"type": "session_info_changed", "name": null}));
+        // Round-trip: null deserializes back to None.
         assert_eq!(serde_json::from_value::<AgentSessionEvent>(value)?, event);
         Ok(())
     }

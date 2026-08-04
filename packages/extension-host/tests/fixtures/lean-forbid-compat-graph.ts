@@ -3,9 +3,11 @@
  * Mode-1 compat graph. Registered as a runtime resolution plugin: every
  * specifier resolved after preload is appended to $LEAN_RESOLVE_LOG, and
  * any specifier from the compat/upstream graph (host.ts, virtual-modules,
- * builtins, upstream @earendil-works/* runtime packages, jiti, typebox)
- * hard-fails the process. `@earendil-works/pi-tui-protocol` stays legal —
- * it is the shared wire package, not the upstream runtime graph.
+ * builtins, upstream @earendil-works/* runtime packages, jiti, typebox,
+ * node:module / module — createRequire bypasses the preload onResolve
+ * hook for its string argument) hard-fails the process.
+ * `@earendil-works/pi-tui-protocol` stays legal — it is the shared wire
+ * package, not the upstream runtime graph.
  */
 import { appendFileSync } from "node:fs";
 import { plugin } from "bun";
@@ -13,7 +15,7 @@ import { plugin } from "bun";
 const LOG_PATH = process.env["LEAN_RESOLVE_LOG"];
 
 const FORBIDDEN =
-	/^(?:@earendil-works\/(?:pi-coding-agent|pi-agent-core|pi-ai|pi-tui(?!-protocol))|@mariozechner\/|jiti(?:\/|$)|typebox(?:\/|$)|(?:[^:]*\/)?(?:host|virtual-modules)\.ts$)/;
+	/^(?:@earendil-works\/(?:pi-coding-agent|pi-agent-core|pi-ai|pi-tui(?!-protocol))|@mariozechner\/|jiti(?:\/|$)|typebox(?:\/|$)|(?:node:)?module$|(?:[^:]*\/)?(?:host|virtual-modules)\.ts$)/;
 
 plugin({
 	name: "lean-forbid-compat-graph",

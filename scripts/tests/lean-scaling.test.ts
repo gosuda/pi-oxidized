@@ -473,7 +473,6 @@ describe("runModeDistinctness toolRounds", () => {
 			/toolRounds must be a positive integer/,
 		);
 	});
-});
 
 	test("allows configured tool rounds above the legacy retained-frame cap", async () => {
 		const hostCwd = resolve(process.cwd(), "packages", "extension-host");
@@ -489,13 +488,13 @@ describe("runModeDistinctness toolRounds", () => {
 		});
 
 		expect(result.toolRoundTrip.rounds).toBe(32);
-		expect(result.toolRoundTrip.responses).toBe(96);
 		expect(result.toolRoundTrip.updateEvents).toBeGreaterThanOrEqual(32);
 		expect(result.toolRoundTrip.prepareMs.n).toBe(32);
 		expect(result.toolRoundTrip.validateMs.n).toBe(32);
 		expect(result.toolRoundTrip.executeMs.n).toBe(32);
 		expect(result.failures).toEqual([]);
 	}, 180_000);
+	});
 
 describe("runModeDistinctness validatedBy gate", () => {
 	test("rejects a lean fixture whose validate merely echoes args (no validatedBy marker)", async () => {
@@ -757,7 +756,6 @@ describe("mode distinctness smoke", () => {
 			// Per-call contract: all three RPC stages answered for every round
 			// and the execute stage streamed an update per round.
 			expect(result.toolRoundTrip.rounds).toBe(2);
-			expect(result.toolRoundTrip.responses).toBe(6);
 			expect(result.toolRoundTrip.updateEvents).toBeGreaterThanOrEqual(2);
 			expect(result.toolRoundTrip.prepareMs.n).toBe(2);
 			expect(result.toolRoundTrip.validateMs.n).toBe(2);

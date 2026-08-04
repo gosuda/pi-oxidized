@@ -37,7 +37,6 @@
 		"package-release.ts"
 	],
 	"exclude": [
-		"verification/extension.ts",
 		"verification/foundation.test.ts",
 		"verification/e2e-smoke.ts",
 		"verification/pty.ts"

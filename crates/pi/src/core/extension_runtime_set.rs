@@ -28,7 +28,7 @@ use super::agent_session::extension_runner::{
     BeforeAgentStartResult, CancelResult, ExtensionRunner, ExtensionRunnerError,
     InputTransformResult,
 };
-use super::agent_session_runtime::CreateAgentSessionRuntimeResult;
+use super::agent_session_runtime::{CreateAgentSessionRuntimeResult, spawn_runtime_safe};
 use super::agent_session_services::ExtensionFlagType;
 use super::extension_host::{
     EVENT_CHANNEL_CAPACITY, ExtensionUiEvent, HOOK_TIMEOUT, HostExtensionRunner, HostStartError,
@@ -60,10 +60,10 @@ struct EndpointPlan {
     label: String,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy)]
 enum GenerationBuildPolicy {
     BestEffortStart,
+    #[allow(dead_code)]
     RequireAllEndpointStarts,
 }
 
@@ -123,7 +123,7 @@ impl Drop for PreparedReload {
             abort_bridges(&generation);
             for endpoint in generation.endpoints.iter() {
                 let runner = Arc::clone(&endpoint.runner);
-                tokio::spawn(async move {
+                spawn_runtime_safe("prepared-reload-shutdown", async move {
                     runner.shutdown_once().await;
                 });
             }
@@ -172,6 +172,26 @@ enum PendingReadyState {
         token: String,
         replacement_target: Option<Arc<AgentSession>>,
     },
+}
+
+/// Releases the finalizing slot when the finalizer completes or unwinds.
+///
+/// Returned from [`ExtensionRuntimeSet::take_finalizing`] alongside the
+/// transferred operation. If the finalizer task panics or returns early
+/// without calling [`ExtensionRuntimeSet::finish_finalize`], this guard's
+/// `Drop` impl clears the slot so future replacements are not wedged.
+pub(crate) struct FinalizeGuard {
+    set: Weak<ExtensionRuntimeSet>,
+    token: String,
+}
+
+impl Drop for FinalizeGuard {
+    fn drop(&mut self) {
+        if let Some(set) = self.set.upgrade() {
+            // Idempotent: a normal finish already cleared the slot.
+            let _ = set.finish_finalize(&self.token);
+        }
+    }
 }
 
 /// Outcome of a committed extension-runtime reload.
@@ -876,14 +896,29 @@ impl ExtensionRuntimeSet {
     }
 
     /// Transfer a token-correlated operation to its finalizer while retaining slot ownership.
-    pub(crate) fn take_finalizing(&self, token: &str) -> Option<PendingReadyOp> {
+    ///
+    /// Returns the operation and a [`FinalizeGuard`] that releases the
+    /// finalizing slot on drop. If the finalizer completes normally it
+    /// should call [`ExtensionRuntimeSet::finish_finalize`] to clear
+    /// the slot explicitly; if it panics or returns early, the guard's
+    /// `Drop` impl clears the slot so future replacements are not wedged.
+    pub(crate) fn take_finalizing(
+        self: &Arc<Self>,
+        token: &str,
+    ) -> Option<(PendingReadyOp, FinalizeGuard)> {
         let mut state = self.pending_ready();
         match &mut *state {
             PendingReadyState::Finalizing {
                 op,
                 token: pending_token,
                 ..
-            } if pending_token == token => op.take(),
+            } if pending_token == token => op.take().map(|op| {
+                let guard = FinalizeGuard {
+                    set: Arc::downgrade(self),
+                    token: token.to_owned(),
+                };
+                (op, guard)
+            }),
             PendingReadyState::None
             | PendingReadyState::Pending { .. }
             | PendingReadyState::Finalizing { .. } => None,
@@ -891,20 +926,26 @@ impl ExtensionRuntimeSet {
     }
 
     /// Release the finalizing slot after the transferred operation was applied.
+    ///
+    /// Tolerates an already-cleared slot: if the slot was cleared by a
+    /// [`FinalizeGuard`] drop or a prior call, this returns `true` so
+    /// callers that race a guard drop with an explicit finish do not
+    /// observe a spurious failure.
     pub(crate) fn finish_finalize(&self, token: &str) -> bool {
         let mut state = self.pending_ready();
-        let finished = matches!(
-            &*state,
+        match &*state {
             PendingReadyState::Finalizing {
                 op: None,
                 token: pending_token,
                 ..
-            } if pending_token == token
-        );
-        if finished {
-            *state = PendingReadyState::None;
+            } if pending_token == token => {
+                *state = PendingReadyState::None;
+                true
+            }
+            // Slot already cleared (e.g. by a guard drop racing this call).
+            PendingReadyState::None => true,
+            _ => false,
         }
-        finished
     }
 
     /// Abort an operation that has not been transferred to a finalizer.
@@ -1786,7 +1827,8 @@ impl ExtensionRuntimeSet {
     /// # Errors
     ///
     /// Returns an error when the runtime is no longer reloadable, no replacement endpoint starts,
-    /// flag encoding/sync fails globally, or the facade is invalidated after flags are applied.
+    /// flag encoding/sync fails globally, replacement provider validation fails, or the facade is
+    /// invalidated after flags are applied.
     pub(crate) async fn prepare_reload(
         &self,
         preserved_flags: HashMap<String, Value>,
@@ -1840,6 +1882,17 @@ impl ExtensionRuntimeSet {
                 ));
             }
         }
+        // Validate replacement providers before returning success so a failed
+        // validation never reaches commit_reload after session_shutdown{reload}
+        // has been emitted to the old generation.
+        if let Err((path, error)) = validate_generation_providers(&next) {
+            diagnostics.push(ExtensionSetDiagnostic {
+                path,
+                message: error.to_string(),
+            });
+            stop_generation(&next).await;
+            return Err(HostStartError::Load(error.to_string()));
+        }
         if !self.state().reloadable() {
             stop_generation(&next).await;
             return Err(HostStartError::Load(
@@ -1853,19 +1906,25 @@ impl ExtensionRuntimeSet {
         })
     }
 
-    /// Commit a prepared reload after validating all replacement providers.
-    #[allow(clippy::expect_used)]
+    /// Commit a prepared reload. Provider validation already ran in `prepare_reload`;
+    /// the check here is defense-in-depth for direct commit callers.
     pub(crate) async fn commit_reload(
         &self,
         runtime: &ModelRuntime,
         mut prepared: PreparedReload,
     ) -> ReloadResult {
-        let next = prepared
-            .generation
-            .take()
-            .expect("prepared reload missing generation");
-        let pending = std::mem::take(&mut prepared.pending);
         let mut diagnostics = std::mem::take(&mut prepared.diagnostics);
+        let Some(next) = prepared.generation.take() else {
+            diagnostics.push(ExtensionSetDiagnostic {
+                path: "<reload>".to_owned(),
+                message: "prepared reload carried no replacement generation".to_owned(),
+            });
+            return ReloadResult {
+                diagnostics,
+                committed: false,
+            };
+        };
+        let pending = std::mem::take(&mut prepared.pending);
 
         if let Err((path, error)) = validate_generation_providers(&next) {
             diagnostics.push(ExtensionSetDiagnostic {
@@ -1930,7 +1989,7 @@ impl ExtensionRuntimeSet {
     /// # Errors
     ///
     /// Returns an error when prepare fails. Commit itself always returns diagnostics.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) async fn restart_and_rewire(
         &self,
         runtime: &ModelRuntime,
@@ -2917,7 +2976,7 @@ fn spawn_session_relay(
 fn discard_pending_ready_op(op: PendingReadyOp) {
     match op {
         PendingReadyOp::Replacement { result, .. } => {
-            tokio::spawn(async move {
+            spawn_runtime_safe("prepared-replacement-discard", async move {
                 result.session.dispose().await;
             });
         }
@@ -2952,7 +3011,6 @@ fn abort_bridges(generation: &Generation) {
     }
 }
 
-#[allow(dead_code)]
 fn validate_generation_providers(
     generation: &Generation,
 ) -> Result<(), (String, ModelRuntimeError)> {
@@ -3223,8 +3281,12 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn pending_ready_slot_correlates_one_operation_through_finalizing() -> TestResult {
         let (generation, _) = generation_from_endpoints(1, Vec::new());
-        let set =
-            ExtensionRuntimeSet::from_generation(generation, Vec::new(), String::new(), false);
+        let set = Arc::new(ExtensionRuntimeSet::from_generation(
+            generation,
+            Vec::new(),
+            String::new(),
+            false,
+        ));
         let runtime = Arc::new(ModelRuntime::create_in_memory().await?);
         let token = set.next_replacement_token();
         let ready = set
@@ -3259,13 +3321,87 @@ pub(crate) mod tests {
         assert!(!set.complete_ready("stale-token"));
         assert!(set.complete_ready(&token));
         ready.await?;
-        let finalizing = set
+        let (finalizing, _guard) = set
             .take_finalizing(&token)
             .ok_or("ready operation was not finalizing")?;
         assert!(matches!(finalizing, PendingReadyOp::Reload { .. }));
         assert!(set.is_pending_busy());
+        // Explicit finish clears the slot; the guard is dropped after.
         assert!(set.finish_finalize(&token));
         assert!(!set.is_pending_busy());
+        // A second finish is idempotent (slot already cleared).
+        assert!(set.finish_finalize(&token));
+        assert!(!set.is_pending_busy());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finalize_guard_releases_slot_when_dropped_without_finish() -> TestResult {
+        let (generation, _) = generation_from_endpoints(1, Vec::new());
+        let set = Arc::new(ExtensionRuntimeSet::from_generation(
+            generation,
+            Vec::new(),
+            String::new(),
+            false,
+        ));
+        let runtime = Arc::new(ModelRuntime::create_in_memory().await?);
+        let token = set.next_replacement_token();
+        let ready = set
+            .install_pending(
+                token.clone(),
+                PendingReadyOp::Reload {
+                    prepared: PreparedReload {
+                        generation: None,
+                        pending: Vec::new(),
+                        diagnostics: Vec::new(),
+                    },
+                    model_runtime: Arc::clone(&runtime),
+                },
+            )
+            .map_err(|_| "initial pending install was rejected")?;
+
+        assert!(set.complete_ready(&token));
+        ready.await?;
+        {
+            let (finalizing, _guard) = set
+                .take_finalizing(&token)
+                .ok_or("ready operation was not finalizing")?;
+            assert!(matches!(finalizing, PendingReadyOp::Reload { .. }));
+            assert!(set.is_pending_busy());
+            // Drop the guard without calling finish — the slot must be
+            // released so future replacements are not wedged.
+        }
+        assert!(
+            !set.is_pending_busy(),
+            "dropped finalize guard must release the finalizing slot"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn commit_reload_without_generation_returns_uncommitted_diagnostic() -> TestResult {
+        let (generation, _) = generation_from_endpoints(1, Vec::new());
+        let set =
+            ExtensionRuntimeSet::from_generation(generation, Vec::new(), String::new(), false);
+        let runtime = ModelRuntime::create_in_memory().await?;
+        let prepared = PreparedReload {
+            generation: None,
+            pending: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let result = set.commit_reload(&runtime, prepared).await;
+        assert!(
+            !result.committed,
+            "a reload without a generation must not commit"
+        );
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("no replacement generation")),
+            "diagnostics must explain the missing generation: {:?}",
+            result.diagnostics
+        );
         Ok(())
     }
 
@@ -4364,37 +4500,20 @@ pub(crate) mod tests {
             }],
         );
         let runtime = ModelRuntime::create_in_memory().await?;
+        // Provider validation now runs in prepare_reload before commit, so
+        // restart_and_rewire returns an error when the replacement has an
+        // invalid provider. The old generation stays live.
         let result = set
             .restart_and_rewire(
                 &runtime,
                 HashMap::from([("demo".to_owned(), Value::Bool(true))]),
             )
-            .await?;
+            .await;
         assert!(
-            result.diagnostics.iter().any(|diagnostic| {
-                diagnostic.path == "broken-sibling.ts" && diagnostic.message == "load failed"
-            }),
-            "missing load diagnostic: {:?}",
-            result.diagnostics
+            result.is_err(),
+            "prepare_reload must reject invalid providers"
         );
-        assert!(
-            result.diagnostics.iter().any(|diagnostic| {
-                diagnostic.path == "<replacement>"
-                    && diagnostic.message.to_lowercase().contains("flag")
-            }),
-            "missing flag diagnostic: {:?}",
-            result.diagnostics
-        );
-        assert!(
-            result
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.path != "broken-sibling.ts"
-                    && diagnostic.path != "<replacement>"),
-            "missing provider diagnostic: {:?}",
-            result.diagnostics
-        );
-        assert!(!result.committed);
+        assert!(set.is_active());
         assert_eq!(set.reload_generation(), 1);
         replacement_host.wait_for_exit().await?;
         set.shutdown_once().await;
@@ -5299,17 +5418,24 @@ pub(crate) mod tests {
         ));
         set.install(pending);
         let runtime = ModelRuntime::create_in_memory().await?;
-        let provider_epoch = runtime.provider_mutation_epoch();
+        let before = set.reload_generation();
 
-        let _reload = set
+        let result = set
             .restart_and_rewire(&runtime, HashMap::new())
             .await
             .expect("best-effort native replacement should prepare/commit");
         assert!(
-            set.reload_generation() >= 1,
-            "generation remains published after reload"
+            result.committed,
+            "reload did not commit: {:?}",
+            result.diagnostics
         );
-        let _ = (provider_epoch, old_host);
+        assert_eq!(
+            set.reload_generation(),
+            before + 1,
+            "a committed reload must publish exactly one new generation"
+        );
+        assert!(set.is_active(), "facade lost every endpoint after reload");
+        old_host.wait_for_exit().await?;
         set.shutdown_once().await;
         Ok(())
     }
@@ -5383,15 +5509,13 @@ pub(crate) mod tests {
         );
         let provider_epoch = runtime.provider_mutation_epoch();
 
-        let result = set
-            .restart_and_rewire(&runtime, HashMap::new())
-            .await
-            .expect("replacement preparation succeeds before provider validation");
-        assert!(!result.committed);
+        // Provider validation now runs in prepare_reload, so restart_and_rewire
+        // returns an error (not a ReloadResult) when the replacement has an
+        // invalid provider. The old generation stays live and untouched.
+        let result = set.restart_and_rewire(&runtime, HashMap::new()).await;
         assert!(
-            !result.diagnostics.is_empty(),
-            "expected provider diagnostics: {:?}",
-            result.diagnostics
+            result.is_err(),
+            "prepare_reload must reject invalid providers"
         );
         assert_eq!(set.reload_generation(), 1);
         assert_eq!(runtime.provider_mutation_epoch(), provider_epoch);

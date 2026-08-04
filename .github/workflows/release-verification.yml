@@ -114,8 +114,9 @@ jobs:
             bun build ./src/main.ts --compile --minify --compile-autoload-tsconfig --compile-autoload-package-json --target "$host_target" --outfile dist/pi-extension-host
           )
 
-      # Bun's terminal spawn is POSIX-only. The Windows leg still runs every
-      # non-PTY script test; Linux and macOS run PTY + interactive smoke tests.
+      # Bun's terminal spawn is POSIX-only. The Windows leg runs the portable
+      # script tests; PTY driver, interactive smoke, and performance suites
+      # self-skip via describe.skipIf(isWindows) where prerequisites are absent.
       - name: JS checks and scripts tests
         shell: bash
         run: |
@@ -124,6 +125,10 @@ jobs:
 
       # The full correctness and same-machine performance signal runs once;
       # the remaining four jobs stay focused on target-specific packaging.
+      - name: Generate session fixtures
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: bun run scripts/generate-session-fixtures.ts
+
       - name: Generate Rust test fixtures
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: bun run scripts/generate-tool-schemas.ts

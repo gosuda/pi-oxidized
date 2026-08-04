@@ -11,7 +11,10 @@ pub mod writer;
 pub use backend::{
     ByteAuditReport, GuardedBackend, audit_bytes, encode_full_row_prefix, wrap_synchronized,
 };
-pub use caps::{CellDimensions, ImageProtocol, KeyboardProtocol, TerminalCapabilities};
+pub use caps::{
+    CellDimensions, ImageProtocol, KeyboardProtocol, TerminalCapabilities, kitty_delete_all,
+    kitty_delete_id,
+};
 pub use guard::{
     GuardScript, KITTY_KEYBOARD_FLAGS, TerminalGuard, install_panic_emergency_hook,
     write_emergency_restore_bytes,

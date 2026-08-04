@@ -255,6 +255,10 @@ pub type SummarizeStreamFn = Arc<
         + Sync,
 >;
 
+/// Upper bound on one summarization backoff, in milliseconds. Prevents a
+/// saturated `checked_shl` from turning a retry delay into an unbounded sleep.
+const MAX_RETRY_BACKOFF_MS: u64 = 60_000;
+
 /// Bounded retry settings for one standalone summarization request.
 ///
 /// The initial request is not a retry. Enabled retries use
@@ -981,7 +985,10 @@ where
         let delay_ms = policy.map_or(0, |policy| {
             let exponent = attempt.saturating_sub(1);
             let multiplier = 1_u64.checked_shl(exponent).unwrap_or(u64::MAX);
-            policy.base_delay_ms.saturating_mul(multiplier)
+            policy
+                .base_delay_ms
+                .saturating_mul(multiplier)
+                .min(MAX_RETRY_BACKOFF_MS)
         });
 
         if let Some(callback) =

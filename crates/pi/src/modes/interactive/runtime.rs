@@ -3532,7 +3532,9 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             }
             UiControl::SetTitle { title } => {
                 let sequence = encode_osc0_set_title(title.as_deref().unwrap_or(""));
-                let _ = self.tui.outer_mut().write_all(&sequence);
+                if let Err(error) = self.tui.outer_mut().write_all(&sequence) {
+                    self.last_error = Some(format!("write terminal title: {error}"));
+                }
             }
             UiControl::PasteToEditor { text } => {
                 let _ = self.paste_text(&text);
@@ -4101,6 +4103,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             return;
         }
         self.rebind_session_channels().await;
+        self.refresh_footer().await;
         self.session_events_closed_for_rebind = false;
     }
 

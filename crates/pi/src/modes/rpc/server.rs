@@ -60,39 +60,168 @@ use super::types::{
     RpcSessionTreeNode, RpcSlashCommand, SessionStats, StreamingBehavior,
 };
 
-/// Serialize one RPC wire value, normalizing native compact user text to the
-/// block array used by the TypeScript authority.
+/// Serialize one RPC wire value, normalizing known envelope fields whose wire
+/// contract requires it while preserving opaque extension-owned values.
 fn to_jsonl<T: Serialize>(value: &T) -> String {
     let Ok(mut wire) = serde_json::to_value(value) else {
         return String::new();
     };
-    normalize_user_message_content(&mut wire);
+    normalize_wire_envelope(&mut wire);
     serialize_json_line(&wire).unwrap_or_default()
 }
 
-fn normalize_user_message_content(value: &mut Value) {
-    match value {
-        Value::Array(values) => {
-            for value in values {
-                normalize_user_message_content(value);
+/// Convert a known user message's compact string `content` to the block array
+/// used by the TypeScript authority. Does not recurse into `content` or any
+/// other field — opaque nested values are preserved byte-for-JSON-shape.
+fn normalize_message_user_content(message: &mut Value) {
+    if let Value::Object(fields) = message
+        && fields.get("role").and_then(Value::as_str) == Some("user")
+        && let Some(content) = fields.get_mut("content")
+        && let Value::String(text) = content
+    {
+        let text = std::mem::take(text);
+        *content = serde_json::json!([{ "type": "text", "text": text }]);
+    }
+}
+
+fn normalize_message(message: &mut Value) {
+    let is_tool_result = message.get("role").and_then(Value::as_str) == Some("toolResult");
+    normalize_message_user_content(message);
+    if is_tool_result {
+        normalize_tool_result_null_details(message);
+    }
+}
+
+fn normalize_message_entry(entry: &mut Value) {
+    let Some(fields) = entry.as_object_mut() else {
+        return;
+    };
+    if fields.get("type").and_then(Value::as_str) != Some("message") {
+        return;
+    }
+    if let Some(message) = fields.get_mut("message") {
+        normalize_message(message);
+    }
+}
+
+fn normalize_tree_message_entries(tree: &mut Value) {
+    let Some(nodes) = tree.as_array_mut() else {
+        return;
+    };
+    let mut pending: Vec<&mut Value> = nodes.iter_mut().collect();
+    while let Some(node) = pending.pop() {
+        let Some(fields) = node.as_object_mut() else {
+            continue;
+        };
+        if let Some(entry) = fields.get_mut("entry") {
+            normalize_message_entry(entry);
+        }
+        if let Some(Value::Array(children)) = fields.get_mut("children") {
+            pending.extend(children.iter_mut());
+        }
+    }
+}
+
+/// Strip a null `details` field from a known tool-result object. Does not
+/// recurse into `details` or any other field — opaque nested values inside
+/// `details` are preserved.
+fn normalize_tool_result_null_details(result: &mut Value) {
+    if let Value::Object(fields) = result
+        && fields.get("details").is_some_and(Value::is_null)
+    {
+        fields.remove("details");
+    }
+}
+
+/// Normalize only the known RPC envelope/message/tool-result fields whose wire
+/// contract requires it. Opaque nested `details`, custom payloads, and nested
+/// role/content objects are preserved byte-for-JSON-shape — the function does
+/// not recurse into them.
+fn normalize_wire_envelope(value: &mut Value) {
+    let Some(fields) = value.as_object_mut() else {
+        return;
+    };
+    let event_type = fields.get("type").and_then(Value::as_str);
+    match event_type {
+        // Message lifecycle events: normalize the known `message` wire shape.
+        Some("message_start" | "message_update" | "message_end") => {
+            if let Some(message) = fields.get_mut("message") {
+                normalize_message(message);
             }
         }
-        Value::Object(fields) => {
-            if fields.get("details").is_some_and(Value::is_null) {
-                fields.remove("details");
-            }
-            if fields.get("role").and_then(Value::as_str) == Some("user")
-                && let Some(content) = fields.get_mut("content")
-                && let Value::String(text) = content
-            {
-                let text = std::mem::take(text);
-                *content = serde_json::json!([{ "type": "text", "text": text }]);
-            }
-            for value in fields.values_mut() {
-                normalize_user_message_content(value);
+        // Tool execution events: strip null `details` from the result object.
+        Some("tool_execution_end") => {
+            if let Some(result) = fields.get_mut("result") {
+                normalize_tool_result_null_details(result);
             }
         }
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+        Some("tool_execution_update") => {
+            if let Some(result) = fields.get_mut("partialResult") {
+                normalize_tool_result_null_details(result);
+            }
+        }
+        // Turn end: normalize the completing message and each tool-result message.
+        Some("turn_end") => {
+            if let Some(message) = fields.get_mut("message") {
+                normalize_message(message);
+            }
+            if let Some(Value::Array(results)) = fields.get_mut("toolResults") {
+                for result in results {
+                    normalize_tool_result_null_details(result);
+                }
+            }
+        }
+        // Agent end: normalize each produced message.
+        Some("agent_end") => {
+            if let Some(Value::Array(messages)) = fields.get_mut("messages") {
+                for message in messages {
+                    normalize_message(message);
+                }
+            }
+        }
+        // Entry appended: normalize a message entry's `message` field only.
+        Some("entry_appended") => {
+            if let Some(entry) = fields.get_mut("entry") {
+                normalize_message_entry(entry);
+            }
+        }
+        // Response envelope: normalize known data fields by command.
+        Some("response") => {
+            let command = fields
+                .get("command")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if let Some(data) = fields.get_mut("data") {
+                normalize_response_data(data, command.as_deref());
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Normalize known fields within a response `data` payload.
+fn normalize_response_data(data: &mut Value, command: Option<&str>) {
+    match command {
+        Some("get_messages") => {
+            if let Some(Value::Array(messages)) = data.get_mut("messages") {
+                for message in messages {
+                    normalize_message(message);
+                }
+            }
+        }
+        Some("get_entries") => {
+            if let Some(Value::Array(entries)) = data.get_mut("entries") {
+                for entry in entries {
+                    normalize_message_entry(entry);
+                }
+            }
+        }
+        Some("get_tree") => {
+            if let Some(tree) = data.get_mut("tree") {
+                normalize_tree_message_entries(tree);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -3027,11 +3156,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // ExtensionErrorOutput serialization
+    // Wire-envelope normalization
     // -----------------------------------------------------------------------
 
     #[test]
     fn rpc_jsonl_normalizes_user_text_to_content_blocks() {
+        // Supported envelope: message_start with user string content → blocks.
         let line = to_jsonl(&serde_json::json!({
             "type": "message_start",
             "message": {
@@ -3046,12 +3176,249 @@ mod tests {
             serde_json::json!([{ "type": "text", "text": "hello" }])
         );
 
+        // Message lifecycle events carry tool-result messages too.
+        let line = to_jsonl(&serde_json::json!({
+            "type": "message_start",
+            "message": {
+                "role": "toolResult",
+                "toolCallId": "tc1",
+                "toolName": "read",
+                "content": [],
+                "details": null,
+                "isError": false,
+                "timestamp": 2
+            }
+        }));
+        let parsed: Value = serde_json::from_str(&line).expect("valid RPC JSONL");
+        assert!(parsed["message"].get("details").is_none());
+
+        // Supported envelope: tool_execution_end with null details → stripped.
         let line = to_jsonl(&serde_json::json!({
             "type": "tool_execution_end",
             "result": { "content": [], "details": null }
         }));
         let parsed: Value = serde_json::from_str(&line).expect("valid RPC JSONL");
         assert!(parsed["result"].get("details").is_none());
+    }
+
+    #[test]
+    fn rpc_jsonl_preserves_opaque_nested_details() {
+        // A tool result whose `details` payload contains a nested `details: null`
+        // must preserve the inner field — only the top-level tool-result
+        // `details: null` is stripped.
+        let line = to_jsonl(&serde_json::json!({
+            "type": "tool_execution_end",
+            "result": {
+                "content": [],
+                "details": { "details": null, "extra": 42 }
+            }
+        }));
+        let parsed: Value = serde_json::from_str(&line).expect("valid RPC JSONL");
+        // The top-level details is a non-null object → preserved as-is.
+        assert_eq!(parsed["result"]["details"]["details"], Value::Null);
+        assert_eq!(parsed["result"]["details"]["extra"], 42);
+
+        // A tool result whose `details` payload contains a nested
+        // `{ role: "user", content: "raw" }` must preserve it — only the
+        // known `message` field of message events is normalized.
+        let line = to_jsonl(&serde_json::json!({
+            "type": "tool_execution_end",
+            "result": {
+                "content": [],
+                "details": { "role": "user", "content": "raw" }
+            }
+        }));
+        let parsed: Value = serde_json::from_str(&line).expect("valid RPC JSONL");
+        assert_eq!(parsed["result"]["details"]["role"], "user");
+        assert_eq!(parsed["result"]["details"]["content"], "raw");
+    }
+
+    #[test]
+    fn rpc_jsonl_preserves_opaque_nested_role_content() {
+        // An extension-owned payload nested inside a message event's
+        // non-message field must not have its role/content rewritten.
+        let line = to_jsonl(&serde_json::json!({
+            "type": "message_start",
+            "message": {
+                "role": "user",
+                "content": "hello",
+                "timestamp": 1
+            },
+            "metadata": {
+                "role": "user",
+                "content": "do-not-touch"
+            }
+        }));
+        let parsed: Value = serde_json::from_str(&line).expect("valid RPC JSONL");
+        // Known message field normalized.
+        assert_eq!(
+            parsed["message"]["content"],
+            serde_json::json!([{ "type": "text", "text": "hello" }])
+        );
+        // Opaque metadata field preserved.
+        assert_eq!(parsed["metadata"]["role"], "user");
+        assert_eq!(parsed["metadata"]["content"], "do-not-touch");
+    }
+
+    #[test]
+    fn rpc_jsonl_normalizes_get_messages_response() {
+        // get_messages response: each user message with string content is
+        // normalized; opaque nested values inside details are preserved.
+        let line = to_jsonl(&serde_json::json!({
+            "type": "response",
+            "command": "get_messages",
+            "data": {
+                "messages": [
+                    { "role": "user", "content": "hi", "timestamp": 1 },
+                    { "role": "assistant", "content": [], "timestamp": 2 }
+                ]
+            }
+        }));
+        let parsed: Value = serde_json::from_str(&line).expect("valid RPC JSONL");
+        assert_eq!(
+            parsed["data"]["messages"][0]["content"],
+            serde_json::json!([{ "type": "text", "text": "hi" }])
+        );
+        // Assistant message content (already an array) is untouched.
+        assert_eq!(
+            parsed["data"]["messages"][1]["content"],
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn rpc_jsonl_normalizes_get_entries_response() {
+        // get_entries response: message entries have their `message` field
+        // normalized; non-message entries are untouched.
+        let line = to_jsonl(&serde_json::json!({
+            "type": "response",
+            "command": "get_entries",
+            "data": {
+                "entries": [
+                    {
+                        "type": "message",
+                        "id": "e1",
+                        "message": { "role": "user", "content": "hello", "timestamp": 1 }
+                    },
+                    {
+                        "type": "compaction",
+                        "id": "e2",
+                        "summary": "text"
+                    }
+                ],
+                "leafId": "e2"
+            }
+        }));
+        let parsed: Value = serde_json::from_str(&line).expect("valid RPC JSONL");
+        assert_eq!(
+            parsed["data"]["entries"][0]["message"]["content"],
+            serde_json::json!([{ "type": "text", "text": "hello" }])
+        );
+        // Non-message entry is untouched.
+        assert_eq!(parsed["data"]["entries"][1]["type"], "compaction");
+        assert_eq!(parsed["data"]["entries"][1]["summary"], "text");
+    }
+
+    #[test]
+    fn rpc_jsonl_normalizes_get_tree_message_entries() {
+        let line = to_jsonl(&serde_json::json!({
+            "type": "response",
+            "command": "get_tree",
+            "data": {
+                "tree": [{
+                    "entry": {
+                        "type": "message",
+                        "message": { "role": "user", "content": "root", "timestamp": 1 }
+                    },
+                    "children": [{
+                        "entry": {
+                            "type": "message",
+                            "message": {
+                                "role": "toolResult",
+                                "content": [],
+                                "details": null,
+                                "timestamp": 2
+                            }
+                        },
+                        "children": []
+                    }],
+                    "metadata": { "role": "user", "content": "opaque" }
+                }]
+            }
+        }));
+        let parsed: Value = serde_json::from_str(&line).expect("valid RPC JSONL");
+        assert_eq!(
+            parsed["data"]["tree"][0]["entry"]["message"]["content"],
+            serde_json::json!([{ "type": "text", "text": "root" }])
+        );
+        assert!(
+            parsed["data"]["tree"][0]["children"][0]["entry"]["message"]
+                .get("details")
+                .is_none()
+        );
+        assert_eq!(
+            parsed["data"]["tree"][0]["metadata"],
+            serde_json::json!({ "role": "user", "content": "opaque" })
+        );
+    }
+
+    #[test]
+    fn rpc_jsonl_preserves_opaque_details_in_get_messages() {
+        // Opaque `details` inside a get_messages response message must not be
+        // stripped or rewritten, even if it contains null or role/content shapes.
+        let line = to_jsonl(&serde_json::json!({
+            "type": "response",
+            "command": "get_messages",
+            "data": {
+                "messages": [
+                    {
+                        "role": "toolResult",
+                        "toolCallId": "tc1",
+                        "toolName": "bash",
+                        "content": [],
+                        "details": { "details": null, "role": "user", "content": "raw" },
+                        "isError": false,
+                        "timestamp": 1
+                    }
+                ]
+            }
+        }));
+        let parsed: Value = serde_json::from_str(&line).expect("valid RPC JSONL");
+        // Opaque nested details preserved byte-for-JSON-shape.
+        assert_eq!(
+            parsed["data"]["messages"][0]["details"]["details"],
+            Value::Null
+        );
+        assert_eq!(parsed["data"]["messages"][0]["details"]["role"], "user");
+        assert_eq!(parsed["data"]["messages"][0]["details"]["content"], "raw");
+    }
+
+    #[test]
+    fn rpc_jsonl_normalizes_turn_end_and_agent_end() {
+        // turn_end: completing message normalized, toolResults null details stripped.
+        let line = to_jsonl(&serde_json::json!({
+            "type": "turn_end",
+            "message": { "role": "assistant", "content": [], "timestamp": 1 },
+            "toolResults": [
+                { "role": "toolResult", "toolCallId": "tc1", "toolName": "bash", "content": [], "details": null, "isError": false, "timestamp": 2 }
+            ]
+        }));
+        let parsed: Value = serde_json::from_str(&line).expect("valid RPC JSONL");
+        assert!(parsed["toolResults"][0].get("details").is_none());
+
+        // agent_end: each user message normalized.
+        let line = to_jsonl(&serde_json::json!({
+            "type": "agent_end",
+            "messages": [
+                { "role": "user", "content": "ping", "timestamp": 1 }
+            ],
+            "willRetry": false
+        }));
+        let parsed: Value = serde_json::from_str(&line).expect("valid RPC JSONL");
+        assert_eq!(
+            parsed["messages"][0]["content"],
+            serde_json::json!([{ "type": "text", "text": "ping" }])
+        );
     }
 
     #[tokio::test]

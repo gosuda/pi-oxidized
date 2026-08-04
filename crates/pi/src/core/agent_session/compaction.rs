@@ -555,20 +555,16 @@ impl AgentSession {
 
     // -- auth + stream resolution -----------------------------------------
 
-    /// Resolve the stream function, API key, headers, and env for compaction.
-    ///
-    /// Tries the concrete [`ModelRuntime`] first (production path). Falls back
-    /// to [`CompactionStreamHandle`] (tests / SDK override).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CompactionError::SummarizationFailed`] when no model runtime
-    /// is configured or auth resolution fails.
     /// Resolve model-runtime auth and stream inputs shared by compaction and
     /// branch summarization.
     ///
     /// The test-only [`CompactionStreamHandle`] fallback remains compaction
     /// specific; tree navigation requires a real model runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompactionError::SummarizationFailed`] when no model runtime
+    /// is configured or auth resolution fails.
     pub(crate) async fn resolve_summarization_inputs(
         &self,
     ) -> Result<(SummarizationAuth, SummarizeStreamFn), CompactionError> {
