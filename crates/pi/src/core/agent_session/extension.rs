@@ -1050,16 +1050,12 @@ impl AgentSession {
                 .await;
             return;
         }
-        // Do not hold the lifecycle_gate read lock during the (potentially long)
-        // summarization: it blocks replacement teardown. The branch-summary
-        // cancellation token is cancelled by disposal/replacement, and
-        // navigate_tree_inner checks it before persisting.
-        if self.is_disposed() {
-            let _ = host
-                .respond_navigate_tree(id, Err("session replaced".to_owned()))
-                .await;
-            return;
-        }
+        // The disposed check above is an early-out for a session already torn
+        // down; it is not re-checked here because navigate_tree enforces the
+        // same lifecycle rule. Disposal that races the (potentially long)
+        // summarization cancels the branch-summary token, which
+        // navigate_tree_inner observes and surfaces as an aborted result rather
+        // than persisting a stale summary.
 
         let options = NavigateTreeOptions {
             summarize: request.summarize.unwrap_or(false),

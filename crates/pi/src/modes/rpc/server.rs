@@ -199,30 +199,227 @@ fn normalize_wire_envelope(value: &mut Value) {
     }
 }
 
-/// Normalize known fields within a response `data` payload.
-fn normalize_response_data(data: &mut Value, command: Option<&str>) {
-    match command {
-        Some("get_messages") => {
+/// Response-data normalization required by a command's success response.
+///
+/// Every [`RpcCommand`] variant is exhaustively classified in
+/// [`command_response_normalization`]; adding a variant is a compile error
+/// until classified there.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResponseDataNormalization {
+    /// No response-data normalization (opaque payloads left untouched).
+    None,
+    /// `data.messages` — array of message objects.
+    Messages,
+    /// `data.entries` — array of entry objects.
+    Entries,
+    /// `data.tree` — array of tree nodes.
+    Tree,
+}
+
+/// Apply response-data normalization for the classified kind.
+fn normalize_response_data_kind(data: &mut Value, kind: ResponseDataNormalization) {
+    match kind {
+        ResponseDataNormalization::Messages => {
             if let Some(Value::Array(messages)) = data.get_mut("messages") {
                 for message in messages {
                     normalize_message(message);
                 }
             }
         }
-        Some("get_entries") => {
+        ResponseDataNormalization::Entries => {
             if let Some(Value::Array(entries)) = data.get_mut("entries") {
                 for entry in entries {
                     normalize_message_entry(entry);
                 }
             }
         }
-        Some("get_tree") => {
+        ResponseDataNormalization::Tree => {
             if let Some(tree) = data.get_mut("tree") {
                 normalize_tree_message_entries(tree);
             }
         }
-        _ => {}
+        ResponseDataNormalization::None => {}
     }
+}
+
+/// Normalize known fields within a response `data` payload.
+///
+/// Delegates to [`normalize_response_data_kind`] via a command-string → kind
+/// mapping. This serves the generic/Value-level serialization path; production
+/// response serialization uses [`serialize_response`] driven by the
+/// compile-time-exhaustive [`command_response_normalization`] classification.
+fn normalize_response_data(data: &mut Value, command: Option<&str>) {
+    let kind = match command {
+        Some("get_messages") => ResponseDataNormalization::Messages,
+        Some("get_entries") => ResponseDataNormalization::Entries,
+        Some("get_tree") => ResponseDataNormalization::Tree,
+        _ => ResponseDataNormalization::None,
+    };
+    normalize_response_data_kind(data, kind);
+}
+
+// ---------------------------------------------------------------------------
+// Compile-time exhaustive normalization classification
+// ---------------------------------------------------------------------------
+//
+// Production event and response serialization is driven by compile-time-
+// exhaustive matches over the *typed* enums ([`AgentSessionEvent`] and
+// [`RpcCommand`]). Every variant is explicitly classified as normalization-
+// required or normalization-not-required. Adding a new variant is a compile
+// error until classified — it cannot silently fall through a string allowlist.
+
+/// Compile-time-exhaustive classification: every [`RpcCommand`] variant is
+/// matched. Success responses for `get_messages`, `get_entries`, and
+/// `get_tree` carry message-bearing payloads that need wire normalization;
+/// all other commands (including [`RpcCommand::Unknown`]) are explicitly
+/// `None`. Adding a new variant is a compile error until classified here.
+fn command_response_normalization(command: &RpcCommand) -> ResponseDataNormalization {
+    match command {
+        RpcCommand::GetMessages { .. } => ResponseDataNormalization::Messages,
+        RpcCommand::GetEntries { .. } => ResponseDataNormalization::Entries,
+        RpcCommand::GetTree { .. } => ResponseDataNormalization::Tree,
+        RpcCommand::Prompt { .. }
+        | RpcCommand::Steer { .. }
+        | RpcCommand::FollowUp { .. }
+        | RpcCommand::Abort { .. }
+        | RpcCommand::NewSession { .. }
+        | RpcCommand::GetState { .. }
+        | RpcCommand::SetModel { .. }
+        | RpcCommand::CycleModel { .. }
+        | RpcCommand::GetAvailableModels { .. }
+        | RpcCommand::SetThinkingLevel { .. }
+        | RpcCommand::CycleThinkingLevel { .. }
+        | RpcCommand::GetAvailableThinkingLevels { .. }
+        | RpcCommand::SetSteeringMode { .. }
+        | RpcCommand::SetFollowUpMode { .. }
+        | RpcCommand::Compact { .. }
+        | RpcCommand::SetAutoCompaction { .. }
+        | RpcCommand::SetAutoRetry { .. }
+        | RpcCommand::AbortRetry { .. }
+        | RpcCommand::Bash { .. }
+        | RpcCommand::AbortBash { .. }
+        | RpcCommand::GetSessionStats { .. }
+        | RpcCommand::ExportHtml { .. }
+        | RpcCommand::SwitchSession { .. }
+        | RpcCommand::Fork { .. }
+        | RpcCommand::Clone { .. }
+        | RpcCommand::GetForkMessages { .. }
+        | RpcCommand::GetLastAssistantText { .. }
+        | RpcCommand::SetSessionName { .. }
+        | RpcCommand::GetCommands { .. }
+        | RpcCommand::Unknown { .. } => ResponseDataNormalization::None,
+    }
+}
+
+/// Serialize an [`AgentSessionEvent`] to a JSONL wire line.
+///
+/// Normalization is dispatched from a compile-time-exhaustive match over the
+/// typed event in [`normalize_event_envelope`] — every variant is explicitly
+/// classified as normalization-required or normalization-not-required. Adding
+/// a new variant is a compile error until classified there. Opaque nested
+/// values are preserved byte-for-JSON-shape.
+fn serialize_event(event: &AgentSessionEvent) -> String {
+    let Ok(mut wire) = serde_json::to_value(event) else {
+        return String::new();
+    };
+    normalize_event_envelope(event, &mut wire);
+    serialize_json_line(&wire).unwrap_or_default()
+}
+
+/// Exhaustive classification + dispatch: every [`AgentSessionEvent`] variant
+/// is matched here. Message-bearing variants have their known wire fields
+/// normalized; all others are explicitly no-ops. Adding a variant is a
+/// compile error until classified — it cannot silently fall through a string
+/// allowlist. Opaque nested `details`, custom payloads, and nested
+/// role/content objects are preserved byte-for-JSON-shape.
+fn normalize_event_envelope(event: &AgentSessionEvent, wire: &mut Value) {
+    let Some(fields) = wire.as_object_mut() else {
+        return;
+    };
+    match event {
+        // Message lifecycle events: normalize the known `message` wire shape.
+        AgentSessionEvent::MessageStart { .. }
+        | AgentSessionEvent::MessageUpdate { .. }
+        | AgentSessionEvent::MessageEnd { .. } => {
+            if let Some(message) = fields.get_mut("message") {
+                normalize_message(message);
+            }
+        }
+        // Tool execution events: strip null `details` from the result object.
+        AgentSessionEvent::ToolExecutionEnd { .. } => {
+            if let Some(result) = fields.get_mut("result") {
+                normalize_tool_result_null_details(result);
+            }
+        }
+        AgentSessionEvent::ToolExecutionUpdate { .. } => {
+            if let Some(result) = fields.get_mut("partialResult") {
+                normalize_tool_result_null_details(result);
+            }
+        }
+        // Turn end: normalize the completing message and each tool-result.
+        AgentSessionEvent::TurnEnd { .. } => {
+            if let Some(message) = fields.get_mut("message") {
+                normalize_message(message);
+            }
+            if let Some(Value::Array(results)) = fields.get_mut("toolResults") {
+                for result in results {
+                    normalize_tool_result_null_details(result);
+                }
+            }
+        }
+        // Agent end: normalize each produced message.
+        AgentSessionEvent::AgentEnd { .. } => {
+            if let Some(Value::Array(messages)) = fields.get_mut("messages") {
+                for message in messages {
+                    normalize_message(message);
+                }
+            }
+        }
+        // Entry appended: normalize a message entry's `message` field only.
+        AgentSessionEvent::EntryAppended { .. } => {
+            if let Some(entry) = fields.get_mut("entry") {
+                normalize_message_entry(entry);
+            }
+        }
+        // Explicitly no normalization required — exhaustively classified.
+        AgentSessionEvent::SessionBeforeSwitch { .. }
+        | AgentSessionEvent::SessionBeforeFork { .. }
+        | AgentSessionEvent::SessionStart { .. }
+        | AgentSessionEvent::SessionShutdown { .. }
+        | AgentSessionEvent::ModelSelect { .. }
+        | AgentSessionEvent::AgentStart
+        | AgentSessionEvent::TurnStart
+        | AgentSessionEvent::ToolExecutionStart { .. }
+        | AgentSessionEvent::AgentSettled
+        | AgentSessionEvent::QueueUpdate { .. }
+        | AgentSessionEvent::CompactionStart { .. }
+        | AgentSessionEvent::CompactionEnd { .. }
+        | AgentSessionEvent::SessionInfoChanged { .. }
+        | AgentSessionEvent::ThinkingLevelChanged { .. }
+        | AgentSessionEvent::AutoRetryStart { .. }
+        | AgentSessionEvent::AutoRetryEnd { .. }
+        | AgentSessionEvent::SummarizationRetryScheduled { .. }
+        | AgentSessionEvent::SummarizationRetryAttemptStart { .. }
+        | AgentSessionEvent::SummarizationRetryFinished
+        | AgentSessionEvent::BashExecutionUpdate { .. } => {}
+    }
+}
+
+/// Serialize an [`RpcResponse`] to a JSONL wire line.
+///
+/// Response-data normalization is driven by the compile-time-exhaustive
+/// [`command_response_normalization`] classification rather than a string
+/// allowlist. Opaque nested values are preserved byte-for-JSON-shape.
+fn serialize_response(response: &RpcResponse, kind: ResponseDataNormalization) -> String {
+    let Ok(mut wire) = serde_json::to_value(response) else {
+        return String::new();
+    };
+    if let Some(fields) = wire.as_object_mut()
+        && let Some(data) = fields.get_mut("data")
+    {
+        normalize_response_data_kind(data, kind);
+    }
+    serialize_json_line(&wire).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -702,7 +899,7 @@ impl ServerState {
         let event_tx = self.write_tx.clone();
         let signal = Arc::clone(&self.signal);
         let unsub = host.subscribe(Arc::new(move |event: &AgentSessionEvent| {
-            let _ = event_tx.send(WriteMessage::Line(to_jsonl(event)));
+            let _ = event_tx.send(WriteMessage::Line(serialize_event(event)));
             if matches!(event, AgentSessionEvent::AgentSettled) {
                 signal.notify_one();
             }
@@ -1408,7 +1605,10 @@ async fn spawn_prompt<H>(
                 .is_ok()
         {
             let response = RpcResponse::ok(success_id.clone(), "prompt");
-            let _ = success_tx.send(WriteMessage::Line(to_jsonl(&response)));
+            let _ = success_tx.send(WriteMessage::Line(serialize_response(
+                &response,
+                ResponseDataNormalization::None,
+            )));
         }
         // Unblock the dispatcher after preflight so later commands cannot
         // enqueue ahead of the prompt response.
@@ -1433,7 +1633,10 @@ async fn spawn_prompt<H>(
             && !error_flag.load(Ordering::SeqCst)
         {
             let response = RpcResponse::err(error_id, "prompt", msg);
-            let _ = error_tx.send(WriteMessage::Line(to_jsonl(&response)));
+            let _ = error_tx.send(WriteMessage::Line(serialize_response(
+                &response,
+                ResponseDataNormalization::None,
+            )));
         }
         // If preflight never fired (host bug / panic path), still release the
         // dispatcher so the command loop cannot hang forever.
@@ -1471,7 +1674,10 @@ where
         Ok(v) => v,
         Err(e) => {
             let response = RpcResponse::err(None, "parse", format!("Failed to parse command: {e}"));
-            state.enqueue(to_jsonl(&response));
+            state.enqueue(serialize_response(
+                &response,
+                ResponseDataNormalization::None,
+            ));
             return LineOutcome::Done;
         }
     };
@@ -1492,13 +1698,19 @@ where
                 "parse",
                 format!("Failed to parse command: {}", error.message),
             );
-            state.enqueue(to_jsonl(&response));
+            state.enqueue(serialize_response(
+                &response,
+                ResponseDataNormalization::None,
+            ));
             return LineOutcome::Done;
         }
     };
 
     if let Some(resp) = handle_command(&command, host, state).await {
-        state.enqueue(to_jsonl(&resp));
+        state.enqueue(serialize_response(
+            &resp,
+            command_response_normalization(&command),
+        ));
     }
 
     if state.shutdown_requested.load(Ordering::SeqCst) {
@@ -1607,7 +1819,10 @@ where
                             "transport",
                             format!("Failed to read stdin: {error}"),
                         );
-                        state.enqueue(to_jsonl(&response));
+                        state.enqueue(serialize_response(
+                            &response,
+                            ResponseDataNormalization::None,
+                        ));
                         break 1;
                     }
                     Some(LineMsg::Eof) | None => break 0,
@@ -1692,7 +1907,10 @@ where
                             "transport",
                             format!("Failed to read stdin: {error}"),
                         );
-                        state.enqueue(to_jsonl(&response));
+                        state.enqueue(serialize_response(
+                            &response,
+                            ResponseDataNormalization::None,
+                        ));
                         break 1;
                     }
                     Some(LineMsg::Eof) | None => break 0,
@@ -2916,7 +3134,7 @@ mod tests {
         // This ensures the host's emitted events go into the same write_tx queue.
         let event_tx = state.write_tx.clone();
         let unsub = host.subscribe(Arc::new(move |event: &AgentSessionEvent| {
-            let _ = event_tx.send(WriteMessage::Line(to_jsonl(event)));
+            let _ = event_tx.send(WriteMessage::Line(serialize_event(event)));
         }));
         *state.unsubscribe_events.lock().unwrap() = Some(unsub);
 
@@ -3429,5 +3647,69 @@ mod tests {
         assert_eq!(parsed["type"], "extension_error");
         assert_eq!(parsed["extensionPath"], "ext/path");
         assert_eq!(parsed["error"], "boom");
+    }
+
+    // -----------------------------------------------------------------------
+    // Typed classification path (compile-time exhaustive)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn serialize_event_normalizes_typed_message_start() {
+        // The typed serialization path must normalize user string content to
+        // content blocks, proving the exhaustive match dispatches
+        // normalization for message-bearing events.
+        let event: AgentSessionEvent = serde_json::from_value(serde_json::json!({
+            "type": "message_start",
+            "message": { "role": "user", "content": "hello", "timestamp": 1 }
+        }))
+        .expect("valid AgentSessionEvent");
+        let line = serialize_event(&event);
+        let parsed: Value = serde_json::from_str(&line).expect("valid JSONL");
+        assert_eq!(parsed["type"], "message_start");
+        let content = &parsed["message"]["content"];
+        assert!(
+            content.is_array(),
+            "typed path normalizes user string content to blocks"
+        );
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "hello");
+    }
+
+    #[test]
+    fn serialize_event_preserves_non_message_events() {
+        // Non-message-bearing events pass through the exhaustive
+        // classification as explicitly-not-required and are serialized
+        // unchanged.
+        let event: AgentSessionEvent =
+            serde_json::from_value(serde_json::json!({ "type": "turn_start" }))
+                .expect("valid AgentSessionEvent");
+        let line = serialize_event(&event);
+        let parsed: Value = serde_json::from_str(&line).expect("valid JSONL");
+        assert_eq!(parsed["type"], "turn_start");
+        assert_eq!(parsed.as_object().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn serialize_response_normalizes_typed_get_messages() {
+        // The typed response path must normalize response data through the
+        // command_response_normalization classification, not a string allowlist.
+        let response: RpcResponse = serde_json::from_value(serde_json::json!({
+            "type": "response",
+            "command": "get_messages",
+            "success": true,
+            "data": {
+                "messages": [{ "role": "user", "content": "hi", "timestamp": 1 }]
+            }
+        }))
+        .expect("valid RpcResponse");
+        let line = serialize_response(&response, ResponseDataNormalization::Messages);
+        let parsed: Value = serde_json::from_str(&line).expect("valid JSONL");
+        let content = &parsed["data"]["messages"][0]["content"];
+        assert!(
+            content.is_array(),
+            "typed response path normalizes user string content"
+        );
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "hi");
     }
 }

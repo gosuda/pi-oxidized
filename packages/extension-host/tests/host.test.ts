@@ -1393,8 +1393,9 @@ describe("host: protocol extension order", () => {
 			'  pi.registerCommand("lateCmd", { description: "late", async handler(_a, ctx) { ctx.ui.notify("late", "info"); } });\n' +
 			'}\n',
 		);
+		let connected: Connected | undefined;
 		try {
-			const connected = await connectHost([toolFactory]);
+			connected = await connectHost([toolFactory]);
 			const { collector, stdin } = connected;
 
 			push(stdin, {
@@ -1426,8 +1427,10 @@ describe("host: protocol extension order", () => {
 			expect(afterLateLoad[1]).toBe(builtin);
 			expect(afterLateLoad[2]?.commands.has("lateCmd")).toBe(true);
 
-			await teardown(connected);
 		} finally {
+			if (connected) {
+				await teardown(connected);
+			}
 			await rm(dir, { recursive: true, force: true });
 		}
 	});

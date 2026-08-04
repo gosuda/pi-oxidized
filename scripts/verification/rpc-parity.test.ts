@@ -5,10 +5,15 @@ import {
 	AUTHORITATIVE_RPC_TYPES_PATH,
 	assertFullCoverage,
 	buildScenario,
+	buildScenarioStep,
 	canonicalStringify,
 	deriveRpcCommandTypes,
+	drainStream,
 	normalizeTranscript,
+	PumpErrorHolder,
+	recordPumpFailure,
 	scenarioCommandTypes,
+	TranscriptWaiter,
 } from "./rpc-parity.ts";
 
 test("derives the authoritative RPC command set from the source-pinned union", () => {
@@ -39,16 +44,13 @@ test("scenario covers every authoritative command exactly", () => {
 });
 
 test("settle and harvest options compose on the same scenario step without loss", () => {
-	const scenario = buildScenario();
-	// The step helper must spread both settle and harvest onto the step,
-	// not use if/return which silently drops one option.
-	for (const step of scenario) {
-		if (step.settle !== undefined) expect(step.settle).toBe(true);
-		if (step.harvest !== undefined) expect(typeof step.harvest).toBe("function");
-	}
-	// At least one step exercises each option to guard against regression.
-	expect(scenario.some((s) => s.settle === true)).toBe(true);
-	expect(scenario.some((s) => s.harvest !== undefined)).toBe(true);
+	// The step helper must spread both settle and harvest onto the SAME object,
+	// not use if/return which silently drops one option. Build a step that asks
+	// for both and require the returned object to carry both — separate
+	// .some() checks across different steps cannot catch the dropped option.
+	const step = buildScenarioStep("get_state", {}, { settle: true, harvest: () => {} }, 99);
+	expect(step.settle).toBe(true);
+	expect(typeof step.harvest).toBe("function");
 });
 
 test("manual RPC correlation ids are ordered from c23 onward with no collisions", () => {
@@ -141,4 +143,77 @@ test("streaming delta runs collapse; boundary events keep full payloads", () => 
 test("canonicalStringify ignores object key order but not values", () => {
 	expect(canonicalStringify({ b: 1, a: [{ d: 2, c: 3 }] })).toBe(canonicalStringify({ a: [{ c: 3, d: 2 }], b: 1 }));
 	expect(canonicalStringify({ a: 1 })).not.toBe(canonicalStringify({ a: 2 }));
+});
+
+test("a stderr stream failure is observed and cannot remain unhandled", async () => {
+	const transcript = new TranscriptWaiter();
+	const holder: PumpErrorHolder = { pumpError: null };
+	const failure = new Error("stderr stream exploded");
+
+	async function* explodingStream(): AsyncIterable<Uint8Array> {
+		throw failure;
+	}
+
+	// A waiter is pending; the unguarded pump would have left it hanging forever.
+	const pending = transcript.waitFor((record) => record.type === "response", 0, 60_000, "probe");
+	// abort() rejects this waiter synchronously through the pump; observe the
+	// rejection eagerly so it is never momentarily unhandled while we await.
+	pending.catch(() => {});
+
+	const stderrPump = drainStream(
+		explodingStream(),
+		() => {},
+		(error) => recordPumpFailure(error, holder, transcript),
+	);
+
+	// The pump promise resolves on failure instead of becoming an unhandled rejection.
+	await expect(stderrPump).resolves.toBeUndefined();
+	// The real Error object is recorded in shared state, not stringified away.
+	expect(holder.pumpError).toBe(failure);
+	// The pending waiter was woken through the existing abort mechanism.
+	await expect(pending).rejects.toBe(failure);
+});
+
+test("drainStream drains chunks normally and forwards a mid-stream failure without rejecting", async () => {
+	const failure = new Error("stderr stream exploded");
+	async function* partialStream(): AsyncIterable<Uint8Array> {
+		yield new Uint8Array([0x68, 0x69]); // "hi"
+		throw failure;
+	}
+
+	const chunks: Uint8Array[] = [];
+	const failures: unknown[] = [];
+	const pump = drainStream(partialStream(), (chunk) => chunks.push(chunk), (error) => failures.push(error));
+
+	await expect(pump).resolves.toBeUndefined();
+	expect(chunks.map((chunk) => new TextDecoder().decode(chunk))).toEqual(["hi"]);
+	expect(failures).toEqual([failure]);
+	expect(drainStream(null, () => {}, () => {})).resolves.toBeUndefined();
+});
+
+test("recordPumpFailure preserves the original diagnostic and aborts waiters with it", async () => {
+	const transcript = new TranscriptWaiter();
+	const holder: PumpErrorHolder = { pumpError: null };
+	const original = new Error("stderr pump died");
+
+	const pending = transcript.waitFor((record) => record.type === "response", 0, 60_000, "probe");
+	pending.catch(() => {});
+
+	// A real Error is preserved by reference, not reduced to a string message.
+	recordPumpFailure(original, holder, transcript);
+	expect(holder.pumpError).toBe(original);
+	await expect(pending).rejects.toBe(original);
+
+	// A non-Error is normalized to a real Error carrying the original text.
+	const holder2: PumpErrorHolder = { pumpError: null };
+	recordPumpFailure("raw stderr fault", holder2, { abort: () => {} });
+	expect(holder2.pumpError).toBeInstanceOf(Error);
+	expect((holder2.pumpError as Error).message).toBe("raw stderr fault");
+
+	// The first failure owns the shared slot, so the original diagnostic survives a later one.
+	const shared: PumpErrorHolder = { pumpError: null };
+	const noop = { abort: () => {} };
+	recordPumpFailure(new Error("first"), shared, noop);
+	recordPumpFailure(new Error("second"), shared, noop);
+	expect(shared.pumpError?.message).toBe("first");
 });

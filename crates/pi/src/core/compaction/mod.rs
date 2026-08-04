@@ -939,14 +939,13 @@ where
     let mut attempt = 0_u32;
     let mut retried = false;
 
+    let finish_callback = callbacks.and_then(|callbacks| callbacks.on_retry_finished.as_ref());
+
     loop {
         let response = match produce().await {
             Ok(response) => response,
             Err(error) => {
-                if retried
-                    && let Some(callback) =
-                        callbacks.and_then(|callbacks| callbacks.on_retry_finished.as_ref())
-                {
+                if retried && let Some(callback) = finish_callback {
                     callback();
                 }
                 return Err(error);
@@ -954,10 +953,7 @@ where
         };
 
         if response.stop_reason == StopReason::Aborted {
-            if retried
-                && let Some(callback) =
-                    callbacks.and_then(|callbacks| callbacks.on_retry_finished.as_ref())
-            {
+            if retried && let Some(callback) = finish_callback {
                 callback();
             }
             return Ok(response);
@@ -967,10 +963,7 @@ where
             || attempt >= max_retries
             || !crate::core::agent_session::retry::is_retryable_assistant_error(&response)
         {
-            if retried
-                && let Some(callback) =
-                    callbacks.and_then(|callbacks| callbacks.on_retry_finished.as_ref())
-            {
+            if retried && let Some(callback) = finish_callback {
                 callback();
             }
             return Ok(response);
@@ -1007,9 +1000,7 @@ where
             false
         };
         if cancelled {
-            if let Some(callback) =
-                callbacks.and_then(|callbacks| callbacks.on_retry_finished.as_ref())
-            {
+            if let Some(callback) = finish_callback {
                 callback();
             }
             let mut aborted = response;

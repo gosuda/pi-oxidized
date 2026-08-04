@@ -653,6 +653,22 @@ function scanModuleLoads(source: string): ModuleLoadScan {
 				continue;
 			}
 		}
+		// `getBuiltinModule` returns a built-in module by string name, so it
+		// bypasses the excluded-specifier graph the same way `require` does —
+		// e.g. `getBuiltinModule("module")` hands back the excluded `module`
+		// builtin whose `createRequire` would then be a member call and slip
+		// past the guard above. Fail closed on any non-member call regardless
+		// of how the identifier entered scope (global, destructured, re-exported,
+		// or escaped); a member property access stays an ordinary property name.
+		if (word === "getBuiltinModule" && !isMember) {
+			const next = skipInsignificant(index);
+			if (source[next] === "(") {
+				unsupported ??= "getBuiltinModule loader";
+				lastSignificant = { kind: "punctuator", value: "(" };
+				index = next + 1;
+				continue;
+			}
+		}
 		if ((word !== "import" && word !== "export") || isMember) continue;
 		if (word === "export") {
 			index = scanFromClause(index);

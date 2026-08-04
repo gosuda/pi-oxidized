@@ -2127,14 +2127,31 @@ mod tests {
 
     #[test]
     fn deeply_nested_blockquote_does_not_exhaust_stack() {
-        // 200 levels of nesting would overflow the call stack with the old
-        // recursive render_quoted_segments; the iterative traversal handles
-        // it without panic.
-        let src = "> x".repeat(200);
-        let lines = plain_default(&src, 80);
+        // A genuinely 200-level-deep CommonMark blockquote: every `> ` marker
+        // opens one nesting level, so the source is `> > > … > x`. The earlier
+        // fixture `"> x".repeat(200)` was a single flat one-level line and
+        // proved nothing about nested rendering.
+        //
+        // The iterative `render_quoted_segments` walks nesting on an explicit
+        // heap stack instead of the call stack. Width must exceed ~2× the
+        // depth: each level consumes a 2-column border, and once the per-level
+        // content width saturates to 1 the ANSI wrapper splits accumulated
+        // border lines into per-grapheme pieces, exploding the line count
+        // exponentially (depth 200 at width 80 hangs on this very renderer).
+        let src = format!("{}x", "> ".repeat(200));
+        let lines = plain_default(&src, 600);
+        // Rendering must complete and yield output rather than panicking.
         assert!(!lines.is_empty(), "should render without panic");
-        // Every visible line must carry at least one quote border.
+        // Every visible line sits inside the outermost quote and carries its border.
         assert!(lines.iter().all(|line| line.contains('│')), "{lines:?}");
+        // Proof of real nesting: the flat fixture renders a single 1-level
+        // quote (one border column); 200 nested levels render ~200 distinct
+        // border columns on the line.
+        let border_columns = lines.first().map_or(0, |line| line.matches('│').count());
+        assert!(
+            border_columns >= 100,
+            "expected deep nesting, found only {border_columns} border columns in {lines:?}"
+        );
     }
 
     #[test]

@@ -477,6 +477,65 @@ describe("lean: extensions.load registry", () => {
 			await rm(directory, { recursive: true, force: true });
 		}
 	});
+	test("rejects getBuiltinModule loader bypasses before evaluation", async () => {
+		const directory = await mkdtemp(join(PACKAGE_DIR, ".test-lean-get-builtin-module-"));
+		const bareEntry = join(directory, "get-builtin-module.mjs");
+		const aliasedEntry = join(directory, "aliased-get-builtin-module.mjs");
+		const escapedEntry = join(directory, "escaped-get-builtin-module.mjs");
+		const memberEntry = join(directory, "member-get-builtin-module.mjs");
+		const holder = globalThis as Record<string, unknown>;
+		const link = new LeanLink({ cwd: directory, extensionPaths: [] });
+		try {
+			await Promise.all([
+				writeFile(
+					bareEntry,
+					'globalThis.__leanGetBuiltinModuleEvaluated = true; const m = getBuiltinModule("module"); m.createRequire(import.meta.url)("jiti"); export default { name: "bare-get-builtin-module" };',
+				),
+				writeFile(
+					aliasedEntry,
+					'globalThis.__leanAliasedGetBuiltinModuleEvaluated = true; const { getBuiltinModule } = process; const m = getBuiltinModule("module"); m.createRequire(import.meta.url)("jiti"); export default { name: "aliased-get-builtin-module" };',
+				),
+				writeFile(
+					escapedEntry,
+					'globalThis.__leanEscapedGetBuiltinModuleEvaluated = true; const m = \\u{67}etBuiltinModule("module"); m.createRequire(import.meta.url)("jiti"); export default { name: "escaped-get-builtin-module" };',
+				),
+				writeFile(
+					memberEntry,
+					'globalThis.__leanMemberGetBuiltinModuleEvaluated = true; const obj = { getBuiltinModule: () => null }; obj.getBuiltinModule("module"); export default { name: "member-get-builtin-module" };',
+				),
+			]);
+			await link.hello(1);
+			link.request(2, "extensions.load", {
+				extensionPaths: [bareEntry, aliasedEntry, escapedEntry, memberEntry],
+				cwd: directory,
+			});
+			const response = payload(await link.response(2, "extensions.load"));
+			const errors = new Map(
+				(response["errors"] as Array<{ path: string; error: string }>).map(
+					(error) => [error.path, error.error],
+				),
+			);
+			// Every non-member getBuiltinModule call is rejected as an
+			// unsupported loader form before evaluation, regardless of how the
+			// identifier entered scope (global, destructured from process, or
+			// Unicode-escaped) — the member createRequire chain is never reached.
+			expect(errors.get(bareEntry)).toContain("unsupported getBuiltinModule loader");
+			expect(errors.get(aliasedEntry)).toContain("unsupported getBuiltinModule loader");
+			expect(errors.get(escapedEntry)).toContain("unsupported getBuiltinModule loader");
+			// A member-access getBuiltinModule is a property name, not a loader.
+			expect(errors.has(memberEntry)).toBe(false);
+			expect(holder["__leanGetBuiltinModuleEvaluated"]).toBeUndefined();
+			expect(holder["__leanAliasedGetBuiltinModuleEvaluated"]).toBeUndefined();
+			expect(holder["__leanEscapedGetBuiltinModuleEvaluated"]).toBeUndefined();
+		} finally {
+			delete holder["__leanGetBuiltinModuleEvaluated"];
+			delete holder["__leanAliasedGetBuiltinModuleEvaluated"];
+			delete holder["__leanEscapedGetBuiltinModuleEvaluated"];
+			delete holder["__leanMemberGetBuiltinModuleEvaluated"];
+			await link.finish();
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
 
 	test("finds excluded imports through Bun extensionless and directory-index local paths", async () => {
 		const directory = await mkdtemp(join(PACKAGE_DIR, ".test-lean-extensionless-import-"));
@@ -2538,13 +2597,32 @@ describe("lean: subprocess graph-absence proof", () => {
 			const exitCode = await withTimeout(exited, "process exit");
 			expect(exitCode).toBe(0);
 
-			// Positive evidence: the lean graph resolved; the compat graph never did.
+			// Each resolve-log line is "<specifier>\t<importer>", mirroring the
+			// production onResolve hook (args.path then args.importer). The
+			// production FORBIDDEN gate tests only the specifier column, so these
+			// assertions key off it too — a raw substring search over the whole
+			// log false-matches node_modules importer paths: the old
+			// /(?:node:)?module/ regex matched the "module" inside "node_modules".
 			const log = readFileSync(resolveLog, "utf8");
-			expect(log).toContain("./lean-runner.ts");
-			expect(log).not.toMatch(/host\.ts/);
-			expect(log).not.toMatch(/virtual-modules/);
-			expect(log).not.toMatch(/pi-coding-agent/);
-			expect(log).not.toMatch(/(?:node:)?module/);
+			const specifiers = log
+				.split("\n")
+				.filter((line) => line.trim() !== "")
+				.map((line) => {
+					const tab = line.indexOf("\t");
+					return tab === -1 ? line : line.slice(0, tab);
+				});
+
+			// Positive evidence: the lean entry resolved.
+			expect(specifiers).toContain("./lean-runner.ts");
+			// Compat-graph specifiers never resolved — matched on the specifier
+			// column, never the importer.
+			expect(specifiers.some((s) => s.includes("host.ts"))).toBe(false);
+			expect(specifiers.some((s) => s.includes("virtual-modules"))).toBe(false);
+			expect(specifiers.some((s) => s.includes("pi-coding-agent"))).toBe(false);
+			// The module specifier is matched exactly: only the bare specifier
+			// "module" or "node:module" is forbidden, never a node_modules path.
+			expect(specifiers).not.toContain("module");
+			expect(specifiers).not.toContain("node:module");
 		} finally {
 			// Never orphan the graph-proof subprocess: a failed expect or a
 			// withTimeout rejection on a wedged child leaves it running with an

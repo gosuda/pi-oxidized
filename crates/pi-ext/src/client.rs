@@ -37,6 +37,8 @@ use std::process::Stdio;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+#[cfg(test)]
+use tokio::sync::Notify;
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
@@ -189,6 +191,11 @@ struct Shared {
     stderr: StdMutex<String>,
     /// Cleared once the reader or writer observes end-of-stream.
     running: AtomicBool,
+    /// Test-only: signaled once a background cancel cleanup completes so
+    /// regression tests await the real cleanup rather than guessing with
+    /// yield loops.
+    #[cfg(test)]
+    cancel_cleanup_done: Notify,
 }
 
 /// Typed unsolicited event delivered to subscribers.
@@ -408,6 +415,8 @@ impl HostClient {
             next_pending_generation: AtomicU64::new(1),
             stderr: StdMutex::new(String::new()),
             running: AtomicBool::new(true),
+            #[cfg(test)]
+            cancel_cleanup_done: Notify::new(),
         });
 
         let writer_shared = Arc::clone(&shared);
@@ -1388,6 +1397,8 @@ fn cancel_pending(
             runtime.spawn(async move {
                 let _ = tx.send(cancel).await;
                 remove_cancelling_pending(&shared, id, generation);
+                #[cfg(test)]
+                shared.cancel_cleanup_done.notify_one();
             });
             CancellationStart::QueuedInBackground
         }
@@ -2179,15 +2190,16 @@ mod tests {
         assert_eq!(cancel.method, "provider.cancel");
         assert_eq!(cancel.payload["id"], id);
 
-        // Give the background cleanup task a chance to run after its send
-        // completed; it must NOT remove the newer-generation entry.
-        tokio::time::timeout(Duration::from_millis(100), async {
-            for _ in 0..100 {
-                tokio::task::yield_now().await;
-            }
-        })
+        // Await the background cleanup completion signal before asserting.
+        // The cleanup task calls `notify_one` after `remove_cancelling_pending`;
+        // awaiting it proves the cleanup actually ran, so the test cannot pass
+        // merely because cancellation was requested while cleanup never ran.
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            shared.cancel_cleanup_done.notified(),
+        )
         .await
-        .map_err(|_| "cleanup yield loop timed out")?;
+        .map_err(|_| "background cancel cleanup did not complete")?;
 
         let (survives, surviving_gen, cancelling) = {
             let pending = shared

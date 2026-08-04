@@ -430,6 +430,12 @@ fn bash_execution_payload(
 /// delta (computed under a `previous` lock) and the callback (invoked under a
 /// separate `callback` lock) can be reordered, causing the consumer to
 /// receive chunks out of order.
+///
+/// If the user callback panics, the unwind is caught at this invocation
+/// boundary. The callback and all queue/state invariants are restored while
+/// the guard is still held, the guard is released, and the original unwind is
+/// resumed. This keeps the mutex unpoisoned so later queued callbacks continue
+/// to be delivered in FIFO order; the panic is never swallowed or translated.
 fn make_chunk_channel<F>(
     on_chunk: Option<F>,
 ) -> (pi_agent::ToolUpdates, tokio::sync::mpsc::Receiver<()>)
@@ -480,10 +486,22 @@ where
         let Some(mut cb) = guard.callback.take() else {
             return;
         };
-        cb(&delta);
+        // Invoke the user callback with the guard held so delta delivery and
+        // notification stay serialized. If the callback panics, catch the
+        // unwind, restore the callback and queue invariants while we still
+        // own the guard, then drop the guard and resume the original unwind.
+        // The mutex is left unpoisoned, so later queued callbacks continue to
+        // be delivered in FIFO order; the panic is never swallowed.
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(&delta)));
         guard.callback = Some(cb);
+        // We are done mutating state under the guard; drop it before resuming
+        // the unwind so the mutex is released cleanly.
         if let Some(tx) = guard.tx.as_ref() {
             let _ = tx.try_send(());
+        }
+        drop(guard);
+        if let Err(payload) = panic {
+            std::panic::resume_unwind(payload);
         }
     });
 
@@ -771,6 +789,76 @@ mod tests {
             received.len(),
             8,
             "every concurrent delta must be delivered"
+        );
+    }
+
+    /// Regression: a panicking user callback must propagate the panic, must not
+    /// poison the sink mutex, must restore the callback, and must leave later
+    /// queued callbacks delivering in FIFO order.
+    #[test]
+    fn chunk_channel_callback_panic_restores_invariants_and_keeps_fifo() {
+        let received = Arc::new(Mutex::new(Vec::<String>::new()));
+        let received_clone = Arc::clone(&received);
+        let (updates, _rx) = make_chunk_channel(Some(move |delta: &str| {
+            received_clone
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(delta.to_owned());
+            if delta == "boom" {
+                std::panic::resume_unwind(Box::new("callback exploded on boom".to_owned()));
+            }
+        }));
+
+        let partial = |text: &str| pi_agent::AgentToolResult {
+            content: vec![pi_ai::ToolResultContent::Text(pi_ai::TextContent::new(
+                text,
+            ))],
+            details: serde_json::Value::Null,
+            added_tool_names: None,
+            terminate: None,
+        };
+
+        // First chunk delivered normally.
+        updates.send(partial("before"));
+
+        // Second chunk triggers the panic. It must propagate out of `send`.
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            updates.send(partial("beforeboom"));
+        }));
+        assert!(
+            panicked.is_err(),
+            "the callback panic must propagate out of send, not be swallowed"
+        );
+        let payload_msg: Option<&str> = panicked
+            .as_ref()
+            .err()
+            .and_then(|p| p.downcast_ref::<String>().map(String::as_str))
+            .or_else(|| {
+                panicked
+                    .as_ref()
+                    .err()
+                    .and_then(|p| p.downcast_ref::<&str>().copied())
+            });
+        assert_eq!(
+            payload_msg,
+            Some("callback exploded on boom"),
+            "the original panic payload must be resumed unchanged"
+        );
+
+        // After the panic, the sink must still be usable: the mutex is
+        // unpoisoned and the callback was restored. A later chunk must
+        // deliver in FIFO order relative to the already-received ones.
+        updates.send(partial("beforeboomafter"));
+
+        let received = received
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // "before" delivered; "boom" panicked after being pushed; "after"
+        // delivered. FIFO order preserved across the panic.
+        assert_eq!(
+            received.as_slice(),
+            ["before", "boom", "after"],
+            "callback must be restored and FIFO delivery must continue after a panic"
         );
     }
 }

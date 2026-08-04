@@ -727,7 +727,17 @@ fn import_publication_preserves_both_link_and_move_errors() -> TestResult {
     let result = publish_no_replace_with(
         &staged,
         &destination,
-        |_, _| Err(io::Error::from_raw_os_error(18)), // EXDEV — cross-device link
+        // Simulate EXDEV with an explicit, deterministic message. `from_raw_os_error`
+        // surfaces platform/locale-specific `strerror` text (e.g. "Invalid
+        // cross-device link" on Linux), so the assertion below could not be relied
+        // on across targets. `CrossesDevices` is the kind a real cross-device
+        // `hard_link` yields, and the message text is fully under our control.
+        |_, _| {
+            Err(io::Error::new(
+                io::ErrorKind::CrossesDevices,
+                "cross-device link not permitted",
+            ))
+        },
         |_, _| {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,

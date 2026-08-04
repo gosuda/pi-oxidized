@@ -105,9 +105,7 @@ async function run(argv: string[], env?: Record<string, string>): Promise<void> 
 
 export async function reopenWithSourcePinnedTypescript(
 	root: string,
-	options: { preserveHistoricalPrefix?: boolean } = {},
 ): Promise<number> {
-	const preserveHistoricalPrefix = options.preserveHistoricalPrefix ?? true;
 	const SessionManager = await referenceSessionManager();
 	const files = await jsonlFiles(root);
 	assert(files.length > 0, `Rust proof did not produce session files under ${root}`);
@@ -124,22 +122,20 @@ export async function reopenWithSourcePinnedTypescript(
 		if (after.includes(OPAQUE_ENTRY_MARKER)) {
 			preservedUnknownEntry = true;
 		}
-		if (preserveHistoricalPrefix) {
-			if (versionBefore >= 3) {
-				// Already-current sessions must not be rewritten on reopen.
+		if (versionBefore >= 3) {
+			// Already-current sessions must not be rewritten on reopen.
+			assert(
+				Buffer.compare(before, after) === 0,
+				`TypeScript reopen rewrote historical JSONL: ${relative(REPO_ROOT, file)}`,
+			);
+		} else {
+			// v1/v2 sessions are migrated to v3 on reopen; verify opaque
+			// entries survive the migration rather than asserting byte equality.
+			if (before.includes(OPAQUE_ENTRY_MARKER)) {
 				assert(
-					Buffer.compare(before, after) === 0,
-					`TypeScript reopen rewrote historical JSONL: ${relative(REPO_ROOT, file)}`,
+					after.includes(OPAQUE_ENTRY_MARKER),
+					`TypeScript reopen dropped opaque future_thing entry during migration: ${relative(REPO_ROOT, file)}`,
 				);
-			} else {
-				// v1/v2 sessions are migrated to v3 on reopen; verify opaque
-				// entries survive the migration rather than asserting byte equality.
-				if (before.includes(OPAQUE_ENTRY_MARKER)) {
-					assert(
-						after.includes(OPAQUE_ENTRY_MARKER),
-						`TypeScript reopen dropped opaque future_thing entry during migration: ${relative(REPO_ROOT, file)}`,
-					);
-				}
 			}
 		}
 		assert(manager.getHeader()?.version === 3, `TypeScript reopen did not see v3 header: ${file}`);

@@ -1891,7 +1891,7 @@ impl ExtensionRuntimeSet {
                 message: error.to_string(),
             });
             stop_generation(&next).await;
-            return Err(HostStartError::Load(error.to_string()));
+            return Err(HostStartError::Load(summarize_diagnostics(&diagnostics)));
         }
         if !self.state().reloadable() {
             stop_generation(&next).await;
@@ -3080,6 +3080,16 @@ fn unregister_endpoint_providers(endpoints: &[Endpoint], runtime: &ModelRuntime)
 
 fn endpoint_diagnostic_path(endpoint: &Endpoint) -> String {
     endpoint.label.clone()
+}
+
+/// Render every reload diagnostic in collection order so a failed prepare
+/// surfaces the full path-scoped failure history, not just the terminal error.
+fn summarize_diagnostics(diagnostics: &[ExtensionSetDiagnostic]) -> String {
+    diagnostics
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 async fn apply_flags_to_generation(
@@ -4515,6 +4525,123 @@ pub(crate) mod tests {
         );
         assert!(set.is_active());
         assert_eq!(set.reload_generation(), 1);
+        replacement_host.wait_for_exit().await?;
+        set.shutdown_once().await;
+        old_host.wait_for_exit().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prepare_reload_preserves_all_diagnostics_on_provider_validation_failure() -> TestResult
+    {
+        // Old generation carries a valid provider that must stay published.
+        let old_provider = json!({
+            "name": "old-provider",
+            "baseUrl": "https://old.example/v1",
+            "api": "openai-completions",
+            "models": [{
+                "id": "old-model",
+                "name": "Old model",
+                "api": "openai-completions",
+                "baseUrl": "https://old.example/v1",
+                "reasoning": false
+            }]
+        });
+        let (old, old_host) = make_runner(json!({
+            "providers": [old_provider],
+            "handlers": ["input"],
+            "terminalInput": false
+        }))
+        .await?;
+        // Replacement carries an invalid provider (no api/baseUrl) so
+        // validate_generation_providers fails during prepare_reload.
+        let (replacement, replacement_host) = make_runner(json!({
+            "providers": [{
+                "name": "invalid-provider",
+                "models": [{"id": "invalid-model", "reasoning": false}]
+            }],
+            "handlers": [],
+            "terminalInput": false
+        }))
+        .await?;
+        let (generation, pending) =
+            generation_from_endpoints(1, vec![(EndpointKind::TsCompat, "<old>".to_owned(), old)]);
+        let set = Arc::new(ExtensionRuntimeSet::from_generation(
+            generation,
+            Vec::new(),
+            String::new(),
+            false,
+        ));
+        set.install(pending);
+        let runtime = ModelRuntime::create_in_memory().await?;
+        assert!(
+            set.register_providers_on(&runtime)
+                .into_iter()
+                .all(|(_path, result)| result.is_ok())
+        );
+        let provider_epoch = runtime.provider_mutation_epoch();
+
+        // Inject the invalid replacement together with a load diagnostic so the
+        // candidate generation accumulates diagnostics before validation fails.
+        let (replacement_generation, replacement_pending) = generation_from_endpoints(
+            2,
+            vec![(
+                EndpointKind::TsCompat,
+                "<replacement>".to_owned(),
+                replacement,
+            )],
+        );
+        set.inject_prepared_replacement_with_diagnostics_for_reload(
+            replacement_generation,
+            replacement_pending,
+            vec![ExtensionSetDiagnostic {
+                path: "broken-sibling.ts".to_owned(),
+                message: "load failed".to_owned(),
+            }],
+        );
+
+        // No preserved flags, so flag sync succeeds and prepare_reload reaches
+        // provider validation. Every collected diagnostic must survive the error.
+        let Err(error) = set.prepare_reload(HashMap::new()).await else {
+            return Err("prepare_reload unexpectedly succeeded with an invalid provider".into());
+        };
+        let HostStartError::Load(message) = error else {
+            return Err(format!("expected HostStartError::Load, got {error}").into());
+        };
+        assert!(
+            message.contains("broken-sibling.ts"),
+            "collected load diagnostic path was lost: {message}"
+        );
+        assert!(
+            message.contains("load failed"),
+            "collected load diagnostic message was lost: {message}"
+        );
+        assert!(
+            message.contains("invalid-provider"),
+            "provider validation path was lost: {message}"
+        );
+        assert!(
+            message.contains("no \"api\" specified"),
+            "provider validation error was lost: {message}"
+        );
+
+        // The live generation is unchanged: no new generation, old provider
+        // still published, replacement never registered.
+        assert!(set.is_active());
+        assert_eq!(set.reload_generation(), 1);
+        assert_eq!(runtime.provider_mutation_epoch(), provider_epoch);
+        assert!(
+            runtime
+                .get_registered_provider_config("old-provider")
+                .is_some(),
+            "old provider must remain published"
+        );
+        assert!(
+            runtime
+                .get_registered_provider_config("invalid-provider")
+                .is_none(),
+            "invalid replacement provider must not publish"
+        );
         replacement_host.wait_for_exit().await?;
         set.shutdown_once().await;
         old_host.wait_for_exit().await?;

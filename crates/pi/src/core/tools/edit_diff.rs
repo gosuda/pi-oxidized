@@ -924,6 +924,11 @@ fn collapse_ops(ops: &[Op]) -> Vec<DiffPart> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Alphabet for `overlapping_edits_are_rejected`; the generated length is
+    /// bounded by its actual length so the slice indices stay valid even if
+    /// the literal is edited.
+    const OVERLAP_ALPHABET: &str = "abcdefghijklmnopqrstuvw";
+
     use proptest::prelude::*;
 
     proptest! {
@@ -950,8 +955,8 @@ mod tests {
         }
 
         #[test]
-        fn overlapping_edits_are_rejected(length in 3_usize..24) {
-            let original = "abcdefghijklmnopqrstuvw"[..length].to_owned();
+        fn overlapping_edits_are_rejected(length in 3_usize..=OVERLAP_ALPHABET.len()) {
+            let original = OVERLAP_ALPHABET[..length].to_owned();
             let first = original[..length - 1].to_owned();
             let second = original[1..].to_owned();
             let result = apply_edits_to_normalized_content(&original, &[

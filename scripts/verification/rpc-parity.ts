@@ -148,6 +148,27 @@ function responseData(response: JsonObject, label: string): JsonObject {
 }
 
 /**
+ * Build one scenario step. Both `settle` and `harvest` are spread onto the
+ * returned object so a single step can carry both — never an if/return that
+ * silently drops one option.
+ */
+export function buildScenarioStep(
+	commandType: string,
+	fields: JsonObject,
+	options: { settle?: boolean; suffix?: string; harvest?: ScenarioStep["harvest"] } = {},
+	sequence: number,
+): ScenarioStep {
+	const name = `c${String(sequence).padStart(2, "0")}-${commandType}${options.suffix ?? ""}`;
+	return {
+		name,
+		commandType,
+		build: () => ({ id: name, type: commandType, ...fields }),
+		...(options.settle === true ? { settle: true } : {}),
+		...(options.harvest ? { harvest: options.harvest } : {}),
+	};
+}
+
+/**
  * Dependency-valid replay order: state-free commands run on the fresh
  * session, prompts create history, then history-dependent commands harvest
  * real ids from prior responses. Expected errors are parity outcomes, not
@@ -161,14 +182,7 @@ export function buildScenario(): ScenarioStep[] {
 		options: { settle?: boolean; suffix?: string; harvest?: ScenarioStep["harvest"] } = {},
 	): ScenarioStep => {
 		sequence += 1;
-		const name = `c${String(sequence).padStart(2, "0")}-${commandType}${options.suffix ?? ""}`;
-		return {
-			name,
-			commandType,
-			build: () => ({ id: name, type: commandType, ...fields }),
-			...(options.settle === true ? { settle: true } : {}),
-			...(options.harvest ? { harvest: options.harvest } : {}),
-		};
+		return buildScenarioStep(commandType, fields, options, sequence);
 	};
 
 	const steps: ScenarioStep[] = [
@@ -444,7 +458,7 @@ interface DriveResult {
 	readonly stderrTail: string;
 }
 
-class TranscriptWaiter {
+export class TranscriptWaiter {
 	readonly records: JsonObject[] = [];
 	private waiters: Array<{
 		readonly from: number;
@@ -508,6 +522,48 @@ class TranscriptWaiter {
 	}
 }
 
+/**
+ * Single ownership contract shared by the stdout and stderr stream pumps: the
+ * first async-iterator failure is normalized to a real Error, recorded in
+ * shared state, and broadcast to every pending transcript waiter — so a stream
+ * pump death surfaces as a scenario failure instead of stalling a `waitFor` or
+ * leaking an unhandled rejection. The first failure owns the shared slot (the
+ * original diagnostic is preserved); `transcript.abort` is idempotent, so a
+ * later failure on the other stream still reaches any waiters.
+ */
+export interface PumpErrorHolder {
+	pumpError: Error | null;
+}
+
+export function recordPumpFailure(
+	error: unknown,
+	holder: PumpErrorHolder,
+	transcript: { abort(error: Error): void },
+): void {
+	const normalized = error instanceof Error ? error : new Error(String(error));
+	if (holder.pumpError === null) holder.pumpError = normalized;
+	transcript.abort(holder.pumpError);
+}
+
+/**
+ * Iterate `stream` into `onChunk`, forwarding any async-iterator failure to
+ * `onFailure` instead of rejecting. Resolving (rather than rejecting) on
+ * failure is what keeps a stream pump from becoming an unhandled rejection:
+ * the failure is observed solely through `onFailure`, which records and aborts.
+ */
+export async function drainStream(
+	stream: AsyncIterable<Uint8Array> | null,
+	onChunk: (chunk: Uint8Array) => void,
+	onFailure: (error: unknown) => void,
+): Promise<void> {
+	if (stream === null) return;
+	try {
+		for await (const chunk of stream) onChunk(chunk);
+	} catch (error) {
+		onFailure(error);
+	}
+}
+
 function processEnvironment(runRoot: string): Record<string, string> {
 	const env: Record<string, string> = {
 		...(process.env as Record<string, string>),
@@ -565,13 +621,16 @@ async function driveBinary(label: string, argv: readonly string[], runRoot: stri
 
 	const transcript = new TranscriptWaiter();
 	let stderrTail = "";
-	const stderrPump = (async () => {
-		const decoder = new TextDecoder();
-		for await (const chunk of child.stderr) {
-			stderrTail = (stderrTail + decoder.decode(chunk, { stream: true })).slice(-65_536);
-		}
-	})();
-	let pumpError: Error | null = null;
+	const pumpHolder: PumpErrorHolder = { pumpError: null };
+	const recordFailure = (error: unknown): void => recordPumpFailure(error, pumpHolder, transcript);
+	const stderrDecoder = new TextDecoder();
+	const stderrPump = drainStream(
+		child.stderr,
+		(chunk) => {
+			stderrTail = (stderrTail + stderrDecoder.decode(chunk, { stream: true })).slice(-65_536);
+		},
+		recordFailure,
+	);
 	const stdoutPump = (async () => {
 		try {
 			const decoder = new TextDecoder();
@@ -595,8 +654,7 @@ async function driveBinary(label: string, argv: readonly string[], runRoot: stri
 				}
 			}
 		} catch (error) {
-			pumpError = error instanceof Error ? error : new Error(String(error));
-			transcript.abort(pumpError);
+			recordFailure(error);
 		}
 	})();
 
@@ -645,7 +703,7 @@ async function driveBinary(label: string, argv: readonly string[], runRoot: stri
 	const exitCode = await child.exited;
 	clearTimeout(exitTimer);
 	await Promise.all([stdoutPump, stderrPump]);
-	if (pumpError) throw pumpError;
+	if (pumpHolder.pumpError) throw pumpHolder.pumpError;
 	return { label, runRoot, transcript: transcript.records, exitCode, stderrTail };
 }
 

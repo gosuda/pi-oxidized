@@ -35,6 +35,15 @@ const REAL_PROVIDERS_DIR = join(
 	".references/pi/packages/ai/src/providers",
 );
 const REAL_DATA_DIR = join(REAL_PROVIDERS_DIR, "data");
+const REFERENCE_PROVIDERS_AVAILABLE = (() => {
+	try {
+		readdirSync(REAL_PROVIDERS_DIR);
+		return true;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+		throw error;
+	}
+})();
 
 /**
  * Copy the real provider-data tree into an isolated temp fixture so
@@ -613,9 +622,9 @@ describe("reconstructProviderData transaction (Cluster C)", () => {
 		}
 	});
 
-	test("repeat-run is content-idempotent against a temp copy of the real tree", async () => {
+	test.skipIf(!REFERENCE_PROVIDERS_AVAILABLE)("repeat-run is content-idempotent against a temp copy of the real tree", async () => {
 		const fx = realProvidersFixture();
-		if (fx === null) return; // reference providers dir not provisioned
+		if (fx === null) throw new Error("reference providers must be provisioned (guarded by test.skipIf)");
 		const catalogBefore = readFileSync(fx.catalogPath);
 		const dataBefore = snapshotDir(fx.dataDir);
 		try {
