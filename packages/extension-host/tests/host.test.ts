@@ -854,13 +854,25 @@ describe("host: session.replacementReady + passthrough fields", () => {
 
 		await collector.awaitFrame((f) => f.method === "notify");
 		await collector.awaitFrame((f) => f.id === 71 && f.kind === "res");
-		// Give the finally path a tick to emit if it were going to.
-		await Promise.resolve();
+
+		// A single microtask tick cannot prove the suppressed frame was never
+		// emitted — it only proves it wasn't emitted *yet*. Instead, drive a
+		// positive milestone that must follow the finally path: send a `measure`
+		// request and await its response. The ProtocolClient writeChain is
+		// strictly ordered, so the measure response write happens after the
+		// first command's finally-block write (if any). When the measure
+		// response arrives, any replacementReady frame would already be in
+		// collector.frames.
+		push(stdin, {
+			id: 9001, kind: "req", method: "measure",
+			payload: { key: "nonexistent", width: 80 },
+		});
+		await collector.awaitFrame((f) => f.id === 9001 && f.kind === "res");
+
 		const readyFrames = collector.frames.filter(
 			(f) => f.kind === "event" && f.method === "session.replacementReady",
 		);
 		expect(readyFrames).toEqual([]);
-
 		await teardown(connected);
 	});
 

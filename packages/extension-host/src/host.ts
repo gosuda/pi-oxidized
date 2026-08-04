@@ -37,6 +37,7 @@ import type {
 	ExtensionActions,
 	ExtensionCommandContext,
 	ExtensionCommandContextActions,
+	ExtensionContext,
 	ExtensionContextActions,
 	ExtensionFactory,
 	ExtensionRuntime,
@@ -51,7 +52,7 @@ import type { Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai"
 import { AsyncLocalStorage } from "node:async_hooks";
 import { EventEmitter } from "node:events";
 import { validateToolArguments } from "@earendil-works/pi-ai/compat";
-import { parseStreamingJson } from "@earendil-works/pi-ai/utils/json-parse.ts";
+import { AssistantDeltaReducer } from "./assistant-delta.ts";
 
 /** Minimal event bus for extension-to-extension communication. */
 export function createEventBus() {
@@ -513,10 +514,8 @@ export class ExtensionHost {
 	/** Capacity-64 sequential queue of terminal-input jobs. */
 	private readonly terminalInputQueue: Array<() => Promise<void>> = [];
 	private terminalInputDraining = false;
-	/** Active assistant snapshot reconstructed from compact Rust updates. */
-	private activeAssistant: Record<string, unknown> | undefined;
-	/** Raw streamed tool-argument fragments keyed by assistant content index. */
-	private readonly activeToolArguments = new Map<number, string>();
+	/** Compact assistant stream reconstruction (shared with the lean runner). */
+	private readonly assistantDelta = new AssistantDeltaReducer();
 	/** Active theme served to extensions (`ctx.ui.theme`). */
 	private currentTheme: Theme = fallbackTheme();
 	/** Theme catalog from the latest `theme.update` push. */
@@ -540,7 +539,7 @@ export class ExtensionHost {
 	 * ready-gated session responses and emitted as `session.replacementReady`
 	 * only from that command's finally path — never via a global slot.
 	 */
-	private readonly commandScope = new AsyncLocalStorage<{ tokens: string[] }>();
+	private readonly commandScope = new AsyncLocalStorage<{ tokens: string[]; closed: boolean }>();
 
 	constructor(stdin: ByteReadable, stdout: ByteWritable) {
 		const onFrame: FrameHandler = (frame) => this.onInbound(frame);
@@ -826,8 +825,20 @@ export class ExtensionHost {
 			}
 			throw error;
 		}
+		// Hand the handler a context whose `signal` is THIS invocation's
+		// cancellation (aborted on dispose / keyed single-flight), matching the
+		// lean runner's shortcut context. defineProperties keeps the runner's
+		// other getters lazy instead of freezing eager reads into a spread.
+		const context = Object.defineProperties(
+			{},
+			Object.getOwnPropertyDescriptors(runner.createContext()),
+		) as ExtensionContext;
+		Object.defineProperty(context, "signal", {
+			get: () => controller.signal,
+			enumerable: true,
+		});
 		void Promise.resolve()
-			.then(() => shortcut.handler(runner.createContext()))
+			.then(() => shortcut.handler(context))
 			.catch((error) => {
 				if (controller.signal.aborted || this.state === HostState.DISPOSED) {
 					return;
@@ -865,7 +876,7 @@ export class ExtensionHost {
 			if (eventType === "message_start") {
 				const message = payload["message"];
 				if (isRecord(message) && message["role"] === "assistant") {
-					this.seedActiveAssistant(message);
+					this.assistantDelta.seedActiveAssistant(message);
 				}
 			}
 			let result: unknown;
@@ -936,7 +947,7 @@ export class ExtensionHost {
 					return;
 				}
 				case "message_end": {
-					this.clearActiveAssistant();
+					this.assistantDelta.clearActiveAssistant();
 					// Rust sends the raw AgentMessage AS the request payload (no
 					// `{ message }` wrapper); wrap it for emitMessageEnd.
 					result = await runner.emitMessageEnd({
@@ -972,7 +983,7 @@ export class ExtensionHost {
 					return;
 				default:
 					if (eventType === "agent_end" || eventType === "session_shutdown") {
-						this.clearActiveAssistant();
+						this.assistantDelta.clearActiveAssistant();
 					}
 					result = await runner.emit({ type: eventType, ...payload } as Parameters<typeof runner.emit>[0]);
 					await this.client.respond(id, eventType as Method, result ?? { ok: true });
@@ -1013,7 +1024,7 @@ export class ExtensionHost {
 				const assistantMessageEvent = type === "done"
 					? { type, reason: event["reason"], message }
 					: { type, reason: event["reason"], error: message };
-                this.clearActiveAssistant();
+				this.assistantDelta.clearActiveAssistant();
 				const result = await runner.emit({
 					type: "message_update",
 					message,
@@ -1023,12 +1034,13 @@ export class ExtensionHost {
 				return;
 			}
 
-			this.applyAssistantDelta(event);
-			if (this.activeAssistant === undefined) {
+			this.assistantDelta.applyAssistantDelta(event);
+			const activeAssistant = this.assistantDelta.getActiveAssistant();
+			if (activeAssistant === undefined) {
 				throw new Error("message update arrived before assistant start");
 			}
-			const message = structuredClone(this.activeAssistant);
-			const assistantMessageEvent = this.expandAssistantEvent(event, message);
+			const message = structuredClone(activeAssistant);
+			const assistantMessageEvent = this.assistantDelta.expandAssistantEvent(event, message);
 			const result = await runner.emit({
 				type: "message_update",
 				message,
@@ -1044,77 +1056,8 @@ export class ExtensionHost {
 		}
 	}
 
-	private seedActiveAssistant(message: Record<string, unknown>): void {
-		this.activeAssistant = structuredClone(message);
-		this.activeToolArguments.clear();
-	}
-
-	private clearActiveAssistant(): void {
-		this.activeAssistant = undefined;
-		this.activeToolArguments.clear();
-	}
-
-	private applyAssistantDelta(event: Record<string, unknown>): void {
-		const meta = isRecord(event["meta"]) ? event["meta"] : {};
-		if (this.activeAssistant === undefined) {
-			if (event["type"] !== "start") {
-				throw new Error("message update arrived before assistant start");
-			}
-			this.activeAssistant = { ...meta, content: [] };
-		} else if (event["type"] === "start") {
-			this.activeAssistant = { ...meta, content: [] };
-			this.activeToolArguments.clear();
-		} else {
-			const content = this.activeAssistant["content"];
-			this.activeAssistant = { ...this.activeAssistant, ...meta, content };
-		}
-		const content = this.activeAssistant["content"];
-		if (!Array.isArray(content)) {
-			throw new Error("active assistant content is not an array");
-		}
-		const index = event["contentIndex"];
-		if (typeof index !== "number") return;
-		const type = event["type"];
-		if ((type === "text_start" || type === "thinking_start" || type === "toolcall_start"
-			|| type === "text_end" || type === "thinking_end" || type === "toolcall_end")
-			&& isRecord(event["block"])) {
-			content[index] = structuredClone(event["block"]);
-			if (type === "toolcall_start") this.activeToolArguments.set(index, "");
-			if (type === "toolcall_end") this.activeToolArguments.delete(index);
-			return;
-		}
-		const delta = event["delta"];
-		const block = content[index];
-		if (typeof delta !== "string" || !isRecord(block)) return;
-		if (type === "text_delta") {
-			block["text"] = `${typeof block["text"] === "string" ? block["text"] : ""}${delta}`;
-		} else if (type === "thinking_delta") {
-			block["thinking"] = `${typeof block["thinking"] === "string" ? block["thinking"] : ""}${delta}`;
-		} else if (type === "toolcall_delta") {
-			const fragments = `${this.activeToolArguments.get(index) ?? ""}${delta}`;
-			this.activeToolArguments.set(index, fragments);
-			block["arguments"] = parseStreamingJson(fragments);
-		}
-	}
-
-	private expandAssistantEvent(
-		event: Record<string, unknown>, partial: Record<string, unknown>,
-	): Record<string, unknown> {
-		const type = event["type"] as string;
-		const expanded: Record<string, unknown> = { type, partial };
-		const index = event["contentIndex"];
-		if (typeof index === "number") expanded["contentIndex"] = index;
-		if (typeof event["delta"] === "string") expanded["delta"] = event["delta"];
-		const content = partial["content"];
-		const block = Array.isArray(content) && typeof index === "number" ? content[index] : undefined;
-		if (type === "text_end" && isRecord(block)) expanded["content"] = block["text"];
-		if (type === "thinking_end" && isRecord(block)) expanded["content"] = block["thinking"];
-		if (type === "toolcall_end" && isRecord(block)) expanded["toolCall"] = block;
-		return expanded;
-	}
-
 	private async handleExtensionsLoad(id: number, p: Record<string, unknown>): Promise<void> {
-		this.clearActiveAssistant();
+		this.assistantDelta.clearActiveAssistant();
 		const request = parseExtensionsLoadRequest(
 			p,
 			this.loadOptions?.cwd ?? process.cwd(),
@@ -1191,7 +1134,7 @@ export class ExtensionHost {
 			return;
 		}
 
-		const scope = { tokens: [] as string[] };
+		const scope = { tokens: [] as string[], closed: false };
 		try {
 			await this.commandScope.run(scope, async () => {
 				await cmd.handler(args, this.createCommandContext(runner));
@@ -1207,6 +1150,9 @@ export class ExtensionHost {
 			// After the command.execute res/error write: writeChain orders ready
 			// after the response and any session.command frames from the handler.
 			// Emit even when the handler threw after a successful replacement.
+			// Closed first so a late fire-and-forget capture is diagnosed, not
+			// pushed into a scope nobody will flush.
+			scope.closed = true;
 			for (const token of scope.tokens) {
 				try {
 					await this.client.send({
@@ -1482,7 +1428,7 @@ export class ExtensionHost {
 			this.disposeSlot(key);
 			return;
 		}
-		let component: SlotComponent;
+		let component: SlotComponent | null;
 		let recreate: SlotFactory | undefined;
 		if (Array.isArray(content)) {
 			const lines = content as string[];
@@ -1501,20 +1447,11 @@ export class ExtensionHost {
 				onBranchChange: () => () => {},
 			};
 			recreate = (theme) => (content as (...args: unknown[]) => unknown)(tui, theme, footerData);
-			try {
-				component = recreate(this.currentTheme) as SlotComponent;
-			} catch (err) {
-				this.emitExtensionError("<inline>", "setComponentSlot", String(err));
-				return;
-			}
-			if (!isSlotComponent(component)) {
-				this.emitExtensionError(
-					"<inline>",
-					"setComponentSlot",
-					`factory for ${key} did not return a component`,
-				);
-				return;
-			}
+			// One factory contract on both paths: store the entry first, then let
+			// `recreateSlot` install — it already validates the result, handles
+			// thenables, and keeps a synchronous result's slot identical to the
+			// previous eager call.
+			component = null;
 		} else {
 			return;
 		}
@@ -1530,7 +1467,13 @@ export class ExtensionHost {
 			recreationRevision: 0,
 		};
 		this.slots.set(key, entry);
-		this.pushSlot(key, entry, 80);
+		if (entry.recreate === undefined) {
+			this.pushSlot(key, entry, 80);
+			return;
+		}
+		this.recreateSlot(key, entry, () => {
+			if (this.slots.get(key) === entry) this.disposeSlot(key);
+		});
 	}
 
 	/**
@@ -2523,10 +2466,21 @@ export class ExtensionHost {
 			if (cancelled) return;
 			const token = payload["replacementToken"];
 			if (typeof token !== "string") return;
-			// Authors must await replacement calls so the token stays scoped to the
-			// initiating command.execute. Fire-and-forget drops the token and Rust
-			// timeout-aborts the pending replacement.
-			self.commandScope.getStore()?.tokens.push(token);
+			// Authors must await replacement calls so the token stays scoped to
+			// the initiating command.execute. Fire-and-forget loses the scope
+			// (or finds it already flushed); without a diagnostic the user only
+			// learns via the Rust-side replacement-ready timeout, so surface the
+			// drop on the spot.
+			const scope = self.commandScope.getStore();
+			if (scope === undefined || scope.closed) {
+				self.emitExtensionError(
+					"<host>",
+					"session.replacementReady",
+					"replacement token dropped: the replacement call was not awaited inside its command.execute handler",
+				);
+			} else {
+				scope.tokens.push(token);
+			}
 			markStale?.();
 		};
 
@@ -2674,6 +2628,14 @@ export class ExtensionHost {
 				if (typeof prop !== "string") return undefined;
 				// Never expose a callable `then`: the proxy must not look like a thenable.
 				if (prop === "then") return undefined;
+				// Logging/printing/probing the bridge must not throw: forward
+				// `Object.prototype` members (`toString`, `valueOf`,
+				// `hasOwnProperty`, `constructor`, …) and leave `toJSON`
+				// undefined so `JSON.stringify` serializes instead of throwing.
+				// Only real SessionManager methods fail loudly.
+				if (prop === "toJSON") return undefined;
+				const inherited = Reflect.get(Object.prototype, prop);
+				if (inherited !== undefined) return inherited;
 				switch (prop) {
 					case "appendCustomEntry":
 						return (customType: string, data?: unknown) =>
@@ -2724,7 +2686,7 @@ export class ExtensionHost {
 	}
 
 	private terminate(reason: string): void {
-		this.clearActiveAssistant();
+		this.assistantDelta.clearActiveAssistant();
 		console.error(`[host] fatal: ${reason}`);
 		this.dispose(reason);
 	}

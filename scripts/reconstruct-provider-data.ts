@@ -664,6 +664,7 @@ export async function defaultInversionProof(ctx: ReconstructProofContext): Promi
 	const before = await Bun.file(ctx.catalogPath).bytes();
 	const restoreCatalog = ctx.restoreCatalog ?? writeFile;
 	let proofFailure: unknown;
+	let restoreFailure: unknown;
 	try {
 		const regen = Bun.spawnSync(
 			[process.execPath, "run", join(ctx.repoRoot, "scripts/generate-builtin-models.ts")],
@@ -684,17 +685,26 @@ export async function defaultInversionProof(ctx: ReconstructProofContext): Promi
 		}
 	} catch (error) {
 		proofFailure = error;
-		throw error;
 	} finally {
+		// Cleanup only — never throw inside finally (noUnsafeFinally).
 		try {
 			await restoreCatalog(ctx.catalogPath, before);
 		} catch (restoreError) {
-			if (proofFailure === undefined) throw restoreError;
+			restoreFailure = restoreError;
+		}
+	}
+	// Compose after try/finally so the in-flight exception is never discarded.
+	if (restoreFailure !== undefined) {
+		if (proofFailure !== undefined) {
 			throw new Error(
-				`inversion proof failed (${errorDetail(proofFailure)}); additionally failed to restore catalog snapshot: ${errorDetail(restoreError)}`,
+				`inversion proof failed (${errorDetail(proofFailure)}); additionally failed to restore catalog snapshot: ${errorDetail(restoreFailure)}`,
 				{ cause: proofFailure },
 			);
 		}
+		throw restoreFailure;
+	}
+	if (proofFailure !== undefined) {
+		throw proofFailure;
 	}
 }
 
@@ -768,6 +778,8 @@ export async function reconstructProviderData(
 	const lock = await acquireDataDirectoryLock(dataDir, lockAcquireTimeoutMs, options.onLockWait);
 	let primaryFailure: unknown = undefined;
 	let hasPrimaryFailure = false;
+	let releaseFailure: unknown = undefined;
+	let result!: ReconstructProviderDataResult;
 	try {
 		const hadLive = await pathExists(dataDir);
 		const manifestPath = join(dataDir, DATA_MANIFEST_FILE);
@@ -878,7 +890,7 @@ export async function reconstructProviderData(
 			console.warn("inversion proof passed: catalog round-trips exactly");
 		}
 
-		return {
+		result = {
 			written: wrappers.length,
 			providers: wrappers,
 			dataDir,
@@ -886,20 +898,30 @@ export async function reconstructProviderData(
 	} catch (error) {
 		hasPrimaryFailure = true;
 		primaryFailure = error;
-		throw error;
 	} finally {
 		// Token-verified release: runs even after publish/proof/cleanup failures
 		// above and removes only directories still owned by this acquisition.
+		// Cleanup only — never throw inside finally (noUnsafeFinally).
 		try {
 			await releaseLock(lock);
 		} catch (releaseError) {
-			if (!hasPrimaryFailure) throw releaseError;
+			releaseFailure = releaseError;
+		}
+	}
+	// Compose after try/finally so the in-flight exception is never discarded.
+	if (releaseFailure !== undefined) {
+		if (hasPrimaryFailure) {
 			throw new Error(
-				`reconstruction failed (${errorDetail(primaryFailure)}); additionally failed to release reconstruction lock: ${errorDetail(releaseError)}`,
+				`reconstruction failed (${errorDetail(primaryFailure)}); additionally failed to release reconstruction lock: ${errorDetail(releaseFailure)}`,
 				{ cause: primaryFailure },
 			);
 		}
+		throw releaseFailure;
 	}
+	if (hasPrimaryFailure) {
+		throw primaryFailure;
+	}
+	return result;
 }
 
 async function main(): Promise<void> {

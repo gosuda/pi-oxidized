@@ -58,6 +58,8 @@ pub struct FileLockBackend {
     lock_contention: Option<Arc<tokio::sync::Notify>>,
     #[cfg(test)]
     atomic_write_failure: Arc<Mutex<Option<std::io::ErrorKind>>>,
+    #[cfg(test)]
+    async_lock_retry_delay: Option<Duration>,
 }
 
 impl FileLockBackend {
@@ -70,6 +72,8 @@ impl FileLockBackend {
             lock_contention: None,
             #[cfg(test)]
             atomic_write_failure: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            async_lock_retry_delay: None,
         }
     }
 
@@ -237,16 +241,24 @@ impl FileLockBackend {
         // interleave credential writes after an in-place unlink.
         reject_legacy_file_locks(&[unresolved, target.clone()])?;
         let options = LockOptions::new().attempts(1);
-        for attempt in 1..=SYNC_LOCK_ATTEMPTS {
+        for _ in 1..SYNC_LOCK_ATTEMPTS {
             match LockGuard::acquire_with(&target, &options) {
                 Ok(guard) => return Ok(guard),
-                Err(LockError::Contended { .. }) if attempt < SYNC_LOCK_ATTEMPTS => {
-                    std::thread::sleep(SYNC_LOCK_DELAY);
-                }
+                Err(LockError::Contended { .. }) => std::thread::sleep(SYNC_LOCK_DELAY),
                 Err(error) => return Err(lock_error_to_store(&error)),
             }
         }
-        Err(StoreError::message("Failed to acquire auth storage lock"))
+        // Final attempt: contention here exhausts the budget. Name the wedged
+        // lock directory so an operator knows what to inspect — the `Contended`
+        // display text alone ("Lock file is already being held") carries no path.
+        match LockGuard::acquire_with(&target, &options) {
+            Ok(guard) => Ok(guard),
+            Err(LockError::Contended { .. }) => Err(StoreError::message(format!(
+                "Failed to acquire auth storage lock {} after {SYNC_LOCK_ATTEMPTS} attempts",
+                lock_path_for(&target).display()
+            ))),
+            Err(error) => Err(lock_error_to_store(&error)),
+        }
     }
 
     async fn acquire_async_lock(&self) -> Result<LockGuard, StoreError> {
@@ -259,10 +271,17 @@ impl FileLockBackend {
         reject_legacy_file_locks(&[unresolved, target.clone()])?;
         let options = LockOptions::new().attempts(1).stale(ASYNC_LOCK_STALE);
         let mut delay = LOCK_MIN_DELAY;
-        for retry in 0..=ASYNC_LOCK_RETRIES {
+        // Tests substitute a near-zero initial delay so exhausting the full
+        // retry budget takes milliseconds instead of most of a minute; the
+        // doubling schedule itself stays on the production path.
+        #[cfg(test)]
+        if let Some(override_delay) = self.async_lock_retry_delay {
+            delay = override_delay;
+        }
+        for retry in 0..ASYNC_LOCK_RETRIES {
             match LockGuard::acquire_with(&target, &options) {
                 Ok(guard) => return Ok(guard),
-                Err(LockError::Contended { .. }) if retry < ASYNC_LOCK_RETRIES => {
+                Err(LockError::Contended { .. }) => {
                     #[cfg(test)]
                     self.notify_lock_contention();
                     sleep_with_jitter(delay, retry).await;
@@ -271,7 +290,17 @@ impl FileLockBackend {
                 Err(error) => return Err(lock_error_to_store(&error)),
             }
         }
-        Err(StoreError::message("Failed to acquire auth storage lock"))
+        // Final attempt: contention here exhausts the retry budget. Name the
+        // wedged lock directory so an operator knows what to inspect — the
+        // `Contended` display text alone carries no path.
+        match LockGuard::acquire_with(&target, &options) {
+            Ok(guard) => Ok(guard),
+            Err(LockError::Contended { .. }) => Err(StoreError::message(format!(
+                "Failed to acquire auth storage lock {} after {ASYNC_LOCK_RETRIES} retries",
+                lock_path_for(&target).display()
+            ))),
+            Err(error) => Err(lock_error_to_store(&error)),
+        }
     }
 
     fn read_data_file(&self) -> Result<Option<String>, StoreError> {
@@ -1259,6 +1288,59 @@ mod tests {
         // Release the held directory so the async acquirer can finish cleanly.
         fs::remove_dir(&shared_lock)?;
         task.await??;
+        Ok(())
+    }
+
+    #[test]
+    fn sync_lock_exhaustion_names_lock_path_and_attempt_count() -> TestResult {
+        let (_dir, path) = temp_auth_path()?;
+        fs::create_dir_all(path.parent().ok_or("auth path must have a parent")?)?;
+        // Hold the lock with a live guard so every acquisition attempt reports
+        // contention and the sync budget (SYNC_LOCK_ATTEMPTS) is exhausted.
+        let _guard = LockGuard::acquire(&path)?;
+
+        let backend = FileLockBackend::new(&path);
+        let result = backend.with_lock_sync(|content| Ok((content.map(str::to_owned), None)));
+        let Err(error) = result else {
+            return Err("sync acquisition unexpectedly succeeded under a held lock".into());
+        };
+        let message = error.to_string();
+        let lock_dir = lock_path_for(&canonical_lock_target(&path)?);
+        assert!(
+            message.contains(&lock_dir.display().to_string()),
+            "exhaustion error must name the wedged lock directory {lock_dir:?}: {message}"
+        );
+        assert!(
+            message.contains(&format!("{SYNC_LOCK_ATTEMPTS} attempts")),
+            "exhaustion error must state the sync attempt count: {message}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn async_lock_exhaustion_names_lock_path_and_retry_count() -> TestResult {
+        let (_dir, path) = temp_auth_path()?;
+        fs::create_dir_all(path.parent().ok_or("auth path must have a parent")?)?;
+        let _guard = LockGuard::acquire(&path)?;
+
+        let mut backend = FileLockBackend::new(&path);
+        backend.async_lock_retry_delay = Some(Duration::from_millis(1));
+        let result = backend
+            .with_lock_async(|content| async move { Ok::<_, StoreError>((content, None)) })
+            .await;
+        let Err(error) = result else {
+            return Err("async acquisition unexpectedly succeeded under a held lock".into());
+        };
+        let message = error.to_string();
+        let lock_dir = lock_path_for(&canonical_lock_target(&path)?);
+        assert!(
+            message.contains(&lock_dir.display().to_string()),
+            "exhaustion error must name the wedged lock directory {lock_dir:?}: {message}"
+        );
+        assert!(
+            message.contains(&format!("{ASYNC_LOCK_RETRIES} retries")),
+            "exhaustion error must state the async retry count: {message}"
+        );
         Ok(())
     }
 

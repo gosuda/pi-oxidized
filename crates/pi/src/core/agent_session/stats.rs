@@ -53,13 +53,17 @@ pub struct SessionStats {
 /// Token totals (TypeScript `SessionStats['tokens']`).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct SessionTokenTotals {
-    /// Sum of assistant `usage.input`.
+    /// Sum of `usage.input` across assistant messages, compaction, and
+    /// branch-summary entries.
     pub input: u64,
-    /// Sum of assistant `usage.output`.
+    /// Sum of `usage.output` across assistant messages, compaction, and
+    /// branch-summary entries.
     pub output: u64,
-    /// Sum of assistant `usage.cacheRead`.
+    /// Sum of `usage.cacheRead` across assistant messages, compaction, and
+    /// branch-summary entries.
     pub cache_read: u64,
-    /// Sum of assistant `usage.cacheWrite`.
+    /// Sum of `usage.cacheWrite` across assistant messages, compaction, and
+    /// branch-summary entries.
     pub cache_write: u64,
     /// `input + output + cache_read + cache_write`.
     pub total: u64,
@@ -111,26 +115,12 @@ impl AgentSession {
             // their own LLM usage from the summarization call. Include it in
             // token/cost totals so they reflect what was actually billed
             // (TypeScript `addUsageToTotals` on `entry.usage`).
-            match entry {
-                SessionEntry::Compaction(c) => {
-                    if let Some(usage) = &c.usage {
-                        input = input.saturating_add(usage.input);
-                        output = output.saturating_add(usage.output);
-                        cache_read = cache_read.saturating_add(usage.cache_read);
-                        cache_write = cache_write.saturating_add(usage.cache_write);
-                        cost += usage.cost.total;
-                    }
-                }
-                SessionEntry::BranchSummary(b) => {
-                    if let Some(usage) = &b.usage {
-                        input = input.saturating_add(usage.input);
-                        output = output.saturating_add(usage.output);
-                        cache_read = cache_read.saturating_add(usage.cache_read);
-                        cache_write = cache_write.saturating_add(usage.cache_write);
-                        cost += usage.cost.total;
-                    }
-                }
-                _ => {}
+            if let Some(usage) = summary_usage(entry) {
+                input = input.saturating_add(usage.input);
+                output = output.saturating_add(usage.output);
+                cache_read = cache_read.saturating_add(usage.cache_read);
+                cache_write = cache_write.saturating_add(usage.cache_write);
+                cost += usage.cost.total;
             }
 
             let SessionEntry::Message(message_entry) = entry else {
@@ -261,6 +251,20 @@ fn u64_as_f64(value: u64) -> f64 {
     let high = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
     let low = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
     f64::from(high).mul_add(4_294_967_296.0, f64::from(low))
+}
+
+/// LLM usage attached to a persisted summary entry (compaction or
+/// branch-summary), when present.
+///
+/// Both entry types carry an optional `Usage` from the summarization call;
+/// this extracts it through one path so the aggregation loop accumulates
+/// once (special-case elimination).
+fn summary_usage(entry: &SessionEntry) -> Option<&pi_ai::Usage> {
+    match entry {
+        SessionEntry::Compaction(c) => c.usage.as_ref(),
+        SessionEntry::BranchSummary(b) => b.usage.as_ref(),
+        _ => None,
+    }
 }
 
 /// Tokens reported by an assistant entry usable as a post-compaction baseline.

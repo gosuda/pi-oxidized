@@ -36,6 +36,15 @@ const EVIDENCE_ROOT = resolve(REPO_ROOT, "target/verification/rpc-parity");
 const VERIFICATION_PROVIDER = "verification";
 const VERIFICATION_MODEL = "model";
 const TOOL_FILE = "verification-rpc.txt";
+const SUPPORTED_ENV_VARS: Record<string, true> = { PI_RPC_PARITY_STEP_TIMEOUT_MS: true };
+const ENV_PREFIX = "PI_RPC_PARITY_";
+for (const key of Object.keys(process.env)) {
+	if (key.startsWith(ENV_PREFIX) && SUPPORTED_ENV_VARS[key] !== true) {
+		fail(
+			`unsupported environment variable "${key}" (supported: ${Object.keys(SUPPORTED_ENV_VARS).join(", ")}); check for typos`,
+		);
+	}
+}
 const STEP_DEADLINE_MS = Number(process.env.PI_RPC_PARITY_STEP_TIMEOUT_MS ?? "120000");
 const EXIT_DEADLINE_MS = 30_000;
 
@@ -527,9 +536,11 @@ export class TranscriptWaiter {
  * first async-iterator failure is normalized to a real Error, recorded in
  * shared state, and broadcast to every pending transcript waiter — so a stream
  * pump death surfaces as a scenario failure instead of stalling a `waitFor` or
- * leaking an unhandled rejection. The first failure owns the shared slot (the
- * original diagnostic is preserved); `transcript.abort` is idempotent, so a
- * later failure on the other stream still reaches any waiters.
+ * leaking an unhandled rejection. The FIRST normalized Error owns
+ * `holder.pumpError` and is used to abort pending or future waiters; a later
+ * failure on the other stream does not replace it. `transcript.abort` is
+ * idempotent, so the second call is a no-op once the first error has aborted
+ * the transcript.
  */
 export interface PumpErrorHolder {
 	pumpError: Error | null;

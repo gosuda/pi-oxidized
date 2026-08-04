@@ -325,7 +325,7 @@
 		},
 		{
 			"id": "product-release-build",
-			"surface": "session interoperability",
+			"surface": "release build",
 			"tier": "product",
 			"required": true,
 			"commands": [
@@ -356,6 +356,7 @@
 			"surface": "generated v1/v2/v3 session interoperability",
 			"tier": "product",
 			"required": true,
+			"requires": [".references/pi"],
 			"commands": [
 				{
 					"cwd": ".",
@@ -370,6 +371,7 @@
 			"surface": "rpc protocol parity",
 			"tier": "product",
 			"required": true,
+			"requires": [".references/pi"],
 			"commands": [
 				{
 					"cwd": ".",

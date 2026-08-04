@@ -32,7 +32,7 @@ function temporaryDirectory(prefix: string): string {
 	return path;
 }
 
-test.skip("does not run the benchmark when performance verification is imported", () => {
+test("does not run the benchmark when performance verification is imported", () => {
 	const sandbox = temporaryDirectory("perf-import-");
 	const artifactBefore = existsSync(PERFORMANCE_ARTIFACT)
 		? readFileSync(PERFORMANCE_ARTIFACT)
@@ -100,6 +100,15 @@ const CLEAN_EXIT_CHILD = "process.exit(0);";
 const FAILURE_EXIT_CHILD = "process.exit(7);";
 
 describe.skipIf(isWindows)("performance first-frame lifecycle", () => {
+	// Internal deadlines exercised by the ignore-quit test: 5_000ms frame
+	// wait + 10_000ms /quit exit wait (terminateAndRequireCleanExit). The
+	// test timeout is their sum plus 50% headroom so a slow runner fails
+	// the assertion, not the harness timeout.
+	const FRAME_WAIT_DEADLINE_MS = 5_000;
+	const QUIT_EXIT_DEADLINE_MS = 10_000;
+	const IGNORE_QUIT_TEST_TIMEOUT_MS = Math.round(
+		(FRAME_WAIT_DEADLINE_MS + QUIT_EXIT_DEADLINE_MS) * 1.5,
+	);
 	test("accepts an already-settled clean exit through the production helper", async () => {
 		const sandbox = temporaryDirectory("perf-settled-clean-");
 		const pty = spawnPty({
@@ -141,7 +150,7 @@ describe.skipIf(isWindows)("performance first-frame lifecycle", () => {
 		});
 		try {
 			await pty.waitFor((candidate) => frameObservation(candidate) !== undefined, {
-				deadlineMs: 5_000,
+				deadlineMs: FRAME_WAIT_DEADLINE_MS,
 				source: "raw",
 			});
 			const frame = frameObservation(pty.snapshot());
@@ -151,7 +160,7 @@ describe.skipIf(isWindows)("performance first-frame lifecycle", () => {
 		} finally {
 			await pty.terminate();
 		}
-	}, 15_000);
+	}, IGNORE_QUIT_TEST_TIMEOUT_MS);
 
 	test("passes a child that emits a frame and exits cleanly on /quit", async () => {
 		const sandbox = temporaryDirectory("perf-clean-quit-");

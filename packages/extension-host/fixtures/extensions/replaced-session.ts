@@ -59,16 +59,15 @@ export default function replacedSessionExtension(pi: ExtensionAPI): void {
 					});
 					await replacedCtx.sendUserMessage("user hello");
 					report["withSessionSendsDone"] = true;
-
-				// Notify through the fresh replacement context; the
-				// original ctx is stale after a successful replacement.
-				report["setupOrder"] = setupOrder;
-				// `cancelled: false` here is the protocol precondition
-				// established by entering withSession (a cancelled
-				// replacement never calls this callback), not a measured
-				// result read back from the wire.
-				report["newSessionResult"] = { cancelled: false };
-				replacedCtx.ui.notify(JSON.stringify(report), "info");
+					// Notify through the fresh replacement context; the
+					// original ctx is stale after a successful replacement.
+					report["setupOrder"] = setupOrder;
+					// `cancelled: false` here is the protocol precondition
+					// established by entering withSession (a cancelled
+					// replacement never calls this callback), not a measured
+					// result read back from the wire.
+					report["newSessionResult"] = { cancelled: false };
+					replacedCtx.ui.notify(JSON.stringify(report), "info");
 				},
 			});
 

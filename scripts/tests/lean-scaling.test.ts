@@ -369,6 +369,14 @@ describe("ChildHost malformed stdout", () => {
 			[
 				"await Bun.sleep(150);",
 				`process.stderr.write(${JSON.stringify(hostileStderr)});`,
+				// Yield the child's event loop so the parent's stderr `data`
+				// handler fires and buffers hostileStderr before the fatal
+				// stdout line arrives. Without this ordering point, stdout
+				// and stderr are separate descriptors whose parent-side
+				// `data` events race on a loaded runner; if stdout lands
+				// first, failAll builds the diagnostic with an empty
+				// stderrTail and the tail assertions below flake.
+				"await Bun.sleep(50);",
 				`process.stdout.write(${JSON.stringify(`${hostileStdout}\n`)});`,
 				"await Bun.sleep(50);",
 				`process.stdout.write(${JSON.stringify(postFailureFrame)});`,

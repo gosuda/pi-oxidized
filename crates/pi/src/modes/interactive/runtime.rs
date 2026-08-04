@@ -713,6 +713,11 @@ impl Default for InteractiveRuntimeOptions {
 
 impl InteractiveRuntimeOptions {
     /// Build production startup options from environment capabilities.
+    ///
+    /// Detection performs blocking terminal I/O (see
+    /// [`TerminalCapabilities::detect`]), so async callers must offload it
+    /// with `tokio::task::spawn_blocking` rather than run it on a runtime
+    /// worker.
     #[must_use]
     pub fn detect() -> Self {
         let caps = TerminalCapabilities::detect();
@@ -6700,6 +6705,21 @@ mod tests {
     use crate::modes::interactive::state::SelectorKind;
 
     type TestResult = Result<(), String>;
+
+    /// The startup closure in `cli::entry` offloads detection with
+    /// `tokio::task::spawn_blocking`; the blocking pool must yield exactly the
+    /// options a direct synchronous call produces (the tmux hyperlink probe is
+    /// cached process-wide, so a second detection observes the same answer).
+    #[tokio::test]
+    async fn detect_offloaded_matches_sync_detect() -> TestResult {
+        let sync = InteractiveRuntimeOptions::detect();
+        let offloaded = tokio::task::spawn_blocking(InteractiveRuntimeOptions::detect)
+            .await
+            .map_err(|error| format!("spawn_blocking join failed: {error}"))?;
+        assert_eq!(sync.caps, offloaded.caps);
+        assert_eq!(sync.terminal_theme, offloaded.terminal_theme);
+        Ok(())
+    }
 
     /// Records every action dispatched to it; tests assert on the call log.
     #[derive(Default)]

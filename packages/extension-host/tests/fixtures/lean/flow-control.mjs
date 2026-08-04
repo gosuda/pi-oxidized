@@ -12,7 +12,13 @@ export default {
 			description: "Emit many synchronous partial results",
 			execute: (_args, ctx) => {
 				for (let index = 0; index < 200; index++) ctx.onUpdate({ index });
-				flow().late.promise.then(() => ctx.onUpdate({ index: "late" }));
+				flow()
+					.late.promise.then(() => ctx.onUpdate({ index: "late" }))
+					.catch(() => {
+						// The late update lands after cancellation, where onUpdate
+						// rejects by design; swallow it so the expected rejection
+						// does not escape the fixture as an unhandled rejection.
+					});
 				return { ok: true };
 			},
 		},

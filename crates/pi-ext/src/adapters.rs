@@ -891,8 +891,12 @@ pub enum CommandSourceOrigin {
 }
 
 /// Provenance for an extension command.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+///
+/// A present-but-partial `sourceInfo` object is rejected with a typed error
+/// rather than silently filling defaults — wrong provenance would misattribute
+/// command ownership. Omitting `sourceInfo` entirely is safe (the caller
+/// falls back to a synthetic source).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommandSourceInfo {
     /// Absolute or synthetic path.
     pub path: String,
@@ -903,8 +907,50 @@ pub struct CommandSourceInfo {
     /// Package or top-level origin.
     pub origin: CommandSourceOrigin,
     /// Optional source base directory.
-    #[serde(default)]
     pub base_dir: Option<String>,
+}
+
+impl<'de> serde::Deserialize<'de> for CommandSourceInfo {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Partial {
+            #[serde(default)]
+            path: Option<String>,
+            #[serde(default)]
+            source: Option<String>,
+            #[serde(default)]
+            scope: Option<CommandSourceScope>,
+            #[serde(default)]
+            origin: Option<CommandSourceOrigin>,
+            #[serde(default)]
+            base_dir: Option<String>,
+        }
+
+        let p = Partial::deserialize(deserializer)?;
+        let path = p.path.ok_or_else(|| {
+            serde::de::Error::custom("sourceInfo.path is required when sourceInfo is present")
+        })?;
+        let source = p.source.ok_or_else(|| {
+            serde::de::Error::custom("sourceInfo.source is required when sourceInfo is present")
+        })?;
+        let scope = p.scope.ok_or_else(|| {
+            serde::de::Error::custom("sourceInfo.scope is required when sourceInfo is present")
+        })?;
+        let origin = p.origin.ok_or_else(|| {
+            serde::de::Error::custom("sourceInfo.origin is required when sourceInfo is present")
+        })?;
+        Ok(CommandSourceInfo {
+            path,
+            source,
+            scope,
+            origin,
+            base_dir: p.base_dir,
+        })
+    }
 }
 
 /// A registered custom command.
@@ -1899,5 +1945,92 @@ mod tests {
             api: None,
         }));
         assert!(registry.tool("t").is_some());
+    }
+
+    #[test]
+    fn command_source_info_absent_is_safe() -> Result<(), Box<dyn std::error::Error>> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Wire {
+            #[serde(default)]
+            source_info: Option<CommandSourceInfo>,
+        }
+
+        // Omitting sourceInfo entirely is safe — the field is Option.
+        let json = serde_json::json!({
+            "name": "mycmd",
+            "description": "test",
+        });
+        let wire: Wire = serde_json::from_value(json)?;
+        assert!(wire.source_info.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn command_source_info_complete_decodes() -> Result<(), Box<dyn std::error::Error>> {
+        let json = serde_json::json!({
+            "path": "/ext/cmd.ts",
+            "source": "extension",
+            "scope": "user",
+            "origin": "top-level",
+            "baseDir": "/ext",
+        });
+        let info: CommandSourceInfo = serde_json::from_value(json)?;
+        assert_eq!(info.path, "/ext/cmd.ts");
+        assert_eq!(info.source, "extension");
+        assert_eq!(info.scope, CommandSourceScope::User);
+        assert_eq!(info.origin, CommandSourceOrigin::TopLevel);
+        assert_eq!(info.base_dir.as_deref(), Some("/ext"));
+        Ok(())
+    }
+
+    #[test]
+    fn command_source_info_partial_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
+        // A present-but-partial object must be rejected, not silently filled.
+        // The custom Deserialize names the missing field with a
+        // "sourceInfo.<field> is required" message — the derived Deserialize
+        // would reject too but with a generic "missing field" message.
+        let partial = serde_json::json!({
+            "path": "/ext/cmd.ts",
+            "source": "extension",
+            // scope and origin missing
+        });
+        let Err(error) = serde_json::from_value::<CommandSourceInfo>(partial) else {
+            return Err("partial sourceInfo must be rejected, not silently accepted".into());
+        };
+        let err = error.to_string();
+        assert!(
+            err.contains("sourceInfo.scope"),
+            "error should name sourceInfo.scope, got: {err}"
+        );
+
+        // Missing path alone.
+        let partial2 = serde_json::json!({
+            "source": "extension",
+            "scope": "project",
+            "origin": "package",
+        });
+        let Err(error2) = serde_json::from_value::<CommandSourceInfo>(partial2) else {
+            return Err("partial sourceInfo without path must be rejected".into());
+        };
+        assert!(
+            error2.to_string().contains("sourceInfo.path"),
+            "error should name sourceInfo.path"
+        );
+
+        // Missing origin alone.
+        let partial3 = serde_json::json!({
+            "path": "/x",
+            "source": "ext",
+            "scope": "temporary",
+        });
+        let Err(error3) = serde_json::from_value::<CommandSourceInfo>(partial3) else {
+            return Err("partial sourceInfo without origin must be rejected".into());
+        };
+        assert!(
+            error3.to_string().contains("sourceInfo.origin"),
+            "error should name sourceInfo.origin"
+        );
+        Ok(())
     }
 }

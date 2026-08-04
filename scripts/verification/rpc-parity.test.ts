@@ -188,7 +188,7 @@ test("drainStream drains chunks normally and forwards a mid-stream failure witho
 	await expect(pump).resolves.toBeUndefined();
 	expect(chunks.map((chunk) => new TextDecoder().decode(chunk))).toEqual(["hi"]);
 	expect(failures).toEqual([failure]);
-	expect(drainStream(null, () => {}, () => {})).resolves.toBeUndefined();
+	await expect(drainStream(null, () => {}, () => {})).resolves.toBeUndefined();
 });
 
 test("recordPumpFailure preserves the original diagnostic and aborts waiters with it", async () => {

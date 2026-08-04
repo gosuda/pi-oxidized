@@ -190,7 +190,9 @@ interface PerformanceArtifact {
 		artifacts?: Record<string, FileRecord>;
 		sourceFingerprints?: {
 			before: { rust: SourceFingerprint; typescript: SourceFingerprint };
+			built?: { rust: SourceFingerprint; typescript: SourceFingerprint };
 			after?: { rust: SourceFingerprint; typescript: SourceFingerprint };
+			buildRegenerated?: { rust: boolean; typescript: boolean };
 			stable?: boolean;
 		};
 	};
@@ -1222,16 +1224,26 @@ async function main(): Promise<void> {
 		streamChunkDelayMs: STREAM_CHUNK_DELAY_MS,
 	};
 
-	await buildProducts();
-
-	// The authority build materializes generated model catalogs. Fingerprint
-	// after that intentional build step so the guard detects only source drift
-	// during measurement.
+	// Pre-build capture records the source the measured binaries were built
+	// from; capturing only after the build could report fingerprint B for
+	// binaries built from source A. The build legitimately regenerates files
+	// inside the fingerprinted roots (provider data under
+	// .references/pi/packages/ai), so the drift blocker below compares the
+	// post-build baseline against the post-measurement state and records the
+	// build-window delta separately instead of hiding it.
 	const sourceBefore = {
 		rust: sourceFingerprint(RUST_SOURCE_ROOTS),
 		typescript: sourceFingerprint(TYPESCRIPT_SOURCE_ROOTS),
 	};
 	artifact.build.sourceFingerprints = { before: sourceBefore };
+
+	await buildProducts();
+
+	const sourceBuilt = {
+		rust: sourceFingerprint(RUST_SOURCE_ROOTS),
+		typescript: sourceFingerprint(TYPESCRIPT_SOURCE_ROOTS),
+	};
+	artifact.build.sourceFingerprints = { before: sourceBefore, built: sourceBuilt };
 
 	const versionSamples = await collectVersionSamples(python, ticksPerSecond);
 	const versionSummary = {
@@ -1325,19 +1337,24 @@ async function main(): Promise<void> {
 		typescript: sourceFingerprint(TYPESCRIPT_SOURCE_ROOTS),
 	};
 	const sourceStable =
-		sourceBefore.rust.sha256 === sourceAfter.rust.sha256 &&
-		sourceBefore.typescript.sha256 === sourceAfter.typescript.sha256;
+		sourceBuilt.rust.sha256 === sourceAfter.rust.sha256 &&
+		sourceBuilt.typescript.sha256 === sourceAfter.typescript.sha256;
 	artifact.build.sourceFingerprints = {
 		before: sourceBefore,
+		built: sourceBuilt,
 		after: sourceAfter,
+		buildRegenerated: {
+			rust: sourceBefore.rust.sha256 !== sourceBuilt.rust.sha256,
+			typescript: sourceBefore.typescript.sha256 !== sourceBuilt.typescript.sha256,
+		},
 		stable: sourceStable,
 	};
 
 	const blockers: string[] = [];
 	if (!sourceStable) {
 		blockers.push(
-			`source changed during benchmark session: Rust ${sourceBefore.rust.sha256} -> ${sourceAfter.rust.sha256}; ` +
-				`TypeScript ${sourceBefore.typescript.sha256} -> ${sourceAfter.typescript.sha256}`,
+			`source changed during measurement: Rust ${sourceBuilt.rust.sha256} -> ${sourceAfter.rust.sha256}; ` +
+				`TypeScript ${sourceBuilt.typescript.sha256} -> ${sourceAfter.typescript.sha256}`,
 		);
 	}
 	if (versionSpeedups.cold < VERSION_SPEEDUP_TARGET) {

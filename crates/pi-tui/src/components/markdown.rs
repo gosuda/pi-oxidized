@@ -385,6 +385,15 @@ struct MarkdownRenderer<'a> {
     strike: usize,
 }
 
+/// Deepest blockquote nesting level that still receives a border and a
+/// wrap at its own content width. Each bordered level spends 2 columns on
+/// the border, so at 16 levels a full third of an 80-column terminal is
+/// border — beyond this depth a border costs more columns than it conveys.
+/// Deeper frames fold their raw lines into the parent untransformed, which
+/// also bounds the renderer: bordered wrapping below the cap stays linear
+/// instead of re-splitting accumulated border lines per level.
+const MAX_BORDERED_QUOTE_DEPTH: usize = 16;
+
 impl<'a> MarkdownRenderer<'a> {
     fn new(
         source: &'a str,
@@ -933,6 +942,7 @@ impl<'a> MarkdownRenderer<'a> {
         struct Frame {
             pending: std::vec::IntoIter<ItemSegment>,
             content_width: usize,
+            depth: usize,
             raw: Vec<String>,
         }
         let border = (self.theme.quote_border)("│ ");
@@ -946,26 +956,46 @@ impl<'a> MarkdownRenderer<'a> {
             (!style_prefix.is_empty()).then(|| format!("\u{1b}[0m{style_prefix}"));
 
         // Iterative depth-safe traversal: each stack frame carries its own
-        // `content_width` (shrunk by one border per nesting level) and the
-        // raw lines collected so far. When a `Quote` segment is encountered
-        // we suspend the current frame and push a child frame; when a frame
-        // is exhausted we apply its border/style transform and fold the
-        // bordered lines into the parent, so deeply nested blockquotes no
-        // longer recurse on the call stack.
+        // `content_width` (shrunk by one border per nesting level), its nesting
+        // `depth`, and the raw lines collected so far. When a `Quote` segment
+        // is encountered we suspend the current frame and push a child frame;
+        // when a frame is exhausted we apply its border/style transform and
+        // fold the bordered lines into the parent (frames past
+        // `MAX_BORDERED_QUOTE_DEPTH` fold raw instead), so deeply nested
+        // blockquotes neither recurse on the call stack nor blow up the line
+        // count.
         let initial_width = width.saturating_sub(border_w).max(1);
         let mut stack: Vec<Frame> = vec![Frame {
             pending: segments.into_iter(),
             content_width: initial_width,
+            depth: 1,
             raw: Vec::new(),
         }];
 
         while let Some(frame) = stack.last_mut() {
             let Some(segment) = frame.pending.next() else {
-                // Frame exhausted: style, wrap, and border every raw line at
-                // this frame's content width, then fold into the parent.
+                let depth = frame.depth;
                 let content_width = frame.content_width;
+                let raw = std::mem::take(&mut frame.raw);
+                stack.pop();
+                // Past the depth cap, fold raw lines into the parent without
+                // the border/wrap transform: each bordered level shrinks the
+                // parent's content width by one border while lengthening every
+                // accumulated line by one, so wrapping re-splits those lines
+                // and the line count grows multiplicatively with depth.
+                // Folding raw keeps output size linear in input size.
+                if depth > MAX_BORDERED_QUOTE_DEPTH {
+                    match stack.last_mut() {
+                        Some(parent) => parent.raw.extend(raw),
+                        None => return raw,
+                    }
+                    continue;
+                }
+                // Frame exhausted below the cap: style, wrap, and border every
+                // raw line at this frame's content width, then fold into the
+                // parent.
                 let reset = reset_with_style.clone();
-                let bordered: Vec<String> = std::mem::take(&mut frame.raw)
+                let bordered: Vec<String> = raw
                     .into_iter()
                     .flat_map(|line| {
                         let line = match &reset {
@@ -978,7 +1008,6 @@ impl<'a> MarkdownRenderer<'a> {
                             .map(|wrapped| format!("{border}{wrapped}"))
                     })
                     .collect();
-                stack.pop();
                 match stack.last_mut() {
                     Some(parent) => parent.raw.extend(bordered),
                     None => return bordered,
@@ -994,9 +1023,11 @@ impl<'a> MarkdownRenderer<'a> {
                 }
                 ItemSegment::Quote(nested) => {
                     let child_width = frame.content_width.saturating_sub(border_w).max(1);
+                    let child_depth = frame.depth + 1;
                     stack.push(Frame {
                         pending: nested.into_iter(),
                         content_width: child_width,
+                        depth: child_depth,
                         raw: Vec::new(),
                     });
                 }
@@ -2133,24 +2164,31 @@ mod tests {
         // proved nothing about nested rendering.
         //
         // The iterative `render_quoted_segments` walks nesting on an explicit
-        // heap stack instead of the call stack. Width must exceed ~2× the
-        // depth: each level consumes a 2-column border, and once the per-level
-        // content width saturates to 1 the ANSI wrapper splits accumulated
-        // border lines into per-grapheme pieces, exploding the line count
-        // exponentially (depth 200 at width 80 hangs on this very renderer).
+        // heap stack instead of the call stack, and nesting past
+        // `MAX_BORDERED_QUOTE_DEPTH` folds raw lines into the parent without
+        // the border/wrap transform, so output size stays linear in input
+        // size at any terminal width — including a normal 80-column one.
         let src = format!("{}x", "> ".repeat(200));
-        let lines = plain_default(&src, 600);
-        // Rendering must complete and yield output rather than panicking.
-        assert!(!lines.is_empty(), "should render without panic");
-        // Every visible line sits inside the outermost quote and carries its border.
-        assert!(lines.iter().all(|line| line.contains('│')), "{lines:?}");
-        // Proof of real nesting: the flat fixture renders a single 1-level
-        // quote (one border column); 200 nested levels render ~200 distinct
-        // border columns on the line.
+        let lines = plain_default(&src, 80);
+        // The single text segment "x" is one raw line; each of the
+        // `MAX_BORDERED_QUOTE_DEPTH` bordered levels wraps it at a content
+        // width that still fits the accumulated line, so the quote renders as
+        // exactly one bordered line plus the trailing blank the quote closer
+        // appends. Anything multiplicative in the 200 nesting levels breaks
+        // this bound.
+        assert!(lines.len() <= 2, "expected bounded output, got {lines:?}");
+        // Nesting-depth proof: border columns are present up to the cap. A
+        // flat one-level fixture yields exactly 1 border column; genuine
+        // nesting yields one per bordered level.
         let border_columns = lines.first().map_or(0, |line| line.matches('│').count());
+        assert_eq!(
+            border_columns, MAX_BORDERED_QUOTE_DEPTH,
+            "expected one border column per bordered level in {lines:?}"
+        );
+        // The text survives the deep fold.
         assert!(
-            border_columns >= 100,
-            "expected deep nesting, found only {border_columns} border columns in {lines:?}"
+            lines.first().is_some_and(|line| line.contains('x')),
+            "content lost in {lines:?}"
         );
     }
 

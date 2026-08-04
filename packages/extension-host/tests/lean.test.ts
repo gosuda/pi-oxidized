@@ -52,8 +52,17 @@ function markerLog(): Marker[] {
 	return Array.isArray(log) ? (log as Marker[]) : [];
 }
 
+/** flag-context.mjs writes to its own key so its lines cannot mix with echo markers. */
+function flagContextLog(): Marker[] {
+	const key = "__leanFlagContextLog";
+	const holder = globalThis as Record<string, unknown>;
+	const log = holder[key];
+	return Array.isArray(log) ? (log as Marker[]) : [];
+}
+
 afterEach(() => {
 	(globalThis as Record<string, unknown>).__leanEchoLog = [];
+	(globalThis as Record<string, unknown>).__leanFlagContextLog = [];
 	delete (globalThis as Record<string, unknown>).__leanFlow;
 });
 
@@ -439,7 +448,7 @@ describe("lean: extensions.load registry", () => {
 				),
 				writeFile(
 					memberCreateRequireEntry,
-					'globalThis.__leanMemberCreateRequireEvaluated = true; const obj = { createRequire: () => () => null }; obj.createRequire(import.meta.url)("jiti"); export default { name: "member-create-require" };',
+					'globalThis.__leanMemberCreateRequireEvaluated = true; const r = module.createRequire; r(import.meta.url)("jiti"); export default { name: "member-create-require" };',
 				),
 				writeFile(
 					bareCreateRequireEntry,
@@ -457,21 +466,25 @@ describe("lean: extensions.load registry", () => {
 					(error) => [error.path, error.error],
 				),
 			);
-			// The createRequire call is caught as an unsupported loader form
-			// before the node:module import is even reached.
+			// The createRequire name is caught as an unsupported loader form
+			// on its import binding, before evaluation can begin.
 			expect(errors.get(createRequireEntry)).toContain("unsupported createRequire loader");
 			expect(errors.get(nodeModuleEntry)).toContain("module");
 			// A bare createRequire call (no node:module import) is caught as
 			// an unsupported loader form before evaluation.
 			expect(errors.get(bareCreateRequireEntry)).toContain("unsupported createRequire loader");
-			// A member-access createRequire is a property name, not a loader.
-			expect(errors.has(memberCreateRequireEntry)).toBe(false);
+			// A member-read createRequire alias (`const r = m.createRequire`)
+			// fails closed as well: the loader name is rejected on ANY
+			// appearance, so the aliased binding is never invoked.
+			expect(errors.get(memberCreateRequireEntry)).toContain("unsupported createRequire loader");
 			expect(holder["__leanCreateRequireEvaluated"]).toBeUndefined();
 			expect(holder["__leanNodeModuleEvaluated"]).toBeUndefined();
+			expect(holder["__leanMemberCreateRequireEvaluated"]).toBeUndefined();
 			expect(holder["__leanBareCreateRequireEvaluated"]).toBeUndefined();
 		} finally {
 			delete holder["__leanCreateRequireEvaluated"];
 			delete holder["__leanNodeModuleEvaluated"];
+			delete holder["__leanMemberCreateRequireEvaluated"];
 			delete holder["__leanBareCreateRequireEvaluated"];
 			await link.finish();
 			await rm(directory, { recursive: true, force: true });
@@ -483,6 +496,9 @@ describe("lean: extensions.load registry", () => {
 		const aliasedEntry = join(directory, "aliased-get-builtin-module.mjs");
 		const escapedEntry = join(directory, "escaped-get-builtin-module.mjs");
 		const memberEntry = join(directory, "member-get-builtin-module.mjs");
+		const memberAliasEntry = join(directory, "member-alias-get-builtin-module.mjs");
+		const computedEntry = join(directory, "computed-get-builtin-module.mjs");
+		const cleanEntry = join(directory, "clean.mjs");
 		const holder = globalThis as Record<string, unknown>;
 		const link = new LeanLink({ cwd: directory, extensionPaths: [] });
 		try {
@@ -501,12 +517,24 @@ describe("lean: extensions.load registry", () => {
 				),
 				writeFile(
 					memberEntry,
-					'globalThis.__leanMemberGetBuiltinModuleEvaluated = true; const obj = { getBuiltinModule: () => null }; obj.getBuiltinModule("module"); export default { name: "member-get-builtin-module" };',
+					'globalThis.__leanMemberGetBuiltinModuleEvaluated = true; const m = process.getBuiltinModule("module"); m.createRequire(import.meta.url)("jiti"); export default { name: "member-get-builtin-module" };',
+				),
+				writeFile(
+					memberAliasEntry,
+					'globalThis.__leanMemberAliasGetBuiltinModuleEvaluated = true; const g = process.getBuiltinModule; g("module").createRequire(import.meta.url)("jiti"); export default { name: "member-alias-get-builtin-module" };',
+				),
+				writeFile(
+					computedEntry,
+					'globalThis.__leanComputedGetBuiltinModuleEvaluated = true; process["getBuiltinModule"]("module").createRequire(import.meta.url)("jiti"); export default { name: "computed-get-builtin-module" };',
+				),
+				writeFile(
+					cleanEntry,
+					'globalThis.__leanCleanEvaluated = true; export default { name: "clean" };',
 				),
 			]);
 			await link.hello(1);
 			link.request(2, "extensions.load", {
-				extensionPaths: [bareEntry, aliasedEntry, escapedEntry, memberEntry],
+				extensionPaths: [bareEntry, aliasedEntry, escapedEntry, memberEntry, memberAliasEntry, computedEntry, cleanEntry],
 				cwd: directory,
 			});
 			const response = payload(await link.response(2, "extensions.load"));
@@ -515,23 +543,121 @@ describe("lean: extensions.load registry", () => {
 					(error) => [error.path, error.error],
 				),
 			);
-			// Every non-member getBuiltinModule call is rejected as an
-			// unsupported loader form before evaluation, regardless of how the
-			// identifier entered scope (global, destructured from process, or
-			// Unicode-escaped) — the member createRequire chain is never reached.
+			// EVERY appearance of the loader name fails closed before
+			// evaluation: bare call, destructured binding, Unicode-escaped
+			// spelling, member call, member-read alias invoked through a local
+			// binding, and computed string key.
 			expect(errors.get(bareEntry)).toContain("unsupported getBuiltinModule loader");
 			expect(errors.get(aliasedEntry)).toContain("unsupported getBuiltinModule loader");
 			expect(errors.get(escapedEntry)).toContain("unsupported getBuiltinModule loader");
-			// A member-access getBuiltinModule is a property name, not a loader.
-			expect(errors.has(memberEntry)).toBe(false);
+			expect(errors.get(memberEntry)).toContain("unsupported getBuiltinModule loader");
+			expect(errors.get(memberAliasEntry)).toContain("unsupported getBuiltinModule loader");
+			expect(errors.get(computedEntry)).toContain("unsupported getBuiltinModule loader");
+			// Positive control: a clean extension in the same load batch still
+			// evaluates and registers, proving the rejections are pre-evaluation
+			// scan results rather than a wholesale load failure.
+			expect(errors.has(cleanEntry)).toBe(false);
+			expect(response["extensions"]).toBe(1);
+			expect(holder["__leanCleanEvaluated"]).toBe(true);
 			expect(holder["__leanGetBuiltinModuleEvaluated"]).toBeUndefined();
 			expect(holder["__leanAliasedGetBuiltinModuleEvaluated"]).toBeUndefined();
 			expect(holder["__leanEscapedGetBuiltinModuleEvaluated"]).toBeUndefined();
+			expect(holder["__leanMemberGetBuiltinModuleEvaluated"]).toBeUndefined();
+			expect(holder["__leanMemberAliasGetBuiltinModuleEvaluated"]).toBeUndefined();
+			expect(holder["__leanComputedGetBuiltinModuleEvaluated"]).toBeUndefined();
 		} finally {
 			delete holder["__leanGetBuiltinModuleEvaluated"];
 			delete holder["__leanAliasedGetBuiltinModuleEvaluated"];
 			delete holder["__leanEscapedGetBuiltinModuleEvaluated"];
 			delete holder["__leanMemberGetBuiltinModuleEvaluated"];
+			delete holder["__leanMemberAliasGetBuiltinModuleEvaluated"];
+			delete holder["__leanComputedGetBuiltinModuleEvaluated"];
+			delete holder["__leanCleanEvaluated"];
+			await link.finish();
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
+
+	test("extensions.load of an already-loaded path registers nothing and does not double-count", async () => {
+		const link = new LeanLink({ cwd: PACKAGE_DIR, extensionPaths: [] });
+		await link.hello(1);
+		link.request(2, "extensions.load", { extensionPaths: [ECHO_ENTRY], cwd: PACKAGE_DIR });
+		const first = payload(await link.response(2, "extensions.load"));
+		expect(first["extensions"]).toBe(1);
+
+		// A repeat load of the same path is a no-op: no duplicate shortcut,
+		// no duplicate hook handler, and no inflated loaded count.
+		link.request(3, "extensions.load", { extensionPaths: [ECHO_ENTRY], cwd: PACKAGE_DIR });
+		const second = payload(await link.response(3, "extensions.load"));
+		expect(second["extensions"]).toBe(0);
+		expect(second["errors"]).toEqual([]);
+		expect(second["shortcuts"]).toHaveLength(1);
+		expect(link.runner.extensionCount).toBe(1);
+
+		link.request(4, "session_start", { reason: "startup" });
+		const res = payload(await link.response(4, "session_start"));
+		expect(res["ok"]).toBe(true);
+		const firings = markerLog().filter((marker) => marker.name === "hook.session_start");
+		expect(firings).toHaveLength(1);
+		await link.finish();
+	});
+
+	test("rejects malformed string escapes in import specifiers before evaluation", async () => {
+		const directory = await mkdtemp(join(PACKAGE_DIR, ".test-lean-malformed-escape-"));
+		const badHexEntry = join(directory, "bad-hex.mjs");
+		const badBracedEntry = join(directory, "bad-braced.mjs");
+		const surrogateEntry = join(directory, "surrogate.mjs");
+		const cleanEntry = join(directory, "clean.mjs");
+		const holder = globalThis as Record<string, unknown>;
+		const link = new LeanLink({ cwd: directory, extensionPaths: [] });
+		try {
+			await Promise.all([
+				writeFile(
+					badHexEntry,
+					'globalThis.__leanBadHexEvaluated = true; import "ji\\xNNti"; export default { name: "bad-hex" };',
+				),
+				writeFile(
+					badBracedEntry,
+					'globalThis.__leanBadBracedEvaluated = true; import "ji\\u{}ti"; export default { name: "bad-braced" };',
+				),
+				writeFile(
+					surrogateEntry,
+					'globalThis.__leanSurrogateEvaluated = true; import "ji\\u{D800}ti"; export default { name: "surrogate" };',
+				),
+				writeFile(
+					cleanEntry,
+					'globalThis.__leanMalformedCleanEvaluated = true; import "./d\\u0065p.mjs"; export default { name: "clean" };',
+				),
+				writeFile(join(directory, "dep.mjs"), "export const dep = true;"),
+			]);
+			await link.hello(1);
+			link.request(2, "extensions.load", {
+				extensionPaths: [badHexEntry, badBracedEntry, surrogateEntry, cleanEntry],
+				cwd: directory,
+			});
+			const response = payload(await link.response(2, "extensions.load"));
+			const errors = new Map(
+				(response["errors"] as Array<{ path: string; error: string }>).map(
+					(error) => [error.path, error.error],
+				),
+			);
+			// Malformed hex/Unicode escapes fail closed through the scanner
+			// instead of cooking to a wrong character that could hide a
+			// forbidden specifier.
+			expect(errors.get(badHexEntry)).toContain("unsupported malformed string escape");
+			expect(errors.get(badBracedEntry)).toContain("unsupported malformed string escape");
+			expect(errors.get(surrogateEntry)).toContain("unsupported malformed string escape");
+			// A well-formed escape still cooks and evaluates normally.
+			expect(errors.has(cleanEntry)).toBe(false);
+			expect(holder["__leanMalformedCleanEvaluated"]).toBe(true);
+			expect(holder["__leanBadHexEvaluated"]).toBeUndefined();
+			expect(holder["__leanBadBracedEvaluated"]).toBeUndefined();
+			expect(holder["__leanSurrogateEvaluated"]).toBeUndefined();
+		} finally {
+			delete holder["__leanBadHexEvaluated"];
+			delete holder["__leanBadBracedEvaluated"];
+			delete holder["__leanSurrogateEvaluated"];
+			delete holder["__leanMalformedCleanEvaluated"];
 			await link.finish();
 			await rm(directory, { recursive: true, force: true });
 		}
@@ -908,7 +1034,7 @@ describe("lean: commands, flags, shortcuts, providers", () => {
 		// Before any flags.set, callbacks observe the declared defaults.
 		link.request(3, "command.execute", { command: "report-flags", args: "" });
 		await link.response(3, "command.execute");
-		expect(markerLog()).toContainEqual({
+		expect(flagContextLog()).toContainEqual({
 			name: "flags",
 			value: { mode: "quiet", debug: false },
 		});
@@ -918,7 +1044,7 @@ describe("lean: commands, flags, shortcuts, providers", () => {
 		expect(payload(await link.response(4, "flags.set"))["ok"]).toBe(true);
 		link.request(5, "command.execute", { command: "report-flags", args: "" });
 		await link.response(5, "command.execute");
-		expect(markerLog()).toContainEqual({
+		expect(flagContextLog()).toContainEqual({
 			name: "flags",
 			value: { mode: "loud", debug: true },
 		});
@@ -926,7 +1052,7 @@ describe("lean: commands, flags, shortcuts, providers", () => {
 		// tool.execute contexts carry the same effective values.
 		link.request(6, "tool.execute", { name: "flag-tool", toolCallId: "flag-1", args: {}, prepared: true });
 		await link.response(6, "tool.execute");
-		expect(markerLog()).toContainEqual({
+		expect(flagContextLog()).toContainEqual({
 			name: "tool-flags",
 			value: { mode: "loud", debug: true },
 		});
@@ -2015,6 +2141,32 @@ describe("lean: surface validation units", () => {
 		}
 	});
 
+	test("parseLeanExtension rejects empty optional strings like required ones", () => {
+		// requireString and optionalString agree: the empty string is not a
+		// value, so an empty label/description can never reach the registry
+		// snapshot (`label ?? name` only falls back on nullish).
+		const cases: Array<[definition: unknown, message: string]> = [
+			[{ tools: [{ name: "t", description: "d", label: "", execute: () => ({}) }] }, "label must be a non-empty string when present"],
+			[{ commands: [{ name: "c", description: "", handler: () => {} }] }, "description must be a non-empty string when present"],
+			[{ flags: [{ name: "f", type: "boolean", description: "" }] }, "description must be a non-empty string when present"],
+			[{ shortcuts: [{ key: "ctrl+x", description: "", handler: () => {} }] }, "description must be a non-empty string when present"],
+			[{ providers: [{ name: "p", displayName: "" }] }, "displayName must be a non-empty string when present"],
+			[{ providers: [{ name: "p", baseUrl: "" }] }, "baseUrl must be a non-empty string when present"],
+			[{ providers: [{ name: "p", api: "" }] }, "api must be a non-empty string when present"],
+			[{ providers: [{ name: "p", apiKey: "" }] }, "apiKey must be a non-empty string when present"],
+		];
+		for (const [definition, message] of cases) {
+			expect(() => parseLeanExtension(definition)).toThrow(message);
+		}
+		// Absent optionals stay optional.
+		expect(() =>
+			parseLeanExtension({
+				tools: [{ name: "t", description: "d", execute: () => ({}) }],
+				commands: [{ name: "c", handler: () => {} }],
+			})
+		).not.toThrow();
+	});
+
 	test("parseLeanExtension accepts a full valid definition", () => {
 		const definition = parseLeanExtension({
 			name: "ok",
@@ -2162,6 +2314,33 @@ describe("lean: surface validation units", () => {
 		];
 		for (const [source, expected] of cases) {
 			expect(findExcludedImport(source)).toBe(expected);
+		}
+	});
+
+	test("excluded-specifier and preload guards agree on aliased typebox and anchored pi-ai", () => {
+		// The preload fixture executes a Bun plugin on import, so its regex is
+		// read back from source instead of imported; the table then proves the
+		// two guards cannot drift apart.
+		const fixtureSource = readFileSync(PRELOAD, "utf8");
+		const forbiddenMatch = fixtureSource.match(/const FORBIDDEN =\s*\/(.+)\/;/);
+		expect(forbiddenMatch).not.toBeNull();
+		const forbidden = new RegExp(forbiddenMatch?.[1] ?? "");
+		const cases: Array<[specifier: string, excluded: boolean]> = [
+			["typebox", true],
+			["typebox/value", true],
+			["@sinclair/typebox", true],
+			["@sinclair/typebox/value", true],
+			["@earendil-works/pi-ai", true],
+			["@earendil-works/pi-ai/compat", true],
+			["@earendil-works/pi-ai-extra", false],
+			["@earendil-works/pi-tui-protocol", false],
+			["jiti", true],
+			["jiti/subpath", true],
+			["some-package", false],
+		];
+		for (const [specifier, excluded] of cases) {
+			expect(findExcludedImport(`import "${specifier}";`)).toBe(excluded ? specifier : undefined);
+			expect(forbidden.test(specifier)).toBe(excluded);
 		}
 	});
 

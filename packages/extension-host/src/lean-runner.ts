@@ -100,7 +100,17 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * a loader whose string argument is not a recognized import form, so it
  * could otherwise bypass the excluded-module graph.
  */
-const EXCLUDED_SPECIFIER = /^(?:@earendil-works\/(?:pi-coding-agent|pi-agent-core|pi-ai|pi-tui(?!-protocol))|@mariozechner\/|jiti(?:\/|$)|typebox(?:\/|$)|(?:node:)?module$|.*\/(?:host|virtual-modules)\.ts$)/;
+const EXCLUDED_SPECIFIER = /^(?:@earendil-works\/(?:pi-coding-agent|pi-agent-core|pi-ai(?:\/|$)|pi-tui(?!-protocol))|@mariozechner\/|jiti(?:\/|$)|@sinclair\/typebox(?:\/|$)|typebox(?:\/|$)|(?:node:)?module$|.*\/(?:host|virtual-modules)\.ts$)/;
+
+/**
+ * Builtin loader factories whose string argument never appears as a scanned
+ * import form, so any appearance — bare, member-read, computed-key, aliased,
+ * or escape-cooked — fails closed. `createRequire`/`getBuiltinModule` hand
+ * back a loader for the excluded graph; proving that one particular read is
+ * an innocent same-named property would take a full parser, and a false
+ * positive only costs the entry its load, never its isolation.
+ */
+const LOADER_NAMES: ReadonlySet<string> = new Set(["createRequire", "getBuiltinModule"]);
 
 function isAsciiIdentifierStartCode(code: number): boolean {
 	return (
@@ -317,8 +327,13 @@ interface ModuleLoadScan {
  * import scanner records specifiers this way so an escaped literal such as
  * `import("j\u0069ti")` matches the same exclusion — and resolves to the same
  * path — as the plain `import("jiti")`.
+ *
+ * Hex escapes are validated exactly like `decodeIdentifierEscape`: a malformed
+ * sequence yields undefined so the scanner fails closed instead of letting a
+ * `NaN` parse silently cook to the wrong character and smuggle a specifier
+ * past the exclusion check.
  */
-function decodeStringEscapes(raw: string): string {
+function decodeStringEscapes(raw: string): string | undefined {
 	let out = "";
 	let at = 0;
 	const length = raw.length;
@@ -343,24 +358,31 @@ function decodeStringEscapes(raw: string): string {
 			case "\r":
 				if (raw[at] === "\n") at += 1;
 				break;
-			case "x":
-				out += String.fromCharCode(Number.parseInt(raw.slice(at, at + 2), 16));
+			case "x": {
+				const digits = raw.slice(at, at + 2);
+				if (!/^[0-9A-Fa-f]{2}$/.test(digits)) return undefined;
+				out += String.fromCharCode(Number.parseInt(digits, 16));
 				at += 2;
 				break;
-			case "u":
+			}
+			case "u": {
+				let digits: string;
 				if (raw[at] === "{") {
 					const close = raw.indexOf("}", at);
-					if (close === -1) {
-						out += "u";
-						break;
-					}
-					out += String.fromCodePoint(Number.parseInt(raw.slice(at + 1, close), 16));
+					if (close === -1) return undefined;
+					digits = raw.slice(at + 1, close);
+					if (!/^[0-9A-Fa-f]{1,6}$/.test(digits)) return undefined;
 					at = close + 1;
 				} else {
-					out += String.fromCharCode(Number.parseInt(raw.slice(at, at + 4), 16));
+					digits = raw.slice(at, at + 4);
+					if (!/^[0-9A-Fa-f]{4}$/.test(digits)) return undefined;
 					at += 4;
 				}
+				const codePoint = Number.parseInt(digits, 16);
+				if (codePoint > 0x10_FFFF || (codePoint >= 0xD800 && codePoint <= 0xDFFF)) return undefined;
+				out += String.fromCodePoint(codePoint);
 				break;
+			}
 			default:
 				out += next;
 				break;
@@ -481,14 +503,22 @@ function scanModuleLoads(source: string): ModuleLoadScan {
 		|| (previous.kind === "punctuator" && REGEX_PREFIX_PUNCTUATORS.has(previous.value));
 	/**
 	 * Record the terminated string literal at `from` as a specifier and
-	 * return the index after its closing quote; undefined otherwise.
+	 * return the index after its closing quote; undefined otherwise. A
+	 * literal whose escapes do not cook cleanly is not a specifier the
+	 * runtime could load either, so it fails closed as unsupported rather
+	 * than being recorded half-decoded.
 	 */
 	const readSpecifier = (from: number): number | undefined => {
 		const quote = source[from];
 		if (quote !== '"' && quote !== "'") return undefined;
 		const end = skipString(from, quote);
 		if (end <= from + 1 || source[end - 1] !== quote) return undefined;
-		specifiers.push(decodeStringEscapes(source.slice(from + 1, end - 1)));
+		const cooked = decodeStringEscapes(source.slice(from + 1, end - 1));
+		if (cooked === undefined) {
+			unsupported ??= "malformed string escape";
+		} else {
+			specifiers.push(cooked);
+		}
 		lastSignificant = { kind: "literal", value: "string" };
 		return end;
 	};
@@ -537,6 +567,14 @@ function scanModuleLoads(source: string): ModuleLoadScan {
 			at = identifier.end;
 			if (word === "import" || word === "export") return start;
 			recordWord(word);
+			// A loader factory imported or re-exported under its own name
+			// enters scope through this clause even when the specifier itself
+			// is not excluded (e.g. a `node:process` named import); fail
+			// closed for the same reason as in the main scan.
+			if (LOADER_NAMES.has(word)) {
+				unsupported ??= `${word} loader`;
+				continue;
+			}
 			if (word !== "from") continue;
 			const literalEnd = readSpecifier(skipInsignificant(at));
 			if (literalEnd !== undefined) return literalEnd;
@@ -580,7 +618,25 @@ function scanModuleLoads(source: string): ModuleLoadScan {
 			}
 		}
 		if (char === '"' || char === "'") {
-			index = skipString(index, char);
+			// A string directly after `[` is a computed member key, so a
+			// loader name there (`process["getBuiltinModule"]`) is the same
+			// bypass as the dotted member read. Array-literal elements share
+			// the `[`-prefix shape and fail closed with it: a lexically
+			// scoped pre-scan cannot separate the two without a full parser.
+			if (lastSignificant?.kind === "punctuator" && lastSignificant.value === "[") {
+				const end = skipString(index, char);
+				if (source[end - 1] === char) {
+					const cooked = decodeStringEscapes(source.slice(index + 1, end - 1));
+					if (cooked === undefined) {
+						unsupported ??= "malformed string escape";
+					} else if (LOADER_NAMES.has(cooked)) {
+						unsupported ??= `${cooked} loader`;
+					}
+				}
+				index = end;
+			} else {
+				index = skipString(index, char);
+			}
 			lastSignificant = { kind: "literal", value: "string" };
 			continue;
 		}
@@ -639,35 +695,17 @@ function scanModuleLoads(source: string): ModuleLoadScan {
 				continue;
 			}
 		}
-		// `createRequire` from `node:module` produces a loader whose string
-		// argument is not a recognized import form, so it can load the
-		// excluded compat graph without recording a specifier. Fail closed
-		// on any non-member call so aliasing through a local re-export
-		// cannot reintroduce the same hole.
-		if (word === "createRequire" && !isMember) {
-			const next = skipInsignificant(index);
-			if (source[next] === "(") {
-				unsupported ??= "createRequire loader";
-				lastSignificant = { kind: "punctuator", value: "(" };
-				index = next + 1;
-				continue;
-			}
-		}
-		// `getBuiltinModule` returns a built-in module by string name, so it
-		// bypasses the excluded-specifier graph the same way `require` does —
-		// e.g. `getBuiltinModule("module")` hands back the excluded `module`
-		// builtin whose `createRequire` would then be a member call and slip
-		// past the guard above. Fail closed on any non-member call regardless
-		// of how the identifier entered scope (global, destructured, re-exported,
-		// or escaped); a member property access stays an ordinary property name.
-		if (word === "getBuiltinModule" && !isMember) {
-			const next = skipInsignificant(index);
-			if (source[next] === "(") {
-				unsupported ??= "getBuiltinModule loader";
-				lastSignificant = { kind: "punctuator", value: "(" };
-				index = next + 1;
-				continue;
-			}
+		// `createRequire` (from `node:module`) and `getBuiltinModule` produce
+		// loaders whose string argument is not a recognized import form, so
+		// either one can load the excluded compat graph without recording a
+		// specifier. Fail closed on ANY appearance of the name — bare call,
+		// bare read, member read or call (`process.getBuiltinModule`),
+		// aliasing read (`const g = process.getBuiltinModule`), private name,
+		// or escape-cooked spelling — because the aliased value is invoked
+		// through an innocent-looking local binding the scan cannot trace.
+		if (LOADER_NAMES.has(word)) {
+			unsupported ??= `${word} loader`;
+			continue;
 		}
 		if ((word !== "import" && word !== "export") || isMember) continue;
 		if (word === "export") {
@@ -747,9 +785,13 @@ async function resolveLocalSpecifier(importer: string, specifier: string): Promi
 		try {
 			if ((await stat(candidate)).isFile()) return candidate;
 		} catch {
-			// Let the runtime report an unresolved local module as it did before graph scanning.
+			// A failed stat rules out this one candidate; keep trying the
+			// remaining spellings of the same specifier.
 		}
 	}
+	// No candidate exists on disk. Returning the unresolved path is what lets
+	// the graph walk surface the missing module as this entry's load error
+	// instead of silently dropping the specifier from the scanned graph.
 	return path;
 }
 
@@ -807,6 +849,13 @@ export class LeanRunner {
 	private readonly shortcuts: RegisteredShortcut[] = [];
 	private readonly providers = new Map<string, RegisteredProvider>();
 	private readonly hooks = new Map<string, RegisteredHook[]>();
+	/**
+	 * Entry paths already registered on this live runner. `extensions.load`
+	 * is idempotent per path: shortcuts and hooks are push-based (unlike the
+	 * first-wins maps), so a repeat load would double-register them and
+	 * double-count `loadedCount` unless the path is skipped outright.
+	 */
+	private readonly loadedPaths = new Set<string>();
 	private loadedCount = 0;
 
 	/** In-flight tool.execute AbortControllers keyed by request id. */
@@ -935,8 +984,10 @@ export class LeanRunner {
 		const errors: Array<{ path: string; error: string }> = [];
 		let loaded = 0;
 		for (const entryPath of paths) {
+			if (this.loadedPaths.has(entryPath)) continue;
 			try {
 				await this.loadOne(entryPath, cwd);
+				this.loadedPaths.add(entryPath);
 				loaded++;
 			} catch (err) {
 				errors.push({

@@ -2254,10 +2254,6 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn generated_cross_version_session_interoperability() -> TestResult {
-        // The generator writes one `.jsonl` per scenario in
-        // scripts/generate-session-fixtures.ts main(); keep this in sync with
-        // that manifest so adding a fixture updates both sites together.
-        const EXPECTED_FIXTURE_COUNT: usize = 9;
         fn fixture_files(
             root: &Path,
             files: &mut Vec<PathBuf>,
@@ -2294,6 +2290,11 @@ mod tests {
                 }
             }
         }
+        // Derive the expected fixture count from the generator's own manifest
+        // (scripts/generate-session-fixtures.ts `fixtures.push(...)` calls) so
+        // adding a fixture updates the expected count automatically.
+        let generator_source = include_str!("../../../../../scripts/generate-session-fixtures.ts");
+        let expected_fixture_count: usize = generator_source.matches("fixtures.push(").count();
 
         let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../.agent-tasks/pi-rust-rewrite/fixtures/sessions");
@@ -2328,8 +2329,8 @@ mod tests {
         fixtures.sort();
         assert_eq!(
             fixtures.len(),
-            EXPECTED_FIXTURE_COUNT,
-            "expected {EXPECTED_FIXTURE_COUNT} session fixtures under {}, found {}; \
+            expected_fixture_count,
+            "expected {expected_fixture_count} session fixtures under {}, found {}; \
              run `bun run scripts/generate-session-fixtures.ts` to regenerate",
             fixture_root.display(),
             fixtures.len()

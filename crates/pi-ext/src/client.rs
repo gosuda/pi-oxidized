@@ -488,6 +488,50 @@ impl HostClient {
         }
     }
 
+    /// Serialize a typed value into a `FrameKind::Res` frame and send it.
+    ///
+    /// `encode_label` appears in the [`HostClientError::Payload`] message when
+    /// serialization fails, preserving the per-responder error text.
+    async fn send_typed_response<T: serde::Serialize>(
+        &self,
+        id: FrameId,
+        method: &str,
+        value: &T,
+        encode_label: &str,
+    ) -> HostResult<()> {
+        let payload = serde_json::to_value(value)
+            .map_err(|error| HostClientError::Payload(format!("encode {encode_label}: {error}")))?;
+        self.send_frame(Frame {
+            id,
+            kind: FrameKind::Res,
+            method: method.to_owned(),
+            payload,
+        })
+        .await
+    }
+
+    /// Send a `FrameKind::Error` frame built from an [`ErrorPayload`].
+    ///
+    /// `encode_label` appears in the [`HostClientError::Payload`] message when
+    /// serialization fails, preserving the per-responder error text.
+    async fn send_error_frame(
+        &self,
+        id: FrameId,
+        method: &str,
+        payload: crate::protocol::ErrorPayload,
+        encode_label: &str,
+    ) -> HostResult<()> {
+        let payload = serde_json::to_value(payload)
+            .map_err(|error| HostClientError::Payload(format!("encode {encode_label}: {error}")))?;
+        self.send_frame(Frame {
+            id,
+            kind: FrameKind::Error,
+            method: method.to_owned(),
+            payload,
+        })
+        .await
+    }
+
     /// Send a request and await its terminal response.
     ///
     /// # Errors
@@ -602,16 +646,12 @@ impl HostClient {
     /// Returns a payload or transport error when the response cannot be
     /// encoded or sent.
     pub async fn respond_set_model(&self, id: FrameId, success: bool) -> HostResult<()> {
-        let payload = serde_json::to_value(crate::protocol::SessionSetModelResponse { success })
-            .map_err(|error| {
-                HostClientError::Payload(format!("encode setModel response: {error}"))
-            })?;
-        self.send_frame(Frame {
+        self.send_typed_response(
             id,
-            kind: FrameKind::Res,
-            method: crate::protocol::SESSION_SET_MODEL_METHOD.to_owned(),
-            payload,
-        })
+            crate::protocol::SESSION_SET_MODEL_METHOD,
+            &crate::protocol::SessionSetModelResponse { success },
+            "setModel response",
+        )
         .await
     }
 
@@ -629,30 +669,26 @@ impl HostClient {
         id: FrameId,
         outcome: Result<serde_json::Value, String>,
     ) -> HostResult<()> {
-        let frame = match outcome {
-            Ok(result) => Frame {
-                id,
-                kind: FrameKind::Res,
-                method: crate::protocol::SESSION_COMPACT_METHOD.to_owned(),
-                payload: serde_json::to_value(crate::protocol::SessionCompactResponse { result })
-                    .map_err(|error| {
-                    HostClientError::Payload(format!("encode compact response: {error}"))
-                })?,
-            },
-            Err(message) => Frame {
-                id,
-                kind: FrameKind::Error,
-                method: crate::protocol::SESSION_COMPACT_METHOD.to_owned(),
-                payload: serde_json::to_value(crate::protocol::ErrorPayload::new(
-                    "extension_error",
-                    &message,
-                ))
-                .map_err(|error| {
-                    HostClientError::Payload(format!("encode compact error: {error}"))
-                })?,
-            },
-        };
-        self.send_frame(frame).await
+        match outcome {
+            Ok(result) => {
+                self.send_typed_response(
+                    id,
+                    crate::protocol::SESSION_COMPACT_METHOD,
+                    &crate::protocol::SessionCompactResponse { result },
+                    "compact response",
+                )
+                .await
+            }
+            Err(message) => {
+                self.send_error_frame(
+                    id,
+                    crate::protocol::SESSION_COMPACT_METHOD,
+                    crate::protocol::ErrorPayload::new("extension_error", &message),
+                    "compact error",
+                )
+                .await
+            }
+        }
     }
 
     /// Answer a correlated `session.newSession` request from the host.
@@ -667,19 +703,15 @@ impl HostClient {
         cancelled: bool,
         token: Option<&str>,
     ) -> HostResult<()> {
-        let payload = serde_json::to_value(crate::protocol::SessionNewSessionResponse {
-            cancelled,
-            replacement_token: token.map(str::to_owned),
-        })
-        .map_err(|error| {
-            HostClientError::Payload(format!("encode newSession response: {error}"))
-        })?;
-        self.send_frame(Frame {
+        self.send_typed_response(
             id,
-            kind: FrameKind::Res,
-            method: crate::protocol::SESSION_NEW_SESSION_METHOD.to_owned(),
-            payload,
-        })
+            crate::protocol::SESSION_NEW_SESSION_METHOD,
+            &crate::protocol::SessionNewSessionResponse {
+                cancelled,
+                replacement_token: token.map(str::to_owned),
+            },
+            "newSession response",
+        )
         .await
     }
 
@@ -696,18 +728,16 @@ impl HostClient {
         selected_text: Option<&str>,
         token: Option<&str>,
     ) -> HostResult<()> {
-        let payload = serde_json::to_value(crate::protocol::SessionForkResponse {
-            cancelled,
-            selected_text: selected_text.map(str::to_owned),
-            replacement_token: token.map(str::to_owned),
-        })
-        .map_err(|error| HostClientError::Payload(format!("encode fork response: {error}")))?;
-        self.send_frame(Frame {
+        self.send_typed_response(
             id,
-            kind: FrameKind::Res,
-            method: crate::protocol::SESSION_FORK_METHOD.to_owned(),
-            payload,
-        })
+            crate::protocol::SESSION_FORK_METHOD,
+            &crate::protocol::SessionForkResponse {
+                cancelled,
+                selected_text: selected_text.map(str::to_owned),
+                replacement_token: token.map(str::to_owned),
+            },
+            "fork response",
+        )
         .await
     }
 
@@ -723,19 +753,15 @@ impl HostClient {
         cancelled: bool,
         token: Option<&str>,
     ) -> HostResult<()> {
-        let payload = serde_json::to_value(crate::protocol::SessionSwitchSessionResponse {
-            cancelled,
-            replacement_token: token.map(str::to_owned),
-        })
-        .map_err(|error| {
-            HostClientError::Payload(format!("encode switchSession response: {error}"))
-        })?;
-        self.send_frame(Frame {
+        self.send_typed_response(
             id,
-            kind: FrameKind::Res,
-            method: crate::protocol::SESSION_SWITCH_SESSION_METHOD.to_owned(),
-            payload,
-        })
+            crate::protocol::SESSION_SWITCH_SESSION_METHOD,
+            &crate::protocol::SessionSwitchSessionResponse {
+                cancelled,
+                replacement_token: token.map(str::to_owned),
+            },
+            "switchSession response",
+        )
         .await
     }
 
@@ -753,29 +779,26 @@ impl HostClient {
         id: FrameId,
         outcome: Result<crate::protocol::SessionNavigateTreeResponse, String>,
     ) -> HostResult<()> {
-        let frame = match outcome {
-            Ok(result) => Frame {
-                id,
-                kind: FrameKind::Res,
-                method: crate::protocol::SESSION_NAVIGATE_TREE_METHOD.to_owned(),
-                payload: serde_json::to_value(result).map_err(|error| {
-                    HostClientError::Payload(format!("encode navigateTree response: {error}"))
-                })?,
-            },
-            Err(message) => Frame {
-                id,
-                kind: FrameKind::Error,
-                method: crate::protocol::SESSION_NAVIGATE_TREE_METHOD.to_owned(),
-                payload: serde_json::to_value(crate::protocol::ErrorPayload::new(
-                    "extension_error",
-                    &message,
-                ))
-                .map_err(|error| {
-                    HostClientError::Payload(format!("encode navigateTree error: {error}"))
-                })?,
-            },
-        };
-        self.send_frame(frame).await
+        match outcome {
+            Ok(result) => {
+                self.send_typed_response(
+                    id,
+                    crate::protocol::SESSION_NAVIGATE_TREE_METHOD,
+                    &result,
+                    "navigateTree response",
+                )
+                .await
+            }
+            Err(message) => {
+                self.send_error_frame(
+                    id,
+                    crate::protocol::SESSION_NAVIGATE_TREE_METHOD,
+                    crate::protocol::ErrorPayload::new("extension_error", &message),
+                    "navigateTree error",
+                )
+                .await
+            }
+        }
     }
 
     /// Answer a correlated `session.reload` request from the host.
@@ -792,32 +815,28 @@ impl HostClient {
         id: FrameId,
         outcome: Result<Option<&str>, String>,
     ) -> HostResult<()> {
-        let frame = match outcome {
-            Ok(token) => Frame {
-                id,
-                kind: FrameKind::Res,
-                method: crate::protocol::SESSION_RELOAD_METHOD.to_owned(),
-                payload: serde_json::to_value(crate::protocol::SessionReloadResponse {
-                    replacement_token: token.map(str::to_owned),
-                })
-                .map_err(|error| {
-                    HostClientError::Payload(format!("encode reload response: {error}"))
-                })?,
-            },
-            Err(message) => Frame {
-                id,
-                kind: FrameKind::Error,
-                method: crate::protocol::SESSION_RELOAD_METHOD.to_owned(),
-                payload: serde_json::to_value(crate::protocol::ErrorPayload::new(
-                    "extension_error",
-                    &message,
-                ))
-                .map_err(|error| {
-                    HostClientError::Payload(format!("encode reload error: {error}"))
-                })?,
-            },
-        };
-        self.send_frame(frame).await
+        match outcome {
+            Ok(token) => {
+                self.send_typed_response(
+                    id,
+                    crate::protocol::SESSION_RELOAD_METHOD,
+                    &crate::protocol::SessionReloadResponse {
+                        replacement_token: token.map(str::to_owned),
+                    },
+                    "reload response",
+                )
+                .await
+            }
+            Err(message) => {
+                self.send_error_frame(
+                    id,
+                    crate::protocol::SESSION_RELOAD_METHOD,
+                    crate::protocol::ErrorPayload::new("extension_error", &message),
+                    "reload error",
+                )
+                .await
+            }
+        }
     }
 
     /// Reject a correlated replacement request because another is pending.
@@ -827,21 +846,17 @@ impl HostClient {
     /// Returns a payload or transport error when the error frame cannot be
     /// encoded or sent.
     pub async fn respond_replacement_busy(&self, id: FrameId, method: &str) -> HostResult<()> {
-        let payload = serde_json::to_value(crate::protocol::ErrorPayload {
-            code: "replacement_busy".to_owned(),
-            message: "session replacement in progress".to_owned(),
-            retryable: true,
-            data: None,
-        })
-        .map_err(|error| {
-            HostClientError::Payload(format!("encode replacement_busy error: {error}"))
-        })?;
-        self.send_frame(Frame {
+        self.send_error_frame(
             id,
-            kind: FrameKind::Error,
-            method: method.to_owned(),
-            payload,
-        })
+            method,
+            crate::protocol::ErrorPayload {
+                code: "replacement_busy".to_owned(),
+                message: "session replacement in progress".to_owned(),
+                retryable: true,
+                data: None,
+            },
+            "replacement_busy error",
+        )
         .await
     }
 
@@ -860,17 +875,12 @@ impl HostClient {
         method: &str,
         message: &str,
     ) -> HostResult<()> {
-        let payload = serde_json::to_value(crate::protocol::ErrorPayload::new(
-            "extension_error",
-            message,
-        ))
-        .map_err(|error| HostClientError::Payload(format!("encode session error: {error}")))?;
-        self.send_frame(Frame {
+        self.send_error_frame(
             id,
-            kind: FrameKind::Error,
-            method: method.to_owned(),
-            payload,
-        })
+            method,
+            crate::protocol::ErrorPayload::new("extension_error", message),
+            "session error",
+        )
         .await
     }
 
@@ -1047,15 +1057,25 @@ impl HostClient {
         // Drop the outbound sender so the writer EOFs stdin.
         drop(self.cmd_tx.lock().await.take());
         let mut child_guard = self.child.lock().await;
-        if let Some(child) = child_guard.take() {
+        let reap = if let Some(child) = child_guard.take() {
             let reap = reap_child(child).await;
             drop(self.reader_handle.lock().await.take());
             reap
         } else {
-            // In-memory transport: no child to reap. Pending calls remain the
-            // reader's responsibility; `running` is already cleared.
+            // In-memory transport: no child to reap. `running` is already
+            // cleared; pending calls are failed below.
             Ok(())
-        }
+        };
+        // Fail any pending calls that survived transport teardown. The reader
+        // task may have already drained them on EOF; this is a no-op then.
+        fail_all(
+            &self.shared,
+            &HostClientError::Closed {
+                message: "host shut down".to_owned(),
+                stderr: stderr_of(&self.shared),
+            },
+        );
+        reap
     }
 }
 
@@ -2524,6 +2544,174 @@ mod tests {
             )
             .await;
         assert!(matches!(result, Err(HostClientError::NotRunning)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn responder_success_frames_preserve_shape() -> R {
+        let (client, mut host) = make_pair().await;
+
+        client.respond_set_model(1, true).await?;
+        let f = host.require_frame("setModel res").await?;
+        assert_eq!(f.id, 1);
+        assert_eq!(f.kind, FrameKind::Res);
+        assert_eq!(f.method, crate::protocol::SESSION_SET_MODEL_METHOD);
+        assert_eq!(f.payload["success"], true);
+
+        client
+            .respond_compact(2, Ok(serde_json::json!({"summary": "ok"})))
+            .await?;
+        let f = host.require_frame("compact res").await?;
+        assert_eq!(f.id, 2);
+        assert_eq!(f.kind, FrameKind::Res);
+        assert_eq!(f.method, crate::protocol::SESSION_COMPACT_METHOD);
+        assert_eq!(f.payload["result"]["summary"], "ok");
+
+        client.respond_new_session(3, false, Some("tok")).await?;
+        let f = host.require_frame("newSession res").await?;
+        assert_eq!(f.id, 3);
+        assert_eq!(f.kind, FrameKind::Res);
+        assert_eq!(f.method, crate::protocol::SESSION_NEW_SESSION_METHOD);
+        assert_eq!(f.payload["cancelled"], false);
+        assert_eq!(f.payload["replacementToken"], "tok");
+
+        client
+            .respond_fork(4, false, Some("sel"), Some("tok2"))
+            .await?;
+        let f = host.require_frame("fork res").await?;
+        assert_eq!(f.id, 4);
+        assert_eq!(f.kind, FrameKind::Res);
+        assert_eq!(f.method, crate::protocol::SESSION_FORK_METHOD);
+        assert_eq!(f.payload["selectedText"], "sel");
+        assert_eq!(f.payload["replacementToken"], "tok2");
+
+        client.respond_switch_session(5, true, None).await?;
+        let f = host.require_frame("switchSession res").await?;
+        assert_eq!(f.id, 5);
+        assert_eq!(f.kind, FrameKind::Res);
+        assert_eq!(f.method, crate::protocol::SESSION_SWITCH_SESSION_METHOD);
+        assert_eq!(f.payload["cancelled"], true);
+        assert!(f.payload.get("replacementToken").is_none());
+
+        let nav = crate::protocol::SessionNavigateTreeResponse {
+            cancelled: false,
+            editor_text: Some("draft".to_owned()),
+            aborted: None,
+            summary_entry: None,
+        };
+        client.respond_navigate_tree(6, Ok(nav)).await?;
+        let f = host.require_frame("navigateTree res").await?;
+        assert_eq!(f.id, 6);
+        assert_eq!(f.kind, FrameKind::Res);
+        assert_eq!(f.method, crate::protocol::SESSION_NAVIGATE_TREE_METHOD);
+        assert_eq!(f.payload["editorText"], "draft");
+
+        client.respond_reload(7, Ok(Some("tok3"))).await?;
+        let f = host.require_frame("reload res").await?;
+        assert_eq!(f.id, 7);
+        assert_eq!(f.kind, FrameKind::Res);
+        assert_eq!(f.method, crate::protocol::SESSION_RELOAD_METHOD);
+        assert_eq!(f.payload["replacementToken"], "tok3");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn responder_error_frames_preserve_shape() -> R {
+        let (client, mut host) = make_pair().await;
+
+        client
+            .respond_compact(10, Err("compaction failed".to_owned()))
+            .await?;
+        let f = host.require_frame("compact err").await?;
+        assert_eq!(f.id, 10);
+        assert_eq!(f.kind, FrameKind::Error);
+        assert_eq!(f.method, crate::protocol::SESSION_COMPACT_METHOD);
+        assert_eq!(f.payload["code"], "extension_error");
+        assert_eq!(f.payload["message"], "compaction failed");
+        assert_eq!(f.payload["retryable"], false);
+
+        client
+            .respond_navigate_tree(11, Err("entry not found".to_owned()))
+            .await?;
+        let f = host.require_frame("navigateTree err").await?;
+        assert_eq!(f.id, 11);
+        assert_eq!(f.kind, FrameKind::Error);
+        assert_eq!(f.method, crate::protocol::SESSION_NAVIGATE_TREE_METHOD);
+        assert_eq!(f.payload["code"], "extension_error");
+        assert_eq!(f.payload["message"], "entry not found");
+        assert_eq!(f.payload["retryable"], false);
+
+        client
+            .respond_reload(12, Err("reload failed".to_owned()))
+            .await?;
+        let f = host.require_frame("reload err").await?;
+        assert_eq!(f.id, 12);
+        assert_eq!(f.kind, FrameKind::Error);
+        assert_eq!(f.method, crate::protocol::SESSION_RELOAD_METHOD);
+        assert_eq!(f.payload["code"], "extension_error");
+        assert_eq!(f.payload["message"], "reload failed");
+        assert_eq!(f.payload["retryable"], false);
+
+        client
+            .respond_replacement_busy(13, crate::protocol::SESSION_NEW_SESSION_METHOD)
+            .await?;
+        let f = host.require_frame("replacement_busy err").await?;
+        assert_eq!(f.id, 13);
+        assert_eq!(f.kind, FrameKind::Error);
+        assert_eq!(f.method, crate::protocol::SESSION_NEW_SESSION_METHOD);
+        assert_eq!(f.payload["code"], "replacement_busy");
+        assert_eq!(f.payload["message"], "session replacement in progress");
+        assert_eq!(f.payload["retryable"], true);
+
+        client
+            .respond_session_error(14, crate::protocol::SESSION_FORK_METHOD, "unclaimed")
+            .await?;
+        let f = host.require_frame("session_error err").await?;
+        assert_eq!(f.id, 14);
+        assert_eq!(f.kind, FrameKind::Error);
+        assert_eq!(f.method, crate::protocol::SESSION_FORK_METHOD);
+        assert_eq!(f.payload["code"], "extension_error");
+        assert_eq!(f.payload["message"], "unclaimed");
+        assert_eq!(f.payload["retryable"], false);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_fails_pending_calls() -> R {
+        let (client, _host) = make_pair().await;
+        // Start a request that will never be answered by the host.
+        let request_fut = client.request(
+            Method::Notify,
+            serde_json::json!({}),
+            Duration::from_secs(30),
+        );
+        tokio::pin!(request_fut);
+        // Let the request register in the pending map (synchronous prefix).
+        tokio::select! {
+            biased;
+            _ = &mut request_fut => {
+                return Err("request completed before shutdown — test setup issue".into());
+            }
+            () = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+        // Shut down while the request is pending.
+        client.shutdown().await?;
+        // The request must resolve with an error, not hang.
+        let result = tokio::time::timeout(Duration::from_secs(2), &mut request_fut)
+            .await
+            .map_err(|_| "request hung after shutdown")?;
+        assert!(
+            matches!(
+                result,
+                Err(HostClientError::Closed { .. } | HostClientError::NotRunning)
+            ),
+            "expected Closed or NotRunning after shutdown, got {result:?}"
+        );
+        // The pending map must be empty.
+        let pending_len = client.shared.pending.lock().map_or(0, |p| p.len());
+        assert_eq!(pending_len, 0, "pending map should be empty after shutdown");
         Ok(())
     }
 }

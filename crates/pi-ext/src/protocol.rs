@@ -2511,6 +2511,9 @@ mod bridge_tests {
                 SESSION_RELOAD_METHOD => {
                     from_payload::<SessionReloadResponse>(&frame.payload)?;
                 }
+                SESSION_REPLACEMENT_READY_METHOD => {
+                    from_payload::<SessionReplacementReadyEvent>(&frame.payload)?;
+                }
                 UI_CONTROL_METHOD => {
                     from_payload::<UiControl>(&frame.payload)?;
                 }
@@ -2548,6 +2551,7 @@ mod bridge_tests {
             (SESSION_RELOAD_METHOD, FrameKind::Error),
             (SESSION_RELOAD_METHOD, FrameKind::Res),
             (UI_CONTROL_METHOD, FrameKind::Event),
+            (SESSION_REPLACEMENT_READY_METHOD, FrameKind::Event),
             (UI_STATE_METHOD, FrameKind::Event),
         ] {
             assert!(

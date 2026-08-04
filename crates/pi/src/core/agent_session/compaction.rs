@@ -770,7 +770,7 @@ impl AgentSession {
         let retry = self.lock_settings().get_retry_settings();
         SummarizationRetryPolicy {
             enabled: retry.enabled,
-            max_retries: u32::try_from(retry.max_retries).unwrap_or(u32::MAX),
+            max_retries: clamp_summarization_max_retries(retry.max_retries),
             base_delay_ms: retry.base_delay_ms,
         }
     }
@@ -810,6 +810,28 @@ impl AgentSession {
                 }
             })),
         }
+    }
+}
+
+/// Sane ceiling for summarization retry attempts.
+///
+/// A summarization request is a single LLM call within a user-facing session.
+/// With the 60-second backoff cap, more than this many retries would keep the
+/// session blocked for ~10+ minutes on a transient failure that either
+/// resolves in a few attempts or indicates a persistent problem. Values at or
+/// below this are passed through unchanged; oversized or rejected values clamp
+/// here rather than falling back to `u32::MAX` (~4.29e9 retries).
+const SUMMARIZATION_MAX_RETRIES_CEILING: u32 = 10;
+
+/// Clamp a resolved `max_retries` to the sane summarization ceiling.
+///
+/// Values that fit in `u32` and are at or below the ceiling pass through.
+/// Oversized values (above the ceiling or overflowing `u32`) clamp to the
+/// ceiling, preserving the existing default behavior for rejected input.
+fn clamp_summarization_max_retries(max_retries: u64) -> u32 {
+    match u32::try_from(max_retries) {
+        Ok(value) => value.min(SUMMARIZATION_MAX_RETRIES_CEILING),
+        Err(_) => SUMMARIZATION_MAX_RETRIES_CEILING,
     }
 }
 
@@ -1908,5 +1930,26 @@ mod tests {
             "should emit entry_appended for the compaction entry: {events:?}"
         );
         Ok(())
+    }
+
+    #[test]
+    fn summarization_retry_clamps_oversized_max_retries() {
+        // Values at or below the ceiling pass through unchanged.
+        assert_eq!(clamp_summarization_max_retries(0), 0);
+        assert_eq!(clamp_summarization_max_retries(3), 3);
+        assert_eq!(
+            clamp_summarization_max_retries(u64::from(SUMMARIZATION_MAX_RETRIES_CEILING)),
+            SUMMARIZATION_MAX_RETRIES_CEILING
+        );
+        // Values above the ceiling clamp to the ceiling.
+        assert_eq!(
+            clamp_summarization_max_retries(u64::from(SUMMARIZATION_MAX_RETRIES_CEILING) + 1),
+            SUMMARIZATION_MAX_RETRIES_CEILING
+        );
+        // u64 overflow also clamps to the ceiling (was u32::MAX ~4.29e9).
+        assert_eq!(
+            clamp_summarization_max_retries(u64::MAX),
+            SUMMARIZATION_MAX_RETRIES_CEILING
+        );
     }
 }

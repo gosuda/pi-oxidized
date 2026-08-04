@@ -472,7 +472,25 @@ describe("reconstructProviderData transaction (Cluster C)", () => {
 		});
 		let second: Promise<ReconstructProviderDataResult> | undefined;
 		try {
-			await firstProofReached.promise;
+			// Race the proof barrier against the first transaction's rejection.
+			// If an earlier failure (lock acquisition, staging, backup rename)
+			// rejects `first` before the proof runs, the barrier never resolves
+			// and the test would hang until the runner timeout. Surfacing the
+			// real rejection here makes the underlying failure the diagnosis.
+			// On the success path `first` cannot settle until the proof returns
+			// (it awaits releaseFirstProof inside the proof), so this race
+			// cannot fire spuriously.
+			await Promise.race([
+				firstProofReached.promise,
+				first.then(
+					() => {
+						throw new Error("first transaction completed without reaching the proof barrier");
+					},
+					(error: unknown) => {
+						throw error;
+					},
+				),
+			]);
 			let secondProofRan = false;
 			// Deferred barrier: resolves only when the second contender's
 			// onLockWait fires, proving it observed the first owner's held

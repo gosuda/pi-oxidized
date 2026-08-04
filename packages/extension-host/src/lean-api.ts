@@ -459,8 +459,8 @@ function requireFunction(context: string, value: unknown, field: string): void {
 }
 
 function optionalString(context: string, value: unknown, field: string): void {
-	if (value !== undefined && typeof value !== "string") {
-		fail(context, `${field} must be a string when present`);
+	if (value !== undefined && (typeof value !== "string" || value === "")) {
+		fail(context, `${field} must be a non-empty string when present`);
 	}
 }
 

@@ -5,7 +5,7 @@
  */
 
 function mark(name, value) {
-	const key = "__leanEchoLog";
+	const key = "__leanFlagContextLog";
 	const log = globalThis[key] ?? [];
 	log.push({ name, value });
 	globalThis[key] = log;

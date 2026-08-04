@@ -406,6 +406,7 @@ pub async fn generate_branch_summary(
     if response.stop_reason == StopReason::Aborted {
         return Ok(BranchSummaryResult {
             aborted: Some(true),
+            usage: Some(response.usage),
             ..BranchSummaryResult::default()
         });
     }
@@ -417,6 +418,7 @@ pub async fn generate_branch_summary(
                     .clone()
                     .unwrap_or_else(|| "Summarization failed".to_owned()),
             ),
+            usage: Some(response.usage),
             ..BranchSummaryResult::default()
         });
     }
@@ -722,6 +724,98 @@ mod tests {
             assert!(!prompts[0].contains("## Goal"));
         }
         assert_eq!(result_ok(maxes.lock())[0], DEFAULT_BRANCH_MAX_TOKENS);
+    }
+
+    /// Build a `stream_fn` whose response uses the given `stop_reason` and usage,
+    /// so the early-return paths in `generate_branch_summary` can be exercised.
+    fn stream_with_stop(stop: StopReason, response_usage: pi_ai::Usage) -> SummarizeStreamFn {
+        Arc::new(move |_model, _ctx, _opts| {
+            let mut message = AssistantMessage::new("a", "p", "m", 1);
+            message.content = vec![AssistantContent::Text(TextContent::new("BRANCH"))];
+            message.stop_reason = stop;
+            message.usage = response_usage.clone();
+            if stop == StopReason::Error {
+                message.error_message = Some("boom".into());
+            }
+            Box::pin(async move {
+                let stream = futures::stream::iter(vec![Ok(AssistantMessageEvent::Done {
+                    reason: pi_ai::DoneReason::Stop,
+                    message,
+                })]);
+                Box::pin(stream)
+                    as Pin<
+                        Box<
+                            dyn futures::Stream<Item = Result<AssistantMessageEvent, ProviderError>>
+                                + Send,
+                        >,
+                    >
+            })
+        })
+    }
+
+    fn one_entry() -> SessionEntry {
+        result_ok(serde_json::from_value(json!({
+            "type": "message",
+            "id": "u",
+            "parentId": null,
+            "timestamp": "2025-01-01T00:00:00.000Z",
+            "message": user_agent("hello branch"),
+        })))
+    }
+
+    fn summary_opts(stream_fn: SummarizeStreamFn) -> GenerateBranchSummaryOptions {
+        GenerateBranchSummaryOptions {
+            model: test_model(),
+            api_key: None,
+            headers: None,
+            env: None,
+            signal: CancellationToken::new(),
+            custom_instructions: None,
+            replace_instructions: false,
+            reserve_tokens: Some(16_384),
+            stream_fn,
+            retry: None,
+            retry_callbacks: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn aborted_branch_summary_persists_usage() {
+        let billed = usage(200, 50);
+        let result = result_ok(
+            generate_branch_summary(
+                &[one_entry()],
+                summary_opts(stream_with_stop(StopReason::Aborted, billed.clone())),
+            )
+            .await,
+        );
+        assert_eq!(result.aborted, Some(true));
+        assert_eq!(
+            result.usage,
+            Some(billed),
+            "aborted summary must persist billed usage"
+        );
+    }
+
+    #[tokio::test]
+    async fn errored_branch_summary_persists_usage() {
+        let billed = usage(300, 75);
+        let result = result_ok(
+            generate_branch_summary(
+                &[one_entry()],
+                summary_opts(stream_with_stop(StopReason::Error, billed.clone())),
+            )
+            .await,
+        );
+        assert!(
+            result.error.is_some(),
+            "errored summary must carry an error message"
+        );
+        assert_eq!(
+            result.usage,
+            Some(billed),
+            "errored summary must persist billed usage"
+        );
     }
 
     // keep DEFAULT_COMPACTION_SETTINGS referenced so settings parity is visible

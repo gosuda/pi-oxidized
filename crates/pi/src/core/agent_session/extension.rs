@@ -651,6 +651,9 @@ impl AgentSession {
                     .pending_replacement_target()
                     .or_else(|| host.session_target());
                 let Some(target) = target else {
+                    // The item was already dequeued; answer its correlated
+                    // request so the host does not hang, then stop.
+                    answer_unclaimed_bridge_event(&host, item).await;
                     break;
                 };
                 target.apply_session_bridge_event(&host, item).await;
@@ -1500,6 +1503,59 @@ async fn abort_bridge_pending(
     match pending_replacement(op) {
         Ok(prepared) => runtime.abort_prepared_replacement(prepared).await,
         Err(op) => drop(op),
+    }
+}
+
+/// Answer a dequeued bridge event whose target session is gone.
+///
+/// The bridge loop dequeues an item before checking for a live target. When
+/// the target is `None` the item must still be answered — correlated
+/// requests (`setModel`, `compact`, …) would otherwise hang the host.
+/// Fire-and-forget variants (`Command`, `ReplacementReady`) need no response.
+async fn answer_unclaimed_bridge_event(host: &Arc<ExtensionRuntimeSet>, event: SessionBridgeEvent) {
+    match event {
+        SessionBridgeEvent::Command(_) | SessionBridgeEvent::ReplacementReady { .. } => {}
+        SessionBridgeEvent::SetModel { id, .. } => {
+            let _ = host.respond_set_model(id, false).await;
+        }
+        SessionBridgeEvent::Compact { id, .. } => {
+            let _ = host
+                .respond_compact(id, Err("no active session".to_owned()))
+                .await;
+        }
+        SessionBridgeEvent::NewSession { id, .. } => {
+            let _ = host
+                .respond_session_error(
+                    id,
+                    protocol::SESSION_NEW_SESSION_METHOD,
+                    "no active session",
+                )
+                .await;
+        }
+        SessionBridgeEvent::Fork { id, .. } => {
+            let _ = host
+                .respond_session_error(id, protocol::SESSION_FORK_METHOD, "no active session")
+                .await;
+        }
+        SessionBridgeEvent::NavigateTree { id, .. } => {
+            let _ = host
+                .respond_navigate_tree(id, Err("no active session".to_owned()))
+                .await;
+        }
+        SessionBridgeEvent::SwitchSession { id, .. } => {
+            let _ = host
+                .respond_session_error(
+                    id,
+                    protocol::SESSION_SWITCH_SESSION_METHOD,
+                    "no active session",
+                )
+                .await;
+        }
+        SessionBridgeEvent::Reload { id } => {
+            let _ = host
+                .respond_reload(id, Err("no active session".to_owned()))
+                .await;
+        }
     }
 }
 
@@ -2580,6 +2636,52 @@ mod tests {
         })
         .await?;
         session.dispose().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn answer_unclaimed_bridge_event_answers_correlated_requests() -> TestResult {
+        use crate::core::extension_host::SessionBridgeEvent;
+        use crate::core::extension_runtime_set::{EndpointKind, ExtensionRuntimeSet};
+        use pi_ext::protocol::{SessionCompactRequest, SessionSetModelRequest};
+
+        let (runner, _host) =
+            crate::core::extension_runtime_set::tests::make_runner(serde_json::json!({
+                "handlers": [],
+                "terminalInput": false
+            }))
+            .await?;
+        let set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, runner)]);
+
+        // Each correlated bridge event must be answered so the host does not
+        // hang. The respond_* calls route through the set to the endpoint.
+        // If answer_unclaimed_bridge_event dropped the item instead of
+        // answering, the host's pending request would never resolve.
+        answer_unclaimed_bridge_event(
+            &set,
+            SessionBridgeEvent::SetModel {
+                id: 1,
+                request: SessionSetModelRequest {
+                    model: json!({"provider": "p", "id": "m"}),
+                },
+            },
+        )
+        .await;
+
+        answer_unclaimed_bridge_event(
+            &set,
+            SessionBridgeEvent::Compact {
+                id: 2,
+                request: SessionCompactRequest {
+                    custom_instructions: None,
+                },
+            },
+        )
+        .await;
+
+        answer_unclaimed_bridge_event(&set, SessionBridgeEvent::Reload { id: 3 }).await;
+
+        set.shutdown_once().await;
         Ok(())
     }
 }

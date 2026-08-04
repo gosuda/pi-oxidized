@@ -37,16 +37,30 @@ function assert(condition: unknown, message: string): asserts condition {
 	if (!condition) throw new Error(message);
 }
 
-/** Detect the session version from the first JSONL line (defaults to v1 when absent). */
-function sessionVersionFromBytes(bytes: Buffer): number {
+/** Sentinel for a session whose first record is unparseable or carries a non-numeric version. */
+export const SESSION_VERSION_UNKNOWN = -1;
+
+/** A v1 session header predates the `version` field, so its absence IS the v1 signal. */
+const SESSION_VERSION_LEGACY = 1;
+
+/**
+ * Detect the session version from the first JSONL line. Returns
+ * `SESSION_VERSION_UNKNOWN` when the first record is unparseable or carries a
+ * present-but-non-numeric version, so the caller rejects an unclassifiable file
+ * instead of silently taking the lenient migration branch. A parseable header
+ * with no `version` field is a genuine v1 session, not an unreadable one.
+ */
+export function sessionVersionFromBytes(bytes: Buffer): number {
 	const newlineIndex = bytes.indexOf(0x0a);
 	const firstLine = newlineIndex >= 0 ? bytes.subarray(0, newlineIndex) : bytes;
+	let header: { version?: unknown };
 	try {
-		const header = JSON.parse(firstLine.toString("utf8")) as { version?: number };
-		return header.version ?? 1;
+		header = JSON.parse(firstLine.toString("utf8")) as { version?: unknown };
 	} catch {
-		return 1;
+		return SESSION_VERSION_UNKNOWN;
 	}
+	if (header.version === undefined) return SESSION_VERSION_LEGACY;
+	return typeof header.version === "number" ? header.version : SESSION_VERSION_UNKNOWN;
 }
 
 function installReferenceResolver(): void {
@@ -115,6 +129,10 @@ export async function reopenWithSourcePinnedTypescript(
 	for (const file of files) {
 		const before = await readFile(file);
 		const versionBefore = sessionVersionFromBytes(before);
+		assert(
+			versionBefore !== SESSION_VERSION_UNKNOWN,
+			`session file has an unparseable or non-numeric version header: ${relative(REPO_ROOT, file)}`,
+		);
 		const manager = SessionManager.open(file);
 		const after = await readFile(file);
 		// Verify the opaque entry survived reopen (post-open file, not

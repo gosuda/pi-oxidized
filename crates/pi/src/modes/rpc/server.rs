@@ -244,16 +244,23 @@ fn normalize_response_data_kind(data: &mut Value, kind: ResponseDataNormalizatio
 
 /// Normalize known fields within a response `data` payload.
 ///
-/// Delegates to [`normalize_response_data_kind`] via a command-string → kind
-/// mapping. This serves the generic/Value-level serialization path; production
-/// response serialization uses [`serialize_response`] driven by the
-/// compile-time-exhaustive [`command_response_normalization`] classification.
+/// Delegates to the compile-time-exhaustive [`command_response_normalization`]
+/// classifier by parsing the command string into a typed [`RpcCommand`]. This
+/// ensures one classifier governs both the typed (production) and the
+/// string-based (generic/Value) serialization paths. Commands whose required
+/// fields are absent from the wire `type` alone fail to parse and fall back to
+/// [`ResponseDataNormalization::None`] — but those commands are already
+/// classified as `None` by the typed classifier, so the outcome is identical.
 fn normalize_response_data(data: &mut Value, command: Option<&str>) {
     let kind = match command {
-        Some("get_messages") => ResponseDataNormalization::Messages,
-        Some("get_entries") => ResponseDataNormalization::Entries,
-        Some("get_tree") => ResponseDataNormalization::Tree,
-        _ => ResponseDataNormalization::None,
+        Some(command_type) => {
+            let wire = serde_json::json!({"type": command_type});
+            match RpcCommand::parse_value(&wire) {
+                Ok(parsed) => command_response_normalization(&parsed),
+                Err(_) => ResponseDataNormalization::None,
+            }
+        }
+        None => ResponseDataNormalization::None,
     };
     normalize_response_data_kind(data, kind);
 }
@@ -3702,7 +3709,10 @@ mod tests {
             }
         }))
         .expect("valid RpcResponse");
-        let line = serialize_response(&response, ResponseDataNormalization::Messages);
+        let command = RpcCommand::parse_value(&serde_json::json!({"type": "get_messages"}))
+            .expect("valid get_messages command");
+        let kind = command_response_normalization(&command);
+        let line = serialize_response(&response, kind);
         let parsed: Value = serde_json::from_str(&line).expect("valid JSONL");
         let content = &parsed["data"]["messages"][0]["content"];
         assert!(
@@ -3711,5 +3721,69 @@ mod tests {
         );
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[0]["text"], "hi");
+    }
+
+    #[test]
+    fn command_response_normalization_classifies_representative_commands() {
+        // The compile-time-exhaustive classifier must return the correct
+        // normalization kind for every representative RpcCommand variant.
+        // Misclassifying any arm (e.g. flipping GetMessages to None) fails
+        // this test.
+        let parse = |ty: &str| {
+            RpcCommand::parse_value(&serde_json::json!({"type": ty})).expect("valid command")
+        };
+
+        assert_eq!(
+            command_response_normalization(&parse("get_messages")),
+            ResponseDataNormalization::Messages
+        );
+        assert_eq!(
+            command_response_normalization(&parse("get_entries")),
+            ResponseDataNormalization::Entries
+        );
+        assert_eq!(
+            command_response_normalization(&parse("get_tree")),
+            ResponseDataNormalization::Tree
+        );
+        assert_eq!(
+            command_response_normalization(&parse("get_state")),
+            ResponseDataNormalization::None
+        );
+        assert_eq!(
+            command_response_normalization(&parse("abort")),
+            ResponseDataNormalization::None
+        );
+        assert_eq!(
+            command_response_normalization(&parse("get_commands")),
+            ResponseDataNormalization::None
+        );
+    }
+
+    #[test]
+    fn normalize_response_data_delegates_to_typed_classifier() {
+        // The string-based path must produce the same normalization as the
+        // typed classifier — one source of truth, not a parallel mapping.
+        let mut data = serde_json::json!({
+            "messages": [{ "role": "user", "content": "hi", "timestamp": 1 }]
+        });
+        normalize_response_data(&mut data, Some("get_messages"));
+        assert!(
+            data["messages"][0]["content"].is_array(),
+            "string path delegates to typed classifier for get_messages"
+        );
+
+        let mut data = serde_json::json!({
+            "entries": [{ "type": "message", "message": { "role": "user", "content": "hi" } }]
+        });
+        normalize_response_data(&mut data, Some("get_entries"));
+        assert!(
+            data["entries"][0]["message"]["content"].is_array(),
+            "string path delegates to typed classifier for get_entries"
+        );
+
+        // A command that is not message-bearing must leave data untouched.
+        let mut data = serde_json::json!({"state": "idle"});
+        normalize_response_data(&mut data, Some("get_state"));
+        assert_eq!(data, serde_json::json!({"state": "idle"}));
     }
 }

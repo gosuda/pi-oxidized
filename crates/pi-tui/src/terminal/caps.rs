@@ -84,6 +84,13 @@ impl TerminalCapabilities {
     /// Detect capabilities from the process environment.
     ///
     /// Escape-based probes (Kitty flags, CSI 16t, OSC 11) refine this cache later.
+    ///
+    /// This probe performs blocking terminal I/O (under tmux it spawns
+    /// `tmux display-message` and polls it for up to [`TMUX_PROBE_TIMEOUT`]),
+    /// so async callers must offload it with `tokio::task::spawn_blocking`
+    /// instead of running it on a runtime worker. The result is unaffected by
+    /// which thread runs it: the tmux hyperlink answer is cached process-wide
+    /// in [`TMUX_HYPERLINK_CACHE`].
     #[must_use]
     pub fn detect() -> Self {
         detect_with(

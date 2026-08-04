@@ -6,7 +6,7 @@
  * the selected acceptance rows, and writes a machine-readable result artifact.
  */
 
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { arch, cpus, hostname, platform, release } from "node:os";
 import { dirname, resolve } from "node:path";
 
@@ -31,6 +31,7 @@ interface MatrixRow {
 	readonly tier: Tier;
 	readonly required: boolean;
 	readonly excluded?: boolean;
+	readonly requires?: readonly string[];
 	readonly commands: readonly CommandSpec[];
 	readonly evidence: string;
 	readonly rationale?: string;
@@ -177,6 +178,9 @@ function assertMatrixRow(value: unknown, index: number): asserts value is Matrix
 	}
 	if (value.excluded !== undefined && !isBoolean(value.excluded)) {
 		throw new Error(`rows[${index}].excluded must be a boolean`);
+	}
+	if (value.requires !== undefined && !isStringArray(value.requires)) {
+		throw new Error(`rows[${index}].requires must be a string array`);
 	}
 	if (value.rationale !== undefined && !isString(value.rationale)) {
 		throw new Error(`rows[${index}].rationale must be a string`);
@@ -358,7 +362,26 @@ export async function runMatrix(options: {
 }): Promise<MatrixResult> {
 	const { matrix, matrixPath, repoRoot, request, dryRun } = options;
 	const selected = selectRows(matrix, request);
-	const groups = uniqueCommands(selected);
+
+	// Check declared prerequisites before grouping commands so a missing
+	// prerequisite fails the row with a named error instead of an opaque
+	// command failure downstream.
+	const prerequisiteFailures = new Map<string, string>();
+	for (const row of selected) {
+		if (row.excluded || row.requires === undefined) continue;
+		for (const requiredPath of row.requires) {
+			if (!existsSync(resolve(repoRoot, requiredPath))) {
+				prerequisiteFailures.set(
+					row.id,
+					`missing prerequisite: ${requiredPath} not found under ${repoRoot}`,
+				);
+				break;
+			}
+		}
+	}
+
+	const runnableRows = selected.filter((row) => !prerequisiteFailures.has(row.id));
+	const groups = uniqueCommands(runnableRows);
 	const commandResults: CommandResult[] = [];
 	const rowResultById = new Map<string, RowResult>();
 	const startedAt = isoNow();
@@ -369,6 +392,15 @@ export async function runMatrix(options: {
 				rowId: row.id,
 				status: "skipped",
 				error: row.rationale,
+			});
+			continue;
+		}
+		const prereqError = prerequisiteFailures.get(row.id);
+		if (prereqError !== undefined) {
+			rowResultById.set(row.id, {
+				rowId: row.id,
+				status: "failed",
+				error: prereqError,
 			});
 			continue;
 		}

@@ -254,9 +254,15 @@ pub fn truncate_tail(content: &str, options: TruncationOptions) -> TruncationRes
             // maxBytes — take a UTF-8-safe suffix of it.
             if output_lines.is_empty() {
                 let truncated_line = truncate_string_to_bytes_from_end(line, max_bytes);
-                output_bytes = truncated_line.len();
-                output_lines.push(truncated_line.to_owned());
-                last_line_partial = true;
+                // Only count a line when the partial suffix is non-empty. When
+                // maxBytes is too small for even one character the suffix is
+                // empty; pushing it would report output_lines=1 while the
+                // content is empty (zero lines).
+                if !truncated_line.is_empty() {
+                    output_bytes = truncated_line.len();
+                    output_lines.push(truncated_line.to_owned());
+                    last_line_partial = true;
+                }
             }
             break;
         }
@@ -417,6 +423,7 @@ mod tests {
             });
 
             prop_assert_eq!(result.output_bytes, result.content.len());
+            prop_assert_eq!(result.output_lines, split_lines_for_counting(&result.content).len());
             prop_assert!(result.output_bytes <= max_bytes);
             prop_assert!(result.output_lines <= max_lines);
             prop_assert!(content.ends_with(&result.content));
@@ -596,6 +603,23 @@ mod tests {
         assert!(result.last_line_partial);
         assert_eq!(result.content, "éé");
         assert_eq!(result.output_bytes, 4);
+    }
+
+    #[test]
+    fn tail_partial_line_too_small_for_one_character_yields_no_lines() {
+        // "é" is 2 bytes; max_bytes=1 cannot fit even one character, so the
+        // partial-tail suffix is empty. The output must report zero lines to
+        // match the empty content, not one phantom line from the empty push.
+        let result = tail("é", 10, 1);
+        assert!(result.truncated);
+        assert_eq!(result.truncated_by, Some(TruncatedBy::Bytes));
+        assert_eq!(result.content, "");
+        assert_eq!(result.output_bytes, 0);
+        assert_eq!(result.output_lines, 0);
+        assert_eq!(
+            result.output_lines,
+            split_lines_for_counting(&result.content).len()
+        );
     }
 
     #[test]

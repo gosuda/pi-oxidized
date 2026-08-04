@@ -21,7 +21,10 @@ use super::extension_runtime_set::{
 use super::model_runtime::{
     CreateModelRuntimeOptions, ModelRuntime, ModelRuntimeError, ProviderConfigInput,
 };
-use super::resources::{DefaultResourceLoader, DefaultResourceLoaderOptions, ResourceLoader};
+use super::resources::{
+    DefaultResourceLoader, DefaultResourceLoaderOptions, ExtensionPathInfo, ResourceLoader,
+    SourceInfo,
+};
 use super::settings::{SettingsManager, SettingsManagerCreateOptions};
 use super::trust::{ProjectTrustStore, ResolveProjectTrustedOptions, resolve_project_trusted};
 
@@ -703,10 +706,7 @@ async fn start_extension_phase(
     let Some(runner) = record_extension_start(started, diagnostics) else {
         return (None, BTreeMap::new());
     };
-    runner.set_command_source_infos(extension_infos.into_iter().flat_map(|info| {
-        let source = info.source_info;
-        [(info.path, source.clone()), (info.resolved_path, source)]
-    }));
+    runner.set_command_source_infos(command_source_info_entries(extension_infos));
     for (path, outcome) in runner.register_providers_on(model_runtime) {
         if let Err(error) = outcome {
             diagnostics.push(AgentSessionRuntimeDiagnostic::error(format!(
@@ -733,6 +733,24 @@ async fn apply_flags_to_runner(
         })
         .collect();
     runner.apply_flag_values(&values).await
+}
+
+/// Build the `(path, source_info)` entries for
+/// [`ExtensionRuntimeSet::set_command_source_infos`].
+///
+/// An empty `resolved_path` (the loader falls back to `info.path` for
+/// execution) would collide every unresolved extension onto one `""` key —
+/// last silently wins. Skip it, and skip the duplicate entry when
+/// `path == resolved_path`.
+fn command_source_info_entries(
+    infos: Vec<ExtensionPathInfo>,
+) -> impl Iterator<Item = (String, SourceInfo)> {
+    infos.into_iter().flat_map(|info| {
+        let source = info.source_info;
+        let resolved = (!info.resolved_path.is_empty() && info.resolved_path != info.path)
+            .then(|| (info.resolved_path, source.clone()));
+        [(info.path, source)].into_iter().chain(resolved)
+    })
 }
 
 /// Validate and apply extension CLI flag values.
@@ -1671,5 +1689,77 @@ mod tests {
                 "Extension \"broken.ts\" error: load failed"
             )]
         );
+    }
+
+    #[test]
+    fn command_source_info_entries_skips_empty_and_duplicate_resolved_path() {
+        use crate::core::resources::{ExtensionPathInfo, SourceInfo, SourceOrigin, SourceScope};
+
+        fn src(path: &str) -> SourceInfo {
+            SourceInfo {
+                path: path.to_owned(),
+                source: "local".to_owned(),
+                scope: SourceScope::Temporary,
+                origin: SourceOrigin::TopLevel,
+                base_dir: None,
+            }
+        }
+
+        // Two extensions with empty resolved_path: without the fix both
+        // write ("", source) and collide — last silently wins. With the fix
+        // each keeps its own path key.
+        let infos = vec![
+            ExtensionPathInfo {
+                path: "/ext/a".to_owned(),
+                resolved_path: String::new(),
+                source_info: src("/ext/a"),
+            },
+            ExtensionPathInfo {
+                path: "/ext/b".to_owned(),
+                resolved_path: String::new(),
+                source_info: src("/ext/b"),
+            },
+        ];
+        let map: std::collections::HashMap<String, SourceInfo> =
+            command_source_info_entries(infos).collect();
+        assert_eq!(
+            map.get("/ext/a").map(|info| info.path.as_str()),
+            Some("/ext/a")
+        );
+        assert_eq!(
+            map.get("/ext/b").map(|info| info.path.as_str()),
+            Some("/ext/b")
+        );
+        assert!(!map.contains_key(""), "no empty-string collision key");
+
+        // path == resolved_path: only one entry, not a duplicate.
+        let infos = vec![ExtensionPathInfo {
+            path: "/ext/c".to_owned(),
+            resolved_path: "/ext/c".to_owned(),
+            source_info: src("/ext/c"),
+        }];
+        let map: std::collections::HashMap<String, SourceInfo> =
+            command_source_info_entries(infos).collect();
+        assert_eq!(
+            map.len(),
+            1,
+            "duplicate path==resolved must produce one entry"
+        );
+
+        // Distinct path and resolved_path: two entries.
+        let infos = vec![ExtensionPathInfo {
+            path: "/ext/d".to_owned(),
+            resolved_path: "/resolved/d".to_owned(),
+            source_info: src("/ext/d"),
+        }];
+        let map: std::collections::HashMap<String, SourceInfo> =
+            command_source_info_entries(infos).collect();
+        assert_eq!(
+            map.len(),
+            2,
+            "distinct path+resolved must produce two entries"
+        );
+        assert!(map.contains_key("/ext/d"));
+        assert!(map.contains_key("/resolved/d"));
     }
 }

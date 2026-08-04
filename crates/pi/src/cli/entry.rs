@@ -100,7 +100,14 @@ impl Io {
             .with_interactive(|dispatched, runtime| {
                 Box::pin(async move {
                     let _ = dispatched;
-                    run_interactive_mode(runtime, InteractiveRuntimeOptions::detect())
+                    // Detection probes the terminal with blocking I/O; keep it
+                    // off the runtime worker. The blocking pool does not change
+                    // the result — the tmux hyperlink probe is cached in a
+                    // process-wide `OnceLock`.
+                    let options = tokio::task::spawn_blocking(InteractiveRuntimeOptions::detect)
+                        .await
+                        .map_err(|e| format!("interactive: {e}"))?;
+                    run_interactive_mode(runtime, options)
                         .await
                         .map_err(|e| format!("interactive: {e}"))
                 })

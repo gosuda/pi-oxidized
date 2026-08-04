@@ -45,11 +45,15 @@ describe.skipIf(isWindows)("PTY driver", () => {
 			argv: ["/bin/sh", "-c", "sleep 300 & printf 'CHILD:%s\\n' \"$!\"; wait"],
 			cwd: temporaryDirectory("pi-verification-tree-"),
 		});
-		const snapshot = await process.waitFor(/CHILD:(\d+)/, { deadlineMs: 5_000, source: "raw" });
-		const match = /CHILD:(\d+)/.exec(snapshot.rawText);
-		if (!match?.[1]) throw new Error("child pid was not reported");
-		const childPid = Number(match[1]);
-		await process.terminate();
-		expect(() => globalThis.process.kill(childPid, 0)).toThrow();
+		try {
+			const snapshot = await process.waitFor(/CHILD:(\d+)/, { deadlineMs: 5_000, source: "raw" });
+			const match = /CHILD:(\d+)/.exec(snapshot.rawText);
+			if (!match?.[1]) throw new Error("child pid was not reported");
+			const childPid = Number(match[1]);
+			await process.terminate();
+			expect(() => globalThis.process.kill(childPid, 0)).toThrow();
+		} finally {
+			await process.terminate();
+		}
 	}, 15_000);
 });
