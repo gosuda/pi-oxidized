@@ -567,11 +567,12 @@ impl AgentSession {
     /// is configured or auth resolution fails.
     pub(crate) async fn resolve_summarization_inputs(
         &self,
+        operation: &str,
     ) -> Result<(SummarizationAuth, SummarizeStreamFn), CompactionError> {
         let runtime = self.model_runtime_handle().ok_or_else(|| {
-            CompactionError::SummarizationFailed(
-                "No model runtime configured for compaction".to_owned(),
-            )
+            CompactionError::SummarizationFailed(format!(
+                "No model runtime configured for {operation}"
+            ))
         })?;
         let model = self.model();
         let auth = runtime
@@ -608,7 +609,7 @@ impl AgentSession {
 
     async fn resolve_compaction_inputs(&self) -> Result<CompactionInputs, CompactionError> {
         if self.model_runtime_handle().is_some() {
-            let (auth, stream_fn) = self.resolve_summarization_inputs().await?;
+            let (auth, stream_fn) = self.resolve_summarization_inputs("compaction").await?;
             return Ok(CompactionInputs {
                 stream_fn,
                 api_key: auth.api_key,
@@ -1867,6 +1868,32 @@ mod tests {
         assert!(
             matches!(result, Err(CompactionError::SummarizationFailed(_))),
             "expected SummarizationFailed without model_runtime: {result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolve_summarization_inputs_tree_navigation_label() -> TestResult {
+        // Tree navigation / branch summarization calls resolve_summarization_inputs
+        // directly (not through resolve_compaction_inputs). The missing-runtime
+        // error must name that operation, not "compaction", so a user navigating
+        // a tree does not read an error naming an operation they did not perform.
+        let provider = mock_provider();
+        let config = AgentSessionConfig::test_config(provider, test_model(8_192))?;
+        let session = AgentSession::new(config)?;
+        let result = session
+            .resolve_summarization_inputs("branch summarization")
+            .await;
+        let Err(CompactionError::SummarizationFailed(msg)) = &result else {
+            return Err("expected SummarizationFailed".into());
+        };
+        assert!(
+            msg.contains("branch summarization"),
+            "error should name the tree-navigation operation, got: {msg}"
+        );
+        assert!(
+            !msg.contains("for compaction"),
+            "error must not say 'compaction' for tree navigation, got: {msg}"
         );
         Ok(())
     }

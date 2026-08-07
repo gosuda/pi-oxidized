@@ -564,12 +564,15 @@ async fn run_standalone_list(list: &mut SettingsList, closed: &AtomicBool) -> Re
         .activate(!cfg!(windows))
         .map_err(|error| format!("terminal activation failed: {error}"))?;
 
+    let caps = tokio::task::spawn_blocking(TerminalCapabilities::detect)
+        .await
+        .map_err(|err| format!("capability detection join failed: {err}"))?;
     let mut tui = Tui::new(
         io::stdout(),
         ratatui::layout::Size::new(size.0, size.1),
         ratatui::layout::Position::ORIGIN,
         size.1.max(1),
-        TerminalCapabilities::detect(),
+        caps,
     )
     .map_err(|error| format!("tui initialization failed: {error}"))?;
 

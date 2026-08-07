@@ -385,13 +385,14 @@ struct MarkdownRenderer<'a> {
     strike: usize,
 }
 
-/// Deepest blockquote nesting level that still receives a border and a
-/// wrap at its own content width. Each bordered level spends 2 columns on
-/// the border, so at 16 levels a full third of an 80-column terminal is
-/// border — beyond this depth a border costs more columns than it conveys.
-/// Deeper frames fold their raw lines into the parent untransformed, which
-/// also bounds the renderer: bordered wrapping below the cap stays linear
-/// instead of re-splitting accumulated border lines per level.
+/// Absolute ceiling on blockquote nesting levels that still receive a border
+/// and a wrap at their own content width. The effective cap used at runtime
+/// is derived from the available width: each bordered level spends
+/// `border_w` columns on the border, so once `content_width` would saturate
+/// at 1 the bordered transform only re-splits accumulated lines without
+/// adding any real content columns — the line count then grows
+/// multiplicatively with depth. Folding raw below the width-derived cap
+/// keeps output size linear in input size at every terminal width.
 const MAX_BORDERED_QUOTE_DEPTH: usize = 16;
 
 impl<'a> MarkdownRenderer<'a> {
@@ -559,29 +560,8 @@ impl<'a> MarkdownRenderer<'a> {
             self.push_list_segment(ItemSegment::Code { lang, body });
             return;
         }
-        let fence = format!("```{}", lang.as_deref().unwrap_or(""));
-        self.lines.push((self.theme.code_block_border)(&fence));
-        let indent = &self.theme.code_block_indent;
-        if let Some(highlight) = &self.theme.highlight_code {
-            self.lines.extend(
-                highlight(&body, lang.as_deref())
-                    .into_iter()
-                    .map(|line| format!("{indent}{line}")),
-            );
-        } else {
-            self.lines.extend(
-                body.split('\n')
-                    .map(|line| format!("{indent}{}", (self.theme.code_block)(line))),
-            );
-            if body.ends_with('\n')
-                && self.lines.last().is_some_and(|last| {
-                    last == indent || last == &format!("{indent}{}", (self.theme.code_block)(""))
-                })
-            {
-                self.lines.pop();
-            }
-        }
-        self.lines.push((self.theme.code_block_border)("```"));
+        self.lines
+            .extend(self.code_block_logical_lines(lang.as_deref(), &body));
         self.lines.push(String::new());
     }
 
@@ -688,7 +668,6 @@ impl<'a> MarkdownRenderer<'a> {
                     quote_depth_at_start: self.quote_depth,
                     segments: Vec::new(),
                     finished_items: Vec::new(),
-                    range: range.clone(),
                 });
             }
             Event::Start(Tag::Item) => {
@@ -960,11 +939,18 @@ impl<'a> MarkdownRenderer<'a> {
         // `depth`, and the raw lines collected so far. When a `Quote` segment
         // is encountered we suspend the current frame and push a child frame;
         // when a frame is exhausted we apply its border/style transform and
-        // fold the bordered lines into the parent (frames past
-        // `MAX_BORDERED_QUOTE_DEPTH` fold raw instead), so deeply nested
+        // fold the bordered lines into the parent (frames past the
+        // width-derived cap fold raw instead), so deeply nested
         // blockquotes neither recurse on the call stack nor blow up the line
         // count.
         let initial_width = width.saturating_sub(border_w).max(1);
+        // Derive the effective depth cap from the available width: once
+        // `content_width` would saturate at 1, a bordered level only
+        // re-splits accumulated lines without adding real content columns,
+        // so the line count grows multiplicatively. The cap is the largest
+        // depth at which `content_width` is still at least 1 before the
+        // `.max(1)` floor — i.e. `width - border_w * depth >= 1`.
+        let effective_cap = MAX_BORDERED_QUOTE_DEPTH.min(width.saturating_sub(1) / border_w);
         let mut stack: Vec<Frame> = vec![Frame {
             pending: segments.into_iter(),
             content_width: initial_width,
@@ -984,7 +970,7 @@ impl<'a> MarkdownRenderer<'a> {
                 // accumulated line by one, so wrapping re-splits those lines
                 // and the line count grows multiplicatively with depth.
                 // Folding raw keeps output size linear in input size.
-                if depth > MAX_BORDERED_QUOTE_DEPTH {
+                if depth > effective_cap {
                     match stack.last_mut() {
                         Some(parent) => parent.raw.extend(raw),
                         None => return raw,
@@ -1201,27 +1187,14 @@ impl<'a> MarkdownRenderer<'a> {
         if self.inline.is_empty() && heading.is_none() {
             return;
         }
-        let mut text = std::mem::take(&mut self.inline);
-        if let Some(level) = heading {
-            let style = |value: &str| {
-                if level == 1 {
-                    (self.theme.heading)(&(self.theme.bold)(&(self.theme.underline)(value)))
-                } else {
-                    (self.theme.heading)(&(self.theme.bold)(value))
-                }
-            };
-            if level >= 3 {
-                text = format!(
-                    "{}{}",
-                    style(&format!("{} ", "#".repeat(level.into()))),
-                    text
-                );
-            } else {
-                text = style(&text);
-            }
+        let text = std::mem::take(&mut self.inline);
+        let text = if heading.is_some() {
+            self.style_heading_text(text, heading)
         } else if self.quote_depth == 0 {
-            text = (self.apply_default)(&text);
-        }
+            (self.apply_default)(&text)
+        } else {
+            text
+        };
 
         if self.quote_depth > 0 {
             self.lines
@@ -1267,8 +1240,6 @@ struct ListState {
     source_marker: Option<String>,
     segments: Vec<ItemSegment>,
     finished_items: Vec<Vec<String>>,
-    #[allow(dead_code)]
-    range: Range<usize>,
 }
 
 /// A segment of content within a list item.
@@ -2164,10 +2135,14 @@ mod tests {
         // proved nothing about nested rendering.
         //
         // The iterative `render_quoted_segments` walks nesting on an explicit
-        // heap stack instead of the call stack, and nesting past
-        // `MAX_BORDERED_QUOTE_DEPTH` folds raw lines into the parent without
-        // the border/wrap transform, so output size stays linear in input
-        // size at any terminal width — including a normal 80-column one.
+        // heap stack instead of the call stack, and nesting past the
+        // width-derived cap folds raw lines into the parent without the
+        // border/wrap transform, so output size stays linear in input size.
+        // At width 80 the cap is `MAX_BORDERED_QUOTE_DEPTH` (16), so this
+        // fixture exercises the same path as before. The single-token "x"
+        // never wraps, so it only proves the stack is bounded — the
+        // multiplicative saturation path needs a narrow width and multi-token
+        // text (see `deeply_nested_blockquote_narrow_width_stays_bounded`).
         let src = format!("{}x", "> ".repeat(200));
         let lines = plain_default(&src, 80);
         // The single text segment "x" is one raw line; each of the
@@ -2190,6 +2165,54 @@ mod tests {
             lines.first().is_some_and(|line| line.contains('x')),
             "content lost in {lines:?}"
         );
+    }
+
+    #[test]
+    fn deeply_nested_blockquote_narrow_width_stays_bounded()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // At width 20 the width-derived cap is `(20 - 1) / 2 = 9`, so only
+        // depths 1..=9 receive borders (content_width 18, 16, …, 2). Depths
+        // 10..=200 fold raw. With the old fixed cap of 16, depths 10..=16
+        // would still border at content_width 1, splitting every accumulated
+        // line into single characters and re-splitting at each parent level —
+        // multiplicative growth. Multi-token text forces wrapping at the
+        // deepest bordered level so the saturation path is actually reached.
+        let src = format!("{}alpha beta gamma delta", "> ".repeat(200));
+        // Bound the render with an explicit deadline so a hang (e.g. from a
+        // reverted fixed cap) reports as a test failure, not a CI timeout.
+        let lines = std::thread::scope(|s| {
+            let handle = s.spawn(|| plain_default(&src, 20));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if handle.is_finished() {
+                    return handle
+                        .join()
+                        .map_err(|_| "render thread panicked for 200-level quote at width 20");
+                }
+                if std::time::Instant::now() > deadline {
+                    return Err("rendering 200 nested quotes at width 20 did not complete in 10s");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        })?;
+        // The deepest bordered level (depth 9, content_width 2) wraps the
+        // 22-character text into at most 11 lines; each parent level adds a
+        // border but never re-splits (parent content_width = child
+        // content_width + border_w). So the total is bounded by the deepest
+        // level's wrap count plus the trailing blank.
+        assert!(
+            lines.len() <= 15,
+            "expected bounded output at width 20, got {} lines",
+            lines.len()
+        );
+        // The text survives the deep fold — at content_width 2 it is split
+        // into 2-char fragments, so check for the first fragment rather than
+        // the full word.
+        assert!(
+            lines.iter().any(|line| line.contains("al")),
+            "content lost in {lines:?}"
+        );
+        Ok(())
     }
 
     #[test]

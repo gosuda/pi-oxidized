@@ -44,8 +44,13 @@ const LOCK_MIN_DELAY: Duration = Duration::from_millis(100);
 /// Cap for exponential lock-retry backoff.
 const LOCK_MAX_DELAY: Duration = Duration::from_secs(10);
 
-/// TypeScript async auth storage declares a 30-second stale threshold.
-const ASYNC_LOCK_STALE: Duration = Duration::from_secs(30);
+/// Stale threshold for the auth storage lock, shared by the sync and async
+/// acquisition paths so two writers of the same lock agree on when a holder
+/// may be reclaimed. Matches the TypeScript async auth storage's 30-second
+/// `stale` value; the sync path sets it explicitly rather than relying on
+/// `LockOptions::new()`'s 10-second default, which previously let it reclaim
+/// a lock the async path still considered live.
+const AUTH_LOCK_STALE: Duration = Duration::from_secs(30);
 
 /// Shared file-backed JSON map with exclusive locking and atomic replace.
 ///
@@ -240,7 +245,7 @@ impl FileLockBackend {
         // an old process blocked on the advisory-file lock would otherwise
         // interleave credential writes after an in-place unlink.
         reject_legacy_file_locks(&[unresolved, target.clone()])?;
-        let options = LockOptions::new().attempts(1);
+        let options = LockOptions::new().attempts(1).stale(AUTH_LOCK_STALE);
         for _ in 1..SYNC_LOCK_ATTEMPTS {
             match LockGuard::acquire_with(&target, &options) {
                 Ok(guard) => return Ok(guard),
@@ -269,7 +274,7 @@ impl FileLockBackend {
         let unresolved = absolute_lock_target(&self.path)?;
         let target = canonical_lock_target(&self.path)?;
         reject_legacy_file_locks(&[unresolved, target.clone()])?;
-        let options = LockOptions::new().attempts(1).stale(ASYNC_LOCK_STALE);
+        let options = LockOptions::new().attempts(1).stale(AUTH_LOCK_STALE);
         let mut delay = LOCK_MIN_DELAY;
         // Tests substitute a near-zero initial delay so exhausting the full
         // retry budget takes milliseconds instead of most of a minute; the
@@ -815,6 +820,21 @@ mod tests {
         Ok((dir, path))
     }
 
+    /// Acquire a guard at the canonical lock target the backend resolves.
+    ///
+    /// `LockGuard::acquire(&path)` resolves the target with the unresolved
+    /// absolute spelling, while `acquire_sync_lock`/`acquire_async_lock`
+    /// resolve it with `canonical_lock_target`. Where those spellings diverge
+    /// (a symlinked temp dir, e.g. macOS `/var` -> `/private/var`) the bare
+    /// `acquire` would hold a *different* sibling directory than the backend
+    /// creates, so the backend acquires unopposed and the test proves nothing.
+    /// This helper resolves through `canonical_lock_target` first so the test
+    /// guard and the backend always contend on the same lock directory.
+    fn acquire_canonical_lock(path: &Path) -> TestResult<LockGuard> {
+        let canonical = canonical_lock_target(path)?;
+        Ok(LockGuard::acquire(&canonical)?)
+    }
+
     async fn refresh_expired(
         current: Option<Credential>,
         refresh_calls: Arc<AtomicUsize>,
@@ -1121,7 +1141,7 @@ mod tests {
         let mut backend = FileLockBackend::new(&path);
         let contention = Arc::new(tokio::sync::Notify::new());
         backend.lock_contention = Some(Arc::clone(&contention));
-        let guard = LockGuard::acquire(&path)?;
+        let guard = acquire_canonical_lock(&path)?;
 
         let task_backend = backend.clone();
         let task = tokio::spawn(async move {
@@ -1297,7 +1317,7 @@ mod tests {
         fs::create_dir_all(path.parent().ok_or("auth path must have a parent")?)?;
         // Hold the lock with a live guard so every acquisition attempt reports
         // contention and the sync budget (SYNC_LOCK_ATTEMPTS) is exhausted.
-        let _guard = LockGuard::acquire(&path)?;
+        let _guard = acquire_canonical_lock(&path)?;
 
         let backend = FileLockBackend::new(&path);
         let result = backend.with_lock_sync(|content| Ok((content.map(str::to_owned), None)));
@@ -1321,7 +1341,7 @@ mod tests {
     async fn async_lock_exhaustion_names_lock_path_and_retry_count() -> TestResult {
         let (_dir, path) = temp_auth_path()?;
         fs::create_dir_all(path.parent().ok_or("auth path must have a parent")?)?;
-        let _guard = LockGuard::acquire(&path)?;
+        let _guard = acquire_canonical_lock(&path)?;
 
         let mut backend = FileLockBackend::new(&path);
         backend.async_lock_retry_delay = Some(Duration::from_millis(1));

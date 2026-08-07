@@ -37,8 +37,9 @@ export function createAssistantMessageEventStream(): AssistantMessageEventStream
 	try {
 		raw = require(modulePath);
 	} catch (cause) {
+		const detail = cause instanceof Error ? cause.message : String(cause);
 		throw new Error(
-			`[verification] reference prerequisite failed to load: ${modulePath} (${(cause as Error).message}). ` +
+			`[verification] reference prerequisite failed to load: ${modulePath} (${detail}). ` +
 				"Restore or rebuild .references/pi before running verification.",
 			{ cause },
 		);

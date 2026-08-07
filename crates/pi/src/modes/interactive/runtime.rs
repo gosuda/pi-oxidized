@@ -4519,10 +4519,27 @@ fn project_event(view: &mut ViewState, event: &AgentSessionEvent) {
         | Event::SessionStart { .. }
         | Event::SessionShutdown { .. }
         | Event::ModelSelect { .. }
-        | Event::SummarizationRetryScheduled { .. }
-        | Event::SummarizationRetryAttemptStart { .. }
-        | Event::SummarizationRetryFinished
         | Event::BashExecutionUpdate { .. } => {}
+        Event::SummarizationRetryScheduled {
+            attempt,
+            max_attempts,
+            delay_ms,
+            error_message,
+        } => project_summarization_retry_scheduled(
+            view,
+            *attempt,
+            *max_attempts,
+            *delay_ms,
+            error_message,
+        ),
+        Event::SummarizationRetryAttemptStart { source } => {
+            project_summarization_retry_attempt_start(view, *source);
+        }
+        Event::SummarizationRetryFinished => {
+            // Matches interactive-mode.ts:3242-3245: clear the retry
+            // indicator.
+            view.status = None;
+        }
         Event::MessageStart { message } => project_message_start(view, message),
         Event::MessageUpdate { message, .. } => {
             project_assistant_message(view, message, false);
@@ -4689,6 +4706,54 @@ fn project_queue(view: &mut ViewState, steering: &[String], follow_up: &[String]
             text: text.clone(),
         })
         .collect();
+}
+
+/// Project `summarization_retry_scheduled` (interactive-mode.ts:3222-3228):
+/// showError(errorMessage) then a retry status indicator with attempt,
+/// maxAttempts, delayMs.
+fn project_summarization_retry_scheduled(
+    view: &mut ViewState,
+    attempt: u32,
+    max_attempts: u32,
+    delay_ms: u64,
+    error_message: &str,
+) {
+    view.messages
+        .push(MessageView::Custom(super::messages::CustomMessageView {
+            custom_type: "error".to_owned(),
+            text: format!("Error: {error_message}"),
+        }));
+    view.status = Some(SessionStatus {
+        kind: StatusKind::Retry,
+        frame: 0,
+        elapsed_secs: 0,
+        message: format!(
+            "Retrying ({attempt}/{max_attempts}) in {}s",
+            delay_ms / 1000
+        ),
+    });
+}
+
+/// Project `summarization_retry_attempt_start` (interactive-mode.ts:3231-3239):
+/// clear the retry indicator, then show a branch-summary indicator when
+/// source is `BranchSummary`, else a compaction indicator with reason.
+fn project_summarization_retry_attempt_start(
+    view: &mut ViewState,
+    source: crate::core::agent_session::events::SummarizationRetrySource,
+) {
+    match source {
+        crate::core::agent_session::events::SummarizationRetrySource::BranchSummary => {
+            view.status = Some(SessionStatus {
+                kind: StatusKind::BranchSummary,
+                frame: 0,
+                elapsed_secs: 0,
+                message: "Summarizing…".to_owned(),
+            });
+        }
+        crate::core::agent_session::events::SummarizationRetrySource::Compaction { reason } => {
+            project_compaction_start(view, reason);
+        }
+    }
 }
 
 fn project_compaction_start(
@@ -7680,6 +7745,85 @@ mod tests {
         );
         let status = view.status.as_ref().ok_or("retry status not set")?;
         assert_eq!(status.kind, StatusKind::Retry);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_event_summarization_retry_scheduled_sets_retry_status_and_error()
+    -> Result<(), String> {
+        let mut view = ViewState::empty();
+        project_event(
+            &mut view,
+            &AgentSessionEvent::SummarizationRetryScheduled {
+                attempt: 1,
+                max_attempts: 3,
+                delay_ms: 2000,
+                error_message: "overloaded".to_owned(),
+            },
+        );
+        let status = view.status.as_ref().ok_or("retry status not set")?;
+        assert_eq!(status.kind, StatusKind::Retry);
+        assert!(status.message.contains("Retrying (1/3)"));
+        // showError equivalent: an error message is pushed to the chat.
+        let last = view.messages.last().ok_or("no message pushed")?;
+        match last {
+            MessageView::Custom(custom) => {
+                assert_eq!(custom.custom_type, "error");
+                assert!(custom.text.contains("overloaded"));
+            }
+            _ => return Err(format!("expected Custom error message, got {last:?}")),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_event_summarization_retry_attempt_start_branch_summary() -> Result<(), String>
+    {
+        let mut view = ViewState::empty();
+        project_event(
+            &mut view,
+            &AgentSessionEvent::SummarizationRetryAttemptStart {
+                source: crate::core::agent_session::events::SummarizationRetrySource::BranchSummary,
+            },
+        );
+        let status = view
+            .status
+            .as_ref()
+            .ok_or("branch-summary status not set")?;
+        assert_eq!(status.kind, StatusKind::BranchSummary);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_event_summarization_retry_attempt_start_compaction() -> Result<(), String> {
+        let mut view = ViewState::empty();
+        project_event(
+            &mut view,
+            &AgentSessionEvent::SummarizationRetryAttemptStart {
+                source: crate::core::agent_session::events::SummarizationRetrySource::Compaction {
+                    reason: crate::core::agent_session::events::CompactionReason::Manual,
+                },
+            },
+        );
+        let status = view.status.as_ref().ok_or("compaction status not set")?;
+        assert_eq!(status.kind, StatusKind::Compaction);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_event_summarization_retry_finished_clears_status() -> Result<(), String> {
+        let mut view = ViewState::empty();
+        view.status = Some(SessionStatus {
+            kind: StatusKind::Retry,
+            frame: 0,
+            elapsed_secs: 0,
+            message: "Retrying…".to_owned(),
+        });
+        project_event(&mut view, &AgentSessionEvent::SummarizationRetryFinished);
+        assert!(
+            view.status.is_none(),
+            "status should be cleared after retry finished"
+        );
         Ok(())
     }
 

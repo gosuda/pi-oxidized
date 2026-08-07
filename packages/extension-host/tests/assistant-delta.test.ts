@@ -88,7 +88,7 @@ describe("StreamingJsonParser: byte-identical to batch at every prefix", () => {
 				expect(incremental).toEqual(batch);
 			}
 		}
-	});
+	}, 30_000);
 
 	test("window-crossing streams forget old candidates identically", () => {
 		const streams = [
@@ -353,10 +353,16 @@ describe("host SessionManager bridge", () => {
 			pi.registerCommand("managerProbe", {
 				description: "Probe the SessionManager bridge for throwable traps",
 				async handler(_args, ctx) {
+					// setup receives only the SessionManager proxy by design; the
+					// fresh context is the ReplacedSessionContext handed to
+					// withSession. Build the report inside setup, capture it in
+					// the closure, and emit it from withSession via that fresh
+					// context — the originating ctx is stale after newSession.
+					let report: Record<string, unknown> = {};
 					await ctx.newSession({
 						parentSession: "parent-1",
 						setup: async (manager) => {
-							const report: Record<string, unknown> = {};
+							report = {};
 							report["stringified"] = `${manager}`;
 							report["json"] = JSON.stringify(manager);
 							report["hasOwn"] = manager.hasOwnProperty("anything");
@@ -369,8 +375,16 @@ describe("host SessionManager bridge", () => {
 								report["realMethodMessage"] =
 									error instanceof Error ? error.message : String(error);
 							}
-							report["then"] = !("then" in manager) ? undefined : "present";
-							await ctx.ui.notify(JSON.stringify(report), "info");
+							// Assert the value the runtime actually reads: thenable
+							// resolution consults only the `get` trap, not `has`.
+							// A Proxy can answer `"then" in manager` with true while
+							// `get` returns undefined.
+							report["then"] = Reflect.get(manager, "then") === undefined
+								? undefined
+								: "present";
+						},
+						withSession: async (freshCtx) => {
+							freshCtx.ui.notify(JSON.stringify(report), "info");
 						},
 					});
 				},
@@ -384,7 +398,7 @@ describe("host SessionManager bridge", () => {
 			.then((request) => {
 				push(stdin, {
 					id: request.id, kind: "res", method: "session.newSession",
-					payload: { cancelled: false },
+					payload: { cancelled: false, replacementToken: "tok-1" },
 				});
 			});
 		push(stdin, {

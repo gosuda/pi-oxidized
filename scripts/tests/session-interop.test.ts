@@ -18,6 +18,13 @@ test("source-pinned TypeScript pi reopens every generated fixture", async () => 
 		stdout: "pipe",
 		stderr: "pipe",
 	});
+	if (generated.exitCode !== 0) {
+		const stdout = generated.stdout?.toString().trim() ?? "";
+		const stderr = generated.stderr?.toString().trim() ?? "";
+		throw new Error(
+			`generate-session-fixtures.ts exited ${generated.exitCode}\nstdout:\n${stdout}\nstderr:\n${stderr}`,
+		);
+	}
 	expect(generated.exitCode).toBe(0);
 
 	const directory = await mkdtemp(join(tmpdir(), "pi-session-interop-ts-"));
@@ -26,11 +33,14 @@ test("source-pinned TypeScript pi reopens every generated fixture", async () => 
 		const expected = (await readdir(directory, { recursive: true })).filter(
 			(path) => typeof path === "string" && path.endsWith(".jsonl"),
 		).length;
+		// The fixture set must be non-empty; otherwise a zero-count comparison
+		// would pass vacuously and prove nothing about the reopen path.
+		expect(expected).toBeGreaterThan(0);
 		expect(await reopenWithSourcePinnedTypescript(directory)).toBe(expected);
 	} finally {
 		await rm(directory, { recursive: true, force: true });
 	}
-});
+}, 120_000);
 
 test("version classification separates legacy v1 headers from unclassifiable ones", () => {
 	// A v1 session predates the `version` field, so its absence is the v1 signal.

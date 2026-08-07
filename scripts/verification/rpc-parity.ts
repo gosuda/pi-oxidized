@@ -45,7 +45,18 @@ for (const key of Object.keys(process.env)) {
 		);
 	}
 }
-const STEP_DEADLINE_MS = Number(process.env.PI_RPC_PARITY_STEP_TIMEOUT_MS ?? "120000");
+const STEP_DEADLINE_MS = (() => {
+	const raw = process.env.PI_RPC_PARITY_STEP_TIMEOUT_MS;
+	if (raw === undefined) return 120_000;
+	const value = Number(raw);
+	if (!Number.isFinite(value) || !Number.isInteger(value) || value <= 0) {
+		fail(
+			`invalid value for PI_RPC_PARITY_STEP_TIMEOUT_MS: received "${raw}" ` +
+				"(must be a positive finite integer milliseconds value)",
+		);
+	}
+	return value;
+})();
 const EXIT_DEADLINE_MS = 30_000;
 
 interface JsonObject {

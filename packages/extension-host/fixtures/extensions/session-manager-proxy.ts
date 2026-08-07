@@ -29,7 +29,10 @@ export default function sessionManagerProxyExtension(pi: ExtensionAPI): void {
 					await manager;
 					setupRan = true;
 					managerIsObject = typeof manager === "object" && manager !== null;
-					thenIsUndefined = !("then" in manager);
+					// Assert the value the runtime actually reads: thenable resolution
+					// consults only the `get` trap, not `has`. A Proxy can answer
+					// `"then" in manager` with true while `get` returns undefined.
+					thenIsUndefined = Reflect.get(manager, "then") === undefined;
 				},
 				withSession: async (freshCtx) => {
 					// Report from the fresh context (the old ctx is stale after newSession).

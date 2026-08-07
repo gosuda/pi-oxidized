@@ -72,7 +72,7 @@ class StdoutSink {
 }
 
 async function main(): Promise<void> {
-	const { cwd, extensionPaths, lean, noBuiltins } = parseArgs(process.argv);
+	const { cwd, extensionPaths, lean } = parseArgs(process.argv);
 	if (lean) {
 		// Dynamic import is required: mode selection happens at runtime and the
 		// lean graph must stay the only graph evaluated in this mode.
@@ -87,10 +87,11 @@ async function main(): Promise<void> {
 	}
 	// Dynamic import is required: the compat graph (host + upstream builtins)
 	// must not be evaluated until AFTER mode selection rejects --lean.
+	// loadRunOptions performs its await import inside the function body, so
+	// calling it here evaluates no upstream module until this branch is taken
+	// — the same deferral the early return already gives for --lean.
 	const { ExtensionHost } = await import("./host.ts");
-	const factories = noBuiltins
-		? []
-		: (await import("@earendil-works/pi-coding-agent/builtins")).builtInExtensions;
+	const { factories } = await loadRunOptions(process.argv);
 	const host = new ExtensionHost(process.stdin, new StdoutSink());
 	await host.run({ cwd, extensionPaths, factories });
 }

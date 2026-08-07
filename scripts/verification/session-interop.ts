@@ -135,9 +135,19 @@ export async function reopenWithSourcePinnedTypescript(
 		);
 		const manager = SessionManager.open(file);
 		const after = await readFile(file);
-		// Verify the opaque entry survived reopen (post-open file, not
-		// just the pre-open Rust output).
-		if (after.includes(OPAQUE_ENTRY_MARKER)) {
+		// Verify the opaque entry survived reopen by asking the manager's
+		// parsed in-memory view — the only independent evidence that the
+		// TypeScript SessionManager retained the entry, not just that the
+		// bytes on disk still contain it.
+		const reopenedEntries = manager.getEntries();
+		const hasOpaqueEntry = reopenedEntries.some(
+			(entry) => entry.type === "future_thing",
+		);
+		if (before.includes(OPAQUE_ENTRY_MARKER)) {
+			assert(
+				hasOpaqueEntry,
+				`TypeScript reopen dropped the opaque future_thing entry: ${relative(REPO_ROOT, file)}`,
+			);
 			preservedUnknownEntry = true;
 		}
 		if (versionBefore >= 3) {

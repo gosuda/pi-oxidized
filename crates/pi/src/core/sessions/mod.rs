@@ -2290,12 +2290,6 @@ mod tests {
                 }
             }
         }
-        // Derive the expected fixture count from the generator's own manifest
-        // (scripts/generate-session-fixtures.ts `fixtures.push(...)` calls) so
-        // adding a fixture updates the expected count automatically.
-        let generator_source = include_str!("../../../../../scripts/generate-session-fixtures.ts");
-        let expected_fixture_count: usize = generator_source.matches("fixtures.push(").count();
-
         let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../.agent-tasks/pi-rust-rewrite/fixtures/sessions");
         // The verification harness sets PI_SESSION_INTEROP_OUTPUT so TypeScript
@@ -2325,6 +2319,41 @@ mod tests {
             )
             .into());
         }
+        // Derive the expected fixture count from the generator's authoritative
+        // manifest (written next to the fixtures by
+        // scripts/generate-session-fixtures.ts) rather than scraping the
+        // generator source at compile time.
+        let manifest_path = fixture_root.join("manifest.json");
+        let expected_fixture_count: usize = {
+            let manifest_bytes = fs::read(&manifest_path).map_err(|err| {
+                format!(
+                    "session fixture manifest not found: {}\n\
+                     run `bun run scripts/generate-session-fixtures.ts` to regenerate ({err})",
+                    manifest_path.display()
+                )
+            })?;
+            let manifest: Value = serde_json::from_slice(&manifest_bytes).map_err(|err| {
+                format!(
+                    "invalid session fixture manifest {}: {err}",
+                    manifest_path.display()
+                )
+            })?;
+            let count = manifest
+                .get("count")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    format!(
+                        "session fixture manifest {} has no numeric `count` field",
+                        manifest_path.display()
+                    )
+                })?;
+            usize::try_from(count).map_err(|_| {
+                format!(
+                    "session fixture manifest {} `count` overflows usize",
+                    manifest_path.display()
+                )
+            })?
+        };
         fixture_files(&fixture_root, &mut fixtures)?;
         fixtures.sort();
         assert_eq!(

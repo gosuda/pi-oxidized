@@ -1067,7 +1067,10 @@ impl AgentSession {
             label: request.label,
         };
         let outcome = if options.summarize {
-            match self.resolve_summarization_inputs().await {
+            match self
+                .resolve_summarization_inputs("branch summarization")
+                .await
+            {
                 Ok((auth, summarizer)) => {
                     self.navigate_tree(&request.target_id, options, auth, Some(&summarizer))
                         .await

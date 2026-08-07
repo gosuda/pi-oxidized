@@ -112,6 +112,20 @@ const EXCLUDED_SPECIFIER = /^(?:@earendil-works\/(?:pi-coding-agent|pi-agent-cor
  */
 const LOADER_NAMES: ReadonlySet<string> = new Set(["createRequire", "getBuiltinModule"]);
 
+/**
+ * Declaration keywords that bind a fresh local named `require` (`const
+ * require = …`, `let require;`, `var require;`, `class require {}`),
+ * shadowing the global. A lexical scan cannot prove shadowing, so a
+ * `require` preceded by one of these is a binding site, not a bare read.
+ */
+const REQUIRE_DECLARATION_KEYWORDS: Readonly<Record<string, true>> = {
+	const: true,
+	let: true,
+	var: true,
+	function: true,
+	class: true,
+};
+
 function isAsciiIdentifierStartCode(code: number): boolean {
 	return (
 		(code >= 97 && code <= 122) // a-z
@@ -620,16 +634,19 @@ function scanModuleLoads(source: string): ModuleLoadScan {
 		if (char === '"' || char === "'") {
 			// A string directly after `[` is a computed member key, so a
 			// loader name there (`process["getBuiltinModule"]`) is the same
-			// bypass as the dotted member read. Array-literal elements share
-			// the `[`-prefix shape and fail closed with it: a lexically
-			// scoped pre-scan cannot separate the two without a full parser.
+			// bypass as the dotted member read. `require` is the same class
+			// of alias when read through a computed key (`module["require"]`):
+			// the value is later invoked through an innocent local binding the
+			// scan cannot trace. Array-literal elements share the `[`-prefix
+			// shape and fail closed with it: a lexically scoped pre-scan
+			// cannot separate the two without a full parser.
 			if (lastSignificant?.kind === "punctuator" && lastSignificant.value === "[") {
 				const end = skipString(index, char);
 				if (source[end - 1] === char) {
 					const cooked = decodeStringEscapes(source.slice(index + 1, end - 1));
 					if (cooked === undefined) {
 						unsupported ??= "malformed string escape";
-					} else if (LOADER_NAMES.has(cooked)) {
+					} else if (LOADER_NAMES.has(cooked) || cooked === "require") {
 						unsupported ??= `${cooked} loader`;
 					}
 				}
@@ -680,6 +697,17 @@ function scanModuleLoads(source: string): ModuleLoadScan {
 		const isMember = preceded?.kind === "punctuator" && MEMBER_PUNCTUATORS[preceded.value] === true;
 		// Bun exposes bare `require` in ESM. Keep this check lexical and
 		// fail closed: proving a shadowed binding would require a full parser.
+		// A `require` preceded by a declaration keyword (`const require = …`,
+		// `let require;`, `var require;`, `class require {}`) is a binding
+		// site that shadows the global, not a read; a lexical scan cannot
+		// prove shadowing, so those are left alone. A `require` followed by
+		// `(` is the literal-call path: the specifier is extracted (or the
+		// call is rejected as computed). Any other non-call reference is a
+		// bare read — alias assignment (`const r = require`), destructured/
+		// renamed binding (`const { require } = …`, `const { require: r } =
+		// …`), or escape-cooked spelling — and the aliased value is later
+		// invoked through an innocent local binding the scan cannot trace,
+		// the same bypass class as an aliased loader factory.
 		if (word === "require" && !isMember) {
 			const next = skipInsignificant(index);
 			if (source[next] === "(") {
@@ -694,6 +722,13 @@ function scanModuleLoads(source: string): ModuleLoadScan {
 				}
 				continue;
 			}
+			const isRequireBinding =
+				preceded?.kind === "identifier"
+				&& REQUIRE_DECLARATION_KEYWORDS[preceded.value] === true;
+			if (!isRequireBinding) {
+				unsupported ??= "bare require read";
+			}
+			continue;
 		}
 		// `createRequire` (from `node:module`) and `getBuiltinModule` produce
 		// loaders whose string argument is not a recognized import form, so

@@ -1735,6 +1735,18 @@ async function main(): Promise<void> {
 		}
 	}
 
+	// Authoritative manifest: the Rust interop test reads this at runtime
+	// instead of scraping the generator source, so the expected fixture
+	// count always reflects what was actually written to disk.
+	const manifest = {
+		count: results.length,
+		fixtures: results.map((r) => r.rel),
+	};
+	await writeAtomically(
+		join(OUT_DIR, "manifest.json"),
+		`${JSON.stringify(manifest, null, 2)}\n`,
+	);
+
 	// Summary
 	const totalJsonl = results.length;
 	const totalExpected = results.length;

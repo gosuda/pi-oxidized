@@ -281,6 +281,8 @@ class FrameCollector {
 	private readonly waiters: Array<{
 		predicate: (f: Frame) => boolean;
 		resolve: (f: Frame) => void;
+		reject: (error: Error) => void;
+		timer: ReturnType<typeof setTimeout>;
 	}> = [];
 	private buf = "";
 
@@ -296,8 +298,10 @@ class FrameCollector {
 				this.beforeFrame(frame);
 				this.frames.push(frame);
 				for (let i = this.waiters.length - 1; i >= 0; i--) {
-					if (this.waiters[i]?.predicate(frame)) {
-						this.waiters[i]?.resolve(frame);
+					const waiter = this.waiters[i];
+					if (waiter !== undefined && waiter.predicate(frame)) {
+						clearTimeout(waiter.timer);
+						waiter.resolve(frame);
 						this.waiters.splice(i, 1);
 					}
 				}
@@ -305,11 +309,19 @@ class FrameCollector {
 		}
 	}
 
-	awaitFrame(predicate: (f: Frame) => boolean): Promise<Frame> {
+	awaitFrame(predicate: (f: Frame) => boolean, label = "frame", timeoutMs = 5_000): Promise<Frame> {
 		const existing = this.frames.find(predicate);
 		if (existing !== undefined) return Promise.resolve(existing);
-		const { promise, resolve: resolveWaiter } = Promise.withResolvers<Frame>();
-		this.waiters.push({ predicate, resolve: resolveWaiter });
+		const { promise, resolve, reject } = Promise.withResolvers<Frame>();
+		const timer = setTimeout(() => {
+			const index = this.waiters.indexOf(waiter);
+			if (index !== -1) this.waiters.splice(index, 1);
+			const seen = this.frames.map((f) => `${f.kind}:${f.method}:${f.id}`).join(", ");
+			reject(new Error(`awaitFrame timed out waiting for "${label}" after ${timeoutMs}ms; frames seen: [${seen}]`));
+		}, timeoutMs);
+		timer.unref();
+		const waiter = { predicate, resolve, reject, timer };
+		this.waiters.push(waiter);
 		return promise;
 	}
 }
@@ -356,7 +368,7 @@ async function connectHost(
 		id: 1, kind: "req", method: "hello",
 		payload: { protocolVersion: PROTOCOL_VERSION, compatibilityVersion: COMPATIBILITY_VERSION },
 	})));
-	await collector.awaitFrame((f) => f.id === 1 && f.kind === "res");
+	await collector.awaitFrame((f) => f.id === 1 && f.kind === "res", "res 1");
 	return { collector, stdin, host, runPromise };
 }
 
@@ -401,7 +413,7 @@ describe("host: command context + mirrored session state", () => {
 		});
 
 		void collector
-			.awaitFrame((f) => f.kind === "req" && f.method === "session.newSession")
+			.awaitFrame((f) => f.kind === "req" && f.method === "session.newSession", "session.newSession req")
 			.then((request) => {
 				expect(payloadOf(request)["parentSession"]).toBe("parent-1");
 				push(stdin, {
@@ -431,8 +443,8 @@ describe("host: command context + mirrored session state", () => {
 			},
 		});
 
-		const notify = await collector.awaitFrame((f) => f.method === "notify");
-		await collector.awaitFrame((f) => f.id === 40 && f.kind === "res");
+		const notify = await collector.awaitFrame((f) => f.method === "notify", "notify");
+		await collector.awaitFrame((f) => f.id === 40 && f.kind === "res", "res 40");
 
 		const report = JSON.parse(String(payloadOf(notify)["message"])) as Record<string, unknown>;
 		expect(report["contextUsage"]).toEqual(usage);
@@ -472,7 +484,7 @@ describe("host: command context + mirrored session state", () => {
 
 		const bridgeCalls: string[] = [];
 		void collector
-			.awaitFrame((f) => f.kind === "req" && f.method === "session.newSession")
+			.awaitFrame((f) => f.kind === "req" && f.method === "session.newSession", "session.newSession req")
 			.then((request) => {
 				bridgeCalls.push("session.newSession");
 				push(stdin, {
@@ -486,8 +498,8 @@ describe("host: command context + mirrored session state", () => {
 			payload: { command: "commandContextProbe", args: "" },
 		});
 
-		const notify = await collector.awaitFrame((f) => f.method === "notify");
-		await collector.awaitFrame((f) => f.id === 41 && f.kind === "res");
+		const notify = await collector.awaitFrame((f) => f.method === "notify", "notify");
+		await collector.awaitFrame((f) => f.id === 41 && f.kind === "res", "res 41");
 
 		const report = JSON.parse(String(payloadOf(notify)["message"])) as Record<string, unknown>;
 		expect(bridgeCalls).toEqual(["session.newSession"]);
@@ -544,7 +556,7 @@ describe("host: newSession setup + withSession + ReplacedSessionContext", () => 
 
 		// Respond to session.newSession with cancelled:false so setup + withSession run.
 		void collector
-			.awaitFrame((f) => f.kind === "req" && f.method === "session.newSession")
+			.awaitFrame((f) => f.kind === "req" && f.method === "session.newSession", "session.newSession req")
 			.then((request) => {
 				push(stdin, {
 					id: request.id, kind: "res", method: "session.newSession",
@@ -557,8 +569,8 @@ describe("host: newSession setup + withSession + ReplacedSessionContext", () => 
 			payload: { command: "replacedSessionProbe", args: "" },
 		});
 
-		const notify = await collector.awaitFrame((f) => f.method === "notify");
-		await collector.awaitFrame((f) => f.id === 50 && f.kind === "res");
+		const notify = await collector.awaitFrame((f) => f.method === "notify", "notify");
+		await collector.awaitFrame((f) => f.id === 50 && f.kind === "res", "res 50");
 
 		const report = JSON.parse(String(payloadOf(notify)["message"])) as Record<string, unknown>;
 		expect(report["setupOrder"]).toEqual(["setup", "withSession"]);
@@ -640,7 +652,7 @@ describe("host: newSession setup + withSession + ReplacedSessionContext", () => 
 		sessionUpdate(stdin, true);
 
 		void collector
-			.awaitFrame((f) => f.kind === "req" && f.method === "session.newSession")
+			.awaitFrame((f) => f.kind === "req" && f.method === "session.newSession", "session.newSession req")
 			.then((request) => {
 				push(stdin, {
 					id: request.id, kind: "res", method: "session.newSession",
@@ -653,8 +665,8 @@ describe("host: newSession setup + withSession + ReplacedSessionContext", () => 
 			payload: { command: "replacedSessionCancel", args: "" },
 		});
 
-		const notify = await collector.awaitFrame((f) => f.method === "notify");
-		await collector.awaitFrame((f) => f.id === 51 && f.kind === "res");
+		const notify = await collector.awaitFrame((f) => f.method === "notify", "notify");
+		await collector.awaitFrame((f) => f.id === 51 && f.kind === "res", "res 51");
 
 		const report = JSON.parse(String(payloadOf(notify)["message"])) as Record<string, unknown>;
 		expect(report["setupRanOnCancel"]).toEqual([]);
@@ -670,7 +682,7 @@ describe("host: newSession setup + withSession + ReplacedSessionContext", () => 
 		sessionUpdate(stdin, true);
 
 		void collector
-			.awaitFrame((f) => f.kind === "req" && f.method === "session.newSession")
+			.awaitFrame((f) => f.kind === "req" && f.method === "session.newSession", "session.newSession req")
 			.then((request) => {
 				push(stdin, {
 					id: request.id, kind: "res", method: "session.newSession",
@@ -685,8 +697,8 @@ describe("host: newSession setup + withSession + ReplacedSessionContext", () => 
 
 		// Wait for the command to complete; by then sendMessage/sendUserMessage
 		// have fired session.command events through the bridge.
-		await collector.awaitFrame((f) => f.method === "notify");
-		await collector.awaitFrame((f) => f.id === 52 && f.kind === "res");
+		await collector.awaitFrame((f) => f.method === "notify", "notify");
+		await collector.awaitFrame((f) => f.id === 52 && f.kind === "res", "res 52");
 
 		const sendMessageFrame = collector.frames.find(
 			(f) =>
@@ -734,11 +746,11 @@ describe("host: newSession setup + withSession + ReplacedSessionContext", () => 
 					compatibilityVersion: COMPATIBILITY_VERSION,
 				},
 			})));
-			await stdout.awaitFrame((f) => f.id === 1 && f.kind === "res");
+			await stdout.awaitFrame((f) => f.id === 1 && f.kind === "res", "res 1");
 			sessionUpdate(stdin, true);
 
 			void stdout
-				.awaitFrame((f) => f.kind === "req" && f.method === "session.newSession")
+				.awaitFrame((f) => f.kind === "req" && f.method === "session.newSession", "session.newSession req")
 				.then((request) => {
 					push(stdin, {
 						id: request.id, kind: "res", method: "session.newSession",
@@ -756,6 +768,7 @@ describe("host: newSession setup + withSession + ReplacedSessionContext", () => 
 
 			const errorRes = await stdout.awaitFrame(
 				(f) => f.id === requestId && f.kind === "error",
+				"error requestId",
 			);
 			const errPayload = payloadOf(errorRes);
 			expect(stdout.failedAction).toBe(failedAction);
@@ -802,7 +815,7 @@ describe("host: session.replacementReady + passthrough fields", () => {
 		sessionUpdate(stdin, true);
 
 		void collector
-			.awaitFrame((f) => f.kind === "req" && f.method === "session.newSession")
+			.awaitFrame((f) => f.kind === "req" && f.method === "session.newSession", "session.newSession req")
 			.then((request) => {
 				push(stdin, {
 					id: request.id, kind: "res", method: "session.newSession",
@@ -815,10 +828,11 @@ describe("host: session.replacementReady + passthrough fields", () => {
 			payload: { command: "replacementReadyProbe", args: "" },
 		});
 
-		const notify = await collector.awaitFrame((f) => f.method === "notify");
-		const commandRes = await collector.awaitFrame((f) => f.id === 70 && f.kind === "res");
+		const notify = await collector.awaitFrame((f) => f.method === "notify", "notify");
+		const commandRes = await collector.awaitFrame((f) => f.id === 70 && f.kind === "res", "res 70");
 		const ready = await collector.awaitFrame(
 			(f) => f.kind === "event" && f.method === "session.replacementReady",
+			"session.replacementReady",
 		);
 
 		const report = JSON.parse(String(payloadOf(notify)["message"])) as Record<string, unknown>;
@@ -839,7 +853,7 @@ describe("host: session.replacementReady + passthrough fields", () => {
 		sessionUpdate(stdin, true);
 
 		void collector
-			.awaitFrame((f) => f.kind === "req" && f.method === "session.newSession")
+			.awaitFrame((f) => f.kind === "req" && f.method === "session.newSession", "session.newSession req")
 			.then((request) => {
 				push(stdin, {
 					id: request.id, kind: "res", method: "session.newSession",
@@ -852,8 +866,8 @@ describe("host: session.replacementReady + passthrough fields", () => {
 			payload: { command: "replacementReadyCancel", args: "" },
 		});
 
-		await collector.awaitFrame((f) => f.method === "notify");
-		await collector.awaitFrame((f) => f.id === 71 && f.kind === "res");
+		await collector.awaitFrame((f) => f.method === "notify", "notify");
+		await collector.awaitFrame((f) => f.id === 71 && f.kind === "res", "res 71");
 
 		// A single microtask tick cannot prove the suppressed frame was never
 		// emitted — it only proves it wasn't emitted *yet*. Instead, drive a
@@ -867,7 +881,7 @@ describe("host: session.replacementReady + passthrough fields", () => {
 			id: 9001, kind: "req", method: "measure",
 			payload: { key: "nonexistent", width: 80 },
 		});
-		await collector.awaitFrame((f) => f.id === 9001 && f.kind === "res");
+		await collector.awaitFrame((f) => f.id === 9001 && f.kind === "res", "res 9001");
 
 		const readyFrames = collector.frames.filter(
 			(f) => f.kind === "event" && f.method === "session.replacementReady",
@@ -882,7 +896,7 @@ describe("host: session.replacementReady + passthrough fields", () => {
 		sessionUpdate(stdin, true);
 
 		void collector
-			.awaitFrame((f) => f.kind === "req" && f.method === "session.newSession")
+			.awaitFrame((f) => f.kind === "req" && f.method === "session.newSession", "session.newSession req")
 			.then((request) => {
 				push(stdin, {
 					id: request.id, kind: "res", method: "session.newSession",
@@ -895,9 +909,10 @@ describe("host: session.replacementReady + passthrough fields", () => {
 			payload: { command: "replacementReadyThrow", args: "" },
 		});
 
-		const errorRes = await collector.awaitFrame((f) => f.id === 72 && f.kind === "error");
+		const errorRes = await collector.awaitFrame((f) => f.id === 72 && f.kind === "error", "error 72");
 		const ready = await collector.awaitFrame(
 			(f) => f.kind === "event" && f.method === "session.replacementReady",
+			"session.replacementReady",
 		);
 		expect(payloadOf(errorRes)["message"]).toContain("post-replacement boom");
 		expect(payloadOf(ready)).toEqual({ token: "tok-throw-1" });
@@ -915,7 +930,7 @@ describe("host: session.replacementReady + passthrough fields", () => {
 		sessionUpdate(stdin, true);
 
 		void collector
-			.awaitFrame((f) => f.kind === "req" && f.method === "session.reload")
+			.awaitFrame((f) => f.kind === "req" && f.method === "session.reload", "session.reload req")
 			.then((request) => {
 				push(stdin, {
 					id: request.id, kind: "res", method: "session.reload",
@@ -928,9 +943,10 @@ describe("host: session.replacementReady + passthrough fields", () => {
 			payload: { command: "replacementReadyReload", args: "" },
 		});
 
-		const commandRes = await collector.awaitFrame((f) => f.id === 73 && f.kind === "res");
+		const commandRes = await collector.awaitFrame((f) => f.id === 73 && f.kind === "res", "res 73");
 		const ready = await collector.awaitFrame(
 			(f) => f.kind === "event" && f.method === "session.replacementReady",
+			"session.replacementReady",
 		);
 		expect(payloadOf(ready)).toEqual({ token: "tok-reload-1" });
 		expect(collector.frames.indexOf(ready)).toBeGreaterThan(collector.frames.indexOf(commandRes));
@@ -944,7 +960,7 @@ describe("host: session.replacementReady + passthrough fields", () => {
 		sessionUpdate(stdin, true);
 
 		void collector
-			.awaitFrame((f) => f.kind === "req" && f.method === "session.fork")
+			.awaitFrame((f) => f.kind === "req" && f.method === "session.fork", "session.fork req")
 			.then((request) => {
 				expect(payloadOf(request)).toMatchObject({ entryId: "entry-1", position: "at" });
 				push(stdin, {
@@ -962,10 +978,11 @@ describe("host: session.replacementReady + passthrough fields", () => {
 			payload: { command: "forkPassthroughProbe", args: "" },
 		});
 
-		const notify = await collector.awaitFrame((f) => f.method === "notify");
-		await collector.awaitFrame((f) => f.id === 74 && f.kind === "res");
+		const notify = await collector.awaitFrame((f) => f.method === "notify", "notify");
+		await collector.awaitFrame((f) => f.id === 74 && f.kind === "res", "res 74");
 		const ready = await collector.awaitFrame(
 			(f) => f.kind === "event" && f.method === "session.replacementReady",
+			"session.replacementReady",
 		);
 
 		const report = JSON.parse(String(payloadOf(notify)["message"])) as Record<string, unknown>;
@@ -991,7 +1008,7 @@ describe("host: session.replacementReady + passthrough fields", () => {
 		};
 
 		void collector
-			.awaitFrame((f) => f.kind === "req" && f.method === "session.navigateTree")
+			.awaitFrame((f) => f.kind === "req" && f.method === "session.navigateTree", "session.navigateTree req")
 			.then((request) => {
 				expect(payloadOf(request)).toMatchObject({ targetId: "leaf-1", summarize: true });
 				push(stdin, {
@@ -1010,9 +1027,22 @@ describe("host: session.replacementReady + passthrough fields", () => {
 			payload: { command: "navigateTreePassthroughProbe", args: "" },
 		});
 
-		const notify = await collector.awaitFrame((f) => f.method === "notify");
-		await collector.awaitFrame((f) => f.id === 75 && f.kind === "res");
-		await Promise.resolve();
+		const notify = await collector.awaitFrame((f) => f.method === "notify", "notify");
+		await collector.awaitFrame((f) => f.id === 75 && f.kind === "res", "res 75");
+
+		// A single microtask tick cannot prove the suppressed frame was never
+		// emitted — it only proves it wasn't emitted *yet*. Instead, drive a
+		// positive milestone that must follow the finally path: send a `measure`
+		// request and await its response. The ProtocolClient writeChain is
+		// strictly ordered, so the measure response write happens after the
+		// first command's finally-block write (if any). When the measure
+		// response arrives, any replacementReady frame would already be in
+		// collector.frames.
+		push(stdin, {
+			id: 9001, kind: "req", method: "measure",
+			payload: { key: "nonexistent", width: 80 },
+		});
+		await collector.awaitFrame((f) => f.id === 9001 && f.kind === "res", "res 9001");
 
 		const report = JSON.parse(String(payloadOf(notify)["message"])) as Record<string, unknown>;
 		expect(report["navigateTree"]).toEqual({
@@ -1037,6 +1067,7 @@ describe("host: session.replacementReady + passthrough fields", () => {
 
 		const newSessionReq = collector.awaitFrame(
 			(f) => f.kind === "req" && f.method === "session.newSession",
+			"session.newSession req",
 		);
 
 		// Start the idle peer first so it is in-flight under a different ALS scope.
@@ -1057,10 +1088,11 @@ describe("host: session.replacementReady + passthrough fields", () => {
 		// Release the idle peer only after the owner captured its token.
 		sessionUpdate(stdin, true);
 
-		await collector.awaitFrame((f) => f.id === 76 && f.kind === "res");
-		const ownerRes = await collector.awaitFrame((f) => f.id === 77 && f.kind === "res");
+		await collector.awaitFrame((f) => f.id === 76 && f.kind === "res", "res 76");
+		const ownerRes = await collector.awaitFrame((f) => f.id === 77 && f.kind === "res", "res 77");
 		const ready = await collector.awaitFrame(
 			(f) => f.kind === "event" && f.method === "session.replacementReady",
+			"session.replacementReady",
 		);
 		const readyFrames = collector.frames.filter(
 			(f) => f.kind === "event" && f.method === "session.replacementReady",
@@ -1129,6 +1161,7 @@ describe("host: per-command replacement staleness", () => {
 
 			const replacementRequest = collector.awaitFrame(
 				(frame) => frame.kind === "req" && frame.method === replacement.method,
+				"req",
 			);
 			push(stdin, {
 				id: 100, kind: "req", method: "command.execute",
@@ -1140,9 +1173,10 @@ describe("host: per-command replacement staleness", () => {
 				payload: replacement.payload,
 			});
 
-			const error = await collector.awaitFrame((frame) => frame.id === 100 && frame.kind === "error");
+			const error = await collector.awaitFrame((frame) => frame.id === 100 && frame.kind === "error", "error 100");
 			const ready = await collector.awaitFrame(
 				(frame) => frame.kind === "event" && frame.method === "session.replacementReady",
+				"session.replacementReady",
 			);
 			expect(payloadOf(error)["message"]).toBe(staleContextMessage);
 			expect(payloadOf(ready)).toEqual({ token: replacement.payload.replacementToken });
@@ -1159,9 +1193,11 @@ describe("host: per-command replacement staleness", () => {
 			});
 			const notify = await collector.awaitFrame(
 				(frame) => frame.kind === "event" && frame.method === "notify",
+				"notify",
 			);
 			const activeResult = await collector.awaitFrame(
 				(frame) => frame.id === 101 && frame.kind === "res",
+				"res 101",
 			);
 			expect(JSON.parse(String(payloadOf(notify)["message"]))).toEqual({ active: true });
 			expect(payloadOf(activeResult)).toEqual({ ok: true });
@@ -1175,7 +1211,7 @@ describe("host: per-command replacement staleness", () => {
 		const { collector, stdin } = connected;
 		setIdle(stdin);
 
-		void collector.awaitFrame((frame) => frame.kind === "req" && frame.method === "session.newSession")
+		void collector.awaitFrame((frame) => frame.kind === "req" && frame.method === "session.newSession", "session.newSession req")
 			.then((request) => {
 				push(stdin, {
 					id: request.id, kind: "res", method: "session.newSession",
@@ -1187,8 +1223,8 @@ describe("host: per-command replacement staleness", () => {
 			payload: { command: "cancelledCtxRemainsUsable", args: "" },
 		});
 
-		const notify = await collector.awaitFrame((frame) => frame.kind === "event" && frame.method === "notify");
-		const result = await collector.awaitFrame((frame) => frame.id === 110 && frame.kind === "res");
+		const notify = await collector.awaitFrame((frame) => frame.kind === "event" && frame.method === "notify", "notify");
+		const result = await collector.awaitFrame((frame) => frame.id === 110 && frame.kind === "res", "res 110");
 		expect(JSON.parse(String(payloadOf(notify)["message"]))).toEqual({ cancelled: true, stillUsable: true });
 		expect(payloadOf(result)).toEqual({ ok: true });
 		expect(collector.frames.filter(
@@ -1203,7 +1239,7 @@ describe("host: per-command replacement staleness", () => {
 		const { collector, stdin } = connected;
 		setIdle(stdin);
 
-		void collector.awaitFrame((frame) => frame.kind === "req" && frame.method === "session.newSession")
+		void collector.awaitFrame((frame) => frame.kind === "req" && frame.method === "session.newSession", "session.newSession req")
 			.then((request) => {
 				push(stdin, {
 					id: request.id, kind: "res", method: "session.newSession",
@@ -1215,9 +1251,10 @@ describe("host: per-command replacement staleness", () => {
 			payload: { command: "withSessionUsesFreshContext", args: "" },
 		});
 
-		const error = await collector.awaitFrame((frame) => frame.id === 120 && frame.kind === "error");
+		const error = await collector.awaitFrame((frame) => frame.id === 120 && frame.kind === "error", "error 120");
 		const ready = await collector.awaitFrame(
 			(frame) => frame.kind === "event" && frame.method === "session.replacementReady",
+			"session.replacementReady",
 		);
 		const sessionCommands = collector.frames.filter(
 			(frame) => frame.kind === "event" && frame.method === "session.command",
@@ -1241,7 +1278,7 @@ describe("host: per-command replacement staleness", () => {
 		const { collector, stdin } = connected;
 		setIdle(stdin);
 
-		void collector.awaitFrame((frame) => frame.kind === "req" && frame.method === "session.newSession")
+		void collector.awaitFrame((frame) => frame.kind === "req" && frame.method === "session.newSession", "session.newSession req")
 			.then((request) => {
 				push(stdin, {
 					id: request.id, kind: "res", method: "session.newSession",
@@ -1253,9 +1290,10 @@ describe("host: per-command replacement staleness", () => {
 			payload: { command: "capturedMethodStalesAfterNewSession", args: "" },
 		});
 
-		const error = await collector.awaitFrame((frame) => frame.id === 125 && frame.kind === "error");
+		const error = await collector.awaitFrame((frame) => frame.id === 125 && frame.kind === "error", "error 125");
 		const ready = await collector.awaitFrame(
 			(frame) => frame.kind === "event" && frame.method === "session.replacementReady",
+			"session.replacementReady",
 		);
 		const newSessionReqs = collector.frames.filter(
 			(frame) => frame.kind === "req" && frame.method === "session.newSession",
@@ -1288,19 +1326,19 @@ describe("host: per-command replacement staleness", () => {
 			id: 130, kind: "req", method: "command.execute",
 			payload: { command: "captureCtx", args: "" },
 		});
-		await collector.awaitFrame((frame) => frame.id === 130 && frame.kind === "res");
+		await collector.awaitFrame((frame) => frame.id === 130 && frame.kind === "res", "res 130");
 
 		push(stdin, {
 			id: 131, kind: "req", method: "extensions.load",
 			payload: { extensionPaths: [], cwd: process.cwd() },
 		});
-		await collector.awaitFrame((frame) => frame.id === 131 && frame.kind === "res");
+		await collector.awaitFrame((frame) => frame.id === 131 && frame.kind === "res", "res 131");
 
 		push(stdin, {
 			id: 132, kind: "req", method: "command.execute",
 			payload: { command: "useStaleCtx", args: "" },
 		});
-		const error = await collector.awaitFrame((frame) => frame.id === 132 && frame.kind === "error");
+		const error = await collector.awaitFrame((frame) => frame.id === 132 && frame.kind === "error", "error 132");
 		expect(payloadOf(error)["message"]).toBe(staleContextMessage);
 
 		await teardown(connected);
@@ -1320,7 +1358,7 @@ describe("host: tool_call key-order-insensitive input comparison", () => {
 				input: { z: 3, a: 1, m: 2 },
 			},
 		});
-		const res = await collector.awaitFrame((f) => f.id === 200 && f.kind === "res");
+		const res = await collector.awaitFrame((f) => f.id === 200 && f.kind === "res", "res 200");
 		const body = payloadOf(res);
 		expect(body["block"]).toBe(false);
 		expect(body["reason"]).toBe("reorder-ack");
@@ -1353,7 +1391,7 @@ describe("host: replacementReady write failure is contained", () => {
 		});
 
 		void collector
-			.awaitFrame((f) => f.kind === "req" && f.method === "session.newSession")
+			.awaitFrame((f) => f.kind === "req" && f.method === "session.newSession", "session.newSession req")
 			.then((request) => {
 				push(stdin, {
 					id: request.id, kind: "res", method: "session.newSession",
@@ -1367,13 +1405,14 @@ describe("host: replacementReady write failure is contained", () => {
 		});
 
 		// The command.execute response must arrive (the handler succeeded).
-		const commandRes = await collector.awaitFrame((f) => f.id === 210 && f.kind === "res");
+		const commandRes = await collector.awaitFrame((f) => f.id === 210 && f.kind === "res", "res 210");
 		expect(commandRes).toBeDefined();
 
 		// The replacementReady send failed; the error must be contained as an
 		// extensionError event, not a second terminal frame for id 210.
 		const errorEvent = await collector.awaitFrame(
 			(f) => f.kind === "event" && f.method === "extensionError",
+			"extensionError",
 		);
 		expect(payloadOf(errorEvent)["message"]).toContain("session.replacementReady");
 
@@ -1414,7 +1453,7 @@ describe("host: protocol extension order", () => {
 				id: 219, kind: "req", method: "command.execute",
 				payload: { command: "greet", args: "" },
 			});
-			await collector.awaitFrame((f) => f.id === 219 && f.kind === "res");
+			await collector.awaitFrame((f) => f.id === 219 && f.kind === "res", "res 219");
 			const [builtin] = connected.host.getExtensions();
 			expect(builtin?.commands.has("greet")).toBe(true);
 
@@ -1422,7 +1461,7 @@ describe("host: protocol extension order", () => {
 				id: 220, kind: "req", method: "extensions.load",
 				payload: { extensionPaths: [initialPath], cwd: process.cwd() },
 			});
-			await collector.awaitFrame((f) => f.id === 220 && f.kind === "res");
+			await collector.awaitFrame((f) => f.id === 220 && f.kind === "res", "res 220");
 			const afterInitialLoad = connected.host.getExtensions();
 			expect(afterInitialLoad).toHaveLength(2);
 			expect(afterInitialLoad[0]?.commands.has("initialCmd")).toBe(true);
@@ -1432,7 +1471,7 @@ describe("host: protocol extension order", () => {
 				id: 221, kind: "req", method: "extensions.load",
 				payload: { extensionPaths: [latePath], cwd: process.cwd() },
 			});
-			await collector.awaitFrame((f) => f.id === 221 && f.kind === "res");
+			await collector.awaitFrame((f) => f.id === 221 && f.kind === "res", "res 221");
 			const afterLateLoad = connected.host.getExtensions();
 			expect(afterLateLoad).toHaveLength(3);
 			expect(afterLateLoad[0]?.commands.has("initialCmd")).toBe(true);
@@ -1469,7 +1508,7 @@ describe("host: SessionManager proxy is not a thenable", () => {
 		});
 
 		void collector
-			.awaitFrame((f) => f.kind === "req" && f.method === "session.newSession")
+			.awaitFrame((f) => f.kind === "req" && f.method === "session.newSession", "session.newSession req")
 			.then((request) => {
 				push(stdin, {
 					id: request.id, kind: "res", method: "session.newSession",
@@ -1482,8 +1521,8 @@ describe("host: SessionManager proxy is not a thenable", () => {
 			payload: { command: "sessionManagerThenProbe", args: "" },
 		});
 
-		const notify = await collector.awaitFrame((f) => f.method === "notify");
-		await collector.awaitFrame((f) => f.id === 230 && f.kind === "res");
+		const notify = await collector.awaitFrame((f) => f.method === "notify", "notify");
+		await collector.awaitFrame((f) => f.id === 230 && f.kind === "res", "res 230");
 
 		const report = JSON.parse(String(payloadOf(notify)["message"])) as Record<string, unknown>;
 		expect(report["setupRan"]).toBe(true);

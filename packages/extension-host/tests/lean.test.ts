@@ -578,6 +578,103 @@ describe("lean: extensions.load registry", () => {
 		}
 	});
 
+	test("rejects bare require reads (alias/destructured/computed) before evaluation", async () => {
+		const directory = await mkdtemp(join(PACKAGE_DIR, ".test-lean-bare-require-"));
+		const aliasEntry = join(directory, "alias.mjs");
+		const destructuredEntry = join(directory, "destructured.mjs");
+		const escapedEntry = join(directory, "escaped-bare.mjs");
+		const computedEntry = join(directory, "computed-require.mjs");
+		const shadowedEntry = join(directory, "shadowed.mjs");
+		const cleanEntry = join(directory, "clean.mjs");
+		const holder = globalThis as Record<string, unknown>;
+		const link = new LeanLink({ cwd: directory, extensionPaths: [] });
+		try {
+			await Promise.all([
+				// Plain assignment alias: `r("jiti")` never extracts a
+				// specifier (r is not require), so only the bare read is
+				// evidence of the bypass.
+				writeFile(
+					aliasEntry,
+					'globalThis.__leanBareRequireAliasEvaluated = true; const r = require; r("jiti"); export default { name: "alias" };',
+				),
+				// Renamed destructured binding: the call uses the alias `r`,
+				// so the specifier is not extracted; the bare `require` read
+				// in the pattern is the only graph evidence.
+				writeFile(
+					destructuredEntry,
+					'globalThis.__leanBareRequireDestructuredEvaluated = true; const { require: r } = module; r("jiti"); export default { name: "destructured" };',
+				),
+				// Escape-cooked bare read: `\u0072equire` cooks to `require`
+				// via the cooked-identifier reader, then falls through to
+				// the bare-read rejection.
+				writeFile(
+					escapedEntry,
+					'globalThis.__leanBareRequireEscapedEvaluated = true; const r = \\u0072equire; r("jiti"); export default { name: "escaped-bare" };',
+				),
+				// Computed member key: `module["require"]` is caught by the
+				// bracket-string reader, the same path as `["getBuiltinModule"]`.
+				writeFile(
+					computedEntry,
+					'globalThis.__leanBareRequireComputedEvaluated = true; const r = module["require"]; r("jiti"); export default { name: "computed-require" };',
+				),
+				// Positive control for the declaration-keyword carve-out:
+				// `const require = …` binds a fresh local that shadows the
+				// global (the scanner cannot prove shadowing), so it must
+				// still evaluate. The later `require("shadowed")` call
+				// extracts the non-excluded specifier "shadowed".
+				writeFile(
+					shadowedEntry,
+					'globalThis.__leanBareRequireShadowedEvaluated = true; const require = (value) => value; export default { name: require("shadowed") };',
+				),
+				// Positive control: a clean extension in the same batch still
+				// evaluates and registers, proving the rejections are
+				// pre-evaluation scan results rather than a wholesale failure.
+				writeFile(
+					cleanEntry,
+					'globalThis.__leanBareRequireCleanEvaluated = true; export default { name: "clean" };',
+				),
+			]);
+			await link.hello(1);
+			link.request(2, "extensions.load", {
+				extensionPaths: [aliasEntry, destructuredEntry, escapedEntry, computedEntry, shadowedEntry, cleanEntry],
+				cwd: directory,
+			});
+			const response = payload(await link.response(2, "extensions.load"));
+			const errors = new Map(
+				(response["errors"] as Array<{ path: string; error: string }>).map(
+					(error) => [error.path, error.error],
+				),
+			);
+			// Every bare-require alias form fails closed before evaluation.
+			expect(errors.get(aliasEntry)).toContain("unsupported bare require read");
+			expect(errors.get(destructuredEntry)).toContain("unsupported bare require read");
+			expect(errors.get(escapedEntry)).toContain("unsupported bare require read");
+			expect(errors.get(computedEntry)).toContain("unsupported require loader");
+			// The declaration-keyword carve-out keeps a shadowing `const
+			// require = …` binding site permitted (not a bare read).
+			expect(errors.has(shadowedEntry)).toBe(false);
+			expect(holder["__leanBareRequireShadowedEvaluated"]).toBe(true);
+			// Positive control: the clean extension still registers.
+			expect(errors.has(cleanEntry)).toBe(false);
+			expect(response["extensions"]).toBe(2);
+			expect(holder["__leanBareRequireCleanEvaluated"]).toBe(true);
+			// Rejected entries never set their evaluation markers.
+			expect(holder["__leanBareRequireAliasEvaluated"]).toBeUndefined();
+			expect(holder["__leanBareRequireDestructuredEvaluated"]).toBeUndefined();
+			expect(holder["__leanBareRequireEscapedEvaluated"]).toBeUndefined();
+			expect(holder["__leanBareRequireComputedEvaluated"]).toBeUndefined();
+		} finally {
+			delete holder["__leanBareRequireAliasEvaluated"];
+			delete holder["__leanBareRequireDestructuredEvaluated"];
+			delete holder["__leanBareRequireEscapedEvaluated"];
+			delete holder["__leanBareRequireComputedEvaluated"];
+			delete holder["__leanBareRequireShadowedEvaluated"];
+			delete holder["__leanBareRequireCleanEvaluated"];
+			await link.finish();
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
+
 	test("extensions.load of an already-loaded path registers nothing and does not double-count", async () => {
 		const link = new LeanLink({ cwd: PACKAGE_DIR, extensionPaths: [] });
 		await link.hello(1);

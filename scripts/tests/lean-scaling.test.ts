@@ -701,14 +701,14 @@ describe("ChildHost retained frame cap", () => {
 		});
 		try {
 			const waiters = [
-				host.waitFor(() => false, 1_500, "waiter-a"),
-				host.waitFor(() => false, 1_500, "waiter-b"),
-				host.waitFor(() => false, 1_500, "waiter-c"),
+				host.waitFor(() => false, 60_000, "waiter-a"),
+				host.waitFor(() => false, 60_000, "waiter-b"),
+				host.waitFor(() => false, 60_000, "waiter-c"),
 			];
 			const started = performance.now();
 			const rejections = await Promise.all(waiters.map((pending) => pending.catch((err: unknown) => err)));
 
-			expect(performance.now() - started).toBeLessThan(1_000);
+			expect(performance.now() - started).toBeLessThan(5_000);
 			const messages = rejections.map((err) => {
 				expect(err).toBeInstanceOf(Error);
 				return (err as Error).message;

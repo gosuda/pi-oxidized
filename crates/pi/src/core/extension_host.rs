@@ -2117,8 +2117,17 @@ async fn forward_session_bridge(inner: &Arc<Inner>, event: SessionBridgeEvent) {
         Some(event)
     };
     match undelivered {
-        None
-        | Some(SessionBridgeEvent::Command(_) | SessionBridgeEvent::ReplacementReady { .. }) => {}
+        None | Some(SessionBridgeEvent::Command(_)) => {}
+        Some(SessionBridgeEvent::ReplacementReady { .. }) => {
+            // A dropped readiness frame means the awaiting receiver will wait
+            // out REPLACEMENT_READY_TIMEOUT and report a generic timeout.
+            // Name the cause immediately at the point of failure instead.
+            inner.publish_error(
+                "extension_replacement_ready_dropped",
+                "replacement ready frame dropped: session bridge unavailable or full",
+                None,
+            );
+        }
         Some(SessionBridgeEvent::SetModel { id, .. }) => {
             let _ = inner.client.respond_set_model(id, false).await;
         }

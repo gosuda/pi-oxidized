@@ -146,6 +146,8 @@ type SlotComponent = {
 	render(width: number): string[];
 	handleInput?(data: string): void;
 	dispose?(): void;
+	/** Receive a new theme without reconstruction (stateful overlays). */
+	updateTheme?(theme: Theme): void;
 };
 
 type SlotFactory = (theme: Theme) => unknown;
@@ -159,6 +161,8 @@ interface SlotEntry {
 	width: number;
 	/** Retained only for components that must capture the active theme at construction. */
 	recreate?: SlotFactory;
+	/** When false, theme updates re-render without reconstruction (preserves state). */
+	recreateOnThemeUpdate: boolean;
 	/** Invalidates older asynchronous recreation results. */
 	recreationRevision: number;
 }
@@ -531,7 +535,7 @@ export class ExtensionHost {
 	/** Abort controller for the current agent turn (`ctx.getSignal`). */
 	private turnAbort: AbortController | undefined;
 	/** Resolvers waiting for the next idle transition (`ctx.waitForIdle`). */
-	private readonly idleWaiters: Array<() => void> = [];
+	private readonly idleWaiters: Array<{ resolve: () => void; reject: (reason?: unknown) => void }> = [];
 	/** Extension statuses set via `ui.setStatus` (served to custom footers). */
 	private readonly extensionStatuses = new Map<string, string>();
 	/**
@@ -1102,13 +1106,41 @@ export class ExtensionHost {
 				});
 			}
 		}
-		if (this.hasLoadedProtocolExtensions) {
-			this.extensions.push(...loadedExtensions);
-		} else {
-			// The first JSONL load is startup configuration, equivalent to CLI
-			// extension paths, which load before built-in factories.
-			this.extensions.unshift(...loadedExtensions);
-			this.hasLoadedProtocolExtensions = true;
+		// Idempotent per resolved extension path: replace a previously
+		// loaded extension for the same path in place (preserving its
+		// ordering position) rather than appending a duplicate. New paths
+		// keep the first-load-unshift / later-load-push ordering semantics.
+		const existingByPath = new Map<string, number>();
+		for (const [i, existing] of this.extensions.entries()) {
+			if (!existingByPath.has(existing.path)) {
+				existingByPath.set(existing.path, i);
+			}
+		}
+		const newExtensions: Extension[] = [];
+		const newPathIndex = new Map<string, number>();
+		for (const ext of loadedExtensions) {
+			const existingIdx = existingByPath.get(ext.path);
+			if (existingIdx !== undefined) {
+				this.extensions[existingIdx] = ext;
+				continue;
+			}
+			const batchIdx = newPathIndex.get(ext.path);
+			if (batchIdx !== undefined) {
+				newExtensions[batchIdx] = ext;
+			} else {
+				newPathIndex.set(ext.path, newExtensions.length);
+				newExtensions.push(ext);
+			}
+		}
+		if (newExtensions.length > 0) {
+			if (this.hasLoadedProtocolExtensions) {
+				this.extensions.push(...newExtensions);
+			} else {
+				// The first JSONL load is startup configuration, equivalent to CLI
+				// extension paths, which load before built-in factories.
+				this.extensions.unshift(...newExtensions);
+				this.hasLoadedProtocolExtensions = true;
+			}
 		}
 
 		// Rebuild so newly loaded tools/providers/handlers bind without killing siblings.
@@ -1464,6 +1496,7 @@ export class ExtensionHost {
 			overlayOptions: undefined,
 			width: 80,
 			recreate,
+			recreateOnThemeUpdate: true,
 			recreationRevision: 0,
 		};
 		this.slots.set(key, entry);
@@ -1629,6 +1662,7 @@ export class ExtensionHost {
 					overlayOptions,
 					width: 80,
 					recreate: (theme) => factory(tui, theme, {}, done),
+					recreateOnThemeUpdate: false,
 					recreationRevision: 0,
 				};
 				self.slots.set(key, entry);
@@ -1897,7 +1931,7 @@ export class ExtensionHost {
 		}
 		if (this.sessionState.isIdle && this.idleWaiters.length > 0) {
 			const waiters = this.idleWaiters.splice(0);
-			for (const resolve of waiters) resolve();
+			for (const waiter of waiters) waiter.resolve();
 		}
 	}
 
@@ -1916,6 +1950,13 @@ export class ExtensionHost {
 		this.terminalTheme = update.terminalTheme === "light" ? "light" : "dark";
 		this.themeMode = typeof update.themeMode === "string" ? update.themeMode : "auto";
 		for (const [key, entry] of this.slots) {
+			if (!entry.recreateOnThemeUpdate) {
+				// Stateful overlays keep their instance and state; propagate the
+				// new theme for components that opt in, then re-render in place.
+				entry.component?.updateTheme?.(this.currentTheme);
+				this.pushSlot(key, entry, entry.width);
+				continue;
+			}
 			this.recreateSlot(key, entry);
 		}
 	}
@@ -2464,6 +2505,12 @@ export class ExtensionHost {
 			cancelled: boolean,
 		): void => {
 			if (cancelled) return;
+			// Staleness follows from "the session was replaced", not from "a
+			// token came back". Mark stale for every non-cancelled replacement
+			// response before any token-shaped early return so that
+			// createCommandContext guards reject a context bound to a session
+			// that no longer exists.
+			markStale?.();
 			const token = payload["replacementToken"];
 			if (typeof token !== "string") return;
 			// Authors must await replacement calls so the token stays scoped to
@@ -2481,16 +2528,19 @@ export class ExtensionHost {
 			} else {
 				scope.tokens.push(token);
 			}
-			markStale?.();
 		};
 
 		return {
 			waitForIdle: () => {
 				guardActive();
 				if (self.sessionState.isIdle) return Promise.resolve();
-				return new Promise<void>((resolve) => {
-					self.idleWaiters.push(resolve);
+				const promise = new Promise<void>((resolve, reject) => {
+					self.idleWaiters.push({ resolve, reject });
 				});
+				// Prevent unhandled rejection for fire-and-forget callers; an
+				// awaiting caller still receives the rejection from dispose().
+				promise.catch(() => {});
+				return promise;
 			},
 			newSession: async (options) => {
 				guardActive();
@@ -2703,6 +2753,11 @@ export class ExtensionHost {
 		for (const controller of this.inFlightShortcuts.values()) controller.abort();
 		this.inFlightShortcuts.clear();
 		this.providers.clear();
+		// Settle pending waitForIdle waiters: idle was never reached, so
+		// reject with the disposal reason. Each waiter has a no-op catch
+		// attached at creation, so this cannot become an unhandled rejection.
+		const waiters = this.idleWaiters.splice(0);
+		for (const waiter of waiters) waiter.reject(new Error(reason));
 		for (const key of [...this.slots.keys()]) this.disposeSlot(key);
 		this.client.dispose(reason);
 	}

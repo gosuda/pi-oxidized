@@ -2361,6 +2361,32 @@ async fn unclaimed_set_model_request_is_answered_failure() -> R {
 }
 
 #[tokio::test]
+async fn dropped_replacement_ready_emits_diagnostic() -> R {
+    let (runner, host) = make_runner(json!({})).await?;
+    // Claim the bridge, then drop the receiver to close the channel.
+    let bridge = runner.take_session_bridge().ok_or("bridge missing")?;
+    drop(bridge);
+    let mut errors = runner.subscribe_errors();
+    // Emit a replacementReady event — the channel is closed so try_send
+    // fails, and the dropped frame must produce an immediate diagnostic
+    // instead of a silent REPLACEMENT_READY_TIMEOUT.
+    host.emit(Frame {
+        id: 0,
+        kind: FrameKind::Event,
+        method: "session.replacementReady".to_owned(),
+        payload: json!({"token": "tok-1"}),
+    })
+    .await;
+    let error = next_error(&mut errors, Duration::from_secs(2)).await?;
+    assert!(
+        error.code.contains("replacement_ready_dropped"),
+        "expected replacement_ready_dropped diagnostic, got: {error:?}"
+    );
+    runner.shutdown_once().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn ui_control_event_forwards_typed_to_ui_subscribers() -> R {
     use crate::core::extension_host::ExtensionUiEvent;
     use pi_ext::protocol::UiControl;
