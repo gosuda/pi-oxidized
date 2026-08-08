@@ -494,11 +494,18 @@ fn is_lock_stale(meta: &fs::Metadata, stale: Duration) -> bool {
     }
 }
 
-/// Reclaim a stale lock directory only when its identity is unchanged.
+/// Reclaim a stale lock directory after re-reading its filesystem identity.
 ///
 /// `stale_meta` is the metadata captured when the directory at `lock_path` was
-/// judged stale. The path is re-read immediately before removal so a contender
-/// that reclaimed and recreated this path cannot have its fresh lock deleted.
+/// judged stale. The path is re-read immediately before removal so that a
+/// contender which reclaimed and recreated this path is *usually* detected and
+/// its fresh lock spared. This narrows the TOCTOU window but does not close
+/// it: `fs::metadata` and `fs::remove_dir` are separate syscalls, and a
+/// contender can install a fresh lock in the gap between them. POSIX provides
+/// no atomic compare-and-unlink for directories, so the race is inherent.
+/// The identity check mitigates the consequence to a spurious error rather
+/// than split state, but holders must still verify ownership via
+/// [`LockGuard::check_ownership`] after acquisition.
 ///
 /// Returns `Ok(true)` when the stale directory was removed (or had already
 /// vanished) and the caller may retry creation, `Ok(false)` when a contender

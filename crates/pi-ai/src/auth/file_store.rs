@@ -59,6 +59,14 @@ const AUTH_LOCK_STALE: Duration = Duration::from_secs(30);
 #[derive(Clone, Debug)]
 pub struct FileLockBackend {
     path: PathBuf,
+    /// Canonical path used for all lock acquisition, reads, and atomic writes.
+    ///
+    /// Resolved once at construction so that locking, reading, and persisting
+    /// never diverge across symlink spellings: `NamedTempFile::persist` calls
+    /// `rename(2)`, which does not follow a symlink at the final component and
+    /// would otherwise replace the symlink with a regular file, splitting the
+    /// credential file from its lock target.
+    effective_path: PathBuf,
     #[cfg(test)]
     lock_contention: Option<Arc<tokio::sync::Notify>>,
     #[cfg(test)]
@@ -71,8 +79,11 @@ impl FileLockBackend {
     /// Create a backend for the given JSON data path.
     #[must_use]
     pub fn new(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        let effective_path = canonical_lock_target(&path).unwrap_or_else(|_| path.clone());
         Self {
-            path: path.into(),
+            path,
+            effective_path,
             #[cfg(test)]
             lock_contention: None,
             #[cfg(test)]
@@ -107,7 +118,7 @@ impl FileLockBackend {
     /// Path of the sibling exclusive-lock file.
     #[must_use]
     pub fn lock_path(&self) -> PathBuf {
-        lock_path_for(&self.path)
+        lock_path_for(&self.effective_path)
     }
 
     /// Synchronous locked critical section.
@@ -220,7 +231,7 @@ impl FileLockBackend {
     }
 
     fn ensure_parent_dir(&self) -> Result<(), StoreError> {
-        let Some(parent) = parent_dir(&self.path) else {
+        let Some(parent) = parent_dir(&self.effective_path) else {
             return Ok(());
         };
         if !parent.exists() {
@@ -230,7 +241,7 @@ impl FileLockBackend {
     }
 
     fn ensure_data_file(&self) -> Result<(), StoreError> {
-        if self.path.exists() {
+        if self.effective_path.exists() {
             return Ok(());
         }
         // Callers hold the sibling lock here, so the missing-path recheck and
@@ -240,7 +251,7 @@ impl FileLockBackend {
 
     fn acquire_sync_lock(&self) -> Result<LockGuard, StoreError> {
         let unresolved = absolute_lock_target(&self.path)?;
-        let target = canonical_lock_target(&self.path)?;
+        let target = self.effective_path.clone();
         // Reject legacy file locks at both spellings rather than migrating them:
         // an old process blocked on the advisory-file lock would otherwise
         // interleave credential writes after an in-place unlink.
@@ -272,7 +283,7 @@ impl FileLockBackend {
         // the canonical spelling, which maps every symlink spelling of the auth
         // path onto a single lock directory.
         let unresolved = absolute_lock_target(&self.path)?;
-        let target = canonical_lock_target(&self.path)?;
+        let target = self.effective_path.clone();
         reject_legacy_file_locks(&[unresolved, target.clone()])?;
         let options = LockOptions::new().attempts(1).stale(AUTH_LOCK_STALE);
         let mut delay = LOCK_MIN_DELAY;
@@ -309,12 +320,12 @@ impl FileLockBackend {
     }
 
     fn read_data_file(&self) -> Result<Option<String>, StoreError> {
-        match fs::read_to_string(&self.path) {
+        match fs::read_to_string(&self.effective_path) {
             Ok(content) => Ok(Some(content)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(StoreError::message(format!(
                 "Failed to read auth storage {}: {error}",
-                self.path.display()
+                self.effective_path.display()
             ))),
         }
     }
@@ -336,7 +347,7 @@ impl FileLockBackend {
             }
         }
 
-        let parent = parent_dir(&self.path).unwrap_or_else(|| Path::new("."));
+        let parent = parent_dir(&self.effective_path).unwrap_or_else(|| Path::new("."));
         if !parent.exists() {
             create_dir_all_secure(parent)?;
         }
@@ -380,16 +391,16 @@ impl FileLockBackend {
         set_owner_secret_mode(tmp.path())?;
 
         let tmp_path = tmp.path().to_path_buf();
-        tmp.persist(&self.path).map_err(|error| {
+        tmp.persist(&self.effective_path).map_err(|error| {
             StoreError::message(format!(
                 "Failed to persist auth storage from {} to {}: {}",
                 tmp_path.display(),
-                self.path.display(),
+                self.effective_path.display(),
                 error.error
             ))
         })?;
 
-        set_owner_secret_mode(&self.path)?;
+        set_owner_secret_mode(&self.effective_path)?;
         sync_parent_dir(parent);
         Ok(())
     }
@@ -666,6 +677,39 @@ fn canonical_lock_target(path: &Path) -> Result<PathBuf, StoreError> {
             ))
         });
     }
+    // Dangling symlink leaf: `path.exists()` is false for a broken symlink, so
+    // the generic parent-join below would return the link path itself. `persist`
+    // would then replace the symlink with a regular file. Resolve the link
+    // target explicitly so `effective_path` points at the intended target and the
+    // symlink is preserved.
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            let link_target = fs::read_link(path).map_err(|error| {
+                StoreError::message(format!(
+                    "Failed to resolve auth storage symlink {}: {error}",
+                    path.display()
+                ))
+            })?;
+            let link_parent = parent_dir(path).unwrap_or_else(|| Path::new("."));
+            let target_path = if link_target.is_absolute() {
+                link_target
+            } else {
+                link_parent.join(link_target)
+            };
+            let target_parent = parent_dir(&target_path).unwrap_or_else(|| Path::new("."));
+            let canonical_target_parent = match fs::canonicalize(target_parent) {
+                Ok(canonical) => canonical,
+                Err(_) => absolute_lock_target(target_parent)?,
+            };
+            let Some(file_name) = target_path.file_name() else {
+                return Err(StoreError::message(format!(
+                    "Auth storage symlink target {} has no file name",
+                    target_path.display()
+                )));
+            };
+            return Ok(canonical_target_parent.join(file_name));
+        }
+    }
     let parent = parent_dir(path).unwrap_or_else(|| Path::new("."));
     let parent = fs::canonicalize(parent).map_err(|error| {
         StoreError::message(format!(
@@ -682,8 +726,9 @@ fn canonical_lock_target(path: &Path) -> Result<PathBuf, StoreError> {
     Ok(parent.join(file_name))
 }
 
-async fn sleep_with_jitter(delay: Duration, retry: u32) {
-    let jitter = Duration::from_millis(u64::from((retry + 1).saturating_mul(7) % 37));
+async fn sleep_with_jitter(delay: Duration, _retry: u32) {
+    let jitter_ms = u64::from(uuid::Uuid::new_v4().as_bytes()[0] % 37);
+    let jitter = Duration::from_millis(jitter_ms);
     tokio::time::sleep(delay.saturating_add(jitter)).await;
 }
 
@@ -1410,6 +1455,97 @@ mod tests {
         assert!(result.is_err(), "injected persistence failure must surface");
         assert_eq!(fs::read_to_string(&path)?, durable);
         assert_eq!(store.read("openai").await?, Some(api_key("old")));
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn atomic_write_preserves_symlink_leaf() -> TestResult {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir()?;
+        let real_path = dir.path().join("real.json");
+        fs::write(&real_path, "{}")?;
+        let link_path = dir.path().join("link.json");
+        symlink(&real_path, &link_path)?;
+        let store = FileCredentialStore::new(&link_path);
+        store
+            .modify(
+                "openai",
+                Box::new(|_| Box::pin(async { Ok(Some(api_key("leaf-test"))) })),
+            )
+            .await?;
+        let meta = fs::symlink_metadata(&link_path)?;
+        assert!(
+            meta.file_type().is_symlink(),
+            "symlink leaf should be preserved after atomic_write, got {:?}",
+            meta.file_type()
+        );
+        let real_content = fs::read_to_string(&real_path)?;
+        assert!(
+            real_content.contains("leaf-test"),
+            "real file should contain new credential, got {real_content:?}"
+        );
+        let via_link = fs::read_to_string(&link_path)?;
+        assert_eq!(
+            real_content, via_link,
+            "reading through symlink should see same content"
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn atomic_write_preserves_dangling_symlink_leaf() -> TestResult {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir()?;
+        let link_path = dir.path().join("link.json");
+        // Relative dangling symlink: link -> "real.json" in same dir, target does not exist yet.
+        symlink("real.json", &link_path)?;
+        assert!(
+            fs::symlink_metadata(&link_path).is_ok_and(|m| m.file_type().is_symlink()),
+            "link should be a symlink"
+        );
+        assert!(
+            !link_path.exists(),
+            "dangling symlink should report !exists()"
+        );
+        let real_path = dir.path().join("real.json");
+        assert!(!real_path.exists(), "target should not exist before write");
+        let store = FileCredentialStore::new(&link_path);
+        // Effective path must resolve to the symlink target, not the link itself.
+        assert_eq!(
+            store.backend.effective_path,
+            fs::canonicalize(dir.path())?.join("real.json"),
+            "effective_path should resolve dangling symlink to its target"
+        );
+        store
+            .modify(
+                "openai",
+                Box::new(|_| Box::pin(async { Ok(Some(api_key("dangling-test"))) })),
+            )
+            .await?;
+        let meta = fs::symlink_metadata(&link_path)?;
+        assert!(
+            meta.file_type().is_symlink(),
+            "dangling symlink leaf should be preserved after atomic_write, got {:?}",
+            meta.file_type()
+        );
+        assert!(real_path.exists(), "target should be created after write");
+        let real_content = fs::read_to_string(&real_path)?;
+        assert!(
+            real_content.contains("dangling-test"),
+            "real file should contain new credential, got {real_content:?}"
+        );
+        let via_link = fs::read_to_string(&link_path)?;
+        assert_eq!(
+            real_content, via_link,
+            "reading through symlink should see same content"
+        );
+        // Lock path must be at the target, not the link.
+        assert_eq!(
+            store.backend.lock_path(),
+            store.backend.effective_path.with_extension("json.lock"),
+            "lock should be sibling of effective_path"
+        );
         Ok(())
     }
 }

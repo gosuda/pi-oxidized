@@ -51,7 +51,18 @@ describe.skipIf(isWindows)("PTY driver", () => {
 			if (!match?.[1]) throw new Error("child pid was not reported");
 			const childPid = Number(match[1]);
 			await process.terminate();
-			expect(() => globalThis.process.kill(childPid, 0)).toThrow();
+		const deadline = Date.now() + 5_000;
+		let alive = true;
+		while (Date.now() < deadline) {
+			try {
+				globalThis.process.kill(childPid, 0);
+			} catch {
+				alive = false;
+				break;
+			}
+			await Bun.sleep(25);
+		}
+		expect(alive).toBe(false);
 		} finally {
 			await process.terminate();
 		}

@@ -62,6 +62,8 @@ pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum retained stderr tail in bytes.
 pub const STDERR_TAIL_BYTES: usize = 16 * 1024;
+/// Maximum time to wait when enqueueing a cancel frame on a saturated command channel.
+pub const CANCEL_QUEUE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Result type for host client operations.
 pub type HostResult<T> = Result<T, HostClientError>;

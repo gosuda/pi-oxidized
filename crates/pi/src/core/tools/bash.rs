@@ -1234,6 +1234,16 @@ mod tests {
         }
         Ok(())
     }
+    /// Build a nested `sleep 60` process tree `depth` levels deep, recording
+    /// each spawned pid into `marker`. Used by the timeout/cancel tree tests.
+    fn nested_tree_command(marker: &Path, depth: usize) -> String {
+        let marker_str = marker.display();
+        let mut command = format!("sleep 60 & echo $! >> '{marker_str}'; wait");
+        for _ in 1..depth {
+            command = format!("({command}) & echo $! >> '{marker_str}'; wait");
+        }
+        command
+    }
 
     proptest! {
         #![proptest_config(ProptestConfig { cases: 4, .. ProptestConfig::default() })]
@@ -1247,11 +1257,7 @@ mod tests {
                 runtime.block_on(async {
                     let dir = tempdir().map_err(|error| error.to_string())?;
                     let marker = dir.path().join("tree.pid");
-                    let marker_str = marker.display();
-                    let mut command = format!("sleep 60 & echo $! >> '{marker_str}'; wait");
-                    for _ in 1..depth {
-                        command = format!("({command}) & echo $! >> '{marker_str}'; wait");
-                    }
+                    let command = nested_tree_command(&marker, depth);
                     let tool = BashTool::new(dir.path());
                     let timeout = f64::from(timeout_tenths) / 10.0;
                     let err = expected_error(
@@ -1473,11 +1479,7 @@ mod tests {
         for depth in 1..=3 {
             let dir = tempdir()?;
             let marker = dir.path().join("nested.pid");
-            let marker_str = marker.display();
-            let mut command = format!("sleep 60 & echo $! >> '{marker_str}'; wait");
-            for _ in 1..depth {
-                command = format!("({command}) & echo $! >> '{marker_str}'; wait");
-            }
+            let command = nested_tree_command(&marker, depth);
             let tool = BashTool::new(dir.path());
             let err = expected_error(
                 tool.execute(

@@ -153,13 +153,16 @@ export const MAX_RETAINED_FRAMES = 128;
 export const DEFAULT_HOSTILE_OUTPUT_CEILING = 10_000;
 
 /**
- * Four frames per tool round (prepare, validate, update, execute), plus
- * setup slack. The hard ceiling still bounds hostile child output.
+ * Eight frames per tool round (prepare, validate, update, execute, plus
+ * headroom for additional toolUpdate frames per round), plus setup slack.
+ * The per-round term is doubled from the strict 4-frame minimum so a round
+ * that emits more than one toolUpdate does not trip a false hostile gate.
+ * The hard ceiling still bounds hostile child output.
  */
 export function deriveRetainedFrameBudget(rounds: number): number {
 	return Math.min(
 		DEFAULT_HOSTILE_OUTPUT_CEILING,
-		Math.max(MAX_RETAINED_FRAMES, 16 + rounds * 4),
+		Math.max(MAX_RETAINED_FRAMES, 16 + rounds * 8),
 	);
 }
 

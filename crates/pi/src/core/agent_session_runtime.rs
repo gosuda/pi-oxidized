@@ -1375,11 +1375,30 @@ fn atomic_move_noreplace(staged_path: &Path, destination: &Path) -> io::Result<(
     .map_err(io::Error::from)
 }
 
+#[cfg(windows)]
+fn atomic_move_noreplace(staged_path: &Path, destination: &Path) -> io::Result<()> {
+    // Windows has no atomic no-replace rename syscall. Fall back to a
+    // pre-check + std::fs::rename: if the destination does not exist, the
+    // rename succeeds; if it appeared between the check and the rename, the
+    // caller's AlreadyExists handling in publish_no_replace_with catches it.
+    match fs::metadata(destination) {
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "destination already exists",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::rename(staged_path, destination)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(not(any(
     target_os = "linux",
     target_os = "android",
     target_vendor = "apple",
-    target_os = "redox"
+    target_os = "redox",
+    windows
 )))]
 fn atomic_move_noreplace(_staged_path: &Path, _destination: &Path) -> io::Result<()> {
     Err(io::Error::new(

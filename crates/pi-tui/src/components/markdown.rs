@@ -2180,21 +2180,23 @@ mod tests {
         let src = format!("{}alpha beta gamma delta", "> ".repeat(200));
         // Bound the render with an explicit deadline so a hang (e.g. from a
         // reverted fixed cap) reports as a test failure, not a CI timeout.
-        let lines = std::thread::scope(|s| {
-            let handle = s.spawn(|| plain_default(&src, 20));
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            loop {
-                if handle.is_finished() {
-                    return handle
-                        .join()
-                        .map_err(|_| "render thread panicked for 200-level quote at width 20");
-                }
-                if std::time::Instant::now() > deadline {
-                    return Err("rendering 200 nested quotes at width 20 did not complete in 10s");
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
+        // The render thread is detached (not joined): joining it would block
+        // the watchdog on return, defeating the deadline entirely.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(plain_default(&src, 20));
+        });
+        let lines = match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(lines) => lines,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                return Err(
+                    "rendering 200 nested quotes at width 20 did not complete in 10s".into(),
+                );
             }
-        })?;
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("render thread panicked for 200-level quote at width 20".into());
+            }
+        };
         // The deepest bordered level (depth 9, content_width 2) wraps the
         // 22-character text into at most 11 lines; each parent level adds a
         // border but never re-splits (parent content_width = child

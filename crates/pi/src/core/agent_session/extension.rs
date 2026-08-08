@@ -652,9 +652,12 @@ impl AgentSession {
                     .or_else(|| host.session_target());
                 let Some(target) = target else {
                     // The item was already dequeued; answer its correlated
-                    // request so the host does not hang, then stop.
+                    // request so the host does not hang, then keep draining.
+                    // A transient None (e.g. during a replacement handoff)
+                    // must not kill the bridge — only channel close
+                    // (recv returning None) terminates this task.
                     answer_unclaimed_bridge_event(&host, item).await;
-                    break;
+                    continue;
                 };
                 target.apply_session_bridge_event(&host, item).await;
                 let state = target.session_state_wire().await;

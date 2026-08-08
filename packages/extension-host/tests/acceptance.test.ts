@@ -1893,24 +1893,26 @@ describe("extension theme API", () => {
 		// Mutate the state to prove it survives the theme update.
 		initialComponent!.state.value = "mutated";
 
-		// Push a theme.update — the overlay must NOT re-invoke the factory.
-		(host as unknown as { applyThemeUpdate(update: unknown): void }).applyThemeUpdate(themeUpdateFrame("red").payload);
+	// Push a theme.update through the full frame decode path — the overlay must NOT re-invoke the factory.
+	stdin.push(Buffer.from(encodeFrameString(themeUpdateFrame("red"))));
 
-		// (a) factory invoked exactly once — NOT re-invoked.
-		expect(factoryCalls).toBe(1);
-		// (b) component object reference unchanged and state survives.
-		expect(capturedComponent).toBe(initialComponent);
-		expect(capturedComponent!.state.value).toBe("mutated");
-		// (c) updateTheme received the new theme.
-		expect(updateThemeCalls).toEqual(["red"]);
-		// (d) a re-render happened — a new uiSlot frame was emitted.
-		await collector.awaitFrame((f) =>
-			f.method === "uiSlot"
-			&& collector.frames.filter((frame) => frame.method === "uiSlot").length > slotCountBefore,
-		);
-		const repushed = collector.frames.filter((f) => f.method === "uiSlot").at(-1);
-		expect((repushed?.payload as Record<string, unknown>)["key"])
-			.toBe((firstSlot.payload as Record<string, unknown>)["key"]);
+	// Await the re-render uiSlot before asserting overlay behavior.
+	await collector.awaitFrame((f) =>
+		f.method === "uiSlot"
+		&& collector.frames.filter((frame) => frame.method === "uiSlot").length > slotCountBefore,
+	);
+
+	// (a) factory invoked exactly once — NOT re-invoked.
+	expect(factoryCalls).toBe(1);
+	// (b) component object reference unchanged and state survives.
+	expect(capturedComponent).toBe(initialComponent);
+	expect(capturedComponent?.state.value).toBe("mutated");
+	// (c) updateTheme received the new theme.
+	expect(updateThemeCalls).toEqual(["red"]);
+	// (d) the re-render uiSlot preserves the slot key.
+	const repushed = collector.frames.filter((f) => f.method === "uiSlot").at(-1);
+	expect((repushed?.payload as Record<string, unknown>)["key"])
+		.toBe((firstSlot.payload as Record<string, unknown>)["key"]);
 
 		// Complete the overlay and await the command response.
 		capturedDone?.("complete");

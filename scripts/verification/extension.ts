@@ -243,27 +243,28 @@ export default function verificationExtension(pi: ExtensionAPI): void {
 		},
 	});
 
-	pi.registerCommand(VERIFICATION_FLAG_COMMAND, {
-		description: "Record the current verification profile flag",
-		handler: async () => {
-			recordCompatibility("flag_observation.before", { flag: VERIFICATION_PROFILE_FLAG });
-			recordCompatibility("flag_observation.after", { value: pi.getFlag(VERIFICATION_PROFILE_FLAG) ?? null });
-			recordCompatibility("replacement.post.before", {});
-			try {
-				pi.sendMessage({
-					customType: "verification-post-replacement",
-					content: "verification post replacement",
-					display: false,
-				});
-				recordCompatibility("replacement.post", {});
-			} catch (error) {
-				recordCompatibility("replacement.post.error", {
-					message: error instanceof Error ? error.message : String(error),
-				});
-				throw error;
-			}
-		},
-	});
+pi.registerCommand(VERIFICATION_FLAG_COMMAND, {
+	description: "Record the current verification profile flag; sends verification-post-replacement only when args includes 'post-replacement'",
+	handler: async (args: string) => {
+		recordCompatibility("flag_observation.before", { flag: VERIFICATION_PROFILE_FLAG });
+		recordCompatibility("flag_observation.after", { value: pi.getFlag(VERIFICATION_PROFILE_FLAG) ?? null });
+		if (!args.includes("post-replacement")) return;
+		recordCompatibility("replacement.post.before", {});
+		try {
+			pi.sendMessage({
+				customType: "verification-post-replacement",
+				content: "verification post replacement",
+				display: false,
+			});
+			recordCompatibility("replacement.post", {});
+		} catch (error) {
+			recordCompatibility("replacement.post.error", {
+				message: error instanceof Error ? error.message : String(error),
+			});
+			throw error;
+		}
+	},
+});
 
 	pi.registerCommand(VERIFICATION_SESSION_REPLACEMENT_COMMAND, {
 		description: "Exercise real session replacement lifecycle",

@@ -19,7 +19,7 @@
  * final content parity is enforced by `message_end`/`tool_execution_end`.
  */
 
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 export const REPO_ROOT = resolve(import.meta.dirname, "../..");
@@ -772,7 +772,7 @@ function writeJsonl(path: string, records: readonly JsonValue[]): void {
 async function main(): Promise<void> {
 	for (const required of [RUST_BINARY, EXTENSION_HOST, EXTENSION_PATH, TYPESCRIPT_CLI, AUTHORITATIVE_RPC_TYPES_PATH]) {
 		try {
-			readFileSync(required);
+			statSync(required);
 		} catch {
 			fail(
 				`rpc-parity prerequisite missing: ${required}${

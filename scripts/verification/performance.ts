@@ -1351,6 +1351,11 @@ async function main(): Promise<void> {
 	};
 
 	const blockers: string[] = [];
+	if (artifact.build.sourceFingerprints.buildRegenerated?.rust) {
+		blockers.push(
+			`Rust source fingerprint changed during build window: ${sourceBefore.rust.sha256} -> ${sourceBuilt.rust.sha256}`,
+		);
+	}
 	if (!sourceStable) {
 		blockers.push(
 			`source changed during measurement: Rust ${sourceBuilt.rust.sha256} -> ${sourceAfter.rust.sha256}; ` +

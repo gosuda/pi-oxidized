@@ -53,7 +53,7 @@ describe("retained frame budgets", () => {
 		expect(MAX_RETAINED_FRAMES).toBe(128);
 		expect(DEFAULT_HOSTILE_OUTPUT_CEILING).toBe(10_000);
 		expect(deriveRetainedFrameBudget(2)).toBe(128);
-		expect(deriveRetainedFrameBudget(50)).toBe(216);
+		expect(deriveRetainedFrameBudget(50)).toBe(416);
 		expect(deriveRetainedFrameBudget(3_000)).toBe(10_000);
 	});
 });

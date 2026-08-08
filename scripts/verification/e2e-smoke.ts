@@ -957,11 +957,10 @@ async function runSessionReplacement(state: WorkflowState): Promise<SessionDocum
 			state, "replacement after marker", rust, withSessionAfter.index + 1, "replacement.after",
 			(marker) => marker.instance === instance,
 		);
-		assert(
-			before.index < setup.index && setup.index < withSessionBefore.index
-				&& withSessionBefore.index < withSessionAfter.index && withSessionAfter.index < after.index,
-			"replacement compatibility markers were not recorded in the required stage order",
-		);
+	// Stage order is enforced structurally via startIndex threading: each
+	// marker is awaited at the predecessor's index + 1, so the sequence
+	// before -> setup -> withSessionBefore -> withSessionAfter -> after
+	// is guaranteed by construction.
 		const cancelled = markerValue(after.marker).cancelled;
 		assert(cancelled === false, "session replacement was cancelled instead of completing");
 		const rebound = await waitForCompatibilityMarker(

@@ -182,6 +182,8 @@ class FrameCollector {
 	private readonly waiters: Array<{
 		predicate: (f: Frame) => boolean;
 		resolve: (f: Frame) => void;
+		reject: (error: Error) => void;
+		timer: ReturnType<typeof setTimeout>;
 	}> = [];
 
 	write(chunk: Uint8Array): void {
@@ -195,6 +197,7 @@ class FrameCollector {
 			for (let i = this.waiters.length - 1; i >= 0; i--) {
 				const waiter = this.waiters[i];
 				if (waiter !== undefined && waiter.predicate(frame)) {
+					clearTimeout(waiter.timer);
 					waiter.resolve(frame);
 					this.waiters.splice(i, 1);
 				}
@@ -202,11 +205,19 @@ class FrameCollector {
 		}
 	}
 
-	awaitFrame(predicate: (f: Frame) => boolean): Promise<Frame> {
+	awaitFrame(predicate: (f: Frame) => boolean, label = "frame", timeoutMs = 5_000): Promise<Frame> {
 		const existing = this.frames.find(predicate);
 		if (existing !== undefined) return Promise.resolve(existing);
-		const { promise, resolve } = Promise.withResolvers<Frame>();
-		this.waiters.push({ predicate, resolve });
+		const { promise, resolve, reject } = Promise.withResolvers<Frame>();
+		const timer = setTimeout(() => {
+			const index = this.waiters.indexOf(waiter);
+			if (index !== -1) this.waiters.splice(index, 1);
+			const seen = this.frames.map((f) => `${f.kind}:${f.method}:${f.id}`).join(", ");
+			reject(new Error(`awaitFrame timed out waiting for "${label}" after ${timeoutMs}ms; frames seen: [${seen}]`));
+		}, timeoutMs);
+		timer.unref();
+		const waiter = { predicate, resolve, reject, timer };
+		this.waiters.push(waiter);
 		return promise;
 	}
 }
