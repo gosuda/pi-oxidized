@@ -22,11 +22,14 @@ declare module "@earendil-works/pi-coding-agent" {
 	} from "@earendil-works/pi-ai";
 	export type ExtensionMode = "tui" | "rpc" | "json" | "print";
 
+	export type SourceScope = "user" | "project" | "temporary";
+	export type SourceOrigin = "package" | "top-level";
+
 	export interface SourceInfo {
 		path: string;
 		source: string;
-		scope?: string;
-		origin?: string;
+		scope: SourceScope;
+		origin: SourceOrigin;
 		baseDir?: string;
 	}
 
@@ -507,6 +510,11 @@ declare module "@earendil-works/pi-coding-agent" {
 
 	export interface ExtensionRuntime {
 		flagValues: Map<string, boolean | string>;
+		pendingProviderRegistrations: Array<{ name: string; config: ProviderConfig; extensionPath: string }>;
+		pendingNativeProviderRegistrations: Array<{ provider: Record<string, unknown>; extensionPath: string }>;
+		registerProvider: (name: string, config: ProviderConfig, extensionPath?: string) => void;
+		registerNativeProvider: (provider: Record<string, unknown>, extensionPath?: string) => void;
+		unregisterProvider: (name: string, extensionPath?: string) => void;
 		assertActive: () => void;
 		invalidate: (message?: string) => void;
 	}

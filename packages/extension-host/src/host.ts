@@ -285,7 +285,7 @@ function initialSessionState(): SessionStatePayload {
 
 /** Minimal `SourceInfo` for natively owned tools/commands crossing the bridge. */
 function nativeSourceInfo(source: string): Record<string, unknown> {
-	return { path: `<${source}>`, source };
+	return { path: `<${source}>`, source, scope: "temporary", origin: "top-level" };
 }
 
 /** `theme.update` event payload (Rust → host). */
@@ -486,6 +486,28 @@ function ansiToInertHtml(lines: string[]): string {
 	return `<pre class="pi-tool-render">${rendered}</pre>`;
 }
 
+type ProviderRegistration = {
+	readonly name: string;
+	readonly config: ProviderConfig;
+	readonly order: number;
+};
+
+type ProviderRegistrationOperation =
+	| ({ readonly kind: "register"; readonly extensionPath: string } & ProviderRegistration)
+	| {
+		readonly kind: "native";
+		readonly provider: Record<string, unknown>;
+		readonly extensionPath: string;
+		readonly order: number;
+	}
+	| { readonly kind: "unregister"; readonly name: string; readonly order: number };
+
+type ProviderLoadScope = {
+	phase: "loading" | "committed" | "aborted";
+	readonly extensionPath: string;
+	readonly operations: ProviderRegistrationOperation[];
+};
+
 /**
  * Extension host process. Owns the ExtensionRunner and bridges it to Rust over
  * a single JSONL byte transport. One stdout writer; all writes are ordered
@@ -500,9 +522,17 @@ export class ExtensionHost {
 	private runtime: ExtensionRuntime | undefined;
 	private extensions: Extension[] = [];
 	private hasLoadedProtocolExtensions = false;
-	/** Captured custom providers (first registration wins). */
+	/** Captured custom providers (rebuilt from the current extension set on each rebuild). */
 	private readonly providers = new Map<string, ProviderConfig>();
-	/** In-flight tool.execute AbortControllers keyed by request id. */
+	/**
+	 * Provider registrations captured per extension path during factory
+	 * execution, used to rebuild this.providers from the current extension
+	 * set so removed/replaced captures cannot remain stale.
+	 */
+	private readonly providerRegistrationsByPath = new Map<string, ProviderRegistration[]>();
+	private readonly providerUnregisterOrderByName = new Map<string, number>();
+	private readonly activeProviderLoadScopeByPath = new Map<string, ProviderLoadScope>();
+	private nextProviderRegistrationOrder = 0;
 	private readonly inFlightTools = new Map<number, AbortController>();
 	/** In-flight provider.stream AbortControllers keyed by request id. */
 	private readonly inFlightProviders = new Map<number, AbortController>();
@@ -544,6 +574,7 @@ export class ExtensionHost {
 	 * only from that command's finally path — never via a global slot.
 	 */
 	private readonly commandScope = new AsyncLocalStorage<{ tokens: string[]; closed: boolean }>();
+	private readonly providerLoadScope = new AsyncLocalStorage<ProviderLoadScope>();
 
 	constructor(stdin: ByteReadable, stdout: ByteWritable) {
 		const onFrame: FrameHandler = (frame) => this.onInbound(frame);
@@ -629,6 +660,7 @@ export class ExtensionHost {
 
 	/** Begin extension loading; transitions to READY when complete. */
 	private async startLoading(): Promise<void> {
+		if (this.isDisposed) return;
 		this.state = HostState.LOADING;
 		const opts = this.loadOptions;
 		if (opts === undefined) {
@@ -636,6 +668,7 @@ export class ExtensionHost {
 			return;
 		}
 		this.runtime = createExtensionRuntime();
+		this.installProviderCallbacks(this.runtime);
 		const eventBus = createEventBus();
 		const errors: Array<{ path: string; error: string }> = [];
 
@@ -643,6 +676,7 @@ export class ExtensionHost {
 			try {
 				const jiti = createExtensionJiti();
 				const module = await jiti.import(extPath, { default: true }) as unknown;
+				if (this.isDisposed) return;
 				if (typeof module !== "function") {
 					errors.push({
 						path: extPath,
@@ -650,11 +684,12 @@ export class ExtensionHost {
 					});
 					continue;
 				}
-				const ext = await loadExtensionFromFactory(
-					module as ExtensionFactory, opts.cwd, eventBus, this.runtime, extPath,
+				const ext = await this.loadFactoryWithProviderStaging(
+					module as ExtensionFactory, extPath, opts.cwd, eventBus,
 				);
 				this.extensions.push(ext);
 			} catch (err) {
+				if (this.isDisposed) return;
 				errors.push({
 					path: extPath,
 					error: err instanceof Error ? err.message : String(err),
@@ -667,18 +702,21 @@ export class ExtensionHost {
 			const factory = isNamed ? input.factory : input;
 			const extensionPath = `<inline:${isNamed ? input.name : index + 1}>`;
 			try {
-				const ext = await loadExtensionFromFactory(
-					factory, opts.cwd, eventBus, this.runtime, extensionPath,
+				const ext = await this.loadFactoryWithProviderStaging(
+					factory, extensionPath, opts.cwd, eventBus,
 				);
 				ext.hidden = isNamed ? input.hidden ?? false : false;
 				this.extensions.push(ext);
 			} catch (err) {
+				if (this.isDisposed) return;
 				errors.push({
 					path: extensionPath,
 					error: err instanceof Error ? err.message : String(err),
 				});
 			}
 		}
+
+		if (this.isDisposed) return;
 
 		// Isolation: failed factories/paths stay in errors; successful ones bind.
 		this.rebuildRunner(opts.cwd);
@@ -1080,6 +1118,8 @@ export class ExtensionHost {
 		}
 		this.projectTrusted = projectTrusted;
 
+		this.installProviderCallbacks(this.runtime);
+
 		const eventBus = createEventBus();
 		const loadedExtensions: Extension[] = [];
 
@@ -1087,6 +1127,7 @@ export class ExtensionHost {
 			try {
 				const jiti = createExtensionJiti();
 				const module = await jiti.import(extPath, { default: true }) as unknown;
+				if (this.state === HostState.DISPOSED) return;
 				if (typeof module !== "function") {
 					errors.push({
 						path: extPath,
@@ -1094,18 +1135,21 @@ export class ExtensionHost {
 					});
 					continue;
 				}
-				const ext = await loadExtensionFromFactory(
-					module as ExtensionFactory, cwd, eventBus, this.runtime, extPath,
+				const ext = await this.loadFactoryWithProviderStaging(
+					module as ExtensionFactory, extPath, cwd, eventBus,
 				);
 				loadedExtensions.push(ext);
 				loadedCount++;
 			} catch (err) {
+				if (this.state === HostState.DISPOSED) return;
 				errors.push({
 					path: extPath,
 					error: err instanceof Error ? err.message : String(err),
 				});
 			}
 		}
+		if (this.state === HostState.DISPOSED) return;
+
 		// Idempotent per resolved extension path: replace a previously
 		// loaded extension for the same path in place (preserving its
 		// ordering position) rather than appending a duplicate. New paths
@@ -1730,12 +1774,20 @@ export class ExtensionHost {
 
 	/**
 	 * Rebuild ExtensionRunner from the current extension list, rebinding core
-	 * actions and capturing provider registrations (first registration wins).
+	 * actions and rebuilding provider registrations from the current set.
 	 */
 	private rebuildRunner(cwd: string): void {
 		if (this.runtime === undefined) return;
-		// Keep captured providers across rebuild: late-loaded extensions register
-		// via the live callback before rebuild, and pending is already drained.
+		const rt = this.runtime;
+		// Per-factory staging should have left pending queues empty and
+		// committed all captures to providerRegistrationsByPath. Clear them
+		// as a safety net so bindCore's flush is a no-op.
+		rt.pendingProviderRegistrations = [];
+		rt.pendingNativeProviderRegistrations = [];
+		// Derive this.providers from successful per-path registrations in their
+		// actual registration order. This preserves late live overrides across
+		// unrelated rebuilds.
+		this.rebuildProvidersFromRegistrations();
 		const runner = new ExtensionRunner(
 			this.extensions,
 			this.runtime,
@@ -1748,13 +1800,11 @@ export class ExtensionHost {
 			this.createContextActions(),
 			{
 				registerProvider: (name, config) => {
-					if (!this.providers.has(name)) {
-						this.providers.set(name, config);
-					}
+					this.providers.set(name, config);
 				},
 				registerNativeProvider: (provider) => {
 					const id = (provider as Record<string, unknown>)["id"];
-					if (typeof id === "string" && !this.providers.has(id)) {
+					if (typeof id === "string") {
 						const native = provider as ProviderConfig;
 						this.providers.set(id, {
 							name: native.name,
@@ -1768,12 +1818,166 @@ export class ExtensionHost {
 				},
 			},
 		);
+		// After bindCore, install path-aware runtime callbacks so live
+		// register/unregister calls update the same per-path state used by
+		// rebuilds. Without this, post-bind registrations would be lost on
+		// the next rebuild because this.providers is cleared and re-derived
+		// from providerRegistrationsByPath.
+		this.installProviderCallbacks(rt);
 		runner.bindCommandContext(this.createCommandContextActions(runner));
 		runner.setUIContext(this.createUIContext(), "tui");
 		runner.onError((error) => {
 			this.emitExtensionError(error.extensionPath, error.event, error.error);
 		});
 		this.runner = runner;
+	}
+
+	/**
+	 * Install provider callbacks that stage only calls made by the factory
+	 * currently executing in this async context. Concurrent calls from already
+	 * loaded extensions remain live and update the durable per-path state.
+	 */
+	private installProviderCallbacks(rt: ExtensionRuntime): void {
+		const stageOrApply = (createOperation: () => ProviderRegistrationOperation): void => {
+			if (this.state === HostState.DISPOSED) return;
+			const operation = createOperation();
+			const scope = this.providerLoadScope.getStore();
+			if (scope === undefined) {
+				this.applyProviderOperation(operation);
+				return;
+			}
+			if (scope.phase === "loading") {
+				scope.operations.push(operation);
+				return;
+			}
+			if (scope.phase === "committed"
+				&& this.activeProviderLoadScopeByPath.get(scope.extensionPath) === scope) {
+				this.applyProviderOperation(operation);
+			}
+		};
+
+		rt.registerProvider = (name, config, extensionPath = "<unknown>") => {
+			stageOrApply(() => ({
+				kind: "register",
+				name,
+				config,
+				extensionPath,
+				order: this.nextProviderRegistrationOrder++,
+			}));
+		};
+		rt.registerNativeProvider = (provider, extensionPath = "<unknown>") => {
+			stageOrApply(() => ({
+				kind: "native",
+				provider,
+				extensionPath,
+				order: this.nextProviderRegistrationOrder++,
+			}));
+		};
+		rt.unregisterProvider = (name) => {
+			stageOrApply(() => ({
+				kind: "unregister",
+				name,
+				order: this.nextProviderRegistrationOrder++,
+			}));
+		};
+	}
+
+	private applyProviderOperation(operation: ProviderRegistrationOperation): void {
+		if (operation.kind === "native") {
+			const id = operation.provider["id"];
+			if (typeof id === "string") {
+				const native = operation.provider as ProviderConfig;
+				this.applyProviderOperation({
+					kind: "register",
+					name: id,
+					config: {
+						name: native.name,
+						baseUrl: native.baseUrl,
+						streamSimple: native.streamSimple,
+					},
+					extensionPath: operation.extensionPath,
+					order: operation.order,
+				});
+			}
+			return;
+		}
+
+		if (operation.kind === "unregister") {
+			const latestUnregister = this.providerUnregisterOrderByName.get(operation.name);
+			if (latestUnregister === undefined || operation.order > latestUnregister) {
+				this.providerUnregisterOrderByName.set(operation.name, operation.order);
+			}
+			for (const [path, registrations] of this.providerRegistrationsByPath) {
+				const retained = registrations.filter((registration) =>
+					registration.name !== operation.name || registration.order > operation.order
+				);
+				if (retained.length === 0) this.providerRegistrationsByPath.delete(path);
+				else this.providerRegistrationsByPath.set(path, retained);
+			}
+		} else {
+			const latestUnregister = this.providerUnregisterOrderByName.get(operation.name);
+			if (latestUnregister !== undefined && operation.order <= latestUnregister) return;
+			const registrations = this.providerRegistrationsByPath.get(operation.extensionPath) ?? [];
+			registrations.push(operation);
+			this.providerRegistrationsByPath.set(operation.extensionPath, registrations);
+		}
+
+		this.rebuildProvidersFromRegistrations();
+	}
+
+	private rebuildProvidersFromRegistrations(): void {
+		const registrations: ProviderRegistration[] = [];
+		for (const extension of this.extensions) {
+			registrations.push(...(this.providerRegistrationsByPath.get(extension.path) ?? []));
+		}
+		registrations.sort((left, right) => left.order - right.order);
+		this.providers.clear();
+		for (const { name, config, order } of registrations) {
+			const latestUnregister = this.providerUnregisterOrderByName.get(name);
+			if (latestUnregister === undefined || order > latestUnregister) this.providers.set(name, config);
+		}
+	}
+
+	/**
+	 * Load one extension factory and commit its provider operations atomically.
+	 */
+	private async loadFactoryWithProviderStaging(
+		factory: ExtensionFactory,
+		extensionPath: string,
+		cwd: string,
+		eventBus: unknown,
+	): Promise<Extension> {
+		const rt = this.runtime;
+		if (rt === undefined) throw new Error("Runtime not initialized");
+
+		const scope: ProviderLoadScope = {
+			phase: "loading",
+			extensionPath,
+			operations: [],
+		};
+		try {
+			const extension = await this.providerLoadScope.run(scope, () =>
+				loadExtensionFromFactory(factory, cwd, eventBus, rt, extensionPath)
+			);
+			if (this.state === HostState.DISPOSED) {
+				throw new Error("extension host was disposed during load");
+			}
+
+			// A successful replacement owns this path from this point forward. A
+			// failed factory never reaches this mutation, so the previous path state
+			// and concurrent live registrations remain intact.
+			this.providerRegistrationsByPath.delete(extensionPath);
+			for (const operation of scope.operations) this.applyProviderOperation(operation);
+
+			const priorScope = this.activeProviderLoadScopeByPath.get(extensionPath);
+			if (priorScope !== undefined) priorScope.phase = "aborted";
+			scope.phase = "committed";
+			this.activeProviderLoadScopeByPath.set(extensionPath, scope);
+			return extension;
+		} catch (error) {
+			scope.phase = "aborted";
+			throw error;
+		}
 	}
 
 	/** Full RegistrySnapshotWire for Rust HostExtensionRunner::load. */
@@ -2752,7 +2956,11 @@ export class ExtensionHost {
 		this.inFlightProviders.clear();
 		for (const controller of this.inFlightShortcuts.values()) controller.abort();
 		this.inFlightShortcuts.clear();
+		for (const scope of this.activeProviderLoadScopeByPath.values()) scope.phase = "aborted";
+		this.activeProviderLoadScopeByPath.clear();
+		this.providerUnregisterOrderByName.clear();
 		this.providers.clear();
+		this.providerRegistrationsByPath.clear();
 		// Settle pending waitForIdle waiters: idle was never reached, so
 		// reject with the disposal reason. Each waiter has a no-op catch
 		// attached at creation, so this cannot become an unhandled rejection.

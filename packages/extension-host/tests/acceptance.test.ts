@@ -5,7 +5,7 @@
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { copyFile, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Readable } from "node:stream";
@@ -948,6 +948,416 @@ describe("acceptance: registry snapshot and tool/provider bridges", () => {
 		stdin.push(null);
 		host.dispose("test");
 		await runPromise.catch(() => void 0);
+	});
+
+	test("replacing an extension rebuilds provider registrations from the current set", async () => {
+		const v1Path = resolve(import.meta.dirname, "..", "fixtures", "extensions", "provider-replace-v1.ts");
+		const v2Path = resolve(import.meta.dirname, "..", "fixtures", "extensions", "provider-replace-v2.ts");
+		// Temp file inside the fixtures tree so jiti's resolver paths work.
+		const sharedPath = resolve(import.meta.dirname, "..", "fixtures", "extensions", "tmp-replace-shared.ts");
+		const { collector, stdin, host, runPromise } = await connectHost([]);
+
+		try {
+			// Seed the shared path with v1 content and load it.
+			await copyFile(v1Path, sharedPath);
+			stdin.push(Buffer.from(encodeFrameString({
+				id: 70, kind: "req", method: "extensions.load",
+				payload: { extensionPaths: [sharedPath], cwd: process.cwd() },
+			})));
+			const res1 = await collector.awaitFrame((f) => f.id === 70 && f.kind === "res");
+			const providers1 = (res1.payload as Record<string, unknown>)["providers"] as Array<Record<string, unknown>>;
+			expect(providers1.map((p) => p["name"])).toEqual(["replace_provider"]);
+			expect(providers1[0]?.["baseUrl"]).toBe("https://v1.example");
+
+			// Stream from v1: start event carries model "v1-marker".
+			stdin.push(Buffer.from(encodeFrameString({
+				id: 71, kind: "req", method: "provider.stream",
+				payload: {
+					providerId: "replace_provider",
+					model: { id: "ok", provider: "replace_provider", api: "custom" },
+					context: { messages: [] },
+					options: {},
+				},
+			})));
+			const v1Start = await collector.awaitFrame(
+				(f) => f.id === 71 && f.kind === "event" && f.method === "providerEvent"
+					&& (f.payload as Record<string, unknown>)["type"] === "start",
+			);
+			const v1Partial = (v1Start.payload as Record<string, unknown>)["partial"] as Record<string, unknown>;
+			expect(v1Partial["model"]).toBe("v1-marker");
+			await collector.awaitFrame((f) => f.id === 71 && f.kind === "res");
+
+			// Overwrite with v2 content and reload the same path (replacement).
+			await copyFile(v2Path, sharedPath);
+			stdin.push(Buffer.from(encodeFrameString({
+				id: 73, kind: "req", method: "extensions.load",
+				payload: { extensionPaths: [sharedPath], cwd: process.cwd() },
+			})));
+			const res2 = await collector.awaitFrame((f) => f.id === 73 && f.kind === "res");
+			const providers2 = (res2.payload as Record<string, unknown>)["providers"] as Array<Record<string, unknown>>;
+			expect(providers2.map((p) => p["name"])).toEqual(["replace_provider"]);
+			// The stale v1 capture must NOT survive — v2's baseUrl replaces it.
+			expect(providers2[0]?.["baseUrl"]).toBe("https://v2.example");
+
+			// Stream from the replaced provider: start event carries "v2-marker",
+			// proving the new streamSimple function is live, not the stale v1 capture.
+			stdin.push(Buffer.from(encodeFrameString({
+				id: 74, kind: "req", method: "provider.stream",
+				payload: {
+					providerId: "replace_provider",
+					model: { id: "ok", provider: "replace_provider", api: "custom" },
+					context: { messages: [] },
+					options: {},
+				},
+			})));
+			const v2Start = await collector.awaitFrame(
+				(f) => f.id === 74 && f.kind === "event" && f.method === "providerEvent"
+					&& (f.payload as Record<string, unknown>)["type"] === "start",
+			);
+			const v2Partial = (v2Start.payload as Record<string, unknown>)["partial"] as Record<string, unknown>;
+			expect(v2Partial["model"]).toBe("v2-marker");
+			await collector.awaitFrame((f) => f.id === 74 && f.kind === "res");
+
+			stdin.push(null);
+			host.dispose("test");
+			await runPromise.catch(() => void 0);
+		} finally {
+			await rm(sharedPath, { force: true });
+		}
+	});
+
+	test("live registration survives an unrelated load", async () => {
+		const livePath = resolve(import.meta.dirname, "..", "fixtures", "extensions", "provider-live-register.ts");
+		const stablePath = resolve(import.meta.dirname, "..", "fixtures", "extensions", "provider-stable.ts");
+		const { collector, stdin, host, runPromise } = await connectHost([]);
+
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 80, kind: "req", method: "extensions.load",
+			payload: { extensionPaths: [livePath], cwd: process.cwd() },
+		})));
+		const loaded = await collector.awaitFrame((frame) => frame.id === 80 && frame.kind === "res");
+		const before = (loaded.payload as Record<string, unknown>)["providers"] as Array<Record<string, unknown>>;
+		expect(before.map((provider) => provider["name"])).not.toContain("live_provider");
+
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 81, kind: "req", method: "command.execute",
+			payload: { command: "registerLiveProvider", args: "" },
+		})));
+		await collector.awaitFrame((frame) => frame.id === 81 && frame.kind === "res");
+
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 82, kind: "req", method: "extensions.load",
+			payload: { extensionPaths: [stablePath], cwd: process.cwd() },
+		})));
+		const rebuilt = await collector.awaitFrame((frame) => frame.id === 82 && frame.kind === "res");
+		const providers = (rebuilt.payload as Record<string, unknown>)["providers"] as Array<Record<string, unknown>>;
+		expect(providers.map((provider) => provider["name"])).toContain("live_provider");
+		expect(providers.map((provider) => provider["name"])).toContain("stable_provider");
+
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 83, kind: "req", method: "provider.stream",
+			payload: {
+				providerId: "live_provider",
+				model: { id: "ok", provider: "live_provider", api: "custom" },
+				context: { messages: [] },
+				options: {},
+			},
+		})));
+		const start = await collector.awaitFrame((frame) =>
+			frame.id === 83 && frame.kind === "event" && frame.method === "providerEvent"
+			&& (frame.payload as Record<string, unknown>)["type"] === "start"
+		);
+		expect(((start.payload as Record<string, unknown>)["partial"] as Record<string, unknown>)["model"])
+			.toBe("live-marker");
+		await collector.awaitFrame((frame) => frame.id === 83 && frame.kind === "res");
+
+		stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
+	});
+
+	test("live unregistration stays removed after an unrelated load", async () => {
+		const unregPath = resolve(import.meta.dirname, "..", "fixtures", "extensions", "provider-live-unregister.ts");
+		const stablePath = resolve(import.meta.dirname, "..", "fixtures", "extensions", "provider-stable.ts");
+		const { collector, stdin, host, runPromise } = await connectHost([]);
+
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 90, kind: "req", method: "extensions.load",
+			payload: { extensionPaths: [unregPath], cwd: process.cwd() },
+		})));
+		const loaded = await collector.awaitFrame((frame) => frame.id === 90 && frame.kind === "res");
+		const before = (loaded.payload as Record<string, unknown>)["providers"] as Array<Record<string, unknown>>;
+		expect(before.map((provider) => provider["name"])).toContain("unreg_provider");
+
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 91, kind: "req", method: "command.execute",
+			payload: { command: "unregisterLiveProvider", args: "" },
+		})));
+		await collector.awaitFrame((frame) => frame.id === 91 && frame.kind === "res");
+
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 92, kind: "req", method: "extensions.load",
+			payload: { extensionPaths: [stablePath], cwd: process.cwd() },
+		})));
+		const rebuilt = await collector.awaitFrame((frame) => frame.id === 92 && frame.kind === "res");
+		const providers = (rebuilt.payload as Record<string, unknown>)["providers"] as Array<Record<string, unknown>>;
+		expect(providers.map((provider) => provider["name"])).not.toContain("unreg_provider");
+		expect(providers.map((provider) => provider["name"])).toContain("stable_provider");
+
+		stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
+	});
+
+	test("live registration during an unrelated load is committed", async () => {
+		const livePath = resolve(import.meta.dirname, "..", "fixtures", "extensions", "provider-live-register.ts");
+		const slowPath = resolve(import.meta.dirname, "..", "fixtures", "extensions", "provider-slow-load.ts");
+		const { collector, stdin, host, runPromise } = await connectHost([]);
+		const coordination = globalThis as typeof globalThis & {
+			__providerLoadStarted?: () => void;
+			__providerLoadRelease?: () => void;
+		};
+
+		try {
+			stdin.push(Buffer.from(encodeFrameString({
+				id: 100, kind: "req", method: "extensions.load",
+				payload: { extensionPaths: [livePath], cwd: process.cwd() },
+			})));
+			await collector.awaitFrame((frame) => frame.id === 100 && frame.kind === "res");
+
+			let markStarted: (() => void) | undefined;
+			const started = new Promise<void>((resolveStarted) => {
+				markStarted = resolveStarted;
+			});
+			coordination.__providerLoadStarted = () => markStarted?.();
+			stdin.push(Buffer.from(encodeFrameString({
+				id: 101, kind: "req", method: "extensions.load",
+				payload: { extensionPaths: [slowPath], cwd: process.cwd() },
+			})));
+			await started;
+
+			stdin.push(Buffer.from(encodeFrameString({
+				id: 102, kind: "req", method: "command.execute",
+				payload: { command: "registerLiveProvider", args: "" },
+			})));
+			await collector.awaitFrame((frame) => frame.id === 102 && frame.kind === "res");
+
+			const loaded = await collector.awaitFrame((frame) => frame.id === 101 && frame.kind === "res");
+			const providers = (loaded.payload as Record<string, unknown>)["providers"] as Array<Record<string, unknown>>;
+			expect(providers.map((provider) => provider["name"])).toContain("live_provider");
+		} finally {
+			delete coordination.__providerLoadStarted;
+			coordination.__providerLoadRelease?.();
+			delete coordination.__providerLoadRelease;
+			stdin.push(null);
+			host.dispose("test");
+			await runPromise.catch(() => void 0);
+		}
+	});
+
+	test("register-then-throw replacement leaks nothing and preserves the old provider", async () => {
+		const v1Path = resolve(import.meta.dirname, "..", "fixtures", "extensions", "provider-replace-v1.ts");
+		const throwPath = resolve(import.meta.dirname, "..", "fixtures", "extensions", "provider-register-throw.ts");
+		const sharedPath = resolve(import.meta.dirname, "..", "fixtures", "extensions", "tmp-throw-shared.ts");
+		const { collector, stdin, host, runPromise } = await connectHost([]);
+
+		try {
+			// Seed the shared path with v1 content and load it.
+			await copyFile(v1Path, sharedPath);
+			stdin.push(Buffer.from(encodeFrameString({
+				id: 100, kind: "req", method: "extensions.load",
+				payload: { extensionPaths: [sharedPath], cwd: process.cwd() },
+			})));
+			const res1 = await collector.awaitFrame((f) => f.id === 100 && f.kind === "res");
+			const providers1 = (res1.payload as Record<string, unknown>)["providers"] as Array<Record<string, unknown>>;
+			expect(providers1.map((p) => p["name"])).toEqual(["replace_provider"]);
+			expect(providers1[0]?.["baseUrl"]).toBe("https://v1.example");
+
+			// Stream from v1 to confirm it works.
+			stdin.push(Buffer.from(encodeFrameString({
+				id: 101, kind: "req", method: "provider.stream",
+				payload: {
+					providerId: "replace_provider",
+					model: { id: "ok", provider: "replace_provider", api: "custom" },
+					context: { messages: [] },
+					options: {},
+				},
+			})));
+			const v1Start = await collector.awaitFrame(
+				(f) => f.id === 101 && f.kind === "event" && f.method === "providerEvent"
+					&& (f.payload as Record<string, unknown>)["type"] === "start",
+			);
+			const v1Partial = (v1Start.payload as Record<string, unknown>)["partial"] as Record<string, unknown>;
+			expect(v1Partial["model"]).toBe("v1-marker");
+			await collector.awaitFrame((f) => f.id === 101 && f.kind === "res");
+
+			// Overwrite with the throw fixture and reload the same path.
+			// The factory registers "throw_provider" then throws.
+			await copyFile(throwPath, sharedPath);
+			stdin.push(Buffer.from(encodeFrameString({
+				id: 103, kind: "req", method: "extensions.load",
+				payload: { extensionPaths: [sharedPath], cwd: process.cwd() },
+			})));
+			const res2 = await collector.awaitFrame((f) => f.id === 103 && f.kind === "res");
+			const providers2 = (res2.payload as Record<string, unknown>)["providers"] as Array<Record<string, unknown>>;
+			// The failed factory's "throw_provider" must NOT appear.
+			expect(providers2.map((p) => p["name"])).not.toContain("throw_provider");
+			// The old "replace_provider" (v1) must still be present — the
+			// failed replacement must preserve the old provider state.
+			expect(providers2.map((p) => p["name"])).toContain("replace_provider");
+			expect(providers2.find((p) => p["name"] === "replace_provider")?.["baseUrl"]).toBe("https://v1.example");
+
+			// Stream from the preserved v1 provider to prove it still works.
+			stdin.push(Buffer.from(encodeFrameString({
+				id: 104, kind: "req", method: "provider.stream",
+				payload: {
+					providerId: "replace_provider",
+					model: { id: "ok", provider: "replace_provider", api: "custom" },
+					context: { messages: [] },
+					options: {},
+				},
+			})));
+			const v1StartAgain = await collector.awaitFrame(
+				(f) => f.id === 104 && f.kind === "event" && f.method === "providerEvent"
+					&& (f.payload as Record<string, unknown>)["type"] === "start",
+			);
+			const v1PartialAgain = (v1StartAgain.payload as Record<string, unknown>)["partial"] as Record<string, unknown>;
+			expect(v1PartialAgain["model"]).toBe("v1-marker");
+			await collector.awaitFrame((f) => f.id === 104 && f.kind === "res");
+
+			stdin.push(null);
+			host.dispose("test");
+			await runPromise.catch(() => void 0);
+		} finally {
+			await rm(sharedPath, { force: true });
+		}
+	});
+
+	test("delayed post-success registration applies live from committed scope", async () => {
+		const delayedPath = resolve(import.meta.dirname, "..", "fixtures", "extensions", "provider-delayed-register.ts");
+		const stablePath = resolve(import.meta.dirname, "..", "fixtures", "extensions", "provider-stable.ts");
+		const { collector, stdin, host, runPromise } = await connectHost([]);
+		const coordination = globalThis as typeof globalThis & {
+			__providerDelayedRegisterRelease?: () => void;
+		};
+
+		try {
+			// Load the delayed-register fixture.  The factory returns immediately;
+			// the scope transitions to "committed" but "delayed_provider" is not
+			// yet registered — the async continuation is still waiting.
+			stdin.push(Buffer.from(encodeFrameString({
+				id: 110, kind: "req", method: "extensions.load",
+				payload: { extensionPaths: [delayedPath], cwd: process.cwd() },
+			})));
+			const res1 = await collector.awaitFrame((f) => f.id === 110 && f.kind === "res");
+			const providers1 = (res1.payload as Record<string, unknown>)["providers"] as Array<Record<string, unknown>>;
+			expect(providers1.map((p) => p["name"])).not.toContain("delayed_provider");
+
+			// Release the delayed continuation.  It resumes in the committed scope
+			// and calls registerProvider — stageOrApply applies it live because the
+			// scope is "committed" and still the active scope for that path.
+			coordination.__providerDelayedRegisterRelease?.();
+			delete coordination.__providerDelayedRegisterRelease;
+			// Yield a microtask so the continuation runs before the next frame.
+			await Promise.resolve();
+
+			// Trigger a rebuild via an unrelated load and verify the delayed
+			// provider is now present in the snapshot.
+			stdin.push(Buffer.from(encodeFrameString({
+				id: 111, kind: "req", method: "extensions.load",
+				payload: { extensionPaths: [stablePath], cwd: process.cwd() },
+			})));
+			const res2 = await collector.awaitFrame((f) => f.id === 111 && f.kind === "res");
+			const providers2 = (res2.payload as Record<string, unknown>)["providers"] as Array<Record<string, unknown>>;
+			expect(providers2.map((p) => p["name"])).toContain("delayed_provider");
+			expect(providers2.map((p) => p["name"])).toContain("stable_provider");
+			expect(providers2.find((p) => p["name"] === "delayed_provider")?.["baseUrl"]).toBe("https://delayed.example");
+
+			// Stream from the delayed provider to prove the live registration
+			// installed a working streamSimple.
+			stdin.push(Buffer.from(encodeFrameString({
+				id: 112, kind: "req", method: "provider.stream",
+				payload: {
+					providerId: "delayed_provider",
+					model: { id: "ok", provider: "delayed_provider", api: "custom" },
+					context: { messages: [] },
+					options: {},
+				},
+			})));
+			const start = await collector.awaitFrame((f) =>
+				f.id === 112 && f.kind === "event" && f.method === "providerEvent"
+				&& (f.payload as Record<string, unknown>)["type"] === "start",
+			);
+			expect(((start.payload as Record<string, unknown>)["partial"] as Record<string, unknown>)["model"])
+				.toBe("delayed-marker");
+			await collector.awaitFrame((f) => f.id === 112 && f.kind === "res");
+
+			stdin.push(null);
+			host.dispose("test");
+			await runPromise.catch(() => void 0);
+		} finally {
+			delete coordination.__providerDelayedRegisterRelease;
+		}
+	});
+
+	test("staged register at N is defeated by live unregister at N+1", async () => {
+		const unregRacePath = resolve(import.meta.dirname, "..", "fixtures", "extensions", "provider-unregister-race.ts");
+		const stagedPath = resolve(import.meta.dirname, "..", "fixtures", "extensions", "provider-staged-defeated.ts");
+		const { collector, stdin, host, runPromise } = await connectHost([]);
+		const coordination = globalThis as typeof globalThis & {
+			__providerStagedStarted?: () => void;
+			__providerStagedRelease?: () => void;
+		};
+
+		try {
+			// Load the unregister-race fixture first — it provides the
+			// "unregisterRaceProvider" command for live unregistration.
+			stdin.push(Buffer.from(encodeFrameString({
+				id: 120, kind: "req", method: "extensions.load",
+				payload: { extensionPaths: [unregRacePath], cwd: process.cwd() },
+			})));
+			await collector.awaitFrame((f) => f.id === 120 && f.kind === "res");
+
+			// Start loading the staged-defeated fixture.  It stages a
+			// registration for "race_provider" at order N, signals started,
+			// then pauses.
+			let markStarted: (() => void) | undefined;
+			const started = new Promise<void>((resolveStarted) => {
+				markStarted = resolveStarted;
+			});
+			coordination.__providerStagedStarted = () => markStarted?.();
+			stdin.push(Buffer.from(encodeFrameString({
+				id: 121, kind: "req", method: "extensions.load",
+				payload: { extensionPaths: [stagedPath], cwd: process.cwd() },
+			})));
+			await started;
+
+			// While the staged fixture is paused, execute the live unregister
+			// command.  This applies at order N+1 (higher than the staged N)
+			// and sets a durable tombstone for "race_provider".
+			stdin.push(Buffer.from(encodeFrameString({
+				id: 122, kind: "req", method: "command.execute",
+				payload: { command: "unregisterRaceProvider", args: "" },
+			})));
+			await collector.awaitFrame((f) => f.id === 122 && f.kind === "res");
+
+			// Release the staged fixture — it completes and the host commits
+			// its staged operations.  The register at order N is rejected
+			// because N <= N+1 (the tombstone order).
+			coordination.__providerStagedRelease?.();
+			const loaded = await collector.awaitFrame((f) => f.id === 121 && f.kind === "res");
+			const providers = (loaded.payload as Record<string, unknown>)["providers"] as Array<Record<string, unknown>>;
+			// "race_provider" must NOT appear — the live unregister defeated
+			// the staged registration despite async commit ordering.
+			expect(providers.map((p) => p["name"])).not.toContain("race_provider");
+		} finally {
+			delete coordination.__providerStagedStarted;
+			coordination.__providerStagedRelease?.();
+			delete coordination.__providerStagedRelease;
+			stdin.push(null);
+			host.dispose("test");
+			await runPromise.catch(() => void 0);
+		}
 	});
 
 	test("tool.execute returns result and streams toolUpdate progress", async () => {
