@@ -694,7 +694,13 @@ fn canonical_lock_target(path: &Path) -> Result<PathBuf, StoreError> {
         }
         let meta = match fs::symlink_metadata(&current) {
             Ok(m) => m,
-            Err(_) => break,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
+            Err(err) => {
+                return Err(StoreError::message(format!(
+                    "Failed to inspect auth storage path {}: {err}",
+                    current.display()
+                )));
+            }
         };
         if !meta.file_type().is_symlink() {
             break;
