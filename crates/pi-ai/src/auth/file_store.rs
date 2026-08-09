@@ -10,7 +10,7 @@
 //! before retrying. Data commits remain same-directory atomic replacements
 //! through [`tempfile::NamedTempFile`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -677,50 +677,69 @@ fn canonical_lock_target(path: &Path) -> Result<PathBuf, StoreError> {
             ))
         });
     }
-    // Dangling symlink leaf: `path.exists()` is false for a broken symlink, so
-    // the generic parent-join below would return the link path itself. `persist`
-    // would then replace the symlink with a regular file. Resolve the link
-    // target explicitly so `effective_path` points at the intended target and the
-    // symlink is preserved.
-    if let Ok(meta) = fs::symlink_metadata(path) {
-        if meta.file_type().is_symlink() {
-            let link_target = fs::read_link(path).map_err(|error| {
+    // Dangling symlink chain: `path.exists()` is false for a broken symlink, so
+    // the generic parent-join below would return the link path itself and
+    // `persist` would replace the symlink. Follow the full chain, resolving each
+    // relative target against its link parent, and reject cycles as ELOOP.
+    let mut current = path.to_path_buf();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    loop {
+        if current.exists() {
+            return fs::canonicalize(&current).map_err(|error| {
                 StoreError::message(format!(
-                    "Failed to resolve auth storage symlink {}: {error}",
-                    path.display()
+                    "Failed to resolve auth storage path {}: {error}",
+                    current.display()
                 ))
-            })?;
-            let link_parent = parent_dir(path).unwrap_or_else(|| Path::new("."));
-            let target_path = if link_target.is_absolute() {
-                link_target
-            } else {
-                link_parent.join(link_target)
-            };
-            let target_parent = parent_dir(&target_path).unwrap_or_else(|| Path::new("."));
-            let canonical_target_parent = match fs::canonicalize(target_parent) {
-                Ok(canonical) => canonical,
-                Err(_) => absolute_lock_target(target_parent)?,
-            };
-            let Some(file_name) = target_path.file_name() else {
-                return Err(StoreError::message(format!(
-                    "Auth storage symlink target {} has no file name",
-                    target_path.display()
-                )));
-            };
-            return Ok(canonical_target_parent.join(file_name));
+            });
         }
+        let meta = match fs::symlink_metadata(&current) {
+            Ok(m) => m,
+            Err(_) => break,
+        };
+        if !meta.file_type().is_symlink() {
+            break;
+        }
+        if !seen.insert(current.clone()) {
+            return Err(StoreError::message(format!(
+                "Too many levels of symbolic links (ELOOP) for {}",
+                path.display()
+            )));
+        }
+        if seen.len() > 40 {
+            return Err(StoreError::message(format!(
+                "Too many levels of symbolic links (ELOOP) for {}",
+                path.display()
+            )));
+        }
+        let link_target = fs::read_link(&current).map_err(|error| {
+            StoreError::message(format!(
+                "Failed to resolve auth storage symlink {}: {error}",
+                current.display()
+            ))
+        })?;
+        let link_parent = parent_dir(&current).unwrap_or_else(|| Path::new("."));
+        let target_path = if link_target.is_absolute() {
+            link_target
+        } else {
+            link_parent.join(link_target)
+        };
+        if seen.contains(&target_path) {
+            return Err(StoreError::message(format!(
+                "Too many levels of symbolic links (ELOOP) for {}",
+                path.display()
+            )));
+        }
+        current = target_path;
     }
-    let parent = parent_dir(path).unwrap_or_else(|| Path::new("."));
-    let parent = fs::canonicalize(parent).map_err(|error| {
-        StoreError::message(format!(
-            "Failed to resolve auth storage directory {}: {error}",
-            parent.display()
-        ))
-    })?;
-    let Some(file_name) = path.file_name() else {
+    let parent = parent_dir(&current).unwrap_or_else(|| Path::new("."));
+    let parent = match fs::canonicalize(parent) {
+        Ok(canonical) => canonical,
+        Err(_) => absolute_lock_target(parent)?,
+    };
+    let Some(file_name) = current.file_name() else {
         return Err(StoreError::message(format!(
             "Auth storage path {} has no file name",
-            path.display()
+            current.display()
         )));
     };
     Ok(parent.join(file_name))
@@ -1545,6 +1564,84 @@ mod tests {
             store.backend.lock_path(),
             store.backend.effective_path.with_extension("json.lock"),
             "lock should be sibling of effective_path"
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn atomic_write_preserves_symlink_chain() -> TestResult {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir()?;
+        let real_path = dir.path().join("real.json");
+        let second_path = dir.path().join("second.json");
+        let link_path = dir.path().join("link.json");
+        // Chain: link -> second -> real.json, all dangling initially.
+        symlink("real.json", &second_path)?;
+        symlink("second.json", &link_path)?;
+        assert!(!link_path.exists());
+        assert!(!second_path.exists());
+        assert!(!real_path.exists());
+        let store = FileCredentialStore::new(&link_path);
+        assert_eq!(
+            store.backend.effective_path,
+            fs::canonicalize(dir.path())?.join("real.json"),
+            "effective_path should resolve full chain to real.json"
+        );
+        store
+            .modify(
+                "openai",
+                Box::new(|_| Box::pin(async { Ok(Some(api_key("chain-test"))) })),
+            )
+            .await?;
+        for path in [&link_path, &second_path] {
+            let meta = fs::symlink_metadata(path)?;
+            assert!(
+                meta.file_type().is_symlink(),
+                "chain symlink {} should remain symlink, got {:?}",
+                path.display(),
+                meta.file_type()
+            );
+        }
+        assert!(real_path.exists(), "real target should be created");
+        let real_content = fs::read_to_string(&real_path)?;
+        assert!(
+            real_content.contains("chain-test"),
+            "real file should contain chain-test, got {real_content:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(&link_path)?,
+            real_content,
+            "read through link should match real"
+        );
+        assert_eq!(
+            fs::read_to_string(&second_path)?,
+            real_content,
+            "read through second should match real"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn canonical_lock_target_rejects_symlink_cycle() -> TestResult {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir()?;
+        let a_path = dir.path().join("a.json");
+        let b_path = dir.path().join("b.json");
+        symlink("b.json", &a_path)?;
+        symlink("a.json", &b_path)?;
+        let err = canonical_lock_target(&a_path).expect_err("cycle should be rejected");
+        assert!(
+            err.to_string().contains("ELOOP"),
+            "cycle error should mention ELOOP, got {err:?}"
+        );
+        // Self-loop
+        let self_path = dir.path().join("self.json");
+        symlink("self.json", &self_path)?;
+        let err = canonical_lock_target(&self_path).expect_err("self-loop should be rejected");
+        assert!(
+            err.to_string().contains("ELOOP"),
+            "self-loop error should mention ELOOP, got {err:?}"
         );
         Ok(())
     }
