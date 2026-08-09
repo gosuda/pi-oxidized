@@ -77,23 +77,17 @@ pub struct FileLockBackend {
 
 impl FileLockBackend {
     /// Create a backend for the given JSON data path.
-    #[must_use]
-    pub fn new(path: impl Into<PathBuf>) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the canonical lock target cannot be
+    /// resolved (symlink cycles, inspection failures, or missing file-name
+    /// components). Every resolution error is propagated — the unresolved
+    /// path is never used as a silent fallback.
+    pub fn new(path: impl Into<PathBuf>) -> Result<Self, StoreError> {
         let path = path.into();
-        let effective_path = match canonical_lock_target(&path) {
-            Ok(p) => p,
-            Err(err) => {
-                let msg = err.to_string();
-                if msg.contains("ELOOP") || msg.contains("Failed to inspect") {
-                    panic!(
-                        "auth storage symlink resolution failed for {}: {msg}",
-                        path.display()
-                    );
-                }
-                path.clone()
-            }
-        };
-        Self {
+        let effective_path = canonical_lock_target(&path)?;
+        Ok(Self {
             path,
             effective_path,
             #[cfg(test)]
@@ -102,7 +96,7 @@ impl FileLockBackend {
             atomic_write_failure: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             async_lock_retry_delay: None,
-        }
+        })
     }
 
     #[cfg(test)]
@@ -433,14 +427,20 @@ pub struct FileCredentialStore {
 
 impl FileCredentialStore {
     /// Open (or create) a file-backed credential store at `auth_path`.
-    #[must_use]
-    pub fn new(auth_path: impl Into<PathBuf>) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the lock backend cannot be constructed or
+    /// the initial reload fails (legacy file lock, malformed JSON, or I/O
+    /// failure). The error is propagated rather than discarded so a caller
+    /// never observes a store with a silently empty cache.
+    pub fn new(auth_path: impl Into<PathBuf>) -> Result<Self, StoreError> {
         let store = Self {
-            backend: FileLockBackend::new(auth_path),
+            backend: FileLockBackend::new(auth_path)?,
             cache: Arc::new(Mutex::new(BTreeMap::new())),
         };
-        store.reload();
-        store
+        store.reload()?;
+        Ok(store)
     }
 
     /// Path of the underlying `auth.json` file.
@@ -457,17 +457,22 @@ impl FileCredentialStore {
 
     /// Reload credentials from disk.
     ///
-    /// On failure the last valid in-memory snapshot is preserved.
-    pub fn reload(&self) {
+    /// On failure the last valid in-memory snapshot is preserved and the error
+    /// is returned so callers can surface it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the locked read fails (legacy file lock,
+    /// malformed JSON, or I/O failure).
+    pub fn reload(&self) -> Result<(), StoreError> {
         let loaded = self.backend.with_lock_sync(|content| {
             let data = parse_storage_data(content)?;
             Ok((data, None))
-        });
-        if let Ok(data) = loaded
-            && let Ok(mut cache) = self.cache.lock()
-        {
-            *cache = data;
+        })?;
+        if let Ok(mut cache) = self.cache.lock() {
+            *cache = loaded;
         }
+        Ok(())
     }
 
     fn cache_snapshot(&self) -> Result<BTreeMap<String, Credential>, StoreError> {
@@ -939,14 +944,14 @@ mod tests {
     #[tokio::test]
     async fn concurrent_modify_serializes_refresh_callback() -> TestResult {
         let (_dir, path) = temp_auth_path()?;
-        let store_a = FileCredentialStore::new(&path);
+        let store_a = FileCredentialStore::new(&path)?;
         store_a
             .modify(
                 "openai-codex",
                 Box::new(|_| Box::pin(async { Ok(Some(oauth("r0", "a0", 1))) })),
             )
             .await?;
-        let store_b = FileCredentialStore::new(&path);
+        let store_b = FileCredentialStore::new(&path)?;
         let refresh_calls = Arc::new(AtomicUsize::new(0));
         let first_entered = Arc::new(tokio::sync::Notify::new());
 
@@ -1002,7 +1007,7 @@ mod tests {
     #[tokio::test]
     async fn modify_none_preserves_byte_identity() -> TestResult {
         let (_dir, path) = temp_auth_path()?;
-        let store = FileCredentialStore::new(&path);
+        let store = FileCredentialStore::new(&path)?;
         store
             .modify(
                 "anthropic",
@@ -1037,15 +1042,9 @@ mod tests {
         let garbage = b"{not-json";
         fs::write(&path, garbage)?;
 
-        let store = FileCredentialStore::new(&path);
-        let result = store
-            .modify(
-                "openai",
-                Box::new(|_| Box::pin(async { Ok(Some(api_key("sk"))) })),
-            )
-            .await;
+        let result = FileCredentialStore::new(&path);
         let Err(error) = result else {
-            return Err("malformed JSON unexpectedly succeeded".into());
+            return Err("malformed JSON unexpectedly succeeded at construction".into());
         };
         assert!(error.to_string().contains("JSON"));
         assert_eq!(fs::read(&path)?, garbage);
@@ -1056,7 +1055,7 @@ mod tests {
     #[tokio::test]
     async fn oauth_extras_and_raw_api_key_roundtrip() -> TestResult {
         let (_dir, path) = temp_auth_path()?;
-        let store = FileCredentialStore::new(&path);
+        let store = FileCredentialStore::new(&path)?;
         let env = ProviderEnv::from([("CLOUDFLARE_ACCOUNT_ID".into(), "acct".into())]);
         store
             .modify(
@@ -1117,7 +1116,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let (_dir, path) = temp_auth_path()?;
-        let store = FileCredentialStore::new(&path);
+        let store = FileCredentialStore::new(&path)?;
         store
             .modify(
                 "openai",
@@ -1160,15 +1159,15 @@ mod tests {
     #[tokio::test]
     async fn atomic_replace_keeps_parseable_old_or_new() -> TestResult {
         let (_dir, path) = temp_auth_path()?;
-        let store = FileCredentialStore::new(&path);
+        let store = FileCredentialStore::new(&path)?;
         store
             .modify(
                 "openai",
                 Box::new(|_| Box::pin(async { Ok(Some(api_key("v1"))) })),
             )
             .await?;
-        let task_a = tokio::spawn(write_versions(FileCredentialStore::new(&path), "a"));
-        let task_b = tokio::spawn(write_versions(FileCredentialStore::new(&path), "b"));
+        let task_a = tokio::spawn(write_versions(FileCredentialStore::new(&path)?, "a"));
+        let task_b = tokio::spawn(write_versions(FileCredentialStore::new(&path)?, "b"));
         task_a.await??;
         task_b.await??;
 
@@ -1187,7 +1186,7 @@ mod tests {
     #[tokio::test]
     async fn delete_removes_provider_and_list_skips_command_resolution() -> TestResult {
         let (_dir, path) = temp_auth_path()?;
-        let store = FileCredentialStore::new(&path);
+        let store = FileCredentialStore::new(&path)?;
         store
             .modify(
                 "openai",
@@ -1220,7 +1219,7 @@ mod tests {
     async fn missing_file_is_seeded_only_after_sibling_lock_is_acquired() -> TestResult {
         let (dir, path) = temp_auth_path()?;
         fs::create_dir_all(path.parent().ok_or("auth path must have a parent")?)?;
-        let mut backend = FileLockBackend::new(&path);
+        let mut backend = FileLockBackend::new(&path)?;
         let contention = Arc::new(tokio::sync::Notify::new());
         backend.lock_contention = Some(Arc::clone(&contention));
         let guard = acquire_canonical_lock(&path)?;
@@ -1253,7 +1252,7 @@ mod tests {
     async fn legacy_file_lock_is_rejected_by_async_path() -> TestResult {
         let (_dir, path) = temp_auth_path()?;
         fs::create_dir_all(path.parent().ok_or("auth path must have a parent")?)?;
-        let backend = FileLockBackend::new(&path);
+        let backend = FileLockBackend::new(&path)?;
         let lock_path = backend.lock_path();
         fs::write(&lock_path, [])?;
 
@@ -1278,7 +1277,7 @@ mod tests {
     fn legacy_file_lock_is_rejected_by_sync_path() -> TestResult {
         let (_dir, path) = temp_auth_path()?;
         fs::create_dir_all(path.parent().ok_or("auth path must have a parent")?)?;
-        let backend = FileLockBackend::new(&path);
+        let backend = FileLockBackend::new(&path)?;
         let lock_path = backend.lock_path();
         fs::write(&lock_path, [])?;
 
@@ -1306,7 +1305,7 @@ mod tests {
     async fn legacy_file_lock_is_rejected_by_async_without_waiting() -> TestResult {
         let (_dir, path) = temp_auth_path()?;
         fs::create_dir_all(path.parent().ok_or("auth path must have a parent")?)?;
-        let backend = FileLockBackend::new(&path);
+        let backend = FileLockBackend::new(&path)?;
         let lock_path = backend.lock_path();
         fs::write(&lock_path, [])?;
 
@@ -1362,7 +1361,7 @@ mod tests {
 
         // The synchronous path must lock the canonical path, not an unresolved
         // alias that would let it proceed past a held sibling.
-        let sync_backend = FileLockBackend::new(&path);
+        let sync_backend = FileLockBackend::new(&path)?;
         let sync_result =
             sync_backend.with_lock_sync(|content| Ok((content.map(str::to_owned), None)));
         assert!(
@@ -1372,7 +1371,7 @@ mod tests {
 
         // The async path must contend on the same canonical directory rather
         // than locking a separately-resolved path and proceeding unopposed.
-        let mut async_backend = FileLockBackend::new(&path);
+        let mut async_backend = FileLockBackend::new(&path)?;
         let contention = Arc::new(tokio::sync::Notify::new());
         async_backend.lock_contention = Some(Arc::clone(&contention));
         let task = tokio::spawn(async move {
@@ -1401,7 +1400,7 @@ mod tests {
         // contention and the sync budget (SYNC_LOCK_ATTEMPTS) is exhausted.
         let _guard = acquire_canonical_lock(&path)?;
 
-        let backend = FileLockBackend::new(&path);
+        let backend = FileLockBackend::new(&path)?;
         let result = backend.with_lock_sync(|content| Ok((content.map(str::to_owned), None)));
         let Err(error) = result else {
             return Err("sync acquisition unexpectedly succeeded under a held lock".into());
@@ -1425,7 +1424,7 @@ mod tests {
         fs::create_dir_all(path.parent().ok_or("auth path must have a parent")?)?;
         let _guard = acquire_canonical_lock(&path)?;
 
-        let mut backend = FileLockBackend::new(&path);
+        let mut backend = FileLockBackend::new(&path)?;
         backend.async_lock_retry_delay = Some(Duration::from_millis(1));
         let result = backend
             .with_lock_async(|content| async move { Ok::<_, StoreError>((content, None)) })
@@ -1449,7 +1448,7 @@ mod tests {
     #[tokio::test]
     async fn failed_modify_does_not_publish_unpersisted_cache() -> TestResult {
         let (_dir, path) = temp_auth_path()?;
-        let store = FileCredentialStore::new(&path);
+        let store = FileCredentialStore::new(&path)?;
         store
             .modify(
                 "openai",
@@ -1476,7 +1475,7 @@ mod tests {
     #[tokio::test]
     async fn failed_delete_does_not_evict_persisted_cache() -> TestResult {
         let (_dir, path) = temp_auth_path()?;
-        let store = FileCredentialStore::new(&path);
+        let store = FileCredentialStore::new(&path)?;
         store
             .modify(
                 "openai",
@@ -1504,7 +1503,7 @@ mod tests {
         fs::write(&real_path, "{}")?;
         let link_path = dir.path().join("link.json");
         symlink(&real_path, &link_path)?;
-        let store = FileCredentialStore::new(&link_path);
+        let store = FileCredentialStore::new(&link_path)?;
         store
             .modify(
                 "openai",
@@ -1547,7 +1546,7 @@ mod tests {
         );
         let real_path = dir.path().join("real.json");
         assert!(!real_path.exists(), "target should not exist before write");
-        let store = FileCredentialStore::new(&link_path);
+        let store = FileCredentialStore::new(&link_path)?;
         // Effective path must resolve to the symlink target, not the link itself.
         assert_eq!(
             store.backend.effective_path,
@@ -1599,7 +1598,7 @@ mod tests {
         assert!(!link_path.exists());
         assert!(!second_path.exists());
         assert!(!real_path.exists());
-        let store = FileCredentialStore::new(&link_path);
+        let store = FileCredentialStore::new(&link_path)?;
         assert_eq!(
             store.backend.effective_path,
             fs::canonicalize(dir.path())?.join("real.json"),
@@ -1648,7 +1647,9 @@ mod tests {
         let b_path = dir.path().join("b.json");
         symlink("b.json", &a_path)?;
         symlink("a.json", &b_path)?;
-        let err = canonical_lock_target(&a_path).expect_err("cycle should be rejected");
+        let Err(err) = canonical_lock_target(&a_path) else {
+            return Err("cycle should be rejected".into());
+        };
         assert!(
             err.to_string().contains("ELOOP"),
             "cycle error should mention ELOOP, got {err:?}"
@@ -1656,7 +1657,9 @@ mod tests {
         // Self-loop
         let self_path = dir.path().join("self.json");
         symlink("self.json", &self_path)?;
-        let err = canonical_lock_target(&self_path).expect_err("self-loop should be rejected");
+        let Err(err) = canonical_lock_target(&self_path) else {
+            return Err("self-loop should be rejected".into());
+        };
         assert!(
             err.to_string().contains("ELOOP"),
             "self-loop error should mention ELOOP, got {err:?}"
@@ -1665,14 +1668,68 @@ mod tests {
     }
     #[test]
     #[cfg(unix)]
-    #[should_panic(expected = "ELOOP")]
-    fn file_lock_backend_new_panics_on_symlink_cycle() {
+    fn file_lock_backend_new_returns_error_on_symlink_cycle() -> TestResult {
         use std::os::unix::fs::symlink;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir()?;
         let a = dir.path().join("a.json");
         let b = dir.path().join("b.json");
-        symlink("b.json", &a).unwrap();
-        symlink("a.json", &b).unwrap();
-        let _ = FileLockBackend::new(&a);
+        symlink("b.json", &a)?;
+        symlink("a.json", &b)?;
+        let Err(err) = FileLockBackend::new(&a) else {
+            return Err("cycle should be rejected".into());
+        };
+        assert!(
+            err.to_string().contains("ELOOP"),
+            "cycle error should mention ELOOP, got {err:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn file_lock_backend_new_returns_non_eloop_resolution_error() -> TestResult {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir()?;
+        // A symlink to a regular file, used as a directory prefix, makes
+        // symlink_metadata return ENOTDIR (not NotFound) on the composed path.
+        // This triggers a non-ELOOP "Failed to inspect" error that must be
+        // returned as a typed StoreError — not panicked or silently swallowed.
+        let real_file = dir.path().join("real_file");
+        fs::write(&real_file, "data")?;
+        let file_symlink = dir.path().join("file_symlink");
+        symlink(&real_file, &file_symlink)?;
+        let path = file_symlink.join("auth.json");
+        let Err(err) = FileLockBackend::new(&path) else {
+            return Err("non-ELOOP resolution error should be returned".into());
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Failed to inspect"),
+            "error should mention inspection failure, got {msg:?}"
+        );
+        assert!(
+            !msg.contains("ELOOP"),
+            "error must not be ELOOP, got {msg:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_file_lock_error_visible_at_store_construction() -> TestResult {
+        let (_dir, path) = temp_auth_path()?;
+        let parent = path.parent().ok_or("auth path must have a parent")?;
+        fs::create_dir_all(parent)?;
+        // Create a legacy regular-file lock at the sibling lock path.
+        let lock_path = lock_path_for(&path);
+        fs::write(&lock_path, [])?;
+        let result = FileCredentialStore::new(&path);
+        let Err(error) = result else {
+            return Err("legacy file lock should fail store construction".into());
+        };
+        assert!(
+            error.to_string().contains("legacy file lock"),
+            "construction error should mention legacy file lock, got {error:?}"
+        );
+        Ok(())
     }
 }

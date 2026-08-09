@@ -63,7 +63,12 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum retained stderr tail in bytes.
 pub const STDERR_TAIL_BYTES: usize = 16 * 1024;
 /// Maximum time to wait when enqueueing a cancel frame on a saturated command channel.
+#[cfg(not(test))]
 pub const CANCEL_QUEUE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Test override: a short deadline so timeout-path regressions run without
+/// real-time delay or the `tokio/test-util` `start_paused` feature.
+#[cfg(test)]
+pub const CANCEL_QUEUE_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// Result type for host client operations.
 pub type HostResult<T> = Result<T, HostClientError>;
@@ -1369,7 +1374,10 @@ fn remove_cancelling_pending(shared: &Shared, id: FrameId, generation: u64) {
 
 /// Marks one pending route as cancelling and queues exactly one control frame.
 /// On a full queue, the retained route is removed only after the spawned send
-/// has queued that frame or observed channel closure.
+/// has queued that frame, observed channel closure, or the
+/// [`CANCEL_QUEUE_TIMEOUT`] deadline elapsed — so neither the cancellation
+/// task nor the stale pending entry can live beyond the deadline solely
+/// because the outbound queue is full.
 fn cancel_pending(
     shared: &Arc<Shared>,
     id: FrameId,
@@ -1417,7 +1425,12 @@ fn cancel_pending(
             let runtime = shared.runtime.clone();
             let shared = Arc::clone(shared);
             runtime.spawn(async move {
-                let _ = tx.send(cancel).await;
+                // Bound the send so a permanently saturated queue cannot keep
+                // the cancellation task or the stale pending entry alive
+                // indefinitely. On timeout or send failure the
+                // generation-matched cleanup below removes only this route,
+                // preserving any replacement reusing the same frame id.
+                let _ = tokio::time::timeout(CANCEL_QUEUE_TIMEOUT, tx.send(cancel)).await;
                 remove_cancelling_pending(&shared, id, generation);
                 #[cfg(test)]
                 shared.cancel_cleanup_done.notify_one();
@@ -2238,6 +2251,138 @@ mod tests {
         assert!(
             survives,
             "newer same-id pending entry was removed by stale cleanup"
+        );
+        assert_eq!(
+            surviving_gen,
+            Some(new_generation),
+            "surviving entry is the replacement, not the cancelled one"
+        );
+        assert_eq!(
+            cancelling,
+            Some(false),
+            "replacement entry must not be marked cancelling"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn background_cancel_timeout_cleans_original_pending_entry() -> R {
+        let (client, _host) = make_pair().await;
+        let (_stalled, _original) = client.stall_outbound_for_test().await;
+        let stream = client
+            .open_stream_raw("provider.stream", serde_json::json!({}), 2)
+            .await?;
+        let id = stream.id();
+        let shared = Arc::clone(&stream.shared);
+
+        // The request occupies the one-slot writer queue. Dropping the stream
+        // retains its correlation state while the cancel waits on the
+        // saturated channel (background send path).
+        drop(stream);
+        assert!(
+            shared
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&id)
+                .is_some_and(|entry| entry.cancelling),
+            "the pending route remains cancellation-owned until the deadline"
+        );
+
+        // Do NOT drain the stalled channel: the background send cannot
+        // complete, so the (test-shortened) CANCEL_QUEUE_TIMEOUT deadline
+        // must fire. The existing Notify signal proves the cleanup ran.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            shared.cancel_cleanup_done.notified(),
+        )
+        .await
+        .map_err(|_| "background cancel cleanup did not complete after timeout")?;
+
+        assert!(
+            !shared
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&id),
+            "original pending entry was not cleaned after cancel timeout"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn background_cancel_timeout_preserves_replacement_generation() -> R {
+        let (client, _host) = make_pair().await;
+        let (_stalled, _original) = client.stall_outbound_for_test().await;
+        let stream = client
+            .open_stream_raw("provider.stream", serde_json::json!({}), 2)
+            .await?;
+        let id = stream.id();
+        let shared = Arc::clone(&stream.shared);
+        let old_generation = stream.generation;
+
+        // The request occupies the one-slot writer queue. Dropping the stream
+        // retains its correlation state while the cancel waits on the
+        // saturated channel (background send path).
+        drop(stream);
+        assert!(
+            shared
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&id)
+                .is_some_and(|entry| entry.cancelling && entry.generation == old_generation),
+            "the pending route remains cancellation-owned by the old generation"
+        );
+
+        // Replace the pending route under the same frame id with a fresh,
+        // non-cancelling entry carrying a newer generation.
+        let new_generation = shared
+            .next_pending_generation
+            .fetch_add(1, Ordering::Relaxed);
+        {
+            let mut pending = shared
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pending.insert(
+                id,
+                PendingEntry {
+                    terminal: None,
+                    stream: None,
+                    cancelling: false,
+                    generation: new_generation,
+                },
+            );
+        }
+
+        // Do NOT drain the stalled channel: the background send cannot
+        // complete, so the (test-shortened) CANCEL_QUEUE_TIMEOUT deadline
+        // must fire. The generation-matched cleanup must remove only the old
+        // cancelling route, not the replacement. The existing Notify signal
+        // proves the cleanup ran.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            shared.cancel_cleanup_done.notified(),
+        )
+        .await
+        .map_err(|_| "background cancel cleanup did not complete after timeout")?;
+
+        let (survives, surviving_gen, cancelling) = {
+            let pending = shared
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let entry = pending.get(&id);
+            (
+                entry.is_some(),
+                entry.map(|e| e.generation),
+                entry.map(|e| e.cancelling),
+            )
+        };
+        assert!(
+            survives,
+            "replacement entry was removed by stale cleanup after timeout"
         );
         assert_eq!(
             surviving_gen,

@@ -237,6 +237,9 @@ pub(super) struct AgentSessionInner {
     pub(super) auto_compaction_abort: Option<CancellationToken>,
     /// Cancellation: branch summary.
     pub(super) branch_summary_abort: Option<CancellationToken>,
+    /// Owner generation for the branch-summary slot; prevents an older
+    /// navigation from clearing a newer navigation's token.
+    pub(super) branch_summary_owner: u64,
     /// Cancellation: bash execution.
     pub(super) bash_abort: Option<CancellationToken>,
     /// Pending nextTurn custom messages injected into the next prompt.
@@ -355,6 +358,7 @@ impl AgentSessionInner {
             compaction_abort: None,
             auto_compaction_abort: None,
             branch_summary_abort: None,
+            branch_summary_owner: 0,
             bash_abort: None,
             pending_next_turn_messages: Vec::new(),
             extension_mode: None,
@@ -1019,6 +1023,17 @@ impl AgentSession {
     /// replacement layer owns the single reason-specific extension shutdown
     /// event and must emit it before calling this method when handlers exist.
     pub async fn dispose(&self) {
+        let runtime = self.runtime_handle();
+        let _lifecycle_guard = if let Some(runtime) = &runtime {
+            Some(runtime.lifecycle_gate().write().await)
+        } else {
+            None
+        };
+        self.dispose_lifecycle_gate_held().await;
+    }
+
+    /// Dispose local resources while the owning runtime lifecycle write gate is held.
+    pub(super) async fn dispose_lifecycle_gate_held(&self) {
         {
             let mut inner = self.lock_inner();
             if inner.disposed {

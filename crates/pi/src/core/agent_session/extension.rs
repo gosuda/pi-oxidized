@@ -416,6 +416,8 @@ impl AgentSession {
                 active_tool_names: None,
                 include_all_extension_tools: true,
             });
+            self.refresh_selected_model_after_reload();
+            self.hydrate_replacement_host().await;
             self.emit_session_start_reload().await;
             self.extend_resources_from_extensions(SessionStartReason::Reload.as_str())
                 .await?;
@@ -467,6 +469,43 @@ impl AgentSession {
                 previous_session_file: None,
             })
             .await;
+    }
+
+    /// Re-resolve the currently selected model against the post-reload
+    /// [`ModelRuntime`] and apply session model-selection semantics.
+    ///
+    /// After `commit_reload` the provider registry may have changed: a model's
+    /// configuration may have been updated, or the model may have been removed
+    /// entirely. This looks up the current model in the refreshed runtime and,
+    /// when the definition changed, assigns the refreshed [`Model`] directly to
+    /// the live agent via the low-level `Agent::set_model` setter. Unlike
+    /// [`AgentSession::set_model`], this does not append a `model_change`
+    /// session entry, mutate saved defaults, re-clamp the thinking level, or
+    /// emit `model_select` — the reload is a provider-configuration refresh,
+    /// not an explicit user selection. When the selected identity was removed
+    /// from the post-reload registry, the existing model is kept as-is; the
+    /// pinned TypeScript `reload` contract performs no automatic fallback.
+    fn refresh_selected_model_after_reload(&self) {
+        let Some(runtime) = self.model_runtime() else {
+            return;
+        };
+        let current = self.model();
+        if let Some(refreshed) = runtime.get_model(&current.provider, &current.id)
+            && refreshed != current
+        {
+            self.agent.set_model(refreshed);
+        }
+    }
+
+    /// Push the current authoritative session snapshot to the replacement
+    /// host so synchronous `session_start{reload}` hooks observe real state,
+    /// not initial/fallback defaults. No-op when no concrete host is attached.
+    async fn hydrate_replacement_host(&self) {
+        let Some(host) = self.host_extension_runner() else {
+            return;
+        };
+        let state = self.session_state_wire().await;
+        host.push_session_state(&state).await;
     }
 
     /// Build the [`ReplacedSessionContext`] for `withSession` callbacks.
@@ -1294,6 +1333,8 @@ impl AgentSession {
                 for diagnostic in reload.diagnostics {
                     self.report_extension_error(diagnostic.to_string());
                 }
+                self.refresh_selected_model_after_reload();
+                self.hydrate_replacement_host().await;
                 self.emit_session_start_reload().await;
                 if let Err(error) = self
                     .extend_resources_from_extensions(SessionStartReason::Reload.as_str())
@@ -2688,6 +2729,237 @@ mod tests {
         answer_unclaimed_bridge_event(&set, SessionBridgeEvent::Reload { id: 3 }).await;
 
         set.shutdown_once().await;
+        Ok(())
+    }
+
+    // -- reload: model refresh + host hydration regressions -----------------
+
+    /// Provider snapshot with an API key so `mark_configured_if_auth_present`
+    /// marks the provider as auth-configured (required for `set_model`).
+    fn provider_snapshot_with_auth(
+        name: &str,
+        base_url: &str,
+        model_id: &str,
+        context_window: u64,
+    ) -> Value {
+        json!({
+            "name": name,
+            "baseUrl": base_url,
+            "api": "openai-completions",
+            "apiKey": "sk-test-key",
+            "models": [{
+                "id": model_id,
+                "name": model_id,
+                "api": "openai-completions",
+                "baseUrl": base_url,
+                "reasoning": false,
+                "contextWindow": context_window
+            }]
+        })
+    }
+
+    /// Build a session with a concrete host runner + model runtime, bind it,
+    /// and register the initial provider. Returns the session, runtime, and
+    /// host set so the test can drive a reload.
+    async fn build_reload_session_with_provider(
+        provider: Value,
+    ) -> TestResult<(
+        Arc<AgentSession>,
+        Arc<crate::core::model_runtime::ModelRuntime>,
+        Arc<ExtensionRuntimeSet>,
+        crate::core::extension_runtime_set::tests::FakeHost,
+    )> {
+        let (runner, host) = crate::core::extension_runtime_set::tests::make_runner(json!({
+            "providers": [provider],
+            "handlers": ["session_start", "session_shutdown"],
+            "terminalInput": false
+        }))
+        .await?;
+        let set = ExtensionRuntimeSet::bind(vec![(
+            crate::core::extension_runtime_set::EndpointKind::TsCompat,
+            runner,
+        )]);
+        let runtime = Arc::new(crate::core::model_runtime::ModelRuntime::create_in_memory().await?);
+        assert!(
+            set.register_providers_on(&runtime)
+                .into_iter()
+                .all(|(_path, result)| result.is_ok()),
+            "initial provider registration failed"
+        );
+
+        // Use the registered provider's model as the session model.
+        let available = runtime.get_available_snapshot();
+        let model = available
+            .iter()
+            .find(|m| m.provider == "reload-provider")
+            .cloned()
+            .ok_or("reload-provider model not found after registration")?;
+        let mut config = AgentSessionConfig::test_config(Arc::new(StubProvider), model)?;
+        config.extension_runner = Some(set.clone());
+        config.host_extension_runner = Some(set.clone());
+        config.model_runtime = Some(Arc::clone(&runtime));
+        let session = AgentSession::new(config)?;
+
+        // Bind so the session bridge mirror is established.
+        session
+            .bind_extensions(ExtensionBindings {
+                mode: Some(ExtensionMode::Rpc),
+                ..Default::default()
+            })
+            .await?;
+        Ok((session, runtime, set, host))
+    }
+
+    #[tokio::test]
+    async fn reload_refreshes_selected_model_against_post_reload_registry() -> TestResult {
+        // Initial provider has context_window 4096.
+        let initial = provider_snapshot_with_auth(
+            "reload-provider",
+            "https://old.example/v1",
+            "reload-model",
+            4096,
+        );
+        let (session, _runtime, set, _old_host) =
+            build_reload_session_with_provider(initial).await?;
+
+        // The session model should have the initial context_window.
+        let before = session.model();
+        assert_eq!(before.provider, "reload-provider");
+        assert_eq!(before.id, "reload-model");
+        assert_eq!(before.context_window, 4096);
+
+        // Capture the session entry count and subscribe to public events so
+        // we can prove the reload produces no model-switch side effects.
+        let entry_count_before = session.session_manager.lock().await.get_entries().len();
+        let observed_events: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_clone = Arc::clone(&observed_events);
+        let _unsub = session.subscribe(move |event| {
+            if let Ok(mut log) = events_clone.lock() {
+                log.push(event.type_name());
+            }
+        });
+
+        // Prepare a replacement endpoint whose provider changed the model
+        // definition (context_window 8192).
+        let updated = provider_snapshot_with_auth(
+            "reload-provider",
+            "https://new.example/v1",
+            "reload-model",
+            8192,
+        );
+        let (replacement, replacement_host) =
+            crate::core::extension_runtime_set::tests::make_runner(json!({
+                "providers": [updated],
+                "handlers": ["session_start", "session_shutdown"],
+                "terminalInput": false
+            }))
+            .await?;
+        replacement_host.set_response("flags.set", json!({"ok": true}));
+        let (replacement_gen, pending) =
+            crate::core::extension_runtime_set::generation_from_endpoints(
+                2,
+                vec![(
+                    crate::core::extension_runtime_set::EndpointKind::TsCompat,
+                    "<replacement>".to_owned(),
+                    replacement,
+                )],
+            );
+        set.inject_prepared_replacement_for_reload(replacement_gen, pending);
+
+        // Drive the reload through the session — this commits the replacement,
+        // re-registers providers, then calls refresh_selected_model_after_reload
+        // before emitting session_start{reload}.
+        session.reload().await?;
+
+        // The session model must now reflect the post-reload definition:
+        // context_window changed from 4096 to 8192.
+        let after = session.model();
+        assert_eq!(after.provider, "reload-provider");
+        assert_eq!(after.id, "reload-model");
+        assert_eq!(
+            after.context_window, 8192,
+            "reload must re-resolve the selected model against the post-reload registry"
+        );
+
+        // The refresh is a provider-configuration update, not an explicit
+        // model switch: no model_change entry is appended and no model_select
+        // event is emitted.
+        let entry_count_after = session.session_manager.lock().await.get_entries().len();
+        assert_eq!(
+            entry_count_after, entry_count_before,
+            "reload model refresh must not append a model_change session entry"
+        );
+        let logged = observed_events
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        assert!(
+            !logged.contains(&"model_select"),
+            "reload model refresh must not emit model_select (events={logged:?})"
+        );
+
+        set.shutdown_once().await;
+        replacement_host.wait_for_exit().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reload_hydrates_replacement_host_before_session_start_hooks() -> TestResult {
+        let initial = provider_snapshot_with_auth(
+            "reload-provider",
+            "https://old.example/v1",
+            "reload-model",
+            4096,
+        );
+        let (session, _runtime, set, _old_host) =
+            build_reload_session_with_provider(initial.clone()).await?;
+
+        let (replacement, replacement_host) =
+            crate::core::extension_runtime_set::tests::make_runner(json!({
+                "providers": [initial.clone()],
+                "handlers": ["session_start", "session_shutdown"],
+                "terminalInput": false
+            }))
+            .await?;
+        replacement_host.set_response("flags.set", json!({"ok": true}));
+        let (replacement_gen, pending) =
+            crate::core::extension_runtime_set::generation_from_endpoints(
+                2,
+                vec![(
+                    crate::core::extension_runtime_set::EndpointKind::TsCompat,
+                    "<replacement>".to_owned(),
+                    replacement,
+                )],
+            );
+        set.inject_prepared_replacement_for_reload(replacement_gen, pending);
+
+        session.reload().await?;
+
+        let methods = replacement_host.observed_methods();
+        let update_index = methods
+            .iter()
+            .position(|method| method == "session.update")
+            .ok_or("replacement host did not receive session.update")?;
+        let start_index = methods
+            .iter()
+            .position(|method| method == "session_start")
+            .ok_or("replacement host did not receive session_start")?;
+        assert!(
+            update_index < start_index,
+            "session.update must precede session_start (methods={methods:?})"
+        );
+
+        let state = replacement_host
+            .first_payload("session.update")
+            .ok_or("replacement host did not retain session.update payload")?;
+        assert_eq!(
+            state.pointer("/model/provider"),
+            Some(&serde_json::json!("reload-provider")),
+            "hydrated session state must carry the selected model"
+        );
+
+        set.shutdown_once().await;
+        replacement_host.wait_for_exit().await?;
         Ok(())
     }
 }

@@ -355,19 +355,20 @@ impl ModelRuntime {
             .cloned()
             .map_err(|error| models_error_from_catalog(&error))?;
 
-        let credentials: Arc<dyn CredentialStore> = options.credentials.unwrap_or_else(|| {
-            let path = options
-                .auth_path
-                .clone()
-                .unwrap_or_else(|| PathBuf::from("auth.json"));
-            // Prefer in-memory when the caller did not pass a path and no file
-            // credentials were injected — tests never touch the real home dir.
-            if options.auth_path.is_none() {
-                Arc::new(InMemoryCredentialStore::new())
-            } else {
-                Arc::new(FileCredentialStore::new(path))
-            }
-        });
+        let credentials: Arc<dyn CredentialStore> =
+            match options.credentials {
+                Some(credentials) => credentials,
+                None if options.auth_path.is_none() => Arc::new(InMemoryCredentialStore::new()),
+                None => {
+                    let path = options
+                        .auth_path
+                        .clone()
+                        .unwrap_or_else(|| PathBuf::from("auth.json"));
+                    Arc::new(FileCredentialStore::new(path).map_err(|error| {
+                        ModelsError::new(ModelsErrorCode::Auth, error.to_string())
+                    })?)
+                }
+            };
         let credentials = RuntimeCredentials::new(credentials);
 
         let models_path = options.models_path.clone();
@@ -375,17 +376,22 @@ impl ModelRuntime {
             .models_config
             .unwrap_or_else(|| ModelsJsonConfig::load(models_path.as_deref()));
 
-        let models_store: Arc<dyn ModelsStore> = options.models_store.unwrap_or_else(|| {
-            if let Some(path) = options.models_store_path.clone().or_else(|| {
-                models_path
-                    .as_ref()
-                    .map(|models| models.with_file_name("models-store.json"))
-            }) {
-                Arc::new(FileModelsStore::new(path))
-            } else {
-                Arc::new(InMemoryModelsStore::new())
+        let models_store: Arc<dyn ModelsStore> = match options.models_store {
+            Some(store) => store,
+            None => {
+                if let Some(path) = options.models_store_path.clone().or_else(|| {
+                    models_path
+                        .as_ref()
+                        .map(|models| models.with_file_name("models-store.json"))
+                }) {
+                    Arc::new(FileModelsStore::new(path).map_err(|error| {
+                        ModelsError::new(ModelsErrorCode::ModelSource, error.to_string())
+                    })?)
+                } else {
+                    Arc::new(InMemoryModelsStore::new())
+                }
             }
-        });
+        };
 
         let allow_model_network = options.allow_model_network.unwrap_or(false);
         let auth_env = options.auth_env.unwrap_or_default();

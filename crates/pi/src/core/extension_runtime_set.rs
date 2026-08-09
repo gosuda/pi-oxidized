@@ -224,7 +224,7 @@ struct Endpoint {
     runner: Arc<HostExtensionRunner>,
 }
 
-struct Generation {
+pub(crate) struct Generation {
     id: u64,
     endpoints: Arc<[Endpoint]>,
     bridges: StdMutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -289,7 +289,7 @@ impl Drop for GenerationLease {
     }
 }
 
-struct PendingEndpointBridges {
+pub(crate) struct PendingEndpointBridges {
     endpoint: Endpoint,
     tool_updates: broadcast::Receiver<ToolUpdate>,
     provider_events: broadcast::Receiver<ProviderEvent>,
@@ -1003,7 +1003,7 @@ impl ExtensionRuntimeSet {
     }
 
     #[cfg(test)]
-    fn inject_prepared_replacement_for_reload(
+    pub(crate) fn inject_prepared_replacement_for_reload(
         &self,
         generation: Generation,
         pending: PendingBridges,
@@ -2655,7 +2655,7 @@ async fn start_endpoint(
     result.map_err(|error| error.to_string())
 }
 
-fn generation_from_endpoints(
+pub(crate) fn generation_from_endpoints(
     id: u64,
     endpoints: Vec<(EndpointKind, String, Arc<HostExtensionRunner>)>,
 ) -> (Generation, PendingBridges) {
@@ -3466,7 +3466,7 @@ pub(crate) mod tests {
     }
 
     impl FakeHost {
-        fn set_response(&self, method: &str, payload: Value) {
+        pub(crate) fn set_response(&self, method: &str, payload: Value) {
             self.responses
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3588,8 +3588,27 @@ pub(crate) mod tests {
                 .filter(|frame| frame.kind == FrameKind::Req && frame.method == method)
                 .count()
         }
+        pub(crate) fn first_payload(&self, method: &str) -> Option<Value> {
+            self.state
+                .frames
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .find(|frame| frame.method == method)
+                .map(|frame| frame.payload.clone())
+        }
 
-        async fn wait_for_exit(&self) -> TestResult {
+        pub(crate) fn observed_methods(&self) -> Vec<String> {
+            self.state
+                .frames
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .map(|frame| frame.method.clone())
+                .collect()
+        }
+
+        pub(crate) async fn wait_for_exit(&self) -> TestResult {
             tokio::time::timeout(TEST_TIMEOUT, async {
                 while self.state.exits.load(Ordering::Acquire) == 0 {
                     tokio::task::yield_now().await;

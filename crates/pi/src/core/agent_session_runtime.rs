@@ -12,7 +12,7 @@
 //! 2. Build the new session manager.
 //! 3. Call the factory → new session + services + diagnostics.
 //! 4. `teardown_current`: typed `session_shutdown{reason, targetSessionFile}`
-//!    emit, then `before_session_invalidate`, then `session.dispose()`.
+//!    emit, then `before_session_invalidate`, then `session.dispose_lifecycle_gate_held()`.
 //! 5. `apply(result)`: swap session + services + diagnostics.
 //! 6. `finish_session_replacement`: `rebind_session(new_session)` then
 //!    optional `with_session(ctx)`. The mode's rebind calls `bind_extensions`
@@ -305,6 +305,12 @@ pub struct AgentSessionRuntime {
     import_commit_started: tokio::sync::Notify,
     #[cfg(test)]
     import_commit_finished: tokio::sync::Notify,
+    /// Test hook: fires after `navigate_tree` acquires the lifecycle read gate.
+    #[cfg(test)]
+    tree_read_gate_acquired: tokio::sync::Notify,
+    /// Test hook: `navigate_tree` awaits this before proceeding past the read gate.
+    #[cfg(test)]
+    tree_read_gate_proceed: tokio::sync::Notify,
 }
 
 impl AgentSessionRuntime {
@@ -341,6 +347,10 @@ impl AgentSessionRuntime {
             import_commit_started: tokio::sync::Notify::new(),
             #[cfg(test)]
             import_commit_finished: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            tree_read_gate_acquired: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            tree_read_gate_proceed: tokio::sync::Notify::new(),
         });
         runtime.link();
         runtime
@@ -371,6 +381,30 @@ impl AgentSessionRuntime {
     #[allow(dead_code)]
     pub(crate) fn lifecycle_gate(&self) -> &AsyncRwLock<()> {
         &self.lifecycle_gate
+    }
+
+    /// Test hook: wait for `navigate_tree` to acquire the lifecycle read gate.
+    #[cfg(test)]
+    pub(crate) async fn wait_for_tree_read_gate_acquired(&self) {
+        self.tree_read_gate_acquired.notified().await;
+    }
+
+    /// Test hook: signal that `navigate_tree` has acquired the lifecycle read gate.
+    #[cfg(test)]
+    pub(crate) fn notify_tree_read_gate_acquired(&self) {
+        self.tree_read_gate_acquired.notify_one();
+    }
+
+    /// Test hook: wait for the test to signal proceed past the read-gate hook.
+    #[cfg(test)]
+    pub(crate) async fn wait_for_tree_read_gate_proceed(&self) {
+        self.tree_read_gate_proceed.notified().await;
+    }
+
+    /// Test hook: signal `navigate_tree` to proceed past the read-gate hook.
+    #[cfg(test)]
+    pub(crate) fn notify_tree_read_gate_proceed(&self) {
+        self.tree_read_gate_proceed.notify_one();
     }
 
     /// Reject operations while the attached facade owns a pending replacement.
@@ -916,8 +950,14 @@ impl AgentSessionRuntime {
     }
 
     /// Dispose the current session and the runtime.
+    ///
+    /// Acquires the lifecycle write gate so that no concurrent tree
+    /// navigation can overlap final tree persistence. `teardown_current`
+    /// then calls `dispose_lifecycle_gate_held` (the internal gate-held
+    /// path) rather than re-entering the write gate.
     pub async fn dispose(&self) {
         let _guard = self.replacement_lock.lock().await;
+        let _lifecycle_guard = self.lifecycle_gate.write().await;
         self.teardown_current(SessionShutdownReason::Quit, None)
             .await;
     }
@@ -1087,8 +1127,12 @@ impl AgentSessionRuntime {
         if reason == SessionShutdownReason::Quit {
             session.invoke_extension_shutdown_handler();
         }
-        // dispose always awaits host process reap exactly once when bound.
-        session.dispose().await;
+        // dispose uses the internal gate-held path: every caller of
+        // `teardown_current` already holds the lifecycle write gate
+        // (replacement paths acquire it in `finalize_replacement_locked` /
+        // import commit; `dispose` acquires it explicitly).  Calling the
+        // public `dispose` here would re-enter the write gate and deadlock.
+        session.dispose_lifecycle_gate_held().await;
     }
 
     /// Apply the factory result: swap session + services + diagnostics.
@@ -1376,21 +1420,19 @@ fn atomic_move_noreplace(staged_path: &Path, destination: &Path) -> io::Result<(
 }
 
 #[cfg(windows)]
-fn atomic_move_noreplace(staged_path: &Path, destination: &Path) -> io::Result<()> {
-    // Windows has no atomic no-replace rename syscall. Fall back to a
-    // pre-check + std::fs::rename: if the destination does not exist, the
-    // rename succeeds; if it appeared between the check and the rename, the
-    // caller's AlreadyExists handling in publish_no_replace_with catches it.
-    match fs::metadata(destination) {
-        Ok(_) => Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "destination already exists",
-        )),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            fs::rename(staged_path, destination)
-        }
-        Err(error) => Err(error),
-    }
+fn atomic_move_noreplace(_staged_path: &Path, _destination: &Path) -> io::Result<()> {
+    // Windows has no safe, atomic no-replace rename. `std::fs::rename` uses
+    // `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`, so a metadata-check +
+    // rename is a TOCTOU race that can silently overwrite a concurrent
+    // destination. `windows-sys::MoveFileExW` without that flag would be
+    // atomic but is `unsafe`, and the workspace lint forbids `unsafe_code`.
+    // `renamore` is unmaintained (>12 months). Fail closed: data integrity
+    // wins over a non-atomic fallback. The caller still tries `hard_link`
+    // first; only when that fails does this `Unsupported` surface.
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic no-replace rename is unavailable on Windows; hard-link fallback also failed",
+    ))
 }
 
 #[cfg(not(any(

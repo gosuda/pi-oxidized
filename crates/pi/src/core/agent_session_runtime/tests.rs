@@ -769,6 +769,65 @@ fn import_publication_preserves_both_link_and_move_errors() -> TestResult {
     Ok(())
 }
 
+// The former Windows fallback checked before rename, so a concurrent writer
+// could create the destination before the move and be overwritten.
+#[test]
+fn import_publication_race_cannot_report_success_after_already_exists() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let staged = root.path().join("staged.tmp");
+    let destination = root.path().join("session.jsonl");
+    fs::write(&staged, b"staged session bytes")?;
+
+    // Pre-seed the destination to simulate a concurrent writer winning the
+    // race. The injected `move_noreplace` sees this and returns
+    // `AlreadyExists` — exactly what an atomic NOREPLACE rename yields when
+    // the destination materialises between the link attempt and the move.
+    fs::write(&destination, b"racing session bytes")?;
+
+    let result = publish_no_replace_with(
+        &staged,
+        &destination,
+        // Hard link fails (e.g. cross-device), forcing the move fallback.
+        |_, _| {
+            Err(io::Error::new(
+                io::ErrorKind::CrossesDevices,
+                "cross-device link not permitted",
+            ))
+        },
+        // Simulates an atomic no-replace rename that loses the race: the
+        // destination exists, so it returns `AlreadyExists` instead of
+        // overwriting. The old Windows TOCTOU path would have called
+        // `fs::rename` here and silently clobbered the destination.
+        |_, target| {
+            if target.exists() {
+                Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "destination appeared during move",
+                ))
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "no atomic no-replace rename available",
+                ))
+            }
+        },
+    );
+
+    let Err(error) = result else {
+        return Err("race fallback unexpectedly reported success after AlreadyExists".into());
+    };
+    assert_eq!(
+        error.kind(),
+        io::ErrorKind::AlreadyExists,
+        "race must surface as AlreadyExists, not success or another kind: {error}"
+    );
+    // The racing destination must be untouched.
+    assert_eq!(fs::read(&destination)?, b"racing session bytes");
+    // The staged file must still exist (the move never succeeded).
+    assert_eq!(fs::read(&staged)?, b"staged session bytes");
+    Ok(())
+}
+
 #[test]
 fn staged_import_drop_reports_cleanup_failure() -> TestResult {
     let root = tempfile::tempdir()?;

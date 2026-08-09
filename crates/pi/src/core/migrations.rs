@@ -221,7 +221,9 @@ pub fn migrate_auth_to_auth_json_in(agent_dir: &Path) -> Vec<String> {
     let auth_path = agent_dir.join("auth.json");
     let oauth_path = agent_dir.join("oauth.json");
     let settings_path = agent_dir.join("settings.json");
-    let backend = FileLockBackend::new(&auth_path);
+    let Ok(backend) = FileLockBackend::new(&auth_path) else {
+        return Vec::new();
+    };
 
     let migration = backend.with_lock_sync_unseeded(|_| {
         // Recheck under the same sibling lock used by every normal auth read
@@ -757,7 +759,7 @@ mod tests {
             &serde_json::json!({"apiKeys": {"openai": "sk-test"}}),
         )?;
 
-        let backend = FileLockBackend::new(agent.join("auth.json"));
+        let backend = FileLockBackend::new(agent.join("auth.json"))?;
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let holder = std::thread::spawn(move || {
             backend.with_lock_sync_unseeded(|_| {
