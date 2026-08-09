@@ -31,7 +31,7 @@
 {"id":0,"kind":"event","method":"theme.update","payload":{"theme":{"name":"dark","sourcePath":"/pkg/theme/dark.json","colorMode":"truecolor","fg":{"text":"#ededed","accent":39,"muted":""},"bg":{"selectedBg":"#0a0a0a"}},"terminalTheme":"light","themeMode":"auto","themeGeneration":42,"themes":[{"name":"mytheme","path":"/agent/themes/my-file.json","fileStem":"my-file","theme":{"name":"mytheme","colorMode":"256color","fg":{},"bg":{}}}]}}
 {"id":0,"kind":"event","method":"theme.set","payload":{"name":"light/dark","persist":true}}
 {"id":0,"kind":"event","method":"theme.set","payload":{"persist":false,"theme":{"colorMode":"truecolor","fg":{"text":"#ffffff"},"bg":{}}}}
-{"id":0,"kind":"event","method":"session.update","payload":{"sessionName":"My Session","thinkingLevel":"medium","activeTools":["read","bash"],"allTools":[{"name":"read","description":"Read a file","parameters":{"type":"object"},"source":"builtin"}],"commands":[{"name":"review","description":"Review changes","source":"extension"}],"model":{"id":"gpt-x","provider":"openai"},"isIdle":true,"hasPendingMessages":false,"contextUsage":{"tokens":1200,"contextWindow":128000,"percent":0.9},"systemPrompt":"You are pi."}}
+{"id":0,"kind":"event","method":"session.update","payload":{"sessionName":"My Session","thinkingLevel":"medium","activeTools":["read","bash"],"allTools":[{"name":"read","description":"Read a file","parameters":{"type":"object"},"source":"builtin"}],"commands":[{"name":"review","description":"Review changes","source":"extension"}],"model":{"id":"gpt-x","provider":"openai"},"scopedModels":[{"model":{"id":"gpt-x","provider":"openai"},"thinkingLevel":"high"},{"model":{"id":"haiku","provider":"anthropic"}}],"isIdle":true,"hasPendingMessages":false,"contextUsage":{"tokens":1200,"contextWindow":128000,"percent":0.9},"systemPrompt":"You are pi."}}
 {"id":0,"kind":"event","method":"session.command","payload":{"action":"setSessionName","name":"Renamed"}}
 {"id":0,"kind":"event","method":"session.command","payload":{"action":"sendMessage","message":{"customType":"note","content":"hi","display":true},"options":{"triggerTurn":false,"deliverAs":"nextTurn"}}}
 {"id":0,"kind":"event","method":"session.command","payload":{"action":"shutdown"}}
@@ -62,4 +62,7 @@
 {"id":28,"kind":"error","method":"session.navigateTree","payload":{"code":"extension_error","message":"entry not found","retryable":false}}
 {"id":29,"kind":"error","method":"session.switchSession","payload":{"code":"replacement_busy","message":"session replacement in progress","retryable":true}}
 {"id":30,"kind":"error","method":"session.reload","payload":{"code":"extension_error","message":"reload failed","retryable":false}}
+{"id":31,"kind":"req","method":"session.setupEntries","payload":{"replacementToken":"tok-1"}}
+{"id":31,"kind":"res","method":"session.setupEntries","payload":{"entries":[{"type":"message","id":"e1","parentId":null,"timestamp":"2025-01-01T00:00:00.000Z","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}]}}
+{"id":32,"kind":"error","method":"session.setupEntries","payload":{"code":"extension_error","message":"stale replacement token","retryable":false}}
 {"id":0,"kind":"event","method":"session.replacementReady","payload":{"token":"tok-1"}}

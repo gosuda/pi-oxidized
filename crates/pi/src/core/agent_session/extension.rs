@@ -38,7 +38,7 @@ use crate::core::resources::{
 use pi_ai::{ImageContent, Model, ModelThinkingLevel};
 use pi_ext::protocol::{
     self, SessionCommand, SessionCommandInfoWire, SessionForkPosition, SessionNavigateTreeResponse,
-    SessionStateWire, SessionToolWire,
+    SessionScopedModelWire, SessionSetupEntriesRequest, SessionStateWire, SessionToolWire,
 };
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
@@ -785,6 +785,14 @@ impl AgentSession {
                 })
                 .collect(),
             model: serde_json::to_value(&model).ok(),
+            scoped_models: self
+                .scoped_models()
+                .into_iter()
+                .map(|scoped| SessionScopedModelWire {
+                    model: serde_json::to_value(&scoped.model).unwrap_or(Value::Null),
+                    thinking_level: scoped.thinking_level.map(thinking_level_wire),
+                })
+                .collect(),
             is_idle: self.is_idle(),
             has_pending_messages: self.pending_message_count() > 0,
             context_usage,
@@ -871,6 +879,13 @@ impl AgentSession {
                 let host = Arc::clone(host);
                 tokio::spawn(async move {
                     session.handle_bridge_reload(host, id).await;
+                });
+            }
+            SessionBridgeEvent::SetupEntries { id, request } => {
+                let session = Arc::clone(self);
+                let host = Arc::clone(host);
+                tokio::spawn(async move {
+                    session.handle_bridge_setup_entries(host, id, request).await;
                 });
             }
             SessionBridgeEvent::ReplacementReady { token } => {
@@ -1233,6 +1248,36 @@ impl AgentSession {
             return;
         }
         self.await_bridge_reload(host, token, ready_rx).await;
+    }
+
+    /// Handle a correlated `session.setupEntries` request: validate the
+    /// replacement token and return the authoritative current entries from
+    /// the pending replacement target session. Stale tokens fail closed.
+    async fn handle_bridge_setup_entries(
+        self: &Arc<Self>,
+        host: Arc<ExtensionRuntimeSet>,
+        id: protocol::FrameId,
+        request: SessionSetupEntriesRequest,
+    ) {
+        let Some(target) = host.validate_setup_token(&request.replacement_token) else {
+            let _ = host
+                .respond_setup_entries(id, Err("stale replacement token".to_owned()))
+                .await;
+            return;
+        };
+        // Build the whole snapshot before responding. A partial entry list
+        // would lie about the authoritative session state.
+        let entries = {
+            let sm = target.session_manager.lock().await;
+            sm.get_entries()
+                .iter()
+                .map(|entry| serde_json::to_value(*entry))
+                .collect::<Result<Vec<Value>, _>>()
+        };
+        let outcome = entries
+            .map(|entries| protocol::SessionSetupEntriesResponse { entries })
+            .map_err(|error| format!("serialize session entries: {error}"));
+        let _ = host.respond_setup_entries(id, outcome).await;
     }
 
     async fn await_bridge_replacement(
@@ -1601,6 +1646,11 @@ async fn answer_unclaimed_bridge_event(host: &Arc<ExtensionRuntimeSet>, event: S
         SessionBridgeEvent::Reload { id } => {
             let _ = host
                 .respond_reload(id, Err("no active session".to_owned()))
+                .await;
+        }
+        SessionBridgeEvent::SetupEntries { id, .. } => {
+            let _ = host
+                .respond_setup_entries(id, Err("no active session".to_owned()))
                 .await;
         }
     }
@@ -2960,6 +3010,51 @@ mod tests {
 
         set.shutdown_once().await;
         replacement_host.wait_for_exit().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_state_wire_produces_scoped_models() -> TestResult {
+        use crate::core::agent_session::ScopedModel;
+        use pi_ai::ModelThinkingLevel;
+
+        let mut config = AgentSessionConfig::test_config(Arc::new(StubProvider), test_model())?;
+        config.scoped_models = vec![
+            ScopedModel {
+                model: test_model(),
+                thinking_level: Some(ModelThinkingLevel::High),
+            },
+            ScopedModel {
+                model: Model {
+                    id: "other".to_owned(),
+                    name: "other".to_owned(),
+                    api: "test-api".to_owned(),
+                    provider: "other-provider".to_owned(),
+                    base_url: String::new(),
+                    reasoning: false,
+                    thinking_level_map: None,
+                    input: vec![ModelInput::Text],
+                    cost: ModelCost::default(),
+                    context_window: 8_192,
+                    max_tokens: 1_024,
+                    headers: None,
+                    compat: None,
+                    extra: std::collections::BTreeMap::new(),
+                },
+                thinking_level: None,
+            },
+        ];
+        let session = Arc::new(AgentSession::new(config)?);
+        let state = session.session_state_wire().await;
+
+        assert_eq!(state.scoped_models.len(), 2);
+        assert_eq!(
+            state.scoped_models[0].thinking_level,
+            Some("high".to_owned())
+        );
+        assert!(state.scoped_models[1].thinking_level.is_none());
+        assert_eq!(state.scoped_models[0].model["id"], "m");
+        assert_eq!(state.scoped_models[1].model["provider"], "other-provider");
         Ok(())
     }
 }

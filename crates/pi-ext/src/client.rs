@@ -273,6 +273,13 @@ pub enum HostEvent {
         /// Original host correlation id.
         id: FrameId,
     },
+    /// Correlated `session.setupEntries` request awaiting [`HostClient::respond_setup_entries`].
+    SetupEntriesRequest {
+        /// Original host correlation id.
+        id: FrameId,
+        /// Setup-entries request payload.
+        request: crate::protocol::SessionSetupEntriesRequest,
+    },
     /// Host finished a ready-gated replacement (`session.replacementReady`).
     ReplacementReady {
         /// Token previously returned on a replacement response.
@@ -840,6 +847,42 @@ impl HostClient {
                     crate::protocol::SESSION_RELOAD_METHOD,
                     crate::protocol::ErrorPayload::new("extension_error", &message),
                     "reload error",
+                )
+                .await
+            }
+        }
+    }
+
+    /// Answer a correlated `session.setupEntries` request from the host.
+    ///
+    /// Success sends the serialized session entries; failure sends an
+    /// `extension_error` frame (stale token, no active replacement).
+    ///
+    /// # Errors
+    ///
+    /// Returns a payload or transport error when the response cannot be
+    /// encoded or sent.
+    pub async fn respond_setup_entries(
+        &self,
+        id: FrameId,
+        outcome: Result<crate::protocol::SessionSetupEntriesResponse, String>,
+    ) -> HostResult<()> {
+        match outcome {
+            Ok(response) => {
+                self.send_typed_response(
+                    id,
+                    crate::protocol::SESSION_SETUP_ENTRIES_METHOD,
+                    &response,
+                    "setupEntries response",
+                )
+                .await
+            }
+            Err(message) => {
+                self.send_error_frame(
+                    id,
+                    crate::protocol::SESSION_SETUP_ENTRIES_METHOD,
+                    crate::protocol::ErrorPayload::new("extension_error", &message),
+                    "setupEntries error",
                 )
                 .await
             }
@@ -1557,6 +1600,18 @@ fn dispatch(shared: &Shared, frame: Frame) {
                         let _ = shared
                             .events
                             .send(HostEvent::ReloadRequest { id: frame.id });
+                    }
+                    Err(_) => {
+                        let _ = shared.events.send(HostEvent::Raw(frame));
+                    }
+                }
+            } else if frame.method == crate::protocol::SESSION_SETUP_ENTRIES_METHOD {
+                match from_payload::<crate::protocol::SessionSetupEntriesRequest>(&frame.payload) {
+                    Ok(request) => {
+                        let _ = shared.events.send(HostEvent::SetupEntriesRequest {
+                            id: frame.id,
+                            request,
+                        });
                     }
                     Err(_) => {
                         let _ = shared.events.send(HostEvent::Raw(frame));
@@ -2760,6 +2815,15 @@ mod tests {
         assert_eq!(f.method, crate::protocol::SESSION_RELOAD_METHOD);
         assert_eq!(f.payload["replacementToken"], "tok3");
 
+        let setup = crate::protocol::SessionSetupEntriesResponse {
+            entries: vec![serde_json::json!({"type": "message", "id": "e1"})],
+        };
+        client.respond_setup_entries(8, Ok(setup)).await?;
+        let f = host.require_frame("setupEntries res").await?;
+        assert_eq!(f.id, 8);
+        assert_eq!(f.kind, FrameKind::Res);
+        assert_eq!(f.method, crate::protocol::SESSION_SETUP_ENTRIES_METHOD);
+        assert_eq!(f.payload["entries"][0]["id"], "e1");
         Ok(())
     }
 
@@ -2798,6 +2862,17 @@ mod tests {
         assert_eq!(f.method, crate::protocol::SESSION_RELOAD_METHOD);
         assert_eq!(f.payload["code"], "extension_error");
         assert_eq!(f.payload["message"], "reload failed");
+        assert_eq!(f.payload["retryable"], false);
+
+        client
+            .respond_setup_entries(16, Err("stale replacement token".to_owned()))
+            .await?;
+        let f = host.require_frame("setupEntries err").await?;
+        assert_eq!(f.id, 16);
+        assert_eq!(f.kind, FrameKind::Error);
+        assert_eq!(f.method, crate::protocol::SESSION_SETUP_ENTRIES_METHOD);
+        assert_eq!(f.payload["code"], "extension_error");
+        assert_eq!(f.payload["message"], "stale replacement token");
         assert_eq!(f.payload["retryable"], false);
 
         client

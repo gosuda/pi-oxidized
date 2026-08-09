@@ -15,8 +15,9 @@ use pi_ext::adapters::{ExtensionProvider, Registry, RendererKind, ShortcutRegist
 use pi_ext::client::{HostClient, HostClientError, HostUiRequest, HostUiResponse};
 use pi_ext::host::{self, HostSource, HostSpec};
 use pi_ext::protocol::{
-    self, ExtensionErrorEvent, FlagValueWire, FrameId, ProviderEvent, SessionStateWire,
-    ShortcutExecuteResponse, ThemeUpdate, ToolUpdate, UiEventRequest, UiEventResponse, UiStateWire,
+    self, ExtensionErrorEvent, FlagValueWire, FrameId, ProviderEvent, SessionSetupEntriesResponse,
+    SessionStateWire, ShortcutExecuteResponse, ThemeUpdate, ToolUpdate, UiEventRequest,
+    UiEventResponse, UiStateWire,
 };
 use pi_ext::sanitize::SanitizedSlot;
 use serde_json::{Map, Value};
@@ -1729,6 +1730,42 @@ impl ExtensionRuntimeSet {
         endpoint.runner.respond_reload(local, outcome).await
     }
 
+    /// Route a correlated setup-entries response to its originating endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the response route is stale or missing, or its host rejects it.
+    pub async fn respond_setup_entries(
+        &self,
+        id: FrameId,
+        outcome: Result<SessionSetupEntriesResponse, String>,
+    ) -> Result<(), HostClientError> {
+        let Some((_lease, endpoint, local)) = self.state().claim_route(id) else {
+            return Err(HostClientError::NotRunning);
+        };
+        endpoint.runner.respond_setup_entries(local, outcome).await
+    }
+
+    /// Validate a replacement token and return the pending replacement target
+    /// session. Returns `None` for stale or missing tokens (fail closed).
+    #[must_use]
+    pub(crate) fn validate_setup_token(&self, token: &str) -> Option<Arc<AgentSession>> {
+        let state = self.pending_ready();
+        match &*state {
+            PendingReadyState::Pending {
+                op,
+                token: pending_token,
+                ..
+            } if pending_token == token => op.replacement_target(),
+            PendingReadyState::Finalizing {
+                replacement_target,
+                token: pending_token,
+                ..
+            } if pending_token == token => replacement_target.clone(),
+            _ => None,
+        }
+    }
+
     /// Route a deterministic busy rejection to the request's originating endpoint.
     ///
     /// # Errors
@@ -2949,6 +2986,14 @@ fn spawn_session_relay(
                                 routed_id,
                             )
                         }
+                        SessionBridgeEvent::SetupEntries { id, request } => {
+                            let routed_id = state.allocate_route(endpoint, id);
+                            (
+                                routed_id
+                                    .map(|id| SessionBridgeEvent::SetupEntries { id, request }),
+                                routed_id,
+                            )
+                        }
                         SessionBridgeEvent::Command(command) => {
                             (Some(SessionBridgeEvent::Command(command)), None)
                         }
@@ -3199,6 +3244,11 @@ async fn answer_unclaimed_session(runner: &HostExtensionRunner, event: SessionBr
         SessionBridgeEvent::Reload { id } => {
             let _ = runner
                 .respond_reload(id, Err("no active session".to_owned()))
+                .await;
+        }
+        SessionBridgeEvent::SetupEntries { id, .. } => {
+            let _ = runner
+                .respond_setup_entries(id, Err("no active session".to_owned()))
                 .await;
         }
         SessionBridgeEvent::Command(_) | SessionBridgeEvent::ReplacementReady { .. } => {}

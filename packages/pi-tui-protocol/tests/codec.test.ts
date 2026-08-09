@@ -232,6 +232,8 @@ describe("shared fixtures", () => {
 			"session.setModel:res",
 			"ui.control:event",
 			"ui.state:event",
+			"session.setupEntries:req",
+			"session.setupEntries:res",
 		]) {
 			expect(seen).toContain(key);
 		}

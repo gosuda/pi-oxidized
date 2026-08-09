@@ -359,37 +359,36 @@ describe("host message_update_delta: hostile contentIndex parity with the reduce
 // ---------------------------------------------------------------------------
 
 describe("host SessionManager bridge", () => {
-	test("logging, JSON.stringify, and hasOwnProperty do not throw; real methods do", async () => {
+	test("getEntries stays authoritative while unsupported setup methods throw", async () => {
 		const probeFactory: ExtensionFactory = (pi) => {
 			pi.registerCommand("managerProbe", {
-				description: "Probe the SessionManager bridge for throwable traps",
+				description: "Probe the SessionManager setup bridge",
 				async handler(_args, ctx) {
-					// setup receives only the SessionManager proxy by design; the
-					// fresh context is the ReplacedSessionContext handed to
-					// withSession. Build the report inside setup, capture it in
-					// the closure, and emit it from withSession via that fresh
-					// context — the originating ctx is stale after newSession.
 					let report: Record<string, unknown> = {};
 					await ctx.newSession({
 						parentSession: "parent-1",
 						setup: async (manager) => {
-							report = {};
-							report["stringified"] = `${manager}`;
-							report["json"] = JSON.stringify(manager);
-							report["hasOwn"] = manager.hasOwnProperty("anything");
-							report["valueOfIsObject"] = typeof manager.valueOf() === "object";
+							report = {
+								stringified: `${manager}`,
+								json: JSON.stringify(manager),
+								hasOwn: manager.hasOwnProperty("anything"),
+								valueOfIsObject: typeof manager.valueOf() === "object",
+								initialEntries: manager.getEntries(),
+							};
+							await manager.appendCustomEntry("probe", { value: 1 });
+							report["refreshedEntries"] = manager.getEntries();
 							try {
-								manager.getEntries();
-								report["realMethodThrew"] = false;
+								const getBranch = Reflect.get(manager, "getBranch");
+								if (typeof getBranch !== "function") {
+									throw new Error("getBranch proxy member is not callable");
+								}
+								Reflect.apply(getBranch, manager, []);
+								report["unsupportedMethodThrew"] = false;
 							} catch (error) {
-								report["realMethodThrew"] = true;
-								report["realMethodMessage"] =
+								report["unsupportedMethodThrew"] = true;
+								report["unsupportedMethodMessage"] =
 									error instanceof Error ? error.message : String(error);
 							}
-							// Assert the value the runtime actually reads: thenable
-							// resolution consults only the `get` trap, not `has`.
-							// A Proxy can answer `"then" in manager` with true while
-							// `get` returns undefined.
 							report["then"] = Reflect.get(manager, "then") === undefined
 								? undefined
 								: "present";
@@ -403,17 +402,60 @@ describe("host SessionManager bridge", () => {
 		};
 		const connected = await connectHost([probeFactory]);
 		const { collector, stdin } = connected;
+		const initialEntry = { type: "message", id: "entry-1" };
+		const appendedEntry = {
+			type: "custom",
+			id: "entry-2",
+			customType: "probe",
+			data: { value: 1 },
+		};
 
-		void collector
-			.awaitFrame((f) => f.kind === "req" && f.method === "session.newSession")
-			.then((request) => {
-				push(stdin, {
-					id: request.id, kind: "res", method: "session.newSession",
-					payload: { cancelled: false, replacementToken: "tok-1" },
-				});
+		void (async () => {
+			const replacement = await collector.awaitFrame(
+				(f) => f.kind === "req" && f.method === "session.newSession",
+			);
+			push(stdin, {
+				id: replacement.id,
+				kind: "res",
+				method: "session.newSession",
+				payload: { cancelled: false, replacementToken: "tok-1" },
 			});
+			const seed = await collector.awaitFrame(
+				(f) => f.kind === "req" && f.method === "session.setupEntries",
+			);
+			expect(payloadOf(seed)["replacementToken"]).toBe("tok-1");
+			push(stdin, {
+				id: seed.id,
+				kind: "res",
+				method: "session.setupEntries",
+				payload: { entries: [initialEntry] },
+			});
+			const append = await collector.awaitFrame(
+				(f) => f.kind === "event"
+					&& f.method === "session.command"
+					&& payloadOf(f)["action"] === "appendEntry",
+			);
+			expect(payloadOf(append)).toEqual({
+				action: "appendEntry",
+				customType: "probe",
+				data: { value: 1 },
+			});
+			const refresh = await collector.awaitFrame(
+				(f) => f.kind === "req" && f.method === "session.setupEntries" && f.id !== seed.id,
+			);
+			expect(payloadOf(refresh)["replacementToken"]).toBe("tok-1");
+			push(stdin, {
+				id: refresh.id,
+				kind: "res",
+				method: "session.setupEntries",
+				payload: { entries: [initialEntry, appendedEntry] },
+			});
+		})();
+
 		push(stdin, {
-			id: 40, kind: "req", method: "command.execute",
+			id: 40,
+			kind: "req",
+			method: "command.execute",
 			payload: { command: "managerProbe", args: "" },
 		});
 		const notify = await collector.awaitFrame((f) => f.method === "notify");
@@ -423,8 +465,70 @@ describe("host SessionManager bridge", () => {
 		expect(report["hasOwn"]).toBe(false);
 		expect(report["valueOfIsObject"]).toBe(true);
 		expect(report["then"]).toBeUndefined();
-		expect(report["realMethodThrew"]).toBe(true);
-		expect(String(report["realMethodMessage"])).toContain("not supported");
+		expect(report["initialEntries"]).toEqual([initialEntry]);
+		expect(report["refreshedEntries"]).toEqual([initialEntry, appendedEntry]);
+		expect(report["unsupportedMethodThrew"]).toBe(true);
+		expect(String(report["unsupportedMethodMessage"])).toContain("not supported");
+		await teardown(connected);
+	});
+
+	test("stale setup token rejects before the setup callback runs", async () => {
+		const staleFactory: ExtensionFactory = (pi) => {
+			pi.registerCommand("staleSetupProbe", {
+				description: "Reject a stale setup snapshot",
+				async handler(_args, ctx) {
+					await ctx.newSession({
+						setup: async () => {
+							throw new Error("setup unexpectedly ran");
+						},
+					});
+				},
+			});
+		};
+		const connected = await connectHost([staleFactory]);
+		const { collector, stdin } = connected;
+
+		void (async () => {
+			const replacement = await collector.awaitFrame(
+				(f) => f.kind === "req" && f.method === "session.newSession",
+			);
+			push(stdin, {
+				id: replacement.id,
+				kind: "res",
+				method: "session.newSession",
+				payload: { cancelled: false, replacementToken: "stale-token" },
+			});
+			const setup = await collector.awaitFrame(
+				(f) => f.kind === "req" && f.method === "session.setupEntries",
+			);
+			push(stdin, {
+				id: setup.id,
+				kind: "error",
+				method: "session.setupEntries",
+				payload: {
+					code: "stale_replacement_token",
+					message: "stale replacement token",
+					retryable: false,
+				},
+			});
+		})();
+
+		push(stdin, {
+			id: 41,
+			kind: "req",
+			method: "command.execute",
+			payload: { command: "staleSetupProbe", args: "" },
+		});
+		const failure = await collector.awaitFrame(
+			(f) => f.id === 41 && f.kind === "error",
+		);
+		expect(String(payloadOf(failure)["message"])).toContain("stale replacement token");
+		expect(String(payloadOf(failure)["message"])).not.toContain("setup unexpectedly ran");
+		expect(
+			collector.frames.filter(
+				(f) => f.kind === "event" && f.method === "session.command",
+			),
+		).toEqual([]);
 		await teardown(connected);
 	});
 });

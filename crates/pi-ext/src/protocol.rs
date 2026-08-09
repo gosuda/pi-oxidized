@@ -1347,6 +1347,17 @@ pub struct SessionCommandInfoWire {
     pub source: String,
 }
 
+/// One model scoped to this session (`--models` / `enabledModels`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionScopedModelWire {
+    /// Serialized `Model` in the upstream shape.
+    pub model: Value,
+    /// Thinking level pinned by the scope, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<String>,
+}
+
 /// `session.update` event payload (Rust → host): the authoritative mirror
 /// behind every synchronous session getter on the host.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -1366,6 +1377,8 @@ pub struct SessionStateWire {
     /// Serialized active `Model` (upstream shape), if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<Value>,
+    /// Models scoped to this session (`--models` / `enabledModels`).
+    pub scoped_models: Vec<SessionScopedModelWire>,
     /// Whether the session has no active agent run.
     pub is_idle: bool,
     /// Whether steering/follow-up messages are queued.
@@ -1493,6 +1506,9 @@ pub const SESSION_SWITCH_SESSION_METHOD: &str = "session.switchSession";
 
 /// Open method string: correlated `ctx.reload` request (host → Rust).
 pub const SESSION_RELOAD_METHOD: &str = "session.reload";
+
+/// Open method string: correlated setup-entry snapshot request (host → Rust).
+pub const SESSION_SETUP_ENTRIES_METHOD: &str = "session.setupEntries";
 
 /// Open method string: host → Rust ready event after a replacement settles.
 pub const SESSION_REPLACEMENT_READY_METHOD: &str = "session.replacementReady";
@@ -1623,6 +1639,22 @@ pub struct SessionReloadResponse {
     /// Ready-gate token when the reload is pending host-side readiness.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replacement_token: Option<String>,
+}
+
+/// Correlated setup-entry snapshot request (host → Rust).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSetupEntriesRequest {
+    /// Token returned by the initiating pending session replacement.
+    pub replacement_token: String,
+}
+
+/// Correlated setup-entry snapshot response (Rust → host).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSetupEntriesResponse {
+    /// Serialized `SessionEntry` values, opaque at the `pi-ext` boundary.
+    pub entries: Vec<Value>,
 }
 
 /// `session.replacementReady` event payload (host → Rust).
@@ -2465,6 +2497,7 @@ mod bridge_tests {
                 | SESSION_NAVIGATE_TREE_METHOD
                 | SESSION_SWITCH_SESSION_METHOD
                 | SESSION_RELOAD_METHOD
+                | SESSION_SETUP_ENTRIES_METHOD
                     if frame.kind == FrameKind::Error =>
                 {
                     from_payload::<ErrorPayload>(&frame.payload)?;
@@ -2511,6 +2544,12 @@ mod bridge_tests {
                 SESSION_RELOAD_METHOD => {
                     from_payload::<SessionReloadResponse>(&frame.payload)?;
                 }
+                SESSION_SETUP_ENTRIES_METHOD if frame.kind == FrameKind::Req => {
+                    from_payload::<SessionSetupEntriesRequest>(&frame.payload)?;
+                }
+                SESSION_SETUP_ENTRIES_METHOD => {
+                    from_payload::<SessionSetupEntriesResponse>(&frame.payload)?;
+                }
                 SESSION_REPLACEMENT_READY_METHOD => {
                     from_payload::<SessionReplacementReadyEvent>(&frame.payload)?;
                 }
@@ -2550,6 +2589,9 @@ mod bridge_tests {
             (SESSION_RELOAD_METHOD, FrameKind::Req),
             (SESSION_RELOAD_METHOD, FrameKind::Error),
             (SESSION_RELOAD_METHOD, FrameKind::Res),
+            (SESSION_SETUP_ENTRIES_METHOD, FrameKind::Req),
+            (SESSION_SETUP_ENTRIES_METHOD, FrameKind::Error),
+            (SESSION_SETUP_ENTRIES_METHOD, FrameKind::Res),
             (UI_CONTROL_METHOD, FrameKind::Event),
             (SESSION_REPLACEMENT_READY_METHOD, FrameKind::Event),
             (UI_STATE_METHOD, FrameKind::Event),
@@ -2626,6 +2668,16 @@ mod bridge_tests {
                 source: "extension".to_owned(),
             }],
             model: None,
+            scoped_models: vec![
+                SessionScopedModelWire {
+                    model: serde_json::json!({"id": "gpt-x", "provider": "openai"}),
+                    thinking_level: Some("high".to_owned()),
+                },
+                SessionScopedModelWire {
+                    model: serde_json::json!({"id": "haiku", "provider": "anthropic"}),
+                    thinking_level: None,
+                },
+            ],
             is_idle: false,
             has_pending_messages: true,
             context_usage: None,
@@ -2634,8 +2686,37 @@ mod bridge_tests {
         let payload = to_payload(&state)?;
         assert_eq!(payload["thinkingLevel"], "high");
         assert_eq!(payload["hasPendingMessages"], true);
+        assert_eq!(payload["scopedModels"][0]["thinkingLevel"], "high");
+        assert!(payload["scopedModels"][1].get("thinkingLevel").is_none());
         assert!(payload.get("model").is_none());
         assert_eq!(from_payload::<SessionStateWire>(&payload)?, state);
+        Ok(())
+    }
+
+    #[test]
+    fn session_setup_entries_wire_roundtrip() -> TestResult {
+        let request = SessionSetupEntriesRequest {
+            replacement_token: "tok-1".to_owned(),
+        };
+        let payload = to_payload(&request)?;
+        assert_eq!(payload["replacementToken"], "tok-1");
+        assert_eq!(
+            from_payload::<SessionSetupEntriesRequest>(&payload)?,
+            request
+        );
+
+        let response = SessionSetupEntriesResponse {
+            entries: vec![
+                serde_json::json!({"type": "session_info", "id": "e1"}),
+                serde_json::json!({"type": "custom", "id": "e2"}),
+            ],
+        };
+        let payload = to_payload(&response)?;
+        assert_eq!(payload["entries"].as_array().map(Vec::len), Some(2));
+        assert_eq!(
+            from_payload::<SessionSetupEntriesResponse>(&payload)?,
+            response
+        );
         Ok(())
     }
 

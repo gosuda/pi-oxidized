@@ -101,7 +101,7 @@ declare module "@earendil-works/pi-coding-agent" {
 		appendCustomEntry(customType: string, data?: unknown): Promise<void>;
 		appendSessionInfo(name: string): Promise<void>;
 		getSessionName(): string | undefined;
-		getEntries(): unknown;
+		getEntries(): unknown[];
 	}
 	export interface BranchSummaryEntry {
 		type: "branch_summary";

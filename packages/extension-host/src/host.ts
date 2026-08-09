@@ -2757,7 +2757,23 @@ export class ExtensionHost {
 				const cancelled = cancelledOf(frame);
 				captureReplacementToken(payload, cancelled);
 				if (!cancelled && options?.setup !== undefined) {
-					await options.setup(self.createSessionManagerProxy());
+					const token = payload["replacementToken"];
+					if (typeof token !== "string" || token.length === 0) {
+						throw new Error(
+							"session.newSession response omitted replacementToken for setup",
+						);
+					}
+					const setupFrame = await self.client.request(
+						"session.setupEntries",
+						{ replacementToken: token },
+						{ timeoutMs: EXTENSION_HOOK_TIMEOUT_MS },
+					);
+					const setupPayload = setupFrame.payload as Record<string, unknown>;
+					const initialEntries = setupPayload["entries"];
+					if (!Array.isArray(initialEntries)) {
+						throw new Error("session.setupEntries response omitted entries");
+					}
+					await options.setup(self.createSessionManagerProxy(token, initialEntries));
 				}
 				return afterReplacement(cancelled, options?.withSession);
 			},
@@ -2867,16 +2883,50 @@ export class ExtensionHost {
 	// host cannot instantiate. Rust owns the real session tree. Only matching
 	// SessionManager mutations route through `session.command`; each returns
 	// the write-delivery Promise rather than a fabricated synchronous entry ID.
-	// The uncorrelated wire therefore cannot support ID-dependent chaining.
-	// Its one mirrored getter is `getSessionName`. Every other SessionManager
-	// method fails explicitly instead of silently no-op-ing.
-	private createSessionManagerProxy(): SessionManagerSetupBridge {
+	// `getEntries()` is synchronous over a token-scoped snapshot seeded before
+	// setup and refreshed after each awaited append. Stale tokens fail closed.
+	// Every other SessionManager method fails explicitly instead of silently no-op-ing.
+	private createSessionManagerProxy(
+		replacementToken?: string,
+		initialEntries: unknown[] = [],
+	): SessionManagerSetupBridge {
 		const self = this;
-		const unsupported = (method: string) => () => {
-			throw new Error(
-				`SessionManager method '${method}' is not supported via the extension bridge`,
-			);
+		let entriesSnapshot: unknown[] = initialEntries;
+		const sessionNameFromEntries = (entries: readonly unknown[]): string | undefined => {
+			for (let index = entries.length - 1; index >= 0; index--) {
+				const entry = entries[index];
+				if (
+					typeof entry === "object"
+					&& entry !== null
+					&& "type" in entry
+					&& entry.type === "session_info"
+				) {
+					return "name" in entry && typeof entry.name === "string"
+						? entry.name
+						: undefined;
+				}
+			}
+			return undefined;
 		};
+		let setupSessionName = replacementToken === undefined
+			? undefined
+			: sessionNameFromEntries(entriesSnapshot);
+		const refreshSnapshot = replacementToken === undefined
+			? undefined
+			: async (): Promise<void> => {
+				const frame = await self.client.request(
+					"session.setupEntries",
+					{ replacementToken },
+					{ timeoutMs: EXTENSION_HOOK_TIMEOUT_MS },
+				);
+				const payload = frame.payload as Record<string, unknown>;
+				const entries = payload["entries"];
+				if (!Array.isArray(entries)) {
+					throw new Error("session.setupEntries response omitted entries");
+				}
+				entriesSnapshot = entries;
+				setupSessionName = sessionNameFromEntries(entries);
+			};
 		return new Proxy({}, {
 			get(_target, prop) {
 				if (typeof prop !== "string") return undefined;
@@ -2892,17 +2942,38 @@ export class ExtensionHost {
 				if (inherited !== undefined) return inherited;
 				switch (prop) {
 					case "appendCustomEntry":
-						return (customType: string, data?: unknown) =>
-							self.sendSessionCommand({ action: "appendEntry", customType, data });
+						return async (customType: string, data?: unknown) => {
+							await self.sendSessionCommand({ action: "appendEntry", customType, data });
+							if (refreshSnapshot !== undefined) await refreshSnapshot();
+						};
 					case "appendSessionInfo":
 						return async (name: string) => {
 							await self.sendSessionCommand({ action: "setSessionName", name });
-							self.sessionState.sessionName = name;
+							if (refreshSnapshot === undefined) {
+								self.sessionState.sessionName = name;
+							} else {
+								await refreshSnapshot();
+							}
 						};
 					case "getSessionName":
-						return () => self.sessionState.sessionName;
+						return () =>
+							refreshSnapshot === undefined
+								? self.sessionState.sessionName
+								: setupSessionName;
+					case "getEntries":
+						return refreshSnapshot === undefined
+							? () => {
+								throw new Error(
+									"SessionManager method 'getEntries' is not supported via the extension bridge",
+								);
+							}
+							: () => [...entriesSnapshot];
 					default:
-						return unsupported(prop);
+						return () => {
+							throw new Error(
+								`SessionManager method '${prop}' is not supported via the extension bridge`,
+							);
+						};
 				}
 			},
 		}) as SessionManagerSetupBridge;

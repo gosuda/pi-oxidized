@@ -10,7 +10,8 @@ type SessionManagerSetup = {
 	appendCustomEntry(customType: string, data?: unknown): Promise<void>;
 	appendSessionInfo(name: string): Promise<void>;
 	getSessionName(): string | undefined;
-	getEntries(): unknown;
+	getEntries(): unknown[];
+	getBranch(): never;
 };
 
 export default function replacedSessionExtension(pi: ExtensionAPI): void {
@@ -28,21 +29,19 @@ export default function replacedSessionExtension(pi: ExtensionAPI): void {
 					// sessionManager is the narrow bridge proxy.
 					report["setupReceived"] = sessionManager !== undefined;
 
-					// Supported mutations route through the bridge and await wire delivery.
-					// Neither operation fabricates the reference SessionManager entry ID.
+					report["initialEntries"] = sessionManager.getEntries();
 					await sessionManager.appendCustomEntry("setup-custom", { from: "setup" });
+					report["entriesAfterAppend"] = sessionManager.getEntries();
 					await sessionManager.appendSessionInfo("setup-session");
+					report["entriesAfterSessionInfo"] = sessionManager.getEntries();
 
-					// This is the one SessionManager getter mirrored by the host.
 					report["setupSessionName"] = sessionManager.getSessionName();
-					// Unsupported methods are on the minimal bridge surface for probe
-					// coverage but throw at runtime when invoked.
 					try {
-						sessionManager.getEntries();
+						sessionManager.getBranch();
 						report["unsupportedThrew"] = false;
 					} catch (e) {
 						report["unsupportedThrew"] = true;
-						report["unsupportedMessage"] = (e as Error).message;
+						report["unsupportedMessage"] = e instanceof Error ? e.message : String(e);
 					}
 				},
 				withSession: async (replacedCtx) => {

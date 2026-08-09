@@ -34,9 +34,9 @@ use pi_ext::protocol::{
     self, DisposeSlot, ExtensionErrorEvent, FlagValueWire, FlagsSetRequest, FlagsSetResponse,
     FrameId, NotifyRequest, ProviderEvent, SessionCommand, SessionCompactRequest,
     SessionForkRequest, SessionNavigateTreeRequest, SessionNewSessionRequest,
-    SessionSetModelRequest, SessionStateWire, SessionSwitchSessionRequest, ShortcutExecuteRequest,
-    ShortcutExecuteResponse, ThemeSet, ThemeUpdate, ToolUpdate, UiControl, UiEventRequest,
-    UiEventResponse, UiSlot, UiStateWire,
+    SessionSetModelRequest, SessionSetupEntriesRequest, SessionStateWire,
+    SessionSwitchSessionRequest, ShortcutExecuteRequest, ShortcutExecuteResponse, ThemeSet,
+    ThemeUpdate, ToolUpdate, UiControl, UiEventRequest, UiEventResponse, UiSlot, UiStateWire,
 };
 use pi_ext::sanitize::{SanitizedSlot, sanitize_slot};
 use serde::{Deserialize, Serialize};
@@ -202,6 +202,13 @@ pub enum SessionBridgeEvent {
     Reload {
         /// Host correlation id (echo into `respond_reload`).
         id: FrameId,
+    },
+    /// Correlated `session.setupEntries` request (host → Rust).
+    SetupEntries {
+        /// Host correlation id (echo into `respond_setup_entries`).
+        id: FrameId,
+        /// Setup-entries request payload.
+        request: SessionSetupEntriesRequest,
     },
     /// Host completed the command that initiated a ready-gated operation.
     ReplacementReady {
@@ -1678,6 +1685,19 @@ impl HostExtensionRunner {
         self.inner.client.respond_reload(id, outcome).await
     }
 
+    /// Answer a correlated `session.setupEntries` request from the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport error if the host has already exited.
+    pub async fn respond_setup_entries(
+        &self,
+        id: FrameId,
+        outcome: Result<protocol::SessionSetupEntriesResponse, String>,
+    ) -> Result<(), HostClientError> {
+        self.inner.client.respond_setup_entries(id, outcome).await
+    }
+
     /// Reject a ready-gated operation while another operation owns the facade slot.
     ///
     /// # Errors
@@ -2043,6 +2063,13 @@ fn spawn_event_pump(inner: Arc<Inner>) {
                 Ok(HostEvent::ReloadRequest { id }) => {
                     forward_session_bridge(&inner, SessionBridgeEvent::Reload { id }).await;
                 }
+                Ok(HostEvent::SetupEntriesRequest { id, request }) => {
+                    forward_session_bridge(
+                        &inner,
+                        SessionBridgeEvent::SetupEntries { id, request },
+                    )
+                    .await;
+                }
                 Ok(HostEvent::ReplacementReady { token }) => {
                     forward_session_bridge(&inner, SessionBridgeEvent::ReplacementReady { token })
                         .await;
@@ -2173,6 +2200,12 @@ async fn forward_session_bridge(inner: &Arc<Inner>, event: SessionBridgeEvent) {
             let _ = inner
                 .client
                 .respond_reload(id, Err("no active session".to_owned()))
+                .await;
+        }
+        Some(SessionBridgeEvent::SetupEntries { id, .. }) => {
+            let _ = inner
+                .client
+                .respond_setup_entries(id, Err("no active session".to_owned()))
                 .await;
         }
     }

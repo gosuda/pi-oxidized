@@ -386,6 +386,32 @@ function payloadOf(frame: Frame): Record<string, unknown> {
 	return frame.payload as Record<string, unknown>;
 }
 
+async function respondSetupEntries(
+	collector: FrameCollector,
+	stdin: Readable,
+	replacementToken: string,
+	snapshots: readonly (readonly unknown[])[],
+): Promise<void> {
+	const seen = new Set<Frame["id"]>();
+	for (const entries of snapshots) {
+		const request = await collector.awaitFrame(
+			(frame) =>
+				frame.kind === "req"
+				&& frame.method === "session.setupEntries"
+				&& !seen.has(frame.id),
+			"session.setupEntries req",
+		);
+		seen.add(request.id);
+		expect(payloadOf(request)["replacementToken"]).toBe(replacementToken);
+		push(stdin, {
+			id: request.id,
+			kind: "res",
+			method: "session.setupEntries",
+			payload: { entries },
+		});
+	}
+}
+
 describe("host: command context + mirrored session state", () => {
 	test("getContextUsage and scopedModels round-trip from session.update", async () => {
 		const connected = await connectHost([commandContextFactory]);
@@ -531,10 +557,15 @@ class FailingOnSessionCommand extends FrameCollector {
 }
 
 describe("host: newSession setup + withSession + ReplacedSessionContext", () => {
-	function sessionUpdate(stdin: Readable, idle: boolean): void {
+	function sessionUpdate(
+		stdin: Readable,
+		idle: boolean,
+		sessionName?: string,
+	): void {
 		push(stdin, {
 			id: 0, kind: "event", method: "session.update",
 			payload: {
+				sessionName,
 				thinkingLevel: "medium",
 				activeTools: [],
 				allTools: [],
@@ -554,15 +585,31 @@ describe("host: newSession setup + withSession + ReplacedSessionContext", () => 
 
 		sessionUpdate(stdin, true);
 
-		// Respond to session.newSession with cancelled:false so setup + withSession run.
-		void collector
-			.awaitFrame((f) => f.kind === "req" && f.method === "session.newSession", "session.newSession req")
-			.then((request) => {
-				push(stdin, {
-					id: request.id, kind: "res", method: "session.newSession",
-					payload: { cancelled: false },
-				});
+		const initialEntry = { type: "message", id: "initial" };
+		const customEntry = { type: "custom", id: "custom" };
+		const sessionInfoEntry = {
+			type: "session_info",
+			id: "session-info",
+			name: "setup-session",
+		};
+
+		const setupResponses = (async () => {
+			const request = await collector.awaitFrame(
+				(f) => f.kind === "req" && f.method === "session.newSession",
+				"session.newSession req",
+			);
+			push(stdin, {
+				id: request.id,
+				kind: "res",
+				method: "session.newSession",
+				payload: { cancelled: false, replacementToken: "tok-setup-1" },
 			});
+			await respondSetupEntries(collector, stdin, "tok-setup-1", [
+				[initialEntry],
+				[initialEntry, customEntry],
+				[initialEntry, customEntry, sessionInfoEntry],
+			]);
+		})();
 
 		push(stdin, {
 			id: 50, kind: "req", method: "command.execute",
@@ -571,6 +618,7 @@ describe("host: newSession setup + withSession + ReplacedSessionContext", () => 
 
 		const notify = await collector.awaitFrame((f) => f.method === "notify", "notify");
 		await collector.awaitFrame((f) => f.id === 50 && f.kind === "res", "res 50");
+		await setupResponses;
 
 		const report = JSON.parse(String(payloadOf(notify)["message"])) as Record<string, unknown>;
 		expect(report["setupOrder"]).toEqual(["setup", "withSession"]);
@@ -584,6 +632,13 @@ describe("host: newSession setup + withSession + ReplacedSessionContext", () => 
 		expect(String(report["unsupportedMessage"])).toContain("is not supported");
 		// appendSessionInfo updates the one mirrored SessionManager getter.
 		expect(report["setupSessionName"]).toBe("setup-session");
+		expect(report["initialEntries"]).toEqual([initialEntry]);
+		expect(report["entriesAfterAppend"]).toEqual([initialEntry, customEntry]);
+		expect(report["entriesAfterSessionInfo"]).toEqual([
+			initialEntry,
+			customEntry,
+			sessionInfoEntry,
+		]);
 		// withSession sends awaited the wire write to completion.
 		expect(report["withSessionSendsDone"]).toBe(true);
 
@@ -645,6 +700,105 @@ describe("host: newSession setup + withSession + ReplacedSessionContext", () => 
 		await teardown(connected);
 	});
 
+
+	test("failed setup-name refresh leaves the active session mirror unchanged", async () => {
+		let setupRejected = false;
+		const setupNameFactory: ExtensionFactory = (pi) => {
+			pi.registerCommand("failSetupName", {
+				description: "Fail a pending setup name refresh",
+				async handler(_args, ctx) {
+					try {
+						await ctx.newSession({
+							setup: async (manager) => {
+								await manager.appendSessionInfo("pending-name");
+							},
+						});
+					} catch {
+						setupRejected = true;
+					}
+				},
+			});
+			pi.registerCommand("readActiveName", {
+				description: "Read the active session name",
+				handler(_args, ctx) {
+					ctx.ui.notify(String(pi.getSessionName()), "info");
+				},
+			});
+		};
+		const connected = await connectHost([setupNameFactory]);
+		const { collector, stdin } = connected;
+		sessionUpdate(stdin, true, "active-name");
+
+		const setupResponses = (async () => {
+			const replacement = await collector.awaitFrame(
+				(f) => f.kind === "req" && f.method === "session.newSession",
+				"session.newSession req",
+			);
+			push(stdin, {
+				id: replacement.id,
+				kind: "res",
+				method: "session.newSession",
+				payload: { cancelled: false, replacementToken: "tok-name-failure" },
+			});
+			const seed = await collector.awaitFrame(
+				(f) => f.kind === "req" && f.method === "session.setupEntries",
+				"session.setupEntries seed",
+			);
+			push(stdin, {
+				id: seed.id,
+				kind: "res",
+				method: "session.setupEntries",
+				payload: { entries: [] },
+			});
+			await collector.awaitFrame(
+				(f) =>
+					f.kind === "event"
+					&& f.method === "session.command"
+					&& payloadOf(f)["action"] === "setSessionName",
+				"setSessionName command",
+			);
+			const refresh = await collector.awaitFrame(
+				(f) =>
+					f.kind === "req"
+					&& f.method === "session.setupEntries"
+					&& f.id !== seed.id,
+				"session.setupEntries refresh",
+			);
+			push(stdin, {
+				id: refresh.id,
+				kind: "error",
+				method: "session.setupEntries",
+				payload: {
+					code: "stale_replacement_token",
+					message: "stale replacement token",
+					retryable: false,
+				},
+			});
+		})();
+
+		push(stdin, {
+			id: 55,
+			kind: "req",
+			method: "command.execute",
+			payload: { command: "failSetupName", args: "" },
+		});
+		await collector.awaitFrame((f) => f.id === 55 && f.kind === "res", "res 55");
+		await setupResponses;
+		expect(setupRejected).toBe(true);
+
+		push(stdin, {
+			id: 56,
+			kind: "req",
+			method: "command.execute",
+			payload: { command: "readActiveName", args: "" },
+		});
+		const notify = await collector.awaitFrame(
+			(f) => f.kind === "event" && f.method === "notify",
+			"active session name",
+		);
+		expect(payloadOf(notify)["message"]).toBe("active-name");
+		await teardown(connected);
+	});
 	test("newSession: setup and withSession do NOT run when replacement is cancelled", async () => {
 		const connected = await connectHost([replacedSessionFactory]);
 		const { collector, stdin } = connected;
@@ -681,14 +835,19 @@ describe("host: newSession setup + withSession + ReplacedSessionContext", () => 
 
 		sessionUpdate(stdin, true);
 
-		void collector
-			.awaitFrame((f) => f.kind === "req" && f.method === "session.newSession", "session.newSession req")
-			.then((request) => {
-				push(stdin, {
-					id: request.id, kind: "res", method: "session.newSession",
-					payload: { cancelled: false },
-				});
+		const setupResponses = (async () => {
+			const request = await collector.awaitFrame(
+				(f) => f.kind === "req" && f.method === "session.newSession",
+				"session.newSession req",
+			);
+			push(stdin, {
+				id: request.id,
+				kind: "res",
+				method: "session.newSession",
+				payload: { cancelled: false, replacementToken: "tok-setup-2" },
 			});
+			await respondSetupEntries(collector, stdin, "tok-setup-2", [[], [], []]);
+		})();
 
 		push(stdin, {
 			id: 52, kind: "req", method: "command.execute",
@@ -699,6 +858,7 @@ describe("host: newSession setup + withSession + ReplacedSessionContext", () => 
 		// have fired session.command events through the bridge.
 		await collector.awaitFrame((f) => f.method === "notify", "notify");
 		await collector.awaitFrame((f) => f.id === 52 && f.kind === "res", "res 52");
+		await setupResponses;
 
 		const sendMessageFrame = collector.frames.find(
 			(f) =>
@@ -749,14 +909,20 @@ describe("host: newSession setup + withSession + ReplacedSessionContext", () => 
 			await stdout.awaitFrame((f) => f.id === 1 && f.kind === "res", "res 1");
 			sessionUpdate(stdin, true);
 
-			void stdout
-				.awaitFrame((f) => f.kind === "req" && f.method === "session.newSession", "session.newSession req")
-				.then((request) => {
-					push(stdin, {
-						id: request.id, kind: "res", method: "session.newSession",
-						payload: { cancelled: false },
-					});
+			const replacementToken = `tok-fail-${requestId}`;
+			const setupResponses = (async () => {
+				const request = await stdout.awaitFrame(
+					(f) => f.kind === "req" && f.method === "session.newSession",
+					"session.newSession req",
+				);
+				push(stdin, {
+					id: request.id,
+					kind: "res",
+					method: "session.newSession",
+					payload: { cancelled: false, replacementToken },
 				});
+				await respondSetupEntries(stdout, stdin, replacementToken, [[], [], []]);
+			})();
 
 			// Setup's appendEntry succeeds; fail the selected actual
 			// ReplacedSessionContext helper write instead.
@@ -770,6 +936,7 @@ describe("host: newSession setup + withSession + ReplacedSessionContext", () => 
 				(f) => f.id === requestId && f.kind === "error",
 				"error requestId",
 			);
+			await setupResponses;
 			const errPayload = payloadOf(errorRes);
 			expect(stdout.failedAction).toBe(failedAction);
 			expect(errPayload["code"]).toBeDefined();
@@ -1239,13 +1406,24 @@ describe("host: per-command replacement staleness", () => {
 		const { collector, stdin } = connected;
 		setIdle(stdin);
 
-		void collector.awaitFrame((frame) => frame.kind === "req" && frame.method === "session.newSession", "session.newSession req")
-			.then((request) => {
-				push(stdin, {
-					id: request.id, kind: "res", method: "session.newSession",
-					payload: { cancelled: false, replacementToken: "fresh-context-token" },
-				});
+		const setupResponses = (async () => {
+			const request = await collector.awaitFrame(
+				(frame) => frame.kind === "req" && frame.method === "session.newSession",
+				"session.newSession req",
+			);
+			push(stdin, {
+				id: request.id,
+				kind: "res",
+				method: "session.newSession",
+				payload: { cancelled: false, replacementToken: "fresh-context-token" },
 			});
+			await respondSetupEntries(
+				collector,
+				stdin,
+				"fresh-context-token",
+				[[], [{ type: "session_info", id: "session-info" }]],
+			);
+		})();
 		push(stdin, {
 			id: 120, kind: "req", method: "command.execute",
 			payload: { command: "withSessionUsesFreshContext", args: "" },
@@ -1256,6 +1434,7 @@ describe("host: per-command replacement staleness", () => {
 			(frame) => frame.kind === "event" && frame.method === "session.replacementReady",
 			"session.replacementReady",
 		);
+		await setupResponses;
 		const sessionCommands = collector.frames.filter(
 			(frame) => frame.kind === "event" && frame.method === "session.command",
 		);
@@ -1507,14 +1686,19 @@ describe("host: SessionManager proxy is not a thenable", () => {
 			},
 		});
 
-		void collector
-			.awaitFrame((f) => f.kind === "req" && f.method === "session.newSession", "session.newSession req")
-			.then((request) => {
-				push(stdin, {
-					id: request.id, kind: "res", method: "session.newSession",
-					payload: { cancelled: false, replacementToken: "tok-proxy-1" },
-				});
+		const setupResponses = (async () => {
+			const request = await collector.awaitFrame(
+				(f) => f.kind === "req" && f.method === "session.newSession",
+				"session.newSession req",
+			);
+			push(stdin, {
+				id: request.id,
+				kind: "res",
+				method: "session.newSession",
+				payload: { cancelled: false, replacementToken: "tok-proxy-1" },
 			});
+			await respondSetupEntries(collector, stdin, "tok-proxy-1", [[]]);
+		})();
 
 		push(stdin, {
 			id: 230, kind: "req", method: "command.execute",
@@ -1523,6 +1707,7 @@ describe("host: SessionManager proxy is not a thenable", () => {
 
 		const notify = await collector.awaitFrame((f) => f.method === "notify", "notify");
 		await collector.awaitFrame((f) => f.id === 230 && f.kind === "res", "res 230");
+		await setupResponses;
 
 		const report = JSON.parse(String(payloadOf(notify)["message"])) as Record<string, unknown>;
 		expect(report["setupRan"]).toBe(true);
