@@ -1,4 +1,4 @@
-import { encodeFrame, errorFrame, FrameDecoder, requestFrame, responseFrame, } from "./codec.js";
+import { encodeFrame, FrameDecoder, } from "./codec.js";
 /**
  * Request/correlation client over injected readable/writable streams.
  *
@@ -59,7 +59,7 @@ export class ProtocolClient {
     async request(method, payload = {}, options) {
         this.ensureOpen();
         const id = this.allocateId();
-        const frame = requestFrame(id, method, payload);
+        const frame = { id, kind: "req", method, payload };
         return await this.requestWithFrame(frame, options);
     }
     /**
@@ -131,11 +131,19 @@ export class ProtocolClient {
     }
     /** Convenience: respond to a request. */
     async respond(id, method, payload = {}) {
-        await this.send(responseFrame(id, method, payload));
+        await this.send({ id, kind: "res", method, payload });
     }
     /** Convenience: send a correlated error frame. */
     async respondError(id, method, error) {
-        await this.send(errorFrame(id, method, error));
+        const errorPayload = {
+            code: error.code,
+            message: error.message,
+            retryable: error.retryable ?? false,
+        };
+        if (error.data !== undefined) {
+            errorPayload.data = error.data;
+        }
+        await this.send({ id, kind: "error", method, payload: errorPayload });
     }
     /**
      * Inject a decoded inbound frame (tests / custom pumps).

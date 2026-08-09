@@ -41,6 +41,23 @@ describe("constants", () => {
 			expect(decodeFrameStrStrict(encodeFrameString(frame).trimEnd())).toEqual(frame);
 		}
 	});
+
+	test("session.* open methods are rejected by strict decoding (Rust Method::parse parity)", () => {
+		// Rust treats session.* as open method strings (const &str), not Method
+		// enum variants — Method::parse returns None for them, so strict decoding
+		// (decode_frame_str_strict) rejects them. TypeScript must match.
+		const sessionMethods = [
+			"session.newSession", "session.fork", "session.navigateTree",
+			"session.switchSession", "session.reload", "session.replacementReady",
+		] as const;
+		for (const method of sessionMethods) {
+			expect(METHODS).not.toContain(method);
+			expect(isMethod(method)).toBe(false);
+			const line = JSON.stringify({ id: 1, kind: "req", method, payload: {} });
+			expect(decodeFrameStr(line).method).toBe(method);
+			expect(() => decodeFrameStrStrict(line)).toThrow(ProtocolError);
+		}
+	});
 });
 
 describe("encode/decode", () => {

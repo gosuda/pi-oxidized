@@ -39,13 +39,7 @@ export type Method =
 	| "shortcut.execute"
 	| "uiEvent"
 	| "measure"
-	| "render"
-	| "session.newSession"
-	| "session.fork"
-	| "session.navigateTree"
-	| "session.switchSession"
-	| "session.reload"
-	| "session.replacementReady";
+	| "render";
 
 /** All allowlisted methods in stable order. */
 export const METHODS: readonly Method[] = [
@@ -66,12 +60,6 @@ export const METHODS: readonly Method[] = [
 	"uiEvent",
 	"measure",
 	"render",
-	"session.newSession",
-	"session.fork",
-	"session.navigateTree",
-	"session.switchSession",
-	"session.reload",
-	"session.replacementReady",
 ] as const;
 
 const METHOD_SET: ReadonlySet<string> = new Set(METHODS);

@@ -30,12 +30,6 @@ export const METHODS = [
     "uiEvent",
     "measure",
     "render",
-    "session.newSession",
-    "session.fork",
-    "session.navigateTree",
-    "session.switchSession",
-    "session.reload",
-    "session.replacementReady",
 ];
 const METHOD_SET = new Set(METHODS);
 /** Returns true when `raw` is an allowlisted method. */
