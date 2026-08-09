@@ -80,7 +80,19 @@ impl FileLockBackend {
     #[must_use]
     pub fn new(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
-        let effective_path = canonical_lock_target(&path).unwrap_or_else(|_| path.clone());
+        let effective_path = match canonical_lock_target(&path) {
+            Ok(p) => p,
+            Err(err) => {
+                let msg = err.to_string();
+                if msg.contains("ELOOP") || msg.contains("Failed to inspect") {
+                    panic!(
+                        "auth storage symlink resolution failed for {}: {msg}",
+                        path.display()
+                    );
+                }
+                path.clone()
+            }
+        };
         Self {
             path,
             effective_path,
@@ -1650,5 +1662,17 @@ mod tests {
             "self-loop error should mention ELOOP, got {err:?}"
         );
         Ok(())
+    }
+    #[test]
+    #[cfg(unix)]
+    #[should_panic(expected = "ELOOP")]
+    fn file_lock_backend_new_panics_on_symlink_cycle() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.json");
+        let b = dir.path().join("b.json");
+        symlink("b.json", &a).unwrap();
+        symlink("a.json", &b).unwrap();
+        let _ = FileLockBackend::new(&a);
     }
 }
