@@ -428,7 +428,7 @@ describe("lean: extensions.load registry", () => {
 		}
 	});
 
-	test("rejects createRequire and node:module loader bypasses before evaluation", async () => {
+	test("rejects createRequire and node:module as unsupported loader forms before evaluation", async () => {
 		const directory = await mkdtemp(join(PACKAGE_DIR, ".test-lean-create-require-"));
 		const createRequireEntry = join(directory, "create-require.mjs");
 		const nodeModuleEntry = join(directory, "node-module.mjs");
@@ -474,8 +474,8 @@ describe("lean: extensions.load registry", () => {
 			// an unsupported loader form before evaluation.
 			expect(errors.get(bareCreateRequireEntry)).toContain("unsupported createRequire loader");
 			// A member-read createRequire alias (`const r = m.createRequire`)
-			// fails closed as well: the loader name is rejected on ANY
-			// appearance, so the aliased binding is never invoked.
+			// is rejected by the static scan as well: the loader name is
+			// rejected on ANY appearance, so the aliased binding is never invoked.
 			expect(errors.get(memberCreateRequireEntry)).toContain("unsupported createRequire loader");
 			expect(holder["__leanCreateRequireEvaluated"]).toBeUndefined();
 			expect(holder["__leanNodeModuleEvaluated"]).toBeUndefined();
@@ -490,7 +490,7 @@ describe("lean: extensions.load registry", () => {
 			await rm(directory, { recursive: true, force: true });
 		}
 	});
-	test("rejects getBuiltinModule loader bypasses before evaluation", async () => {
+	test("rejects getBuiltinModule as an unsupported loader form before evaluation", async () => {
 		const directory = await mkdtemp(join(PACKAGE_DIR, ".test-lean-get-builtin-module-"));
 		const bareEntry = join(directory, "get-builtin-module.mjs");
 		const aliasedEntry = join(directory, "aliased-get-builtin-module.mjs");
@@ -543,10 +543,10 @@ describe("lean: extensions.load registry", () => {
 					(error) => [error.path, error.error],
 				),
 			);
-			// EVERY appearance of the loader name fails closed before
-			// evaluation: bare call, destructured binding, Unicode-escaped
-			// spelling, member call, member-read alias invoked through a local
-			// binding, and computed string key.
+			// EVERY appearance of the loader name is rejected by the static
+			// scan before evaluation: bare call, destructured binding,
+			// Unicode-escaped spelling, member call, member-read alias invoked
+			// through a local binding, and computed string key.
 			expect(errors.get(bareEntry)).toContain("unsupported getBuiltinModule loader");
 			expect(errors.get(aliasedEntry)).toContain("unsupported getBuiltinModule loader");
 			expect(errors.get(escapedEntry)).toContain("unsupported getBuiltinModule loader");
@@ -645,7 +645,7 @@ describe("lean: extensions.load registry", () => {
 					(error) => [error.path, error.error],
 				),
 			);
-			// Every bare-require alias form fails closed before evaluation.
+			// Every bare-require alias form is rejected by the static scan before evaluation.
 			expect(errors.get(aliasEntry)).toContain("unsupported bare require read");
 			expect(errors.get(destructuredEntry)).toContain("unsupported bare require read");
 			expect(errors.get(escapedEntry)).toContain("unsupported bare require read");
@@ -2359,7 +2359,7 @@ describe("lean: surface validation units", () => {
 			// Dynamic import and side-effect import (spaced and minified).
 			['const m = await import("jiti");', "jiti"],
 			['import "./host.ts";', "./host.ts"],
-			// node:module loader factory is excluded: createRequire bypasses the graph.
+			// node:module loader factory is excluded: createRequire is an unsupported loader form.
 			['import { createRequire } from "node:module";', "node:module"],
 			['import "module";', "module"],
 			['import { createRequire } from "node:module"; const load = createRequire(import.meta.url);', "node:module"],
@@ -2444,6 +2444,7 @@ describe("lean: surface validation units", () => {
 	test("findExcludedImport advances through an unterminated braced Unicode escape", () => {
 		expect(findExcludedImport('import "j\\u{";')).toBeUndefined();
 	});
+
 
 	test("parseStreamingJson tolerates truncated streams", () => {
 		expect(parseStreamingJson('{"a":1,"b":[true,"x"]}')).toEqual({ a: 1, b: [true, "x"] });

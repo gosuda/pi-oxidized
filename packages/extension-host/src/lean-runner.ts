@@ -9,6 +9,15 @@
  * (`lean-api.ts`). Unknown/unsupported module surfaces become per-extension
  * load errors; the runner itself stays up.
  *
+ * IMPORTANT: lean extensions are trusted code. The pre-import lexical scan
+ * is a static validation that catches accidental unsupported module-loading
+ * forms (e.g. `require`, `createRequire`, `getBuiltinModule`). It is NOT a
+ * security sandbox or a runtime boundary: a determined extension can always
+ * reconstruct an equivalent loader at runtime using `eval`, `Function`,
+ * computed property access, or string assembly. We do not try to enumerate
+ * every bypassable spelling because that would still be bypassable and would
+ * misrepresent the trust model.
+ *
  * Wire parity with Mode 1 (`host.ts`): identical method names, payload
  * shapes, registry snapshot (RegistrySnapshotWire-compatible), error codes,
  * and hook response shaping. The only intentional deviation is the hello
@@ -92,23 +101,24 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 
 /**
- * Import specifiers a lean entry must never reference. Lean entries are
- * prebundled, so ANY upstream-compat specifier means the entry was built
- * for the wrong mode. `@earendil-works/pi-tui-protocol` stays legal: it is
- * the shared wire package, not the upstream runtime graph. `node:module`
- * (and the bare `module` builtin) is excluded too: `createRequire` produces
- * a loader whose string argument is not a recognized import form, so it
- * could otherwise bypass the excluded-module graph.
+ * Import specifiers that mark a lean entry as accidentally built for
+ * the wrong mode. Lean entries are prebundled, so any upstream-compat
+ * specifier is a build mistake, not a security signal. `@earendil-works/pi-tui-protocol`
+ * stays legal: it is the shared wire package, not the upstream runtime graph.
+ * `node:module` (and the bare `module` builtin) is excluded because the
+ * `createRequire` factory is not the literal ESM import form the lean API
+ * expects. This is a static compatibility check, not a sandbox.
  */
 const EXCLUDED_SPECIFIER = /^(?:@earendil-works\/(?:pi-coding-agent|pi-agent-core|pi-ai(?:\/|$)|pi-tui(?!-protocol))|@mariozechner\/|jiti(?:\/|$)|@sinclair\/typebox(?:\/|$)|typebox(?:\/|$)|(?:node:)?module$|.*\/(?:host|virtual-modules)\.ts$)/;
 
 /**
- * Builtin loader factories whose string argument never appears as a scanned
- * import form, so any appearance — bare, member-read, computed-key, aliased,
- * or escape-cooked — fails closed. `createRequire`/`getBuiltinModule` hand
- * back a loader for the excluded graph; proving that one particular read is
- * an innocent same-named property would take a full parser, and a false
- * positive only costs the entry its load, never its isolation.
+ * Builtin loader factory names that the static scan treats as accidental
+ * unsupported module-loading forms. Any lexical appearance — bare, member-read,
+ * computed-key, aliased, or escape-cooked — is rejected because the scan
+ * cannot follow the value through an aliased local binding. This is an
+ * over-approximate, pre-evaluation check, not a security boundary: trusted
+ * extension code can always recover equivalent loading at runtime through
+ * `eval`, `Function`, or dynamic property access.
  */
 const LOADER_NAMES: ReadonlySet<string> = new Set(["createRequire", "getBuiltinModule"]);
 
@@ -634,12 +644,13 @@ function scanModuleLoads(source: string): ModuleLoadScan {
 		if (char === '"' || char === "'") {
 			// A string directly after `[` is a computed member key, so a
 			// loader name there (`process["getBuiltinModule"]`) is the same
-			// bypass as the dotted member read. `require` is the same class
-			// of alias when read through a computed key (`module["require"]`):
-			// the value is later invoked through an innocent local binding the
-			// scan cannot trace. Array-literal elements share the `[`-prefix
-			// shape and fail closed with it: a lexically scoped pre-scan
-			// cannot separate the two without a full parser.
+			// unsupported loader alias as a dotted member read. `require` is
+			// the same class of alias when read through a computed key
+			// (`module["require"]`): the value may later be invoked through an
+			// aliased local binding the scan cannot follow, so the static check
+			// conservatively rejects the same spelling. Array-literal elements
+			// share the `[`-prefix shape and are rejected with it: a lexical
+			// pre-scan cannot separate the two without a full parser.
 			if (lastSignificant?.kind === "punctuator" && lastSignificant.value === "[") {
 				const end = skipString(index, char);
 				if (source[end - 1] === char) {
@@ -695,9 +706,8 @@ function scanModuleLoads(source: string): ModuleLoadScan {
 		const preceded = lastSignificant;
 		recordWord(word, preceded);
 		const isMember = preceded?.kind === "punctuator" && MEMBER_PUNCTUATORS[preceded.value] === true;
-		// Bun exposes bare `require` in ESM. Keep this check lexical and
-		// fail closed: proving a shadowed binding would require a full parser.
-		// A `require` preceded by a declaration keyword (`const require = …`,
+		// Bun exposes bare `require` in ESM. This check stays lexical: a
+		// `require` preceded by a declaration keyword (`const require = …`,
 		// `let require;`, `var require;`, `class require {}`) is a binding
 		// site that shadows the global, not a read; a lexical scan cannot
 		// prove shadowing, so those are left alone. A `require` followed by
@@ -706,8 +716,8 @@ function scanModuleLoads(source: string): ModuleLoadScan {
 		// bare read — alias assignment (`const r = require`), destructured/
 		// renamed binding (`const { require } = …`, `const { require: r } =
 		// …`), or escape-cooked spelling — and the aliased value is later
-		// invoked through an innocent local binding the scan cannot trace,
-		// the same bypass class as an aliased loader factory.
+		// invoked through an aliased local binding the scan cannot follow,
+		// the same unsupported loader alias as an aliased loader factory.
 		if (word === "require" && !isMember) {
 			const next = skipInsignificant(index);
 			if (source[next] === "(") {
@@ -730,14 +740,15 @@ function scanModuleLoads(source: string): ModuleLoadScan {
 			}
 			continue;
 		}
-		// `createRequire` (from `node:module`) and `getBuiltinModule` produce
-		// loaders whose string argument is not a recognized import form, so
-		// either one can load the excluded compat graph without recording a
-		// specifier. Fail closed on ANY appearance of the name — bare call,
-		// bare read, member read or call (`process.getBuiltinModule`),
-		// aliasing read (`const g = process.getBuiltinModule`), private name,
-		// or escape-cooked spelling — because the aliased value is invoked
-		// through an innocent-looking local binding the scan cannot trace.
+		// `createRequire` (from `node:module`) and `getBuiltinModule` are
+		// loader factories whose string argument is not a recognized import
+		// form. The static scan rejects any lexical use of these names because
+		// it cannot follow the resulting loader through an aliased local
+		// binding. This is NOT a sandbox guarantee: a determined, trusted
+		// extension can reconstruct an equivalent loader at runtime with
+		// `eval("require")` or `process["get" + "BuiltinModule"]`, and the
+		// scan only catches the common accidental unsupported form before
+		// evaluation.
 		if (LOADER_NAMES.has(word)) {
 			unsupported ??= `${word} loader`;
 			continue;
@@ -834,7 +845,12 @@ type ModuleLoadViolation =
 	| { kind: "excluded"; specifier: string }
 	| { kind: "unsupported"; form: string };
 
-/** Walk every local dependency whose module-loading form is statically provable. */
+/**
+ * Walk every local dependency whose module-loading form is statically provable.
+ * Lean extension code is trusted once evaluated; this pre-evaluation
+ * compatibility check catches accidental unsupported module-loading forms.
+ * It is not a runtime sandbox.
+ */
 async function findModuleLoadViolationInGraph(entry: string): Promise<ModuleLoadViolation | undefined> {
 	const pending = [entry];
 	const visited = new Set<string>();
