@@ -467,16 +467,11 @@ pub fn apply_edits_to_normalized_content(
     })
 }
 
-fn split_lines_keep_trailing_empty(content: &str) -> Vec<&str> {
-    content.split('\n').collect()
-}
-
-fn split_patch_lines(content: &str) -> Vec<&str> {
+fn split_display_lines(content: &str) -> Vec<&str> {
     if content.is_empty() {
-        Vec::new()
-    } else {
-        content.split_terminator('\n').collect()
+        return Vec::new();
     }
+    content.split_inclusive('\n').collect()
 }
 
 #[derive(Clone, Debug)]
@@ -500,8 +495,8 @@ impl PatchLine {
 }
 
 fn patch_lines(old_content: &str, new_content: &str) -> Vec<PatchLine> {
-    let old_lines = split_patch_lines(old_content);
-    let new_lines = split_patch_lines(new_content);
+    let old_lines = split_display_lines(old_content);
+    let new_lines = split_display_lines(new_content);
     let lcs = longest_common_subsequence(&old_lines, &new_lines);
     let mut ops = Vec::new();
     let mut old_index = 0;
@@ -641,8 +636,11 @@ pub fn generate_unified_patch(
         out.push_str(" @@\n");
         for line in &lines[start..end] {
             out.push(line.prefix);
-            out.push_str(&line.text);
+            out.push_str(line.text.strip_suffix('\n').unwrap_or(&line.text));
             out.push('\n');
+            if !line.text.ends_with('\n') {
+                out.push_str("\\ No newline at end of file\n");
+            }
         }
     }
     out
@@ -655,14 +653,8 @@ pub fn generate_diff_string(
     new_content: &str,
     context_lines: usize,
 ) -> DiffStringResult {
-    let mut old_lines = split_lines_keep_trailing_empty(old_content);
-    let mut new_lines = split_lines_keep_trailing_empty(new_content);
-    if old_lines.last() == Some(&"") {
-        old_lines.pop();
-    }
-    if new_lines.last() == Some(&"") {
-        new_lines.pop();
-    }
+    let old_lines = split_display_lines(old_content);
+    let new_lines = split_display_lines(new_content);
     let line_num_width = old_lines
         .len()
         .max(new_lines.len())
@@ -727,13 +719,14 @@ impl DiffRenderState {
     }
 
     fn push_numbered(&mut self, prefix: char, line: &str, width: usize) {
+        let visible = line.strip_suffix('\n').unwrap_or(line);
         let line_num = if prefix == '+' {
             self.new_line_num
         } else {
             self.old_line_num
         };
         self.output
-            .push(format!("{prefix}{line_num:>width$} {line}"));
+            .push(format!("{prefix}{line_num:>width$} {visible}"));
     }
 
     fn advance_both(&mut self, count: usize) {
@@ -1216,6 +1209,21 @@ mod tests {
     }
 
     #[test]
+    fn unified_patch_preserves_eof_newline_change() {
+        let added = generate_unified_patch("a.txt", "verification", "verification\n", 4);
+        assert_eq!(
+            added,
+            "--- a.txt\n+++ a.txt\n@@ -1,1 +1,1 @@\n-verification\n\\ No newline at end of file\n+verification\n"
+        );
+
+        let removed = generate_unified_patch("a.txt", "verification\n", "verification", 4);
+        assert_eq!(
+            removed,
+            "--- a.txt\n+++ a.txt\n@@ -1,1 +1,1 @@\n-verification\n+verification\n\\ No newline at end of file\n"
+        );
+    }
+
+    #[test]
     fn display_diff_marks_first_changed_line() {
         let result = generate_diff_string("a\nb\nc\n", "a\nB\nc\n", 4);
         assert_eq!(result.first_changed_line, Some(2));
@@ -1230,10 +1238,9 @@ mod tests {
 
     #[test]
     fn display_diff_line_number_width_excludes_trailing_empty() {
-        // Nine newline-terminated lines: split_lines_keep_trailing_empty
-        // yields 10 elements (trailing ""), but only 9 render.  The width
-        // must be computed from the 9 rendered lines so single-digit line
-        // numbers are not padded to width 2.
+        // Nine newline-terminated lines: split_display_lines yields one
+        // borrowed token per line, so the width is computed from the 9 logical
+        // lines and single-digit line numbers are not padded to width 2.
         let old = "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\n";
         let new = old.replace("line 5\n", "LINE 5\n");
         let result = generate_diff_string(old, &new, 4);
@@ -1253,5 +1260,19 @@ mod tests {
             "line 5 was padded to width 2:\n{}",
             result.diff
         );
+    }
+    #[test]
+    fn display_diff_preserves_eof_newline_change() {
+        for (old, new) in [
+            ("verification", "verification\n"),
+            ("verification\n", "verification"),
+        ] {
+            let result = generate_diff_string(old, new, 4);
+            assert_eq!(
+                result.diff, "-1 verification\n+1 verification",
+                "old={old:?}, new={new:?}"
+            );
+            assert_eq!(result.first_changed_line, Some(1));
+        }
     }
 }
