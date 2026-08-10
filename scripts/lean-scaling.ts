@@ -176,7 +176,7 @@ function diagnosticSnippet(text: string, maxChars: number): string {
 }
 
 export interface HostSpec {
-	/** Working directory for `bun` (packages/extension-host, so bunfig applies). */
+	/** Working directory for `bun` (packages/extension-host, so its tsconfig applies). */
 	hostCwd: string;
 	/** Host entry relative to hostCwd ("src/main.ts"). */
 	hostEntry: string;

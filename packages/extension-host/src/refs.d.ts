@@ -3,8 +3,8 @@
  *
  * Isolates the compiler from reference `.ts` source (which has pre-existing
  * type errors in proxy.ts and syntax-highlight.ts). At runtime, Bun resolves
- * the real source via `bunfig.toml` resolver paths; the bridge is validated
- * through tests.
+ * the real source through relative `tsconfig` path mappings; tests validate
+ * the bridge.
  */
 
 declare module "@earendil-works/pi-coding-agent" {
@@ -741,7 +741,7 @@ declare module "@earendil-works/pi-coding-agent/builtins" {
 }
 
 // Opaque bundles passed straight to jiti virtualModules (no typed surface
-// needed host-side); runtime resolution comes from bunfig.toml.
+// needed host-side); runtime resolution follows the `tsconfig` path mappings.
 declare module "pi-coding-agent-full";
 declare module "@earendil-works/pi-agent-core";
 declare module "@earendil-works/pi-tui";

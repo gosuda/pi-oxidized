@@ -17,10 +17,10 @@ import { createJiti, type Jiti } from "jiti/static";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 // Static imports so Bun bundles these into the compiled binary, matching the
-// reference loader's VIRTUAL_MODULES. The bunfig resolver maps the pi-*
-// specifiers to reference source; `pi-coding-agent-full` maps to the
-// coding-agent FULL package index (the org-scoped specifier resolves to the
-// extensions subset the host itself consumes).
+// reference loader's VIRTUAL_MODULES. The host tsconfig maps the pi-* specifiers
+// to reference source; `pi-coding-agent-full` maps to the coding-agent FULL
+// package index (the org-scoped specifier resolves to the extensions subset the
+// host itself consumes).
 import * as _bundledPiAgentCore from "@earendil-works/pi-agent-core";
 import * as _bundledPiAiCompat from "@earendil-works/pi-ai/compat";
 import * as _bundledPiAiOauth from "@earendil-works/pi-ai/oauth";
