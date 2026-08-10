@@ -1454,6 +1454,21 @@ pub enum SessionCommand {
     Shutdown,
 }
 
+/// `session.command` event payload with optional pending-replacement scope.
+///
+/// Flattening preserves the original command object when no token is present;
+/// candidate-session commands add only `replacementToken`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionCommandEnvelope {
+    /// Token identifying the pending replacement session, when scoped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement_token: Option<String>,
+    /// Existing flat `action`-tagged session command.
+    #[serde(flatten)]
+    pub command: SessionCommand,
+}
+
 /// Open method string: correlated `ctx.compact` request (host → Rust). The
 /// response carries the serialized `CompactionResult`; failures arrive as a
 /// protocol error frame (upstream delivers them to `onError`).
@@ -1512,6 +1527,9 @@ pub const SESSION_SETUP_ENTRIES_METHOD: &str = "session.setupEntries";
 
 /// Open method string: host → Rust ready event after a replacement settles.
 pub const SESSION_REPLACEMENT_READY_METHOD: &str = "session.replacementReady";
+
+/// Open method string: host → Rust abort event for an abandoned replacement.
+pub const SESSION_REPLACEMENT_ABORT_METHOD: &str = "session.replacementAbort";
 
 /// Fork cut position relative to the target entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1662,6 +1680,14 @@ pub struct SessionSetupEntriesResponse {
 #[serde(rename_all = "camelCase")]
 pub struct SessionReplacementReadyEvent {
     /// Token previously returned on a replacement response.
+    pub token: String,
+}
+
+/// `session.replacementAbort` event payload (host → Rust).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionReplacementAbortEvent {
+    /// Token for the pending replacement that must be aborted.
     pub token: String,
 }
 
@@ -2488,7 +2514,7 @@ mod bridge_tests {
                     from_payload::<SessionStateWire>(&frame.payload)?;
                 }
                 SESSION_COMMAND_METHOD => {
-                    from_payload::<SessionCommand>(&frame.payload)?;
+                    from_payload::<SessionCommandEnvelope>(&frame.payload)?;
                 }
                 SESSION_SET_MODEL_METHOD
                 | SESSION_COMPACT_METHOD
@@ -2553,6 +2579,9 @@ mod bridge_tests {
                 SESSION_REPLACEMENT_READY_METHOD => {
                     from_payload::<SessionReplacementReadyEvent>(&frame.payload)?;
                 }
+                SESSION_REPLACEMENT_ABORT_METHOD => {
+                    from_payload::<SessionReplacementAbortEvent>(&frame.payload)?;
+                }
                 UI_CONTROL_METHOD => {
                     from_payload::<UiControl>(&frame.payload)?;
                 }
@@ -2594,6 +2623,7 @@ mod bridge_tests {
             (SESSION_SETUP_ENTRIES_METHOD, FrameKind::Res),
             (UI_CONTROL_METHOD, FrameKind::Event),
             (SESSION_REPLACEMENT_READY_METHOD, FrameKind::Event),
+            (SESSION_REPLACEMENT_ABORT_METHOD, FrameKind::Event),
             (UI_STATE_METHOD, FrameKind::Event),
         ] {
             assert!(
@@ -2601,6 +2631,46 @@ mod bridge_tests {
                 "fixture missing {method} {kind} frame"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn shared_fixtures_require_legacy_and_tagged_session_command_witnesses() -> TestResult {
+        let mut legacy = std::collections::HashSet::<String>::new();
+        let mut candidate = std::collections::HashSet::<String>::new();
+        for line in FIXTURES.lines() {
+            if line.trim().is_empty() || line.trim_start().starts_with('#') {
+                continue;
+            }
+            let frame = decode_frame_str(line)?;
+            if frame.method != SESSION_COMMAND_METHOD || frame.kind != FrameKind::Event {
+                continue;
+            }
+            let envelope = from_payload::<SessionCommandEnvelope>(&frame.payload)?;
+            let action = frame.payload["action"].as_str().ok_or_else(|| {
+                "session.command fixture is missing a string `action` field".to_owned()
+            })?;
+            if envelope.replacement_token.is_some() {
+                candidate.insert(action.to_owned());
+            } else {
+                legacy.insert(action.to_owned());
+            }
+        }
+
+        let expected: std::collections::HashSet<String> =
+            ["setSessionName", "sendMessage", "shutdown"]
+                .iter()
+                .map(|&s| s.to_owned())
+                .collect();
+
+        assert_eq!(
+            legacy, expected,
+            "legacy untagged session.command action set does not match fixture"
+        );
+        assert_eq!(
+            candidate, expected,
+            "candidate-tagged session.command action set does not match fixture"
+        );
         Ok(())
     }
 
@@ -2629,6 +2699,47 @@ mod bridge_tests {
         let payload = to_payload(&request)?;
         assert_eq!(payload["customInstructions"], "keep decisions");
         assert_eq!(from_payload::<SessionCompactRequest>(&payload)?, request);
+        Ok(())
+    }
+
+    #[test]
+    fn session_command_envelope_preserves_untagged_and_tagged_commands() -> TestResult {
+        let ordinary_payload = serde_json::json!({
+            "action": "setSessionName",
+            "name": "Renamed"
+        });
+        let ordinary = from_payload::<SessionCommandEnvelope>(&ordinary_payload)?;
+        assert_eq!(ordinary.replacement_token, None);
+        assert_eq!(
+            ordinary.command,
+            SessionCommand::SetSessionName {
+                name: "Renamed".to_owned(),
+            }
+        );
+        assert_eq!(to_payload(&ordinary)?, ordinary_payload);
+
+        let candidate_payload = serde_json::json!({
+            "replacementToken": "tok-1",
+            "action": "setSessionName",
+            "name": "Candidate"
+        });
+        let candidate = from_payload::<SessionCommandEnvelope>(&candidate_payload)?;
+        assert_eq!(candidate.replacement_token.as_deref(), Some("tok-1"));
+        assert_eq!(to_payload(&candidate)?, candidate_payload);
+        Ok(())
+    }
+
+    #[test]
+    fn session_replacement_abort_has_canonical_shape() -> TestResult {
+        let event = SessionReplacementAbortEvent {
+            token: "tok-closed".to_owned(),
+        };
+        let payload = to_payload(&event)?;
+        assert_eq!(payload, serde_json::json!({"token": "tok-closed"}));
+        assert_eq!(
+            from_payload::<SessionReplacementAbortEvent>(&payload)?,
+            event
+        );
         Ok(())
     }
 

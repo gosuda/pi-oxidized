@@ -49,6 +49,7 @@ describe("constants", () => {
 		const sessionMethods = [
 			"session.newSession", "session.fork", "session.navigateTree",
 			"session.switchSession", "session.reload", "session.replacementReady",
+			"session.replacementAbort",
 		] as const;
 		for (const method of sessionMethods) {
 			expect(METHODS).not.toContain(method);
@@ -234,8 +235,38 @@ describe("shared fixtures", () => {
 			"ui.state:event",
 			"session.setupEntries:req",
 			"session.setupEntries:res",
+			"session.replacementReady:event",
+			"session.replacementAbort:event",
 		]) {
 			expect(seen).toContain(key);
 		}
+	});
+
+	test("session.command fixtures cover legacy untagged and candidate-tagged actions", () => {
+		const text = readFileSync(fixturesPath, "utf8");
+		const legacy = new Set<string>();
+		const candidate = new Set<string>();
+		for (const line of text.split("\n")) {
+			if (line.trim() === "" || line.trimStart().startsWith("#")) {
+				continue;
+			}
+			const frame = decodeFrameStr(line);
+			if (frame.method !== "session.command" || frame.kind !== "event") {
+				continue;
+			}
+			const payload = frame.payload as Record<string, unknown>;
+			const action = payload["action"];
+			expect(typeof action).toBe("string");
+			const round = decodeFrameStr(encodeFrameString(frame).trimEnd());
+			expect(round.payload).toEqual(payload);
+			if ("replacementToken" in payload) {
+				expect(typeof payload["replacementToken"]).toBe("string");
+				candidate.add(action as string);
+			} else {
+				legacy.add(action as string);
+			}
+		}
+		expect([...legacy].sort()).toEqual(["sendMessage", "setSessionName", "shutdown"]);
+		expect([...candidate].sort()).toEqual(["sendMessage", "setSessionName", "shutdown"]);
 	});
 });

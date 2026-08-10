@@ -444,7 +444,7 @@ describe("host: command context + mirrored session state", () => {
 				expect(payloadOf(request)["parentSession"]).toBe("parent-1");
 				push(stdin, {
 					id: request.id, kind: "res", method: "session.newSession",
-					payload: { cancelled: false },
+					payload: { cancelled: true },
 				});
 			});
 
@@ -478,7 +478,7 @@ describe("host: command context + mirrored session state", () => {
 		expect(report["hasWaitForIdle"]).toBe(true);
 		expect(report["hasNewSession"]).toBe(true);
 		expect(report["waitForIdleOk"]).toBe(true);
-		expect(report["newSession"]).toEqual({ cancelled: false });
+		expect(report["newSession"]).toEqual({ cancelled: true });
 
 		const newSessionReq = collector.frames.find(
 			(f) => f.kind === "req" && f.method === "session.newSession",
@@ -720,7 +720,7 @@ describe("host: newSession setup + withSession + ReplacedSessionContext", () => 
 			});
 			pi.registerCommand("readActiveName", {
 				description: "Read the active session name",
-				handler(_args, ctx) {
+				async handler(_args, ctx) {
 					ctx.ui.notify(String(pi.getSessionName()), "info");
 				},
 			});
@@ -1713,6 +1713,293 @@ describe("host: SessionManager proxy is not a thenable", () => {
 		expect(report["setupRan"]).toBe(true);
 		expect(report["managerIsObject"]).toBe(true);
 		expect(report["thenIsUndefined"]).toBe(true);
+
+		await teardown(connected);
+	});
+});
+describe("host: replacement-token scoped command wire contract", () => {
+	const activeCommandFactory: ExtensionFactory = (pi) => {
+		pi.registerCommand("activeSessionCommandProbe", {
+			description: "Emit ordinary active-session commands",
+			async handler(_args, ctx) {
+				pi.setSessionName("active-name");
+				pi.appendEntry("active-custom", { from: "active" });
+				pi.sendUserMessage("active user");
+				ctx.ui.notify("active done", "info");
+			},
+		});
+	};
+
+	test("active session commands are flattened and omit replacementToken", async () => {
+		const connected = await connectHost([activeCommandFactory]);
+		const { collector, stdin } = connected;
+
+		push(stdin, {
+			id: 0, kind: "event", method: "session.update",
+			payload: {
+				thinkingLevel: "medium",
+				activeTools: [],
+				allTools: [],
+				commands: [],
+				isIdle: true,
+				hasPendingMessages: false,
+				contextUsage: { tokens: 10, contextWindow: 1000, percent: 1 },
+				scopedModels: [],
+				systemPrompt: "",
+			},
+		});
+
+		push(stdin, {
+			id: 300, kind: "req", method: "command.execute",
+			payload: { command: "activeSessionCommandProbe", args: "" },
+		});
+
+		await collector.awaitFrame(
+			(f) =>
+				f.kind === "event"
+				&& f.method === "notify"
+				&& payloadOf(f)["message"] === "active done",
+			"active done notify",
+		);
+		await collector.awaitFrame((f) => f.id === 300 && f.kind === "res", "res 300");
+
+		const activeCommands = collector.frames.filter(
+			(f) => f.kind === "event" && f.method === "session.command",
+		);
+		expect(activeCommands).toHaveLength(3);
+		expect(activeCommands.map((f) => payloadOf(f)["action"])).toEqual([
+			"setSessionName",
+			"appendEntry",
+			"sendUserMessage",
+		]);
+
+		const byAction = new Map(
+			activeCommands.map((f) => [String(payloadOf(f)["action"]), payloadOf(f)] as const),
+		);
+		expect(byAction.get("setSessionName")).toEqual({
+			action: "setSessionName",
+			name: "active-name",
+		});
+		expect(byAction.get("appendEntry")).toEqual({
+			action: "appendEntry",
+			customType: "active-custom",
+			data: { from: "active" },
+		});
+		expect(byAction.get("sendUserMessage")).toEqual({
+			action: "sendUserMessage",
+			content: "active user",
+		});
+
+		for (const frame of activeCommands) {
+			expect(Object.hasOwn(payloadOf(frame), "replacementToken")).toBe(false);
+		}
+
+		await teardown(connected);
+	});
+
+	test("candidate SessionManager and ReplacedSessionContext commands carry the token", async () => {
+		const connected = await connectHost([replacedSessionFactory]);
+		const { collector, stdin } = connected;
+
+		push(stdin, {
+			id: 0, kind: "event", method: "session.update",
+			payload: {
+				thinkingLevel: "medium",
+				activeTools: [],
+				allTools: [],
+				commands: [],
+				isIdle: true,
+				hasPendingMessages: false,
+				contextUsage: { tokens: 10, contextWindow: 1000, percent: 1 },
+				scopedModels: [],
+				systemPrompt: "",
+			},
+		});
+
+		const initialEntry = { type: "message", id: "initial" };
+		const customEntry = { type: "custom", id: "custom" };
+		const sessionInfoEntry = {
+			type: "session_info",
+			id: "session-info",
+			name: "setup-session",
+		};
+
+		const setupResponses = (async () => {
+			const request = await collector.awaitFrame(
+				(f) => f.kind === "req" && f.method === "session.newSession",
+				"session.newSession req",
+			);
+			expect(payloadOf(request)).toEqual({ parentSession: "parent-1" });
+			push(stdin, {
+				id: request.id,
+				kind: "res",
+				method: "session.newSession",
+				payload: { cancelled: false, replacementToken: "tok-cand-1" },
+			});
+			await respondSetupEntries(collector, stdin, "tok-cand-1", [
+				[initialEntry],
+				[initialEntry, customEntry],
+				[initialEntry, customEntry, sessionInfoEntry],
+			]);
+		})();
+
+		push(stdin, {
+			id: 301, kind: "req", method: "command.execute",
+			payload: { command: "replacedSessionProbe", args: "" },
+		});
+
+		await collector.awaitFrame((f) => f.kind === "event" && f.method === "notify", "notify");
+		await collector.awaitFrame((f) => f.id === 301 && f.kind === "res", "res 301");
+		await setupResponses;
+
+		const commandEvents = collector.frames.filter(
+			(f) => f.kind === "event" && f.method === "session.command",
+		);
+		expect(commandEvents.map((f) => payloadOf(f)["action"])).toEqual([
+			"appendEntry",
+			"setSessionName",
+			"sendMessage",
+			"sendUserMessage",
+		]);
+
+		const byAction = new Map(
+			commandEvents.map((f) => [String(payloadOf(f)["action"]), payloadOf(f)] as const),
+		);
+		expect(byAction.get("appendEntry")).toEqual({
+			replacementToken: "tok-cand-1",
+			action: "appendEntry",
+			customType: "setup-custom",
+			data: { from: "setup" },
+		});
+		expect(byAction.get("setSessionName")).toEqual({
+			replacementToken: "tok-cand-1",
+			action: "setSessionName",
+			name: "setup-session",
+		});
+		expect(byAction.get("sendMessage")).toEqual({
+			replacementToken: "tok-cand-1",
+			action: "sendMessage",
+			message: {
+				customType: "test-custom",
+				content: "hello",
+				display: true,
+			},
+		});
+		expect(byAction.get("sendUserMessage")).toEqual({
+			replacementToken: "tok-cand-1",
+			action: "sendUserMessage",
+			content: "user hello",
+		});
+
+		const setupRequests = collector.frames.filter(
+			(f) => f.kind === "req" && f.method === "session.setupEntries",
+		);
+		expect(setupRequests).toHaveLength(3);
+		for (const req of setupRequests) {
+			expect(payloadOf(req)).toEqual({ replacementToken: "tok-cand-1" });
+		}
+
+		const ready = await collector.awaitFrame(
+			(f) => f.kind === "event" && f.method === "session.replacementReady",
+			"session.replacementReady",
+		);
+		expect(payloadOf(ready)).toEqual({ token: "tok-cand-1" });
+		expect(collector.frames.filter(
+			(f) => f.kind === "event" && f.method === "session.replacementReady",
+		)).toHaveLength(1);
+
+		const aborts = collector.frames.filter(
+			(f) => f.kind === "event" && f.method === "session.replacementAbort",
+		);
+		expect(aborts).toEqual([]);
+
+		await teardown(connected);
+	});
+
+	const lateTokenFactory: ExtensionFactory = (pi) => {
+		pi.registerCommand("lateReplacementProbe", {
+			description: "Fire-and-forget newSession so the token arrives after command scope close",
+			async handler(_args, ctx) {
+				void ctx.newSession({
+					parentSession: "parent-1",
+					withSession: async (replacedCtx) => {
+						replacedCtx.ui.notify("withSession ran", "info");
+					},
+				});
+				ctx.ui.notify("fire and forget", "info");
+			},
+		});
+	};
+
+	test("late successful replacement token after command scope close emits one replacementAbort", async () => {
+		const connected = await connectHost([lateTokenFactory]);
+		const { collector, stdin } = connected;
+
+		push(stdin, {
+			id: 0, kind: "event", method: "session.update",
+			payload: {
+				thinkingLevel: "medium",
+				activeTools: [],
+				allTools: [],
+				commands: [],
+				isIdle: true,
+				hasPendingMessages: false,
+				contextUsage: { tokens: 10, contextWindow: 1000, percent: 1 },
+				scopedModels: [],
+				systemPrompt: "",
+			},
+		});
+
+		push(stdin, {
+			id: 302, kind: "req", method: "command.execute",
+			payload: { command: "lateReplacementProbe", args: "" },
+		});
+
+		const newSessionReq = await collector.awaitFrame(
+			(f) => f.kind === "req" && f.method === "session.newSession",
+			"session.newSession req",
+		);
+		expect(payloadOf(newSessionReq)).toEqual({ parentSession: "parent-1" });
+
+		await collector.awaitFrame(
+			(f) =>
+				f.kind === "event"
+				&& f.method === "notify"
+				&& payloadOf(f)["message"] === "fire and forget",
+			"fire and forget notify",
+		);
+		await collector.awaitFrame((f) => f.id === 302 && f.kind === "res", "res 302");
+
+		// The command response proves its AsyncLocalStorage scope is closed.
+		// Delivering the successful replacement response now must take the late path.
+		push(stdin, {
+			id: newSessionReq.id,
+			kind: "res",
+			method: "session.newSession",
+			payload: { cancelled: false, replacementToken: "tok-late-1" },
+		});
+
+		const abort = await collector.awaitFrame(
+			(f) => f.kind === "event" && f.method === "session.replacementAbort",
+			"session.replacementAbort",
+		);
+
+		expect(payloadOf(abort)).toEqual({ token: "tok-late-1" });
+		expect(collector.frames.filter((f) => f.kind === "event" && f.method === "session.replacementAbort")).toHaveLength(1);
+		expect(collector.frames.filter((f) => f.kind === "event" && f.method === "session.replacementReady")).toEqual([]);
+		expect(collector.frames.filter((f) =>
+			f.kind === "event"
+			&& f.method === "session.command"
+			&& Object.hasOwn(payloadOf(f), "replacementToken"),
+		)).toEqual([]);
+
+		const withSessionNotify = collector.frames.find(
+			(f) =>
+				f.kind === "event"
+				&& f.method === "notify"
+				&& payloadOf(f)["message"] === "withSession ran",
+		);
+		expect(withSessionNotify).toBeUndefined();
 
 		await teardown(connected);
 	});

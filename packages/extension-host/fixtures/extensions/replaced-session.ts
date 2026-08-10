@@ -3,16 +3,7 @@
  * the narrow SessionManager bridge (supported mutation + unsupported throw),
  * cancel behaviour, and sendMessage/sendUserMessage on ReplacedSessionContext.
  */
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-
-/** Minimal structural setup surface needed by this fixture's `setup` callback. */
-type SessionManagerSetup = {
-	appendCustomEntry(customType: string, data?: unknown): Promise<void>;
-	appendSessionInfo(name: string): Promise<void>;
-	getSessionName(): string | undefined;
-	getEntries(): unknown[];
-	getBranch(): never;
-};
+import type { ExtensionAPI, SessionManagerSetupBridge } from "@earendil-works/pi-coding-agent";
 
 export default function replacedSessionExtension(pi: ExtensionAPI): void {
 	pi.registerCommand("replacedSessionProbe", {
@@ -24,7 +15,7 @@ export default function replacedSessionExtension(pi: ExtensionAPI): void {
 			const setupOrder: string[] = [];
 			const result = await ctx.newSession({
 				parentSession: "parent-1",
-				setup: async (sessionManager: SessionManagerSetup) => {
+				setup: async (sessionManager: SessionManagerSetupBridge) => {
 					setupOrder.push("setup");
 					// sessionManager is the narrow bridge proxy.
 					report["setupReceived"] = sessionManager !== undefined;
@@ -37,7 +28,11 @@ export default function replacedSessionExtension(pi: ExtensionAPI): void {
 
 					report["setupSessionName"] = sessionManager.getSessionName();
 					try {
-						sessionManager.getBranch();
+						const getBranch = Reflect.get(sessionManager, "getBranch");
+						if (typeof getBranch !== "function") {
+							throw new Error("getBranch proxy member is not callable");
+						}
+						Reflect.apply(getBranch, sessionManager, []);
 						report["unsupportedThrew"] = false;
 					} catch (e) {
 						report["unsupportedThrew"] = true;

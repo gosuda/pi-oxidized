@@ -35,6 +35,9 @@
 {"id":0,"kind":"event","method":"session.command","payload":{"action":"setSessionName","name":"Renamed"}}
 {"id":0,"kind":"event","method":"session.command","payload":{"action":"sendMessage","message":{"customType":"note","content":"hi","display":true},"options":{"triggerTurn":false,"deliverAs":"nextTurn"}}}
 {"id":0,"kind":"event","method":"session.command","payload":{"action":"shutdown"}}
+{"id":0,"kind":"event","method":"session.command","payload":{"replacementToken":"tok-candidate","action":"setSessionName","name":"Candidate"}}
+{"id":0,"kind":"event","method":"session.command","payload":{"replacementToken":"tok-candidate","action":"sendMessage","message":{"customType":"note","content":"hi","display":true}}}
+{"id":0,"kind":"event","method":"session.command","payload":{"replacementToken":"tok-candidate","action":"shutdown"}}
 {"id":17,"kind":"req","method":"session.compact","payload":{"customInstructions":"keep decisions"}}
 {"id":17,"kind":"res","method":"session.compact","payload":{"result":{"summary":"…","firstKeptEntryId":"e9","tokensBefore":1200,"details":null}}}
 {"id":16,"kind":"req","method":"session.setModel","payload":{"model":{"id":"gpt-x","provider":"openai"}}}
@@ -66,3 +69,4 @@
 {"id":31,"kind":"res","method":"session.setupEntries","payload":{"entries":[{"type":"message","id":"e1","parentId":null,"timestamp":"2025-01-01T00:00:00.000Z","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}]}}
 {"id":32,"kind":"error","method":"session.setupEntries","payload":{"code":"extension_error","message":"stale replacement token","retryable":false}}
 {"id":0,"kind":"event","method":"session.replacementReady","payload":{"token":"tok-1"}}
+{"id":0,"kind":"event","method":"session.replacementAbort","payload":{"token":"tok-candidate"}}

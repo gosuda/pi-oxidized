@@ -2231,9 +2231,17 @@ export class ExtensionHost {
 	}
 
 	/** Bridge a `session.command` action to Rust; awaits the wire write. */
-	private async sendSessionCommand(payload: Record<string, unknown>): Promise<void> {
+	private async sendSessionCommand(
+		payload: Record<string, unknown>,
+		replacementToken?: string,
+	): Promise<void> {
 		await this.client.send({
-			id: 0, kind: "event", method: "session.command" as Method, payload,
+			id: 0,
+			kind: "event",
+			method: "session.command" as Method,
+			payload: replacementToken === undefined
+				? payload
+				: { replacementToken, ...payload },
 		});
 	}
 
@@ -2674,7 +2682,10 @@ export class ExtensionHost {
 		const cancelledOf = (frame: Frame): boolean =>
 			(frame.payload as Record<string, unknown>)["cancelled"] === true;
 
-		const createReplacedSessionContext = (runner: ExtensionRunner): ReplacedSessionContext => {
+		const createReplacedSessionContext = (
+			runner: ExtensionRunner,
+			replacementToken: string,
+		): ReplacedSessionContext => {
 			const context = self.createCommandContext(runner) as ReplacedSessionContext;
 			context.sendMessage = async (message, options) => {
 				await self.sendSessionCommand({
@@ -2686,20 +2697,35 @@ export class ExtensionHost {
 						details: message.details,
 					},
 					options,
-				});
+				}, replacementToken);
 			};
 			context.sendUserMessage = async (content, options) => {
-				await self.sendSessionCommand({ action: "sendUserMessage", content, options });
+				await self.sendSessionCommand(
+					{ action: "sendUserMessage", content, options },
+					replacementToken,
+				);
 			};
 			return context;
 		};
 
 		const afterReplacement = async (
 			cancelled: boolean,
+			replacementToken: string | undefined,
 			withSession?: (ctx: ReplacedSessionContext) => Promise<void>,
 		): Promise<{ cancelled: boolean }> => {
-			if (!cancelled && withSession !== undefined && self.runner !== undefined) {
-				await withSession(createReplacedSessionContext(self.runner));
+			if (
+				!cancelled
+				&& replacementToken !== undefined
+				&& withSession !== undefined
+				&& self.runner !== undefined
+			) {
+				await withSession(createReplacedSessionContext(self.runner, replacementToken));
+			}
+			// A token that was dropped because the command scope closed before the
+			// response arrived is not a successful replacement; report it as cancelled
+			// so the extension does not proceed as if withSession ran.
+			if (replacementToken === undefined && withSession !== undefined) {
+				return { cancelled: true };
 			}
 			return { cancelled };
 		};
@@ -2707,8 +2733,8 @@ export class ExtensionHost {
 		const captureReplacementToken = (
 			payload: Record<string, unknown>,
 			cancelled: boolean,
-		): void => {
-			if (cancelled) return;
+		): string | undefined => {
+			if (cancelled) return undefined;
 			// Staleness follows from "the session was replaced", not from "a
 			// token came back". Mark stale for every non-cancelled replacement
 			// response before any token-shaped early return so that
@@ -2716,22 +2742,30 @@ export class ExtensionHost {
 			// that no longer exists.
 			markStale?.();
 			const token = payload["replacementToken"];
-			if (typeof token !== "string") return;
-			// Authors must await replacement calls so the token stays scoped to
-			// the initiating command.execute. Fire-and-forget loses the scope
-			// (or finds it already flushed); without a diagnostic the user only
-			// learns via the Rust-side replacement-ready timeout, so surface the
-			// drop on the spot.
+			if (typeof token !== "string" || token.length === 0) return undefined;
 			const scope = self.commandScope.getStore();
 			if (scope === undefined || scope.closed) {
-				self.emitExtensionError(
-					"<host>",
-					"session.replacementReady",
-					"replacement token dropped: the replacement call was not awaited inside its command.execute handler",
-				);
-			} else {
-				scope.tokens.push(token);
+				// The command.execute scope that initiated this replacement has
+				// already closed, so the extension will not observe the result.
+				// Emit an explicit abort for the token so Rust does not keep the
+				// pending replacement alive, and do not let setup or withSession
+				// run against a stale scope.
+				void self.client.send({
+					id: 0,
+					kind: "event",
+					method: "session.replacementAbort" as Method,
+					payload: { token },
+				}).catch((err: unknown) => {
+					self.emitExtensionError(
+						"<host>",
+						"session.replacementAbort",
+						err instanceof Error ? err.message : String(err),
+					);
+				});
+				return undefined;
 			}
+			scope.tokens.push(token);
+			return token;
 		};
 
 		return {
@@ -2755,17 +2789,23 @@ export class ExtensionHost {
 				);
 				const payload = frame.payload as Record<string, unknown>;
 				const cancelled = cancelledOf(frame);
-				captureReplacementToken(payload, cancelled);
+				const rawToken = payload["replacementToken"];
+				const replacementToken = captureReplacementToken(payload, cancelled);
 				if (!cancelled && options?.setup !== undefined) {
-					const token = payload["replacementToken"];
-					if (typeof token !== "string" || token.length === 0) {
+					if (typeof rawToken !== "string" || rawToken.length === 0) {
 						throw new Error(
 							"session.newSession response omitted replacementToken for setup",
 						);
 					}
+					if (replacementToken === undefined) {
+						// The response carried a token but it arrived after the
+						// command scope closed (fire-and-forget). The replacement has
+						// already been aborted above; treat it as cancelled.
+						return { cancelled: true };
+					}
 					const setupFrame = await self.client.request(
 						"session.setupEntries",
-						{ replacementToken: token },
+						{ replacementToken },
 						{ timeoutMs: EXTENSION_HOOK_TIMEOUT_MS },
 					);
 					const setupPayload = setupFrame.payload as Record<string, unknown>;
@@ -2773,9 +2813,9 @@ export class ExtensionHost {
 					if (!Array.isArray(initialEntries)) {
 						throw new Error("session.setupEntries response omitted entries");
 					}
-					await options.setup(self.createSessionManagerProxy(token, initialEntries));
+					await options.setup(self.createSessionManagerProxy(replacementToken, initialEntries));
 				}
-				return afterReplacement(cancelled, options?.withSession);
+				return afterReplacement(cancelled, replacementToken, options?.withSession);
 			},
 			fork: async (entryId, options) => {
 				guardActive();
@@ -2786,8 +2826,8 @@ export class ExtensionHost {
 				);
 				const payload = frame.payload as Record<string, unknown>;
 				const cancelled = cancelledOf(frame);
-				captureReplacementToken(payload, cancelled);
-				const result = await afterReplacement(cancelled, options?.withSession);
+				const replacementToken = captureReplacementToken(payload, cancelled);
+				const result = await afterReplacement(cancelled, replacementToken, options?.withSession);
 				return {
 					cancelled: result.cancelled,
 					selectedText: payload["selectedText"] as string | undefined,
@@ -2827,8 +2867,8 @@ export class ExtensionHost {
 				);
 				const payload = frame.payload as Record<string, unknown>;
 				const cancelled = cancelledOf(frame);
-				captureReplacementToken(payload, cancelled);
-				return afterReplacement(cancelled, options?.withSession);
+				const replacementToken = captureReplacementToken(payload, cancelled);
+				return afterReplacement(cancelled, replacementToken, options?.withSession);
 			},
 			reload: async () => {
 				guardActive();
@@ -2943,12 +2983,18 @@ export class ExtensionHost {
 				switch (prop) {
 					case "appendCustomEntry":
 						return async (customType: string, data?: unknown) => {
-							await self.sendSessionCommand({ action: "appendEntry", customType, data });
+							await self.sendSessionCommand(
+								{ action: "appendEntry", customType, data },
+								replacementToken,
+							);
 							if (refreshSnapshot !== undefined) await refreshSnapshot();
 						};
 					case "appendSessionInfo":
 						return async (name: string) => {
-							await self.sendSessionCommand({ action: "setSessionName", name });
+							await self.sendSessionCommand(
+								{ action: "setSessionName", name },
+								replacementToken,
+							);
 							if (refreshSnapshot === undefined) {
 								self.sessionState.sessionName = name;
 							} else {
