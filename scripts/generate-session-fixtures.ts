@@ -55,8 +55,7 @@ const REF_SESSION_MANAGER = join(
 	REF_ROOT,
 	"packages/coding-agent/src/core/session-manager.ts",
 );
-const REF_UUID = join(REF_ROOT, "packages/agent/src/harness/session/uuid.ts");
-const REF_AI_TYPES = join(REF_ROOT, "packages/ai/src/types.ts");
+const REF_UUID = join(REF_ROOT, "packages/ai/src/utils/uuid.ts");
 const OUT_DIR = join(
 	REPO_ROOT,
 	".agent-tasks/pi-rust-rewrite/fixtures/sessions",
@@ -122,16 +121,11 @@ function registerReferenceResolver(): void {
 	Bun.plugin({
 		name: "pi-reference-resolver",
 		setup(build) {
-			// session-manager only needs uuidv7 at runtime from agent-core.
-			// Mapping the package root to the real reference uuid.ts keeps ID
-			// generation faithful without pulling the full agent harness graph.
-			build.onResolve({ filter: /^@earendil-works\/pi-agent-core$/ }, () => ({
-				path: REF_UUID,
-			}));
-			// pi-ai is type-only in the loaded graph; alias still present so a
-			// stray runtime import fails loudly against a real reference file.
+			// SessionManager only needs uuidv7 at runtime from pi-ai. Mapping the
+			// package root to the implementation keeps ID generation faithful
+			// without pulling the full provider graph.
 			build.onResolve({ filter: /^@earendil-works\/pi-ai$/ }, () => ({
-				path: REF_AI_TYPES,
+				path: REF_UUID,
 			}));
 			// child-process.ts imports cross-spawn; on Linux it is never called
 			// (win32-only branch). Shim satisfies resolution without npm install.
@@ -254,7 +248,6 @@ let ref: ReferenceSessionModule;
 async function loadReference(): Promise<void> {
 	await assertPathReadable(REF_SESSION_MANAGER, "reference SessionManager");
 	await assertPathReadable(REF_UUID, "reference uuidv7");
-	await assertPathReadable(REF_AI_TYPES, "reference pi-ai types");
 
 	registerReferenceResolver();
 
