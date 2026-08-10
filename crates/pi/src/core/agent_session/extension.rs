@@ -26,7 +26,7 @@ use crate::core::agent_session_runtime::{
     AgentSessionRuntime, AgentSessionRuntimeError, ForkPosition, NewSessionOptions,
     PrepareReplacementOutcome, PreparedReplacement, SwitchSessionOptions,
 };
-use crate::core::extension_host::{HOOK_TIMEOUT, SessionBridgeEvent};
+use crate::core::extension_host::SessionBridgeEvent;
 use crate::core::extension_runtime_set::{
     ExtensionRuntimeSet, ExtensionSetDiagnostic, PendingReadyOp,
 };
@@ -42,7 +42,6 @@ use pi_ext::protocol::{
 };
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use super::prompt::{CustomMessageInput, DeliverAs};
 use super::tools::RefreshToolRegistryOptions;
@@ -53,7 +52,6 @@ use super::events::{
     AgentSessionEvent, SessionShutdownReason, SessionStartEvent, SessionStartReason,
 };
 
-const REPLACEMENT_READY_TIMEOUT: Duration = HOOK_TIMEOUT;
 /// Mode the session is bound to (mirrors `AppMode` minus `Interactive`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExtensionMode {
@@ -1288,49 +1286,45 @@ impl AgentSession {
         ready_rx: tokio::sync::oneshot::Receiver<()>,
         operation: &'static str,
     ) {
-        match tokio::time::timeout(REPLACEMENT_READY_TIMEOUT, ready_rx).await {
-            Ok(Ok(())) => {
-                let Some((op, _finalize_guard)) = host.take_finalizing(&token) else {
-                    self.report_extension_error(format!(
-                        "{operation}: replacement ready state was lost"
-                    ));
-                    return;
-                };
-                match pending_replacement(op) {
-                    Ok(prepared) => {
-                        let Some(result) = prepared.result.as_ref() else {
-                            let _ = host.finish_finalize(&token);
-                            self.report_extension_error(format!(
-                                "{operation}: prepared replacement was already consumed"
-                            ));
-                            return;
-                        };
-                        // Route bridge commands at the replacement session
-                        // before teardown drops the old one, so no command is
-                        // orphaned while teardown drains old state.
-                        host.bind_session_target(Arc::downgrade(&result.session));
-                        runtime.finalize_replacement(prepared).await;
-                        let _ = host.finish_finalize(&token);
-                    }
-                    Err(op) => {
-                        drop(op);
+        if let Ok(()) = ready_rx.await {
+            let Some((op, _finalize_guard)) = host.take_finalizing(&token) else {
+                self.report_extension_error(format!(
+                    "{operation}: replacement ready state was lost"
+                ));
+                return;
+            };
+            match pending_replacement(op) {
+                Ok(prepared) => {
+                    let Some(result) = prepared.result.as_ref() else {
                         let _ = host.finish_finalize(&token);
                         self.report_extension_error(format!(
-                            "{operation}: replacement ready state had the wrong operation"
+                            "{operation}: prepared replacement was already consumed"
                         ));
-                    }
+                        return;
+                    };
+                    // Route bridge commands at the replacement session
+                    // before teardown drops the old one, so no command is
+                    // orphaned while teardown drains old state.
+                    host.bind_session_target(Arc::downgrade(&result.session));
+                    runtime.finalize_replacement(prepared).await;
+                    let _ = host.finish_finalize(&token);
+                }
+                Err(op) => {
+                    drop(op);
+                    let _ = host.finish_finalize(&token);
+                    self.report_extension_error(format!(
+                        "{operation}: replacement ready state had the wrong operation"
+                    ));
                 }
             }
-            Ok(Err(_)) => {
-                abort_bridge_pending(&host, &runtime, &token).await;
-                self.report_extension_error(format!(
-                    "{operation}: replacement ready wait ended before completion"
-                ));
-            }
-            Err(_) => {
-                abort_bridge_pending(&host, &runtime, &token).await;
-                self.report_extension_error(format!("{operation}: replacement ready timed out"));
-            }
+        } else {
+            // Receiver closed without completion: a dropped readiness frame
+            // aborted the matching pending token. Clean up any remaining
+            // state and report the cause.
+            abort_bridge_pending(&host, &runtime, &token).await;
+            self.report_extension_error(format!(
+                "{operation}: replacement ready wait ended before completion"
+            ));
         }
     }
 
@@ -1340,64 +1334,57 @@ impl AgentSession {
         token: String,
         ready_rx: tokio::sync::oneshot::Receiver<()>,
     ) {
-        match tokio::time::timeout(REPLACEMENT_READY_TIMEOUT, ready_rx).await {
-            Ok(Ok(())) => {
-                let Some((
-                    PendingReadyOp::Reload {
-                        prepared,
-                        model_runtime,
-                    },
-                    _finalize_guard,
-                )) = host.take_finalizing(&token)
-                else {
-                    self.report_extension_error("reload: replacement ready state was lost");
-                    return;
-                };
-                let _ = self
-                    .hooks
-                    .runner()
-                    .emit(AgentSessionEvent::SessionShutdown {
-                        reason: SessionShutdownReason::Reload,
-                        target_session_file: None,
-                    })
-                    .await;
-                let reload_guard = host.reload_lock().lock().await;
-                let reload = host.commit_reload(&model_runtime, prepared).await;
-                let _ = host.finish_finalize(&token);
-                drop(reload_guard);
-                if !reload.committed {
-                    self.report_extension_error(
-                        "reload: extension runtime was invalidated before commit",
-                    );
-                    return;
-                }
-                self.refresh_tool_registry(&RefreshToolRegistryOptions {
-                    active_tool_names: None,
-                    include_all_extension_tools: true,
-                });
-                for diagnostic in reload.diagnostics {
-                    self.report_extension_error(diagnostic.to_string());
-                }
-                self.refresh_selected_model_after_reload();
-                self.hydrate_replacement_host().await;
-                self.emit_session_start_reload().await;
-                if let Err(error) = self
-                    .extend_resources_from_extensions(SessionStartReason::Reload.as_str())
-                    .await
-                {
-                    self.report_extension_error(format!("reload resources: {error}"));
-                }
-            }
-            Ok(Err(_)) => {
-                let _ = host.abort_pending(&token);
+        if let Ok(()) = ready_rx.await {
+            let Some((
+                PendingReadyOp::Reload {
+                    prepared,
+                    model_runtime,
+                },
+                _finalize_guard,
+            )) = host.take_finalizing(&token)
+            else {
+                self.report_extension_error("reload: replacement ready state was lost");
+                return;
+            };
+            let _ = self
+                .hooks
+                .runner()
+                .emit(AgentSessionEvent::SessionShutdown {
+                    reason: SessionShutdownReason::Reload,
+                    target_session_file: None,
+                })
+                .await;
+            let reload_guard = host.reload_lock().lock().await;
+            let reload = host.commit_reload(&model_runtime, prepared).await;
+            let _ = host.finish_finalize(&token);
+            drop(reload_guard);
+            if !reload.committed {
                 self.report_extension_error(
-                    "reload: replacement ready wait ended before completion",
+                    "reload: extension runtime was invalidated before commit",
                 );
+                return;
             }
-            Err(_) => {
-                let _ = host.abort_pending(&token);
-                self.report_extension_error("reload: replacement ready timed out");
+            self.refresh_tool_registry(&RefreshToolRegistryOptions {
+                active_tool_names: None,
+                include_all_extension_tools: true,
+            });
+            for diagnostic in reload.diagnostics {
+                self.report_extension_error(diagnostic.to_string());
             }
+            self.refresh_selected_model_after_reload();
+            self.hydrate_replacement_host().await;
+            self.emit_session_start_reload().await;
+            if let Err(error) = self
+                .extend_resources_from_extensions(SessionStartReason::Reload.as_str())
+                .await
+            {
+                self.report_extension_error(format!("reload resources: {error}"));
+            }
+        } else {
+            // Receiver closed without completion: a dropped readiness frame
+            // aborted the matching pending token.
+            let _ = host.abort_pending(&token);
+            self.report_extension_error("reload: replacement ready wait ended before completion");
         }
     }
 
@@ -2572,6 +2559,68 @@ mod tests {
         config.extension_runner = Some(Arc::new(FailingRunner) as Arc<dyn ExtensionRunner>);
         let session = AgentSession::new(config)?;
         session.reload().await?;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bridge_reload_ready_wait_has_no_hook_deadline() -> TestResult {
+        // Drive the production await_bridge_reload path: the ready wait must
+        // have no hook deadline, so advancing paused time past the old 30s
+        // timeout must not abort the operation. complete_ready must then
+        // finish it successfully.
+        let session = make_session()?;
+        let set = ExtensionRuntimeSet::bind(Vec::new());
+        let runtime = Arc::new(crate::core::model_runtime::ModelRuntime::create_in_memory().await?);
+        let token = set.next_replacement_token();
+        let ready_rx = set
+            .install_pending(
+                token.clone(),
+                PendingReadyOp::Reload {
+                    prepared: crate::core::extension_runtime_set::PreparedReload::empty_for_test(),
+                    model_runtime: Arc::clone(&runtime),
+                },
+            )
+            .map_err(|_| "initial pending install was rejected")?;
+
+        // Spawn the production waiter.
+        let wait_session = Arc::clone(&session);
+        let wait_set = Arc::clone(&set);
+        let wait_token = token.clone();
+        let wait_task = tokio::spawn(async move {
+            wait_session
+                .await_bridge_reload(wait_set, wait_token, ready_rx)
+                .await;
+        });
+
+        // Advance time well beyond the old 30-second deadline.
+        tokio::time::advance(std::time::Duration::from_mins(1)).await;
+
+        // The operation must still be pending and the production task
+        // unfinished — no deadline fired.
+        assert!(
+            set.is_pending_busy(),
+            "operation must remain pending past the old deadline"
+        );
+        assert!(
+            !wait_task.is_finished(),
+            "production await_bridge_reload must not finish after advancing time past the old deadline"
+        );
+
+        // Now complete_ready — the production task must finish. A
+        // PreparedReload with generation None causes commit_reload to
+        // return uncommitted, but the waiter still completes.
+        assert!(
+            set.complete_ready(&token),
+            "complete_ready must succeed for the matching token"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), wait_task)
+            .await
+            .map_err(|_| "production await_bridge_reload did not finish after complete_ready")??;
+        assert!(
+            !set.is_pending_busy(),
+            "pending slot must be cleared after successful completion"
+        );
         Ok(())
     }
 

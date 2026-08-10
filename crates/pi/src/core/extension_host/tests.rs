@@ -2363,13 +2363,21 @@ async fn unclaimed_set_model_request_is_answered_failure() -> R {
 #[tokio::test]
 async fn dropped_replacement_ready_emits_diagnostic() -> R {
     let (runner, host) = make_runner(json!({})).await?;
+    // Install a drop handler that records the token it receives.
+    let received_token = Arc::new(Mutex::new(None::<String>));
+    let handler_token = Arc::clone(&received_token);
+    runner.set_replacement_ready_drop_handler(Arc::new(move |token: &str| {
+        *handler_token
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(token.to_owned());
+    }));
     // Claim the bridge, then drop the receiver to close the channel.
     let bridge = runner.take_session_bridge().ok_or("bridge missing")?;
     drop(bridge);
     let mut errors = runner.subscribe_errors();
     // Emit a replacementReady event — the channel is closed so try_send
     // fails, and the dropped frame must produce an immediate diagnostic
-    // instead of a silent REPLACEMENT_READY_TIMEOUT.
+    // and invoke the drop handler with the token.
     host.emit(Frame {
         id: 0,
         kind: FrameKind::Event,
@@ -2382,6 +2390,13 @@ async fn dropped_replacement_ready_emits_diagnostic() -> R {
         error.code.contains("replacement_ready_dropped"),
         "expected replacement_ready_dropped diagnostic, got: {error:?}"
     );
+    // The drop handler must receive tok-1 synchronously.
+    let token = received_token
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .ok_or("drop handler was not invoked")?;
+    assert_eq!(token, "tok-1", "drop handler received the wrong token");
     runner.shutdown_once().await;
     Ok(())
 }

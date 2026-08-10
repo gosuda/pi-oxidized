@@ -675,6 +675,8 @@ struct ToolRenderHtmlWire {
 /// Slot subscription state: latest sanitized slot (or `None` when disposed).
 type SlotWatch = watch::Sender<Option<SanitizedSlot>>;
 
+type ReplacementReadyDropHandler = Arc<dyn Fn(&str) + Send + Sync>;
+
 struct Inner {
     client: Arc<HostClient>,
     snapshot: RwLock<RegistrySnapshot>,
@@ -713,8 +715,12 @@ struct Inner {
     /// Per-hook control-RPC deadline (`HOOK_TIMEOUT` in production; shorter in
     /// tests to exercise the timeout path quickly).
     hook_timeout: Duration,
+    /// Lower-layer callback invoked when a `ReplacementReady` frame is dropped
+    /// at the host-to-endpoint hop (the session bridge is closed or full). The
+    /// callback receives the replacement token so the facade can abort only
+    /// the matching pending operation. Runs without session-bridge locks held.
+    replacement_ready_drop: StdMutex<Option<ReplacementReadyDropHandler>>,
 }
-
 impl Inner {
     fn new(
         client: Arc<HostClient>,
@@ -756,6 +762,7 @@ impl Inner {
             shutdown_lock: tokio::sync::Mutex::new(()),
             hook_timeout,
             theme_generation: AtomicU64::new(0),
+            replacement_ready_drop: StdMutex::new(None),
         }
     }
 
@@ -1581,6 +1588,19 @@ impl HostExtensionRunner {
         receiver
     }
 
+    /// Install the lower-layer callback invoked when a `ReplacementReady`
+    /// frame is dropped at the host-to-endpoint hop (the session bridge is
+    /// closed or full). The callback receives the replacement token so the
+    /// facade can abort only the matching pending operation. Called from
+    /// [`ExtensionRuntimeSet::start_bridges`] before any relay begins.
+    pub(crate) fn set_replacement_ready_drop_handler(&self, handler: ReplacementReadyDropHandler) {
+        *self
+            .inner
+            .replacement_ready_drop
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handler);
+    }
+
     /// Answer a correlated `session.setModel` request.
     ///
     /// # Errors
@@ -2003,6 +2023,14 @@ fn clone_registry(source: &Registry) -> Registry {
 #[allow(clippy::too_many_lines)]
 fn spawn_event_pump(inner: Arc<Inner>) {
     let mut rx = inner.client.subscribe();
+    let ready_inner = Arc::downgrade(&inner);
+    inner
+        .client
+        .set_replacement_ready_handler(Some(Arc::new(move |token: &str| {
+            if let Some(inner) = ready_inner.upgrade() {
+                deliver_replacement_ready(&inner, token.to_owned());
+            }
+        })));
     tokio::spawn(async move {
         if !inner.client.is_running() {
             inner.disabled.store(true, Ordering::Relaxed);
@@ -2071,8 +2099,7 @@ fn spawn_event_pump(inner: Arc<Inner>) {
                     .await;
                 }
                 Ok(HostEvent::ReplacementReady { token }) => {
-                    forward_session_bridge(&inner, SessionBridgeEvent::ReplacementReady { token })
-                        .await;
+                    deliver_replacement_ready(&inner, token);
                 }
                 Ok(HostEvent::UiSlot(slot)) => {
                     forward_slot(&inner, &slot);
@@ -2126,6 +2153,40 @@ fn spawn_event_pump(inner: Arc<Inner>) {
     });
 }
 
+/// Route readiness synchronously so the transport reader never waits behind the
+/// bounded session bridge. An unavailable bridge aborts the exact pending token.
+fn deliver_replacement_ready(inner: &Arc<Inner>, token: String) {
+    let claimed = inner.active() && inner.session_bridge_claimed.load(Ordering::Acquire);
+    let undelivered = if claimed {
+        inner
+            .session_bridge_tx
+            .try_send(SessionBridgeEvent::ReplacementReady { token })
+            .err()
+            .map(mpsc::error::TrySendError::into_inner)
+    } else {
+        Some(SessionBridgeEvent::ReplacementReady { token })
+    };
+    if let Some(SessionBridgeEvent::ReplacementReady { token }) = undelivered {
+        handle_dropped_replacement_ready(inner, &token);
+    }
+}
+
+fn handle_dropped_replacement_ready(inner: &Arc<Inner>, token: &str) {
+    inner.publish_error(
+        "extension_replacement_ready_dropped",
+        "replacement ready frame dropped: session bridge unavailable or full",
+        None,
+    );
+    let handler = inner
+        .replacement_ready_drop
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(handler) = handler {
+        handler(token);
+    }
+}
+
 /// Route one session-bridge item to the claiming session task. Unclaimed,
 /// closed, or FULL bridges answer correlated requests immediately (so the
 /// host's awaiting extension never hangs) and drop fire-and-forget commands.
@@ -2145,15 +2206,8 @@ async fn forward_session_bridge(inner: &Arc<Inner>, event: SessionBridgeEvent) {
     };
     match undelivered {
         None | Some(SessionBridgeEvent::Command(_)) => {}
-        Some(SessionBridgeEvent::ReplacementReady { .. }) => {
-            // A dropped readiness frame means the awaiting receiver will wait
-            // out REPLACEMENT_READY_TIMEOUT and report a generic timeout.
-            // Name the cause immediately at the point of failure instead.
-            inner.publish_error(
-                "extension_replacement_ready_dropped",
-                "replacement ready frame dropped: session bridge unavailable or full",
-                None,
-            );
+        Some(SessionBridgeEvent::ReplacementReady { token }) => {
+            handle_dropped_replacement_ready(inner, &token);
         }
         Some(SessionBridgeEvent::SetModel { id, .. }) => {
             let _ = inner.client.respond_set_model(id, false).await;
@@ -2862,6 +2916,7 @@ impl HostExtensionRunner {
         // Order matters for the slot_send/slot_dispose teardown gate: the
         // flag must be set before dispose_all_slots takes the slots lock.
         inner.disabled.store(true, Ordering::Relaxed);
+        inner.client.set_replacement_ready_handler(None);
         inner.dispose_all_slots();
         let _ = inner.client.shutdown().await;
     }

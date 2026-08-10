@@ -118,6 +118,17 @@ pub(crate) struct PreparedReload {
     diagnostics: Vec<ExtensionSetDiagnostic>,
 }
 
+#[cfg(test)]
+impl PreparedReload {
+    pub(crate) fn empty_for_test() -> Self {
+        Self {
+            generation: None,
+            pending: Vec::new(),
+            diagnostics: Vec::new(),
+        }
+    }
+}
+
 impl Drop for PreparedReload {
     fn drop(&mut self) {
         if let Some(generation) = self.generation.take() {
@@ -167,6 +178,7 @@ enum PendingReadyState {
         op: PendingReadyOp,
         token: String,
         ready_tx: oneshot::Sender<()>,
+        owner: Option<EndpointId>,
     },
     Finalizing {
         op: Option<PendingReadyOp>,
@@ -301,14 +313,15 @@ pub(crate) struct PendingEndpointBridges {
     slots: Vec<SanitizedSlot>,
 }
 
+type PendingBridges = Vec<PendingEndpointBridges>;
+
 /// Every relay for one endpoint shares this stable routing identity.
 struct EndpointRelayContext {
     state: Weak<StdMutex<PublishedRuntimeState>>,
     channels: Arc<FacadeChannels>,
     endpoint: Endpoint,
+    replacement_ready_drop: Weak<StdMutex<PendingReadyState>>,
 }
-
-type PendingBridges = Vec<PendingEndpointBridges>;
 
 #[derive(Clone, Copy)]
 struct CorrelationRoute {
@@ -661,7 +674,7 @@ pub struct ExtensionRuntimeSet {
     load_cwd: String,
     project_trusted: bool,
     reload_lock: tokio::sync::Mutex<()>,
-    pending_ready: StdMutex<PendingReadyState>,
+    pending_ready: Arc<StdMutex<PendingReadyState>>,
     next_replacement_token_id: AtomicU64,
     #[cfg(test)]
     test_prepared_reload: StdMutex<Option<TestPreparedReload>>,
@@ -754,7 +767,7 @@ impl ExtensionRuntimeSet {
             load_cwd,
             project_trusted,
             reload_lock: tokio::sync::Mutex::new(()),
-            pending_ready: StdMutex::new(PendingReadyState::None),
+            pending_ready: Arc::new(StdMutex::new(PendingReadyState::None)),
             next_replacement_token_id: AtomicU64::new(1),
             #[cfg(test)]
             test_prepared_reload: StdMutex::new(None),
@@ -811,6 +824,25 @@ impl ExtensionRuntimeSet {
     fn lease(&self) -> GenerationLease {
         self.state().lease()
     }
+
+    fn claim_route_and_bind_owner(
+        &self,
+        id: FrameId,
+        bind_token: Option<&str>,
+    ) -> Option<(GenerationLease, Endpoint, FrameId)> {
+        // Keep route claim and owner binding atomic against endpoint retirement.
+        let mut state = self.state();
+        let claimed = state.claim_route(id)?;
+        if let Some(bind_token) = bind_token {
+            let mut pending = self.pending_ready();
+            if let PendingReadyState::Pending { token, owner, .. } = &mut *pending
+                && token == bind_token
+            {
+                *owner = Some(claimed.1.id);
+            }
+        }
+        Some(claimed)
+    }
     fn pending_ready(&self) -> std::sync::MutexGuard<'_, PendingReadyState> {
         self.pending_ready
             .lock()
@@ -847,6 +879,7 @@ impl ExtensionRuntimeSet {
             op,
             token,
             ready_tx,
+            owner: None,
         };
         Ok(ready_rx)
     }
@@ -857,12 +890,13 @@ impl ExtensionRuntimeSet {
     pub(crate) fn complete_ready(&self, token: &str) -> bool {
         let mut state = self.pending_ready();
         let current = std::mem::replace(&mut *state, PendingReadyState::None);
-        let (op, pending_token, ready_tx) = match current {
+        let (op, pending_token, ready_tx, owner) = match current {
             PendingReadyState::Pending {
                 op,
                 token,
                 ready_tx,
-            } => (op, token, ready_tx),
+                owner,
+            } => (op, token, ready_tx, owner),
             other => {
                 *state = other;
                 return false;
@@ -873,6 +907,7 @@ impl ExtensionRuntimeSet {
                 op,
                 token: pending_token,
                 ready_tx,
+                owner,
             };
             return false;
         }
@@ -973,6 +1008,12 @@ impl ExtensionRuntimeSet {
             PendingReadyState::Finalizing { op, .. } => op,
             PendingReadyState::None => None,
         }
+    }
+
+    /// Weak handle to the pending-ready slot for relay drop callbacks.
+    #[must_use]
+    fn pending_ready_weak(&self) -> Weak<StdMutex<PendingReadyState>> {
+        Arc::downgrade(&self.pending_ready)
     }
 
     /// Drain any facade-owned prepared resources and wake a pending waiter.
@@ -1205,10 +1246,21 @@ impl ExtensionRuntimeSet {
                 session_bridge,
                 slots: _,
             } = pending_endpoint;
+            let pending_ready_weak = self.pending_ready_weak();
+            // Register the lower-layer drop callback on the endpoint runner
+            // so a ReplacementReady frame rejected at the host-to-endpoint
+            // hop aborts only the matching pending token.
+            let drop_pending = Weak::clone(&pending_ready_weak);
+            endpoint
+                .runner
+                .set_replacement_ready_drop_handler(Arc::new(move |token: &str| {
+                    abort_dropped_pending_ready(&drop_pending, token);
+                }));
             let context = EndpointRelayContext {
                 state: Arc::downgrade(&self.state),
                 channels: Arc::clone(&self.channels),
                 endpoint,
+                replacement_ready_drop: Weak::clone(&pending_ready_weak),
             };
             handles.extend(spawn_broadcast_relays(
                 &context,
@@ -1648,7 +1700,9 @@ impl ExtensionRuntimeSet {
         cancelled: bool,
         token: Option<&str>,
     ) -> Result<(), HostClientError> {
-        let Some((_lease, endpoint, local)) = self.state().claim_route(id) else {
+        let bind_token = (!cancelled).then_some(token).flatten();
+        let Some((_lease, endpoint, local)) = self.claim_route_and_bind_owner(id, bind_token)
+        else {
             return Err(HostClientError::NotRunning);
         };
         endpoint
@@ -1669,7 +1723,9 @@ impl ExtensionRuntimeSet {
         selected_text: Option<&str>,
         token: Option<&str>,
     ) -> Result<(), HostClientError> {
-        let Some((_lease, endpoint, local)) = self.state().claim_route(id) else {
+        let bind_token = (!cancelled).then_some(token).flatten();
+        let Some((_lease, endpoint, local)) = self.claim_route_and_bind_owner(id, bind_token)
+        else {
             return Err(HostClientError::NotRunning);
         };
         endpoint
@@ -1705,7 +1761,9 @@ impl ExtensionRuntimeSet {
         cancelled: bool,
         token: Option<&str>,
     ) -> Result<(), HostClientError> {
-        let Some((_lease, endpoint, local)) = self.state().claim_route(id) else {
+        let bind_token = (!cancelled).then_some(token).flatten();
+        let Some((_lease, endpoint, local)) = self.claim_route_and_bind_owner(id, bind_token)
+        else {
             return Err(HostClientError::NotRunning);
         };
         endpoint
@@ -1724,7 +1782,9 @@ impl ExtensionRuntimeSet {
         id: FrameId,
         outcome: Result<Option<&str>, String>,
     ) -> Result<(), HostClientError> {
-        let Some((_lease, endpoint, local)) = self.state().claim_route(id) else {
+        let bind_token = outcome.as_ref().ok().and_then(|token| *token);
+        let Some((_lease, endpoint, local)) = self.claim_route_and_bind_owner(id, bind_token)
+        else {
             return Err(HostClientError::NotRunning);
         };
         endpoint.runner.respond_reload(local, outcome).await
@@ -2822,6 +2882,7 @@ fn spawn_broadcast_relays(
             Arc::clone(channels),
             label.clone(),
             errors,
+            Weak::clone(&context.replacement_ready_drop),
         ),
     ]
 }
@@ -2912,8 +2973,8 @@ fn spawn_ui_relays(
     }
     handles
 }
-
-/// Spawn a session relay that cleans every failed correlated route before replying locally.
+// Keep the exhaustive bridge-variant routing in one flat dispatch.
+#[allow(clippy::too_many_lines)]
 fn spawn_session_relay(
     context: &EndpointRelayContext,
     session_bridge: Option<mpsc::Receiver<SessionBridgeEvent>>,
@@ -2922,6 +2983,7 @@ fn spawn_session_relay(
     let state = Weak::clone(&context.state);
     let channels = Arc::clone(&context.channels);
     let runner = Arc::clone(&context.endpoint.runner);
+    let replacement_ready_drop = Weak::clone(&context.replacement_ready_drop);
     let endpoint = context.endpoint.id;
     Some(tokio::spawn(async move {
         while let Some(event) = session.recv().await {
@@ -2929,6 +2991,7 @@ fn spawn_session_relay(
             let Some(state) = state.upgrade() else {
                 break;
             };
+            let mut dropped_replacement_token: Option<String> = None;
             let send_failed = {
                 let mut state = state
                     .lock()
@@ -3013,7 +3076,14 @@ fn spawn_session_relay(
                 }
             };
             if send_failed.unwrap_or(true) {
-                answer_unclaimed_session(&runner, fallback).await;
+                if let SessionBridgeEvent::ReplacementReady { token } = &fallback {
+                    dropped_replacement_token = Some(token.clone());
+                } else {
+                    answer_unclaimed_session(&runner, fallback).await;
+                }
+            }
+            if let Some(token) = dropped_replacement_token {
+                abort_dropped_pending_ready(&replacement_ready_drop, &token);
             }
         }
     }))
@@ -3026,6 +3096,74 @@ fn discard_pending_ready_op(op: PendingReadyOp) {
             });
         }
         PendingReadyOp::Reload { .. } => {}
+    }
+}
+
+/// Drop-specific token removal: removes ONLY a matching `Pending` state,
+/// never `Finalizing`. A duplicate dropped readiness frame must not revoke an
+/// already accepted `complete_ready` that won the race. Returns the removed
+/// operation so the caller can discard it after releasing the mutex guard.
+fn abort_pending_ready_drop(
+    pending: &StdMutex<PendingReadyState>,
+    token: &str,
+) -> Option<PendingReadyOp> {
+    let mut state = pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match &*state {
+        PendingReadyState::Pending {
+            token: pending_token,
+            ..
+        } if pending_token == token => {}
+        _ => return None,
+    }
+    match std::mem::replace(&mut *state, PendingReadyState::None) {
+        PendingReadyState::Pending { op, ready_tx, .. } => {
+            drop(ready_tx);
+            Some(op)
+        }
+        _ => None,
+    }
+}
+
+fn abort_dropped_pending_ready(pending: &Weak<StdMutex<PendingReadyState>>, token: &str) {
+    let Some(pending) = pending.upgrade() else {
+        return;
+    };
+    if let Some(op) = abort_pending_ready_drop(&pending, token) {
+        discard_pending_ready_op(op);
+    }
+}
+
+fn abort_pending_ready_owner(
+    pending: &StdMutex<PendingReadyState>,
+    owner: EndpointId,
+) -> Option<PendingReadyOp> {
+    let mut state = pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match &*state {
+        PendingReadyState::Pending {
+            owner: Some(pending_owner),
+            ..
+        } if *pending_owner == owner => {}
+        _ => return None,
+    }
+    match std::mem::replace(&mut *state, PendingReadyState::None) {
+        PendingReadyState::Pending { op, ready_tx, .. } => {
+            drop(ready_tx);
+            Some(op)
+        }
+        _ => None,
+    }
+}
+
+fn abort_owned_pending_ready(pending: &Weak<StdMutex<PendingReadyState>>, owner: EndpointId) {
+    let Some(pending) = pending.upgrade() else {
+        return;
+    };
+    if let Some(op) = abort_pending_ready_owner(&pending, owner) {
+        discard_pending_ready_op(op);
     }
 }
 
@@ -3262,6 +3400,7 @@ fn spawn_fatal_error_relay(
     channels: Arc<FacadeChannels>,
     label: String,
     mut receiver: broadcast::Receiver<ExtensionErrorEvent>,
+    pending_ready: Weak<StdMutex<PendingReadyState>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut forward_first_fatal = false;
@@ -3272,6 +3411,9 @@ fn spawn_fatal_error_relay(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .retire_endpoint(endpoint, &channels);
+            if forward_first_fatal {
+                abort_owned_pending_ready(&pending_ready, endpoint);
+            }
         }
         loop {
             match receiver.recv().await {
@@ -3279,12 +3421,20 @@ fn spawn_fatal_error_relay(
                     let Some(state) = state.upgrade() else {
                         break;
                     };
-                    let mut state = state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let retired_now =
-                        !runner.is_active() && state.retire_endpoint(endpoint, &channels);
-                    if forward_first_fatal || retired_now || state.accepts_relay(endpoint) {
+                    let (retired_now, forward) = {
+                        let mut state = state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let retired_now =
+                            !runner.is_active() && state.retire_endpoint(endpoint, &channels);
+                        let forward =
+                            forward_first_fatal || retired_now || state.accepts_relay(endpoint);
+                        (retired_now, forward)
+                    };
+                    if retired_now {
+                        abort_owned_pending_ready(&pending_ready, endpoint);
+                    }
+                    if forward {
                         let _ = channels.errors_tx.send(item);
                         forward_first_fatal = false;
                     }
@@ -3293,12 +3443,19 @@ fn spawn_fatal_error_relay(
                     let Some(state) = state.upgrade() else {
                         break;
                     };
-                    let mut state = state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if !runner.is_active() {
-                        state.retire_endpoint(endpoint, &channels);
-                    } else if state.accepts_relay(endpoint) {
+                    let (retired_now, accepts_relay) = {
+                        let mut state = state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if runner.is_active() {
+                            (false, state.accepts_relay(endpoint))
+                        } else {
+                            (state.retire_endpoint(endpoint, &channels), false)
+                        }
+                    };
+                    if retired_now {
+                        abort_owned_pending_ready(&pending_ready, endpoint);
+                    } else if accepts_relay {
                         channels.publish_error(
                             "extension_event_lagged",
                             format!("extension {label:?} relay lagged by {count} events"),
@@ -3307,13 +3464,18 @@ fn spawn_fatal_error_relay(
                     }
                 }
                 Err(broadcast::error::RecvError::Closed) => {
-                    if !runner.is_active()
-                        && let Some(state) = state.upgrade()
-                    {
-                        state
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .retire_endpoint(endpoint, &channels);
+                    let retired_now = if runner.is_active() {
+                        false
+                    } else {
+                        state.upgrade().is_some_and(|state| {
+                            state
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .retire_endpoint(endpoint, &channels)
+                        })
+                    };
+                    if retired_now {
+                        abort_owned_pending_ready(&pending_ready, endpoint);
                     }
                     break;
                 }
@@ -3330,7 +3492,7 @@ pub(crate) mod tests {
     use std::io::{BufRead, Write};
     use std::sync::atomic::AtomicUsize;
 
-    use pi_ext::protocol::{Frame, FrameKind, HelloAck};
+    use pi_ext::protocol::{Frame, FrameKind, HelloAck, SessionCommand};
     use pi_ext::sanitize::{SanitizedRun, SanitizedSlot};
     use serde_json::json;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -3435,6 +3597,119 @@ pub(crate) mod tests {
             !set.is_pending_busy(),
             "dropped finalize guard must release the finalizing slot"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn second_hop_full_aborts_only_matching_pending_token() -> TestResult {
+        let (runner, host) = make_runner(snapshot(&[])).await?;
+        let set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, runner)]);
+
+        // Install a PendingReadyOp::Reload and keep ready_rx.
+        let runtime = Arc::new(ModelRuntime::create_in_memory().await?);
+        let token = set.next_replacement_token();
+        let ready_rx = set
+            .install_pending(
+                token.clone(),
+                PendingReadyOp::Reload {
+                    prepared: PreparedReload {
+                        generation: None,
+                        pending: Vec::new(),
+                        diagnostics: Vec::new(),
+                    },
+                    model_runtime: Arc::clone(&runtime),
+                },
+            )
+            .map_err(|_| "initial pending install was rejected")?;
+
+        // Send a stale dropped token — the pending slot must remain.
+        let stale_token = "stale-tok-999".to_owned();
+        abort_pending_ready_drop(&set.pending_ready, &stale_token);
+        assert!(
+            set.is_pending_busy(),
+            "stale dropped token must not clear the active operation"
+        );
+
+        // Fill the facade session_bridge_tx to EVENT_CHANNEL_CAPACITY while
+        // its receiver is held and not drained.
+        let _bridge_rx = set
+            .take_session_bridge()
+            .ok_or("session bridge receiver missing")?;
+        for _ in 0..EVENT_CHANNEL_CAPACITY {
+            set.channels
+                .session_bridge_tx
+                .try_send(SessionBridgeEvent::Command(
+                    SessionCommand::SetSessionName {
+                        name: "filler".to_owned(),
+                    },
+                ))
+                .map_err(|_| "failed to fill session bridge")?;
+        }
+
+        // Emit a real session.replacementReady from the fake host for the
+        // installed token. The relay's try_send to the facade will fail
+        // (channel full), so the drop handler must abort the matching token.
+        host.emit(Frame {
+            id: 0,
+            kind: FrameKind::Event,
+            method: "session.replacementReady".to_owned(),
+            payload: json!({"token": token}),
+        })
+        .await;
+
+        // Assert within a bounded test-only timeout that ready_rx returns Err,
+        // pending busy is false, and no finalizing operation exists.
+        let result = tokio::time::timeout(Duration::from_secs(5), ready_rx).await;
+        assert!(
+            matches!(result, Ok(Err(_))),
+            "ready_rx must return Err after the matching token is aborted"
+        );
+        assert!(
+            !set.is_pending_busy(),
+            "pending slot must be cleared after the matching token is aborted"
+        );
+        assert!(
+            set.take_finalizing(&token).is_none(),
+            "no finalizing operation must exist after a dropped ready"
+        );
+
+        set.shutdown_once().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dropped_duplicate_ready_preserves_finalizing_operation() -> TestResult {
+        let (generation, _) = generation_from_endpoints(1, Vec::new());
+        let set = Arc::new(ExtensionRuntimeSet::from_generation(
+            generation,
+            Vec::new(),
+            String::new(),
+            false,
+        ));
+        let runtime = Arc::new(ModelRuntime::create_in_memory().await?);
+        let token = set.next_replacement_token();
+        let ready_rx = set
+            .install_pending(
+                token.clone(),
+                PendingReadyOp::Reload {
+                    prepared: PreparedReload::empty_for_test(),
+                    model_runtime: runtime,
+                },
+            )
+            .map_err(|_| "initial pending install was rejected")?;
+
+        assert!(set.complete_ready(&token));
+        assert!(
+            abort_pending_ready_drop(&set.pending_ready, &token).is_none(),
+            "a duplicate dropped ready must not revoke a finalizing operation"
+        );
+        ready_rx.await?;
+        let (op, _guard) = set
+            .take_finalizing(&token)
+            .ok_or("duplicate dropped ready removed the finalizing operation")?;
+        assert!(matches!(&op, PendingReadyOp::Reload { .. }));
+        drop(op);
+        assert!(set.finish_finalize(&token));
         Ok(())
     }
 
@@ -5805,6 +6080,7 @@ pub(crate) mod tests {
             state: Arc::downgrade(&set.state),
             channels: Arc::clone(&set.channels),
             endpoint,
+            replacement_ready_drop: set.pending_ready_weak(),
         };
         let handles = spawn_ui_relays(&context, ui_rx, None);
         let mut published = set.subscribe_ui();
@@ -6452,6 +6728,103 @@ pub(crate) mod tests {
         })
         .await
         .map_err(|_| "endpoint was not retired")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fatal_retirement_aborts_only_owner_pending_ready() -> TestResult {
+        let (owner_runner, owner_host) = make_runner(snapshot(&[])).await?;
+        let (other_runner, other_host) = make_runner(snapshot(&[])).await?;
+        let set = ExtensionRuntimeSet::bind(vec![
+            (EndpointKind::TsCompat, owner_runner),
+            (EndpointKind::Native, other_runner),
+        ]);
+        let (owner, other) = {
+            let state = set.state();
+            (
+                state.generation.endpoints[0].id,
+                state.generation.endpoints[1].id,
+            )
+        };
+        let runtime = Arc::new(ModelRuntime::create_in_memory().await?);
+        let token = set.next_replacement_token();
+        let mut ready_rx = set
+            .install_pending(
+                token.clone(),
+                PendingReadyOp::Reload {
+                    prepared: PreparedReload::empty_for_test(),
+                    model_runtime: runtime,
+                },
+            )
+            .map_err(|_| "initial pending install was rejected")?;
+        let route = set
+            .state()
+            .allocate_route(owner, 77)
+            .ok_or("owner route allocation failed")?;
+        set.respond_reload(route, Ok(Some(&token))).await?;
+        owner_host
+            .wait_for_response(protocol::SESSION_RELOAD_METHOD, 77)
+            .await?;
+
+        other_host.close().await;
+        wait_for_retirement(&set, other).await?;
+        assert!(
+            set.is_pending_busy(),
+            "retiring an unrelated endpoint aborted the pending operation"
+        );
+        assert!(matches!(
+            ready_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+
+        owner_host.close().await;
+        wait_for_retirement(&set, owner).await?;
+        let result = tokio::time::timeout(TEST_TIMEOUT, ready_rx).await;
+        assert!(
+            matches!(result, Ok(Err(_))),
+            "retiring the owner must wake the pending ready waiter"
+        );
+        assert!(!set.is_pending_busy());
+        assert!(set.take_finalizing(&token).is_none());
+        set.shutdown_once().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fatal_retirement_preserves_finalizing_ready() -> TestResult {
+        let (runner, host) = make_runner(snapshot(&[])).await?;
+        let set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, runner)]);
+        let owner = set.state().generation.endpoints[0].id;
+        let runtime = Arc::new(ModelRuntime::create_in_memory().await?);
+        let token = set.next_replacement_token();
+        let ready_rx = set
+            .install_pending(
+                token.clone(),
+                PendingReadyOp::Reload {
+                    prepared: PreparedReload::empty_for_test(),
+                    model_runtime: runtime,
+                },
+            )
+            .map_err(|_| "initial pending install was rejected")?;
+        let route = set
+            .state()
+            .allocate_route(owner, 78)
+            .ok_or("owner route allocation failed")?;
+        set.respond_reload(route, Ok(Some(&token))).await?;
+        host.wait_for_response(protocol::SESSION_RELOAD_METHOD, 78)
+            .await?;
+        assert!(set.complete_ready(&token));
+        ready_rx.await?;
+
+        host.close().await;
+        wait_for_retirement(&set, owner).await?;
+        let (op, _guard) = set
+            .take_finalizing(&token)
+            .ok_or("owner retirement removed the finalizing operation")?;
+        assert!(matches!(&op, PendingReadyOp::Reload { .. }));
+        drop(op);
+        assert!(set.finish_finalize(&token));
+        set.shutdown_once().await;
         Ok(())
     }
 

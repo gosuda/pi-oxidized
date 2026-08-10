@@ -74,6 +74,9 @@ pub const CANCEL_QUEUE_TIMEOUT: Duration = Duration::from_millis(50);
 /// Result type for host client operations.
 pub type HostResult<T> = Result<T, HostClientError>;
 
+/// Synchronous sink for replacement-ready tokens that must not be lost to broadcast lag.
+pub type ReplacementReadyHandler = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// A terminal frame result delivered to a pending caller.
 type FrameResult = HostResult<Frame>;
 
@@ -191,6 +194,8 @@ struct Shared {
     /// Runtime that owns background cancellation sends, including drops made
     /// from threads that are not currently entered into Tokio.
     runtime: tokio::runtime::Handle,
+    /// Optional direct sink for the one readiness event that must never lag.
+    replacement_ready_handler: StdMutex<Option<ReplacementReadyHandler>>,
     /// slot key → latest accepted generation. Stale pushes are discarded.
     slot_generations: StdMutex<HashMap<String, u64>>,
     /// Unsolicited event fan-out.
@@ -429,6 +434,7 @@ impl HostClient {
         let shared = Arc::new(Shared {
             pending: StdMutex::new(HashMap::new()),
             runtime: tokio::runtime::Handle::current(),
+            replacement_ready_handler: StdMutex::new(None),
             slot_generations: StdMutex::new(HashMap::new()),
             events: events_tx,
             next_id: AtomicU64::new(1),
@@ -486,6 +492,18 @@ impl HostClient {
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<HostEvent> {
         self.shared.events.subscribe()
+    }
+
+    /// Install or clear the direct replacement-ready sink.
+    ///
+    /// The reader invokes the sink without holding client locks. Without a sink,
+    /// replacement-ready events retain their ordinary broadcast behavior.
+    pub fn set_replacement_ready_handler(&self, handler: Option<ReplacementReadyHandler>) {
+        *self
+            .shared
+            .replacement_ready_handler
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = handler;
     }
 
     fn next_id(&self) -> FrameId {
@@ -1307,7 +1325,9 @@ async fn reader_task(stdout: Box<dyn AsyncRead + Unpin + Send>, shared: Arc<Shar
             Ok(n) => match decoder.push(&buf[..n]) {
                 Ok(frames) => {
                     for frame in frames {
-                        dispatch(&shared, frame).await;
+                        if !dispatch(&shared, frame).await {
+                            return;
+                        }
                     }
                 }
                 Err(e) => {
@@ -1497,10 +1517,10 @@ fn cancel_pending(
 }
 
 #[allow(clippy::too_many_lines)]
-async fn dispatch(shared: &Shared, frame: Frame) {
+async fn dispatch(shared: &Shared, frame: Frame) -> bool {
     if let Err(e) = frame.validate(false) {
         let _ = shared.events.send(HostEvent::ProtocolError(e.to_string()));
-        return;
+        return true;
     }
     let id = frame.id;
     match frame.kind {
@@ -1525,7 +1545,9 @@ async fn dispatch(shared: &Shared, frame: Frame) {
         }
         FrameKind::Event => {
             if id == 0 {
-                forward_event(shared, frame);
+                if !forward_event(shared, frame) {
+                    return false;
+                }
             } else if frame.method == Method::ProviderEvent.as_str() {
                 // Provider events are lossless: await capacity so no event
                 // is silently dropped before the stream terminates. The
@@ -1640,9 +1662,10 @@ async fn dispatch(shared: &Shared, frame: Frame) {
             }
         }
     }
+    true
 }
 
-fn forward_event(shared: &Shared, frame: Frame) {
+fn forward_event(shared: &Shared, frame: Frame) -> bool {
     let method = frame.method.as_str();
     if method == Method::UiSlot.as_str() {
         match from_payload::<crate::protocol::UiSlot>(&frame.payload) {
@@ -1730,19 +1753,49 @@ fn forward_event(shared: &Shared, frame: Frame) {
             }
         }
     } else if method == crate::protocol::SESSION_REPLACEMENT_READY_METHOD {
-        match from_payload::<crate::protocol::SessionReplacementReadyEvent>(&frame.payload) {
-            Ok(ready) => {
-                let _ = shared
-                    .events
-                    .send(HostEvent::ReplacementReady { token: ready.token });
-            }
-            Err(_) => {
-                let _ = shared.events.send(HostEvent::Raw(frame));
-            }
-        }
+        return if let Ok(ready) =
+            from_payload::<crate::protocol::SessionReplacementReadyEvent>(&frame.payload)
+        {
+            forward_replacement_ready(shared, &ready.token)
+        } else {
+            let _ = shared.events.send(HostEvent::Raw(frame));
+            true
+        };
     } else {
         let _ = shared.events.send(HostEvent::Raw(frame));
     }
+    true
+}
+
+fn forward_replacement_ready(shared: &Shared, token: &str) -> bool {
+    let handler = shared
+        .replacement_ready_handler
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let Some(handler) = handler else {
+        let _ = shared.events.send(HostEvent::ReplacementReady {
+            token: token.to_owned(),
+        });
+        return true;
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        handler(token);
+    }));
+    if result.is_ok() {
+        return true;
+    }
+    let message = "replacement-ready handler panicked".to_owned();
+    fail_all(
+        shared,
+        &HostClientError::Protocol {
+            message: message.clone(),
+            stderr: stderr_of(shared),
+        },
+    );
+    shared.running.store(false, Ordering::Relaxed);
+    let _ = shared.events.send(HostEvent::ProtocolError(message));
+    false
 }
 
 fn forward_stream_event(shared: &Shared, frame: Frame) {
@@ -3141,10 +3194,46 @@ mod tests {
         Ok(())
     }
 
-    /// `shutdown` calls `fail_all` from a separate task while the reader is
-    /// blocked on a full provider channel. `fail_all` cancels every per-stream
-    /// token, waking the blocked lossless send, and fails the terminal.
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test]
+    #[allow(clippy::panic)] // The contract under test is containment of callback panics.
+    async fn replacement_ready_handler_panic_fails_transport() -> R {
+        let (client, mut host) = make_pair().await;
+        let mut events = client.subscribe();
+        client.set_replacement_ready_handler(Some(Arc::new(|_: &str| {
+            panic!("replacement-ready test panic");
+        })));
+
+        let client = Arc::new(client);
+        let requester = Arc::clone(&client);
+        let request_task = tokio::spawn(async move {
+            requester
+                .request(
+                    Method::Notify,
+                    serde_json::json!({"pending": true}),
+                    Duration::from_secs(2),
+                )
+                .await
+        });
+        let _request = host.read_frame().await.ok_or("no pending request")?;
+        host.write_frame(&Frame {
+            id: 0,
+            kind: FrameKind::Event,
+            method: crate::protocol::SESSION_REPLACEMENT_READY_METHOD.to_owned(),
+            payload: serde_json::json!({"token": "panic-ready"}),
+        })
+        .await?;
+
+        let result = tokio::time::timeout(Duration::from_secs(1), request_task).await??;
+        assert!(matches!(result, Err(HostClientError::Protocol { .. })));
+        assert!(!client.is_running());
+        let event = tokio::time::timeout(Duration::from_secs(1), events.recv()).await??;
+        assert!(
+            matches!(event, HostEvent::ProtocolError(message) if message.contains("handler panicked"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn shutdown_wakes_blocked_provider_event_send() -> R {
         let (client, mut host) = make_pair().await;
         let stream = client
