@@ -267,6 +267,11 @@ pub struct ExtensionProvider {
     provider_id: String,
     client: Arc<HostClient>,
     timeout: Duration,
+    /// Test-only probe notified immediately before a bounded consumer send
+    /// when the channel is full (`capacity() == 0`). Absent in non-test
+    /// builds so production behavior is unchanged.
+    #[cfg(test)]
+    blocked_send_probe: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl ExtensionProvider {
@@ -277,6 +282,8 @@ impl ExtensionProvider {
             provider_id: provider_id.into(),
             client,
             timeout: DEFAULT_CALL_TIMEOUT,
+            #[cfg(test)]
+            blocked_send_probe: None,
         }
     }
 
@@ -284,6 +291,16 @@ impl ExtensionProvider {
     #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Test-only builder: install a probe that is notified immediately
+    /// before a bounded consumer send when the channel is full. Absent in
+    /// non-test builds.
+    #[cfg(test)]
+    #[must_use]
+    fn with_blocked_send_probe(mut self, probe: Arc<tokio::sync::Notify>) -> Self {
+        self.blocked_send_probe = Some(probe);
         self
     }
 }
@@ -299,6 +316,8 @@ impl Provider for ExtensionProvider {
         let provider_id = self.provider_id.clone();
         let timeout = self.timeout;
         let cancel = options.signal.clone().unwrap_or_default();
+        #[cfg(test)]
+        let blocked_send_probe = self.blocked_send_probe.clone();
         // Serialize model/context/options before spawning so no lock is held
         // across the host await (prepare_request already completed upstream).
         let model_value = serde_json::to_value(model).unwrap_or(Value::Null);
@@ -328,28 +347,82 @@ impl Provider for ExtensionProvider {
                     biased;
                     () = cancel.cancelled() => {
                         let _ = handle.cancel(methods::PROVIDER_CANCEL);
-                        let _ = tx
-                            .send(Err(ProviderError::new("provider stream cancelled")))
-                            .await;
+                        let _ = tx.try_send(Err(ProviderError::new(
+                            "provider stream cancelled",
+                        )));
                         return;
                     }
                     ev = handle.next_event() => match ev {
                         Some(frame) => {
-                            if let Some(event) = decode_provider_stream_event(&frame.payload)
-                                && tx.send(Ok(event)).await.is_err()
-                            {
-                                // Consumer dropped — stop driving the host stream.
-                                return;
+                            if let Some(event) = decode_provider_stream_event(&frame.payload) {
+                                #[cfg(test)]
+                                if tx.capacity() == 0
+                                    && let Some(probe) = &blocked_send_probe
+                                {
+                                    probe.notify_one();
+                                }
+                                // Race the consumer send against caller
+                                // cancellation so a full consumer channel
+                                // does not block cancellation teardown.
+                                let cancelled = tokio::select! {
+                                    biased;
+                                    () = cancel.cancelled() => true,
+                                    result = tx.send(Ok(event)) => {
+                                        if result.is_err() {
+                                            // Consumer dropped — stop driving the host stream.
+                                            return;
+                                        }
+                                        false
+                                    }
+                                };
+                                if cancelled {
+                                    let _ = handle.cancel(methods::PROVIDER_CANCEL);
+                                    let _ = tx.try_send(Err(ProviderError::new(
+                                        "provider stream cancelled",
+                                    )));
+                                    return;
+                                }
                             }
                         }
                         None => break,
                     }
                 }
             }
-            match handle.finish(timeout).await {
+            // Dropping the pending finish future on caller cancellation also
+            // drops the handle, which sends the provider cancel control frame.
+            let terminal = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    // handle is dropped here → Drop sends provider.cancel.
+                    let _ = tx.try_send(Err(ProviderError::new(
+                        "provider stream cancelled",
+                    )));
+                    return;
+                }
+                result = handle.finish(timeout) => result,
+            };
+            match terminal {
                 Ok(_terminal) => {}
                 Err(e) => {
-                    let _ = tx.send(Err(provider_error(e))).await;
+                    #[cfg(test)]
+                    if tx.capacity() == 0
+                        && let Some(probe) = &blocked_send_probe
+                    {
+                        probe.notify_one();
+                    }
+                    // Race terminal-error delivery against caller
+                    // cancellation so a full consumer channel does not
+                    // block cancellation teardown. When cancellation wins,
+                    // return without awaiting capacity.
+                    tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => {}
+                        result = tx.send(Err(provider_error(e))) => {
+                            if result.is_err() {
+                                // Consumer dropped — nothing more to do.
+                            }
+                        }
+                    }
                 }
             }
             // tx drops → stream ends.
@@ -2030,6 +2103,185 @@ mod tests {
         assert!(
             error3.to_string().contains("sourceInfo.origin"),
             "error should name sourceInfo.origin"
+        );
+        Ok(())
+    }
+
+    /// A saturated consumer must not make cancellation wait for another
+    /// channel slot. The rejected awaited error send appends a spurious
+    /// cancellation error after the 64 accepted events; `try_send` keeps
+    /// teardown non-blocking and leaves buffered events intact.
+    #[tokio::test(flavor = "current_thread")]
+    async fn extension_provider_cancel_unblocks_full_consumer_channel() -> R {
+        use pi_ai::types::AssistantMessage;
+
+        let (client, mut host) = make_pair().await;
+        let probe = Arc::new(tokio::sync::Notify::new());
+        let provider = ExtensionProvider::new("custom", Arc::new(client))
+            .with_blocked_send_probe(Arc::clone(&probe));
+        let model = Model {
+            id: "m".to_owned(),
+            name: "M".to_owned(),
+            api: "custom".to_owned(),
+            provider: "custom".to_owned(),
+            ..base_model_defaults()
+        };
+        let cancel = CancellationToken::new();
+        let options = StreamOptions {
+            signal: Some(cancel.clone()),
+            ..StreamOptions::default()
+        };
+        // Keep the stream mutable so we can drain it after saturation.
+        let mut stream = provider.stream(&model, Context::default(), options);
+        let req = host.require_frame("provider.stream").await?;
+
+        // Build a minimal valid AssistantMessageEvent payload. The adapter
+        // decodes `providerEvent` frames via `decode_provider_stream_event`,
+        // which tries `AssistantMessageEvent` first.
+        let partial = AssistantMessage::new("custom", "custom", "m", 0);
+        let event = AssistantMessageEvent::TextDelta {
+            content_index: 0,
+            delta: "x".to_owned(),
+            partial,
+        };
+        let payload = serde_json::to_value(&event)?;
+
+        // Send 65 events: 64 fill the channel, the 65th blocks the adapter.
+        for _ in 0..65 {
+            let ev = Frame::event(req.id, Method::ProviderEvent, payload.clone());
+            host.write_frame(&ev).await?;
+        }
+
+        // Wait for the adapter to fill the channel and block on the 65th
+        // event's `tx.send(Ok(event))` — the probe fires at `capacity() == 0`.
+        tokio::time::timeout(Duration::from_secs(2), probe.notified())
+            .await
+            .map_err(|_| "adapter did not block on the 65th event send within 2s")?;
+
+        // Cancel the caller token. The inner `select!` cancel branch fires,
+        // calls `handle.cancel(PROVIDER_CANCEL)`, and uses `try_send` (not
+        // `.await`) for the error — so `provider.cancel` must arrive promptly
+        // even though the consumer channel is full.
+        cancel.cancel();
+        let cancel_frame = tokio::time::timeout(
+            Duration::from_millis(500),
+            host.require_frame("provider.cancel"),
+        )
+        .await
+        .map_err(|_| {
+            "provider.cancel did not arrive within 500ms — \
+             cancellation error delivery is blocking on the full consumer queue"
+        })??;
+        assert_eq!(cancel_frame.method, methods::PROVIDER_CANCEL);
+        assert_eq!(cancel_frame.payload["id"], req.id);
+
+        // An awaited cancellation error would appear after the buffered events.
+        let mut ok_count = 0usize;
+        let mut got_err = false;
+        while let Some(item) = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .map_err(|_| "consumer stream did not end within 2s")?
+        {
+            if item.is_err() {
+                got_err = true;
+                break;
+            }
+            ok_count += 1;
+        }
+        assert!(
+            !got_err,
+            "consumer stream yielded an injected cancellation Err after \
+             {ok_count} Ok events"
+        );
+        assert_eq!(
+            ok_count, 64,
+            "consumer stream must yield exactly 64 Ok events, got {ok_count}"
+        );
+        Ok(())
+    }
+
+    /// A saturated consumer must not make terminal-error delivery ignore
+    /// caller cancellation. The rejected unconditional send appends the error
+    /// after the 64 buffered events; the cancellation race ends the stream
+    /// without waiting for another channel slot.
+    #[tokio::test(flavor = "current_thread")]
+    async fn extension_provider_terminal_error_cancelled_on_full_channel() -> R {
+        use crate::protocol::ErrorPayload;
+        use pi_ai::types::AssistantMessage;
+
+        let (client, mut host) = make_pair().await;
+        let probe = Arc::new(tokio::sync::Notify::new());
+        let provider = ExtensionProvider::new("custom", Arc::new(client))
+            .with_blocked_send_probe(Arc::clone(&probe));
+        let model = Model {
+            id: "m".to_owned(),
+            name: "M".to_owned(),
+            api: "custom".to_owned(),
+            provider: "custom".to_owned(),
+            ..base_model_defaults()
+        };
+        let cancel = CancellationToken::new();
+        let options = StreamOptions {
+            signal: Some(cancel.clone()),
+            ..StreamOptions::default()
+        };
+        let mut stream = provider.stream(&model, Context::default(), options);
+        let req = host.require_frame("provider.stream").await?;
+
+        // Build a minimal valid AssistantMessageEvent payload.
+        let partial = AssistantMessage::new("custom", "custom", "m", 0);
+        let event = AssistantMessageEvent::TextDelta {
+            content_index: 0,
+            delta: "x".to_owned(),
+            partial,
+        };
+        let payload = serde_json::to_value(&event)?;
+
+        // Send 64 provider events to fill the consumer channel, then a
+        // correlated error frame (terminal). The adapter will process the
+        // 64 Ok events, see the stream end (None from next_event), then
+        // await finish which receives the error. The terminal-error send
+        // blocks because the channel is still full (consumer not draining).
+        for _ in 0..64 {
+            let ev = Frame::event(req.id, Method::ProviderEvent, payload.clone());
+            host.write_frame(&ev).await?;
+        }
+        let error = ErrorPayload::new("extension_error", "host provider failed");
+        host.write_frame(&Frame::error_frame(req.id, Method::Notify, &error)?)
+            .await?;
+
+        // Wait for the adapter to queue 64 events, break out of the event
+        // loop, await finish (gets the error), and block on the terminal
+        // `tx.send(Err(...))` — the probe fires at `capacity() == 0`.
+        tokio::time::timeout(Duration::from_secs(2), probe.notified())
+            .await
+            .map_err(|_| "adapter did not block on terminal-error send within 2s")?;
+
+        // Cancel the caller token. The terminal-error delivery must race
+        // against cancellation and return without awaiting capacity.
+        cancel.cancel();
+
+        // The rejected awaited send would append an error after the buffered events.
+        let mut ok_count = 0usize;
+        let mut got_err = false;
+        while let Some(item) = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .map_err(|_| "consumer stream did not end within 2s")?
+        {
+            if item.is_err() {
+                got_err = true;
+                break;
+            }
+            ok_count += 1;
+        }
+        assert!(
+            !got_err,
+            "consumer stream yielded a terminal error after {ok_count} Ok \
+             events; terminal-error delivery is not cancellation-aware"
+        );
+        assert_eq!(
+            ok_count, 64,
+            "consumer stream must yield exactly 64 Ok events, got {ok_count}"
         );
         Ok(())
     }

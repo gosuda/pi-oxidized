@@ -41,6 +41,7 @@ use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::Notify;
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::host::{HostError, HostSpec};
 use crate::protocol::{
@@ -88,6 +89,11 @@ struct PendingEntry {
     /// cancel cleanup matches it so a newer entry reusing the same frame id
     /// is not removed underneath a stale cancellation.
     generation: u64,
+    /// Per-stream cancellation token. Cancelled from `cancel_pending`,
+    /// `fail_one`, and `fail_all` so a blocked lossless provider-event
+    /// send in [`dispatch`] wakes immediately instead of waiting for the
+    /// consumer to drain the bounded channel.
+    cancel: CancellationToken,
 }
 
 /// Outcome of asking the outbound writer to cancel a pending route.
@@ -584,6 +590,7 @@ impl HostClient {
                 stream: None,
                 cancelling: false,
                 generation: 0,
+                cancel: CancellationToken::new(),
             },
         );
         let frame = Frame {
@@ -994,6 +1001,7 @@ impl HostClient {
                 stream: Some(stream_tx),
                 cancelling: false,
                 generation: 0,
+                cancel: CancellationToken::new(),
             },
         );
         let frame = Frame {
@@ -1106,18 +1114,8 @@ impl HostClient {
         self.shared.running.store(false, Ordering::Relaxed);
         // Drop the outbound sender so the writer EOFs stdin.
         drop(self.cmd_tx.lock().await.take());
-        let mut child_guard = self.child.lock().await;
-        let reap = if let Some(child) = child_guard.take() {
-            let reap = reap_child(child).await;
-            drop(self.reader_handle.lock().await.take());
-            reap
-        } else {
-            // In-memory transport: no child to reap. `running` is already
-            // cleared; pending calls are failed below.
-            Ok(())
-        };
-        // Fail any pending calls that survived transport teardown. The reader
-        // task may have already drained them on EOF; this is a no-op then.
+        // Cancel blocked stream delivery before reaping so the child can
+        // drain stdout and observe stdin EOF during graceful shutdown.
         fail_all(
             &self.shared,
             &HostClientError::Closed {
@@ -1125,7 +1123,15 @@ impl HostClient {
                 stderr: stderr_of(&self.shared),
             },
         );
-        reap
+        let mut child_guard = self.child.lock().await;
+        if let Some(child) = child_guard.take() {
+            let reap = reap_child(child).await;
+            drop(self.reader_handle.lock().await.take());
+            reap
+        } else {
+            // In-memory transport has no child to reap.
+            Ok(())
+        }
     }
 }
 
@@ -1301,7 +1307,7 @@ async fn reader_task(stdout: Box<dyn AsyncRead + Unpin + Send>, shared: Arc<Shar
             Ok(n) => match decoder.push(&buf[..n]) {
                 Ok(frames) => {
                     for frame in frames {
-                        dispatch(&shared, frame);
+                        dispatch(&shared, frame).await;
                     }
                 }
                 Err(e) => {
@@ -1366,10 +1372,11 @@ fn stderr_of(shared: &Shared) -> String {
 
 fn fail_one(shared: &Shared, id: FrameId, err: HostClientError) {
     let entry = take_pending(shared, id);
-    if let Some(entry) = entry
-        && let Some(tx) = entry.terminal
-    {
-        let _ = tx.send(Err(err));
+    if let Some(entry) = entry {
+        entry.cancel.cancel();
+        if let Some(tx) = entry.terminal {
+            let _ = tx.send(Err(err));
+        }
     }
 }
 
@@ -1380,6 +1387,7 @@ fn fail_all(shared: &Shared, err: &HostClientError) {
         Vec::new()
     };
     for entry in entries {
+        entry.cancel.cancel();
         if let Some(tx) = entry.terminal {
             let _ = tx.send(Err(err.clone()));
         }
@@ -1439,6 +1447,7 @@ fn cancel_pending(
             return CancellationStart::AlreadyCancelling;
         }
         entry.cancelling = true;
+        entry.cancel.cancel();
         if terminal_error.is_some() {
             entry.terminal.take()
         } else {
@@ -1488,7 +1497,7 @@ fn cancel_pending(
 }
 
 #[allow(clippy::too_many_lines)]
-fn dispatch(shared: &Shared, frame: Frame) {
+async fn dispatch(shared: &Shared, frame: Frame) {
     if let Err(e) = frame.validate(false) {
         let _ = shared.events.send(HostEvent::ProtocolError(e.to_string()));
         return;
@@ -1517,7 +1526,14 @@ fn dispatch(shared: &Shared, frame: Frame) {
         FrameKind::Event => {
             if id == 0 {
                 forward_event(shared, frame);
+            } else if frame.method == Method::ProviderEvent.as_str() {
+                // Provider events are lossless: await capacity so no event
+                // is silently dropped before the stream terminates. The
+                // per-stream cancellation token unblocks the await when the
+                // call is cancelled or failed.
+                forward_provider_event(shared, frame).await;
             } else {
+                // Tool updates and other stream events stay lossy.
                 forward_stream_event(shared, frame);
             }
         }
@@ -1745,6 +1761,41 @@ fn forward_stream_event(shared: &Shared, frame: Frame) {
     }
 }
 
+/// Forward a correlated `providerEvent` frame with lossless, cancellation-aware
+/// delivery. Unlike [`forward_stream_event`], this awaits channel capacity so
+/// no provider event is silently dropped before the stream terminates. The
+/// per-stream cancellation token unblocks the await when the call is cancelled
+/// or failed, so the reader loop never deadlocks on a slow consumer.
+///
+/// The pending mutex is released before awaiting so cancel/fail/terminal
+/// dispatch can proceed concurrently.
+async fn forward_provider_event(shared: &Shared, frame: Frame) {
+    let id = frame.id;
+    let (stream, cancel) = if let Ok(pending) = shared.pending.lock() {
+        match pending.get(&id).filter(|entry| !entry.cancelling) {
+            Some(entry) => (entry.stream.clone(), entry.cancel.clone()),
+            None => return,
+        }
+    } else {
+        return;
+    };
+    if let Some(stream) = stream {
+        // Await capacity so every provider event is delivered in order.
+        // Race against the per-stream cancellation token so cancel/fail
+        // wakes a blocked send instead of waiting for the consumer.
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => {}
+            result = stream.send(frame) => {
+                if let Err(mpsc::error::SendError(_)) = result {
+                    // Consumer dropped the stream receiver; cleanup is
+                    // handled by cancel/fail/terminal dispatch.
+                }
+            }
+        }
+    }
+}
+
 fn accept_generation(shared: &Shared, key: &str, generation: u64) -> bool {
     if let Ok(mut generations) = shared.slot_generations.lock() {
         let prev = generations.insert(key.to_owned(), generation);
@@ -1852,6 +1903,26 @@ mod tests {
     type R = Result<(), Box<dyn Error>>;
 
     use crate::test_support::make_pair;
+
+    async fn wait_for_blocked_provider_send(stream: &StreamHandle) -> R {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let blocked = stream.shared.pending.lock().is_ok_and(|pending| {
+                    pending
+                        .get(&stream.id)
+                        .and_then(|entry| entry.stream.as_ref())
+                        .is_some_and(|sender| sender.capacity() == 0 && sender.strong_count() > 1)
+                });
+                if blocked {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "provider send did not block on the full stream buffer")?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn handshake_succeeds() -> R {
@@ -2260,6 +2331,7 @@ mod tests {
                     stream: None,
                     cancelling: false,
                     generation: new_generation,
+                    cancel: CancellationToken::new(),
                 },
             );
         }
@@ -2407,6 +2479,7 @@ mod tests {
                     stream: None,
                     cancelling: false,
                     generation: new_generation,
+                    cancel: CancellationToken::new(),
                 },
             );
         }
@@ -2934,6 +3007,177 @@ mod tests {
         // The pending map must be empty.
         let pending_len = client.shared.pending.lock().map_or(0, |p| p.len());
         assert_eq!(pending_len, 0, "pending map should be empty after shutdown");
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Provider event lossless delivery + cancellation-aware backpressure
+    // -----------------------------------------------------------------------
+
+    /// A capacity-2 provider stream must preserve *every* `providerEvent`
+    /// frame in FIFO order, even when the consumer pauses draining. The
+    /// reader awaits bounded capacity instead of dropping stale events.
+    #[tokio::test]
+    async fn provider_stream_preserves_all_events_before_terminal() -> R {
+        let (client, mut host) = make_pair().await;
+        let mut stream = client
+            .open_stream_raw("provider.stream", serde_json::json!({}), 2)
+            .await?;
+        let req = host.read_frame().await.ok_or("no provider request")?;
+        for n in 0..5u64 {
+            let ev = Frame::event(req.id, Method::ProviderEvent, serde_json::json!({"n": n}));
+            host.write_frame(&ev).await?;
+        }
+        let res = Frame::response(req.id, Method::Notify, serde_json::json!({"done": true}));
+        host.write_frame(&res).await?;
+
+        // Saturation must be observed before draining; otherwise the old lossy
+        // path could pass by racing a fast consumer.
+        wait_for_blocked_provider_send(&stream).await?;
+        let mut received = Vec::new();
+        while let Some(frame) = stream.next_event().await {
+            received.push(
+                frame.payload["n"]
+                    .as_u64()
+                    .ok_or_else(|| HostClientError::Payload("missing event index".into()))?,
+            );
+        }
+        let terminal = stream.finish(Duration::from_secs(2)).await?;
+        assert_eq!(
+            received,
+            vec![0, 1, 2, 3, 4],
+            "provider events must all be delivered in FIFO order"
+        );
+        assert_eq!(terminal.payload["done"], true);
+        Ok(())
+    }
+
+    /// Tool-update stream events remain lossy: a capacity-2 channel drops
+    /// excess events under backpressure, preserving only a FIFO prefix.
+    #[tokio::test]
+    async fn tool_update_stream_stays_lossy_under_backpressure() -> R {
+        let (client, mut host) = make_pair().await;
+        let mut events = client.subscribe();
+        let mut stream = client
+            .open_stream_raw("tool.execute", serde_json::json!({}), 2)
+            .await?;
+        let req = host.read_frame().await.ok_or("no req")?;
+        for n in 0..10u64 {
+            let ev = Frame::event(req.id, Method::ToolUpdate, serde_json::json!({"n": n}));
+            host.write_frame(&ev).await?;
+        }
+        let res = Frame::response(req.id, Method::Notify, serde_json::json!({"done": true}));
+        host.write_frame(&res).await?;
+        host.write_frame(&Frame::event(
+            0,
+            Method::Notify,
+            serde_json::json!({"message": "tool stream barrier", "level": "info"}),
+        ))
+        .await?;
+        let barrier = tokio::time::timeout(Duration::from_secs(1), events.recv()).await??;
+        assert!(matches!(barrier, HostEvent::Notify(_)));
+
+        let mut received = Vec::new();
+        while let Some(frame) = stream.next_event().await {
+            received.push(frame.payload["n"].as_u64().unwrap_or(0));
+        }
+        let terminal = stream.finish(Duration::from_secs(2)).await?;
+        assert!(
+            received.len() <= 2,
+            "tool updates must stay lossy, got {received:?}"
+        );
+        assert_eq!(received.first(), Some(&0), "first event is never dropped");
+        assert_eq!(terminal.payload["done"], true);
+        Ok(())
+    }
+
+    /// Cancelling a provider stream whose lossless send is blocked on a
+    /// full channel must wake the reader. After cancellation, subsequent
+    /// requests must be processable — proving the reader is not deadlocked.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_wakes_blocked_provider_event_send() -> R {
+        let (client, mut host) = make_pair().await;
+        let stream = client
+            .open_stream_raw("provider.stream", serde_json::json!({}), 2)
+            .await?;
+        let id = stream.id();
+        let shared = Arc::clone(&stream.shared);
+
+        // Host writes five provider events. The reader will block on the
+        // third because the capacity-2 channel is full (consumer is not
+        // draining — the stream handle is held but never polled).
+        let req = host.read_frame().await.ok_or("no provider request")?;
+        for n in 0..5u64 {
+            let ev = Frame::event(req.id, Method::ProviderEvent, serde_json::json!({"n": n}));
+            host.write_frame(&ev).await?;
+        }
+
+        wait_for_blocked_provider_send(&stream).await?;
+
+        // Cancel the stream directly. This cancels the per-stream token,
+        // which wakes the blocked `forward_provider_event` send.
+        let _ = cancel_pending(&shared, id, stream.generation, None, None, None);
+
+        // After cancellation the reader must be unblocked. Verify by
+        // issuing a new request: if the reader were still blocked on the
+        // provider send, this request's response would never be dispatched.
+        let client_task = tokio::spawn(async move {
+            client
+                .request(
+                    Method::Notify,
+                    serde_json::json!({"ping": true}),
+                    Duration::from_secs(2),
+                )
+                .await
+        });
+        let req2 = host.read_frame().await.ok_or("no second request")?;
+        let response = Frame::response(req2.id, Method::Notify, serde_json::json!({"pong": true}));
+        host.write_frame(&response).await?;
+        let result = tokio::time::timeout(Duration::from_secs(1), client_task)
+            .await
+            .map_err(|_| "second request timed out — reader is still blocked")??;
+        let frame = result?;
+        assert_eq!(frame.payload["pong"], true);
+        Ok(())
+    }
+
+    /// `shutdown` calls `fail_all` from a separate task while the reader is
+    /// blocked on a full provider channel. `fail_all` cancels every per-stream
+    /// token, waking the blocked lossless send, and fails the terminal.
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_wakes_blocked_provider_event_send() -> R {
+        let (client, mut host) = make_pair().await;
+        let stream = client
+            .open_stream_raw("provider.stream", serde_json::json!({}), 2)
+            .await?;
+
+        // Host writes five provider events. The reader blocks on the third
+        // because the capacity-2 channel is full (consumer is not draining).
+        let req = host.read_frame().await.ok_or("no provider request")?;
+        for n in 0..5u64 {
+            let ev = Frame::event(req.id, Method::ProviderEvent, serde_json::json!({"n": n}));
+            host.write_frame(&ev).await?;
+        }
+        wait_for_blocked_provider_send(&stream).await?;
+
+        // `shutdown` runs from a separate task and calls `fail_all`, which
+        // cancels every per-stream token — waking the blocked reader send —
+        // and sends `Err(Closed)` to each terminal.
+        let shutdown_task = tokio::spawn(async move { client.shutdown().await });
+        let _ = shutdown_task.await?;
+
+        // The stream's terminal must resolve via `fail_all` rather than
+        // hanging forever on the blocked send.
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            stream.finish(Duration::from_secs(2)),
+        )
+        .await
+        .map_err(|_| "stream terminal did not resolve after shutdown")?;
+        assert!(
+            matches!(result, Err(HostClientError::Closed { .. })),
+            "expected Closed after shutdown, got {result:?}"
+        );
         Ok(())
     }
 }
