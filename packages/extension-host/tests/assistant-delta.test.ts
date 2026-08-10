@@ -436,6 +436,7 @@ describe("host SessionManager bridge", () => {
 					&& payloadOf(f)["action"] === "appendEntry",
 			);
 			expect(payloadOf(append)).toEqual({
+				replacementToken: "tok-1",
 				action: "appendEntry",
 				customType: "probe",
 				data: { value: 1 },

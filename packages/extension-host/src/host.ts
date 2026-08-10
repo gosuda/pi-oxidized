@@ -2750,6 +2750,11 @@ export class ExtensionHost {
 				// Emit an explicit abort for the token so Rust does not keep the
 				// pending replacement alive, and do not let setup or withSession
 				// run against a stale scope.
+				self.emitExtensionError(
+					"<host>",
+					"session.replacementAbort",
+					"replacement token dropped after command scope closed",
+				);
 				void self.client.send({
 					id: 0,
 					kind: "event",
