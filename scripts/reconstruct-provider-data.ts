@@ -41,6 +41,8 @@ const LOCK_INITIALIZING_GRACE_MS = 30_000;
 const LOCK_OWNER_FILE = "owner.json";
 const DATA_MANIFEST_FILE = ".manifest.json";
 const MANIFEST_SCHEMA_VERSION = 3;
+// UTC time of the newest provider snapshot commit in pinned reference 4488ad55.
+const PINNED_PROVIDER_DATA_GENERATED_AT = "2026-07-30T07:01:42.000Z";
 const LOCK_OWNER_VERSION = 1;
 type FileSystemError = Error & { code?: string };
 
@@ -51,6 +53,12 @@ export type ReconstructProviderDataOptions = {
 	catalogPath?: string;
 	providersDir?: string;
 	dataDir?: string;
+	/**
+	 * Timestamp for a new manifest when no live manifest exists. Repository
+	 * defaults use the pinned package timestamp; custom paths omit the manifest
+	 * unless the caller supplies this value.
+	 */
+	initialManifestGeneratedAt?: string;
 	/**
 	 * Inversion authority hook. When omitted, the default proof (spawning
 	 * `scripts/generate-builtin-models.ts` and comparing `catalogPath`
@@ -167,28 +175,38 @@ function encodeProviderModels(provider: string, models: Record<string, unknown>)
 function rebuildProviderManifest(
 	catalog: ProviderCatalog,
 	bodies: ReadonlyMap<string, string>,
-	previous: Uint8Array,
-): Uint8Array {
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(previous));
-	} catch (error) {
-		throw new Error(
-			`provider manifest is not valid UTF-8 JSON: ${error instanceof Error ? error.message : String(error)}`,
-		);
+	previous: Uint8Array | null,
+	initialGeneratedAt?: string,
+): Uint8Array | null {
+	let generatedAt = initialGeneratedAt;
+	if (previous !== null) {
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(previous));
+		} catch (error) {
+			throw new Error(
+				`provider manifest is not valid UTF-8 JSON: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+		if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+			throw new Error("provider manifest must contain a JSON object");
+		}
+		const record = parsed as Record<string, unknown>;
+		const previousGeneratedAt = record["generatedAt"];
+		if (typeof previousGeneratedAt !== "string") {
+			throw new Error("provider manifest has an invalid generation timestamp");
+		}
+		generatedAt = previousGeneratedAt;
+		const previousSchemaVersion = record["schemaVersion"];
+		if (previousSchemaVersion !== MANIFEST_SCHEMA_VERSION) {
+			throw new Error(
+				`provider manifest schemaVersion ${String(previousSchemaVersion)} is not supported; this reconstruction emits ${MANIFEST_SCHEMA_VERSION}`,
+			);
+		}
 	}
-	if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-		throw new Error("provider manifest must contain a JSON object");
-	}
-	const generatedAt = (parsed as Record<string, unknown>)["generatedAt"];
-	if (typeof generatedAt !== "string" || Number.isNaN(Date.parse(generatedAt))) {
+	if (generatedAt === undefined) return null;
+	if (Number.isNaN(Date.parse(generatedAt))) {
 		throw new Error("provider manifest has an invalid generation timestamp");
-	}
-	const previousSchemaVersion = (parsed as Record<string, unknown>)["schemaVersion"];
-	if (previousSchemaVersion !== MANIFEST_SCHEMA_VERSION) {
-		throw new Error(
-			`provider manifest schemaVersion ${String(previousSchemaVersion)} is not supported; this reconstruction emits ${MANIFEST_SCHEMA_VERSION}`,
-		);
 	}
 
 	const structure = Object.create(null) as Record<string, Record<string, string>>;
@@ -786,9 +804,14 @@ export async function reconstructProviderData(
 		const previousManifest = await pathExists(manifestPath)
 			? await Bun.file(manifestPath).bytes()
 			: null;
-		const manifestBody = previousManifest === null
-			? null
-			: rebuildProviderManifest(catalog, expectedBodies, previousManifest);
+		const initialManifestGeneratedAt = options.initialManifestGeneratedAt
+			?? (usesRepositoryDefaultPaths(proofCtx) ? PINNED_PROVIDER_DATA_GENERATED_AT : undefined);
+		const manifestBody = rebuildProviderManifest(
+			catalog,
+			expectedBodies,
+			previousManifest,
+			initialManifestGeneratedAt,
+		);
 		const stagingDir = uniqueSibling(dataDir, "staging");
 		let backupDir: string | null = null;
 		let published = false;

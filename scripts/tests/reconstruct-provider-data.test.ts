@@ -232,6 +232,37 @@ describe("reconstructProviderData transaction (Cluster C)", () => {
 		}
 	});
 
+	test("creates an absent manifest from an explicit generation timestamp", async () => {
+		const catalog: ProviderCatalog = {
+			alpha: { model: { api: "test-api", id: "model" } },
+		};
+		const fixture = makeFixture(catalog);
+		const generatedAt = "2026-08-11T00:00:00.000Z";
+		try {
+			await reconstructProviderData({
+				repoRoot: fixture.root,
+				catalogPath: fixture.catalogPath,
+				providersDir: fixture.providersDir,
+				dataDir: fixture.dataDir,
+				initialManifestGeneratedAt: generatedAt,
+				inversionProof: noopProof,
+			});
+
+			const providerBody = readFileSync(join(fixture.dataDir, "alpha.json"), "utf8");
+			const manifest = asRecord(
+				JSON.parse(readFileSync(join(fixture.dataDir, ".manifest.json"), "utf8")),
+			);
+			const files = asRecord(manifest.files);
+			expect(manifest.schemaVersion).toBe(3);
+			expect(manifest.generatedAt).toBe(generatedAt);
+			expect(files["alpha.json"]).toBe(
+				createHash("sha256").update(providerBody).digest("hex"),
+			);
+		} finally {
+			rmSync(fixture.root, { recursive: true, force: true });
+		}
+	});
+
 
 	test("round-trips nested __proto__ model maps through reconstruction and inversion", async () => {
 		const catalog = JSON.parse(
