@@ -938,12 +938,11 @@ where
         .map_or(0, |policy| policy.max_retries);
     let mut attempt = 0_u32;
     let mut retried = false;
-    let mut accumulated_usage: Option<Usage> = None;
 
     let finish_callback = callbacks.and_then(|callbacks| callbacks.on_retry_finished.as_ref());
 
     loop {
-        let mut response = match produce().await {
+        let response = match produce().await {
             Ok(response) => response,
             Err(error) => {
                 if retried && let Some(callback) = finish_callback {
@@ -953,16 +952,10 @@ where
             }
         };
 
-        accumulated_usage = Some(match &accumulated_usage {
-            Some(acc) => combine_usage(acc, &response.usage),
-            None => response.usage.clone(),
-        });
-
         if response.stop_reason == StopReason::Aborted {
             if retried && let Some(callback) = finish_callback {
                 callback();
             }
-            response.usage = accumulated_usage.unwrap_or_default();
             return Ok(response);
         }
 
@@ -973,7 +966,6 @@ where
             if retried && let Some(callback) = finish_callback {
                 callback();
             }
-            response.usage = accumulated_usage.unwrap_or_default();
             return Ok(response);
         }
 
@@ -1014,7 +1006,6 @@ where
             let mut aborted = response;
             aborted.stop_reason = StopReason::Aborted;
             aborted.error_message = None;
-            aborted.usage = accumulated_usage.unwrap_or_default();
             return Ok(aborted);
         }
 
@@ -2200,7 +2191,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_summarization_call_accumulates_usage_across_attempts() {
+    async fn retry_summarization_call_returns_terminal_attempt_usage() {
         let policy = SummarizationRetryPolicy {
             enabled: true,
             max_retries: 1,
@@ -2214,7 +2205,7 @@ mod tests {
                 call_count = call_count.saturating_add(1);
                 Box::pin(async move {
                     if count == 0 {
-                        // First attempt: retryable error with nonzero usage and cost.
+                        // Pinned TypeScript parity discards usage from retryable responses.
                         let mut msg = AssistantMessage::new(
                             "anthropic-messages",
                             "anthropic",
@@ -2241,7 +2232,6 @@ mod tests {
                         };
                         Ok(msg)
                     } else {
-                        // Second attempt: success with nonzero usage and cost.
                         let mut msg = AssistantMessage::new(
                             "anthropic-messages",
                             "anthropic",
@@ -2278,24 +2268,19 @@ mod tests {
 
         let response = result_ok(result);
 
-        // Terminal response content and stop reason are preserved.
         assert_eq!(response.stop_reason, StopReason::Stop);
         assert_eq!(assistant_text(&response), "summary");
-
-        // Token usage is the exact sum of both attempts.
-        assert_eq!(response.usage.input, 300);
-        assert_eq!(response.usage.output, 150);
-        assert_eq!(response.usage.cache_read, 30);
-        assert_eq!(response.usage.cache_write, 15);
-        assert_eq!(response.usage.cache_write1h, Some(10));
-        assert_eq!(response.usage.reasoning, Some(60));
-        assert_eq!(response.usage.total_tokens, 495);
-
-        // Cost is the exact sum of both attempts.
-        assert!((response.usage.cost.input - 0.03).abs() < 1e-9);
-        assert!((response.usage.cost.output - 0.06).abs() < 1e-9);
-        assert!((response.usage.cost.cache_read - 0.003).abs() < 1e-9);
-        assert!((response.usage.cost.cache_write - 0.015).abs() < 1e-9);
-        assert!((response.usage.cost.total - 0.108).abs() < 1e-9);
+        assert_eq!(response.usage.input, 200);
+        assert_eq!(response.usage.output, 100);
+        assert_eq!(response.usage.cache_read, 20);
+        assert_eq!(response.usage.cache_write, 10);
+        assert_eq!(response.usage.cache_write1h, Some(7));
+        assert_eq!(response.usage.reasoning, Some(40));
+        assert_eq!(response.usage.total_tokens, 330);
+        assert!((response.usage.cost.input - 0.02).abs() < 1e-9);
+        assert!((response.usage.cost.output - 0.04).abs() < 1e-9);
+        assert!((response.usage.cost.cache_read - 0.002).abs() < 1e-9);
+        assert!((response.usage.cost.cache_write - 0.01).abs() < 1e-9);
+        assert!((response.usage.cost.total - 0.072).abs() < 1e-9);
     }
 }
