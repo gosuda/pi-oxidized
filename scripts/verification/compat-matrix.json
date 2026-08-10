@@ -407,7 +407,7 @@
 					"timeoutMs": 600000
 				}
 			],
-			"evidence": "bench-extension-scaling reports zero/idle/active widget medians and terminal-input p99 within thresholds"
+			"evidence": "bench-extension-scaling reports zero/idle/active widget medians; enforces idle-vs-zero p99 and terminal-input thresholds"
 		},
 		{
 			"id": "performance",
