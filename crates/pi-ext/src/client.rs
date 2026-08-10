@@ -74,9 +74,6 @@ pub const CANCEL_QUEUE_TIMEOUT: Duration = Duration::from_millis(50);
 /// Result type for host client operations.
 pub type HostResult<T> = Result<T, HostClientError>;
 
-/// Synchronous sink for replacement-ready tokens that must not be lost to broadcast lag.
-pub type ReplacementReadyHandler = Arc<dyn Fn(&str) + Send + Sync>;
-
 /// A terminal frame result delivered to a pending caller.
 type FrameResult = HostResult<Frame>;
 
@@ -194,8 +191,8 @@ struct Shared {
     /// Runtime that owns background cancellation sends, including drops made
     /// from threads that are not currently entered into Tokio.
     runtime: tokio::runtime::Handle,
-    /// Optional direct sink for the one readiness event that must never lag.
-    replacement_ready_handler: StdMutex<Option<ReplacementReadyHandler>>,
+    /// Optional direct sink that preserves session-control frame order.
+    session_control_handler: StdMutex<Option<HostSessionControlHandler>>,
     /// slot key → latest accepted generation. Stale pushes are discarded.
     slot_generations: StdMutex<HashMap<String, u64>>,
     /// Unsolicited event fan-out.
@@ -215,6 +212,26 @@ struct Shared {
     #[cfg(test)]
     cancel_cleanup_done: Notify,
 }
+
+/// Ordered host-to-client session control that must not be lost or reordered.
+#[derive(Debug, Clone)]
+pub enum HostSessionControlEvent {
+    /// Fire-and-forget action, optionally scoped to a pending replacement.
+    Command(crate::protocol::SessionCommandEnvelope),
+    /// Host finished a ready-gated replacement.
+    ReplacementReady {
+        /// Token previously returned on a replacement response.
+        token: String,
+    },
+    /// Host abandoned a ready-gated replacement.
+    ReplacementAbort {
+        /// Token previously returned on a replacement response.
+        token: String,
+    },
+}
+
+/// Synchronous sink for ordered session-control events.
+pub type HostSessionControlHandler = Arc<dyn Fn(HostSessionControlEvent) + Send + Sync>;
 
 /// Typed unsolicited event delivered to subscribers.
 #[derive(Debug, Clone)]
@@ -236,7 +253,7 @@ pub enum HostEvent {
     /// Extension `setTheme` application request.
     ThemeSet(crate::protocol::ThemeSet),
     /// Extension fire-and-forget session action (`pi.setSessionName`, …).
-    SessionCommand(crate::protocol::SessionCommand),
+    SessionCommand(crate::protocol::SessionCommandEnvelope),
     /// Correlated `pi.setModel` request awaiting [`HostClient::respond_set_model`].
     SetModelRequest {
         /// Original host correlation id.
@@ -293,6 +310,11 @@ pub enum HostEvent {
     },
     /// Host finished a ready-gated replacement (`session.replacementReady`).
     ReplacementReady {
+        /// Token previously returned on a replacement response.
+        token: String,
+    },
+    /// Host abandoned a ready-gated replacement (`session.replacementAbort`).
+    ReplacementAbort {
         /// Token previously returned on a replacement response.
         token: String,
     },
@@ -434,7 +456,7 @@ impl HostClient {
         let shared = Arc::new(Shared {
             pending: StdMutex::new(HashMap::new()),
             runtime: tokio::runtime::Handle::current(),
-            replacement_ready_handler: StdMutex::new(None),
+            session_control_handler: StdMutex::new(None),
             slot_generations: StdMutex::new(HashMap::new()),
             events: events_tx,
             next_id: AtomicU64::new(1),
@@ -494,14 +516,14 @@ impl HostClient {
         self.shared.events.subscribe()
     }
 
-    /// Install or clear the direct replacement-ready sink.
+    /// Install or clear the ordered session-control sink.
     ///
     /// The reader invokes the sink without holding client locks. Without a sink,
-    /// replacement-ready events retain their ordinary broadcast behavior.
-    pub fn set_replacement_ready_handler(&self, handler: Option<ReplacementReadyHandler>) {
+    /// these events retain their ordinary broadcast behavior.
+    pub fn set_session_control_handler(&self, handler: Option<HostSessionControlHandler>) {
         *self
             .shared
-            .replacement_ready_handler
+            .session_control_handler
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = handler;
     }
@@ -1734,15 +1756,6 @@ fn forward_event(shared: &Shared, frame: Frame) -> bool {
                 let _ = shared.events.send(HostEvent::Raw(frame));
             }
         }
-    } else if method == crate::protocol::SESSION_COMMAND_METHOD {
-        match from_payload::<crate::protocol::SessionCommand>(&frame.payload) {
-            Ok(command) => {
-                let _ = shared.events.send(HostEvent::SessionCommand(command));
-            }
-            Err(_) => {
-                let _ = shared.events.send(HostEvent::Raw(frame));
-            }
-        }
     } else if method == crate::protocol::UI_CONTROL_METHOD {
         match from_payload::<crate::protocol::UiControl>(&frame.payload) {
             Ok(control) => {
@@ -1752,40 +1765,67 @@ fn forward_event(shared: &Shared, frame: Frame) -> bool {
                 let _ = shared.events.send(HostEvent::Raw(frame));
             }
         }
-    } else if method == crate::protocol::SESSION_REPLACEMENT_READY_METHOD {
-        return if let Ok(ready) =
-            from_payload::<crate::protocol::SessionReplacementReadyEvent>(&frame.payload)
-        {
-            forward_replacement_ready(shared, &ready.token)
-        } else {
-            let _ = shared.events.send(HostEvent::Raw(frame));
-            true
-        };
+    } else if method == crate::protocol::SESSION_COMMAND_METHOD
+        || method == crate::protocol::SESSION_REPLACEMENT_READY_METHOD
+        || method == crate::protocol::SESSION_REPLACEMENT_ABORT_METHOD
+    {
+        return forward_session_control_frame(shared, frame);
     } else {
         let _ = shared.events.send(HostEvent::Raw(frame));
     }
     true
 }
 
-fn forward_replacement_ready(shared: &Shared, token: &str) -> bool {
+fn forward_session_control_frame(shared: &Shared, frame: Frame) -> bool {
+    let event = match frame.method.as_str() {
+        crate::protocol::SESSION_COMMAND_METHOD => {
+            from_payload::<crate::protocol::SessionCommandEnvelope>(&frame.payload)
+                .map(HostSessionControlEvent::Command)
+        }
+        crate::protocol::SESSION_REPLACEMENT_READY_METHOD => {
+            from_payload::<crate::protocol::SessionReplacementReadyEvent>(&frame.payload)
+                .map(|ready| HostSessionControlEvent::ReplacementReady { token: ready.token })
+        }
+        crate::protocol::SESSION_REPLACEMENT_ABORT_METHOD => {
+            from_payload::<crate::protocol::SessionReplacementAbortEvent>(&frame.payload)
+                .map(|abort| HostSessionControlEvent::ReplacementAbort { token: abort.token })
+        }
+        _ => unreachable!("caller accepts only session-control methods"),
+    };
+    if let Ok(event) = event {
+        forward_session_control(shared, event)
+    } else {
+        let _ = shared.events.send(HostEvent::Raw(frame));
+        true
+    }
+}
+
+fn forward_session_control(shared: &Shared, event: HostSessionControlEvent) -> bool {
     let handler = shared
-        .replacement_ready_handler
+        .session_control_handler
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
     let Some(handler) = handler else {
-        let _ = shared.events.send(HostEvent::ReplacementReady {
-            token: token.to_owned(),
-        });
+        let event = match event {
+            HostSessionControlEvent::Command(envelope) => HostEvent::SessionCommand(envelope),
+            HostSessionControlEvent::ReplacementReady { token } => {
+                HostEvent::ReplacementReady { token }
+            }
+            HostSessionControlEvent::ReplacementAbort { token } => {
+                HostEvent::ReplacementAbort { token }
+            }
+        };
+        let _ = shared.events.send(event);
         return true;
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        handler(token);
+        handler(event);
     }));
     if result.is_ok() {
         return true;
     }
-    let message = "replacement-ready handler panicked".to_owned();
+    let message = "session-control handler panicked".to_owned();
     fail_all(
         shared,
         &HostClientError::Protocol {
@@ -3195,12 +3235,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replacement_ready_handler_bypasses_broadcast_lag() -> R {
+        let (client, mut host) = make_pair().await;
+        let _lagged = client.subscribe();
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let ready_tx = StdMutex::new(Some(ready_tx));
+        client.set_session_control_handler(Some(Arc::new(move |event| {
+            let HostSessionControlEvent::ReplacementReady { token } = event else {
+                return;
+            };
+            if let Some(sender) = ready_tx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                let _ = sender.send(token);
+            }
+        })));
+
+        for index in 0..=EVENT_CAPACITY {
+            host.write_frame(&Frame::event(
+                0,
+                Method::Notify,
+                serde_json::json!({"message": index}),
+            ))
+            .await?;
+        }
+        host.write_frame(&Frame {
+            id: 0,
+            kind: FrameKind::Event,
+            method: crate::protocol::SESSION_REPLACEMENT_READY_METHOD.to_owned(),
+            payload: serde_json::json!({"token": "ready-after-lag"}),
+        })
+        .await?;
+
+        let token = tokio::time::timeout(Duration::from_secs(1), ready_rx).await??;
+        assert_eq!(token, "ready-after-lag");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replacement_ready_without_handler_uses_broadcast() -> R {
+        let (client, mut host) = make_pair().await;
+        let mut events = client.subscribe();
+        host.write_frame(&Frame {
+            id: 0,
+            kind: FrameKind::Event,
+            method: crate::protocol::SESSION_REPLACEMENT_READY_METHOD.to_owned(),
+            payload: serde_json::json!({"token": "broadcast-ready"}),
+        })
+        .await?;
+
+        let event = tokio::time::timeout(Duration::from_secs(1), events.recv()).await??;
+        assert!(
+            matches!(event, HostEvent::ReplacementReady { token } if token == "broadcast-ready")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_control_handler_preserves_command_before_ready() -> R {
+        let (client, mut host) = make_pair().await;
+        let (done_tx, done_rx) = oneshot::channel();
+        let done_tx = StdMutex::new(Some(done_tx));
+        let observed = Arc::new(StdMutex::new(Vec::new()));
+        let handler_observed = Arc::clone(&observed);
+        client.set_session_control_handler(Some(Arc::new(move |event| {
+            let label = match event {
+                HostSessionControlEvent::Command(envelope) => {
+                    assert_eq!(envelope.replacement_token.as_deref(), Some("ordered-token"));
+                    "command"
+                }
+                HostSessionControlEvent::ReplacementReady { token } => {
+                    assert_eq!(token, "ordered-token");
+                    if let Some(sender) = done_tx
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take()
+                    {
+                        let _ = sender.send(());
+                    }
+                    "ready"
+                }
+                HostSessionControlEvent::ReplacementAbort { .. } => "abort",
+            };
+            handler_observed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(label);
+        })));
+
+        host.write_frame(&Frame {
+            id: 0,
+            kind: FrameKind::Event,
+            method: crate::protocol::SESSION_COMMAND_METHOD.to_owned(),
+            payload: serde_json::json!({
+                "replacementToken": "ordered-token",
+                "action": "setSessionName",
+                "name": "candidate",
+            }),
+        })
+        .await?;
+        host.write_frame(&Frame {
+            id: 0,
+            kind: FrameKind::Event,
+            method: crate::protocol::SESSION_REPLACEMENT_READY_METHOD.to_owned(),
+            payload: serde_json::json!({"token": "ordered-token"}),
+        })
+        .await?;
+
+        tokio::time::timeout(Duration::from_secs(1), done_rx).await??;
+        assert_eq!(
+            *observed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec!["command", "ready"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     #[allow(clippy::panic)] // The contract under test is containment of callback panics.
     async fn replacement_ready_handler_panic_fails_transport() -> R {
         let (client, mut host) = make_pair().await;
         let mut events = client.subscribe();
-        client.set_replacement_ready_handler(Some(Arc::new(|_: &str| {
-            panic!("replacement-ready test panic");
+        client.set_session_control_handler(Some(Arc::new(|_| {
+            panic!("session-control test panic");
         })));
 
         let client = Arc::new(client);
@@ -3267,6 +3427,67 @@ mod tests {
             matches!(result, Err(HostClientError::Closed { .. })),
             "expected Closed after shutdown, got {result:?}"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replacement_abort_handler_preserves_order() -> R {
+        let (client, mut host) = make_pair().await;
+        let (done_tx, done_rx) = oneshot::channel();
+        let done_tx = StdMutex::new(Some(done_tx));
+        client.set_session_control_handler(Some(Arc::new(move |event| {
+            if let HostSessionControlEvent::ReplacementAbort { token } = event {
+                assert_eq!(token, "abort-token");
+                if let Some(sender) = done_tx
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    let _ = sender.send(());
+                }
+            }
+        })));
+
+        host.write_frame(&Frame {
+            id: 0,
+            kind: FrameKind::Event,
+            method: crate::protocol::SESSION_REPLACEMENT_ABORT_METHOD.to_owned(),
+            payload: serde_json::json!({"token": "abort-token"}),
+        })
+        .await?;
+
+        tokio::time::timeout(Duration::from_secs(1), done_rx).await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn malformed_session_control_payloads_fail_closed() -> R {
+        let (client, mut host) = make_pair().await;
+        let mut events = client.subscribe();
+
+        for method in [
+            crate::protocol::SESSION_COMMAND_METHOD,
+            crate::protocol::SESSION_REPLACEMENT_READY_METHOD,
+            crate::protocol::SESSION_REPLACEMENT_ABORT_METHOD,
+        ] {
+            host.write_frame(&Frame {
+                id: 0,
+                kind: FrameKind::Event,
+                method: method.to_owned(),
+                payload: serde_json::json!({"unexpected": "shape"}),
+            })
+            .await?;
+        }
+
+        for _ in 0..3 {
+            let event = tokio::time::timeout(Duration::from_secs(1), events.recv()).await??;
+            assert!(
+                matches!(event, HostEvent::Raw(_)),
+                "malformed control frame should fail closed as Raw: {event:?}"
+            );
+        }
+
+        assert!(client.is_running());
         Ok(())
     }
 }

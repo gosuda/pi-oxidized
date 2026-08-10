@@ -28,7 +28,8 @@ use crate::core::agent_session_runtime::{
 };
 use crate::core::extension_host::SessionBridgeEvent;
 use crate::core::extension_runtime_set::{
-    ExtensionRuntimeSet, ExtensionSetDiagnostic, PendingReadyOp,
+    ExtensionRuntimeSet, ExtensionSetDiagnostic, PendingReadyOp, SessionBridgeRoute,
+    SessionTargetBinding,
 };
 use crate::core::messages::CustomMessageContent;
 use crate::core::resources::{
@@ -675,30 +676,45 @@ impl AgentSession {
         let Some(session) = self.upgrade_self() else {
             return;
         };
-        host.bind_session_target(session.clone());
-        self.bind_session_mirror(Arc::clone(&host), session.clone())
-            .await;
-
+        // Claim the sole session bridge before any bind or publish. A session
+        // that loses the claim (the receiver was already taken) must never
+        // bind the global target or publish global state.
         let Some(mut bridge_rx) = host.take_session_bridge() else {
             return;
         };
+        let binding = host.bind_session_target(session.clone());
+        self.bind_session_mirror(Arc::clone(&host), session, binding)
+            .await;
+
         tokio::spawn(async move {
             while let Some(item) = bridge_rx.recv().await {
-                let target = host
-                    .pending_replacement_target()
-                    .or_else(|| host.session_target());
-                let Some(target) = target else {
-                    // The item was already dequeued; answer its correlated
-                    // request so the host does not hang, then keep draining.
-                    // A transient None (e.g. during a replacement handoff)
-                    // must not kill the bridge — only channel close
-                    // (recv returning None) terminates this task.
-                    answer_unclaimed_bridge_event(&host, item).await;
-                    continue;
-                };
-                target.apply_session_bridge_event(&host, item).await;
-                let state = target.session_state_wire().await;
-                host.push_session_state(&state).await;
+                match host.route_session_bridge(&item) {
+                    SessionBridgeRoute::Active { target, binding } => {
+                        target.apply_session_bridge_event(&host, item).await;
+                        if !host.is_session_target_current(binding) {
+                            continue;
+                        }
+                        let state = target.session_state_wire().await;
+                        if host.is_session_target_current(binding) {
+                            host.push_session_state(&state).await;
+                        }
+                    }
+                    SessionBridgeRoute::Candidate(target) => {
+                        target.apply_session_bridge_event(&host, item).await;
+                    }
+                    SessionBridgeRoute::Operation => match item {
+                        SessionBridgeEvent::ReplacementReady { token, .. } => {
+                            let _ = host.complete_ready(&token);
+                        }
+                        SessionBridgeEvent::ReplacementAbort { token, .. } => {
+                            let _ = host.abort_waiting_ready(&token);
+                        }
+                        _ => unreachable!("only replacement controls route as operations"),
+                    },
+                    SessionBridgeRoute::Rejected => {
+                        answer_unclaimed_bridge_event(&host, item).await;
+                    }
+                }
             }
         });
     }
@@ -707,6 +723,7 @@ impl AgentSession {
         &self,
         host: Arc<ExtensionRuntimeSet>,
         session: std::sync::Weak<AgentSession>,
+        binding: SessionTargetBinding,
     ) {
         let (dirty_tx, mut dirty_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
         let unsubscribe = self.subscribe(move |event| {
@@ -725,18 +742,25 @@ impl AgentSession {
             }
         });
         // Awaited: lifecycle handlers must observe the new session state.
-        let state = self.session_state_wire().await;
-        host.push_session_state(&state).await;
+        if host.is_session_target_current(binding) {
+            let state = self.session_state_wire().await;
+            if host.is_session_target_current(binding) {
+                host.push_session_state(&state).await;
+            }
+        }
         tokio::spawn(async move {
             while dirty_rx.recv().await.is_some() {
                 while dirty_rx.try_recv().is_ok() {}
-                if !host.is_active() {
+                if !host.is_active() || !host.is_session_target_current(binding) {
                     break;
                 }
                 let Some(session) = session.upgrade() else {
                     break;
                 };
                 let state = session.session_state_wire().await;
+                if !host.is_session_target_current(binding) {
+                    break;
+                }
                 host.push_session_state(&state).await;
             }
             unsubscribe();
@@ -806,7 +830,9 @@ impl AgentSession {
         event: SessionBridgeEvent,
     ) {
         match event {
-            SessionBridgeEvent::Command(command) => self.apply_session_command(command).await,
+            SessionBridgeEvent::Command { envelope, .. } => {
+                self.apply_session_command(envelope.command).await;
+            }
             SessionBridgeEvent::SetModel { id, request } => {
                 let success = match serde_json::from_value::<Model>(request.model) {
                     Ok(model) => match self.set_model(model).await {
@@ -879,15 +905,16 @@ impl AgentSession {
                     session.handle_bridge_reload(host, id).await;
                 });
             }
-            SessionBridgeEvent::SetupEntries { id, request } => {
+            SessionBridgeEvent::SetupEntries { id, request, .. } => {
                 let session = Arc::clone(self);
                 let host = Arc::clone(host);
                 tokio::spawn(async move {
                     session.handle_bridge_setup_entries(host, id, request).await;
                 });
             }
-            SessionBridgeEvent::ReplacementReady { token } => {
-                let _ = host.complete_ready(&token);
+            SessionBridgeEvent::ReplacementReady { .. }
+            | SessionBridgeEvent::ReplacementAbort { .. } => {
+                unreachable!("replacement controls are routed before session dispatch");
             }
         }
     }
@@ -1302,12 +1329,20 @@ impl AgentSession {
                         ));
                         return;
                     };
-                    // Route bridge commands at the replacement session
-                    // before teardown drops the old one, so no command is
-                    // orphaned while teardown drains old state.
-                    host.bind_session_target(Arc::downgrade(&result.session));
+                    // Bind before teardown so host callbacks invoked during
+                    // finalization route through the accepted replacement.
+                    // Start its global mirror only after the swap completes.
+                    let new_session = Arc::clone(&result.session);
+                    let binding = host.bind_session_target(Arc::downgrade(&new_session));
                     runtime.finalize_replacement(prepared).await;
                     let _ = host.finish_finalize(&token);
+                    new_session
+                        .bind_session_mirror(
+                            Arc::clone(&host),
+                            Arc::downgrade(&new_session),
+                            binding,
+                        )
+                        .await;
                 }
                 Err(op) => {
                     drop(op);
@@ -1590,10 +1625,13 @@ async fn abort_bridge_pending(
 /// The bridge loop dequeues an item before checking for a live target. When
 /// the target is `None` the item must still be answered — correlated
 /// requests (`setModel`, `compact`, …) would otherwise hang the host.
-/// Fire-and-forget variants (`Command`, `ReplacementReady`) need no response.
+/// Fire-and-forget commands need no response. Rejected replacement controls
+/// must not mutate the pending operation.
 async fn answer_unclaimed_bridge_event(host: &Arc<ExtensionRuntimeSet>, event: SessionBridgeEvent) {
     match event {
-        SessionBridgeEvent::Command(_) | SessionBridgeEvent::ReplacementReady { .. } => {}
+        SessionBridgeEvent::Command { .. }
+        | SessionBridgeEvent::ReplacementReady { .. }
+        | SessionBridgeEvent::ReplacementAbort { .. } => {}
         SessionBridgeEvent::SetModel { id, .. } => {
             let _ = host.respond_set_model(id, false).await;
         }
@@ -3104,6 +3142,122 @@ mod tests {
         assert!(state.scoped_models[1].thinking_level.is_none());
         assert_eq!(state.scoped_models[0].model["id"], "m");
         assert_eq!(state.scoped_models[1].model["provider"], "other-provider");
+        Ok(())
+    }
+
+    fn session_name_command(name: &str, replacement_token: Option<&str>) -> SessionBridgeEvent {
+        SessionBridgeEvent::Command {
+            envelope: protocol::SessionCommandEnvelope {
+                replacement_token: replacement_token.map(str::to_owned),
+                command: SessionCommand::SetSessionName {
+                    name: name.to_owned(),
+                },
+            },
+            origin: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn session_bridge_rebind_invalidates_committed_authority() -> TestResult {
+        let first = make_session()?;
+        let second = make_session()?;
+        let set = ExtensionRuntimeSet::bind(Vec::new());
+        let first_binding = set.bind_session_target(Arc::downgrade(&first));
+        let ordinary = session_name_command("first", None);
+        let SessionBridgeRoute::Active { target, binding } = set.route_session_bridge(&ordinary)
+        else {
+            return Err("tokenless command did not route to the active session".into());
+        };
+        assert!(Arc::ptr_eq(&target, &first));
+        assert_eq!(binding, first_binding);
+
+        let second_binding = set.bind_session_target(Arc::downgrade(&second));
+        assert!(!set.is_session_target_current(first_binding));
+        assert!(set.is_session_target_current(second_binding));
+        let SessionBridgeRoute::Active { target, binding } = set.route_session_bridge(&ordinary)
+        else {
+            return Err("tokenless command did not follow the committed rebind".into());
+        };
+        assert!(Arc::ptr_eq(&target, &second));
+        assert_eq!(binding, second_binding);
+
+        first.dispose().await;
+        second.dispose().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_bridge_routes_candidate_until_ready_finalizes() -> TestResult {
+        use crate::core::agent_session_runtime::{
+            AgentSessionRuntimeServices, CreateAgentSessionRuntimeResult,
+        };
+        use std::path::PathBuf;
+
+        let candidate = make_session()?;
+        let set = ExtensionRuntimeSet::bind(Vec::new());
+        let token = set.next_replacement_token();
+        let ready_rx = set
+            .install_pending(
+                token.clone(),
+                PendingReadyOp::Replacement {
+                    result: CreateAgentSessionRuntimeResult {
+                        session: Arc::clone(&candidate),
+                        services: AgentSessionRuntimeServices {
+                            cwd: PathBuf::new(),
+                            agent_dir: PathBuf::new(),
+                        },
+                        diagnostics: Vec::new(),
+                        model_fallback_message: None,
+                    },
+                    reason: SessionShutdownReason::New,
+                    target_session_file: None,
+                },
+            )
+            .map_err(|_| "candidate pending install was rejected")?;
+        let scoped = session_name_command("candidate", Some(&token));
+        let SessionBridgeRoute::Candidate(target) = set.route_session_bridge(&scoped) else {
+            return Err("scoped command did not route to the pending candidate".into());
+        };
+        assert!(Arc::ptr_eq(&target, &candidate));
+        assert!(matches!(
+            set.route_session_bridge(&SessionBridgeEvent::SetupEntries {
+                id: 1,
+                request: SessionSetupEntriesRequest {
+                    replacement_token: token.clone(),
+                },
+                origin: None,
+            }),
+            SessionBridgeRoute::Candidate(_)
+        ));
+        assert!(matches!(
+            set.route_session_bridge(&SessionBridgeEvent::ReplacementReady {
+                token: token.clone(),
+                origin: None,
+            }),
+            SessionBridgeRoute::Operation
+        ));
+
+        assert!(set.complete_ready(&token));
+        ready_rx.await?;
+        assert!(matches!(
+            set.route_session_bridge(&scoped),
+            SessionBridgeRoute::Candidate(_)
+        ));
+        assert!(matches!(
+            set.route_session_bridge(&SessionBridgeEvent::ReplacementAbort {
+                token: token.clone(),
+                origin: None,
+            }),
+            SessionBridgeRoute::Rejected
+        ));
+
+        let (op, guard) = set
+            .take_finalizing(&token)
+            .ok_or("candidate operation was not finalizing")?;
+        drop(op);
+        assert!(set.finish_finalize(&token));
+        drop(guard);
+        candidate.dispose().await;
         Ok(())
     }
 }

@@ -43,7 +43,7 @@ use super::super::agent_session::events::{
     AgentSessionEvent, SessionShutdownReason as ShutdownReason,
 };
 use super::super::agent_session::extension_runner::{ExtensionRunner, SessionHooks};
-use super::super::extension_runtime_set::{EndpointKind, ExtensionRuntimeSet};
+use super::super::extension_runtime_set::{EndpointId, EndpointKind, ExtensionRuntimeSet};
 use super::super::model_runtime::{CreateModelRuntimeOptions, ModelRuntime};
 use super::{
     ALL_EVENT_TYPES, HostExtensionRunner, HostStartError, ToolRenderPhase,
@@ -84,14 +84,6 @@ impl FakeHost {
         }
     }
 
-    async fn emit(&self, frame: Frame) {
-        let _ = self.cmd_tx.send(FakeCmd::Emit(frame)).await;
-    }
-
-    async fn close(&self) {
-        let _ = self.cmd_tx.send(FakeCmd::Close).await;
-    }
-
     async fn wait_for_request(&self, method: &str) -> R {
         tokio::time::timeout(Duration::from_millis(500), async {
             loop {
@@ -108,6 +100,14 @@ impl FakeHost {
         .await
         .map_err(|_| format!("fake host did not receive {method}"))?;
         Ok(())
+    }
+
+    async fn emit(&self, frame: Frame) {
+        let _ = self.cmd_tx.send(FakeCmd::Emit(frame)).await;
+    }
+
+    async fn close(&self) {
+        let _ = self.cmd_tx.send(FakeCmd::Close).await;
     }
 }
 
@@ -2288,8 +2288,12 @@ async fn session_command_and_set_model_route_through_claimed_bridge() -> R {
     let event = tokio::time::timeout(Duration::from_millis(500), bridge.recv())
         .await?
         .ok_or("bridge closed")?;
-    let SessionBridgeEvent::Command(SessionCommand::SetSessionName { name }) = event else {
+    let SessionBridgeEvent::Command { envelope, .. } = event else {
         return Err(format!("expected SetSessionName, got {event:?}").into());
+    };
+    assert_eq!(envelope.replacement_token, None);
+    let SessionCommand::SetSessionName { name } = envelope.command else {
+        return Err("expected SetSessionName command".into());
     };
     assert_eq!(name, "Renamed");
 
@@ -2324,6 +2328,59 @@ async fn session_command_and_set_model_route_through_claimed_bridge() -> R {
         .ok_or("setModel response missing")?;
     assert_eq!(response.id, 41);
     assert_eq!(response.payload["success"], true);
+
+    runner.shutdown_once().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn scoped_command_precedes_replacement_ready_on_claimed_bridge() -> R {
+    use crate::core::extension_host::SessionBridgeEvent;
+    let (runner, host) = make_runner(json!({})).await?;
+    let mut bridge = runner
+        .take_session_bridge()
+        .ok_or("first claim must yield the bridge receiver")?;
+
+    host.emit(Frame {
+        id: 0,
+        kind: FrameKind::Event,
+        method: "session.command".to_owned(),
+        payload: json!({
+            "replacementToken": "ordered-token",
+            "action": "setSessionName",
+            "name": "Candidate"
+        }),
+    })
+    .await;
+    host.emit(Frame {
+        id: 0,
+        kind: FrameKind::Event,
+        method: "session.replacementReady".to_owned(),
+        payload: json!({"token": "ordered-token"}),
+    })
+    .await;
+
+    let command = tokio::time::timeout(Duration::from_millis(500), bridge.recv())
+        .await?
+        .ok_or("bridge closed before command")?;
+    let ready = tokio::time::timeout(Duration::from_millis(500), bridge.recv())
+        .await?
+        .ok_or("bridge closed before readiness")?;
+    assert!(matches!(
+        command,
+        SessionBridgeEvent::Command {
+            envelope: pi_ext::protocol::SessionCommandEnvelope {
+                replacement_token: Some(token),
+                ..
+            },
+            ..
+        } if token == "ordered-token"
+    ));
+    assert!(matches!(
+        ready,
+        SessionBridgeEvent::ReplacementReady { token, .. }
+            if token == "ordered-token"
+    ));
 
     runner.shutdown_once().await;
     Ok(())
@@ -2366,11 +2423,13 @@ async fn dropped_replacement_ready_emits_diagnostic() -> R {
     // Install a drop handler that records the token it receives.
     let received_token = Arc::new(Mutex::new(None::<String>));
     let handler_token = Arc::clone(&received_token);
-    runner.set_replacement_ready_drop_handler(Arc::new(move |token: &str| {
-        *handler_token
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(token.to_owned());
-    }));
+    runner.set_replacement_drop_handler(Arc::new(
+        move |token: &str, _origin: Option<EndpointId>| {
+            *handler_token
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(token.to_owned());
+        },
+    ));
     // Claim the bridge, then drop the receiver to close the channel.
     let bridge = runner.take_session_bridge().ok_or("bridge missing")?;
     drop(bridge);
@@ -2386,9 +2445,9 @@ async fn dropped_replacement_ready_emits_diagnostic() -> R {
     })
     .await;
     let error = next_error(&mut errors, Duration::from_secs(2)).await?;
-    assert!(
-        error.code.contains("replacement_ready_dropped"),
-        "expected replacement_ready_dropped diagnostic, got: {error:?}"
+    assert_eq!(
+        error.code, "extension_replacement_dropped",
+        "expected extension_replacement_dropped diagnostic, got: {error:?}"
     );
     // The drop handler must receive tok-1 synchronously.
     let token = received_token

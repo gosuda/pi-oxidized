@@ -28,11 +28,13 @@ use pi_ext::adapters::{
     FlagRegistration, ProviderRegistration, Registry, RendererRegistration, ShortcutRegistration,
     ToolRegistration,
 };
-use pi_ext::client::{HostClient, HostClientError, HostEvent, HostUiRequest, HostUiResponse};
+use pi_ext::client::{
+    HostClient, HostClientError, HostEvent, HostSessionControlEvent, HostUiRequest, HostUiResponse,
+};
 use pi_ext::host::{self, HostError, HostSpec};
 use pi_ext::protocol::{
     self, DisposeSlot, ExtensionErrorEvent, FlagValueWire, FlagsSetRequest, FlagsSetResponse,
-    FrameId, NotifyRequest, ProviderEvent, SessionCommand, SessionCompactRequest,
+    FrameId, NotifyRequest, ProviderEvent, SessionCommandEnvelope, SessionCompactRequest,
     SessionForkRequest, SessionNavigateTreeRequest, SessionNewSessionRequest,
     SessionSetModelRequest, SessionSetupEntriesRequest, SessionStateWire,
     SessionSwitchSessionRequest, ShortcutExecuteRequest, ShortcutExecuteResponse, ThemeSet,
@@ -47,6 +49,7 @@ use super::agent_session::events::AgentSessionEvent;
 use super::agent_session::extension_runner::{
     BeforeAgentStartResult, CancelResult, ExtensionRunner, InputTransformResult,
 };
+use super::extension_runtime_set::EndpointId;
 use super::model_runtime::{
     ModelRuntime, ModelRuntimeError, ProviderConfigInput, ProviderModelDefinition,
 };
@@ -153,9 +156,14 @@ pub enum ExtensionUiEvent {
 /// session task applies each item against the effective `AgentSession` and
 /// answers every correlated request through this runner.
 #[derive(Debug, Clone)]
-pub enum SessionBridgeEvent {
+pub(crate) enum SessionBridgeEvent {
     /// Fire-and-forget extension session action.
-    Command(SessionCommand),
+    Command {
+        /// Action and optional pending-replacement scope.
+        envelope: SessionCommandEnvelope,
+        /// Endpoint that emitted the command.
+        origin: Option<EndpointId>,
+    },
     /// Correlated `pi.setModel` request.
     SetModel {
         /// Host correlation id (echo into `respond_set_model`).
@@ -209,11 +217,22 @@ pub enum SessionBridgeEvent {
         id: FrameId,
         /// Setup-entries request payload.
         request: SessionSetupEntriesRequest,
+        /// Endpoint that requested the candidate snapshot.
+        origin: Option<EndpointId>,
     },
     /// Host completed the command that initiated a ready-gated operation.
     ReplacementReady {
         /// Facade token returned by the replacement response.
         token: String,
+        /// Endpoint that completed the replacement.
+        origin: Option<EndpointId>,
+    },
+    /// Host abandoned a ready-gated replacement without completing it.
+    ReplacementAbort {
+        /// Facade token returned by the replacement response.
+        token: String,
+        /// Endpoint that abandoned the replacement.
+        origin: Option<EndpointId>,
     },
 }
 
@@ -675,7 +694,7 @@ struct ToolRenderHtmlWire {
 /// Slot subscription state: latest sanitized slot (or `None` when disposed).
 type SlotWatch = watch::Sender<Option<SanitizedSlot>>;
 
-type ReplacementReadyDropHandler = Arc<dyn Fn(&str) + Send + Sync>;
+type ReplacementDropHandler = Arc<dyn Fn(&str, Option<EndpointId>) + Send + Sync>;
 
 struct Inner {
     client: Arc<HostClient>,
@@ -715,11 +734,12 @@ struct Inner {
     /// Per-hook control-RPC deadline (`HOOK_TIMEOUT` in production; shorter in
     /// tests to exercise the timeout path quickly).
     hook_timeout: Duration,
-    /// Lower-layer callback invoked when a `ReplacementReady` frame is dropped
-    /// at the host-to-endpoint hop (the session bridge is closed or full). The
-    /// callback receives the replacement token so the facade can abort only
-    /// the matching pending operation. Runs without session-bridge locks held.
-    replacement_ready_drop: StdMutex<Option<ReplacementReadyDropHandler>>,
+    /// Stable endpoint identity assigned when this runner joins a generation.
+    endpoint_id: StdMutex<Option<EndpointId>>,
+    /// Lower-layer callback invoked when a token-bearing replacement event is
+    /// dropped at either host bounded-send hop. The callback receives the
+    /// facade token and endpoint so the facade can reject cross-endpoint control.
+    replacement_drop: StdMutex<Option<ReplacementDropHandler>>,
 }
 impl Inner {
     fn new(
@@ -762,7 +782,8 @@ impl Inner {
             shutdown_lock: tokio::sync::Mutex::new(()),
             hook_timeout,
             theme_generation: AtomicU64::new(0),
-            replacement_ready_drop: StdMutex::new(None),
+            replacement_drop: StdMutex::new(None),
+            endpoint_id: StdMutex::new(None),
         }
     }
 
@@ -928,6 +949,13 @@ impl Inner {
                 .send(ExtensionUiEvent::Dispose { key: key.clone() });
         }
         slots.clear();
+    }
+
+    fn endpoint_id(&self) -> Option<EndpointId> {
+        *self
+            .endpoint_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -1573,7 +1601,7 @@ impl HostExtensionRunner {
     /// actions are dropped and correlated requests receive their existing
     /// `no active session` fallback.
     #[must_use]
-    pub fn take_session_bridge(&self) -> Option<mpsc::Receiver<SessionBridgeEvent>> {
+    pub(crate) fn take_session_bridge(&self) -> Option<mpsc::Receiver<SessionBridgeEvent>> {
         let receiver = self
             .inner
             .session_bridge_rx
@@ -1588,17 +1616,24 @@ impl HostExtensionRunner {
         receiver
     }
 
-    /// Install the lower-layer callback invoked when a `ReplacementReady`
-    /// frame is dropped at the host-to-endpoint hop (the session bridge is
-    /// closed or full). The callback receives the replacement token so the
-    /// facade can abort only the matching pending operation. Called from
+    /// Install the lower-layer callback invoked when a token-bearing
+    /// replacement event is dropped at either host bounded-send hop. The
+    /// callback receives the facade token and endpoint. Called from
     /// [`ExtensionRuntimeSet::start_bridges`] before any relay begins.
-    pub(crate) fn set_replacement_ready_drop_handler(&self, handler: ReplacementReadyDropHandler) {
+    pub(crate) fn set_replacement_drop_handler(&self, handler: ReplacementDropHandler) {
         *self
             .inner
-            .replacement_ready_drop
+            .replacement_drop
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handler);
+    }
+
+    pub(crate) fn set_endpoint_id(&self, endpoint: EndpointId) {
+        *self
+            .inner
+            .endpoint_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(endpoint);
     }
 
     /// Answer a correlated `session.setModel` request.
@@ -2017,20 +2052,19 @@ fn clone_registry(source: &Registry) -> Registry {
 /// subscribers; on fatal host conditions marks the runner disabled and emits a
 /// single non-retryable `extension_error`.
 ///
-/// Subscribe-then-check: a fast-exiting host can broadcast `Eof` (then clear
-/// `running`) before this pump subscribes, so the flag is probed after
-/// subscribing — state catches an early EOF, the broadcast catches a late one.
+/// Install-before-subscribe keeps every session-control frame on one ordered
+/// path. Valid replacement traffic cannot exist before this runner is published.
 #[allow(clippy::too_many_lines)]
 fn spawn_event_pump(inner: Arc<Inner>) {
-    let mut rx = inner.client.subscribe();
-    let ready_inner = Arc::downgrade(&inner);
+    let control_inner = Arc::downgrade(&inner);
     inner
         .client
-        .set_replacement_ready_handler(Some(Arc::new(move |token: &str| {
-            if let Some(inner) = ready_inner.upgrade() {
-                deliver_replacement_ready(&inner, token.to_owned());
+        .set_session_control_handler(Some(Arc::new(move |event| {
+            if let Some(inner) = control_inner.upgrade() {
+                deliver_session_control(&inner, event);
             }
         })));
+    let mut rx = inner.client.subscribe();
     tokio::spawn(async move {
         if !inner.client.is_running() {
             inner.disabled.store(true, Ordering::Relaxed);
@@ -2056,8 +2090,14 @@ fn spawn_event_pump(inner: Arc<Inner>) {
                 Ok(HostEvent::UiControl(control)) => {
                     inner.ui_control_send(control);
                 }
-                Ok(HostEvent::SessionCommand(command)) => {
-                    forward_session_bridge(&inner, SessionBridgeEvent::Command(command)).await;
+                Ok(HostEvent::SessionCommand(envelope)) => {
+                    deliver_session_control(&inner, HostSessionControlEvent::Command(envelope));
+                }
+                Ok(HostEvent::ReplacementAbort { token }) => {
+                    deliver_session_control(
+                        &inner,
+                        HostSessionControlEvent::ReplacementAbort { token },
+                    );
                 }
                 Ok(HostEvent::SetModelRequest { id, request }) => {
                     forward_session_bridge(&inner, SessionBridgeEvent::SetModel { id, request })
@@ -2094,12 +2134,19 @@ fn spawn_event_pump(inner: Arc<Inner>) {
                 Ok(HostEvent::SetupEntriesRequest { id, request }) => {
                     forward_session_bridge(
                         &inner,
-                        SessionBridgeEvent::SetupEntries { id, request },
+                        SessionBridgeEvent::SetupEntries {
+                            id,
+                            request,
+                            origin: inner.endpoint_id(),
+                        },
                     )
                     .await;
                 }
                 Ok(HostEvent::ReplacementReady { token }) => {
-                    deliver_replacement_ready(&inner, token);
+                    deliver_session_control(
+                        &inner,
+                        HostSessionControlEvent::ReplacementReady { token },
+                    );
                 }
                 Ok(HostEvent::UiSlot(slot)) => {
                     forward_slot(&inner, &slot);
@@ -2153,37 +2200,62 @@ fn spawn_event_pump(inner: Arc<Inner>) {
     });
 }
 
-/// Route readiness synchronously so the transport reader never waits behind the
-/// bounded session bridge. An unavailable bridge aborts the exact pending token.
-fn deliver_replacement_ready(inner: &Arc<Inner>, token: String) {
+/// Route ordered session control synchronously into the bounded bridge.
+fn deliver_session_control(inner: &Arc<Inner>, event: HostSessionControlEvent) {
+    let origin = inner.endpoint_id();
+    let event = match event {
+        HostSessionControlEvent::Command(envelope) => {
+            SessionBridgeEvent::Command { envelope, origin }
+        }
+        HostSessionControlEvent::ReplacementReady { token } => {
+            SessionBridgeEvent::ReplacementReady { token, origin }
+        }
+        HostSessionControlEvent::ReplacementAbort { token } => {
+            SessionBridgeEvent::ReplacementAbort { token, origin }
+        }
+    };
     let claimed = inner.active() && inner.session_bridge_claimed.load(Ordering::Acquire);
     let undelivered = if claimed {
         inner
             .session_bridge_tx
-            .try_send(SessionBridgeEvent::ReplacementReady { token })
+            .try_send(event)
             .err()
             .map(mpsc::error::TrySendError::into_inner)
     } else {
-        Some(SessionBridgeEvent::ReplacementReady { token })
+        Some(event)
     };
-    if let Some(SessionBridgeEvent::ReplacementReady { token }) = undelivered {
-        handle_dropped_replacement_ready(inner, &token);
+    match undelivered {
+        None => {}
+        Some(SessionBridgeEvent::Command { envelope, origin }) => {
+            if let Some(token) = envelope.replacement_token {
+                handle_dropped_replacement_event(inner, &token, origin);
+            }
+        }
+        Some(
+            SessionBridgeEvent::ReplacementReady { token, origin }
+            | SessionBridgeEvent::ReplacementAbort { token, origin },
+        ) => {
+            handle_dropped_replacement_event(inner, &token, origin);
+        }
+        Some(_) => unreachable!("direct session-control route produced a correlated event"),
     }
 }
 
-fn handle_dropped_replacement_ready(inner: &Arc<Inner>, token: &str) {
+fn handle_dropped_replacement_event(inner: &Arc<Inner>, token: &str, origin: Option<EndpointId>) {
     inner.publish_error(
-        "extension_replacement_ready_dropped",
-        "replacement ready frame dropped: session bridge unavailable or full",
+        "extension_replacement_dropped",
+        &format!(
+            "replacement bridge event dropped for token {token}: session bridge unavailable or full"
+        ),
         None,
     );
     let handler = inner
-        .replacement_ready_drop
+        .replacement_drop
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
     if let Some(handler) = handler {
-        handler(token);
+        handler(token, origin);
     }
 }
 
@@ -2205,9 +2277,23 @@ async fn forward_session_bridge(inner: &Arc<Inner>, event: SessionBridgeEvent) {
         Some(event)
     };
     match undelivered {
-        None | Some(SessionBridgeEvent::Command(_)) => {}
-        Some(SessionBridgeEvent::ReplacementReady { token }) => {
-            handle_dropped_replacement_ready(inner, &token);
+        None => {}
+        Some(SessionBridgeEvent::Command { envelope, origin }) => {
+            if let Some(token) = envelope.replacement_token {
+                handle_dropped_replacement_event(inner, &token, origin);
+            }
+        }
+        Some(
+            SessionBridgeEvent::ReplacementReady { token, origin }
+            | SessionBridgeEvent::ReplacementAbort { token, origin },
+        ) => {
+            handle_dropped_replacement_event(inner, &token, origin);
+        }
+        Some(SessionBridgeEvent::SetupEntries { id, .. }) => {
+            let _ = inner
+                .client
+                .respond_setup_entries(id, Err("no active session".to_owned()))
+                .await;
         }
         Some(SessionBridgeEvent::SetModel { id, .. }) => {
             let _ = inner.client.respond_set_model(id, false).await;
@@ -2254,12 +2340,6 @@ async fn forward_session_bridge(inner: &Arc<Inner>, event: SessionBridgeEvent) {
             let _ = inner
                 .client
                 .respond_reload(id, Err("no active session".to_owned()))
-                .await;
-        }
-        Some(SessionBridgeEvent::SetupEntries { id, .. }) => {
-            let _ = inner
-                .client
-                .respond_setup_entries(id, Err("no active session".to_owned()))
                 .await;
         }
     }
@@ -2916,7 +2996,7 @@ impl HostExtensionRunner {
         // Order matters for the slot_send/slot_dispose teardown gate: the
         // flag must be set before dispose_all_slots takes the slots lock.
         inner.disabled.store(true, Ordering::Relaxed);
-        inner.client.set_replacement_ready_handler(None);
+        inner.client.set_session_control_handler(None);
         inner.dispose_all_slots();
         let _ = inner.client.shutdown().await;
     }
