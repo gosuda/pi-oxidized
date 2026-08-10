@@ -93,12 +93,24 @@ impl CreateAgentSessionRuntimeFactory for TestFactory {
 /// sessions a recording factory creates).
 struct EmitRecordingRunner {
     log: Mutex<Vec<String>>,
+    shutdown_gate: Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>,
 }
 
 impl EmitRecordingRunner {
     fn new() -> Self {
         Self {
             log: Mutex::new(Vec::new()),
+            shutdown_gate: None,
+        }
+    }
+
+    fn with_shutdown_gate(
+        entered: Arc<tokio::sync::Barrier>,
+        release: Arc<tokio::sync::Barrier>,
+    ) -> Self {
+        Self {
+            log: Mutex::new(Vec::new()),
+            shutdown_gate: Some((entered, release)),
         }
     }
 
@@ -124,6 +136,9 @@ impl crate::core::agent_session::ExtensionRunner for EmitRecordingRunner {
             crate::core::agent_session::ExtensionRunnerError,
         >,
     > {
+        let shutdown_gate = matches!(&event, AgentSessionEvent::SessionShutdown { .. })
+            .then(|| self.shutdown_gate.clone())
+            .flatten();
         let entry = match &event {
             AgentSessionEvent::SessionStart {
                 reason,
@@ -146,7 +161,13 @@ impl crate::core::agent_session::ExtensionRunner for EmitRecordingRunner {
         if let Ok(mut g) = self.log.lock() {
             g.push(entry);
         }
-        Box::pin(async { Ok(None) })
+        Box::pin(async move {
+            if let Some((entered, release)) = shutdown_gate {
+                entered.wait().await;
+                release.wait().await;
+            }
+            Ok(None)
+        })
     }
 
     fn emit_message_end(
@@ -1230,6 +1251,37 @@ async fn dispose_tears_down_session_without_replacing() -> TestResult {
     let session = runtime.session();
     runtime.dispose().await;
     assert!(Arc::ptr_eq(&runtime.session(), &session));
+    Ok(())
+}
+
+#[tokio::test]
+async fn shutdown_hook_runs_before_lifecycle_write_gate() -> TestResult {
+    let entered = Arc::new(tokio::sync::Barrier::new(2));
+    let release = Arc::new(tokio::sync::Barrier::new(2));
+    let runner = Arc::new(EmitRecordingRunner::with_shutdown_gate(
+        Arc::clone(&entered),
+        Arc::clone(&release),
+    ));
+    let factory = Arc::new(RecordingFactory::new(runner));
+    let runtime = create_agent_session_runtime(
+        factory,
+        ".".into(),
+        ".".into(),
+        SessionManager::in_memory(Some("."), None)?,
+    )
+    .await?;
+
+    let disposing_runtime = Arc::clone(&runtime);
+    let dispose = tokio::spawn(async move { disposing_runtime.dispose().await });
+    entered.wait().await;
+    let hook_can_navigate = runtime.lifecycle_gate().try_read().is_ok();
+    release.wait().await;
+    dispose.await?;
+
+    assert!(
+        hook_can_navigate,
+        "session_shutdown hooks must be able to navigate before lifecycle exclusion"
+    );
     Ok(())
 }
 

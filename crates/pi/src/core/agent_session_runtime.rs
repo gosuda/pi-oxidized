@@ -12,7 +12,7 @@
 //! 2. Build the new session manager.
 //! 3. Call the factory → new session + services + diagnostics.
 //! 4. `teardown_current`: typed `session_shutdown{reason, targetSessionFile}`
-//!    emit, then `before_session_invalidate`, then `session.dispose_lifecycle_gate_held()`.
+//!    emit, then lifecycle exclusion, `before_session_invalidate`, and disposal.
 //! 5. `apply(result)`: swap session + services + diagnostics.
 //! 6. `finish_session_replacement`: `rebind_session(new_session)` then
 //!    optional `with_session(ctx)`. The mode's rebind calls `bind_extensions`
@@ -787,13 +787,13 @@ impl AgentSessionRuntime {
     }
 
     async fn finalize_replacement_locked(&self, mut prepared: PreparedReplacement) {
-        let _lifecycle_guard = self.lifecycle_gate.write().await;
         let Some(result) = prepared.result.take() else {
             return;
         };
         let reason = prepared.reason;
         let target_session_file = prepared.target_session_file.take();
-        self.teardown_current(reason, target_session_file.as_deref())
+        let _lifecycle_guard = self
+            .teardown_current(reason, target_session_file.as_deref())
             .await;
         self.apply(result);
         self.finish_session_replacement(None).await;
@@ -850,8 +850,8 @@ impl AgentSessionRuntime {
             let result = self
                 .create_import_replacement(&paths.destination_text, &session_dir, cwd_override)
                 .await?;
-            let _lifecycle_guard = self.lifecycle_gate.write().await;
-            self.teardown_current(SessionShutdownReason::Resume, Some(&paths.destination_text))
+            let _lifecycle_guard = self
+                .teardown_current(SessionShutdownReason::Resume, Some(&paths.destination_text))
                 .await;
             self.apply(result);
             self.finish_session_replacement(None).await;
@@ -939,8 +939,8 @@ impl AgentSessionRuntime {
             .lock()
             .await
             .rebind_session_file_after_atomic_move(&destination_text);
-        let _lifecycle_guard = self.lifecycle_gate.write().await;
-        self.teardown_current(SessionShutdownReason::Resume, Some(&destination_text))
+        let _lifecycle_guard = self
+            .teardown_current(SessionShutdownReason::Resume, Some(&destination_text))
             .await;
         self.apply(result);
         self.finish_session_replacement(None).await;
@@ -951,14 +951,12 @@ impl AgentSessionRuntime {
 
     /// Dispose the current session and the runtime.
     ///
-    /// Acquires the lifecycle write gate so that no concurrent tree
-    /// navigation can overlap final tree persistence. `teardown_current`
-    /// then calls `dispose_lifecycle_gate_held` (the internal gate-held
-    /// path) rather than re-entering the write gate.
+    /// Serializes against replacements, lets `session_shutdown` handlers finish,
+    /// then holds the lifecycle write gate through final tree persistence.
     pub async fn dispose(&self) {
         let _guard = self.replacement_lock.lock().await;
-        let _lifecycle_guard = self.lifecycle_gate.write().await;
-        self.teardown_current(SessionShutdownReason::Quit, None)
+        let _lifecycle_guard = self
+            .teardown_current(SessionShutdownReason::Quit, None)
             .await;
     }
 
@@ -1094,17 +1092,20 @@ impl AgentSessionRuntime {
     }
 
     /// Tear down the current session: typed `session_shutdown` emit →
-    /// pre-invalidate → dispose.
+    /// lifecycle exclusion → pre-invalidate → dispose.
     ///
     /// The emit self-gates on `session_shutdown` handler presence and host
-    /// errors are isolated. Host process reap is always performed exactly
-    /// once inside [`AgentSession::dispose`] when a concrete host is present,
-    /// even without `session_shutdown` handlers.
+    /// errors are isolated. It runs before lifecycle exclusion because hooks
+    /// can navigate the session tree. The returned guard keeps final tree
+    /// persistence excluded through the caller's apply and rebind steps. Host
+    /// process reap is always performed exactly once inside
+    /// [`AgentSession::dispose`] when a concrete host is present, even without
+    /// `session_shutdown` handlers.
     async fn teardown_current(
         &self,
         reason: SessionShutdownReason,
         target_session_file: Option<&str>,
-    ) {
+    ) -> tokio::sync::RwLockWriteGuard<'_, ()> {
         let session = self.read_session();
         let runner = session.extension_runner();
         let _ = runner
@@ -1113,6 +1114,7 @@ impl AgentSessionRuntime {
                 target_session_file: target_session_file.map(str::to_owned),
             })
             .await;
+        let lifecycle_guard = self.lifecycle_gate.write().await;
         // Pre-invalidate callbacks reset mode-owned UI during replacement.
         // The extension shutdown handler is a process-exit request that must
         // run for final disposal regardless of whether a UI callback is set.
@@ -1127,12 +1129,8 @@ impl AgentSessionRuntime {
         if reason == SessionShutdownReason::Quit {
             session.invoke_extension_shutdown_handler();
         }
-        // dispose uses the internal gate-held path: every caller of
-        // `teardown_current` already holds the lifecycle write gate
-        // (replacement paths acquire it in `finalize_replacement_locked` /
-        // import commit; `dispose` acquires it explicitly).  Calling the
-        // public `dispose` here would re-enter the write gate and deadlock.
         session.dispose_lifecycle_gate_held().await;
+        lifecycle_guard
     }
 
     /// Apply the factory result: swap session + services + diagnostics.
