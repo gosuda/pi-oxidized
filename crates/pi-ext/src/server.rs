@@ -1261,6 +1261,11 @@ struct ServerRuntime<E: NativeExtension> {
     lifecycle_deadline: std::time::Duration,
     /// Latest-wins hand-off slot for the synchronous theme callback.
     theme: Arc<ThemeDispatch>,
+    /// Registered shortcut keys with an in-flight handler, for single-flight
+    /// dispatch per registered key. `Arc` so an owned RAII claim can cross
+    /// the spawn boundary into the request task. Unregistered keys are
+    /// never tracked.
+    shortcut_in_flight: Arc<Mutex<HashSet<String>>>,
 }
 
 impl<E: NativeExtension> ServerRuntime<E> {
@@ -1283,6 +1288,7 @@ impl<E: NativeExtension> ServerRuntime<E> {
                 update_capacity: config.update_capacity,
                 lifecycle_deadline: config.lifecycle_deadline,
                 theme: Arc::new(ThemeDispatch::default()),
+                shortcut_in_flight: Arc::new(Mutex::new(HashSet::new())),
             },
             out_rx,
         )
@@ -1473,6 +1479,136 @@ async fn run_theme_supervisor<E: NativeExtension>(
     }
 }
 
+enum ShortcutAdmission {
+    Untracked,
+    Claimed(ShortcutClaim),
+    Duplicate,
+}
+
+fn registered_shortcut_key<'a, E: NativeExtension>(
+    runtime: &ServerRuntime<E>,
+    frame: &'a Frame,
+) -> Option<&'a str> {
+    if frame.method != SHORTCUT_EXECUTE_METHOD {
+        return None;
+    }
+    let key = frame.payload.get("key").and_then(Value::as_str)?;
+    runtime
+        .snapshot
+        .shortcuts
+        .iter()
+        .any(|shortcut| shortcut.key == key)
+        .then_some(key)
+}
+
+fn claim_shortcut<E: NativeExtension>(
+    runtime: &ServerRuntime<E>,
+    frame: &Frame,
+) -> ShortcutAdmission {
+    let Some(key) = registered_shortcut_key(runtime, frame) else {
+        return ShortcutAdmission::Untracked;
+    };
+    let mut in_flight = runtime
+        .shortcut_in_flight
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if in_flight.contains(key) {
+        return ShortcutAdmission::Duplicate;
+    }
+    let key = key.to_owned();
+    in_flight.insert(key.clone());
+    ShortcutAdmission::Claimed(ShortcutClaim {
+        in_flight: Arc::clone(&runtime.shortcut_in_flight),
+        key,
+    })
+}
+
+fn shortcut_is_in_flight<E: NativeExtension>(runtime: &ServerRuntime<E>, frame: &Frame) -> bool {
+    let Some(key) = registered_shortcut_key(runtime, frame) else {
+        return false;
+    };
+    runtime
+        .shortcut_in_flight
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(key)
+}
+
+fn send_deferred_frame(
+    rejection_tx: &mpsc::Sender<Frame>,
+    frame: Frame,
+) -> Result<(), ServerError> {
+    match rejection_tx.try_send(frame) {
+        Ok(()) => Ok(()),
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Err(ServerError::OutboundOverflow),
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(ServerError::Io(
+            std::io::Error::other("deferred rejection channel closed"),
+        )),
+    }
+}
+
+fn dispatch_request<E: NativeExtension>(
+    frame: Frame,
+    runtime: &Arc<ServerRuntime<E>>,
+    rejection_tx: &mpsc::Sender<Frame>,
+    tasks: &mut JoinSet<()>,
+) -> Result<(), ServerError> {
+    let Ok(permit) = runtime.semaphore.clone().try_acquire_owned() else {
+        let response = if shortcut_is_in_flight(runtime, &frame) {
+            res_frame(frame.id, &frame.method, json!({ "handled": true }))
+        } else {
+            error_frame(
+                frame.id,
+                &frame.method,
+                "overloaded",
+                "too many in-flight requests",
+                true,
+            )
+        };
+        return send_deferred_frame(rejection_tx, response);
+    };
+
+    let shortcut_claim = match claim_shortcut(runtime, &frame) {
+        ShortcutAdmission::Untracked => None,
+        ShortcutAdmission::Claimed(claim) => Some(claim),
+        ShortcutAdmission::Duplicate => {
+            drop(permit);
+            let response = res_frame(frame.id, &frame.method, json!({ "handled": true }));
+            return send_deferred_frame(rejection_tx, response);
+        }
+    };
+
+    // Register cancellation before spawning so the next frame can find it.
+    let kind = match frame.method.as_str() {
+        methods::TOOL_EXECUTE => Some(InFlightKind::Tool),
+        methods::PROVIDER_STREAM => Some(InFlightKind::Provider),
+        _ => None,
+    };
+    let token = kind.map(|kind| {
+        let token = CancellationToken::new();
+        runtime
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                frame.id,
+                InFlightEntry {
+                    token: token.clone(),
+                    kind,
+                },
+            );
+        token
+    });
+    let runtime = Arc::clone(runtime);
+    tasks.spawn(async move {
+        let _permit = permit;
+        let _claim = shortcut_claim;
+        handle_request(runtime, frame, token).await;
+    });
+    while tasks.try_join_next().is_some() {}
+    Ok(())
+}
+
 /// Dispatch one post-handshake frame.
 fn dispatch_ready<E: NativeExtension>(
     frame: Frame,
@@ -1481,89 +1617,30 @@ fn dispatch_ready<E: NativeExtension>(
     tasks: &mut JoinSet<()>,
 ) -> Result<(), ServerError> {
     match frame.kind {
-        FrameKind::Req => {
-            if let Ok(permit) = runtime.semaphore.clone().try_acquire_owned() {
-                // Register the cancel token BEFORE spawning: a cancel event
-                // read right after this request must find its target.
-                let kind = match frame.method.as_str() {
-                    methods::TOOL_EXECUTE => Some(InFlightKind::Tool),
-                    methods::PROVIDER_STREAM => Some(InFlightKind::Provider),
-                    _ => None,
+        FrameKind::Req => dispatch_request(frame, runtime, rejection_tx, tasks)?,
+        FrameKind::Event => match frame.method.as_str() {
+            methods::TOOL_CANCEL | methods::PROVIDER_CANCEL => {
+                let kind = if frame.method == methods::TOOL_CANCEL {
+                    InFlightKind::Tool
+                } else {
+                    InFlightKind::Provider
                 };
-                let token = kind.map(|kind| {
-                    let token = CancellationToken::new();
-                    runtime
+                if let Some(id) = frame.payload.get("id").and_then(Value::as_u64)
+                    && let Some(entry) = runtime
                         .in_flight
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .insert(
-                            frame.id,
-                            InFlightEntry {
-                                token: token.clone(),
-                                kind,
-                            },
-                        );
-                    token
-                });
-                let runtime = Arc::clone(runtime);
-                tasks.spawn(async move {
-                    let _permit = permit;
-                    handle_request(runtime, frame, token).await;
-                });
-                // Reap finished tasks so the set does not grow per request.
-                while tasks.try_join_next().is_some() {}
-            } else {
-                // Defer the correlated rejection without stalling reads. If
-                // this bounded queue also fills, the peer is not draining;
-                // fail the transport instead of orphaning another request.
-                let overloaded = error_frame(
-                    frame.id,
-                    &frame.method,
-                    "overloaded",
-                    "too many in-flight requests",
-                    true,
-                );
-                match rejection_tx.try_send(overloaded) {
-                    Ok(()) => {}
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                        return Err(ServerError::OutboundOverflow);
-                    }
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                        return Err(ServerError::Io(std::io::Error::other(
-                            "deferred rejection channel closed",
-                        )));
-                    }
+                        .get(&id)
+                    && entry.kind == kind
+                {
+                    entry.token.cancel();
                 }
             }
-        }
-        FrameKind::Event => {
-            match frame.method.as_str() {
-                methods::TOOL_CANCEL | methods::PROVIDER_CANCEL => {
-                    let kind = if frame.method == methods::TOOL_CANCEL {
-                        InFlightKind::Tool
-                    } else {
-                        InFlightKind::Provider
-                    };
-                    if let Some(id) = frame.payload.get("id").and_then(Value::as_u64)
-                        && let Some(entry) = runtime
-                            .in_flight
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .get(&id)
-                        && entry.kind == kind
-                    {
-                        entry.token.cancel();
-                    }
-                }
-                crate::protocol::THEME_UPDATE_METHOD => {
-                    handle_theme_update(runtime, rejection_tx, tasks, &frame.payload);
-                }
-                // Unknown events are fire-and-forget: ignored by design.
-                _ => {}
+            crate::protocol::THEME_UPDATE_METHOD => {
+                handle_theme_update(runtime, rejection_tx, tasks, &frame.payload);
             }
-        }
-        // The native endpoint initiates no requests; stray res/error frames
-        // carry no correlation state and are ignored.
+            _ => {}
+        },
         FrameKind::Res | FrameKind::Error => {}
     }
     Ok(())
@@ -1887,8 +1964,32 @@ async fn handle_flags_set<E: NativeExtension>(
     }
 }
 
+/// RAII guard releasing a claimed registered shortcut key on drop. Covers
+/// every exit path: success, callback error, timeout, panic unwind, and
+/// request-task abort (which drops the guard without running extension
+/// code). The guard holds an `Arc` clone — never a lock — so no mutex is
+/// retained across the callback await, and the claim can cross the spawn
+/// boundary into the request task.
+struct ShortcutClaim {
+    in_flight: Arc<Mutex<HashSet<String>>>,
+    key: String,
+}
+
+impl Drop for ShortcutClaim {
+    fn drop(&mut self) {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.key);
+    }
+}
+
 /// `shortcut.execute`: dispatch one key; unowned keys answer
 /// `handled: false` rather than an error, matching the TypeScript hosts.
+/// Registered-key single-flight (duplicate detection and RAII claim) is
+/// handled in `dispatch_ready`'s synchronous admission, before the
+/// callback is spawned, so a duplicate for an already-in-flight key ACKs
+/// `handled: true` even when the global semaphore is exhausted.
 async fn handle_shortcut<E: NativeExtension>(
     runtime: &ServerRuntime<E>,
     id: FrameId,
@@ -2477,6 +2578,9 @@ mod tests {
         lifecycle: Arc<Mutex<Vec<(String, Value)>>>,
         flags: Arc<Mutex<BTreeMap<String, FlagValueWire>>>,
         shortcuts: Arc<Mutex<Vec<String>>>,
+        shortcut_started: Arc<Notify>,
+        shortcut_release: Arc<Notify>,
+        shortcut_gate: Arc<AtomicBool>,
         terminal_inputs: Arc<Mutex<Vec<String>>>,
         terminal_started: Arc<Notify>,
         terminal_stopped: Arc<AtomicBool>,
@@ -2508,6 +2612,9 @@ mod tests {
                 lifecycle: Arc::new(Mutex::new(Vec::new())),
                 flags: Arc::new(Mutex::new(BTreeMap::new())),
                 shortcuts: Arc::new(Mutex::new(Vec::new())),
+                shortcut_started: Arc::new(Notify::new()),
+                shortcut_release: Arc::new(Notify::new()),
+                shortcut_gate: Arc::new(AtomicBool::new(false)),
                 terminal_inputs: Arc::new(Mutex::new(Vec::new())),
                 terminal_started: Arc::new(Notify::new()),
                 terminal_stopped: Arc::new(AtomicBool::new(false)),
@@ -2534,6 +2641,9 @@ mod tests {
                 lifecycle: Arc::clone(&self.lifecycle),
                 flags: Arc::clone(&self.flags),
                 shortcuts: Arc::clone(&self.shortcuts),
+                shortcut_started: Arc::clone(&self.shortcut_started),
+                shortcut_release: Arc::clone(&self.shortcut_release),
+                shortcut_gate: Arc::clone(&self.shortcut_gate),
                 terminal_inputs: Arc::clone(&self.terminal_inputs),
                 terminal_started: Arc::clone(&self.terminal_started),
                 terminal_stopped: Arc::clone(&self.terminal_stopped),
@@ -2886,8 +2996,15 @@ mod tests {
             key: String,
         ) -> NativeFuture<Result<bool, ExtensionFault>> {
             let shortcuts = Arc::clone(&self.handles.shortcuts);
+            let started = Arc::clone(&self.handles.shortcut_started);
+            let release = Arc::clone(&self.handles.shortcut_release);
+            let gate = Arc::clone(&self.handles.shortcut_gate);
             Box::pin(async move {
                 let owned = key == "ctrl+alt+d";
+                if owned && gate.load(AtomicOrdering::SeqCst) {
+                    started.notify_one();
+                    release.notified().await;
+                }
                 record(&shortcuts, key);
                 Ok(owned)
             })
@@ -5051,6 +5168,102 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             assert_eq!(seen.as_slice(), &[String::new(), "ctrl+alt+d".to_owned()]);
+        }
+
+        drop(client);
+        let result = tokio::time::timeout(TIMEOUT, server).await??;
+        assert!(result.is_ok());
+        Ok(())
+    }
+
+    /// A duplicate request for a registered key whose handler is already
+    /// in flight answers `handled: true` promptly without re-invoking the
+    /// callback; the key is reusable after the first handler completes.
+    #[tokio::test]
+    async fn shortcut_execute_single_flight_for_registered_key() -> R {
+        let (ext, handles) = DemoExtension::new();
+        // Gate the registered shortcut callback so it blocks until released,
+        // letting a duplicate request arrive while the first is in flight.
+        handles.shortcut_gate.store(true, AtomicOrdering::SeqCst);
+        // max_in_flight=1: the first blocking shortcut exhausts the only
+        // permit, so the duplicate must bypass the global admission gate
+        // via the synchronous single-flight check in dispatch_ready.
+        let config = ServerConfig {
+            max_in_flight: 1,
+            ..ServerConfig::default()
+        };
+        let (mut client, server) = spawn_raw(ext, config);
+        client.hello(PROTOCOL_VERSION, "anything").await?;
+        let _ack = client.recv().await?;
+        client.load_context().await?;
+
+        // First request: the callback starts and blocks on the gate.
+        client
+            .send(&Frame {
+                id: 2,
+                kind: FrameKind::Req,
+                method: SHORTCUT_EXECUTE_METHOD.to_owned(),
+                payload: json!({ "key": "ctrl+alt+d" }),
+            })
+            .await?;
+        tokio::time::timeout(TIMEOUT, handles.shortcut_started.notified()).await?;
+
+        // Duplicate request for the same registered key: must return promptly
+        // with `handled: true` without invoking the callback again.
+        let dup = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            client.request(3, SHORTCUT_EXECUTE_METHOD, json!({ "key": "ctrl+alt+d" })),
+        )
+        .await??;
+        assert_eq!(dup.id, 3);
+        assert_eq!(dup.kind, FrameKind::Res);
+        assert_eq!(dup.payload, json!({ "handled": true }));
+
+        // The callback has not completed yet (the first request is still
+        // blocked), proving the duplicate did not re-invoke it.
+        {
+            let seen = handles
+                .shortcuts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                seen.is_empty(),
+                "callback should not have completed yet: {seen:?}"
+            );
+        }
+
+        // Release the first callback; it completes normally.
+        handles.shortcut_release.notify_one();
+        let first = client.recv().await?;
+        assert_eq!(first.id, 2);
+        assert_eq!(first.kind, FrameKind::Res);
+        assert_eq!(first.payload, json!({ "handled": true }));
+        {
+            let seen = handles
+                .shortcuts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(seen.as_slice(), &["ctrl+alt+d".to_owned()]);
+        }
+
+        // The key is now reusable: a new request dispatches the callback
+        // and returns the real handler result.
+        handles.shortcut_gate.store(false, AtomicOrdering::SeqCst);
+        let reuse = client
+            .request(4, SHORTCUT_EXECUTE_METHOD, json!({ "key": "ctrl+alt+d" }))
+            .await?;
+        assert_eq!(reuse.id, 4);
+        assert_eq!(reuse.kind, FrameKind::Res);
+        assert_eq!(reuse.payload, json!({ "handled": true }));
+        {
+            let seen = handles
+                .shortcuts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(
+                seen.as_slice(),
+                &["ctrl+alt+d".to_owned(), "ctrl+alt+d".to_owned()]
+            );
         }
 
         drop(client);
