@@ -938,11 +938,12 @@ where
         .map_or(0, |policy| policy.max_retries);
     let mut attempt = 0_u32;
     let mut retried = false;
+    let mut accumulated_usage: Option<Usage> = None;
 
     let finish_callback = callbacks.and_then(|callbacks| callbacks.on_retry_finished.as_ref());
 
     loop {
-        let response = match produce().await {
+        let mut response = match produce().await {
             Ok(response) => response,
             Err(error) => {
                 if retried && let Some(callback) = finish_callback {
@@ -952,10 +953,16 @@ where
             }
         };
 
+        accumulated_usage = Some(match &accumulated_usage {
+            Some(acc) => combine_usage(acc, &response.usage),
+            None => response.usage.clone(),
+        });
+
         if response.stop_reason == StopReason::Aborted {
             if retried && let Some(callback) = finish_callback {
                 callback();
             }
+            response.usage = accumulated_usage.unwrap_or_default();
             return Ok(response);
         }
 
@@ -966,6 +973,7 @@ where
             if retried && let Some(callback) = finish_callback {
                 callback();
             }
+            response.usage = accumulated_usage.unwrap_or_default();
             return Ok(response);
         }
 
@@ -1006,6 +1014,7 @@ where
             let mut aborted = response;
             aborted.stop_reason = StopReason::Aborted;
             aborted.error_message = None;
+            aborted.usage = accumulated_usage.unwrap_or_default();
             return Ok(aborted);
         }
 
@@ -2188,5 +2197,105 @@ mod tests {
         assert_eq!(DEFAULT_COMPACTION_SETTINGS.reserve_tokens, 16_384);
         assert_eq!(DEFAULT_COMPACTION_SETTINGS.keep_recent_tokens, 20_000);
         assert!(std::hint::black_box(DEFAULT_COMPACTION_SETTINGS).enabled);
+    }
+
+    #[tokio::test]
+    async fn retry_summarization_call_accumulates_usage_across_attempts() {
+        let policy = SummarizationRetryPolicy {
+            enabled: true,
+            max_retries: 1,
+            base_delay_ms: 0,
+        };
+
+        let mut call_count = 0_u32;
+        let result = retry_summarization_call(
+            move || {
+                let count = call_count;
+                call_count = call_count.saturating_add(1);
+                Box::pin(async move {
+                    if count == 0 {
+                        // First attempt: retryable error with nonzero usage and cost.
+                        let mut msg = AssistantMessage::new(
+                            "anthropic-messages",
+                            "anthropic",
+                            "claude-sonnet-4-5",
+                            1,
+                        );
+                        msg.stop_reason = StopReason::Error;
+                        msg.error_message = Some("overloaded_error".to_owned());
+                        msg.usage = Usage {
+                            input: 100,
+                            output: 50,
+                            cache_read: 10,
+                            cache_write: 5,
+                            cache_write1h: Some(3),
+                            reasoning: Some(20),
+                            total_tokens: 165,
+                            cost: pi_ai::UsageCost {
+                                input: 0.01,
+                                output: 0.02,
+                                cache_read: 0.001,
+                                cache_write: 0.005,
+                                total: 0.036,
+                            },
+                        };
+                        Ok(msg)
+                    } else {
+                        // Second attempt: success with nonzero usage and cost.
+                        let mut msg = AssistantMessage::new(
+                            "anthropic-messages",
+                            "anthropic",
+                            "claude-sonnet-4-5",
+                            1,
+                        );
+                        msg.content = vec![AssistantContent::Text(TextContent::new("summary"))];
+                        msg.stop_reason = StopReason::Stop;
+                        msg.usage = Usage {
+                            input: 200,
+                            output: 100,
+                            cache_read: 20,
+                            cache_write: 10,
+                            cache_write1h: Some(7),
+                            reasoning: Some(40),
+                            total_tokens: 330,
+                            cost: pi_ai::UsageCost {
+                                input: 0.02,
+                                output: 0.04,
+                                cache_read: 0.002,
+                                cache_write: 0.01,
+                                total: 0.072,
+                            },
+                        };
+                        Ok(msg)
+                    }
+                })
+            },
+            Some(&policy),
+            None,
+            None,
+        )
+        .await;
+
+        let response = result_ok(result);
+
+        // Terminal response content and stop reason are preserved.
+        assert_eq!(response.stop_reason, StopReason::Stop);
+        assert_eq!(assistant_text(&response), "summary");
+
+        // Token usage is the exact sum of both attempts.
+        assert_eq!(response.usage.input, 300);
+        assert_eq!(response.usage.output, 150);
+        assert_eq!(response.usage.cache_read, 30);
+        assert_eq!(response.usage.cache_write, 15);
+        assert_eq!(response.usage.cache_write1h, Some(10));
+        assert_eq!(response.usage.reasoning, Some(60));
+        assert_eq!(response.usage.total_tokens, 495);
+
+        // Cost is the exact sum of both attempts.
+        assert!((response.usage.cost.input - 0.03).abs() < 1e-9);
+        assert!((response.usage.cost.output - 0.06).abs() < 1e-9);
+        assert!((response.usage.cost.cache_read - 0.003).abs() < 1e-9);
+        assert!((response.usage.cost.cache_write - 0.015).abs() < 1e-9);
+        assert!((response.usage.cost.total - 0.108).abs() < 1e-9);
     }
 }
