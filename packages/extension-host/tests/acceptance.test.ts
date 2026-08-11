@@ -578,25 +578,16 @@ describe("acceptance: extension runtime", () => {
 	const executableSuffix = process.platform === "win32" ? ".exe" : "";
 	let artifactDir: string;
 	let compiledHost: string;
-	let compiledRuntimeImport: string;
 
 	beforeAll(async () => {
 		artifactDir = await mkdtemp(join(tmpdir(), "pi-extension-host-acceptance-"));
 		compiledHost = join(artifactDir, `pi-extension-host${executableSuffix}`);
-		compiledRuntimeImport = join(artifactDir, `runtime-import${executableSuffix}`);
 		await runProcess(process.execPath, [
 			"build",
 			"./src/main.ts",
 			"--compile",
 			"--outfile",
 			compiledHost,
-		], hostDir);
-		await runProcess(process.execPath, [
-			"build",
-			"./fixtures/runtime-import.ts",
-			"--compile",
-			"--outfile",
-			compiledRuntimeImport,
 		], hostDir);
 	});
 
@@ -671,24 +662,9 @@ describe("acceptance: extension runtime", () => {
 			child.kill("SIGTERM");
 		}
 	});
+
 	test("runtime-import loads real extension via jiti", async () => {
 		const helloPath = resolve(
-			import.meta.dirname, "..", "..", "..",
-			".references", "pi", "packages", "coding-agent", "examples", "extensions", "hello.ts",
-		);
-		const jiti = createExtensionJiti();
-		const module = await jiti.import(helloPath, { default: true }) as unknown;
-		expect(typeof module).toBe("function");
-		const runtime = createExtensionRuntime();
-		const bus = createEventBus();
-		const ext = await loadExtensionFromFactory(
-			module as ExtensionFactory, process.cwd(), bus, runtime, helloPath,
-		);
-		expect([...ext.tools.keys()]).toContain("hello");
-	});
-
-	test("compiled runtime-import binary loads a real extension", async () => {
-		const extensionPath = resolve(
 			import.meta.dirname,
 			"..",
 			"..",
@@ -701,17 +677,58 @@ describe("acceptance: extension runtime", () => {
 			"extensions",
 			"hello.ts",
 		);
-		const output = await runProcess(compiledRuntimeImport, [extensionPath], hostDir);
+		const jiti = createExtensionJiti();
+		const module = await jiti.import(helloPath, { default: true }) as unknown;
+		expect(typeof module).toBe("function");
+		const runtime = createExtensionRuntime();
+		const bus = createEventBus();
+		const ext = await loadExtensionFromFactory(
+			module as ExtensionFactory,
+			process.cwd(),
+			bus,
+			runtime,
+			helloPath,
+		);
+		expect([...ext.tools.keys()]).toContain("hello");
+	});
+
+	test("runtime-import probe drives the compiled sidecar", async () => {
+		const probePath = resolve(hostDir, "fixtures", "runtime-import.ts");
+		const extensionPath = resolve(hostDir, "fixtures", "extensions", "tool.ts");
+		const output = await runProcess(
+			process.execPath,
+			[probePath, compiledHost, extensionPath],
+			hostDir,
+		);
 		const result = JSON.parse(output.stdout.trim()) as Record<string, unknown>;
 		expect(result).toEqual({
 			path: extensionPath,
-			tools: ["hello"],
-			handlers: [],
-			commands: [],
+			tools: ["echo"],
+			handlers: ["session_start"],
+			commands: ["greet", "showOverlay", "interactiveOverlay", "llama"],
 			flags: [],
 			shortcuts: [],
 			messageRenderers: [],
 		});
+	});
+
+	test("runtime-import probe rejects missing arguments", async () => {
+		const probePath = resolve(hostDir, "fixtures", "runtime-import.ts");
+		await expect(runProcess(process.execPath, [probePath], hostDir)).rejects.toThrow(
+			"exited with code 2",
+		);
+	});
+
+	test("runtime-import probe rejects an extension load error", async () => {
+		const probePath = resolve(hostDir, "fixtures", "runtime-import.ts");
+		const missingExtension = resolve(hostDir, "fixtures", "extensions", "missing.ts");
+		await expect(
+			runProcess(
+				process.execPath,
+				[probePath, compiledHost, missingExtension],
+				hostDir,
+			),
+		).rejects.toThrow("exited with code 4");
 	});
 
 	test("input hook forwards action union (not { ok: true })", async () => {
