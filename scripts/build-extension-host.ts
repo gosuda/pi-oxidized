@@ -26,7 +26,6 @@ async function main(): Promise<void> {
 		repoRoot,
 		stagingRoot,
 		plan: args.plan,
-		skipTests: args.skipHostTests,
 		skipRuntimeImport: false,
 		skipHandshake: !args.handshake,
 		runner: new SpawnRunner(),

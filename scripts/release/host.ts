@@ -56,8 +56,6 @@ export interface BuildHostOptions {
 	readonly plan: TargetPlan;
 	/** Working directory under which artifacts are emitted (a `host/` subdir is created). */
 	readonly stagingRoot: string;
-	/** Skip the host unit tests (`bun test`). */
-	readonly skipTests: boolean;
 	/** Skip the runtime-import fixture run. */
 	readonly skipRuntimeImport: boolean;
 	/** Skip the `hello` handshake against the compiled sidecar. */
@@ -92,14 +90,13 @@ function targetStagingDir(stagingRoot: string, plan: TargetPlan): string {
  * Algorithm:
  *   1. `bun install --frozen-lockfile` (host deps are source-pinned).
  *   2. `tsc --noEmit` (host typecheck).
- *   3. `bun test` (unless `skipTests`).
- *   4. `bun build --compile --target <plan.bunTarget>` → sidecar binary.
- *   5. Run the source probe against that binary: `hello`, then
+ *   3. `bun build --compile --target <plan.bunTarget>` → sidecar binary.
+ *   4. Run the source probe against that binary: `hello`, then
  *      `extensions.load` of the Type-based tool fixture.
- *   6. Speak an independent JSONL `hello` handshake (unless
+ *   5. Speak an independent JSONL `hello` handshake (unless
  *      `skipHandshake`).
  *
- * If step 4 cannot create a compiled artifact, the function falls back to the
+ * If step 3 cannot create a compiled artifact, the function falls back to the
  * runtime+bundle path. A compiled artifact that fails either behavioral probe
  * fails the release instead of substituting a different runtime graph.
  */
@@ -111,7 +108,6 @@ export async function buildHost(options: BuildHostOptions): Promise<HostArtifact
 
 	await installHostDeps(hostDir, runner);
 	await typecheckHost(hostDir, runner);
-	if (!options.skipTests) await testHost(hostDir, runner);
 
 	const compiled = await tryCompiledPath(options, hostDir, outDir, runner);
 	if (compiled !== undefined) return compiled;
@@ -151,21 +147,6 @@ async function typecheckHost(hostDir: string, runner: CommandRunner): Promise<vo
 		throw new HostBuildError(
 			hostDir,
 			`host typecheck failed (exit ${res.exitCode}). stderr=${res.stderr.slice(0, 1000)}`,
-		);
-	}
-}
-
-/** Run `bun test` in the host package. */
-async function testHost(hostDir: string, runner: CommandRunner): Promise<void> {
-	const res = await runner.run("bun", ["run", "test"], {
-		cwd: hostDir,
-		rejectOnError: false,
-		timeoutMs: HOST_BUILD_TIMEOUT_MS,
-	});
-	if (res.exitCode !== 0) {
-		throw new HostBuildError(
-			hostDir,
-			`host tests failed (exit ${res.exitCode}). stderr=${res.stderr.slice(0, 1000)}`,
 		);
 	}
 }

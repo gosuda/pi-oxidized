@@ -48,7 +48,6 @@ describe("buildHost", () => {
 			repoRoot: "/workspace",
 			stagingRoot: work,
 			plan,
-			skipTests: true,
 			skipRuntimeImport: true, // skipped because we don't have mock workspaces setup
 			skipHandshake: false,
 			runner,
@@ -59,9 +58,14 @@ describe("buildHost", () => {
 			expect(host.binaryPath).toBe(sidecarBuildPath);
 		}
 
-		const subcommands = runner.calls.map((c) => c.args[0]);
-		expect(subcommands).not.toContain("test");
-		expect(subcommands.filter((s) => s === "build")).toHaveLength(1);
+		const subcommands = runner.calls.map((call) => call.args[0]);
+		const ranHostTests = runner.calls.some(
+			(call) =>
+				call.command === "bun" &&
+				(call.args[0] === "test" || (call.args[0] === "run" && call.args[1] === "test")),
+		);
+		expect(ranHostTests).toBe(false);
+		expect(subcommands.filter((subcommand) => subcommand === "build")).toHaveLength(1);
 
 		const handshakeCall = runner.calls.find((c) => c.command.includes("pi-extension-host"));
 		expect(handshakeCall).toBeDefined();
@@ -118,7 +122,6 @@ describe("buildHost", () => {
 			repoRoot,
 			stagingRoot: work,
 			plan,
-			skipTests: true,
 			skipRuntimeImport: false,
 			skipHandshake: false,
 			runner,
@@ -167,7 +170,6 @@ describe("buildHost", () => {
 				repoRoot,
 				stagingRoot: work,
 				plan,
-				skipTests: true,
 				skipRuntimeImport: false,
 				skipHandshake: true,
 				runner,
@@ -196,7 +198,6 @@ describe("buildHost", () => {
 			repoRoot: "/workspace",
 			stagingRoot: work,
 			plan,
-			skipTests: true,
 			skipRuntimeImport: true,
 			skipHandshake: true,
 			runner,

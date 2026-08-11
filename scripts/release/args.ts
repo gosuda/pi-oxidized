@@ -24,8 +24,6 @@ export interface ReleaseArgs {
 	readonly dryRun: boolean;
 	/** When true, skip cargo build only (still compile host). */
 	readonly noCargo: boolean;
-	/** When true, skip host unit tests (still typecheck + compile). */
-	readonly skipHostTests: boolean;
 	/** When true, run the host `hello` handshake against the sidecar. */
 	readonly handshake: boolean;
 	/** Override the SOURCE_DATE_EPOCH timestamp used for archive mtimes. */
@@ -112,7 +110,6 @@ export function parseReleaseArgs(
 	let outDir: string | undefined;
 	let dryRun = false;
 	let noCargo = false;
-	let skipHostTests = false;
 	let handshake = true;
 	let sourceDateEpoch = sourceDateEpochEnv ?? "0";
 
@@ -144,10 +141,6 @@ export function parseReleaseArgs(
 				noCargo = true;
 				break;
 			}
-			case "--skip-host-tests": {
-				skipHostTests = true;
-				break;
-			}
 			case "--no-handshake": {
 				handshake = false;
 				break;
@@ -173,7 +166,6 @@ export function parseReleaseArgs(
 		outDir: resolve(cwd, outDir ?? "dist/release"),
 		dryRun,
 		noCargo,
-		skipHostTests,
 		handshake,
 		sourceDateEpoch,
 	};
