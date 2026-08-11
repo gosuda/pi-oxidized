@@ -650,15 +650,11 @@ impl PublishedRuntimeState {
         Some(self.quiesce(channels))
     }
 }
-/// State that owns the bound session target, repudiating stale publishers.
-///
-/// `bind` mints a fresh `SessionTargetBinding` on each new target. The same
-/// target bound twice (e.g. duplicate bind calls racing) receives the same
-/// binding so the second call is a no-op, but a new target always invalidates
-/// the previous binding before the normal post-apply committed rebind.
+/// State that owns the bound session target and its mirror publication authority.
 struct SessionTargetState {
     target: Weak<AgentSession>,
     binding: Option<SessionTargetBinding>,
+    published: bool,
     next_binding: u64,
 }
 
@@ -667,6 +663,7 @@ impl SessionTargetState {
         Self {
             target: Weak::new(),
             binding: None,
+            published: false,
             next_binding: 1,
         }
     }
@@ -681,6 +678,7 @@ impl SessionTargetState {
         self.next_binding = self.next_binding.wrapping_add(1).max(1);
         self.target = target;
         self.binding = Some(binding);
+        self.published = false;
         binding
     }
 
@@ -688,8 +686,25 @@ impl SessionTargetState {
         Some((self.target.upgrade()?, self.binding?))
     }
 
+    fn binding_for(&self, target: &Arc<AgentSession>) -> Option<SessionTargetBinding> {
+        let (current, binding) = self.route()?;
+        (self.published && Arc::ptr_eq(&current, target)).then_some(binding)
+    }
+
     fn is_current(&self, binding: SessionTargetBinding) -> bool {
         self.binding == Some(binding) && self.target.strong_count() != 0
+    }
+
+    fn is_published(&self, binding: SessionTargetBinding) -> bool {
+        self.published && self.is_current(binding)
+    }
+
+    fn publish(&mut self, binding: SessionTargetBinding) -> bool {
+        if !self.is_current(binding) {
+            return false;
+        }
+        self.published = true;
+        true
     }
 }
 
@@ -753,6 +768,7 @@ pub struct ExtensionRuntimeSet {
     load_cwd: String,
     project_trusted: bool,
     reload_lock: tokio::sync::Mutex<()>,
+    session_publish_lock: tokio::sync::Mutex<()>,
     pending_ready: Arc<StdMutex<PendingReadyState>>,
     next_replacement_token_id: AtomicU64,
     #[cfg(test)]
@@ -846,6 +862,7 @@ impl ExtensionRuntimeSet {
             load_cwd,
             project_trusted,
             reload_lock: tokio::sync::Mutex::new(()),
+            session_publish_lock: tokio::sync::Mutex::new(()),
             pending_ready: Arc::new(StdMutex::new(PendingReadyState::None)),
             next_replacement_token_id: AtomicU64::new(1),
             #[cfg(test)]
@@ -1093,8 +1110,8 @@ impl ExtensionRuntimeSet {
     /// Abort an exact token that is still waiting for host readiness.
     ///
     /// Accepted readiness is irreversible: `Finalizing` states are never removed.
-    pub(crate) fn abort_waiting_ready(&self, token: &str) -> bool {
-        let Some(op) = abort_pending_ready_drop(&self.pending_ready, token) else {
+    pub(crate) fn abort_waiting_ready(&self, token: &str, owner: Option<EndpointId>) -> bool {
+        let Some(op) = abort_pending_ready_drop(&self.pending_ready, token, owner) else {
             return false;
         };
         discard_pending_ready_op(op);
@@ -1330,12 +1347,9 @@ impl ExtensionRuntimeSet {
             // Rejecting any token-bearing control at the first bounded hop
             // aborts only the matching operation from this endpoint.
             let drop_pending = Weak::clone(&pending_ready_weak);
-            let endpoint_id = endpoint.id;
             endpoint.runner.set_replacement_drop_handler(Arc::new(
                 move |token: &str, origin: Option<EndpointId>| {
-                    if origin.is_none_or(|origin| origin == endpoint_id) {
-                        abort_dropped_pending_ready(&drop_pending, token);
-                    }
+                    abort_dropped_pending_ready(&drop_pending, token, origin);
                 },
             ));
             let context = EndpointRelayContext {
@@ -1721,12 +1735,58 @@ impl ExtensionRuntimeSet {
     }
 
     /// Bind the session that receives facade commands after ready finalization.
-    pub(crate) fn bind_session_target(&self, session: Weak<AgentSession>) -> SessionTargetBinding {
+    pub(crate) async fn bind_session_target(
+        &self,
+        session: Weak<AgentSession>,
+    ) -> SessionTargetBinding {
+        let _publish = self.session_publish_lock.lock().await;
         self.channels
             .session_target
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .bind(session)
+    }
+
+    /// Return the binding only when `session` owns the published mirror.
+    #[must_use]
+    pub(crate) fn session_binding_for(
+        &self,
+        session: &Arc<AgentSession>,
+    ) -> Option<SessionTargetBinding> {
+        self.channels
+            .session_target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .binding_for(session)
+    }
+
+    /// Commit an already-bound replacement and release its exact token.
+    pub(crate) async fn commit_session_replacement(
+        &self,
+        token: &str,
+    ) -> Option<(Arc<AgentSession>, SessionTargetBinding)> {
+        let _publish = self.session_publish_lock.lock().await;
+        let mut pending = self.pending_ready();
+        let expected = match &*pending {
+            PendingReadyState::Finalizing {
+                op: None,
+                token: pending_token,
+                replacement_target: Some(target),
+                ..
+            } if pending_token == token => Arc::clone(target),
+            _ => return None,
+        };
+        let (target, binding) = self
+            .channels
+            .session_target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .route()?;
+        if !Arc::ptr_eq(&target, &expected) {
+            return None;
+        }
+        *pending = PendingReadyState::None;
+        Some((target, binding))
     }
 
     /// Whether a mirror publisher still owns the committed session binding.
@@ -1782,8 +1842,7 @@ impl ExtensionRuntimeSet {
         } = scope
         {
             let state = self.pending_ready();
-            let owner_matches =
-                |owner: Option<EndpointId>| origin.is_none_or(|origin| owner == Some(origin));
+            let owner_matches = |owner: Option<EndpointId>| owner == origin;
             return match (&*state, kind) {
                 (
                     PendingReadyState::Pending {
@@ -2039,8 +2098,51 @@ impl ExtensionRuntimeSet {
             .await
     }
 
-    /// Broadcast mirrored session state.
-    pub async fn push_session_state(&self, state: &SessionStateWire) {
+    /// Publish the first mirror snapshot and grant this binding publication authority.
+    pub(crate) async fn activate_session_state(
+        &self,
+        binding: SessionTargetBinding,
+        state: &SessionStateWire,
+    ) -> bool {
+        let _publish = self.session_publish_lock.lock().await;
+        if !self
+            .channels
+            .session_target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_current(binding)
+        {
+            return false;
+        }
+        self.broadcast_session_state(state).await;
+        self.channels
+            .session_target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .publish(binding)
+    }
+
+    /// Broadcast mirrored session state only for the published binding.
+    pub(crate) async fn push_session_state_for_binding(
+        &self,
+        binding: SessionTargetBinding,
+        state: &SessionStateWire,
+    ) -> bool {
+        let _publish = self.session_publish_lock.lock().await;
+        if !self
+            .channels
+            .session_target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_published(binding)
+        {
+            return false;
+        }
+        self.broadcast_session_state(state).await;
+        true
+    }
+
+    async fn broadcast_session_state(&self, state: &SessionStateWire) {
         let lease = self.lease();
         let mut sends = FuturesUnordered::new();
         for endpoint in lease.live_endpoints() {
@@ -3165,7 +3267,7 @@ fn spawn_session_relay(
             let Some(state) = state.upgrade() else {
                 break;
             };
-            let mut dropped_replacement_token: Option<String> = None;
+            let mut dropped_replacement: Option<(String, Option<EndpointId>)> = None;
             let send_failed = {
                 let mut state = state
                     .lock()
@@ -3269,20 +3371,21 @@ fn spawn_session_relay(
             };
             if send_failed.unwrap_or(true) {
                 match &fallback {
-                    SessionBridgeEvent::Command { envelope, .. } => {
+                    SessionBridgeEvent::Command { envelope, origin } => {
                         if let Some(token) = &envelope.replacement_token {
-                            dropped_replacement_token = Some(token.clone());
+                            dropped_replacement = Some((token.clone(), *origin));
                         }
                     }
-                    SessionBridgeEvent::ReplacementReady { token, .. }
-                    | SessionBridgeEvent::ReplacementAbort { token, .. } => {
-                        dropped_replacement_token = Some(token.clone());
+                    SessionBridgeEvent::ReplacementReady { token, origin }
+                    | SessionBridgeEvent::ReplacementAbort { token, origin } => {
+                        dropped_replacement = Some((token.clone(), *origin));
                     }
-                    _ => answer_unclaimed_session(&runner, fallback).await,
+                    _ => {}
                 }
+                answer_unclaimed_session(&runner, fallback).await;
             }
-            if let Some(token) = dropped_replacement_token {
-                abort_dropped_pending_ready(&replacement_ready_drop, &token);
+            if let Some((token, owner)) = dropped_replacement {
+                abort_dropped_pending_ready(&replacement_ready_drop, &token, owner);
             }
         }
     }))
@@ -3305,6 +3408,7 @@ fn discard_pending_ready_op(op: PendingReadyOp) {
 fn abort_pending_ready_drop(
     pending: &StdMutex<PendingReadyState>,
     token: &str,
+    owner: Option<EndpointId>,
 ) -> Option<PendingReadyOp> {
     let mut state = pending
         .lock()
@@ -3312,8 +3416,9 @@ fn abort_pending_ready_drop(
     match &*state {
         PendingReadyState::Pending {
             token: pending_token,
+            owner: pending_owner,
             ..
-        } if pending_token == token => {}
+        } if pending_token == token && *pending_owner == owner => {}
         _ => return None,
     }
     match std::mem::replace(&mut *state, PendingReadyState::None) {
@@ -3325,11 +3430,15 @@ fn abort_pending_ready_drop(
     }
 }
 
-fn abort_dropped_pending_ready(pending: &Weak<StdMutex<PendingReadyState>>, token: &str) {
+fn abort_dropped_pending_ready(
+    pending: &Weak<StdMutex<PendingReadyState>>,
+    token: &str,
+    owner: Option<EndpointId>,
+) {
     let Some(pending) = pending.upgrade() else {
         return;
     };
-    if let Some(op) = abort_pending_ready_drop(&pending, token) {
+    if let Some(op) = abort_pending_ready_drop(&pending, token, owner) {
         discard_pending_ready_op(op);
     }
 }
@@ -3594,6 +3703,20 @@ async fn answer_unclaimed_session(runner: &HostExtensionRunner, event: SessionBr
     }
 }
 
+/// Keep retirement and pending ownership cleanup atomic to observers.
+fn retire_endpoint_and_abort_pending(
+    state: &mut PublishedRuntimeState,
+    endpoint: EndpointId,
+    channels: &FacadeChannels,
+    pending_ready: &Weak<StdMutex<PendingReadyState>>,
+) -> bool {
+    let retired = state.retire_endpoint(endpoint, channels);
+    if retired {
+        abort_owned_pending_ready(pending_ready, endpoint);
+    }
+    retired
+}
+
 fn spawn_fatal_error_relay(
     state: Weak<StdMutex<PublishedRuntimeState>>,
     endpoint: EndpointId,
@@ -3608,13 +3731,11 @@ fn spawn_fatal_error_relay(
         if !runner.is_active()
             && let Some(state) = state.upgrade()
         {
-            forward_first_fatal = state
+            let mut state = state
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .retire_endpoint(endpoint, &channels);
-            if forward_first_fatal {
-                abort_owned_pending_ready(&pending_ready, endpoint);
-            }
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            forward_first_fatal =
+                retire_endpoint_and_abort_pending(&mut state, endpoint, &channels, &pending_ready);
         }
         loop {
             match receiver.recv().await {
@@ -3622,19 +3743,19 @@ fn spawn_fatal_error_relay(
                     let Some(state) = state.upgrade() else {
                         break;
                     };
-                    let (retired_now, forward) = {
+                    let forward = {
                         let mut state = state
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        let retired_now =
-                            !runner.is_active() && state.retire_endpoint(endpoint, &channels);
-                        let forward =
-                            forward_first_fatal || retired_now || state.accepts_relay(endpoint);
-                        (retired_now, forward)
+                        let retired_now = !runner.is_active()
+                            && retire_endpoint_and_abort_pending(
+                                &mut state,
+                                endpoint,
+                                &channels,
+                                &pending_ready,
+                            );
+                        forward_first_fatal || retired_now || state.accepts_relay(endpoint)
                     };
-                    if retired_now {
-                        abort_owned_pending_ready(&pending_ready, endpoint);
-                    }
                     if forward {
                         let _ = channels.errors_tx.send(item);
                         forward_first_fatal = false;
@@ -3651,12 +3772,18 @@ fn spawn_fatal_error_relay(
                         if runner.is_active() {
                             (false, state.accepts_relay(endpoint))
                         } else {
-                            (state.retire_endpoint(endpoint, &channels), false)
+                            (
+                                retire_endpoint_and_abort_pending(
+                                    &mut state,
+                                    endpoint,
+                                    &channels,
+                                    &pending_ready,
+                                ),
+                                false,
+                            )
                         }
                     };
-                    if retired_now {
-                        abort_owned_pending_ready(&pending_ready, endpoint);
-                    } else if accepts_relay {
+                    if !retired_now && accepts_relay {
                         channels.publish_error(
                             "extension_event_lagged",
                             format!("extension {label:?} relay lagged by {count} events"),
@@ -3665,18 +3792,18 @@ fn spawn_fatal_error_relay(
                     }
                 }
                 Err(broadcast::error::RecvError::Closed) => {
-                    let retired_now = if runner.is_active() {
-                        false
-                    } else {
-                        state.upgrade().is_some_and(|state| {
-                            state
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .retire_endpoint(endpoint, &channels)
-                        })
-                    };
-                    if retired_now {
-                        abort_owned_pending_ready(&pending_ready, endpoint);
+                    if !runner.is_active()
+                        && let Some(state) = state.upgrade()
+                    {
+                        let mut state = state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        retire_endpoint_and_abort_pending(
+                            &mut state,
+                            endpoint,
+                            &channels,
+                            &pending_ready,
+                        );
                     }
                     break;
                 }
@@ -3822,14 +3949,31 @@ pub(crate) mod tests {
                 },
             )
             .map_err(|_| "initial pending install was rejected")?;
+        let owner = set.state().generation.endpoints[0].id;
+        let route = set
+            .state()
+            .allocate_route(owner, 80)
+            .ok_or("owner route allocation failed")?;
+        set.respond_reload(route, Ok(Some(&token))).await?;
+        host.wait_for_response(protocol::SESSION_RELOAD_METHOD, 80)
+            .await?;
 
         // Send a stale dropped token — the pending slot must remain.
         let stale_token = "stale-tok-999".to_owned();
-        abort_pending_ready_drop(&set.pending_ready, &stale_token);
+        abort_pending_ready_drop(&set.pending_ready, &stale_token, Some(owner));
         assert!(
             set.is_pending_busy(),
             "stale dropped token must not clear the active operation"
         );
+        let wrong_owner = EndpointId {
+            generation: owner.generation,
+            position: owner.position + 1,
+        };
+        assert!(
+            abort_pending_ready_drop(&set.pending_ready, &token, Some(wrong_owner)).is_none(),
+            "a dropped frame from another endpoint aborted the pending operation"
+        );
+        assert!(set.is_pending_busy());
 
         // Fill the facade session_bridge_tx to EVENT_CHANNEL_CAPACITY while
         // its receiver is held and not drained.
@@ -3897,6 +4041,14 @@ pub(crate) mod tests {
                 },
             )
             .map_err(|_| "initial pending install was rejected")?;
+        let owner = set.state().generation.endpoints[0].id;
+        let route = set
+            .state()
+            .allocate_route(owner, 81)
+            .ok_or("owner route allocation failed")?;
+        set.respond_reload(route, Ok(Some(&token))).await?;
+        host.wait_for_response(protocol::SESSION_RELOAD_METHOD, 81)
+            .await?;
         let _bridge_rx = set
             .take_session_bridge()
             .ok_or("session bridge receiver missing")?;
@@ -3963,7 +4115,7 @@ pub(crate) mod tests {
 
         assert!(set.complete_ready(&token));
         assert!(
-            abort_pending_ready_drop(&set.pending_ready, &token).is_none(),
+            abort_pending_ready_drop(&set.pending_ready, &token, None).is_none(),
             "a duplicate dropped ready must not revoke a finalizing operation"
         );
         ready_rx.await?;
@@ -4082,7 +4234,7 @@ pub(crate) mod tests {
             let _ = self.commands.send(FakeCommand::Emit(frame)).await;
         }
 
-        async fn wait_for_frame(&self, method: &str) -> TestResult {
+        pub(crate) async fn wait_for_frame(&self, method: &str) -> TestResult {
             tokio::time::timeout(TEST_TIMEOUT, async {
                 loop {
                     if self
@@ -4176,6 +4328,16 @@ pub(crate) mod tests {
                 .filter(|frame| frame.kind == FrameKind::Req && frame.method == method)
                 .count()
         }
+        pub(crate) fn frame_count(&self, method: &str) -> usize {
+            self.state
+                .frames
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .filter(|frame| frame.method == method)
+                .count()
+        }
+
         pub(crate) fn first_payload(&self, method: &str) -> Option<Value> {
             self.state
                 .frames
@@ -7142,6 +7304,13 @@ pub(crate) mod tests {
         ));
         assert!(matches!(
             set.route_session_bridge(&SessionBridgeEvent::ReplacementReady {
+                token: token.clone(),
+                origin: None,
+            }),
+            SessionBridgeRoute::Rejected
+        ));
+        assert!(matches!(
+            set.route_session_bridge(&SessionBridgeEvent::ReplacementReady {
                 token: "stale-token".to_owned(),
                 origin: Some(owner),
             }),
@@ -7165,9 +7334,10 @@ pub(crate) mod tests {
         assert!(matches!(
             &*set.pending_ready(),
             PendingReadyState::Finalizing {
+                token: current,
                 owner: Some(bound_owner),
                 ..
-            } if *bound_owner == owner
+            } if current == &token && *bound_owner == owner
         ));
         assert!(matches!(
             set.route_session_bridge(&SessionBridgeEvent::ReplacementAbort {
