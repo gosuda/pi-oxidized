@@ -270,22 +270,29 @@ pi.registerCommand(VERIFICATION_FLAG_COMMAND, {
 		description: "Exercise real session replacement lifecycle",
 		handler: async (_args, ctx) => {
 			recordCompatibility("replacement.before", { command: VERIFICATION_SESSION_REPLACEMENT_COMMAND });
-			const result = await ctx.newSession({
-				setup: async (sessionManager) => {
-					await sessionManager.appendCustomEntry("verification-replacement-setup", { source: "setup" });
-					recordCompatibility("replacement.setup", { source: "setup" });
-				},
-				withSession: async (replacementCtx) => {
-					recordCompatibility("replacement.withSession.before", {});
-					await replacementCtx.sendMessage({
-						customType: "verification-replacement-with-session",
-						content: "verification replacement withSession",
-						display: false,
-					});
-					recordCompatibility("replacement.withSession.after", {});
-				},
-			});
-			recordCompatibility("replacement.after", { cancelled: result.cancelled });
+			try {
+				const result = await ctx.newSession({
+					setup: async (sessionManager) => {
+						await sessionManager.appendCustomEntry("verification-replacement-setup", { source: "setup" });
+						recordCompatibility("replacement.setup", { source: "setup" });
+					},
+					withSession: async (replacementCtx) => {
+						recordCompatibility("replacement.withSession.before", {});
+						await replacementCtx.sendMessage({
+							customType: "verification-replacement-with-session",
+							content: "verification replacement withSession",
+							display: false,
+						});
+						recordCompatibility("replacement.withSession.after", {});
+					},
+				});
+				recordCompatibility("replacement.after", { cancelled: result.cancelled });
+			} catch (error) {
+				recordCompatibility("replacement.error", {
+					message: error instanceof Error ? error.message : String(error),
+				});
+				throw error;
+			}
 		},
 	});
 

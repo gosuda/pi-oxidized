@@ -29,12 +29,16 @@ export default async function providerStagedDefeated(pi: ExtensionAPI): Promise<
 		},
 	});
 
+	// Install the release hook BEFORE signalling, so a synchronous release
+	// from the started callback cannot be dropped.
+	const released = new Promise<void>((resolve) => {
+		coordination.__providerStagedRelease = resolve;
+	});
+
 	// Signal that the registration has been staged and we are about to pause.
 	coordination.__providerStagedStarted?.();
 
 	// Wait for release — during this pause, the test triggers a live
 	// unregister of "race_provider" at a higher order.
-	await new Promise<void>((resolve) => {
-		coordination.__providerStagedRelease = resolve;
-	});
+	await released;
 }

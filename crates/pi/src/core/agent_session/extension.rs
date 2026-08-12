@@ -691,13 +691,14 @@ impl AgentSession {
         let Some(mut bridge_rx) = host.take_session_bridge() else {
             return;
         };
+        let diagnostic_session = session.clone();
         let binding = host.bind_session_target(session.clone()).await;
         self.bind_session_mirror(Arc::clone(&host), session, binding)
             .await;
 
         tokio::spawn(async move {
             while let Some(item) = bridge_rx.recv().await {
-                dispatch_session_bridge(&host, item).await;
+                dispatch_session_bridge(&host, item, &diagnostic_session).await;
             }
         });
     }
@@ -892,7 +893,9 @@ impl AgentSession {
             }
             SessionBridgeEvent::ReplacementReady { .. }
             | SessionBridgeEvent::ReplacementAbort { .. } => {
-                unreachable!("replacement controls are routed before session dispatch");
+                self.report_extension_error(
+                    "replacement control unexpectedly reached session bridge dispatch",
+                );
             }
         }
     }
@@ -1605,8 +1608,22 @@ async fn abort_bridge_pending(
     }
 }
 
-async fn dispatch_session_bridge(host: &Arc<ExtensionRuntimeSet>, item: SessionBridgeEvent) {
-    match host.route_session_bridge(&item) {
+async fn dispatch_session_bridge(
+    host: &Arc<ExtensionRuntimeSet>,
+    item: SessionBridgeEvent,
+    diagnostic_session: &std::sync::Weak<AgentSession>,
+) {
+    let route = host.route_session_bridge(&item);
+    dispatch_session_bridge_route(host, item, route, diagnostic_session).await;
+}
+
+async fn dispatch_session_bridge_route(
+    host: &Arc<ExtensionRuntimeSet>,
+    item: SessionBridgeEvent,
+    route: SessionBridgeRoute,
+    diagnostic_session: &std::sync::Weak<AgentSession>,
+) {
+    match route {
         SessionBridgeRoute::Active { target, binding } => {
             target.apply_session_bridge_event(host, item).await;
             if !host.is_session_target_current(binding) {
@@ -1625,7 +1642,13 @@ async fn dispatch_session_bridge(host: &Arc<ExtensionRuntimeSet>, item: SessionB
             SessionBridgeEvent::ReplacementAbort { token, origin } => {
                 let _ = host.abort_waiting_ready(&token, origin);
             }
-            _ => unreachable!("only replacement controls route as operations"),
+            _ => {
+                if let Some(session) = diagnostic_session.upgrade() {
+                    session.report_extension_error(
+                        "non-replacement event unexpectedly routed as a bridge operation",
+                    );
+                }
+            }
         },
         SessionBridgeRoute::Rejected => {
             answer_unclaimed_bridge_event(host, item).await;
@@ -3382,7 +3405,12 @@ mod tests {
             )
             .map_err(|_| "candidate pending install was rejected")?;
 
-        dispatch_session_bridge(&set, session_name_command("candidate-name", Some(&token))).await;
+        dispatch_session_bridge(
+            &set,
+            session_name_command("candidate-name", Some(&token)),
+            &Arc::downgrade(&active),
+        )
+        .await;
         let _ = set.emit_input("barrier", None, "user", None).await?;
         fake_host.wait_for_request("input").await?;
         assert_eq!(
@@ -3399,6 +3427,134 @@ mod tests {
         set.shutdown_once().await;
         active.dispose().await;
         candidate.dispose().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unexpected_replacement_control_at_session_route_reports_and_continues() -> TestResult {
+        use crate::core::extension_runtime_set::EndpointKind;
+
+        let (runner, _fake_host) = crate::core::extension_runtime_set::tests::make_runner(json!({
+            "handlers": [],
+            "terminalInput": false
+        }))
+        .await?;
+        let set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, runner)]);
+        let session = make_session()?;
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let captured_errors = Arc::clone(&errors);
+        session
+            .bind_extensions(ExtensionBindings {
+                on_error: Some(Arc::new(move |message| {
+                    captured_errors
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(message.to_owned());
+                })),
+                ..Default::default()
+            })
+            .await?;
+        let weak = Arc::downgrade(&session);
+        let binding = set.bind_session_target(weak.clone()).await;
+
+        dispatch_session_bridge_route(
+            &set,
+            SessionBridgeEvent::ReplacementReady {
+                token: "unexpected".to_owned(),
+                origin: None,
+            },
+            SessionBridgeRoute::Active {
+                target: Arc::clone(&session),
+                binding,
+            },
+            &weak,
+        )
+        .await;
+        dispatch_session_bridge_route(
+            &set,
+            session_name_command("still-running", None),
+            SessionBridgeRoute::Active {
+                target: Arc::clone(&session),
+                binding,
+            },
+            &weak,
+        )
+        .await;
+
+        assert_eq!(
+            errors
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_slice(),
+            ["replacement control unexpectedly reached session bridge dispatch"]
+        );
+        assert_eq!(
+            session.session_state_wire().await.session_name.as_deref(),
+            Some("still-running")
+        );
+        set.shutdown_once().await;
+        session.dispose().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unexpected_operation_route_reports_and_continues() -> TestResult {
+        use crate::core::extension_runtime_set::EndpointKind;
+
+        let (runner, _fake_host) = crate::core::extension_runtime_set::tests::make_runner(json!({
+            "handlers": [],
+            "terminalInput": false
+        }))
+        .await?;
+        let set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, runner)]);
+        let session = make_session()?;
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let captured_errors = Arc::clone(&errors);
+        session
+            .bind_extensions(ExtensionBindings {
+                on_error: Some(Arc::new(move |message| {
+                    captured_errors
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(message.to_owned());
+                })),
+                ..Default::default()
+            })
+            .await?;
+        let weak = Arc::downgrade(&session);
+        let binding = set.bind_session_target(weak.clone()).await;
+
+        dispatch_session_bridge_route(
+            &set,
+            session_name_command("ignored", None),
+            SessionBridgeRoute::Operation,
+            &weak,
+        )
+        .await;
+        dispatch_session_bridge_route(
+            &set,
+            session_name_command("still-running", None),
+            SessionBridgeRoute::Active {
+                target: Arc::clone(&session),
+                binding,
+            },
+            &weak,
+        )
+        .await;
+
+        assert_eq!(
+            errors
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_slice(),
+            ["non-replacement event unexpectedly routed as a bridge operation"]
+        );
+        assert_eq!(
+            session.session_state_wire().await.session_name.as_deref(),
+            Some("still-running")
+        );
+        set.shutdown_once().await;
+        session.dispose().await;
         Ok(())
     }
 }

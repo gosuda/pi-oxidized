@@ -46,8 +46,8 @@ use super::super::agent_session::extension_runner::{ExtensionRunner, SessionHook
 use super::super::extension_runtime_set::{EndpointId, EndpointKind, ExtensionRuntimeSet};
 use super::super::model_runtime::{CreateModelRuntimeOptions, ModelRuntime};
 use super::{
-    ALL_EVENT_TYPES, HostExtensionRunner, HostStartError, ToolRenderPhase,
-    compact_message_update_event, sanitize_html,
+    ALL_EVENT_TYPES, HostExtensionRunner, HostStartError, SessionBridgeEvent, ToolRenderPhase,
+    compact_message_update_event, finish_direct_session_control_delivery, sanitize_html,
 };
 
 type BoxErr = Box<dyn Error>;
@@ -2456,6 +2456,52 @@ async fn dropped_replacement_ready_emits_diagnostic() -> R {
         .clone()
         .ok_or("drop handler was not invoked")?;
     assert_eq!(token, "tok-1", "drop handler received the wrong token");
+    runner.shutdown_once().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn unexpected_direct_session_control_reports_and_continues() -> R {
+    let (runner, _host) = make_runner(json!({})).await?;
+    let received_token = Arc::new(Mutex::new(None::<String>));
+    let handler_token = Arc::clone(&received_token);
+    runner.set_replacement_drop_handler(Arc::new(
+        move |token: &str, _origin: Option<EndpointId>| {
+            *handler_token
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(token.to_owned());
+        },
+    ));
+    let mut errors = runner.subscribe_errors();
+
+    finish_direct_session_control_delivery(
+        &runner.inner,
+        Some(SessionBridgeEvent::Reload { id: 41 }),
+    );
+    let protocol_error = next_error(&mut errors, Duration::from_secs(2)).await?;
+    assert_eq!(protocol_error.code, "extension_protocol");
+    assert_eq!(
+        protocol_error.message,
+        "correlated event reached the direct session-control route"
+    );
+
+    finish_direct_session_control_delivery(
+        &runner.inner,
+        Some(SessionBridgeEvent::ReplacementReady {
+            token: "after-diagnostic".to_owned(),
+            origin: None,
+        }),
+    );
+    let dropped_error = next_error(&mut errors, Duration::from_secs(2)).await?;
+    assert_eq!(dropped_error.code, "extension_replacement_dropped");
+    assert_eq!(
+        received_token
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_deref(),
+        Some("after-diagnostic")
+    );
+
     runner.shutdown_once().await;
     Ok(())
 }

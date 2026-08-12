@@ -792,10 +792,11 @@ impl AgentSessionRuntime {
         };
         let reason = prepared.reason;
         let target_session_file = prepared.target_session_file.take();
-        let _lifecycle_guard = self
+        let lifecycle_guard = self
             .teardown_current(reason, target_session_file.as_deref())
             .await;
         self.apply(result);
+        drop(lifecycle_guard);
         self.finish_session_replacement(None).await;
     }
 
@@ -1097,7 +1098,8 @@ impl AgentSessionRuntime {
     /// The emit self-gates on `session_shutdown` handler presence and host
     /// errors are isolated. It runs before lifecycle exclusion because hooks
     /// can navigate the session tree. The returned guard keeps final tree
-    /// persistence excluded through the caller's apply and rebind steps. Host
+    /// persistence excluded through the caller's apply step; callers must release
+    /// it before asynchronous rebind callbacks, which may reacquire the gate. Host
     /// process reap is always performed exactly once inside
     /// [`AgentSession::dispose`] when a concrete host is present, even without
     /// `session_shutdown` handlers.

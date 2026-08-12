@@ -410,7 +410,7 @@ describe("host SessionManager bridge", () => {
 			data: { value: 1 },
 		};
 
-		void (async () => {
+		const responder = (async () => {
 			const replacement = await collector.awaitFrame(
 				(f) => f.kind === "req" && f.method === "session.newSession",
 			);
@@ -470,6 +470,7 @@ describe("host SessionManager bridge", () => {
 		expect(report["refreshedEntries"]).toEqual([initialEntry, appendedEntry]);
 		expect(report["unsupportedMethodThrew"]).toBe(true);
 		expect(String(report["unsupportedMethodMessage"])).toContain("not supported");
+		await responder;
 		await teardown(connected);
 	});
 
@@ -489,7 +490,7 @@ describe("host SessionManager bridge", () => {
 		const connected = await connectHost([staleFactory]);
 		const { collector, stdin } = connected;
 
-		void (async () => {
+		const responder = (async () => {
 			const replacement = await collector.awaitFrame(
 				(f) => f.kind === "req" && f.method === "session.newSession",
 			);
@@ -530,6 +531,7 @@ describe("host SessionManager bridge", () => {
 				(f) => f.kind === "event" && f.method === "session.command",
 			),
 		).toEqual([]);
+		await responder;
 		await teardown(connected);
 	});
 });

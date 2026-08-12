@@ -1048,49 +1048,51 @@ describe("acceptance: registry snapshot and tool/provider bridges", () => {
 		const stablePath = resolve(import.meta.dirname, "..", "fixtures", "extensions", "provider-stable.ts");
 		const { collector, stdin, host, runPromise } = await connectHost([]);
 
-		stdin.push(Buffer.from(encodeFrameString({
-			id: 80, kind: "req", method: "extensions.load",
-			payload: { extensionPaths: [livePath], cwd: process.cwd() },
-		})));
-		const loaded = await collector.awaitFrame((frame) => frame.id === 80 && frame.kind === "res");
-		const before = (loaded.payload as Record<string, unknown>)["providers"] as Array<Record<string, unknown>>;
-		expect(before.map((provider) => provider["name"])).not.toContain("live_provider");
+		try {
+			stdin.push(Buffer.from(encodeFrameString({
+				id: 80, kind: "req", method: "extensions.load",
+				payload: { extensionPaths: [livePath], cwd: process.cwd() },
+			})));
+			const loaded = await collector.awaitFrame((frame) => frame.id === 80 && frame.kind === "res");
+			const before = (loaded.payload as Record<string, unknown>)["providers"] as Array<Record<string, unknown>>;
+			expect(before.map((provider) => provider["name"])).not.toContain("live_provider");
 
-		stdin.push(Buffer.from(encodeFrameString({
-			id: 81, kind: "req", method: "command.execute",
-			payload: { command: "registerLiveProvider", args: "" },
-		})));
-		await collector.awaitFrame((frame) => frame.id === 81 && frame.kind === "res");
+			stdin.push(Buffer.from(encodeFrameString({
+				id: 81, kind: "req", method: "command.execute",
+				payload: { command: "registerLiveProvider", args: "" },
+			})));
+			await collector.awaitFrame((frame) => frame.id === 81 && frame.kind === "res");
 
-		stdin.push(Buffer.from(encodeFrameString({
-			id: 82, kind: "req", method: "extensions.load",
-			payload: { extensionPaths: [stablePath], cwd: process.cwd() },
-		})));
-		const rebuilt = await collector.awaitFrame((frame) => frame.id === 82 && frame.kind === "res");
-		const providers = (rebuilt.payload as Record<string, unknown>)["providers"] as Array<Record<string, unknown>>;
-		expect(providers.map((provider) => provider["name"])).toContain("live_provider");
-		expect(providers.map((provider) => provider["name"])).toContain("stable_provider");
+			stdin.push(Buffer.from(encodeFrameString({
+				id: 82, kind: "req", method: "extensions.load",
+				payload: { extensionPaths: [stablePath], cwd: process.cwd() },
+			})));
+			const rebuilt = await collector.awaitFrame((frame) => frame.id === 82 && frame.kind === "res");
+			const providers = (rebuilt.payload as Record<string, unknown>)["providers"] as Array<Record<string, unknown>>;
+			expect(providers.map((provider) => provider["name"])).toContain("live_provider");
+			expect(providers.map((provider) => provider["name"])).toContain("stable_provider");
 
-		stdin.push(Buffer.from(encodeFrameString({
-			id: 83, kind: "req", method: "provider.stream",
-			payload: {
-				providerId: "live_provider",
-				model: { id: "ok", provider: "live_provider", api: "custom" },
-				context: { messages: [] },
-				options: {},
-			},
-		})));
-		const start = await collector.awaitFrame((frame) =>
-			frame.id === 83 && frame.kind === "event" && frame.method === "providerEvent"
-			&& (frame.payload as Record<string, unknown>)["type"] === "start"
-		);
-		expect(((start.payload as Record<string, unknown>)["partial"] as Record<string, unknown>)["model"])
-			.toBe("live-marker");
-		await collector.awaitFrame((frame) => frame.id === 83 && frame.kind === "res");
-
-		stdin.push(null);
-		host.dispose("test");
-		await runPromise.catch(() => void 0);
+			stdin.push(Buffer.from(encodeFrameString({
+				id: 83, kind: "req", method: "provider.stream",
+				payload: {
+					providerId: "live_provider",
+					model: { id: "ok", provider: "live_provider", api: "custom" },
+					context: { messages: [] },
+					options: {},
+				},
+			})));
+			const start = await collector.awaitFrame((frame) =>
+				frame.id === 83 && frame.kind === "event" && frame.method === "providerEvent"
+				&& (frame.payload as Record<string, unknown>)["type"] === "start"
+			);
+			expect(((start.payload as Record<string, unknown>)["partial"] as Record<string, unknown>)["model"])
+				.toBe("live-marker");
+			await collector.awaitFrame((frame) => frame.id === 83 && frame.kind === "res");
+		} finally {
+			stdin.push(null);
+			host.dispose("test");
+			await runPromise.catch(() => void 0);
+		}
 	});
 
 	test("live unregistration stays removed after an unrelated load", async () => {
@@ -1098,32 +1100,34 @@ describe("acceptance: registry snapshot and tool/provider bridges", () => {
 		const stablePath = resolve(import.meta.dirname, "..", "fixtures", "extensions", "provider-stable.ts");
 		const { collector, stdin, host, runPromise } = await connectHost([]);
 
-		stdin.push(Buffer.from(encodeFrameString({
-			id: 90, kind: "req", method: "extensions.load",
-			payload: { extensionPaths: [unregPath], cwd: process.cwd() },
-		})));
-		const loaded = await collector.awaitFrame((frame) => frame.id === 90 && frame.kind === "res");
-		const before = (loaded.payload as Record<string, unknown>)["providers"] as Array<Record<string, unknown>>;
-		expect(before.map((provider) => provider["name"])).toContain("unreg_provider");
+		try {
+			stdin.push(Buffer.from(encodeFrameString({
+				id: 90, kind: "req", method: "extensions.load",
+				payload: { extensionPaths: [unregPath], cwd: process.cwd() },
+			})));
+			const loaded = await collector.awaitFrame((frame) => frame.id === 90 && frame.kind === "res");
+			const before = (loaded.payload as Record<string, unknown>)["providers"] as Array<Record<string, unknown>>;
+			expect(before.map((provider) => provider["name"])).toContain("unreg_provider");
 
-		stdin.push(Buffer.from(encodeFrameString({
-			id: 91, kind: "req", method: "command.execute",
-			payload: { command: "unregisterLiveProvider", args: "" },
-		})));
-		await collector.awaitFrame((frame) => frame.id === 91 && frame.kind === "res");
+			stdin.push(Buffer.from(encodeFrameString({
+				id: 91, kind: "req", method: "command.execute",
+				payload: { command: "unregisterLiveProvider", args: "" },
+			})));
+			await collector.awaitFrame((frame) => frame.id === 91 && frame.kind === "res");
 
-		stdin.push(Buffer.from(encodeFrameString({
-			id: 92, kind: "req", method: "extensions.load",
-			payload: { extensionPaths: [stablePath], cwd: process.cwd() },
-		})));
-		const rebuilt = await collector.awaitFrame((frame) => frame.id === 92 && frame.kind === "res");
-		const providers = (rebuilt.payload as Record<string, unknown>)["providers"] as Array<Record<string, unknown>>;
-		expect(providers.map((provider) => provider["name"])).not.toContain("unreg_provider");
-		expect(providers.map((provider) => provider["name"])).toContain("stable_provider");
-
-		stdin.push(null);
-		host.dispose("test");
-		await runPromise.catch(() => void 0);
+			stdin.push(Buffer.from(encodeFrameString({
+				id: 92, kind: "req", method: "extensions.load",
+				payload: { extensionPaths: [stablePath], cwd: process.cwd() },
+			})));
+			const rebuilt = await collector.awaitFrame((frame) => frame.id === 92 && frame.kind === "res");
+			const providers = (rebuilt.payload as Record<string, unknown>)["providers"] as Array<Record<string, unknown>>;
+			expect(providers.map((provider) => provider["name"])).not.toContain("unreg_provider");
+			expect(providers.map((provider) => provider["name"])).toContain("stable_provider");
+		} finally {
+			stdin.push(null);
+			host.dispose("test");
+			await runPromise.catch(() => void 0);
+		}
 	});
 
 	test("live registration during an unrelated load is committed", async () => {

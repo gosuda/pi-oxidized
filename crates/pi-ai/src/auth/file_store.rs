@@ -463,16 +463,16 @@ impl FileCredentialStore {
     /// # Errors
     ///
     /// Returns [`StoreError`] when the locked read fails (legacy file lock,
-    /// malformed JSON, or I/O failure).
+    /// malformed JSON, or I/O failure), or when the cache mutex is poisoned;
+    /// a poisoned lock propagates the established "Auth storage cache lock
+    /// poisoned" error instead of silently keeping a stale snapshot behind an
+    /// `Ok(())`.
     pub fn reload(&self) -> Result<(), StoreError> {
         let loaded = self.backend.with_lock_sync(|content| {
             let data = parse_storage_data(content)?;
             Ok((data, None))
         })?;
-        if let Ok(mut cache) = self.cache.lock() {
-            *cache = loaded;
-        }
-        Ok(())
+        replace_cache_mutex(&self.cache, loaded)
     }
 
     fn cache_snapshot(&self) -> Result<BTreeMap<String, Credential>, StoreError> {
@@ -757,7 +757,20 @@ fn canonical_lock_target(path: &Path) -> Result<PathBuf, StoreError> {
     let parent = parent_dir(&current).unwrap_or_else(|| Path::new("."));
     let parent = match fs::canonicalize(parent) {
         Ok(canonical) => canonical,
-        Err(_) => absolute_lock_target(parent)?,
+        // Missing intermediate parent is expected for a fresh path: fall back
+        // to the unresolved absolute spelling so the lock sibling can be
+        // created once the directory is.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => absolute_lock_target(parent)?,
+        // Any other failure (permission denied, a component not being a
+        // directory, I/O error) must not masquerade as a fresh path: an
+        // invented lock location would break mutual exclusion with a real
+        // holder.
+        Err(error) => {
+            return Err(StoreError::message(format!(
+                "Failed to resolve auth storage path {}: {error}",
+                parent.display()
+            )));
+        }
     };
     let Some(file_name) = current.file_name() else {
         return Err(StoreError::message(format!(
@@ -1729,6 +1742,87 @@ mod tests {
         assert!(
             error.to_string().contains("legacy file lock"),
             "construction error should mention legacy file lock, got {error:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reload_propagates_poisoned_cache_lock_and_preserves_snapshot() -> TestResult {
+        let (_dir, path) = temp_auth_path()?;
+        let parent = path.parent().ok_or("auth path must have a parent")?;
+        fs::create_dir_all(parent)?;
+        let data = BTreeMap::from([("openai".to_string(), api_key("keep"))]);
+        fs::write(&path, serde_json::to_string_pretty(&data)?)?;
+        let store = FileCredentialStore::new(&path)?;
+
+        // Poison the cache mutex by panicking while holding the guard.
+        let cache = Arc::clone(&store.cache);
+        let handle = std::thread::spawn(move || {
+            let Ok(_guard) = cache.lock() else {
+                return;
+            };
+            std::panic::resume_unwind(Box::new("poison the auth cache lock"));
+        });
+        assert!(handle.join().is_err(), "poisoning thread must panic");
+
+        let Err(error) = store.reload() else {
+            return Err("reload must surface a poisoned cache lock, not Ok(())".into());
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("Auth storage cache lock poisoned"),
+            "reload must propagate the established poison error, got {error:?}"
+        );
+        // The last valid snapshot survives the poisoned reload.
+        let recovered = store
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(recovered.len(), 1, "loaded snapshot must be preserved");
+        assert!(recovered.contains_key("openai"));
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn canonical_lock_target_errors_on_unreadable_parent() -> TestResult {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir()?;
+        let blocked = dir.path().join("blocked");
+        fs::create_dir(&blocked)?;
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000))?;
+        // Root bypasses DAC: probing metadata through the mode-0 directory
+        // reaches NotFound (traversal succeeded) instead of PermissionDenied.
+        // Skip rather than assert a false failure under root.
+        let root_like = matches!(
+            fs::metadata(blocked.join("probe")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        );
+        let path = blocked.join("inner").join("auth.json");
+        let outcome = if root_like {
+            None
+        } else {
+            Some(canonical_lock_target(&path))
+        };
+        // Restore traversal before assertions so the temp dir can be cleaned up.
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700))?;
+        let Some(outcome) = outcome else {
+            return Ok(());
+        };
+        let Err(error) = outcome else {
+            return Err(
+                "unreadable parent must fail, not fall back to an invented lock path".into(),
+            );
+        };
+        let msg = error.to_string();
+        assert!(
+            msg.contains("auth storage path"),
+            "path inspection failure must retain operation context, got {msg:?}"
+        );
+        assert!(
+            msg.contains(&blocked.display().to_string()),
+            "error must carry the parent path context, got {msg:?}"
         );
         Ok(())
     }

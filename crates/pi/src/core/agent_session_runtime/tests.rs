@@ -1311,6 +1311,34 @@ async fn rebind_callback_runs_after_apply_on_new_session() -> TestResult {
 }
 
 #[tokio::test]
+async fn replacement_rebind_can_reacquire_lifecycle_gate() -> TestResult {
+    let runtime = make_runtime().await?;
+    let callback_runtime = Arc::downgrade(&runtime);
+    let rebound = Arc::new(tokio::sync::Notify::new());
+    let callback_rebound = Arc::clone(&rebound);
+    runtime.set_rebind_session(Some(Arc::new(move |_session| {
+        let runtime = callback_runtime.clone();
+        let rebound = Arc::clone(&callback_rebound);
+        Box::pin(async move {
+            let Some(runtime) = runtime.upgrade() else {
+                return;
+            };
+            let _guard = runtime.lifecycle_gate().write().await;
+            rebound.notify_one();
+        })
+    })));
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        runtime.new_session(NewSessionOptions::default()),
+    )
+    .await
+    .map_err(|_| failure("replacement rebind deadlocked on the lifecycle gate"))??;
+    rebound.notified().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn set_before_session_invalidate_invoked_during_teardown() -> TestResult {
     let runtime = make_runtime().await?;
     let called = Arc::new(AtomicUsize::new(0));

@@ -2364,20 +2364,40 @@ fn deliver_session_control(inner: &Arc<Inner>, event: HostSessionControlEvent) {
     } else {
         Some(event)
     };
-    match undelivered {
-        None => {}
-        Some(SessionBridgeEvent::Command { envelope, origin }) => {
-            if let Some(token) = envelope.replacement_token {
-                handle_dropped_replacement_event(inner, &token, origin);
+    finish_direct_session_control_delivery(inner, undelivered);
+}
+
+fn finish_direct_session_control_delivery(
+    inner: &Arc<Inner>,
+    undelivered: Option<SessionBridgeEvent>,
+) {
+    let Some(event) = undelivered else {
+        return;
+    };
+    if handle_dropped_session_control(inner, &event) {
+        return;
+    }
+    inner.publish_error(
+        "extension_protocol",
+        "correlated event reached the direct session-control route",
+        None,
+    );
+}
+
+fn handle_dropped_session_control(inner: &Arc<Inner>, event: &SessionBridgeEvent) -> bool {
+    match event {
+        SessionBridgeEvent::Command { envelope, origin } => {
+            if let Some(token) = envelope.replacement_token.as_deref() {
+                handle_dropped_replacement_event(inner, token, *origin);
             }
+            true
         }
-        Some(
-            SessionBridgeEvent::ReplacementReady { token, origin }
-            | SessionBridgeEvent::ReplacementAbort { token, origin },
-        ) => {
-            handle_dropped_replacement_event(inner, &token, origin);
+        SessionBridgeEvent::ReplacementReady { token, origin }
+        | SessionBridgeEvent::ReplacementAbort { token, origin } => {
+            handle_dropped_replacement_event(inner, token, *origin);
+            true
         }
-        Some(_) => unreachable!("direct session-control route produced a correlated event"),
+        _ => false,
     }
 }
 
@@ -2418,16 +2438,13 @@ async fn forward_session_bridge(inner: &Arc<Inner>, event: SessionBridgeEvent) {
     };
     match undelivered {
         None => {}
-        Some(SessionBridgeEvent::Command { envelope, origin }) => {
-            if let Some(token) = envelope.replacement_token {
-                handle_dropped_replacement_event(inner, &token, origin);
-            }
-        }
         Some(
-            SessionBridgeEvent::ReplacementReady { token, origin }
-            | SessionBridgeEvent::ReplacementAbort { token, origin },
+            event @ (SessionBridgeEvent::Command { .. }
+            | SessionBridgeEvent::ReplacementReady { .. }
+            | SessionBridgeEvent::ReplacementAbort { .. }),
         ) => {
-            handle_dropped_replacement_event(inner, &token, origin);
+            let handled = handle_dropped_session_control(inner, &event);
+            debug_assert!(handled);
         }
         Some(SessionBridgeEvent::SetupEntries { id, .. }) => {
             let _ = inner

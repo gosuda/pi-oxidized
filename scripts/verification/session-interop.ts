@@ -156,16 +156,20 @@ export async function reopenWithSourcePinnedTypescript(
 				Buffer.compare(before, after) === 0,
 				`TypeScript reopen rewrote historical JSONL: ${relative(REPO_ROOT, file)}`,
 			);
-		} else {
-			// v1/v2 sessions are migrated to v3 on reopen; verify opaque
-			// entries survive the migration rather than asserting byte equality.
-			if (before.includes(OPAQUE_ENTRY_MARKER)) {
-				assert(
-					after.includes(OPAQUE_ENTRY_MARKER),
-					`TypeScript reopen dropped opaque future_thing entry during migration: ${relative(REPO_ROOT, file)}`,
-				);
-			}
+	} else {
+		// v1/v2 sessions are migrated to v3 on reopen; verify the migration
+		// produced a v3 header before checking that opaque entries survived.
+		assert(
+			sessionVersionFromBytes(after) === 3,
+			`TypeScript reopen did not migrate to v3: ${relative(REPO_ROOT, file)}`,
+		);
+		if (before.includes(OPAQUE_ENTRY_MARKER)) {
+			assert(
+				after.includes(OPAQUE_ENTRY_MARKER),
+				`TypeScript reopen dropped opaque future_thing entry during migration: ${relative(REPO_ROOT, file)}`,
+			);
 		}
+	}
 		assert(manager.getHeader()?.version === 3, `TypeScript reopen did not see v3 header: ${file}`);
 		assert(manager.getEntries().length > 0, `TypeScript reopen lost entries: ${file}`);
 		assert(manager.getTree().length > 0, `TypeScript reopen lost tree: ${file}`);

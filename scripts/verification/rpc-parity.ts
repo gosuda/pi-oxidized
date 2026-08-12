@@ -173,16 +173,23 @@ function responseData(response: JsonObject, label: string): JsonObject {
  * silently drops one option.
  */
 export function buildScenarioStep(
-	commandType: string,
-	fields: JsonObject,
+	commandType: string | undefined,
+	fields: JsonObject | ((state: ScenarioState) => JsonObject),
 	options: { settle?: boolean; suffix?: string; harvest?: ScenarioStep["harvest"] } = {},
 	sequence: number,
 ): ScenarioStep {
-	const name = `c${String(sequence).padStart(2, "0")}-${commandType}${options.suffix ?? ""}`;
+	const resolvedForName = typeof fields === "function" ? undefined : fields;
+	const baseName =
+		commandType ??
+		(isObject(resolvedForName) && typeof resolvedForName.type === "string" ? resolvedForName.type : "unknown");
+	const name = `c${String(sequence).padStart(2, "0")}-${baseName}${options.suffix ?? ""}`;
 	return {
 		name,
 		commandType,
-		build: () => ({ id: name, type: commandType, ...fields }),
+		build: (state: ScenarioState) => {
+			const resolved = typeof fields === "function" ? fields(state) : fields;
+			return { id: name, ...(commandType === undefined ? {} : { type: commandType }), ...resolved };
+		},
 		...(options.settle === true ? { settle: true } : {}),
 		...(options.harvest ? { harvest: options.harvest } : {}),
 	};
@@ -197,8 +204,8 @@ export function buildScenarioStep(
 export function buildScenario(): ScenarioStep[] {
 	let sequence = 0;
 	const step = (
-		commandType: string,
-		fields: JsonObject,
+		commandType: string | undefined,
+		fields: JsonObject | ((state: ScenarioState) => JsonObject) = {},
 		options: { settle?: boolean; suffix?: string; harvest?: ScenarioStep["harvest"] } = {},
 	): ScenarioStep => {
 		sequence += 1;
@@ -230,130 +237,66 @@ export function buildScenario(): ScenarioStep[] {
 		step("follow_up", { message: "queued follow-up note" }),
 	];
 
-
-	steps.push({
-		name: "c23-get_state-harvest",
-		commandType: "get_state",
-		build: () => ({ id: "c23-get_state-harvest", type: "get_state" }),
-		harvest: (response, state) => {
-			state.sessionFile = requireString(responseData(response, "get_state").sessionFile, "get_state sessionFile");
-		},
-	});
-	steps.push({
-		name: "c24-prompt-flush",
-		commandType: "prompt",
-		settle: true,
-		build: () => ({ id: "c24-prompt-flush", type: "prompt", message: "Flush the queued messages." }),
-	});
-	steps.push({
-		name: "c25-get_last_assistant_text",
-		commandType: "get_last_assistant_text",
-		build: () => ({ id: "c25-get_last_assistant_text", type: "get_last_assistant_text" }),
-	});
-	steps.push({
-		name: "c26-get_messages",
-		commandType: "get_messages",
-		build: () => ({ id: "c26-get_messages", type: "get_messages" }),
-	});
-	steps.push({
-		name: "c27-get_session_stats",
-		commandType: "get_session_stats",
-		build: () => ({ id: "c27-get_session_stats", type: "get_session_stats" }),
-	});
-	steps.push({
-		name: "c28-get_entries",
-		commandType: "get_entries",
-		build: () => ({ id: "c28-get_entries", type: "get_entries" }),
-		harvest: (response, state) => {
-			const entries = responseData(response, "get_entries").entries;
-			assert(Array.isArray(entries) && entries.length > 0, "get_entries must return entries");
-			const first = entries[0];
-			assert(isObject(first), "get_entries first entry must be an object");
-			state.firstEntryId = requireString(first.id, "get_entries first entry id");
-		},
-	});
-	steps.push({
-		name: "c29-get_entries-since",
-		commandType: "get_entries",
-		build: (state) => ({
-			id: "c29-get_entries-since",
-			type: "get_entries",
-			since: requireString(state.firstEntryId, "harvested first entry id"),
+	steps.push(
+		step("get_state", {}, {
+			suffix: "-harvest",
+			harvest: (response, state) => {
+				state.sessionFile = requireString(
+					responseData(response, "get_state").sessionFile,
+					"get_state sessionFile",
+				);
+			},
 		}),
-	});
-	steps.push({
-		name: "c30-get_tree",
-		commandType: "get_tree",
-		build: () => ({ id: "c30-get_tree", type: "get_tree" }),
-	});
-	steps.push({
-		name: "c31-get_fork_messages",
-		commandType: "get_fork_messages",
-		build: () => ({ id: "c31-get_fork_messages", type: "get_fork_messages" }),
-		harvest: (response, state) => {
-			const messages = responseData(response, "get_fork_messages").messages;
-			assert(Array.isArray(messages) && messages.length > 0, "get_fork_messages must return messages");
-			const first = messages[0];
-			assert(isObject(first), "get_fork_messages first message must be an object");
-			state.forkEntryId = requireString(first.entryId, "get_fork_messages first entryId");
-		},
-	});
-	steps.push({
-		name: "c32-fork",
-		commandType: "fork",
-		build: (state) => ({
-			id: "c32-fork",
-			type: "fork",
-			entryId: requireString(state.forkEntryId, "harvested fork entry id"),
+	);
+	steps.push(step("prompt", { message: "Flush the queued messages." }, { settle: true, suffix: "-flush" }));
+	steps.push(step("get_last_assistant_text", {}));
+	steps.push(step("get_messages", {}));
+	steps.push(step("get_session_stats", {}));
+	steps.push(
+		step("get_entries", {}, {
+			harvest: (response, state) => {
+				const entries = responseData(response, "get_entries").entries;
+				assert(Array.isArray(entries) && entries.length > 0, "get_entries must return entries");
+				const first = entries[0];
+				assert(isObject(first), "get_entries first entry must be an object");
+				state.firstEntryId = requireString(first.id, "get_entries first entry id");
+			},
 		}),
-	});
-	steps.push({
-		name: "c33-get_state-postfork",
-		commandType: "get_state",
-		build: () => ({ id: "c33-get_state-postfork", type: "get_state" }),
-	});
-	steps.push({
-		name: "c34-clone",
-		commandType: "clone",
-		build: () => ({ id: "c34-clone", type: "clone" }),
-	});
-	steps.push({
-		name: "c35-new_session",
-		commandType: "new_session",
-		build: () => ({ id: "c35-new_session", type: "new_session" }),
-	});
-	steps.push({
-		name: "c36-switch_session",
-		commandType: "switch_session",
-		build: (state) => ({
-			id: "c36-switch_session",
-			type: "switch_session",
+	);
+	steps.push(
+		step("get_entries", (state) => ({ since: requireString(state.firstEntryId, "harvested first entry id") }), {
+			suffix: "-since",
+		}),
+	);
+	steps.push(step("get_tree", {}));
+	steps.push(
+		step("get_fork_messages", {}, {
+			harvest: (response, state) => {
+				const messages = responseData(response, "get_fork_messages").messages;
+				assert(Array.isArray(messages) && messages.length > 0, "get_fork_messages must return messages");
+				const first = messages[0];
+				assert(isObject(first), "get_fork_messages first message must be an object");
+				state.forkEntryId = requireString(first.entryId, "get_fork_messages first entryId");
+			},
+		}),
+	);
+	steps.push(step("fork", (state) => ({ entryId: requireString(state.forkEntryId, "harvested fork entry id") })));
+	steps.push(step("get_state", {}, { suffix: "-postfork" }));
+	steps.push(step("clone", {}));
+	steps.push(step("new_session", {}));
+	steps.push(
+		step("switch_session", (state) => ({
 			sessionPath: requireString(state.sessionFile, "harvested session file"),
-		}),
-	});
-	steps.push({
-		name: "c37-compact",
-		commandType: "compact",
-		build: () => ({ id: "c37-compact", type: "compact" }),
-	});
-	steps.push({
-		name: "c38-export_html",
-		commandType: "export_html",
-		build: (state) => ({
-			id: "c38-export_html",
-			type: "export_html",
+		})),
+	);
+	steps.push(step("compact", {}));
+	steps.push(
+		step("export_html", (state) => ({
 			outputPath: join(state.workDir, "rpc-parity-export.html"),
-		}),
-	});
-	steps.push({
-		name: "c39-unknown-probe",
-		build: () => ({ id: "c39-unknown-probe", type: "rpc_parity_probe", payload: { value: 1 } }),
-	});
-	steps.push({
-		name: "c40-get_state-final",
-		commandType: "get_state",
-		build: () => ({ id: "c40-get_state-final", type: "get_state" }),
-	});
+		})),
+	);
+	steps.push(step(undefined, { type: "rpc_parity_probe", payload: { value: 1 } }, { suffix: "-unknown-probe" }));
+	steps.push(step("get_state", {}, { suffix: "-final" }));
 	return steps;
 }
 

@@ -1,8 +1,8 @@
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-
-type SessionManagerSetup = {
-	appendSessionInfo(name: string): Promise<void>;
-};
+import type {
+	ExtensionAPI,
+	ExtensionCommandContext,
+	SessionManagerSetupBridge,
+} from "@earendil-works/pi-coding-agent";
 
 let capturedCtx: ExtensionCommandContext | undefined;
 
@@ -72,7 +72,7 @@ export default function staleCtxExtension(pi: ExtensionAPI): void {
 		description: "setup and withSession work after the original ctx turns stale",
 		async handler(_args, ctx) {
 			await ctx.newSession({
-				setup: async (sessionManager: SessionManagerSetup) => {
+				setup: async (sessionManager: SessionManagerSetupBridge) => {
 					await sessionManager.appendSessionInfo("setup-after-token");
 				},
 				withSession: async (replacedCtx) => {
