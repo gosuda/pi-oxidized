@@ -80,6 +80,11 @@ export type ReconstructProviderDataOptions = {
 	 */
 	inversionProof?: (ctx: ReconstructProofContext) => Promise<void>;
 	/**
+	 * Cancels only the inversion proof. A cancellation before child exit fails
+	 * the proof and rolls publication back after the child has terminated.
+	 */
+	inversionProofSignal?: AbortSignal;
+	/**
 	 * Post-proof backup cleanup hook. Defaults to recursive force-removal of the
 	 * backup sibling. inversionProof success is the commit point: a cleanup
 	 * failure must surface without rolling the published live tree back to the
@@ -123,6 +128,8 @@ export type ReconstructProofContext = {
 	catalogPath: string;
 	providersDir: string;
 	dataDir: string;
+	/** Cancels the proof subprocess without cancelling transaction cleanup. */
+	signal?: AbortSignal;
 	/**
 	 * Optional override for the catalog snapshot restore in `defaultInversionProof`.
 	 * Defaults to `writeFile` from `node:fs/promises`. Tests inject a failing
@@ -677,6 +684,17 @@ async function removeIfExists(path: string | null | undefined): Promise<void> {
 	await rm(path, { recursive: true, force: true });
 }
 
+async function removeGeneratorTemps(catalogPath: string, pid: number): Promise<void> {
+	const catalogDir = dirname(catalogPath);
+	const prefix = `.builtin-models.${pid}.`;
+	const names = await readdir(catalogDir);
+	await Promise.all(
+		names
+			.filter((name) => name.startsWith(prefix) && name.endsWith(".tmp.json"))
+			.map((name) => rm(join(catalogDir, name), { force: true })),
+	);
+}
+
 async function listWrapperProviders(providersDir: string): Promise<string[]> {
 	const names = await readdir(providersDir);
 	return names
@@ -778,32 +796,71 @@ export async function defaultInversionProof(ctx: ReconstructProofContext): Promi
 	// CRLF only because Windows checkout conversion is not generator drift.
 	// Snapshot/restore keeps the generator-owned artifact untouched.
 	// Only valid for repository default paths — see usesRepositoryDefaultPaths.
+	ctx.signal?.throwIfAborted();
 	const before = await Bun.file(ctx.catalogPath).bytes();
+	ctx.signal?.throwIfAborted();
 	const restoreCatalog = ctx.restoreCatalog ?? writeFile;
 	let proofFailure: unknown;
+	let generatorCleanupFailure: unknown;
 	let restoreFailure: unknown;
 	try {
-		const regen = Bun.spawn(
-			[process.execPath, "run", join(ctx.repoRoot, "scripts/generate-builtin-models.ts")],
-			{ cwd: ctx.repoRoot, stdout: "ignore", stderr: "pipe" },
-		);
-		// Start draining stderr immediately so the child cannot block on a full
-		// pipe, then await exit and the captured text.
-		const stderrPromise = new Response(regen.stderr).text();
-		const exitCode = await regen.exited;
-		const stderr = await stderrPromise;
-		if (exitCode !== 0) {
-			throw new Error(
-				`inversion proof failed: generate-builtin-models exited ${exitCode}: ${stderr.slice(0, 400)}`,
+		const signal = ctx.signal;
+		let abortFailure: { reason: unknown } | undefined;
+		const onAbort = (): void => {
+			abortFailure ??= { reason: signal?.reason };
+		};
+		signal?.addEventListener("abort", onAbort, { once: true });
+		try {
+			signal?.throwIfAborted();
+			const regen = Bun.spawn(
+				[process.execPath, "run", join(ctx.repoRoot, "scripts/generate-builtin-models.ts")],
+				{
+					cwd: ctx.repoRoot,
+					stdout: "ignore",
+					stderr: "pipe",
+					signal,
+					killSignal: "SIGKILL",
+				},
 			);
-		}
-		const after = await Bun.file(ctx.catalogPath).bytes();
-		const normalizeCrLf = (bytes: Uint8Array): string =>
-			Buffer.from(bytes).toString("utf8").replaceAll("\r\n", "\n");
-		if (normalizeCrLf(before) !== normalizeCrLf(after)) {
-			throw new Error(
-				"inversion proof failed: regenerated builtin-models.json differs from the catalog the reconstruction used",
+			// Convert the pipe read to a tagged outcome immediately. A rejected
+			// reader cannot bypass the process-exit cleanup barrier.
+			const stderrOutcome = new Response(regen.stderr).text().then(
+				(text) => ({ kind: "text" as const, text }),
+				(error) => ({ kind: "error" as const, error }),
 			);
+			const exitCode = await regen.exited;
+			// This is the cancellation linearization point. No asynchronous work
+			// can interleave between this continuation and listener removal.
+			signal?.removeEventListener("abort", onAbort);
+			const stderr = await stderrOutcome;
+			try {
+				await removeGeneratorTemps(ctx.catalogPath, regen.pid);
+			} catch (error) {
+				generatorCleanupFailure = new Error(
+					`failed to remove generator temp artifacts for pid ${regen.pid}: ${errorDetail(error)}`,
+					{ cause: error },
+				);
+			}
+			if (abortFailure !== undefined) throw abortFailure.reason;
+			if (exitCode !== 0) {
+				const stderrDetail = stderr.kind === "text"
+					? stderr.text.slice(0, 400)
+					: `stderr unavailable: ${errorDetail(stderr.error)}`;
+				throw new Error(
+					`inversion proof failed: generate-builtin-models exited ${exitCode}: ${stderrDetail}`,
+				);
+			}
+			if (stderr.kind === "error") throw stderr.error;
+			const after = await Bun.file(ctx.catalogPath).bytes();
+			const normalizeCrLf = (bytes: Uint8Array): string =>
+				Buffer.from(bytes).toString("utf8").replaceAll("\r\n", "\n");
+			if (normalizeCrLf(before) !== normalizeCrLf(after)) {
+				throw new Error(
+					"inversion proof failed: regenerated builtin-models.json differs from the catalog the reconstruction used",
+				);
+			}
+		} finally {
+			signal?.removeEventListener("abort", onAbort);
 		}
 	} catch (error) {
 		proofFailure = error;
@@ -815,7 +872,15 @@ export async function defaultInversionProof(ctx: ReconstructProofContext): Promi
 			restoreFailure = restoreError;
 		}
 	}
-	// Compose after try/finally so the in-flight exception is never discarded.
+	// Compose after try/finally so cleanup never discards the primary failure.
+	if (generatorCleanupFailure !== undefined) {
+		proofFailure = proofFailure === undefined
+			? generatorCleanupFailure
+			: new Error(
+				`inversion proof failed (${errorDetail(proofFailure)}); additionally failed to clean generator temp artifacts: ${errorDetail(generatorCleanupFailure)}`,
+				{ cause: proofFailure },
+			);
+	}
 	if (restoreFailure !== undefined) {
 		if (proofFailure !== undefined) {
 			throw new Error(
@@ -856,6 +921,7 @@ export async function reconstructProviderData(
 		catalogPath,
 		providersDir,
 		dataDir,
+		signal: options.inversionProofSignal,
 	};
 	let inversionProof = options.inversionProof;
 	if (inversionProof === undefined) {
@@ -992,6 +1058,7 @@ export async function reconstructProviderData(
 						backupDir === null ? "" : `; preserved known-good backup at ${backupDir}`;
 					throw new Error(
 						`reconstruction failed (${errorDetail(error)}); additionally failed to restore live data: ${restoreFailure}${preservedBackup}`,
+						{ cause: error },
 					);
 				}
 				await removeIfExists(backupDir);

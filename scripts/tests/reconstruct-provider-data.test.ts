@@ -10,6 +10,7 @@ import {
 	readdirSync,
 	rmSync,
 	utimesSync,
+	watch,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -745,6 +746,7 @@ describe("reconstructProviderData default inversion proof path gating (P2)", () 
 			alpha: { model: { id: "model", v: 1 } },
 		};
 		const fixture = makeFixture(catalog);
+		const controller = new AbortController();
 		const seen: ReconstructProofContext[] = [];
 		try {
 			const result = await reconstructProviderData({
@@ -752,6 +754,7 @@ describe("reconstructProviderData default inversion proof path gating (P2)", () 
 				catalogPath: fixture.catalogPath,
 				providersDir: fixture.providersDir,
 				dataDir: fixture.dataDir,
+				inversionProofSignal: controller.signal,
 				inversionProof: async (ctx) => {
 					seen.push(ctx);
 				},
@@ -761,6 +764,7 @@ describe("reconstructProviderData default inversion proof path gating (P2)", () 
 			expect(seen).toHaveLength(1);
 			expect(seen[0]?.catalogPath).toBe(fixture.catalogPath);
 			expect(seen[0]?.dataDir).toBe(fixture.dataDir);
+			expect(seen[0]?.signal).toBe(controller.signal);
 			expect(readdirSync(fixture.dataDir)).toEqual(["alpha.json"]);
 			expect(siblingArtifacts(fixture.providersDir)).toEqual([]);
 		} finally {
@@ -928,6 +932,121 @@ describe("defaultInversionProof event-loop availability (PRRT_kwDOTcPStM6Yme3E)"
 	});
 });
 
+describe("defaultInversionProof cancellation", () => {
+	test("a pre-aborted proof fails before reading or spawning", async () => {
+		const root = mkdtempSync(join(tmpdir(), "inversion-proof-pre-abort-"));
+		const reason = new Error("injected pre-spawn abort");
+		const controller = new AbortController();
+		controller.abort(reason);
+		try {
+			const error = await captureError(
+				defaultInversionProof({
+					repoRoot: root,
+					catalogPath: join(root, "missing-catalog.json"),
+					providersDir: join(root, "providers"),
+					dataDir: join(root, "providers", "data"),
+					signal: controller.signal,
+				}),
+			);
+
+			expect(error).toBe(reason);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("live abort waits for child death before restoring the catalog", async () => {
+		const root = mkdtempSync(join(tmpdir(), "inversion-proof-live-abort-"));
+		const catalogPath = join(root, "builtin-models.json");
+		const markerPath = join(root, "child.pid");
+		const releasePath = join(root, "release");
+		const releasedPath = join(root, "child-released");
+		const generatorPath = join(root, "scripts", "generate-builtin-models.ts");
+		mkdirSync(dirname(generatorPath), { recursive: true });
+		writeFileSync(catalogPath, '{"alpha":{"model":{"id":"model"}}}\n', "utf8");
+		writeFileSync(
+			generatorPath,
+			`import { watch } from "node:fs";\nconst release = Promise.withResolvers<void>();\nconst watcher = watch(${JSON.stringify(root)}, (_event, name) => { if (String(name) === "release") { watcher.close(); release.resolve(); } });\nconst tempPath = ${JSON.stringify(`${root}/.builtin-models.`)} + process.pid + ".fixture.tmp.json";\nawait Bun.write(tempPath, "partial");\nawait Bun.write(${JSON.stringify(markerPath)}, String(process.pid));\nawait release.promise;\nawait Bun.write(${JSON.stringify(releasedPath)}, "released");\n`,
+			"utf8",
+		);
+		const reason = new Error("injected live proof abort");
+		const controller = new AbortController();
+		let childPid: number | undefined;
+		let childAliveAtRestore = true;
+		try {
+			const proof = defaultInversionProof({
+				repoRoot: root,
+				catalogPath,
+				providersDir: join(root, "providers"),
+				dataDir: join(root, "providers", "data"),
+				signal: controller.signal,
+				restoreCatalog: async (path, data) => {
+					if (childPid === undefined) throw new Error("child pid was not published");
+					childAliveAtRestore = processIsAlive(childPid);
+					writeFileSync(path, data);
+				},
+			});
+			await waitForFile(markerPath);
+			childPid = Number.parseInt(readFileSync(markerPath, "utf8"), 10);
+			controller.abort(reason);
+			await Bun.write(releasePath, "release");
+
+			const error = await captureError(proof);
+			expect(error).toBe(reason);
+			expect(childAliveAtRestore).toBe(false);
+			expect(await Bun.file(releasedPath).exists()).toBe(false);
+			expect(
+				await Bun.file(join(root, `.builtin-models.${childPid}.fixture.tmp.json`)).exists(),
+			).toBe(false);
+		} finally {
+			if (childPid !== undefined && processIsAlive(childPid)) process.kill(childPid, "SIGKILL");
+			rmSync(root, { recursive: true, force: true });
+		}
+	}, 5_000);
+
+	test("restore failure retains a winning abort as the primary error", async () => {
+		const root = mkdtempSync(join(tmpdir(), "inversion-proof-abort-restore-"));
+		const catalogPath = join(root, "builtin-models.json");
+		const markerPath = join(root, "child.pid");
+		const releasePath = join(root, "release");
+		const generatorPath = join(root, "scripts", "generate-builtin-models.ts");
+		mkdirSync(dirname(generatorPath), { recursive: true });
+		writeFileSync(catalogPath, '{"alpha":{"model":{"id":"model"}}}\n', "utf8");
+		writeFileSync(
+			generatorPath,
+			`import { watch } from "node:fs";\nconst release = Promise.withResolvers<void>();\nconst watcher = watch(${JSON.stringify(root)}, (_event, name) => { if (String(name) === "release") { watcher.close(); release.resolve(); } });\nawait Bun.write(${JSON.stringify(markerPath)}, String(process.pid));\nawait release.promise;\n`,
+			"utf8",
+		);
+		const reason = new Error("injected proof abort");
+		const controller = new AbortController();
+		let childPid: number | undefined;
+		try {
+			const proof = defaultInversionProof({
+				repoRoot: root,
+				catalogPath,
+				providersDir: join(root, "providers"),
+				dataDir: join(root, "providers", "data"),
+				signal: controller.signal,
+				restoreCatalog: async () => {
+					throw new Error("injected restore failure");
+				},
+			});
+			await waitForFile(markerPath);
+			childPid = Number.parseInt(readFileSync(markerPath, "utf8"), 10);
+			controller.abort(reason);
+			await Bun.write(releasePath, "release");
+
+			const error = await captureError(proof);
+			expect(error.message).toContain("inversion proof failed (injected proof abort)");
+			expect(error.message).toContain("additionally failed to restore catalog snapshot: injected restore failure");
+			expect(error.cause).toBe(reason);
+		} finally {
+			if (childPid !== undefined && processIsAlive(childPid)) process.kill(childPid, "SIGKILL");
+			rmSync(root, { recursive: true, force: true });
+		}
+	}, 5_000);
+});
+
 const LOCK_OWNER_FILE = "owner.json";
 
 type LockFixture = { root: string; dataDir: string; lockDir: string };
@@ -989,6 +1108,38 @@ async function captureError(promise: Promise<unknown>): Promise<Error> {
 	throw new Error("expected promise to reject");
 }
 
+async function waitForFile(path: string): Promise<void> {
+	if (await Bun.file(path).exists()) return;
+	const { promise, resolve: resolvePromise, reject } = Promise.withResolvers<void>();
+	const watcher = watch(dirname(path));
+	const fail = (error: Error): void => {
+		watcher.close();
+		reject(error);
+	};
+	const check = (): void => {
+		void Bun.file(path).exists().then((exists) => {
+			if (!exists) return;
+			watcher.close();
+			resolvePromise();
+		}, fail);
+	};
+	watcher.on("change", check);
+	watcher.on("error", fail);
+	check();
+	await promise;
+}
+
+
+function processIsAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		if (error instanceof Error && "code" in error && error.code === "ESRCH") return false;
+		throw error;
+	}
+}
+
 // These lock tests exercise the real OS-backed mkdir/rename/stat contention
 // protocol and its wall-clock acquisition bound; fake timers cannot advance
 // the competing filesystem operations or the production retry sleeps.
@@ -1018,6 +1169,7 @@ describe("reconstruction data-directory lock stale recovery (N16/N21)", () => {
 			rmSync(fx.root, { recursive: true, force: true });
 		}
 	});
+
 
 	test("a live owner with a fresh heartbeat is never reaped merely because its lock is old", async () => {
 		const fx = makeLockFixture();
