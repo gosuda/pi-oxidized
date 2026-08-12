@@ -415,7 +415,7 @@ impl AgentSession {
                 active_tool_names: None,
                 include_all_extension_tools: true,
             });
-            self.refresh_selected_model_after_reload();
+            self.refresh_selected_model_from_runtime();
             self.hydrate_replacement_host().await;
             self.emit_session_start_reload().await;
             self.extend_resources_from_extensions(SessionStartReason::Reload.as_str())
@@ -470,21 +470,21 @@ impl AgentSession {
             .await;
     }
 
-    /// Re-resolve the currently selected model against the post-reload
+    /// Re-resolve the currently selected model against the current
     /// [`ModelRuntime`] and apply session model-selection semantics.
     ///
-    /// After `commit_reload` the provider registry may have changed: a model's
-    /// configuration may have been updated, or the model may have been removed
-    /// entirely. This looks up the current model in the refreshed runtime and,
-    /// when the definition changed, assigns the refreshed [`Model`] directly to
-    /// the live agent via the low-level `Agent::set_model` setter. Unlike
-    /// [`AgentSession::set_model`], this does not append a `model_change`
-    /// session entry, mutate saved defaults, re-clamp the thinking level, or
-    /// emit `model_select` — the reload is a provider-configuration refresh,
+    /// After a live provider or reload mutation the provider registry may have
+    /// changed: a model's configuration may have been updated, or the model may
+    /// have been removed entirely. This looks up the current model in the
+    /// refreshed runtime and, when the definition changed, assigns the refreshed
+    /// [`Model`] directly to the live agent via the low-level `Agent::set_model`
+    /// setter. Unlike [`AgentSession::set_model`], this does not append a
+    /// `model_change` session entry, mutate saved defaults, re-clamp the thinking
+    /// level, or emit `model_select` — it is a provider-configuration refresh,
     /// not an explicit user selection. When the selected identity was removed
-    /// from the post-reload registry, the existing model is kept as-is; the
-    /// pinned TypeScript `reload` contract performs no automatic fallback.
-    fn refresh_selected_model_after_reload(&self) {
+    /// from the registry, the existing model is kept as-is; the pinned
+    /// TypeScript `reload` contract performs no automatic fallback.
+    pub(super) fn refresh_selected_model_from_runtime(&self) {
         let Some(runtime) = self.model_runtime() else {
             return;
         };
@@ -1394,7 +1394,7 @@ impl AgentSession {
             for diagnostic in reload.diagnostics {
                 self.report_extension_error(diagnostic.to_string());
             }
-            self.refresh_selected_model_after_reload();
+            self.refresh_selected_model_from_runtime();
             self.hydrate_replacement_host().await;
             self.emit_session_start_reload().await;
             if let Err(error) = self
@@ -3044,7 +3044,7 @@ mod tests {
         set.inject_prepared_replacement_for_reload(replacement_gen, pending);
 
         // Drive the reload through the session — this commits the replacement,
-        // re-registers providers, then calls refresh_selected_model_after_reload
+        // re-registers providers, then calls refresh_selected_model_from_runtime
         // before emitting session_start{reload}.
         session.reload().await?;
 
@@ -3077,6 +3077,67 @@ mod tests {
 
         set.shutdown_once().await;
         replacement_host.wait_for_exit().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_provider_update_refreshes_selected_model_without_selection_side_effects()
+    -> TestResult {
+        let initial = provider_snapshot_with_auth(
+            "reload-provider",
+            "https://old.example/v1",
+            "reload-model",
+            4096,
+        );
+        let (session, _runtime, set, host) = build_reload_session_with_provider(initial).await?;
+        let entry_count_before = session.session_manager.lock().await.get_entries().len();
+        let observed_events: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_clone = Arc::clone(&observed_events);
+        let _unsubscribe = session.subscribe(move |event| {
+            if let Ok(mut events) = events_clone.lock() {
+                events.push(event.type_name());
+            }
+        });
+
+        host.emit(pi_ext::protocol::Frame {
+            id: 0,
+            kind: pi_ext::protocol::FrameKind::Event,
+            method: pi_ext::protocol::PROVIDERS_UPDATE_METHOD.to_owned(),
+            payload: json!({
+                "providers": [provider_snapshot_with_auth(
+                    "reload-provider",
+                    "https://new.example/v1",
+                    "reload-model",
+                    8192,
+                )]
+            }),
+        })
+        .await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while session.model().context_window != 8192 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "live provider update did not refresh the selected model")?;
+        assert_eq!(session.model().base_url, "https://new.example/v1");
+        assert_eq!(
+            session.session_manager.lock().await.get_entries().len(),
+            entry_count_before,
+            "provider refresh must not append a model_change session entry"
+        );
+        let logged = observed_events
+            .lock()
+            .map(|events| events.clone())
+            .unwrap_or_default();
+        assert!(
+            !logged.contains(&"model_select"),
+            "provider refresh must not emit model_select (events={logged:?})"
+        );
+
+        set.shutdown_once().await;
+        host.wait_for_exit().await?;
         Ok(())
     }
 

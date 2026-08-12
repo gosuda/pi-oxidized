@@ -3441,21 +3441,32 @@ fn spawn_providers_update_relay(
 ) -> Option<tokio::task::JoinHandle<()>> {
     let mut rx = rx?;
     let state = context.state.clone();
+    let channels = Arc::clone(&context.channels);
     let endpoint_id = context.endpoint.id;
     Some(tokio::spawn(async move {
         while rx.changed().await.is_ok() {
             let update = rx.borrow_and_update().clone();
-            if let Some(set) = state.upgrade() {
-                let mut set = set
+            let publish = if let Some(state) = state.upgrade() {
+                let mut set = state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if set.stale || set.shutdown_done || set.retired.contains(&endpoint_id) {
-                    continue;
+                    false
+                } else {
+                    match set.generation.endpoint(endpoint_id).cloned() {
+                        Some(endpoint) => {
+                            set.apply_providers_update(&endpoint, &update);
+                            true
+                        }
+                        None => false,
+                    }
                 }
-                let Some(endpoint) = set.generation.endpoint(endpoint_id).cloned() else {
-                    continue;
-                };
-                set.apply_providers_update(&endpoint, &update);
+                // `set` is dropped here, releasing PublishedRuntimeState
+            } else {
+                false
+            };
+            if publish {
+                channels.publish_registry_change();
             }
         }
     }))
@@ -4300,7 +4311,7 @@ pub(crate) mod tests {
             rx
         }
 
-        async fn emit(&self, frame: Frame) {
+        pub(crate) async fn emit(&self, frame: Frame) {
             let _ = self.commands.send(FakeCommand::Emit(frame)).await;
         }
 
@@ -5961,6 +5972,8 @@ pub(crate) mod tests {
             String::new(),
             false,
         ));
+        let mut registry_changes = set.subscribe_registry_changes();
+        let revision = *registry_changes.borrow_and_update();
         set.install(pending);
         let runtime = ModelRuntime::create_in_memory().await?;
         assert!(
@@ -5975,6 +5988,10 @@ pub(crate) mod tests {
             &["shared-provider"],
         )
         .await?;
+        tokio::time::timeout(TEST_TIMEOUT, registry_changes.changed())
+            .await
+            .map_err(|_| "provider update did not publish a registry revision")??;
+        assert_ne!(*registry_changes.borrow_and_update(), revision);
 
         for (name, base_url) in [
             ("transient", "https://transient.example/v1"),

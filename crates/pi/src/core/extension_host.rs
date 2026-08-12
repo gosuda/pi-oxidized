@@ -711,11 +711,6 @@ struct Inner {
     session_bridge_tx: mpsc::Sender<SessionBridgeEvent>,
     session_bridge_rx: StdMutex<Option<mpsc::Receiver<SessionBridgeEvent>>>,
     session_bridge_claimed: AtomicBool,
-    /// Live provider registry updates from the host (`providers.update`).
-    /// Consumed by the facade relay that replaces the endpoint's provider
-    /// snapshot and rewires `ModelRuntime`.
-    providers_update_tx: watch::Sender<pi_ext::protocol::ProvidersUpdate>,
-    providers_update_rx: StdMutex<Option<watch::Receiver<pi_ext::protocol::ProvidersUpdate>>>,
     /// Paths passed to `extensions.load` (restart reuses them).
     extension_paths: Vec<String>,
     /// Cwd passed to `extensions.load`.
@@ -761,8 +756,6 @@ impl Inner {
         let (ui_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let (ui_requests_tx, ui_requests_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let (session_bridge_tx, session_bridge_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
-        let (providers_update_tx, providers_update_rx) =
-            watch::channel(pi_ext::protocol::ProvidersUpdate::default());
         let flag_values = snapshot.flag_values.clone();
         Self {
             client,
@@ -779,8 +772,6 @@ impl Inner {
             session_bridge_tx,
             session_bridge_rx: StdMutex::new(Some(session_bridge_rx)),
             session_bridge_claimed: AtomicBool::new(false),
-            providers_update_tx,
-            providers_update_rx: StdMutex::new(Some(providers_update_rx)),
             extension_paths,
             load_cwd,
             project_trusted,
@@ -1688,11 +1679,7 @@ impl HostExtensionRunner {
     pub(crate) fn take_providers_updates(
         &self,
     ) -> Option<watch::Receiver<pi_ext::protocol::ProvidersUpdate>> {
-        self.inner
-            .providers_update_rx
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
+        self.client().take_providers_updates()
     }
 
     /// Install the lower-layer callback invoked when a token-bearing
@@ -2281,9 +2268,6 @@ fn spawn_event_pump(inner: Arc<Inner>) {
                     }
                     Ok(HostEvent::ProviderEvent(event)) => {
                         let _ = inner.provider_events_tx.send(event);
-                    }
-                    Ok(HostEvent::ProvidersUpdate(update)) => {
-                        inner.providers_update_tx.send_replace(update);
                     }
                     Ok(HostEvent::ExtensionError(event)) => {
                         let _ = inner.errors_tx.send(event);

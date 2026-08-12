@@ -885,6 +885,49 @@ describe("defaultInversionProof primary-error preservation (PRRT_kwDOTcPStM6UYj9
 	});
 });
 
+describe("defaultInversionProof event-loop availability (PRRT_kwDOTcPStM6Yme3E)", () => {
+	test("timers execute while the child proof is alive", async () => {
+		const root = mkdtempSync(join(tmpdir(), "inversion-proof-event-loop-"));
+		const scriptsDir = join(root, "scripts");
+		const catalogPath = join(root, "crates", "pi-ai", "data", "builtin-models.json");
+		const generatorPath = join(scriptsDir, "generate-builtin-models.ts");
+		mkdirSync(dirname(catalogPath), { recursive: true });
+		mkdirSync(scriptsDir, { recursive: true });
+		writeFileSync(catalogPath, '{"alpha":{"model":{"id":"model"}}}\n', "utf8");
+		writeFileSync(
+			generatorPath,
+			"const { promise, resolve } = Promise.withResolvers<void>();\n" +
+				"setTimeout(resolve, 250);\n" +
+				"await promise;\n" +
+				"process.exit(0);\n",
+			"utf8",
+		);
+		// Real wall-clock delay is required here: fake timers cannot advance a
+		// real child process, so the only way to observe the parent's event loop
+		// staying free while defaultInversionProof awaits the child is to run a
+		// short setInterval against the real clock. The 250ms child is well
+		// below the 5s lock-heartbeat stale threshold.
+		let ticks = 0;
+		const interval = setInterval(() => {
+			ticks++;
+		}, 10);
+		try {
+			await defaultInversionProof({
+				repoRoot: root,
+				catalogPath,
+				providersDir: join(root, "providers"),
+				dataDir: join(root, "providers", "data"),
+			});
+			// If the event loop was blocked by a synchronous spawn, the interval
+			// would not have ticked while the ~250ms child was alive.
+			expect(ticks).toBeGreaterThan(0);
+		} finally {
+			clearInterval(interval);
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+});
+
 const LOCK_OWNER_FILE = "owner.json";
 
 type LockFixture = { root: string; dataDir: string; lockDir: string };

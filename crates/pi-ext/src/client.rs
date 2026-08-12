@@ -39,7 +39,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWrite
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 #[cfg(test)]
 use tokio::sync::Notify;
-use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
+use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -203,6 +203,8 @@ struct Shared {
     slot_generations: StdMutex<HashMap<String, u64>>,
     /// Unsolicited event fan-out (lossy broadcast).
     events: broadcast::Sender<HostEvent>,
+    /// Latest complete provider snapshot, delivered losslessly with watch semantics.
+    providers_update: watch::Sender<crate::protocol::ProvidersUpdate>,
     /// Outbound frame sender mirror, so `dispatch` can send explicit error
     /// responses for correlated requests that cannot be delivered losslessly.
     outbound: StdMutex<Option<mpsc::Sender<Frame>>>,
@@ -335,10 +337,6 @@ pub enum HostEvent {
     },
     /// Extension fire-and-forget UI control (`ui.setStatus`, …).
     UiControl(crate::protocol::UiControl),
-    /// Live provider registry update (`providers.update`). Carries the
-    /// sender endpoint's complete current provider list after a committed
-    /// live mutation (register/unregister from a command or callback).
-    ProvidersUpdate(crate::protocol::ProvidersUpdate),
     /// Untyped / unrecognized frame.
     Raw(Frame),
     /// Host stdout closed.
@@ -424,6 +422,8 @@ pub struct HostClient {
     /// Sole lossless receiver for correlated host requests, taken once by the
     /// event pump. Stored outside `Shared` so only the owning client can claim it.
     correlated_requests_rx: StdMutex<Option<mpsc::Receiver<HostEvent>>>,
+    /// Sole receiver for lossless latest-state provider snapshots.
+    providers_update_rx: StdMutex<Option<watch::Receiver<crate::protocol::ProvidersUpdate>>>,
 }
 
 impl HostClient {
@@ -473,6 +473,8 @@ impl HostClient {
         child: Option<Child>,
     ) -> Self {
         let (events_tx, _) = broadcast::channel(EVENT_CAPACITY);
+        let (providers_update_tx, providers_update_rx) =
+            watch::channel(crate::protocol::ProvidersUpdate::default());
         let (cmd_tx, cmd_rx) = mpsc::channel::<Frame>(OUTBOUND_CAPACITY);
         let (correlated_tx, correlated_rx) =
             mpsc::channel::<HostEvent>(CORRELATED_REQUEST_CAPACITY);
@@ -482,6 +484,7 @@ impl HostClient {
             session_control_handler: StdMutex::new(None),
             slot_generations: StdMutex::new(HashMap::new()),
             events: events_tx,
+            providers_update: providers_update_tx,
             outbound: StdMutex::new(Some(cmd_tx.clone())),
             correlated_requests: correlated_tx,
             next_id: AtomicU64::new(1),
@@ -511,6 +514,7 @@ impl HostClient {
             child: Mutex::new(child),
             reader_handle: Mutex::new(Some(reader_handle)),
             correlated_requests_rx: StdMutex::new(Some(correlated_rx)),
+            providers_update_rx: StdMutex::new(Some(providers_update_rx)),
         }
     }
 
@@ -549,6 +553,21 @@ impl HostClient {
     #[must_use]
     pub fn take_correlated_requests(&self) -> Option<mpsc::Receiver<HostEvent>> {
         self.correlated_requests_rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    /// Claim the sole lossless latest-state provider-update receiver.
+    ///
+    /// The receiver starts with a default snapshot already observed, so its
+    /// first `changed().await` waits for a real host update. Subsequent callers
+    /// receive `None`.
+    #[must_use]
+    pub fn take_providers_updates(
+        &self,
+    ) -> Option<watch::Receiver<crate::protocol::ProvidersUpdate>> {
+        self.providers_update_rx
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
@@ -1851,7 +1870,7 @@ fn forward_event(shared: &Shared, frame: Frame) -> bool {
     } else if method == crate::protocol::PROVIDERS_UPDATE_METHOD {
         match from_payload::<crate::protocol::ProvidersUpdate>(&frame.payload) {
             Ok(update) => {
-                let _ = shared.events.send(HostEvent::ProvidersUpdate(update));
+                let _ = shared.providers_update.send(update);
             }
             Err(_) => {
                 let _ = shared.events.send(HostEvent::Raw(frame));
@@ -3405,6 +3424,67 @@ mod tests {
 
         let token = tokio::time::timeout(Duration::from_secs(1), ready_rx).await??;
         assert_eq!(token, "ready-after-lag");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn providers_update_watch_bypasses_broadcast_lag() -> R {
+        let (client, mut host) = make_pair().await;
+        let mut providers = client
+            .take_providers_updates()
+            .ok_or("provider update receiver missing")?;
+        assert!(
+            !providers.has_changed()?,
+            "the initial default provider snapshot must already be observed"
+        );
+
+        // Subscribe to the lossy general broadcast *before* flooding it.
+        let mut general = client.subscribe();
+        for index in 0..(EVENT_CAPACITY + 10) {
+            host.write_frame(&Frame::event(
+                0,
+                Method::Notify,
+                serde_json::json!({"message": index}),
+            ))
+            .await?;
+        }
+
+        // A provider update must still arrive on the lossless watch, not the
+        // lossy broadcast. If it were sent through the broadcast it would be
+        // dropped or lagged past this point.
+        let payload = serde_json::json!({
+            "providers": [{
+                "name": "live-provider",
+                "baseUrl": "https://live.example/v1",
+                "api": "openai-completions",
+                "apiKey": "sk-live",
+                "headers": {"x-provider": "live"},
+                "authHeader": true,
+                "models": [{"id": "live-model", "contextWindow": 8192}],
+                "streamSimple": true,
+                "extensionPath": "/extensions/live.ts"
+            }]
+        });
+        let expected: crate::protocol::ProvidersUpdate = serde_json::from_value(payload.clone())?;
+        host.write_frame(&Frame {
+            id: 0,
+            kind: FrameKind::Event,
+            method: crate::protocol::PROVIDERS_UPDATE_METHOD.to_owned(),
+            payload,
+        })
+        .await?;
+
+        tokio::time::timeout(Duration::from_secs(1), providers.changed())
+            .await
+            .map_err(|_| "provider watch did not change after providers.update")??;
+
+        // Reaching the later provider frame proves the reader has already
+        // processed every notification in the flood.
+        let first = tokio::time::timeout(Duration::from_secs(1), general.recv())
+            .await
+            .map_err(|_| "general broadcast receiver did not report status")?;
+        assert!(matches!(first, Err(broadcast::error::RecvError::Lagged(_))));
+        assert_eq!(*providers.borrow_and_update(), expected);
         Ok(())
     }
 

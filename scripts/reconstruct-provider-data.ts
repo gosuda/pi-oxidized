@@ -780,13 +780,18 @@ export async function defaultInversionProof(ctx: ReconstructProofContext): Promi
 	let proofFailure: unknown;
 	let restoreFailure: unknown;
 	try {
-		const regen = Bun.spawnSync(
+		const regen = Bun.spawn(
 			[process.execPath, "run", join(ctx.repoRoot, "scripts/generate-builtin-models.ts")],
 			{ cwd: ctx.repoRoot, stdout: "ignore", stderr: "pipe" },
 		);
-		if (regen.exitCode !== 0) {
+		// Start draining stderr immediately so the child cannot block on a full
+		// pipe, then await exit and the captured text.
+		const stderrPromise = new Response(regen.stderr).text();
+		const exitCode = await regen.exited;
+		const stderr = await stderrPromise;
+		if (exitCode !== 0) {
 			throw new Error(
-				`inversion proof failed: generate-builtin-models exited ${regen.exitCode}: ${regen.stderr.toString().slice(0, 400)}`,
+				`inversion proof failed: generate-builtin-models exited ${exitCode}: ${stderr.slice(0, 400)}`,
 			);
 		}
 		const after = await Bun.file(ctx.catalogPath).bytes();

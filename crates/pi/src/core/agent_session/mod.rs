@@ -1150,6 +1150,7 @@ impl AgentSession {
                             active_tool_names: None,
                             include_all_extension_tools: true,
                         });
+                        session.refresh_selected_model_from_runtime();
                         drop(session);
                     }
                 }
