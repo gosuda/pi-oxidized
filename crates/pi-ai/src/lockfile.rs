@@ -448,6 +448,15 @@ fn try_create_lock(
             if !allow_stale_reclaim || stale.is_zero() {
                 return Err(OnceError::Contended);
             }
+            // Windows has no safe std API that atomically renames the directory
+            // identified during the stale check. A metadata or handle precheck
+            // followed by path-based removal still lets a new holder replace
+            // the path in between. Fail closed until reclaim can be one
+            // captured-handle operation; manual cleanup is safer than split
+            // credential or settings writes.
+            #[cfg(windows)]
+            return Err(OnceError::Contended);
+            #[cfg(not(windows))]
             match fs::metadata(lock_path) {
                 Err(meta_err) if meta_err.kind() == io::ErrorKind::NotFound => {
                     // Lost the race with a releaser; one non-reclaiming retry.
@@ -494,6 +503,7 @@ fn is_lock_stale(meta: &fs::Metadata, stale: Duration) -> bool {
     }
 }
 
+#[cfg(not(windows))]
 /// Reclaim a stale lock directory after re-reading its filesystem identity.
 ///
 /// `stale_meta` is the metadata captured when the directory at `lock_path` was
@@ -530,6 +540,7 @@ fn reclaim_stale_lock(lock_path: &Path, stale_meta: &fs::Metadata) -> Result<boo
     }
 }
 
+#[cfg(not(windows))]
 /// Compare two directory metadata objects for the same filesystem identity.
 fn same_dir_identity(a: &fs::Metadata, b: &fs::Metadata) -> bool {
     #[cfg(unix)]
@@ -537,7 +548,7 @@ fn same_dir_identity(a: &fs::Metadata, b: &fs::Metadata) -> bool {
         use std::os::unix::fs::MetadataExt;
         a.dev() == b.dev() && a.ino() == b.ino()
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         a.len() == b.len()
             && a.modified().ok() == b.modified().ok()
@@ -767,6 +778,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn stale_lock_is_reclaimed() -> TestResult {
         let dir = make_temp_dir()?;
@@ -795,6 +807,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn stale_reclaim_removes_unchanged_stale_directory() -> TestResult {
         let dir = make_temp_dir()?;
@@ -819,6 +832,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn stale_reclaim_keeps_replacement_lock_directory() -> TestResult {
         let dir = make_temp_dir()?;
@@ -856,6 +870,39 @@ mod tests {
         }
         if Handle::from_path(&lock_path)? != replacement {
             return Err(fail("replacement lock identity changed after reclaim"));
+        }
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stale_windows_lock_is_not_reclaimed_without_atomic_handle_rename() -> TestResult {
+        let dir = make_temp_dir()?;
+        let target = dir.join("settings.json");
+        let lock_path = default_lock_path(&absolute_path(&target));
+        fs::create_dir(&lock_path)?;
+        let past = SystemTime::now()
+            .checked_sub(Duration::from_secs(30))
+            .ok_or_else(|| fail("past time underflow"))?;
+        set_file_mtime(&lock_path, FileTime::from_system_time(past))?;
+        let identity = Handle::from_path(&lock_path)?;
+
+        let err = require_contended(LockGuard::acquire_with(
+            &target,
+            &LockOptions::new()
+                .attempts(1)
+                .retry_delay(Duration::ZERO)
+                .stale(Duration::from_millis(50))
+                .update(Duration::ZERO),
+        ))?;
+        if !err.is_contended() {
+            return Err(fail("stale Windows lock must fail closed as contention"));
+        }
+        if Handle::from_path(&lock_path)? != identity {
+            return Err(fail(
+                "stale Windows lock identity changed during acquisition",
+            ));
         }
         let _ = fs::remove_dir_all(&dir);
         Ok(())
