@@ -4732,6 +4732,47 @@ pub(crate) mod tests {
             }),
         }
     }
+    fn provider_update_frame(name: &str, base_url: &str) -> Frame {
+        Frame {
+            id: 0,
+            kind: FrameKind::Event,
+            method: pi_ext::protocol::PROVIDERS_UPDATE_METHOD.to_owned(),
+            payload: json!({
+                "providers": [{
+                    "name": name,
+                    "baseUrl": base_url,
+                    "api": "openai-completions"
+                }]
+            }),
+        }
+    }
+
+    async fn wait_for_provider_snapshot(
+        runtime: &ModelRuntime,
+        name: &str,
+        base_url: &str,
+        absent: &[&str],
+    ) -> TestResult {
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            loop {
+                let current = runtime.get_registered_provider_config(name);
+                if current
+                    .as_ref()
+                    .and_then(|config| config.base_url.as_deref())
+                    == Some(base_url)
+                    && absent
+                        .iter()
+                        .all(|name| runtime.get_registered_provider_config(name).is_none())
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| format!("provider runtime did not publish {name}"))?;
+        Ok(())
+    }
 
     async fn wait_for_slot_text(set: &ExtensionRuntimeSet, text: &str) -> TestResult {
         tokio::time::timeout(TEST_TIMEOUT, async {
@@ -5900,19 +5941,8 @@ pub(crate) mod tests {
             )],
         );
 
-        host.emit(Frame {
-            id: 0,
-            kind: FrameKind::Event,
-            method: pi_ext::protocol::PROVIDERS_UPDATE_METHOD.to_owned(),
-            payload: json!({
-                "providers": [{
-                    "name": "pre-spawn",
-                    "baseUrl": "https://pre.example/v1",
-                    "api": "openai-completions"
-                }]
-            }),
-        })
-        .await;
+        host.emit(provider_update_frame("pre-spawn", "https://pre.example/v1"))
+            .await;
         tokio::time::timeout(TEST_TIMEOUT, async {
             while !pending[0]
                 .providers_update
@@ -5938,50 +5968,28 @@ pub(crate) mod tests {
                 .into_iter()
                 .all(|(_, result)| result.is_ok())
         );
+        wait_for_provider_snapshot(
+            &runtime,
+            "pre-spawn",
+            "https://pre.example/v1",
+            &["shared-provider"],
+        )
+        .await?;
 
         for (name, base_url) in [
             ("transient", "https://transient.example/v1"),
             ("final-provider", "https://final.example/v1"),
         ] {
-            host.emit(Frame {
-                id: 0,
-                kind: FrameKind::Event,
-                method: pi_ext::protocol::PROVIDERS_UPDATE_METHOD.to_owned(),
-                payload: json!({
-                    "providers": [{
-                        "name": name,
-                        "baseUrl": base_url,
-                        "api": "openai-completions"
-                    }]
-                }),
-            })
-            .await;
+            host.emit(provider_update_frame(name, base_url)).await;
         }
 
-        tokio::time::timeout(TEST_TIMEOUT, async {
-            loop {
-                let final_config = runtime.get_registered_provider_config("final-provider");
-                if final_config
-                    .as_ref()
-                    .and_then(|config| config.base_url.as_deref())
-                    == Some("https://final.example/v1")
-                    && runtime
-                        .get_registered_provider_config("shared-provider")
-                        .is_none()
-                    && runtime
-                        .get_registered_provider_config("pre-spawn")
-                        .is_none()
-                    && runtime
-                        .get_registered_provider_config("transient")
-                        .is_none()
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .map_err(|_| "provider runtime did not converge on the latest complete snapshot")?;
+        wait_for_provider_snapshot(
+            &runtime,
+            "final-provider",
+            "https://final.example/v1",
+            &["shared-provider", "pre-spawn", "transient"],
+        )
+        .await?;
 
         set.shutdown_once().await;
         host.wait_for_exit().await?;
