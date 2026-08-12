@@ -70,3 +70,4 @@
 {"id":32,"kind":"error","method":"session.setupEntries","payload":{"code":"extension_error","message":"stale replacement token","retryable":false}}
 {"id":0,"kind":"event","method":"session.replacementReady","payload":{"token":"tok-1"}}
 {"id":0,"kind":"event","method":"session.replacementAbort","payload":{"token":"tok-candidate"}}
+{"id":0,"kind":"event","method":"providers.update","payload":{"providers":[{"name":"custom","baseUrl":"https://custom.example/v1","api":"openai-completions","streamSimple":true,"models":[{"id":"custom-model","reasoning":false}]},{"name":"baseurl-only","baseUrl":"https://base.example/v1"}]}}

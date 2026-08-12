@@ -106,6 +106,8 @@ export const ALL_EVENT_TYPES = [
 
 /** Hook timeout: mutable lifecycle hooks must respond within 30 s. */
 export const EXTENSION_HOOK_TIMEOUT_MS = 30_000;
+/** Open host-control method that publishes the endpoint's live provider registry. */
+const PROVIDERS_UPDATE_METHOD = "providers.update";
 
 const STALE_COMMAND_CONTEXT_MESSAGE =
 	"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().";
@@ -158,12 +160,11 @@ interface SlotEntry {
 	placement: SlotPlacement;
 	focusable: boolean;
 	overlayOptions: OverlayOptions | undefined;
+	overlayOptionsResolver?: () => OverlayOptions | undefined;
 	width: number;
-	/** Retained only for components that must capture the active theme at construction. */
+	/** Retained to install an asynchronously-created component. */
 	recreate?: SlotFactory;
-	/** When false, theme updates re-render without reconstruction (preserves state). */
-	recreateOnThemeUpdate: boolean;
-	/** Invalidates older asynchronous recreation results. */
+	/** Invalidates older asynchronous factory results. */
 	recreationRevision: number;
 }
 
@@ -532,6 +533,8 @@ export class ExtensionHost {
 	private readonly providerRegistrationsByPath = new Map<string, ProviderRegistration[]>();
 	private readonly providerUnregisterOrderByName = new Map<string, number>();
 	private readonly activeProviderLoadScopeByPath = new Map<string, ProviderLoadScope>();
+	private readonly latestExtensionLoadTokenByPath = new Map<string, number>();
+	private nextExtensionLoadToken = 0;
 	private nextProviderRegistrationOrder = 0;
 	private readonly inFlightTools = new Map<number, AbortController>();
 	/** In-flight provider.stream AbortControllers keyed by request id. */
@@ -552,6 +555,19 @@ export class ExtensionHost {
 	private readonly assistantDelta = new AssistantDeltaReducer();
 	/** Active theme served to extensions (`ctx.ui.theme`). */
 	private currentTheme: Theme = fallbackTheme();
+	/** Stable facade whose reads always resolve through currentTheme. */
+	private readonly liveTheme = new Proxy(fallbackTheme(), {
+		get: (_target, property) => {
+			const value = Reflect.get(this.currentTheme, property, this.currentTheme);
+			return typeof value === "function" ? value.bind(this.currentTheme) : value;
+		},
+		has: (_target, property) => Reflect.has(this.currentTheme, property),
+		ownKeys: () => Reflect.ownKeys(this.currentTheme),
+		getOwnPropertyDescriptor: (_target, property) => {
+			const descriptor = Reflect.getOwnPropertyDescriptor(this.currentTheme, property);
+			return descriptor === undefined ? undefined : { ...descriptor, configurable: true };
+		},
+	}) as Theme;
 	/** Theme catalog from the latest `theme.update` push. */
 	private themeCatalog: ThemeCatalogEntryPayload[] = [];
 	/** Detected terminal polarity from the latest `theme.update` push. */
@@ -687,7 +703,7 @@ export class ExtensionHost {
 				const ext = await this.loadFactoryWithProviderStaging(
 					module as ExtensionFactory, extPath, opts.cwd, eventBus,
 				);
-				this.extensions.push(ext);
+				if (ext !== undefined) this.extensions.push(ext);
 			} catch (err) {
 				if (this.isDisposed) return;
 				errors.push({
@@ -705,8 +721,10 @@ export class ExtensionHost {
 				const ext = await this.loadFactoryWithProviderStaging(
 					factory, extensionPath, opts.cwd, eventBus,
 				);
-				ext.hidden = isNamed ? input.hidden ?? false : false;
-				this.extensions.push(ext);
+				if (ext !== undefined) {
+					ext.hidden = isNamed ? input.hidden ?? false : false;
+					this.extensions.push(ext);
+				}
 			} catch (err) {
 				if (this.isDisposed) return;
 				errors.push({
@@ -1105,6 +1123,12 @@ export class ExtensionHost {
 			this.loadOptions?.cwd ?? process.cwd(),
 		);
 		const { extensionPaths: paths, cwd, projectTrusted } = request;
+		const loadTokens = new Map<string, number>();
+		for (const path of paths) {
+			const token = ++this.nextExtensionLoadToken;
+			loadTokens.set(path, token);
+			this.latestExtensionLoadTokenByPath.set(path, token);
+		}
 		const errors: Array<{ path: string; error: string }> = [];
 		let loadedCount = 0;
 
@@ -1121,9 +1145,10 @@ export class ExtensionHost {
 		this.installProviderCallbacks(this.runtime);
 
 		const eventBus = createEventBus();
-		const loadedExtensions: Extension[] = [];
+		const loadedExtensions: Array<{ extension: Extension; token: number }> = [];
 
 		for (const extPath of paths) {
+			const token = loadTokens.get(extPath)!;
 			try {
 				const jiti = createExtensionJiti();
 				const module = await jiti.import(extPath, { default: true }) as unknown;
@@ -1136,10 +1161,12 @@ export class ExtensionHost {
 					continue;
 				}
 				const ext = await this.loadFactoryWithProviderStaging(
-					module as ExtensionFactory, extPath, cwd, eventBus,
+					module as ExtensionFactory, extPath, cwd, eventBus, token,
 				);
-				loadedExtensions.push(ext);
-				loadedCount++;
+				if (ext !== undefined) {
+					loadedExtensions.push({ extension: ext, token });
+					loadedCount++;
+				}
 			} catch (err) {
 				if (this.state === HostState.DISPOSED) return;
 				errors.push({
@@ -1162,7 +1189,8 @@ export class ExtensionHost {
 		}
 		const newExtensions: Extension[] = [];
 		const newPathIndex = new Map<string, number>();
-		for (const ext of loadedExtensions) {
+		for (const { extension: ext, token } of loadedExtensions) {
+			if (this.latestExtensionLoadTokenByPath.get(ext.path) !== token) continue;
 			const existingIdx = existingByPath.get(ext.path);
 			if (existingIdx !== undefined) {
 				this.extensions[existingIdx] = ext;
@@ -1253,8 +1281,8 @@ export class ExtensionHost {
 		const width = p["width"] as number;
 		const entry = this.slots.get(key);
 		if (entry !== undefined && Number.isFinite(width)) entry.width = width;
-		const height = entry?.component?.render(width)?.length ?? 0;
-		await this.client.respond(id, "measure", { height });
+		const lines = entry === undefined ? [] : this.safeRenderSlot(key, entry, width);
+		await this.client.respond(id, "measure", { height: lines?.length ?? 0 });
 	}
 
 	private async handleRender(id: number, p: Record<string, unknown>): Promise<void> {
@@ -1262,8 +1290,8 @@ export class ExtensionHost {
 		const width = p["width"] as number;
 		const entry = this.slots.get(key);
 		if (entry !== undefined && Number.isFinite(width)) entry.width = width;
-		const lines = entry?.component?.render(width) ?? [];
-		const runs = lines.map((line) => parseAnsiLines(line)[0] ?? []) as StyledRun[][];
+		const lines = entry === undefined ? [] : this.safeRenderSlot(key, entry, width);
+		const runs = (lines ?? []).map((line) => parseAnsiLines(line)[0] ?? []) as StyledRun[][];
 		await this.client.respond(id, "render", { runs });
 	}
 
@@ -1271,6 +1299,23 @@ export class ExtensionHost {
 		const data = typeof p["data"] === "string" ? p["data"] : "";
 		const result = await this.enqueueTerminalInput(data);
 		await this.client.respond(id, "terminalInput", result);
+	}
+
+	private safeRenderSlot(key: string, entry: SlotEntry, width: number): string[] | undefined {
+		try {
+			return entry.component?.render(width) ?? [];
+		} catch (error) {
+			this.emitExtensionError("<inline>", `component.render (${key})`, error instanceof Error ? error.message : String(error));
+			return undefined;
+		}
+	}
+
+	private safeDisposeComponent(key: string, component: SlotComponent | null): void {
+		try {
+			component?.dispose?.();
+		} catch (error) {
+			this.emitExtensionError("<inline>", `component.dispose (${key})`, error instanceof Error ? error.message : String(error));
+		}
 	}
 
 	/**
@@ -1464,7 +1509,17 @@ export class ExtensionHost {
 
 	private pushSlot(key: string, entry: SlotEntry, width: number): void {
 		if (entry.component === null) return;
-		const lines = entry.component.render(width);
+		let overlayOptions = entry.overlayOptions;
+		if (entry.overlayOptionsResolver !== undefined) {
+			try {
+				overlayOptions = entry.overlayOptionsResolver() ?? {};
+			} catch (error) {
+				this.emitExtensionError("<inline>", `overlayOptions (${key})`, error instanceof Error ? error.message : String(error));
+				return;
+			}
+		}
+		const lines = this.safeRenderSlot(key, entry, width);
+		if (lines === undefined) return;
 		const runs = lines.map((line) => parseAnsiLines(line)[0] ?? []);
 		const slot: UiSlot = {
 			key,
@@ -1474,7 +1529,7 @@ export class ExtensionHost {
 			runs,
 			focusable: entry.focusable,
 		};
-		if (entry.overlayOptions !== undefined) slot.overlayOptions = entry.overlayOptions;
+		if (overlayOptions !== undefined) slot.overlayOptions = overlayOptions;
 		this.client.send({
 			id: 0, kind: "event", method: "uiSlot", payload: slot,
 		}).catch(() => void 0);
@@ -1483,8 +1538,8 @@ export class ExtensionHost {
 	disposeSlot(key: string): void {
 		const entry = this.slots.get(key);
 		if (entry === undefined) return;
-		entry.component?.dispose?.();
 		this.slots.delete(key);
+		this.safeDisposeComponent(key, entry.component);
 		this.client.send({
 			id: 0, kind: "event", method: "disposeSlot",
 			payload: { key, generation: entry.generation },
@@ -1531,7 +1586,7 @@ export class ExtensionHost {
 		} else {
 			return;
 		}
-		this.slots.get(key)?.component?.dispose?.();
+		this.safeDisposeComponent(key, this.slots.get(key)?.component ?? null);
 		const entry: SlotEntry = {
 			generation: this.nextGeneration++,
 			component,
@@ -1540,7 +1595,6 @@ export class ExtensionHost {
 			overlayOptions: undefined,
 			width: 80,
 			recreate,
-			recreateOnThemeUpdate: true,
 			recreationRevision: 0,
 		};
 		this.slots.set(key, entry);
@@ -1574,7 +1628,7 @@ export class ExtensionHost {
 		};
 		const install = (replacement: unknown) => {
 			if (!isCurrent()) {
-				if (isSlotComponent(replacement)) replacement.dispose?.();
+				if (isSlotComponent(replacement)) this.safeDisposeComponent(key, replacement);
 				return;
 			}
 			if (!isSlotComponent(replacement)) {
@@ -1583,12 +1637,12 @@ export class ExtensionHost {
 			}
 			const old = entry.component;
 			entry.component = replacement;
-			old?.dispose?.();
+			this.safeDisposeComponent(key, old);
 			this.pushSlot(key, entry, entry.width);
 		};
 		let recreated: unknown;
 		try {
-			recreated = entry.recreate(this.currentTheme);
+			recreated = entry.recreate(this.liveTheme);
 		} catch (err) {
 			fail(err);
 			return;
@@ -1689,10 +1743,14 @@ export class ExtensionHost {
 					},
 				};
 				let overlayOptions: OverlayOptions | undefined;
+				let overlayOptionsResolver: (() => OverlayOptions | undefined) | undefined;
 				try {
-					overlayOptions = (typeof options?.overlayOptions === "function"
-						? options.overlayOptions()
-						: options?.overlayOptions) ?? {};
+					overlayOptionsResolver = typeof options?.overlayOptions === "function"
+						? options.overlayOptions as () => OverlayOptions | undefined
+						: undefined;
+					overlayOptions = overlayOptionsResolver === undefined
+						? (options?.overlayOptions ?? {}) as OverlayOptions
+						: undefined;
 				} catch (err) {
 					self.emitExtensionError("<inline>", "custom", String(err));
 					done(undefined);
@@ -1704,9 +1762,9 @@ export class ExtensionHost {
 					placement: "overlay",
 					focusable: true,
 					overlayOptions,
+					overlayOptionsResolver,
 					width: 80,
 					recreate: (theme) => factory(tui, theme, {}, done),
-					recreateOnThemeUpdate: false,
 					recreationRevision: 0,
 				};
 				self.slots.set(key, entry);
@@ -1844,6 +1902,7 @@ export class ExtensionHost {
 			const scope = this.providerLoadScope.getStore();
 			if (scope === undefined) {
 				this.applyProviderOperation(operation);
+				this.emitProvidersUpdate();
 				return;
 			}
 			if (scope.phase === "loading") {
@@ -1853,6 +1912,7 @@ export class ExtensionHost {
 			if (scope.phase === "committed"
 				&& this.activeProviderLoadScopeByPath.get(scope.extensionPath) === scope) {
 				this.applyProviderOperation(operation);
+				this.emitProvidersUpdate();
 			}
 		};
 
@@ -1946,7 +2006,8 @@ export class ExtensionHost {
 		extensionPath: string,
 		cwd: string,
 		eventBus: unknown,
-	): Promise<Extension> {
+		loadToken?: number,
+	): Promise<Extension | undefined> {
 		const rt = this.runtime;
 		if (rt === undefined) throw new Error("Runtime not initialized");
 
@@ -1961,6 +2022,11 @@ export class ExtensionHost {
 			);
 			if (this.state === HostState.DISPOSED) {
 				throw new Error("extension host was disposed during load");
+			}
+			if (loadToken !== undefined
+				&& this.latestExtensionLoadTokenByPath.get(extensionPath) !== loadToken) {
+				scope.phase = "aborted";
+				return undefined;
 			}
 
 			// A successful replacement owns this path from this point forward. A
@@ -1978,6 +2044,35 @@ export class ExtensionHost {
 			scope.phase = "aborted";
 			throw error;
 		}
+	}
+
+	private emitProvidersUpdate(): void {
+		if (this.state === HostState.DISPOSED) return;
+		void this.client.send({
+			id: 0,
+			kind: "event",
+			method: PROVIDERS_UPDATE_METHOD,
+			payload: { providers: this.buildProviderSnapshot() },
+		}).catch(() => void 0);
+	}
+
+	private buildProviderSnapshot(): Array<Record<string, unknown>> {
+		const providers: Array<Record<string, unknown>> = [];
+		for (const [name, config] of this.providers) {
+			const entry: Record<string, unknown> = {
+				name,
+				streamSimple: typeof config.streamSimple === "function",
+			};
+			if (config.baseUrl !== undefined) entry["baseUrl"] = config.baseUrl;
+			if (config.api !== undefined) entry["api"] = config.api;
+			if (config.name !== undefined) entry["displayName"] = config.name;
+			if (config.apiKey !== undefined) entry["apiKey"] = config.apiKey;
+			if (config.headers !== undefined) entry["headers"] = config.headers;
+			if (config.authHeader !== undefined) entry["authHeader"] = config.authHeader;
+			if (config.models !== undefined) entry["models"] = config.models;
+			providers.push(entry);
+		}
+		return providers;
 	}
 
 	/** Full RegistrySnapshotWire for Rust HostExtensionRunner::load. */
@@ -2064,21 +2159,7 @@ export class ExtensionHost {
 			}
 		}
 
-		const providers: Array<Record<string, unknown>> = [];
-		for (const [name, config] of this.providers) {
-			const entry: Record<string, unknown> = {
-				name,
-				streamSimple: typeof config.streamSimple === "function",
-			};
-			if (config.baseUrl !== undefined) entry["baseUrl"] = config.baseUrl;
-			if (config.api !== undefined) entry["api"] = config.api;
-			if (config.name !== undefined) entry["displayName"] = config.name;
-			if (config.apiKey !== undefined) entry["apiKey"] = config.apiKey;
-			if (config.headers !== undefined) entry["headers"] = config.headers;
-			if (config.authHeader !== undefined) entry["authHeader"] = config.authHeader;
-			if (config.models !== undefined) entry["models"] = config.models;
-			providers.push(entry);
-		}
+		const providers = this.buildProviderSnapshot();
 
 		const handlers = ALL_EVENT_TYPES.filter((eventType) => runner.hasHandlers(eventType));
 
@@ -2154,14 +2235,7 @@ export class ExtensionHost {
 		this.terminalTheme = update.terminalTheme === "light" ? "light" : "dark";
 		this.themeMode = typeof update.themeMode === "string" ? update.themeMode : "auto";
 		for (const [key, entry] of this.slots) {
-			if (!entry.recreateOnThemeUpdate) {
-				// Stateful overlays keep their instance and state; propagate the
-				// new theme for components that opt in, then re-render in place.
-				entry.component?.updateTheme?.(this.currentTheme);
-				this.pushSlot(key, entry, entry.width);
-				continue;
-			}
-			this.recreateSlot(key, entry);
+			this.pushSlot(key, entry, entry.width);
 		}
 	}
 
@@ -3080,6 +3154,7 @@ export class ExtensionHost {
 		this.inFlightShortcuts.clear();
 		for (const scope of this.activeProviderLoadScopeByPath.values()) scope.phase = "aborted";
 		this.activeProviderLoadScopeByPath.clear();
+		this.latestExtensionLoadTokenByPath.clear();
 		this.providerUnregisterOrderByName.clear();
 		this.providers.clear();
 		this.providerRegistrationsByPath.clear();

@@ -37,7 +37,7 @@ describe("buildHost", () => {
 			if (call.command.includes("pi-extension-host")) {
 				return {
 					exitCode: 0,
-					stdout: '{"kind":"res","method":"hello","payload":{"protocolVersion":1,"compatibilityVersion":"0.80.10"}}\n',
+					stdout: '{"id":1,"kind":"res","method":"hello","payload":{"protocolVersion":1,"compatibilityVersion":"0.80.10"}}\n',
 					stderr: "",
 				};
 			}
@@ -111,7 +111,7 @@ describe("buildHost", () => {
 			if (call.command.includes("pi-extension-host")) {
 				return {
 					exitCode: 0,
-					stdout: '{"kind":"res","method":"hello","payload":{"protocolVersion":1,"compatibilityVersion":"0.80.10"}}\n',
+					stdout: '{"id":1,"kind":"res","method":"hello","payload":{"protocolVersion":1,"compatibilityVersion":"0.80.10"}}\n',
 					stderr: "",
 				};
 			}
@@ -222,8 +222,35 @@ describe("buildHost", () => {
 });
 
 describe("isHelloAckLine", () => {
-	test("accepts only strict protocol and compatibility acknowledgements", () => {
+	test("accepts a complete hello acknowledgement with id 1", () => {
 		const canonical = JSON.stringify({
+			id: 1,
+			kind: "res",
+			method: "hello",
+			payload: { protocolVersion: 1, compatibilityVersion: "0.80.10" },
+		});
+		expect(isHelloAckLine(canonical)).toBe(true);
+	});
+
+	test("rejects missing, zero, and mismatched request identifiers", () => {
+		const payload = { protocolVersion: 1, compatibilityVersion: "0.80.10" };
+		expect(
+			isHelloAckLine(JSON.stringify({ kind: "res", method: "hello", payload })),
+		).toBe(false); // missing id
+		expect(
+			isHelloAckLine(JSON.stringify({ id: 0, kind: "res", method: "hello", payload })),
+		).toBe(false); // zero id
+		expect(
+			isHelloAckLine(JSON.stringify({ id: 2, kind: "res", method: "hello", payload })),
+		).toBe(false); // mismatched id
+		expect(
+			isHelloAckLine(JSON.stringify({ id: "1", kind: "res", method: "hello", payload })),
+		).toBe(false); // wrong type
+	});
+
+	test("preserves strict protocol and compatibility checks", () => {
+		const canonical = JSON.stringify({
+			id: 1,
 			kind: "res",
 			method: "hello",
 			payload: { protocolVersion: 1, compatibilityVersion: "0.80.10" },
@@ -233,6 +260,7 @@ describe("isHelloAckLine", () => {
 		expect(
 			isHelloAckLine(
 				JSON.stringify({
+					id: 1,
 					kind: "res",
 					method: "hello",
 					payload: { protocolVersion: 1, compatibilityVersion: "wrong" },

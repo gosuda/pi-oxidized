@@ -347,6 +347,7 @@ pub(crate) struct PendingEndpointBridges {
     ui: broadcast::Receiver<ExtensionUiEvent>,
     ui_requests: Option<mpsc::Receiver<HostUiRequest>>,
     session_bridge: Option<mpsc::Receiver<SessionBridgeEvent>>,
+    providers_update: Option<watch::Receiver<pi_ext::protocol::ProvidersUpdate>>,
     slots: Vec<SanitizedSlot>,
 }
 
@@ -414,6 +415,39 @@ impl PublishedRuntimeState {
                 .generation
                 .endpoint(endpoint)
                 .is_some_and(|endpoint| endpoint.runner.is_active())
+    }
+
+    /// Apply a live `providers.update` from one endpoint.
+    ///
+    /// Replaces only that endpoint's provider snapshot in the runner, then
+    /// rebuilds the aggregate in live endpoint order and rewires
+    /// `ModelRuntime`. The snapshot write lock is released before any
+    /// `ModelRuntime` call (it is held inside `apply_providers_update`
+    /// on the runner and released before we touch the runtime).
+    fn apply_providers_update(
+        &mut self,
+        endpoint: &Endpoint,
+        update: &pi_ext::protocol::ProvidersUpdate,
+    ) {
+        // Remove the pre-update aggregate before replacing this endpoint's
+        // authoritative snapshot, or an unregistered name disappears before
+        // ModelRuntime can remove its stale config and stream adapter.
+        let runtime = self.provider_runtime.clone();
+        if let Some(runtime) = &runtime {
+            unregister_endpoint_providers(&self.generation.endpoints, runtime);
+        }
+
+        endpoint.runner.apply_providers_update(update);
+
+        let Some(runtime) = runtime else {
+            return;
+        };
+        let active = self
+            .generation
+            .endpoints
+            .iter()
+            .filter(|ep| !self.retired.contains(&ep.id) && ep.runner.is_active());
+        register_endpoint_providers(active, &runtime);
     }
 
     fn retire_endpoint(&mut self, endpoint: EndpointId, channels: &FacadeChannels) -> bool {
@@ -1340,6 +1374,7 @@ impl ExtensionRuntimeSet {
                 ui,
                 ui_requests,
                 session_bridge,
+                providers_update,
                 slots: _,
             } = pending_endpoint;
             endpoint.runner.set_endpoint_id(endpoint.id);
@@ -1366,6 +1401,9 @@ impl ExtensionRuntimeSet {
             ));
             handles.extend(spawn_ui_relays(&context, ui, ui_requests));
             if let Some(handle) = spawn_session_relay(&context, session_bridge) {
+                handles.push(handle);
+            }
+            if let Some(handle) = spawn_providers_update_relay(&context, providers_update) {
                 handles.push(handle);
             }
         }
@@ -3055,6 +3093,7 @@ pub(crate) fn generation_from_endpoints(
             ui: endpoint.runner.subscribe_ui(),
             ui_requests: endpoint.runner.take_ui_requests(),
             session_bridge: endpoint.runner.take_session_bridge(),
+            providers_update: endpoint.runner.take_providers_updates(),
             slots: endpoint.runner.current_slots(),
             endpoint,
         })
@@ -3358,6 +3397,7 @@ fn spawn_session_relay(
                             None,
                         ),
                     };
+
                     routed.map(|routed| {
                         let failed = channels.session_bridge_tx.try_send(routed).is_err();
                         if failed && let Some(route_id) = route_id {
@@ -3386,6 +3426,36 @@ fn spawn_session_relay(
             }
             if let Some((token, owner)) = dropped_replacement {
                 abort_dropped_pending_ready(&replacement_ready_drop, &token, owner);
+            }
+        }
+    }))
+}
+/// Spawn the live `providers.update` relay for one endpoint.
+///
+/// Each update replaces only this endpoint's provider snapshot, then the
+/// aggregate is rebuilt in live endpoint order and `ModelRuntime` is
+/// rewired. Stale or retired endpoints are ignored.
+fn spawn_providers_update_relay(
+    context: &EndpointRelayContext,
+    rx: Option<watch::Receiver<pi_ext::protocol::ProvidersUpdate>>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let mut rx = rx?;
+    let state = context.state.clone();
+    let endpoint_id = context.endpoint.id;
+    Some(tokio::spawn(async move {
+        while rx.changed().await.is_ok() {
+            let update = rx.borrow_and_update().clone();
+            if let Some(set) = state.upgrade() {
+                let mut set = set
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if set.stale || set.shutdown_done || set.retired.contains(&endpoint_id) {
+                    continue;
+                }
+                let Some(endpoint) = set.generation.endpoint(endpoint_id).cloned() else {
+                    continue;
+                };
+                set.apply_providers_update(&endpoint, &update);
             }
         }
     }))
@@ -5810,6 +5880,111 @@ pub(crate) mod tests {
         second_host.wait_for_request("command.execute").await?;
         assert_eq!(first_host.request_count("command.execute"), 0);
         set.shutdown_once().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_update_relay_keeps_latest_complete_snapshot() -> TestResult {
+        let (runner, host) = make_runner(json!({
+            "providers": [shared_provider("https://old.example/v1")],
+            "handlers": [],
+            "terminalInput": false
+        }))
+        .await?;
+        let (generation, pending) = generation_from_endpoints(
+            1,
+            vec![(
+                EndpointKind::TsCompat,
+                "<provider-update>".to_owned(),
+                runner,
+            )],
+        );
+
+        host.emit(Frame {
+            id: 0,
+            kind: FrameKind::Event,
+            method: pi_ext::protocol::PROVIDERS_UPDATE_METHOD.to_owned(),
+            payload: json!({
+                "providers": [{
+                    "name": "pre-spawn",
+                    "baseUrl": "https://pre.example/v1",
+                    "api": "openai-completions"
+                }]
+            }),
+        })
+        .await;
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            while !pending[0]
+                .providers_update
+                .as_ref()
+                .is_some_and(|receiver| receiver.has_changed().unwrap_or(false))
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "pre-spawn provider update did not reach the watch receiver")?;
+
+        let set = Arc::new(ExtensionRuntimeSet::from_generation(
+            generation,
+            Vec::new(),
+            String::new(),
+            false,
+        ));
+        set.install(pending);
+        let runtime = ModelRuntime::create_in_memory().await?;
+        assert!(
+            set.register_providers_on(&runtime)
+                .into_iter()
+                .all(|(_, result)| result.is_ok())
+        );
+
+        for (name, base_url) in [
+            ("transient", "https://transient.example/v1"),
+            ("final-provider", "https://final.example/v1"),
+        ] {
+            host.emit(Frame {
+                id: 0,
+                kind: FrameKind::Event,
+                method: pi_ext::protocol::PROVIDERS_UPDATE_METHOD.to_owned(),
+                payload: json!({
+                    "providers": [{
+                        "name": name,
+                        "baseUrl": base_url,
+                        "api": "openai-completions"
+                    }]
+                }),
+            })
+            .await;
+        }
+
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            loop {
+                let final_config = runtime.get_registered_provider_config("final-provider");
+                if final_config
+                    .as_ref()
+                    .and_then(|config| config.base_url.as_deref())
+                    == Some("https://final.example/v1")
+                    && runtime
+                        .get_registered_provider_config("shared-provider")
+                        .is_none()
+                    && runtime
+                        .get_registered_provider_config("pre-spawn")
+                        .is_none()
+                    && runtime
+                        .get_registered_provider_config("transient")
+                        .is_none()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "provider runtime did not converge on the latest complete snapshot")?;
+
+        set.shutdown_once().await;
+        host.wait_for_exit().await?;
         Ok(())
     }
 

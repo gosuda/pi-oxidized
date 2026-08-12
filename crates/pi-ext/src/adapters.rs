@@ -1182,6 +1182,11 @@ impl Registry {
         true
     }
 
+    /// Remove all registered providers.
+    pub fn clear_providers(&mut self) {
+        self.providers.clear();
+    }
+
     /// Look up a tool by name.
     #[must_use]
     pub fn tool(&self, name: &str) -> Option<&ToolRegistration> {

@@ -13,6 +13,13 @@
  *     v3/{basic,branched-labels,compacted-twice,unknown-entries,
  *         forked-header,custom-messages,branched-session}.jsonl
  *     <same>.expected.json  (context/tree/labels/name/leaf + originalLines)
+ *     manifest.json (published last, after stale-pair pruning)
+ *
+ * Reruns converge on the same tree: after every current `.jsonl` and
+ * matching `.expected.json` pair is written, unlisted stale pairs under
+ * the output directory are removed and only then is the manifest
+ * published. The output directory itself is never deleted, so a failed
+ * run preserves the previous complete tree and manifest.
  *
  * Normalization (must be reproducible by Rust-side test helpers):
  *   - session id  → 00000000-0000-7000-8000-0000000000NN (per fixture)
@@ -29,7 +36,7 @@
  * Usage: bun scripts/generate-session-fixtures.ts
  */
 
-import { access, mkdir, rename, writeFile } from "node:fs/promises";
+import { access, mkdir, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import {
 	appendFileSync,
 	constants as fsConstants,
@@ -313,7 +320,9 @@ async function loadReference(): Promise<void> {
 	}
 
 	ref = {
-		SessionManager: SessionManager as SessionManagerStatic,
+		// Escape hatch: the read-only `.references/pi` module is imported
+		// untyped at runtime; the typeof check above is the runtime gate.
+		SessionManager: SessionManager as unknown as SessionManagerStatic,
 		migrateSessionEntries: migrateSessionEntries as (
 			entries: FileEntry[],
 		) => void,
@@ -599,7 +608,7 @@ function migrateAndNormalize(
 // Expected-view collection
 // ---------------------------------------------------------------------------
 
-interface CollectedView {
+export interface CollectedView {
 	header: SessionHeader;
 	entries: SessionEntryBase[];
 	tree: SessionTreeNode[];
@@ -961,10 +970,90 @@ async function writeAtomically(path: string, contents: string): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Stale fixture pruning
+// ---------------------------------------------------------------------------
+
+const FIXTURE_MANIFEST_NAME = "manifest.json";
+
+/**
+ * Enumerate generator-owned fixture files under `outDir`, grouped by the
+ * `.jsonl` rel that owns them.
+ *
+ * Ownership is conservative: only regular files ending in `.jsonl`, or in
+ * `.expected.json` (owned by the sibling `.jsonl` rel), are listed.
+ * Unrelated files and directories never appear here and are therefore
+ * never removed.
+ */
+async function listOwnedFixtureFiles(
+	outDir: string,
+): Promise<Map<string, string[]>> {
+	const owned = new Map<string, string[]>();
+	let names: string[];
+	try {
+		names = await readdir(outDir, { recursive: true });
+	} catch (error) {
+		const code = error instanceof Error
+			? (error as Error & { code?: string }).code
+			: undefined;
+		if (code === "ENOENT") return owned;
+		throw error;
+	}
+	for (const name of names) {
+		const rel = String(name);
+		let isFile: boolean;
+		try {
+			isFile = (await stat(join(outDir, rel))).isFile();
+		} catch {
+			continue; // vanished between readdir and stat
+		}
+		if (!isFile) continue;
+		let owner: string | null = null;
+		if (rel.endsWith(".jsonl")) {
+			owner = rel;
+		} else if (rel.endsWith(".expected.json")) {
+			owner = `${rel.slice(0, -".expected.json".length)}.jsonl`;
+		}
+		if (owner === null) continue;
+		const files = owned.get(owner) ?? [];
+		files.push(rel);
+		owned.set(owner, files);
+	}
+	return owned;
+}
+
+/**
+ * Remove stale generator-owned fixture pairs after every current pair has
+ * been written successfully. A pair is stale when its `.jsonl` rel is not
+ * in `listedRels`; a lone `.expected.json` whose `.jsonl` is missing is
+ * stale too. Listed pairs, unrelated files, and `outDir` itself are never
+ * touched, so fresh and dirty checkouts converge on the same tree and a
+ * failed run leaves the previous complete tree intact. The caller
+ * publishes the manifest only after this returns.
+ */
+export async function pruneStaleFixturePairs(
+	outDir: string,
+	listedRels: readonly string[],
+): Promise<string[]> {
+	const listed = new Set(listedRels);
+	const owned = await listOwnedFixtureFiles(outDir);
+	const removed: string[] = [];
+	for (const [owner, files] of [...owned.entries()].sort(([a], [b]) =>
+		a.localeCompare(b),
+	)) {
+		if (listed.has(owner)) continue;
+		for (const rel of files.sort()) {
+			await unlink(join(outDir, rel));
+			removed.push(rel);
+		}
+	}
+	return removed;
+}
+
+// ---------------------------------------------------------------------------
 // Scenario builders
 // ---------------------------------------------------------------------------
 
-interface BuiltFixture {
+export interface BuiltFixture {
 	/** Relative path under OUT_DIR, e.g. "v3/basic.jsonl" */
 	rel: string;
 	formatVersion: number;
@@ -1649,38 +1738,58 @@ interface WriteResult {
 	formatVersion: number;
 }
 
-async function main(): Promise<void> {
+export interface GenerateSessionFixturesOptions {
+	/** Output directory override (tests); defaults to OUT_DIR. */
+	outDir?: string;
+	/** Fixture set override (tests); defaults to the nine scenarios. */
+	fixtures?: BuiltFixture[];
+}
+
+export interface GenerateSessionFixturesResult {
+	outDir: string;
+	results: WriteResult[];
+	pruned: string[];
+}
+
+function buildDefaultFixtures(workRoot: string): BuiltFixture[] {
+	// Fixture index order (session id NN):
+	// 01 v1/linear-with-compaction
+	// 02 v2/branched
+	// 03 v3/basic
+	// 04 v3/branched-labels
+	// 05 v3/compacted-twice
+	// 06 v3/unknown-entries
+	// 07 v3/forked-header
+	// 08 v3/custom-messages
+	// 09 v3/branched-session
+	const fixtures: BuiltFixture[] = [];
+	fixtures.push(buildV1LinearWithCompaction(workRoot, 1));
+	fixtures.push(buildV2Branched(workRoot, 2));
+	fixtures.push(buildBasic(workRoot, 3));
+	const branchedLabels = buildBranchedLabels(workRoot, 4);
+	fixtures.push(branchedLabels);
+	fixtures.push(buildCompactedTwice(workRoot, 5));
+	fixtures.push(buildUnknownEntries(workRoot, 6));
+	fixtures.push(buildForkedHeader(workRoot, 7));
+	fixtures.push(buildCustomMessages(workRoot, 8));
+	fixtures.push(
+		buildBranchedSession(workRoot, 9, branchedLabels.lines),
+	);
+	return fixtures;
+}
+
+export async function generateSessionFixtures(
+	options: GenerateSessionFixturesOptions = {},
+): Promise<GenerateSessionFixturesResult> {
 	assertBunRuntime();
 	await loadReference();
 
+	const outDir = options.outDir ?? OUT_DIR;
 	const workRoot = mkdtempSync(join(tmpdir(), "pi-session-fixtures-"));
 	const results: WriteResult[] = [];
 
 	try {
-		// Fixture index order (session id NN):
-		// 01 v1/linear-with-compaction
-		// 02 v2/branched
-		// 03 v3/basic
-		// 04 v3/branched-labels
-		// 05 v3/compacted-twice
-		// 06 v3/unknown-entries
-		// 07 v3/forked-header
-		// 08 v3/custom-messages
-		// 09 v3/branched-session
-		const fixtures: BuiltFixture[] = [];
-
-		fixtures.push(buildV1LinearWithCompaction(workRoot, 1));
-		fixtures.push(buildV2Branched(workRoot, 2));
-		fixtures.push(buildBasic(workRoot, 3));
-		const branchedLabels = buildBranchedLabels(workRoot, 4);
-		fixtures.push(branchedLabels);
-		fixtures.push(buildCompactedTwice(workRoot, 5));
-		fixtures.push(buildUnknownEntries(workRoot, 6));
-		fixtures.push(buildForkedHeader(workRoot, 7));
-		fixtures.push(buildCustomMessages(workRoot, 8));
-		fixtures.push(
-			buildBranchedSession(workRoot, 9, branchedLabels.lines),
-		);
+		const fixtures = options.fixtures ?? buildDefaultFixtures(workRoot);
 
 		for (const built of fixtures) {
 			const fixtureName = built.rel.replace(/\.jsonl$/, "");
@@ -1703,9 +1812,9 @@ async function main(): Promise<void> {
 				tmpLeakNeedle: workRoot,
 			});
 
-			const jsonlPath = join(OUT_DIR, built.rel);
+			const jsonlPath = join(outDir, built.rel);
 			const expectedPath = join(
-				OUT_DIR,
+				outDir,
 				built.rel.replace(/\.jsonl$/, ".expected.json"),
 			);
 
@@ -1728,6 +1837,15 @@ async function main(): Promise<void> {
 		}
 	}
 
+	// Prune stale generator-owned pairs only after every current pair was
+	// written successfully; publish the manifest only after pruning. OUT_DIR
+	// is never deleted: a failed run leaves the previous complete tree and
+	// manifest intact.
+	const pruned = await pruneStaleFixturePairs(
+		outDir,
+		results.map((r) => r.rel),
+	);
+
 	// Authoritative manifest: the Rust interop test reads this at runtime
 	// instead of scraping the generator source, so the expected fixture
 	// count always reflects what was actually written to disk.
@@ -1736,9 +1854,15 @@ async function main(): Promise<void> {
 		fixtures: results.map((r) => r.rel),
 	};
 	await writeAtomically(
-		join(OUT_DIR, "manifest.json"),
+		join(outDir, FIXTURE_MANIFEST_NAME),
 		`${JSON.stringify(manifest, null, 2)}\n`,
 	);
+
+	return { outDir, results, pruned };
+}
+
+async function main(): Promise<void> {
+	const { outDir, results, pruned } = await generateSessionFixtures();
 
 	// Summary
 	const totalJsonl = results.length;
@@ -1748,10 +1872,15 @@ async function main(): Promise<void> {
 	const totalContext = results.reduce((n, r) => n + r.contextMessages, 0);
 
 	const linesOut: string[] = [
-		`Wrote ${totalJsonl} JSONL + ${totalExpected} expected under ${OUT_DIR}`,
+		`Wrote ${totalJsonl} JSONL + ${totalExpected} expected under ${outDir}`,
 		`totals: lines=${totalLines} entries=${totalEntries} contextMessages=${totalContext}`,
 		`source: ${REF_SESSION_MANAGER}`,
 	];
+	if (pruned.length > 0) {
+		linesOut.push(
+			`pruned ${pruned.length} stale fixture file(s): ${pruned.join(", ")}`,
+		);
+	}
 	for (const r of results) {
 		linesOut.push(
 			`  ${r.rel}: v${r.formatVersion} lines=${r.jsonlLines} entries=${r.entries} context=${r.contextMessages}`,
@@ -1760,4 +1889,6 @@ async function main(): Promise<void> {
 	process.stdout.write(`${linesOut.join("\n")}\n`);
 }
 
-await main();
+if (import.meta.main) {
+	await main();
+}

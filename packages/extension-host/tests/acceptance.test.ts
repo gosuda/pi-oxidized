@@ -2081,6 +2081,72 @@ describe("extension theme API", () => {
 		await runPromise.catch(() => void 0);
 	});
 
+	test("theme.update preserves overlay state and propagates the new theme without re-invoking the factory", async () => {
+		let factoryCalls = 0;
+		let capturedDone: ((result: unknown) => void) | undefined;
+		let capturedComponent: {
+			state: { value: string };
+			render: () => string[];
+		} | undefined;
+		const overlayFactory: ExtensionFactory = (pi) => {
+			pi.registerCommand("stateful-overlay", {
+				description: "Creates a stateful overlay",
+				async handler(_args, ctx) {
+					await ctx.ui.custom((_tui, theme, _keybindings, done) => {
+						factoryCalls++;
+						const component = {
+							state: { value: "initial" },
+							render: () => [`overlay-${theme.name}`],
+						};
+						capturedComponent = component;
+						capturedDone = done;
+						return Promise.resolve(component);
+					});
+				},
+			});
+		};
+		const { collector, stdin, host, runPromise } = await connectHost([overlayFactory]);
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 64, kind: "req", method: "command.execute",
+			payload: { command: "stateful-overlay", args: "" },
+		})));
+		const firstSlot = await collector.awaitFrame((f) => f.method === "uiSlot");
+		const slotCountBefore = collector.frames.filter((f) => f.method === "uiSlot").length;
+		expect(factoryCalls).toBe(1);
+		const initialComponent = capturedComponent;
+		expect(initialComponent).toBeDefined();
+		// Mutate the state to prove it survives the theme update.
+		initialComponent!.state.value = "mutated";
+
+		// Push a theme.update through the full frame decode path — the overlay must NOT re-invoke the factory.
+		stdin.push(Buffer.from(encodeFrameString(themeUpdateFrame("red"))));
+
+		// Await the re-render uiSlot before asserting overlay behavior.
+		await collector.awaitFrame((f) =>
+			f.method === "uiSlot"
+			&& collector.frames.filter((frame) => frame.method === "uiSlot").length > slotCountBefore,
+		);
+
+		// (a) factory invoked exactly once — NOT re-invoked.
+		expect(factoryCalls).toBe(1);
+		// (b) component object reference unchanged and state survives.
+		expect(capturedComponent).toBe(initialComponent);
+		expect(capturedComponent?.state.value).toBe("mutated");
+		// (c) the re-render uses the new theme without updateTheme.
+		const repushed = collector.frames.filter((f) => f.method === "uiSlot").at(-1);
+		expect((repushed?.payload as Record<string, unknown>)["key"])
+			.toBe((firstSlot.payload as Record<string, unknown>)["key"]);
+		expect(JSON.stringify(repushed?.payload)).toContain("overlay-red");
+
+		// Complete the overlay and await the command response.
+		capturedDone?.("complete");
+		await collector.awaitFrame((f) => f.id === 64 && f.kind === "res");
+
+		stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
+	});
+
 	test("theme.update re-renders live slots with the new theme", async () => {
 		const { collector, stdin, host, runPromise } = await connectHost([toolFactory]);
 		// tool.ts greet does not set a widget; use setWidget via the host's UI
@@ -2106,16 +2172,15 @@ describe("extension theme API", () => {
 		await runPromise.catch(() => void 0);
 	});
 
-	test("theme.update recreates factory slots with the new theme and disposes the old component once", async () => {
+	test("theme.update preserves widget identity and re-renders with the new theme", async () => {
 		const disposed: number[] = [];
 		let factoryCalls = 0;
 		const themeCaptureFactory: ExtensionFactory = (pi) => {
 			pi.on("session_start", (_event, ctx) => {
 				ctx.ui.setWidget("widget.theme-capture", (_tui, theme) => {
 					const instance = factoryCalls++;
-					const rendered = theme.fg("accent", "theme-capture");
 					return {
-						render: () => [rendered],
+						render: () => [theme.fg("accent", "theme-capture")],
 						dispose: () => disposed.push(instance),
 					};
 				});
@@ -2133,217 +2198,51 @@ describe("extension theme API", () => {
 			&& (frame.payload as Record<string, unknown>)["key"] === "widget.theme-capture"
 			&& collector.frames.filter((candidate) => candidate.method === "uiSlot").length > priorSlotCount,
 		);
+		// Same component instance: factory never re-invoked, dispose never called.
+		expect(factoryCalls).toBe(1);
+		expect(disposed).toEqual([]);
 		expect((updated.payload as Record<string, unknown>)["generation"])
 			.toBe((initial.payload as Record<string, unknown>)["generation"]);
 		expect((updated.payload as Record<string, unknown>)["runs"])
 			.not.toEqual((initial.payload as Record<string, unknown>)["runs"]);
-		expect(disposed).toEqual([0]);
 
 		stdin.push(null);
 		host.dispose("test");
 		await runPromise.catch(() => void 0);
 	});
 
-	test("failed factory recreation reports an error and retains the existing slot", async () => {
-		const disposed: string[] = [];
-		const failureFactory: ExtensionFactory = (pi) => {
+	test("component render throw emits extensionError and leaves the slot consistent", async () => {
+		const normalFactory: ExtensionFactory = (pi) => {
 			pi.on("session_start", (_event, ctx) => {
-				ctx.ui.setWidget("widget.theme-failure", (_tui, theme) => {
-					if (theme.name === "broken") throw new Error("theme factory failed");
-					const name = String(theme.name);
-					return {
-						render: () => [`factory-${name}`],
-						dispose: () => disposed.push(name),
-					};
-				});
+				ctx.ui.setWidget("widget.ok", ["ok"]);
 			});
 		};
-		const { collector, stdin, host, runPromise } = await connectHost([failureFactory]);
+		const throwFactory: ExtensionFactory = (pi) => {
+			pi.on("session_start", (_event, ctx) => {
+				ctx.ui.setWidget("widget.throw", () => ({
+					render: () => { throw new Error("render throw"); },
+				}));
+			});
+		};
+		const { collector, stdin, host, runPromise } = await connectHost([normalFactory, throwFactory]);
 		await sendSessionStart(stdin, collector);
-		const initial = await collector.awaitFrame((frame) =>
-			frame.method === "uiSlot" && (frame.payload as Record<string, unknown>)["key"] === "widget.theme-failure",
-		);
-		(host as unknown as { applyThemeUpdate(update: unknown): void }).applyThemeUpdate(themeUpdateFrame("broken").payload);
+
+		// The throwing widget emits an extensionError, not a transport error.
 		const error = await collector.awaitFrame((frame) =>
 			frame.method === "extensionError"
-			&& String((frame.payload as Record<string, unknown>)["message"]).includes("theme factory failed"),
+			&& String((frame.payload as Record<string, unknown>)["message"]).includes("component.render"),
 		);
 		expect((error.payload as Record<string, unknown>)["code"]).toBe("extension_error");
-		expect(disposed).toEqual([]);
+
+		// A sibling slot still got a uiSlot; transport is alive.
+		expect(collector.frames.some((f) => f.method === "uiSlot")).toBe(true);
+
+		// The failed slot is still addressable; render RPC returns an empty run list instead of crashing.
 		stdin.push(Buffer.from(encodeFrameString({
-			id: 63, kind: "req", method: "render", payload: { key: "widget.theme-failure", width: 80 },
+			id: 63, kind: "req", method: "render", payload: { key: "widget.throw", width: 80 },
 		})));
 		const rendered = await collector.awaitFrame((frame) => frame.id === 63 && frame.kind === "res");
-		expect((rendered.payload as Record<string, unknown>)["runs"])
-			.toEqual((initial.payload as Record<string, unknown>)["runs"]);
-
-		stdin.push(null);
-		host.dispose("test");
-		await runPromise.catch(() => void 0);
-	});
-
-	test("stale async custom-overlay resolution is disposed when done precedes resolution", async () => {
-		// ui.custom is the only declared-async slot factory (its factory return
-		// type is `unknown`, accepting a Promise). setWidget/setFooter/setHeader
-		// declare synchronous factories, so an async widget factory is off-type.
-		// ui.custom generates a unique key per call (host.ts:1633:
-		// `overlay.${nextGeneration++}`), so a same-key collision is impossible
-		// through the public API. The on-contract path to !isCurrent() is:
-		// the factory returns a pending Promise, then done() is called before
-		// it resolves — disposeSlot(key) removes the entry from this.slots, so
-		// when the Promise resolves, install() sees this.slots.get(key) !== entry
-		// and discards the stale component without emitting a uiSlot frame.
-		const disposed: string[] = [];
-		const staleComponent = {
-			render: () => ["stale-content"],
-			dispose: () => disposed.push("stale"),
-		};
-		const survivingComponent = {
-			render: () => ["surviving-content"],
-			dispose: () => disposed.push("surviving"),
-		};
-		const staleResolver = Promise.withResolvers<typeof staleComponent>();
-		const survivingResolver = Promise.withResolvers<typeof survivingComponent>();
-		const { promise: staleFactoryStarted, resolve: resolveStaleFactoryStarted } =
-			Promise.withResolvers<void>();
-		const { promise: survivingFactoryStarted, resolve: resolveSurvivingFactoryStarted } =
-			Promise.withResolvers<void>();
-		let staleDone: ((result: unknown) => void) | undefined;
-
-		const raceFactory: ExtensionFactory = (pi) => {
-			pi.registerCommand("custom-race", {
-				description: "Two overlapping custom overlays with controlled resolution",
-				async handler(_args, ctx) {
-					await Promise.all([
-						ctx.ui.custom((_tui, _theme, _kb, done) => {
-							staleDone = done;
-							resolveStaleFactoryStarted();
-							return staleResolver.promise;
-						}),
-						ctx.ui.custom((_tui, _theme, _kb, _done) => {
-							resolveSurvivingFactoryStarted();
-							return survivingResolver.promise;
-						}),
-					]);
-				},
-			});
-		};
-		const { collector, stdin, host, runPromise } = await connectHost([raceFactory]);
-		stdin.push(Buffer.from(encodeFrameString({
-			id: 65, kind: "req", method: "command.execute",
-			payload: { command: "custom-race", args: "" },
-		})));
-
-		// Wait for both factories to have been invoked so both Promises are
-		// pending and staleDone is captured.
-		await staleFactoryStarted;
-		await survivingFactoryStarted;
-
-		// No uiSlot yet — neither factory has resolved.
-		expect(collector.frames.some((f) => f.method === "uiSlot")).toBe(false);
-
-		// Dispose the first slot before its factory resolves. done() calls
-		// disposeSlot(key), removing the entry from this.slots. When the
-		// factory promise later resolves, install() sees !isCurrent() (the
-		// entry is gone), disposes the stale component, and emits no uiSlot.
-		staleDone?.("cancelled");
-
-		// Resolve the stale factory — its component must be disposed and no
-		// uiSlot frame emitted.
-		staleResolver.resolve(staleComponent);
-
-		// Wait on the observable the test cares about — the disposed list
-		// reaching its expected membership — before asserting the negative.
-		// The host emits no uiSlot here (stale resolution is suppressed), so
-		// awaitFrame cannot gate this step.
-		const sDeadline = Date.now() + 2_000;
-		while (disposed.length < 1 && Date.now() < sDeadline) {
-			await new Promise((r) => setTimeout(r, 1));
-		}
-		expect(disposed).toEqual(["stale"]);
-		expect(collector.frames.some((frame) => frame.method === "uiSlot")).toBe(false);
-
-		// Resolve the surviving factory — it installs and emits exactly one
-		// uiSlot frame carrying its own content.
-		survivingResolver.resolve(survivingComponent);
-		const latest = await collector.awaitFrame((frame) => frame.method === "uiSlot");
-		expect(JSON.stringify(latest.payload)).toContain("surviving-content");
-		expect(collector.frames.filter((frame) => frame.method === "uiSlot")).toHaveLength(1);
-
-		stdin.push(null);
-		host.dispose("test");
-		await runPromise.catch(() => void 0);
-	});
-
-	test("theme.update preserves overlay state and propagates the new theme without re-invoking the factory", async () => {
-		let factoryCalls = 0;
-		const updateThemeCalls: string[] = [];
-		let capturedDone: ((result: unknown) => void) | undefined;
-		let capturedComponent: {
-			state: { value: string };
-			render: () => string[];
-			updateTheme: (theme: unknown) => void;
-		} | undefined;
-		const overlayFactory: ExtensionFactory = (pi) => {
-			pi.registerCommand("stateful-overlay", {
-				description: "Creates a stateful overlay",
-				async handler(_args, ctx) {
-					await ctx.ui.custom((_tui, theme, _keybindings, done) => {
-						factoryCalls++;
-						const name = String((theme as { name?: unknown }).name ?? "dark");
-						const component = {
-							state: { value: "initial" },
-							render: () => [`overlay-${name}`],
-							updateTheme: (newTheme: unknown) => {
-								updateThemeCalls.push(
-									String((newTheme as { name?: unknown }).name ?? "?"),
-								);
-							},
-						};
-						capturedComponent = component;
-						capturedDone = done;
-						return Promise.resolve(component);
-					});
-				},
-			});
-		};
-		const { collector, stdin, host, runPromise } = await connectHost([overlayFactory]);
-		stdin.push(Buffer.from(encodeFrameString({
-			id: 64, kind: "req", method: "command.execute",
-			payload: { command: "stateful-overlay", args: "" },
-		})));
-		const firstSlot = await collector.awaitFrame((f) => f.method === "uiSlot");
-		const slotCountBefore = collector.frames.filter((f) => f.method === "uiSlot").length;
-		expect(factoryCalls).toBe(1);
-		const initialComponent = capturedComponent;
-		expect(initialComponent).toBeDefined();
-		// Mutate the state to prove it survives the theme update.
-		initialComponent!.state.value = "mutated";
-
-	// Push a theme.update through the full frame decode path — the overlay must NOT re-invoke the factory.
-	stdin.push(Buffer.from(encodeFrameString(themeUpdateFrame("red"))));
-
-	// Await the re-render uiSlot before asserting overlay behavior.
-	await collector.awaitFrame((f) =>
-		f.method === "uiSlot"
-		&& collector.frames.filter((frame) => frame.method === "uiSlot").length > slotCountBefore,
-	);
-
-	// (a) factory invoked exactly once — NOT re-invoked.
-	expect(factoryCalls).toBe(1);
-	// (b) component object reference unchanged and state survives.
-	expect(capturedComponent).toBe(initialComponent);
-	expect(capturedComponent?.state.value).toBe("mutated");
-	// (c) updateTheme received the new theme.
-	expect(updateThemeCalls).toEqual(["red"]);
-	// (d) the re-render uiSlot preserves the slot key.
-	const repushed = collector.frames.filter((f) => f.method === "uiSlot").at(-1);
-	expect((repushed?.payload as Record<string, unknown>)["key"])
-		.toBe((firstSlot.payload as Record<string, unknown>)["key"]);
-
-		// Complete the overlay and await the command response.
-		capturedDone?.("complete");
-		await collector.awaitFrame((f) => f.id === 64 && f.kind === "res");
+		expect(Array.isArray((rendered.payload as Record<string, unknown>)["runs"])).toBe(true);
 
 		stdin.push(null);
 		host.dispose("test");
@@ -2376,6 +2275,310 @@ describe("acceptance: built-in extensions load by default", () => {
 		const llamaCmd = commands.find((c) => c["name"] === "llama");
 		expect(llamaCmd).toBeDefined();
 		expect(llamaCmd?.["source"]).toBe("<inline:llama.cpp>");
+
+		stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
+	});
+});
+
+// ===========================================================================
+// 8. Host review-fix boundaries
+// ===========================================================================
+
+describe("acceptance: host review boundaries", () => {
+	test("callback overlayOptions resolve on every push and throw without sending a malformed slot", async () => {
+		const callbackOverlayFactory: ExtensionFactory = (pi) => {
+			pi.registerCommand("callbackOverlay", {
+				description: "Overlay with a callback options factory",
+				async handler(_args, ctx) {
+					let pushes = 0;
+					let throwNext = true;
+					let requestRender: (() => void) | undefined;
+					const coordination = globalThis as typeof globalThis & { __overlayRelease?: () => void };
+
+					// Set a normal sibling so transport survival is observable.
+					ctx.ui.setWidget("widget.callback-backdrop", ["backdrop"]);
+
+					const overlayPromise = ctx.ui.custom((tui, _theme, _keybindings, done) => {
+						requestRender = tui.requestRender;
+						let value = "ok";
+						return {
+							handleInput: (data: string) => {
+								if (data === "next") {
+									value = "changed";
+									tui.requestRender();
+								}
+								if (data === "done") done("ok");
+							},
+							render: () => [`overlay:${value}`],
+						};
+					}, {
+						overlayOptions: () => {
+							if (throwNext) {
+								throwNext = false;
+								throw new Error("overlay options throw");
+							}
+							pushes++;
+							return { title: `title-${pushes}` };
+						},
+					});
+
+					// Wait for the test to release the overlay so we can re-render.
+					await new Promise<void>((resolve) => {
+						coordination.__overlayRelease = resolve;
+					});
+					requestRender!();
+					await overlayPromise;
+				},
+			});
+		};
+
+		const { collector, stdin, host, runPromise } = await connectHost([callbackOverlayFactory]);
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 70, kind: "req", method: "command.execute",
+			payload: { command: "callbackOverlay", args: "" },
+		})));
+
+		// The first push throws in overlayOptions, so it emits an error and no overlay uiSlot.
+		const error = await collector.awaitFrame((frame) =>
+			frame.method === "extensionError"
+			&& String((frame.payload as Record<string, unknown>)["message"]).includes("overlayOptions"),
+		);
+		expect((error.payload as Record<string, unknown>)["code"]).toBe("extension_error");
+
+		// The sibling widget still pushed, so the transport is alive.
+		expect(collector.frames.some((f) =>
+			f.method === "uiSlot"
+			&& (f.payload as Record<string, unknown>)["key"] === "widget.callback-backdrop",
+		)).toBe(true);
+
+		// Release the re-render; the second push resolves options successfully.
+		const coordination = globalThis as typeof globalThis & { __overlayRelease?: () => void };
+		coordination.__overlayRelease?.();
+		delete coordination.__overlayRelease;
+
+		const firstOverlay = await collector.awaitFrame((frame) =>
+			frame.method === "uiSlot"
+			&& (frame.payload as Record<string, unknown>)["placement"] === "overlay",
+		);
+		const firstPayload = firstOverlay.payload as Record<string, unknown>;
+		const firstOptions = firstPayload["overlayOptions"] as Record<string, unknown> | undefined;
+		expect(firstOptions?.["title"]).toBe("title-1");
+		const key = firstPayload["key"] as string;
+		const generation = firstPayload["generation"] as number;
+
+		// Trigger another render; the callback should produce different options.
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 71, kind: "req", method: "uiEvent",
+			payload: {
+				key,
+				generation,
+				event: { type: "key", code: "n", modifiers: {}, kind: "press" },
+				data: "next",
+			},
+		})));
+		await collector.awaitFrame((frame) => frame.id === 71 && frame.kind === "res");
+
+		const firstOverlayIndex = collector.frames.indexOf(firstOverlay);
+		const secondOverlay = await collector.awaitFrame((frame) =>
+			collector.frames.indexOf(frame) > firstOverlayIndex
+			&& frame.method === "uiSlot"
+			&& typeof frame.payload === "object"
+			&& frame.payload !== null
+			&& "key" in frame.payload
+			&& frame.payload.key === key,
+		);
+		const secondPayload = secondOverlay.payload;
+		if (
+			typeof secondPayload !== "object"
+			|| secondPayload === null
+			|| !("overlayOptions" in secondPayload)
+		) {
+			throw new Error("second overlay omitted overlayOptions");
+		}
+		const secondOptions = secondPayload.overlayOptions;
+		if (
+			typeof secondOptions !== "object"
+			|| secondOptions === null
+			|| !("title" in secondOptions)
+		) {
+			throw new Error("second overlay options omitted title");
+		}
+		expect(secondOptions.title).toBe("title-2");
+
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 72, kind: "req", method: "uiEvent",
+			payload: {
+				key,
+				generation,
+				event: { type: "key", code: "d", modifiers: {}, kind: "press" },
+				data: "done",
+			},
+		})));
+		await collector.awaitFrame((frame) => frame.id === 70 && frame.kind === "res");
+
+		stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
+	});
+
+	test("component dispose throw emits extensionError and the new slot still installs", async () => {
+		const disposeThrowFactory: ExtensionFactory = (pi) => {
+			pi.registerCommand("disposeThrow", {
+				description: "Replace a widget whose dispose throws",
+				async handler(_args, ctx) {
+					ctx.ui.setWidget("widget.dispose-throw", () => ({
+						render: () => ["before"],
+						dispose: () => { throw new Error("dispose throw"); },
+					}));
+					ctx.ui.setWidget("widget.dispose-throw", ["after"]);
+				},
+			});
+		};
+
+		const { collector, stdin, host, runPromise } = await connectHost([disposeThrowFactory]);
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 75, kind: "req", method: "command.execute",
+			payload: { command: "disposeThrow", args: "" },
+		})));
+		await collector.awaitFrame((frame) => frame.id === 75 && frame.kind === "res");
+
+		// The throwing dispose was contained as an extensionError.
+		const error = collector.frames.find((frame) =>
+			frame.method === "extensionError"
+			&& String((frame.payload as Record<string, unknown>)["message"]).includes("component.dispose"),
+		);
+		expect(error).toBeDefined();
+
+		// The replacement slot was still pushed.
+		const slots = collector.frames.filter((frame) => frame.method === "uiSlot" && (frame.payload as Record<string, unknown>)["key"] === "widget.dispose-throw");
+		expect(slots.length).toBeGreaterThanOrEqual(1);
+		const lastPayload = slots.at(-1)!.payload as Record<string, unknown>;
+		expect(JSON.stringify(lastPayload["runs"])).toContain("after");
+
+		stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
+	});
+
+	test("older overlapping load cannot win", async () => {
+		const overlapPath = resolve(import.meta.dirname, "..", "fixtures", "extensions", "load-overlap.ts");
+		const { collector, stdin, host, runPromise } = await connectHost([]);
+		const coordination = globalThis as typeof globalThis & {
+			__overlapLoadStartedCount?: number;
+			__overlapLoadResolvers?: Array<() => void>;
+		};
+
+		// Start the first load.
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 80, kind: "req", method: "extensions.load",
+			payload: { extensionPaths: [overlapPath], cwd: process.cwd() },
+		})));
+		while ((coordination.__overlapLoadStartedCount ?? 0) < 1) {
+			await new Promise((r) => setTimeout(r, 5));
+		}
+
+		// Start a second load for the same path before the first finishes.
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 81, kind: "req", method: "extensions.load",
+			payload: { extensionPaths: [overlapPath], cwd: process.cwd() },
+		})));
+		while ((coordination.__overlapLoadStartedCount ?? 0) < 2) {
+			await new Promise((r) => setTimeout(r, 5));
+		}
+
+		// Release both simultaneously.
+		const resolvers = coordination.__overlapLoadResolvers ?? [];
+		for (const resolve of resolvers) resolve();
+		delete coordination.__overlapLoadResolvers;
+		delete coordination.__overlapLoadStartedCount;
+
+		await collector.awaitFrame((frame) => frame.id === 80 && frame.kind === "res");
+		await collector.awaitFrame((frame) => frame.id === 81 && frame.kind === "res");
+
+		// Probe the final registry with an empty load.
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 82, kind: "req", method: "extensions.load",
+			payload: { extensionPaths: [], cwd: process.cwd() },
+		})));
+		const probe = await collector.awaitFrame((frame) => frame.id === 82 && frame.kind === "res");
+		const providers = (probe.payload as Record<string, unknown>)["providers"] as Array<Record<string, unknown>>;
+		const names = providers.map((provider) => provider["name"]);
+		expect(names).not.toContain("overlap_provider_1");
+		expect(names).toContain("overlap_provider_2");
+
+		stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
+	});
+
+	test("live provider register and unregister emit providers.update snapshots", async () => {
+		const livePath = resolve(import.meta.dirname, "..", "fixtures", "extensions", "provider-live-register.ts");
+		const unregPath = resolve(import.meta.dirname, "..", "fixtures", "extensions", "provider-live-unregister.ts");
+		const { collector, stdin, host, runPromise } = await connectHost([]);
+
+		// Load the live-register fixture, then invoke its command.
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 90, kind: "req", method: "extensions.load",
+			payload: { extensionPaths: [livePath], cwd: process.cwd() },
+		})));
+		await collector.awaitFrame((frame) => frame.id === 90 && frame.kind === "res");
+
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 91, kind: "req", method: "command.execute",
+			payload: { command: "registerLiveProvider", args: "" },
+		})));
+		await collector.awaitFrame((frame) => frame.id === 91 && frame.kind === "res");
+
+		const liveUpdate = collector.frames.find((frame) =>
+			frame.method === "providers.update"
+			&& ((frame.payload as Record<string, unknown>)["providers"] as Array<Record<string, unknown>>)?.some((p) => p["name"] === "live_provider"),
+		);
+		expect(liveUpdate).toBeDefined();
+
+		// Load the live-unregister fixture and run its command.
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 92, kind: "req", method: "extensions.load",
+			payload: { extensionPaths: [unregPath], cwd: process.cwd() },
+		})));
+		await collector.awaitFrame((frame) => frame.id === 92 && frame.kind === "res");
+
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 93, kind: "req", method: "command.execute",
+			payload: { command: "unregisterLiveProvider", args: "" },
+		})));
+		await collector.awaitFrame((frame) => frame.id === 93 && frame.kind === "res");
+
+		const allProviderUpdates = collector.frames.filter((frame) => frame.method === "providers.update");
+		const unregisterUpdate = allProviderUpdates.at(-1);
+		expect(unregisterUpdate).toBeDefined();
+		const unregisterSnapshot = (unregisterUpdate!.payload as Record<string, unknown>)["providers"] as Array<Record<string, unknown>>;
+		expect(unregisterSnapshot.some((p) => p["name"] === "unreg_provider")).toBe(false);
+		expect(unregisterSnapshot.some((p) => p["name"] === "live_provider")).toBe(true);
+
+		stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
+	});
+
+	test("staged and aborted provider changes do not emit providers.update", async () => {
+		const throwPath = resolve(import.meta.dirname, "..", "fixtures", "extensions", "provider-register-throw.ts");
+		const { collector, stdin, host, runPromise } = await connectHost([]);
+
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 95, kind: "req", method: "extensions.load",
+			payload: { extensionPaths: [throwPath], cwd: process.cwd() },
+		})));
+		const res = await collector.awaitFrame((frame) => frame.id === 95 && frame.kind === "res");
+		expect((res.payload as Record<string, unknown>)["extensions"]).toBe(0);
+
+		// No live providers.update event should have been emitted for the staged/rolled-back registration.
+		const badUpdate = collector.frames.find((frame) =>
+			frame.method === "providers.update"
+			&& ((frame.payload as Record<string, unknown>)["providers"] as Array<Record<string, unknown>>)?.some((p) => p["name"] === "throw_provider"),
+		);
+		expect(badUpdate).toBeUndefined();
 
 		stdin.push(null);
 		host.dispose("test");

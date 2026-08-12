@@ -55,7 +55,13 @@ use crate::protocol::{
 pub const OUTBOUND_CAPACITY: usize = 128;
 /// Default bounded capacity for the unsolicited event broadcast.
 pub const EVENT_CAPACITY: usize = 256;
-/// Default bounded capacity for per-call streaming event channels.
+/// Default bounded capacity for the lossless correlated-request channel.
+/// Correlated host requests (setModel, compact, newSession, …) must never be
+/// silently dropped; when this capacity is exceeded the host receives an
+/// explicit error response instead of a timeout.
+pub const CORRELATED_REQUEST_CAPACITY: usize = 64;
+/// Capacity of each per-stream provider event channel (bounded, lossless
+/// until saturated; saturation fails with an error, never silently drops).
 pub const STREAM_EVENT_CAPACITY: usize = 64;
 /// Grace period before killing the host on shutdown.
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
@@ -195,8 +201,17 @@ struct Shared {
     session_control_handler: StdMutex<Option<HostSessionControlHandler>>,
     /// slot key → latest accepted generation. Stale pushes are discarded.
     slot_generations: StdMutex<HashMap<String, u64>>,
-    /// Unsolicited event fan-out.
+    /// Unsolicited event fan-out (lossy broadcast).
     events: broadcast::Sender<HostEvent>,
+    /// Outbound frame sender mirror, so `dispatch` can send explicit error
+    /// responses for correlated requests that cannot be delivered losslessly.
+    outbound: StdMutex<Option<mpsc::Sender<Frame>>>,
+    /// Bounded lossless channel for correlated host requests (setModel,
+    /// compact, newSession, fork, navigateTree, switchSession, reload,
+    /// setupEntries). Unlike the lossy `events` broadcast, every accepted
+    /// request must reach exactly one consumer or receive an explicit error
+    /// response when delivery is unavailable/full/closed.
+    correlated_requests: mpsc::Sender<HostEvent>,
     /// Monotonic request id allocator.
     next_id: AtomicU64,
     /// Monotonic generation stamped onto each `PendingEntry` so a delayed
@@ -320,6 +335,10 @@ pub enum HostEvent {
     },
     /// Extension fire-and-forget UI control (`ui.setStatus`, …).
     UiControl(crate::protocol::UiControl),
+    /// Live provider registry update (`providers.update`). Carries the
+    /// sender endpoint's complete current provider list after a committed
+    /// live mutation (register/unregister from a command or callback).
+    ProvidersUpdate(crate::protocol::ProvidersUpdate),
     /// Untyped / unrecognized frame.
     Raw(Frame),
     /// Host stdout closed.
@@ -396,13 +415,15 @@ impl From<HostError> for HostClientError {
         }
     }
 }
-
 /// Multiplexed host client.
 pub struct HostClient {
     cmd_tx: Mutex<Option<mpsc::Sender<Frame>>>,
     shared: Arc<Shared>,
     child: Mutex<Option<Child>>,
     reader_handle: Mutex<Option<JoinHandle<()>>>,
+    /// Sole lossless receiver for correlated host requests, taken once by the
+    /// event pump. Stored outside `Shared` so only the owning client can claim it.
+    correlated_requests_rx: StdMutex<Option<mpsc::Receiver<HostEvent>>>,
 }
 
 impl HostClient {
@@ -453,12 +474,16 @@ impl HostClient {
     ) -> Self {
         let (events_tx, _) = broadcast::channel(EVENT_CAPACITY);
         let (cmd_tx, cmd_rx) = mpsc::channel::<Frame>(OUTBOUND_CAPACITY);
+        let (correlated_tx, correlated_rx) =
+            mpsc::channel::<HostEvent>(CORRELATED_REQUEST_CAPACITY);
         let shared = Arc::new(Shared {
             pending: StdMutex::new(HashMap::new()),
             runtime: tokio::runtime::Handle::current(),
             session_control_handler: StdMutex::new(None),
             slot_generations: StdMutex::new(HashMap::new()),
             events: events_tx,
+            outbound: StdMutex::new(Some(cmd_tx.clone())),
+            correlated_requests: correlated_tx,
             next_id: AtomicU64::new(1),
             next_pending_generation: AtomicU64::new(1),
             stderr: StdMutex::new(String::new()),
@@ -480,12 +505,12 @@ impl HostClient {
         tokio::spawn(async move {
             stderr_task(stderr, stderr_shared).await;
         });
-
         Self {
             cmd_tx: Mutex::new(Some(cmd_tx)),
             shared,
             child: Mutex::new(child),
             reader_handle: Mutex::new(Some(reader_handle)),
+            correlated_requests_rx: StdMutex::new(Some(correlated_rx)),
         }
     }
 
@@ -514,6 +539,19 @@ impl HostClient {
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<HostEvent> {
         self.shared.events.subscribe()
+    }
+
+    /// Claim the sole lossless receiver for correlated host requests.
+    ///
+    /// The event pump calls this exactly once. Subsequent callers receive
+    /// `None`. While unclaimed, correlated requests receive an explicit error
+    /// response (the host observes a failure instead of a timeout).
+    #[must_use]
+    pub fn take_correlated_requests(&self) -> Option<mpsc::Receiver<HostEvent>> {
+        self.correlated_requests_rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 
     /// Install or clear the ordered session-control sink.
@@ -1154,6 +1192,13 @@ impl HostClient {
         self.shared.running.store(false, Ordering::Relaxed);
         // Drop the outbound sender so the writer EOFs stdin.
         drop(self.cmd_tx.lock().await.take());
+        drop(
+            self.shared
+                .outbound
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+        );
         // Cancel blocked stream delivery before reaping so the child can
         // drain stdout and observe stdin EOF during graceful shutdown.
         fail_all(
@@ -1585,10 +1630,15 @@ async fn dispatch(shared: &Shared, frame: Frame) -> bool {
             if frame.method == crate::protocol::SESSION_SET_MODEL_METHOD {
                 match from_payload::<crate::protocol::SessionSetModelRequest>(&frame.payload) {
                     Ok(request) => {
-                        let _ = shared.events.send(HostEvent::SetModelRequest {
-                            id: frame.id,
-                            request,
-                        });
+                        forward_correlated_request(
+                            shared,
+                            HostEvent::SetModelRequest {
+                                id: frame.id,
+                                request,
+                            },
+                            frame.id,
+                            crate::protocol::SESSION_SET_MODEL_METHOD,
+                        );
                     }
                     Err(_) => {
                         let _ = shared.events.send(HostEvent::Raw(frame));
@@ -1597,10 +1647,15 @@ async fn dispatch(shared: &Shared, frame: Frame) -> bool {
             } else if frame.method == crate::protocol::SESSION_COMPACT_METHOD {
                 match from_payload::<crate::protocol::SessionCompactRequest>(&frame.payload) {
                     Ok(request) => {
-                        let _ = shared.events.send(HostEvent::CompactRequest {
-                            id: frame.id,
-                            request,
-                        });
+                        forward_correlated_request(
+                            shared,
+                            HostEvent::CompactRequest {
+                                id: frame.id,
+                                request,
+                            },
+                            frame.id,
+                            crate::protocol::SESSION_COMPACT_METHOD,
+                        );
                     }
                     Err(_) => {
                         let _ = shared.events.send(HostEvent::Raw(frame));
@@ -1609,10 +1664,15 @@ async fn dispatch(shared: &Shared, frame: Frame) -> bool {
             } else if frame.method == crate::protocol::SESSION_NEW_SESSION_METHOD {
                 match from_payload::<crate::protocol::SessionNewSessionRequest>(&frame.payload) {
                     Ok(request) => {
-                        let _ = shared.events.send(HostEvent::NewSessionRequest {
-                            id: frame.id,
-                            request,
-                        });
+                        forward_correlated_request(
+                            shared,
+                            HostEvent::NewSessionRequest {
+                                id: frame.id,
+                                request,
+                            },
+                            frame.id,
+                            crate::protocol::SESSION_NEW_SESSION_METHOD,
+                        );
                     }
                     Err(_) => {
                         let _ = shared.events.send(HostEvent::Raw(frame));
@@ -1621,10 +1681,15 @@ async fn dispatch(shared: &Shared, frame: Frame) -> bool {
             } else if frame.method == crate::protocol::SESSION_FORK_METHOD {
                 match from_payload::<crate::protocol::SessionForkRequest>(&frame.payload) {
                     Ok(request) => {
-                        let _ = shared.events.send(HostEvent::ForkRequest {
-                            id: frame.id,
-                            request,
-                        });
+                        forward_correlated_request(
+                            shared,
+                            HostEvent::ForkRequest {
+                                id: frame.id,
+                                request,
+                            },
+                            frame.id,
+                            crate::protocol::SESSION_FORK_METHOD,
+                        );
                     }
                     Err(_) => {
                         let _ = shared.events.send(HostEvent::Raw(frame));
@@ -1633,10 +1698,15 @@ async fn dispatch(shared: &Shared, frame: Frame) -> bool {
             } else if frame.method == crate::protocol::SESSION_NAVIGATE_TREE_METHOD {
                 match from_payload::<crate::protocol::SessionNavigateTreeRequest>(&frame.payload) {
                     Ok(request) => {
-                        let _ = shared.events.send(HostEvent::NavigateTreeRequest {
-                            id: frame.id,
-                            request,
-                        });
+                        forward_correlated_request(
+                            shared,
+                            HostEvent::NavigateTreeRequest {
+                                id: frame.id,
+                                request,
+                            },
+                            frame.id,
+                            crate::protocol::SESSION_NAVIGATE_TREE_METHOD,
+                        );
                     }
                     Err(_) => {
                         let _ = shared.events.send(HostEvent::Raw(frame));
@@ -1645,10 +1715,15 @@ async fn dispatch(shared: &Shared, frame: Frame) -> bool {
             } else if frame.method == crate::protocol::SESSION_SWITCH_SESSION_METHOD {
                 match from_payload::<crate::protocol::SessionSwitchSessionRequest>(&frame.payload) {
                     Ok(request) => {
-                        let _ = shared.events.send(HostEvent::SwitchSessionRequest {
-                            id: frame.id,
-                            request,
-                        });
+                        forward_correlated_request(
+                            shared,
+                            HostEvent::SwitchSessionRequest {
+                                id: frame.id,
+                                request,
+                            },
+                            frame.id,
+                            crate::protocol::SESSION_SWITCH_SESSION_METHOD,
+                        );
                     }
                     Err(_) => {
                         let _ = shared.events.send(HostEvent::Raw(frame));
@@ -1657,9 +1732,12 @@ async fn dispatch(shared: &Shared, frame: Frame) -> bool {
             } else if frame.method == crate::protocol::SESSION_RELOAD_METHOD {
                 match from_payload::<crate::protocol::SessionReloadRequest>(&frame.payload) {
                     Ok(_request) => {
-                        let _ = shared
-                            .events
-                            .send(HostEvent::ReloadRequest { id: frame.id });
+                        forward_correlated_request(
+                            shared,
+                            HostEvent::ReloadRequest { id: frame.id },
+                            frame.id,
+                            crate::protocol::SESSION_RELOAD_METHOD,
+                        );
                     }
                     Err(_) => {
                         let _ = shared.events.send(HostEvent::Raw(frame));
@@ -1668,10 +1746,15 @@ async fn dispatch(shared: &Shared, frame: Frame) -> bool {
             } else if frame.method == crate::protocol::SESSION_SETUP_ENTRIES_METHOD {
                 match from_payload::<crate::protocol::SessionSetupEntriesRequest>(&frame.payload) {
                     Ok(request) => {
-                        let _ = shared.events.send(HostEvent::SetupEntriesRequest {
-                            id: frame.id,
-                            request,
-                        });
+                        forward_correlated_request(
+                            shared,
+                            HostEvent::SetupEntriesRequest {
+                                id: frame.id,
+                                request,
+                            },
+                            frame.id,
+                            crate::protocol::SESSION_SETUP_ENTRIES_METHOD,
+                        );
                     }
                     Err(_) => {
                         let _ = shared.events.send(HostEvent::Raw(frame));
@@ -1765,6 +1848,15 @@ fn forward_event(shared: &Shared, frame: Frame) -> bool {
                 let _ = shared.events.send(HostEvent::Raw(frame));
             }
         }
+    } else if method == crate::protocol::PROVIDERS_UPDATE_METHOD {
+        match from_payload::<crate::protocol::ProvidersUpdate>(&frame.payload) {
+            Ok(update) => {
+                let _ = shared.events.send(HostEvent::ProvidersUpdate(update));
+            }
+            Err(_) => {
+                let _ = shared.events.send(HostEvent::Raw(frame));
+            }
+        }
     } else if method == crate::protocol::SESSION_COMMAND_METHOD
         || method == crate::protocol::SESSION_REPLACEMENT_READY_METHOD
         || method == crate::protocol::SESSION_REPLACEMENT_ABORT_METHOD
@@ -1851,6 +1943,48 @@ fn forward_stream_event(shared: &Shared, frame: Frame) {
     if let Some(stream) = stream {
         // Non-blocking: a full channel drops the stale event (backpressure).
         let _ = stream.try_send(frame);
+    }
+}
+
+/// Forward a correlated host request through the bounded lossless channel.
+///
+/// Unlike the lossy `events` broadcast, every accepted request must reach
+/// exactly one consumer. When the channel is full or closed (consumer not yet
+/// claimed or teardown in progress), an explicit error frame is sent back to
+/// the host so the extension observes a failure instead of a timeout. The
+/// `try_send` never blocks the reader loop; teardown and cancellation can
+/// never block on a saturated queue.
+fn forward_correlated_request(shared: &Shared, event: HostEvent, id: FrameId, method: &str) {
+    match shared.correlated_requests.try_send(event) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            send_correlated_error(shared, id, method, "correlated request channel full");
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            send_correlated_error(shared, id, method, "no active session");
+        }
+    }
+}
+
+/// Send an error frame for a correlated request that could not be delivered.
+fn send_correlated_error(shared: &Shared, id: FrameId, method: &str, message: &str) {
+    let frame = Frame {
+        id,
+        kind: FrameKind::Error,
+        method: method.to_owned(),
+        payload: serde_json::to_value(crate::protocol::ErrorPayload::new(
+            "extension_error",
+            message,
+        ))
+        .unwrap_or(serde_json::Value::Null),
+    };
+    let outbound = shared
+        .outbound
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(tx) = outbound {
+        let _ = tx.try_send(frame);
     }
 }
 
@@ -3488,6 +3622,136 @@ mod tests {
         }
 
         assert!(client.is_running());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn correlated_request_reaches_exactly_one_consumer() -> R {
+        let (client, _host) = make_pair().await;
+        let mut correlated = client
+            .take_correlated_requests()
+            .ok_or("correlated receiver missing")?;
+
+        // Simulate the host sending a session.setModel request.
+        let frame = Frame {
+            id: 42,
+            kind: FrameKind::Req,
+            method: crate::protocol::SESSION_SET_MODEL_METHOD.to_owned(),
+            payload: serde_json::json!({"model": {"id": "gpt-x", "provider": "openai"}}),
+        };
+        // Dispatch directly through the shared state (bypassing the reader).
+        dispatch(&client.shared, frame).await;
+
+        let event = tokio::time::timeout(Duration::from_secs(1), correlated.recv())
+            .await
+            .map_err(|_| "correlated request timed out")?
+            .ok_or("correlated channel closed")?;
+        let HostEvent::SetModelRequest { id, .. } = event else {
+            return Err(format!("expected SetModelRequest, got {event:?}").into());
+        };
+        assert_eq!(id, 42);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn correlated_request_gets_error_when_channel_closed() -> R {
+        let (client, mut host) = make_pair().await;
+        // Drop the receiver without claiming it — simulates no event pump.
+        drop(client.take_correlated_requests());
+
+        // Send a session.setModel request from the host side.
+        host.write_frame(&Frame {
+            id: 99,
+            kind: FrameKind::Req,
+            method: crate::protocol::SESSION_SET_MODEL_METHOD.to_owned(),
+            payload: serde_json::json!({"model": {"id": "gpt-x", "provider": "openai"}}),
+        })
+        .await?;
+
+        // The client should send an error frame back.
+        let response = tokio::time::timeout(Duration::from_secs(1), host.read_frame())
+            .await
+            .map_err(|_| "no error response within timeout")?
+            .ok_or("host stream closed without error response")?;
+        assert_eq!(response.id, 99);
+        assert_eq!(response.kind, FrameKind::Error);
+        assert_eq!(response.method, crate::protocol::SESSION_SET_MODEL_METHOD);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn correlated_request_gets_error_when_channel_saturated() -> R {
+        let (client, mut host) = make_pair().await;
+        // Claim the receiver but never drain it — fills the bounded channel.
+        let _correlated = client
+            .take_correlated_requests()
+            .ok_or("correlated receiver missing")?;
+
+        // Send more correlated requests than CORRELATED_REQUEST_CAPACITY.
+        let total = CORRELATED_REQUEST_CAPACITY + 4;
+        for i in 1..=total {
+            host.write_frame(&Frame {
+                id: i as u64,
+                kind: FrameKind::Req,
+                method: crate::protocol::SESSION_RELOAD_METHOD.to_owned(),
+                payload: serde_json::json!({}),
+            })
+            .await?;
+        }
+
+        // At least one error frame should come back for the overflow.
+        let mut errors = 0;
+        for _ in 0..total {
+            match tokio::time::timeout(Duration::from_millis(200), host.read_frame()).await {
+                Ok(Some(frame)) if frame.kind == FrameKind::Error => {
+                    errors += 1;
+                }
+                _ => break,
+            }
+        }
+        assert!(
+            errors > 0,
+            "saturated correlated channel should produce at least one error response"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn broadcast_lag_does_not_lose_correlated_requests() -> R {
+        let (client, mut host) = make_pair().await;
+        let mut correlated = client
+            .take_correlated_requests()
+            .ok_or("correlated receiver missing")?;
+
+        // Flood the lossy broadcast with notifications to force a Lagged event.
+        // Correlated requests must still arrive through the lossless channel.
+        for _ in 0..(EVENT_CAPACITY + 10) {
+            host.write_frame(&Frame {
+                id: 0,
+                kind: FrameKind::Event,
+                method: Method::Notify.as_str().to_owned(),
+                payload: serde_json::json!({"message": "flood", "type": "info"}),
+            })
+            .await?;
+        }
+
+        // Now send a correlated request — it must arrive despite broadcast lag.
+        host.write_frame(&Frame {
+            id: 77,
+            kind: FrameKind::Req,
+            method: crate::protocol::SESSION_COMPACT_METHOD.to_owned(),
+            payload: serde_json::json!({}),
+        })
+        .await?;
+
+        let event = tokio::time::timeout(Duration::from_secs(2), correlated.recv())
+            .await
+            .map_err(|_| "correlated request lost during broadcast lag")?
+            .ok_or("correlated channel closed during broadcast lag")?;
+        let HostEvent::CompactRequest { id, .. } = event else {
+            return Err(format!("expected CompactRequest, got {event:?}").into());
+        };
+        assert_eq!(id, 77);
         Ok(())
     }
 }

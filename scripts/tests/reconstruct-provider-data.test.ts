@@ -906,11 +906,12 @@ function readLockOwner(lockDir: string): Record<string, unknown> {
 
 function lockOwnerRecord(overrides: Record<string, unknown> = {}): Record<string, unknown> {
 	return {
-		version: 1,
+		version: 2,
 		pid: process.pid,
 		token: crypto.randomUUID(),
 		createdAtMs: Date.now(),
 		phase: "held",
+		heartbeatAtMs: Date.now(),
 		...overrides,
 	};
 }
@@ -975,18 +976,25 @@ describe("reconstruction data-directory lock stale recovery (N16/N21)", () => {
 		}
 	});
 
-	test("a live owner is never reaped merely because its lock is old", async () => {
+	test("a live owner with a fresh heartbeat is never reaped merely because its lock is old", async () => {
 		const fx = makeLockFixture();
 		try {
 			const ancientMs = Date.now() - 3_600_000;
 			const liveToken = crypto.randomUUID();
-			writeLockOwner(fx.lockDir, lockOwnerRecord({ token: liveToken, createdAtMs: ancientMs }));
+			writeLockOwner(
+				fx.lockDir,
+				lockOwnerRecord({
+					token: liveToken,
+					createdAtMs: ancientMs,
+					heartbeatAtMs: Date.now(),
+				}),
+			);
 			const past = new Date(ancientMs);
 			utimesSync(fx.lockDir, past, past);
 
 			const error = await captureError(acquireDataDirectoryLock(fx.dataDir, 200));
 			expect(error.message).toContain(`live owner pid ${process.pid}`);
-			// Old but alive: the canonical lock is untouched and never quarantined.
+			// Old but alive and heartbeating: the canonical lock is untouched.
 			expect(lockArtifacts(fx.root)).toEqual(["data.lock"]);
 			expect(readLockOwner(fx.lockDir).token).toBe(liveToken);
 		} finally {
@@ -1198,6 +1206,174 @@ describe("reconstruction data-directory lock stale recovery (N16/N21)", () => {
 
 			const handle = await acquireDataDirectoryLock(fx.dataDir, 2_000);
 			await releaseDataDirectoryLock(handle);
+			expect(lockArtifacts(fx.root)).toEqual([]);
+		} finally {
+			rmSync(fx.root, { recursive: true, force: true });
+		}
+	});
+});
+
+// Real wall-clock delays are the exception case here: the heartbeat is a
+// production setInterval racing OS-backed rename/stat contention, which fake
+// timers cannot advance; each sleep is bounded just past one heartbeat
+// interval and the suite's existing contention tests already pay this cost.
+describe("lock heartbeat freshness under PID reuse (PRRT_kwDOTcPStM6YK-Fj)", () => {
+	test("a reused live PID with a stale heartbeat is reclaimed instead of wedging recovery", async () => {
+		const fx = makeLockFixture();
+		try {
+			// The recorded pid is this very process (a stand-in for an
+			// unrelated process that recycled a dead owner's pid), but the
+			// owner stopped heartbeating long ago: pid liveness alone would
+			// treat it as live forever.
+			writeLockOwner(
+				fx.lockDir,
+				lockOwnerRecord({
+					pid: process.pid,
+					createdAtMs: Date.now() - 120_000,
+					heartbeatAtMs: Date.now() - 60_000,
+				}),
+			);
+
+			const handle = await acquireDataDirectoryLock(fx.dataDir, 2_000);
+			expect(readLockOwner(fx.lockDir).token).toBe(handle.token);
+			expect(readLockOwner(fx.lockDir).phase).toBe("held");
+			await releaseDataDirectoryLock(handle);
+			expect(lockArtifacts(fx.root)).toEqual([]);
+		} finally {
+			rmSync(fx.root, { recursive: true, force: true });
+		}
+	});
+
+	test("a quarantined owner with a reused live PID is swept once its heartbeat goes stale", async () => {
+		const fx = makeLockFixture();
+		try {
+			writeLockOwner(
+				`${fx.lockDir}.reap-${crypto.randomUUID()}`,
+				lockOwnerRecord({
+					pid: process.pid,
+					createdAtMs: Date.now() - 120_000,
+					heartbeatAtMs: Date.now() - 60_000,
+				}),
+			);
+
+			const handle = await acquireDataDirectoryLock(fx.dataDir, 2_000);
+			await releaseDataDirectoryLock(handle);
+			expect(lockArtifacts(fx.root)).toEqual([]);
+		} finally {
+			rmSync(fx.root, { recursive: true, force: true });
+		}
+	});
+
+	test("a fresh real owner refreshes its heartbeat and cannot be stolen while contenders spin", async () => {
+		const fx = makeLockFixture();
+		try {
+			const holder = await acquireDataDirectoryLock(fx.dataDir, 5_000);
+			try {
+				// Real hold window long enough for at least one refresh beat.
+				await Bun.sleep(1_300);
+				const refreshed = readLockOwner(fx.lockDir);
+				expect(refreshed.token).toBe(holder.token);
+				expect(typeof refreshed.heartbeatAtMs).toBe("number");
+				expect(refreshed.heartbeatAtMs as number).toBeGreaterThan(
+					refreshed.createdAtMs as number,
+				);
+
+				const error = await captureError(acquireDataDirectoryLock(fx.dataDir, 250));
+				expect(error.message).toContain(`live owner pid ${process.pid}`);
+				// Fresh and live: never quarantined, never stolen.
+				expect(lockArtifacts(fx.root)).toEqual(["data.lock"]);
+				expect(readLockOwner(fx.lockDir).token).toBe(holder.token);
+			} finally {
+				await releaseDataDirectoryLock(holder);
+			}
+			expect(lockArtifacts(fx.root)).toEqual([]);
+		} finally {
+			rmSync(fx.root, { recursive: true, force: true });
+		}
+	});
+
+	test("takeover token race: recovering an observed stale token never deletes the live successor's lock", async () => {
+		const fx = makeLockFixture();
+		try {
+			const staleToken = crypto.randomUUID();
+			// Dead original owner with a reused-pid-proof stale heartbeat.
+			writeLockOwner(
+				fx.lockDir,
+				lockOwnerRecord({
+					token: staleToken,
+					pid: deadPid(),
+					createdAtMs: Date.now() - 120_000,
+					heartbeatAtMs: Date.now() - 60_000,
+				}),
+			);
+			const successor = await acquireDataDirectoryLock(fx.dataDir, 2_000);
+			expect(successor.token).not.toBe(staleToken);
+
+			// A delayed reaper acting on the earlier stale observation must
+			// lose the token recheck and leave the successor untouched.
+			const recovered = await recoverStaleLock(fx.dataDir, staleToken);
+			expect(recovered).toBe(false);
+			const successorArtifacts = lockArtifacts(fx.root);
+			expect(successorArtifacts).toHaveLength(1);
+			const successorDir = join(fx.root, successorArtifacts[0] ?? "");
+			expect(readLockOwner(successorDir).token).toBe(successor.token);
+			expect(readLockOwner(successorDir).phase).toBe("held");
+
+			// The successor's token-verified release still cleans everything,
+			// including the mismatched quarantine left by the failed takeover.
+			await releaseDataDirectoryLock(successor);
+			expect(lockArtifacts(fx.root)).toEqual([]);
+		} finally {
+			rmSync(fx.root, { recursive: true, force: true });
+		}
+	});
+
+	test("cleanup ownership: a reaped owner's heartbeat stops and its release never touches the successor's lock", async () => {
+		const fx = makeLockFixture();
+		try {
+			const old = await acquireDataDirectoryLock(fx.dataDir, 1_000);
+			// The old owner "dies" without releasing: same token, dead pid,
+			// stale heartbeat; its heartbeat self-stops on the identity change.
+			writeLockOwner(
+				fx.lockDir,
+				lockOwnerRecord({
+					token: old.token,
+					pid: deadPid(),
+					createdAtMs: Date.now() - 60_000,
+					heartbeatAtMs: Date.now() - 60_000,
+				}),
+			);
+			const successor = await acquireDataDirectoryLock(fx.dataDir, 3_000);
+			expect(successor.token).not.toBe(old.token);
+
+			// Delayed cleanup of the reaped owner: heartbeat already stopped,
+			// token-verified removal matches nothing.
+			await releaseDataDirectoryLock(old);
+
+			// A full heartbeat interval later the successor's record is intact
+			// and still owned by the successor.
+			await Bun.sleep(1_300);
+			const record = readLockOwner(fx.lockDir);
+			expect(record.token).toBe(successor.token);
+			expect(record.phase).toBe("held");
+
+			await releaseDataDirectoryLock(successor);
+			expect(lockArtifacts(fx.root)).toEqual([]);
+		} finally {
+			rmSync(fx.root, { recursive: true, force: true });
+		}
+	});
+
+	test("heartbeat work stops deterministically on failure and cannot resurrect a removed lock", async () => {
+		const fx = makeLockFixture();
+		try {
+			const holder = await acquireDataDirectoryLock(fx.dataDir, 1_000);
+			// External failure removes the lock directory while the owner
+			// still holds its handle.
+			rmSync(fx.lockDir, { recursive: true, force: true });
+			await releaseDataDirectoryLock(holder);
+			// Longer than one heartbeat interval: no beat may recreate it.
+			await Bun.sleep(1_300);
 			expect(lockArtifacts(fx.root)).toEqual([]);
 		} finally {
 			rmSync(fx.root, { recursive: true, force: true });

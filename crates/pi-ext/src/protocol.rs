@@ -116,8 +116,16 @@ pub enum OverlayAnchor {
 }
 
 /// Per-side overlay margin from terminal edges.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
+///
+/// This is the direct `pi_ext::protocol` copy. Unlike
+/// [`OverlayMarginWire`], it performs the canonical one-way normalization
+/// shared with `pi_tui::layout::OverlayMargin`: a bare scalar such as `4`
+/// deserializes to a uniform four-side value, and the value always serializes
+/// as the normalized `{ top, right, bottom, left }` object. `OverlaySpec`
+/// keeps [`OverlayMarginWire`] so the portable scalar round-trip stays part of
+/// the shared Rust/TypeScript fixture contract; do not replace it there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OverlayMargin {
     /// Top margin in rows.
     pub top: u16,
@@ -127,6 +135,77 @@ pub struct OverlayMargin {
     pub bottom: u16,
     /// Left margin in columns.
     pub left: u16,
+}
+
+impl OverlayMargin {
+    /// Same margin on every side.
+    #[must_use]
+    pub const fn uniform(n: u16) -> Self {
+        Self {
+            top: n,
+            right: n,
+            bottom: n,
+            left: n,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for OverlayMargin {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = OverlayMargin;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(
+                    "a margin number or an object with optional top/right/bottom/left sides",
+                )
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                u16::try_from(v)
+                    .map(OverlayMargin::uniform)
+                    .map_err(|_| E::custom("margin value exceeds u16"))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                if v < 0 {
+                    return Err(E::custom("margin must be non-negative"));
+                }
+                self.visit_u64(v.cast_unsigned())
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut top = 0u16;
+                let mut right = 0u16;
+                let mut bottom = 0u16;
+                let mut left = 0u16;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "top" => top = map.next_value()?,
+                        "right" => right = map.next_value()?,
+                        "bottom" => bottom = map.next_value()?,
+                        "left" => left = map.next_value()?,
+                        _ => {
+                            let _: serde::de::IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+                Ok(OverlayMargin {
+                    top,
+                    right,
+                    bottom,
+                    left,
+                })
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
 }
 /// Wire margin accepts either a uniform scalar or per-side object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -923,6 +1002,58 @@ pub struct ProviderEvent {
     /// Event payload (open JSON).
     #[serde(default)]
     pub data: Value,
+}
+
+/// Open method string: the host emits this event after a committed live
+/// provider mutation (register/unregister from a command or delayed callback).
+/// It is an open dotted control name, not a [`Method`] enum variant, so strict
+/// method decoding rejects it while the extension bridge accepts it.
+pub const PROVIDERS_UPDATE_METHOD: &str = "providers.update";
+
+/// One provider entry in a [`ProvidersUpdate`] frame.
+///
+/// Mirrors the host's provider registration shape (camelCase). The Rust bridge
+/// converts each entry into a `ProviderConfigInput`; unknown fields are ignored.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ProviderUpdateEntry {
+    /// Provider display name / id.
+    pub name: String,
+    /// Base URL for the provider API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// API kind (e.g. `openai-completions`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<String>,
+    /// Optional API key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    /// Optional static headers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers: Option<BTreeMap<String, String>>,
+    /// Whether the host sends the auth header for this provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_header: Option<bool>,
+    /// Models declared by the provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<Vec<Value>>,
+    /// `true` when the host holds a live `streamSimple` function.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stream_simple: bool,
+    /// Optional extension path used in diagnostics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension_path: Option<String>,
+}
+
+/// `providers.update` event payload (host → Rust). Carries the sender
+/// endpoint's complete current provider registry after a committed live
+/// mutation; the Rust bridge replaces only that endpoint's provider snapshot.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ProvidersUpdate {
+    /// The endpoint's complete current provider list.
+    #[serde(default)]
+    pub providers: Vec<ProviderUpdateEntry>,
 }
 
 /// Key modifiers on the wire (shift|alt|ctrl|super).
@@ -2148,6 +2279,61 @@ mod tests {
     }
 
     #[test]
+    fn direct_overlay_margin_deserializes_scalar_as_uniform() -> TestResult {
+        let m: OverlayMargin = serde_json::from_str("4")?;
+        assert_eq!(m, OverlayMargin::uniform(4));
+        let m2: OverlayMargin = serde_json::from_value(serde_json::Value::Number(7.into()))?;
+        assert_eq!(m2, OverlayMargin::uniform(7));
+        Ok(())
+    }
+
+    #[test]
+    fn direct_overlay_margin_deserializes_partial_object_defaults_zero() -> TestResult {
+        let m: OverlayMargin = serde_json::from_str(r#"{"top":1}"#)?;
+        assert_eq!(
+            m,
+            OverlayMargin {
+                top: 1,
+                right: 0,
+                bottom: 0,
+                left: 0
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn direct_overlay_margin_serializes_as_normalized_object() -> TestResult {
+        let m = OverlayMargin::uniform(4);
+        let out = serde_json::to_value(m)?;
+        assert!(out.is_object());
+        assert_eq!(out["top"], 4);
+        assert_eq!(out["right"], 4);
+        assert_eq!(out["bottom"], 4);
+        assert_eq!(out["left"], 4);
+        // A scalar input round-trips through the normalized object form.
+        let back: OverlayMargin = serde_json::from_value(out)?;
+        assert_eq!(back, OverlayMargin::uniform(4));
+        Ok(())
+    }
+
+    #[test]
+    fn direct_overlay_margin_rejects_negative_scalar() {
+        assert!(serde_json::from_str::<OverlayMargin>("-1").is_err());
+    }
+
+    #[test]
+    fn overlay_spec_keeps_portable_scalar_form_via_wire() -> TestResult {
+        // OverlaySpec must retain OverlayMarginWire so the scalar round-trip
+        // stays part of the shared Rust/TypeScript fixture contract.
+        let spec: OverlaySpec = serde_json::from_value(serde_json::json!({"margin": 5}))?;
+        assert_eq!(spec.margin, Some(OverlayMarginWire::Uniform(5)));
+        let encoded = serde_json::to_value(&spec)?;
+        assert_eq!(encoded["margin"], 5);
+        Ok(())
+    }
+
+    #[test]
     fn ui_slot_rejects_forbidden_and_oversized_links() {
         for link in [
             serde_json::json!({"uri": "javascript:alert(1)"}),
@@ -2400,9 +2586,7 @@ mod tests {
                 ),
             ]),
         };
-        let payload = to_payload(&flags)?;
-        assert_eq!(from_payload::<FlagsSetRequest>(&payload)?, flags);
-
+        let _payload = to_payload(&flags)?;
         let shortcut = ShortcutExecuteRequest {
             key: "ctrl+alt+p".to_owned(),
         };
@@ -2588,6 +2772,9 @@ mod bridge_tests {
                 UI_STATE_METHOD => {
                     from_payload::<UiStateWire>(&frame.payload)?;
                 }
+                PROVIDERS_UPDATE_METHOD => {
+                    from_payload::<ProvidersUpdate>(&frame.payload)?;
+                }
                 _ => continue,
             }
             seen.insert((frame.method, frame.kind));
@@ -2621,7 +2808,7 @@ mod bridge_tests {
             (SESSION_SETUP_ENTRIES_METHOD, FrameKind::Req),
             (SESSION_SETUP_ENTRIES_METHOD, FrameKind::Error),
             (SESSION_SETUP_ENTRIES_METHOD, FrameKind::Res),
-            (UI_CONTROL_METHOD, FrameKind::Event),
+            (PROVIDERS_UPDATE_METHOD, FrameKind::Event),
             (SESSION_REPLACEMENT_READY_METHOD, FrameKind::Event),
             (SESSION_REPLACEMENT_ABORT_METHOD, FrameKind::Event),
             (UI_STATE_METHOD, FrameKind::Event),

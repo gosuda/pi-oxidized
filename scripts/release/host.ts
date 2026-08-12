@@ -312,8 +312,8 @@ export function isHelloAckLine(line: string): boolean {
 /** Narrow a parsed frame into a hello-ack with the expected versions. */
 export function isHelloAck(frame: unknown): boolean {
 	if (typeof frame !== "object" || frame === null) return false;
-	const f = frame as { kind?: unknown; method?: unknown; payload?: unknown };
-	if (f.kind !== "res" || f.method !== "hello") return false;
+	const f = frame as { id?: unknown; kind?: unknown; method?: unknown; payload?: unknown };
+	if (f.kind !== "res" || f.method !== "hello" || f.id !== 1) return false;
 	if (typeof f.payload !== "object" || f.payload === null) return false;
 	const p = f.payload as { protocolVersion?: unknown; compatibilityVersion?: unknown };
 	return (

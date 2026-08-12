@@ -43,7 +43,17 @@ const DATA_MANIFEST_FILE = ".manifest.json";
 const MANIFEST_SCHEMA_VERSION = 3;
 // UTC time of the newest provider snapshot commit in pinned reference 4488ad55.
 const PINNED_PROVIDER_DATA_GENERATED_AT = "2026-07-30T07:01:42.000Z";
-const LOCK_OWNER_VERSION = 1;
+const LOCK_OWNER_VERSION = 2;
+/**
+ * Heartbeat freshness contract: while an owner holds the lock it atomically
+ * rewrites its owner record at this interval, and contenders classify a
+ * record whose heartbeat (or creation, before the first beat) is older than
+ * this bound as stale even when the recorded pid still exists — the pid may
+ * have been recycled for an unrelated process, so pid liveness alone can wedge
+ * recovery forever. PID death remains an immediate staleness signal.
+ */
+const LOCK_HEARTBEAT_INTERVAL_MS = 1_000;
+const LOCK_HEARTBEAT_STALE_MS = 5_000;
 type FileSystemError = Error & { code?: string };
 
 export type ProviderCatalog = Record<string, Record<string, unknown>>;
@@ -94,8 +104,8 @@ export type ReconstructProviderDataOptions = {
 	/**
 	 * Bounded lock acquisition: total milliseconds to wait for the data
 	 * directory lock before failing with owner/bounded-wait diagnostics. Must
-	 * be a finite positive integer; defaults to 10_000. A live lock owner is
-	 * never reaped — waiters simply time out at this bound.
+	 * be a finite positive integer; defaults to 10_000. A live owner with a
+	 * fresh heartbeat is never reaped — waiters simply time out at this bound.
 	 */
 	lockAcquireTimeoutMs?: number;
 	/**
@@ -136,6 +146,8 @@ export type ReconstructProviderDataResult = {
 export type DataDirectoryLockHandle = {
 	lockDir: string;
 	token: string;
+	/** Stops the owner heartbeat; awaited by release before any removal. */
+	stopHeartbeat?: () => Promise<void>;
 };
 
 function sortDeep(value: unknown): unknown {
@@ -271,6 +283,7 @@ type LockOwnerRecord = {
 	token: string;
 	createdAtMs: number;
 	phase: "initializing" | "held";
+	heartbeatAtMs: number;
 };
 
 type LockContention =
@@ -297,6 +310,15 @@ function isProcessAlive(pid: number): boolean {
 }
 
 /**
+ * Milliseconds since the owner's most recent liveness proof: its first
+ * heartbeat is its creation, later beats are the refreshes the owner writes
+ * atomically while holding the lock.
+ */
+function lockHeartbeatAgeMs(record: LockOwnerRecord): number {
+	return Math.max(0, Math.round(Date.now() - Math.max(record.heartbeatAtMs, record.createdAtMs)));
+}
+
+/**
  * Strictly parse a versioned lock owner record. Anything short of the exact
  * shape is invalid and is treated as still-initializing metadata; parsed
  * values are identity only and never supply filesystem paths.
@@ -310,10 +332,13 @@ function parseLockOwnerRecord(raw: string): LockOwnerRecord | null {
 	}
 	if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
 	const candidate = value as Record<string, unknown>;
-	if (Object.keys(candidate).sort().join(",") !== "createdAtMs,phase,pid,token,version") {
+	if (
+		Object.keys(candidate).sort().join(",") !==
+		"createdAtMs,heartbeatAtMs,phase,pid,token,version"
+	) {
 		return null;
 	}
-	const { version, pid, token, createdAtMs, phase } = candidate;
+	const { version, pid, token, createdAtMs, phase, heartbeatAtMs } = candidate;
 	if (version !== LOCK_OWNER_VERSION) return null;
 	if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0) return null;
 	if (typeof token !== "string" || token.length === 0) return null;
@@ -321,7 +346,14 @@ function parseLockOwnerRecord(raw: string): LockOwnerRecord | null {
 		return null;
 	}
 	if (phase !== "initializing" && phase !== "held") return null;
-	return { version: LOCK_OWNER_VERSION, pid, token, createdAtMs, phase };
+	if (
+		typeof heartbeatAtMs !== "number" ||
+		!Number.isFinite(heartbeatAtMs) ||
+		heartbeatAtMs < 0
+	) {
+		return null;
+	}
+	return { version: LOCK_OWNER_VERSION, pid, token, createdAtMs, phase, heartbeatAtMs };
 }
 
 async function readLockOwnerRecord(dir: string): Promise<LockOwnerRecord | null> {
@@ -360,9 +392,10 @@ async function listQuarantineDirs(lockDir: string): Promise<string[]> {
 
 /**
  * Remove quarantined lock directories whose owner is provably gone: a valid
- * record with a dead pid, or invalid metadata older than the initializing
- * grace. A quarantine with a live owner is left untouched — it is the barrier
- * that keeps claimants provisional until that owner releases it.
+ * record whose pid is dead or whose heartbeat has gone stale, or invalid
+ * metadata older than the initializing grace. A quarantine whose owner is
+ * live and fresh is left untouched — it is the barrier that keeps claimants
+ * provisional until that owner releases it.
  */
 async function sweepDeadQuarantines(lockDir: string): Promise<void> {
 	for (const quarantineDir of await listQuarantineDirs(lockDir)) {
@@ -375,7 +408,7 @@ async function sweepDeadQuarantines(lockDir: string): Promise<void> {
 				continue;
 			}
 			if (Date.now() - mtimeMs < LOCK_INITIALIZING_GRACE_MS) continue;
-		} else if (isProcessAlive(record.pid)) {
+		} else if (isProcessAlive(record.pid) && lockHeartbeatAgeMs(record) <= LOCK_HEARTBEAT_STALE_MS) {
 			continue;
 		}
 		await rm(quarantineDir, { recursive: true, force: true });
@@ -403,36 +436,90 @@ async function confirmProvisionalOwnership(lockDir: string, token: string): Prom
 }
 
 /**
+ * Owner-side heartbeat: every {@link LOCK_HEARTBEAT_INTERVAL_MS} the holder
+ * atomically rewrites its owner record (same-directory temp + rename) with a
+ * fresh `heartbeatAtMs`, so contenders can distinguish a genuinely live owner
+ * from a recycled pid. Before each refresh the stored identity is rechecked:
+ * if the token or pid no longer matches (released, reaped, or transferred),
+ * the heartbeat stops instead of ever writing into another owner's directory.
+ * The timer is unref'd so an abandoned process cannot keep the runtime alive;
+ * `stop` clears it and resolves only after the final in-flight refresh
+ * settles, making cleanup ownership deterministic. Refresh failures never
+ * throw — token-verified release is the only cleanup authority.
+ */
+function startLockHeartbeat(
+	lockDir: string,
+	record: LockOwnerRecord,
+): () => Promise<void> {
+	let inFlight: Promise<void> | null = null;
+	const timer = setInterval(() => {
+		if (inFlight !== null) return;
+		inFlight = (async () => {
+			const current = await readLockOwnerRecord(lockDir);
+			if (
+				current === null ||
+				current.token !== record.token ||
+				current.pid !== record.pid
+			) {
+				clearInterval(timer);
+				return;
+			}
+			await writeLockOwnerRecord(lockDir, {
+				...record,
+				phase: "held",
+				heartbeatAtMs: Date.now(),
+			});
+		})().catch(() => undefined);
+	}, LOCK_HEARTBEAT_INTERVAL_MS);
+	timer.unref?.();
+	let stopped = false;
+	return async () => {
+		if (stopped) return;
+		stopped = true;
+		clearInterval(timer);
+		const pending = inFlight;
+		inFlight = null;
+		if (pending !== null) await pending;
+	};
+}
+
+/**
  * Complete a provisional claim on a freshly created lock directory. The
  * acquirer stays `initializing` until it proves that no reaper quarantine
  * exists and that the canonical metadata still carries its exact token; only
- * then does it promote to `held`, re-verify, and return ownership. Any failed
- * check withdraws the exact-token directories and reports the claim as lost,
- * closing the observe→rename ABA window from the claimant's side.
+ * then does it promote to `held`, re-verify, and start the owner heartbeat
+ * that keeps its liveness provable under PID reuse. Any failed check withdraws
+ * the exact-token directories and reports the claim as lost, closing the
+ * observe→rename ABA window from the claimant's side.
  */
-async function claimLockDirectory(lockDir: string, token: string): Promise<boolean> {
+async function claimLockDirectory(
+	lockDir: string,
+	token: string,
+): Promise<(() => Promise<void>) | null> {
+	const nowMs = Date.now();
 	const record: LockOwnerRecord = {
 		version: LOCK_OWNER_VERSION,
 		pid: process.pid,
 		token,
-		createdAtMs: Date.now(),
+		createdAtMs: nowMs,
 		phase: "initializing",
+		heartbeatAtMs: nowMs,
 	};
 	try {
 		await writeLockOwnerRecord(lockDir, record);
 		if (!(await confirmProvisionalOwnership(lockDir, token))) {
 			await removeOwnedLockDirectories(lockDir, token);
-			return false;
+			return null;
 		}
 		await writeLockOwnerRecord(lockDir, { ...record, phase: "held" });
 		if (!(await confirmProvisionalOwnership(lockDir, token))) {
 			await removeOwnedLockDirectories(lockDir, token);
-			return false;
+			return null;
 		}
-		return true;
+		return startLockHeartbeat(lockDir, record);
 	} catch (error) {
 		await removeOwnedLockDirectories(lockDir, token).catch(() => undefined);
-		if (errorCode(error) === "ENOENT") return false;
+		if (errorCode(error) === "ENOENT") return null;
 		throw new Error(`failed to claim reconstruction lock ${lockDir}: ${errorDetail(error)}`);
 	}
 }
@@ -460,16 +547,20 @@ async function inspectLockOwner(lockDir: string): Promise<LockContention> {
 			detail: `abandoned lock without valid owner metadata (age ${ageMs}ms)`,
 		};
 	}
-	if (isProcessAlive(record.pid)) {
+	const heartbeatAgeMs = lockHeartbeatAgeMs(record);
+	if (isProcessAlive(record.pid) && heartbeatAgeMs <= LOCK_HEARTBEAT_STALE_MS) {
 		return {
 			kind: "wait",
-			detail: `live owner pid ${record.pid} (phase ${record.phase}); a live owner is never reaped`,
+			detail: `live owner pid ${record.pid} (phase ${record.phase}, heartbeat ${heartbeatAgeMs}ms old); a fresh live owner is never reaped`,
 		};
 	}
 	return {
 		kind: "stale",
 		observedToken: record.token,
-		detail: `dead owner pid ${record.pid} (phase ${record.phase})`,
+		detail:
+			heartbeatAgeMs > LOCK_HEARTBEAT_STALE_MS
+				? `owner pid ${record.pid} (phase ${record.phase}) stopped heartbeating ${heartbeatAgeMs}ms ago (stale bound ${LOCK_HEARTBEAT_STALE_MS}ms); the pid may have been reused by an unrelated process`
+				: `dead owner pid ${record.pid} (phase ${record.phase})`,
 	};
 }
 
@@ -508,9 +599,10 @@ export async function recoverStaleLock(
 
 /**
  * Acquire the reconstruction lock for `dataDir` within a bounded wait. Owners
- * store versioned metadata; a live owner pid is never reaped no matter how
- * old, while dead-owner and abandoned-invalid locks are recovered through the
- * quarantine protocol in {@link recoverStaleLock}.
+ * store versioned metadata and refresh it with a heartbeat while holding the
+ * lock; an owner that is live AND fresh is never reaped, while dead owners,
+ * stale-heartbeat owners (recycled pids), and abandoned-invalid locks are
+ * recovered through the quarantine protocol in {@link recoverStaleLock}.
  */
 export async function acquireDataDirectoryLock(
 	dataDir: string,
@@ -534,7 +626,8 @@ export async function acquireDataDirectoryLock(
 		}
 		let observedWait = false;
 		if (created) {
-			if (await claimLockDirectory(lockDir, token)) return { lockDir, token };
+			const stopHeartbeat = await claimLockDirectory(lockDir, token);
+			if (stopHeartbeat !== null) return { lockDir, token, stopHeartbeat };
 			contention =
 				"withdrew provisional claim: an active quarantine or lost canonical ownership forced a retry";
 		} else {
@@ -559,12 +652,15 @@ export async function acquireDataDirectoryLock(
 }
 
 /**
- * Release only directories that still carry this handle's exact token — the
- * canonical lock directory and any quarantine that captured it. ENOENT or a
- * different token means ownership was lost and removes nothing.
+ * Stop this handle's heartbeat first, then remove only directories that still
+ * carry its exact token — the canonical lock directory and any quarantine
+ * that captured it. Awaiting the heartbeat guarantees no owner refresh can
+ * race the removals and no refresh can ever land on a successor's lock.
+ * ENOENT or a different token means ownership was lost and removes nothing.
  */
 export async function releaseDataDirectoryLock(handle: DataDirectoryLockHandle): Promise<void> {
 	try {
+		await handle.stopHeartbeat?.();
 		await removeOwnedLockDirectories(handle.lockDir, handle.token);
 	} catch (error) {
 		throw new Error(
@@ -732,8 +828,9 @@ export async function defaultInversionProof(ctx: ReconstructProofContext): Promi
  * Never writes directly into the live data directory: candidates are staged,
  * validated, published by rename, then inversion-proved while a token-owned
  * sibling lock serializes every observation and mutation of that data
- * directory (dead or abandoned owners are recovered race-safely; live owners
- * are only ever waited on, bounded by `lockAcquireTimeoutMs`). Successful
+ * directory (dead, heartbeat-stale, or abandoned owners are recovered
+ * race-safely; live fresh owners are only ever waited on, bounded by
+ * `lockAcquireTimeoutMs`). Successful
  * `inversionProof` is the commit point. On proof or rename failure the previous
  * live tree is restored byte-for-byte (or removed when it was initially absent)
  * and staging/backup siblings are cleaned up. After commit, backup cleanup
