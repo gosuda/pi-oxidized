@@ -1312,13 +1312,19 @@ describe("lock heartbeat freshness under PID reuse (PRRT_kwDOTcPStM6YK-Fj)", () 
 		try {
 			const holder = await acquireDataDirectoryLock(fx.dataDir, 5_000);
 			try {
-				// Real hold window long enough for at least one refresh beat.
+				// Hold across two heartbeat intervals. The second timestamp must
+				// advance; a stuck in-flight marker allows only the first beat.
+				await Bun.sleep(1_300);
+				const first = readLockOwner(fx.lockDir);
+				expect(first.heartbeatAtMs as number).toBeGreaterThan(
+					first.createdAtMs as number,
+				);
 				await Bun.sleep(1_300);
 				const refreshed = readLockOwner(fx.lockDir);
 				expect(refreshed.token).toBe(holder.token);
 				expect(typeof refreshed.heartbeatAtMs).toBe("number");
 				expect(refreshed.heartbeatAtMs as number).toBeGreaterThan(
-					refreshed.createdAtMs as number,
+					first.heartbeatAtMs as number,
 				);
 
 				const error = await captureError(acquireDataDirectoryLock(fx.dataDir, 250));

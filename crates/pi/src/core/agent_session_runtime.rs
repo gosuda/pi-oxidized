@@ -851,10 +851,11 @@ impl AgentSessionRuntime {
             let result = self
                 .create_import_replacement(&paths.destination_text, &session_dir, cwd_override)
                 .await?;
-            let _lifecycle_guard = self
+            let lifecycle_guard = self
                 .teardown_current(SessionShutdownReason::Resume, Some(&paths.destination_text))
                 .await;
             self.apply(result);
+            drop(lifecycle_guard);
             self.finish_session_replacement(None).await;
             return Ok(SwitchOutcome { cancelled: false });
         }
@@ -940,10 +941,11 @@ impl AgentSessionRuntime {
             .lock()
             .await
             .rebind_session_file_after_atomic_move(&destination_text);
-        let _lifecycle_guard = self
+        let lifecycle_guard = self
             .teardown_current(SessionShutdownReason::Resume, Some(&destination_text))
             .await;
         self.apply(result);
+        drop(lifecycle_guard);
         self.finish_session_replacement(None).await;
         #[cfg(test)]
         self.import_commit_finished.notify_one();

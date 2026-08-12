@@ -454,7 +454,7 @@ function startLockHeartbeat(
 	let inFlight: Promise<void> | null = null;
 	const timer = setInterval(() => {
 		if (inFlight !== null) return;
-		inFlight = (async () => {
+		const beat = (async () => {
 			const current = await readLockOwnerRecord(lockDir);
 			if (
 				current === null ||
@@ -470,6 +470,10 @@ function startLockHeartbeat(
 				heartbeatAtMs: Date.now(),
 			});
 		})().catch(() => undefined);
+		inFlight = beat;
+		void beat.then(() => {
+			if (inFlight === beat) inFlight = null;
+		});
 	}, LOCK_HEARTBEAT_INTERVAL_MS);
 	timer.unref?.();
 	let stopped = false;
@@ -478,7 +482,6 @@ function startLockHeartbeat(
 		stopped = true;
 		clearInterval(timer);
 		const pending = inFlight;
-		inFlight = null;
 		if (pending !== null) await pending;
 	};
 }

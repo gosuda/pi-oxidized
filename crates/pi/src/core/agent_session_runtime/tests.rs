@@ -2008,3 +2008,58 @@ fn extension_flag_validation_preserves_bool_false() {
         "Bool(false) must not produce a diagnostic"
     );
 }
+
+async fn run_import_rebind_reacquires_lifecycle_gate(
+    session_dir: &Path,
+    source: &Path,
+) -> TestResult {
+    let runtime = make_persistent_runtime(session_dir).await?;
+    let callback_runtime = Arc::downgrade(&runtime);
+    let rebound = Arc::new(tokio::sync::Notify::new());
+    let callback_rebound = Arc::clone(&rebound);
+    runtime.set_rebind_session(Some(Arc::new(move |_session| {
+        let runtime = callback_runtime.clone();
+        let rebound = Arc::clone(&callback_rebound);
+        Box::pin(async move {
+            let Some(runtime) = runtime.upgrade() else {
+                return;
+            };
+            let _guard = runtime.lifecycle_gate().write().await;
+            rebound.notify_one();
+        })
+    })));
+
+    let source_text = source
+        .to_str()
+        .ok_or("source path is not UTF-8")?
+        .to_owned();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        runtime.import_from_jsonl(&source_text, None),
+    )
+    .await
+    .map_err(|_| failure("import rebind deadlocked on the lifecycle gate"))??;
+    rebound.notified().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn import_copied_file_rebind_can_reacquire_lifecycle_gate() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let session_dir = root.path().join("sessions");
+    let source_dir = root.path().join("external");
+    fs::create_dir_all(&source_dir)?;
+    let source = source_dir.join("published.jsonl");
+    write_import_fixture(&source)?;
+    run_import_rebind_reacquires_lifecycle_gate(&session_dir, &source).await
+}
+
+#[tokio::test]
+async fn import_same_file_rebind_can_reacquire_lifecycle_gate() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let session_dir = root.path().join("sessions");
+    fs::create_dir_all(&session_dir)?;
+    let source = session_dir.join("published.jsonl");
+    write_import_fixture(&source)?;
+    run_import_rebind_reacquires_lifecycle_gate(&session_dir, &source).await
+}
