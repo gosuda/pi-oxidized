@@ -621,7 +621,7 @@ export async function acquireDataDirectoryLock(
 ): Promise<DataDirectoryLockHandle> {
 	const lockDir = `${dataDir}.lock`;
 	const token = crypto.randomUUID();
-	const startedAtMs = Date.now();
+	const startedAtMs = performance.now();
 	let contention = "lock directory already exists";
 	for (;;) {
 		await sweepDeadQuarantines(lockDir);
@@ -650,7 +650,7 @@ export async function acquireDataDirectoryLock(
 				observedWait = true;
 			}
 		}
-		const elapsedMs = Date.now() - startedAtMs;
+		const elapsedMs = performance.now() - startedAtMs;
 		if (elapsedMs >= lockAcquireTimeoutMs) {
 			throw new Error(
 				`timed out acquiring reconstruction lock ${lockDir} after ${elapsedMs}ms (bound ${lockAcquireTimeoutMs}ms); ${contention}`,

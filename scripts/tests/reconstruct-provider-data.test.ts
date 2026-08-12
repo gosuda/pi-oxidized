@@ -23,6 +23,7 @@ import {
 	recoverStaleLock,
 	reconstructProviderData,
 	releaseDataDirectoryLock,
+	type DataDirectoryLockHandle,
 	type ProviderCatalog,
 	type ReconstructProofContext,
 	type ReconstructProviderDataResult,
@@ -1171,6 +1172,30 @@ describe("reconstruction data-directory lock stale recovery (N16/N21)", () => {
 	});
 
 
+	test("backward wall-clock skew does not extend the acquisition bound", async () => {
+		const fx = makeLockFixture();
+		const originalDateNow = Date.now;
+		let acquisition: Promise<DataDirectoryLockHandle> | undefined;
+		try {
+			writeLockOwner(fx.lockDir, lockOwnerRecord());
+			acquisition = acquireDataDirectoryLock(fx.dataDir, 50, () => {
+				Date.now = () => originalDateNow() - 60_000;
+			});
+
+			const outcome = await Promise.race([
+				acquisition.then(
+					() => "acquired" as const,
+					() => "timed-out" as const,
+				),
+				Bun.sleep(200).then(() => "deadline-exceeded" as const),
+			]);
+			expect(outcome).toBe("timed-out");
+		} finally {
+			Date.now = originalDateNow;
+			await acquisition?.catch(() => undefined);
+			rmSync(fx.root, { recursive: true, force: true });
+		}
+	}, 5_000);
 	test("a live owner with a fresh heartbeat is never reaped merely because its lock is old", async () => {
 		const fx = makeLockFixture();
 		try {
