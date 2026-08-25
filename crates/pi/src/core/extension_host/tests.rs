@@ -43,11 +43,11 @@ use super::super::agent_session::events::{
     AgentSessionEvent, SessionShutdownReason as ShutdownReason,
 };
 use super::super::agent_session::extension_runner::{ExtensionRunner, SessionHooks};
-use super::super::extension_runtime_set::{EndpointKind, ExtensionRuntimeSet};
+use super::super::extension_runtime_set::{EndpointId, EndpointKind, ExtensionRuntimeSet};
 use super::super::model_runtime::{CreateModelRuntimeOptions, ModelRuntime};
 use super::{
-    ALL_EVENT_TYPES, HostExtensionRunner, HostStartError, ToolRenderPhase,
-    compact_message_update_event, sanitize_html,
+    ALL_EVENT_TYPES, HostExtensionRunner, HostStartError, SessionBridgeEvent, ToolRenderPhase,
+    compact_message_update_event, finish_direct_session_control_delivery, sanitize_html,
 };
 
 type BoxErr = Box<dyn Error>;
@@ -84,14 +84,6 @@ impl FakeHost {
         }
     }
 
-    async fn emit(&self, frame: Frame) {
-        let _ = self.cmd_tx.send(FakeCmd::Emit(frame)).await;
-    }
-
-    async fn close(&self) {
-        let _ = self.cmd_tx.send(FakeCmd::Close).await;
-    }
-
     async fn wait_for_request(&self, method: &str) -> R {
         tokio::time::timeout(Duration::from_millis(500), async {
             loop {
@@ -108,6 +100,14 @@ impl FakeHost {
         .await
         .map_err(|_| format!("fake host did not receive {method}"))?;
         Ok(())
+    }
+
+    async fn emit(&self, frame: Frame) {
+        let _ = self.cmd_tx.send(FakeCmd::Emit(frame)).await;
+    }
+
+    async fn close(&self) {
+        let _ = self.cmd_tx.send(FakeCmd::Close).await;
     }
 }
 
@@ -320,6 +320,131 @@ async fn load_reports_all_33_handlers_and_registry_surfaces() -> R {
     assert_eq!(
         runner.get_flag_values().get("extFlag"),
         Some(&Value::String("x".to_owned()))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_boolean_flag_default_decodes_and_preserves_typed_fallback() -> R {
+    let snapshot = json!({
+        "flags": [
+            {
+                "name": "verbose",
+                "type": "boolean",
+                "default": false,
+                "extensionPath": "native://demo"
+            },
+            {
+                "name": "mode",
+                "type": "string",
+                "default": "quiet",
+                "extensionPath": "native://demo"
+            }
+        ],
+        "handlers": [],
+    });
+    let (runner, _host) = make_runner(snapshot).await?;
+
+    assert_eq!(
+        runner.get_flag_values().get("verbose"),
+        Some(&Value::Bool(false))
+    );
+    assert_eq!(
+        runner.get_flag_values().get("mode"),
+        Some(&Value::String("quiet".to_owned()))
+    );
+
+    let registry = runner.registry();
+    let flags = registry.flags();
+    let verbose = flags
+        .iter()
+        .find(|flag| flag.name == "verbose")
+        .ok_or("missing verbose flag registration")?;
+    assert_eq!(verbose.kind, pi_ext::adapters::FlagKind::Boolean);
+    assert_eq!(verbose.default.as_deref(), Some("false"));
+
+    let mode = flags
+        .iter()
+        .find(|flag| flag.name == "mode")
+        .ok_or("missing mode flag registration")?;
+    assert_eq!(mode.kind, pi_ext::adapters::FlagKind::String);
+    assert_eq!(mode.default.as_deref(), Some("quiet"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn unset_boolean_flag_falls_back_to_typed_false() -> R {
+    let snapshot = json!({
+        "flags": [
+            {
+                "name": "verbose",
+                "type": "boolean",
+                "extensionPath": "native://demo"
+            },
+            {
+                "name": "mode",
+                "type": "string",
+                "extensionPath": "native://demo"
+            }
+        ],
+        "handlers": [],
+    });
+    let (runner, _host) = make_runner(snapshot).await?;
+
+    // Boolean flag with no value and no default must be typed false,
+    // not an empty string.
+    assert_eq!(
+        runner.get_flag_values().get("verbose"),
+        Some(&Value::Bool(false))
+    );
+    // String flag with no value and no default stays an empty string.
+    assert_eq!(
+        runner.get_flag_values().get("mode"),
+        Some(&Value::String(String::new()))
+    );
+
+    // The typed fallback survives the restart-and-rewire flag preservation
+    // path: Value::Bool(false) converts to FlagValueWire::Boolean(false) and
+    // back, remaining typed through apply_flag_values.
+    let preserved = runner.get_flag_values();
+    let overlay: BTreeMap<String, FlagValueWire> = preserved
+        .iter()
+        .map(|(name, value)| match value {
+            Value::Bool(b) => Ok((name.clone(), FlagValueWire::Boolean(*b))),
+            Value::String(s) => Ok((name.clone(), FlagValueWire::String(s.clone()))),
+            other => Err(format!("unsupported flag value for {name}: {other}")),
+        })
+        .collect::<Result<_, _>>()?;
+    runner.apply_flag_values(&overlay).await?;
+    assert_eq!(
+        runner.get_flag_values().get("verbose"),
+        Some(&Value::Bool(false)),
+        "boolean fallback must stay typed through apply_flag_values"
+    );
+    assert_eq!(
+        runner.get_flag_values().get("mode"),
+        Some(&Value::String(String::new())),
+        "string fallback must stay typed through apply_flag_values"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_flag_default_yields_to_host_resolved_value() -> R {
+    let snapshot = json!({
+        "flags": [{
+            "name": "verbose",
+            "type": "boolean",
+            "default": false,
+            "value": true,
+            "extensionPath": "native://demo"
+        }],
+        "handlers": [],
+    });
+    let (runner, _host) = make_runner(snapshot).await?;
+    assert_eq!(
+        runner.get_flag_values().get("verbose"),
+        Some(&Value::Bool(true))
     );
     Ok(())
 }
@@ -2163,8 +2288,12 @@ async fn session_command_and_set_model_route_through_claimed_bridge() -> R {
     let event = tokio::time::timeout(Duration::from_millis(500), bridge.recv())
         .await?
         .ok_or("bridge closed")?;
-    let SessionBridgeEvent::Command(SessionCommand::SetSessionName { name }) = event else {
+    let SessionBridgeEvent::Command { envelope, .. } = event else {
         return Err(format!("expected SetSessionName, got {event:?}").into());
+    };
+    assert_eq!(envelope.replacement_token, None);
+    let SessionCommand::SetSessionName { name } = envelope.command else {
+        return Err("expected SetSessionName command".into());
     };
     assert_eq!(name, "Renamed");
 
@@ -2205,6 +2334,59 @@ async fn session_command_and_set_model_route_through_claimed_bridge() -> R {
 }
 
 #[tokio::test]
+async fn scoped_command_precedes_replacement_ready_on_claimed_bridge() -> R {
+    use crate::core::extension_host::SessionBridgeEvent;
+    let (runner, host) = make_runner(json!({})).await?;
+    let mut bridge = runner
+        .take_session_bridge()
+        .ok_or("first claim must yield the bridge receiver")?;
+
+    host.emit(Frame {
+        id: 0,
+        kind: FrameKind::Event,
+        method: "session.command".to_owned(),
+        payload: json!({
+            "replacementToken": "ordered-token",
+            "action": "setSessionName",
+            "name": "Candidate"
+        }),
+    })
+    .await;
+    host.emit(Frame {
+        id: 0,
+        kind: FrameKind::Event,
+        method: "session.replacementReady".to_owned(),
+        payload: json!({"token": "ordered-token"}),
+    })
+    .await;
+
+    let command = tokio::time::timeout(Duration::from_millis(500), bridge.recv())
+        .await?
+        .ok_or("bridge closed before command")?;
+    let ready = tokio::time::timeout(Duration::from_millis(500), bridge.recv())
+        .await?
+        .ok_or("bridge closed before readiness")?;
+    assert!(matches!(
+        command,
+        SessionBridgeEvent::Command {
+            envelope: pi_ext::protocol::SessionCommandEnvelope {
+                replacement_token: Some(token),
+                ..
+            },
+            ..
+        } if token == "ordered-token"
+    ));
+    assert!(matches!(
+        ready,
+        SessionBridgeEvent::ReplacementReady { token, .. }
+            if token == "ordered-token"
+    ));
+
+    runner.shutdown_once().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn unclaimed_set_model_request_is_answered_failure() -> R {
     let (runner, host) = make_runner(json!({})).await?;
 
@@ -2230,6 +2412,95 @@ async fn unclaimed_set_model_request_is_answered_failure() -> R {
         .ok_or("setModel failure response missing")?;
     assert_eq!(response.id, 7);
     assert_eq!(response.payload["success"], false);
+
+    runner.shutdown_once().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn dropped_replacement_ready_emits_diagnostic() -> R {
+    let (runner, host) = make_runner(json!({})).await?;
+    // Install a drop handler that records the token it receives.
+    let received_token = Arc::new(Mutex::new(None::<String>));
+    let handler_token = Arc::clone(&received_token);
+    runner.set_replacement_drop_handler(Arc::new(
+        move |token: &str, _origin: Option<EndpointId>| {
+            *handler_token
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(token.to_owned());
+        },
+    ));
+    // Claim the bridge, then drop the receiver to close the channel.
+    let bridge = runner.take_session_bridge().ok_or("bridge missing")?;
+    drop(bridge);
+    let mut errors = runner.subscribe_errors();
+    // Emit a replacementReady event — the channel is closed so try_send
+    // fails, and the dropped frame must produce an immediate diagnostic
+    // and invoke the drop handler with the token.
+    host.emit(Frame {
+        id: 0,
+        kind: FrameKind::Event,
+        method: "session.replacementReady".to_owned(),
+        payload: json!({"token": "tok-1"}),
+    })
+    .await;
+    let error = next_error(&mut errors, Duration::from_secs(2)).await?;
+    assert_eq!(
+        error.code, "extension_replacement_dropped",
+        "expected extension_replacement_dropped diagnostic, got: {error:?}"
+    );
+    // The drop handler must receive tok-1 synchronously.
+    let token = received_token
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .ok_or("drop handler was not invoked")?;
+    assert_eq!(token, "tok-1", "drop handler received the wrong token");
+    runner.shutdown_once().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn unexpected_direct_session_control_reports_and_continues() -> R {
+    let (runner, _host) = make_runner(json!({})).await?;
+    let received_token = Arc::new(Mutex::new(None::<String>));
+    let handler_token = Arc::clone(&received_token);
+    runner.set_replacement_drop_handler(Arc::new(
+        move |token: &str, _origin: Option<EndpointId>| {
+            *handler_token
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(token.to_owned());
+        },
+    ));
+    let mut errors = runner.subscribe_errors();
+
+    finish_direct_session_control_delivery(
+        &runner.inner,
+        Some(SessionBridgeEvent::Reload { id: 41 }),
+    );
+    let protocol_error = next_error(&mut errors, Duration::from_secs(2)).await?;
+    assert_eq!(protocol_error.code, "extension_protocol");
+    assert_eq!(
+        protocol_error.message,
+        "correlated event reached the direct session-control route"
+    );
+
+    finish_direct_session_control_delivery(
+        &runner.inner,
+        Some(SessionBridgeEvent::ReplacementReady {
+            token: "after-diagnostic".to_owned(),
+            origin: None,
+        }),
+    );
+    let dropped_error = next_error(&mut errors, Duration::from_secs(2)).await?;
+    assert_eq!(dropped_error.code, "extension_replacement_dropped");
+    assert_eq!(
+        received_token
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_deref(),
+        Some("after-diagnostic")
+    );
 
     runner.shutdown_once().await;
     Ok(())

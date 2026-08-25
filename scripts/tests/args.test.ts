@@ -16,7 +16,6 @@ describe("args", () => {
 		expect(args.plan.rustTarget).toBe("x86_64-unknown-linux-gnu");
 		expect(args.dryRun).toBe(false);
 		expect(args.noCargo).toBe(false);
-		expect(args.skipHostTests).toBe(false);
 		expect(args.handshake).toBe(true);
 		expect(args.sourceDateEpoch).toBe("0");
 	});
@@ -143,9 +142,10 @@ describe("args", () => {
 		expect(args.handshake).toBe(false);
 	});
 
-	test("--skip-host-tests disables host test step", () => {
-		const args = parseReleaseArgs(["--target", "x86_64-apple-darwin", "--skip-host-tests"]);
-		expect(args.skipHostTests).toBe(true);
+	test("rejects removed --skip-host-tests flag", () => {
+		expect(() =>
+			parseReleaseArgs(["--target", "x86_64-apple-darwin", "--skip-host-tests"]),
+		).toThrow(UnknownArgError);
 	});
 
 	test("iterates over every supported triple without throwing", () => {

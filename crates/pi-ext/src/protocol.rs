@@ -116,8 +116,16 @@ pub enum OverlayAnchor {
 }
 
 /// Per-side overlay margin from terminal edges.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
+///
+/// This is the direct `pi_ext::protocol` copy. Unlike
+/// [`OverlayMarginWire`], it performs the canonical one-way normalization
+/// shared with `pi_tui::layout::OverlayMargin`: a bare scalar such as `4`
+/// deserializes to a uniform four-side value, and the value always serializes
+/// as the normalized `{ top, right, bottom, left }` object. `OverlaySpec`
+/// keeps [`OverlayMarginWire`] so the portable scalar round-trip stays part of
+/// the shared Rust/TypeScript fixture contract; do not replace it there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OverlayMargin {
     /// Top margin in rows.
     pub top: u16,
@@ -127,6 +135,77 @@ pub struct OverlayMargin {
     pub bottom: u16,
     /// Left margin in columns.
     pub left: u16,
+}
+
+impl OverlayMargin {
+    /// Same margin on every side.
+    #[must_use]
+    pub const fn uniform(n: u16) -> Self {
+        Self {
+            top: n,
+            right: n,
+            bottom: n,
+            left: n,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for OverlayMargin {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = OverlayMargin;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(
+                    "a margin number or an object with optional top/right/bottom/left sides",
+                )
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                u16::try_from(v)
+                    .map(OverlayMargin::uniform)
+                    .map_err(|_| E::custom("margin value exceeds u16"))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                if v < 0 {
+                    return Err(E::custom("margin must be non-negative"));
+                }
+                self.visit_u64(v.cast_unsigned())
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut top = 0u16;
+                let mut right = 0u16;
+                let mut bottom = 0u16;
+                let mut left = 0u16;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "top" => top = map.next_value()?,
+                        "right" => right = map.next_value()?,
+                        "bottom" => bottom = map.next_value()?,
+                        "left" => left = map.next_value()?,
+                        _ => {
+                            let _: serde::de::IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+                Ok(OverlayMargin {
+                    top,
+                    right,
+                    bottom,
+                    left,
+                })
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
 }
 /// Wire margin accepts either a uniform scalar or per-side object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -925,6 +1004,58 @@ pub struct ProviderEvent {
     pub data: Value,
 }
 
+/// Open method string: the host emits this event after a committed live
+/// provider mutation (register/unregister from a command or delayed callback).
+/// It is an open dotted control name, not a [`Method`] enum variant, so strict
+/// method decoding rejects it while the extension bridge accepts it.
+pub const PROVIDERS_UPDATE_METHOD: &str = "providers.update";
+
+/// One provider entry in a [`ProvidersUpdate`] frame.
+///
+/// Mirrors the host's provider registration shape (camelCase). The Rust bridge
+/// converts each entry into a `ProviderConfigInput`; unknown fields are ignored.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ProviderUpdateEntry {
+    /// Provider display name / id.
+    pub name: String,
+    /// Base URL for the provider API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// API kind (e.g. `openai-completions`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<String>,
+    /// Optional API key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    /// Optional static headers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers: Option<BTreeMap<String, String>>,
+    /// Whether the host sends the auth header for this provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_header: Option<bool>,
+    /// Models declared by the provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<Vec<Value>>,
+    /// `true` when the host holds a live `streamSimple` function.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stream_simple: bool,
+    /// Optional extension path used in diagnostics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension_path: Option<String>,
+}
+
+/// `providers.update` event payload (host → Rust). Carries the sender
+/// endpoint's complete current provider registry after a committed live
+/// mutation; the Rust bridge replaces only that endpoint's provider snapshot.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ProvidersUpdate {
+    /// The endpoint's complete current provider list.
+    #[serde(default)]
+    pub providers: Vec<ProviderUpdateEntry>,
+}
+
 /// Key modifiers on the wire (shift|alt|ctrl|super).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -1347,6 +1478,17 @@ pub struct SessionCommandInfoWire {
     pub source: String,
 }
 
+/// One model scoped to this session (`--models` / `enabledModels`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionScopedModelWire {
+    /// Serialized `Model` in the upstream shape.
+    pub model: Value,
+    /// Thinking level pinned by the scope, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<String>,
+}
+
 /// `session.update` event payload (Rust → host): the authoritative mirror
 /// behind every synchronous session getter on the host.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -1366,6 +1508,8 @@ pub struct SessionStateWire {
     /// Serialized active `Model` (upstream shape), if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<Value>,
+    /// Models scoped to this session (`--models` / `enabledModels`).
+    pub scoped_models: Vec<SessionScopedModelWire>,
     /// Whether the session has no active agent run.
     pub is_idle: bool,
     /// Whether steering/follow-up messages are queued.
@@ -1441,6 +1585,21 @@ pub enum SessionCommand {
     Shutdown,
 }
 
+/// `session.command` event payload with optional pending-replacement scope.
+///
+/// Flattening preserves the original command object when no token is present;
+/// candidate-session commands add only `replacementToken`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionCommandEnvelope {
+    /// Token identifying the pending replacement session, when scoped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement_token: Option<String>,
+    /// Existing flat `action`-tagged session command.
+    #[serde(flatten)]
+    pub command: SessionCommand,
+}
+
 /// Open method string: correlated `ctx.compact` request (host → Rust). The
 /// response carries the serialized `CompactionResult`; failures arrive as a
 /// protocol error frame (upstream delivers them to `onError`).
@@ -1477,6 +1636,190 @@ pub struct SessionSetModelRequest {
 pub struct SessionSetModelResponse {
     /// Upstream `SetModelHandler` result: false when auth/persist failed.
     pub success: bool,
+}
+
+/// Open method string: correlated `ctx.newSession` request (host → Rust).
+pub const SESSION_NEW_SESSION_METHOD: &str = "session.newSession";
+
+/// Open method string: correlated `ctx.fork` request (host → Rust).
+pub const SESSION_FORK_METHOD: &str = "session.fork";
+
+/// Open method string: correlated `ctx.navigateTree` request (host → Rust).
+pub const SESSION_NAVIGATE_TREE_METHOD: &str = "session.navigateTree";
+
+/// Open method string: correlated `ctx.switchSession` request (host → Rust).
+pub const SESSION_SWITCH_SESSION_METHOD: &str = "session.switchSession";
+
+/// Open method string: correlated `ctx.reload` request (host → Rust).
+pub const SESSION_RELOAD_METHOD: &str = "session.reload";
+
+/// Open method string: correlated setup-entry snapshot request (host → Rust).
+pub const SESSION_SETUP_ENTRIES_METHOD: &str = "session.setupEntries";
+
+/// Open method string: host → Rust ready event after a replacement settles.
+pub const SESSION_REPLACEMENT_READY_METHOD: &str = "session.replacementReady";
+
+/// Open method string: host → Rust abort event for an abandoned replacement.
+pub const SESSION_REPLACEMENT_ABORT_METHOD: &str = "session.replacementAbort";
+
+/// Fork cut position relative to the target entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionForkPosition {
+    /// Cut before the entry (default when omitted downstream).
+    Before,
+    /// Cut at the entry.
+    At,
+}
+
+/// `session.newSession` request payload (host → Rust, correlated).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionNewSessionRequest {
+    /// Optional parent session id / path for the new session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session: Option<String>,
+}
+
+/// `session.fork` request payload (host → Rust, correlated).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionForkRequest {
+    /// Entry id to fork from.
+    pub entry_id: String,
+    /// Cut position; omitted maps to [`SessionForkPosition::Before`] downstream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<SessionForkPosition>,
+}
+
+/// `session.navigateTree` request payload (host → Rust, correlated).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionNavigateTreeRequest {
+    /// Target entry / branch id.
+    pub target_id: String,
+    /// Whether to summarize the branch being left.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summarize: Option<bool>,
+    /// Optional custom summary instructions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_instructions: Option<String>,
+    /// Whether custom instructions replace (vs append) the default ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replace_instructions: Option<bool>,
+    /// Optional label applied during navigation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// `session.switchSession` request payload (host → Rust, correlated).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSwitchSessionRequest {
+    /// Filesystem path of the session to switch to.
+    pub session_path: String,
+}
+
+/// `session.reload` request payload (host → Rust, correlated).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionReloadRequest {}
+
+/// `session.newSession` response payload (Rust → host).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionNewSessionResponse {
+    /// True when a before-hook cancelled the replacement.
+    pub cancelled: bool,
+    /// Ready-gate token; omitted when cancelled or ungated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement_token: Option<String>,
+}
+
+/// `session.fork` response payload (Rust → host).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionForkResponse {
+    /// True when a before-hook cancelled the replacement.
+    pub cancelled: bool,
+    /// Editor selection captured at fork time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_text: Option<String>,
+    /// Ready-gate token; omitted when cancelled or ungated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement_token: Option<String>,
+}
+
+/// `session.switchSession` response payload (Rust → host).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSwitchSessionResponse {
+    /// True when a before-hook cancelled the replacement.
+    pub cancelled: bool,
+    /// Ready-gate token; omitted when cancelled or ungated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement_token: Option<String>,
+}
+
+/// `session.navigateTree` response payload (Rust → host).
+///
+/// `summary_entry` is an opaque JSON value at the pi-ext boundary so this
+/// crate does not depend on `pi`'s `SessionEntry`; the bridge arm serializes it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionNavigateTreeResponse {
+    /// True when a before-hook cancelled the navigation.
+    pub cancelled: bool,
+    /// Editor text restored after navigation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor_text: Option<String>,
+    /// True when summarization was aborted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aborted: Option<bool>,
+    /// Opaque serialized branch-summary / session entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_entry: Option<Value>,
+}
+
+/// `session.reload` response payload (Rust → host).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionReloadResponse {
+    /// Ready-gate token when the reload is pending host-side readiness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement_token: Option<String>,
+}
+
+/// Correlated setup-entry snapshot request (host → Rust).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSetupEntriesRequest {
+    /// Token returned by the initiating pending session replacement.
+    pub replacement_token: String,
+}
+
+/// Correlated setup-entry snapshot response (Rust → host).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSetupEntriesResponse {
+    /// Serialized `SessionEntry` values, opaque at the `pi-ext` boundary.
+    pub entries: Vec<Value>,
+}
+
+/// `session.replacementReady` event payload (host → Rust).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionReplacementReadyEvent {
+    /// Token previously returned on a replacement response.
+    pub token: String,
+}
+
+/// `session.replacementAbort` event payload (host → Rust).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionReplacementAbortEvent {
+    /// Token for the pending replacement that must be aborted.
+    pub token: String,
 }
 
 /// `ui.control` event payload (host → Rust): one fire-and-forget
@@ -1936,6 +2279,61 @@ mod tests {
     }
 
     #[test]
+    fn direct_overlay_margin_deserializes_scalar_as_uniform() -> TestResult {
+        let m: OverlayMargin = serde_json::from_str("4")?;
+        assert_eq!(m, OverlayMargin::uniform(4));
+        let m2: OverlayMargin = serde_json::from_value(serde_json::Value::Number(7.into()))?;
+        assert_eq!(m2, OverlayMargin::uniform(7));
+        Ok(())
+    }
+
+    #[test]
+    fn direct_overlay_margin_deserializes_partial_object_defaults_zero() -> TestResult {
+        let m: OverlayMargin = serde_json::from_str(r#"{"top":1}"#)?;
+        assert_eq!(
+            m,
+            OverlayMargin {
+                top: 1,
+                right: 0,
+                bottom: 0,
+                left: 0
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn direct_overlay_margin_serializes_as_normalized_object() -> TestResult {
+        let m = OverlayMargin::uniform(4);
+        let out = serde_json::to_value(m)?;
+        assert!(out.is_object());
+        assert_eq!(out["top"], 4);
+        assert_eq!(out["right"], 4);
+        assert_eq!(out["bottom"], 4);
+        assert_eq!(out["left"], 4);
+        // A scalar input round-trips through the normalized object form.
+        let back: OverlayMargin = serde_json::from_value(out)?;
+        assert_eq!(back, OverlayMargin::uniform(4));
+        Ok(())
+    }
+
+    #[test]
+    fn direct_overlay_margin_rejects_negative_scalar() {
+        assert!(serde_json::from_str::<OverlayMargin>("-1").is_err());
+    }
+
+    #[test]
+    fn overlay_spec_keeps_portable_scalar_form_via_wire() -> TestResult {
+        // OverlaySpec must retain OverlayMarginWire so the scalar round-trip
+        // stays part of the shared Rust/TypeScript fixture contract.
+        let spec: OverlaySpec = serde_json::from_value(serde_json::json!({"margin": 5}))?;
+        assert_eq!(spec.margin, Some(OverlayMarginWire::Uniform(5)));
+        let encoded = serde_json::to_value(&spec)?;
+        assert_eq!(encoded["margin"], 5);
+        Ok(())
+    }
+
+    #[test]
     fn ui_slot_rejects_forbidden_and_oversized_links() {
         for link in [
             serde_json::json!({"uri": "javascript:alert(1)"}),
@@ -2188,9 +2586,7 @@ mod tests {
                 ),
             ]),
         };
-        let payload = to_payload(&flags)?;
-        assert_eq!(from_payload::<FlagsSetRequest>(&payload)?, flags);
-
+        let _payload = to_payload(&flags)?;
         let shortcut = ShortcutExecuteRequest {
             key: "ctrl+alt+p".to_owned(),
         };
@@ -2281,6 +2677,7 @@ mod bridge_tests {
 
     /// Every open bridge method must be locked into the shared witness, and
     /// each witnessed payload must decode through its typed wire struct.
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn shared_fixtures_cover_bridge_methods_typed() -> TestResult {
         let mut seen: std::collections::HashSet<(String, FrameKind)> =
@@ -2301,7 +2698,19 @@ mod bridge_tests {
                     from_payload::<SessionStateWire>(&frame.payload)?;
                 }
                 SESSION_COMMAND_METHOD => {
-                    from_payload::<SessionCommand>(&frame.payload)?;
+                    from_payload::<SessionCommandEnvelope>(&frame.payload)?;
+                }
+                SESSION_SET_MODEL_METHOD
+                | SESSION_COMPACT_METHOD
+                | SESSION_NEW_SESSION_METHOD
+                | SESSION_FORK_METHOD
+                | SESSION_NAVIGATE_TREE_METHOD
+                | SESSION_SWITCH_SESSION_METHOD
+                | SESSION_RELOAD_METHOD
+                | SESSION_SETUP_ENTRIES_METHOD
+                    if frame.kind == FrameKind::Error =>
+                {
+                    from_payload::<ErrorPayload>(&frame.payload)?;
                 }
                 SESSION_SET_MODEL_METHOD if frame.kind == FrameKind::Req => {
                     from_payload::<SessionSetModelRequest>(&frame.payload)?;
@@ -2315,11 +2724,56 @@ mod bridge_tests {
                 SESSION_COMPACT_METHOD => {
                     from_payload::<SessionCompactResponse>(&frame.payload)?;
                 }
+                SESSION_NEW_SESSION_METHOD if frame.kind == FrameKind::Req => {
+                    from_payload::<SessionNewSessionRequest>(&frame.payload)?;
+                }
+                SESSION_NEW_SESSION_METHOD if frame.kind == FrameKind::Res => {
+                    from_payload::<SessionNewSessionResponse>(&frame.payload)?;
+                }
+                SESSION_FORK_METHOD if frame.kind == FrameKind::Req => {
+                    from_payload::<SessionForkRequest>(&frame.payload)?;
+                }
+                SESSION_FORK_METHOD => {
+                    from_payload::<SessionForkResponse>(&frame.payload)?;
+                }
+                SESSION_NAVIGATE_TREE_METHOD if frame.kind == FrameKind::Req => {
+                    from_payload::<SessionNavigateTreeRequest>(&frame.payload)?;
+                }
+                SESSION_NAVIGATE_TREE_METHOD => {
+                    from_payload::<SessionNavigateTreeResponse>(&frame.payload)?;
+                }
+                SESSION_SWITCH_SESSION_METHOD if frame.kind == FrameKind::Req => {
+                    from_payload::<SessionSwitchSessionRequest>(&frame.payload)?;
+                }
+                SESSION_SWITCH_SESSION_METHOD => {
+                    from_payload::<SessionSwitchSessionResponse>(&frame.payload)?;
+                }
+                SESSION_RELOAD_METHOD if frame.kind == FrameKind::Req => {
+                    from_payload::<SessionReloadRequest>(&frame.payload)?;
+                }
+                SESSION_RELOAD_METHOD => {
+                    from_payload::<SessionReloadResponse>(&frame.payload)?;
+                }
+                SESSION_SETUP_ENTRIES_METHOD if frame.kind == FrameKind::Req => {
+                    from_payload::<SessionSetupEntriesRequest>(&frame.payload)?;
+                }
+                SESSION_SETUP_ENTRIES_METHOD => {
+                    from_payload::<SessionSetupEntriesResponse>(&frame.payload)?;
+                }
+                SESSION_REPLACEMENT_READY_METHOD => {
+                    from_payload::<SessionReplacementReadyEvent>(&frame.payload)?;
+                }
+                SESSION_REPLACEMENT_ABORT_METHOD => {
+                    from_payload::<SessionReplacementAbortEvent>(&frame.payload)?;
+                }
                 UI_CONTROL_METHOD => {
                     from_payload::<UiControl>(&frame.payload)?;
                 }
                 UI_STATE_METHOD => {
                     from_payload::<UiStateWire>(&frame.payload)?;
+                }
+                PROVIDERS_UPDATE_METHOD => {
+                    from_payload::<ProvidersUpdate>(&frame.payload)?;
                 }
                 _ => continue,
             }
@@ -2331,10 +2785,32 @@ mod bridge_tests {
             (SESSION_UPDATE_METHOD, FrameKind::Event),
             (SESSION_COMMAND_METHOD, FrameKind::Event),
             (SESSION_SET_MODEL_METHOD, FrameKind::Req),
+            (SESSION_SET_MODEL_METHOD, FrameKind::Error),
             (SESSION_SET_MODEL_METHOD, FrameKind::Res),
             (SESSION_COMPACT_METHOD, FrameKind::Req),
+            (SESSION_COMPACT_METHOD, FrameKind::Error),
             (SESSION_COMPACT_METHOD, FrameKind::Res),
-            (UI_CONTROL_METHOD, FrameKind::Event),
+            (SESSION_NEW_SESSION_METHOD, FrameKind::Req),
+            (SESSION_NEW_SESSION_METHOD, FrameKind::Res),
+            (SESSION_NEW_SESSION_METHOD, FrameKind::Error),
+            (SESSION_FORK_METHOD, FrameKind::Req),
+            (SESSION_FORK_METHOD, FrameKind::Error),
+            (SESSION_FORK_METHOD, FrameKind::Res),
+            (SESSION_NAVIGATE_TREE_METHOD, FrameKind::Req),
+            (SESSION_NAVIGATE_TREE_METHOD, FrameKind::Error),
+            (SESSION_NAVIGATE_TREE_METHOD, FrameKind::Res),
+            (SESSION_SWITCH_SESSION_METHOD, FrameKind::Req),
+            (SESSION_SWITCH_SESSION_METHOD, FrameKind::Error),
+            (SESSION_SWITCH_SESSION_METHOD, FrameKind::Res),
+            (SESSION_RELOAD_METHOD, FrameKind::Req),
+            (SESSION_RELOAD_METHOD, FrameKind::Error),
+            (SESSION_RELOAD_METHOD, FrameKind::Res),
+            (SESSION_SETUP_ENTRIES_METHOD, FrameKind::Req),
+            (SESSION_SETUP_ENTRIES_METHOD, FrameKind::Error),
+            (SESSION_SETUP_ENTRIES_METHOD, FrameKind::Res),
+            (PROVIDERS_UPDATE_METHOD, FrameKind::Event),
+            (SESSION_REPLACEMENT_READY_METHOD, FrameKind::Event),
+            (SESSION_REPLACEMENT_ABORT_METHOD, FrameKind::Event),
             (UI_STATE_METHOD, FrameKind::Event),
         ] {
             assert!(
@@ -2342,6 +2818,46 @@ mod bridge_tests {
                 "fixture missing {method} {kind} frame"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn shared_fixtures_require_legacy_and_tagged_session_command_witnesses() -> TestResult {
+        let mut legacy = std::collections::HashSet::<String>::new();
+        let mut candidate = std::collections::HashSet::<String>::new();
+        for line in FIXTURES.lines() {
+            if line.trim().is_empty() || line.trim_start().starts_with('#') {
+                continue;
+            }
+            let frame = decode_frame_str(line)?;
+            if frame.method != SESSION_COMMAND_METHOD || frame.kind != FrameKind::Event {
+                continue;
+            }
+            let envelope = from_payload::<SessionCommandEnvelope>(&frame.payload)?;
+            let action = frame.payload["action"].as_str().ok_or_else(|| {
+                "session.command fixture is missing a string `action` field".to_owned()
+            })?;
+            if envelope.replacement_token.is_some() {
+                candidate.insert(action.to_owned());
+            } else {
+                legacy.insert(action.to_owned());
+            }
+        }
+
+        let expected: std::collections::HashSet<String> =
+            ["setSessionName", "sendMessage", "shutdown"]
+                .iter()
+                .map(|&s| s.to_owned())
+                .collect();
+
+        assert_eq!(
+            legacy, expected,
+            "legacy untagged session.command action set does not match fixture"
+        );
+        assert_eq!(
+            candidate, expected,
+            "candidate-tagged session.command action set does not match fixture"
+        );
         Ok(())
     }
 
@@ -2370,6 +2886,47 @@ mod bridge_tests {
         let payload = to_payload(&request)?;
         assert_eq!(payload["customInstructions"], "keep decisions");
         assert_eq!(from_payload::<SessionCompactRequest>(&payload)?, request);
+        Ok(())
+    }
+
+    #[test]
+    fn session_command_envelope_preserves_untagged_and_tagged_commands() -> TestResult {
+        let ordinary_payload = serde_json::json!({
+            "action": "setSessionName",
+            "name": "Renamed"
+        });
+        let ordinary = from_payload::<SessionCommandEnvelope>(&ordinary_payload)?;
+        assert_eq!(ordinary.replacement_token, None);
+        assert_eq!(
+            ordinary.command,
+            SessionCommand::SetSessionName {
+                name: "Renamed".to_owned(),
+            }
+        );
+        assert_eq!(to_payload(&ordinary)?, ordinary_payload);
+
+        let candidate_payload = serde_json::json!({
+            "replacementToken": "tok-1",
+            "action": "setSessionName",
+            "name": "Candidate"
+        });
+        let candidate = from_payload::<SessionCommandEnvelope>(&candidate_payload)?;
+        assert_eq!(candidate.replacement_token.as_deref(), Some("tok-1"));
+        assert_eq!(to_payload(&candidate)?, candidate_payload);
+        Ok(())
+    }
+
+    #[test]
+    fn session_replacement_abort_has_canonical_shape() -> TestResult {
+        let event = SessionReplacementAbortEvent {
+            token: "tok-closed".to_owned(),
+        };
+        let payload = to_payload(&event)?;
+        assert_eq!(payload, serde_json::json!({"token": "tok-closed"}));
+        assert_eq!(
+            from_payload::<SessionReplacementAbortEvent>(&payload)?,
+            event
+        );
         Ok(())
     }
 
@@ -2409,6 +2966,16 @@ mod bridge_tests {
                 source: "extension".to_owned(),
             }],
             model: None,
+            scoped_models: vec![
+                SessionScopedModelWire {
+                    model: serde_json::json!({"id": "gpt-x", "provider": "openai"}),
+                    thinking_level: Some("high".to_owned()),
+                },
+                SessionScopedModelWire {
+                    model: serde_json::json!({"id": "haiku", "provider": "anthropic"}),
+                    thinking_level: None,
+                },
+            ],
             is_idle: false,
             has_pending_messages: true,
             context_usage: None,
@@ -2417,8 +2984,97 @@ mod bridge_tests {
         let payload = to_payload(&state)?;
         assert_eq!(payload["thinkingLevel"], "high");
         assert_eq!(payload["hasPendingMessages"], true);
+        assert_eq!(payload["scopedModels"][0]["thinkingLevel"], "high");
+        assert!(payload["scopedModels"][1].get("thinkingLevel").is_none());
         assert!(payload.get("model").is_none());
         assert_eq!(from_payload::<SessionStateWire>(&payload)?, state);
+        Ok(())
+    }
+
+    #[test]
+    fn session_setup_entries_wire_roundtrip() -> TestResult {
+        let request = SessionSetupEntriesRequest {
+            replacement_token: "tok-1".to_owned(),
+        };
+        let payload = to_payload(&request)?;
+        assert_eq!(payload["replacementToken"], "tok-1");
+        assert_eq!(
+            from_payload::<SessionSetupEntriesRequest>(&payload)?,
+            request
+        );
+
+        let response = SessionSetupEntriesResponse {
+            entries: vec![
+                serde_json::json!({"type": "session_info", "id": "e1"}),
+                serde_json::json!({"type": "custom", "id": "e2"}),
+            ],
+        };
+        let payload = to_payload(&response)?;
+        assert_eq!(payload["entries"].as_array().map(Vec::len), Some(2));
+        assert_eq!(
+            from_payload::<SessionSetupEntriesResponse>(&payload)?,
+            response
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn session_replacement_wire_optional_fields() -> TestResult {
+        let cancelled = SessionNewSessionResponse {
+            cancelled: true,
+            replacement_token: None,
+        };
+        let payload = to_payload(&cancelled)?;
+        assert_eq!(payload["cancelled"], true);
+        assert!(payload.get("replacementToken").is_none());
+        assert_eq!(
+            from_payload::<SessionNewSessionResponse>(&payload)?,
+            cancelled
+        );
+
+        let full = SessionNavigateTreeResponse {
+            cancelled: false,
+            editor_text: Some("draft".to_owned()),
+            aborted: Some(false),
+            summary_entry: Some(serde_json::json!({
+                "type": "branch_summary",
+                "id": "s1",
+                "summary": "kept"
+            })),
+        };
+        let payload = to_payload(&full)?;
+        assert_eq!(payload["editorText"], "draft");
+        assert_eq!(payload["summaryEntry"]["type"], "branch_summary");
+        assert_eq!(from_payload::<SessionNavigateTreeResponse>(&payload)?, full);
+
+        let bare = SessionNavigateTreeResponse {
+            cancelled: false,
+            editor_text: None,
+            aborted: None,
+            summary_entry: None,
+        };
+        let payload = to_payload(&bare)?;
+        assert_eq!(payload, serde_json::json!({"cancelled": false}));
+        assert_eq!(from_payload::<SessionNavigateTreeResponse>(&payload)?, bare);
+
+        let fork = SessionForkRequest {
+            entry_id: "e1".to_owned(),
+            position: Some(SessionForkPosition::At),
+        };
+        let payload = to_payload(&fork)?;
+        assert_eq!(payload["entryId"], "e1");
+        assert_eq!(payload["position"], "at");
+        assert_eq!(from_payload::<SessionForkRequest>(&payload)?, fork);
+
+        let ready = SessionReplacementReadyEvent {
+            token: "tok-1".to_owned(),
+        };
+        let payload = to_payload(&ready)?;
+        assert_eq!(payload["token"], "tok-1");
+        assert_eq!(
+            from_payload::<SessionReplacementReadyEvent>(&payload)?,
+            ready
+        );
         Ok(())
     }
 }

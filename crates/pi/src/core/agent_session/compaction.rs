@@ -26,25 +26,23 @@ use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use pi_ai::{
-    AssistantMessage, AssistantMessageEvent, Context, Model, ProviderError, StopReason,
-    StreamOptions,
-};
+use pi_ai::{AssistantMessage, AssistantMessageEvent, Model, ProviderError, StopReason};
 use regex::Regex;
 use tokio_util::sync::CancellationToken;
 
 use crate::core::compaction::{
     self, BeforeCompactResult, CompactOptions, CompactionError, CompactionResult,
-    CompactionSettings, SummarizeStreamFn, preparation_none_error, prepare_compaction,
-    should_compact,
+    CompactionSettings, SummarizationRetryCallbacks, SummarizationRetryPolicy, SummarizeStreamFn,
+    preparation_none_error, prepare_compaction, should_compact,
 };
 use crate::core::model_runtime::ModelRuntimeAuthOverrides;
 use crate::core::sessions::{CompactionEntry, SessionEntry, get_latest_compaction_entry};
 use crate::core::settings::ResolvedCompactionSettings;
 
 use super::AgentSession;
-use super::events::{AgentSessionEvent, CompactionReason};
+use super::events::{AgentSessionEvent, CompactionReason, SummarizationRetrySource};
 use super::extension_runner::ExtensionRunner;
+use super::tree::SummarizationAuth;
 
 // ---------------------------------------------------------------------------
 // Resolved auth + stream source for compaction
@@ -161,7 +159,7 @@ impl AgentSession {
                 let path_entries = self.snapshot_branch_entries().await;
                 let path_refs: Vec<&SessionEntry> = path_entries.iter().collect();
                 let err = preparation_none_error(&path_refs);
-                let message = err.to_string();
+                let message = format!("Compaction failed: {err}");
                 self.emit_public_awaited(&AgentSessionEvent::CompactionEnd {
                     reason: CompactionReason::Manual,
                     result: None,
@@ -462,6 +460,9 @@ impl AgentSession {
 
         // Run the pure engine.
         let thinking_level = thinking_level_str(self.thinking_level());
+        let retry = self.summarization_retry_policy();
+        let retry_callbacks =
+            self.summarization_retry_callbacks(SummarizationRetrySource::Compaction { reason });
 
         let result = compaction::compact(
             &preparation,
@@ -474,6 +475,8 @@ impl AgentSession {
                 thinking_level: thinking_level.as_deref(),
                 stream_fn: inputs.stream_fn.clone(),
                 env: inputs.env.clone(),
+                retry: Some(retry),
+                retry_callbacks: Some(retry_callbacks),
                 hooks: None,
             },
         )
@@ -511,6 +514,7 @@ impl AgentSession {
                     tokens_before_i64,
                     details,
                     if from_hook { Some(true) } else { None },
+                    result.usage.clone(),
                 )
                 .map_err(|err| {
                     CompactionError::SummarizationFailed(format!(
@@ -551,58 +555,66 @@ impl AgentSession {
 
     // -- auth + stream resolution -----------------------------------------
 
-    /// Resolve the stream function, API key, headers, and env for compaction.
+    /// Resolve model-runtime auth and stream inputs shared by compaction and
+    /// branch summarization.
     ///
-    /// Tries the concrete [`ModelRuntime`] first (production path). Falls back
-    /// to [`CompactionStreamHandle`] (tests / SDK override).
+    /// The test-only [`CompactionStreamHandle`] fallback remains compaction
+    /// specific; tree navigation requires a real model runtime.
     ///
     /// # Errors
     ///
     /// Returns [`CompactionError::SummarizationFailed`] when no model runtime
     /// is configured or auth resolution fails.
-    async fn resolve_compaction_inputs(&self) -> Result<CompactionInputs, CompactionError> {
-        if let Some(runtime) = self.model_runtime_handle() {
-            let model = self.model();
-
-            let auth = runtime
-                .get_auth_for_model(&model, ModelRuntimeAuthOverrides::default())
-                .await
-                .map_err(|err| {
-                    CompactionError::SummarizationFailed(format!("auth resolution failed: {err}"))
-                })?;
-
-            let api_key = auth.as_ref().and_then(|a| a.auth.api_key.clone());
-            let headers = auth.as_ref().and_then(|a| a.auth.headers.clone());
-            let env = auth.and_then(|a| {
-                a.env.map(|provider_env| {
+    pub(crate) async fn resolve_summarization_inputs(
+        &self,
+        operation: &str,
+    ) -> Result<(SummarizationAuth, SummarizeStreamFn), CompactionError> {
+        let runtime = self.model_runtime_handle().ok_or_else(|| {
+            CompactionError::SummarizationFailed(format!(
+                "No model runtime configured for {operation}"
+            ))
+        })?;
+        let model = self.model();
+        let auth = runtime
+            .get_auth_for_model(&model, ModelRuntimeAuthOverrides::default())
+            .await
+            .map_err(|err| {
+                CompactionError::SummarizationFailed(format!("auth resolution failed: {err}"))
+            })?;
+        let auth = SummarizationAuth {
+            api_key: auth.as_ref().and_then(|value| value.auth.api_key.clone()),
+            headers: auth.as_ref().and_then(|value| value.auth.headers.clone()),
+            env: auth.and_then(|value| {
+                value.env.map(|provider_env| {
                     provider_env
                         .into_iter()
                         .collect::<BTreeMap<String, String>>()
                 })
-            });
+            }),
+        };
+        let stream_fn: SummarizeStreamFn = Arc::new(move |model, context, options| {
+            let runtime = Arc::clone(&runtime);
+            Box::pin(async move {
+                runtime.stream_simple(model, context, options)
+                    as Pin<
+                        Box<
+                            dyn futures::Stream<Item = Result<AssistantMessageEvent, ProviderError>>
+                                + Send,
+                        >,
+                    >
+            })
+        });
+        Ok((auth, stream_fn))
+    }
 
-            let stream_fn: SummarizeStreamFn = {
-                let runtime = runtime.clone();
-                Arc::new(move |model: Model, ctx: Context, opts: StreamOptions| {
-                    let runtime = runtime.clone();
-                    Box::pin(async move {
-                        runtime.stream_simple(model, ctx, opts)
-                            as Pin<
-                                Box<
-                                    dyn futures::Stream<
-                                            Item = Result<AssistantMessageEvent, ProviderError>,
-                                        > + Send,
-                                >,
-                            >
-                    })
-                })
-            };
-
+    async fn resolve_compaction_inputs(&self) -> Result<CompactionInputs, CompactionError> {
+        if self.model_runtime_handle().is_some() {
+            let (auth, stream_fn) = self.resolve_summarization_inputs("compaction").await?;
             return Ok(CompactionInputs {
                 stream_fn,
-                api_key,
-                headers,
-                env,
+                api_key: auth.api_key,
+                headers: auth.headers,
+                env: auth.env,
             });
         }
 
@@ -752,6 +764,75 @@ impl AgentSession {
         }
 
         estimate.tokens
+    }
+
+    /// Resolve the settings retry policy for one summarization request.
+    pub(super) fn summarization_retry_policy(&self) -> SummarizationRetryPolicy {
+        let retry = self.lock_settings().get_retry_settings();
+        SummarizationRetryPolicy {
+            enabled: retry.enabled,
+            max_retries: clamp_summarization_max_retries(retry.max_retries),
+            base_delay_ms: retry.base_delay_ms,
+        }
+    }
+
+    /// Emit the TypeScript-compatible retry lifecycle for one summary source.
+    pub(super) fn summarization_retry_callbacks(
+        &self,
+        source: SummarizationRetrySource,
+    ) -> SummarizationRetryCallbacks {
+        let weak = self.upgrade_self();
+        let scheduled_weak = weak.clone();
+        let attempt_weak = weak.clone();
+        SummarizationRetryCallbacks {
+            on_retry_scheduled: Some(Arc::new(
+                move |attempt, max_attempts, delay_ms, error_message| {
+                    if let Some(session) =
+                        scheduled_weak.as_ref().and_then(std::sync::Weak::upgrade)
+                    {
+                        session.emit_public(AgentSessionEvent::SummarizationRetryScheduled {
+                            attempt,
+                            max_attempts,
+                            delay_ms,
+                            error_message,
+                        });
+                    }
+                },
+            )),
+            on_retry_attempt_start: Some(Arc::new(move || {
+                if let Some(session) = attempt_weak.as_ref().and_then(std::sync::Weak::upgrade) {
+                    session
+                        .emit_public(AgentSessionEvent::SummarizationRetryAttemptStart { source });
+                }
+            })),
+            on_retry_finished: Some(Arc::new(move || {
+                if let Some(session) = weak.as_ref().and_then(std::sync::Weak::upgrade) {
+                    session.emit_public(AgentSessionEvent::SummarizationRetryFinished);
+                }
+            })),
+        }
+    }
+}
+
+/// Sane ceiling for summarization retry attempts.
+///
+/// A summarization request is a single LLM call within a user-facing session.
+/// With the 60-second backoff cap, more than this many retries would keep the
+/// session blocked for ~10+ minutes on a transient failure that either
+/// resolves in a few attempts or indicates a persistent problem. Values at or
+/// below this are passed through unchanged; oversized or rejected values clamp
+/// here rather than falling back to `u32::MAX` (~4.29e9 retries).
+const SUMMARIZATION_MAX_RETRIES_CEILING: u32 = 10;
+
+/// Clamp a resolved `max_retries` to the sane summarization ceiling.
+///
+/// Values that fit in `u32` and are at or below the ceiling pass through.
+/// Oversized values (above the ceiling or overflowing `u32`) clamp to the
+/// ceiling, preserving the existing default behavior for rejected input.
+fn clamp_summarization_max_retries(max_retries: u64) -> u32 {
+    match u32::try_from(max_retries) {
+        Ok(value) => value.min(SUMMARIZATION_MAX_RETRIES_CEILING),
+        Err(_) => SUMMARIZATION_MAX_RETRIES_CEILING,
     }
 }
 
@@ -1400,14 +1481,24 @@ mod tests {
 
         sleep(std::time::Duration::from_millis(50)).await;
 
-        // Collect compaction_end events.
+        // Collect compaction_end events and confirm the deterministic error did not retry.
         let mut end_events = Vec::new();
+        let mut retry_events = Vec::new();
         while let Ok(Some(event)) = timeout(std::time::Duration::from_millis(100), rx.recv()).await
         {
             if event.type_name() == "compaction_end" {
-                end_events.push(event);
+                end_events.push(event.clone());
+            }
+            if matches!(
+                event,
+                AgentSessionEvent::SummarizationRetryScheduled { .. }
+                    | AgentSessionEvent::SummarizationRetryAttemptStart { .. }
+                    | AgentSessionEvent::SummarizationRetryFinished
+            ) {
+                retry_events.push(event);
             }
         }
+        assert!(retry_events.is_empty());
         assert!(!end_events.is_empty(), "should emit compaction_end");
         let Some(AgentSessionEvent::CompactionEnd { error_message, .. }) = end_events.first()
         else {
@@ -1426,6 +1517,69 @@ mod tests {
     async fn manual_compact_custom_instructions_passed_to_summary() -> TestResult {
         let session = session_with_history(8_192, summary_stream_fn("## Goal\nSummary")).await?;
         session.compact(Some("Focus on file changes")).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manual_compact_transient_summary_error_emits_retry_lifecycle() -> TestResult {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stream_fn: SummarizeStreamFn = Arc::new({
+            let attempts = Arc::clone(&attempts);
+            move |_model, _ctx, _opts| {
+                let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async move {
+                    let mut message = AssistantMessage::new("a", "p", "m", 1);
+                    if attempt == 0 {
+                        message.stop_reason = StopReason::Error;
+                        message.error_message = Some("provider overloaded".to_owned());
+                    } else {
+                        message.content =
+                            vec![AssistantContent::Text(TextContent::new("recovered"))];
+                        message.stop_reason = StopReason::Stop;
+                    }
+                    let stream = stream::iter(vec![Ok(AssistantMessageEvent::Done {
+                        reason: DoneReason::Stop,
+                        message,
+                    })]);
+                    Box::pin(stream)
+                        as Pin<
+                            Box<
+                                dyn futures::Stream<
+                                        Item = Result<AssistantMessageEvent, ProviderError>,
+                                    > + Send,
+                            >,
+                        >
+                })
+            }
+        });
+        let session = session_with_history(8_192, stream_fn).await?;
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let _unsub = session.subscribe(move |event| {
+            if matches!(
+                event,
+                AgentSessionEvent::SummarizationRetryScheduled { .. }
+                    | AgentSessionEvent::SummarizationRetryAttemptStart { .. }
+                    | AgentSessionEvent::SummarizationRetryFinished
+            ) {
+                let _ = tx.send(event.type_name().to_owned());
+            }
+        });
+
+        let result = session.compact(None).await?;
+        assert!(result.summary.contains("recovered"));
+        assert!(attempts.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert_eq!(
+            events,
+            [
+                "summarization_retry_scheduled",
+                "summarization_retry_attempt_start",
+                "summarization_retry_finished",
+            ]
+        );
         Ok(())
     }
 
@@ -1719,6 +1873,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_summarization_inputs_tree_navigation_label() -> TestResult {
+        // Tree navigation / branch summarization calls resolve_summarization_inputs
+        // directly (not through resolve_compaction_inputs). The missing-runtime
+        // error must name that operation, not "compaction", so a user navigating
+        // a tree does not read an error naming an operation they did not perform.
+        let provider = mock_provider();
+        let config = AgentSessionConfig::test_config(provider, test_model(8_192))?;
+        let session = AgentSession::new(config)?;
+        let result = session
+            .resolve_summarization_inputs("branch summarization")
+            .await;
+        let Err(CompactionError::SummarizationFailed(msg)) = &result else {
+            return Err("expected SummarizationFailed".into());
+        };
+        assert!(
+            msg.contains("branch summarization"),
+            "error should name the tree-navigation operation, got: {msg}"
+        );
+        assert!(
+            !msg.contains("for compaction"),
+            "error must not say 'compaction' for tree navigation, got: {msg}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn run_auto_compaction_queued_message_continuation() -> TestResult {
         let session = session_with_history(8_192, summary_stream_fn("queued summary")).await?;
         session
@@ -1777,5 +1957,26 @@ mod tests {
             "should emit entry_appended for the compaction entry: {events:?}"
         );
         Ok(())
+    }
+
+    #[test]
+    fn summarization_retry_clamps_oversized_max_retries() {
+        // Values at or below the ceiling pass through unchanged.
+        assert_eq!(clamp_summarization_max_retries(0), 0);
+        assert_eq!(clamp_summarization_max_retries(3), 3);
+        assert_eq!(
+            clamp_summarization_max_retries(u64::from(SUMMARIZATION_MAX_RETRIES_CEILING)),
+            SUMMARIZATION_MAX_RETRIES_CEILING
+        );
+        // Values above the ceiling clamp to the ceiling.
+        assert_eq!(
+            clamp_summarization_max_retries(u64::from(SUMMARIZATION_MAX_RETRIES_CEILING) + 1),
+            SUMMARIZATION_MAX_RETRIES_CEILING
+        );
+        // u64 overflow also clamps to the ceiling (was u32::MAX ~4.29e9).
+        assert_eq!(
+            clamp_summarization_max_retries(u64::MAX),
+            SUMMARIZATION_MAX_RETRIES_CEILING
+        );
     }
 }

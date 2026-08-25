@@ -1,4 +1,4 @@
-import type { Frame, FrameId, Method } from "./types.js";
+import type { Frame, FrameId } from "./types.js";
 /** Options for a correlated request. */
 export interface RequestOptions {
     /** Timeout in milliseconds. */
@@ -54,15 +54,15 @@ export declare class ProtocolClient {
      *
      * @throws when timed out, aborted, disposed, or when an error frame arrives.
      */
-    request(method: Method, payload?: unknown, options?: RequestOptions): Promise<Frame>;
+    request(method: string, payload?: unknown, options?: RequestOptions): Promise<Frame>;
     /**
      * Send a pre-built request frame and wait for correlation.
      */
     requestWithFrame(frame: Frame, options?: RequestOptions): Promise<Frame>;
     /** Convenience: respond to a request. */
-    respond(id: FrameId, method: Method, payload?: unknown): Promise<void>;
+    respond(id: FrameId, method: string, payload?: unknown): Promise<void>;
     /** Convenience: send a correlated error frame. */
-    respondError(id: FrameId, method: Method, error: {
+    respondError(id: FrameId, method: string, error: {
         code: string;
         message: string;
         retryable?: boolean;

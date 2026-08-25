@@ -1,11 +1,8 @@
 import {
 	encodeFrame,
-	errorFrame,
 	FrameDecoder,
-	requestFrame,
-	responseFrame,
 } from "./codec.js";
-import type { Frame, FrameId, Method } from "./types.js";
+import type { Frame, FrameId } from "./types.js";
 
 /** Options for a correlated request. */
 export interface RequestOptions {
@@ -102,13 +99,13 @@ export class ProtocolClient {
 	 * @throws when timed out, aborted, disposed, or when an error frame arrives.
 	 */
 	async request(
-		method: Method,
+		method: string,
 		payload: unknown = {},
 		options?: RequestOptions,
 	): Promise<Frame> {
 		this.ensureOpen();
 		const id = this.allocateId();
-		const frame = requestFrame(id, method, payload);
+		const frame: Frame = { id, kind: "req", method, payload };
 		return await this.requestWithFrame(frame, options);
 	}
 
@@ -186,17 +183,25 @@ export class ProtocolClient {
 	}
 
 	/** Convenience: respond to a request. */
-	async respond(id: FrameId, method: Method, payload: unknown = {}): Promise<void> {
-		await this.send(responseFrame(id, method, payload));
+	async respond(id: FrameId, method: string, payload: unknown = {}): Promise<void> {
+		await this.send({ id, kind: "res", method, payload });
 	}
 
 	/** Convenience: send a correlated error frame. */
 	async respondError(
 		id: FrameId,
-		method: Method,
+		method: string,
 		error: { code: string; message: string; retryable?: boolean; data?: unknown },
 	): Promise<void> {
-		await this.send(errorFrame(id, method, error));
+		const errorPayload: Record<string, unknown> = {
+			code: error.code,
+			message: error.message,
+			retryable: error.retryable ?? false,
+		};
+		if (error.data !== undefined) {
+			errorPayload.data = error.data;
+		}
+		await this.send({ id, kind: "error", method, payload: errorPayload });
 	}
 
 	/**

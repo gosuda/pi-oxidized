@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 
@@ -15,18 +15,21 @@ use pi_ext::adapters::{ExtensionProvider, Registry, RendererKind, ShortcutRegist
 use pi_ext::client::{HostClient, HostClientError, HostUiRequest, HostUiResponse};
 use pi_ext::host::{self, HostSource, HostSpec};
 use pi_ext::protocol::{
-    self, ExtensionErrorEvent, FlagValueWire, FrameId, ProviderEvent, SessionStateWire,
-    ShortcutExecuteResponse, ThemeUpdate, ToolUpdate, UiEventRequest, UiEventResponse, UiStateWire,
+    self, ExtensionErrorEvent, FlagValueWire, FrameId, ProviderEvent, SessionSetupEntriesResponse,
+    SessionStateWire, ShortcutExecuteResponse, ThemeUpdate, ToolUpdate, UiEventRequest,
+    UiEventResponse, UiStateWire,
 };
 use pi_ext::sanitize::SanitizedSlot;
 use serde_json::{Map, Value};
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
-use super::agent_session::events::AgentSessionEvent;
+use super::agent_session::AgentSession;
+use super::agent_session::events::{AgentSessionEvent, SessionShutdownReason};
 use super::agent_session::extension_runner::{
     BeforeAgentStartResult, CancelResult, ExtensionRunner, ExtensionRunnerError,
     InputTransformResult,
 };
+use super::agent_session_runtime::{CreateAgentSessionRuntimeResult, spawn_runtime_safe};
 use super::agent_session_services::ExtensionFlagType;
 use super::extension_host::{
     EVENT_CHANNEL_CAPACITY, ExtensionUiEvent, HOOK_TIMEOUT, HostExtensionRunner, HostStartError,
@@ -34,7 +37,7 @@ use super::extension_host::{
 };
 use super::extension_manifest::{ClassifiedExtension, ExtensionRuntime, classify};
 use super::model_runtime::{ModelRuntime, ModelRuntimeError};
-use super::resources::ResourceExtensionPaths;
+use super::resources::{ResourceExtensionPaths, SourceInfo};
 
 /// One aggregate deadline shared by every terminal-input endpoint request.
 pub const TERMINAL_INPUT_DEADLINE: Duration = Duration::from_millis(4);
@@ -61,6 +64,7 @@ struct EndpointPlan {
 #[derive(Clone, Copy)]
 enum GenerationBuildPolicy {
     BestEffortStart,
+    #[allow(dead_code)]
     RequireAllEndpointStarts,
 }
 
@@ -82,6 +86,7 @@ struct PreparedEndpoint {
     kind: EndpointKind,
     label: String,
     runner: Arc<HostExtensionRunner>,
+    plan: EndpointPlan,
 }
 
 struct GenerationStarts {
@@ -100,6 +105,153 @@ pub struct ExtensionSetDiagnostic {
     pub message: String,
 }
 
+impl std::fmt::Display for ExtensionSetDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Extension \"{}\" error: {}", self.path, self.message)
+    }
+}
+
+/// Prepared replacement held between prepare and commit of a reload.
+pub(crate) struct PreparedReload {
+    generation: Option<Generation>,
+    pending: PendingBridges,
+    diagnostics: Vec<ExtensionSetDiagnostic>,
+}
+
+#[cfg(test)]
+impl PreparedReload {
+    pub(crate) fn empty_for_test() -> Self {
+        Self {
+            generation: None,
+            pending: Vec::new(),
+            diagnostics: Vec::new(),
+        }
+    }
+}
+
+impl Drop for PreparedReload {
+    fn drop(&mut self) {
+        if let Some(generation) = self.generation.take() {
+            abort_bridges(&generation);
+            for endpoint in generation.endpoints.iter() {
+                let runner = Arc::clone(&endpoint.runner);
+                spawn_runtime_safe("prepared-reload-shutdown", async move {
+                    runner.shutdown_once().await;
+                });
+            }
+        }
+    }
+}
+
+/// Prepared resources owned by the facade while a replacement waits for host readiness.
+pub(crate) enum PendingReadyOp {
+    /// A fully-created session runtime waiting to replace the current runtime.
+    Replacement {
+        /// New runtime state. It is neither applied nor disposed before the ready decision.
+        result: CreateAgentSessionRuntimeResult,
+        /// Shutdown reason emitted by the old session during finalization.
+        reason: SessionShutdownReason,
+        /// Session file that will replace the old session file, when known.
+        target_session_file: Option<String>,
+    },
+    /// A prepared extension generation waiting to replace the published generation.
+    Reload {
+        /// Unpublished extension generation.
+        prepared: PreparedReload,
+        /// Provider registry receiving the committed generation.
+        model_runtime: Arc<ModelRuntime>,
+    },
+}
+
+impl PendingReadyOp {
+    fn replacement_target(&self) -> Option<Arc<AgentSession>> {
+        match self {
+            Self::Replacement { result, .. } => Some(Arc::clone(&result.session)),
+            Self::Reload { .. } => None,
+        }
+    }
+}
+
+enum PendingReadyState {
+    None,
+    Pending {
+        op: PendingReadyOp,
+        token: String,
+        ready_tx: oneshot::Sender<()>,
+        owner: Option<EndpointId>,
+    },
+    Finalizing {
+        op: Option<PendingReadyOp>,
+        token: String,
+        owner: Option<EndpointId>,
+        replacement_target: Option<Arc<AgentSession>>,
+    },
+}
+
+/// Authority carried by the current committed session target. This tag lets
+/// a publisher prove it was bound before a subsequent rebind changed target.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SessionTargetBinding(u64);
+
+/// Centralized routing result so bridge consumers do not duplicate state
+/// matching. Created by `ExtensionRuntimeSet::route_session_bridge`.
+pub(crate) enum SessionBridgeRoute {
+    /// Route to the committed session and retain its publication authority.
+    Active {
+        target: Arc<AgentSession>,
+        binding: SessionTargetBinding,
+    },
+    /// Route to the exact token-and-owner candidate without publishing its mirror.
+    Candidate(Arc<AgentSession>),
+    /// Apply an exact token-and-owner readiness operation.
+    Operation,
+    /// Drop or answer an event that does not carry current authority.
+    Rejected,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TaggedBridgeKind {
+    Candidate,
+    Operation,
+}
+
+enum BridgeScope<'a> {
+    Untagged,
+    Tagged {
+        token: &'a str,
+        origin: Option<EndpointId>,
+        kind: TaggedBridgeKind,
+    },
+}
+
+/// Releases the finalizing slot when the finalizer completes or unwinds.
+///
+/// Returned from [`ExtensionRuntimeSet::take_finalizing`] alongside the
+/// transferred operation. If the finalizer task panics or returns early
+/// without calling [`ExtensionRuntimeSet::finish_finalize`], this guard's
+/// `Drop` impl clears the slot so future replacements are not wedged.
+pub(crate) struct FinalizeGuard {
+    set: Weak<ExtensionRuntimeSet>,
+    token: String,
+}
+
+impl Drop for FinalizeGuard {
+    fn drop(&mut self) {
+        if let Some(set) = self.set.upgrade() {
+            // Idempotent: a normal finish already cleared the slot.
+            let _ = set.finish_finalize(&self.token);
+        }
+    }
+}
+
+/// Outcome of a committed extension-runtime reload.
+pub(crate) struct ReloadResult {
+    /// Classification, load, flag, and provider diagnostics collected across prepare/commit.
+    pub diagnostics: Vec<ExtensionSetDiagnostic>,
+    /// Whether the prepared generation was published.
+    pub(crate) committed: bool,
+}
+
 /// Result of best-effort cold startup.
 pub struct ExtensionSetStart {
     /// Stable facade, absent only when no endpoint became ready.
@@ -109,7 +261,7 @@ pub struct ExtensionSetStart {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-struct EndpointId {
+pub(crate) struct EndpointId {
     generation: u64,
     position: usize,
 }
@@ -122,7 +274,7 @@ struct Endpoint {
     runner: Arc<HostExtensionRunner>,
 }
 
-struct Generation {
+pub(crate) struct Generation {
     id: u64,
     endpoints: Arc<[Endpoint]>,
     bridges: StdMutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -143,9 +295,6 @@ impl Generation {
             .iter()
             .filter(|endpoint| endpoint.runner.is_active());
         matches!(active.next(), Some(endpoint) if endpoint.kind == EndpointKind::TsCompat && active.next().is_none())
-    }
-    fn is_single_compat_replacement(&self) -> bool {
-        self.endpoints.len() == 1 && self.endpoints[0].kind == EndpointKind::TsCompat
     }
 }
 
@@ -190,7 +339,7 @@ impl Drop for GenerationLease {
     }
 }
 
-struct PendingEndpointBridges {
+pub(crate) struct PendingEndpointBridges {
     endpoint: Endpoint,
     tool_updates: broadcast::Receiver<ToolUpdate>,
     provider_events: broadcast::Receiver<ProviderEvent>,
@@ -198,17 +347,19 @@ struct PendingEndpointBridges {
     ui: broadcast::Receiver<ExtensionUiEvent>,
     ui_requests: Option<mpsc::Receiver<HostUiRequest>>,
     session_bridge: Option<mpsc::Receiver<SessionBridgeEvent>>,
+    providers_update: Option<watch::Receiver<pi_ext::protocol::ProvidersUpdate>>,
     slots: Vec<SanitizedSlot>,
 }
+
+type PendingBridges = Vec<PendingEndpointBridges>;
 
 /// Every relay for one endpoint shares this stable routing identity.
 struct EndpointRelayContext {
     state: Weak<StdMutex<PublishedRuntimeState>>,
     channels: Arc<FacadeChannels>,
     endpoint: Endpoint,
+    replacement_ready_drop: Weak<StdMutex<PendingReadyState>>,
 }
-
-type PendingBridges = Vec<PendingEndpointBridges>;
 
 #[derive(Clone, Copy)]
 struct CorrelationRoute {
@@ -264,6 +415,39 @@ impl PublishedRuntimeState {
                 .generation
                 .endpoint(endpoint)
                 .is_some_and(|endpoint| endpoint.runner.is_active())
+    }
+
+    /// Apply a live `providers.update` from one endpoint.
+    ///
+    /// Replaces only that endpoint's provider snapshot in the runner, then
+    /// rebuilds the aggregate in live endpoint order and rewires
+    /// `ModelRuntime`. The snapshot write lock is released before any
+    /// `ModelRuntime` call (it is held inside `apply_providers_update`
+    /// on the runner and released before we touch the runtime).
+    fn apply_providers_update(
+        &mut self,
+        endpoint: &Endpoint,
+        update: &pi_ext::protocol::ProvidersUpdate,
+    ) {
+        // Remove the pre-update aggregate before replacing this endpoint's
+        // authoritative snapshot, or an unregistered name disappears before
+        // ModelRuntime can remove its stale config and stream adapter.
+        let runtime = self.provider_runtime.clone();
+        if let Some(runtime) = &runtime {
+            unregister_endpoint_providers(&self.generation.endpoints, runtime);
+        }
+
+        endpoint.runner.apply_providers_update(update);
+
+        let Some(runtime) = runtime else {
+            return;
+        };
+        let active = self
+            .generation
+            .endpoints
+            .iter()
+            .filter(|ep| !self.retired.contains(&ep.id) && ep.runner.is_active());
+        register_endpoint_providers(active, &runtime);
     }
 
     fn retire_endpoint(&mut self, endpoint: EndpointId, channels: &FacadeChannels) -> bool {
@@ -500,6 +684,63 @@ impl PublishedRuntimeState {
         Some(self.quiesce(channels))
     }
 }
+/// State that owns the bound session target and its mirror publication authority.
+struct SessionTargetState {
+    target: Weak<AgentSession>,
+    binding: Option<SessionTargetBinding>,
+    published: bool,
+    next_binding: u64,
+}
+
+impl SessionTargetState {
+    fn new() -> Self {
+        Self {
+            target: Weak::new(),
+            binding: None,
+            published: false,
+            next_binding: 1,
+        }
+    }
+
+    fn bind(&mut self, target: Weak<AgentSession>) -> SessionTargetBinding {
+        if self.target.ptr_eq(&target)
+            && let Some(binding) = self.binding
+        {
+            return binding;
+        }
+        let binding = SessionTargetBinding(self.next_binding);
+        self.next_binding = self.next_binding.wrapping_add(1).max(1);
+        self.target = target;
+        self.binding = Some(binding);
+        self.published = false;
+        binding
+    }
+
+    fn route(&self) -> Option<(Arc<AgentSession>, SessionTargetBinding)> {
+        Some((self.target.upgrade()?, self.binding?))
+    }
+
+    fn binding_for(&self, target: &Arc<AgentSession>) -> Option<SessionTargetBinding> {
+        let (current, binding) = self.route()?;
+        (self.published && Arc::ptr_eq(&current, target)).then_some(binding)
+    }
+
+    fn is_current(&self, binding: SessionTargetBinding) -> bool {
+        self.binding == Some(binding) && self.target.strong_count() != 0
+    }
+
+    fn is_published(&self, binding: SessionTargetBinding) -> bool {
+        self.published && self.is_current(binding)
+    }
+
+    fn publish(&mut self, binding: SessionTargetBinding) -> bool {
+        if !self.is_current(binding) {
+            return false;
+        }
+        self.published = true;
+        true
+    }
+}
 
 struct FacadeChannels {
     tool_updates_tx: broadcast::Sender<ToolUpdate>,
@@ -510,6 +751,7 @@ struct FacadeChannels {
     ui_requests_rx: StdMutex<Option<mpsc::Receiver<HostUiRequest>>>,
     session_bridge_tx: mpsc::Sender<SessionBridgeEvent>,
     session_bridge_rx: StdMutex<Option<mpsc::Receiver<SessionBridgeEvent>>>,
+    session_target: StdMutex<SessionTargetState>,
     registry_revision_tx: watch::Sender<u64>,
 }
 
@@ -531,6 +773,7 @@ impl FacadeChannels {
             ui_requests_rx: StdMutex::new(Some(ui_requests_rx)),
             session_bridge_tx,
             session_bridge_rx: StdMutex::new(Some(session_bridge_rx)),
+            session_target: StdMutex::new(SessionTargetState::new()),
             registry_revision_tx,
         }
     }
@@ -555,11 +798,17 @@ pub struct ExtensionRuntimeSet {
     state: Arc<StdMutex<PublishedRuntimeState>>,
     channels: Arc<FacadeChannels>,
     discovered_paths: Vec<String>,
+    command_source_infos: StdMutex<HashMap<String, SourceInfo>>,
     load_cwd: String,
     project_trusted: bool,
     reload_lock: tokio::sync::Mutex<()>,
+    session_publish_lock: tokio::sync::Mutex<()>,
+    pending_ready: Arc<StdMutex<PendingReadyState>>,
+    next_replacement_token_id: AtomicU64,
     #[cfg(test)]
     test_prepared_reload: StdMutex<Option<TestPreparedReload>>,
+    #[cfg(test)]
+    test_abort_prepare_after_flags: StdMutex<bool>,
 }
 
 #[cfg(test)]
@@ -574,6 +823,10 @@ enum TestPreparedReload {
         diagnostics: Vec<ExtensionSetDiagnostic>,
     },
     ReplacementThenInvalidation {
+        generation: Generation,
+        pending: PendingBridges,
+    },
+    ReplacementThenFatalPreparationFailure {
         generation: Generation,
         pending: PendingBridges,
     },
@@ -639,12 +892,38 @@ impl ExtensionRuntimeSet {
             )))),
             channels: Arc::new(FacadeChannels::new()),
             discovered_paths,
+            command_source_infos: StdMutex::new(HashMap::new()),
             load_cwd,
             project_trusted,
             reload_lock: tokio::sync::Mutex::new(()),
+            session_publish_lock: tokio::sync::Mutex::new(()),
+            pending_ready: Arc::new(StdMutex::new(PendingReadyState::None)),
+            next_replacement_token_id: AtomicU64::new(1),
             #[cfg(test)]
             test_prepared_reload: StdMutex::new(None),
+            #[cfg(test)]
+            test_abort_prepare_after_flags: StdMutex::new(false),
         }
+    }
+
+    /// Install resource-loader provenance for command-owning extension paths.
+    pub fn set_command_source_infos(&self, infos: impl IntoIterator<Item = (String, SourceInfo)>) {
+        let mut current = self
+            .command_source_infos
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        current.clear();
+        current.extend(infos);
+    }
+
+    /// Resolve resource-loader provenance for one command-owning path.
+    #[must_use]
+    pub fn command_source_info(&self, path: &str) -> Option<SourceInfo> {
+        self.command_source_infos
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(path)
+            .cloned()
     }
 
     /// Bind pre-built single-endpoint runners (focused fake-host tests).
@@ -676,8 +955,227 @@ impl ExtensionRuntimeSet {
         self.state().lease()
     }
 
+    fn claim_route_and_bind_owner(
+        &self,
+        id: FrameId,
+        bind_token: Option<&str>,
+    ) -> Option<(GenerationLease, Endpoint, FrameId)> {
+        // Keep route claim and owner binding atomic against endpoint retirement.
+        let mut state = self.state();
+        let claimed = state.claim_route(id)?;
+        if let Some(bind_token) = bind_token {
+            let mut pending = self.pending_ready();
+            if let PendingReadyState::Pending { token, owner, .. } = &mut *pending
+                && token == bind_token
+            {
+                *owner = Some(claimed.1.id);
+            }
+        }
+        Some(claimed)
+    }
+    fn pending_ready(&self) -> std::sync::MutexGuard<'_, PendingReadyState> {
+        self.pending_ready
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Mint a facade-scoped replacement token safe to serialize across JavaScript.
+    #[must_use]
+    #[allow(clippy::expect_used)]
+    pub(crate) fn next_replacement_token(&self) -> String {
+        self.next_replacement_token_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .expect("replacement token space exhausted")
+            .to_string()
+    }
+
+    /// Install the sole ready-gated operation before its success response is written.
+    ///
+    /// On conflict, ownership of `op` is returned to the caller for explicit cleanup.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn install_pending(
+        &self,
+        token: String,
+        op: PendingReadyOp,
+    ) -> Result<oneshot::Receiver<()>, PendingReadyOp> {
+        let mut state = self.pending_ready();
+        if !matches!(*state, PendingReadyState::None) {
+            return Err(op);
+        }
+        let (ready_tx, ready_rx) = oneshot::channel();
+        *state = PendingReadyState::Pending {
+            op,
+            token,
+            ready_tx,
+            owner: None,
+        };
+        Ok(ready_rx)
+    }
+
+    /// Correlate a host-ready event and advance its operation into finalization.
+    ///
+    /// Returns false for stale/mismatched tokens and for a waiter that was already dropped.
+    pub(crate) fn complete_ready(&self, token: &str) -> bool {
+        let mut state = self.pending_ready();
+        let current = std::mem::replace(&mut *state, PendingReadyState::None);
+        let (op, pending_token, ready_tx, owner) = match current {
+            PendingReadyState::Pending {
+                op,
+                token,
+                ready_tx,
+                owner,
+            } => (op, token, ready_tx, owner),
+            other => {
+                *state = other;
+                return false;
+            }
+        };
+        if pending_token != token {
+            *state = PendingReadyState::Pending {
+                op,
+                token: pending_token,
+                ready_tx,
+                owner,
+            };
+            return false;
+        }
+        let replacement_target = op.replacement_target();
+        *state = PendingReadyState::Finalizing {
+            op: Some(op),
+            token: pending_token,
+            owner,
+            replacement_target,
+        };
+        if ready_tx.send(()).is_ok() {
+            return true;
+        }
+        let drained = match std::mem::replace(&mut *state, PendingReadyState::None) {
+            PendingReadyState::Finalizing { op, .. } => op,
+            PendingReadyState::None | PendingReadyState::Pending { .. } => None,
+        };
+        drop(state);
+        if let Some(op) = drained {
+            discard_pending_ready_op(op);
+        }
+        false
+    }
+
+    /// Transfer a token-correlated operation to its finalizer while retaining slot ownership.
+    ///
+    /// Returns the operation and a [`FinalizeGuard`] that releases the
+    /// finalizing slot on drop. If the finalizer completes normally it
+    /// should call [`ExtensionRuntimeSet::finish_finalize`] to clear
+    /// the slot explicitly; if it panics or returns early, the guard's
+    /// `Drop` impl clears the slot so future replacements are not wedged.
+    pub(crate) fn take_finalizing(
+        self: &Arc<Self>,
+        token: &str,
+    ) -> Option<(PendingReadyOp, FinalizeGuard)> {
+        let mut state = self.pending_ready();
+        match &mut *state {
+            PendingReadyState::Finalizing {
+                op,
+                token: pending_token,
+                ..
+            } if pending_token == token => op.take().map(|op| {
+                let guard = FinalizeGuard {
+                    set: Arc::downgrade(self),
+                    token: token.to_owned(),
+                };
+                (op, guard)
+            }),
+            PendingReadyState::None
+            | PendingReadyState::Pending { .. }
+            | PendingReadyState::Finalizing { .. } => None,
+        }
+    }
+
+    /// Release the finalizing slot after the transferred operation was applied.
+    ///
+    /// Tolerates an already-cleared slot: if the slot was cleared by a
+    /// [`FinalizeGuard`] drop or a prior call, this returns `true` so
+    /// callers that race a guard drop with an explicit finish do not
+    /// observe a spurious failure.
+    pub(crate) fn finish_finalize(&self, token: &str) -> bool {
+        let mut state = self.pending_ready();
+        match &*state {
+            PendingReadyState::Finalizing {
+                op: None,
+                token: pending_token,
+                ..
+            } if pending_token == token => {
+                *state = PendingReadyState::None;
+                true
+            }
+            // Slot already cleared (e.g. by a guard drop racing this call).
+            PendingReadyState::None => true,
+            _ => false,
+        }
+    }
+
+    /// Abort an operation that has not been transferred to a finalizer.
+    #[must_use]
+    pub(crate) fn abort_pending(&self, token: &str) -> Option<PendingReadyOp> {
+        let mut state = self.pending_ready();
+        let matches = match &*state {
+            PendingReadyState::Pending {
+                token: pending_token,
+                ..
+            }
+            | PendingReadyState::Finalizing {
+                token: pending_token,
+                op: Some(_),
+                ..
+            } => pending_token == token,
+            PendingReadyState::None | PendingReadyState::Finalizing { op: None, .. } => false,
+        };
+        if !matches {
+            return None;
+        }
+        match std::mem::replace(&mut *state, PendingReadyState::None) {
+            PendingReadyState::Pending { op, .. } => Some(op),
+            PendingReadyState::Finalizing { op, .. } => op,
+            PendingReadyState::None => None,
+        }
+    }
+
+    /// Abort an exact token that is still waiting for host readiness.
+    ///
+    /// Accepted readiness is irreversible: `Finalizing` states are never removed.
+    pub(crate) fn abort_waiting_ready(&self, token: &str, owner: Option<EndpointId>) -> bool {
+        let Some(op) = abort_pending_ready_drop(&self.pending_ready, token, owner) else {
+            return false;
+        };
+        discard_pending_ready_op(op);
+        true
+    }
+
+    /// Weak handle to the pending-ready slot for relay drop callbacks.
+    #[must_use]
+    fn pending_ready_weak(&self) -> Weak<StdMutex<PendingReadyState>> {
+        Arc::downgrade(&self.pending_ready)
+    }
+
+    /// Drain any facade-owned prepared resources and wake a pending waiter.
+    #[must_use]
+    pub(crate) fn drain_pending(&self) -> Option<PendingReadyOp> {
+        match std::mem::replace(&mut *self.pending_ready(), PendingReadyState::None) {
+            PendingReadyState::Pending { op, .. } => Some(op),
+            PendingReadyState::Finalizing { op, .. } => op,
+            PendingReadyState::None => None,
+        }
+    }
+
+    /// Whether a ready-gated operation is pending or finalizing.
+    #[must_use]
+    pub(crate) fn is_pending_busy(&self) -> bool {
+        !matches!(*self.pending_ready(), PendingReadyState::None)
+    }
+
     #[cfg(test)]
-    fn inject_prepared_replacement_for_reload(
+    pub(crate) fn inject_prepared_replacement_for_reload(
         &self,
         generation: Generation,
         pending: PendingBridges,
@@ -738,6 +1236,26 @@ impl ExtensionRuntimeSet {
         });
     }
 
+    #[cfg(test)]
+    fn inject_prepared_replacement_then_fatal_preparation_failure(
+        &self,
+        generation: Generation,
+        pending: PendingBridges,
+    ) {
+        let mut prepared = self
+            .test_prepared_reload
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            prepared.is_none(),
+            "reload test preparation was already injected"
+        );
+        *prepared = Some(TestPreparedReload::ReplacementThenFatalPreparationFailure {
+            generation,
+            pending,
+        });
+    }
+
     async fn build_reload_generation(&self, id: u64, plans: Vec<EndpointPlan>) -> GenerationBuild {
         #[cfg(test)]
         {
@@ -779,6 +1297,21 @@ impl ExtensionRuntimeSet {
                             endpoint_start_failure: None,
                         }
                     }
+                    TestPreparedReload::ReplacementThenFatalPreparationFailure {
+                        generation,
+                        pending,
+                    } => {
+                        *self
+                            .test_abort_prepare_after_flags
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+                        GenerationBuild {
+                            generation: Some(generation),
+                            pending,
+                            diagnostics: Vec::new(),
+                            endpoint_start_failure: None,
+                        }
+                    }
                 };
             }
         }
@@ -787,7 +1320,7 @@ impl ExtensionRuntimeSet {
             plans,
             &self.load_cwd,
             self.project_trusted,
-            GenerationBuildPolicy::RequireAllEndpointStarts,
+            GenerationBuildPolicy::BestEffortStart,
         )
         .await
     }
@@ -841,12 +1374,24 @@ impl ExtensionRuntimeSet {
                 ui,
                 ui_requests,
                 session_bridge,
+                providers_update,
                 slots: _,
             } = pending_endpoint;
+            endpoint.runner.set_endpoint_id(endpoint.id);
+            let pending_ready_weak = self.pending_ready_weak();
+            // Rejecting any token-bearing control at the first bounded hop
+            // aborts only the matching operation from this endpoint.
+            let drop_pending = Weak::clone(&pending_ready_weak);
+            endpoint.runner.set_replacement_drop_handler(Arc::new(
+                move |token: &str, origin: Option<EndpointId>| {
+                    abort_dropped_pending_ready(&drop_pending, token, origin);
+                },
+            ));
             let context = EndpointRelayContext {
                 state: Arc::downgrade(&self.state),
                 channels: Arc::clone(&self.channels),
                 endpoint,
+                replacement_ready_drop: Weak::clone(&pending_ready_weak),
             };
             handles.extend(spawn_broadcast_relays(
                 &context,
@@ -856,6 +1401,9 @@ impl ExtensionRuntimeSet {
             ));
             handles.extend(spawn_ui_relays(&context, ui, ui_requests));
             if let Some(handle) = spawn_session_relay(&context, session_bridge) {
+                handles.push(handle);
+            }
+            if let Some(handle) = spawn_providers_update_relay(&context, providers_update) {
                 handles.push(handle);
             }
         }
@@ -975,23 +1523,31 @@ impl ExtensionRuntimeSet {
 
     /// Synchronize flags to all active endpoints; siblings are attempted after an error.
     ///
+    /// Returns path-qualified diagnostics for per-endpoint failures without aborting siblings.
+    /// An empty overlay returns `Ok(vec![])` without contacting endpoints.
+    ///
     /// # Errors
     ///
-    /// Returns the first active endpoint error after attempting every endpoint.
+    /// Returns a runner-global failure only. Per-endpoint errors are collected into the Ok
+    /// diagnostics list.
     pub async fn apply_flag_values(
         &self,
         values: &BTreeMap<String, FlagValueWire>,
-    ) -> Result<(), HostClientError> {
+    ) -> Result<Vec<ExtensionSetDiagnostic>, HostClientError> {
+        if values.is_empty() {
+            return Ok(Vec::new());
+        }
         let lease = self.lease();
-        let mut first_error = None;
+        let mut diagnostics = Vec::new();
         for endpoint in lease.live_endpoints() {
-            if let Err(error) = endpoint.runner.apply_flag_values(values).await
-                && first_error.is_none()
-            {
-                first_error = Some(error);
+            if let Err(error) = endpoint.runner.apply_flag_values(values).await {
+                diagnostics.push(ExtensionSetDiagnostic {
+                    path: endpoint_diagnostic_path(endpoint),
+                    message: error.to_string(),
+                });
             }
         }
-        first_error.map_or(Ok(()), Err)
+        Ok(diagnostics)
     }
 
     /// Execute the last registration of a shortcut key.
@@ -1208,12 +1764,168 @@ impl ExtensionRuntimeSet {
 
     /// Claim the persistent facade session bridge once.
     #[must_use]
-    pub fn take_session_bridge(&self) -> Option<mpsc::Receiver<SessionBridgeEvent>> {
+    pub(crate) fn take_session_bridge(&self) -> Option<mpsc::Receiver<SessionBridgeEvent>> {
         self.channels
             .session_bridge_rx
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
+    }
+
+    /// Bind the session that receives facade commands after ready finalization.
+    pub(crate) async fn bind_session_target(
+        &self,
+        session: Weak<AgentSession>,
+    ) -> SessionTargetBinding {
+        let _publish = self.session_publish_lock.lock().await;
+        self.channels
+            .session_target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .bind(session)
+    }
+
+    /// Return the binding only when `session` owns the published mirror.
+    #[must_use]
+    pub(crate) fn session_binding_for(
+        &self,
+        session: &Arc<AgentSession>,
+    ) -> Option<SessionTargetBinding> {
+        self.channels
+            .session_target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .binding_for(session)
+    }
+
+    /// Commit an already-bound replacement and release its exact token.
+    pub(crate) async fn commit_session_replacement(
+        &self,
+        token: &str,
+    ) -> Option<(Arc<AgentSession>, SessionTargetBinding)> {
+        let _publish = self.session_publish_lock.lock().await;
+        let mut pending = self.pending_ready();
+        let expected = match &*pending {
+            PendingReadyState::Finalizing {
+                op: None,
+                token: pending_token,
+                replacement_target: Some(target),
+                ..
+            } if pending_token == token => Arc::clone(target),
+            _ => return None,
+        };
+        let (target, binding) = self
+            .channels
+            .session_target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .route()?;
+        if !Arc::ptr_eq(&target, &expected) {
+            return None;
+        }
+        *pending = PendingReadyState::None;
+        Some((target, binding))
+    }
+
+    /// Whether a mirror publisher still owns the committed session binding.
+    #[must_use]
+    pub(crate) fn is_session_target_current(&self, binding: SessionTargetBinding) -> bool {
+        self.channels
+            .session_target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_current(binding)
+    }
+
+    /// Route one bridge item from the sole token, owner, and session authority.
+    #[must_use]
+    pub(crate) fn route_session_bridge(&self, event: &SessionBridgeEvent) -> SessionBridgeRoute {
+        let scope = match event {
+            SessionBridgeEvent::Command { envelope, origin } => {
+                match envelope.replacement_token.as_deref() {
+                    Some(token) => BridgeScope::Tagged {
+                        token,
+                        origin: *origin,
+                        kind: TaggedBridgeKind::Candidate,
+                    },
+                    None => BridgeScope::Untagged,
+                }
+            }
+            SessionBridgeEvent::SetupEntries {
+                request, origin, ..
+            } => BridgeScope::Tagged {
+                token: &request.replacement_token,
+                origin: *origin,
+                kind: TaggedBridgeKind::Candidate,
+            },
+            SessionBridgeEvent::ReplacementReady { token, origin }
+            | SessionBridgeEvent::ReplacementAbort { token, origin } => BridgeScope::Tagged {
+                token,
+                origin: *origin,
+                kind: TaggedBridgeKind::Operation,
+            },
+            SessionBridgeEvent::SetModel { .. }
+            | SessionBridgeEvent::Compact { .. }
+            | SessionBridgeEvent::NewSession { .. }
+            | SessionBridgeEvent::Fork { .. }
+            | SessionBridgeEvent::NavigateTree { .. }
+            | SessionBridgeEvent::SwitchSession { .. }
+            | SessionBridgeEvent::Reload { .. } => BridgeScope::Untagged,
+        };
+
+        if let BridgeScope::Tagged {
+            token,
+            origin,
+            kind,
+        } = scope
+        {
+            let state = self.pending_ready();
+            let owner_matches = |owner: Option<EndpointId>| owner == origin;
+            return match (&*state, kind) {
+                (
+                    PendingReadyState::Pending {
+                        op,
+                        token: current,
+                        owner,
+                        ..
+                    },
+                    TaggedBridgeKind::Candidate,
+                ) if current == token && owner_matches(*owner) => op
+                    .replacement_target()
+                    .map_or(SessionBridgeRoute::Rejected, SessionBridgeRoute::Candidate),
+                (
+                    PendingReadyState::Finalizing {
+                        token: current,
+                        owner,
+                        replacement_target,
+                        ..
+                    },
+                    TaggedBridgeKind::Candidate,
+                ) if current == token && owner_matches(*owner) => replacement_target
+                    .clone()
+                    .map_or(SessionBridgeRoute::Rejected, SessionBridgeRoute::Candidate),
+                (
+                    PendingReadyState::Pending {
+                        token: current,
+                        owner,
+                        ..
+                    },
+                    TaggedBridgeKind::Operation,
+                ) if current == token && owner_matches(*owner) => SessionBridgeRoute::Operation,
+                _ => SessionBridgeRoute::Rejected,
+            };
+        }
+
+        let target = self
+            .channels
+            .session_target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .route();
+        match target {
+            Some((target, binding)) => SessionBridgeRoute::Active { target, binding },
+            None => SessionBridgeRoute::Rejected,
+        }
     }
 
     /// Route a correlated model response to its originating endpoint.
@@ -1248,8 +1960,227 @@ impl ExtensionRuntimeSet {
         endpoint.runner.respond_compact(local, outcome).await
     }
 
-    /// Broadcast mirrored session state.
-    pub async fn push_session_state(&self, state: &SessionStateWire) {
+    /// Route a correlated new-session response to its originating endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the response route is stale or its host rejects it.
+    pub async fn respond_new_session(
+        &self,
+        id: FrameId,
+        cancelled: bool,
+        token: Option<&str>,
+    ) -> Result<(), HostClientError> {
+        let bind_token = (!cancelled).then_some(token).flatten();
+        let Some((_lease, endpoint, local)) = self.claim_route_and_bind_owner(id, bind_token)
+        else {
+            return Err(HostClientError::NotRunning);
+        };
+        endpoint
+            .runner
+            .respond_new_session(local, cancelled, token)
+            .await
+    }
+
+    /// Route a correlated fork response to its originating endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the response route is stale or its host rejects it.
+    pub async fn respond_fork(
+        &self,
+        id: FrameId,
+        cancelled: bool,
+        selected_text: Option<&str>,
+        token: Option<&str>,
+    ) -> Result<(), HostClientError> {
+        let bind_token = (!cancelled).then_some(token).flatten();
+        let Some((_lease, endpoint, local)) = self.claim_route_and_bind_owner(id, bind_token)
+        else {
+            return Err(HostClientError::NotRunning);
+        };
+        endpoint
+            .runner
+            .respond_fork(local, cancelled, selected_text, token)
+            .await
+    }
+
+    /// Route a correlated tree-navigation response to its originating endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the response route is stale or its host rejects it.
+    pub async fn respond_navigate_tree(
+        &self,
+        id: FrameId,
+        outcome: Result<protocol::SessionNavigateTreeResponse, String>,
+    ) -> Result<(), HostClientError> {
+        let Some((_lease, endpoint, local)) = self.state().claim_route(id) else {
+            return Err(HostClientError::NotRunning);
+        };
+        endpoint.runner.respond_navigate_tree(local, outcome).await
+    }
+
+    /// Route a correlated switch-session response to its originating endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the response route is stale or its host rejects it.
+    pub async fn respond_switch_session(
+        &self,
+        id: FrameId,
+        cancelled: bool,
+        token: Option<&str>,
+    ) -> Result<(), HostClientError> {
+        let bind_token = (!cancelled).then_some(token).flatten();
+        let Some((_lease, endpoint, local)) = self.claim_route_and_bind_owner(id, bind_token)
+        else {
+            return Err(HostClientError::NotRunning);
+        };
+        endpoint
+            .runner
+            .respond_switch_session(local, cancelled, token)
+            .await
+    }
+
+    /// Route a correlated reload response to its originating endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the response route is stale or its host rejects it.
+    pub async fn respond_reload(
+        &self,
+        id: FrameId,
+        outcome: Result<Option<&str>, String>,
+    ) -> Result<(), HostClientError> {
+        let bind_token = outcome.as_ref().ok().and_then(|token| *token);
+        let Some((_lease, endpoint, local)) = self.claim_route_and_bind_owner(id, bind_token)
+        else {
+            return Err(HostClientError::NotRunning);
+        };
+        endpoint.runner.respond_reload(local, outcome).await
+    }
+
+    /// Route a correlated setup-entries response to its originating endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the response route is stale or missing, or its host rejects it.
+    pub async fn respond_setup_entries(
+        &self,
+        id: FrameId,
+        outcome: Result<SessionSetupEntriesResponse, String>,
+    ) -> Result<(), HostClientError> {
+        let Some((_lease, endpoint, local)) = self.state().claim_route(id) else {
+            return Err(HostClientError::NotRunning);
+        };
+        endpoint.runner.respond_setup_entries(local, outcome).await
+    }
+
+    /// Validate a replacement token and return the pending replacement target
+    /// session. Returns `None` for stale or missing tokens (fail closed).
+    #[must_use]
+    pub(crate) fn validate_setup_token(&self, token: &str) -> Option<Arc<AgentSession>> {
+        let state = self.pending_ready();
+        match &*state {
+            PendingReadyState::Pending {
+                op,
+                token: pending_token,
+                ..
+            } if pending_token == token => op.replacement_target(),
+            PendingReadyState::Finalizing {
+                replacement_target,
+                token: pending_token,
+                ..
+            } if pending_token == token => replacement_target.clone(),
+            _ => None,
+        }
+    }
+
+    /// Route a deterministic busy rejection to the request's originating endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the response route is stale or its host rejects it.
+    pub async fn respond_replacement_busy(
+        &self,
+        id: FrameId,
+        method: &str,
+    ) -> Result<(), HostClientError> {
+        let Some((_lease, endpoint, local)) = self.state().claim_route(id) else {
+            return Err(HostClientError::NotRunning);
+        };
+        endpoint
+            .runner
+            .respond_replacement_busy(local, method)
+            .await
+    }
+
+    /// Route an `extension_error` response to the request's originating endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the response route is stale or its host rejects it.
+    pub async fn respond_session_error(
+        &self,
+        id: FrameId,
+        method: &str,
+        message: &str,
+    ) -> Result<(), HostClientError> {
+        let Some((_lease, endpoint, local)) = self.state().claim_route(id) else {
+            return Err(HostClientError::NotRunning);
+        };
+        endpoint
+            .runner
+            .respond_session_error(local, method, message)
+            .await
+    }
+
+    /// Publish the first mirror snapshot and grant this binding publication authority.
+    pub(crate) async fn activate_session_state(
+        &self,
+        binding: SessionTargetBinding,
+        state: &SessionStateWire,
+    ) -> bool {
+        let _publish = self.session_publish_lock.lock().await;
+        if !self
+            .channels
+            .session_target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_current(binding)
+        {
+            return false;
+        }
+        self.broadcast_session_state(state).await;
+        self.channels
+            .session_target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .publish(binding)
+    }
+
+    /// Broadcast mirrored session state only for the published binding.
+    pub(crate) async fn push_session_state_for_binding(
+        &self,
+        binding: SessionTargetBinding,
+        state: &SessionStateWire,
+    ) -> bool {
+        let _publish = self.session_publish_lock.lock().await;
+        if !self
+            .channels
+            .session_target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_published(binding)
+        {
+            return false;
+        }
+        self.broadcast_session_state(state).await;
+        true
+    }
+
+    async fn broadcast_session_state(&self, state: &SessionStateWire) {
         let lease = self.lease();
         let mut sends = FuturesUnordered::new();
         for endpoint in lease.live_endpoints() {
@@ -1292,25 +2223,34 @@ impl ExtensionRuntimeSet {
         }
         None
     }
+    /// Short-lived serialization lock for reload prepare or commit phases.
+    ///
+    /// Callers must not hold this lock while awaiting a host callback.
+    #[must_use]
+    pub(crate) fn reload_lock(&self) -> &tokio::sync::Mutex<()> {
+        &self.reload_lock
+    }
 
-    /// Build a complete replacement, preserve the facade, then reap the old generation.
+    /// Prepare a reload replacement without mutating published providers or bridges.
+    ///
+    /// The caller must hold [`Self::reload_lock`] for this preparation phase.
     ///
     /// # Errors
     ///
-    /// Returns an error when the runtime is no longer reloadable, a replacement endpoint fails to
-    /// start, or a replacement provider cannot be registered.
-    pub async fn restart_and_rewire(
+    /// Returns an error when the runtime is no longer reloadable, no replacement endpoint starts,
+    /// flag encoding/sync fails globally, replacement provider validation fails, or the facade is
+    /// invalidated after flags are applied.
+    pub(crate) async fn prepare_reload(
         &self,
-        runtime: &ModelRuntime,
         preserved_flags: HashMap<String, Value>,
-    ) -> Result<(), HostStartError> {
-        let _reload = self.reload_lock.lock().await;
+    ) -> Result<PreparedReload, HostStartError> {
         if !self.state().reloadable() {
             return Err(HostStartError::Load(
                 "extension runtime is not reloadable".to_owned(),
             ));
         }
-        let (classified, _classification_diagnostics) = classify_paths(&self.discovered_paths);
+        let flags = encode_flags(preserved_flags)?;
+        let (classified, mut diagnostics) = classify_paths(&self.discovered_paths);
         let plans = plan_endpoints(&classified);
         let next_id = self
             .reload_generation()
@@ -1319,41 +2259,102 @@ impl ExtensionRuntimeSet {
         let GenerationBuild {
             generation: next,
             pending,
-            diagnostics: _load_diagnostics,
+            diagnostics: mut load_diagnostics,
             endpoint_start_failure,
         } = self.build_reload_generation(next_id, plans).await;
+        diagnostics.append(&mut load_diagnostics);
         let Some(next) = next else {
             let message = endpoint_start_failure.map_or_else(
                 || "no extension endpoint started".to_owned(),
-                |diagnostic| format!("{}: {}", diagnostic.path, diagnostic.message),
+                |diagnostic| diagnostic.to_string(),
             );
             return Err(HostStartError::Load(message));
         };
-        if !next.is_single_compat_replacement() {
+        match apply_flags_to_generation(&next, &flags).await {
+            Ok(mut flag_diagnostics) => diagnostics.append(&mut flag_diagnostics),
+            Err(error) => {
+                stop_generation(&next).await;
+                return Err(HostStartError::FlagSync(error.to_string()));
+            }
+        }
+        #[cfg(test)]
+        {
+            let abort = std::mem::replace(
+                &mut *self
+                    .test_abort_prepare_after_flags
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                false,
+            );
+            if abort {
+                stop_generation(&next).await;
+                return Err(HostStartError::FlagSync(
+                    "injected post-start preparation failure".to_owned(),
+                ));
+            }
+        }
+        // Validate replacement providers before returning success so a failed
+        // validation never reaches commit_reload after session_shutdown{reload}
+        // has been emitted to the old generation.
+        if let Err((path, error)) = validate_generation_providers(&next) {
+            diagnostics.push(ExtensionSetDiagnostic {
+                path,
+                message: error.to_string(),
+            });
+            stop_generation(&next).await;
+            return Err(HostStartError::Load(summarize_diagnostics(&diagnostics)));
+        }
+        if !self.state().reloadable() {
             stop_generation(&next).await;
             return Err(HostStartError::Load(
                 "extension runtime is not reloadable".to_owned(),
             ));
         }
-        let flags = match encode_flags(preserved_flags) {
-            Ok(flags) => flags,
-            Err(error) => {
-                stop_generation(&next).await;
-                return Err(error);
-            }
+        Ok(PreparedReload {
+            generation: Some(next),
+            pending,
+            diagnostics,
+        })
+    }
+
+    /// Commit a prepared reload. Provider validation already ran in `prepare_reload`;
+    /// the check here is defense-in-depth for direct commit callers.
+    pub(crate) async fn commit_reload(
+        &self,
+        runtime: &ModelRuntime,
+        mut prepared: PreparedReload,
+    ) -> ReloadResult {
+        let mut diagnostics = std::mem::take(&mut prepared.diagnostics);
+        let Some(next) = prepared.generation.take() else {
+            diagnostics.push(ExtensionSetDiagnostic {
+                path: "<reload>".to_owned(),
+                message: "prepared reload carried no replacement generation".to_owned(),
+            });
+            return ReloadResult {
+                diagnostics,
+                committed: false,
+            };
         };
-        if let Err(error) = apply_flags_to_generation(&next, &flags).await {
-            stop_generation(&next).await;
-            return Err(HostStartError::FlagSync(error.to_string()));
-        }
+        let pending = std::mem::take(&mut prepared.pending);
+
         if let Err((path, error)) = validate_generation_providers(&next) {
+            diagnostics.push(ExtensionSetDiagnostic {
+                path,
+                message: error.to_string(),
+            });
             stop_generation(&next).await;
-            return Err(HostStartError::Load(format!("{path}: {error}")));
+            return ReloadResult {
+                diagnostics,
+                committed: false,
+            };
         }
+
         let next = Arc::new(next);
         let old = {
             let mut state = self.state();
-            if state.reloadable() {
+            if state.stale || state.shutdown_done {
+                None
+            } else {
                 let old = Arc::clone(&state.generation);
                 unregister_endpoint_providers(&old.endpoints, runtime);
                 let registrations = register_endpoint_providers(
@@ -1362,32 +2363,24 @@ impl ExtensionRuntimeSet {
                         .filter(|endpoint| endpoint.runner.is_active()),
                     runtime,
                 );
-                if let Some((path, Err(error))) = registrations
-                    .iter()
-                    .find(|(_path, outcome)| outcome.is_err())
-                {
-                    unregister_endpoint_providers(&next.endpoints, runtime);
-                    let _ = register_endpoint_providers(
-                        old.endpoints.iter().filter(|endpoint| {
-                            !state.retired.contains(&endpoint.id) && endpoint.runner.is_active()
-                        }),
-                        runtime,
-                    );
-                    Err(format!("{path}: {error}"))
-                } else {
-                    state.provider_runtime = Some(runtime.clone());
-                    Ok(state.replace_generation(Arc::clone(&next), &pending, &self.channels))
+                for (path, outcome) in registrations {
+                    if let Err(error) = outcome {
+                        diagnostics.push(ExtensionSetDiagnostic {
+                            path,
+                            message: error.to_string(),
+                        });
+                    }
                 }
-            } else {
-                Err("extension runtime was invalidated during reload".to_owned())
+                state.provider_runtime = Some(runtime.clone());
+                Some(state.replace_generation(Arc::clone(&next), &pending, &self.channels))
             }
         };
-        let old = match old {
-            Ok(old) => old,
-            Err(message) => {
-                stop_generation(&next).await;
-                return Err(HostStartError::Load(message));
-            }
+        let Some(old) = old else {
+            stop_generation(&next).await;
+            return ReloadResult {
+                diagnostics,
+                committed: false,
+            };
         };
         self.start_bridges(&next, pending);
         drain_leases(&old).await;
@@ -1396,11 +2389,33 @@ impl ExtensionRuntimeSet {
         }
         abort_bridges(&old);
         stop_generation(&old).await;
-        Ok(())
+        ReloadResult {
+            diagnostics,
+            committed: true,
+        }
+    }
+
+    /// Build a complete replacement, preserve the facade, then reap the old generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when prepare fails. Commit itself always returns diagnostics.
+    #[cfg(test)]
+    pub(crate) async fn restart_and_rewire(
+        &self,
+        runtime: &ModelRuntime,
+        preserved_flags: HashMap<String, Value>,
+    ) -> Result<ReloadResult, HostStartError> {
+        let _reload = self.reload_lock().lock().await;
+        let prepared = self.prepare_reload(preserved_flags).await?;
+        Ok(self.commit_reload(runtime, prepared).await)
     }
 
     /// Invalidate all endpoints and synchronously dispose product-visible slots.
     pub fn invalidate(&self) {
+        if let Some(op) = self.drain_pending() {
+            discard_pending_ready_op(op);
+        }
         let Some(generation) = self.state().invalidate(&self.channels) else {
             return;
         };
@@ -1411,7 +2426,10 @@ impl ExtensionRuntimeSet {
 
     /// Gracefully stop every endpoint exactly once.
     pub async fn shutdown_once(&self) {
-        let _reload = self.reload_lock.lock().await;
+        let _reload = self.reload_lock().lock().await;
+        if let Some(op) = self.drain_pending() {
+            discard_pending_ready_op(op);
+        }
         let Some(generation) = self.state().begin_shutdown(&self.channels) else {
             return;
         };
@@ -1857,8 +2875,9 @@ fn collect_generation_starts(results: Vec<EndpointStartOutcome>) -> GenerationSt
                 endpoints.push(PreparedEndpoint {
                     position,
                     kind: plan.kind,
-                    label: plan.label,
+                    label: plan.label.clone(),
                     runner,
+                    plan,
                 });
             }
             Err(message) => {
@@ -1891,6 +2910,7 @@ fn collect_generation_starts(results: Vec<EndpointStartOutcome>) -> GenerationSt
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn build_generation_with_starter<Starter, StartFuture>(
     id: u64,
     plans: Vec<EndpointPlan>,
@@ -1949,36 +2969,57 @@ where
 
     if matches!(policy, GenerationBuildPolicy::BestEffortStart)
         && !endpoints.is_empty()
-        && let Some(owner) = failed_builtins_owner
+        && failed_builtins_owner.is_some()
+        && let Some(index) = endpoints
+            .iter()
+            .position(|endpoint| endpoint.kind == EndpointKind::TsCompat && !endpoint.plan.builtins)
     {
-        let fallback = EndpointPlan {
-            position: owner.position,
-            kind: EndpointKind::TsCompat,
-            entries: Vec::new(),
-            diagnostic_paths: Vec::new(),
-            builtins: true,
-            label: "<builtins>".to_owned(),
-        };
-        let result = match endpoint_host_spec(&fallback, ts_spec.as_ref()) {
-            Ok(spec) => starter(fallback.clone(), spec, load_cwd.to_owned(), project_trusted).await,
+        let mut promotion_plan = endpoints[index].plan.clone();
+        promotion_plan.builtins = true;
+        let result = match endpoint_host_spec(&promotion_plan, ts_spec.as_ref()) {
+            Ok(spec) => {
+                starter(
+                    promotion_plan.clone(),
+                    spec,
+                    load_cwd.to_owned(),
+                    project_trusted,
+                )
+                .await
+            }
             Err(message) => Err(message),
         };
         match result {
             Ok(runner) => {
                 for (path, message) in runner.load_errors() {
+                    let path = promotion_plan
+                        .entries
+                        .iter()
+                        .position(|entry| entry == &path)
+                        .and_then(|entry_index| promotion_plan.diagnostic_paths.get(entry_index))
+                        .cloned()
+                        .unwrap_or(path);
                     diagnostics.push(ExtensionSetDiagnostic { path, message });
                 }
-                endpoints.push(PreparedEndpoint {
-                    position: fallback.position,
-                    kind: fallback.kind,
-                    label: fallback.label,
-                    runner,
+                let position = endpoints[index].position;
+                let old = std::mem::replace(
+                    &mut endpoints[index],
+                    PreparedEndpoint {
+                        position,
+                        kind: promotion_plan.kind,
+                        label: promotion_plan.label.clone(),
+                        runner,
+                        plan: promotion_plan,
+                    },
+                );
+                old.runner.shutdown_once().await;
+            }
+            Err(message) => {
+                let label = endpoints[index].label.clone();
+                diagnostics.push(ExtensionSetDiagnostic {
+                    path: label.clone(),
+                    message: format!("builtins promotion failed for {label}: {message}"),
                 });
             }
-            Err(message) => diagnostics.push(ExtensionSetDiagnostic {
-                path: fallback.label,
-                message: format!("built-ins fallback after {} failed: {message}", owner.label),
-            }),
         }
     }
 
@@ -2025,7 +3066,7 @@ async fn start_endpoint(
     result.map_err(|error| error.to_string())
 }
 
-fn generation_from_endpoints(
+pub(crate) fn generation_from_endpoints(
     id: u64,
     endpoints: Vec<(EndpointKind, String, Arc<HostExtensionRunner>)>,
 ) -> (Generation, PendingBridges) {
@@ -2052,6 +3093,7 @@ fn generation_from_endpoints(
             ui: endpoint.runner.subscribe_ui(),
             ui_requests: endpoint.runner.take_ui_requests(),
             session_bridge: endpoint.runner.take_session_bridge(),
+            providers_update: endpoint.runner.take_providers_updates(),
             slots: endpoint.runner.current_slots(),
             endpoint,
         })
@@ -2155,6 +3197,7 @@ fn spawn_broadcast_relays(
             Arc::clone(channels),
             label.clone(),
             errors,
+            Weak::clone(&context.replacement_ready_drop),
         ),
     ]
 }
@@ -2245,8 +3288,8 @@ fn spawn_ui_relays(
     }
     handles
 }
-
-/// Spawn a session relay that cleans every failed correlated route before replying locally.
+// Keep the exhaustive bridge-variant routing in one flat dispatch.
+#[allow(clippy::too_many_lines)]
 fn spawn_session_relay(
     context: &EndpointRelayContext,
     session_bridge: Option<mpsc::Receiver<SessionBridgeEvent>>,
@@ -2255,6 +3298,7 @@ fn spawn_session_relay(
     let state = Weak::clone(&context.state);
     let channels = Arc::clone(&context.channels);
     let runner = Arc::clone(&context.endpoint.runner);
+    let replacement_ready_drop = Weak::clone(&context.replacement_ready_drop);
     let endpoint = context.endpoint.id;
     Some(tokio::spawn(async move {
         while let Some(event) = session.recv().await {
@@ -2262,6 +3306,7 @@ fn spawn_session_relay(
             let Some(state) = state.upgrade() else {
                 break;
             };
+            let mut dropped_replacement: Option<(String, Option<EndpointId>)> = None;
             let send_failed = {
                 let mut state = state
                     .lock()
@@ -2282,10 +3327,77 @@ fn spawn_session_relay(
                                 routed_id,
                             )
                         }
-                        SessionBridgeEvent::Command(command) => {
-                            (Some(SessionBridgeEvent::Command(command)), None)
+                        SessionBridgeEvent::NewSession { id, request } => {
+                            let routed_id = state.allocate_route(endpoint, id);
+                            (
+                                routed_id.map(|id| SessionBridgeEvent::NewSession { id, request }),
+                                routed_id,
+                            )
                         }
+                        SessionBridgeEvent::Fork { id, request } => {
+                            let routed_id = state.allocate_route(endpoint, id);
+                            (
+                                routed_id.map(|id| SessionBridgeEvent::Fork { id, request }),
+                                routed_id,
+                            )
+                        }
+                        SessionBridgeEvent::NavigateTree { id, request } => {
+                            let routed_id = state.allocate_route(endpoint, id);
+                            (
+                                routed_id
+                                    .map(|id| SessionBridgeEvent::NavigateTree { id, request }),
+                                routed_id,
+                            )
+                        }
+                        SessionBridgeEvent::SwitchSession { id, request } => {
+                            let routed_id = state.allocate_route(endpoint, id);
+                            (
+                                routed_id
+                                    .map(|id| SessionBridgeEvent::SwitchSession { id, request }),
+                                routed_id,
+                            )
+                        }
+                        SessionBridgeEvent::Reload { id } => {
+                            let routed_id = state.allocate_route(endpoint, id);
+                            (
+                                routed_id.map(|id| SessionBridgeEvent::Reload { id }),
+                                routed_id,
+                            )
+                        }
+                        SessionBridgeEvent::SetupEntries { id, request, .. } => {
+                            let routed_id = state.allocate_route(endpoint, id);
+                            (
+                                routed_id.map(|id| SessionBridgeEvent::SetupEntries {
+                                    id,
+                                    request,
+                                    origin: Some(endpoint),
+                                }),
+                                routed_id,
+                            )
+                        }
+                        SessionBridgeEvent::Command { envelope, .. } => (
+                            Some(SessionBridgeEvent::Command {
+                                envelope,
+                                origin: Some(endpoint),
+                            }),
+                            None,
+                        ),
+                        SessionBridgeEvent::ReplacementReady { token, .. } => (
+                            Some(SessionBridgeEvent::ReplacementReady {
+                                token,
+                                origin: Some(endpoint),
+                            }),
+                            None,
+                        ),
+                        SessionBridgeEvent::ReplacementAbort { token, .. } => (
+                            Some(SessionBridgeEvent::ReplacementAbort {
+                                token,
+                                origin: Some(endpoint),
+                            }),
+                            None,
+                        ),
                     };
+
                     routed.map(|routed| {
                         let failed = channels.session_bridge_tx.try_send(routed).is_err();
                         if failed && let Some(route_id) = route_id {
@@ -2298,10 +3410,150 @@ fn spawn_session_relay(
                 }
             };
             if send_failed.unwrap_or(true) {
+                match &fallback {
+                    SessionBridgeEvent::Command { envelope, origin } => {
+                        if let Some(token) = &envelope.replacement_token {
+                            dropped_replacement = Some((token.clone(), *origin));
+                        }
+                    }
+                    SessionBridgeEvent::ReplacementReady { token, origin }
+                    | SessionBridgeEvent::ReplacementAbort { token, origin } => {
+                        dropped_replacement = Some((token.clone(), *origin));
+                    }
+                    _ => {}
+                }
                 answer_unclaimed_session(&runner, fallback).await;
+            }
+            if let Some((token, owner)) = dropped_replacement {
+                abort_dropped_pending_ready(&replacement_ready_drop, &token, owner);
             }
         }
     }))
+}
+/// Spawn the live `providers.update` relay for one endpoint.
+///
+/// Each update replaces only this endpoint's provider snapshot, then the
+/// aggregate is rebuilt in live endpoint order and `ModelRuntime` is
+/// rewired. Stale or retired endpoints are ignored.
+fn spawn_providers_update_relay(
+    context: &EndpointRelayContext,
+    rx: Option<watch::Receiver<pi_ext::protocol::ProvidersUpdate>>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let mut rx = rx?;
+    let state = context.state.clone();
+    let channels = Arc::clone(&context.channels);
+    let endpoint_id = context.endpoint.id;
+    Some(tokio::spawn(async move {
+        while rx.changed().await.is_ok() {
+            let update = rx.borrow_and_update().clone();
+            let publish = if let Some(state) = state.upgrade() {
+                let mut set = state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if set.stale || set.shutdown_done || set.retired.contains(&endpoint_id) {
+                    false
+                } else {
+                    match set.generation.endpoint(endpoint_id).cloned() {
+                        Some(endpoint) => {
+                            set.apply_providers_update(&endpoint, &update);
+                            true
+                        }
+                        None => false,
+                    }
+                }
+                // `set` is dropped here, releasing PublishedRuntimeState
+            } else {
+                false
+            };
+            if publish {
+                channels.publish_registry_change();
+            }
+        }
+    }))
+}
+fn discard_pending_ready_op(op: PendingReadyOp) {
+    match op {
+        PendingReadyOp::Replacement { result, .. } => {
+            spawn_runtime_safe("prepared-replacement-discard", async move {
+                result.session.dispose().await;
+            });
+        }
+        PendingReadyOp::Reload { .. } => {}
+    }
+}
+
+/// Drop-specific token removal: removes ONLY a matching `Pending` state,
+/// never `Finalizing`. A duplicate dropped readiness frame must not revoke an
+/// already accepted `complete_ready` that won the race. Returns the removed
+/// operation so the caller can discard it after releasing the mutex guard.
+fn abort_pending_ready_drop(
+    pending: &StdMutex<PendingReadyState>,
+    token: &str,
+    owner: Option<EndpointId>,
+) -> Option<PendingReadyOp> {
+    let mut state = pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match &*state {
+        PendingReadyState::Pending {
+            token: pending_token,
+            owner: pending_owner,
+            ..
+        } if pending_token == token && *pending_owner == owner => {}
+        _ => return None,
+    }
+    match std::mem::replace(&mut *state, PendingReadyState::None) {
+        PendingReadyState::Pending { op, ready_tx, .. } => {
+            drop(ready_tx);
+            Some(op)
+        }
+        _ => None,
+    }
+}
+
+fn abort_dropped_pending_ready(
+    pending: &Weak<StdMutex<PendingReadyState>>,
+    token: &str,
+    owner: Option<EndpointId>,
+) {
+    let Some(pending) = pending.upgrade() else {
+        return;
+    };
+    if let Some(op) = abort_pending_ready_drop(&pending, token, owner) {
+        discard_pending_ready_op(op);
+    }
+}
+
+fn abort_pending_ready_owner(
+    pending: &StdMutex<PendingReadyState>,
+    owner: EndpointId,
+) -> Option<PendingReadyOp> {
+    let mut state = pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match &*state {
+        PendingReadyState::Pending {
+            owner: Some(pending_owner),
+            ..
+        } if *pending_owner == owner => {}
+        _ => return None,
+    }
+    match std::mem::replace(&mut *state, PendingReadyState::None) {
+        PendingReadyState::Pending { op, ready_tx, .. } => {
+            drop(ready_tx);
+            Some(op)
+        }
+        _ => None,
+    }
+}
+
+fn abort_owned_pending_ready(pending: &Weak<StdMutex<PendingReadyState>>, owner: EndpointId) {
+    let Some(pending) = pending.upgrade() else {
+        return;
+    };
+    if let Some(op) = abort_pending_ready_owner(&pending, owner) {
+        discard_pending_ready_op(op);
+    }
 }
 
 async fn drain_leases(generation: &Generation) {
@@ -2398,19 +3650,37 @@ fn unregister_endpoint_providers(endpoints: &[Endpoint], runtime: &ModelRuntime)
     }
 }
 
+fn endpoint_diagnostic_path(endpoint: &Endpoint) -> String {
+    endpoint.label.clone()
+}
+
+/// Render every reload diagnostic in collection order so a failed prepare
+/// surfaces the full path-scoped failure history, not just the terminal error.
+fn summarize_diagnostics(diagnostics: &[ExtensionSetDiagnostic]) -> String {
+    diagnostics
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 async fn apply_flags_to_generation(
     generation: &Generation,
     flags: &BTreeMap<String, FlagValueWire>,
-) -> Result<(), HostClientError> {
-    let mut first_error = None;
+) -> Result<Vec<ExtensionSetDiagnostic>, HostClientError> {
+    if flags.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut diagnostics = Vec::new();
     for endpoint in generation.endpoints.iter() {
-        if let Err(error) = endpoint.runner.apply_flag_values(flags).await
-            && first_error.is_none()
-        {
-            first_error = Some(error);
+        if let Err(error) = endpoint.runner.apply_flag_values(flags).await {
+            diagnostics.push(ExtensionSetDiagnostic {
+                path: endpoint_diagnostic_path(endpoint),
+                message: error.to_string(),
+            });
         }
     }
-    first_error.map_or(Ok(()), Err)
+    Ok(diagnostics)
 }
 
 fn encode_flags(
@@ -2470,8 +3740,62 @@ async fn answer_unclaimed_session(runner: &HostExtensionRunner, event: SessionBr
                 .respond_compact(id, Err("no active session".to_owned()))
                 .await;
         }
-        SessionBridgeEvent::Command(_) => {}
+        SessionBridgeEvent::NewSession { id, .. } => {
+            let _ = runner
+                .respond_session_error(
+                    id,
+                    protocol::SESSION_NEW_SESSION_METHOD,
+                    "no active session",
+                )
+                .await;
+        }
+        SessionBridgeEvent::Fork { id, .. } => {
+            let _ = runner
+                .respond_session_error(id, protocol::SESSION_FORK_METHOD, "no active session")
+                .await;
+        }
+        SessionBridgeEvent::NavigateTree { id, .. } => {
+            let _ = runner
+                .respond_navigate_tree(id, Err("no active session".to_owned()))
+                .await;
+        }
+        SessionBridgeEvent::SwitchSession { id, .. } => {
+            let _ = runner
+                .respond_session_error(
+                    id,
+                    protocol::SESSION_SWITCH_SESSION_METHOD,
+                    "no active session",
+                )
+                .await;
+        }
+        SessionBridgeEvent::Reload { id } => {
+            let _ = runner
+                .respond_reload(id, Err("no active session".to_owned()))
+                .await;
+        }
+        SessionBridgeEvent::SetupEntries { id, .. } => {
+            let _ = runner
+                .respond_setup_entries(id, Err("no active session".to_owned()))
+                .await;
+        }
+        SessionBridgeEvent::Command { .. }
+        | SessionBridgeEvent::ReplacementReady { .. }
+        | SessionBridgeEvent::ReplacementAbort { .. } => {}
     }
+}
+
+/// Keep retirement and pending ownership cleanup atomic to observers.
+fn retire_endpoint_and_abort_pending(
+    state: &mut PublishedRuntimeState,
+    endpoint: EndpointId,
+    channels: &FacadeChannels,
+    pending_ready: &Weak<StdMutex<PendingReadyState>>,
+) -> bool {
+    let retired = state.retire_endpoint(endpoint, channels);
+    if retired {
+        abort_owned_pending_ready(pending_ready, endpoint);
+    }
+    retired
 }
 
 fn spawn_fatal_error_relay(
@@ -2481,16 +3805,18 @@ fn spawn_fatal_error_relay(
     channels: Arc<FacadeChannels>,
     label: String,
     mut receiver: broadcast::Receiver<ExtensionErrorEvent>,
+    pending_ready: Weak<StdMutex<PendingReadyState>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut forward_first_fatal = false;
         if !runner.is_active()
             && let Some(state) = state.upgrade()
         {
-            forward_first_fatal = state
+            let mut state = state
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .retire_endpoint(endpoint, &channels);
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            forward_first_fatal =
+                retire_endpoint_and_abort_pending(&mut state, endpoint, &channels, &pending_ready);
         }
         loop {
             match receiver.recv().await {
@@ -2498,12 +3824,20 @@ fn spawn_fatal_error_relay(
                     let Some(state) = state.upgrade() else {
                         break;
                     };
-                    let mut state = state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let retired_now =
-                        !runner.is_active() && state.retire_endpoint(endpoint, &channels);
-                    if forward_first_fatal || retired_now || state.accepts_relay(endpoint) {
+                    let forward = {
+                        let mut state = state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let retired_now = !runner.is_active()
+                            && retire_endpoint_and_abort_pending(
+                                &mut state,
+                                endpoint,
+                                &channels,
+                                &pending_ready,
+                            );
+                        forward_first_fatal || retired_now || state.accepts_relay(endpoint)
+                    };
+                    if forward {
                         let _ = channels.errors_tx.send(item);
                         forward_first_fatal = false;
                     }
@@ -2512,12 +3846,25 @@ fn spawn_fatal_error_relay(
                     let Some(state) = state.upgrade() else {
                         break;
                     };
-                    let mut state = state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if !runner.is_active() {
-                        state.retire_endpoint(endpoint, &channels);
-                    } else if state.accepts_relay(endpoint) {
+                    let (retired_now, accepts_relay) = {
+                        let mut state = state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if runner.is_active() {
+                            (false, state.accepts_relay(endpoint))
+                        } else {
+                            (
+                                retire_endpoint_and_abort_pending(
+                                    &mut state,
+                                    endpoint,
+                                    &channels,
+                                    &pending_ready,
+                                ),
+                                false,
+                            )
+                        }
+                    };
+                    if !retired_now && accepts_relay {
                         channels.publish_error(
                             "extension_event_lagged",
                             format!("extension {label:?} relay lagged by {count} events"),
@@ -2529,10 +3876,15 @@ fn spawn_fatal_error_relay(
                     if !runner.is_active()
                         && let Some(state) = state.upgrade()
                     {
-                        state
+                        let mut state = state
                             .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .retire_endpoint(endpoint, &channels);
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        retire_endpoint_and_abort_pending(
+                            &mut state,
+                            endpoint,
+                            &channels,
+                            &pending_ready,
+                        );
                     }
                     break;
                 }
@@ -2543,12 +3895,13 @@ fn spawn_fatal_error_relay(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #![allow(clippy::expect_used)]
     use super::*;
     use std::error::Error;
     use std::io::{BufRead, Write};
     use std::sync::atomic::AtomicUsize;
 
-    use pi_ext::protocol::{Frame, FrameKind, HelloAck};
+    use pi_ext::protocol::{Frame, FrameKind, HelloAck, SessionCommand, SessionCommandEnvelope};
     use pi_ext::sanitize::{SanitizedRun, SanitizedSlot};
     use serde_json::json;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -2556,6 +3909,359 @@ pub(crate) mod tests {
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+    #[tokio::test]
+    async fn pending_ready_slot_correlates_one_operation_through_finalizing() -> TestResult {
+        let (generation, _) = generation_from_endpoints(1, Vec::new());
+        let set = Arc::new(ExtensionRuntimeSet::from_generation(
+            generation,
+            Vec::new(),
+            String::new(),
+            false,
+        ));
+        let runtime = Arc::new(ModelRuntime::create_in_memory().await?);
+        let token = set.next_replacement_token();
+        let ready = set
+            .install_pending(
+                token.clone(),
+                PendingReadyOp::Reload {
+                    prepared: PreparedReload {
+                        generation: None,
+                        pending: Vec::new(),
+                        diagnostics: Vec::new(),
+                    },
+                    model_runtime: Arc::clone(&runtime),
+                },
+            )
+            .map_err(|_| "initial pending install was rejected")?;
+
+        assert!(set.is_pending_busy());
+        assert!(
+            set.install_pending(
+                set.next_replacement_token(),
+                PendingReadyOp::Reload {
+                    prepared: PreparedReload {
+                        generation: None,
+                        pending: Vec::new(),
+                        diagnostics: Vec::new(),
+                    },
+                    model_runtime: runtime,
+                },
+            )
+            .is_err()
+        );
+        assert!(!set.complete_ready("stale-token"));
+        assert!(set.complete_ready(&token));
+        ready.await?;
+        let (finalizing, _guard) = set
+            .take_finalizing(&token)
+            .ok_or("ready operation was not finalizing")?;
+        assert!(matches!(finalizing, PendingReadyOp::Reload { .. }));
+        assert!(set.is_pending_busy());
+        // Explicit finish clears the slot; the guard is dropped after.
+        assert!(set.finish_finalize(&token));
+        assert!(!set.is_pending_busy());
+        // A second finish is idempotent (slot already cleared).
+        assert!(set.finish_finalize(&token));
+        assert!(!set.is_pending_busy());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finalize_guard_releases_slot_when_dropped_without_finish() -> TestResult {
+        let (generation, _) = generation_from_endpoints(1, Vec::new());
+        let set = Arc::new(ExtensionRuntimeSet::from_generation(
+            generation,
+            Vec::new(),
+            String::new(),
+            false,
+        ));
+        let runtime = Arc::new(ModelRuntime::create_in_memory().await?);
+        let token = set.next_replacement_token();
+        let ready = set
+            .install_pending(
+                token.clone(),
+                PendingReadyOp::Reload {
+                    prepared: PreparedReload {
+                        generation: None,
+                        pending: Vec::new(),
+                        diagnostics: Vec::new(),
+                    },
+                    model_runtime: Arc::clone(&runtime),
+                },
+            )
+            .map_err(|_| "initial pending install was rejected")?;
+
+        assert!(set.complete_ready(&token));
+        ready.await?;
+        {
+            let (finalizing, _guard) = set
+                .take_finalizing(&token)
+                .ok_or("ready operation was not finalizing")?;
+            assert!(matches!(finalizing, PendingReadyOp::Reload { .. }));
+            assert!(set.is_pending_busy());
+            // Drop the guard without calling finish — the slot must be
+            // released so future replacements are not wedged.
+        }
+        assert!(
+            !set.is_pending_busy(),
+            "dropped finalize guard must release the finalizing slot"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn second_hop_full_aborts_only_matching_pending_token() -> TestResult {
+        let (runner, host) = make_runner(snapshot(&[])).await?;
+        let set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, runner)]);
+
+        // Install a PendingReadyOp::Reload and keep ready_rx.
+        let runtime = Arc::new(ModelRuntime::create_in_memory().await?);
+        let token = set.next_replacement_token();
+        let ready_rx = set
+            .install_pending(
+                token.clone(),
+                PendingReadyOp::Reload {
+                    prepared: PreparedReload {
+                        generation: None,
+                        pending: Vec::new(),
+                        diagnostics: Vec::new(),
+                    },
+                    model_runtime: Arc::clone(&runtime),
+                },
+            )
+            .map_err(|_| "initial pending install was rejected")?;
+        let owner = set.state().generation.endpoints[0].id;
+        let route = set
+            .state()
+            .allocate_route(owner, 80)
+            .ok_or("owner route allocation failed")?;
+        set.respond_reload(route, Ok(Some(&token))).await?;
+        host.wait_for_response(protocol::SESSION_RELOAD_METHOD, 80)
+            .await?;
+
+        // Send a stale dropped token — the pending slot must remain.
+        let stale_token = "stale-tok-999".to_owned();
+        abort_pending_ready_drop(&set.pending_ready, &stale_token, Some(owner));
+        assert!(
+            set.is_pending_busy(),
+            "stale dropped token must not clear the active operation"
+        );
+        let wrong_owner = EndpointId {
+            generation: owner.generation,
+            position: owner.position + 1,
+        };
+        assert!(
+            abort_pending_ready_drop(&set.pending_ready, &token, Some(wrong_owner)).is_none(),
+            "a dropped frame from another endpoint aborted the pending operation"
+        );
+        assert!(set.is_pending_busy());
+
+        // Fill the facade session_bridge_tx to EVENT_CHANNEL_CAPACITY while
+        // its receiver is held and not drained.
+        let _bridge_rx = set
+            .take_session_bridge()
+            .ok_or("session bridge receiver missing")?;
+        for _ in 0..EVENT_CHANNEL_CAPACITY {
+            set.channels
+                .session_bridge_tx
+                .try_send(SessionBridgeEvent::Command {
+                    envelope: SessionCommandEnvelope {
+                        replacement_token: None,
+                        command: SessionCommand::SetSessionName {
+                            name: "filler".to_owned(),
+                        },
+                    },
+                    origin: None,
+                })
+                .map_err(|_| "failed to fill session bridge")?;
+        }
+
+        // Emit a real session.replacementReady from the fake host for the
+        // installed token. The relay's try_send to the facade will fail
+        // (channel full), so the drop handler must abort the matching token.
+        host.emit(Frame {
+            id: 0,
+            kind: FrameKind::Event,
+            method: "session.replacementReady".to_owned(),
+            payload: json!({"token": token}),
+        })
+        .await;
+
+        // Assert within a bounded test-only timeout that ready_rx returns Err,
+        // pending busy is false, and no finalizing operation exists.
+        let result = tokio::time::timeout(Duration::from_secs(5), ready_rx).await;
+        assert!(
+            matches!(result, Ok(Err(_))),
+            "ready_rx must return Err after the matching token is aborted"
+        );
+        assert!(
+            !set.is_pending_busy(),
+            "pending slot must be cleared after the matching token is aborted"
+        );
+        assert!(
+            set.take_finalizing(&token).is_none(),
+            "no finalizing operation must exist after a dropped ready"
+        );
+
+        set.shutdown_once().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn second_hop_full_scoped_command_aborts_pending_token() -> TestResult {
+        let (runner, host) = make_runner(snapshot(&[])).await?;
+        let set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, runner)]);
+        let runtime = Arc::new(ModelRuntime::create_in_memory().await?);
+        let token = set.next_replacement_token();
+        let ready_rx = set
+            .install_pending(
+                token.clone(),
+                PendingReadyOp::Reload {
+                    prepared: PreparedReload::empty_for_test(),
+                    model_runtime: runtime,
+                },
+            )
+            .map_err(|_| "initial pending install was rejected")?;
+        let owner = set.state().generation.endpoints[0].id;
+        let route = set
+            .state()
+            .allocate_route(owner, 81)
+            .ok_or("owner route allocation failed")?;
+        set.respond_reload(route, Ok(Some(&token))).await?;
+        host.wait_for_response(protocol::SESSION_RELOAD_METHOD, 81)
+            .await?;
+        let _bridge_rx = set
+            .take_session_bridge()
+            .ok_or("session bridge receiver missing")?;
+        for _ in 0..EVENT_CHANNEL_CAPACITY {
+            set.channels
+                .session_bridge_tx
+                .try_send(SessionBridgeEvent::Command {
+                    envelope: SessionCommandEnvelope {
+                        replacement_token: None,
+                        command: SessionCommand::SetSessionName {
+                            name: "filler".to_owned(),
+                        },
+                    },
+                    origin: None,
+                })
+                .map_err(|_| "failed to fill session bridge")?;
+        }
+
+        host.emit(Frame {
+            id: 0,
+            kind: FrameKind::Event,
+            method: protocol::SESSION_COMMAND_METHOD.to_owned(),
+            payload: json!({
+                "replacementToken": token,
+                "action": "setSessionName",
+                "name": "candidate"
+            }),
+        })
+        .await;
+
+        let result = tokio::time::timeout(TEST_TIMEOUT, ready_rx).await;
+        assert!(
+            matches!(result, Ok(Err(_))),
+            "dropping a scoped command must wake the pending waiter"
+        );
+        assert!(
+            !set.is_pending_busy(),
+            "dropping a scoped command must clear the matching pending slot"
+        );
+        set.shutdown_once().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dropped_duplicate_ready_preserves_finalizing_operation() -> TestResult {
+        let (generation, _) = generation_from_endpoints(1, Vec::new());
+        let set = Arc::new(ExtensionRuntimeSet::from_generation(
+            generation,
+            Vec::new(),
+            String::new(),
+            false,
+        ));
+        let runtime = Arc::new(ModelRuntime::create_in_memory().await?);
+        let token = set.next_replacement_token();
+        let ready_rx = set
+            .install_pending(
+                token.clone(),
+                PendingReadyOp::Reload {
+                    prepared: PreparedReload::empty_for_test(),
+                    model_runtime: runtime,
+                },
+            )
+            .map_err(|_| "initial pending install was rejected")?;
+
+        assert!(set.complete_ready(&token));
+        assert!(
+            abort_pending_ready_drop(&set.pending_ready, &token, None).is_none(),
+            "a duplicate dropped ready must not revoke a finalizing operation"
+        );
+        ready_rx.await?;
+        let (op, _guard) = set
+            .take_finalizing(&token)
+            .ok_or("duplicate dropped ready removed the finalizing operation")?;
+        assert!(matches!(&op, PendingReadyOp::Reload { .. }));
+        drop(op);
+        assert!(set.finish_finalize(&token));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn commit_reload_without_generation_returns_uncommitted_diagnostic() -> TestResult {
+        let (generation, _) = generation_from_endpoints(1, Vec::new());
+        let set =
+            ExtensionRuntimeSet::from_generation(generation, Vec::new(), String::new(), false);
+        let runtime = ModelRuntime::create_in_memory().await?;
+        let prepared = PreparedReload {
+            generation: None,
+            pending: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let result = set.commit_reload(&runtime, prepared).await;
+        assert!(
+            !result.committed,
+            "a reload without a generation must not commit"
+        );
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("no replacement generation")),
+            "diagnostics must explain the missing generation: {:?}",
+            result.diagnostics
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_pending_ready_and_wakes_waiter() -> TestResult {
+        let (generation, _) = generation_from_endpoints(1, Vec::new());
+        let set =
+            ExtensionRuntimeSet::from_generation(generation, Vec::new(), String::new(), false);
+        let token = set.next_replacement_token();
+        let ready = set
+            .install_pending(
+                token,
+                PendingReadyOp::Reload {
+                    prepared: PreparedReload {
+                        generation: None,
+                        pending: Vec::new(),
+                        diagnostics: Vec::new(),
+                    },
+                    model_runtime: Arc::new(ModelRuntime::create_in_memory().await?),
+                },
+            )
+            .map_err(|_| "pending install was rejected")?;
+
+        set.shutdown_once().await;
+
+        assert!(ready.await.is_err());
+        assert!(!set.is_pending_busy());
+        Ok(())
+    }
 
     enum FakeCommand {
         Emit(Frame),
@@ -2581,7 +4287,7 @@ pub(crate) mod tests {
     }
 
     impl FakeHost {
-        fn set_response(&self, method: &str, payload: Value) {
+        pub(crate) fn set_response(&self, method: &str, payload: Value) {
             self.responses
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2605,11 +4311,11 @@ pub(crate) mod tests {
             rx
         }
 
-        async fn emit(&self, frame: Frame) {
+        pub(crate) async fn emit(&self, frame: Frame) {
             let _ = self.commands.send(FakeCommand::Emit(frame)).await;
         }
 
-        async fn wait_for_frame(&self, method: &str) -> TestResult {
+        pub(crate) async fn wait_for_frame(&self, method: &str) -> TestResult {
             tokio::time::timeout(TEST_TIMEOUT, async {
                 loop {
                     if self
@@ -2703,8 +4409,37 @@ pub(crate) mod tests {
                 .filter(|frame| frame.kind == FrameKind::Req && frame.method == method)
                 .count()
         }
+        pub(crate) fn frame_count(&self, method: &str) -> usize {
+            self.state
+                .frames
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .filter(|frame| frame.method == method)
+                .count()
+        }
 
-        async fn wait_for_exit(&self) -> TestResult {
+        pub(crate) fn first_payload(&self, method: &str) -> Option<Value> {
+            self.state
+                .frames
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .find(|frame| frame.method == method)
+                .map(|frame| frame.payload.clone())
+        }
+
+        pub(crate) fn observed_methods(&self) -> Vec<String> {
+            self.state
+                .frames
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .map(|frame| frame.method.clone())
+                .collect()
+        }
+
+        pub(crate) async fn wait_for_exit(&self) -> TestResult {
             tokio::time::timeout(TEST_TIMEOUT, async {
                 while self.state.exits.load(Ordering::Acquire) == 0 {
                     tokio::task::yield_now().await;
@@ -3008,6 +4743,47 @@ pub(crate) mod tests {
             }),
         }
     }
+    fn provider_update_frame(name: &str, base_url: &str) -> Frame {
+        Frame {
+            id: 0,
+            kind: FrameKind::Event,
+            method: pi_ext::protocol::PROVIDERS_UPDATE_METHOD.to_owned(),
+            payload: json!({
+                "providers": [{
+                    "name": name,
+                    "baseUrl": base_url,
+                    "api": "openai-completions"
+                }]
+            }),
+        }
+    }
+
+    async fn wait_for_provider_snapshot(
+        runtime: &ModelRuntime,
+        name: &str,
+        base_url: &str,
+        absent: &[&str],
+    ) -> TestResult {
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            loop {
+                let current = runtime.get_registered_provider_config(name);
+                if current
+                    .as_ref()
+                    .and_then(|config| config.base_url.as_deref())
+                    == Some(base_url)
+                    && absent
+                        .iter()
+                        .all(|name| runtime.get_registered_provider_config(name).is_none())
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| format!("provider runtime did not publish {name}"))?;
+        Ok(())
+    }
 
     async fn wait_for_slot_text(set: &ExtensionRuntimeSet, text: &str) -> TestResult {
         tokio::time::timeout(TEST_TIMEOUT, async {
@@ -3051,6 +4827,10 @@ pub(crate) mod tests {
             discovered: entry.to_owned(),
             entry: entry.to_owned(),
         }
+    }
+
+    fn probe_preserved_flags() -> HashMap<String, Value> {
+        HashMap::from([("probe".to_owned(), Value::Bool(true))])
     }
 
     fn test_endpoint_plan(
@@ -3107,7 +4887,7 @@ pub(crate) mod tests {
                     if plan.label == "owner" {
                         return Err("owner failed".to_owned());
                     }
-                    let registry = if plan.label == "<builtins>" {
+                    let registry = if plan.builtins && plan.label == "secondary" {
                         let mut registry = snapshot(&[]);
                         registry["errors"] = json!([{
                             "path": "<builtin:test>",
@@ -3159,7 +4939,7 @@ pub(crate) mod tests {
                 .iter()
                 .map(|endpoint| endpoint.label.as_str())
                 .collect::<Vec<_>>(),
-            ["native", "<builtins>", "secondary"]
+            ["native", "secondary"]
         );
         let starts = starts
             .lock()
@@ -3178,7 +4958,7 @@ pub(crate) mod tests {
             label == "secondary" && entries == &["secondary.entry"] && !*builtins
         }));
         assert!(starts.iter().any(|(_, label, entries, builtins)| {
-            label == "<builtins>" && entries.is_empty() && *builtins
+            label == "secondary" && entries == &["secondary.entry"] && *builtins
         }));
         drop(starts);
         shutdown_generation(&generation).await;
@@ -3197,13 +4977,15 @@ pub(crate) mod tests {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .push((plan.label.clone(), plan.entries.clone(), plan.builtins));
-                    match plan.label.as_str() {
-                        "owner" => Err("owner failed".to_owned()),
-                        "<builtins>" => Err("fallback failed".to_owned()),
-                        _ => make_runner(snapshot(&[]))
+                    if plan.label == "owner" {
+                        Err("owner failed".to_owned())
+                    } else if plan.label == "secondary" && plan.builtins {
+                        Err("promotion failed".to_owned())
+                    } else {
+                        make_runner(snapshot(&[]))
                             .await
                             .map(|(runner, _)| runner)
-                            .map_err(|error| error.to_string()),
+                            .map_err(|error| error.to_string())
                     }
                 }
             }
@@ -3231,8 +5013,8 @@ pub(crate) mod tests {
                     message: "owner failed".to_owned(),
                 },
                 ExtensionSetDiagnostic {
-                    path: "<builtins>".to_owned(),
-                    message: "built-ins fallback after owner failed: fallback failed".to_owned(),
+                    path: "secondary".to_owned(),
+                    message: "builtins promotion failed for secondary: promotion failed".to_owned(),
                 },
             ]
         );
@@ -3262,10 +5044,498 @@ pub(crate) mod tests {
             label == "secondary" && entries == &["secondary.entry"] && !*builtins
         }));
         assert!(starts.iter().any(|(label, entries, builtins)| {
-            label == "<builtins>" && entries.is_empty() && *builtins
+            label == "secondary" && entries == &["secondary.entry"] && *builtins
         }));
         drop(starts);
         shutdown_generation(&generation).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn builtins_owner_failure_promotes_first_surviving_compat() -> TestResult {
+        let starts = Arc::new(StdMutex::new(Vec::new()));
+        let starter = {
+            let starts = Arc::clone(&starts);
+            move |plan: EndpointPlan, _: HostSpec, _: String, _: bool| {
+                let starts = Arc::clone(&starts);
+                async move {
+                    starts
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push((plan.label.clone(), plan.entries.clone(), plan.builtins));
+                    if plan.label == "owner" {
+                        return Err("owner failed".to_owned());
+                    }
+                    make_runner(snapshot(&[]))
+                        .await
+                        .map(|(runner, _)| runner)
+                        .map_err(|error| error.to_string())
+                }
+            }
+        };
+        let build = build_generation_with_starter(
+            1,
+            vec![
+                test_endpoint_plan(0, EndpointKind::Native, "native", false),
+                test_endpoint_plan(1, EndpointKind::TsCompat, "owner", true),
+                test_endpoint_plan(2, EndpointKind::TsCompat, "secondary", false),
+            ],
+            "/workspace",
+            false,
+            GenerationBuildPolicy::BestEffortStart,
+            Some(Ok(test_typescript_host_spec())),
+            starter,
+        )
+        .await;
+        let generation = build.generation.ok_or("promoted generation missing")?;
+        assert_eq!(
+            generation
+                .endpoints
+                .iter()
+                .map(|endpoint| endpoint.label.as_str())
+                .collect::<Vec<_>>(),
+            ["native", "secondary"]
+        );
+        let starts = starts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(starts.iter().any(|(label, entries, builtins)| {
+            label == "secondary" && entries == &["secondary.entry"] && *builtins
+        }));
+        assert!(build.diagnostics.iter().any(|diagnostic| {
+            diagnostic.path == "owner" && diagnostic.message == "owner failed"
+        }));
+        drop(starts);
+        shutdown_generation(&generation).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn builtins_promotion_failure_keeps_surviving_endpoint_and_reports_path() -> TestResult {
+        let starter = move |plan: EndpointPlan, _: HostSpec, _: String, _: bool| async move {
+            if plan.label == "owner" {
+                Err("owner failed".to_owned())
+            } else if plan.label == "secondary" && plan.builtins {
+                Err("promotion failed".to_owned())
+            } else {
+                make_runner(snapshot(&[]))
+                    .await
+                    .map(|(runner, _)| runner)
+                    .map_err(|error| error.to_string())
+            }
+        };
+        let build = build_generation_with_starter(
+            1,
+            vec![
+                test_endpoint_plan(0, EndpointKind::Native, "native", false),
+                test_endpoint_plan(1, EndpointKind::TsCompat, "owner", true),
+                test_endpoint_plan(2, EndpointKind::TsCompat, "secondary", false),
+            ],
+            "/workspace",
+            false,
+            GenerationBuildPolicy::BestEffortStart,
+            Some(Ok(test_typescript_host_spec())),
+            starter,
+        )
+        .await;
+        let generation = build.generation.ok_or("survivor generation missing")?;
+        assert_eq!(
+            generation
+                .endpoints
+                .iter()
+                .map(|endpoint| endpoint.label.as_str())
+                .collect::<Vec<_>>(),
+            ["native", "secondary"]
+        );
+        assert!(build.diagnostics.iter().any(|diagnostic| {
+            diagnostic.path == "secondary" && diagnostic.message.contains("promotion")
+        }));
+        shutdown_generation(&generation).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn multi_endpoint_flag_failures_are_path_qualified_and_do_not_abort_siblings()
+    -> TestResult {
+        let (first, first_host) = make_runner(snapshot(&[])).await?;
+        let (second, second_host) = make_runner(snapshot(&[])).await?;
+        first_host.set_response("flags.set", json!({"ok": false}));
+        second_host.set_response("flags.set", json!({"ok": true}));
+        let set = ExtensionRuntimeSet::bind(vec![
+            (EndpointKind::TsCompat, first),
+            (EndpointKind::TsCompat, second),
+        ]);
+        let values = BTreeMap::from([("demo".to_owned(), FlagValueWire::Boolean(true))]);
+        let diagnostics = set.apply_flag_values(&values).await?;
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.path.contains("test:")),
+            "expected path-qualified flag diagnostics: {diagnostics:?}"
+        );
+        assert!(
+            first_host.request_count("flags.set") + second_host.request_count("flags.set") >= 2,
+            "sibling endpoints must both be attempted"
+        );
+        set.shutdown_once().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prepare_reload_failure_keeps_old_runner_provider_and_transport_live() -> TestResult {
+        let old_provider = json!({
+            "name": "old-provider",
+            "baseUrl": "https://old.example/v1",
+            "api": "openai-completions",
+            "models": [{
+                "id": "old-model",
+                "name": "Old model",
+                "api": "openai-completions",
+                "baseUrl": "https://old.example/v1",
+                "reasoning": false
+            }]
+        });
+        let (old, old_host) = make_runner(json!({
+            "providers": [old_provider],
+            "handlers": ["input"],
+            "terminalInput": false
+        }))
+        .await?;
+        let (generation, pending) =
+            generation_from_endpoints(1, vec![(EndpointKind::TsCompat, "<old>".to_owned(), old)]);
+        let set = Arc::new(ExtensionRuntimeSet::from_generation(
+            generation,
+            Vec::new(),
+            String::new(),
+            false,
+        ));
+        set.install(pending);
+        let runtime = ModelRuntime::create_in_memory().await?;
+        assert!(
+            set.register_providers_on(&runtime)
+                .into_iter()
+                .all(|(_path, result)| result.is_ok())
+        );
+        let provider_epoch = runtime.provider_mutation_epoch();
+        set.invalidate();
+        assert!(
+            set.prepare_reload(HashMap::new()).await.is_err(),
+            "invalidated facade must fail prepare early"
+        );
+        assert_eq!(set.reload_generation(), 1);
+        assert_eq!(runtime.provider_mutation_epoch(), provider_epoch);
+        assert_eq!(runtime.get_registered_provider_ids(), ["old-provider"]);
+        assert!(runtime.get_model("old-provider", "old-model").is_some());
+        assert_eq!(old_host.exit_count(), 0);
+        set.shutdown_once().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn post_start_fatal_prepare_failure_reaps_replacement_and_keeps_old_live() -> TestResult {
+        let old_provider = json!({
+            "name": "old-provider",
+            "baseUrl": "https://old.example/v1",
+            "api": "openai-completions",
+            "models": [{
+                "id": "old-model",
+                "name": "Old model",
+                "api": "openai-completions",
+                "baseUrl": "https://old.example/v1",
+                "reasoning": false
+            }]
+        });
+        let (old, old_host) = make_runner(json!({
+            "providers": [old_provider],
+            "handlers": ["input"],
+            "terminalInput": false
+        }))
+        .await?;
+        let (replacement, replacement_host) = make_runner(snapshot(&[])).await?;
+        let (generation, pending) =
+            generation_from_endpoints(1, vec![(EndpointKind::TsCompat, "<old>".to_owned(), old)]);
+        let set = Arc::new(ExtensionRuntimeSet::from_generation(
+            generation,
+            Vec::new(),
+            String::new(),
+            false,
+        ));
+        set.install(pending);
+        let runtime = ModelRuntime::create_in_memory().await?;
+        assert!(
+            set.register_providers_on(&runtime)
+                .into_iter()
+                .all(|(_path, result)| result.is_ok())
+        );
+        let provider_epoch = runtime.provider_mutation_epoch();
+        let (replacement, pending) = generation_from_endpoints(
+            2,
+            vec![(
+                EndpointKind::TsCompat,
+                "<replacement>".to_owned(),
+                replacement,
+            )],
+        );
+        set.inject_prepared_replacement_then_fatal_preparation_failure(replacement, pending);
+        replacement_host.set_response("flags.set", json!({"ok": true}));
+        assert!(
+            set.prepare_reload(probe_preserved_flags()).await.is_err(),
+            "post-start fatal prepare must fail after replacement start"
+        );
+        assert_eq!(replacement_host.request_count("flags.set"), 1);
+        replacement_host.wait_for_exit().await?;
+        assert_eq!(replacement_host.exit_count(), 1);
+        assert_eq!(set.reload_generation(), 1);
+        assert!(set.is_active());
+        assert!(set.can_reload());
+        assert_eq!(runtime.provider_mutation_epoch(), provider_epoch);
+        assert_eq!(runtime.get_registered_provider_ids(), ["old-provider"]);
+        assert!(runtime.get_model("old-provider", "old-model").is_some());
+        assert_eq!(old_host.exit_count(), 0);
+        let result = set.emit_input("still-live", None, "user", None).await?;
+        assert!(!result.handled);
+        old_host.wait_for_request("input").await?;
+        set.shutdown_once().await;
+        old_host.wait_for_exit().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn commit_replaces_prepared_generation_after_old_endpoint_inactivates() -> TestResult {
+        let (old, old_host) = make_runner(snapshot(&[])).await?;
+        let old_to_invalidate = Arc::clone(&old);
+        let set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, old)]);
+        let (replacement, replacement_host) = make_runner(snapshot(&[])).await?;
+        let (replacement, pending) = generation_from_endpoints(
+            2,
+            vec![(
+                EndpointKind::TsCompat,
+                "<replacement>".to_owned(),
+                replacement,
+            )],
+        );
+        set.inject_prepared_replacement_for_reload(replacement, pending);
+        let runtime = ModelRuntime::create_in_memory().await?;
+        let prepared = set.prepare_reload(HashMap::new()).await?;
+
+        old_to_invalidate.invalidate();
+        let result = set.commit_reload(&runtime, prepared).await;
+
+        assert!(result.diagnostics.is_empty());
+        assert_eq!(set.reload_generation(), 2);
+        assert!(set.is_active());
+        old_host.wait_for_exit().await?;
+        set.shutdown_once().await;
+        replacement_host.wait_for_exit().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn commit_rejects_stale_facade_without_provider_mutation() -> TestResult {
+        let (old, old_host) = make_runner(snapshot(&[])).await?;
+        let set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, old)]);
+        let (replacement, replacement_host) = make_runner(snapshot(&[])).await?;
+        let (replacement, pending) = generation_from_endpoints(
+            2,
+            vec![(
+                EndpointKind::TsCompat,
+                "<replacement>".to_owned(),
+                replacement,
+            )],
+        );
+        set.inject_prepared_replacement_for_reload(replacement, pending);
+        let runtime = ModelRuntime::create_in_memory().await?;
+        let prepared = set.prepare_reload(HashMap::new()).await?;
+        let provider_epoch = runtime.provider_mutation_epoch();
+
+        set.invalidate();
+        let result = set.commit_reload(&runtime, prepared).await;
+
+        assert!(!result.committed);
+        assert_eq!(set.reload_generation(), 1);
+        assert_eq!(runtime.provider_mutation_epoch(), provider_epoch);
+        replacement_host.wait_for_exit().await?;
+        assert_eq!(replacement_host.exit_count(), 1);
+        set.shutdown_once().await;
+        old_host.wait_for_exit().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reload_returns_load_flag_and_provider_diagnostics() -> TestResult {
+        let (old, old_host) = make_runner(snapshot(&["input"])).await?;
+        let (replacement, replacement_host) = make_runner(json!({
+            "providers": [{
+                "name": "invalid-provider",
+                "models": [{"id": "invalid-model", "reasoning": false}]
+            }],
+            "handlers": [],
+            "terminalInput": false
+        }))
+        .await?;
+        replacement_host.set_response("flags.set", json!({"ok": false}));
+        let (generation, pending) =
+            generation_from_endpoints(1, vec![(EndpointKind::TsCompat, "<old>".to_owned(), old)]);
+        let set = Arc::new(ExtensionRuntimeSet::from_generation(
+            generation,
+            Vec::new(),
+            String::new(),
+            false,
+        ));
+        set.install(pending);
+        let (replacement, pending) = generation_from_endpoints(
+            2,
+            vec![(
+                EndpointKind::TsCompat,
+                "<replacement>".to_owned(),
+                replacement,
+            )],
+        );
+        set.inject_prepared_replacement_with_diagnostics_for_reload(
+            replacement,
+            pending,
+            vec![ExtensionSetDiagnostic {
+                path: "broken-sibling.ts".to_owned(),
+                message: "load failed".to_owned(),
+            }],
+        );
+        let runtime = ModelRuntime::create_in_memory().await?;
+        // Provider validation now runs in prepare_reload before commit, so
+        // restart_and_rewire returns an error when the replacement has an
+        // invalid provider. The old generation stays live.
+        let result = set
+            .restart_and_rewire(
+                &runtime,
+                HashMap::from([("demo".to_owned(), Value::Bool(true))]),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "prepare_reload must reject invalid providers"
+        );
+        assert!(set.is_active());
+        assert_eq!(set.reload_generation(), 1);
+        replacement_host.wait_for_exit().await?;
+        set.shutdown_once().await;
+        old_host.wait_for_exit().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prepare_reload_preserves_all_diagnostics_on_provider_validation_failure() -> TestResult
+    {
+        // Old generation carries a valid provider that must stay published.
+        let old_provider = json!({
+            "name": "old-provider",
+            "baseUrl": "https://old.example/v1",
+            "api": "openai-completions",
+            "models": [{
+                "id": "old-model",
+                "name": "Old model",
+                "api": "openai-completions",
+                "baseUrl": "https://old.example/v1",
+                "reasoning": false
+            }]
+        });
+        let (old, old_host) = make_runner(json!({
+            "providers": [old_provider],
+            "handlers": ["input"],
+            "terminalInput": false
+        }))
+        .await?;
+        // Replacement carries an invalid provider (no api/baseUrl) so
+        // validate_generation_providers fails during prepare_reload.
+        let (replacement, replacement_host) = make_runner(json!({
+            "providers": [{
+                "name": "invalid-provider",
+                "models": [{"id": "invalid-model", "reasoning": false}]
+            }],
+            "handlers": [],
+            "terminalInput": false
+        }))
+        .await?;
+        let (generation, pending) =
+            generation_from_endpoints(1, vec![(EndpointKind::TsCompat, "<old>".to_owned(), old)]);
+        let set = Arc::new(ExtensionRuntimeSet::from_generation(
+            generation,
+            Vec::new(),
+            String::new(),
+            false,
+        ));
+        set.install(pending);
+        let runtime = ModelRuntime::create_in_memory().await?;
+        assert!(
+            set.register_providers_on(&runtime)
+                .into_iter()
+                .all(|(_path, result)| result.is_ok())
+        );
+        let provider_epoch = runtime.provider_mutation_epoch();
+
+        // Inject the invalid replacement together with a load diagnostic so the
+        // candidate generation accumulates diagnostics before validation fails.
+        let (replacement_generation, replacement_pending) = generation_from_endpoints(
+            2,
+            vec![(
+                EndpointKind::TsCompat,
+                "<replacement>".to_owned(),
+                replacement,
+            )],
+        );
+        set.inject_prepared_replacement_with_diagnostics_for_reload(
+            replacement_generation,
+            replacement_pending,
+            vec![ExtensionSetDiagnostic {
+                path: "broken-sibling.ts".to_owned(),
+                message: "load failed".to_owned(),
+            }],
+        );
+
+        // No preserved flags, so flag sync succeeds and prepare_reload reaches
+        // provider validation. Every collected diagnostic must survive the error.
+        let Err(error) = set.prepare_reload(HashMap::new()).await else {
+            return Err("prepare_reload unexpectedly succeeded with an invalid provider".into());
+        };
+        let HostStartError::Load(message) = error else {
+            return Err(format!("expected HostStartError::Load, got {error}").into());
+        };
+        assert!(
+            message.contains("broken-sibling.ts"),
+            "collected load diagnostic path was lost: {message}"
+        );
+        assert!(
+            message.contains("load failed"),
+            "collected load diagnostic message was lost: {message}"
+        );
+        assert!(
+            message.contains("invalid-provider"),
+            "provider validation path was lost: {message}"
+        );
+        assert!(
+            message.contains("no \"api\" specified"),
+            "provider validation error was lost: {message}"
+        );
+
+        // The live generation is unchanged: no new generation, old provider
+        // still published, replacement never registered.
+        assert!(set.is_active());
+        assert_eq!(set.reload_generation(), 1);
+        assert_eq!(runtime.provider_mutation_epoch(), provider_epoch);
+        assert!(
+            runtime
+                .get_registered_provider_config("old-provider")
+                .is_some(),
+            "old provider must remain published"
+        );
+        assert!(
+            runtime
+                .get_registered_provider_config("invalid-provider")
+                .is_none(),
+            "invalid replacement provider must not publish"
+        );
+        replacement_host.wait_for_exit().await?;
+        set.shutdown_once().await;
+        old_host.wait_for_exit().await?;
         Ok(())
     }
 
@@ -3662,6 +5932,84 @@ pub(crate) mod tests {
         second_host.wait_for_request("command.execute").await?;
         assert_eq!(first_host.request_count("command.execute"), 0);
         set.shutdown_once().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_update_relay_keeps_latest_complete_snapshot() -> TestResult {
+        let (runner, host) = make_runner(json!({
+            "providers": [shared_provider("https://old.example/v1")],
+            "handlers": [],
+            "terminalInput": false
+        }))
+        .await?;
+        let (generation, pending) = generation_from_endpoints(
+            1,
+            vec![(
+                EndpointKind::TsCompat,
+                "<provider-update>".to_owned(),
+                runner,
+            )],
+        );
+
+        host.emit(provider_update_frame("pre-spawn", "https://pre.example/v1"))
+            .await;
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            while !pending[0]
+                .providers_update
+                .as_ref()
+                .is_some_and(|receiver| receiver.has_changed().unwrap_or(false))
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "pre-spawn provider update did not reach the watch receiver")?;
+
+        let set = Arc::new(ExtensionRuntimeSet::from_generation(
+            generation,
+            Vec::new(),
+            String::new(),
+            false,
+        ));
+        let mut registry_changes = set.subscribe_registry_changes();
+        let revision = *registry_changes.borrow_and_update();
+        set.install(pending);
+        let runtime = ModelRuntime::create_in_memory().await?;
+        assert!(
+            set.register_providers_on(&runtime)
+                .into_iter()
+                .all(|(_, result)| result.is_ok())
+        );
+        wait_for_provider_snapshot(
+            &runtime,
+            "pre-spawn",
+            "https://pre.example/v1",
+            &["shared-provider"],
+        )
+        .await?;
+        tokio::time::timeout(TEST_TIMEOUT, registry_changes.changed())
+            .await
+            .map_err(|_| "provider update did not publish a registry revision")??;
+        assert_ne!(*registry_changes.borrow_and_update(), revision);
+
+        for (name, base_url) in [
+            ("transient", "https://transient.example/v1"),
+            ("final-provider", "https://final.example/v1"),
+        ] {
+            host.emit(provider_update_frame(name, base_url)).await;
+        }
+
+        wait_for_provider_snapshot(
+            &runtime,
+            "final-provider",
+            "https://final.example/v1",
+            &["shared-provider", "pre-spawn", "transient"],
+        )
+        .await?;
+
+        set.shutdown_once().await;
+        host.wait_for_exit().await?;
         Ok(())
     }
 
@@ -4166,20 +6514,24 @@ pub(crate) mod tests {
         ));
         set.install(pending);
         let runtime = ModelRuntime::create_in_memory().await?;
-        let provider_epoch = runtime.provider_mutation_epoch();
+        let before = set.reload_generation();
 
+        let result = set
+            .restart_and_rewire(&runtime, HashMap::new())
+            .await
+            .expect("best-effort native replacement should prepare/commit");
         assert!(
-            set.restart_and_rewire(&runtime, HashMap::new())
-                .await
-                .is_err()
+            result.committed,
+            "reload did not commit: {:?}",
+            result.diagnostics
         );
-        assert_eq!(runtime.provider_mutation_epoch(), provider_epoch);
-        assert_eq!(set.reload_generation(), 1);
-        assert!(set.is_active());
-        let result = set.emit_input("original", None, "user", None).await?;
-        assert!(!result.handled);
-        old_host.wait_for_request("input").await?;
-
+        assert_eq!(
+            set.reload_generation(),
+            before + 1,
+            "a committed reload must publish exactly one new generation"
+        );
+        assert!(set.is_active(), "facade lost every endpoint after reload");
+        old_host.wait_for_exit().await?;
         set.shutdown_once().await;
         Ok(())
     }
@@ -4253,34 +6605,36 @@ pub(crate) mod tests {
         );
         let provider_epoch = runtime.provider_mutation_epoch();
 
+        // Provider validation now runs in prepare_reload, so restart_and_rewire
+        // returns an error (not a ReloadResult) when the replacement has an
+        // invalid provider. The old generation stays live and untouched.
+        let result = set.restart_and_rewire(&runtime, HashMap::new()).await;
         assert!(
-            set.restart_and_rewire(&runtime, HashMap::new())
-                .await
-                .is_err()
-        );
-        assert_eq!(
-            runtime.provider_mutation_epoch(),
-            provider_epoch,
-            "replacement validation must not publish any provider-map mutation"
+            result.is_err(),
+            "prepare_reload must reject invalid providers"
         );
         assert_eq!(set.reload_generation(), 1);
-        assert!(set.is_active());
-        assert!(runtime.get_model("old-provider", "old-model").is_some());
-        assert_eq!(runtime.get_registered_provider_ids(), ["old-provider"]);
+        assert_eq!(runtime.provider_mutation_epoch(), provider_epoch);
+        assert!(
+            runtime
+                .get_registered_provider_config("old-provider")
+                .is_some(),
+            "old provider must remain published"
+        );
         assert!(
             runtime
                 .get_registered_provider_config("replacement-provider")
-                .is_none()
+                .is_none(),
+            "replacement provider must not publish"
         );
         assert!(
             runtime
                 .get_registered_provider_config("invalid-provider")
-                .is_none()
+                .is_none(),
+            "invalid provider must not publish"
         );
-        let result = set.emit_input("original", None, "user", None).await?;
-        assert!(!result.handled);
-        host.wait_for_request("input").await?;
         set.shutdown_once().await;
+        host.wait_for_exit().await?;
         Ok(())
     }
 
@@ -4351,6 +6705,7 @@ pub(crate) mod tests {
             state: Arc::downgrade(&set.state),
             channels: Arc::clone(&set.channels),
             endpoint,
+            replacement_ready_drop: set.pending_ready_weak(),
         };
         let handles = spawn_ui_relays(&context, ui_rx, None);
         let mut published = set.subscribe_ui();
@@ -4535,38 +6890,12 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn reload_rejects_invalid_prepared_runtime_classes() -> TestResult {
+        // Native prepared replacements now commit; cover invalidation on a fresh
+        // reloadable compat facade so flags.set==1 and exit_count==1 still hold.
         let (active_compat, _active_host) = make_runner(snapshot(&["input"])).await?;
-        let (inactive_native, _inactive_host) = make_runner(snapshot(&["input"])).await?;
-        inactive_native.invalidate();
-        let set = ExtensionRuntimeSet::bind(vec![
-            (EndpointKind::TsCompat, active_compat),
-            (EndpointKind::Native, inactive_native),
-        ]);
+        let set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, active_compat)]);
         let runtime = ModelRuntime::create_in_memory().await?;
         let provider_epoch = runtime.provider_mutation_epoch();
-
-        let (native_replacement, native_host) = make_runner(snapshot(&[])).await?;
-        let (native_replacement, native_pending) = generation_from_endpoints(
-            2,
-            vec![(
-                EndpointKind::Native,
-                "<native-replacement>".to_owned(),
-                native_replacement,
-            )],
-        );
-        set.inject_prepared_replacement_for_reload(native_replacement, native_pending);
-        assert!(
-            set.restart_and_rewire(&runtime, HashMap::new())
-                .await
-                .is_err(),
-            "prepared native"
-        );
-        assert_eq!(set.reload_generation(), 1, "prepared native");
-        assert!(set.is_active(), "prepared native");
-        assert_eq!(runtime.provider_mutation_epoch(), provider_epoch);
-        assert!(runtime.get_registered_provider_ids().is_empty());
-        native_host.wait_for_exit().await?;
-        assert_eq!(native_host.exit_count(), 1);
 
         let (replacement, replacement_host) = make_runner(snapshot(&[])).await?;
         let (replacement, pending) = generation_from_endpoints(
@@ -4578,8 +6907,9 @@ pub(crate) mod tests {
             )],
         );
         set.inject_prepared_replacement_then_invalidation_for_reload(replacement, pending);
+        replacement_host.set_response("flags.set", json!({"ok": true}));
         assert!(
-            set.restart_and_rewire(&runtime, HashMap::new())
+            set.restart_and_rewire(&runtime, probe_preserved_flags())
                 .await
                 .is_err(),
             "prepared then invalidated"
@@ -4599,41 +6929,48 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn prepared_reload_admission_requires_one_compat_endpoint() -> TestResult {
         let (compat, _compat_host) = make_runner(snapshot(&[])).await?;
-        let (compat_generation, _) = generation_from_endpoints(
-            2,
-            vec![(EndpointKind::TsCompat, "<compat>".to_owned(), compat)],
-        );
+        let compat_set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, compat)]);
+        assert!(compat_set.can_reload(), "live compat facade");
         assert!(
-            compat_generation.is_single_compat_replacement(),
-            "prepared compat"
+            compat_set
+                .state()
+                .generation
+                .has_one_active_compat_endpoint()
         );
-        stop_generation(&compat_generation).await;
 
         let (native, _native_host) = make_runner(snapshot(&[])).await?;
-        let (native_generation, _) = generation_from_endpoints(
-            2,
-            vec![(EndpointKind::Native, "<native>".to_owned(), native)],
-        );
-        assert!(
-            !native_generation.is_single_compat_replacement(),
-            "prepared native"
-        );
-        stop_generation(&native_generation).await;
+        let native_set = ExtensionRuntimeSet::bind(vec![(EndpointKind::Native, native)]);
+        assert!(!native_set.can_reload(), "native-only facade");
 
         let (first, _first_host) = make_runner(snapshot(&[])).await?;
         let (second, _second_host) = make_runner(snapshot(&[])).await?;
-        let (multi_generation, _) = generation_from_endpoints(
+        let multi_set = ExtensionRuntimeSet::bind(vec![
+            (EndpointKind::TsCompat, first),
+            (EndpointKind::Native, second),
+        ]);
+        assert!(!multi_set.can_reload(), "multi-endpoint live facade");
+
+        // Best-effort prepare accepts multi-endpoint injected replacements.
+        let (live, _live_host) = make_runner(snapshot(&[])).await?;
+        let set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, live)]);
+        let (a, _a_host) = make_runner(snapshot(&[])).await?;
+        let (b, _b_host) = make_runner(snapshot(&[])).await?;
+        let (replacement, pending) = generation_from_endpoints(
             2,
             vec![
-                (EndpointKind::TsCompat, "<compat>".to_owned(), first),
-                (EndpointKind::Native, "<native>".to_owned(), second),
+                (EndpointKind::TsCompat, "<compat>".to_owned(), a),
+                (EndpointKind::Native, "<native>".to_owned(), b),
             ],
         );
-        assert!(
-            !multi_generation.is_single_compat_replacement(),
-            "prepared multi-endpoint"
-        );
-        stop_generation(&multi_generation).await;
+        set.inject_prepared_replacement_for_reload(replacement, pending);
+        let prepared = set.prepare_reload(HashMap::new()).await?;
+        assert!(prepared.generation.is_some());
+        drop(prepared);
+
+        compat_set.shutdown_once().await;
+        native_set.shutdown_once().await;
+        multi_set.shutdown_once().await;
+        set.shutdown_once().await;
         Ok(())
     }
 
@@ -4690,7 +7027,6 @@ pub(crate) mod tests {
                 .into_iter()
                 .all(|(_path, result)| result.is_ok())
         );
-        let provider_epoch = runtime.provider_mutation_epoch();
         let (replacement, pending) = generation_from_endpoints(
             2,
             vec![(
@@ -4701,30 +7037,24 @@ pub(crate) mod tests {
         );
         set.inject_prepared_replacement_for_reload(replacement, pending);
 
-        assert!(
-            set.restart_and_rewire(&runtime, HashMap::new())
-                .await
-                .is_err()
-        );
-        assert_eq!(replacement_host.request_count("flags.set"), 0);
-        assert_eq!(set.reload_generation(), 1);
+        replacement_host.set_response("flags.set", json!({"ok": true}));
+        set.restart_and_rewire(&runtime, probe_preserved_flags())
+            .await
+            .expect("native prepared replacements are accepted");
+        assert_eq!(replacement_host.request_count("flags.set"), 1);
+        assert_eq!(set.reload_generation(), 2);
         assert!(set.is_active());
-        assert_eq!(runtime.provider_mutation_epoch(), provider_epoch);
-        assert_eq!(runtime.get_registered_provider_ids(), ["old-provider"]);
-        assert!(runtime.get_model("old-provider", "old-model").is_some());
         assert!(
             runtime
                 .get_registered_provider_config("replacement-provider")
-                .is_none()
+                .is_some()
         );
-        replacement_host.wait_for_exit().await?;
-        assert_eq!(replacement_host.exit_count(), 1);
-        let result = set.emit_input("original", None, "user", None).await?;
-        assert!(!result.handled);
-        old_host.wait_for_request("input").await?;
+        assert!(runtime.get_model("old-provider", "old-model").is_none());
+        old_host.wait_for_exit().await?;
+        assert_eq!(old_host.exit_count(), 1);
 
         set.shutdown_once().await;
-        old_host.wait_for_exit().await?;
+        replacement_host.wait_for_exit().await?;
         Ok(())
     }
 
@@ -4792,9 +7122,10 @@ pub(crate) mod tests {
             )],
         );
         set.inject_prepared_replacement_then_invalidation_for_reload(replacement, pending);
+        replacement_host.set_response("flags.set", json!({"ok": true}));
 
         assert!(
-            set.restart_and_rewire(&runtime, HashMap::new())
+            set.restart_and_rewire(&runtime, probe_preserved_flags())
                 .await
                 .is_err()
         );
@@ -4904,7 +7235,14 @@ pub(crate) mod tests {
             }],
         );
         let runtime = ModelRuntime::create_in_memory().await?;
-        set.restart_and_rewire(&runtime, HashMap::new()).await?;
+        let result = set.restart_and_rewire(&runtime, HashMap::new()).await?;
+        assert!(
+            result.diagnostics.iter().any(|diagnostic| {
+                diagnostic.path == "broken-sibling.ts" && diagnostic.message == "load failed"
+            }),
+            "reload should return injected load diagnostics: {:?}",
+            result.diagnostics
+        );
         assert_eq!(set.reload_generation(), 2);
         assert!(set.is_active());
         old_host.wait_for_exit().await?;
@@ -5015,6 +7353,209 @@ pub(crate) mod tests {
         })
         .await
         .map_err(|_| "endpoint was not retired")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fatal_retirement_aborts_only_owner_pending_ready() -> TestResult {
+        let (owner_runner, owner_host) = make_runner(snapshot(&[])).await?;
+        let (other_runner, other_host) = make_runner(snapshot(&[])).await?;
+        let set = ExtensionRuntimeSet::bind(vec![
+            (EndpointKind::TsCompat, owner_runner),
+            (EndpointKind::Native, other_runner),
+        ]);
+        let (owner, other) = {
+            let state = set.state();
+            (
+                state.generation.endpoints[0].id,
+                state.generation.endpoints[1].id,
+            )
+        };
+        let runtime = Arc::new(ModelRuntime::create_in_memory().await?);
+        let token = set.next_replacement_token();
+        let mut ready_rx = set
+            .install_pending(
+                token.clone(),
+                PendingReadyOp::Reload {
+                    prepared: PreparedReload::empty_for_test(),
+                    model_runtime: runtime,
+                },
+            )
+            .map_err(|_| "initial pending install was rejected")?;
+        let route = set
+            .state()
+            .allocate_route(owner, 77)
+            .ok_or("owner route allocation failed")?;
+        set.respond_reload(route, Ok(Some(&token))).await?;
+        owner_host
+            .wait_for_response(protocol::SESSION_RELOAD_METHOD, 77)
+            .await?;
+
+        other_host.close().await;
+        wait_for_retirement(&set, other).await?;
+        assert!(
+            set.is_pending_busy(),
+            "retiring an unrelated endpoint aborted the pending operation"
+        );
+        assert!(matches!(
+            ready_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+
+        owner_host.close().await;
+        wait_for_retirement(&set, owner).await?;
+        let result = tokio::time::timeout(TEST_TIMEOUT, ready_rx).await;
+        assert!(
+            matches!(result, Ok(Err(_))),
+            "retiring the owner must wake the pending ready waiter"
+        );
+        assert!(!set.is_pending_busy());
+        assert!(set.take_finalizing(&token).is_none());
+        set.shutdown_once().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fatal_retirement_preserves_finalizing_ready() -> TestResult {
+        let (runner, host) = make_runner(snapshot(&[])).await?;
+        let set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, runner)]);
+        let owner = set.state().generation.endpoints[0].id;
+        let runtime = Arc::new(ModelRuntime::create_in_memory().await?);
+        let token = set.next_replacement_token();
+        let ready_rx = set
+            .install_pending(
+                token.clone(),
+                PendingReadyOp::Reload {
+                    prepared: PreparedReload::empty_for_test(),
+                    model_runtime: runtime,
+                },
+            )
+            .map_err(|_| "initial pending install was rejected")?;
+        let route = set
+            .state()
+            .allocate_route(owner, 78)
+            .ok_or("owner route allocation failed")?;
+        set.respond_reload(route, Ok(Some(&token))).await?;
+        host.wait_for_response(protocol::SESSION_RELOAD_METHOD, 78)
+            .await?;
+        assert!(set.complete_ready(&token));
+        ready_rx.await?;
+
+        host.close().await;
+        wait_for_retirement(&set, owner).await?;
+        let (op, _guard) = set
+            .take_finalizing(&token)
+            .ok_or("owner retirement removed the finalizing operation")?;
+        assert!(matches!(&op, PendingReadyOp::Reload { .. }));
+        drop(op);
+        assert!(set.finish_finalize(&token));
+        set.shutdown_once().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_bridge_operations_require_pending_token_owner() -> TestResult {
+        let (owner_runner, owner_host) = make_runner(snapshot(&[])).await?;
+        let (other_runner, other_host) = make_runner(snapshot(&[])).await?;
+        let set = ExtensionRuntimeSet::bind(vec![
+            (EndpointKind::TsCompat, owner_runner),
+            (EndpointKind::Native, other_runner),
+        ]);
+        let (owner, other) = {
+            let state = set.state();
+            (
+                state.generation.endpoints[0].id,
+                state.generation.endpoints[1].id,
+            )
+        };
+        let runtime = Arc::new(ModelRuntime::create_in_memory().await?);
+        let token = set.next_replacement_token();
+        let ready_rx = set
+            .install_pending(
+                token.clone(),
+                PendingReadyOp::Reload {
+                    prepared: PreparedReload::empty_for_test(),
+                    model_runtime: runtime,
+                },
+            )
+            .map_err(|_| "initial pending install was rejected")?;
+        let route = set
+            .state()
+            .allocate_route(owner, 79)
+            .ok_or("owner route allocation failed")?;
+        set.respond_reload(route, Ok(Some(&token))).await?;
+        owner_host
+            .wait_for_response(protocol::SESSION_RELOAD_METHOD, 79)
+            .await?;
+
+        assert!(matches!(
+            set.route_session_bridge(&SessionBridgeEvent::ReplacementReady {
+                token: token.clone(),
+                origin: Some(owner),
+            }),
+            SessionBridgeRoute::Operation
+        ));
+        assert!(matches!(
+            set.route_session_bridge(&SessionBridgeEvent::ReplacementReady {
+                token: token.clone(),
+                origin: Some(other),
+            }),
+            SessionBridgeRoute::Rejected
+        ));
+        assert!(matches!(
+            set.route_session_bridge(&SessionBridgeEvent::ReplacementReady {
+                token: token.clone(),
+                origin: None,
+            }),
+            SessionBridgeRoute::Rejected
+        ));
+        assert!(matches!(
+            set.route_session_bridge(&SessionBridgeEvent::ReplacementReady {
+                token: "stale-token".to_owned(),
+                origin: Some(owner),
+            }),
+            SessionBridgeRoute::Rejected
+        ));
+        assert!(matches!(
+            set.route_session_bridge(&SessionBridgeEvent::Command {
+                envelope: protocol::SessionCommandEnvelope {
+                    replacement_token: Some(token.clone()),
+                    command: protocol::SessionCommand::SetSessionName {
+                        name: "candidate".to_owned(),
+                    },
+                },
+                origin: Some(owner),
+            }),
+            SessionBridgeRoute::Rejected
+        ));
+
+        assert!(set.complete_ready(&token));
+        ready_rx.await?;
+        assert!(matches!(
+            &*set.pending_ready(),
+            PendingReadyState::Finalizing {
+                token: current,
+                owner: Some(bound_owner),
+                ..
+            } if current == &token && *bound_owner == owner
+        ));
+        assert!(matches!(
+            set.route_session_bridge(&SessionBridgeEvent::ReplacementAbort {
+                token: token.clone(),
+                origin: Some(owner),
+            }),
+            SessionBridgeRoute::Rejected
+        ));
+
+        let (op, guard) = set
+            .take_finalizing(&token)
+            .ok_or("ready operation was not finalizing")?;
+        drop(op);
+        assert!(set.finish_finalize(&token));
+        drop(guard);
+        set.shutdown_once().await;
+        owner_host.wait_for_exit().await?;
+        other_host.wait_for_exit().await?;
         Ok(())
     }
 

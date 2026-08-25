@@ -1528,9 +1528,7 @@ mod tests {
                     diagnostics,
                     None,
                 );
-                Ok(RuntimeHandle {
-                    runtime: Arc::new(runtime),
-                })
+                Ok(RuntimeHandle { runtime })
             })
         }
         fn supports_interactive(&self) -> bool {
@@ -2090,7 +2088,7 @@ mod tests {
         config.host_extension_runner = runner;
         let session = crate::core::agent_session::AgentSession::new(config)
             .map_err(|e| format!("AgentSession::new: {e}"))?;
-        Ok(Arc::new(AgentSessionRuntime::new(
+        let runtime = AgentSessionRuntime::new(
             session,
             crate::core::agent_session_runtime::AgentSessionRuntimeServices {
                 cwd: cwd.clone(),
@@ -2099,7 +2097,8 @@ mod tests {
             Arc::new(StubRuntimeFactory),
             Vec::new(),
             None,
-        )))
+        );
+        Ok(runtime)
     }
 
     /// Answer one fake-host request line, propagating encode/serialization

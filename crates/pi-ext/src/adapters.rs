@@ -216,7 +216,7 @@ impl AgentTool for ExtensionAgentTool {
                 tokio::select! {
                     biased;
                     () = cancel.cancelled() => {
-                        let _ = stream.cancel(methods::TOOL_CANCEL).await;
+                        let _ = stream.cancel(methods::TOOL_CANCEL);
                         return Err(ToolError::new("extension tool cancelled"));
                     }
                     ev = stream.next_event() => match ev {
@@ -267,6 +267,11 @@ pub struct ExtensionProvider {
     provider_id: String,
     client: Arc<HostClient>,
     timeout: Duration,
+    /// Test-only probe notified immediately before a bounded consumer send
+    /// when the channel is full (`capacity() == 0`). Absent in non-test
+    /// builds so production behavior is unchanged.
+    #[cfg(test)]
+    blocked_send_probe: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl ExtensionProvider {
@@ -277,6 +282,8 @@ impl ExtensionProvider {
             provider_id: provider_id.into(),
             client,
             timeout: DEFAULT_CALL_TIMEOUT,
+            #[cfg(test)]
+            blocked_send_probe: None,
         }
     }
 
@@ -284,6 +291,16 @@ impl ExtensionProvider {
     #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Test-only builder: install a probe that is notified immediately
+    /// before a bounded consumer send when the channel is full. Absent in
+    /// non-test builds.
+    #[cfg(test)]
+    #[must_use]
+    fn with_blocked_send_probe(mut self, probe: Arc<tokio::sync::Notify>) -> Self {
+        self.blocked_send_probe = Some(probe);
         self
     }
 }
@@ -299,6 +316,8 @@ impl Provider for ExtensionProvider {
         let provider_id = self.provider_id.clone();
         let timeout = self.timeout;
         let cancel = options.signal.clone().unwrap_or_default();
+        #[cfg(test)]
+        let blocked_send_probe = self.blocked_send_probe.clone();
         // Serialize model/context/options before spawning so no lock is held
         // across the host await (prepare_request already completed upstream).
         let model_value = serde_json::to_value(model).unwrap_or(Value::Null);
@@ -327,29 +346,83 @@ impl Provider for ExtensionProvider {
                 tokio::select! {
                     biased;
                     () = cancel.cancelled() => {
-                        let _ = handle.cancel(methods::PROVIDER_CANCEL).await;
-                        let _ = tx
-                            .send(Err(ProviderError::new("provider stream cancelled")))
-                            .await;
+                        let _ = handle.cancel(methods::PROVIDER_CANCEL);
+                        let _ = tx.try_send(Err(ProviderError::new(
+                            "provider stream cancelled",
+                        )));
                         return;
                     }
                     ev = handle.next_event() => match ev {
                         Some(frame) => {
-                            if let Some(event) = decode_provider_stream_event(&frame.payload)
-                                && tx.send(Ok(event)).await.is_err()
-                            {
-                                // Consumer dropped — stop driving the host stream.
-                                return;
+                            if let Some(event) = decode_provider_stream_event(&frame.payload) {
+                                #[cfg(test)]
+                                if tx.capacity() == 0
+                                    && let Some(probe) = &blocked_send_probe
+                                {
+                                    probe.notify_one();
+                                }
+                                // Race the consumer send against caller
+                                // cancellation so a full consumer channel
+                                // does not block cancellation teardown.
+                                let cancelled = tokio::select! {
+                                    biased;
+                                    () = cancel.cancelled() => true,
+                                    result = tx.send(Ok(event)) => {
+                                        if result.is_err() {
+                                            // Consumer dropped — stop driving the host stream.
+                                            return;
+                                        }
+                                        false
+                                    }
+                                };
+                                if cancelled {
+                                    let _ = handle.cancel(methods::PROVIDER_CANCEL);
+                                    let _ = tx.try_send(Err(ProviderError::new(
+                                        "provider stream cancelled",
+                                    )));
+                                    return;
+                                }
                             }
                         }
                         None => break,
                     }
                 }
             }
-            match handle.finish(timeout).await {
+            // Dropping the pending finish future on caller cancellation also
+            // drops the handle, which sends the provider cancel control frame.
+            let terminal = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    // handle is dropped here → Drop sends provider.cancel.
+                    let _ = tx.try_send(Err(ProviderError::new(
+                        "provider stream cancelled",
+                    )));
+                    return;
+                }
+                result = handle.finish(timeout) => result,
+            };
+            match terminal {
                 Ok(_terminal) => {}
                 Err(e) => {
-                    let _ = tx.send(Err(provider_error(e))).await;
+                    #[cfg(test)]
+                    if tx.capacity() == 0
+                        && let Some(probe) = &blocked_send_probe
+                    {
+                        probe.notify_one();
+                    }
+                    // Race terminal-error delivery against caller
+                    // cancellation so a full consumer channel does not
+                    // block cancellation teardown. When cancellation wins,
+                    // return without awaiting capacity.
+                    tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => {}
+                        result = tx.send(Err(provider_error(e))) => {
+                            if result.is_err() {
+                                // Consumer dropped — nothing more to do.
+                            }
+                        }
+                    }
                 }
             }
             // tx drops → stream ends.
@@ -868,6 +941,91 @@ pub fn tui_overlay_spec(spec: &crate::protocol::OverlaySpec) -> pi_tui::layout::
 // Registration records
 // ---------------------------------------------------------------------------
 
+/// Source scope for an extension command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CommandSourceScope {
+    /// User-level resource.
+    User,
+    /// Project-level resource.
+    Project,
+    /// CLI or synthetic resource.
+    Temporary,
+}
+
+/// Source origin for an extension command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CommandSourceOrigin {
+    /// Package-owned resource.
+    Package,
+    /// Top-level path or inline factory.
+    TopLevel,
+}
+
+/// Provenance for an extension command.
+///
+/// A present-but-partial `sourceInfo` object is rejected with a typed error
+/// rather than silently filling defaults — wrong provenance would misattribute
+/// command ownership. Omitting `sourceInfo` entirely is safe (the caller
+/// falls back to a synthetic source).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandSourceInfo {
+    /// Absolute or synthetic path.
+    pub path: String,
+    /// Discovery source label.
+    pub source: String,
+    /// User, project, or temporary scope.
+    pub scope: CommandSourceScope,
+    /// Package or top-level origin.
+    pub origin: CommandSourceOrigin,
+    /// Optional source base directory.
+    pub base_dir: Option<String>,
+}
+
+impl<'de> serde::Deserialize<'de> for CommandSourceInfo {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Partial {
+            #[serde(default)]
+            path: Option<String>,
+            #[serde(default)]
+            source: Option<String>,
+            #[serde(default)]
+            scope: Option<CommandSourceScope>,
+            #[serde(default)]
+            origin: Option<CommandSourceOrigin>,
+            #[serde(default)]
+            base_dir: Option<String>,
+        }
+
+        let p = Partial::deserialize(deserializer)?;
+        let path = p.path.ok_or_else(|| {
+            serde::de::Error::custom("sourceInfo.path is required when sourceInfo is present")
+        })?;
+        let source = p.source.ok_or_else(|| {
+            serde::de::Error::custom("sourceInfo.source is required when sourceInfo is present")
+        })?;
+        let scope = p.scope.ok_or_else(|| {
+            serde::de::Error::custom("sourceInfo.scope is required when sourceInfo is present")
+        })?;
+        let origin = p.origin.ok_or_else(|| {
+            serde::de::Error::custom("sourceInfo.origin is required when sourceInfo is present")
+        })?;
+        Ok(CommandSourceInfo {
+            path,
+            source,
+            scope,
+            origin,
+            base_dir: p.base_dir,
+        })
+    }
+}
+
 /// A registered custom command.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommandRegistration {
@@ -877,6 +1035,8 @@ pub struct CommandRegistration {
     pub description: Option<String>,
     /// Owning extension path.
     pub source: Option<String>,
+    /// Full command provenance when supplied by the host.
+    pub source_info: Option<CommandSourceInfo>,
 }
 
 /// A registered keyboard shortcut.
@@ -1020,6 +1180,11 @@ impl Registry {
         }
         self.providers.push(provider);
         true
+    }
+
+    /// Remove all registered providers.
+    pub fn clear_providers(&mut self) {
+        self.providers.clear();
     }
 
     /// Look up a tool by name.
@@ -1838,11 +2003,13 @@ mod tests {
             name: "c".to_owned(),
             description: None,
             source: None,
+            source_info: None,
         }));
         assert!(!registry.register_command(CommandRegistration {
             name: "c".to_owned(),
             description: None,
             source: None,
+            source_info: None,
         }));
 
         assert!(registry.register_provider(ProviderRegistration {
@@ -1856,5 +2023,271 @@ mod tests {
             api: None,
         }));
         assert!(registry.tool("t").is_some());
+    }
+
+    #[test]
+    fn command_source_info_absent_is_safe() -> Result<(), Box<dyn std::error::Error>> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Wire {
+            #[serde(default)]
+            source_info: Option<CommandSourceInfo>,
+        }
+
+        // Omitting sourceInfo entirely is safe — the field is Option.
+        let json = serde_json::json!({
+            "name": "mycmd",
+            "description": "test",
+        });
+        let wire: Wire = serde_json::from_value(json)?;
+        assert!(wire.source_info.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn command_source_info_complete_decodes() -> Result<(), Box<dyn std::error::Error>> {
+        let json = serde_json::json!({
+            "path": "/ext/cmd.ts",
+            "source": "extension",
+            "scope": "user",
+            "origin": "top-level",
+            "baseDir": "/ext",
+        });
+        let info: CommandSourceInfo = serde_json::from_value(json)?;
+        assert_eq!(info.path, "/ext/cmd.ts");
+        assert_eq!(info.source, "extension");
+        assert_eq!(info.scope, CommandSourceScope::User);
+        assert_eq!(info.origin, CommandSourceOrigin::TopLevel);
+        assert_eq!(info.base_dir.as_deref(), Some("/ext"));
+        Ok(())
+    }
+
+    #[test]
+    fn command_source_info_partial_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
+        // A present-but-partial object must be rejected, not silently filled.
+        // The custom Deserialize names the missing field with a
+        // "sourceInfo.<field> is required" message — the derived Deserialize
+        // would reject too but with a generic "missing field" message.
+        let partial = serde_json::json!({
+            "path": "/ext/cmd.ts",
+            "source": "extension",
+            // scope and origin missing
+        });
+        let Err(error) = serde_json::from_value::<CommandSourceInfo>(partial) else {
+            return Err("partial sourceInfo must be rejected, not silently accepted".into());
+        };
+        let err = error.to_string();
+        assert!(
+            err.contains("sourceInfo.scope"),
+            "error should name sourceInfo.scope, got: {err}"
+        );
+
+        // Missing path alone.
+        let partial2 = serde_json::json!({
+            "source": "extension",
+            "scope": "project",
+            "origin": "package",
+        });
+        let Err(error2) = serde_json::from_value::<CommandSourceInfo>(partial2) else {
+            return Err("partial sourceInfo without path must be rejected".into());
+        };
+        assert!(
+            error2.to_string().contains("sourceInfo.path"),
+            "error should name sourceInfo.path"
+        );
+
+        // Missing origin alone.
+        let partial3 = serde_json::json!({
+            "path": "/x",
+            "source": "ext",
+            "scope": "temporary",
+        });
+        let Err(error3) = serde_json::from_value::<CommandSourceInfo>(partial3) else {
+            return Err("partial sourceInfo without origin must be rejected".into());
+        };
+        assert!(
+            error3.to_string().contains("sourceInfo.origin"),
+            "error should name sourceInfo.origin"
+        );
+        Ok(())
+    }
+
+    /// A saturated consumer must not make cancellation wait for another
+    /// channel slot. The rejected awaited error send appends a spurious
+    /// cancellation error after the 64 accepted events; `try_send` keeps
+    /// teardown non-blocking and leaves buffered events intact.
+    #[tokio::test(flavor = "current_thread")]
+    async fn extension_provider_cancel_unblocks_full_consumer_channel() -> R {
+        use pi_ai::types::AssistantMessage;
+
+        let (client, mut host) = make_pair().await;
+        let probe = Arc::new(tokio::sync::Notify::new());
+        let provider = ExtensionProvider::new("custom", Arc::new(client))
+            .with_blocked_send_probe(Arc::clone(&probe));
+        let model = Model {
+            id: "m".to_owned(),
+            name: "M".to_owned(),
+            api: "custom".to_owned(),
+            provider: "custom".to_owned(),
+            ..base_model_defaults()
+        };
+        let cancel = CancellationToken::new();
+        let options = StreamOptions {
+            signal: Some(cancel.clone()),
+            ..StreamOptions::default()
+        };
+        // Keep the stream mutable so we can drain it after saturation.
+        let mut stream = provider.stream(&model, Context::default(), options);
+        let req = host.require_frame("provider.stream").await?;
+
+        // Build a minimal valid AssistantMessageEvent payload. The adapter
+        // decodes `providerEvent` frames via `decode_provider_stream_event`,
+        // which tries `AssistantMessageEvent` first.
+        let partial = AssistantMessage::new("custom", "custom", "m", 0);
+        let event = AssistantMessageEvent::TextDelta {
+            content_index: 0,
+            delta: "x".to_owned(),
+            partial,
+        };
+        let payload = serde_json::to_value(&event)?;
+
+        // Send 65 events: 64 fill the channel, the 65th blocks the adapter.
+        for _ in 0..65 {
+            let ev = Frame::event(req.id, Method::ProviderEvent, payload.clone());
+            host.write_frame(&ev).await?;
+        }
+
+        // Wait for the adapter to fill the channel and block on the 65th
+        // event's `tx.send(Ok(event))` — the probe fires at `capacity() == 0`.
+        tokio::time::timeout(Duration::from_secs(2), probe.notified())
+            .await
+            .map_err(|_| "adapter did not block on the 65th event send within 2s")?;
+
+        // Cancel the caller token. The inner `select!` cancel branch fires,
+        // calls `handle.cancel(PROVIDER_CANCEL)`, and uses `try_send` (not
+        // `.await`) for the error — so `provider.cancel` must arrive promptly
+        // even though the consumer channel is full.
+        cancel.cancel();
+        let cancel_frame = tokio::time::timeout(
+            Duration::from_millis(500),
+            host.require_frame("provider.cancel"),
+        )
+        .await
+        .map_err(|_| {
+            "provider.cancel did not arrive within 500ms — \
+             cancellation error delivery is blocking on the full consumer queue"
+        })??;
+        assert_eq!(cancel_frame.method, methods::PROVIDER_CANCEL);
+        assert_eq!(cancel_frame.payload["id"], req.id);
+
+        // An awaited cancellation error would appear after the buffered events.
+        let mut ok_count = 0usize;
+        let mut got_err = false;
+        while let Some(item) = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .map_err(|_| "consumer stream did not end within 2s")?
+        {
+            if item.is_err() {
+                got_err = true;
+                break;
+            }
+            ok_count += 1;
+        }
+        assert!(
+            !got_err,
+            "consumer stream yielded an injected cancellation Err after \
+             {ok_count} Ok events"
+        );
+        assert_eq!(
+            ok_count, 64,
+            "consumer stream must yield exactly 64 Ok events, got {ok_count}"
+        );
+        Ok(())
+    }
+
+    /// A saturated consumer must not make terminal-error delivery ignore
+    /// caller cancellation. The rejected unconditional send appends the error
+    /// after the 64 buffered events; the cancellation race ends the stream
+    /// without waiting for another channel slot.
+    #[tokio::test(flavor = "current_thread")]
+    async fn extension_provider_terminal_error_cancelled_on_full_channel() -> R {
+        use crate::protocol::ErrorPayload;
+        use pi_ai::types::AssistantMessage;
+
+        let (client, mut host) = make_pair().await;
+        let probe = Arc::new(tokio::sync::Notify::new());
+        let provider = ExtensionProvider::new("custom", Arc::new(client))
+            .with_blocked_send_probe(Arc::clone(&probe));
+        let model = Model {
+            id: "m".to_owned(),
+            name: "M".to_owned(),
+            api: "custom".to_owned(),
+            provider: "custom".to_owned(),
+            ..base_model_defaults()
+        };
+        let cancel = CancellationToken::new();
+        let options = StreamOptions {
+            signal: Some(cancel.clone()),
+            ..StreamOptions::default()
+        };
+        let mut stream = provider.stream(&model, Context::default(), options);
+        let req = host.require_frame("provider.stream").await?;
+
+        // Build a minimal valid AssistantMessageEvent payload.
+        let partial = AssistantMessage::new("custom", "custom", "m", 0);
+        let event = AssistantMessageEvent::TextDelta {
+            content_index: 0,
+            delta: "x".to_owned(),
+            partial,
+        };
+        let payload = serde_json::to_value(&event)?;
+
+        // Send 64 provider events to fill the consumer channel, then a
+        // correlated error frame (terminal). The adapter will process the
+        // 64 Ok events, see the stream end (None from next_event), then
+        // await finish which receives the error. The terminal-error send
+        // blocks because the channel is still full (consumer not draining).
+        for _ in 0..64 {
+            let ev = Frame::event(req.id, Method::ProviderEvent, payload.clone());
+            host.write_frame(&ev).await?;
+        }
+        let error = ErrorPayload::new("extension_error", "host provider failed");
+        host.write_frame(&Frame::error_frame(req.id, Method::Notify, &error)?)
+            .await?;
+
+        // Wait for the adapter to queue 64 events, break out of the event
+        // loop, await finish (gets the error), and block on the terminal
+        // `tx.send(Err(...))` — the probe fires at `capacity() == 0`.
+        tokio::time::timeout(Duration::from_secs(2), probe.notified())
+            .await
+            .map_err(|_| "adapter did not block on terminal-error send within 2s")?;
+
+        // Cancel the caller token. The terminal-error delivery must race
+        // against cancellation and return without awaiting capacity.
+        cancel.cancel();
+
+        // The rejected awaited send would append an error after the buffered events.
+        let mut ok_count = 0usize;
+        let mut got_err = false;
+        while let Some(item) = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .map_err(|_| "consumer stream did not end within 2s")?
+        {
+            if item.is_err() {
+                got_err = true;
+                break;
+            }
+            ok_count += 1;
+        }
+        assert!(
+            !got_err,
+            "consumer stream yielded a terminal error after {ok_count} Ok \
+             events; terminal-error delivery is not cancellation-aware"
+        );
+        assert_eq!(
+            ok_count, 64,
+            "consumer stream must yield exactly 64 Ok events, got {ok_count}"
+        );
+        Ok(())
     }
 }

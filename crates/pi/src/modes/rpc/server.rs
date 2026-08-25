@@ -60,10 +60,373 @@ use super::types::{
     RpcSessionTreeNode, RpcSlashCommand, SessionStats, StreamingBehavior,
 };
 
-/// Serialize a value as a JSONL line, falling back to an empty string on
-/// serialization failure (our types are infallible serializers).
+/// Serialize one RPC wire value, normalizing known envelope fields whose wire
+/// contract requires it while preserving opaque extension-owned values.
 fn to_jsonl<T: Serialize>(value: &T) -> String {
-    serialize_json_line(value).unwrap_or_default()
+    let Ok(mut wire) = serde_json::to_value(value) else {
+        return String::new();
+    };
+    normalize_wire_envelope(&mut wire);
+    serialize_json_line(&wire).unwrap_or_default()
+}
+
+/// Convert a known user message's compact string `content` to the block array
+/// used by the TypeScript authority. Does not recurse into `content` or any
+/// other field — opaque nested values are preserved byte-for-JSON-shape.
+fn normalize_message_user_content(message: &mut Value) {
+    if let Value::Object(fields) = message
+        && fields.get("role").and_then(Value::as_str) == Some("user")
+        && let Some(content) = fields.get_mut("content")
+        && let Value::String(text) = content
+    {
+        let text = std::mem::take(text);
+        *content = serde_json::json!([{ "type": "text", "text": text }]);
+    }
+}
+
+fn normalize_message(message: &mut Value) {
+    let is_tool_result = message.get("role").and_then(Value::as_str) == Some("toolResult");
+    normalize_message_user_content(message);
+    if is_tool_result {
+        normalize_tool_result_null_details(message);
+    }
+}
+
+fn normalize_message_entry(entry: &mut Value) {
+    let Some(fields) = entry.as_object_mut() else {
+        return;
+    };
+    if fields.get("type").and_then(Value::as_str) != Some("message") {
+        return;
+    }
+    if let Some(message) = fields.get_mut("message") {
+        normalize_message(message);
+    }
+}
+
+fn normalize_tree_message_entries(tree: &mut Value) {
+    let Some(nodes) = tree.as_array_mut() else {
+        return;
+    };
+    let mut pending: Vec<&mut Value> = nodes.iter_mut().collect();
+    while let Some(node) = pending.pop() {
+        let Some(fields) = node.as_object_mut() else {
+            continue;
+        };
+        if let Some(entry) = fields.get_mut("entry") {
+            normalize_message_entry(entry);
+        }
+        if let Some(Value::Array(children)) = fields.get_mut("children") {
+            pending.extend(children.iter_mut());
+        }
+    }
+}
+
+/// Strip a null `details` field from a known tool-result object. Does not
+/// recurse into `details` or any other field — opaque nested values inside
+/// `details` are preserved.
+fn normalize_tool_result_null_details(result: &mut Value) {
+    if let Value::Object(fields) = result
+        && fields.get("details").is_some_and(Value::is_null)
+    {
+        fields.remove("details");
+    }
+}
+
+/// Normalize only the known RPC envelope/message/tool-result fields whose wire
+/// contract requires it. Opaque nested `details`, custom payloads, and nested
+/// role/content objects are preserved byte-for-JSON-shape — the function does
+/// not recurse into them.
+fn normalize_wire_envelope(value: &mut Value) {
+    let Some(fields) = value.as_object_mut() else {
+        return;
+    };
+    let event_type = fields.get("type").and_then(Value::as_str);
+    match event_type {
+        // Message lifecycle events: normalize the known `message` wire shape.
+        Some("message_start" | "message_update" | "message_end") => {
+            if let Some(message) = fields.get_mut("message") {
+                normalize_message(message);
+            }
+        }
+        // Tool execution events: strip null `details` from the result object.
+        Some("tool_execution_end") => {
+            if let Some(result) = fields.get_mut("result") {
+                normalize_tool_result_null_details(result);
+            }
+        }
+        Some("tool_execution_update") => {
+            if let Some(result) = fields.get_mut("partialResult") {
+                normalize_tool_result_null_details(result);
+            }
+        }
+        // Turn end: normalize the completing message and each tool-result message.
+        Some("turn_end") => {
+            if let Some(message) = fields.get_mut("message") {
+                normalize_message(message);
+            }
+            if let Some(Value::Array(results)) = fields.get_mut("toolResults") {
+                for result in results {
+                    normalize_tool_result_null_details(result);
+                }
+            }
+        }
+        // Agent end: normalize each produced message.
+        Some("agent_end") => {
+            if let Some(Value::Array(messages)) = fields.get_mut("messages") {
+                for message in messages {
+                    normalize_message(message);
+                }
+            }
+        }
+        // Entry appended: normalize a message entry's `message` field only.
+        Some("entry_appended") => {
+            if let Some(entry) = fields.get_mut("entry") {
+                normalize_message_entry(entry);
+            }
+        }
+        // Response envelope: normalize known data fields by command.
+        Some("response") => {
+            let command = fields
+                .get("command")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if let Some(data) = fields.get_mut("data") {
+                normalize_response_data(data, command.as_deref());
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Response-data normalization required by a command's success response.
+///
+/// Every [`RpcCommand`] variant is exhaustively classified in
+/// [`command_response_normalization`]; adding a variant is a compile error
+/// until classified there.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResponseDataNormalization {
+    /// No response-data normalization (opaque payloads left untouched).
+    None,
+    /// `data.messages` — array of message objects.
+    Messages,
+    /// `data.entries` — array of entry objects.
+    Entries,
+    /// `data.tree` — array of tree nodes.
+    Tree,
+}
+
+/// Apply response-data normalization for the classified kind.
+fn normalize_response_data_kind(data: &mut Value, kind: ResponseDataNormalization) {
+    match kind {
+        ResponseDataNormalization::Messages => {
+            if let Some(Value::Array(messages)) = data.get_mut("messages") {
+                for message in messages {
+                    normalize_message(message);
+                }
+            }
+        }
+        ResponseDataNormalization::Entries => {
+            if let Some(Value::Array(entries)) = data.get_mut("entries") {
+                for entry in entries {
+                    normalize_message_entry(entry);
+                }
+            }
+        }
+        ResponseDataNormalization::Tree => {
+            if let Some(tree) = data.get_mut("tree") {
+                normalize_tree_message_entries(tree);
+            }
+        }
+        ResponseDataNormalization::None => {}
+    }
+}
+
+/// Normalize known fields within a response `data` payload.
+///
+/// Delegates to the compile-time-exhaustive [`command_response_normalization`]
+/// classifier by parsing the command string into a typed [`RpcCommand`]. This
+/// ensures one classifier governs both the typed (production) and the
+/// string-based (generic/Value) serialization paths. Commands whose required
+/// fields are absent from the wire `type` alone fail to parse and fall back to
+/// [`ResponseDataNormalization::None`] — but those commands are already
+/// classified as `None` by the typed classifier, so the outcome is identical.
+fn normalize_response_data(data: &mut Value, command: Option<&str>) {
+    let kind = match command {
+        Some(command_type) => {
+            let wire = serde_json::json!({"type": command_type});
+            match RpcCommand::parse_value(&wire) {
+                Ok(parsed) => command_response_normalization(&parsed),
+                Err(_) => ResponseDataNormalization::None,
+            }
+        }
+        None => ResponseDataNormalization::None,
+    };
+    normalize_response_data_kind(data, kind);
+}
+
+// ---------------------------------------------------------------------------
+// Compile-time exhaustive normalization classification
+// ---------------------------------------------------------------------------
+//
+// Production event and response serialization is driven by compile-time-
+// exhaustive matches over the *typed* enums ([`AgentSessionEvent`] and
+// [`RpcCommand`]). Every variant is explicitly classified as normalization-
+// required or normalization-not-required. Adding a new variant is a compile
+// error until classified — it cannot silently fall through a string allowlist.
+
+/// Compile-time-exhaustive classification: every [`RpcCommand`] variant is
+/// matched. Success responses for `get_messages`, `get_entries`, and
+/// `get_tree` carry message-bearing payloads that need wire normalization;
+/// all other commands (including [`RpcCommand::Unknown`]) are explicitly
+/// `None`. Adding a new variant is a compile error until classified here.
+fn command_response_normalization(command: &RpcCommand) -> ResponseDataNormalization {
+    match command {
+        RpcCommand::GetMessages { .. } => ResponseDataNormalization::Messages,
+        RpcCommand::GetEntries { .. } => ResponseDataNormalization::Entries,
+        RpcCommand::GetTree { .. } => ResponseDataNormalization::Tree,
+        RpcCommand::Prompt { .. }
+        | RpcCommand::Steer { .. }
+        | RpcCommand::FollowUp { .. }
+        | RpcCommand::Abort { .. }
+        | RpcCommand::NewSession { .. }
+        | RpcCommand::GetState { .. }
+        | RpcCommand::SetModel { .. }
+        | RpcCommand::CycleModel { .. }
+        | RpcCommand::GetAvailableModels { .. }
+        | RpcCommand::SetThinkingLevel { .. }
+        | RpcCommand::CycleThinkingLevel { .. }
+        | RpcCommand::GetAvailableThinkingLevels { .. }
+        | RpcCommand::SetSteeringMode { .. }
+        | RpcCommand::SetFollowUpMode { .. }
+        | RpcCommand::Compact { .. }
+        | RpcCommand::SetAutoCompaction { .. }
+        | RpcCommand::SetAutoRetry { .. }
+        | RpcCommand::AbortRetry { .. }
+        | RpcCommand::Bash { .. }
+        | RpcCommand::AbortBash { .. }
+        | RpcCommand::GetSessionStats { .. }
+        | RpcCommand::ExportHtml { .. }
+        | RpcCommand::SwitchSession { .. }
+        | RpcCommand::Fork { .. }
+        | RpcCommand::Clone { .. }
+        | RpcCommand::GetForkMessages { .. }
+        | RpcCommand::GetLastAssistantText { .. }
+        | RpcCommand::SetSessionName { .. }
+        | RpcCommand::GetCommands { .. }
+        | RpcCommand::Unknown { .. } => ResponseDataNormalization::None,
+    }
+}
+
+/// Serialize an [`AgentSessionEvent`] to a JSONL wire line.
+///
+/// Normalization is dispatched from a compile-time-exhaustive match over the
+/// typed event in [`normalize_event_envelope`] — every variant is explicitly
+/// classified as normalization-required or normalization-not-required. Adding
+/// a new variant is a compile error until classified there. Opaque nested
+/// values are preserved byte-for-JSON-shape.
+fn serialize_event(event: &AgentSessionEvent) -> String {
+    let Ok(mut wire) = serde_json::to_value(event) else {
+        return String::new();
+    };
+    normalize_event_envelope(event, &mut wire);
+    serialize_json_line(&wire).unwrap_or_default()
+}
+
+/// Exhaustive classification + dispatch: every [`AgentSessionEvent`] variant
+/// is matched here. Message-bearing variants have their known wire fields
+/// normalized; all others are explicitly no-ops. Adding a variant is a
+/// compile error until classified — it cannot silently fall through a string
+/// allowlist. Opaque nested `details`, custom payloads, and nested
+/// role/content objects are preserved byte-for-JSON-shape.
+fn normalize_event_envelope(event: &AgentSessionEvent, wire: &mut Value) {
+    let Some(fields) = wire.as_object_mut() else {
+        return;
+    };
+    match event {
+        // Message lifecycle events: normalize the known `message` wire shape.
+        AgentSessionEvent::MessageStart { .. }
+        | AgentSessionEvent::MessageUpdate { .. }
+        | AgentSessionEvent::MessageEnd { .. } => {
+            if let Some(message) = fields.get_mut("message") {
+                normalize_message(message);
+            }
+        }
+        // Tool execution events: strip null `details` from the result object.
+        AgentSessionEvent::ToolExecutionEnd { .. } => {
+            if let Some(result) = fields.get_mut("result") {
+                normalize_tool_result_null_details(result);
+            }
+        }
+        AgentSessionEvent::ToolExecutionUpdate { .. } => {
+            if let Some(result) = fields.get_mut("partialResult") {
+                normalize_tool_result_null_details(result);
+            }
+        }
+        // Turn end: normalize the completing message and each tool-result.
+        AgentSessionEvent::TurnEnd { .. } => {
+            if let Some(message) = fields.get_mut("message") {
+                normalize_message(message);
+            }
+            if let Some(Value::Array(results)) = fields.get_mut("toolResults") {
+                for result in results {
+                    normalize_tool_result_null_details(result);
+                }
+            }
+        }
+        // Agent end: normalize each produced message.
+        AgentSessionEvent::AgentEnd { .. } => {
+            if let Some(Value::Array(messages)) = fields.get_mut("messages") {
+                for message in messages {
+                    normalize_message(message);
+                }
+            }
+        }
+        // Entry appended: normalize a message entry's `message` field only.
+        AgentSessionEvent::EntryAppended { .. } => {
+            if let Some(entry) = fields.get_mut("entry") {
+                normalize_message_entry(entry);
+            }
+        }
+        // Explicitly no normalization required — exhaustively classified.
+        AgentSessionEvent::SessionBeforeSwitch { .. }
+        | AgentSessionEvent::SessionBeforeFork { .. }
+        | AgentSessionEvent::SessionStart { .. }
+        | AgentSessionEvent::SessionShutdown { .. }
+        | AgentSessionEvent::ModelSelect { .. }
+        | AgentSessionEvent::AgentStart
+        | AgentSessionEvent::TurnStart
+        | AgentSessionEvent::ToolExecutionStart { .. }
+        | AgentSessionEvent::AgentSettled
+        | AgentSessionEvent::QueueUpdate { .. }
+        | AgentSessionEvent::CompactionStart { .. }
+        | AgentSessionEvent::CompactionEnd { .. }
+        | AgentSessionEvent::SessionInfoChanged { .. }
+        | AgentSessionEvent::ThinkingLevelChanged { .. }
+        | AgentSessionEvent::AutoRetryStart { .. }
+        | AgentSessionEvent::AutoRetryEnd { .. }
+        | AgentSessionEvent::SummarizationRetryScheduled { .. }
+        | AgentSessionEvent::SummarizationRetryAttemptStart { .. }
+        | AgentSessionEvent::SummarizationRetryFinished
+        | AgentSessionEvent::BashExecutionUpdate { .. } => {}
+    }
+}
+
+/// Serialize an [`RpcResponse`] to a JSONL wire line.
+///
+/// Response-data normalization is driven by the compile-time-exhaustive
+/// [`command_response_normalization`] classification rather than a string
+/// allowlist. Opaque nested values are preserved byte-for-JSON-shape.
+fn serialize_response(response: &RpcResponse, kind: ResponseDataNormalization) -> String {
+    let Ok(mut wire) = serde_json::to_value(response) else {
+        return String::new();
+    };
+    if let Some(fields) = wire.as_object_mut()
+        && let Some(data) = fields.get_mut("data")
+    {
+        normalize_response_data_kind(data, kind);
+    }
+    serialize_json_line(&wire).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -280,6 +643,8 @@ pub trait RpcSessionHost: Send + Sync {
     fn set_thinking_level(&self, level: ModelThinkingLevel) -> BoxFuture<'static, bool>;
     /// Cycle to the next thinking level.
     fn cycle_thinking_level(&self) -> BoxFuture<'static, Option<ModelThinkingLevel>>;
+    /// List thinking levels supported by the current model.
+    fn get_available_thinking_levels(&self) -> BoxFuture<'static, Vec<ModelThinkingLevel>>;
 
     // ---- Queue modes ----
     /// Set steering queue drain mode.
@@ -308,6 +673,7 @@ pub trait RpcSessionHost: Send + Sync {
         &self,
         command: String,
         exclude_from_context: Option<bool>,
+        id: Option<String>,
     ) -> BoxFuture<'static, Result<BashResult, String>>;
     /// Abort a running bash command.
     fn abort_bash(&self) -> BoxFuture<'static, ()>;
@@ -499,6 +865,15 @@ impl ServerState {
         }
     }
 
+    /// Rebind after session replacement, clearing any pending signal flag first.
+    pub(crate) async fn rebind_host<H>(&self, host: &H)
+    where
+        H: RpcSessionHost + ?Sized,
+    {
+        self.needs_rebind.store(false, Ordering::SeqCst);
+        self.rebind(host).await;
+    }
+
     /// Rebind extensions + subscriptions on the current session.
     ///
     /// All stdout emission (events, extension errors) goes through `write_tx`
@@ -531,7 +906,7 @@ impl ServerState {
         let event_tx = self.write_tx.clone();
         let signal = Arc::clone(&self.signal);
         let unsub = host.subscribe(Arc::new(move |event: &AgentSessionEvent| {
-            let _ = event_tx.send(WriteMessage::Line(to_jsonl(event)));
+            let _ = event_tx.send(WriteMessage::Line(serialize_event(event)));
             if matches!(event, AgentSessionEvent::AgentSettled) {
                 signal.notify_one();
             }
@@ -863,7 +1238,7 @@ where
             match host.new_session(parent_session.clone()).await {
                 Ok(cancelled) => {
                     if !cancelled {
-                        state.rebind(host).await;
+                        state.rebind_host(host).await;
                     }
                     Some(RpcResponse::ok_data(
                         id,
@@ -957,6 +1332,15 @@ where
             ))
         }
 
+        RpcCommand::GetAvailableThinkingLevels { .. } => {
+            let levels = host.get_available_thinking_levels().await;
+            Some(RpcResponse::ok_data(
+                id,
+                "get_available_thinking_levels",
+                RpcResponseData::AvailableThinkingLevels { levels },
+            ))
+        }
+
         RpcCommand::SetSteeringMode { mode, .. } => {
             host.set_steering_mode(*mode).await;
             Some(RpcResponse::ok(id, "set_steering_mode"))
@@ -998,7 +1382,10 @@ where
             command: cmd,
             exclude_from_context,
             ..
-        } => match host.execute_bash(cmd.clone(), *exclude_from_context).await {
+        } => match host
+            .execute_bash(cmd.clone(), *exclude_from_context, id.clone())
+            .await
+        {
             Ok(result) => Some(RpcResponse::ok_data(
                 id,
                 "bash",
@@ -1036,7 +1423,7 @@ where
             match host.switch_session(session_path.clone()).await {
                 Ok(cancelled) => {
                     if !cancelled {
-                        state.rebind(host).await;
+                        state.rebind_host(host).await;
                     }
                     Some(RpcResponse::ok_data(
                         id,
@@ -1052,7 +1439,7 @@ where
             match host.fork(entry_id.clone(), ForkPosition::Before).await {
                 Ok(outcome) => {
                     if !outcome.cancelled {
-                        state.rebind(host).await;
+                        state.rebind_host(host).await;
                     }
                     Some(RpcResponse::ok_data(
                         id,
@@ -1078,7 +1465,7 @@ where
                 Some(leaf_id) => match host.fork(leaf_id, ForkPosition::At).await {
                     Ok(outcome) => {
                         if !outcome.cancelled {
-                            state.rebind(host).await;
+                            state.rebind_host(host).await;
                         }
                         Some(RpcResponse::ok_data(
                             id,
@@ -1225,7 +1612,10 @@ async fn spawn_prompt<H>(
                 .is_ok()
         {
             let response = RpcResponse::ok(success_id.clone(), "prompt");
-            let _ = success_tx.send(WriteMessage::Line(to_jsonl(&response)));
+            let _ = success_tx.send(WriteMessage::Line(serialize_response(
+                &response,
+                ResponseDataNormalization::None,
+            )));
         }
         // Unblock the dispatcher after preflight so later commands cannot
         // enqueue ahead of the prompt response.
@@ -1250,7 +1640,10 @@ async fn spawn_prompt<H>(
             && !error_flag.load(Ordering::SeqCst)
         {
             let response = RpcResponse::err(error_id, "prompt", msg);
-            let _ = error_tx.send(WriteMessage::Line(to_jsonl(&response)));
+            let _ = error_tx.send(WriteMessage::Line(serialize_response(
+                &response,
+                ResponseDataNormalization::None,
+            )));
         }
         // If preflight never fired (host bug / panic path), still release the
         // dispatcher so the command loop cannot hang forever.
@@ -1288,7 +1681,10 @@ where
         Ok(v) => v,
         Err(e) => {
             let response = RpcResponse::err(None, "parse", format!("Failed to parse command: {e}"));
-            state.enqueue(to_jsonl(&response));
+            state.enqueue(serialize_response(
+                &response,
+                ResponseDataNormalization::None,
+            ));
             return LineOutcome::Done;
         }
     };
@@ -1309,13 +1705,19 @@ where
                 "parse",
                 format!("Failed to parse command: {}", error.message),
             );
-            state.enqueue(to_jsonl(&response));
+            state.enqueue(serialize_response(
+                &response,
+                ResponseDataNormalization::None,
+            ));
             return LineOutcome::Done;
         }
     };
 
     if let Some(resp) = handle_command(&command, host, state).await {
-        state.enqueue(to_jsonl(&resp));
+        state.enqueue(serialize_response(
+            &resp,
+            command_response_normalization(&command),
+        ));
     }
 
     if state.shutdown_requested.load(Ordering::SeqCst) {
@@ -1424,7 +1826,10 @@ where
                             "transport",
                             format!("Failed to read stdin: {error}"),
                         );
-                        state.enqueue(to_jsonl(&response));
+                        state.enqueue(serialize_response(
+                            &response,
+                            ResponseDataNormalization::None,
+                        ));
                         break 1;
                     }
                     Some(LineMsg::Eof) | None => break 0,
@@ -1509,7 +1914,10 @@ where
                             "transport",
                             format!("Failed to read stdin: {error}"),
                         );
-                        state.enqueue(to_jsonl(&response));
+                        state.enqueue(serialize_response(
+                            &response,
+                            ResponseDataNormalization::None,
+                        ));
                         break 1;
                     }
                     Some(LineMsg::Eof) | None => break 0,
@@ -1602,9 +2010,13 @@ mod tests {
         commands: Vec<RpcSlashCommand>,
         cycle_model_result: Option<ModelCycleResult>,
         cycle_thinking_result: Option<ModelThinkingLevel>,
+        available_thinking_levels: Vec<ModelThinkingLevel>,
         set_thinking_result: bool,
         compact_result: Option<Result<CompactionResult, String>>,
         bash_result: Option<Result<BashResult, String>>,
+        // Tri-state: None = execute_bash uncalled; Some(None) = id omitted/null; Some(Some) = id value.
+        #[allow(clippy::option_option)]
+        bash_id: Option<Option<String>>,
         fork_outcome: Result<ForkOutcome, String>,
         leaf_id: Option<String>,
         prompt_error: Option<String>,
@@ -1619,9 +2031,11 @@ mod tests {
                 commands: vec![],
                 cycle_model_result: None,
                 cycle_thinking_result: None,
+                available_thinking_levels: vec![ModelThinkingLevel::Off],
                 set_thinking_result: true,
                 compact_result: None,
                 bash_result: None,
+                bash_id: None,
                 fork_outcome: Ok(ForkOutcome::default()),
                 leaf_id: Some("leaf1".into()),
                 prompt_error: None,
@@ -1787,6 +2201,11 @@ mod tests {
             let cfg = Arc::clone(&self.cfg);
             Box::pin(async move { cfg.lock().unwrap().cycle_thinking_result })
         }
+        fn get_available_thinking_levels(&self) -> BoxFuture<'static, Vec<ModelThinkingLevel>> {
+            self.rec("get_available_thinking_levels");
+            let cfg = Arc::clone(&self.cfg);
+            Box::pin(async move { cfg.lock().unwrap().available_thinking_levels.clone() })
+        }
         fn set_steering_mode(&self, _m: QueueMode) -> BoxFuture<'static, ()> {
             self.rec("set_steering_mode");
             Box::pin(async {})
@@ -1825,15 +2244,16 @@ mod tests {
             &self,
             _c: String,
             _e: Option<bool>,
+            id: Option<String>,
         ) -> BoxFuture<'static, Result<BashResult, String>> {
             self.rec("bash");
             let cfg = Arc::clone(&self.cfg);
             Box::pin(async move {
-                cfg.lock()
-                    .unwrap()
-                    .bash_result
-                    .clone()
-                    .unwrap_or(Ok(test_bash_result()))
+                let mut g = cfg.lock().unwrap();
+                if g.bash_id.is_none() {
+                    g.bash_id = Some(id);
+                }
+                g.bash_result.clone().unwrap_or(Ok(test_bash_result()))
             })
         }
         fn abort_bash(&self) -> BoxFuture<'static, ()> {
@@ -1950,6 +2370,7 @@ mod tests {
             estimated_tokens_after: Some(500),
             details: None,
             from_hook: None,
+            usage: None,
         }
     }
     fn test_bash_result() -> BashResult {
@@ -2007,6 +2428,21 @@ mod tests {
         assert!(!lines.is_empty(), "expected at least one response line");
         let resp: Value = serde_json::from_str(&lines[0]).unwrap();
         (resp, sink_clone)
+    }
+
+    async fn dispatch_with_host(
+        cmd_json: &str,
+        cfg: FakeConfig,
+    ) -> (Value, BufferSink, FakeRpcHost) {
+        let host = FakeRpcHost::new(cfg);
+        let sink = BufferSink::new();
+        let (state, sink_clone, mut write_rx) = make_state(sink);
+        process_input_line(cmd_json, &host, &state).await;
+        drain(&sink_clone, &mut write_rx).await;
+        let lines = sink_clone.stdout_lines();
+        assert!(!lines.is_empty(), "expected at least one response line");
+        let resp: Value = serde_json::from_str(&lines[0]).unwrap();
+        (resp, sink_clone, host)
     }
 
     async fn dispatch_no_response(
@@ -2316,12 +2752,18 @@ mod tests {
 
     #[tokio::test]
     async fn bash_returns_result() {
-        let (r, _) = dispatch(
+        let (r, _, host) = dispatch_with_host(
             r#"{"type":"bash","id":"b1","command":"echo hi"}"#,
             FakeConfig::default(),
         )
         .await;
         assert_eq!(r["data"]["output"], "done");
+        // The RPC request id must reach ExecuteBashOptions.id so that
+        // bash_execution_update events correlate with the originating request.
+        assert_eq!(
+            host.cfg.lock().unwrap().bash_id,
+            Some(Some("b1".to_string()))
+        );
     }
 
     #[tokio::test]
@@ -2699,7 +3141,7 @@ mod tests {
         // This ensures the host's emitted events go into the same write_tx queue.
         let event_tx = state.write_tx.clone();
         let unsub = host.subscribe(Arc::new(move |event: &AgentSessionEvent| {
-            let _ = event_tx.send(WriteMessage::Line(to_jsonl(event)));
+            let _ = event_tx.send(WriteMessage::Line(serialize_event(event)));
         }));
         *state.unsubscribe_events.lock().unwrap() = Some(unsub);
 
@@ -2939,8 +3381,270 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // ExtensionErrorOutput serialization
+    // Wire-envelope normalization
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn rpc_jsonl_normalizes_user_text_to_content_blocks() {
+        // Supported envelope: message_start with user string content → blocks.
+        let line = to_jsonl(&serde_json::json!({
+            "type": "message_start",
+            "message": {
+                "role": "user",
+                "content": "hello",
+                "timestamp": 1
+            }
+        }));
+        let parsed: Value = serde_json::from_str(&line).expect("valid RPC JSONL");
+        assert_eq!(
+            parsed["message"]["content"],
+            serde_json::json!([{ "type": "text", "text": "hello" }])
+        );
+
+        // Message lifecycle events carry tool-result messages too.
+        let line = to_jsonl(&serde_json::json!({
+            "type": "message_start",
+            "message": {
+                "role": "toolResult",
+                "toolCallId": "tc1",
+                "toolName": "read",
+                "content": [],
+                "details": null,
+                "isError": false,
+                "timestamp": 2
+            }
+        }));
+        let parsed: Value = serde_json::from_str(&line).expect("valid RPC JSONL");
+        assert!(parsed["message"].get("details").is_none());
+
+        // Supported envelope: tool_execution_end with null details → stripped.
+        let line = to_jsonl(&serde_json::json!({
+            "type": "tool_execution_end",
+            "result": { "content": [], "details": null }
+        }));
+        let parsed: Value = serde_json::from_str(&line).expect("valid RPC JSONL");
+        assert!(parsed["result"].get("details").is_none());
+    }
+
+    #[test]
+    fn rpc_jsonl_preserves_opaque_nested_details() {
+        // A tool result whose `details` payload contains a nested `details: null`
+        // must preserve the inner field — only the top-level tool-result
+        // `details: null` is stripped.
+        let line = to_jsonl(&serde_json::json!({
+            "type": "tool_execution_end",
+            "result": {
+                "content": [],
+                "details": { "details": null, "extra": 42 }
+            }
+        }));
+        let parsed: Value = serde_json::from_str(&line).expect("valid RPC JSONL");
+        // The top-level details is a non-null object → preserved as-is.
+        assert_eq!(parsed["result"]["details"]["details"], Value::Null);
+        assert_eq!(parsed["result"]["details"]["extra"], 42);
+
+        // A tool result whose `details` payload contains a nested
+        // `{ role: "user", content: "raw" }` must preserve it — only the
+        // known `message` field of message events is normalized.
+        let line = to_jsonl(&serde_json::json!({
+            "type": "tool_execution_end",
+            "result": {
+                "content": [],
+                "details": { "role": "user", "content": "raw" }
+            }
+        }));
+        let parsed: Value = serde_json::from_str(&line).expect("valid RPC JSONL");
+        assert_eq!(parsed["result"]["details"]["role"], "user");
+        assert_eq!(parsed["result"]["details"]["content"], "raw");
+    }
+
+    #[test]
+    fn rpc_jsonl_preserves_opaque_nested_role_content() {
+        // An extension-owned payload nested inside a message event's
+        // non-message field must not have its role/content rewritten.
+        let line = to_jsonl(&serde_json::json!({
+            "type": "message_start",
+            "message": {
+                "role": "user",
+                "content": "hello",
+                "timestamp": 1
+            },
+            "metadata": {
+                "role": "user",
+                "content": "do-not-touch"
+            }
+        }));
+        let parsed: Value = serde_json::from_str(&line).expect("valid RPC JSONL");
+        // Known message field normalized.
+        assert_eq!(
+            parsed["message"]["content"],
+            serde_json::json!([{ "type": "text", "text": "hello" }])
+        );
+        // Opaque metadata field preserved.
+        assert_eq!(parsed["metadata"]["role"], "user");
+        assert_eq!(parsed["metadata"]["content"], "do-not-touch");
+    }
+
+    #[test]
+    fn rpc_jsonl_normalizes_get_messages_response() {
+        // get_messages response: each user message with string content is
+        // normalized; opaque nested values inside details are preserved.
+        let line = to_jsonl(&serde_json::json!({
+            "type": "response",
+            "command": "get_messages",
+            "data": {
+                "messages": [
+                    { "role": "user", "content": "hi", "timestamp": 1 },
+                    { "role": "assistant", "content": [], "timestamp": 2 }
+                ]
+            }
+        }));
+        let parsed: Value = serde_json::from_str(&line).expect("valid RPC JSONL");
+        assert_eq!(
+            parsed["data"]["messages"][0]["content"],
+            serde_json::json!([{ "type": "text", "text": "hi" }])
+        );
+        // Assistant message content (already an array) is untouched.
+        assert_eq!(
+            parsed["data"]["messages"][1]["content"],
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn rpc_jsonl_normalizes_get_entries_response() {
+        // get_entries response: message entries have their `message` field
+        // normalized; non-message entries are untouched.
+        let line = to_jsonl(&serde_json::json!({
+            "type": "response",
+            "command": "get_entries",
+            "data": {
+                "entries": [
+                    {
+                        "type": "message",
+                        "id": "e1",
+                        "message": { "role": "user", "content": "hello", "timestamp": 1 }
+                    },
+                    {
+                        "type": "compaction",
+                        "id": "e2",
+                        "summary": "text"
+                    }
+                ],
+                "leafId": "e2"
+            }
+        }));
+        let parsed: Value = serde_json::from_str(&line).expect("valid RPC JSONL");
+        assert_eq!(
+            parsed["data"]["entries"][0]["message"]["content"],
+            serde_json::json!([{ "type": "text", "text": "hello" }])
+        );
+        // Non-message entry is untouched.
+        assert_eq!(parsed["data"]["entries"][1]["type"], "compaction");
+        assert_eq!(parsed["data"]["entries"][1]["summary"], "text");
+    }
+
+    #[test]
+    fn rpc_jsonl_normalizes_get_tree_message_entries() {
+        let line = to_jsonl(&serde_json::json!({
+            "type": "response",
+            "command": "get_tree",
+            "data": {
+                "tree": [{
+                    "entry": {
+                        "type": "message",
+                        "message": { "role": "user", "content": "root", "timestamp": 1 }
+                    },
+                    "children": [{
+                        "entry": {
+                            "type": "message",
+                            "message": {
+                                "role": "toolResult",
+                                "content": [],
+                                "details": null,
+                                "timestamp": 2
+                            }
+                        },
+                        "children": []
+                    }],
+                    "metadata": { "role": "user", "content": "opaque" }
+                }]
+            }
+        }));
+        let parsed: Value = serde_json::from_str(&line).expect("valid RPC JSONL");
+        assert_eq!(
+            parsed["data"]["tree"][0]["entry"]["message"]["content"],
+            serde_json::json!([{ "type": "text", "text": "root" }])
+        );
+        assert!(
+            parsed["data"]["tree"][0]["children"][0]["entry"]["message"]
+                .get("details")
+                .is_none()
+        );
+        assert_eq!(
+            parsed["data"]["tree"][0]["metadata"],
+            serde_json::json!({ "role": "user", "content": "opaque" })
+        );
+    }
+
+    #[test]
+    fn rpc_jsonl_preserves_opaque_details_in_get_messages() {
+        // Opaque `details` inside a get_messages response message must not be
+        // stripped or rewritten, even if it contains null or role/content shapes.
+        let line = to_jsonl(&serde_json::json!({
+            "type": "response",
+            "command": "get_messages",
+            "data": {
+                "messages": [
+                    {
+                        "role": "toolResult",
+                        "toolCallId": "tc1",
+                        "toolName": "bash",
+                        "content": [],
+                        "details": { "details": null, "role": "user", "content": "raw" },
+                        "isError": false,
+                        "timestamp": 1
+                    }
+                ]
+            }
+        }));
+        let parsed: Value = serde_json::from_str(&line).expect("valid RPC JSONL");
+        // Opaque nested details preserved byte-for-JSON-shape.
+        assert_eq!(
+            parsed["data"]["messages"][0]["details"]["details"],
+            Value::Null
+        );
+        assert_eq!(parsed["data"]["messages"][0]["details"]["role"], "user");
+        assert_eq!(parsed["data"]["messages"][0]["details"]["content"], "raw");
+    }
+
+    #[test]
+    fn rpc_jsonl_normalizes_turn_end_and_agent_end() {
+        // turn_end: completing message normalized, toolResults null details stripped.
+        let line = to_jsonl(&serde_json::json!({
+            "type": "turn_end",
+            "message": { "role": "assistant", "content": [], "timestamp": 1 },
+            "toolResults": [
+                { "role": "toolResult", "toolCallId": "tc1", "toolName": "bash", "content": [], "details": null, "isError": false, "timestamp": 2 }
+            ]
+        }));
+        let parsed: Value = serde_json::from_str(&line).expect("valid RPC JSONL");
+        assert!(parsed["toolResults"][0].get("details").is_none());
+
+        // agent_end: each user message normalized.
+        let line = to_jsonl(&serde_json::json!({
+            "type": "agent_end",
+            "messages": [
+                { "role": "user", "content": "ping", "timestamp": 1 }
+            ],
+            "willRetry": false
+        }));
+        let parsed: Value = serde_json::from_str(&line).expect("valid RPC JSONL");
+        assert_eq!(
+            parsed["messages"][0]["content"],
+            serde_json::json!([{ "type": "text", "text": "ping" }])
+        );
+    }
 
     #[tokio::test]
     async fn extension_error_serializes() {
@@ -2950,5 +3654,136 @@ mod tests {
         assert_eq!(parsed["type"], "extension_error");
         assert_eq!(parsed["extensionPath"], "ext/path");
         assert_eq!(parsed["error"], "boom");
+    }
+
+    // -----------------------------------------------------------------------
+    // Typed classification path (compile-time exhaustive)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn serialize_event_normalizes_typed_message_start() {
+        // The typed serialization path must normalize user string content to
+        // content blocks, proving the exhaustive match dispatches
+        // normalization for message-bearing events.
+        let event: AgentSessionEvent = serde_json::from_value(serde_json::json!({
+            "type": "message_start",
+            "message": { "role": "user", "content": "hello", "timestamp": 1 }
+        }))
+        .expect("valid AgentSessionEvent");
+        let line = serialize_event(&event);
+        let parsed: Value = serde_json::from_str(&line).expect("valid JSONL");
+        assert_eq!(parsed["type"], "message_start");
+        let content = &parsed["message"]["content"];
+        assert!(
+            content.is_array(),
+            "typed path normalizes user string content to blocks"
+        );
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "hello");
+    }
+
+    #[test]
+    fn serialize_event_preserves_non_message_events() {
+        // Non-message-bearing events pass through the exhaustive
+        // classification as explicitly-not-required and are serialized
+        // unchanged.
+        let event: AgentSessionEvent =
+            serde_json::from_value(serde_json::json!({ "type": "turn_start" }))
+                .expect("valid AgentSessionEvent");
+        let line = serialize_event(&event);
+        let parsed: Value = serde_json::from_str(&line).expect("valid JSONL");
+        assert_eq!(parsed["type"], "turn_start");
+        assert_eq!(parsed.as_object().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn serialize_response_normalizes_typed_get_messages() {
+        // The typed response path must normalize response data through the
+        // command_response_normalization classification, not a string allowlist.
+        let response: RpcResponse = serde_json::from_value(serde_json::json!({
+            "type": "response",
+            "command": "get_messages",
+            "success": true,
+            "data": {
+                "messages": [{ "role": "user", "content": "hi", "timestamp": 1 }]
+            }
+        }))
+        .expect("valid RpcResponse");
+        let command = RpcCommand::parse_value(&serde_json::json!({"type": "get_messages"}))
+            .expect("valid get_messages command");
+        let kind = command_response_normalization(&command);
+        let line = serialize_response(&response, kind);
+        let parsed: Value = serde_json::from_str(&line).expect("valid JSONL");
+        let content = &parsed["data"]["messages"][0]["content"];
+        assert!(
+            content.is_array(),
+            "typed response path normalizes user string content"
+        );
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "hi");
+    }
+
+    #[test]
+    fn command_response_normalization_classifies_representative_commands() {
+        // The compile-time-exhaustive classifier must return the correct
+        // normalization kind for every representative RpcCommand variant.
+        // Misclassifying any arm (e.g. flipping GetMessages to None) fails
+        // this test.
+        let parse = |ty: &str| {
+            RpcCommand::parse_value(&serde_json::json!({"type": ty})).expect("valid command")
+        };
+
+        assert_eq!(
+            command_response_normalization(&parse("get_messages")),
+            ResponseDataNormalization::Messages
+        );
+        assert_eq!(
+            command_response_normalization(&parse("get_entries")),
+            ResponseDataNormalization::Entries
+        );
+        assert_eq!(
+            command_response_normalization(&parse("get_tree")),
+            ResponseDataNormalization::Tree
+        );
+        assert_eq!(
+            command_response_normalization(&parse("get_state")),
+            ResponseDataNormalization::None
+        );
+        assert_eq!(
+            command_response_normalization(&parse("abort")),
+            ResponseDataNormalization::None
+        );
+        assert_eq!(
+            command_response_normalization(&parse("get_commands")),
+            ResponseDataNormalization::None
+        );
+    }
+
+    #[test]
+    fn normalize_response_data_delegates_to_typed_classifier() {
+        // The string-based path must produce the same normalization as the
+        // typed classifier — one source of truth, not a parallel mapping.
+        let mut data = serde_json::json!({
+            "messages": [{ "role": "user", "content": "hi", "timestamp": 1 }]
+        });
+        normalize_response_data(&mut data, Some("get_messages"));
+        assert!(
+            data["messages"][0]["content"].is_array(),
+            "string path delegates to typed classifier for get_messages"
+        );
+
+        let mut data = serde_json::json!({
+            "entries": [{ "type": "message", "message": { "role": "user", "content": "hi" } }]
+        });
+        normalize_response_data(&mut data, Some("get_entries"));
+        assert!(
+            data["entries"][0]["message"]["content"].is_array(),
+            "string path delegates to typed classifier for get_entries"
+        );
+
+        // A command that is not message-bearing must leave data untouched.
+        let mut data = serde_json::json!({"state": "idle"});
+        normalize_response_data(&mut data, Some("get_state"));
+        assert_eq!(data, serde_json::json!({"state": "idle"}));
     }
 }

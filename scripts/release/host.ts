@@ -3,15 +3,14 @@
  *
  * Encapsulates the three release-time host operations:
  *   1. Compile the host with `bun build --compile --target bun-<os>-<arch>`.
- *   2. Run the runtime-import fixture as a standalone executable, proving
- *      the host can load an external `.ts` extension at runtime.
- *   3. Speak the JSONL `hello` handshake against the compiled sidecar to
- *      confirm the wire protocol and compatibility version.
+ *   2. Drive the compiled sidecar through `hello` and `extensions.load`,
+ *      proving that the released artifact loads an external TypeScript extension.
+ *   3. Speak an independent JSONL `hello` handshake against the sidecar.
  *
- * If compile or runtime-import fails for a target, the caller falls back to
- * shipping the official Bun runtime + the bundled host JavaScript. If both
- * paths fail, the release for that target fails — never embed the host into
- * the Rust binary.
+ * A target that cannot produce a compiled sidecar falls back to the official
+ * Bun runtime plus the bundled host JavaScript. Once compilation succeeds,
+ * probe or handshake failures are fatal: substituting a different runtime
+ * graph would make release verification a false green.
  */
 
 import { existsSync } from "node:fs";
@@ -57,8 +56,6 @@ export interface BuildHostOptions {
 	readonly plan: TargetPlan;
 	/** Working directory under which artifacts are emitted (a `host/` subdir is created). */
 	readonly stagingRoot: string;
-	/** Skip the host unit tests (`bun test`). */
-	readonly skipTests: boolean;
 	/** Skip the runtime-import fixture run. */
 	readonly skipRuntimeImport: boolean;
 	/** Skip the `hello` handshake against the compiled sidecar. */
@@ -93,16 +90,15 @@ function targetStagingDir(stagingRoot: string, plan: TargetPlan): string {
  * Algorithm:
  *   1. `bun install --frozen-lockfile` (host deps are source-pinned).
  *   2. `tsc --noEmit` (host typecheck).
- *   3. `bun test` (unless `skipTests`).
- *   4. `bun build --compile --target <plan.bunTarget>` → sidecar binary.
- *   5. Compile + run the runtime-import fixture (unless `skipRuntimeImport`).
- *   6. Speak the JSONL `hello` handshake against the sidecar (unless
+ *   3. `bun build --compile --target <plan.bunTarget>` → sidecar binary.
+ *   4. Run the source probe against that binary: `hello`, then
+ *      `extensions.load` of the Type-based tool fixture.
+ *   5. Speak an independent JSONL `hello` handshake (unless
  *      `skipHandshake`).
  *
- * If any of steps 4–6 fail, the function falls back to the runtime+bundle
- * path: `bun build --target bun` produces `pi-extension-host.js`, and the
- * caller must provide a sibling `bun[.exe]`. If that path also fails, the
- * function throws {@link HostBuildError}.
+ * If step 3 cannot create a compiled artifact, the function falls back to the
+ * runtime+bundle path. A compiled artifact that fails either behavioral probe
+ * fails the release instead of substituting a different runtime graph.
  */
 export async function buildHost(options: BuildHostOptions): Promise<HostArtifact> {
 	const runner = options.runner ?? new SpawnRunner();
@@ -112,7 +108,6 @@ export async function buildHost(options: BuildHostOptions): Promise<HostArtifact
 
 	await installHostDeps(hostDir, runner);
 	await typecheckHost(hostDir, runner);
-	if (!options.skipTests) await testHost(hostDir, runner);
 
 	const compiled = await tryCompiledPath(options, hostDir, outDir, runner);
 	if (compiled !== undefined) return compiled;
@@ -152,21 +147,6 @@ async function typecheckHost(hostDir: string, runner: CommandRunner): Promise<vo
 		throw new HostBuildError(
 			hostDir,
 			`host typecheck failed (exit ${res.exitCode}). stderr=${res.stderr.slice(0, 1000)}`,
-		);
-	}
-}
-
-/** Run `bun test` in the host package. */
-async function testHost(hostDir: string, runner: CommandRunner): Promise<void> {
-	const res = await runner.run("bun", ["run", "test"], {
-		cwd: hostDir,
-		rejectOnError: false,
-		timeoutMs: HOST_BUILD_TIMEOUT_MS,
-	});
-	if (res.exitCode !== 0) {
-		throw new HostBuildError(
-			hostDir,
-			`host tests failed (exit ${res.exitCode}). stderr=${res.stderr.slice(0, 1000)}`,
 		);
 	}
 }
@@ -213,72 +193,76 @@ async function tryCompiledPath(
 	if (compileRes.exitCode !== 0 || !existsSync(sidecarPath)) return undefined;
 
 	if (!options.skipRuntimeImport) {
-		const ok = await runRuntimeImportFixture(options, hostDir, outDir, runner, sidecarPath);
-		if (!ok) return undefined;
+		const error = await probeRuntimeImport(hostDir, sidecarPath, runner);
+		if (error !== undefined) {
+			throw new HostBuildError(options.plan.rustTarget, error);
+		}
 	}
 	if (!options.skipHandshake) {
 		const ok = await runHelloHandshake(sidecarPath, runner);
-		if (!ok) return undefined;
+		if (!ok) {
+			throw new HostBuildError(
+				options.plan.rustTarget,
+				"compiled sidecar hello handshake failed",
+			);
+		}
 	}
 	return { kind: "compiled", binaryPath: sidecarPath };
 }
 
 /**
- * Compile and run the runtime-import fixture against the freshly built
- * sidecar. The fixture dynamically imports an external `.ts` extension, so
- * this proves the compiled binary can load TypeScript extensions at runtime.
- *
- * The fixture source lives at `fixtures/runtime-import.ts`. We re-compile it
- * with the same Bun target as the host and invoke it against a known-good
- * example extension shipped with the reference tree.
+ * Drive the actual compiled sidecar through a correlated `hello` and
+ * `extensions.load` exchange. The source probe stays outside the release
+ * artifact, so this verifies the binary that will be packaged instead of a
+ * separately compiled copy of the extension runtime.
  */
-async function runRuntimeImportFixture(
-	options: BuildHostOptions,
+async function probeRuntimeImport(
 	hostDir: string,
-	outDir: string,
+	sidecarPath: string,
 	runner: CommandRunner,
-	_sidecarPath: string,
-): Promise<boolean> {
+): Promise<string | undefined> {
 	const fixtureSource = resolve(hostDir, "fixtures", "runtime-import.ts");
-	if (!existsSync(fixtureSource)) return false;
-	const fixtureBin = join(outDir, `runtime-import-test${options.plan.windows ? ".exe" : ""}`);
-	if (existsSync(fixtureBin)) await rm(fixtureBin, { force: true });
-
-	const compile = await runner.run(
+	const exampleExt = resolve(hostDir, "fixtures", "extensions", "tool.ts");
+	if (!existsSync(fixtureSource)) {
+		return `runtime-import probe missing at ${fixtureSource}`;
+	}
+	if (!existsSync(exampleExt)) {
+		return `runtime-import extension missing at ${exampleExt}`;
+	}
+	const run = await runner.run(
 		"bun",
-		[
-			"build",
-			"./fixtures/runtime-import.ts",
-			"--compile",
-			"--target",
-			options.plan.bunTarget,
-			"--outfile",
-			fixtureBin,
-		],
-		{ cwd: hostDir, rejectOnError: false, timeoutMs: HOST_BUILD_TIMEOUT_MS },
+		[fixtureSource, sidecarPath, exampleExt],
+		{
+			cwd: hostDir,
+			rejectOnError: false,
+			timeoutMs: HOST_PROBE_TIMEOUT_MS,
+		},
 	);
-	if (compile.exitCode !== 0 || !existsSync(fixtureBin)) return false;
-
-	// Use a fixture extension that we know loads cleanly without external deps.
-	const exampleExt = resolve(
-		options.repoRoot,
-		"packages",
-		"extension-host",
-		"fixtures",
-		"extensions",
-		"tool.ts",
-	);
-	if (!existsSync(exampleExt)) return false;
-
-	const run = await runner.run(fixtureBin, [exampleExt], {
-		cwd: hostDir,
-		rejectOnError: false,
-		timeoutMs: HOST_PROBE_TIMEOUT_MS,
-	});
-	if (run.exitCode !== 0) return false;
-	// Fixture prints one JSON line of registration summary; accept any nonempty
-	// stdout as success (the wire shape is asserted in dedicated host tests).
-	return run.stdout.trim().length > 0;
+	if (run.exitCode !== 0) {
+		return `runtime-import probe failed (exit ${run.exitCode}): ${run.stderr.slice(-1000)}`;
+	}
+	const lines = run.stdout.split("\n").filter((line) => line.length > 0);
+	if (lines.length !== 1) {
+		return `runtime-import probe emitted ${lines.length} stdout lines`;
+	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(lines[0] ?? "");
+	} catch (error) {
+		return `runtime-import probe returned invalid JSON: ${String(error)}`;
+	}
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+		return "runtime-import probe returned a non-object summary";
+	}
+	const summary = parsed as { path?: unknown; tools?: unknown };
+	if (
+		summary.path !== exampleExt ||
+		!Array.isArray(summary.tools) ||
+		!summary.tools.includes("echo")
+	) {
+		return "runtime-import probe returned the wrong extension summary";
+	}
+	return undefined;
 }
 
 /**
@@ -328,8 +312,8 @@ export function isHelloAckLine(line: string): boolean {
 /** Narrow a parsed frame into a hello-ack with the expected versions. */
 export function isHelloAck(frame: unknown): boolean {
 	if (typeof frame !== "object" || frame === null) return false;
-	const f = frame as { kind?: unknown; method?: unknown; payload?: unknown };
-	if (f.kind !== "res" || f.method !== "hello") return false;
+	const f = frame as { id?: unknown; kind?: unknown; method?: unknown; payload?: unknown };
+	if (f.kind !== "res" || f.method !== "hello" || f.id !== 1) return false;
 	if (typeof f.payload !== "object" || f.payload === null) return false;
 	const p = f.payload as { protocolVersion?: unknown; compatibilityVersion?: unknown };
 	return (

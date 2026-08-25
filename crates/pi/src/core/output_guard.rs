@@ -844,13 +844,21 @@ mod tests {
         }));
         install_sink(Arc::clone(&state)).await?;
 
-        write_raw_stdout("will-fail").await.map_err(map_err)?;
-        let err = match wait_for_raw_stdout_backpressure().await {
-            Ok(()) => return Err("expected writer failure".to_owned()),
+        // The writer can latch the failure before the enqueueing call returns,
+        // so the failure may surface at either observation point; the contract
+        // is that it surfaces once and then stays latched.
+        let surfaced = match write_raw_stdout("will-fail").await {
             Err(err) => err,
+            Ok(()) => match wait_for_raw_stdout_backpressure().await {
+                Ok(()) => return Err("expected writer failure".to_owned()),
+                Err(err) => err,
+            },
         };
-        if !matches!(err, OutputGuardError::Io(_) | OutputGuardError::Latched(_)) {
-            return Err(format!("unexpected error: {err}"));
+        if !matches!(
+            surfaced,
+            OutputGuardError::Io(_) | OutputGuardError::Latched(_)
+        ) {
+            return Err(format!("unexpected error: {surfaced}"));
         }
 
         let latched = match write_raw_stdout("after-fail").await {

@@ -31,20 +31,28 @@ import {
 	createExtensionRuntime,
 } from "@earendil-works/pi-coding-agent";
 import type {
+	BranchSummaryEntry,
+	SessionManagerSetupBridge,
 	Extension,
 	ExtensionActions,
+	ExtensionCommandContext,
+	ExtensionCommandContextActions,
+	ExtensionContext,
 	ExtensionContextActions,
 	ExtensionFactory,
 	ExtensionRuntime,
 	ExtensionUIContext,
 	InlineExtension,
 	ProviderConfig,
+	ReplacedSessionContext,
 	ToolDefinition,
 	Theme,
 } from "@earendil-works/pi-coding-agent";
+import type { Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { EventEmitter } from "node:events";
 import { validateToolArguments } from "@earendil-works/pi-ai/compat";
-import { parseStreamingJson } from "@earendil-works/pi-ai/utils/json-parse.ts";
+import { AssistantDeltaReducer } from "./assistant-delta.ts";
 
 /** Minimal event bus for extension-to-extension communication. */
 export function createEventBus() {
@@ -98,6 +106,12 @@ export const ALL_EVENT_TYPES = [
 
 /** Hook timeout: mutable lifecycle hooks must respond within 30 s. */
 export const EXTENSION_HOOK_TIMEOUT_MS = 30_000;
+/** Open host-control method that publishes the endpoint's live provider registry. */
+const PROVIDERS_UPDATE_METHOD = "providers.update";
+
+const STALE_COMMAND_CONTEXT_MESSAGE =
+	"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().";
+
 /** Input timeout: terminal-input consume/rewrite must respond within 4 ms. */
 export const EXTENSION_INPUT_TIMEOUT_MS = 4;
 /** Bound on the sequential terminal-input actor queue (plan capacity-64). */
@@ -130,13 +144,47 @@ const HostState = {
 type HostState = (typeof HostState)[keyof typeof HostState];
 
 /** State tracked for a keyed UI slot (widget/header/footer/editor/overlay). */
+type SlotComponent = {
+	render(width: number): string[];
+	handleInput?(data: string): void;
+	dispose?(): void;
+	/** Receive a new theme without reconstruction (stateful overlays). */
+	updateTheme?(theme: Theme): void;
+};
+
+type SlotFactory = (theme: Theme) => unknown;
+
 interface SlotEntry {
 	generation: number;
-	component: { render(width: number): string[]; handleInput?(data: string): void; dispose?(): void } | null;
+	component: SlotComponent | null;
 	placement: SlotPlacement;
 	focusable: boolean;
 	overlayOptions: OverlayOptions | undefined;
+	overlayOptionsResolver?: () => OverlayOptions | undefined;
 	width: number;
+	/** Retained to install an asynchronously-created component. */
+	recreate?: SlotFactory;
+	/** Invalidates older asynchronous factory results. */
+	recreationRevision: number;
+}
+
+function isSlotComponent(value: unknown): value is SlotComponent {
+	return value !== null
+		&& typeof value === "object"
+		&& typeof (value as SlotComponent).render === "function";
+}
+
+/**
+ * Structured cancellation only: a real Error (or DOMException, which is
+ * not Error-derived in every runtime) named AbortError. Message text is
+ * deliberately never consulted — an extension failure that merely says
+ * "cancelled" must stay an extension_error.
+ */
+function isStructuredAbortError(error: unknown): boolean {
+	if (error instanceof Error && error.name === "AbortError") return true;
+	return typeof DOMException === "function"
+		&& error instanceof DOMException
+		&& error.name === "AbortError";
 }
 
 /** Pending load options captured during the hello handshake. */
@@ -214,6 +262,8 @@ interface SessionStatePayload {
 	allTools: Array<{ name: string; description: string; parameters: unknown; source?: string }>;
 	commands: Array<{ name: string; description?: string; source: string }>;
 	model?: Record<string, unknown>;
+	/** Models scoped to this session (`--models` / `enabledModels`). */
+	scopedModels: Array<Record<string, unknown>>;
 	isIdle: boolean;
 	hasPendingMessages: boolean;
 	contextUsage?: Record<string, unknown>;
@@ -227,6 +277,7 @@ function initialSessionState(): SessionStatePayload {
 		activeTools: [],
 		allTools: [],
 		commands: [],
+		scopedModels: [],
 		isIdle: true,
 		hasPendingMessages: false,
 		systemPrompt: "",
@@ -235,7 +286,7 @@ function initialSessionState(): SessionStatePayload {
 
 /** Minimal `SourceInfo` for natively owned tools/commands crossing the bridge. */
 function nativeSourceInfo(source: string): Record<string, unknown> {
-	return { path: `<${source}>`, source };
+	return { path: `<${source}>`, source, scope: "temporary", origin: "top-level" };
 }
 
 /** `theme.update` event payload (Rust → host). */
@@ -263,7 +314,7 @@ const THEME_FG_SLOTS = [
 
 /** Background slot names in schema order (mirrors Rust `ALL_BG_SLOTS`). */
 const THEME_BG_SLOTS = [
-	"selectedBg", "userMessageBg", "customMessageBg", "toolPendingBg",
+	"selectedBg", "scrollbarThumb", "userMessageBg", "customMessageBg", "toolPendingBg",
 	"toolSuccessBg", "toolErrorBg",
 ] as const;
 
@@ -436,6 +487,28 @@ function ansiToInertHtml(lines: string[]): string {
 	return `<pre class="pi-tool-render">${rendered}</pre>`;
 }
 
+type ProviderRegistration = {
+	readonly name: string;
+	readonly config: ProviderConfig;
+	readonly order: number;
+};
+
+type ProviderRegistrationOperation =
+	| ({ readonly kind: "register"; readonly extensionPath: string } & ProviderRegistration)
+	| {
+		readonly kind: "native";
+		readonly provider: Record<string, unknown>;
+		readonly extensionPath: string;
+		readonly order: number;
+	}
+	| { readonly kind: "unregister"; readonly name: string; readonly order: number };
+
+type ProviderLoadScope = {
+	phase: "loading" | "committed" | "aborted";
+	readonly extensionPath: string;
+	readonly operations: ProviderRegistrationOperation[];
+};
+
 /**
  * Extension host process. Owns the ExtensionRunner and bridges it to Rust over
  * a single JSONL byte transport. One stdout writer; all writes are ordered
@@ -449,12 +522,25 @@ export class ExtensionHost {
 	private runner: ExtensionRunner | undefined;
 	private runtime: ExtensionRuntime | undefined;
 	private extensions: Extension[] = [];
-	/** Captured custom providers (first registration wins). */
+	private hasLoadedProtocolExtensions = false;
+	/** Captured custom providers (rebuilt from the current extension set on each rebuild). */
 	private readonly providers = new Map<string, ProviderConfig>();
-	/** In-flight tool.execute AbortControllers keyed by request id. */
+	/**
+	 * Provider registrations captured per extension path during factory
+	 * execution, used to rebuild this.providers from the current extension
+	 * set so removed/replaced captures cannot remain stale.
+	 */
+	private readonly providerRegistrationsByPath = new Map<string, ProviderRegistration[]>();
+	private readonly providerUnregisterOrderByName = new Map<string, number>();
+	private readonly activeProviderLoadScopeByPath = new Map<string, ProviderLoadScope>();
+	private readonly latestExtensionLoadTokenByPath = new Map<string, number>();
+	private nextExtensionLoadToken = 0;
+	private nextProviderRegistrationOrder = 0;
 	private readonly inFlightTools = new Map<number, AbortController>();
 	/** In-flight provider.stream AbortControllers keyed by request id. */
 	private readonly inFlightProviders = new Map<number, AbortController>();
+	/** Active shortcut handlers keyed by their resolved shortcut key (single-flight). */
+	private readonly inFlightShortcuts = new Map<string, AbortController>();
 	private loadOptions: LoadOptions | undefined;
 	private projectTrusted = false;
 	/** Frames buffered while extensions are loading. */
@@ -465,12 +551,23 @@ export class ExtensionHost {
 	/** Capacity-64 sequential queue of terminal-input jobs. */
 	private readonly terminalInputQueue: Array<() => Promise<void>> = [];
 	private terminalInputDraining = false;
-	/** Active assistant snapshot reconstructed from compact Rust updates. */
-	private activeAssistant: Record<string, unknown> | undefined;
-	/** Raw streamed tool-argument fragments keyed by assistant content index. */
-	private readonly activeToolArguments = new Map<number, string>();
+	/** Compact assistant stream reconstruction (shared with the lean runner). */
+	private readonly assistantDelta = new AssistantDeltaReducer();
 	/** Active theme served to extensions (`ctx.ui.theme`). */
 	private currentTheme: Theme = fallbackTheme();
+	/** Stable facade whose reads always resolve through currentTheme. */
+	private readonly liveTheme = new Proxy(fallbackTheme(), {
+		get: (_target, property) => {
+			const value = Reflect.get(this.currentTheme, property, this.currentTheme);
+			return typeof value === "function" ? value.bind(this.currentTheme) : value;
+		},
+		has: (_target, property) => Reflect.has(this.currentTheme, property),
+		ownKeys: () => Reflect.ownKeys(this.currentTheme),
+		getOwnPropertyDescriptor: (_target, property) => {
+			const descriptor = Reflect.getOwnPropertyDescriptor(this.currentTheme, property);
+			return descriptor === undefined ? undefined : { ...descriptor, configurable: true };
+		},
+	}) as Theme;
 	/** Theme catalog from the latest `theme.update` push. */
 	private themeCatalog: ThemeCatalogEntryPayload[] = [];
 	/** Detected terminal polarity from the latest `theme.update` push. */
@@ -483,8 +580,17 @@ export class ExtensionHost {
 	private uiState = { editorText: "", toolsExpanded: false };
 	/** Abort controller for the current agent turn (`ctx.getSignal`). */
 	private turnAbort: AbortController | undefined;
+	/** Resolvers waiting for the next idle transition (`ctx.waitForIdle`). */
+	private readonly idleWaiters: Array<{ resolve: () => void; reject: (reason?: unknown) => void }> = [];
 	/** Extension statuses set via `ui.setStatus` (served to custom footers). */
 	private readonly extensionStatuses = new Map<string, string>();
+	/**
+	 * Per-command.execute replacement-token scope. Tokens are captured from
+	 * ready-gated session responses and emitted as `session.replacementReady`
+	 * only from that command's finally path — never via a global slot.
+	 */
+	private readonly commandScope = new AsyncLocalStorage<{ tokens: string[]; closed: boolean }>();
+	private readonly providerLoadScope = new AsyncLocalStorage<ProviderLoadScope>();
 
 	constructor(stdin: ByteReadable, stdout: ByteWritable) {
 		const onFrame: FrameHandler = (frame) => this.onInbound(frame);
@@ -570,6 +676,7 @@ export class ExtensionHost {
 
 	/** Begin extension loading; transitions to READY when complete. */
 	private async startLoading(): Promise<void> {
+		if (this.isDisposed) return;
 		this.state = HostState.LOADING;
 		const opts = this.loadOptions;
 		if (opts === undefined) {
@@ -577,31 +684,15 @@ export class ExtensionHost {
 			return;
 		}
 		this.runtime = createExtensionRuntime();
+		this.installProviderCallbacks(this.runtime);
 		const eventBus = createEventBus();
 		const errors: Array<{ path: string; error: string }> = [];
-
-		for (const [index, input] of opts.factories.entries()) {
-			const isNamed = typeof input !== "function";
-			const factory = isNamed ? input.factory : input;
-			const extensionPath = `<inline:${isNamed ? input.name : index + 1}>`;
-			try {
-				const ext = await loadExtensionFromFactory(
-					factory, opts.cwd, eventBus, this.runtime, extensionPath,
-				);
-				ext.hidden = isNamed ? input.hidden ?? false : false;
-				this.extensions.push(ext);
-			} catch (err) {
-				errors.push({
-					path: extensionPath,
-					error: err instanceof Error ? err.message : String(err),
-				});
-			}
-		}
 
 		for (const extPath of opts.extensionPaths) {
 			try {
 				const jiti = createExtensionJiti();
 				const module = await jiti.import(extPath, { default: true }) as unknown;
+				if (this.isDisposed) return;
 				if (typeof module !== "function") {
 					errors.push({
 						path: extPath,
@@ -609,17 +700,41 @@ export class ExtensionHost {
 					});
 					continue;
 				}
-				const ext = await loadExtensionFromFactory(
-					module as ExtensionFactory, opts.cwd, eventBus, this.runtime, extPath,
+				const ext = await this.loadFactoryWithProviderStaging(
+					module as ExtensionFactory, extPath, opts.cwd, eventBus,
 				);
-				this.extensions.push(ext);
+				if (ext !== undefined) this.extensions.push(ext);
 			} catch (err) {
+				if (this.isDisposed) return;
 				errors.push({
 					path: extPath,
 					error: err instanceof Error ? err.message : String(err),
 				});
 			}
 		}
+
+		for (const [index, input] of opts.factories.entries()) {
+			const isNamed = typeof input !== "function";
+			const factory = isNamed ? input.factory : input;
+			const extensionPath = `<inline:${isNamed ? input.name : index + 1}>`;
+			try {
+				const ext = await this.loadFactoryWithProviderStaging(
+					factory, extensionPath, opts.cwd, eventBus,
+				);
+				if (ext !== undefined) {
+					ext.hidden = isNamed ? input.hidden ?? false : false;
+					this.extensions.push(ext);
+				}
+			} catch (err) {
+				if (this.isDisposed) return;
+				errors.push({
+					path: extensionPath,
+					error: err instanceof Error ? err.message : String(err),
+				});
+			}
+		}
+
+		if (this.isDisposed) return;
 
 		// Isolation: failed factories/paths stay in errors; successful ones bind.
 		this.rebuildRunner(opts.cwd);
@@ -755,21 +870,57 @@ export class ExtensionHost {
 			return;
 		}
 
-		await this.client.respond(id, "shortcut.execute", { handled: true });
-		Promise.resolve()
-			.then(() => shortcut.handler(runner.createContext()))
+		const active = this.inFlightShortcuts.get(key);
+		if (active !== undefined) {
+			await this.client.respond(id, "shortcut.execute", { handled: true });
+			return;
+		}
+		const controller = new AbortController();
+		this.inFlightShortcuts.set(key, controller);
+		try {
+			await this.client.respond(id, "shortcut.execute", { handled: true });
+		} catch (error) {
+			if (this.inFlightShortcuts.get(key) === controller) {
+				this.inFlightShortcuts.delete(key);
+			}
+			throw error;
+		}
+		// Hand the handler a context whose `signal` is THIS invocation's
+		// cancellation (aborted on dispose / keyed single-flight), matching the
+		// lean runner's shortcut context. defineProperties keeps the runner's
+		// other getters lazy instead of freezing eager reads into a spread.
+		const context = Object.defineProperties(
+			{},
+			Object.getOwnPropertyDescriptors(runner.createContext()),
+		) as ExtensionContext;
+		Object.defineProperty(context, "signal", {
+			get: () => controller.signal,
+			enumerable: true,
+		});
+		void Promise.resolve()
+			.then(() => shortcut.handler(context))
 			.catch((error) => {
+				if (controller.signal.aborted || this.state === HostState.DISPOSED) {
+					return;
+				}
 				this.emitExtensionError(
 					shortcut.extensionPath,
 					"shortcut.execute",
 					error instanceof Error ? error.message : String(error),
 				);
+			})
+			.finally(() => {
+				if (this.inFlightShortcuts.get(key) === controller) {
+					this.inFlightShortcuts.delete(key);
+				}
 			});
 	}
 
 	/**
 	 * Drive the real ExtensionRunner for a lifecycle hook. The method name IS
-	 * the event type discriminant; the result is forwarded to Rust verbatim.
+	 * the event type discriminant; response shaping mirrors LeanRunner / the
+	 * specialized upstream emitters (before_agent_start, tool_call, tool_result,
+	 * message_end) rather than the generic emit() discard path.
 	 */
 	private async handleLifecycleHook(
 		id: number, eventType: string, payload: Record<string, unknown>,
@@ -785,16 +936,89 @@ export class ExtensionHost {
 			if (eventType === "message_start") {
 				const message = payload["message"];
 				if (isRecord(message) && message["role"] === "assistant") {
-					this.seedActiveAssistant(message);
+					this.assistantDelta.seedActiveAssistant(message);
 				}
 			}
 			let result: unknown;
 			switch (eventType) {
-				case "message_end":
-                    this.clearActiveAssistant();
-					result = await runner.emitMessageEnd({ type: eventType, ...payload });
-					await this.client.respond(id, eventType as Method, { message: result ?? undefined });
+				case "before_agent_start": {
+					const cwd = this.loadOptions?.cwd ?? process.cwd();
+					const systemPrompt =
+						typeof payload["systemPrompt"] === "string"
+							? payload["systemPrompt"]
+							: this.sessionState.systemPrompt;
+					const combined = await runner.emitBeforeAgentStart(
+						typeof payload["prompt"] === "string" ? payload["prompt"] : "",
+						payload["images"] as Parameters<typeof runner.emitBeforeAgentStart>[1],
+						systemPrompt,
+						{ cwd },
+					);
+					const response: Record<string, unknown> = {};
+					if (combined?.messages !== undefined && combined.messages.length > 0) {
+						response["messages"] = combined.messages;
+					}
+					if (combined?.systemPrompt !== undefined) {
+						response["systemPrompt"] = combined.systemPrompt;
+					}
+					await this.client.respond(id, eventType as Method, response);
 					return;
+				}
+				case "tool_call": {
+					const input = payload["input"];
+					if (!isRecord(input)) throw new Error("tool_call.input is required");
+					const baseline = structuredClone(input);
+					result = await runner.emitToolCall({
+						type: "tool_call",
+						toolName: payload["toolName"] as string,
+						toolCallId: payload["toolCallId"] as string,
+						input,
+					});
+					const response: Record<string, unknown> = {
+						...(isRecord(result) ? result : {}),
+					};
+					if (!canonicalJsonEqual(input, baseline)) {
+						response["input"] = input;
+					} else {
+						delete response["input"];
+					}
+					await this.client.respond(id, eventType as Method, response);
+					return;
+				}
+				case "tool_result": {
+					const input = payload["input"];
+					if (!isRecord(input)) throw new Error("tool_result.input is required");
+					result = await runner.emitToolResult({
+						type: "tool_result",
+						toolName: payload["toolName"] as string,
+						toolCallId: payload["toolCallId"] as string,
+						input,
+						content: payload["content"] as never,
+						details: payload["details"],
+						isError: payload["isError"] === true,
+					});
+					const response: Record<string, unknown> = {};
+					if (isRecord(result)) {
+						if (result["content"] !== undefined) response["content"] = result["content"];
+						if (result["details"] !== undefined) response["details"] = result["details"];
+						if (result["isError"] !== undefined) response["isError"] = result["isError"];
+						if (result["usage"] !== undefined) response["usage"] = result["usage"];
+					}
+					await this.client.respond(id, eventType as Method, response);
+					return;
+				}
+				case "message_end": {
+					this.assistantDelta.clearActiveAssistant();
+					// Rust sends the raw AgentMessage AS the request payload (no
+					// `{ message }` wrapper); wrap it for emitMessageEnd.
+					result = await runner.emitMessageEnd({
+						type: "message_end",
+						message: payload as never,
+					});
+					await this.client.respond(id, eventType as Method, {
+						message: result ?? undefined,
+					});
+					return;
+				}
 				case "input":
 					result = await runner.emitInput(
 						payload["text"] as string,
@@ -818,9 +1042,9 @@ export class ExtensionHost {
 					await this.client.respond(id, eventType as Method, result ?? {});
 					return;
 				default:
-                    if (eventType === "agent_end" || eventType === "session_shutdown") {
-                        this.clearActiveAssistant();
-                    }
+					if (eventType === "agent_end" || eventType === "session_shutdown") {
+						this.assistantDelta.clearActiveAssistant();
+					}
 					result = await runner.emit({ type: eventType, ...payload } as Parameters<typeof runner.emit>[0]);
 					await this.client.respond(id, eventType as Method, result ?? { ok: true });
 					return;
@@ -860,7 +1084,7 @@ export class ExtensionHost {
 				const assistantMessageEvent = type === "done"
 					? { type, reason: event["reason"], message }
 					: { type, reason: event["reason"], error: message };
-                this.clearActiveAssistant();
+				this.assistantDelta.clearActiveAssistant();
 				const result = await runner.emit({
 					type: "message_update",
 					message,
@@ -870,12 +1094,13 @@ export class ExtensionHost {
 				return;
 			}
 
-			this.applyAssistantDelta(event);
-			if (this.activeAssistant === undefined) {
+			this.assistantDelta.applyAssistantDelta(event);
+			const activeAssistant = this.assistantDelta.getActiveAssistant();
+			if (activeAssistant === undefined) {
 				throw new Error("message update arrived before assistant start");
 			}
-			const message = structuredClone(this.activeAssistant);
-			const assistantMessageEvent = this.expandAssistantEvent(event, message);
+			const message = structuredClone(activeAssistant);
+			const assistantMessageEvent = this.assistantDelta.expandAssistantEvent(event, message);
 			const result = await runner.emit({
 				type: "message_update",
 				message,
@@ -891,82 +1116,19 @@ export class ExtensionHost {
 		}
 	}
 
-	private seedActiveAssistant(message: Record<string, unknown>): void {
-		this.activeAssistant = structuredClone(message);
-		this.activeToolArguments.clear();
-	}
-
-	private clearActiveAssistant(): void {
-		this.activeAssistant = undefined;
-		this.activeToolArguments.clear();
-	}
-
-	private applyAssistantDelta(event: Record<string, unknown>): void {
-		const meta = isRecord(event["meta"]) ? event["meta"] : {};
-		if (this.activeAssistant === undefined) {
-			if (event["type"] !== "start") {
-				throw new Error("message update arrived before assistant start");
-			}
-			this.activeAssistant = { ...meta, content: [] };
-		} else if (event["type"] === "start") {
-			this.activeAssistant = { ...meta, content: [] };
-			this.activeToolArguments.clear();
-		} else {
-			const content = this.activeAssistant["content"];
-			this.activeAssistant = { ...this.activeAssistant, ...meta, content };
-		}
-		const content = this.activeAssistant["content"];
-		if (!Array.isArray(content)) {
-			throw new Error("active assistant content is not an array");
-		}
-		const index = event["contentIndex"];
-		if (typeof index !== "number") return;
-		const type = event["type"];
-		if ((type === "text_start" || type === "thinking_start" || type === "toolcall_start"
-			|| type === "text_end" || type === "thinking_end" || type === "toolcall_end")
-			&& isRecord(event["block"])) {
-			content[index] = structuredClone(event["block"]);
-			if (type === "toolcall_start") this.activeToolArguments.set(index, "");
-			if (type === "toolcall_end") this.activeToolArguments.delete(index);
-			return;
-		}
-		const delta = event["delta"];
-		const block = content[index];
-		if (typeof delta !== "string" || !isRecord(block)) return;
-		if (type === "text_delta") {
-			block["text"] = `${typeof block["text"] === "string" ? block["text"] : ""}${delta}`;
-		} else if (type === "thinking_delta") {
-			block["thinking"] = `${typeof block["thinking"] === "string" ? block["thinking"] : ""}${delta}`;
-		} else if (type === "toolcall_delta") {
-			const fragments = `${this.activeToolArguments.get(index) ?? ""}${delta}`;
-			this.activeToolArguments.set(index, fragments);
-			block["arguments"] = parseStreamingJson(fragments);
-		}
-	}
-
-	private expandAssistantEvent(
-		event: Record<string, unknown>, partial: Record<string, unknown>,
-	): Record<string, unknown> {
-		const type = event["type"] as string;
-		const expanded: Record<string, unknown> = { type, partial };
-		const index = event["contentIndex"];
-		if (typeof index === "number") expanded["contentIndex"] = index;
-		if (typeof event["delta"] === "string") expanded["delta"] = event["delta"];
-		const content = partial["content"];
-		const block = Array.isArray(content) && typeof index === "number" ? content[index] : undefined;
-		if (type === "text_end" && isRecord(block)) expanded["content"] = block["text"];
-		if (type === "thinking_end" && isRecord(block)) expanded["content"] = block["thinking"];
-		if (type === "toolcall_end" && isRecord(block)) expanded["toolCall"] = block;
-		return expanded;
-	}
-
 	private async handleExtensionsLoad(id: number, p: Record<string, unknown>): Promise<void> {
-		this.clearActiveAssistant();
+		this.assistantDelta.clearActiveAssistant();
 		const request = parseExtensionsLoadRequest(
 			p,
 			this.loadOptions?.cwd ?? process.cwd(),
 		);
 		const { extensionPaths: paths, cwd, projectTrusted } = request;
+		const loadTokens = new Map<string, number>();
+		for (const path of paths) {
+			const token = ++this.nextExtensionLoadToken;
+			loadTokens.set(path, token);
+			this.latestExtensionLoadTokenByPath.set(path, token);
+		}
 		const errors: Array<{ path: string; error: string }> = [];
 		let loadedCount = 0;
 
@@ -980,12 +1142,17 @@ export class ExtensionHost {
 		}
 		this.projectTrusted = projectTrusted;
 
+		this.installProviderCallbacks(this.runtime);
+
 		const eventBus = createEventBus();
+		const loadedExtensions: Array<{ extension: Extension; token: number }> = [];
 
 		for (const extPath of paths) {
+			const token = loadTokens.get(extPath)!;
 			try {
 				const jiti = createExtensionJiti();
 				const module = await jiti.import(extPath, { default: true }) as unknown;
+				if (this.state === HostState.DISPOSED) return;
 				if (typeof module !== "function") {
 					errors.push({
 						path: extPath,
@@ -993,16 +1160,58 @@ export class ExtensionHost {
 					});
 					continue;
 				}
-				const ext = await loadExtensionFromFactory(
-					module as ExtensionFactory, cwd, eventBus, this.runtime, extPath,
+				const ext = await this.loadFactoryWithProviderStaging(
+					module as ExtensionFactory, extPath, cwd, eventBus, token,
 				);
-				this.extensions.push(ext);
-				loadedCount++;
+				if (ext !== undefined) {
+					loadedExtensions.push({ extension: ext, token });
+					loadedCount++;
+				}
 			} catch (err) {
+				if (this.state === HostState.DISPOSED) return;
 				errors.push({
 					path: extPath,
 					error: err instanceof Error ? err.message : String(err),
 				});
+			}
+		}
+		if (this.state === HostState.DISPOSED) return;
+
+		// Idempotent per resolved extension path: replace a previously
+		// loaded extension for the same path in place (preserving its
+		// ordering position) rather than appending a duplicate. New paths
+		// keep the first-load-unshift / later-load-push ordering semantics.
+		const existingByPath = new Map<string, number>();
+		for (const [i, existing] of this.extensions.entries()) {
+			if (!existingByPath.has(existing.path)) {
+				existingByPath.set(existing.path, i);
+			}
+		}
+		const newExtensions: Extension[] = [];
+		const newPathIndex = new Map<string, number>();
+		for (const { extension: ext, token } of loadedExtensions) {
+			if (this.latestExtensionLoadTokenByPath.get(ext.path) !== token) continue;
+			const existingIdx = existingByPath.get(ext.path);
+			if (existingIdx !== undefined) {
+				this.extensions[existingIdx] = ext;
+				continue;
+			}
+			const batchIdx = newPathIndex.get(ext.path);
+			if (batchIdx !== undefined) {
+				newExtensions[batchIdx] = ext;
+			} else {
+				newPathIndex.set(ext.path, newExtensions.length);
+				newExtensions.push(ext);
+			}
+		}
+		if (newExtensions.length > 0) {
+			if (this.hasLoadedProtocolExtensions) {
+				this.extensions.push(...newExtensions);
+			} else {
+				// The first JSONL load is startup configuration, equivalent to CLI
+				// extension paths, which load before built-in factories.
+				this.extensions.unshift(...newExtensions);
+				this.hasLoadedProtocolExtensions = true;
 			}
 		}
 
@@ -1020,16 +1229,20 @@ export class ExtensionHost {
 		const commandName = (p["command"] ?? p["name"]) as string;
 		const args = (p["args"] as string) ?? "";
 
-		const cmd = this.runner?.getCommand(commandName);
-		if (!cmd || !this.runner) {
+		const runner = this.runner;
+		const cmd = runner?.getCommand(commandName);
+		if (!runner || !cmd) {
 			await this.client.respondError(id, "command.execute" as Method, {
 				code: "not_found", message: `Command not found: ${commandName}`, retryable: false,
 			});
 			return;
 		}
 
+		const scope = { tokens: [] as string[], closed: false };
 		try {
-			await cmd.handler(args, this.runner.createContext());
+			await this.commandScope.run(scope, async () => {
+				await cmd.handler(args, this.createCommandContext(runner));
+			});
 			await this.client.respond(id, "command.execute" as Method, { ok: true });
 		} catch (err) {
 			await this.client.respondError(id, "command.execute" as Method, {
@@ -1037,6 +1250,29 @@ export class ExtensionHost {
 				message: err instanceof Error ? err.message : String(err),
 				retryable: false,
 			});
+		} finally {
+			// After the command.execute res/error write: writeChain orders ready
+			// after the response and any session.command frames from the handler.
+			// Emit even when the handler threw after a successful replacement.
+			// Closed first so a late fire-and-forget capture is diagnosed, not
+			// pushed into a scope nobody will flush.
+			scope.closed = true;
+			for (const token of scope.tokens) {
+				try {
+					await this.client.send({
+						id: 0,
+						kind: "event",
+						method: "session.replacementReady",
+						payload: { token },
+					});
+				} catch (err) {
+					this.emitExtensionError(
+						"<host>",
+						"session.replacementReady",
+						err instanceof Error ? err.message : String(err),
+					);
+				}
+			}
 		}
 	}
 
@@ -1045,8 +1281,8 @@ export class ExtensionHost {
 		const width = p["width"] as number;
 		const entry = this.slots.get(key);
 		if (entry !== undefined && Number.isFinite(width)) entry.width = width;
-		const height = entry?.component?.render(width)?.length ?? 0;
-		await this.client.respond(id, "measure", { height });
+		const lines = entry === undefined ? [] : this.safeRenderSlot(key, entry, width);
+		await this.client.respond(id, "measure", { height: lines?.length ?? 0 });
 	}
 
 	private async handleRender(id: number, p: Record<string, unknown>): Promise<void> {
@@ -1054,8 +1290,8 @@ export class ExtensionHost {
 		const width = p["width"] as number;
 		const entry = this.slots.get(key);
 		if (entry !== undefined && Number.isFinite(width)) entry.width = width;
-		const lines = entry?.component?.render(width) ?? [];
-		const runs = lines.map((line) => parseAnsiLines(line)[0] ?? []) as StyledRun[][];
+		const lines = entry === undefined ? [] : this.safeRenderSlot(key, entry, width);
+		const runs = (lines ?? []).map((line) => parseAnsiLines(line)[0] ?? []) as StyledRun[][];
 		await this.client.respond(id, "render", { runs });
 	}
 
@@ -1063,6 +1299,23 @@ export class ExtensionHost {
 		const data = typeof p["data"] === "string" ? p["data"] : "";
 		const result = await this.enqueueTerminalInput(data);
 		await this.client.respond(id, "terminalInput", result);
+	}
+
+	private safeRenderSlot(key: string, entry: SlotEntry, width: number): string[] | undefined {
+		try {
+			return entry.component?.render(width) ?? [];
+		} catch (error) {
+			this.emitExtensionError("<inline>", `component.render (${key})`, error instanceof Error ? error.message : String(error));
+			return undefined;
+		}
+	}
+
+	private safeDisposeComponent(key: string, component: SlotComponent | null): void {
+		try {
+			component?.dispose?.();
+		} catch (error) {
+			this.emitExtensionError("<inline>", `component.dispose (${key})`, error instanceof Error ? error.message : String(error));
+		}
 	}
 
 	/**
@@ -1256,7 +1509,17 @@ export class ExtensionHost {
 
 	private pushSlot(key: string, entry: SlotEntry, width: number): void {
 		if (entry.component === null) return;
-		const lines = entry.component.render(width);
+		let overlayOptions = entry.overlayOptions;
+		if (entry.overlayOptionsResolver !== undefined) {
+			try {
+				overlayOptions = entry.overlayOptionsResolver() ?? {};
+			} catch (error) {
+				this.emitExtensionError("<inline>", `overlayOptions (${key})`, error instanceof Error ? error.message : String(error));
+				return;
+			}
+		}
+		const lines = this.safeRenderSlot(key, entry, width);
+		if (lines === undefined) return;
 		const runs = lines.map((line) => parseAnsiLines(line)[0] ?? []);
 		const slot: UiSlot = {
 			key,
@@ -1266,7 +1529,7 @@ export class ExtensionHost {
 			runs,
 			focusable: entry.focusable,
 		};
-		if (entry.overlayOptions !== undefined) slot.overlayOptions = entry.overlayOptions;
+		if (overlayOptions !== undefined) slot.overlayOptions = overlayOptions;
 		this.client.send({
 			id: 0, kind: "event", method: "uiSlot", payload: slot,
 		}).catch(() => void 0);
@@ -1275,8 +1538,8 @@ export class ExtensionHost {
 	disposeSlot(key: string): void {
 		const entry = this.slots.get(key);
 		if (entry === undefined) return;
-		entry.component?.dispose?.();
 		this.slots.delete(key);
+		this.safeDisposeComponent(key, entry.component);
 		this.client.send({
 			id: 0, kind: "event", method: "disposeSlot",
 			payload: { key, generation: entry.generation },
@@ -1296,7 +1559,8 @@ export class ExtensionHost {
 			this.disposeSlot(key);
 			return;
 		}
-		let component: SlotEntry["component"];
+		let component: SlotComponent | null;
+		let recreate: SlotFactory | undefined;
 		if (Array.isArray(content)) {
 			const lines = content as string[];
 			component = { render: () => lines };
@@ -1313,28 +1577,16 @@ export class ExtensionHost {
 				getAvailableProviderCount: () => 0,
 				onBranchChange: () => () => {},
 			};
-			try {
-				component = (content as (...args: unknown[]) => SlotEntry["component"])(
-					tui,
-					this.currentTheme,
-					footerData,
-				);
-			} catch (err) {
-				this.emitExtensionError("<inline>", "setComponentSlot", String(err));
-				return;
-			}
-			if (component === null || typeof component?.render !== "function") {
-				this.emitExtensionError(
-					"<inline>",
-					"setComponentSlot",
-					`factory for ${key} did not return a component`,
-				);
-				return;
-			}
+			recreate = (theme) => (content as (...args: unknown[]) => unknown)(tui, theme, footerData);
+			// One factory contract on both paths: store the entry first, then let
+			// `recreateSlot` install — it already validates the result, handles
+			// thenables, and keeps a synchronous result's slot identical to the
+			// previous eager call.
+			component = null;
 		} else {
 			return;
 		}
-		this.slots.get(key)?.component?.dispose?.();
+		this.safeDisposeComponent(key, this.slots.get(key)?.component ?? null);
 		const entry: SlotEntry = {
 			generation: this.nextGeneration++,
 			component,
@@ -1342,9 +1594,64 @@ export class ExtensionHost {
 			focusable: false,
 			overlayOptions: undefined,
 			width: 80,
+			recreate,
+			recreationRevision: 0,
 		};
 		this.slots.set(key, entry);
-		this.pushSlot(key, entry, 80);
+		if (entry.recreate === undefined) {
+			this.pushSlot(key, entry, 80);
+			return;
+		}
+		this.recreateSlot(key, entry, () => {
+			if (this.slots.get(key) === entry) this.disposeSlot(key);
+		});
+	}
+
+	/**
+	 * Re-render a static slot, or recreate a factory-backed slot against
+	 * `currentTheme`. The old component stays installed until replacement
+	 * succeeds; failures emit an extension error and leave the slot untouched.
+	 * Asynchronous recreations carry a monotonic revision so stale results
+	 * dispose themselves instead of resurrecting overwritten UI.
+	 */
+	private recreateSlot(key: string, entry: SlotEntry, onInitialFailure?: () => void): void {
+		if (entry.recreate === undefined) {
+			this.pushSlot(key, entry, entry.width);
+			return;
+		}
+		const revision = ++entry.recreationRevision;
+		const isCurrent = () => this.slots.get(key) === entry && entry.recreationRevision === revision;
+		const fail = (err: unknown) => {
+			if (!isCurrent()) return;
+			this.emitExtensionError("<inline>", "theme.update", String(err));
+			onInitialFailure?.();
+		};
+		const install = (replacement: unknown) => {
+			if (!isCurrent()) {
+				if (isSlotComponent(replacement)) this.safeDisposeComponent(key, replacement);
+				return;
+			}
+			if (!isSlotComponent(replacement)) {
+				fail(`factory for ${key} did not return a component`);
+				return;
+			}
+			const old = entry.component;
+			entry.component = replacement;
+			this.safeDisposeComponent(key, old);
+			this.pushSlot(key, entry, entry.width);
+		};
+		let recreated: unknown;
+		try {
+			recreated = entry.recreate(this.liveTheme);
+		} catch (err) {
+			fail(err);
+			return;
+		}
+		if (recreated !== null && typeof recreated === "object" && typeof (recreated as PromiseLike<unknown>).then === "function") {
+			Promise.resolve(recreated).then(install, fail);
+			return;
+		}
+		install(recreated);
 	}
 
 	// -----------------------------------------------------------------------
@@ -1435,25 +1742,33 @@ export class ExtensionHost {
 						if (entry !== undefined) self.pushSlot(key, entry, entry.width);
 					},
 				};
-				Promise.resolve(factory(tui, self.currentTheme, {}, done)).then((component: any) => {
-					if (resolved) {
-						component?.dispose?.();
-						return;
-					}
-					const entry: SlotEntry = {
-						generation: self.nextGeneration++,
-						component,
-						placement: "overlay",
-						focusable: true,
-						overlayOptions: (typeof options?.overlayOptions === "function" ? options.overlayOptions() : options?.overlayOptions) ?? {},
-						width: 80,
-					};
-					self.slots.set(key, entry);
-					self.pushSlot(key, entry, 80);
-				}).catch((err) => {
+				let overlayOptions: OverlayOptions | undefined;
+				let overlayOptionsResolver: (() => OverlayOptions | undefined) | undefined;
+				try {
+					overlayOptionsResolver = typeof options?.overlayOptions === "function"
+						? options.overlayOptions as () => OverlayOptions | undefined
+						: undefined;
+					overlayOptions = overlayOptionsResolver === undefined
+						? (options?.overlayOptions ?? {}) as OverlayOptions
+						: undefined;
+				} catch (err) {
 					self.emitExtensionError("<inline>", "custom", String(err));
 					done(undefined);
-				});
+					return promise;
+				}
+				const entry: SlotEntry = {
+					generation: self.nextGeneration++,
+					component: null,
+					placement: "overlay",
+					focusable: true,
+					overlayOptions,
+					overlayOptionsResolver,
+					width: 80,
+					recreate: (theme) => factory(tui, theme, {}, done),
+					recreationRevision: 0,
+				};
+				self.slots.set(key, entry);
+				self.recreateSlot(key, entry, () => done(undefined));
 				return promise;
 			},
 			editor: (title: string, prefill?: string) =>
@@ -1517,31 +1832,37 @@ export class ExtensionHost {
 
 	/**
 	 * Rebuild ExtensionRunner from the current extension list, rebinding core
-	 * actions and capturing provider registrations (first registration wins).
+	 * actions and rebuilding provider registrations from the current set.
 	 */
 	private rebuildRunner(cwd: string): void {
 		if (this.runtime === undefined) return;
-		// Keep captured providers across rebuild: late-loaded extensions register
-		// via the live callback before rebuild, and pending is already drained.
-		this.runner = new ExtensionRunner(
+		const rt = this.runtime;
+		// Per-factory staging should have left pending queues empty and
+		// committed all captures to providerRegistrationsByPath. Clear them
+		// as a safety net so bindCore's flush is a no-op.
+		rt.pendingProviderRegistrations = [];
+		rt.pendingNativeProviderRegistrations = [];
+		// Derive this.providers from successful per-path registrations in their
+		// actual registration order. This preserves late live overrides across
+		// unrelated rebuilds.
+		this.rebuildProvidersFromRegistrations();
+		const runner = new ExtensionRunner(
 			this.extensions,
 			this.runtime,
 			cwd,
 			this.createSessionManagerProxy(),
 			this.createModelRegistryProxy(),
 		);
-		this.runner.bindCore(
+		runner.bindCore(
 			this.createExtensionActions(),
 			this.createContextActions(),
 			{
 				registerProvider: (name, config) => {
-					if (!this.providers.has(name)) {
-						this.providers.set(name, config);
-					}
+					this.providers.set(name, config);
 				},
 				registerNativeProvider: (provider) => {
 					const id = (provider as Record<string, unknown>)["id"];
-					if (typeof id === "string" && !this.providers.has(id)) {
+					if (typeof id === "string") {
 						const native = provider as ProviderConfig;
 						this.providers.set(id, {
 							name: native.name,
@@ -1555,10 +1876,203 @@ export class ExtensionHost {
 				},
 			},
 		);
-		this.runner.setUIContext(this.createUIContext(), "tui");
-		this.runner.onError((error) => {
+		// After bindCore, install path-aware runtime callbacks so live
+		// register/unregister calls update the same per-path state used by
+		// rebuilds. Without this, post-bind registrations would be lost on
+		// the next rebuild because this.providers is cleared and re-derived
+		// from providerRegistrationsByPath.
+		this.installProviderCallbacks(rt);
+		runner.bindCommandContext(this.createCommandContextActions(runner));
+		runner.setUIContext(this.createUIContext(), "tui");
+		runner.onError((error) => {
 			this.emitExtensionError(error.extensionPath, error.event, error.error);
 		});
+		this.runner = runner;
+	}
+
+	/**
+	 * Install provider callbacks that stage only calls made by the factory
+	 * currently executing in this async context. Concurrent calls from already
+	 * loaded extensions remain live and update the durable per-path state.
+	 */
+	private installProviderCallbacks(rt: ExtensionRuntime): void {
+		const stageOrApply = (createOperation: () => ProviderRegistrationOperation): void => {
+			if (this.state === HostState.DISPOSED) return;
+			const operation = createOperation();
+			const scope = this.providerLoadScope.getStore();
+			if (scope === undefined) {
+				this.applyProviderOperation(operation);
+				this.emitProvidersUpdate();
+				return;
+			}
+			if (scope.phase === "loading") {
+				scope.operations.push(operation);
+				return;
+			}
+			if (scope.phase === "committed"
+				&& this.activeProviderLoadScopeByPath.get(scope.extensionPath) === scope) {
+				this.applyProviderOperation(operation);
+				this.emitProvidersUpdate();
+			}
+		};
+
+		rt.registerProvider = (name, config, extensionPath = "<unknown>") => {
+			stageOrApply(() => ({
+				kind: "register",
+				name,
+				config,
+				extensionPath,
+				order: this.nextProviderRegistrationOrder++,
+			}));
+		};
+		rt.registerNativeProvider = (provider, extensionPath = "<unknown>") => {
+			stageOrApply(() => ({
+				kind: "native",
+				provider,
+				extensionPath,
+				order: this.nextProviderRegistrationOrder++,
+			}));
+		};
+		rt.unregisterProvider = (name) => {
+			stageOrApply(() => ({
+				kind: "unregister",
+				name,
+				order: this.nextProviderRegistrationOrder++,
+			}));
+		};
+	}
+
+	private applyProviderOperation(operation: ProviderRegistrationOperation): void {
+		if (operation.kind === "native") {
+			const id = operation.provider["id"];
+			if (typeof id === "string") {
+				const native = operation.provider as ProviderConfig;
+				this.applyProviderOperation({
+					kind: "register",
+					name: id,
+					config: {
+						name: native.name,
+						baseUrl: native.baseUrl,
+						streamSimple: native.streamSimple,
+					},
+					extensionPath: operation.extensionPath,
+					order: operation.order,
+				});
+			}
+			return;
+		}
+
+		if (operation.kind === "unregister") {
+			const latestUnregister = this.providerUnregisterOrderByName.get(operation.name);
+			if (latestUnregister === undefined || operation.order > latestUnregister) {
+				this.providerUnregisterOrderByName.set(operation.name, operation.order);
+			}
+			for (const [path, registrations] of this.providerRegistrationsByPath) {
+				const retained = registrations.filter((registration) =>
+					registration.name !== operation.name || registration.order > operation.order
+				);
+				if (retained.length === 0) this.providerRegistrationsByPath.delete(path);
+				else this.providerRegistrationsByPath.set(path, retained);
+			}
+		} else {
+			const latestUnregister = this.providerUnregisterOrderByName.get(operation.name);
+			if (latestUnregister !== undefined && operation.order <= latestUnregister) return;
+			const registrations = this.providerRegistrationsByPath.get(operation.extensionPath) ?? [];
+			registrations.push(operation);
+			this.providerRegistrationsByPath.set(operation.extensionPath, registrations);
+		}
+
+		this.rebuildProvidersFromRegistrations();
+	}
+
+	private rebuildProvidersFromRegistrations(): void {
+		const registrations: ProviderRegistration[] = [];
+		for (const extension of this.extensions) {
+			registrations.push(...(this.providerRegistrationsByPath.get(extension.path) ?? []));
+		}
+		registrations.sort((left, right) => left.order - right.order);
+		this.providers.clear();
+		for (const { name, config, order } of registrations) {
+			const latestUnregister = this.providerUnregisterOrderByName.get(name);
+			if (latestUnregister === undefined || order > latestUnregister) this.providers.set(name, config);
+		}
+	}
+
+	/**
+	 * Load one extension factory and commit its provider operations atomically.
+	 */
+	private async loadFactoryWithProviderStaging(
+		factory: ExtensionFactory,
+		extensionPath: string,
+		cwd: string,
+		eventBus: unknown,
+		loadToken?: number,
+	): Promise<Extension | undefined> {
+		const rt = this.runtime;
+		if (rt === undefined) throw new Error("Runtime not initialized");
+
+		const scope: ProviderLoadScope = {
+			phase: "loading",
+			extensionPath,
+			operations: [],
+		};
+		try {
+			const extension = await this.providerLoadScope.run(scope, () =>
+				loadExtensionFromFactory(factory, cwd, eventBus, rt, extensionPath)
+			);
+			if (this.state === HostState.DISPOSED) {
+				throw new Error("extension host was disposed during load");
+			}
+			if (loadToken !== undefined
+				&& this.latestExtensionLoadTokenByPath.get(extensionPath) !== loadToken) {
+				scope.phase = "aborted";
+				return undefined;
+			}
+
+			// A successful replacement owns this path from this point forward. A
+			// failed factory never reaches this mutation, so the previous path state
+			// and concurrent live registrations remain intact.
+			this.providerRegistrationsByPath.delete(extensionPath);
+			for (const operation of scope.operations) this.applyProviderOperation(operation);
+
+			const priorScope = this.activeProviderLoadScopeByPath.get(extensionPath);
+			if (priorScope !== undefined) priorScope.phase = "aborted";
+			scope.phase = "committed";
+			this.activeProviderLoadScopeByPath.set(extensionPath, scope);
+			return extension;
+		} catch (error) {
+			scope.phase = "aborted";
+			throw error;
+		}
+	}
+
+	private emitProvidersUpdate(): void {
+		if (this.state === HostState.DISPOSED) return;
+		void this.client.send({
+			id: 0,
+			kind: "event",
+			method: PROVIDERS_UPDATE_METHOD,
+			payload: { providers: this.buildProviderSnapshot() },
+		}).catch(() => void 0);
+	}
+
+	private buildProviderSnapshot(): Array<Record<string, unknown>> {
+		const providers: Array<Record<string, unknown>> = [];
+		for (const [name, config] of this.providers) {
+			const entry: Record<string, unknown> = {
+				name,
+				streamSimple: typeof config.streamSimple === "function",
+			};
+			if (config.baseUrl !== undefined) entry["baseUrl"] = config.baseUrl;
+			if (config.api !== undefined) entry["api"] = config.api;
+			if (config.name !== undefined) entry["displayName"] = config.name;
+			if (config.apiKey !== undefined) entry["apiKey"] = config.apiKey;
+			if (config.headers !== undefined) entry["headers"] = config.headers;
+			if (config.authHeader !== undefined) entry["authHeader"] = config.authHeader;
+			if (config.models !== undefined) entry["models"] = config.models;
+			providers.push(entry);
+		}
+		return providers;
 	}
 
 	/** Full RegistrySnapshotWire for Rust HostExtensionRunner::load. */
@@ -1594,6 +2108,7 @@ export class ExtensionHost {
 			name: cmd.invocationName,
 			description: cmd.description,
 			source: cmd.sourceInfo.path,
+			sourceInfo: cmd.sourceInfo,
 		}));
 
 		const shortcuts: Array<Record<string, unknown>> = [];
@@ -1644,21 +2159,7 @@ export class ExtensionHost {
 			}
 		}
 
-		const providers: Array<Record<string, unknown>> = [];
-		for (const [name, config] of this.providers) {
-			const entry: Record<string, unknown> = {
-				name,
-				streamSimple: typeof config.streamSimple === "function",
-			};
-			if (config.baseUrl !== undefined) entry["baseUrl"] = config.baseUrl;
-			if (config.api !== undefined) entry["api"] = config.api;
-			if (config.name !== undefined) entry["displayName"] = config.name;
-			if (config.apiKey !== undefined) entry["apiKey"] = config.apiKey;
-			if (config.headers !== undefined) entry["headers"] = config.headers;
-			if (config.authHeader !== undefined) entry["authHeader"] = config.authHeader;
-			if (config.models !== undefined) entry["models"] = config.models;
-			providers.push(entry);
-		}
+		const providers = this.buildProviderSnapshot();
 
 		const handlers = ALL_EVENT_TYPES.filter((eventType) => runner.hasHandlers(eventType));
 
@@ -1713,12 +2214,17 @@ export class ExtensionHost {
 		if (wasIdle && !this.sessionState.isIdle) {
 			this.turnAbort = new AbortController();
 		}
+		if (this.sessionState.isIdle && this.idleWaiters.length > 0) {
+			const waiters = this.idleWaiters.splice(0);
+			for (const waiter of waiters) waiter.resolve();
+		}
 	}
 
 	/**
 	 * Apply an authoritative `theme.update` push: refresh `ctx.ui.theme`, the
-	 * catalog, polarity context, and re-render every live slot with the new
-	 * colors.
+	 * catalog, polarity context, and recreate/re-render every live slot with
+	 * the new colors. Factory-backed slots rebuild against `currentTheme`;
+	 * static slots only re-render.
 	 */
 	private applyThemeUpdate(update: ThemeUpdatePayload): void {
 		if (update === null || typeof update !== "object" || typeof update.theme !== "object") {
@@ -1798,11 +2304,19 @@ export class ExtensionHost {
 		}).catch(() => void 0);
 	}
 
-	/** Fire-and-forget `session.command` action to Rust. */
-	private sendSessionCommand(payload: Record<string, unknown>): void {
-		this.client.send({
-			id: 0, kind: "event", method: "session.command" as Method, payload,
-		}).catch(() => void 0);
+	/** Bridge a `session.command` action to Rust; awaits the wire write. */
+	private async sendSessionCommand(
+		payload: Record<string, unknown>,
+		replacementToken?: string,
+	): Promise<void> {
+		await this.client.send({
+			id: 0,
+			kind: "event",
+			method: "session.command" as Method,
+			payload: replacementToken === undefined
+				? payload
+				: { replacementToken, ...payload },
+		});
 	}
 
 	/** Fire-and-forget `ui.control` data-surface control to Rust. */
@@ -1980,9 +2494,7 @@ export class ExtensionHost {
 			await this.client.respond(id, "tool.execute" as Method, result);
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
-			const cancelled = controller.signal.aborted
-				|| message.toLowerCase().includes("abort")
-				|| message.toLowerCase().includes("cancel");
+			const cancelled = controller.signal.aborted || isStructuredAbortError(err);
 			await this.client.respondError(id, "tool.execute" as Method, {
 				code: cancelled ? "cancelled" : "extension_error",
 				message: cancelled ? "extension tool cancelled" : message,
@@ -2012,7 +2524,7 @@ export class ExtensionHost {
 			signal: controller.signal,
 		};
 		try {
-			const stream = config.streamSimple(p["model"], p["context"], options);
+			const stream = config.streamSimple(p["model"] as Model<string>, p["context"] as Context, options as SimpleStreamOptions);
 			for await (const event of stream) {
 				if (controller.signal.aborted) break;
 				// Stream-correlated providerEvent carries the AssistantMessageEvent payload.
@@ -2034,9 +2546,7 @@ export class ExtensionHost {
 			await this.client.respond(id, "provider.stream" as Method, {});
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
-			const cancelled = controller.signal.aborted
-				|| message.toLowerCase().includes("abort")
-				|| message.toLowerCase().includes("cancel");
+			const cancelled = controller.signal.aborted || isStructuredAbortError(err);
 			await this.client.respondError(id, "provider.stream" as Method, {
 				code: cancelled ? "cancelled" : "extension_error",
 				message: cancelled ? "provider stream cancelled" : message,
@@ -2075,7 +2585,7 @@ export class ExtensionHost {
 		const self = this;
 		return {
 			sendMessage: (message: Record<string, unknown>, options?: Record<string, unknown>) => {
-				self.sendSessionCommand({
+				void self.sendSessionCommand({
 					action: "sendMessage",
 					message: {
 						customType: message["customType"],
@@ -2084,21 +2594,21 @@ export class ExtensionHost {
 						details: message["details"],
 					},
 					options,
-				});
+				}).catch(() => void 0);
 			},
 			sendUserMessage: (content: unknown, options?: Record<string, unknown>) => {
-				self.sendSessionCommand({ action: "sendUserMessage", content, options });
+				void self.sendSessionCommand({ action: "sendUserMessage", content, options }).catch(() => void 0);
 			},
 			appendEntry: (customType: string, data?: unknown) => {
-				self.sendSessionCommand({ action: "appendEntry", customType, data });
+				void self.sendSessionCommand({ action: "appendEntry", customType, data }).catch(() => void 0);
 			},
 			setSessionName: (name: string) => {
 				self.sessionState.sessionName = name;
-				self.sendSessionCommand({ action: "setSessionName", name });
+				void self.sendSessionCommand({ action: "setSessionName", name }).catch(() => void 0);
 			},
 			getSessionName: () => self.sessionState.sessionName,
 			setLabel: (entryId: string, label: string | undefined) => {
-				self.sendSessionCommand({ action: "setLabel", entryId, label });
+				void self.sendSessionCommand({ action: "setLabel", entryId, label }).catch(() => void 0);
 			},
 			getActiveTools: () => [...self.sessionState.activeTools],
 			getAllTools: () =>
@@ -2110,10 +2620,10 @@ export class ExtensionHost {
 				})),
 			setActiveTools: (toolNames: string[]) => {
 				self.sessionState.activeTools = [...toolNames];
-				self.sendSessionCommand({ action: "setActiveTools", toolNames });
+				void self.sendSessionCommand({ action: "setActiveTools", toolNames }).catch(() => void 0);
 			},
 			refreshTools: () => {
-				self.sendSessionCommand({ action: "refreshTools" });
+				void self.sendSessionCommand({ action: "refreshTools" }).catch(() => void 0);
 			},
 			getCommands: () =>
 				self.sessionState.commands.map((command) => ({
@@ -2141,7 +2651,7 @@ export class ExtensionHost {
 			getThinkingLevel: () => self.sessionState.thinkingLevel,
 			setThinkingLevel: (level: string) => {
 				self.sessionState.thinkingLevel = level;
-				self.sendSessionCommand({ action: "setThinkingLevel", level });
+				void self.sendSessionCommand({ action: "setThinkingLevel", level }).catch(() => void 0);
 			},
 		} as unknown as ExtensionActions;
 	}
@@ -2170,16 +2680,17 @@ export class ExtensionHost {
 		const self = this;
 		return {
 			getModel: () => self.sessionState.model,
+			getScopedModels: () => self.sessionState.scopedModels ?? [],
 			isIdle: () => self.sessionState.isIdle,
 			isProjectTrusted: () => self.projectTrusted,
 			getSignal: () => self.turnAbort?.signal,
 			abort: () => {
 				self.turnAbort?.abort();
-				self.sendSessionCommand({ action: "abort" });
+				void self.sendSessionCommand({ action: "abort" }).catch(() => void 0);
 			},
 			hasPendingMessages: () => self.sessionState.hasPendingMessages,
 			shutdown: () => {
-				self.sendSessionCommand({ action: "shutdown" });
+				void self.sendSessionCommand({ action: "shutdown" }).catch(() => void 0);
 			},
 			getContextUsage: () => self.sessionState.contextUsage,
 			compact: (options?: {
@@ -2206,10 +2717,391 @@ export class ExtensionHost {
 		} as unknown as ExtensionContextActions;
 	}
 
-	// Escape hatch: SessionManager is a 1600-line reference class; Proxy routes
-	// any property access to a no-op. Rust owns the real session state.
-	private createSessionManagerProxy(): ConstructorParameters<typeof ExtensionRunner>[3] {
-		return new Proxy({}, { get: () => () => undefined }) as unknown as ConstructorParameters<typeof ExtensionRunner>[3];
+	/**
+	 * `ExtensionCommandContextActions` for interactive command handlers.
+	 *
+	 * Mirrors reference `runner.bindCommandContext` wiring in interactive /
+	 * print / rpc modes: `waitForIdle` is host-local (resolves on the next
+	 * idle `session.update`), while `newSession` / `fork` / `navigateTree` /
+	 * `switchSession` / `reload` are correlated bridge requests (same pattern
+	 * as `session.setModel` / `session.compact`). Non-serializable callbacks
+	 * (`setup`, `withSession`) stay host-side and run after a non-cancelled
+	 * replacement: `setup` (newSession only) receives the replacement
+	 * SessionManager proxy; `withSession` receives a real
+	 * `ReplacedSessionContext` built from `createCommandContext()` with
+	 * working `sendMessage` / `sendUserMessage` bridged to Rust.
+	 */
+	private createCommandContextActions(
+		ownerRunner: ExtensionRunner,
+		markStale?: () => void,
+		assertFresh?: () => void,
+	): ExtensionCommandContextActions {
+		const self = this;
+		/**
+		 * Per-command staleness guard: reject when this command context was marked
+		 * stale at token capture, or when the active runner has been replaced
+		 * since bind. Lives inside each action closure so methods captured before
+		 * token capture still recheck on call — without a whole-runner
+		 * invalidate() or generation registry.
+		 */
+		const guardActive = (): void => {
+			if (assertFresh !== undefined) {
+				assertFresh();
+				return;
+			}
+			if (self.runner !== ownerRunner) {
+				throw new Error(STALE_COMMAND_CONTEXT_MESSAGE);
+			}
+		};
+		const cancelledOf = (frame: Frame): boolean =>
+			(frame.payload as Record<string, unknown>)["cancelled"] === true;
+
+		const createReplacedSessionContext = (
+			runner: ExtensionRunner,
+			replacementToken: string,
+		): ReplacedSessionContext => {
+			const context = self.createCommandContext(runner) as ReplacedSessionContext;
+			context.sendMessage = async (message, options) => {
+				await self.sendSessionCommand({
+					action: "sendMessage",
+					message: {
+						customType: message.customType,
+						content: message.content,
+						display: message.display,
+						details: message.details,
+					},
+					options,
+				}, replacementToken);
+			};
+			context.sendUserMessage = async (content, options) => {
+				await self.sendSessionCommand(
+					{ action: "sendUserMessage", content, options },
+					replacementToken,
+				);
+			};
+			return context;
+		};
+
+		const afterReplacement = async (
+			cancelled: boolean,
+			replacementToken: string | undefined,
+			withSession?: (ctx: ReplacedSessionContext) => Promise<void>,
+		): Promise<{ cancelled: boolean }> => {
+			if (
+				!cancelled
+				&& replacementToken !== undefined
+				&& withSession !== undefined
+				&& self.runner !== undefined
+			) {
+				await withSession(createReplacedSessionContext(self.runner, replacementToken));
+			}
+			// A token that was dropped because the command scope closed before the
+			// response arrived is not a successful replacement; report it as cancelled
+			// so the extension does not proceed as if withSession ran.
+			if (replacementToken === undefined && withSession !== undefined) {
+				return { cancelled: true };
+			}
+			return { cancelled };
+		};
+
+		const captureReplacementToken = (
+			payload: Record<string, unknown>,
+			cancelled: boolean,
+		): string | undefined => {
+			if (cancelled) return undefined;
+			// Staleness follows from "the session was replaced", not from "a
+			// token came back". Mark stale for every non-cancelled replacement
+			// response before any token-shaped early return so that
+			// createCommandContext guards reject a context bound to a session
+			// that no longer exists.
+			markStale?.();
+			const token = payload["replacementToken"];
+			if (typeof token !== "string" || token.length === 0) return undefined;
+			const scope = self.commandScope.getStore();
+			if (scope === undefined || scope.closed) {
+				// The command.execute scope that initiated this replacement has
+				// already closed, so the extension will not observe the result.
+				// Emit an explicit abort for the token so Rust does not keep the
+				// pending replacement alive, and do not let setup or withSession
+				// run against a stale scope.
+				self.emitExtensionError(
+					"<host>",
+					"session.replacementAbort",
+					"replacement token dropped after command scope closed",
+				);
+				void self.client.send({
+					id: 0,
+					kind: "event",
+					method: "session.replacementAbort" as Method,
+					payload: { token },
+				}).catch((err: unknown) => {
+					self.emitExtensionError(
+						"<host>",
+						"session.replacementAbort",
+						err instanceof Error ? err.message : String(err),
+					);
+				});
+				return undefined;
+			}
+			scope.tokens.push(token);
+			return token;
+		};
+
+		return {
+			waitForIdle: () => {
+				guardActive();
+				if (self.sessionState.isIdle) return Promise.resolve();
+				const promise = new Promise<void>((resolve, reject) => {
+					self.idleWaiters.push({ resolve, reject });
+				});
+				// Prevent unhandled rejection for fire-and-forget callers; an
+				// awaiting caller still receives the rejection from dispose().
+				promise.catch(() => {});
+				return promise;
+			},
+			newSession: async (options) => {
+				guardActive();
+				const frame = await self.client.request(
+					"session.newSession",
+					{ parentSession: options?.parentSession },
+					{ timeoutMs: EXTENSION_HOOK_TIMEOUT_MS },
+				);
+				const payload = frame.payload as Record<string, unknown>;
+				const cancelled = cancelledOf(frame);
+				const rawToken = payload["replacementToken"];
+				const replacementToken = captureReplacementToken(payload, cancelled);
+				if (!cancelled && options?.setup !== undefined) {
+					if (typeof rawToken !== "string" || rawToken.length === 0) {
+						throw new Error(
+							"session.newSession response omitted replacementToken for setup",
+						);
+					}
+					if (replacementToken === undefined) {
+						// The response carried a token but it arrived after the
+						// command scope closed (fire-and-forget). The replacement has
+						// already been aborted above; treat it as cancelled.
+						return { cancelled: true };
+					}
+					const setupFrame = await self.client.request(
+						"session.setupEntries",
+						{ replacementToken },
+						{ timeoutMs: EXTENSION_HOOK_TIMEOUT_MS },
+					);
+					const setupPayload = setupFrame.payload as Record<string, unknown>;
+					const initialEntries = setupPayload["entries"];
+					if (!Array.isArray(initialEntries)) {
+						throw new Error("session.setupEntries response omitted entries");
+					}
+					await options.setup(self.createSessionManagerProxy(replacementToken, initialEntries));
+				}
+				return afterReplacement(cancelled, replacementToken, options?.withSession);
+			},
+			fork: async (entryId, options) => {
+				guardActive();
+				const frame = await self.client.request(
+					"session.fork",
+					{ entryId, position: options?.position },
+					{ timeoutMs: EXTENSION_HOOK_TIMEOUT_MS },
+				);
+				const payload = frame.payload as Record<string, unknown>;
+				const cancelled = cancelledOf(frame);
+				const replacementToken = captureReplacementToken(payload, cancelled);
+				const result = await afterReplacement(cancelled, replacementToken, options?.withSession);
+				return {
+					cancelled: result.cancelled,
+					selectedText: payload["selectedText"] as string | undefined,
+				};
+			},
+			navigateTree: async (targetId, options) => {
+				guardActive();
+				const summarize = options?.summarize === true;
+				const frame = await self.client.request(
+					"session.navigateTree",
+					{
+						targetId,
+						summarize: options?.summarize,
+						customInstructions: options?.customInstructions,
+						replaceInstructions: options?.replaceInstructions,
+						label: options?.label,
+					},
+					// Summarized navigation delegates to a provider-backed branch
+					// summary that can legitimately exceed the 30 s hook deadline.
+					// Only non-summarizing navigation stays under the generic timeout.
+					summarize ? {} : { timeoutMs: EXTENSION_HOOK_TIMEOUT_MS },
+				);
+				const payload = frame.payload as Record<string, unknown>;
+				return {
+					cancelled: cancelledOf(frame),
+					editorText: payload["editorText"] as string | undefined,
+					aborted: payload["aborted"] as boolean | undefined,
+					summaryEntry: payload["summaryEntry"] as BranchSummaryEntry | undefined,
+				};
+			},
+			switchSession: async (sessionPath, options) => {
+				guardActive();
+				const frame = await self.client.request(
+					"session.switchSession",
+					{ sessionPath },
+					{ timeoutMs: EXTENSION_HOOK_TIMEOUT_MS },
+				);
+				const payload = frame.payload as Record<string, unknown>;
+				const cancelled = cancelledOf(frame);
+				const replacementToken = captureReplacementToken(payload, cancelled);
+				return afterReplacement(cancelled, replacementToken, options?.withSession);
+			},
+			reload: async () => {
+				guardActive();
+				const frame = await self.client.request(
+					"session.reload",
+					{},
+					{ timeoutMs: EXTENSION_HOOK_TIMEOUT_MS },
+				);
+				const payload = frame.payload as Record<string, unknown>;
+				// Reload has no cancelled flag; capture any token and strip from extension view.
+				captureReplacementToken(payload, false);
+			},
+		};
+	}
+
+	private createCommandContext(runner: ExtensionRunner): ExtensionCommandContext {
+		let stale = false;
+		const guard = (): void => {
+			if (stale || this.runner !== runner) {
+				throw new Error(STALE_COMMAND_CONTEXT_MESSAGE);
+			}
+		};
+		// Pass guard into action closures so pre-captured methods recheck stale.
+		const actions = this.createCommandContextActions(runner, () => {
+			stale = true;
+		}, guard);
+
+		return new Proxy(runner.createCommandContext(), {
+			get(target, property, receiver) {
+				guard();
+				switch (property) {
+					case "waitForIdle":
+						return actions.waitForIdle;
+					case "newSession":
+						return actions.newSession;
+					case "fork":
+						return actions.fork;
+					case "navigateTree":
+						return actions.navigateTree;
+					case "switchSession":
+						return actions.switchSession;
+					case "reload":
+						return actions.reload;
+					default:
+						return Reflect.get(target, property, receiver);
+				}
+			},
+		});
+	}
+
+	// Honest narrow bridge: SessionManager is a 1600-line reference class the
+	// host cannot instantiate. Rust owns the real session tree. Only matching
+	// SessionManager mutations route through `session.command`; each returns
+	// the write-delivery Promise rather than a fabricated synchronous entry ID.
+	// `getEntries()` is synchronous over a token-scoped snapshot seeded before
+	// setup and refreshed after each awaited append. Stale tokens fail closed.
+	// Every other SessionManager method fails explicitly instead of silently no-op-ing.
+	private createSessionManagerProxy(
+		replacementToken?: string,
+		initialEntries: unknown[] = [],
+	): SessionManagerSetupBridge {
+		const self = this;
+		let entriesSnapshot: unknown[] = initialEntries;
+		const sessionNameFromEntries = (entries: readonly unknown[]): string | undefined => {
+			for (let index = entries.length - 1; index >= 0; index--) {
+				const entry = entries[index];
+				if (
+					typeof entry === "object"
+					&& entry !== null
+					&& "type" in entry
+					&& entry.type === "session_info"
+				) {
+					return "name" in entry && typeof entry.name === "string"
+						? entry.name
+						: undefined;
+				}
+			}
+			return undefined;
+		};
+		let setupSessionName = replacementToken === undefined
+			? undefined
+			: sessionNameFromEntries(entriesSnapshot);
+		const refreshSnapshot = replacementToken === undefined
+			? undefined
+			: async (): Promise<void> => {
+				const frame = await self.client.request(
+					"session.setupEntries",
+					{ replacementToken },
+					{ timeoutMs: EXTENSION_HOOK_TIMEOUT_MS },
+				);
+				const payload = frame.payload as Record<string, unknown>;
+				const entries = payload["entries"];
+				if (!Array.isArray(entries)) {
+					throw new Error("session.setupEntries response omitted entries");
+				}
+				entriesSnapshot = entries;
+				setupSessionName = sessionNameFromEntries(entries);
+			};
+		return new Proxy({}, {
+			get(_target, prop) {
+				if (typeof prop !== "string") return undefined;
+				// Never expose a callable `then`: the proxy must not look like a thenable.
+				if (prop === "then") return undefined;
+				// Logging/printing/probing the bridge must not throw: forward
+				// `Object.prototype` members (`toString`, `valueOf`,
+				// `hasOwnProperty`, `constructor`, …) and leave `toJSON`
+				// undefined so `JSON.stringify` serializes instead of throwing.
+				// Only real SessionManager methods fail loudly.
+				if (prop === "toJSON") return undefined;
+				const inherited = Reflect.get(Object.prototype, prop);
+				if (inherited !== undefined) return inherited;
+				switch (prop) {
+					case "appendCustomEntry":
+						return async (customType: string, data?: unknown) => {
+							await self.sendSessionCommand(
+								{ action: "appendEntry", customType, data },
+								replacementToken,
+							);
+							if (refreshSnapshot !== undefined) await refreshSnapshot();
+						};
+					case "appendSessionInfo":
+						return async (name: string) => {
+							await self.sendSessionCommand(
+								{ action: "setSessionName", name },
+								replacementToken,
+							);
+							if (refreshSnapshot === undefined) {
+								self.sessionState.sessionName = name;
+							} else {
+								await refreshSnapshot();
+							}
+						};
+					case "getSessionName":
+						return () =>
+							refreshSnapshot === undefined
+								? self.sessionState.sessionName
+								: setupSessionName;
+					case "getEntries":
+						return refreshSnapshot === undefined
+							? () => {
+								throw new Error(
+									"SessionManager method 'getEntries' is not supported via the extension bridge",
+								);
+							}
+							: () => [...entriesSnapshot];
+					default:
+						return () => {
+							throw new Error(
+								`SessionManager method '${prop}' is not supported via the extension bridge`,
+							);
+						};
+				}
+			},
+		}) as SessionManagerSetupBridge;
 	}
 
 	// Escape hatch: ModelRegistry wraps a runtime the host doesn't own.
@@ -2244,7 +3136,7 @@ export class ExtensionHost {
 	}
 
 	private terminate(reason: string): void {
-		this.clearActiveAssistant();
+		this.assistantDelta.clearActiveAssistant();
 		console.error(`[host] fatal: ${reason}`);
 		this.dispose(reason);
 	}
@@ -2258,7 +3150,19 @@ export class ExtensionHost {
 		this.inFlightTools.clear();
 		for (const controller of this.inFlightProviders.values()) controller.abort();
 		this.inFlightProviders.clear();
+		for (const controller of this.inFlightShortcuts.values()) controller.abort();
+		this.inFlightShortcuts.clear();
+		for (const scope of this.activeProviderLoadScopeByPath.values()) scope.phase = "aborted";
+		this.activeProviderLoadScopeByPath.clear();
+		this.latestExtensionLoadTokenByPath.clear();
+		this.providerUnregisterOrderByName.clear();
 		this.providers.clear();
+		this.providerRegistrationsByPath.clear();
+		// Settle pending waitForIdle waiters: idle was never reached, so
+		// reject with the disposal reason. Each waiter has a no-op catch
+		// attached at creation, so this cannot become an unhandled rejection.
+		const waiters = this.idleWaiters.splice(0);
+		for (const waiter of waiters) waiter.reject(new Error(reason));
 		for (const key of [...this.slots.keys()]) this.disposeSlot(key);
 		this.client.dispose(reason);
 	}
@@ -2271,4 +3175,21 @@ export class ExtensionHost {
 
 function isRecord<T extends Record<string, unknown>>(value: unknown): value is T {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Compare JSON-serializable values ignoring object-key insertion order. */
+function canonicalJsonEqual(left: unknown, right: unknown): boolean {
+	return JSON.stringify(canonicalizeJson(left)) === JSON.stringify(canonicalizeJson(right));
+}
+
+function canonicalizeJson(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(canonicalizeJson);
+	if (isRecord(value)) {
+		const sorted = Object.create(null) as Record<string, unknown>;
+		for (const key of Object.keys(value).sort()) {
+			sorted[key] = canonicalizeJson(value[key]);
+		}
+		return sorted;
+	}
+	return value;
 }

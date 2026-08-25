@@ -24,17 +24,21 @@ use futures::future::BoxFuture;
 use pi_agent::{AfterToolCallResult, AgentMessage, AgentTool, BeforeToolCallResult};
 use pi_ai::{AssistantMessage, AssistantMessageEvent, ToolResultContent};
 use pi_ext::adapters::{
-    self, CommandRegistration, ExtensionAgentTool, ExtensionProvider, FlagRegistration,
-    ProviderRegistration, Registry, RendererRegistration, ShortcutRegistration, ToolRegistration,
+    self, CommandRegistration, CommandSourceInfo, ExtensionAgentTool, ExtensionProvider,
+    FlagRegistration, ProviderRegistration, Registry, RendererRegistration, ShortcutRegistration,
+    ToolRegistration,
 };
-use pi_ext::client::{HostClient, HostClientError, HostEvent, HostUiRequest, HostUiResponse};
+use pi_ext::client::{
+    HostClient, HostClientError, HostEvent, HostSessionControlEvent, HostUiRequest, HostUiResponse,
+};
 use pi_ext::host::{self, HostError, HostSpec};
 use pi_ext::protocol::{
     self, DisposeSlot, ExtensionErrorEvent, FlagValueWire, FlagsSetRequest, FlagsSetResponse,
-    FrameId, NotifyRequest, ProviderEvent, SessionCommand, SessionCompactRequest,
-    SessionSetModelRequest, SessionStateWire, ShortcutExecuteRequest, ShortcutExecuteResponse,
-    ThemeSet, ThemeUpdate, ToolUpdate, UiControl, UiEventRequest, UiEventResponse, UiSlot,
-    UiStateWire,
+    FrameId, NotifyRequest, ProviderEvent, SessionCommandEnvelope, SessionCompactRequest,
+    SessionForkRequest, SessionNavigateTreeRequest, SessionNewSessionRequest,
+    SessionSetModelRequest, SessionSetupEntriesRequest, SessionStateWire,
+    SessionSwitchSessionRequest, ShortcutExecuteRequest, ShortcutExecuteResponse, ThemeSet,
+    ThemeUpdate, ToolUpdate, UiControl, UiEventRequest, UiEventResponse, UiSlot, UiStateWire,
 };
 use pi_ext::sanitize::{SanitizedSlot, sanitize_slot};
 use serde::{Deserialize, Serialize};
@@ -45,6 +49,7 @@ use super::agent_session::events::AgentSessionEvent;
 use super::agent_session::extension_runner::{
     BeforeAgentStartResult, CancelResult, ExtensionRunner, InputTransformResult,
 };
+use super::extension_runtime_set::EndpointId;
 use super::model_runtime::{
     ModelRuntime, ModelRuntimeError, ProviderConfigInput, ProviderModelDefinition,
 };
@@ -148,12 +153,17 @@ pub enum ExtensionUiEvent {
 /// One item on the claimed session-action bridge.
 ///
 /// Delivered by [`HostExtensionRunner::take_session_bridge`]; the claiming
-/// session task applies each item against the live `AgentSession` and answers
-/// `SetModel` via [`HostExtensionRunner::respond_set_model`].
+/// session task applies each item against the effective `AgentSession` and
+/// answers every correlated request through this runner.
 #[derive(Debug, Clone)]
-pub enum SessionBridgeEvent {
+pub(crate) enum SessionBridgeEvent {
     /// Fire-and-forget extension session action.
-    Command(SessionCommand),
+    Command {
+        /// Action and optional pending-replacement scope.
+        envelope: SessionCommandEnvelope,
+        /// Endpoint that emitted the command.
+        origin: Option<EndpointId>,
+    },
     /// Correlated `pi.setModel` request.
     SetModel {
         /// Host correlation id (echo into `respond_set_model`).
@@ -167,6 +177,62 @@ pub enum SessionBridgeEvent {
         id: FrameId,
         /// Compact request payload.
         request: SessionCompactRequest,
+    },
+    /// Correlated `ctx.newSession` request.
+    NewSession {
+        /// Host correlation id (echo into `respond_new_session`).
+        id: FrameId,
+        /// New-session request payload.
+        request: SessionNewSessionRequest,
+    },
+    /// Correlated `ctx.fork` request.
+    Fork {
+        /// Host correlation id (echo into `respond_fork`).
+        id: FrameId,
+        /// Fork request payload.
+        request: SessionForkRequest,
+    },
+    /// Correlated `ctx.navigateTree` request.
+    NavigateTree {
+        /// Host correlation id (echo into `respond_navigate_tree`).
+        id: FrameId,
+        /// Navigate-tree request payload.
+        request: SessionNavigateTreeRequest,
+    },
+    /// Correlated `ctx.switchSession` request.
+    SwitchSession {
+        /// Host correlation id (echo into `respond_switch_session`).
+        id: FrameId,
+        /// Switch-session request payload.
+        request: SessionSwitchSessionRequest,
+    },
+    /// Correlated `ctx.reload` request.
+    Reload {
+        /// Host correlation id (echo into `respond_reload`).
+        id: FrameId,
+    },
+    /// Correlated `session.setupEntries` request (host → Rust).
+    SetupEntries {
+        /// Host correlation id (echo into `respond_setup_entries`).
+        id: FrameId,
+        /// Setup-entries request payload.
+        request: SessionSetupEntriesRequest,
+        /// Endpoint that requested the candidate snapshot.
+        origin: Option<EndpointId>,
+    },
+    /// Host completed the command that initiated a ready-gated operation.
+    ReplacementReady {
+        /// Facade token returned by the replacement response.
+        token: String,
+        /// Endpoint that completed the replacement.
+        origin: Option<EndpointId>,
+    },
+    /// Host abandoned a ready-gated replacement without completing it.
+    ReplacementAbort {
+        /// Facade token returned by the replacement response.
+        token: String,
+        /// Endpoint that abandoned the replacement.
+        origin: Option<EndpointId>,
     },
 }
 
@@ -236,6 +302,8 @@ struct CommandWire {
     description: Option<String>,
     #[serde(default)]
     source: Option<String>,
+    #[serde(default)]
+    source_info: Option<CommandSourceInfo>,
 }
 
 /// Wire form of [`ShortcutRegistration`].
@@ -258,13 +326,28 @@ struct FlagWire {
     description: Option<String>,
     #[serde(default, rename = "type")]
     kind: Option<String>,
+    /// Native and TypeScript hosts emit boolean or string defaults (`FlagValueWire`).
     #[serde(default)]
-    default: Option<String>,
+    default: Option<FlagValueWire>,
     /// Currently resolved value (from CLI / settings), if any.
     #[serde(default)]
     value: Option<Value>,
     #[serde(default)]
     extension_path: Option<String>,
+}
+
+fn flag_value_wire_to_json(value: &FlagValueWire) -> Value {
+    match value {
+        FlagValueWire::Boolean(value) => Value::Bool(*value),
+        FlagValueWire::String(value) => Value::String(value.clone()),
+    }
+}
+
+fn flag_value_wire_to_legacy_default(value: &FlagValueWire) -> String {
+    match value {
+        FlagValueWire::Boolean(value) => value.to_string(),
+        FlagValueWire::String(value) => value.clone(),
+    }
 }
 
 /// Wire form of [`RendererRegistration`].
@@ -428,6 +511,7 @@ fn build_snapshot(wire: RegistrySnapshotWire, client: &Arc<HostClient>) -> Regis
             name: command.name,
             description: command.description,
             source: command.source,
+            source_info: command.source_info,
         });
     }
 
@@ -449,15 +533,19 @@ fn build_snapshot(wire: RegistrySnapshotWire, client: &Arc<HostClient>) -> Regis
                 Some("boolean") => adapters::FlagKind::Boolean,
                 _ => adapters::FlagKind::String,
             },
-            default: flag.default.clone(),
+            default: flag.default.as_ref().map(flag_value_wire_to_legacy_default),
             extension_path: flag.extension_path,
         }) {
-            // First-wins: prefer the host-resolved value, fall back to default.
+            // First-wins: prefer the host-resolved value, fall back to default,
+            // then to a typed fallback (false for boolean flags, "" for string).
             let value = flag
                 .value
                 .clone()
-                .or_else(|| flag.default.map(Value::String))
-                .unwrap_or_else(|| Value::String(String::new()));
+                .or_else(|| flag.default.as_ref().map(flag_value_wire_to_json))
+                .unwrap_or_else(|| match flag.kind.as_deref() {
+                    Some("boolean") => Value::Bool(false),
+                    _ => Value::String(String::new()),
+                });
             snapshot.flag_values.insert(flag.name, value);
         }
     }
@@ -606,6 +694,8 @@ struct ToolRenderHtmlWire {
 /// Slot subscription state: latest sanitized slot (or `None` when disposed).
 type SlotWatch = watch::Sender<Option<SanitizedSlot>>;
 
+type ReplacementDropHandler = Arc<dyn Fn(&str, Option<EndpointId>) + Send + Sync>;
+
 struct Inner {
     client: Arc<HostClient>,
     snapshot: RwLock<RegistrySnapshot>,
@@ -644,8 +734,13 @@ struct Inner {
     /// Per-hook control-RPC deadline (`HOOK_TIMEOUT` in production; shorter in
     /// tests to exercise the timeout path quickly).
     hook_timeout: Duration,
+    /// Stable endpoint identity assigned when this runner joins a generation.
+    endpoint_id: StdMutex<Option<EndpointId>>,
+    /// Lower-layer callback invoked when a token-bearing replacement event is
+    /// dropped at either host bounded-send hop. The callback receives the
+    /// facade token and endpoint so the facade can reject cross-endpoint control.
+    replacement_drop: StdMutex<Option<ReplacementDropHandler>>,
 }
-
 impl Inner {
     fn new(
         client: Arc<HostClient>,
@@ -687,6 +782,8 @@ impl Inner {
             shutdown_lock: tokio::sync::Mutex::new(()),
             hook_timeout,
             theme_generation: AtomicU64::new(0),
+            replacement_drop: StdMutex::new(None),
+            endpoint_id: StdMutex::new(None),
         }
     }
 
@@ -852,6 +949,13 @@ impl Inner {
                 .send(ExtensionUiEvent::Dispose { key: key.clone() });
         }
         slots.clear();
+    }
+
+    fn endpoint_id(&self) -> Option<EndpointId> {
+        *self
+            .endpoint_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -1067,6 +1171,62 @@ impl HostExtensionRunner {
             .read()
             .map(|guard| guard.provider_extension_paths.clone())
             .unwrap_or_default()
+    }
+
+    /// Replace this endpoint's provider snapshot from a `providers.update`
+    /// event. The update carries the endpoint's complete current provider
+    /// list; unknown fields are ignored.
+    ///
+    /// This only mutates the runner's local snapshot — the caller must
+    /// rebuild the aggregate in live endpoint order and rewire
+    /// `ModelRuntime` after releasing registry locks.
+    pub(crate) fn apply_providers_update(&self, update: &pi_ext::protocol::ProvidersUpdate) {
+        let mut guard = self
+            .inner
+            .snapshot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let snap = &mut *guard;
+        // Clear and rebuild from the update.
+        snap.provider_configs.clear();
+        snap.stream_provider_ids.clear();
+        snap.registry.clear_providers();
+        snap.provider_extension_paths.clear();
+        for entry in &update.providers {
+            let name = entry.name.clone();
+            let config = ProviderConfigInput {
+                name: Some(entry.name.clone()),
+                base_url: entry.base_url.clone(),
+                api_key: entry.api_key.clone(),
+                api: entry.api.clone(),
+                headers: entry.headers.clone(),
+                auth_header: entry.auth_header,
+                models: entry.models.as_ref().map(|models| {
+                    models
+                        .iter()
+                        .filter_map(|v| {
+                            serde_json::from_value::<ProviderModelDefinition>(v.clone()).ok()
+                        })
+                        .collect()
+                }),
+                model_overrides: None,
+                oauth: None,
+            };
+            snap.provider_configs.insert(name.clone(), config);
+            if entry.stream_simple {
+                snap.stream_provider_ids.insert(name.clone());
+            }
+            if let Some(path) = &entry.extension_path {
+                snap.provider_extension_paths
+                    .insert(name.clone(), path.clone());
+            }
+            // Register in the registry.
+            let _ = snap.registry.register_provider(ProviderRegistration {
+                name: name.clone(),
+                base_url: entry.base_url.clone(),
+                api: entry.api.clone(),
+            });
+        }
     }
 
     /// Registered extension flags as name → type, for CLI validation.
@@ -1490,14 +1650,14 @@ impl HostExtensionRunner {
         self.inner.active()
     }
 
-    /// Claim the sole lossless receiver for extension session actions
-    /// (`session.command` events and `session.setModel` requests).
+    /// Claim the sole lossless receiver for extension session actions and requests.
     ///
     /// The session bridge task calls this exactly once per host instance.
-    /// Subsequent callers receive `None`. While unclaimed, commands are
-    /// dropped and `setModel` requests are answered `success: false`.
+    /// Subsequent callers receive `None`. While unclaimed, fire-and-forget
+    /// actions are dropped and correlated requests receive their existing
+    /// `no active session` fallback.
     #[must_use]
-    pub fn take_session_bridge(&self) -> Option<mpsc::Receiver<SessionBridgeEvent>> {
+    pub(crate) fn take_session_bridge(&self) -> Option<mpsc::Receiver<SessionBridgeEvent>> {
         let receiver = self
             .inner
             .session_bridge_rx
@@ -1510,6 +1670,36 @@ impl HostExtensionRunner {
                 .store(true, Ordering::Release);
         }
         receiver
+    }
+
+    /// Claim the sole receiver for live provider registry updates.
+    ///
+    /// The facade relay calls this exactly once per host instance.
+    #[must_use]
+    pub(crate) fn take_providers_updates(
+        &self,
+    ) -> Option<watch::Receiver<pi_ext::protocol::ProvidersUpdate>> {
+        self.client().take_providers_updates()
+    }
+
+    /// Install the lower-layer callback invoked when a token-bearing
+    /// replacement event is dropped at either host bounded-send hop. The
+    /// callback receives the facade token and endpoint. Called from
+    /// [`ExtensionRuntimeSet::start_bridges`] before any relay begins.
+    pub(crate) fn set_replacement_drop_handler(&self, handler: ReplacementDropHandler) {
+        *self
+            .inner
+            .replacement_drop
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handler);
+    }
+
+    pub(crate) fn set_endpoint_id(&self, endpoint: EndpointId) {
+        *self
+            .inner
+            .endpoint_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(endpoint);
     }
 
     /// Answer a correlated `session.setModel` request.
@@ -1536,6 +1726,127 @@ impl HostExtensionRunner {
         outcome: Result<Value, String>,
     ) -> Result<(), HostClientError> {
         self.inner.client.respond_compact(id, outcome).await
+    }
+
+    /// Answer a correlated `session.newSession` request.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport error if the host has already exited.
+    pub async fn respond_new_session(
+        &self,
+        id: FrameId,
+        cancelled: bool,
+        token: Option<&str>,
+    ) -> Result<(), HostClientError> {
+        self.inner
+            .client
+            .respond_new_session(id, cancelled, token)
+            .await
+    }
+
+    /// Answer a correlated `session.fork` request.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport error if the host has already exited.
+    pub async fn respond_fork(
+        &self,
+        id: FrameId,
+        cancelled: bool,
+        selected_text: Option<&str>,
+        token: Option<&str>,
+    ) -> Result<(), HostClientError> {
+        self.inner
+            .client
+            .respond_fork(id, cancelled, selected_text, token)
+            .await
+    }
+
+    /// Answer a correlated `session.navigateTree` request.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport error if the host has already exited.
+    pub async fn respond_navigate_tree(
+        &self,
+        id: FrameId,
+        outcome: Result<protocol::SessionNavigateTreeResponse, String>,
+    ) -> Result<(), HostClientError> {
+        self.inner.client.respond_navigate_tree(id, outcome).await
+    }
+
+    /// Answer a correlated `session.switchSession` request.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport error if the host has already exited.
+    pub async fn respond_switch_session(
+        &self,
+        id: FrameId,
+        cancelled: bool,
+        token: Option<&str>,
+    ) -> Result<(), HostClientError> {
+        self.inner
+            .client
+            .respond_switch_session(id, cancelled, token)
+            .await
+    }
+
+    /// Answer a correlated `session.reload` request.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport error if the host has already exited.
+    pub async fn respond_reload(
+        &self,
+        id: FrameId,
+        outcome: Result<Option<&str>, String>,
+    ) -> Result<(), HostClientError> {
+        self.inner.client.respond_reload(id, outcome).await
+    }
+
+    /// Answer a correlated `session.setupEntries` request from the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport error if the host has already exited.
+    pub async fn respond_setup_entries(
+        &self,
+        id: FrameId,
+        outcome: Result<protocol::SessionSetupEntriesResponse, String>,
+    ) -> Result<(), HostClientError> {
+        self.inner.client.respond_setup_entries(id, outcome).await
+    }
+
+    /// Reject a ready-gated operation while another operation owns the facade slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport error if the host has already exited.
+    pub async fn respond_replacement_busy(
+        &self,
+        id: FrameId,
+        method: &str,
+    ) -> Result<(), HostClientError> {
+        self.inner.client.respond_replacement_busy(id, method).await
+    }
+
+    /// Answer an unclaimed correlated session request without synthesizing cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport error if the host has already exited.
+    pub async fn respond_session_error(
+        &self,
+        id: FrameId,
+        method: &str,
+        message: &str,
+    ) -> Result<(), HostClientError> {
+        self.inner
+            .client
+            .respond_session_error(id, method, message)
+            .await
     }
     /// Push the mirrored session state to the host (`session.update` event).
     ///
@@ -1807,11 +2118,20 @@ fn clone_registry(source: &Registry) -> Registry {
 /// subscribers; on fatal host conditions marks the runner disabled and emits a
 /// single non-retryable `extension_error`.
 ///
-/// Subscribe-then-check: a fast-exiting host can broadcast `Eof` (then clear
-/// `running`) before this pump subscribes, so the flag is probed after
-/// subscribing — state catches an early EOF, the broadcast catches a late one.
+/// Install-before-subscribe keeps every session-control frame on one ordered
+/// path. Valid replacement traffic cannot exist before this runner is published.
+#[allow(clippy::too_many_lines)]
 fn spawn_event_pump(inner: Arc<Inner>) {
+    let control_inner = Arc::downgrade(&inner);
+    inner
+        .client
+        .set_session_control_handler(Some(Arc::new(move |event| {
+            if let Some(inner) = control_inner.upgrade() {
+                deliver_session_control(&inner, event);
+            }
+        })));
     let mut rx = inner.client.subscribe();
+    let mut correlated = inner.client.take_correlated_requests();
     tokio::spawn(async move {
         if !inner.client.is_running() {
             inner.disabled.store(true, Ordering::Relaxed);
@@ -1820,84 +2140,267 @@ fn spawn_event_pump(inner: Arc<Inner>) {
             return;
         }
         loop {
-            match rx.recv().await {
-                Ok(HostEvent::UiRequest(request)) => {
-                    if !inner.active() || !inner.ui_requests_claimed.load(Ordering::Acquire) {
-                        let _ = inner.client.respond_ui(default_ui_response(&request)).await;
-                    } else if let Err(error) = inner.ui_requests_tx.send(request).await {
-                        let _ = inner.client.respond_ui(default_ui_response(&error.0)).await;
+            // Correlated requests use a bounded lossless mpsc so every accepted
+            // request reaches exactly one consumer; notifications and slot
+            // updates stay on the lossy broadcast. The `select!` is biased so
+            // the lossless channel is drained before polling the broadcast,
+            // preserving request ordering relative to notifications.
+            tokio::select! {
+                biased;
+                correlated_event = async { match &mut correlated {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }} => {
+                    match correlated_event {
+                        Some(HostEvent::SetModelRequest { id, request }) => {
+                            forward_session_bridge(
+                                &inner,
+                                SessionBridgeEvent::SetModel { id, request },
+                            )
+                            .await;
+                        }
+                        Some(HostEvent::CompactRequest { id, request }) => {
+                            forward_session_bridge(
+                                &inner,
+                                SessionBridgeEvent::Compact { id, request },
+                            )
+                            .await;
+                        }
+                        Some(HostEvent::NewSessionRequest { id, request }) => {
+                            forward_session_bridge(
+                                &inner,
+                                SessionBridgeEvent::NewSession { id, request },
+                            )
+                            .await;
+                        }
+                        Some(HostEvent::ForkRequest { id, request }) => {
+                            forward_session_bridge(
+                                &inner,
+                                SessionBridgeEvent::Fork { id, request },
+                            )
+                            .await;
+                        }
+                        Some(HostEvent::NavigateTreeRequest { id, request }) => {
+                            forward_session_bridge(
+                                &inner,
+                                SessionBridgeEvent::NavigateTree { id, request },
+                            )
+                            .await;
+                        }
+                        Some(HostEvent::SwitchSessionRequest { id, request }) => {
+                            forward_session_bridge(
+                                &inner,
+                                SessionBridgeEvent::SwitchSession { id, request },
+                            )
+                            .await;
+                        }
+                        Some(HostEvent::ReloadRequest { id }) => {
+                            forward_session_bridge(&inner, SessionBridgeEvent::Reload { id })
+                                .await;
+                        }
+                        Some(HostEvent::SetupEntriesRequest { id, request }) => {
+                            forward_session_bridge(
+                                &inner,
+                                SessionBridgeEvent::SetupEntries {
+                                    id,
+                                    request,
+                                    origin: inner.endpoint_id(),
+                                },
+                            )
+                            .await;
+                        }
+                        Some(_) => {
+                            // Non-correlated events on the lossless channel are
+                            // unexpected but harmless; the broadcast path handles them.
+                        }
+                        None => {
+                            // Consumer not yet claimed or dropped; the client
+                            // already sent an error response for any pending request.
+                            correlated = None;
+                        }
                     }
                 }
-                Ok(HostEvent::Notify(notification)) => {
-                    inner.notify_send(notification);
+                broadcast_event = rx.recv() => match broadcast_event {
+                    Ok(HostEvent::UiRequest(request)) => {
+                        if !inner.active()
+                            || !inner.ui_requests_claimed.load(Ordering::Acquire)
+                        {
+                            let _ = inner.client.respond_ui(default_ui_response(&request)).await;
+                        } else if let Err(error) = inner.ui_requests_tx.send(request).await {
+                            let _ = inner.client.respond_ui(default_ui_response(&error.0)).await;
+                        }
+                    }
+                    Ok(HostEvent::Notify(notification)) => {
+                        inner.notify_send(notification);
+                    }
+                    Ok(HostEvent::ThemeSet(set)) => {
+                        inner.theme_set_send(set);
+                    }
+                    Ok(HostEvent::UiControl(control)) => {
+                        inner.ui_control_send(control);
+                    }
+                    Ok(HostEvent::SessionCommand(envelope)) => {
+                        deliver_session_control(
+                            &inner,
+                            HostSessionControlEvent::Command(envelope),
+                        );
+                    }
+                    Ok(HostEvent::ReplacementAbort { token }) => {
+                        deliver_session_control(
+                            &inner,
+                            HostSessionControlEvent::ReplacementAbort { token },
+                        );
+                    }
+                    Ok(HostEvent::ReplacementReady { token }) => {
+                        deliver_session_control(
+                            &inner,
+                            HostSessionControlEvent::ReplacementReady { token },
+                        );
+                    }
+                    Ok(HostEvent::UiSlot(slot)) => {
+                        forward_slot(&inner, &slot);
+                    }
+                    Ok(HostEvent::DisposeSlot(d)) => {
+                        forward_dispose(&inner, &d);
+                    }
+                    Ok(HostEvent::ToolUpdate(update)) => {
+                        let _ = inner.tool_updates_tx.send(update);
+                    }
+                    Ok(HostEvent::ProviderEvent(event)) => {
+                        let _ = inner.provider_events_tx.send(event);
+                    }
+                    Ok(HostEvent::ExtensionError(event)) => {
+                        let _ = inner.errors_tx.send(event);
+                    }
+                    Ok(HostEvent::Raw(frame)) => {
+                        inner.disabled.store(true, Ordering::Relaxed);
+                        inner.publish_error(
+                            "extension_protocol",
+                            &format!("unhandled host frame: {} {}", frame.kind, frame.method),
+                            None,
+                        );
+                        HostExtensionRunner::shutdown_once_with_inner(&inner).await;
+                        break;
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        inner.publish_error(
+                            "extension_event_lagged",
+                            &format!("dropped {skipped} extension host events"),
+                            None,
+                        );
+                    }
+                    Ok(HostEvent::Eof) => {
+                        // Host stdout closed: fatal. Disable once, report, then
+                        // shut down / reap the transport exactly once before exit.
+                        inner.disabled.store(true, Ordering::Relaxed);
+                        inner
+                            .publish_error("extension_closed", "extension host stream closed", None);
+                        HostExtensionRunner::shutdown_once_with_inner(&inner).await;
+                        break;
+                    }
+                    Ok(HostEvent::ProtocolError(message)) => {
+                        inner.disabled.store(true, Ordering::Relaxed);
+                        inner.publish_error("extension_protocol", &message, None);
+                        HostExtensionRunner::shutdown_once_with_inner(&inner).await;
+                        break;
+                    }
+                    // Correlated request variants no longer arrive through the
+                    // broadcast (they use the lossless mpsc). Match them to keep
+                    // the match exhaustive without `_ =>` masking new variants.
+                    Ok(
+                        HostEvent::SetModelRequest { .. }
+                        | HostEvent::CompactRequest { .. }
+                        | HostEvent::NewSessionRequest { .. }
+                        | HostEvent::ForkRequest { .. }
+                        | HostEvent::NavigateTreeRequest { .. }
+                        | HostEvent::SwitchSessionRequest { .. }
+                        | HostEvent::ReloadRequest { .. }
+                        | HostEvent::SetupEntriesRequest { .. },
+                    ) => {}
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
-                Ok(HostEvent::ThemeSet(set)) => {
-                    inner.theme_set_send(set);
-                }
-                Ok(HostEvent::UiControl(control)) => {
-                    inner.ui_control_send(control);
-                }
-                Ok(HostEvent::SessionCommand(command)) => {
-                    forward_session_bridge(&inner, SessionBridgeEvent::Command(command)).await;
-                }
-                Ok(HostEvent::SetModelRequest { id, request }) => {
-                    forward_session_bridge(&inner, SessionBridgeEvent::SetModel { id, request })
-                        .await;
-                }
-                Ok(HostEvent::CompactRequest { id, request }) => {
-                    forward_session_bridge(&inner, SessionBridgeEvent::Compact { id, request })
-                        .await;
-                }
-                Ok(HostEvent::UiSlot(slot)) => {
-                    forward_slot(&inner, &slot);
-                }
-                Ok(HostEvent::DisposeSlot(d)) => {
-                    forward_dispose(&inner, &d);
-                }
-                Ok(HostEvent::ToolUpdate(update)) => {
-                    let _ = inner.tool_updates_tx.send(update);
-                }
-                Ok(HostEvent::ProviderEvent(event)) => {
-                    let _ = inner.provider_events_tx.send(event);
-                }
-                Ok(HostEvent::ExtensionError(event)) => {
-                    let _ = inner.errors_tx.send(event);
-                }
-                Ok(HostEvent::Raw(frame)) => {
-                    inner.disabled.store(true, Ordering::Relaxed);
-                    inner.publish_error(
-                        "extension_protocol",
-                        &format!("unhandled host frame: {} {}", frame.kind, frame.method),
-                        None,
-                    );
-                    HostExtensionRunner::shutdown_once_with_inner(&inner).await;
-                    break;
-                }
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    inner.publish_error(
-                        "extension_event_lagged",
-                        &format!("dropped {skipped} extension host events"),
-                        None,
-                    );
-                }
-                Ok(HostEvent::Eof) => {
-                    // Host stdout closed: fatal. Disable once, report, then
-                    // shut down / reap the transport exactly once before exit.
-                    inner.disabled.store(true, Ordering::Relaxed);
-                    inner.publish_error("extension_closed", "extension host stream closed", None);
-                    HostExtensionRunner::shutdown_once_with_inner(&inner).await;
-                    break;
-                }
-                Ok(HostEvent::ProtocolError(message)) => {
-                    inner.disabled.store(true, Ordering::Relaxed);
-                    inner.publish_error("extension_protocol", &message, None);
-                    HostExtensionRunner::shutdown_once_with_inner(&inner).await;
-                    break;
-                }
-                Err(broadcast::error::RecvError::Closed) => break,
             }
         }
     });
+}
+
+/// Route ordered session control synchronously into the bounded bridge.
+fn deliver_session_control(inner: &Arc<Inner>, event: HostSessionControlEvent) {
+    let origin = inner.endpoint_id();
+    let event = match event {
+        HostSessionControlEvent::Command(envelope) => {
+            SessionBridgeEvent::Command { envelope, origin }
+        }
+        HostSessionControlEvent::ReplacementReady { token } => {
+            SessionBridgeEvent::ReplacementReady { token, origin }
+        }
+        HostSessionControlEvent::ReplacementAbort { token } => {
+            SessionBridgeEvent::ReplacementAbort { token, origin }
+        }
+    };
+    let claimed = inner.active() && inner.session_bridge_claimed.load(Ordering::Acquire);
+    let undelivered = if claimed {
+        inner
+            .session_bridge_tx
+            .try_send(event)
+            .err()
+            .map(mpsc::error::TrySendError::into_inner)
+    } else {
+        Some(event)
+    };
+    finish_direct_session_control_delivery(inner, undelivered);
+}
+
+fn finish_direct_session_control_delivery(
+    inner: &Arc<Inner>,
+    undelivered: Option<SessionBridgeEvent>,
+) {
+    let Some(event) = undelivered else {
+        return;
+    };
+    if handle_dropped_session_control(inner, &event) {
+        return;
+    }
+    inner.publish_error(
+        "extension_protocol",
+        "correlated event reached the direct session-control route",
+        None,
+    );
+}
+
+fn handle_dropped_session_control(inner: &Arc<Inner>, event: &SessionBridgeEvent) -> bool {
+    match event {
+        SessionBridgeEvent::Command { envelope, origin } => {
+            if let Some(token) = envelope.replacement_token.as_deref() {
+                handle_dropped_replacement_event(inner, token, *origin);
+            }
+            true
+        }
+        SessionBridgeEvent::ReplacementReady { token, origin }
+        | SessionBridgeEvent::ReplacementAbort { token, origin } => {
+            handle_dropped_replacement_event(inner, token, *origin);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn handle_dropped_replacement_event(inner: &Arc<Inner>, token: &str, origin: Option<EndpointId>) {
+    inner.publish_error(
+        "extension_replacement_dropped",
+        &format!(
+            "replacement bridge event dropped for token {token}: session bridge unavailable or full"
+        ),
+        None,
+    );
+    let handler = inner
+        .replacement_drop
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(handler) = handler {
+        handler(token, origin);
+    }
 }
 
 /// Route one session-bridge item to the claiming session task. Unclaimed,
@@ -1918,7 +2421,21 @@ async fn forward_session_bridge(inner: &Arc<Inner>, event: SessionBridgeEvent) {
         Some(event)
     };
     match undelivered {
-        None | Some(SessionBridgeEvent::Command(_)) => {}
+        None => {}
+        Some(
+            event @ (SessionBridgeEvent::Command { .. }
+            | SessionBridgeEvent::ReplacementReady { .. }
+            | SessionBridgeEvent::ReplacementAbort { .. }),
+        ) => {
+            let handled = handle_dropped_session_control(inner, &event);
+            debug_assert!(handled);
+        }
+        Some(SessionBridgeEvent::SetupEntries { id, .. }) => {
+            let _ = inner
+                .client
+                .respond_setup_entries(id, Err("no active session".to_owned()))
+                .await;
+        }
         Some(SessionBridgeEvent::SetModel { id, .. }) => {
             let _ = inner.client.respond_set_model(id, false).await;
         }
@@ -1926,6 +2443,44 @@ async fn forward_session_bridge(inner: &Arc<Inner>, event: SessionBridgeEvent) {
             let _ = inner
                 .client
                 .respond_compact(id, Err("no active session".to_owned()))
+                .await;
+        }
+        Some(SessionBridgeEvent::NewSession { id, .. }) => {
+            let _ = inner
+                .client
+                .respond_session_error(
+                    id,
+                    protocol::SESSION_NEW_SESSION_METHOD,
+                    "no active session",
+                )
+                .await;
+        }
+        Some(SessionBridgeEvent::Fork { id, .. }) => {
+            let _ = inner
+                .client
+                .respond_session_error(id, protocol::SESSION_FORK_METHOD, "no active session")
+                .await;
+        }
+        Some(SessionBridgeEvent::NavigateTree { id, .. }) => {
+            let _ = inner
+                .client
+                .respond_navigate_tree(id, Err("no active session".to_owned()))
+                .await;
+        }
+        Some(SessionBridgeEvent::SwitchSession { id, .. }) => {
+            let _ = inner
+                .client
+                .respond_session_error(
+                    id,
+                    protocol::SESSION_SWITCH_SESSION_METHOD,
+                    "no active session",
+                )
+                .await;
+        }
+        Some(SessionBridgeEvent::Reload { id }) => {
+            let _ = inner
+                .client
+                .respond_reload(id, Err("no active session".to_owned()))
                 .await;
         }
     }
@@ -2582,6 +3137,7 @@ impl HostExtensionRunner {
         // Order matters for the slot_send/slot_dispose teardown gate: the
         // flag must be set before dispose_all_slots takes the slots lock.
         inner.disabled.store(true, Ordering::Relaxed);
+        inner.client.set_session_control_handler(None);
         inner.dispose_all_slots();
         let _ = inner.client.shutdown().await;
     }

@@ -153,11 +153,15 @@ pub struct FileModelsStore {
 
 impl FileModelsStore {
     /// Create a file-backed models store at `path` (`models-store.json`).
-    #[must_use]
-    pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self {
-            backend: FileLockBackend::new(path),
-        }
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the canonical lock target cannot be
+    /// resolved (symlink cycles, inspection failures).
+    pub fn new(path: impl Into<PathBuf>) -> Result<Self, StoreError> {
+        Ok(Self {
+            backend: FileLockBackend::new(path)?,
+        })
     }
 
     /// Path of the underlying `models-store.json` file.
@@ -587,7 +591,7 @@ mod tests {
 }"#;
         fs::write(&path, raw)?;
 
-        let store = FileModelsStore::new(&path);
+        let store = FileModelsStore::new(&path)?;
         let entry = store
             .read("openrouter")
             .await?
@@ -641,7 +645,7 @@ mod tests {
         let bad = "{ not-json ";
         fs::write(&path, bad)?;
 
-        let store = FileModelsStore::new(&path);
+        let store = FileModelsStore::new(&path)?;
         let Err(err) = store.read("demo").await else {
             return Err("malformed models store unexpectedly parsed".into());
         };
@@ -688,7 +692,7 @@ mod tests {
 }"#;
         fs::write(&path, good)?;
 
-        let store = FileModelsStore::new(&path);
+        let store = FileModelsStore::new(&path)?;
         let mut bad_model = sample_model("demo-1", "demo");
         bad_model.name = "   ".to_owned();
         let Err(err) = store
@@ -825,7 +829,7 @@ mod tests {
         let path_a = path.clone();
         let path_b = path.clone();
         let a = tokio::spawn(async move {
-            let store = FileModelsStore::new(path_a);
+            let store = FileModelsStore::new(path_a)?;
             for i in 0..20 {
                 store
                     .write(
@@ -840,7 +844,7 @@ mod tests {
             Ok::<(), StoreError>(())
         });
         let b = tokio::spawn(async move {
-            let store = FileModelsStore::new(path_b);
+            let store = FileModelsStore::new(path_b)?;
             for i in 0..20 {
                 store
                     .write(
@@ -876,7 +880,7 @@ mod tests {
                 .is_some_and(|m| !m.is_empty())
         );
 
-        let store = FileModelsStore::new(&path);
+        let store = FileModelsStore::new(&path)?;
         let alpha = store
             .read("alpha")
             .await?

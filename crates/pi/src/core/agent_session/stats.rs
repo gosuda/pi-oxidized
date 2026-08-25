@@ -53,13 +53,17 @@ pub struct SessionStats {
 /// Token totals (TypeScript `SessionStats['tokens']`).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct SessionTokenTotals {
-    /// Sum of assistant `usage.input`.
+    /// Sum of `usage.input` across assistant messages, compaction, and
+    /// branch-summary entries.
     pub input: u64,
-    /// Sum of assistant `usage.output`.
+    /// Sum of `usage.output` across assistant messages, compaction, and
+    /// branch-summary entries.
     pub output: u64,
-    /// Sum of assistant `usage.cacheRead`.
+    /// Sum of `usage.cacheRead` across assistant messages, compaction, and
+    /// branch-summary entries.
     pub cache_read: u64,
-    /// Sum of assistant `usage.cacheWrite`.
+    /// Sum of `usage.cacheWrite` across assistant messages, compaction, and
+    /// branch-summary entries.
     pub cache_write: u64,
     /// `input + output + cache_read + cache_write`.
     pub total: u64,
@@ -107,6 +111,18 @@ impl AgentSession {
         let mut cost = 0f64;
 
         for entry in &entries {
+            // Persisted summary entries (compaction / branch_summary) carry
+            // their own LLM usage from the summarization call. Include it in
+            // token/cost totals so they reflect what was actually billed
+            // (TypeScript `addUsageToTotals` on `entry.usage`).
+            if let Some(usage) = summary_usage(entry) {
+                input = input.saturating_add(usage.input);
+                output = output.saturating_add(usage.output);
+                cache_read = cache_read.saturating_add(usage.cache_read);
+                cache_write = cache_write.saturating_add(usage.cache_write);
+                cost += usage.cost.total;
+            }
+
             let SessionEntry::Message(message_entry) = entry else {
                 continue;
             };
@@ -237,6 +253,20 @@ fn u64_as_f64(value: u64) -> f64 {
     f64::from(high).mul_add(4_294_967_296.0, f64::from(low))
 }
 
+/// LLM usage attached to a persisted summary entry (compaction or
+/// branch-summary), when present.
+///
+/// Both entry types carry an optional `Usage` from the summarization call;
+/// this extracts it through one path so the aggregation loop accumulates
+/// once (special-case elimination).
+fn summary_usage(entry: &SessionEntry) -> Option<&pi_ai::Usage> {
+    match entry {
+        SessionEntry::Compaction(c) => c.usage.as_ref(),
+        SessionEntry::BranchSummary(b) => b.usage.as_ref(),
+        _ => None,
+    }
+}
+
 /// Tokens reported by an assistant entry usable as a post-compaction baseline.
 ///
 /// Skips `aborted` / `error` stop reasons (TypeScript
@@ -272,31 +302,170 @@ fn model_context_window(model: &Model) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::core::agent_session::{AgentSession, AgentSessionConfig};
+    use futures::stream::{self, BoxStream, StreamExt};
+    use pi_ai::{
+        AssistantMessageEvent, Context, Model, ModelCost, ModelInput, Provider, ProviderError,
+        StreamOptions, Usage, UsageCost,
+    };
+    use std::sync::Arc;
 
-    #[test]
-    fn context_usage_tokens_when_window_zero_is_none() {
-        // Direct constructor test: a zero context window means we cannot
-        // estimate; the public getter returns `None`.
-        let usage = ContextUsage {
-            tokens: Some(100),
-            context_window: 0,
-            percent: None,
-        };
-        assert_eq!(usage.context_window, 0);
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    fn test_model() -> Model {
+        Model {
+            id: "m".to_owned(),
+            name: "m".to_owned(),
+            api: "test-api".to_owned(),
+            provider: "test-provider".to_owned(),
+            base_url: String::new(),
+            reasoning: false,
+            thinking_level_map: None,
+            input: vec![ModelInput::Text],
+            cost: ModelCost::default(),
+            context_window: 8_192,
+            max_tokens: 1_024,
+            headers: None,
+            compat: None,
+            extra: std::collections::BTreeMap::new(),
+        }
     }
 
-    #[test]
-    fn token_totals_saturate_instead_of_overflow() {
-        let totals = SessionTokenTotals {
-            input: u64::MAX,
-            output: 1,
-            cache_read: 0,
-            cache_write: 0,
-            total: 0,
+    #[derive(Clone)]
+    struct StubProvider;
+
+    impl Provider for StubProvider {
+        fn stream(
+            &self,
+            _model: &Model,
+            _context: Context,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, Result<AssistantMessageEvent, ProviderError>> {
+            stream::empty().boxed()
+        }
+    }
+
+    fn make_session() -> TestResult<Arc<AgentSession>> {
+        let config = AgentSessionConfig::test_config(Arc::new(StubProvider), test_model())?;
+        AgentSession::new(config).map_err(Into::into)
+    }
+
+    fn summary_usage(input: u64, output: u64, cost_total: f64) -> Usage {
+        Usage {
+            input,
+            output,
+            cache_read: input / 2,
+            cache_write: output / 2,
+            cost: UsageCost {
+                total: cost_total,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// A zero context-window model means `get_context_usage` cannot estimate
+    /// and must return `None` (TypeScript `getContextUsage` early return).
+    #[tokio::test]
+    async fn context_usage_tokens_when_window_zero_is_none() -> TestResult {
+        let mut model = test_model();
+        model.context_window = 0;
+        let session = {
+            let config = AgentSessionConfig::test_config(Arc::new(StubProvider), model)?;
+            AgentSession::new(config)?
         };
-        // The aggregation path uses saturating_add; just sanity-check that
-        // the helper struct accepts extreme values without panic.
-        assert_eq!(totals.input, u64::MAX);
+        // No compaction, no assistant entries — but the zero window alone
+        // forces `None` before any branch inspection.
+        assert!(session.get_context_usage().await.is_none());
+        Ok(())
+    }
+
+    /// Two compaction usages whose input sums exceed `u64::MAX` must saturate
+    /// at `u64::MAX` rather than overflowing (TypeScript saturating-add path).
+    #[tokio::test]
+    async fn token_totals_saturate_instead_of_overflow() -> TestResult {
+        let session = make_session()?;
+        // Each compaction carries input = u64::MAX; the aggregation path
+        // uses `saturating_add`, so the total clamps at `u64::MAX`.
+        let overflow_usage = summary_usage(u64::MAX, 0, 0.0);
+        {
+            let mut sm = session.session_manager.lock().await;
+            sm.append_compaction(
+                "first compaction",
+                "kept1",
+                1000,
+                None,
+                None,
+                Some(overflow_usage.clone()),
+            )?;
+            sm.append_compaction(
+                "second compaction",
+                "kept2",
+                2000,
+                None,
+                None,
+                Some(overflow_usage),
+            )?;
+        }
+        let stats = session.get_session_stats().await;
+        assert_eq!(
+            stats.tokens.input,
+            u64::MAX,
+            "input must saturate at u64::MAX, not overflow"
+        );
+        Ok(())
+    }
+
+    /// Totals must include persisted `usage` on `compaction` and
+    /// `branch_summary` entries, not just assistant messages.
+    #[tokio::test]
+    async fn stats_include_compaction_and_branch_summary_usage() -> TestResult {
+        let session = make_session()?;
+        let compaction_usage = summary_usage(100, 200, 0.03);
+        let branch_usage = summary_usage(10, 20, 0.01);
+
+        {
+            let mut sm = session.session_manager.lock().await;
+            sm.append_compaction(
+                "compaction summary",
+                "kept1",
+                1000,
+                None,
+                None,
+                Some(compaction_usage),
+            )?;
+            sm.branch_with_summary(None, "branch summary", None, None, Some(branch_usage))?;
+        }
+
+        let stats = session.get_session_stats().await;
+
+        // Compaction: input=100, output=200, cache_read=50, cache_write=100, cost=0.03
+        // Branch:     input=10,  output=20,  cache_read=5,  cache_write=10,  cost=0.01
+        // Totals:     input=110, output=220, cache_read=55, cache_write=110, cost=0.04
+        assert_eq!(
+            stats.tokens.input, 110,
+            "input should include both summary usages"
+        );
+        assert_eq!(
+            stats.tokens.output, 220,
+            "output should include both summary usages"
+        );
+        assert_eq!(
+            stats.tokens.cache_read, 55,
+            "cache_read should include both summary usages"
+        );
+        assert_eq!(
+            stats.tokens.cache_write, 110,
+            "cache_write should include both summary usages"
+        );
+        assert!(
+            (stats.cost - 0.04).abs() < f64::EPSILON,
+            "cost should include both summary usages, got {}",
+            stats.cost
+        );
+        // No message entries → message counts unchanged.
+        assert_eq!(stats.total_messages, 0);
+        assert_eq!(stats.assistant_messages, 0);
+        Ok(())
     }
 }

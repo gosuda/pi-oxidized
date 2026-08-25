@@ -17,7 +17,6 @@
  *   --out / --out-dir <dir>  output directory (default: <cwd>/dist/release)
  *   --dry-run                skip cargo + host build; assemble from stub binaries
  *   --no-cargo               skip cargo build, but still compile host and archive
- *   --skip-host-tests        skip `bun test` inside the host package
  *   --no-handshake           skip the host `hello` handshake verification
  *   --source-date-epoch <s>  override SOURCE_DATE_EPOCH for archive mtimes
  *
@@ -112,7 +111,6 @@ async function main(): Promise<void> {
 					repoRoot,
 					stagingRoot,
 					plan: args.plan,
-					skipTests: args.skipHostTests,
 					skipRuntimeImport: false,
 					skipHandshake: !args.handshake,
 					runner,

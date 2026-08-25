@@ -31,10 +31,13 @@
 {"id":0,"kind":"event","method":"theme.update","payload":{"theme":{"name":"dark","sourcePath":"/pkg/theme/dark.json","colorMode":"truecolor","fg":{"text":"#ededed","accent":39,"muted":""},"bg":{"selectedBg":"#0a0a0a"}},"terminalTheme":"light","themeMode":"auto","themeGeneration":42,"themes":[{"name":"mytheme","path":"/agent/themes/my-file.json","fileStem":"my-file","theme":{"name":"mytheme","colorMode":"256color","fg":{},"bg":{}}}]}}
 {"id":0,"kind":"event","method":"theme.set","payload":{"name":"light/dark","persist":true}}
 {"id":0,"kind":"event","method":"theme.set","payload":{"persist":false,"theme":{"colorMode":"truecolor","fg":{"text":"#ffffff"},"bg":{}}}}
-{"id":0,"kind":"event","method":"session.update","payload":{"sessionName":"My Session","thinkingLevel":"medium","activeTools":["read","bash"],"allTools":[{"name":"read","description":"Read a file","parameters":{"type":"object"},"source":"builtin"}],"commands":[{"name":"review","description":"Review changes","source":"extension"}],"model":{"id":"gpt-x","provider":"openai"},"isIdle":true,"hasPendingMessages":false,"contextUsage":{"tokens":1200,"contextWindow":128000,"percent":0.9},"systemPrompt":"You are pi."}}
+{"id":0,"kind":"event","method":"session.update","payload":{"sessionName":"My Session","thinkingLevel":"medium","activeTools":["read","bash"],"allTools":[{"name":"read","description":"Read a file","parameters":{"type":"object"},"source":"builtin"}],"commands":[{"name":"review","description":"Review changes","source":"extension"}],"model":{"id":"gpt-x","provider":"openai"},"scopedModels":[{"model":{"id":"gpt-x","provider":"openai"},"thinkingLevel":"high"},{"model":{"id":"haiku","provider":"anthropic"}}],"isIdle":true,"hasPendingMessages":false,"contextUsage":{"tokens":1200,"contextWindow":128000,"percent":0.9},"systemPrompt":"You are pi."}}
 {"id":0,"kind":"event","method":"session.command","payload":{"action":"setSessionName","name":"Renamed"}}
 {"id":0,"kind":"event","method":"session.command","payload":{"action":"sendMessage","message":{"customType":"note","content":"hi","display":true},"options":{"triggerTurn":false,"deliverAs":"nextTurn"}}}
 {"id":0,"kind":"event","method":"session.command","payload":{"action":"shutdown"}}
+{"id":0,"kind":"event","method":"session.command","payload":{"replacementToken":"tok-candidate","action":"setSessionName","name":"Candidate"}}
+{"id":0,"kind":"event","method":"session.command","payload":{"replacementToken":"tok-candidate","action":"sendMessage","message":{"customType":"note","content":"hi","display":true}}}
+{"id":0,"kind":"event","method":"session.command","payload":{"replacementToken":"tok-candidate","action":"shutdown"}}
 {"id":17,"kind":"req","method":"session.compact","payload":{"customInstructions":"keep decisions"}}
 {"id":17,"kind":"res","method":"session.compact","payload":{"result":{"summary":"…","firstKeptEntryId":"e9","tokensBefore":1200,"details":null}}}
 {"id":16,"kind":"req","method":"session.setModel","payload":{"model":{"id":"gpt-x","provider":"openai"}}}
@@ -43,3 +46,28 @@
 {"id":0,"kind":"event","method":"ui.control","payload":{"control":"setEditorText","text":"draft"}}
 {"id":0,"kind":"event","method":"ui.control","payload":{"control":"setToolsExpanded","expanded":true}}
 {"id":0,"kind":"event","method":"ui.state","payload":{"editorText":"draft","toolsExpanded":true}}
+{"id":18,"kind":"req","method":"session.newSession","payload":{"parentSession":"parent-1"}}
+{"id":18,"kind":"res","method":"session.newSession","payload":{"cancelled":false,"replacementToken":"tok-1"}}
+{"id":19,"kind":"req","method":"session.fork","payload":{"entryId":"e1","position":"at"}}
+{"id":19,"kind":"res","method":"session.fork","payload":{"cancelled":false,"selectedText":"picked","replacementToken":"tok-2"}}
+{"id":20,"kind":"req","method":"session.navigateTree","payload":{"targetId":"e2"}}
+{"id":20,"kind":"res","method":"session.navigateTree","payload":{"cancelled":false}}
+{"id":21,"kind":"req","method":"session.navigateTree","payload":{"targetId":"e3","summarize":true,"customInstructions":"sum","replaceInstructions":true,"label":"L"}}
+{"id":21,"kind":"res","method":"session.navigateTree","payload":{"cancelled":false,"editorText":"draft","aborted":false,"summaryEntry":{"type":"branch_summary","id":"s1","parentId":"e3","timestamp":1,"fromId":"e0","summary":"kept"}}}
+{"id":22,"kind":"req","method":"session.switchSession","payload":{"sessionPath":"/tmp/s.jsonl"}}
+{"id":22,"kind":"res","method":"session.switchSession","payload":{"cancelled":true}}
+{"id":23,"kind":"req","method":"session.reload","payload":{}}
+{"id":23,"kind":"res","method":"session.reload","payload":{"replacementToken":"tok-3"}}
+{"id":24,"kind":"error","method":"session.newSession","payload":{"code":"replacement_busy","message":"session replacement in progress","retryable":true}}
+{"id":25,"kind":"error","method":"session.setModel","payload":{"code":"extension_error","message":"model not available","retryable":false}}
+{"id":26,"kind":"error","method":"session.compact","payload":{"code":"extension_error","message":"compaction failed","retryable":false}}
+{"id":27,"kind":"error","method":"session.fork","payload":{"code":"replacement_busy","message":"session replacement in progress","retryable":true}}
+{"id":28,"kind":"error","method":"session.navigateTree","payload":{"code":"extension_error","message":"entry not found","retryable":false}}
+{"id":29,"kind":"error","method":"session.switchSession","payload":{"code":"replacement_busy","message":"session replacement in progress","retryable":true}}
+{"id":30,"kind":"error","method":"session.reload","payload":{"code":"extension_error","message":"reload failed","retryable":false}}
+{"id":31,"kind":"req","method":"session.setupEntries","payload":{"replacementToken":"tok-1"}}
+{"id":31,"kind":"res","method":"session.setupEntries","payload":{"entries":[{"type":"message","id":"e1","parentId":null,"timestamp":"2025-01-01T00:00:00.000Z","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}]}}
+{"id":32,"kind":"error","method":"session.setupEntries","payload":{"code":"extension_error","message":"stale replacement token","retryable":false}}
+{"id":0,"kind":"event","method":"session.replacementReady","payload":{"token":"tok-1"}}
+{"id":0,"kind":"event","method":"session.replacementAbort","payload":{"token":"tok-candidate"}}
+{"id":0,"kind":"event","method":"providers.update","payload":{"providers":[{"name":"custom","baseUrl":"https://custom.example/v1","api":"openai-completions","streamSimple":true,"models":[{"id":"custom-model","reasoning":false}]},{"name":"baseurl-only","baseUrl":"https://base.example/v1"}]}}

@@ -15,11 +15,16 @@ use pi_ext::protocol::FlagValueWire;
 use thiserror::Error;
 
 use super::config::{get_agent_dir, get_docs_path, resolve_path};
-use super::extension_runtime_set::{ExtensionRuntimeSet, ExtensionSetStart};
+use super::extension_runtime_set::{
+    ExtensionRuntimeSet, ExtensionSetDiagnostic, ExtensionSetStart,
+};
 use super::model_runtime::{
     CreateModelRuntimeOptions, ModelRuntime, ModelRuntimeError, ProviderConfigInput,
 };
-use super::resources::{DefaultResourceLoader, DefaultResourceLoaderOptions, ResourceLoader};
+use super::resources::{
+    DefaultResourceLoader, DefaultResourceLoaderOptions, ExtensionPathInfo, ResourceLoader,
+    SourceInfo,
+};
 use super::settings::{SettingsManager, SettingsManagerCreateOptions};
 use super::trust::{ProjectTrustStore, ResolveProjectTrustedOptions, resolve_project_trusted};
 
@@ -512,15 +517,22 @@ pub async fn create_agent_session_services_with_trust(
     let (flag_diagnostics, applied_flags) =
         apply_extension_flag_values(extension_flag_values.unwrap_or_default(), &registered_flags);
     diagnostics.extend(flag_diagnostics);
-    if let Some(runner) = extension_runner.as_deref()
-        && let Err(error) = apply_flags_to_runner(runner, &applied_flags).await
-    {
-        diagnostics.push(AgentSessionRuntimeDiagnostic::error(format!(
-            "Extension flags failed to apply: {error}"
-        )));
-        runner.unregister_providers_from(&foundation.model_runtime);
-        runner.shutdown_once().await;
-        extension_runner = None;
+    if let Some(runner) = extension_runner.as_deref() {
+        match apply_flags_to_runner(runner, &applied_flags).await {
+            Ok(flag_diagnostics) => {
+                diagnostics.extend(flag_diagnostics.into_iter().map(|diagnostic| {
+                    AgentSessionRuntimeDiagnostic::warning(diagnostic.to_string())
+                }));
+            }
+            Err(error) => {
+                diagnostics.push(AgentSessionRuntimeDiagnostic::error(format!(
+                    "Extension flags failed to apply: {error}"
+                )));
+                runner.unregister_providers_from(&foundation.model_runtime);
+                runner.shutdown_once().await;
+                extension_runner = None;
+            }
+        }
     }
 
     for registration in pending_provider_registrations {
@@ -650,10 +662,7 @@ fn record_extension_start(
 ) -> Option<Arc<ExtensionRuntimeSet>> {
     let generation_survived = started.set.is_some();
     for diagnostic in started.diagnostics {
-        let message = format!(
-            "Extension \"{}\" error: {}",
-            diagnostic.path, diagnostic.message
-        );
+        let message = diagnostic.to_string();
         diagnostics.push(if generation_survived {
             AgentSessionRuntimeDiagnostic::warning(message)
         } else {
@@ -677,9 +686,8 @@ async fn start_extension_phase(
     if discovery.disables(ResourceDiscoveryPolicy::EXTENSIONS) {
         return (None, BTreeMap::new());
     }
-    let paths = loader
-        .get_extensions()
-        .paths
+    let extension_infos = loader.get_extensions().paths.clone();
+    let paths = extension_infos
         .iter()
         .map(|info| {
             if info.resolved_path.is_empty() {
@@ -698,6 +706,7 @@ async fn start_extension_phase(
     let Some(runner) = record_extension_start(started, diagnostics) else {
         return (None, BTreeMap::new());
     };
+    runner.set_command_source_infos(command_source_info_entries(extension_infos));
     for (path, outcome) in runner.register_providers_on(model_runtime) {
         if let Err(error) = outcome {
             diagnostics.push(AgentSessionRuntimeDiagnostic::error(format!(
@@ -712,7 +721,7 @@ async fn start_extension_phase(
 async fn apply_flags_to_runner(
     runner: &ExtensionRuntimeSet,
     applied_flags: &BTreeMap<String, ExtensionFlagValue>,
-) -> Result<(), pi_ext::client::HostClientError> {
+) -> Result<Vec<ExtensionSetDiagnostic>, pi_ext::client::HostClientError> {
     let values = applied_flags
         .iter()
         .map(|(name, value)| {
@@ -726,11 +735,31 @@ async fn apply_flags_to_runner(
     runner.apply_flag_values(&values).await
 }
 
+/// Build the `(path, source_info)` entries for
+/// [`ExtensionRuntimeSet::set_command_source_infos`].
+///
+/// An empty `resolved_path` (the loader falls back to `info.path` for
+/// execution) would collide every unresolved extension onto one `""` key —
+/// last silently wins. Skip it, and skip the duplicate entry when
+/// `path == resolved_path`.
+fn command_source_info_entries(
+    infos: Vec<ExtensionPathInfo>,
+) -> impl Iterator<Item = (String, SourceInfo)> {
+    infos.into_iter().flat_map(|info| {
+        let source = info.source_info;
+        let resolved = (!info.resolved_path.is_empty() && info.resolved_path != info.path)
+            .then(|| (info.resolved_path, source.clone()));
+        [(info.path, source)].into_iter().chain(resolved)
+    })
+}
+
 /// Validate and apply extension CLI flag values.
 ///
 /// Unknown flags produce a single error diagnostic with the exact
-/// `Unknown option[s]: --a, --b` wording. Boolean flags ignore provided string
-/// values and store `true`. String flags require a string value.
+/// `Unknown option[s]: --a, --b` wording. Boolean flags preserve the
+/// provided boolean value (including `false`); a string value for a
+/// declared boolean flag is rejected with a diagnostic and not applied.
+/// String flags require a string value.
 #[must_use]
 pub fn apply_extension_flag_values(
     extension_flag_values: BTreeMap<String, ExtensionFlagValue>,
@@ -753,9 +782,16 @@ pub fn apply_extension_flag_values(
             continue;
         };
         match flag_type {
-            ExtensionFlagType::Boolean => {
-                applied.insert(name, ExtensionFlagValue::Bool(true));
-            }
+            ExtensionFlagType::Boolean => match value {
+                ExtensionFlagValue::Bool(b) => {
+                    applied.insert(name, ExtensionFlagValue::Bool(b));
+                }
+                ExtensionFlagValue::Str(_) => {
+                    diagnostics.push(AgentSessionRuntimeDiagnostic::error(format!(
+                        "Extension flag \"--{name}\" does not take a value"
+                    )));
+                }
+            },
             ExtensionFlagType::String => match value {
                 ExtensionFlagValue::Str(text) => {
                     applied.insert(name, ExtensionFlagValue::Str(text));
@@ -1653,5 +1689,77 @@ mod tests {
                 "Extension \"broken.ts\" error: load failed"
             )]
         );
+    }
+
+    #[test]
+    fn command_source_info_entries_skips_empty_and_duplicate_resolved_path() {
+        use crate::core::resources::{ExtensionPathInfo, SourceInfo, SourceOrigin, SourceScope};
+
+        fn src(path: &str) -> SourceInfo {
+            SourceInfo {
+                path: path.to_owned(),
+                source: "local".to_owned(),
+                scope: SourceScope::Temporary,
+                origin: SourceOrigin::TopLevel,
+                base_dir: None,
+            }
+        }
+
+        // Two extensions with empty resolved_path: without the fix both
+        // write ("", source) and collide — last silently wins. With the fix
+        // each keeps its own path key.
+        let infos = vec![
+            ExtensionPathInfo {
+                path: "/ext/a".to_owned(),
+                resolved_path: String::new(),
+                source_info: src("/ext/a"),
+            },
+            ExtensionPathInfo {
+                path: "/ext/b".to_owned(),
+                resolved_path: String::new(),
+                source_info: src("/ext/b"),
+            },
+        ];
+        let map: std::collections::HashMap<String, SourceInfo> =
+            command_source_info_entries(infos).collect();
+        assert_eq!(
+            map.get("/ext/a").map(|info| info.path.as_str()),
+            Some("/ext/a")
+        );
+        assert_eq!(
+            map.get("/ext/b").map(|info| info.path.as_str()),
+            Some("/ext/b")
+        );
+        assert!(!map.contains_key(""), "no empty-string collision key");
+
+        // path == resolved_path: only one entry, not a duplicate.
+        let infos = vec![ExtensionPathInfo {
+            path: "/ext/c".to_owned(),
+            resolved_path: "/ext/c".to_owned(),
+            source_info: src("/ext/c"),
+        }];
+        let map: std::collections::HashMap<String, SourceInfo> =
+            command_source_info_entries(infos).collect();
+        assert_eq!(
+            map.len(),
+            1,
+            "duplicate path==resolved must produce one entry"
+        );
+
+        // Distinct path and resolved_path: two entries.
+        let infos = vec![ExtensionPathInfo {
+            path: "/ext/d".to_owned(),
+            resolved_path: "/resolved/d".to_owned(),
+            source_info: src("/ext/d"),
+        }];
+        let map: std::collections::HashMap<String, SourceInfo> =
+            command_source_info_entries(infos).collect();
+        assert_eq!(
+            map.len(),
+            2,
+            "distinct path+resolved must produce two entries"
+        );
+        assert!(map.contains_key("/ext/d"));
+        assert!(map.contains_key("/resolved/d"));
     }
 }

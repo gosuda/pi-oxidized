@@ -40,6 +40,7 @@
 use std::fmt::Debug;
 use std::io::{self, Write};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
@@ -109,6 +110,52 @@ const SPINNER_TICK: Duration = Duration::from_millis(80);
 /// Bound on the runtime's incoming event channel. Matches the agent crate's
 /// extension-queue capacity so a lagging consumer surfaces backpressure early.
 pub const EVENT_CHANNEL_CAPACITY: usize = 256;
+
+/// Maximum UTF-8 bytes of sanitized terminal title payload (OSC 0).
+pub(crate) const MAX_TERMINAL_TITLE_BYTES: usize = 256;
+
+/// OSC 0 set-icon-name-and-window-title introducer (`ESC ] 0 ;`).
+const OSC0_SET_TITLE_PREFIX: &[u8] = b"\x1b]0;";
+
+/// BEL terminates an OSC sequence.
+const OSC_BEL: u8 = 0x07;
+
+/// Sanitize extension-supplied terminal title text for OSC 0 emission.
+///
+/// Drops every [`char::is_control`] scalar and stops before the sanitized
+/// payload would exceed [`MAX_TERMINAL_TITLE_BYTES`] UTF-8 bytes, never
+/// splitting a scalar.
+#[must_use]
+pub(crate) fn sanitize_terminal_title(title: &str) -> String {
+    let mut out = String::new();
+    let mut byte_len = 0usize;
+    for ch in title.chars() {
+        if ch.is_control() {
+            continue;
+        }
+        let ch_len = ch.len_utf8();
+        if byte_len + ch_len > MAX_TERMINAL_TITLE_BYTES {
+            break;
+        }
+        out.push(ch);
+        byte_len += ch_len;
+    }
+    out
+}
+
+/// Encode a safe OSC 0 set-title sequence for `title`.
+///
+/// Only the sanitized payload is written between the fixed introducer and
+/// BEL terminator; hostile control/C1 bytes cannot break the sink.
+#[must_use]
+pub(crate) fn encode_osc0_set_title(title: &str) -> Vec<u8> {
+    let sanitized = sanitize_terminal_title(title);
+    let mut sequence = Vec::with_capacity(OSC0_SET_TITLE_PREFIX.len() + sanitized.len() + 1);
+    sequence.extend_from_slice(OSC0_SET_TITLE_PREFIX);
+    sequence.extend_from_slice(sanitized.as_bytes());
+    sequence.push(OSC_BEL);
+    sequence
+}
 
 // ---------------------------------------------------------------------------
 // SessionHost trait
@@ -327,7 +374,7 @@ pub trait SessionHost: Send + Sync + 'static {
     fn cycle_model(&self, forward: bool) -> BoxFuture<'_, Result<(), String>>;
 
     /// Reload extensions / resources / keybindings.
-    fn reload(&self) -> BoxFuture<'_, Result<(), String>>;
+    fn reload(&self) -> BoxFuture<'_, Result<Vec<String>, String>>;
 
     /// Returns the full transcript for the current session (used on rebind).
     fn messages(&self) -> Vec<pi_agent::AgentMessage>;
@@ -666,6 +713,11 @@ impl Default for InteractiveRuntimeOptions {
 
 impl InteractiveRuntimeOptions {
     /// Build production startup options from environment capabilities.
+    ///
+    /// Detection performs blocking terminal I/O (see
+    /// [`TerminalCapabilities::detect`]), so async callers must offload it
+    /// with `tokio::task::spawn_blocking` rather than run it on a runtime
+    /// worker.
     #[must_use]
     pub fn detect() -> Self {
         let caps = TerminalCapabilities::detect();
@@ -1062,6 +1114,46 @@ struct DisplayPreferences {
 /// The caller owns the [`pi_tui::terminal::guard::TerminalGuard`] so it can
 /// outlive the runtime and write restore bytes on process exit even if the
 /// runtime itself panics.
+struct SessionRebindSignal {
+    next_generation: AtomicU64,
+    pending_generation: AtomicU64,
+    tx: mpsc::UnboundedSender<u64>,
+}
+
+impl SessionRebindSignal {
+    fn new(tx: mpsc::UnboundedSender<u64>) -> Self {
+        Self {
+            next_generation: AtomicU64::new(1),
+            pending_generation: AtomicU64::new(0),
+            tx,
+        }
+    }
+
+    fn begin(&self) {
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        self.pending_generation.store(generation, Ordering::Release);
+    }
+
+    fn pending(&self) -> u64 {
+        self.pending_generation.load(Ordering::Acquire)
+    }
+
+    fn signal_completion(&self) {
+        let generation = self.pending();
+        if generation != 0 {
+            let _ = self.tx.send(generation);
+        }
+    }
+
+    fn claim(&self, generation: u64) -> bool {
+        self.pending_generation
+            .compare_exchange(generation, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+}
+
+/// Interactive terminal event loop and rendered session state.
+#[allow(clippy::struct_excessive_bools)]
 pub struct InteractiveRuntime<W: Write, S: SessionHost> {
     tui: Tui<W>,
     input: TerminalInput,
@@ -1072,6 +1164,11 @@ pub struct InteractiveRuntime<W: Write, S: SessionHost> {
     input_state: InputState,
     events: EventSubscription,
     partial: watch::Receiver<Option<Arc<AssistantMessage>>>,
+    /// Generation handshake for bridge-driven replacement channel closure.
+    session_rebind_signal: Arc<SessionRebindSignal>,
+    session_rebind_rx: mpsc::UnboundedReceiver<u64>,
+    session_events_closed_for_rebind: bool,
+    session_rebind_channel_closed: bool,
     prompt_operations: PromptOperations,
     coalesce_deadline: Option<Instant>,
     /// When the current status phase began; `None` while no status is shown.
@@ -1324,6 +1421,8 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         let (theme_preview_tx, theme_preview_rx) = mpsc::unbounded_channel::<String>();
         let (extension_select_tx, extension_select_rx) = mpsc::unbounded_channel::<String>();
         let (extension_action_tx, extension_action_rx) = mpsc::unbounded_channel();
+        let (session_rebind_tx, session_rebind_rx) = mpsc::unbounded_channel();
+        let session_rebind_signal = Arc::new(SessionRebindSignal::new(session_rebind_tx));
 
         let editor = build_initial_editor(options, submit_tx.clone());
         let agent_dir = crate::core::config::get_agent_dir();
@@ -1339,6 +1438,10 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             mapper: super::input::InputMapper::with_keybindings(keybindings),
             input_state: InputState::new(options.double_escape),
             events,
+            session_rebind_signal,
+            session_rebind_rx,
+            session_events_closed_for_rebind: false,
+            session_rebind_channel_closed: false,
             partial,
             prompt_operations: PromptOperations::new(),
             coalesce_deadline: None,
@@ -1595,15 +1698,27 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                         self.exited = true;
                     }
                 }
-                ev = self.events.rx.recv() => {
+                ev = self.events.rx.recv(), if !self.session_events_closed_for_rebind => {
                     if let Some(event) = ev {
                         self.handle_session_event(&event);
                         if event_refreshes_footer(&event) {
                             self.refresh_footer().await;
                         }
+                    } else if self.session_rebind_signal.pending() != 0 {
+                        self.session_events_closed_for_rebind = true;
                     } else {
                         self.exit_kind = InteractiveExit::SessionEnded;
                         self.exited = true;
+                    }
+                }
+                generation = self.session_rebind_rx.recv(), if !self.session_rebind_channel_closed => {
+                    match generation {
+                        Some(generation) => {
+                            self.handle_session_rebind_completion(generation).await;
+                        }
+                        None => {
+                            self.session_rebind_channel_closed = true;
+                        }
                     }
                 }
                 extension_event = recv_extension_event(&mut self.extension_events) => {
@@ -1625,7 +1740,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 ), if self.pending_extension_dialog.as_ref().and_then(|dialog| dialog.deadline).is_some() => {
                     self.cancel_extension_dialog().await;
                 }
-                changed = self.partial.changed() => {
+                changed = self.partial.changed(), if !self.session_events_closed_for_rebind => {
                     if changed.is_ok() {
                         self.handle_partial_update();
                     }
@@ -2082,7 +2197,14 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         if self.pending_extension_dialog.is_some() {
             self.cancel_extension_dialog().await;
         }
-        self.record_err(self.session.reload().await);
+        match self.session.reload().await {
+            Ok(messages) => {
+                for message in messages {
+                    self.push_notice("reload", message);
+                }
+            }
+            Err(error) => self.last_error = Some(error),
+        }
         self.rebind_extension_channels().await;
         if let Ok(Some(dark)) = self.input.requery_background(self.tui.outer_mut()).await {
             self.tui.capabilities_mut().set_dark_background(Some(dark));
@@ -3414,9 +3536,10 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 self.chat_dirty = true;
             }
             UiControl::SetTitle { title } => {
-                // Best-effort OSC 0 title; terminals that ignore it are fine.
-                let title = title.unwrap_or_default();
-                let _ = write!(self.tui.outer_mut(), "\x1b]0;{title}\x07");
+                let sequence = encode_osc0_set_title(title.as_deref().unwrap_or(""));
+                if let Err(error) = self.tui.outer_mut().write_all(&sequence) {
+                    self.last_error = Some(format!("write terminal title: {error}"));
+                }
             }
             UiControl::PasteToEditor { text } => {
                 let _ = self.paste_text(&text);
@@ -3980,6 +4103,15 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         }
     }
 
+    async fn handle_session_rebind_completion(&mut self, generation: u64) {
+        if !self.session_rebind_signal.claim(generation) {
+            return;
+        }
+        self.rebind_session_channels().await;
+        self.refresh_footer().await;
+        self.session_events_closed_for_rebind = false;
+    }
+
     /// Rebind event/partial subscriptions and reload the transcript after a
     /// session replacement. Used by production rebind callback and tests.
     pub async fn rebind_session_channels(&mut self) {
@@ -4386,7 +4518,28 @@ fn project_event(view: &mut ViewState, event: &AgentSessionEvent) {
         | Event::SessionBeforeFork { .. }
         | Event::SessionStart { .. }
         | Event::SessionShutdown { .. }
-        | Event::ModelSelect { .. } => {}
+        | Event::ModelSelect { .. }
+        | Event::BashExecutionUpdate { .. } => {}
+        Event::SummarizationRetryScheduled {
+            attempt,
+            max_attempts,
+            delay_ms,
+            error_message,
+        } => project_summarization_retry_scheduled(
+            view,
+            *attempt,
+            *max_attempts,
+            *delay_ms,
+            error_message,
+        ),
+        Event::SummarizationRetryAttemptStart { source } => {
+            project_summarization_retry_attempt_start(view, *source);
+        }
+        Event::SummarizationRetryFinished => {
+            // Matches interactive-mode.ts:3242-3245: clear the retry
+            // indicator.
+            view.status = None;
+        }
         Event::MessageStart { message } => project_message_start(view, message),
         Event::MessageUpdate { message, .. } => {
             project_assistant_message(view, message, false);
@@ -4553,6 +4706,54 @@ fn project_queue(view: &mut ViewState, steering: &[String], follow_up: &[String]
             text: text.clone(),
         })
         .collect();
+}
+
+/// Project `summarization_retry_scheduled` (interactive-mode.ts:3222-3228):
+/// showError(errorMessage) then a retry status indicator with attempt,
+/// maxAttempts, delayMs.
+fn project_summarization_retry_scheduled(
+    view: &mut ViewState,
+    attempt: u32,
+    max_attempts: u32,
+    delay_ms: u64,
+    error_message: &str,
+) {
+    view.messages
+        .push(MessageView::Custom(super::messages::CustomMessageView {
+            custom_type: "error".to_owned(),
+            text: format!("Error: {error_message}"),
+        }));
+    view.status = Some(SessionStatus {
+        kind: StatusKind::Retry,
+        frame: 0,
+        elapsed_secs: 0,
+        message: format!(
+            "Retrying ({attempt}/{max_attempts}) in {}s",
+            delay_ms / 1000
+        ),
+    });
+}
+
+/// Project `summarization_retry_attempt_start` (interactive-mode.ts:3231-3239):
+/// clear the retry indicator, then show a branch-summary indicator when
+/// source is `BranchSummary`, else a compaction indicator with reason.
+fn project_summarization_retry_attempt_start(
+    view: &mut ViewState,
+    source: crate::core::agent_session::events::SummarizationRetrySource,
+) {
+    match source {
+        crate::core::agent_session::events::SummarizationRetrySource::BranchSummary => {
+            view.status = Some(SessionStatus {
+                kind: StatusKind::BranchSummary,
+                frame: 0,
+                elapsed_secs: 0,
+                message: "Summarizing…".to_owned(),
+            });
+        }
+        crate::core::agent_session::events::SummarizationRetrySource::Compaction { reason } => {
+            project_compaction_start(view, reason);
+        }
+    }
 }
 
 fn project_compaction_start(
@@ -5352,9 +5553,15 @@ impl SessionHost for AgentSessionHost {
         })
     }
 
-    fn reload(&self) -> BoxFuture<'_, Result<(), String>> {
+    fn reload(&self) -> BoxFuture<'_, Result<Vec<String>, String>> {
         let session = self.read_session();
-        Box::pin(async move { session.reload().await.map_err(|e| e.to_string()) })
+        Box::pin(async move {
+            let diagnostics = session.reload().await.map_err(|error| error.to_string())?;
+            Ok(diagnostics
+                .into_iter()
+                .map(|diagnostic| diagnostic.to_string())
+                .collect())
+        })
     }
 
     fn messages(&self) -> Vec<pi_agent::AgentMessage> {
@@ -6119,13 +6326,19 @@ pub async fn run_interactive_mode(
         })
         .await;
 
-    // Rebind callback keeps AgentSessionHost's cached session Arc current and
-    // binds the replacement session (emitting its stored
-    // session_start{new|resume|fork}).
+    // Resolve the startup theme from settings + the just-probed terminal
+    // polarity (replaces the static dark default).
+    options.theme = startup_theme(host_arc.as_ref(), options.terminal_theme);
+    let mut rt = InteractiveRuntime::new(tui, input, host_arc, &options);
+    // Bridge replacements dispose the old session from a task outside this
+    // loop. Mark that closure before teardown, then rebind after the host
+    // points at the replacement.
     {
-        let host_for_rebind = Arc::clone(&host_arc);
+        let host_for_rebind = Arc::clone(&rt.session);
+        let rebind_signal = Arc::clone(&rt.session_rebind_signal);
         runtime.set_rebind_session(Some(Arc::new(move |_session| {
             let host_for_rebind = Arc::clone(&host_for_rebind);
+            let rebind_signal = Arc::clone(&rebind_signal);
             Box::pin(async move {
                 host_for_rebind.refresh();
                 let _ = host_for_rebind
@@ -6135,14 +6348,16 @@ pub async fn run_interactive_mode(
                         ..Default::default()
                     })
                     .await;
+                rebind_signal.signal_completion();
             })
         })));
     }
-
-    // Resolve the startup theme from settings + the just-probed terminal
-    // polarity (replaces the static dark default).
-    options.theme = startup_theme(host_arc.as_ref(), options.terminal_theme);
-    let mut rt = InteractiveRuntime::new(tui, input, host_arc, &options);
+    {
+        let rebind_signal = Arc::clone(&rt.session_rebind_signal);
+        runtime.set_before_session_replacement(Some(Arc::new(move || {
+            rebind_signal.begin();
+        })));
+    }
 
     // Reset extension-owned UI on every session invalidation (ports upstream
     // `setBeforeSessionInvalidate(() => resetExtensionUI())`). The synchronous
@@ -6202,7 +6417,7 @@ pub async fn run_interactive_mode(
     drop(rt);
     runtime.set_rebind_session(None);
     runtime.set_before_session_invalidate(None);
-
+    runtime.set_before_session_replacement(None);
     // 7. Guard restores on Drop. Convert exit kind to a process exit code.
     let code = match exit {
         InteractiveExit::Clean
@@ -6556,6 +6771,21 @@ mod tests {
 
     type TestResult = Result<(), String>;
 
+    /// The startup closure in `cli::entry` offloads detection with
+    /// `tokio::task::spawn_blocking`; the blocking pool must yield exactly the
+    /// options a direct synchronous call produces (the tmux hyperlink probe is
+    /// cached process-wide, so a second detection observes the same answer).
+    #[tokio::test]
+    async fn detect_offloaded_matches_sync_detect() -> TestResult {
+        let sync = InteractiveRuntimeOptions::detect();
+        let offloaded = tokio::task::spawn_blocking(InteractiveRuntimeOptions::detect)
+            .await
+            .map_err(|error| format!("spawn_blocking join failed: {error}"))?;
+        assert_eq!(sync.caps, offloaded.caps);
+        assert_eq!(sync.terminal_theme, offloaded.terminal_theme);
+        Ok(())
+    }
+
     /// Records every action dispatched to it; tests assert on the call log.
     #[derive(Default)]
     struct ActionLog {
@@ -6595,6 +6825,7 @@ mod tests {
         cancel_fork: Arc<std::sync::atomic::AtomicBool>,
         cancel_switch: Arc<std::sync::atomic::AtomicBool>,
         fork_selected_text: Arc<std::sync::Mutex<Option<String>>>,
+        reload_diagnostics: Arc<std::sync::Mutex<Vec<String>>>,
         extension_runner: Option<Arc<ExtensionRuntimeSet>>,
     }
 
@@ -6614,6 +6845,7 @@ mod tests {
                 cancel_fork: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 cancel_switch: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 fork_selected_text: Arc::new(std::sync::Mutex::new(None)),
+                reload_diagnostics: Arc::new(std::sync::Mutex::new(Vec::new())),
                 extension_runner: None,
             };
             (host, log)
@@ -6651,6 +6883,13 @@ mod tests {
                 .fork_selected_text
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = text;
+        }
+
+        fn set_reload_diagnostics(&self, diagnostics: Vec<String>) {
+            *self
+                .reload_diagnostics
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = diagnostics;
         }
     }
 
@@ -6829,11 +7068,15 @@ mod tests {
             })
         }
 
-        fn reload(&self) -> BoxFuture<'_, Result<(), String>> {
+        fn reload(&self) -> BoxFuture<'_, Result<Vec<String>, String>> {
             let log = Arc::clone(&self.log);
+            let diagnostics = Arc::clone(&self.reload_diagnostics);
             Box::pin(async move {
                 *log.reloads.lock().await += 1;
-                Ok(())
+                Ok(diagnostics
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone())
             })
         }
 
@@ -7502,6 +7745,85 @@ mod tests {
         );
         let status = view.status.as_ref().ok_or("retry status not set")?;
         assert_eq!(status.kind, StatusKind::Retry);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_event_summarization_retry_scheduled_sets_retry_status_and_error()
+    -> Result<(), String> {
+        let mut view = ViewState::empty();
+        project_event(
+            &mut view,
+            &AgentSessionEvent::SummarizationRetryScheduled {
+                attempt: 1,
+                max_attempts: 3,
+                delay_ms: 2000,
+                error_message: "overloaded".to_owned(),
+            },
+        );
+        let status = view.status.as_ref().ok_or("retry status not set")?;
+        assert_eq!(status.kind, StatusKind::Retry);
+        assert!(status.message.contains("Retrying (1/3)"));
+        // showError equivalent: an error message is pushed to the chat.
+        let last = view.messages.last().ok_or("no message pushed")?;
+        match last {
+            MessageView::Custom(custom) => {
+                assert_eq!(custom.custom_type, "error");
+                assert!(custom.text.contains("overloaded"));
+            }
+            _ => return Err(format!("expected Custom error message, got {last:?}")),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_event_summarization_retry_attempt_start_branch_summary() -> Result<(), String>
+    {
+        let mut view = ViewState::empty();
+        project_event(
+            &mut view,
+            &AgentSessionEvent::SummarizationRetryAttemptStart {
+                source: crate::core::agent_session::events::SummarizationRetrySource::BranchSummary,
+            },
+        );
+        let status = view
+            .status
+            .as_ref()
+            .ok_or("branch-summary status not set")?;
+        assert_eq!(status.kind, StatusKind::BranchSummary);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_event_summarization_retry_attempt_start_compaction() -> Result<(), String> {
+        let mut view = ViewState::empty();
+        project_event(
+            &mut view,
+            &AgentSessionEvent::SummarizationRetryAttemptStart {
+                source: crate::core::agent_session::events::SummarizationRetrySource::Compaction {
+                    reason: crate::core::agent_session::events::CompactionReason::Manual,
+                },
+            },
+        );
+        let status = view.status.as_ref().ok_or("compaction status not set")?;
+        assert_eq!(status.kind, StatusKind::Compaction);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_event_summarization_retry_finished_clears_status() -> Result<(), String> {
+        let mut view = ViewState::empty();
+        view.status = Some(SessionStatus {
+            kind: StatusKind::Retry,
+            frame: 0,
+            elapsed_secs: 0,
+            message: "Retrying…".to_owned(),
+        });
+        project_event(&mut view, &AgentSessionEvent::SummarizationRetryFinished);
+        assert!(
+            view.status.is_none(),
+            "status should be cleared after retry finished"
+        );
         Ok(())
     }
 
@@ -8556,6 +8878,51 @@ mod tests {
         assert!(rt.pending_extension_dialog.is_none());
         assert_eq!(rt.editor.get_text(), "draft prompt");
         assert_eq!(rt.view.editor.placeholder, "Type a message…");
+    }
+
+    #[tokio::test]
+    async fn interactive_reload_surfaces_nonfatal_extension_diagnostics() -> TestResult {
+        let writer = SharedWriter::new();
+        let caps = TerminalCapabilities::default();
+        let tui = Tui::new(writer, Size::new(80, 24), Position::ORIGIN, 8, caps)
+            .map_err(|error| error.to_string())?;
+        let (_tx, rx) = mpsc::unbounded_channel::<UiEvent>();
+        let input = TerminalInput::mock(rx);
+        let (host, _log) = FakeHost::new();
+        host.set_reload_diagnostics(vec![
+            "Extension \"first.ts\" error: flag rejected".to_owned(),
+            "Extension \"second.ts\" error: provider rejected".to_owned(),
+        ]);
+        let options = InteractiveRuntimeOptions {
+            size: (80, 24),
+            ..InteractiveRuntimeOptions::default()
+        };
+        let mut runtime = InteractiveRuntime::new(tui, input, Arc::new(host), &options);
+
+        assert_eq!(
+            runtime.dispatch_action(ViewAction::Reload).await,
+            ActionOutcome::Repaint
+        );
+        let notices = runtime
+            .view
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                MessageView::Custom(custom) if custom.custom_type == "reload" => {
+                    Some(custom.text.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            notices,
+            [
+                "Extension \"first.ts\" error: flag rejected",
+                "Extension \"second.ts\" error: provider rejected",
+            ]
+        );
+        assert!(runtime.last_error.is_none());
+        Ok(())
     }
 
     #[tokio::test]
@@ -9830,5 +10197,85 @@ mod tests {
                 .map(|status| status.message.as_str()),
             Some("Deploying…")
         );
+    }
+
+    /// T3: hostile OSC/title bytes are stripped and the sink sees fixed framing.
+    #[test]
+    fn sanitize_terminal_title_strips_raw_controls() {
+        let title = "safe\x07\x1b]1;evil\x07\r\n\x0cmiddle";
+        assert_eq!(sanitize_terminal_title(title), "safe]1;evilmiddle");
+    }
+
+    #[test]
+    fn sanitize_terminal_title_strips_c1_controls() {
+        let title = "before\u{009b}after\u{0085}end";
+        assert_eq!(sanitize_terminal_title(title), "beforeafterend");
+    }
+
+    #[test]
+    fn sanitize_terminal_title_respects_utf8_byte_cap_without_splitting_scalar() {
+        let one_byte = "a".repeat(MAX_TERMINAL_TITLE_BYTES);
+        assert_eq!(
+            sanitize_terminal_title(&one_byte).len(),
+            MAX_TERMINAL_TITLE_BYTES
+        );
+        assert_eq!(
+            sanitize_terminal_title(&format!("{one_byte}x")).len(),
+            MAX_TERMINAL_TITLE_BYTES
+        );
+
+        let emoji = "\u{1f642}"; // 4 UTF-8 bytes
+        let max_emojis = emoji.repeat(MAX_TERMINAL_TITLE_BYTES / emoji.len());
+        assert_eq!(sanitize_terminal_title(&max_emojis), max_emojis);
+        assert_eq!(
+            sanitize_terminal_title(&format!("{max_emojis}a")).len(),
+            MAX_TERMINAL_TITLE_BYTES
+        );
+
+        let prefix = "a".repeat(MAX_TERMINAL_TITLE_BYTES - 1);
+        assert_eq!(sanitize_terminal_title(&format!("{prefix}{emoji}")), prefix);
+    }
+
+    #[test]
+    #[allow(clippy::naive_bytecount)]
+    fn encode_osc0_set_title_uses_fixed_framing_and_valid_payload() {
+        let hostile = "pi\x07\x1b]1;break\x07\u{009b}ok";
+        let sequence = encode_osc0_set_title(hostile);
+        assert_eq!(&sequence[..4], b"\x1b]0;");
+        assert_eq!(sequence.last().copied(), Some(OSC_BEL));
+        let payload = &sequence[4..sequence.len() - 1];
+        assert_eq!(payload, b"pi]1;breakok");
+        assert!(payload.len() <= MAX_TERMINAL_TITLE_BYTES);
+        assert!(std::str::from_utf8(payload).is_ok());
+        assert!(!pi_ext::sanitize::contains_control_bytes(payload));
+        assert_eq!(sequence.iter().filter(|&&b| b == OSC_BEL).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn set_title_control_writes_sanitized_osc0() -> Result<(), String> {
+        let writer = SharedWriter::new();
+        let sink = writer.clone();
+        let caps = TerminalCapabilities::default();
+        let tui = Tui::new(writer, Size::new(80, 24), Position::ORIGIN, 8, caps)
+            .map_err(|error| format!("tui construction: {error}"))?;
+        let (_tx, rx) = mpsc::unbounded_channel::<UiEvent>();
+        let input = TerminalInput::mock(rx);
+        let (host, _log) = FakeHost::new();
+        let options = InteractiveRuntimeOptions {
+            size: (80, 24),
+            ..InteractiveRuntimeOptions::default()
+        };
+        let mut rt = InteractiveRuntime::new(tui, input, Arc::new(host), &options);
+        let before = sink.snapshot().len();
+        rt.handle_extension_ui_control(UiControl::SetTitle {
+            title: Some("safe\x07\x1b]1;evil\x07\u{009b}ok".to_owned()),
+        })
+        .await;
+        let written = &sink.snapshot()[before..];
+        assert_eq!(
+            written,
+            encode_osc0_set_title("safe\x07\x1b]1;evil\x07\u{009b}ok")
+        );
+        Ok(())
     }
 }

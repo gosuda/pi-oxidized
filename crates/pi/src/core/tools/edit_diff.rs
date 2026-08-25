@@ -467,16 +467,11 @@ pub fn apply_edits_to_normalized_content(
     })
 }
 
-fn split_lines_keep_trailing_empty(content: &str) -> Vec<&str> {
-    content.split('\n').collect()
-}
-
-fn split_patch_lines(content: &str) -> Vec<&str> {
+fn split_display_lines(content: &str) -> Vec<&str> {
     if content.is_empty() {
-        Vec::new()
-    } else {
-        content.split_terminator('\n').collect()
+        return Vec::new();
     }
+    content.split_inclusive('\n').collect()
 }
 
 #[derive(Clone, Debug)]
@@ -500,8 +495,8 @@ impl PatchLine {
 }
 
 fn patch_lines(old_content: &str, new_content: &str) -> Vec<PatchLine> {
-    let old_lines = split_patch_lines(old_content);
-    let new_lines = split_patch_lines(new_content);
+    let old_lines = split_display_lines(old_content);
+    let new_lines = split_display_lines(new_content);
     let lcs = longest_common_subsequence(&old_lines, &new_lines);
     let mut ops = Vec::new();
     let mut old_index = 0;
@@ -641,8 +636,11 @@ pub fn generate_unified_patch(
         out.push_str(" @@\n");
         for line in &lines[start..end] {
             out.push(line.prefix);
-            out.push_str(&line.text);
+            out.push_str(line.text.strip_suffix('\n').unwrap_or(&line.text));
             out.push('\n');
+            if !line.text.ends_with('\n') {
+                out.push_str("\\ No newline at end of file\n");
+            }
         }
     }
     out
@@ -655,8 +653,8 @@ pub fn generate_diff_string(
     new_content: &str,
     context_lines: usize,
 ) -> DiffStringResult {
-    let old_lines = split_lines_keep_trailing_empty(old_content);
-    let new_lines = split_lines_keep_trailing_empty(new_content);
+    let old_lines = split_display_lines(old_content);
+    let new_lines = split_display_lines(new_content);
     let line_num_width = old_lines
         .len()
         .max(new_lines.len())
@@ -721,13 +719,14 @@ impl DiffRenderState {
     }
 
     fn push_numbered(&mut self, prefix: char, line: &str, width: usize) {
+        let visible = line.strip_suffix('\n').unwrap_or(line);
         let line_num = if prefix == '+' {
             self.new_line_num
         } else {
             self.old_line_num
         };
         self.output
-            .push(format!("{prefix}{line_num:>width$} {line}"));
+            .push(format!("{prefix}{line_num:>width$} {visible}"));
     }
 
     fn advance_both(&mut self, count: usize) {
@@ -918,6 +917,74 @@ fn collapse_ops(ops: &[Op]) -> Vec<DiffPart> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Alphabet for `overlapping_edits_are_rejected`; the generated length is
+    /// bounded by its actual length so the slice indices stay valid even if
+    /// the literal is edited.
+    const OVERLAP_ALPHABET: &str = "abcdefghijklmnopqrstuvw";
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn multi_edit_order_is_invariant(ids in prop::collection::vec(0_u8..32, 2..8)) {
+            let original = ids.iter().fold(String::new(), |mut content, id| {
+                content.push('[');
+                content.push_str(&id.to_string());
+                content.push(']');
+                content
+            });
+            let edits = ids.iter().enumerate().map(|(index, id)| Edit {
+                old_text: format!("[{id}]"),
+                new_text: format!("[{}]", ids[(index + 1) % ids.len()]),
+            }).collect::<Vec<_>>();
+            prop_assume!(ids.iter().collect::<std::collections::HashSet<_>>().len() == ids.len());
+
+            let forward = apply_edits_to_normalized_content(&original, &edits, "f.txt").map_err(TestCaseError::fail)?;
+            let mut reversed = edits.clone();
+            reversed.reverse();
+            let backward = apply_edits_to_normalized_content(&original, &reversed, "f.txt").map_err(TestCaseError::fail)?;
+
+            prop_assert_eq!(forward.new_content, backward.new_content);
+        }
+
+        #[test]
+        fn overlapping_edits_are_rejected(length in 3_usize..=OVERLAP_ALPHABET.len()) {
+            let original = OVERLAP_ALPHABET[..length].to_owned();
+            let first = original[..length - 1].to_owned();
+            let second = original[1..].to_owned();
+            let result = apply_edits_to_normalized_content(&original, &[
+                Edit { old_text: first, new_text: "first".into() },
+                Edit { old_text: second, new_text: "second".into() },
+            ], "f.txt");
+
+            let error = result.as_ref().err().map_or("", String::as_str);
+            prop_assert!(result.is_err());
+            prop_assert!(error.contains("overlap"));
+        }
+
+        #[test]
+        fn line_endings_round_trip(lines in prop::collection::vec("[a-z]{0,8}", 2..12), crlf in any::<bool>()) {
+            let ending = if crlf { LineEnding::Crlf } else { LineEnding::Lf };
+            let content = lines.join(ending.as_str());
+            let normalized = normalize_to_lf(&content);
+
+            prop_assert_eq!(detect_line_ending(&content), ending);
+            prop_assert_eq!(restore_line_endings(&normalized, ending), content);
+        }
+
+        #[test]
+        fn fuzzy_matching_accepts_nfkc_and_smart_punctuation(word in "[A-Za-z0-9]{1,20}") {
+            let fullwidth = word.chars().map(|ch| char::from_u32(ch as u32 + 0xFEE0).unwrap_or(ch)).collect::<String>();
+            let original = format!("“{fullwidth}”\u{00A0}–\n");
+            let old_text = format!("\"{word}\" -\n");
+            let result = apply_edits_to_normalized_content(&original, &[Edit {
+                old_text,
+                new_text: "updated\n".into(),
+            }], "f.txt").map_err(TestCaseError::fail)?;
+
+            prop_assert_eq!(result.new_content, "updated\n");
+        }
+    }
 
     #[test]
     fn strip_bom_detects_prefix() {
@@ -1142,9 +1209,70 @@ mod tests {
     }
 
     #[test]
+    fn unified_patch_preserves_eof_newline_change() {
+        let added = generate_unified_patch("a.txt", "verification", "verification\n", 4);
+        assert_eq!(
+            added,
+            "--- a.txt\n+++ a.txt\n@@ -1,1 +1,1 @@\n-verification\n\\ No newline at end of file\n+verification\n"
+        );
+
+        let removed = generate_unified_patch("a.txt", "verification\n", "verification", 4);
+        assert_eq!(
+            removed,
+            "--- a.txt\n+++ a.txt\n@@ -1,1 +1,1 @@\n-verification\n+verification\n\\ No newline at end of file\n"
+        );
+    }
+
+    #[test]
     fn display_diff_marks_first_changed_line() {
         let result = generate_diff_string("a\nb\nc\n", "a\nB\nc\n", 4);
         assert_eq!(result.first_changed_line, Some(2));
         assert!(result.diff.contains('B'));
+    }
+
+    #[test]
+    fn display_diff_omits_trailing_empty_context_line() {
+        let result = generate_diff_string("verification-before\n", "verification-after\n", 4);
+        assert_eq!(result.diff, "-1 verification-before\n+1 verification-after");
+    }
+
+    #[test]
+    fn display_diff_line_number_width_excludes_trailing_empty() {
+        // Nine newline-terminated lines: split_display_lines yields one
+        // borrowed token per line, so the width is computed from the 9 logical
+        // lines and single-digit line numbers are not padded to width 2.
+        let old = "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\n";
+        let new = old.replace("line 5\n", "LINE 5\n");
+        let result = generate_diff_string(old, &new, 4);
+        // Line 5 must be unpadded (width 1), not "- 5 line 5".
+        assert!(
+            result.diff.contains("-5 line 5"),
+            "expected unpadded '-5 line 5', got:\n{}",
+            result.diff
+        );
+        assert!(
+            result.diff.contains("+5 LINE 5"),
+            "expected unpadded '+5 LINE 5', got:\n{}",
+            result.diff
+        );
+        assert!(
+            !result.diff.contains("- 5 line 5"),
+            "line 5 was padded to width 2:\n{}",
+            result.diff
+        );
+    }
+    #[test]
+    fn display_diff_preserves_eof_newline_change() {
+        for (old, new) in [
+            ("verification", "verification\n"),
+            ("verification\n", "verification"),
+        ] {
+            let result = generate_diff_string(old, new, 4);
+            assert_eq!(
+                result.diff, "-1 verification\n+1 verification",
+                "old={old:?}, new={new:?}"
+            );
+            assert_eq!(result.first_changed_line, Some(1));
+        }
     }
 }

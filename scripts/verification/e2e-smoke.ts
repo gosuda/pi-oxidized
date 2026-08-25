@@ -15,6 +15,7 @@ import {
 	VERIFICATION_CUSTOM_UI_COMMAND,
 	VERIFICATION_DIALOG_COMMAND,
 	VERIFICATION_FLAG_COMMAND,
+	VERIFICATION_SESSION_REPLACEMENT_COMMAND,
 	VERIFICATION_MODEL,
 	VERIFICATION_PROFILE_FLAG,
 	VERIFICATION_PROVIDER,
@@ -138,14 +139,23 @@ function finishStep(step: StepEvidence, detail?: JsonValue): void {
 	if (detail !== undefined) step.detail = detail;
 }
 
-function ensurePrerequisites(): string {
-	for (const required of [RUST_BINARY, EXTENSION_HOST, EXTENSION_PATH, TYPESCRIPT_CLI]) {
+function ensureRustPrerequisites(): void {
+	for (const required of [RUST_BINARY, EXTENSION_HOST, EXTENSION_PATH]) {
 		if (!existsSync(required)) {
 			fail(
 				`product prerequisite missing: ${required}${
 					required === RUST_BINARY ? "; run cargo build -p pi --release --locked" : ""
 				}`,
 			);
+		}
+	}
+}
+
+function ensurePrerequisites(): string {
+	ensureRustPrerequisites();
+	for (const required of [TYPESCRIPT_CLI]) {
+		if (!existsSync(required)) {
+			fail(`product prerequisite missing: ${required}`);
 		}
 	}
 	const bun = Bun.which("bun");
@@ -911,6 +921,146 @@ async function runResumeAndReload(state: WorkflowState, fork: SessionDocument): 
 	return resumed;
 }
 
+async function runSessionReplacement(state: WorkflowState): Promise<SessionDocument> {
+	const step = beginStep(state, "rust-session-replacement");
+	const expectedLoad = (state.loadGeneration ?? 0) + 1;
+	const startIndex = readCompatibilityMarkers(state).length;
+	const rust = launch(state, "rust-replacement", [
+		RUST_BINARY,
+		...commonArguments(),
+		"--session-dir",
+		state.sessionDir,
+	]);
+	try {
+		await waitForReady("Rust replacement interactive startup", rust);
+		state.loadGeneration = await waitForLoadGeneration(state, expectedLoad, rust);
+		const priorFiles = new Set(sessionFiles(state));
+		sendLine(rust, `/${VERIFICATION_SESSION_REPLACEMENT_COMMAND}`);
+
+		const before = await waitForCompatibilityMarker(
+			state, "replacement before marker", rust, startIndex, "replacement.before",
+		);
+		const instance = before.marker.instance;
+		const setup = await waitForCompatibilityMarker(
+			state, "replacement setup marker", rust, before.index + 1, "replacement.setup",
+			(marker) => marker.instance === instance,
+		);
+		const withSessionBefore = await waitForCompatibilityMarker(
+			state, "replacement withSession before marker", rust, setup.index + 1, "replacement.withSession.before",
+			(marker) => marker.instance === instance,
+		);
+		const withSessionAfter = await waitForCompatibilityMarker(
+			state, "replacement withSession after marker", rust, withSessionBefore.index + 1, "replacement.withSession.after",
+			(marker) => marker.instance === instance,
+		);
+		const after = await waitForCompatibilityMarker(
+			state, "replacement after marker", rust, withSessionAfter.index + 1, "replacement.after",
+			(marker) => marker.instance === instance,
+		);
+	// Stage order is enforced structurally via startIndex threading: each
+	// marker is awaited at the predecessor's index + 1, so the sequence
+	// before -> setup -> withSessionBefore -> withSessionAfter -> after
+	// is guaranteed by construction.
+		const cancelled = markerValue(after.marker).cancelled;
+		assert(cancelled === false, "session replacement was cancelled instead of completing");
+		const rebound = await waitForCompatibilityMarker(
+			state,
+			"replacement session rebind marker",
+			rust,
+			withSessionAfter.index + 1,
+			"session_start.after",
+			(marker) => marker.instance !== instance,
+		);
+
+		// The replacement session is not persisted until its first assistant
+		// response. Drive that turn through the live TUI after the rebind.
+		sendLine(rust, "verification replacement turn");
+		await waitForScreen(rust, "replacement assistant response", FINAL_MARKER);
+		const sessionPath = await waitUntil(
+			"replacement Rust session file",
+			COMMAND_DEADLINE_MS,
+			() => sessionFiles(state).find((path) => !priorFiles.has(path)),
+			rust,
+		);
+		const session = readSession(sessionPath);
+		const setupEntry = session.lines.find(
+			(entry) => entryType(entry) === "custom" && entry.customType === "verification-replacement-setup",
+		);
+		assert(setupEntry !== undefined, "replacement session JSONL did not persist the setup custom entry");
+		assert(
+			typeof setupEntry.data === "object" && setupEntry.data !== null
+				&& asObject(setupEntry.data, "setup custom entry data").source === "setup",
+			"replacement setup custom entry did not persist data.source === \"setup\"",
+		);
+		const withSessionEntry = session.lines.find(
+			(entry) =>
+				entryType(entry) === "custom_message"
+				&& entry.customType === "verification-replacement-with-session",
+		);
+		assert(withSessionEntry !== undefined, "replacement session JSONL did not persist the withSession custom_message");
+		assert(
+			withSessionEntry.content === "verification replacement withSession",
+			"replacement withSession custom_message did not persist the exact content string",
+		);
+		assert(withSessionEntry.display === false, "replacement withSession custom_message did not persist display === false");
+		const userEntry = session.lines.find(
+			(entry) => messageRole(entry) === "user" && messageText(entry) === "verification replacement turn",
+		);
+		assert(userEntry !== undefined, "replacement session JSONL did not persist the user turn");
+		const assistantEntry = session.lines.find(
+			(entry) => messageRole(entry) === "assistant" && messageText(entry).includes(FINAL_MARKER),
+		);
+		assert(assistantEntry !== undefined, "replacement session JSONL did not persist the assistant response");
+		sendLine(rust, `/${VERIFICATION_FLAG_COMMAND} post-replacement`);
+		const post = await waitForCompatibilityMarker(
+			state, "post-replacement command marker", rust, after.index + 1, "replacement.post",
+			(marker) => marker.instance === rebound.marker.instance,
+		);
+		const postSession = await waitUntil(
+			"post-replacement session command persistence",
+			COMMAND_DEADLINE_MS,
+			() => {
+				const current = readSession(sessionPath);
+				return current.lines.some(
+					(entry) =>
+						entryType(entry) === "custom_message"
+						&& entry.customType === "verification-post-replacement"
+						&& entry.content === "verification post replacement"
+						&& entry.display === false,
+				)
+					? current
+					: undefined;
+			},
+			rust,
+		);
+		await cleanQuit("Rust replacement session", rust);
+		finishStep(step, {
+			session: relative(state.runRoot, postSession.path),
+			instance,
+			replacementInstance: rebound.marker.instance,
+			markerIndex: post.index,
+			entries: postSession.lines.length,
+			sha256: sha256(postSession.bytes),
+		});
+		return postSession;
+	} catch (error) {
+		const cause = error instanceof Error ? error : new Error(String(error));
+		const snapshot = rust.snapshot();
+		const ptyTail = snapshot.rawText.slice(-8_000);
+		const markerCount = readCompatibilityMarkers(state).length;
+		const sessions = sessionFiles(state);
+		throw new Error(
+			`${cause.message}\n\n[replacement-smoke context]\n`
+			+ `compatibilityPath: ${state.compatibilityPath} (markers: ${markerCount})\n`
+			+ `sessionDir: ${state.sessionDir} (files: ${sessions.length})\n`
+			+ `sessionPaths: ${sessions.join(", ") || "(none)"}\n`
+			+ `rustExitCode: ${String(snapshot.exitCode)}\n`
+			+ `PTY tail:\n${ptyTail}`,
+			{ cause },
+		);
+	}
+}
+
 async function reopenWithTypescript(
 	state: WorkflowState,
 	bun: string,
@@ -1033,6 +1183,50 @@ function captureSessions(state: WorkflowState): JsonValue {
 	return sessions;
 }
 
+async function runReplacementOnly(): Promise<void> {
+	ensureRustPrerequisites();
+	const state = createState();
+	let failure: Error | undefined;
+	try {
+		await runSessionReplacement(state);
+	} catch (error) {
+		failure = error instanceof Error ? error : new Error(String(error));
+	} finally {
+		await terminateAll(state.processes);
+		for (const named of state.processes) capturePty(state, named);
+		const result = {
+			check: "replacement",
+			status: failure === undefined ? "pass" : "fail",
+			startedAt: state.steps[0]?.startedAt ?? isoNow(),
+			finishedAt: isoNow(),
+			runRoot: state.runRoot,
+			machine: {
+				platform: process.platform,
+				arch: process.arch,
+				bunVersion: Bun.version,
+			},
+			paths: {
+				rustBinary: RUST_BINARY,
+				extensionHost: EXTENSION_HOST,
+				extension: EXTENSION_PATH,
+			},
+			loadGeneration: state.loadGeneration ?? loadGeneration(state.loadCountPath),
+			compatibility: {
+				path: relative(state.runRoot, state.compatibilityPath),
+				markerCount: readCompatibilityMarkers(state).length,
+				rustProfile: RUST_VERIFICATION_PROFILE,
+			},
+			steps: state.steps,
+			sessions: captureSessions(state),
+			failure: failure?.message ?? null,
+		};
+		writeFileSync(join(state.runRoot, "result.json"), `${JSON.stringify(result, null, 2)}\n`, "utf8");
+		writeFileSync(join(EVIDENCE_ROOT, "latest-run.txt"), `${basename(state.runRoot)}\n`, "utf8");
+	}
+	if (failure !== undefined) throw failure;
+	process.stdout.write(`replacement smoke passed; evidence: ${state.runRoot}\n`);
+}
+
 async function main(): Promise<void> {
 	const bun = ensurePrerequisites();
 	const state = createState();
@@ -1087,7 +1281,8 @@ async function main(): Promise<void> {
 	process.stdout.write(`check 11 passed; evidence: ${state.runRoot}\n`);
 }
 
-await main().catch((error: unknown) => {
+const entrypoint = process.argv.includes("--replacement-only") ? runReplacementOnly : main;
+await entrypoint().catch((error: unknown) => {
 	console.error(errorText(error));
 	process.exitCode = 1;
 });

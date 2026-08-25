@@ -65,6 +65,7 @@ use pi_ai::{AssistantMessage, Model, ModelThinkingLevel, Provider};
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio_util::sync::CancellationToken;
 
+use crate::core::agent_session_runtime::AgentSessionRuntime;
 use crate::core::model_runtime::ModelRuntime;
 use crate::core::sessions::{SessionError, SessionManager};
 use crate::core::settings::SettingsManager;
@@ -236,6 +237,9 @@ pub(super) struct AgentSessionInner {
     pub(super) auto_compaction_abort: Option<CancellationToken>,
     /// Cancellation: branch summary.
     pub(super) branch_summary_abort: Option<CancellationToken>,
+    /// Owner generation for the branch-summary slot; prevents an older
+    /// navigation from clearing a newer navigation's token.
+    pub(super) branch_summary_owner: u64,
     /// Cancellation: bash execution.
     pub(super) bash_abort: Option<CancellationToken>,
     /// Pending nextTurn custom messages injected into the next prompt.
@@ -354,6 +358,7 @@ impl AgentSessionInner {
             compaction_abort: None,
             auto_compaction_abort: None,
             branch_summary_abort: None,
+            branch_summary_owner: 0,
             bash_abort: None,
             pending_next_turn_messages: Vec::new(),
             extension_mode: None,
@@ -408,6 +413,8 @@ pub struct AgentSession {
     pub(super) resource_loader: Option<AsyncMutex<crate::core::resources::DefaultResourceLoader>>,
     /// Self handle for pump (set after construction).
     pub(super) self_handle: Mutex<Option<std::sync::Weak<AgentSession>>>,
+    /// Runtime owning this session, when the session participates in replacement.
+    runtime_handle: Mutex<Option<std::sync::Weak<AgentSessionRuntime>>>,
     /// Stops the weak extension-registry observer on dispose or drop.
     extension_registry_cancel: CancellationToken,
     /// Serializes the whole `bind_extensions` lifecycle (record → emit →
@@ -521,6 +528,7 @@ impl AgentSession {
             prompt_templates: Mutex::new(config.prompt_templates),
             resource_loader: config.resource_loader.map(AsyncMutex::new),
             self_handle: Mutex::new(None),
+            runtime_handle: Mutex::new(None),
             extension_registry_cancel: CancellationToken::new(),
             bind_lock: AsyncMutex::new(()),
         });
@@ -567,6 +575,24 @@ impl AgentSession {
         Arc::clone(&self.hooks)
     }
 
+    /// Link this session to the runtime that owns its replacement lifecycle.
+    pub fn set_runtime_handle(&self, handle: std::sync::Weak<AgentSessionRuntime>) {
+        *self
+            .runtime_handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
+    }
+
+    /// Owning runtime, when this session was created through a linked runtime.
+    #[must_use]
+    pub fn runtime_handle(&self) -> Option<Arc<AgentSessionRuntime>> {
+        self.runtime_handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+    }
+
     /// Session manager async mutex (single-writer).
     #[must_use]
     pub fn session_manager(&self) -> Arc<AsyncMutex<SessionManager>> {
@@ -596,6 +622,12 @@ impl AgentSession {
     pub fn is_idle(&self) -> bool {
         let inner = self.lock_inner();
         !inner.is_agent_run_active && !self.agent.state().is_streaming
+    }
+
+    /// Whether disposal has started for this session.
+    #[must_use]
+    pub fn is_disposed(&self) -> bool {
+        self.lock_inner().disposed
     }
 
     /// Whether session-level auto-compaction is in progress.
@@ -991,6 +1023,17 @@ impl AgentSession {
     /// replacement layer owns the single reason-specific extension shutdown
     /// event and must emit it before calling this method when handlers exist.
     pub async fn dispose(&self) {
+        let runtime = self.runtime_handle();
+        let _lifecycle_guard = if let Some(runtime) = &runtime {
+            Some(runtime.lifecycle_gate().write().await)
+        } else {
+            None
+        };
+        self.dispose_lifecycle_gate_held().await;
+    }
+
+    /// Dispose local resources while the owning runtime lifecycle write gate is held.
+    pub(super) async fn dispose_lifecycle_gate_held(&self) {
         {
             let mut inner = self.lock_inner();
             if inner.disposed {
@@ -1072,7 +1115,7 @@ impl AgentSession {
             .is_some_and(|p| p.active.load(std::sync::atomic::Ordering::SeqCst))
     }
 
-    fn upgrade_self(&self) -> Option<std::sync::Weak<AgentSession>> {
+    pub(super) fn upgrade_self(&self) -> Option<std::sync::Weak<AgentSession>> {
         self.self_handle
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1107,6 +1150,7 @@ impl AgentSession {
                             active_tool_names: None,
                             include_all_extension_tools: true,
                         });
+                        session.refresh_selected_model_from_runtime();
                         drop(session);
                     }
                 }

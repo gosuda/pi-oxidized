@@ -190,7 +190,9 @@ interface PerformanceArtifact {
 		artifacts?: Record<string, FileRecord>;
 		sourceFingerprints?: {
 			before: { rust: SourceFingerprint; typescript: SourceFingerprint };
+			built?: { rust: SourceFingerprint; typescript: SourceFingerprint };
 			after?: { rust: SourceFingerprint; typescript: SourceFingerprint };
+			buildRegenerated?: { rust: boolean; typescript: boolean };
 			stable?: boolean;
 		};
 	};
@@ -202,7 +204,7 @@ interface PerformanceArtifact {
 	};
 }
 
-class HarnessFailure extends Error {
+export class HarnessFailure extends Error {
 	constructor(
 		readonly stage: string,
 		message: string,
@@ -523,13 +525,13 @@ function stripTerminalSequences(text: string): string {
 		.replace(/[\x00-\x1f\x7f]/g, "");
 }
 
-interface FrameObservation {
+export interface FrameObservation {
 	readonly elapsedMs: number;
 	readonly bytes: number;
 	readonly detection: FirstFrameSample["detection"];
 }
 
-function frameObservation(snapshot: PtySnapshot, chunkOffset = 0): FrameObservation | undefined {
+export function frameObservation(snapshot: PtySnapshot, chunkOffset = 0): FrameObservation | undefined {
 	let raw = "";
 	let bytes = 0;
 	for (const chunk of snapshot.chunks.slice(chunkOffset)) {
@@ -747,7 +749,7 @@ const streamingArgs = [
 	"--approve",
 ] as const;
 
-async function terminateAndRequireCleanExit(pty: PtyProcess, label: string): Promise<void> {
+export async function terminateAndRequireCleanExit(pty: PtyProcess, label: string): Promise<void> {
 	if (pty.exited) {
 		const code = await pty.waitForExit(1);
 		if (code !== 0) throw new HarnessFailure(label, `${label} exited ${code}\nPTY tail:\n${tail(pty.snapshot().rawText, 4_000)}`);
@@ -1201,11 +1203,6 @@ async function main(): Promise<void> {
 	artifact.machine = machineMetadata();
 	const ticksPerSecond = clockTicksPerSecond();
 	const python = requiredExecutable("python3");
-	const sourceBefore = {
-		rust: sourceFingerprint(RUST_SOURCE_ROOTS),
-		typescript: sourceFingerprint(TYPESCRIPT_SOURCE_ROOTS),
-	};
-	artifact.build.sourceFingerprints = { before: sourceBefore };
 	artifact.harness = {
 		ptyDriver: "scripts/verification/pty.ts PtyProcess",
 		processTreeCpuSource: "/proc/<pid>/stat plus /proc/<pid>/task/*/children rooted at PtyProcess.pid",
@@ -1227,7 +1224,26 @@ async function main(): Promise<void> {
 		streamChunkDelayMs: STREAM_CHUNK_DELAY_MS,
 	};
 
+	// Pre-build capture records the source the measured binaries were built
+	// from; capturing only after the build could report fingerprint B for
+	// binaries built from source A. The build legitimately regenerates files
+	// inside the fingerprinted roots (provider data under
+	// .references/pi/packages/ai), so the drift blocker below compares the
+	// post-build baseline against the post-measurement state and records the
+	// build-window delta separately instead of hiding it.
+	const sourceBefore = {
+		rust: sourceFingerprint(RUST_SOURCE_ROOTS),
+		typescript: sourceFingerprint(TYPESCRIPT_SOURCE_ROOTS),
+	};
+	artifact.build.sourceFingerprints = { before: sourceBefore };
+
 	await buildProducts();
+
+	const sourceBuilt = {
+		rust: sourceFingerprint(RUST_SOURCE_ROOTS),
+		typescript: sourceFingerprint(TYPESCRIPT_SOURCE_ROOTS),
+	};
+	artifact.build.sourceFingerprints = { before: sourceBefore, built: sourceBuilt };
 
 	const versionSamples = await collectVersionSamples(python, ticksPerSecond);
 	const versionSummary = {
@@ -1321,19 +1337,29 @@ async function main(): Promise<void> {
 		typescript: sourceFingerprint(TYPESCRIPT_SOURCE_ROOTS),
 	};
 	const sourceStable =
-		sourceBefore.rust.sha256 === sourceAfter.rust.sha256 &&
-		sourceBefore.typescript.sha256 === sourceAfter.typescript.sha256;
+		sourceBuilt.rust.sha256 === sourceAfter.rust.sha256 &&
+		sourceBuilt.typescript.sha256 === sourceAfter.typescript.sha256;
 	artifact.build.sourceFingerprints = {
 		before: sourceBefore,
+		built: sourceBuilt,
 		after: sourceAfter,
+		buildRegenerated: {
+			rust: sourceBefore.rust.sha256 !== sourceBuilt.rust.sha256,
+			typescript: sourceBefore.typescript.sha256 !== sourceBuilt.typescript.sha256,
+		},
 		stable: sourceStable,
 	};
 
 	const blockers: string[] = [];
+	if (artifact.build.sourceFingerprints.buildRegenerated?.rust) {
+		blockers.push(
+			`Rust source fingerprint changed during build window: ${sourceBefore.rust.sha256} -> ${sourceBuilt.rust.sha256}`,
+		);
+	}
 	if (!sourceStable) {
 		blockers.push(
-			`source changed during benchmark session: Rust ${sourceBefore.rust.sha256} -> ${sourceAfter.rust.sha256}; ` +
-				`TypeScript ${sourceBefore.typescript.sha256} -> ${sourceAfter.typescript.sha256}`,
+			`source changed during measurement: Rust ${sourceBuilt.rust.sha256} -> ${sourceAfter.rust.sha256}; ` +
+				`TypeScript ${sourceBuilt.typescript.sha256} -> ${sourceAfter.typescript.sha256}`,
 		);
 	}
 	if (versionSpeedups.cold < VERSION_SPEEDUP_TARGET) {
@@ -1407,19 +1433,21 @@ async function main(): Promise<void> {
 	process.stdout.write(`check 9 passed; artifact: ${ARTIFACT_PATH}\n`);
 }
 
-try {
-	await main();
-} catch (error) {
-	const failure = error instanceof Error ? error : new Error(String(error));
-	if (!(failure instanceof ThresholdFailure)) {
-		const stage = failure instanceof HarnessFailure ? failure.stage : "unexpected";
-		artifact.pass = false;
-		artifact.blockers = [`${stage}: ${failure.message}`];
-		artifact.failure = { stage, message: failure.message };
-		writeArtifact();
+if (import.meta.main) {
+	try {
+		await main();
+	} catch (error) {
+		const failure = error instanceof Error ? error : new Error(String(error));
+		if (!(failure instanceof ThresholdFailure)) {
+			const stage = failure instanceof HarnessFailure ? failure.stage : "unexpected";
+			artifact.pass = false;
+			artifact.blockers = [`${stage}: ${failure.message}`];
+			artifact.failure = { stage, message: failure.message };
+			writeArtifact();
+		}
+		process.stderr.write(`check 9 failed:\n${failure.message}\nartifact: ${ARTIFACT_PATH}\n`);
+		process.exitCode = 1;
+	} finally {
+		for (const path of temporaryDirectories) rmSync(path, { recursive: true, force: true });
 	}
-	process.stderr.write(`check 9 failed:\n${failure.message}\nartifact: ${ARTIFACT_PATH}\n`);
-	process.exitCode = 1;
-} finally {
-	for (const path of temporaryDirectories) rmSync(path, { recursive: true, force: true });
 }

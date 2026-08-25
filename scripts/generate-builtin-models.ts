@@ -51,6 +51,8 @@ const EXPECTED_PROVIDER_IDS = [
 	"opencode",
 	"opencode-go",
 	"openrouter",
+	"qwen-token-plan",
+	"qwen-token-plan-cn",
 	"together",
 	"vercel-ai-gateway",
 	"xai",
@@ -95,7 +97,7 @@ function sortRecordDeep(value: unknown): unknown {
 	if (!isPlainObject(value)) {
 		return value;
 	}
-	const sorted: Record<string, unknown> = {};
+	const sorted = Object.create(null) as Record<string, unknown>;
 	for (const key of Object.keys(value).sort()) {
 		const nested = value[key];
 		sorted[key] = sortRecordDeep(nested);
@@ -135,14 +137,14 @@ async function loadReferenceModels(): Promise<Record<string, Record<string, unkn
 		);
 	}
 
-	const catalog: Record<string, Record<string, unknown>> = {};
+	const catalog = Object.create(null) as Record<string, Record<string, unknown>>;
 	for (const [providerId, providerModels] of Object.entries(models)) {
 		if (!isPlainObject(providerModels)) {
 			fail(
 				`missing prerequisite: reference provider "${providerId}" is not a model map`,
 			);
 		}
-		const providerCatalog: Record<string, unknown> = {};
+		const providerCatalog = Object.create(null) as Record<string, unknown>;
 		for (const [modelId, model] of Object.entries(providerModels)) {
 			if (!isPlainObject(model)) {
 				fail(
@@ -192,16 +194,16 @@ function validateProviderSet(catalog: Record<string, Record<string, unknown>>): 
 	}
 }
 
-function buildSortedCatalog(
+export function buildSortedCatalog(
 	catalog: Record<string, Record<string, unknown>>,
 ): Record<string, Record<string, unknown>> {
-	const sorted: Record<string, Record<string, unknown>> = {};
+	const sorted = Object.create(null) as Record<string, Record<string, unknown>>;
 	for (const providerId of Object.keys(catalog).sort()) {
 		const models = catalog[providerId];
 		if (models === undefined) {
 			fail(`missing prerequisite: reference provider "${providerId}" disappeared during sort`);
 		}
-		const providerModels: Record<string, unknown> = {};
+		const providerModels = Object.create(null) as Record<string, unknown>;
 		for (const modelId of Object.keys(models).sort()) {
 			const model = models[modelId];
 			if (model === undefined) {
@@ -223,7 +225,7 @@ function buildSortedCatalog(
 	return sorted;
 }
 
-function encodeCatalog(catalog: Record<string, Record<string, unknown>>): string {
+export function encodeCatalog(catalog: Record<string, Record<string, unknown>>): string {
 	// 2-space indent + trailing newline, matching plan/JSON.stringify(_, null, 2).
 	return `${JSON.stringify(catalog, null, 2)}\n`;
 }
@@ -273,7 +275,7 @@ function validateEncodedCatalog(
 
 	// Re-encode must be byte-identical (determinism guard before write).
 	// `parsed` is already narrowed as a plain object; rebuild a typed catalog map.
-	const reparseCatalog: Record<string, Record<string, unknown>> = {};
+	const reparseCatalog = Object.create(null) as Record<string, Record<string, unknown>>;
 	for (const providerId of parsedProviders) {
 		const providerModels = parsed[providerId];
 		if (!isPlainObject(providerModels)) {
@@ -341,4 +343,6 @@ async function main(): Promise<void> {
 	process.stdout.write(`${summarize(sorted)}\n`);
 }
 
-await main();
+if (import.meta.main) {
+	await main();
+}

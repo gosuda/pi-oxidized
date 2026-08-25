@@ -23,6 +23,21 @@ pub enum CompactionReason {
     Overflow,
 }
 
+/// Source of a summarization retry attempt (mirrors TS `_summarizationRetryCallbacks`).
+///
+/// `branchSummary` carries no reason; `compaction` carries the trigger reason.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "source", rename_all = "camelCase")]
+pub enum SummarizationRetrySource {
+    /// Branch-summary summarization retry.
+    BranchSummary,
+    /// Compaction summarization retry.
+    Compaction {
+        /// Why compaction was triggered.
+        reason: CompactionReason,
+    },
+}
+
 /// Why a session replacement is about to occur.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -310,7 +325,10 @@ pub enum AgentSessionEvent {
     },
     /// Session display name changed.
     SessionInfoChanged {
-        /// New name (`None` clears).
+        /// New name (`None` clears the display name). Serialized as
+        /// `"name": null` so consumers can observe clearing; `default`
+        /// still accepts an absent field on deserialize.
+        #[serde(default)]
         name: Option<String>,
     },
     /// Thinking level changed.
@@ -345,6 +363,43 @@ pub enum AgentSessionEvent {
             skip_serializing_if = "Option::is_none"
         )]
         final_error: Option<String>,
+    },
+    /// Summarization retry scheduled (backoff about to start).
+    ///
+    /// Intentionally omits `source`: the TypeScript contract keeps
+    /// `summarization_retry_scheduled` source-free and emits `source` only
+    /// with `summarization_retry_attempt_start`. The source is known to the
+    /// caller when scheduling the retry, so it is not repeated here; it
+    /// appears on the attempt-start event to disambiguate which retry path
+    /// is now running after the backoff elapses.
+    SummarizationRetryScheduled {
+        /// Current retry attempt (1-based).
+        attempt: u32,
+        /// Configured max retry attempts.
+        #[serde(rename = "maxAttempts")]
+        max_attempts: u32,
+        /// Backoff delay in milliseconds.
+        #[serde(rename = "delayMs")]
+        delay_ms: u64,
+        /// Error that triggered the retry.
+        #[serde(rename = "errorMessage")]
+        error_message: String,
+    },
+    /// Summarization retry attempt is starting (after backoff).
+    SummarizationRetryAttemptStart {
+        /// Source + optional reason for the retry (flattened into the event).
+        #[serde(flatten)]
+        source: SummarizationRetrySource,
+    },
+    /// Summarization retry finished (success, exhaustion, or cancel).
+    SummarizationRetryFinished,
+    /// Bash execution produced a streaming output delta.
+    BashExecutionUpdate {
+        /// Optional tool-call / execution id.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        /// Output delta text.
+        delta: String,
     },
 }
 
@@ -439,6 +494,10 @@ impl AgentSessionEvent {
             Self::ThinkingLevelChanged { .. } => "thinking_level_changed",
             Self::AutoRetryStart { .. } => "auto_retry_start",
             Self::AutoRetryEnd { .. } => "auto_retry_end",
+            Self::SummarizationRetryScheduled { .. } => "summarization_retry_scheduled",
+            Self::SummarizationRetryAttemptStart { .. } => "summarization_retry_attempt_start",
+            Self::SummarizationRetryFinished => "summarization_retry_finished",
+            Self::BashExecutionUpdate { .. } => "bash_execution_update",
         }
     }
 }
@@ -617,5 +676,165 @@ mod tests {
             ["quit", "reload", "new", "resume", "fork"]
         );
         assert_eq!(SessionStartReason::default(), SessionStartReason::Startup);
+    }
+
+    #[test]
+    fn session_info_changed_clear_serializes_name_null() -> Result<(), serde_json::Error> {
+        let event = AgentSessionEvent::SessionInfoChanged { name: None };
+        let value = serde_json::to_value(&event)?;
+        // `name: null` must reach consumers so clearing is observable.
+        assert_eq!(value, json!({"type": "session_info_changed", "name": null}));
+        // Round-trip: null deserializes back to None.
+        assert_eq!(serde_json::from_value::<AgentSessionEvent>(value)?, event);
+        Ok(())
+    }
+
+    #[test]
+    fn session_info_changed_rename_includes_name() -> Result<(), serde_json::Error> {
+        let event = AgentSessionEvent::SessionInfoChanged {
+            name: Some("hello".into()),
+        };
+        let value = serde_json::to_value(&event)?;
+        assert_eq!(
+            value,
+            json!({"type": "session_info_changed", "name": "hello"})
+        );
+        assert_eq!(serde_json::from_value::<AgentSessionEvent>(value)?, event);
+        Ok(())
+    }
+
+    #[test]
+    fn session_info_changed_deserializes_name_null() -> Result<(), serde_json::Error> {
+        // TS sends `name: null` on clear; must deserialize to None.
+        let value = json!({"type": "session_info_changed", "name": null});
+        let event: AgentSessionEvent = serde_json::from_value(value)?;
+        assert_eq!(event, AgentSessionEvent::SessionInfoChanged { name: None });
+        Ok(())
+    }
+
+    #[test]
+    fn summarization_retry_scheduled_wire_shape() -> Result<(), serde_json::Error> {
+        let event = AgentSessionEvent::SummarizationRetryScheduled {
+            attempt: 1,
+            max_attempts: 3,
+            delay_ms: 2000,
+            error_message: "overloaded".into(),
+        };
+        let value = serde_json::to_value(&event)?;
+        assert_eq!(
+            value,
+            json!({
+                "type": "summarization_retry_scheduled",
+                "attempt": 1,
+                "maxAttempts": 3,
+                "delayMs": 2000,
+                "errorMessage": "overloaded"
+            })
+        );
+        assert_eq!(serde_json::from_value::<AgentSessionEvent>(value)?, event);
+        Ok(())
+    }
+
+    #[test]
+    fn summarization_retry_attempt_start_branch_summary_wire() -> Result<(), serde_json::Error> {
+        let event = AgentSessionEvent::SummarizationRetryAttemptStart {
+            source: SummarizationRetrySource::BranchSummary,
+        };
+        let value = serde_json::to_value(&event)?;
+        assert_eq!(
+            value,
+            json!({
+                "type": "summarization_retry_attempt_start",
+                "source": "branchSummary"
+            })
+        );
+        assert_eq!(serde_json::from_value::<AgentSessionEvent>(value)?, event);
+        Ok(())
+    }
+
+    #[test]
+    fn summarization_retry_attempt_start_compaction_wire() -> Result<(), serde_json::Error> {
+        let event = AgentSessionEvent::SummarizationRetryAttemptStart {
+            source: SummarizationRetrySource::Compaction {
+                reason: CompactionReason::Manual,
+            },
+        };
+        let value = serde_json::to_value(&event)?;
+        assert_eq!(
+            value,
+            json!({
+                "type": "summarization_retry_attempt_start",
+                "source": "compaction",
+                "reason": "manual"
+            })
+        );
+        // Also verify threshold/overflow reasons.
+        let threshold = AgentSessionEvent::SummarizationRetryAttemptStart {
+            source: SummarizationRetrySource::Compaction {
+                reason: CompactionReason::Threshold,
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(&threshold)?["reason"],
+            json!("threshold")
+        );
+        let overflow = AgentSessionEvent::SummarizationRetryAttemptStart {
+            source: SummarizationRetrySource::Compaction {
+                reason: CompactionReason::Overflow,
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(&overflow)?["reason"],
+            json!("overflow")
+        );
+        assert_eq!(serde_json::from_value::<AgentSessionEvent>(value)?, event);
+        Ok(())
+    }
+
+    #[test]
+    fn summarization_retry_finished_wire_shape() -> Result<(), serde_json::Error> {
+        let event = AgentSessionEvent::SummarizationRetryFinished;
+        let value = serde_json::to_value(&event)?;
+        assert_eq!(value, json!({"type": "summarization_retry_finished"}));
+        assert_eq!(serde_json::from_value::<AgentSessionEvent>(value)?, event);
+        Ok(())
+    }
+
+    #[test]
+    fn bash_execution_update_wire_with_id() -> Result<(), serde_json::Error> {
+        let event = AgentSessionEvent::BashExecutionUpdate {
+            id: Some("call-1".into()),
+            delta: "hello\n".into(),
+        };
+        let value = serde_json::to_value(&event)?;
+        assert_eq!(
+            value,
+            json!({
+                "type": "bash_execution_update",
+                "id": "call-1",
+                "delta": "hello\n"
+            })
+        );
+        assert_eq!(serde_json::from_value::<AgentSessionEvent>(value)?, event);
+        Ok(())
+    }
+
+    #[test]
+    fn bash_execution_update_wire_without_id() -> Result<(), serde_json::Error> {
+        let event = AgentSessionEvent::BashExecutionUpdate {
+            id: None,
+            delta: "world".into(),
+        };
+        let value = serde_json::to_value(&event)?;
+        assert_eq!(
+            value,
+            json!({
+                "type": "bash_execution_update",
+                "delta": "world"
+            })
+        );
+        assert!(value.get("id").is_none());
+        assert_eq!(serde_json::from_value::<AgentSessionEvent>(value)?, event);
+        Ok(())
     }
 }

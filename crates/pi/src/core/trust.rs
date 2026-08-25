@@ -18,7 +18,7 @@ use thiserror::Error;
 use super::config::{
     CONFIG_DIR_NAME, PathInputOptions, canonicalize_path, resolve_path, resolve_path_with,
 };
-use super::lockfile::{LockError, LockGuard, LockOptions};
+use pi_ai::lockfile::{LockError, LockGuard, LockOptions};
 
 /// Project config entries under `{cwd}/.pi` that require a trust decision.
 const TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES: &[&str] = &[

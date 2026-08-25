@@ -131,8 +131,8 @@ pub enum OverlayAnchor {
 }
 
 /// Per-side overlay margin from terminal edges.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OverlayMargin {
     /// Top margin in rows.
     pub top: u16,
@@ -171,6 +171,64 @@ impl OverlayMargin {
     #[must_use]
     pub const fn clamped(self) -> Self {
         self
+    }
+}
+
+impl<'de> Deserialize<'de> for OverlayMargin {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = OverlayMargin;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(
+                    "a margin number or an object with optional top/right/bottom/left sides",
+                )
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                u16::try_from(v)
+                    .map(OverlayMargin::uniform)
+                    .map_err(|_| E::custom("margin value exceeds u16"))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                if v < 0 {
+                    return Err(E::custom("margin must be non-negative"));
+                }
+                self.visit_u64(v.cast_unsigned())
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut top = 0u16;
+                let mut right = 0u16;
+                let mut bottom = 0u16;
+                let mut left = 0u16;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "top" => top = map.next_value()?,
+                        "right" => right = map.next_value()?,
+                        "bottom" => bottom = map.next_value()?,
+                        "left" => left = map.next_value()?,
+                        _ => {
+                            let _: serde::de::IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+                Ok(OverlayMargin {
+                    top,
+                    right,
+                    bottom,
+                    left,
+                })
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
     }
 }
 
@@ -422,6 +480,48 @@ mod tests {
         assert_eq!(out["minWidth"], 20);
         assert_eq!(out["nonCapturing"], true);
         assert_eq!(out["anchor"], "top-right");
+        Ok(())
+    }
+
+    #[test]
+    fn overlay_margin_deserializes_bare_scalar_as_uniform() -> Result<(), serde_json::Error> {
+        let m: OverlayMargin = serde_json::from_str("3")?;
+        assert_eq!(m, OverlayMargin::uniform(3));
+        let m2: OverlayMargin = serde_json::from_value(serde_json::Value::Number(7.into()))?;
+        assert_eq!(m2, OverlayMargin::uniform(7));
+        Ok(())
+    }
+
+    #[test]
+    fn overlay_margin_deserializes_partial_object_defaults_zero() -> Result<(), serde_json::Error> {
+        let m: OverlayMargin = serde_json::from_str(r#"{"top":1}"#)?;
+        assert_eq!(
+            m,
+            OverlayMargin {
+                top: 1,
+                right: 0,
+                bottom: 0,
+                left: 0
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn overlay_margin_object_roundtrip_keeps_shape() -> Result<(), serde_json::Error> {
+        let m = OverlayMargin {
+            top: 1,
+            right: 2,
+            bottom: 3,
+            left: 4,
+        };
+        let out = serde_json::to_value(m)?;
+        assert_eq!(out["top"], 1);
+        assert_eq!(out["right"], 2);
+        assert_eq!(out["bottom"], 3);
+        assert_eq!(out["left"], 4);
+        let back: OverlayMargin = serde_json::from_value(out)?;
+        assert_eq!(back, m);
         Ok(())
     }
 

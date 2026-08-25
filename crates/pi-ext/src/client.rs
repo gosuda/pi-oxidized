@@ -12,8 +12,11 @@
 //!   requests; per-key generation tracking discards stale `uiSlot` pushes.
 //! - **Concurrent pending oneshots.** Each in-flight call owns a
 //!   `oneshot::Receiver`; the reader dispatches matched responses.
-//! - **Cancel / timeout.** Every call has a deadline; cancellation removes the
-//!   pending entry and (optionally) sends a control frame.
+//! - **Cancel / timeout.** Every call has a deadline; cancellation keeps its
+//!   pending route until its control frame queues or the transport closes.
+//!   Each pending route carries a monotonic generation so a delayed
+//!   background cancel cleanup cannot remove a newer entry reusing the same
+//!   frame id.
 //! - **Bounded event broadcast.** Unsolicited events fan out through a
 //!   `broadcast` channel with a fixed capacity.
 //! - **Stderr capture.** A tail is retained for crash diagnostics.
@@ -34,8 +37,11 @@ use std::process::Stdio;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
-use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
+#[cfg(test)]
+use tokio::sync::Notify;
+use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::host::{HostError, HostSpec};
 use crate::protocol::{
@@ -49,7 +55,13 @@ use crate::protocol::{
 pub const OUTBOUND_CAPACITY: usize = 128;
 /// Default bounded capacity for the unsolicited event broadcast.
 pub const EVENT_CAPACITY: usize = 256;
-/// Default bounded capacity for per-call streaming event channels.
+/// Default bounded capacity for the lossless correlated-request channel.
+/// Correlated host requests (setModel, compact, newSession, …) must never be
+/// silently dropped; when this capacity is exceeded the host receives an
+/// explicit error response instead of a timeout.
+pub const CORRELATED_REQUEST_CAPACITY: usize = 64;
+/// Capacity of each per-stream provider event channel (bounded, lossless
+/// until saturated; saturation fails with an error, never silently drops).
 pub const STREAM_EVENT_CAPACITY: usize = 64;
 /// Grace period before killing the host on shutdown.
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
@@ -57,6 +69,13 @@ pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum retained stderr tail in bytes.
 pub const STDERR_TAIL_BYTES: usize = 16 * 1024;
+/// Maximum time to wait when enqueueing a cancel frame on a saturated command channel.
+#[cfg(not(test))]
+pub const CANCEL_QUEUE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Test override: a short deadline so timeout-path regressions run without
+/// real-time delay or the `tokio/test-util` `start_paused` feature.
+#[cfg(test)]
+pub const CANCEL_QUEUE_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// Result type for host client operations.
 pub type HostResult<T> = Result<T, HostClientError>;
@@ -70,6 +89,26 @@ struct PendingEntry {
     terminal: Option<oneshot::Sender<FrameResult>>,
     /// Optional streaming event channel for intermediate events.
     stream: Option<mpsc::Sender<Frame>>,
+    /// True once cancellation delivery owns this correlation id.
+    cancelling: bool,
+    /// Monotonic generation assigned by `insert_pending`. Delayed background
+    /// cancel cleanup matches it so a newer entry reusing the same frame id
+    /// is not removed underneath a stale cancellation.
+    generation: u64,
+    /// Per-stream cancellation token. Cancelled from `cancel_pending`,
+    /// `fail_one`, and `fail_all` so a blocked lossless provider-event
+    /// send in [`dispatch`] wakes immediately instead of waiting for the
+    /// consumer to drain the bounded channel.
+    cancel: CancellationToken,
+}
+
+/// Outcome of asking the outbound writer to cancel a pending route.
+enum CancellationStart {
+    Queued,
+    QueuedInBackground,
+    Closed,
+    NotRunning,
+    AlreadyCancelling,
 }
 
 /// A typed, correlated UI request initiated by the TypeScript host.
@@ -155,17 +194,61 @@ pub enum HostUiResponse {
 struct Shared {
     /// id → pending call. `std::sync::Mutex` because critical sections never await.
     pending: StdMutex<HashMap<FrameId, PendingEntry>>,
+    /// Runtime that owns background cancellation sends, including drops made
+    /// from threads that are not currently entered into Tokio.
+    runtime: tokio::runtime::Handle,
+    /// Optional direct sink that preserves session-control frame order.
+    session_control_handler: StdMutex<Option<HostSessionControlHandler>>,
     /// slot key → latest accepted generation. Stale pushes are discarded.
     slot_generations: StdMutex<HashMap<String, u64>>,
-    /// Unsolicited event fan-out.
+    /// Unsolicited event fan-out (lossy broadcast).
     events: broadcast::Sender<HostEvent>,
+    /// Latest complete provider snapshot, delivered losslessly with watch semantics.
+    providers_update: watch::Sender<crate::protocol::ProvidersUpdate>,
+    /// Outbound frame sender mirror, so `dispatch` can send explicit error
+    /// responses for correlated requests that cannot be delivered losslessly.
+    outbound: StdMutex<Option<mpsc::Sender<Frame>>>,
+    /// Bounded lossless channel for correlated host requests (setModel,
+    /// compact, newSession, fork, navigateTree, switchSession, reload,
+    /// setupEntries). Unlike the lossy `events` broadcast, every accepted
+    /// request must reach exactly one consumer or receive an explicit error
+    /// response when delivery is unavailable/full/closed.
+    correlated_requests: mpsc::Sender<HostEvent>,
     /// Monotonic request id allocator.
     next_id: AtomicU64,
+    /// Monotonic generation stamped onto each `PendingEntry` so a delayed
+    /// background cancel cleanup cannot remove a newer same-id entry.
+    next_pending_generation: AtomicU64,
     /// Retained stderr tail (most recent `STDERR_TAIL_BYTES` bytes).
     stderr: StdMutex<String>,
     /// Cleared once the reader or writer observes end-of-stream.
     running: AtomicBool,
+    /// Test-only: signaled once a background cancel cleanup completes so
+    /// regression tests await the real cleanup rather than guessing with
+    /// yield loops.
+    #[cfg(test)]
+    cancel_cleanup_done: Notify,
 }
+
+/// Ordered host-to-client session control that must not be lost or reordered.
+#[derive(Debug, Clone)]
+pub enum HostSessionControlEvent {
+    /// Fire-and-forget action, optionally scoped to a pending replacement.
+    Command(crate::protocol::SessionCommandEnvelope),
+    /// Host finished a ready-gated replacement.
+    ReplacementReady {
+        /// Token previously returned on a replacement response.
+        token: String,
+    },
+    /// Host abandoned a ready-gated replacement.
+    ReplacementAbort {
+        /// Token previously returned on a replacement response.
+        token: String,
+    },
+}
+
+/// Synchronous sink for ordered session-control events.
+pub type HostSessionControlHandler = Arc<dyn Fn(HostSessionControlEvent) + Send + Sync>;
 
 /// Typed unsolicited event delivered to subscribers.
 #[derive(Debug, Clone)]
@@ -187,7 +270,7 @@ pub enum HostEvent {
     /// Extension `setTheme` application request.
     ThemeSet(crate::protocol::ThemeSet),
     /// Extension fire-and-forget session action (`pi.setSessionName`, …).
-    SessionCommand(crate::protocol::SessionCommand),
+    SessionCommand(crate::protocol::SessionCommandEnvelope),
     /// Correlated `pi.setModel` request awaiting [`HostClient::respond_set_model`].
     SetModelRequest {
         /// Original host correlation id.
@@ -201,6 +284,56 @@ pub enum HostEvent {
         id: FrameId,
         /// Compact request payload.
         request: crate::protocol::SessionCompactRequest,
+    },
+    /// Correlated `ctx.newSession` request awaiting [`HostClient::respond_new_session`].
+    NewSessionRequest {
+        /// Original host correlation id.
+        id: FrameId,
+        /// New-session request payload.
+        request: crate::protocol::SessionNewSessionRequest,
+    },
+    /// Correlated `ctx.fork` request awaiting [`HostClient::respond_fork`].
+    ForkRequest {
+        /// Original host correlation id.
+        id: FrameId,
+        /// Fork request payload.
+        request: crate::protocol::SessionForkRequest,
+    },
+    /// Correlated `ctx.navigateTree` request awaiting [`HostClient::respond_navigate_tree`].
+    NavigateTreeRequest {
+        /// Original host correlation id.
+        id: FrameId,
+        /// Navigate-tree request payload.
+        request: crate::protocol::SessionNavigateTreeRequest,
+    },
+    /// Correlated `ctx.switchSession` request awaiting [`HostClient::respond_switch_session`].
+    SwitchSessionRequest {
+        /// Original host correlation id.
+        id: FrameId,
+        /// Switch-session request payload.
+        request: crate::protocol::SessionSwitchSessionRequest,
+    },
+    /// Correlated `ctx.reload` request awaiting [`HostClient::respond_reload`].
+    ReloadRequest {
+        /// Original host correlation id.
+        id: FrameId,
+    },
+    /// Correlated `session.setupEntries` request awaiting [`HostClient::respond_setup_entries`].
+    SetupEntriesRequest {
+        /// Original host correlation id.
+        id: FrameId,
+        /// Setup-entries request payload.
+        request: crate::protocol::SessionSetupEntriesRequest,
+    },
+    /// Host finished a ready-gated replacement (`session.replacementReady`).
+    ReplacementReady {
+        /// Token previously returned on a replacement response.
+        token: String,
+    },
+    /// Host abandoned a ready-gated replacement (`session.replacementAbort`).
+    ReplacementAbort {
+        /// Token previously returned on a replacement response.
+        token: String,
     },
     /// Extension fire-and-forget UI control (`ui.setStatus`, …).
     UiControl(crate::protocol::UiControl),
@@ -280,13 +413,17 @@ impl From<HostError> for HostClientError {
         }
     }
 }
-
 /// Multiplexed host client.
 pub struct HostClient {
     cmd_tx: Mutex<Option<mpsc::Sender<Frame>>>,
     shared: Arc<Shared>,
     child: Mutex<Option<Child>>,
     reader_handle: Mutex<Option<JoinHandle<()>>>,
+    /// Sole lossless receiver for correlated host requests, taken once by the
+    /// event pump. Stored outside `Shared` so only the owning client can claim it.
+    correlated_requests_rx: StdMutex<Option<mpsc::Receiver<HostEvent>>>,
+    /// Sole receiver for lossless latest-state provider snapshots.
+    providers_update_rx: StdMutex<Option<watch::Receiver<crate::protocol::ProvidersUpdate>>>,
 }
 
 impl HostClient {
@@ -336,14 +473,26 @@ impl HostClient {
         child: Option<Child>,
     ) -> Self {
         let (events_tx, _) = broadcast::channel(EVENT_CAPACITY);
+        let (providers_update_tx, providers_update_rx) =
+            watch::channel(crate::protocol::ProvidersUpdate::default());
         let (cmd_tx, cmd_rx) = mpsc::channel::<Frame>(OUTBOUND_CAPACITY);
+        let (correlated_tx, correlated_rx) =
+            mpsc::channel::<HostEvent>(CORRELATED_REQUEST_CAPACITY);
         let shared = Arc::new(Shared {
             pending: StdMutex::new(HashMap::new()),
+            runtime: tokio::runtime::Handle::current(),
+            session_control_handler: StdMutex::new(None),
             slot_generations: StdMutex::new(HashMap::new()),
             events: events_tx,
+            providers_update: providers_update_tx,
+            outbound: StdMutex::new(Some(cmd_tx.clone())),
+            correlated_requests: correlated_tx,
             next_id: AtomicU64::new(1),
+            next_pending_generation: AtomicU64::new(1),
             stderr: StdMutex::new(String::new()),
             running: AtomicBool::new(true),
+            #[cfg(test)]
+            cancel_cleanup_done: Notify::new(),
         });
 
         let writer_shared = Arc::clone(&shared);
@@ -359,12 +508,13 @@ impl HostClient {
         tokio::spawn(async move {
             stderr_task(stderr, stderr_shared).await;
         });
-
         Self {
             cmd_tx: Mutex::new(Some(cmd_tx)),
             shared,
             child: Mutex::new(child),
             reader_handle: Mutex::new(Some(reader_handle)),
+            correlated_requests_rx: StdMutex::new(Some(correlated_rx)),
+            providers_update_rx: StdMutex::new(Some(providers_update_rx)),
         }
     }
 
@@ -372,6 +522,15 @@ impl HostClient {
     #[must_use]
     pub fn is_running(&self) -> bool {
         self.shared.running.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    async fn stall_outbound_for_test(
+        &self,
+    ) -> (mpsc::Receiver<Frame>, Option<mpsc::Sender<Frame>>) {
+        let (tx, rx) = mpsc::channel(1);
+        let original = self.cmd_tx.lock().await.replace(tx);
+        (rx, original)
     }
 
     /// Latest retained stderr tail.
@@ -384,6 +543,46 @@ impl HostClient {
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<HostEvent> {
         self.shared.events.subscribe()
+    }
+
+    /// Claim the sole lossless receiver for correlated host requests.
+    ///
+    /// The event pump calls this exactly once. Subsequent callers receive
+    /// `None`. While unclaimed, correlated requests receive an explicit error
+    /// response (the host observes a failure instead of a timeout).
+    #[must_use]
+    pub fn take_correlated_requests(&self) -> Option<mpsc::Receiver<HostEvent>> {
+        self.correlated_requests_rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    /// Claim the sole lossless latest-state provider-update receiver.
+    ///
+    /// The receiver starts with a default snapshot already observed, so its
+    /// first `changed().await` waits for a real host update. Subsequent callers
+    /// receive `None`.
+    #[must_use]
+    pub fn take_providers_updates(
+        &self,
+    ) -> Option<watch::Receiver<crate::protocol::ProvidersUpdate>> {
+        self.providers_update_rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    /// Install or clear the ordered session-control sink.
+    ///
+    /// The reader invokes the sink without holding client locks. Without a sink,
+    /// these events retain their ordinary broadcast behavior.
+    pub fn set_session_control_handler(&self, handler: Option<HostSessionControlHandler>) {
+        *self
+            .shared
+            .session_control_handler
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = handler;
     }
 
     fn next_id(&self) -> FrameId {
@@ -404,6 +603,50 @@ impl HostClient {
             }),
             None => Err(HostClientError::NotRunning),
         }
+    }
+
+    /// Serialize a typed value into a `FrameKind::Res` frame and send it.
+    ///
+    /// `encode_label` appears in the [`HostClientError::Payload`] message when
+    /// serialization fails, preserving the per-responder error text.
+    async fn send_typed_response<T: serde::Serialize>(
+        &self,
+        id: FrameId,
+        method: &str,
+        value: &T,
+        encode_label: &str,
+    ) -> HostResult<()> {
+        let payload = serde_json::to_value(value)
+            .map_err(|error| HostClientError::Payload(format!("encode {encode_label}: {error}")))?;
+        self.send_frame(Frame {
+            id,
+            kind: FrameKind::Res,
+            method: method.to_owned(),
+            payload,
+        })
+        .await
+    }
+
+    /// Send a `FrameKind::Error` frame built from an [`ErrorPayload`].
+    ///
+    /// `encode_label` appears in the [`HostClientError::Payload`] message when
+    /// serialization fails, preserving the per-responder error text.
+    async fn send_error_frame(
+        &self,
+        id: FrameId,
+        method: &str,
+        payload: crate::protocol::ErrorPayload,
+        encode_label: &str,
+    ) -> HostResult<()> {
+        let payload = serde_json::to_value(payload)
+            .map_err(|error| HostClientError::Payload(format!("encode {encode_label}: {error}")))?;
+        self.send_frame(Frame {
+            id,
+            kind: FrameKind::Error,
+            method: method.to_owned(),
+            payload,
+        })
+        .await
     }
 
     /// Send a request and await its terminal response.
@@ -437,11 +680,14 @@ impl HostClient {
         }
         let id = self.next_id();
         let (tx, rx) = oneshot::channel::<FrameResult>();
-        self.insert_pending(
+        let generation = self.insert_pending(
             id,
             PendingEntry {
                 terminal: Some(tx),
                 stream: None,
+                cancelling: false,
+                generation: 0,
+                cancel: CancellationToken::new(),
             },
         );
         let frame = Frame {
@@ -462,9 +708,17 @@ impl HostClient {
             }),
             Err(_) => {
                 if let Some(control_method) = cancel_method_for(method) {
-                    let _ = self.send_cancel(id, control_method).await;
+                    let _ = cancel_pending(
+                        &self.shared,
+                        id,
+                        generation,
+                        self.cmd_tx.lock().await.clone(),
+                        Some(control_method),
+                        None,
+                    );
+                } else {
+                    Self::remove_pending(&self.shared, id);
                 }
-                Self::remove_pending(&self.shared, id);
                 Err(HostClientError::Timeout { id, timeout })
             }
         }
@@ -510,16 +764,12 @@ impl HostClient {
     /// Returns a payload or transport error when the response cannot be
     /// encoded or sent.
     pub async fn respond_set_model(&self, id: FrameId, success: bool) -> HostResult<()> {
-        let payload = serde_json::to_value(crate::protocol::SessionSetModelResponse { success })
-            .map_err(|error| {
-                HostClientError::Payload(format!("encode setModel response: {error}"))
-            })?;
-        self.send_frame(Frame {
+        self.send_typed_response(
             id,
-            kind: FrameKind::Res,
-            method: crate::protocol::SESSION_SET_MODEL_METHOD.to_owned(),
-            payload,
-        })
+            crate::protocol::SESSION_SET_MODEL_METHOD,
+            &crate::protocol::SessionSetModelResponse { success },
+            "setModel response",
+        )
         .await
     }
 
@@ -537,30 +787,255 @@ impl HostClient {
         id: FrameId,
         outcome: Result<serde_json::Value, String>,
     ) -> HostResult<()> {
-        let frame = match outcome {
-            Ok(result) => Frame {
-                id,
-                kind: FrameKind::Res,
-                method: crate::protocol::SESSION_COMPACT_METHOD.to_owned(),
-                payload: serde_json::to_value(crate::protocol::SessionCompactResponse { result })
-                    .map_err(|error| {
-                    HostClientError::Payload(format!("encode compact response: {error}"))
-                })?,
+        match outcome {
+            Ok(result) => {
+                self.send_typed_response(
+                    id,
+                    crate::protocol::SESSION_COMPACT_METHOD,
+                    &crate::protocol::SessionCompactResponse { result },
+                    "compact response",
+                )
+                .await
+            }
+            Err(message) => {
+                self.send_error_frame(
+                    id,
+                    crate::protocol::SESSION_COMPACT_METHOD,
+                    crate::protocol::ErrorPayload::new("extension_error", &message),
+                    "compact error",
+                )
+                .await
+            }
+        }
+    }
+
+    /// Answer a correlated `session.newSession` request from the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns a payload or transport error when the response cannot be
+    /// encoded or sent.
+    pub async fn respond_new_session(
+        &self,
+        id: FrameId,
+        cancelled: bool,
+        token: Option<&str>,
+    ) -> HostResult<()> {
+        self.send_typed_response(
+            id,
+            crate::protocol::SESSION_NEW_SESSION_METHOD,
+            &crate::protocol::SessionNewSessionResponse {
+                cancelled,
+                replacement_token: token.map(str::to_owned),
             },
-            Err(message) => Frame {
-                id,
-                kind: FrameKind::Error,
-                method: crate::protocol::SESSION_COMPACT_METHOD.to_owned(),
-                payload: serde_json::to_value(crate::protocol::ErrorPayload::new(
-                    "extension_error",
-                    &message,
-                ))
-                .map_err(|error| {
-                    HostClientError::Payload(format!("encode compact error: {error}"))
-                })?,
+            "newSession response",
+        )
+        .await
+    }
+
+    /// Answer a correlated `session.fork` request from the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns a payload or transport error when the response cannot be
+    /// encoded or sent.
+    pub async fn respond_fork(
+        &self,
+        id: FrameId,
+        cancelled: bool,
+        selected_text: Option<&str>,
+        token: Option<&str>,
+    ) -> HostResult<()> {
+        self.send_typed_response(
+            id,
+            crate::protocol::SESSION_FORK_METHOD,
+            &crate::protocol::SessionForkResponse {
+                cancelled,
+                selected_text: selected_text.map(str::to_owned),
+                replacement_token: token.map(str::to_owned),
             },
-        };
-        self.send_frame(frame).await
+            "fork response",
+        )
+        .await
+    }
+
+    /// Answer a correlated `session.switchSession` request from the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns a payload or transport error when the response cannot be
+    /// encoded or sent.
+    pub async fn respond_switch_session(
+        &self,
+        id: FrameId,
+        cancelled: bool,
+        token: Option<&str>,
+    ) -> HostResult<()> {
+        self.send_typed_response(
+            id,
+            crate::protocol::SESSION_SWITCH_SESSION_METHOD,
+            &crate::protocol::SessionSwitchSessionResponse {
+                cancelled,
+                replacement_token: token.map(str::to_owned),
+            },
+            "switchSession response",
+        )
+        .await
+    }
+
+    /// Answer a correlated `session.navigateTree` request from the host.
+    ///
+    /// Success sends the typed navigation result; failure sends an
+    /// `extension_error` frame the host surfaces to the extension.
+    ///
+    /// # Errors
+    ///
+    /// Returns a payload or transport error when the response cannot be
+    /// encoded or sent.
+    pub async fn respond_navigate_tree(
+        &self,
+        id: FrameId,
+        outcome: Result<crate::protocol::SessionNavigateTreeResponse, String>,
+    ) -> HostResult<()> {
+        match outcome {
+            Ok(result) => {
+                self.send_typed_response(
+                    id,
+                    crate::protocol::SESSION_NAVIGATE_TREE_METHOD,
+                    &result,
+                    "navigateTree response",
+                )
+                .await
+            }
+            Err(message) => {
+                self.send_error_frame(
+                    id,
+                    crate::protocol::SESSION_NAVIGATE_TREE_METHOD,
+                    crate::protocol::ErrorPayload::new("extension_error", &message),
+                    "navigateTree error",
+                )
+                .await
+            }
+        }
+    }
+
+    /// Answer a correlated `session.reload` request from the host.
+    ///
+    /// Success sends an optional ready-gate token; failure sends an
+    /// `extension_error` frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns a payload or transport error when the response cannot be
+    /// encoded or sent.
+    pub async fn respond_reload(
+        &self,
+        id: FrameId,
+        outcome: Result<Option<&str>, String>,
+    ) -> HostResult<()> {
+        match outcome {
+            Ok(token) => {
+                self.send_typed_response(
+                    id,
+                    crate::protocol::SESSION_RELOAD_METHOD,
+                    &crate::protocol::SessionReloadResponse {
+                        replacement_token: token.map(str::to_owned),
+                    },
+                    "reload response",
+                )
+                .await
+            }
+            Err(message) => {
+                self.send_error_frame(
+                    id,
+                    crate::protocol::SESSION_RELOAD_METHOD,
+                    crate::protocol::ErrorPayload::new("extension_error", &message),
+                    "reload error",
+                )
+                .await
+            }
+        }
+    }
+
+    /// Answer a correlated `session.setupEntries` request from the host.
+    ///
+    /// Success sends the serialized session entries; failure sends an
+    /// `extension_error` frame (stale token, no active replacement).
+    ///
+    /// # Errors
+    ///
+    /// Returns a payload or transport error when the response cannot be
+    /// encoded or sent.
+    pub async fn respond_setup_entries(
+        &self,
+        id: FrameId,
+        outcome: Result<crate::protocol::SessionSetupEntriesResponse, String>,
+    ) -> HostResult<()> {
+        match outcome {
+            Ok(response) => {
+                self.send_typed_response(
+                    id,
+                    crate::protocol::SESSION_SETUP_ENTRIES_METHOD,
+                    &response,
+                    "setupEntries response",
+                )
+                .await
+            }
+            Err(message) => {
+                self.send_error_frame(
+                    id,
+                    crate::protocol::SESSION_SETUP_ENTRIES_METHOD,
+                    crate::protocol::ErrorPayload::new("extension_error", &message),
+                    "setupEntries error",
+                )
+                .await
+            }
+        }
+    }
+
+    /// Reject a correlated replacement request because another is pending.
+    ///
+    /// # Errors
+    ///
+    /// Returns a payload or transport error when the error frame cannot be
+    /// encoded or sent.
+    pub async fn respond_replacement_busy(&self, id: FrameId, method: &str) -> HostResult<()> {
+        self.send_error_frame(
+            id,
+            method,
+            crate::protocol::ErrorPayload {
+                code: "replacement_busy".to_owned(),
+                message: "session replacement in progress".to_owned(),
+                retryable: true,
+                data: None,
+            },
+            "replacement_busy error",
+        )
+        .await
+    }
+
+    /// Reject a correlated session request with a non-retryable `extension_error`.
+    ///
+    /// Used for unclaimed newSession/fork/switchSession (and any other session
+    /// method that needs a correlated failure without a typed success helper).
+    ///
+    /// # Errors
+    ///
+    /// Returns a payload or transport error when the error frame cannot be
+    /// encoded or sent.
+    pub async fn respond_session_error(
+        &self,
+        id: FrameId,
+        method: &str,
+        message: &str,
+    ) -> HostResult<()> {
+        self.send_error_frame(
+            id,
+            method,
+            crate::protocol::ErrorPayload::new("extension_error", message),
+            "session error",
+        )
+        .await
     }
 
     /// Send a fire-and-forget event frame (id 0) with an open method string.
@@ -579,10 +1054,6 @@ impl HostClient {
             payload,
         })
         .await
-    }
-
-    async fn send_cancel(&self, id: FrameId, control_method: &'static str) -> HostResult<()> {
-        self.send_frame(cancel_frame(id, control_method)).await
     }
 
     /// Open a streaming call: intermediate `event` frames with the request id
@@ -620,11 +1091,14 @@ impl HostClient {
         let bound = event_bound.clamp(1, STREAM_EVENT_CAPACITY * 8);
         let (terminal_tx, terminal_rx) = oneshot::channel::<FrameResult>();
         let (stream_tx, stream_rx) = mpsc::channel::<Frame>(bound);
-        self.insert_pending(
+        let generation = self.insert_pending(
             id,
             PendingEntry {
                 terminal: Some(terminal_tx),
                 stream: Some(stream_tx),
+                cancelling: false,
+                generation: 0,
+                cancel: CancellationToken::new(),
             },
         );
         let frame = Frame {
@@ -639,12 +1113,12 @@ impl HostClient {
         }
         Ok(StreamHandle {
             id,
+            generation,
             events: stream_rx,
             terminal: Some(terminal_rx),
             shared: Arc::clone(&self.shared),
             cmd_tx: self.cmd_tx.lock().await.clone(),
             cancel_method: cancel_method_for(method),
-            cancel_sent: false,
             consumed: false,
         })
     }
@@ -713,10 +1187,16 @@ impl HostClient {
         Ok(resp.height)
     }
 
-    fn insert_pending(&self, id: FrameId, entry: PendingEntry) {
+    fn insert_pending(&self, id: FrameId, mut entry: PendingEntry) -> u64 {
+        let generation = self
+            .shared
+            .next_pending_generation
+            .fetch_add(1, Ordering::Relaxed);
+        entry.generation = generation;
         if let Ok(mut pending) = self.shared.pending.lock() {
             pending.insert(id, entry);
         }
+        generation
     }
 
     /// Graceful shutdown: close stdin, wait the grace period, then kill + reap.
@@ -731,14 +1211,29 @@ impl HostClient {
         self.shared.running.store(false, Ordering::Relaxed);
         // Drop the outbound sender so the writer EOFs stdin.
         drop(self.cmd_tx.lock().await.take());
+        drop(
+            self.shared
+                .outbound
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+        );
+        // Cancel blocked stream delivery before reaping so the child can
+        // drain stdout and observe stdin EOF during graceful shutdown.
+        fail_all(
+            &self.shared,
+            &HostClientError::Closed {
+                message: "host shut down".to_owned(),
+                stderr: stderr_of(&self.shared),
+            },
+        );
         let mut child_guard = self.child.lock().await;
         if let Some(child) = child_guard.take() {
             let reap = reap_child(child).await;
             drop(self.reader_handle.lock().await.take());
             reap
         } else {
-            // In-memory transport: no child to reap. Pending calls remain the
-            // reader's responsibility; `running` is already cleared.
+            // In-memory transport has no child to reap.
             Ok(())
         }
     }
@@ -747,12 +1242,12 @@ impl HostClient {
 /// Handle for a streaming call.
 pub struct StreamHandle {
     id: FrameId,
+    generation: u64,
     events: mpsc::Receiver<Frame>,
     terminal: Option<oneshot::Receiver<FrameResult>>,
     shared: Arc<Shared>,
     cmd_tx: Option<mpsc::Sender<Frame>>,
     cancel_method: Option<&'static str>,
-    cancel_sent: bool,
     consumed: bool,
 }
 
@@ -775,18 +1270,23 @@ impl StreamHandle {
     /// # Errors
     ///
     /// Returns [`HostClientError::Closed`] when the outbound pipe is broken.
-    pub async fn cancel(&mut self, control_method: &str) -> HostResult<()> {
-        let frame = cancel_frame(self.id, control_method);
-        match &self.cmd_tx {
-            Some(tx) => {
-                tx.send(frame).await.map_err(|e| HostClientError::Closed {
-                    message: format!("cancel send failed: {e}"),
-                    stderr: stderr_of(&self.shared),
-                })?;
-                self.cancel_sent = true;
-                Ok(())
-            }
-            None => Err(HostClientError::NotRunning),
+    pub fn cancel(&mut self, control_method: &str) -> HostResult<()> {
+        match cancel_pending(
+            &self.shared,
+            self.id,
+            self.generation,
+            self.cmd_tx.clone(),
+            Some(control_method),
+            None,
+        ) {
+            CancellationStart::Queued
+            | CancellationStart::AlreadyCancelling
+            | CancellationStart::QueuedInBackground => Ok(()),
+            CancellationStart::Closed => Err(HostClientError::Closed {
+                message: "cancel send failed: outbound pipe closed".to_owned(),
+                stderr: stderr_of(&self.shared),
+            }),
+            CancellationStart::NotRunning => Err(HostClientError::NotRunning),
         }
     }
 
@@ -798,44 +1298,40 @@ impl StreamHandle {
     /// the remote error payload.
     pub async fn finish(mut self, timeout: Duration) -> HostResult<Frame> {
         let terminal = self.terminal.take().ok_or(HostClientError::NotRunning)?;
-        let result = match tokio::time::timeout(timeout, terminal).await {
-            Ok(Ok(r)) => r,
-            Ok(Err(_)) => Err(HostClientError::Closed {
-                message: "stream terminal closed".to_owned(),
-                stderr: stderr_of(&self.shared),
-            }),
-            Err(_) => {
-                if let Some(control_method) = self.cancel_method {
-                    let _ = self.cancel(control_method).await;
-                }
-                Self::remove_pending(&self.shared, self.id);
-                Err(HostClientError::Timeout {
-                    id: self.id,
-                    timeout,
+        match tokio::time::timeout(timeout, terminal).await {
+            Ok(Ok(r)) => {
+                self.consumed = true;
+                r
+            }
+            Ok(Err(_)) => {
+                self.consumed = true;
+                Err(HostClientError::Closed {
+                    message: "stream terminal closed".to_owned(),
+                    stderr: stderr_of(&self.shared),
                 })
             }
-        };
-        self.consumed = true;
-        result
-    }
-
-    fn remove_pending(shared: &Shared, id: FrameId) {
-        if let Ok(mut pending) = shared.pending.lock() {
-            pending.remove(&id);
+            // Leave `consumed` false so `Drop` owns cancellation delivery.
+            Err(_) => Err(HostClientError::Timeout {
+                id: self.id,
+                timeout,
+            }),
         }
     }
 }
 
 impl Drop for StreamHandle {
     fn drop(&mut self) {
-        if !self.consumed {
-            if !self.cancel_sent
-                && let (Some(control_method), Some(tx)) = (self.cancel_method, self.cmd_tx.as_ref())
-            {
-                let _ = tx.try_send(cancel_frame(self.id, control_method));
-            }
-            Self::remove_pending(&self.shared, self.id);
+        if self.consumed {
+            return;
         }
+        let _ = cancel_pending(
+            &self.shared,
+            self.id,
+            self.generation,
+            self.cmd_tx.clone(),
+            self.cancel_method,
+            None,
+        );
     }
 }
 
@@ -915,7 +1411,9 @@ async fn reader_task(stdout: Box<dyn AsyncRead + Unpin + Send>, shared: Arc<Shar
             Ok(n) => match decoder.push(&buf[..n]) {
                 Ok(frames) => {
                     for frame in frames {
-                        dispatch(&shared, frame);
+                        if !dispatch(&shared, frame).await {
+                            return;
+                        }
                     }
                 }
                 Err(e) => {
@@ -980,10 +1478,11 @@ fn stderr_of(shared: &Shared) -> String {
 
 fn fail_one(shared: &Shared, id: FrameId, err: HostClientError) {
     let entry = take_pending(shared, id);
-    if let Some(entry) = entry
-        && let Some(tx) = entry.terminal
-    {
-        let _ = tx.send(Err(err));
+    if let Some(entry) = entry {
+        entry.cancel.cancel();
+        if let Some(tx) = entry.terminal {
+            let _ = tx.send(Err(err));
+        }
     }
 }
 
@@ -994,6 +1493,7 @@ fn fail_all(shared: &Shared, err: &HostClientError) {
         Vec::new()
     };
     for entry in entries {
+        entry.cancel.cancel();
         if let Some(tx) = entry.terminal {
             let _ = tx.send(Err(err.clone()));
         }
@@ -1008,15 +1508,110 @@ fn take_pending(shared: &Shared, id: FrameId) -> Option<PendingEntry> {
     }
 }
 
-fn dispatch(shared: &Shared, frame: Frame) {
+/// Takes an active route while leaving a cancellation-owned route in place.
+fn take_active_pending(shared: &Shared, id: FrameId) -> Option<PendingEntry> {
+    if let Ok(mut pending) = shared.pending.lock()
+        && pending.get(&id).is_some_and(|entry| !entry.cancelling)
+    {
+        pending.remove(&id)
+    } else {
+        None
+    }
+}
+
+fn remove_cancelling_pending(shared: &Shared, id: FrameId, generation: u64) {
+    if let Ok(mut pending) = shared.pending.lock()
+        && pending
+            .get(&id)
+            .is_some_and(|entry| entry.cancelling && entry.generation == generation)
+    {
+        pending.remove(&id);
+    }
+}
+
+/// Marks one pending route as cancelling and queues exactly one control frame.
+/// On a full queue, the retained route is removed only after the spawned send
+/// has queued that frame, observed channel closure, or the
+/// [`CANCEL_QUEUE_TIMEOUT`] deadline elapsed — so neither the cancellation
+/// task nor the stale pending entry can live beyond the deadline solely
+/// because the outbound queue is full.
+fn cancel_pending(
+    shared: &Arc<Shared>,
+    id: FrameId,
+    generation: u64,
+    cmd_tx: Option<mpsc::Sender<Frame>>,
+    control_method: Option<&str>,
+    terminal_error: Option<HostClientError>,
+) -> CancellationStart {
+    let terminal = if let Ok(mut pending) = shared.pending.lock() {
+        let Some(entry) = pending.get_mut(&id) else {
+            return CancellationStart::AlreadyCancelling;
+        };
+        // A missing or generation-mismatched route is already gone or replaced
+        // by a newer same-id entry; never cancel the wrong generation.
+        if entry.generation != generation || entry.cancelling {
+            return CancellationStart::AlreadyCancelling;
+        }
+        entry.cancelling = true;
+        entry.cancel.cancel();
+        if terminal_error.is_some() {
+            entry.terminal.take()
+        } else {
+            None
+        }
+    } else {
+        return CancellationStart::AlreadyCancelling;
+    };
+
+    if let Some(err) = terminal_error
+        && let Some(terminal) = terminal
+    {
+        let _ = terminal.send(Err(err));
+    }
+
+    let (Some(tx), Some(control_method)) = (cmd_tx, control_method) else {
+        remove_cancelling_pending(shared, id, generation);
+        return CancellationStart::NotRunning;
+    };
+    let cancel = cancel_frame(id, control_method);
+    match tx.try_send(cancel) {
+        Ok(()) => {
+            remove_cancelling_pending(shared, id, generation);
+            CancellationStart::Queued
+        }
+        Err(mpsc::error::TrySendError::Full(cancel)) => {
+            let runtime = shared.runtime.clone();
+            let shared = Arc::clone(shared);
+            runtime.spawn(async move {
+                // Bound the send so a permanently saturated queue cannot keep
+                // the cancellation task or the stale pending entry alive
+                // indefinitely. On timeout or send failure the
+                // generation-matched cleanup below removes only this route,
+                // preserving any replacement reusing the same frame id.
+                let _ = tokio::time::timeout(CANCEL_QUEUE_TIMEOUT, tx.send(cancel)).await;
+                remove_cancelling_pending(&shared, id, generation);
+                #[cfg(test)]
+                shared.cancel_cleanup_done.notify_one();
+            });
+            CancellationStart::QueuedInBackground
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            remove_cancelling_pending(shared, id, generation);
+            CancellationStart::Closed
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn dispatch(shared: &Shared, frame: Frame) -> bool {
     if let Err(e) = frame.validate(false) {
         let _ = shared.events.send(HostEvent::ProtocolError(e.to_string()));
-        return;
+        return true;
     }
     let id = frame.id;
     match frame.kind {
         FrameKind::Res => {
-            if let Some(entry) = take_pending(shared, id)
+            if let Some(entry) = take_active_pending(shared, id)
                 && let Some(tx) = entry.terminal
             {
                 let _ = tx.send(Ok(frame));
@@ -1027,7 +1622,7 @@ fn dispatch(shared: &Shared, frame: Frame) {
                 let _ = shared.events.send(HostEvent::Raw(frame));
             } else {
                 let err = remote_error(&frame);
-                if let Some(entry) = take_pending(shared, id)
+                if let Some(entry) = take_active_pending(shared, id)
                     && let Some(tx) = entry.terminal
                 {
                     let _ = tx.send(Err(err));
@@ -1036,8 +1631,17 @@ fn dispatch(shared: &Shared, frame: Frame) {
         }
         FrameKind::Event => {
             if id == 0 {
-                forward_event(shared, frame);
+                if !forward_event(shared, frame) {
+                    return false;
+                }
+            } else if frame.method == Method::ProviderEvent.as_str() {
+                // Provider events are lossless: await capacity so no event
+                // is silently dropped before the stream terminates. The
+                // per-stream cancellation token unblocks the await when the
+                // call is cancelled or failed.
+                forward_provider_event(shared, frame).await;
             } else {
+                // Tool updates and other stream events stay lossy.
                 forward_stream_event(shared, frame);
             }
         }
@@ -1045,10 +1649,15 @@ fn dispatch(shared: &Shared, frame: Frame) {
             if frame.method == crate::protocol::SESSION_SET_MODEL_METHOD {
                 match from_payload::<crate::protocol::SessionSetModelRequest>(&frame.payload) {
                     Ok(request) => {
-                        let _ = shared.events.send(HostEvent::SetModelRequest {
-                            id: frame.id,
-                            request,
-                        });
+                        forward_correlated_request(
+                            shared,
+                            HostEvent::SetModelRequest {
+                                id: frame.id,
+                                request,
+                            },
+                            frame.id,
+                            crate::protocol::SESSION_SET_MODEL_METHOD,
+                        );
                     }
                     Err(_) => {
                         let _ = shared.events.send(HostEvent::Raw(frame));
@@ -1057,10 +1666,114 @@ fn dispatch(shared: &Shared, frame: Frame) {
             } else if frame.method == crate::protocol::SESSION_COMPACT_METHOD {
                 match from_payload::<crate::protocol::SessionCompactRequest>(&frame.payload) {
                     Ok(request) => {
-                        let _ = shared.events.send(HostEvent::CompactRequest {
-                            id: frame.id,
-                            request,
-                        });
+                        forward_correlated_request(
+                            shared,
+                            HostEvent::CompactRequest {
+                                id: frame.id,
+                                request,
+                            },
+                            frame.id,
+                            crate::protocol::SESSION_COMPACT_METHOD,
+                        );
+                    }
+                    Err(_) => {
+                        let _ = shared.events.send(HostEvent::Raw(frame));
+                    }
+                }
+            } else if frame.method == crate::protocol::SESSION_NEW_SESSION_METHOD {
+                match from_payload::<crate::protocol::SessionNewSessionRequest>(&frame.payload) {
+                    Ok(request) => {
+                        forward_correlated_request(
+                            shared,
+                            HostEvent::NewSessionRequest {
+                                id: frame.id,
+                                request,
+                            },
+                            frame.id,
+                            crate::protocol::SESSION_NEW_SESSION_METHOD,
+                        );
+                    }
+                    Err(_) => {
+                        let _ = shared.events.send(HostEvent::Raw(frame));
+                    }
+                }
+            } else if frame.method == crate::protocol::SESSION_FORK_METHOD {
+                match from_payload::<crate::protocol::SessionForkRequest>(&frame.payload) {
+                    Ok(request) => {
+                        forward_correlated_request(
+                            shared,
+                            HostEvent::ForkRequest {
+                                id: frame.id,
+                                request,
+                            },
+                            frame.id,
+                            crate::protocol::SESSION_FORK_METHOD,
+                        );
+                    }
+                    Err(_) => {
+                        let _ = shared.events.send(HostEvent::Raw(frame));
+                    }
+                }
+            } else if frame.method == crate::protocol::SESSION_NAVIGATE_TREE_METHOD {
+                match from_payload::<crate::protocol::SessionNavigateTreeRequest>(&frame.payload) {
+                    Ok(request) => {
+                        forward_correlated_request(
+                            shared,
+                            HostEvent::NavigateTreeRequest {
+                                id: frame.id,
+                                request,
+                            },
+                            frame.id,
+                            crate::protocol::SESSION_NAVIGATE_TREE_METHOD,
+                        );
+                    }
+                    Err(_) => {
+                        let _ = shared.events.send(HostEvent::Raw(frame));
+                    }
+                }
+            } else if frame.method == crate::protocol::SESSION_SWITCH_SESSION_METHOD {
+                match from_payload::<crate::protocol::SessionSwitchSessionRequest>(&frame.payload) {
+                    Ok(request) => {
+                        forward_correlated_request(
+                            shared,
+                            HostEvent::SwitchSessionRequest {
+                                id: frame.id,
+                                request,
+                            },
+                            frame.id,
+                            crate::protocol::SESSION_SWITCH_SESSION_METHOD,
+                        );
+                    }
+                    Err(_) => {
+                        let _ = shared.events.send(HostEvent::Raw(frame));
+                    }
+                }
+            } else if frame.method == crate::protocol::SESSION_RELOAD_METHOD {
+                match from_payload::<crate::protocol::SessionReloadRequest>(&frame.payload) {
+                    Ok(_request) => {
+                        forward_correlated_request(
+                            shared,
+                            HostEvent::ReloadRequest { id: frame.id },
+                            frame.id,
+                            crate::protocol::SESSION_RELOAD_METHOD,
+                        );
+                    }
+                    Err(_) => {
+                        let _ = shared.events.send(HostEvent::Raw(frame));
+                    }
+                }
+            } else if frame.method == crate::protocol::SESSION_SETUP_ENTRIES_METHOD {
+                match from_payload::<crate::protocol::SessionSetupEntriesRequest>(&frame.payload) {
+                    Ok(request) => {
+                        forward_correlated_request(
+                            shared,
+                            HostEvent::SetupEntriesRequest {
+                                id: frame.id,
+                                request,
+                            },
+                            frame.id,
+                            crate::protocol::SESSION_SETUP_ENTRIES_METHOD,
+                        );
                     }
                     Err(_) => {
                         let _ = shared.events.send(HostEvent::Raw(frame));
@@ -1073,9 +1786,10 @@ fn dispatch(shared: &Shared, frame: Frame) {
             }
         }
     }
+    true
 }
 
-fn forward_event(shared: &Shared, frame: Frame) {
+fn forward_event(shared: &Shared, frame: Frame) -> bool {
     let method = frame.method.as_str();
     if method == Method::UiSlot.as_str() {
         match from_payload::<crate::protocol::UiSlot>(&frame.payload) {
@@ -1144,15 +1858,6 @@ fn forward_event(shared: &Shared, frame: Frame) {
                 let _ = shared.events.send(HostEvent::Raw(frame));
             }
         }
-    } else if method == crate::protocol::SESSION_COMMAND_METHOD {
-        match from_payload::<crate::protocol::SessionCommand>(&frame.payload) {
-            Ok(command) => {
-                let _ = shared.events.send(HostEvent::SessionCommand(command));
-            }
-            Err(_) => {
-                let _ = shared.events.send(HostEvent::Raw(frame));
-            }
-        }
     } else if method == crate::protocol::UI_CONTROL_METHOD {
         match from_payload::<crate::protocol::UiControl>(&frame.payload) {
             Ok(control) => {
@@ -1162,21 +1867,178 @@ fn forward_event(shared: &Shared, frame: Frame) {
                 let _ = shared.events.send(HostEvent::Raw(frame));
             }
         }
+    } else if method == crate::protocol::PROVIDERS_UPDATE_METHOD {
+        match from_payload::<crate::protocol::ProvidersUpdate>(&frame.payload) {
+            Ok(update) => {
+                let _ = shared.providers_update.send(update);
+            }
+            Err(_) => {
+                let _ = shared.events.send(HostEvent::Raw(frame));
+            }
+        }
+    } else if method == crate::protocol::SESSION_COMMAND_METHOD
+        || method == crate::protocol::SESSION_REPLACEMENT_READY_METHOD
+        || method == crate::protocol::SESSION_REPLACEMENT_ABORT_METHOD
+    {
+        return forward_session_control_frame(shared, frame);
     } else {
         let _ = shared.events.send(HostEvent::Raw(frame));
     }
+    true
+}
+
+fn forward_session_control_frame(shared: &Shared, frame: Frame) -> bool {
+    let event = match frame.method.as_str() {
+        crate::protocol::SESSION_COMMAND_METHOD => {
+            from_payload::<crate::protocol::SessionCommandEnvelope>(&frame.payload)
+                .map(HostSessionControlEvent::Command)
+        }
+        crate::protocol::SESSION_REPLACEMENT_READY_METHOD => {
+            from_payload::<crate::protocol::SessionReplacementReadyEvent>(&frame.payload)
+                .map(|ready| HostSessionControlEvent::ReplacementReady { token: ready.token })
+        }
+        crate::protocol::SESSION_REPLACEMENT_ABORT_METHOD => {
+            from_payload::<crate::protocol::SessionReplacementAbortEvent>(&frame.payload)
+                .map(|abort| HostSessionControlEvent::ReplacementAbort { token: abort.token })
+        }
+        _ => unreachable!("caller accepts only session-control methods"),
+    };
+    if let Ok(event) = event {
+        forward_session_control(shared, event)
+    } else {
+        let _ = shared.events.send(HostEvent::Raw(frame));
+        true
+    }
+}
+
+fn forward_session_control(shared: &Shared, event: HostSessionControlEvent) -> bool {
+    let handler = shared
+        .session_control_handler
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let Some(handler) = handler else {
+        let event = match event {
+            HostSessionControlEvent::Command(envelope) => HostEvent::SessionCommand(envelope),
+            HostSessionControlEvent::ReplacementReady { token } => {
+                HostEvent::ReplacementReady { token }
+            }
+            HostSessionControlEvent::ReplacementAbort { token } => {
+                HostEvent::ReplacementAbort { token }
+            }
+        };
+        let _ = shared.events.send(event);
+        return true;
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        handler(event);
+    }));
+    if result.is_ok() {
+        return true;
+    }
+    let message = "session-control handler panicked".to_owned();
+    fail_all(
+        shared,
+        &HostClientError::Protocol {
+            message: message.clone(),
+            stderr: stderr_of(shared),
+        },
+    );
+    shared.running.store(false, Ordering::Relaxed);
+    let _ = shared.events.send(HostEvent::ProtocolError(message));
+    false
 }
 
 fn forward_stream_event(shared: &Shared, frame: Frame) {
     let id = frame.id;
     let stream = if let Ok(pending) = shared.pending.lock() {
-        pending.get(&id).and_then(|entry| entry.stream.clone())
+        pending
+            .get(&id)
+            .filter(|entry| !entry.cancelling)
+            .and_then(|entry| entry.stream.clone())
     } else {
         None
     };
     if let Some(stream) = stream {
         // Non-blocking: a full channel drops the stale event (backpressure).
         let _ = stream.try_send(frame);
+    }
+}
+
+/// Forward a correlated host request through the bounded lossless channel.
+///
+/// Unlike the lossy `events` broadcast, every accepted request must reach
+/// exactly one consumer. When the channel is full or closed (consumer not yet
+/// claimed or teardown in progress), an explicit error frame is sent back to
+/// the host so the extension observes a failure instead of a timeout. The
+/// `try_send` never blocks the reader loop; teardown and cancellation can
+/// never block on a saturated queue.
+fn forward_correlated_request(shared: &Shared, event: HostEvent, id: FrameId, method: &str) {
+    match shared.correlated_requests.try_send(event) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            send_correlated_error(shared, id, method, "correlated request channel full");
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            send_correlated_error(shared, id, method, "no active session");
+        }
+    }
+}
+
+/// Send an error frame for a correlated request that could not be delivered.
+fn send_correlated_error(shared: &Shared, id: FrameId, method: &str, message: &str) {
+    let frame = Frame {
+        id,
+        kind: FrameKind::Error,
+        method: method.to_owned(),
+        payload: serde_json::to_value(crate::protocol::ErrorPayload::new(
+            "extension_error",
+            message,
+        ))
+        .unwrap_or(serde_json::Value::Null),
+    };
+    let outbound = shared
+        .outbound
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(tx) = outbound {
+        let _ = tx.try_send(frame);
+    }
+}
+
+/// Forward a correlated `providerEvent` frame with lossless, cancellation-aware
+/// delivery. Unlike [`forward_stream_event`], this awaits channel capacity so
+/// no provider event is silently dropped before the stream terminates. The
+/// per-stream cancellation token unblocks the await when the call is cancelled
+/// or failed, so the reader loop never deadlocks on a slow consumer.
+///
+/// The pending mutex is released before awaiting so cancel/fail/terminal
+/// dispatch can proceed concurrently.
+async fn forward_provider_event(shared: &Shared, frame: Frame) {
+    let id = frame.id;
+    let (stream, cancel) = if let Ok(pending) = shared.pending.lock() {
+        match pending.get(&id).filter(|entry| !entry.cancelling) {
+            Some(entry) => (entry.stream.clone(), entry.cancel.clone()),
+            None => return,
+        }
+    } else {
+        return;
+    };
+    if let Some(stream) = stream {
+        // Await capacity so every provider event is delivered in order.
+        // Race against the per-stream cancellation token so cancel/fail
+        // wakes a blocked send instead of waiting for the consumer.
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => {}
+            result = stream.send(frame) => {
+                if let Err(mpsc::error::SendError(_)) = result {
+                    // Consumer dropped the stream receiver; cleanup is
+                    // handled by cancel/fail/terminal dispatch.
+                }
+            }
+        }
     }
 }
 
@@ -1287,6 +2149,26 @@ mod tests {
     type R = Result<(), Box<dyn Error>>;
 
     use crate::test_support::make_pair;
+
+    async fn wait_for_blocked_provider_send(stream: &StreamHandle) -> R {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let blocked = stream.shared.pending.lock().is_ok_and(|pending| {
+                    pending
+                        .get(&stream.id)
+                        .and_then(|entry| entry.stream.as_ref())
+                        .is_some_and(|sender| sender.capacity() == 0 && sender.strong_count() > 1)
+                });
+                if blocked {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "provider send did not block on the full stream buffer")?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn handshake_succeeds() -> R {
@@ -1562,24 +2444,330 @@ mod tests {
                 .await?;
             // Do not drain events immediately: a flood must not deadlock the host.
             tokio::time::sleep(Duration::from_millis(60)).await;
-            let mut got = 0u32;
-            while stream.next_event().await.is_some() {
-                got = got.saturating_add(1);
+            let mut received = Vec::new();
+            while let Some(frame) = stream.next_event().await {
+                received.push(
+                    frame.payload["n"]
+                        .as_u64()
+                        .ok_or_else(|| HostClientError::Payload("missing event index".into()))?,
+                );
             }
             let terminal = stream.finish(Duration::from_secs(2)).await?;
-            Ok::<_, HostClientError>((got, terminal))
+            Ok::<_, HostClientError>((received, terminal))
         });
         let req = host.read_frame().await.ok_or("no req")?;
-        // Flood 20 events into a bound-2 channel (excess dropped via try_send).
+        // A bound-two channel retains a FIFO prefix (≤2 events) and drops the rest.
         for n in 0..20u64 {
-            let ev = Frame::event(req.id, Method::ToolUpdate, serde_json::json!({"n":n}));
-            let _ = host.write_frame(&ev).await;
+            let ev = Frame::event(req.id, Method::ToolUpdate, serde_json::json!({"n": n}));
+            host.write_frame(&ev).await?;
         }
-        let res = Frame::response(req.id, Method::Notify, serde_json::json!({}));
+        let res = Frame::response(req.id, Method::Notify, serde_json::json!({"done": true}));
         host.write_frame(&res).await?;
-        let (got, _terminal) = client_task.await??;
-        // No deadlock: some events were observed, terminal resolved.
-        assert!(got > 0, "should have observed some events");
+        let (received, terminal) = client_task.await??;
+        assert!(
+            received.len() <= 2,
+            "a bound-two channel retained {} events: {received:?}",
+            received.len()
+        );
+        assert!(
+            received.windows(2).all(|pair| pair[0] < pair[1]),
+            "retained events must stay in FIFO order: {received:?}"
+        );
+        assert_eq!(
+            received.first(),
+            Some(&0),
+            "the first event is never dropped"
+        );
+        assert_eq!(terminal.payload["done"], true);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn saturated_outbound_drop_queues_one_cancel_before_pending_removal() -> R {
+        let (client, _host) = make_pair().await;
+        let (mut stalled, _original) = client.stall_outbound_for_test().await;
+        let stream = client
+            .open_stream_raw("provider.stream", serde_json::json!({}), 2)
+            .await?;
+        let id = stream.id();
+        let shared = Arc::clone(&stream.shared);
+
+        // The request already occupies the one-slot writer queue. Dropping the
+        // stream must retain its correlation state while its cancel waits.
+        drop(stream);
+        assert!(
+            shared
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&id)
+                .is_some_and(|entry| entry.cancelling),
+            "the pending route remains cancellation-owned until the queued send completes"
+        );
+
+        let request = tokio::time::timeout(Duration::from_millis(100), stalled.recv())
+            .await
+            .map_err(|_| "missing queued stream request")?
+            .ok_or("missing queued stream request")?;
+        assert_eq!(request.id, id);
+
+        let cancel = tokio::time::timeout(Duration::from_millis(100), stalled.recv())
+            .await
+            .map_err(|_| "queued cancellation did not reach the writer")?
+            .ok_or("queued cancellation did not reach the writer")?;
+        assert_eq!(cancel.method, "provider.cancel");
+        assert_eq!(cancel.payload["id"], id);
+        tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                let pending = shared
+                    .pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains_key(&id);
+                if !pending {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "pending route was not released after cancellation queued")?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn background_cancel_does_not_remove_replaced_pending_under_same_id() -> R {
+        let (client, _host) = make_pair().await;
+        let (mut stalled, _original) = client.stall_outbound_for_test().await;
+        let stream = client
+            .open_stream_raw("provider.stream", serde_json::json!({}), 2)
+            .await?;
+        let id = stream.id();
+        let shared = Arc::clone(&stream.shared);
+        let old_generation = stream.generation;
+
+        // The request already occupies the one-slot writer queue. Dropping the
+        // stream retains its correlation state while its cancel waits on the
+        // saturated channel (background send path).
+        drop(stream);
+        assert!(
+            shared
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&id)
+                .is_some_and(|entry| entry.cancelling && entry.generation == old_generation),
+            "the pending route remains cancellation-owned by the old generation"
+        );
+
+        // Replace the pending route under the same frame id with a fresh,
+        // non-cancelling entry carrying a newer generation.
+        let new_generation = shared
+            .next_pending_generation
+            .fetch_add(1, Ordering::Relaxed);
+        {
+            let mut pending = shared
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pending.insert(
+                id,
+                PendingEntry {
+                    terminal: None,
+                    stream: None,
+                    cancelling: false,
+                    generation: new_generation,
+                    cancel: CancellationToken::new(),
+                },
+            );
+        }
+
+        // Drain the stalled channel: first the original request, then the
+        // cancel the background send queued. The background cleanup runs
+        // after its send completes.
+        let request = tokio::time::timeout(Duration::from_millis(100), stalled.recv())
+            .await
+            .map_err(|_| "missing queued stream request")?
+            .ok_or("missing queued stream request")?;
+        assert_eq!(request.id, id);
+
+        let cancel = tokio::time::timeout(Duration::from_millis(100), stalled.recv())
+            .await
+            .map_err(|_| "queued cancellation did not reach the writer")?
+            .ok_or("queued cancellation did not reach the writer")?;
+        assert_eq!(cancel.method, "provider.cancel");
+        assert_eq!(cancel.payload["id"], id);
+
+        // Await the background cleanup completion signal before asserting.
+        // The cleanup task calls `notify_one` after `remove_cancelling_pending`;
+        // awaiting it proves the cleanup actually ran, so the test cannot pass
+        // merely because cancellation was requested while cleanup never ran.
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            shared.cancel_cleanup_done.notified(),
+        )
+        .await
+        .map_err(|_| "background cancel cleanup did not complete")?;
+
+        let (survives, surviving_gen, cancelling) = {
+            let pending = shared
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let entry = pending.get(&id);
+            (
+                entry.is_some(),
+                entry.map(|e| e.generation),
+                entry.map(|e| e.cancelling),
+            )
+        };
+        assert!(
+            survives,
+            "newer same-id pending entry was removed by stale cleanup"
+        );
+        assert_eq!(
+            surviving_gen,
+            Some(new_generation),
+            "surviving entry is the replacement, not the cancelled one"
+        );
+        assert_eq!(
+            cancelling,
+            Some(false),
+            "replacement entry must not be marked cancelling"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn background_cancel_timeout_cleans_original_pending_entry() -> R {
+        let (client, _host) = make_pair().await;
+        let (_stalled, _original) = client.stall_outbound_for_test().await;
+        let stream = client
+            .open_stream_raw("provider.stream", serde_json::json!({}), 2)
+            .await?;
+        let id = stream.id();
+        let shared = Arc::clone(&stream.shared);
+
+        // The request occupies the one-slot writer queue. Dropping the stream
+        // retains its correlation state while the cancel waits on the
+        // saturated channel (background send path).
+        drop(stream);
+        assert!(
+            shared
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&id)
+                .is_some_and(|entry| entry.cancelling),
+            "the pending route remains cancellation-owned until the deadline"
+        );
+
+        // Do NOT drain the stalled channel: the background send cannot
+        // complete, so the (test-shortened) CANCEL_QUEUE_TIMEOUT deadline
+        // must fire. The existing Notify signal proves the cleanup ran.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            shared.cancel_cleanup_done.notified(),
+        )
+        .await
+        .map_err(|_| "background cancel cleanup did not complete after timeout")?;
+
+        assert!(
+            !shared
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&id),
+            "original pending entry was not cleaned after cancel timeout"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn background_cancel_timeout_preserves_replacement_generation() -> R {
+        let (client, _host) = make_pair().await;
+        let (_stalled, _original) = client.stall_outbound_for_test().await;
+        let stream = client
+            .open_stream_raw("provider.stream", serde_json::json!({}), 2)
+            .await?;
+        let id = stream.id();
+        let shared = Arc::clone(&stream.shared);
+        let old_generation = stream.generation;
+
+        // The request occupies the one-slot writer queue. Dropping the stream
+        // retains its correlation state while the cancel waits on the
+        // saturated channel (background send path).
+        drop(stream);
+        assert!(
+            shared
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&id)
+                .is_some_and(|entry| entry.cancelling && entry.generation == old_generation),
+            "the pending route remains cancellation-owned by the old generation"
+        );
+
+        // Replace the pending route under the same frame id with a fresh,
+        // non-cancelling entry carrying a newer generation.
+        let new_generation = shared
+            .next_pending_generation
+            .fetch_add(1, Ordering::Relaxed);
+        {
+            let mut pending = shared
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pending.insert(
+                id,
+                PendingEntry {
+                    terminal: None,
+                    stream: None,
+                    cancelling: false,
+                    generation: new_generation,
+                    cancel: CancellationToken::new(),
+                },
+            );
+        }
+
+        // Do NOT drain the stalled channel: the background send cannot
+        // complete, so the (test-shortened) CANCEL_QUEUE_TIMEOUT deadline
+        // must fire. The generation-matched cleanup must remove only the old
+        // cancelling route, not the replacement. The existing Notify signal
+        // proves the cleanup ran.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            shared.cancel_cleanup_done.notified(),
+        )
+        .await
+        .map_err(|_| "background cancel cleanup did not complete after timeout")?;
+
+        let (survives, surviving_gen, cancelling) = {
+            let pending = shared
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let entry = pending.get(&id);
+            (
+                entry.is_some(),
+                entry.map(|e| e.generation),
+                entry.map(|e| e.cancelling),
+            )
+        };
+        assert!(
+            survives,
+            "replacement entry was removed by stale cleanup after timeout"
+        );
+        assert_eq!(
+            surviving_gen,
+            Some(new_generation),
+            "surviving entry is the replacement, not the cancelled one"
+        );
+        assert_eq!(
+            cancelling,
+            Some(false),
+            "replacement entry must not be marked cancelling"
+        );
         Ok(())
     }
 
@@ -1877,6 +3065,773 @@ mod tests {
             )
             .await;
         assert!(matches!(result, Err(HostClientError::NotRunning)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn responder_success_frames_preserve_shape() -> R {
+        let (client, mut host) = make_pair().await;
+
+        client.respond_set_model(1, true).await?;
+        let f = host.require_frame("setModel res").await?;
+        assert_eq!(f.id, 1);
+        assert_eq!(f.kind, FrameKind::Res);
+        assert_eq!(f.method, crate::protocol::SESSION_SET_MODEL_METHOD);
+        assert_eq!(f.payload["success"], true);
+
+        client
+            .respond_compact(2, Ok(serde_json::json!({"summary": "ok"})))
+            .await?;
+        let f = host.require_frame("compact res").await?;
+        assert_eq!(f.id, 2);
+        assert_eq!(f.kind, FrameKind::Res);
+        assert_eq!(f.method, crate::protocol::SESSION_COMPACT_METHOD);
+        assert_eq!(f.payload["result"]["summary"], "ok");
+
+        client.respond_new_session(3, false, Some("tok")).await?;
+        let f = host.require_frame("newSession res").await?;
+        assert_eq!(f.id, 3);
+        assert_eq!(f.kind, FrameKind::Res);
+        assert_eq!(f.method, crate::protocol::SESSION_NEW_SESSION_METHOD);
+        assert_eq!(f.payload["cancelled"], false);
+        assert_eq!(f.payload["replacementToken"], "tok");
+
+        client
+            .respond_fork(4, false, Some("sel"), Some("tok2"))
+            .await?;
+        let f = host.require_frame("fork res").await?;
+        assert_eq!(f.id, 4);
+        assert_eq!(f.kind, FrameKind::Res);
+        assert_eq!(f.method, crate::protocol::SESSION_FORK_METHOD);
+        assert_eq!(f.payload["selectedText"], "sel");
+        assert_eq!(f.payload["replacementToken"], "tok2");
+
+        client.respond_switch_session(5, true, None).await?;
+        let f = host.require_frame("switchSession res").await?;
+        assert_eq!(f.id, 5);
+        assert_eq!(f.kind, FrameKind::Res);
+        assert_eq!(f.method, crate::protocol::SESSION_SWITCH_SESSION_METHOD);
+        assert_eq!(f.payload["cancelled"], true);
+        assert!(f.payload.get("replacementToken").is_none());
+
+        let nav = crate::protocol::SessionNavigateTreeResponse {
+            cancelled: false,
+            editor_text: Some("draft".to_owned()),
+            aborted: None,
+            summary_entry: None,
+        };
+        client.respond_navigate_tree(6, Ok(nav)).await?;
+        let f = host.require_frame("navigateTree res").await?;
+        assert_eq!(f.id, 6);
+        assert_eq!(f.kind, FrameKind::Res);
+        assert_eq!(f.method, crate::protocol::SESSION_NAVIGATE_TREE_METHOD);
+        assert_eq!(f.payload["editorText"], "draft");
+
+        client.respond_reload(7, Ok(Some("tok3"))).await?;
+        let f = host.require_frame("reload res").await?;
+        assert_eq!(f.id, 7);
+        assert_eq!(f.kind, FrameKind::Res);
+        assert_eq!(f.method, crate::protocol::SESSION_RELOAD_METHOD);
+        assert_eq!(f.payload["replacementToken"], "tok3");
+
+        let setup = crate::protocol::SessionSetupEntriesResponse {
+            entries: vec![serde_json::json!({"type": "message", "id": "e1"})],
+        };
+        client.respond_setup_entries(8, Ok(setup)).await?;
+        let f = host.require_frame("setupEntries res").await?;
+        assert_eq!(f.id, 8);
+        assert_eq!(f.kind, FrameKind::Res);
+        assert_eq!(f.method, crate::protocol::SESSION_SETUP_ENTRIES_METHOD);
+        assert_eq!(f.payload["entries"][0]["id"], "e1");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn responder_error_frames_preserve_shape() -> R {
+        let (client, mut host) = make_pair().await;
+
+        client
+            .respond_compact(10, Err("compaction failed".to_owned()))
+            .await?;
+        let f = host.require_frame("compact err").await?;
+        assert_eq!(f.id, 10);
+        assert_eq!(f.kind, FrameKind::Error);
+        assert_eq!(f.method, crate::protocol::SESSION_COMPACT_METHOD);
+        assert_eq!(f.payload["code"], "extension_error");
+        assert_eq!(f.payload["message"], "compaction failed");
+        assert_eq!(f.payload["retryable"], false);
+
+        client
+            .respond_navigate_tree(11, Err("entry not found".to_owned()))
+            .await?;
+        let f = host.require_frame("navigateTree err").await?;
+        assert_eq!(f.id, 11);
+        assert_eq!(f.kind, FrameKind::Error);
+        assert_eq!(f.method, crate::protocol::SESSION_NAVIGATE_TREE_METHOD);
+        assert_eq!(f.payload["code"], "extension_error");
+        assert_eq!(f.payload["message"], "entry not found");
+        assert_eq!(f.payload["retryable"], false);
+
+        client
+            .respond_reload(12, Err("reload failed".to_owned()))
+            .await?;
+        let f = host.require_frame("reload err").await?;
+        assert_eq!(f.id, 12);
+        assert_eq!(f.kind, FrameKind::Error);
+        assert_eq!(f.method, crate::protocol::SESSION_RELOAD_METHOD);
+        assert_eq!(f.payload["code"], "extension_error");
+        assert_eq!(f.payload["message"], "reload failed");
+        assert_eq!(f.payload["retryable"], false);
+
+        client
+            .respond_setup_entries(16, Err("stale replacement token".to_owned()))
+            .await?;
+        let f = host.require_frame("setupEntries err").await?;
+        assert_eq!(f.id, 16);
+        assert_eq!(f.kind, FrameKind::Error);
+        assert_eq!(f.method, crate::protocol::SESSION_SETUP_ENTRIES_METHOD);
+        assert_eq!(f.payload["code"], "extension_error");
+        assert_eq!(f.payload["message"], "stale replacement token");
+        assert_eq!(f.payload["retryable"], false);
+
+        client
+            .respond_replacement_busy(13, crate::protocol::SESSION_NEW_SESSION_METHOD)
+            .await?;
+        let f = host.require_frame("replacement_busy err").await?;
+        assert_eq!(f.id, 13);
+        assert_eq!(f.kind, FrameKind::Error);
+        assert_eq!(f.method, crate::protocol::SESSION_NEW_SESSION_METHOD);
+        assert_eq!(f.payload["code"], "replacement_busy");
+        assert_eq!(f.payload["message"], "session replacement in progress");
+        assert_eq!(f.payload["retryable"], true);
+
+        client
+            .respond_session_error(14, crate::protocol::SESSION_FORK_METHOD, "unclaimed")
+            .await?;
+        let f = host.require_frame("session_error err").await?;
+        assert_eq!(f.id, 14);
+        assert_eq!(f.kind, FrameKind::Error);
+        assert_eq!(f.method, crate::protocol::SESSION_FORK_METHOD);
+        assert_eq!(f.payload["code"], "extension_error");
+        assert_eq!(f.payload["message"], "unclaimed");
+        assert_eq!(f.payload["retryable"], false);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_fails_pending_calls() -> R {
+        let (client, _host) = make_pair().await;
+        // Start a request that will never be answered by the host.
+        let request_fut = client.request(
+            Method::Notify,
+            serde_json::json!({}),
+            Duration::from_secs(30),
+        );
+        tokio::pin!(request_fut);
+        // Let the request register in the pending map (synchronous prefix).
+        tokio::select! {
+            biased;
+            _ = &mut request_fut => {
+                return Err("request completed before shutdown — test setup issue".into());
+            }
+            () = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+        // Shut down while the request is pending.
+        client.shutdown().await?;
+        // The request must resolve with an error, not hang.
+        let result = tokio::time::timeout(Duration::from_secs(2), &mut request_fut)
+            .await
+            .map_err(|_| "request hung after shutdown")?;
+        assert!(
+            matches!(
+                result,
+                Err(HostClientError::Closed { .. } | HostClientError::NotRunning)
+            ),
+            "expected Closed or NotRunning after shutdown, got {result:?}"
+        );
+        // The pending map must be empty.
+        let pending_len = client.shared.pending.lock().map_or(0, |p| p.len());
+        assert_eq!(pending_len, 0, "pending map should be empty after shutdown");
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Provider event lossless delivery + cancellation-aware backpressure
+    // -----------------------------------------------------------------------
+
+    /// A capacity-2 provider stream must preserve *every* `providerEvent`
+    /// frame in FIFO order, even when the consumer pauses draining. The
+    /// reader awaits bounded capacity instead of dropping stale events.
+    #[tokio::test]
+    async fn provider_stream_preserves_all_events_before_terminal() -> R {
+        let (client, mut host) = make_pair().await;
+        let mut stream = client
+            .open_stream_raw("provider.stream", serde_json::json!({}), 2)
+            .await?;
+        let req = host.read_frame().await.ok_or("no provider request")?;
+        for n in 0..5u64 {
+            let ev = Frame::event(req.id, Method::ProviderEvent, serde_json::json!({"n": n}));
+            host.write_frame(&ev).await?;
+        }
+        let res = Frame::response(req.id, Method::Notify, serde_json::json!({"done": true}));
+        host.write_frame(&res).await?;
+
+        // Saturation must be observed before draining; otherwise the old lossy
+        // path could pass by racing a fast consumer.
+        wait_for_blocked_provider_send(&stream).await?;
+        let mut received = Vec::new();
+        while let Some(frame) = stream.next_event().await {
+            received.push(
+                frame.payload["n"]
+                    .as_u64()
+                    .ok_or_else(|| HostClientError::Payload("missing event index".into()))?,
+            );
+        }
+        let terminal = stream.finish(Duration::from_secs(2)).await?;
+        assert_eq!(
+            received,
+            vec![0, 1, 2, 3, 4],
+            "provider events must all be delivered in FIFO order"
+        );
+        assert_eq!(terminal.payload["done"], true);
+        Ok(())
+    }
+
+    /// Tool-update stream events remain lossy: a capacity-2 channel drops
+    /// excess events under backpressure, preserving only a FIFO prefix.
+    #[tokio::test]
+    async fn tool_update_stream_stays_lossy_under_backpressure() -> R {
+        let (client, mut host) = make_pair().await;
+        let mut events = client.subscribe();
+        let mut stream = client
+            .open_stream_raw("tool.execute", serde_json::json!({}), 2)
+            .await?;
+        let req = host.read_frame().await.ok_or("no req")?;
+        for n in 0..10u64 {
+            let ev = Frame::event(req.id, Method::ToolUpdate, serde_json::json!({"n": n}));
+            host.write_frame(&ev).await?;
+        }
+        let res = Frame::response(req.id, Method::Notify, serde_json::json!({"done": true}));
+        host.write_frame(&res).await?;
+        host.write_frame(&Frame::event(
+            0,
+            Method::Notify,
+            serde_json::json!({"message": "tool stream barrier", "level": "info"}),
+        ))
+        .await?;
+        let barrier = tokio::time::timeout(Duration::from_secs(1), events.recv()).await??;
+        assert!(matches!(barrier, HostEvent::Notify(_)));
+
+        let mut received = Vec::new();
+        while let Some(frame) = stream.next_event().await {
+            received.push(frame.payload["n"].as_u64().unwrap_or(0));
+        }
+        let terminal = stream.finish(Duration::from_secs(2)).await?;
+        assert!(
+            received.len() <= 2,
+            "tool updates must stay lossy, got {received:?}"
+        );
+        assert_eq!(received.first(), Some(&0), "first event is never dropped");
+        assert_eq!(terminal.payload["done"], true);
+        Ok(())
+    }
+
+    /// Cancelling a provider stream whose lossless send is blocked on a
+    /// full channel must wake the reader. After cancellation, subsequent
+    /// requests must be processable — proving the reader is not deadlocked.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_wakes_blocked_provider_event_send() -> R {
+        let (client, mut host) = make_pair().await;
+        let stream = client
+            .open_stream_raw("provider.stream", serde_json::json!({}), 2)
+            .await?;
+        let id = stream.id();
+        let shared = Arc::clone(&stream.shared);
+
+        // Host writes five provider events. The reader will block on the
+        // third because the capacity-2 channel is full (consumer is not
+        // draining — the stream handle is held but never polled).
+        let req = host.read_frame().await.ok_or("no provider request")?;
+        for n in 0..5u64 {
+            let ev = Frame::event(req.id, Method::ProviderEvent, serde_json::json!({"n": n}));
+            host.write_frame(&ev).await?;
+        }
+
+        wait_for_blocked_provider_send(&stream).await?;
+
+        // Cancel the stream directly. This cancels the per-stream token,
+        // which wakes the blocked `forward_provider_event` send.
+        let _ = cancel_pending(&shared, id, stream.generation, None, None, None);
+
+        // After cancellation the reader must be unblocked. Verify by
+        // issuing a new request: if the reader were still blocked on the
+        // provider send, this request's response would never be dispatched.
+        let client_task = tokio::spawn(async move {
+            client
+                .request(
+                    Method::Notify,
+                    serde_json::json!({"ping": true}),
+                    Duration::from_secs(2),
+                )
+                .await
+        });
+        let req2 = host.read_frame().await.ok_or("no second request")?;
+        let response = Frame::response(req2.id, Method::Notify, serde_json::json!({"pong": true}));
+        host.write_frame(&response).await?;
+        let result = tokio::time::timeout(Duration::from_secs(1), client_task)
+            .await
+            .map_err(|_| "second request timed out — reader is still blocked")??;
+        let frame = result?;
+        assert_eq!(frame.payload["pong"], true);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replacement_ready_handler_bypasses_broadcast_lag() -> R {
+        let (client, mut host) = make_pair().await;
+        let _lagged = client.subscribe();
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let ready_tx = StdMutex::new(Some(ready_tx));
+        client.set_session_control_handler(Some(Arc::new(move |event| {
+            let HostSessionControlEvent::ReplacementReady { token } = event else {
+                return;
+            };
+            if let Some(sender) = ready_tx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                let _ = sender.send(token);
+            }
+        })));
+
+        for index in 0..=EVENT_CAPACITY {
+            host.write_frame(&Frame::event(
+                0,
+                Method::Notify,
+                serde_json::json!({"message": index}),
+            ))
+            .await?;
+        }
+        host.write_frame(&Frame {
+            id: 0,
+            kind: FrameKind::Event,
+            method: crate::protocol::SESSION_REPLACEMENT_READY_METHOD.to_owned(),
+            payload: serde_json::json!({"token": "ready-after-lag"}),
+        })
+        .await?;
+
+        let token = tokio::time::timeout(Duration::from_secs(1), ready_rx).await??;
+        assert_eq!(token, "ready-after-lag");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn providers_update_watch_bypasses_broadcast_lag() -> R {
+        let (client, mut host) = make_pair().await;
+        let mut providers = client
+            .take_providers_updates()
+            .ok_or("provider update receiver missing")?;
+        assert!(
+            !providers.has_changed()?,
+            "the initial default provider snapshot must already be observed"
+        );
+
+        // Subscribe to the lossy general broadcast *before* flooding it.
+        let mut general = client.subscribe();
+        for index in 0..(EVENT_CAPACITY + 10) {
+            host.write_frame(&Frame::event(
+                0,
+                Method::Notify,
+                serde_json::json!({"message": index}),
+            ))
+            .await?;
+        }
+
+        // A provider update must still arrive on the lossless watch, not the
+        // lossy broadcast. If it were sent through the broadcast it would be
+        // dropped or lagged past this point.
+        let payload = serde_json::json!({
+            "providers": [{
+                "name": "live-provider",
+                "baseUrl": "https://live.example/v1",
+                "api": "openai-completions",
+                "apiKey": "sk-live",
+                "headers": {"x-provider": "live"},
+                "authHeader": true,
+                "models": [{"id": "live-model", "contextWindow": 8192}],
+                "streamSimple": true,
+                "extensionPath": "/extensions/live.ts"
+            }]
+        });
+        let expected: crate::protocol::ProvidersUpdate = serde_json::from_value(payload.clone())?;
+        host.write_frame(&Frame {
+            id: 0,
+            kind: FrameKind::Event,
+            method: crate::protocol::PROVIDERS_UPDATE_METHOD.to_owned(),
+            payload,
+        })
+        .await?;
+
+        tokio::time::timeout(Duration::from_secs(1), providers.changed())
+            .await
+            .map_err(|_| "provider watch did not change after providers.update")??;
+
+        // Reaching the later provider frame proves the reader has already
+        // processed every notification in the flood.
+        let first = tokio::time::timeout(Duration::from_secs(1), general.recv())
+            .await
+            .map_err(|_| "general broadcast receiver did not report status")?;
+        assert!(matches!(first, Err(broadcast::error::RecvError::Lagged(_))));
+        assert_eq!(*providers.borrow_and_update(), expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replacement_ready_without_handler_uses_broadcast() -> R {
+        let (client, mut host) = make_pair().await;
+        let mut events = client.subscribe();
+        host.write_frame(&Frame {
+            id: 0,
+            kind: FrameKind::Event,
+            method: crate::protocol::SESSION_REPLACEMENT_READY_METHOD.to_owned(),
+            payload: serde_json::json!({"token": "broadcast-ready"}),
+        })
+        .await?;
+
+        let event = tokio::time::timeout(Duration::from_secs(1), events.recv()).await??;
+        assert!(
+            matches!(event, HostEvent::ReplacementReady { token } if token == "broadcast-ready")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_control_handler_preserves_command_before_ready() -> R {
+        let (client, mut host) = make_pair().await;
+        let (done_tx, done_rx) = oneshot::channel();
+        let done_tx = StdMutex::new(Some(done_tx));
+        let observed = Arc::new(StdMutex::new(Vec::new()));
+        let handler_observed = Arc::clone(&observed);
+        client.set_session_control_handler(Some(Arc::new(move |event| {
+            let label = match event {
+                HostSessionControlEvent::Command(envelope) => {
+                    assert_eq!(envelope.replacement_token.as_deref(), Some("ordered-token"));
+                    "command"
+                }
+                HostSessionControlEvent::ReplacementReady { token } => {
+                    assert_eq!(token, "ordered-token");
+                    if let Some(sender) = done_tx
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take()
+                    {
+                        let _ = sender.send(());
+                    }
+                    "ready"
+                }
+                HostSessionControlEvent::ReplacementAbort { .. } => "abort",
+            };
+            handler_observed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(label);
+        })));
+
+        host.write_frame(&Frame {
+            id: 0,
+            kind: FrameKind::Event,
+            method: crate::protocol::SESSION_COMMAND_METHOD.to_owned(),
+            payload: serde_json::json!({
+                "replacementToken": "ordered-token",
+                "action": "setSessionName",
+                "name": "candidate",
+            }),
+        })
+        .await?;
+        host.write_frame(&Frame {
+            id: 0,
+            kind: FrameKind::Event,
+            method: crate::protocol::SESSION_REPLACEMENT_READY_METHOD.to_owned(),
+            payload: serde_json::json!({"token": "ordered-token"}),
+        })
+        .await?;
+
+        tokio::time::timeout(Duration::from_secs(1), done_rx).await??;
+        assert_eq!(
+            *observed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec!["command", "ready"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::panic)] // The contract under test is containment of callback panics.
+    async fn replacement_ready_handler_panic_fails_transport() -> R {
+        let (client, mut host) = make_pair().await;
+        let mut events = client.subscribe();
+        client.set_session_control_handler(Some(Arc::new(|_| {
+            panic!("session-control test panic");
+        })));
+
+        let client = Arc::new(client);
+        let requester = Arc::clone(&client);
+        let request_task = tokio::spawn(async move {
+            requester
+                .request(
+                    Method::Notify,
+                    serde_json::json!({"pending": true}),
+                    Duration::from_secs(2),
+                )
+                .await
+        });
+        let _request = host.read_frame().await.ok_or("no pending request")?;
+        host.write_frame(&Frame {
+            id: 0,
+            kind: FrameKind::Event,
+            method: crate::protocol::SESSION_REPLACEMENT_READY_METHOD.to_owned(),
+            payload: serde_json::json!({"token": "panic-ready"}),
+        })
+        .await?;
+
+        let result = tokio::time::timeout(Duration::from_secs(1), request_task).await??;
+        assert!(matches!(result, Err(HostClientError::Protocol { .. })));
+        assert!(!client.is_running());
+        let event = tokio::time::timeout(Duration::from_secs(1), events.recv()).await??;
+        assert!(
+            matches!(event, HostEvent::ProtocolError(message) if message.contains("handler panicked"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_wakes_blocked_provider_event_send() -> R {
+        let (client, mut host) = make_pair().await;
+        let stream = client
+            .open_stream_raw("provider.stream", serde_json::json!({}), 2)
+            .await?;
+
+        // Host writes five provider events. The reader blocks on the third
+        // because the capacity-2 channel is full (consumer is not draining).
+        let req = host.read_frame().await.ok_or("no provider request")?;
+        for n in 0..5u64 {
+            let ev = Frame::event(req.id, Method::ProviderEvent, serde_json::json!({"n": n}));
+            host.write_frame(&ev).await?;
+        }
+        wait_for_blocked_provider_send(&stream).await?;
+
+        // `shutdown` runs from a separate task and calls `fail_all`, which
+        // cancels every per-stream token — waking the blocked reader send —
+        // and sends `Err(Closed)` to each terminal.
+        let shutdown_task = tokio::spawn(async move { client.shutdown().await });
+        let _ = shutdown_task.await?;
+
+        // The stream's terminal must resolve via `fail_all` rather than
+        // hanging forever on the blocked send.
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            stream.finish(Duration::from_secs(2)),
+        )
+        .await
+        .map_err(|_| "stream terminal did not resolve after shutdown")?;
+        assert!(
+            matches!(result, Err(HostClientError::Closed { .. })),
+            "expected Closed after shutdown, got {result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replacement_abort_handler_preserves_order() -> R {
+        let (client, mut host) = make_pair().await;
+        let (done_tx, done_rx) = oneshot::channel();
+        let done_tx = StdMutex::new(Some(done_tx));
+        client.set_session_control_handler(Some(Arc::new(move |event| {
+            if let HostSessionControlEvent::ReplacementAbort { token } = event {
+                assert_eq!(token, "abort-token");
+                if let Some(sender) = done_tx
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    let _ = sender.send(());
+                }
+            }
+        })));
+
+        host.write_frame(&Frame {
+            id: 0,
+            kind: FrameKind::Event,
+            method: crate::protocol::SESSION_REPLACEMENT_ABORT_METHOD.to_owned(),
+            payload: serde_json::json!({"token": "abort-token"}),
+        })
+        .await?;
+
+        tokio::time::timeout(Duration::from_secs(1), done_rx).await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn malformed_session_control_payloads_fail_closed() -> R {
+        let (client, mut host) = make_pair().await;
+        let mut events = client.subscribe();
+
+        for method in [
+            crate::protocol::SESSION_COMMAND_METHOD,
+            crate::protocol::SESSION_REPLACEMENT_READY_METHOD,
+            crate::protocol::SESSION_REPLACEMENT_ABORT_METHOD,
+        ] {
+            host.write_frame(&Frame {
+                id: 0,
+                kind: FrameKind::Event,
+                method: method.to_owned(),
+                payload: serde_json::json!({"unexpected": "shape"}),
+            })
+            .await?;
+        }
+
+        for _ in 0..3 {
+            let event = tokio::time::timeout(Duration::from_secs(1), events.recv()).await??;
+            assert!(
+                matches!(event, HostEvent::Raw(_)),
+                "malformed control frame should fail closed as Raw: {event:?}"
+            );
+        }
+
+        assert!(client.is_running());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn correlated_request_reaches_exactly_one_consumer() -> R {
+        let (client, _host) = make_pair().await;
+        let mut correlated = client
+            .take_correlated_requests()
+            .ok_or("correlated receiver missing")?;
+
+        // Simulate the host sending a session.setModel request.
+        let frame = Frame {
+            id: 42,
+            kind: FrameKind::Req,
+            method: crate::protocol::SESSION_SET_MODEL_METHOD.to_owned(),
+            payload: serde_json::json!({"model": {"id": "gpt-x", "provider": "openai"}}),
+        };
+        // Dispatch directly through the shared state (bypassing the reader).
+        dispatch(&client.shared, frame).await;
+
+        let event = tokio::time::timeout(Duration::from_secs(1), correlated.recv())
+            .await
+            .map_err(|_| "correlated request timed out")?
+            .ok_or("correlated channel closed")?;
+        let HostEvent::SetModelRequest { id, .. } = event else {
+            return Err(format!("expected SetModelRequest, got {event:?}").into());
+        };
+        assert_eq!(id, 42);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn correlated_request_gets_error_when_channel_closed() -> R {
+        let (client, mut host) = make_pair().await;
+        // Drop the receiver without claiming it — simulates no event pump.
+        drop(client.take_correlated_requests());
+
+        // Send a session.setModel request from the host side.
+        host.write_frame(&Frame {
+            id: 99,
+            kind: FrameKind::Req,
+            method: crate::protocol::SESSION_SET_MODEL_METHOD.to_owned(),
+            payload: serde_json::json!({"model": {"id": "gpt-x", "provider": "openai"}}),
+        })
+        .await?;
+
+        // The client should send an error frame back.
+        let response = tokio::time::timeout(Duration::from_secs(1), host.read_frame())
+            .await
+            .map_err(|_| "no error response within timeout")?
+            .ok_or("host stream closed without error response")?;
+        assert_eq!(response.id, 99);
+        assert_eq!(response.kind, FrameKind::Error);
+        assert_eq!(response.method, crate::protocol::SESSION_SET_MODEL_METHOD);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn correlated_request_gets_error_when_channel_saturated() -> R {
+        let (client, mut host) = make_pair().await;
+        // Claim the receiver but never drain it — fills the bounded channel.
+        let _correlated = client
+            .take_correlated_requests()
+            .ok_or("correlated receiver missing")?;
+
+        // Send more correlated requests than CORRELATED_REQUEST_CAPACITY.
+        let total = CORRELATED_REQUEST_CAPACITY + 4;
+        for i in 1..=total {
+            host.write_frame(&Frame {
+                id: i as u64,
+                kind: FrameKind::Req,
+                method: crate::protocol::SESSION_RELOAD_METHOD.to_owned(),
+                payload: serde_json::json!({}),
+            })
+            .await?;
+        }
+
+        // At least one error frame should come back for the overflow.
+        let mut errors = 0;
+        for _ in 0..total {
+            match tokio::time::timeout(Duration::from_millis(200), host.read_frame()).await {
+                Ok(Some(frame)) if frame.kind == FrameKind::Error => {
+                    errors += 1;
+                }
+                _ => break,
+            }
+        }
+        assert!(
+            errors > 0,
+            "saturated correlated channel should produce at least one error response"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn broadcast_lag_does_not_lose_correlated_requests() -> R {
+        let (client, mut host) = make_pair().await;
+        let mut correlated = client
+            .take_correlated_requests()
+            .ok_or("correlated receiver missing")?;
+
+        // Flood the lossy broadcast with notifications to force a Lagged event.
+        // Correlated requests must still arrive through the lossless channel.
+        for _ in 0..(EVENT_CAPACITY + 10) {
+            host.write_frame(&Frame {
+                id: 0,
+                kind: FrameKind::Event,
+                method: Method::Notify.as_str().to_owned(),
+                payload: serde_json::json!({"message": "flood", "type": "info"}),
+            })
+            .await?;
+        }
+
+        // Now send a correlated request — it must arrive despite broadcast lag.
+        host.write_frame(&Frame {
+            id: 77,
+            kind: FrameKind::Req,
+            method: crate::protocol::SESSION_COMPACT_METHOD.to_owned(),
+            payload: serde_json::json!({}),
+        })
+        .await?;
+
+        let event = tokio::time::timeout(Duration::from_secs(2), correlated.recv())
+            .await
+            .map_err(|_| "correlated request lost during broadcast lag")?
+            .ok_or("correlated channel closed during broadcast lag")?;
+        let HostEvent::CompactRequest { id, .. } = event else {
+            return Err(format!("expected CompactRequest, got {event:?}").into());
+        };
+        assert_eq!(id, 77);
         Ok(())
     }
 }

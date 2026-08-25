@@ -5,11 +5,10 @@
 
 use std::collections::BTreeMap;
 
-use futures::StreamExt;
 use pi_agent::AgentMessage;
 use pi_ai::{
-    AssistantContent, AssistantMessage, AssistantMessageEvent, Context, Message, Model, StopReason,
-    StreamOptions, TextContent, UserContent, UserMessage, UserMessageContent,
+    AssistantContent, AssistantMessage, Context, Message, Model, StopReason, StreamOptions,
+    TextContent, UserContent, UserMessage, UserMessageContent,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -22,9 +21,10 @@ use crate::core::messages::{
 use crate::core::sessions::{SessionEntry, SessionManager};
 
 use super::{
-    CompactionError, FileOperations, SUMMARIZATION_SYSTEM_PROMPT, SummarizeStreamFn,
-    compute_file_lists, create_file_ops, estimate_tokens, extract_file_ops_from_message,
-    format_file_operations, serialize_conversation,
+    CompactionError, FileOperations, SUMMARIZATION_SYSTEM_PROMPT, SummarizationRetryCallbacks,
+    SummarizationRetryPolicy, SummarizeStreamFn, complete_summarization, compute_file_lists,
+    create_file_ops, estimate_tokens, extract_file_ops_from_message, format_file_operations,
+    serialize_conversation,
 };
 
 /// Default max tokens for branch summary generation.
@@ -43,7 +43,7 @@ pub const BRANCH_SUMMARY_PREAMBLE: &str = "The user explored a different convers
 pub const BRANCH_SUMMARY_PROMPT: &str = "Create a structured summary of this conversation branch for context when returning later.\n\nUse this EXACT format:\n\n## Goal\n[What was the user trying to accomplish in this branch?]\n\n## Constraints & Preferences\n- [Any constraints, preferences, or requirements mentioned]\n- [Or \"(none)\" if none were mentioned]\n\n## Progress\n### Done\n- [x] [Completed tasks/changes]\n\n### In Progress\n- [ ] [Work that was started but not finished]\n\n### Blocked\n- [Issues preventing progress, if any]\n\n## Key Decisions\n- **[Decision]**: [Brief rationale]\n\n## Next Steps\n1. [What should happen next to continue this work]\n\nKeep each section concise. Preserve exact file paths, function names, and error messages.";
 
 /// Result of [`generate_branch_summary`].
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BranchSummaryResult {
     /// Generated summary text (with preamble + file ops).
@@ -61,6 +61,9 @@ pub struct BranchSummaryResult {
     /// Error message when summarization failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// LLM usage from the branch-summary call, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<pi_ai::Usage>,
 }
 
 /// Details stored on a branch-summary entry for cumulative file tracking.
@@ -113,6 +116,10 @@ pub struct GenerateBranchSummaryOptions {
     pub reserve_tokens: Option<u64>,
     /// Injected summarizer stream.
     pub stream_fn: SummarizeStreamFn,
+    /// Retry policy for the standalone summarization request.
+    pub retry: Option<SummarizationRetryPolicy>,
+    /// Lifecycle callbacks for transient summarization retries.
+    pub retry_callbacks: Option<SummarizationRetryCallbacks>,
 }
 
 /// Collect entries that should be summarized when navigating from one position
@@ -287,53 +294,6 @@ fn ensure_not_cancelled(signal: &CancellationToken) -> Result<(), CompactionErro
     }
 }
 
-async fn complete_summarization(
-    model: &Model,
-    context: Context,
-    options: StreamOptions,
-    stream_fn: &SummarizeStreamFn,
-) -> Result<AssistantMessage, CompactionError> {
-    if options
-        .signal
-        .as_ref()
-        .is_some_and(CancellationToken::is_cancelled)
-    {
-        return Err(CompactionError::Cancelled);
-    }
-
-    let mut stream = stream_fn(model.clone(), context, options).await;
-    let mut last = None;
-    while let Some(item) = stream.next().await {
-        match item {
-            Ok(AssistantMessageEvent::Done { message, .. }) => return Ok(message),
-            Ok(AssistantMessageEvent::Error { error, .. }) => return Ok(error),
-            Ok(other) => {
-                if let Some(partial) = event_partial(&other) {
-                    last = Some(partial.clone());
-                }
-            }
-            Err(err) => return Err(CompactionError::Provider(err)),
-        }
-    }
-    last.ok_or_else(|| CompactionError::SummarizationFailed("Unknown error".to_owned()))
-}
-
-fn event_partial(event: &AssistantMessageEvent) -> Option<&AssistantMessage> {
-    match event {
-        AssistantMessageEvent::Start { partial }
-        | AssistantMessageEvent::TextStart { partial, .. }
-        | AssistantMessageEvent::TextDelta { partial, .. }
-        | AssistantMessageEvent::TextEnd { partial, .. }
-        | AssistantMessageEvent::ThinkingStart { partial, .. }
-        | AssistantMessageEvent::ThinkingDelta { partial, .. }
-        | AssistantMessageEvent::ThinkingEnd { partial, .. }
-        | AssistantMessageEvent::ToolCallStart { partial, .. }
-        | AssistantMessageEvent::ToolCallDelta { partial, .. }
-        | AssistantMessageEvent::ToolCallEnd { partial, .. } => Some(partial),
-        AssistantMessageEvent::Done { .. } | AssistantMessageEvent::Error { .. } => None,
-    }
-}
-
 fn assistant_text(message: &AssistantMessage) -> String {
     message
         .content
@@ -359,6 +319,7 @@ fn now_millis() -> i64 {
 ///
 /// Surfaces cancellation and provider failures; non-abort summarizer errors are
 /// returned as [`BranchSummaryResult::error`] (matching TS soft-error shape).
+#[allow(clippy::too_many_lines)]
 pub async fn generate_branch_summary(
     entries: &[SessionEntry],
     options: GenerateBranchSummaryOptions,
@@ -435,6 +396,8 @@ pub async fn generate_branch_summary(
         },
         request_options,
         &options.stream_fn,
+        options.retry.as_ref(),
+        options.retry_callbacks.as_ref(),
     )
     .await?;
 
@@ -443,6 +406,7 @@ pub async fn generate_branch_summary(
     if response.stop_reason == StopReason::Aborted {
         return Ok(BranchSummaryResult {
             aborted: Some(true),
+            usage: Some(response.usage),
             ..BranchSummaryResult::default()
         });
     }
@@ -454,6 +418,7 @@ pub async fn generate_branch_summary(
                     .clone()
                     .unwrap_or_else(|| "Summarization failed".to_owned()),
             ),
+            usage: Some(response.usage),
             ..BranchSummaryResult::default()
         });
     }
@@ -474,6 +439,7 @@ pub async fn generate_branch_summary(
         modified_files: Some(modified_files),
         aborted: None,
         error: None,
+        usage: Some(response.usage),
     })
 }
 
@@ -482,7 +448,7 @@ mod tests {
     use super::*;
     use crate::core::compaction::{CompactionSettings, DEFAULT_COMPACTION_SETTINGS};
     use pi_ai::ProviderError;
-    use pi_ai::{AssistantMessage, ModelInput, TextContent, ToolCall};
+    use pi_ai::{AssistantMessage, AssistantMessageEvent, ModelInput, TextContent, ToolCall};
     use serde_json::{Map, json};
     use std::pin::Pin;
     use std::sync::Arc;
@@ -711,6 +677,8 @@ mod tests {
                     replace_instructions: false,
                     reserve_tokens: Some(16_384),
                     stream_fn: Arc::clone(&stream_fn),
+                    retry: None,
+                    retry_callbacks: None,
                 },
             )
             .await,
@@ -744,6 +712,8 @@ mod tests {
                     replace_instructions: true,
                     reserve_tokens: None,
                     stream_fn,
+                    retry: None,
+                    retry_callbacks: None,
                 },
             )
             .await,
@@ -754,6 +724,98 @@ mod tests {
             assert!(!prompts[0].contains("## Goal"));
         }
         assert_eq!(result_ok(maxes.lock())[0], DEFAULT_BRANCH_MAX_TOKENS);
+    }
+
+    /// Build a `stream_fn` whose response uses the given `stop_reason` and usage,
+    /// so the early-return paths in `generate_branch_summary` can be exercised.
+    fn stream_with_stop(stop: StopReason, response_usage: pi_ai::Usage) -> SummarizeStreamFn {
+        Arc::new(move |_model, _ctx, _opts| {
+            let mut message = AssistantMessage::new("a", "p", "m", 1);
+            message.content = vec![AssistantContent::Text(TextContent::new("BRANCH"))];
+            message.stop_reason = stop;
+            message.usage = response_usage.clone();
+            if stop == StopReason::Error {
+                message.error_message = Some("boom".into());
+            }
+            Box::pin(async move {
+                let stream = futures::stream::iter(vec![Ok(AssistantMessageEvent::Done {
+                    reason: pi_ai::DoneReason::Stop,
+                    message,
+                })]);
+                Box::pin(stream)
+                    as Pin<
+                        Box<
+                            dyn futures::Stream<Item = Result<AssistantMessageEvent, ProviderError>>
+                                + Send,
+                        >,
+                    >
+            })
+        })
+    }
+
+    fn one_entry() -> SessionEntry {
+        result_ok(serde_json::from_value(json!({
+            "type": "message",
+            "id": "u",
+            "parentId": null,
+            "timestamp": "2025-01-01T00:00:00.000Z",
+            "message": user_agent("hello branch"),
+        })))
+    }
+
+    fn summary_opts(stream_fn: SummarizeStreamFn) -> GenerateBranchSummaryOptions {
+        GenerateBranchSummaryOptions {
+            model: test_model(),
+            api_key: None,
+            headers: None,
+            env: None,
+            signal: CancellationToken::new(),
+            custom_instructions: None,
+            replace_instructions: false,
+            reserve_tokens: Some(16_384),
+            stream_fn,
+            retry: None,
+            retry_callbacks: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn aborted_branch_summary_persists_usage() {
+        let billed = usage(200, 50);
+        let result = result_ok(
+            generate_branch_summary(
+                &[one_entry()],
+                summary_opts(stream_with_stop(StopReason::Aborted, billed.clone())),
+            )
+            .await,
+        );
+        assert_eq!(result.aborted, Some(true));
+        assert_eq!(
+            result.usage,
+            Some(billed),
+            "aborted summary must persist billed usage"
+        );
+    }
+
+    #[tokio::test]
+    async fn errored_branch_summary_persists_usage() {
+        let billed = usage(300, 75);
+        let result = result_ok(
+            generate_branch_summary(
+                &[one_entry()],
+                summary_opts(stream_with_stop(StopReason::Error, billed.clone())),
+            )
+            .await,
+        );
+        assert!(
+            result.error.is_some(),
+            "errored summary must carry an error message"
+        );
+        assert_eq!(
+            result.usage,
+            Some(billed),
+            "errored summary must persist billed usage"
+        );
     }
 
     // keep DEFAULT_COMPACTION_SETTINGS referenced so settings parity is visible

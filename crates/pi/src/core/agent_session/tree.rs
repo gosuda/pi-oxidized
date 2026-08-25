@@ -17,7 +17,7 @@ use pi_ai::{AssistantContent, Message, StopReason};
 use tokio_util::sync::CancellationToken;
 
 use super::AgentSession;
-use super::events::AgentSessionEvent;
+use super::events::{AgentSessionEvent, SummarizationRetrySource};
 use crate::core::compaction::{
     GenerateBranchSummaryOptions, SummarizeStreamFn, collect_entries_for_branch_summary,
     generate_branch_summary,
@@ -124,6 +124,14 @@ pub struct TreePreparation {
     pub replace_instructions: bool,
     /// Label to attach.
     pub label: Option<String>,
+}
+
+#[derive(Default)]
+struct NavigationSummary {
+    text: Option<String>,
+    details: Option<serde_json::Value>,
+    usage: Option<pi_ai::Usage>,
+    aborted: bool,
 }
 
 /// Async closure that pre-renders a tool call or result to HTML fragments.
@@ -251,8 +259,10 @@ impl AgentSession {
             (target_entry, prep)
         };
 
-        // Set up cancellation slot.
-        let token = self.begin_branch_summary_abort();
+        // Set up cancellation slot with an owner generation so an older
+        // navigation finishing after a newer one started cannot clear the
+        // newer navigation's token.
+        let (token, owner) = self.begin_branch_summary_abort();
 
         // Extension before_tree hook gate.
         let _before_handlers = self.has_extension_handlers("session_before_tree");
@@ -260,7 +270,7 @@ impl AgentSession {
         let result = self
             .navigate_tree_inner(target_entry, preparation, auth, summarizer, &token)
             .await;
-        self.clear_branch_summary_abort();
+        self.clear_branch_summary_abort(owner);
         result
     }
 
@@ -272,64 +282,63 @@ impl AgentSession {
         summarizer: Option<&SummarizeStreamFn>,
         token: &CancellationToken,
     ) -> Result<NavigateTreeResult, TreeError> {
-        // Run default summarizer when requested.
-        let mut summary_text: Option<String> = None;
-        let mut summary_details: Option<serde_json::Value> = None;
-        let mut from_extension = false;
-        if preparation.user_wants_summary
-            && !preparation.entries_to_summarize.is_empty()
-            && let Some(stream_fn) = summarizer
-        {
-            let model = self.model();
-            let reserve_tokens = self
-                .lock_settings()
-                .get_branch_summary_settings()
-                .reserve_tokens;
-            let opts = GenerateBranchSummaryOptions {
-                model: model.clone(),
-                api_key: auth.api_key.clone(),
-                headers: auth.headers.clone(),
-                env: auth.env.clone(),
-                signal: token.clone(),
-                custom_instructions: preparation.custom_instructions.clone(),
-                replace_instructions: preparation.replace_instructions,
-                reserve_tokens: Some(reserve_tokens),
-                stream_fn: Arc::clone(stream_fn),
+        let NavigationSummary {
+            text: summary_text,
+            details: summary_details,
+            usage: summary_usage,
+            aborted,
+        } = self
+            .generate_navigation_summary(&preparation, &auth, summarizer, token)
+            .await?;
+        if aborted {
+            return Ok(NavigateTreeResult {
+                cancelled: true,
+                aborted: true,
+                ..Default::default()
+            });
+        }
+
+        let (new_leaf_id, editor_text) = compute_new_leaf_and_editor_text(&target_entry);
+
+        let summary_entry = {
+            let runtime = self.runtime_handle();
+            let _lifecycle_guard = if let Some(runtime) = &runtime {
+                Some(runtime.lifecycle_gate().read().await)
+            } else {
+                None
             };
-            let result = generate_branch_summary(&preparation.entries_to_summarize, opts)
-                .await
-                .map_err(|e| TreeError::Summarization(e.to_string()))?;
-            if result.aborted.unwrap_or(false) {
+
+            #[cfg(test)]
+            {
+                if let Some(runtime) = &runtime {
+                    runtime.notify_tree_read_gate_acquired();
+                    runtime.wait_for_tree_read_gate_proceed().await;
+                }
+            }
+
+            if token.is_cancelled() || self.is_disposed() {
                 return Ok(NavigateTreeResult {
                     cancelled: true,
                     aborted: true,
                     ..Default::default()
                 });
             }
-            if let Some(err) = result.error.clone() {
-                return Err(TreeError::Summarization(err));
-            }
-            summary_text = result.summary;
-            summary_details = Some(serde_json::json!({
-                "readFiles": result.read_files.unwrap_or_default(),
-                "modifiedFiles": result.modified_files.unwrap_or_default(),
-            }));
-            from_extension = false;
-        }
-        let _ = from_extension;
 
-        // Determine new leaf id + editor text from the target entry shape.
-        let (new_leaf_id, editor_text) = compute_new_leaf_and_editor_text(&target_entry);
-
-        // Persist leaf change + optional summary under the lock.
-        let summary_entry = {
             let mut sm = self.session_manager.lock().await;
+            if token.is_cancelled() || self.is_disposed() {
+                return Ok(NavigateTreeResult {
+                    cancelled: true,
+                    aborted: true,
+                    ..Default::default()
+                });
+            }
             if let Some(text) = summary_text.as_deref() {
                 let id = sm.branch_with_summary(
                     new_leaf_id.as_deref(),
                     text,
                     summary_details.clone(),
-                    from_extension.then_some(true),
+                    None,
+                    summary_usage.clone(),
                 )?;
                 if let Some(l) = preparation.label.as_deref() {
                     let _ = sm.append_label_change(&id, Some(l));
@@ -350,7 +359,6 @@ impl AgentSession {
             }
         };
 
-        // Rebuild agent messages from new session context.
         let session_context = {
             let sm = self.session_manager.lock().await;
             sm.build_session_context()
@@ -358,7 +366,6 @@ impl AgentSession {
         };
         self.agent.replace_messages(session_context.messages);
 
-        // Signal session_tree handler presence.
         let _ = self.has_extension_handlers("session_tree");
 
         Ok(NavigateTreeResult {
@@ -369,20 +376,90 @@ impl AgentSession {
         })
     }
 
+    async fn generate_navigation_summary(
+        &self,
+        preparation: &TreePreparation,
+        auth: &SummarizationAuth,
+        summarizer: Option<&SummarizeStreamFn>,
+        token: &CancellationToken,
+    ) -> Result<NavigationSummary, TreeError> {
+        if !preparation.user_wants_summary || preparation.entries_to_summarize.is_empty() {
+            return Ok(NavigationSummary::default());
+        }
+        let Some(stream_fn) = summarizer else {
+            return Ok(NavigationSummary::default());
+        };
+
+        let reserve_tokens = self
+            .lock_settings()
+            .get_branch_summary_settings()
+            .reserve_tokens;
+        let opts = GenerateBranchSummaryOptions {
+            model: self.model(),
+            api_key: auth.api_key.clone(),
+            headers: auth.headers.clone(),
+            env: auth.env.clone(),
+            signal: token.clone(),
+            custom_instructions: preparation.custom_instructions.clone(),
+            replace_instructions: preparation.replace_instructions,
+            reserve_tokens: Some(reserve_tokens),
+            stream_fn: Arc::clone(stream_fn),
+            retry: Some(self.summarization_retry_policy()),
+            retry_callbacks: Some(
+                self.summarization_retry_callbacks(SummarizationRetrySource::BranchSummary),
+            ),
+        };
+        let result = generate_branch_summary(&preparation.entries_to_summarize, opts)
+            .await
+            .map_err(|error| TreeError::Summarization(error.to_string()))?;
+        if result.aborted.unwrap_or(false) {
+            return Ok(NavigationSummary {
+                aborted: true,
+                ..Default::default()
+            });
+        }
+        if let Some(error) = result.error {
+            return Err(TreeError::Summarization(error));
+        }
+        Ok(NavigationSummary {
+            text: result.summary,
+            details: Some(serde_json::json!({
+                "readFiles": result.read_files.unwrap_or_default(),
+                "modifiedFiles": result.modified_files.unwrap_or_default(),
+            })),
+            usage: result.usage,
+            aborted: false,
+        })
+    }
+
     /// Begin the branch-summary cancellation slot.
-    fn begin_branch_summary_abort(&self) -> CancellationToken {
+    ///
+    /// Returns the cancellation token plus a monotonically unique owner
+    /// generation. The owner must be passed to
+    /// [`clear_branch_summary_abort`](Self::clear_branch_summary_abort) so
+    /// that an older navigation finishing after a newer one started cannot
+    /// remove the newer navigation's token from the slot.
+    fn begin_branch_summary_abort(&self) -> (CancellationToken, u64) {
         let token = CancellationToken::new();
         let mut inner = self.lock_inner();
         if let Some(prev) = inner.branch_summary_abort.take() {
             prev.cancel();
         }
+        inner.branch_summary_owner = inner.branch_summary_owner.wrapping_add(1);
+        let owner = inner.branch_summary_owner;
         inner.branch_summary_abort = Some(token.clone());
-        token
+        (token, owner)
     }
 
-    /// Clear the branch-summary cancellation slot.
-    fn clear_branch_summary_abort(&self) {
-        self.lock_inner().branch_summary_abort = None;
+    /// Clear the branch-summary cancellation slot, but only when `owner`
+    /// matches the generation stored at install time. An older navigation
+    /// whose token was superseded by a newer one will have a stale owner
+    /// and leave the newer slot intact.
+    fn clear_branch_summary_abort(&self, owner: u64) {
+        let mut inner = self.lock_inner();
+        if inner.branch_summary_owner == owner {
+            inner.branch_summary_abort = None;
+        }
     }
 
     /// Abort in-flight branch summarization.
@@ -1273,6 +1350,366 @@ mod tests {
             );
         }
 
+        Ok(())
+    }
+
+    // ----- Owner-race and replacement-overlap regressions ------------------
+
+    /// A summarizer that blocks on a gate semaphore until the test releases it,
+    /// so two navigations can be overlapped deterministically without sleeps.
+    fn gated_summarizer(
+        gate: Arc<tokio::sync::Semaphore>,
+        entered: Arc<tokio::sync::Notify>,
+        completed: Option<Arc<tokio::sync::Notify>>,
+    ) -> SummarizeStreamFn {
+        Arc::new(move |_model, _context, options| {
+            let gate = Arc::clone(&gate);
+            let entered = Arc::clone(&entered);
+            let completed = completed.clone();
+            let signal = options.signal.clone();
+            Box::pin(async move {
+                entered.notify_one();
+                // Block until the test releases the gate or the token cancels.
+                tokio::select! {
+                    biased;
+                    () = async {
+                        if let Some(signal) = signal.as_ref() {
+                            signal.cancelled().await;
+                        }
+                    } => {}
+                    _ = gate.acquire_owned() => {}
+                }
+                if let Some(completed) = completed {
+                    completed.notify_one();
+                }
+                let mut message = AssistantMessage::new("test-api", "test-provider", "m", 1);
+                message.stop_reason = pi_ai::StopReason::Stop;
+                let events = stream::iter(vec![Ok(AssistantMessageEvent::Done {
+                    reason: pi_ai::DoneReason::Stop,
+                    message,
+                })]);
+                Box::pin(events)
+                    as std::pin::Pin<
+                        Box<
+                            dyn futures::Stream<Item = Result<AssistantMessageEvent, ProviderError>>
+                                + Send,
+                        >,
+                    >
+            })
+        })
+    }
+
+    /// Regression: an older navigation (A) finishing after a newer navigation
+    /// (B) started must not clear B's abort token from the slot. The owner
+    /// generation ensures `clear_branch_summary_abort` is a no-op when the
+    /// caller's generation is stale.
+    #[tokio::test]
+    async fn older_navigation_cannot_clear_newer_owner_slot() -> TestResult {
+        let session = make_session()?;
+        let target = {
+            let mut manager = session.session_manager.lock().await;
+            let target = manager.append_message(&AgentMessage::Llm(Box::new(
+                Message::Assistant(assistant_with_usage("first", Usage::default())),
+            )))?;
+            manager.append_message(&AgentMessage::Llm(Box::new(Message::Assistant(
+                assistant_with_usage("second", Usage::default()),
+            ))))?;
+            target
+        };
+
+        // Gate A's summarizer so it blocks until we release it.
+        let gate_a = Arc::new(tokio::sync::Semaphore::new(0));
+        let entered_a = Arc::new(tokio::sync::Notify::new());
+        let summarizer_a = gated_summarizer(Arc::clone(&gate_a), Arc::clone(&entered_a), None);
+
+        // Navigation A: starts summarizing and blocks.
+        let session_a = Arc::clone(&session);
+        let target_a = target.clone();
+        let nav_a = tokio::spawn(async move {
+            session_a
+                .navigate_tree(
+                    &target_a,
+                    NavigateTreeOptions {
+                        summarize: true,
+                        ..Default::default()
+                    },
+                    SummarizationAuth::default(),
+                    Some(&summarizer_a),
+                )
+                .await
+        });
+        entered_a.notified().await;
+        assert!(session.is_summarizing(), "A should be summarizing");
+
+        // Navigation B: supersedes A's slot. A's token is cancelled, B gets a
+        // new owner generation.
+        let gate_b = Arc::new(tokio::sync::Semaphore::new(0));
+        let entered_b = Arc::new(tokio::sync::Notify::new());
+        let summarizer_b = gated_summarizer(Arc::clone(&gate_b), Arc::clone(&entered_b), None);
+        let session_b = Arc::clone(&session);
+        let target_b = target.clone();
+        let nav_b = tokio::spawn(async move {
+            session_b
+                .navigate_tree(
+                    &target_b,
+                    NavigateTreeOptions {
+                        summarize: true,
+                        ..Default::default()
+                    },
+                    SummarizationAuth::default(),
+                    Some(&summarizer_b),
+                )
+                .await
+        });
+        entered_b.notified().await;
+        assert!(session.is_summarizing(), "B should be summarizing");
+
+        // Release A's gate so A finishes. A's `clear_branch_summary_abort`
+        // should NOT remove B's token because A's owner generation is stale.
+        gate_a.add_permits(1);
+        let _result_a = tokio::time::timeout(std::time::Duration::from_secs(2), nav_a)
+            .await
+            .map_err(|_| missing("navigation A timed out"))??;
+
+        // B must still be summarizing — A did not clear B's slot.
+        assert!(
+            session.is_summarizing(),
+            "B's slot must survive A's clear (owner generation guard)"
+        );
+
+        // Clean up B.
+        session.abort().await;
+        gate_b.add_permits(1);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), nav_b).await;
+        Ok(())
+    }
+
+    struct TestFactory;
+
+    impl crate::core::agent_session_runtime::CreateAgentSessionRuntimeFactory for TestFactory {
+        fn create(
+            &self,
+            options: crate::core::agent_session_runtime::CreateAgentSessionRuntimeOptions,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            crate::core::agent_session_runtime::CreateAgentSessionRuntimeResult,
+                            crate::core::agent_session_runtime::AgentSessionRuntimeError,
+                        >,
+                    > + Send,
+            >,
+        > {
+            Box::pin(async move {
+                let mut config =
+                    AgentSessionConfig::test_config(Arc::new(StubProvider), test_model()).map_err(
+                        |e| {
+                            crate::core::agent_session_runtime::AgentSessionRuntimeError::Factory(
+                                e.to_string(),
+                            )
+                        },
+                    )?;
+                config.session_manager = options.session_manager;
+                let session = AgentSession::new(config).map_err(|e| {
+                    crate::core::agent_session_runtime::AgentSessionRuntimeError::Factory(
+                        e.to_string(),
+                    )
+                })?;
+                Ok(
+                    crate::core::agent_session_runtime::CreateAgentSessionRuntimeResult {
+                        session,
+                        services: crate::core::agent_session_runtime::AgentSessionRuntimeServices {
+                            cwd: std::path::PathBuf::from(&options.cwd),
+                            agent_dir: std::path::PathBuf::from(&options.agent_dir),
+                        },
+                        diagnostics: Vec::new(),
+                        model_fallback_message: None,
+                    },
+                )
+            })
+        }
+    }
+
+    /// Regression: a navigation that finishes its summarization while a
+    /// replacement is tearing down the session must not persist tree state
+    /// onto the abandoned session. The lifecycle read gate excludes stale
+    /// persistence during replacement teardown (which holds the write gate).
+    #[tokio::test]
+    async fn navigation_does_not_persist_after_replacement_starts() -> TestResult {
+        use crate::core::agent_session_runtime::create_agent_session_runtime;
+        use crate::core::sessions::SessionManager;
+
+        let tmp = tempfile::tempdir()?;
+        let cwd = tmp.path().to_string_lossy().into_owned();
+
+        let factory = Arc::new(TestFactory);
+        let session_manager = SessionManager::in_memory(Some(&cwd), None)?;
+        let runtime =
+            create_agent_session_runtime(factory, cwd.clone(), cwd.clone(), session_manager)
+                .await?;
+
+        let session = runtime.session();
+
+        // Set up two assistant entries so navigation has somewhere to go.
+        let target = {
+            let mut manager = session.session_manager.lock().await;
+            let target = manager.append_message(&AgentMessage::Llm(Box::new(
+                Message::Assistant(assistant_with_usage("first", Usage::default())),
+            )))?;
+            manager.append_message(&AgentMessage::Llm(Box::new(Message::Assistant(
+                assistant_with_usage("second", Usage::default()),
+            ))))?;
+            target
+        };
+
+        // Summarizer that blocks until released, then produces a summary.
+        let nav_gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let nav_entered = Arc::new(tokio::sync::Notify::new());
+        let summary_completed = Arc::new(tokio::sync::Notify::new());
+        let summarizer = gated_summarizer(
+            Arc::clone(&nav_gate),
+            Arc::clone(&nav_entered),
+            Some(Arc::clone(&summary_completed)),
+        );
+
+        // Start navigation — it enters summarization and blocks.
+        let session_nav = Arc::clone(&session);
+        let target_nav = target.clone();
+        let nav = tokio::spawn(async move {
+            session_nav
+                .navigate_tree(
+                    &target_nav,
+                    NavigateTreeOptions {
+                        summarize: true,
+                        ..Default::default()
+                    },
+                    SummarizationAuth::default(),
+                    Some(&summarizer),
+                )
+                .await
+        });
+        nav_entered.notified().await;
+        assert!(session.is_summarizing());
+
+        let lifecycle_guard = runtime.lifecycle_gate().write().await;
+        nav_gate.add_permits(1);
+        summary_completed.notified().await;
+        session.lock_inner().lifecycle.disposed = true;
+        drop(lifecycle_guard);
+        // Signal the cfg(test) read-gate hook to proceed so navigation can
+        // reach the disposed check and abort.
+        runtime.notify_tree_read_gate_proceed();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), nav)
+            .await
+            .map_err(|_| missing("navigation timed out"))?
+            .map_err(|_| missing("navigation task panicked"))?
+            .map_err(|e: TreeError| {
+                std::io::Error::other(format!("navigation inner error: {e}"))
+            })?;
+
+        // The navigation must have been aborted (cancelled) rather than
+        // persisting a summary onto the disposed session.
+        assert!(
+            result.cancelled && result.aborted,
+            "navigation should be aborted after disposal, got {result:?}"
+        );
+        assert!(result.summary_entry.is_none());
+        assert!(!session.is_summarizing());
+        Ok(())
+    }
+
+    /// Regression: the public `dispose` path acquires the lifecycle write
+    /// gate, so a direct `session.dispose()` cannot overlap final tree
+    /// persistence while `navigate_tree` holds the read gate.  Without the
+    /// write gate in `AgentSession::dispose`, disposal would proceed
+    /// immediately and `is_disposed()` would be true while navigation is
+    /// still inside the read-gate section.
+    #[tokio::test]
+    async fn public_dispose_waits_for_tree_read_gate() -> TestResult {
+        use crate::core::agent_session_runtime::create_agent_session_runtime;
+        use crate::core::sessions::SessionManager;
+        use std::future::{Future, poll_fn};
+        use std::task::Poll;
+
+        let tmp = tempfile::tempdir()?;
+        let cwd = tmp.path().to_string_lossy().into_owned();
+
+        let factory = Arc::new(TestFactory);
+        let session_manager = SessionManager::in_memory(Some(&cwd), None)?;
+        let runtime =
+            create_agent_session_runtime(factory, cwd.clone(), cwd.clone(), session_manager)
+                .await?;
+        let session = runtime.session();
+
+        // Two assistant entries: leaf is the second, target is the first.
+        let target = {
+            let mut manager = session.session_manager.lock().await;
+            let target = manager.append_message(&AgentMessage::Llm(Box::new(
+                Message::Assistant(assistant_with_usage("first", Usage::default())),
+            )))?;
+            manager.append_message(&AgentMessage::Llm(Box::new(Message::Assistant(
+                assistant_with_usage("second", Usage::default()),
+            ))))?;
+            target
+        };
+
+        // Start navigation — it acquires the read gate and fires the test hook.
+        let session_nav = Arc::clone(&session);
+        let target_nav = target.clone();
+        let nav = tokio::spawn(async move {
+            session_nav
+                .navigate_tree(
+                    &target_nav,
+                    NavigateTreeOptions::default(),
+                    SummarizationAuth::default(),
+                    None,
+                )
+                .await
+        });
+
+        // Wait for the hook: navigation has acquired the read gate.
+        runtime.wait_for_tree_read_gate_acquired().await;
+
+        // Hold session_manager so navigation blocks inside the read-gate
+        // section (at the `session_manager.lock()` call).
+        let session_manager = session.session_manager();
+        let sm_guard = session_manager.lock().await;
+
+        // Release the hook — navigation proceeds to lock session_manager and blocks.
+        runtime.notify_tree_read_gate_proceed();
+
+        // Poll direct disposal once. The read gate makes the write lock return
+        // `Pending` before disposal can mutate session state.
+        let dispose = session.dispose();
+        tokio::pin!(dispose);
+        let pending =
+            poll_fn(|context| Poll::Ready(matches!(dispose.as_mut().poll(context), Poll::Pending)))
+                .await;
+        assert!(
+            pending,
+            "dispose must be pending while navigation holds the read gate"
+        );
+        assert!(
+            !session.is_disposed(),
+            "session must not be disposed while navigation holds the read gate"
+        );
+
+        // Release session_manager — navigation finishes its tree mutation,
+        // releases the read gate, then dispose acquires the write gate.
+        drop(sm_guard);
+
+        // Both finish.
+        nav.await
+            .map_err(|_| missing("navigation task panicked"))?
+            .map_err(|e: TreeError| {
+                std::io::Error::other(format!("navigation inner error: {e}"))
+            })?;
+        dispose.await;
+        assert!(
+            session.is_disposed(),
+            "session must be disposed after dispose completes"
+        );
         Ok(())
     }
 }

@@ -94,6 +94,35 @@ async function loadExtension(
 	return await promise;
 }
 
+const REFERENCE_MODULES = [
+	["@earendil-works/pi-coding-agent", "packages/coding-agent/src/core/extensions/index.ts"],
+	["@earendil-works/pi-coding-agent/builtins", "packages/coding-agent/src/extensions/index.ts"],
+	["pi-coding-agent-full", "packages/coding-agent/src/index.ts"],
+	["@earendil-works/pi-agent-core", "packages/agent/src/index.ts"],
+	["@earendil-works/pi-tui", "packages/tui/src/index.ts"],
+	["@earendil-works/pi-ai", "packages/ai/src/compat.ts"],
+	["@earendil-works/pi-ai/compat", "packages/ai/src/compat.ts"],
+	["@earendil-works/pi-ai/oauth", "packages/ai/src/oauth.ts"],
+	["@earendil-works/pi-ai/providers/all", "packages/ai/src/providers/all.ts"],
+	["@mariozechner/pi-coding-agent", "packages/coding-agent/src/core/extensions/index.ts"],
+	["@mariozechner/pi-agent-core", "packages/agent/src/index.ts"],
+	["@mariozechner/pi-tui", "packages/tui/src/index.ts"],
+	["@mariozechner/pi-ai", "packages/ai/src/compat.ts"],
+	["@mariozechner/pi-ai/compat", "packages/ai/src/compat.ts"],
+	["@mariozechner/pi-ai/oauth", "packages/ai/src/oauth.ts"],
+	["@mariozechner/pi-ai/providers/all", "packages/ai/src/providers/all.ts"],
+] as const;
+
+test("resolves reference modules from this workspace", () => {
+	const hostRoot = resolve(import.meta.dirname, "..");
+	const referenceRoot = resolve(hostRoot, "../..", ".references", "pi");
+	const importer = resolve(hostRoot, "src", "main.ts");
+
+	for (const [specifier, expectedPath] of REFERENCE_MODULES) {
+		expect(Bun.resolveSync(specifier, importer)).toBe(resolve(referenceRoot, expectedPath));
+	}
+});
+
 /**
  * Release contract: the compiled host bundles the reference packages (jiti
  * `virtualModules`, mirroring the upstream loader), so a bare binary in an
@@ -153,6 +182,25 @@ export default (pi) => pi.registerTool(tool);
 		expect(result["extensions"]).toBe(1);
 		expect(result["tools"]).toEqual(expect.arrayContaining([
 			expect.objectContaining({ name: "bundled" }),
+		]));
+	});
+
+	test("loads an extension importing pi-ai image exports through the root alias", async () => {
+		const fixturePath = resolve(
+			import.meta.dirname,
+			"..",
+			"fixtures",
+			"extensions",
+			"pi-ai-images-import.ts",
+		);
+		const result = await loadExtension(hostPath, outsideCwd, fixturePath);
+		expect(result["errors"]).toEqual([]);
+		expect(result["extensions"]).toBe(1);
+		expect(result["tools"]).toEqual(expect.arrayContaining([
+			expect.objectContaining({
+				name: "piAiImagesProbe",
+				description: "generate=true;models=true;api=true",
+			}),
 		]));
 	});
 });

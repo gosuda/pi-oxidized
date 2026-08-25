@@ -38,14 +38,17 @@ use crate::cli::bootstrap::{
     RuntimeHandle, run_bootstrap,
 };
 use crate::cli::package_manager_cli::{ListedPackage, ListedScope, PackageHandler, PackageOutput};
+use crate::core::agent_session::model::level_str;
 use crate::core::agent_session_runtime::{
-    AgentSessionRuntime, AgentSessionRuntimeServices, CreateAgentSessionRuntimeFactory,
-    CreateAgentSessionRuntimeOptions, CreateAgentSessionRuntimeResult,
+    AgentSessionRuntime, AgentSessionRuntimeError, AgentSessionRuntimeServices,
+    CreateAgentSessionRuntimeFactory, CreateAgentSessionRuntimeOptions,
+    CreateAgentSessionRuntimeResult,
 };
 use crate::core::agent_session_services::{
     AgentSessionRuntimeDiagnostic, AgentSessionServices, AgentSessionServicesError,
     CreateAgentSessionResult, CreateAgentSessionServicesOptions, ExtensionFlagValue,
-    create_agent_session_from_services, create_agent_session_services_with_trust,
+    ResourceLoaderServiceOptions, create_agent_session_from_services,
+    create_agent_session_services_with_trust,
 };
 use crate::core::config::get_agent_dir;
 use crate::core::model_resolver::{
@@ -55,6 +58,7 @@ use crate::core::model_resolver::{
 use crate::core::model_runtime::ModelRuntime;
 use crate::core::package_manager::{PackageManager, PackageManagerOptions, Scope};
 use crate::core::resources::ResourceLoader;
+use crate::core::sessions::SessionManager;
 use crate::core::settings::{SettingsManager, SettingsManagerCreateOptions};
 use crate::core::system_prompt::{BuildSystemPromptOptions, build_system_prompt};
 use crate::core::trust::{
@@ -96,7 +100,14 @@ impl Io {
             .with_interactive(|dispatched, runtime| {
                 Box::pin(async move {
                     let _ = dispatched;
-                    run_interactive_mode(runtime, InteractiveRuntimeOptions::detect())
+                    // Detection probes the terminal with blocking I/O; keep it
+                    // off the runtime worker. The blocking pool does not change
+                    // the result — the tmux hyperlink probe is cached in a
+                    // process-wide `OnceLock`.
+                    let options = tokio::task::spawn_blocking(InteractiveRuntimeOptions::detect)
+                        .await
+                        .map_err(|e| format!("interactive: {e}"))?;
+                    run_interactive_mode(runtime, options)
                         .await
                         .map_err(|e| format!("interactive: {e}"))
                 })
@@ -446,16 +457,18 @@ fn extension_flag_values(args: &crate::cli::args::Args) -> BTreeMap<String, Exte
         })
         .collect()
 }
-
-fn no_tools_mode(
-    args: &crate::cli::args::Args,
-) -> Option<crate::core::agent_session_services::NoToolsMode> {
-    if args.no_tools {
-        Some(crate::core::agent_session_services::NoToolsMode::All)
-    } else if args.no_builtin_tools {
-        Some(crate::core::agent_session_services::NoToolsMode::Builtin)
-    } else {
-        None
+fn resource_loader_options(args: &crate::cli::args::Args) -> ResourceLoaderServiceOptions {
+    ResourceLoaderServiceOptions {
+        no_extensions: args.no_extensions,
+        no_skills: args.no_skills,
+        no_prompt_templates: args.no_prompt_templates,
+        no_themes: args.no_themes,
+        no_context_files: args.no_context_files,
+        system_prompt: args.system_prompt.clone(),
+        append_system_prompt: (!args.append_system_prompt.is_empty())
+            .then(|| args.append_system_prompt.clone()),
+        additional_extension_paths: args.extensions.clone(),
+        ..Default::default()
     }
 }
 
@@ -469,20 +482,7 @@ async fn create_runtime_services(
             cwd: PathBuf::from(cwd),
             agent_dir: Some(PathBuf::from(agent_dir)),
             extension_flag_values: Some(extension_flag_values(args)),
-            resource_loader_options: Some(
-                crate::core::agent_session_services::ResourceLoaderServiceOptions {
-                    no_extensions: args.no_extensions,
-                    no_skills: args.no_skills,
-                    no_prompt_templates: args.no_prompt_templates,
-                    no_themes: args.no_themes,
-                    no_context_files: args.no_context_files,
-                    system_prompt: args.system_prompt.clone(),
-                    append_system_prompt: (!args.append_system_prompt.is_empty())
-                        .then(|| args.append_system_prompt.clone()),
-                    additional_extension_paths: args.extensions.clone(),
-                    ..Default::default()
-                },
-            ),
+            resource_loader_options: Some(resource_loader_options(args)),
             ..Default::default()
         },
         args.project_trust_override,
@@ -497,11 +497,24 @@ struct ResolvedModels {
     diagnostics: Vec<AgentSessionRuntimeDiagnostic>,
 }
 
-async fn resolve_models(args: &crate::cli::args::Args, runtime: &ModelRuntime) -> ResolvedModels {
+async fn resolve_model_scope(
+    patterns: &[String],
+    runtime: &ModelRuntime,
+) -> (ResolveModelScopeResult, Vec<AgentSessionRuntimeDiagnostic>) {
+    let scope = resolve_model_scope_with_diagnostics(patterns, runtime).await;
+    let diagnostics = scope
+        .diagnostics
+        .iter()
+        .map(|diagnostic| AgentSessionRuntimeDiagnostic::warning(diagnostic.message.clone()))
+        .collect();
+    (scope, diagnostics)
+}
+
+async fn resolve_models(scope: &CliRuntimeScope, runtime: &ModelRuntime) -> ResolvedModels {
     let cli = resolve_cli_model(ResolveCliModelOptions {
-        cli_provider: args.provider.as_deref(),
-        cli_model: args.model.as_deref(),
-        cli_thinking: args.thinking,
+        cli_provider: scope.provider.as_deref(),
+        cli_model: scope.model.as_deref(),
+        cli_thinking: scope.thinking,
         model_runtime: runtime,
     });
     let mut diagnostics = Vec::new();
@@ -511,13 +524,8 @@ async fn resolve_models(args: &crate::cli::args::Args, runtime: &ModelRuntime) -
     if let Some(warning) = &cli.warning {
         diagnostics.push(AgentSessionRuntimeDiagnostic::warning(warning.clone()));
     }
-    let scope = resolve_model_scope_with_diagnostics(&args.models, runtime).await;
-    diagnostics.extend(
-        scope
-            .diagnostics
-            .iter()
-            .map(|diagnostic| AgentSessionRuntimeDiagnostic::warning(diagnostic.message.clone())),
-    );
+    let (scope, scope_diagnostics) = resolve_model_scope(&scope.model_patterns, runtime).await;
+    diagnostics.extend(scope_diagnostics);
     ResolvedModels {
         cli,
         scope,
@@ -580,6 +588,50 @@ fn build_session_inputs(
     });
     (settings_manager, tools, system_prompt)
 }
+fn initialize_session_metadata(
+    manager: &mut SessionManager,
+    has_existing_session: bool,
+    has_saved_thinking_level: bool,
+    result: &CreateAgentSessionResult,
+) -> Result<(), String> {
+    if !has_existing_session {
+        if let Some(model) = result.model.as_ref() {
+            manager
+                .append_model_change(&model.provider, &model.id)
+                .map_err(|error| error.to_string())?;
+        }
+    } else if has_saved_thinking_level {
+        return Ok(());
+    }
+    manager
+        .append_thinking_level_change(level_str(result.thinking_level))
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+async fn finish_session_diagnostics(
+    api_key: Option<&str>,
+    result: &mut CreateAgentSessionResult,
+    mut diagnostics: Vec<AgentSessionRuntimeDiagnostic>,
+) -> Result<Option<CliRuntimeApiKey>, String> {
+    let replacement_api_key =
+        api_key
+            .zip(result.model.as_ref())
+            .map(|(value, model)| CliRuntimeApiKey {
+                provider: model.provider.clone(),
+                value: value.to_owned(),
+            });
+    apply_cli_api_key(
+        api_key,
+        result.model.as_ref(),
+        &result.model_runtime,
+        &mut diagnostics,
+    )
+    .await?;
+    result.diagnostics.splice(0..0, diagnostics);
+    Ok(replacement_api_key)
+}
+
 /// Runtime factory backed by real product services.
 struct RealRuntimeFactory;
 
@@ -592,8 +644,8 @@ impl RuntimeFactory for RealRuntimeFactory {
             let cwd = options.cwd.clone();
             let agent_dir = options.agent_dir.clone();
             let parsed = options.parsed;
-            let session_context = options
-                .session_manager
+            let mut session_manager = options.session_manager;
+            let session_context = session_manager
                 .build_session_context()
                 .map_err(|error| error.to_string())?;
             let RestoredSession {
@@ -602,21 +654,23 @@ impl RuntimeFactory for RealRuntimeFactory {
                 saved_thinking_level,
                 messages: existing_messages,
             } = restore_session(session_context);
+            let has_saved_thinking_level = saved_thinking_level.is_some();
 
             let services = create_runtime_services(&cwd, &agent_dir, &parsed).await?;
             let project_trusted = services.settings_manager().is_project_trusted();
 
             // Services refresh registers extension providers before model resolution.
+            let cli_scope = CliRuntimeScope::from_args(&parsed);
             let ResolvedModels {
                 cli: cli_resolved,
                 scope,
-                diagnostics: mut pre_session_diagnostics,
-            } = resolve_models(&parsed, &services.model_runtime).await;
+                diagnostics: pre_session_diagnostics,
+            } = resolve_models(&cli_scope, &services.model_runtime).await;
 
             let resources = session_resources(&services.resource_loader);
-            let no_tools = no_tools_mode(&parsed);
+            let no_tools = cli_scope.no_tools_mode();
 
-            let thinking_level = parsed
+            let thinking_level = cli_scope
                 .thinking
                 .or(cli_resolved.thinking_level)
                 .or(saved_thinking_level);
@@ -628,16 +682,8 @@ impl RuntimeFactory for RealRuntimeFactory {
                     model: cli_resolved.model.clone(),
                     thinking_level,
                     scoped_models: scope.scoped_models,
-                    tools: if parsed.tools.is_empty() {
-                        None
-                    } else {
-                        Some(parsed.tools.clone())
-                    },
-                    exclude_tools: if parsed.exclude_tools.is_empty() {
-                        None
-                    } else {
-                        Some(parsed.exclude_tools.clone())
-                    },
+                    tools: cli_scope.tools.clone(),
+                    exclude_tools: cli_scope.exclude_tools.clone(),
                     no_tools,
                     session_start_event: None,
                     saved_session_model,
@@ -646,16 +692,18 @@ impl RuntimeFactory for RealRuntimeFactory {
             )
             .await
             .map_err(|e: AgentSessionServicesError| format!("{e}"))?;
-            apply_cli_api_key(
+            initialize_session_metadata(
+                &mut session_manager,
+                has_existing_session,
+                has_saved_thinking_level,
+                &session_result,
+            )?;
+            let replacement_api_key = finish_session_diagnostics(
                 parsed.api_key.as_deref(),
-                session_result.model.as_ref(),
-                &session_result.model_runtime,
-                &mut pre_session_diagnostics,
+                &mut session_result,
+                pre_session_diagnostics,
             )
             .await?;
-            session_result
-                .diagnostics
-                .splice(0..0, pre_session_diagnostics);
 
             let (settings_manager, tools, system_prompt) = build_session_inputs(
                 &cwd,
@@ -668,7 +716,7 @@ impl RuntimeFactory for RealRuntimeFactory {
 
             let built = build_session(SessionBuildOptions {
                 cwd: cwd.clone(),
-                session_manager: options.session_manager,
+                session_manager,
                 settings_manager,
                 session_result,
                 tools,
@@ -685,14 +733,15 @@ impl RuntimeFactory for RealRuntimeFactory {
                 },
                 Arc::new(RealReplacementFactory {
                     project_trust_override: parsed.project_trust_override,
+                    api_key: replacement_api_key,
+                    resource_loader_options: resource_loader_options(&parsed),
+                    cli_scope,
                 }),
                 built.diagnostics,
                 built.model_fallback_message,
             );
 
-            Ok(RuntimeHandle {
-                runtime: Arc::new(runtime),
-            })
+            Ok(RuntimeHandle { runtime })
         })
     }
 
@@ -701,35 +750,113 @@ impl RuntimeFactory for RealRuntimeFactory {
     }
 }
 
+#[derive(Clone)]
+struct CliRuntimeApiKey {
+    provider: String,
+    value: String,
+}
+
+async fn apply_replacement_api_key(
+    api_key: Option<CliRuntimeApiKey>,
+    runtime: &ModelRuntime,
+) -> Result<(), AgentSessionRuntimeError> {
+    let Some(api_key) = api_key else {
+        return Ok(());
+    };
+    runtime
+        .set_runtime_api_key(&api_key.provider, &api_key.value)
+        .await
+        .map_err(|error| {
+            AgentSessionRuntimeError::Factory(format!("set replacement API key: {error}"))
+        })
+}
+
+/// Immutable snapshot of parsed CLI selection inputs. Replacement sessions
+/// re-resolve only the process-level model scope and tool constraints.
+#[derive(Clone, Default)]
+struct CliRuntimeScope {
+    /// Raw `--provider` selector.
+    provider: Option<String>,
+    /// Raw `--model` selector, including any thinking suffix.
+    model: Option<String>,
+    /// Raw `--thinking` override.
+    thinking: Option<pi_ai::ModelThinkingLevel>,
+    /// Raw `--models` patterns resolved against each fresh replacement runtime.
+    model_patterns: Vec<String>,
+    /// Effective `--tools` allowlist (`None` when absent, empty, or superseded
+    /// by either tool-suppression mode).
+    tools: Option<Vec<String>>,
+    /// `--exclude-tools` denylist (`None` when the flag was absent or empty).
+    exclude_tools: Option<Vec<String>>,
+    /// Raw `--no-tools` switch.
+    no_tools: bool,
+    /// Raw `--no-builtin-tools` switch. This suppresses the initial built-in
+    /// selection; it is not a permanent tool authorization boundary.
+    no_builtin_tools: bool,
+}
+
+impl CliRuntimeScope {
+    fn from_args(args: &crate::cli::args::Args) -> Self {
+        Self {
+            provider: args.provider.clone(),
+            model: args.model.clone(),
+            thinking: args.thinking,
+            model_patterns: args.models.clone(),
+            tools: (!args.no_tools && !args.no_builtin_tools && !args.tools.is_empty())
+                .then(|| args.tools.clone()),
+            exclude_tools: (!args.exclude_tools.is_empty()).then(|| args.exclude_tools.clone()),
+            no_tools: args.no_tools,
+            no_builtin_tools: args.no_builtin_tools,
+        }
+    }
+
+    fn no_tools_mode(&self) -> Option<crate::core::agent_session_services::NoToolsMode> {
+        if self.no_tools {
+            Some(crate::core::agent_session_services::NoToolsMode::All)
+        } else if self.no_builtin_tools {
+            Some(crate::core::agent_session_services::NoToolsMode::Builtin)
+        } else {
+            None
+        }
+    }
+}
+
 /// Replacement factory for runtime swap operations (new/switch/fork).
 #[derive(Clone)]
 struct RealReplacementFactory {
     project_trust_override: Option<bool>,
+    api_key: Option<CliRuntimeApiKey>,
+    resource_loader_options: ResourceLoaderServiceOptions,
+    cli_scope: CliRuntimeScope,
 }
-
 impl CreateAgentSessionRuntimeFactory for RealReplacementFactory {
     fn create(
         &self,
         options: CreateAgentSessionRuntimeOptions,
-    ) -> BoxFuture<
-        '_,
-        Result<
-            CreateAgentSessionRuntimeResult,
-            crate::core::agent_session_runtime::AgentSessionRuntimeError,
-        >,
-    > {
-        let cwd = options.cwd.clone();
-        let agent_dir = options.agent_dir.clone();
-        let session_context = options
-            .session_manager
-            .build_session_context()
-            .map_err(|error| {
-                crate::core::agent_session_runtime::AgentSessionRuntimeError::Factory(
-                    error.to_string(),
-                )
-            });
+    ) -> BoxFuture<'_, Result<CreateAgentSessionRuntimeResult, AgentSessionRuntimeError>> {
+        let CreateAgentSessionRuntimeOptions {
+            cwd,
+            agent_dir,
+            session_manager,
+            start_reason,
+            previous_session_file,
+            model: requested_model,
+            extension_flag_values,
+        } = options;
+        let api_key = self.api_key.clone();
+        let resource_loader_options = self.resource_loader_options.clone();
+        let cli_scope = self.cli_scope.clone();
         Box::pin(async move {
-            let session_context = session_context?;
+            let (session_context, session_manager) = tokio::task::spawn_blocking(move || {
+                let ctx = session_manager
+                    .build_session_context()
+                    .map_err(|error| AgentSessionRuntimeError::Factory(error.to_string()))?;
+                Ok::<_, AgentSessionRuntimeError>((ctx, session_manager))
+            })
+            .await
+            .map_err(|error| {
+                AgentSessionRuntimeError::Factory(format!("build session context: {error}"))
+            })??;
             let RestoredSession {
                 has_existing_session,
                 saved_session_model,
@@ -740,53 +867,55 @@ impl CreateAgentSessionRuntimeFactory for RealReplacementFactory {
                 CreateAgentSessionServicesOptions {
                     cwd: PathBuf::from(&cwd),
                     agent_dir: Some(PathBuf::from(&agent_dir)),
+                    extension_flag_values: Some(extension_flag_values),
+                    resource_loader_options: Some(resource_loader_options),
                     ..Default::default()
                 },
                 self.project_trust_override,
             )
             .await
-            .map_err(|e| {
-                crate::core::agent_session_runtime::AgentSessionRuntimeError::Factory(format!(
-                    "{e}"
-                ))
-            })?;
+            .map_err(|error| AgentSessionRuntimeError::Factory(error.to_string()))?;
             let project_trusted = services.settings_manager().is_project_trusted();
+            apply_replacement_api_key(api_key, &services.model_runtime).await?;
             let resources = session_resources(&services.resource_loader);
-
-            let session_result = create_agent_session_from_services(
+            let (scope, scope_diagnostics) =
+                resolve_model_scope(&cli_scope.model_patterns, &services.model_runtime).await;
+            let refreshed_requested_model = requested_model
+                .as_ref()
+                .and_then(|model| services.model_runtime.get_model(&model.provider, &model.id));
+            let mut session_result = create_agent_session_from_services(
                 crate::core::agent_session_services::CreateAgentSessionFromServicesOptions {
                     services,
-                    model: None,
+                    model: refreshed_requested_model,
                     thinking_level,
-                    scoped_models: Vec::new(),
-                    tools: None,
-                    exclude_tools: None,
-                    no_tools: None,
+                    scoped_models: scope.scoped_models,
+                    tools: cli_scope.tools.clone(),
+                    exclude_tools: cli_scope.exclude_tools.clone(),
+                    no_tools: cli_scope.no_tools_mode(),
                     session_start_event: Some(crate::core::agent_session::SessionStartEvent {
-                        reason: options.start_reason,
-                        previous_session_file: options.previous_session_file.clone(),
+                        reason: start_reason,
+                        previous_session_file,
                     }),
                     saved_session_model,
                     has_existing_session,
                 },
             )
             .await
-            .map_err(|e| {
-                crate::core::agent_session_runtime::AgentSessionRuntimeError::Factory(format!(
-                    "{e}"
-                ))
-            })?;
+            .map_err(|error| AgentSessionRuntimeError::Factory(error.to_string()))?;
+            // Prepend fresh-runtime resolution diagnostics without dropping
+            // existing services/session diagnostics.
+            session_result.diagnostics.splice(0..0, scope_diagnostics);
 
             let built = assemble_replacement_session(
                 &cwd,
                 &agent_dir,
                 project_trusted,
-                options.session_manager,
+                session_manager,
                 session_result,
                 resources,
                 existing_messages,
             )
-            .map_err(crate::core::agent_session_runtime::AgentSessionRuntimeError::Factory)?;
+            .map_err(AgentSessionRuntimeError::Factory)?;
 
             Ok(CreateAgentSessionRuntimeResult {
                 session: built.session,
@@ -1204,6 +1333,76 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn replacement_factory_restores_saved_model_with_cli_runtime_key() -> Result<(), String> {
+        let probe = ModelRuntime::create_in_memory()
+            .await
+            .map_err(|error| format!("create model probe: {error}"))?;
+        let Some(saved_model) = probe
+            .get_models(None)
+            .into_iter()
+            .find(|model| !probe.has_configured_auth(&model.provider))
+        else {
+            return Err("test requires a built-in provider without ambient auth".to_owned());
+        };
+        let root = tempfile::tempdir().map_err(|error| format!("tempdir: {error}"))?;
+        let cwd = root.path().to_string_lossy().into_owned();
+        let agent_dir = root.path().join("agent");
+        std::fs::create_dir_all(&agent_dir)
+            .map_err(|error| format!("create agent dir: {error}"))?;
+        let mut session_manager =
+            SessionManager::in_memory(Some(&cwd), None).map_err(|error| error.to_string())?;
+        session_manager
+            .append_model_change(&saved_model.provider, &saved_model.id)
+            .map_err(|error| error.to_string())?;
+        session_manager
+            .append_message(&pi_agent::AgentMessage::Llm(Box::new(
+                pi_ai::Message::User(pi_ai::UserMessage::new(
+                    pi_ai::UserMessageContent::Text("resume saved model".to_owned()),
+                    1,
+                )),
+            )))
+            .map_err(|error| error.to_string())?;
+        let factory = RealReplacementFactory {
+            project_trust_override: Some(true),
+            api_key: Some(CliRuntimeApiKey {
+                provider: saved_model.provider.clone(),
+                value: "sk-runtime-only".to_owned(),
+            }),
+            resource_loader_options: ResourceLoaderServiceOptions {
+                no_extensions: true,
+                no_skills: true,
+                no_prompt_templates: true,
+                no_themes: true,
+                no_context_files: true,
+                ..ResourceLoaderServiceOptions::default()
+            },
+            cli_scope: CliRuntimeScope::default(),
+        };
+
+        let result = factory
+            .create(CreateAgentSessionRuntimeOptions {
+                cwd,
+                agent_dir: agent_dir.to_string_lossy().into_owned(),
+                session_manager,
+                start_reason: crate::core::agent_session::SessionStartReason::Resume,
+                previous_session_file: None,
+                model: None,
+                extension_flag_values: BTreeMap::new(),
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+
+        assert_eq!(result.session.model().provider, saved_model.provider);
+        assert_eq!(result.session.model().id, saved_model.id);
+        assert!(
+            result.model_fallback_message.is_none(),
+            "saved model must not fall back after carried auth"
+        );
+        result.session.dispose().await;
+        Ok(())
+    }
+
     /// Version short-circuit works with a fake factory (never reaches runtime).
     #[tokio::test]
     async fn run_pipeline_version_exits_zero() {
@@ -1302,5 +1501,260 @@ mod tests {
         fn error(&self, line: &str) {
             self.status(line);
         }
+    }
+
+    /// Build a `RealReplacementFactory` replacement and return the result,
+    /// using a shared API key so the target provider's models are available
+    /// for scope resolution on the fresh runtime.
+    async fn create_replacement_with_scope(
+        cwd: &str,
+        agent_dir: &str,
+        api_key: &CliRuntimeApiKey,
+        resource_loader_options: &ResourceLoaderServiceOptions,
+        cli_scope: CliRuntimeScope,
+    ) -> Result<CreateAgentSessionRuntimeResult, String> {
+        let session_manager =
+            SessionManager::in_memory(Some(cwd), None).map_err(|error| error.to_string())?;
+        let factory = RealReplacementFactory {
+            project_trust_override: Some(true),
+            api_key: Some(api_key.clone()),
+            resource_loader_options: resource_loader_options.clone(),
+            cli_scope,
+        };
+        factory
+            .create(CreateAgentSessionRuntimeOptions {
+                cwd: cwd.to_owned(),
+                agent_dir: agent_dir.to_owned(),
+                session_manager,
+                start_reason: crate::core::agent_session::SessionStartReason::New,
+                previous_session_file: None,
+                model: None,
+                extension_flag_values: BTreeMap::new(),
+            })
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    struct ReplacementScopeTestContext {
+        _root: tempfile::TempDir,
+        cwd: String,
+        agent_dir: String,
+        api_key: CliRuntimeApiKey,
+        resource_loader_options: ResourceLoaderServiceOptions,
+        model_pattern: String,
+        target_model: Model,
+    }
+
+    async fn replacement_scope_test_context() -> Result<ReplacementScopeTestContext, String> {
+        let probe = ModelRuntime::create_in_memory()
+            .await
+            .map_err(|error| format!("create model probe: {error}"))?;
+        let target_model = probe
+            .get_models(None)
+            .into_iter()
+            .find(|model| !probe.has_configured_auth(&model.provider))
+            .ok_or("test requires a built-in provider without ambient auth")?;
+        let api_key = CliRuntimeApiKey {
+            provider: target_model.provider.clone(),
+            value: "sk-scope-test".to_owned(),
+        };
+        let root = tempfile::tempdir().map_err(|error| format!("tempdir: {error}"))?;
+        let cwd = root.path().to_string_lossy().into_owned();
+        let agent_dir = root.path().join("agent");
+        std::fs::create_dir_all(&agent_dir)
+            .map_err(|error| format!("create agent dir: {error}"))?;
+        Ok(ReplacementScopeTestContext {
+            _root: root,
+            cwd,
+            agent_dir: agent_dir.to_string_lossy().into_owned(),
+            api_key,
+            resource_loader_options: ResourceLoaderServiceOptions {
+                no_extensions: true,
+                no_skills: true,
+                no_prompt_templates: true,
+                no_themes: true,
+                no_context_files: true,
+                ..ResourceLoaderServiceOptions::default()
+            },
+            model_pattern: target_model.id.clone(),
+            target_model,
+        })
+    }
+
+    #[tokio::test]
+    async fn replacement_factory_re_resolves_model_scope_and_reapplies_tool_filters()
+    -> Result<(), String> {
+        let context = replacement_scope_test_context().await?;
+
+        {
+            let result = create_replacement_with_scope(
+                &context.cwd,
+                &context.agent_dir,
+                &context.api_key,
+                &context.resource_loader_options,
+                CliRuntimeScope {
+                    model_patterns: vec![context.model_pattern.clone()],
+                    tools: Some(vec!["read".to_owned()]),
+                    ..Default::default()
+                },
+            )
+            .await?;
+            let active = result.session.active_tool_names();
+            assert!(
+                active.iter().any(|name| name == "read"),
+                "allowlist must keep 'read' active"
+            );
+            assert!(
+                !active.iter().any(|name| name == "bash"),
+                "allowlist must not activate 'bash'"
+            );
+            let all = result.session.get_all_tools();
+            assert!(
+                !all.is_empty(),
+                "allowlist must still populate the tool registry"
+            );
+            let scoped = result.session.scoped_models();
+            assert!(
+                !scoped.is_empty(),
+                "model patterns must be resolved against the fresh runtime, not hard-coded empty"
+            );
+            assert!(
+                scoped
+                    .iter()
+                    .any(|sm| sm.model.id == context.target_model.id
+                        && sm.model.provider == context.target_model.provider),
+                "scoped models must contain the pattern-matched model from the fresh runtime"
+            );
+            result.session.dispose().await;
+        }
+
+        {
+            let result = create_replacement_with_scope(
+                &context.cwd,
+                &context.agent_dir,
+                &context.api_key,
+                &context.resource_loader_options,
+                CliRuntimeScope {
+                    model_patterns: vec![context.model_pattern.clone()],
+                    exclude_tools: Some(vec!["bash".to_owned()]),
+                    ..Default::default()
+                },
+            )
+            .await?;
+            let active = result.session.active_tool_names();
+            assert!(
+                !active.iter().any(|name| name == "bash"),
+                "denylist must exclude 'bash'"
+            );
+            assert!(
+                active.iter().any(|name| name == "read"),
+                "denylist must keep 'read'"
+            );
+            result.session.dispose().await;
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replacement_factory_reapplies_cli_tool_suppression_modes() -> Result<(), String> {
+        let context = replacement_scope_test_context().await?;
+
+        let result = create_replacement_with_scope(
+            &context.cwd,
+            &context.agent_dir,
+            &context.api_key,
+            &context.resource_loader_options,
+            CliRuntimeScope {
+                model_patterns: vec![context.model_pattern.clone()],
+                no_tools: true,
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert!(
+            result.session.active_tool_names().is_empty(),
+            "NoToolsMode::All must disable every tool"
+        );
+        assert!(
+            result.session.get_all_tools().is_empty(),
+            "NoToolsMode::All must remove tools from the registry"
+        );
+        result.session.dispose().await;
+        let result = create_replacement_with_scope(
+            &context.cwd,
+            &context.agent_dir,
+            &context.api_key,
+            &context.resource_loader_options,
+            CliRuntimeScope {
+                model_patterns: vec![context.model_pattern.clone()],
+                no_builtin_tools: true,
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert!(
+            result.session.active_tool_names().is_empty(),
+            "NoToolsMode::Builtin must disable the initial built-in tool set"
+        );
+        assert!(
+            !result.session.get_all_tools().is_empty(),
+            "NoToolsMode::Builtin must keep built-in tools in the registry so extension tools can still become active"
+        );
+        result.session.dispose().await;
+        let parsed = crate::cli::args::parse_args(&[
+            "--models".to_owned(),
+            context.model_pattern.clone(),
+            "--no-tools".to_owned(),
+            "--tools".to_owned(),
+            "read".to_owned(),
+        ]);
+        let result = create_replacement_with_scope(
+            &context.cwd,
+            &context.agent_dir,
+            &context.api_key,
+            &context.resource_loader_options,
+            CliRuntimeScope::from_args(&parsed),
+        )
+        .await?;
+        assert!(
+            result.session.active_tool_names().is_empty(),
+            "--no-tools must dominate an explicit --tools allowlist"
+        );
+        assert!(
+            result.session.get_all_tools().is_empty(),
+            "--no-tools with --tools must remove tools from the registry"
+        );
+        result.session.dispose().await;
+        let parsed = crate::cli::args::parse_args(&[
+            "--models".to_owned(),
+            context.model_pattern.clone(),
+            "--no-builtin-tools".to_owned(),
+            "--tools".to_owned(),
+            "read".to_owned(),
+        ]);
+        let result = create_replacement_with_scope(
+            &context.cwd,
+            &context.agent_dir,
+            &context.api_key,
+            &context.resource_loader_options,
+            CliRuntimeScope::from_args(&parsed),
+        )
+        .await?;
+        assert!(
+            !result
+                .session
+                .active_tool_names()
+                .iter()
+                .any(|name| name == "read"),
+            "--no-builtin-tools must dominate an explicit built-in allowlist"
+        );
+        assert!(
+            !result.session.get_all_tools().is_empty(),
+            "--no-builtin-tools with --tools must keep the registry open to extension tools"
+        );
+        result.session.dispose().await;
+
+        Ok(())
     }
 }

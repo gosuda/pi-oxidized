@@ -149,6 +149,8 @@ pub enum ThemeColor {
 pub enum ThemeBg {
     /// Selected row background.
     SelectedBg,
+    /// Scrollbar thumb background (optional; falls back to selectedBg).
+    ScrollbarThumb,
     /// User message background.
     UserMessageBg,
     /// Custom message background.
@@ -212,8 +214,9 @@ pub const ALL_FG: [ThemeColor; 46] = [
 ];
 
 /// All background slots in schema order.
-pub const ALL_BG: [ThemeBg; 6] = [
+pub const ALL_BG: [ThemeBg; 7] = [
     ThemeBg::SelectedBg,
+    ThemeBg::ScrollbarThumb,
     ThemeBg::UserMessageBg,
     ThemeBg::CustomMessageBg,
     ThemeBg::ToolPendingBg,
@@ -1326,6 +1329,16 @@ impl ThemeJson {
         } else if let Some((_, x)) = colors.iter().find(|(k, _)| k == "thinkingXhigh") {
             colors.push(("thinkingMax".to_owned(), x.clone()));
         }
+        // scrollbarThumb is optional → falls back to selectedBg.
+        if let Some(value) = colors_obj.get("scrollbarThumb") {
+            let color = parse_color_value(value).ok_or_else(|| ThemeError::InvalidColor {
+                slot: "scrollbarThumb".to_owned(),
+                value: value.to_string(),
+            })?;
+            colors.push(("scrollbarThumb".to_owned(), color));
+        } else if let Some((_, x)) = colors.iter().find(|(k, _)| k == "selectedBg") {
+            colors.push(("scrollbarThumb".to_owned(), x.clone()));
+        }
         Ok(Self { name, vars, colors })
     }
 
@@ -1847,6 +1860,7 @@ const ALL_FG_SLOTS: &[(ThemeColor, &str)] = &[
 
 const ALL_BG_SLOTS: &[(ThemeBg, &str)] = &[
     (ThemeBg::SelectedBg, "selectedBg"),
+    (ThemeBg::ScrollbarThumb, "scrollbarThumb"),
     (ThemeBg::UserMessageBg, "userMessageBg"),
     (ThemeBg::CustomMessageBg, "customMessageBg"),
     (ThemeBg::ToolPendingBg, "toolPendingBg"),
@@ -2163,6 +2177,50 @@ mod tests {
             assert_eq!(theme.bg_rgb(ThemeBg::SelectedBg), Rgb(231, 231, 231));
         }
         Ok(())
+    }
+
+    #[test]
+    fn scrollbar_thumb_falls_back_to_selected_bg_when_absent() -> TestResult {
+        // selectedBg is set explicitly; scrollbarThumb is omitted.
+        let theme = parsed_theme(&[("selectedBg", serde_json::json!("#0a0b0c"))])?
+            .resolve_owned(ColorMode::Truecolor)
+            .map_err(|error| format!("test theme should resolve: {error}"))?;
+        assert_eq!(
+            theme.bg_rgb(ThemeBg::ScrollbarThumb),
+            theme.bg_rgb(ThemeBg::SelectedBg),
+            "absent scrollbarThumb must mirror selectedBg"
+        );
+        assert_eq!(theme.bg_rgb(ThemeBg::ScrollbarThumb), Rgb(10, 11, 12));
+        Ok(())
+    }
+
+    #[test]
+    fn scrollbar_thumb_parses_explicit_value_when_present() -> TestResult {
+        let theme = parsed_theme(&[
+            ("selectedBg", serde_json::json!("#0a0b0c")),
+            ("scrollbarThumb", serde_json::json!("#1e2f3f")),
+        ])?
+        .resolve_owned(ColorMode::Truecolor)
+        .map_err(|error| format!("test theme should resolve: {error}"))?;
+        assert_eq!(theme.bg_rgb(ThemeBg::ScrollbarThumb), Rgb(0x1e, 0x2f, 0x3f));
+        assert_ne!(
+            theme.bg_rgb(ThemeBg::ScrollbarThumb),
+            theme.bg_rgb(ThemeBg::SelectedBg),
+            "explicit scrollbarThumb must not mirror selectedBg"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn scrollbar_thumb_slot_is_registered() {
+        assert!(
+            ALL_BG_SLOTS
+                .iter()
+                .any(|(bg, name)| *bg == ThemeBg::ScrollbarThumb && *name == "scrollbarThumb"),
+            "ALL_BG_SLOTS must register (ScrollbarThumb, \"scrollbarThumb\")"
+        );
+        assert_eq!(ALL_BG.len(), 7);
+        assert!(ALL_BG.contains(&ThemeBg::ScrollbarThumb));
     }
 
     // ---- syntax highlighting ----

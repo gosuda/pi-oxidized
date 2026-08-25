@@ -333,6 +333,21 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Rebind the already-open session after its file was atomically moved.
+    ///
+    /// The caller owns the move and has already validated the file, so this must
+    /// not re-read or rewrite it. The path is resolved (matching every other
+    /// `session_file` assignment) and the session directory is retargeted to the
+    /// new parent so later `new_session` and `create_branched_session` paths
+    /// follow the moved file instead of the stale original directory.
+    pub(crate) fn rebind_session_file_after_atomic_move(&mut self, session_file: &str) {
+        let resolved = path_to_string(&resolve_path(session_file));
+        self.session_dir = Path::new(&resolved)
+            .parent()
+            .map_or_else(|| ".".to_owned(), path_to_string);
+        self.session_file = Some(resolved);
+    }
+
     /// Start a new in-memory session (optionally with a deferred file path).
     ///
     /// Returns the session file path when persisting, else `None`.
@@ -715,6 +730,7 @@ impl SessionManager {
         tokens_before: i64,
         details: Option<Value>,
         from_hook: Option<bool>,
+        usage: Option<pi_ai::Usage>,
     ) -> Result<String, SessionError> {
         let id = self.next_id();
         let mut value = serde_json::json!({
@@ -735,6 +751,11 @@ impl SessionManager {
             && let Some(obj) = value.as_object_mut()
         {
             obj.insert("fromHook".to_owned(), Value::Bool(fh));
+        }
+        if let Some(u) = usage
+            && let Some(obj) = value.as_object_mut()
+        {
+            obj.insert("usage".to_owned(), serde_json::to_value(u)?);
         }
         let entry: SessionEntry = serde_json::from_value(value)?;
         self.append_entry(entry)
@@ -1011,6 +1032,7 @@ impl SessionManager {
         summary: &str,
         details: Option<Value>,
         from_hook: Option<bool>,
+        usage: Option<pi_ai::Usage>,
     ) -> Result<String, SessionError> {
         if let Some(id) = branch_from_id {
             if !self.by_id.contains_key(id) {
@@ -1039,6 +1061,11 @@ impl SessionManager {
             && let Some(obj) = value.as_object_mut()
         {
             obj.insert("fromHook".to_owned(), Value::Bool(fh));
+        }
+        if let Some(u) = usage
+            && let Some(obj) = value.as_object_mut()
+        {
+            obj.insert("usage".to_owned(), serde_json::to_value(u)?);
         }
         let entry: SessionEntry = serde_json::from_value(value)?;
         self.append_entry(entry)
@@ -1593,7 +1620,7 @@ fn sync_parent_directory(_parent: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pi_ai::{Message, TextContent, UserMessage, UserMessageContent};
+    use pi_ai::{Message, TextContent, Usage, UsageCost, UserMessage, UserMessageContent};
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -1675,6 +1702,65 @@ mod tests {
         let header: Value = serde_json::from_str(lines[0])?;
         assert_eq!(header["type"], "session");
         assert_eq!(header["version"], 3);
+        Ok(())
+    }
+
+    #[test]
+    fn atomic_move_path_rebind_persists_to_final_file() -> TestResult {
+        let dir = tempdir()?;
+        let mut source =
+            SessionManager::create(path_str(dir.path())?, Some(path_str(dir.path())?), None)?;
+        let source_file = source.get_session_file().ok_or("source file")?.to_owned();
+        source.append_message(&user_agent("before move", 1))?;
+        source.append_message(&assistant_agent("persist source", 2))?;
+
+        let staged = dir.path().join("import.tmp");
+        let final_file = dir.path().join("imported.jsonl");
+        fs::rename(&source_file, &staged)?;
+        let mut reopened =
+            SessionManager::open(path_str(&staged)?, Some(path_str(dir.path())?), None)?;
+        fs::rename(&staged, &final_file)?;
+        reopened.rebind_session_file_after_atomic_move(path_str(&final_file)?);
+
+        reopened.append_message(&user_agent("after move", 3))?;
+
+        assert_eq!(reopened.get_session_file(), Some(path_str(&final_file)?));
+        assert!(!staged.exists());
+        assert!(fs::read_to_string(&final_file)?.contains("after move"));
+        Ok(())
+    }
+
+    #[test]
+    fn atomic_move_rebind_retargets_session_dir() -> TestResult {
+        let dir = tempdir()?;
+        let other = tempdir()?;
+        let mut source =
+            SessionManager::create(path_str(dir.path())?, Some(path_str(dir.path())?), None)?;
+        source.append_message(&user_agent("before move", 1))?;
+        source.append_message(&assistant_agent("persist source", 2))?;
+        let source_file = source.get_session_file().ok_or("source file")?.to_owned();
+
+        // Move the file into a *different* directory than the original
+        // session_dir, then rebind. A later branch must land next to the
+        // moved file, not the stale original directory.
+        let final_file = other.path().join("imported.jsonl");
+        fs::rename(&source_file, &final_file)?;
+        let mut reopened =
+            SessionManager::open(path_str(&final_file)?, Some(path_str(other.path())?), None)?;
+        reopened.rebind_session_file_after_atomic_move(path_str(&final_file)?);
+
+        assert_eq!(reopened.get_session_file(), Some(path_str(&final_file)?));
+        assert_eq!(reopened.get_session_dir(), path_str(other.path())?);
+
+        let leaf = reopened.get_leaf_id().ok_or("leaf")?.to_owned();
+        let branched = reopened
+            .create_branched_session(&leaf)?
+            .ok_or("branched file")?;
+        assert!(
+            Path::new(&branched).starts_with(other.path()),
+            "branch {branched} must follow the retargeted dir, not the original"
+        );
+        assert!(Path::new(&branched).exists());
         Ok(())
     }
 
@@ -2034,7 +2120,7 @@ mod tests {
         sm.append_message(&assistant_agent("r1", 2))?;
         let id3 = sm.append_message(&user_agent("second", 3))?;
         sm.append_message(&assistant_agent("r2", 4))?;
-        sm.append_compaction("Summary of first two turns", &id3, 1000, None, None)?;
+        sm.append_compaction("Summary of first two turns", &id3, 1000, None, None, None)?;
         sm.append_message(&user_agent("third", 5))?;
         sm.append_message(&assistant_agent("r3", 6))?;
 
@@ -2057,6 +2143,68 @@ mod tests {
         let ctx = sm.build_session_context()?;
         assert_eq!(ctx.messages[0].role(), "compactionSummary");
         assert_eq!(ctx.messages.len(), 5);
+        Ok(())
+    }
+
+    #[test]
+    fn summary_entries_persist_optional_usage_and_accept_null() -> TestResult {
+        let usage = Usage {
+            input: 10,
+            output: 5,
+            cache_read: 2,
+            cache_write: 1,
+            cache_write1h: Some(3),
+            reasoning: Some(4),
+            total_tokens: 18,
+            cost: UsageCost {
+                input: 0.1,
+                output: 0.2,
+                cache_read: 0.03,
+                cache_write: 0.04,
+                total: 0.37,
+            },
+        };
+        let mut sm = SessionManager::in_memory(Some("/tmp"), None)?;
+        let root = sm.append_message(&user_agent("root", 1))?;
+        let compaction_id =
+            sm.append_compaction("summary", &root, 18, None, None, Some(usage.clone()))?;
+        let compaction = sm.get_entry(&compaction_id).ok_or("compaction entry")?;
+        assert_eq!(
+            serde_json::to_value(compaction)?["usage"],
+            serde_json::to_value(&usage)?
+        );
+
+        let branch_id = sm.branch_with_summary(
+            Some(&compaction_id),
+            "branch",
+            None,
+            None,
+            Some(usage.clone()),
+        )?;
+        let branch = sm.get_entry(&branch_id).ok_or("branch entry")?;
+        assert_eq!(
+            serde_json::to_value(branch)?["usage"],
+            serde_json::to_value(&usage)?
+        );
+
+        let absent_id = sm.branch_with_summary(Some(&branch_id), "no usage", None, None, None)?;
+        let absent = sm.get_entry(&absent_id).ok_or("absent usage entry")?;
+        assert!(serde_json::to_value(absent)?.get("usage").is_none());
+
+        let legacy: SessionEntry = serde_json::from_value(json!({
+            "type": "compaction",
+            "id": "legacy",
+            "parentId": null,
+            "timestamp": "2025-01-01T00:00:00.000Z",
+            "summary": "legacy",
+            "firstKeptEntryId": "root",
+            "tokensBefore": 0,
+            "usage": null
+        }))?;
+        match legacy {
+            SessionEntry::Compaction(entry) => assert!(entry.usage.is_none()),
+            other => return Err(format!("expected compaction, got {other:?}").into()),
+        }
         Ok(())
     }
 
@@ -2100,6 +2248,302 @@ mod tests {
             return Err("expected entry not found".into());
         };
         assert_eq!(err.to_string(), "Entry nonexistent not found");
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn generated_cross_version_session_interoperability() -> TestResult {
+        fn fixture_files(
+            root: &Path,
+            files: &mut Vec<PathBuf>,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            for entry in fs::read_dir(root)? {
+                let path = entry?.path();
+                if path.is_dir() {
+                    fixture_files(&path, files)?;
+                } else if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+                    files.push(path);
+                }
+            }
+            Ok(())
+        }
+        fn tree_ids(nodes: &[SessionTreeNode], ids: &mut Vec<String>) {
+            for node in nodes {
+                if let Some(id) = node.entry.id() {
+                    ids.push(id.to_owned());
+                }
+                tree_ids(&node.children, ids);
+            }
+        }
+        fn expected_tree_ids(value: &Value, ids: &mut Vec<String>) {
+            for node in value.as_array().into_iter().flatten() {
+                if let Some(id) = node
+                    .get("entry")
+                    .and_then(|entry| entry.get("id"))
+                    .and_then(Value::as_str)
+                {
+                    ids.push(id.to_owned());
+                }
+                if let Some(children) = node.get("children") {
+                    expected_tree_ids(children, ids);
+                }
+            }
+        }
+        let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.agent-tasks/pi-rust-rewrite/fixtures/sessions");
+        // The verification harness sets PI_SESSION_INTEROP_OUTPUT so TypeScript
+        // can reopen the Rust-produced files afterwards. When unset (plain
+        // `cargo test`), fall back to a fresh per-run directory under the crate
+        // temp area so the proof is self-contained and free of stale content.
+        let _output_guard;
+        let output_root: PathBuf = if let Some(dir) = std::env::var_os("PI_SESSION_INTEROP_OUTPUT")
+        {
+            _output_guard = None;
+            PathBuf::from(dir)
+        } else {
+            let tmp_base = std::env::var_os("CARGO_TARGET_TMPDIR")
+                .map_or_else(std::env::temp_dir, PathBuf::from);
+            let guard = tempfile::tempdir_in(&tmp_base)?;
+            let path = guard.path().to_path_buf();
+            _output_guard = Some(guard);
+            path
+        };
+        fs::create_dir_all(&output_root)?;
+        let mut fixtures = Vec::new();
+        if !fixture_root.is_dir() {
+            return Err(format!(
+                "session fixture directory not found: {}\n\
+                 run `bun run scripts/generate-session-fixtures.ts` before this proof",
+                fixture_root.display()
+            )
+            .into());
+        }
+        // Derive the expected fixture count from the generator's authoritative
+        // manifest (written next to the fixtures by
+        // scripts/generate-session-fixtures.ts) rather than scraping the
+        // generator source at compile time.
+        let manifest_path = fixture_root.join("manifest.json");
+        let expected_fixture_count: usize = {
+            let manifest_bytes = fs::read(&manifest_path).map_err(|err| {
+                format!(
+                    "session fixture manifest not found: {}\n\
+                     run `bun run scripts/generate-session-fixtures.ts` to regenerate ({err})",
+                    manifest_path.display()
+                )
+            })?;
+            let manifest: Value = serde_json::from_slice(&manifest_bytes).map_err(|err| {
+                format!(
+                    "invalid session fixture manifest {}: {err}",
+                    manifest_path.display()
+                )
+            })?;
+            let count = manifest
+                .get("count")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    format!(
+                        "session fixture manifest {} has no numeric `count` field",
+                        manifest_path.display()
+                    )
+                })?;
+            usize::try_from(count).map_err(|_| {
+                format!(
+                    "session fixture manifest {} `count` overflows usize",
+                    manifest_path.display()
+                )
+            })?
+        };
+        fixture_files(&fixture_root, &mut fixtures)?;
+        fixtures.sort();
+        assert_eq!(
+            fixtures.len(),
+            expected_fixture_count,
+            "expected {expected_fixture_count} session fixtures under {}, found {}; \
+             run `bun run scripts/generate-session-fixtures.ts` to regenerate",
+            fixture_root.display(),
+            fixtures.len()
+        );
+
+        let mut saw_v1 = false;
+        let mut saw_v2 = false;
+        let mut saw_v3 = false;
+        let mut saw_unknown = false;
+        for fixture in fixtures {
+            let expected_path = fixture.with_extension("expected.json");
+            let expected: Value = serde_json::from_slice(&fs::read(&expected_path)?)?;
+            let fixture_name = expected["fixture"].as_str().ok_or("fixture name")?;
+            match expected["formatVersion"].as_u64().ok_or("format version")? {
+                1 => saw_v1 = true,
+                2 => saw_v2 = true,
+                3 => saw_v3 = true,
+                version => return Err(format!("unexpected fixture version {version}").into()),
+            }
+
+            let relative = fixture.strip_prefix(&fixture_root)?;
+            let scenario_dir = output_root.join(relative).with_extension("");
+            fs::create_dir_all(&scenario_dir)?;
+            let continued = scenario_dir.join("continued.jsonl");
+            fs::copy(&fixture, &continued)?;
+            let mut session =
+                SessionManager::open(path_str(&continued)?, Some(path_str(&scenario_dir)?), None)?;
+            let migrated_prefix = fs::read(&continued)?;
+
+            let header = session.get_header().ok_or("header")?;
+            assert_eq!(
+                header.version,
+                Some(CURRENT_SESSION_VERSION),
+                "{fixture_name}: header version"
+            );
+            assert_eq!(
+                header.id.as_deref(),
+                expected["sessionId"].as_str(),
+                "{fixture_name}: header id"
+            );
+            let entries: Vec<Value> = session
+                .get_entries()
+                .into_iter()
+                .map(serde_json::to_value)
+                .collect::<Result<_, _>>()?;
+            let expected_entries = expected["entries"].as_array().ok_or("expected entries")?;
+            assert_eq!(
+                entries.len(),
+                expected_entries.len(),
+                "{fixture_name}: entry count"
+            );
+            let mut expected_to_actual = HashMap::new();
+            for (actual, expected_entry) in entries.iter().zip(expected_entries) {
+                assert_eq!(
+                    actual["type"], expected_entry["type"],
+                    "{fixture_name}: entry type"
+                );
+                let expected_id = expected_entry["id"].as_str().ok_or("expected entry id")?;
+                let actual_id = actual["id"].as_str().ok_or("actual entry id")?;
+                if let Some(expected_message) = expected_entry.get("message") {
+                    let actual_message = actual.get("message").ok_or("actual message")?;
+                    for key in ["role", "content", "api", "provider", "model", "stopReason"] {
+                        if !expected_message[key].is_null() {
+                            assert_eq!(
+                                actual_message[key], expected_message[key],
+                                "{fixture_name}: message {key}"
+                            );
+                        }
+                    }
+                }
+                expected_to_actual.insert(expected_id.to_owned(), actual_id.to_owned());
+            }
+            assert_eq!(
+                session.get_leaf_id(),
+                expected["leaf"]
+                    .as_str()
+                    .and_then(|id| expected_to_actual.get(id).map(String::as_str)),
+                "{fixture_name}: leaf",
+            );
+            assert_eq!(
+                session.get_session_name(),
+                expected["name"].as_str().map(str::to_owned),
+                "{fixture_name}: name"
+            );
+            for (id, label) in expected["labels"].as_object().ok_or("labels")? {
+                assert_eq!(
+                    session.get_label(expected_to_actual.get(id).ok_or("label target")?),
+                    label.as_str(),
+                    "{fixture_name}: label {id}",
+                );
+            }
+            let mut actual_tree = Vec::new();
+            tree_ids(&session.get_tree(), &mut actual_tree);
+            let mut expected_tree = Vec::new();
+            expected_tree_ids(&expected["tree"], &mut expected_tree);
+            let actual_tree_as_expected: Vec<String> = actual_tree
+                .into_iter()
+                .map(|actual| {
+                    expected_to_actual
+                        .iter()
+                        .find_map(|(expected, mapped)| {
+                            (*mapped == actual).then_some(expected.clone())
+                        })
+                        .ok_or("tree entry")
+                })
+                .collect::<Result<_, _>>()?;
+            assert_eq!(
+                actual_tree_as_expected, expected_tree,
+                "{fixture_name}: tree"
+            );
+            let context = session.build_session_context()?;
+            let expected_context = expected["context"]["messages"]
+                .as_array()
+                .ok_or("context messages")?;
+            let actual_context: Vec<Value> = context
+                .messages
+                .iter()
+                .map(serde_json::to_value)
+                .collect::<Result<_, _>>()?;
+            assert_eq!(
+                actual_context.len(),
+                expected_context.len(),
+                "{fixture_name}: context"
+            );
+            for (actual, expected_message) in actual_context.iter().zip(expected_context) {
+                assert_eq!(
+                    actual["role"], expected_message["role"],
+                    "{fixture_name}: context role"
+                );
+                assert_eq!(
+                    actual["content"], expected_message["content"],
+                    "{fixture_name}: context content"
+                );
+            }
+            assert_eq!(
+                session
+                    .get_entries()
+                    .iter()
+                    .filter(|entry| entry.discriminant() == "compaction")
+                    .count(),
+                expected["entries"]
+                    .as_array()
+                    .ok_or("expected entries")?
+                    .iter()
+                    .filter(|entry| entry["type"] == "compaction")
+                    .count(),
+                "{fixture_name}: compaction",
+            );
+            saw_unknown |= entries.iter().any(|entry| entry["type"] == "future_thing");
+
+            session.append_message(&assistant_agent("Rust interop continuation", 42))?;
+            let continued_bytes = fs::read(&continued)?;
+            assert!(
+                continued_bytes.starts_with(&migrated_prefix),
+                "{fixture_name}: continuation rewrote history"
+            );
+            let leaf = session.get_leaf_id().ok_or("continued leaf")?.to_owned();
+            let forked = SessionManager::fork_from(
+                path_str(&continued)?,
+                path_str(&scenario_dir)?,
+                Some(path_str(&scenario_dir)?),
+                None,
+            )?;
+            let forked_file = forked.get_session_file().ok_or("forked file")?;
+            assert!(
+                Path::new(forked_file).exists(),
+                "{fixture_name}: fork output missing"
+            );
+            let cloned_file = session
+                .create_branched_session(&leaf)?
+                .ok_or("cloned file")?;
+            assert!(
+                Path::new(&cloned_file).exists(),
+                "{fixture_name}: clone output missing"
+            );
+        }
+        assert!(
+            saw_v1 && saw_v2 && saw_v3,
+            "fixture set must cover v1/v2/v3"
+        );
+        assert!(
+            saw_unknown,
+            "fixture set must preserve opaque future entries"
+        );
         Ok(())
     }
 }

@@ -76,6 +76,8 @@ pub struct ExecuteBashOptions {
     /// Custom operations backend (TypeScript `BashOperations`). Defaults to
     /// local shell execution using the settings-configured `shellPath`.
     pub operations: Option<Arc<dyn BashOperations>>,
+    /// Optional execution id forwarded to `bash_execution_update` events.
+    pub id: Option<String>,
 }
 
 impl std::fmt::Debug for ExecuteBashOptions {
@@ -83,6 +85,7 @@ impl std::fmt::Debug for ExecuteBashOptions {
         f.debug_struct("ExecuteBashOptions")
             .field("exclude_from_context", &self.exclude_from_context)
             .field("operations", &self.operations.as_ref().map(|_| "Some(..)"))
+            .field("id", &self.id)
             .finish()
     }
 }
@@ -123,12 +126,26 @@ impl AgentSession {
             _ => command.to_owned(),
         };
 
+        let id = options.id.clone();
+        let weak_self = self.upgrade_self();
+        let mut original = on_chunk;
+        let wrapped_on_chunk = Some(move |delta: &str| {
+            if let Some(cb) = original.as_mut() {
+                cb(delta);
+            }
+            if let Some(arc) = weak_self.as_ref().and_then(std::sync::Weak::upgrade) {
+                arc.emit_public(super::events::AgentSessionEvent::BashExecutionUpdate {
+                    id: id.clone(),
+                    delta: delta.to_owned(),
+                });
+            }
+        });
         let result = run_bash(
             self.cwd.clone(),
             resolved.clone(),
             shell_path,
             options.operations.clone(),
-            on_chunk,
+            wrapped_on_chunk,
             token.clone(),
         )
         .await;
@@ -197,13 +214,12 @@ impl AgentSession {
             return Ok(());
         }
 
-        // Persist immediately.
-        let mut manager = self.session_manager.lock().await;
-        let id = manager.append_message(&agent_message)?;
-        drop(manager);
-        if let Some(entry) = self.session_manager.lock().await.get_entry(&id).cloned() {
-            self.emit_public(super::events::AgentSessionEvent::EntryAppended { entry });
-        }
+        // TypeScript persists bash messages without publishing entry_appended.
+        self.session_manager
+            .lock()
+            .await
+            .append_message(&agent_message)?;
+        self.agent.push_message(agent_message);
         Ok(())
     }
 
@@ -240,19 +256,16 @@ impl AgentSession {
                     "bashExecution",
                     bash_execution_payload(&message),
                 ));
-            let entry = {
-                let mut manager = self.session_manager.lock().await;
-                let id = manager.append_message(&agent_message)?;
-                manager.get_entry(&id).cloned()
-            };
+            self.session_manager
+                .lock()
+                .await
+                .append_message(&agent_message)?;
+            self.agent.push_message(agent_message);
             {
                 let mut inner = self.lock_inner();
                 if inner.pending_bash_messages.first() == Some(&message) {
                     inner.pending_bash_messages.remove(0);
                 }
-            }
-            if let Some(entry) = entry {
-                self.emit_public(super::events::AgentSessionEvent::EntryAppended { entry });
             }
         }
     }
@@ -410,6 +423,19 @@ fn bash_execution_payload(
 }
 
 /// Build a `ToolUpdates` channel that forwards partial text to `on_chunk`.
+///
+/// The entire sink — delta computation, callback invocation, and notification
+/// — is serialized under a single mutex so concurrent `ToolUpdates::send`
+/// calls deliver deltas and notifications in FIFO order. Without this, the
+/// delta (computed under a `previous` lock) and the callback (invoked under a
+/// separate `callback` lock) can be reordered, causing the consumer to
+/// receive chunks out of order.
+///
+/// If the user callback panics, the unwind is caught at this invocation
+/// boundary. The callback and all queue/state invariants are restored while
+/// the guard is still held, the guard is released, and the original unwind is
+/// resumed. This keeps the mutex unpoisoned so later queued callbacks continue
+/// to be delivered in FIFO order; the panic is never swallowed or translated.
 fn make_chunk_channel<F>(
     on_chunk: Option<F>,
 ) -> (pi_agent::ToolUpdates, tokio::sync::mpsc::Receiver<()>)
@@ -417,9 +443,22 @@ where
     F: FnMut(&str) + Send + 'static,
 {
     use std::sync::Mutex;
-    let callback: Arc<Mutex<Option<F>>> = Arc::new(Mutex::new(on_chunk));
+
+    /// Serialized sink state guarded by one mutex.
+    struct ChunkState<F> {
+        callback: Option<F>,
+        previous: String,
+        tx: Option<tokio::sync::mpsc::Sender<()>>,
+    }
+
     let (tx, rx) = tokio::sync::mpsc::channel::<()>(64);
-    let tx = Arc::new(Mutex::new(Some(tx)));
+    let state = Arc::new(Mutex::new(ChunkState {
+        callback: on_chunk,
+        previous: String::new(),
+        tx: Some(tx),
+    }));
+
+    let state_clone = Arc::clone(&state);
     let updates = pi_agent::ToolUpdates::new(move |result| {
         let text = result
             .content
@@ -432,22 +471,394 @@ where
         if text.is_empty() {
             return;
         }
-        let Some(mut cb) = callback.lock().ok().and_then(|mut g| g.take()) else {
+        let Ok(mut guard) = state_clone.lock() else {
             return;
         };
-        cb(text);
-        // Re-store the callback so future partials can use it.
-        if let Ok(mut guard) = callback.lock() {
-            *guard = Some(cb);
+        if guard.previous == text {
+            return;
         }
-        // Notify the receiver that a partial arrived. Best-effort send: if the
-        // channel is full we drop the signal because the receiver only needs
-        // to know *that* activity happened, not how many chunks.
-        if let Ok(tx_guard) = tx.lock()
-            && let Some(tx) = tx_guard.as_ref()
-        {
+        let delta = text
+            .strip_prefix(guard.previous.as_str())
+            .unwrap_or(text)
+            .to_owned();
+        guard.previous.clear();
+        guard.previous.push_str(text);
+        let Some(mut cb) = guard.callback.take() else {
+            return;
+        };
+        // Invoke the user callback with the guard held so delta delivery and
+        // notification stay serialized. If the callback panics, catch the
+        // unwind, restore the callback and queue invariants while we still
+        // own the guard, then drop the guard and resume the original unwind.
+        // The mutex is left unpoisoned, so later queued callbacks continue to
+        // be delivered in FIFO order; the panic is never swallowed.
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(&delta)));
+        guard.callback = Some(cb);
+        // We are done mutating state under the guard; drop it before resuming
+        // the unwind so the mutex is released cleanly.
+        if let Some(tx) = guard.tx.as_ref() {
             let _ = tx.try_send(());
         }
+        drop(guard);
+        if let Err(payload) = panic {
+            std::panic::resume_unwind(payload);
+        }
     });
+
     (updates, rx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::agent_session::AgentSessionConfig;
+    use crate::core::agent_session::events::AgentSessionEvent;
+    use crate::core::tools::bash::BashOperations;
+    use futures::future::BoxFuture;
+    use pi_ai::{Model, ModelCost, ModelInput, Provider, ProviderError, StreamOptions};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    fn test_model() -> Model {
+        Model {
+            id: "m".to_owned(),
+            name: "m".to_owned(),
+            api: "test-api".to_owned(),
+            provider: "test-provider".to_owned(),
+            base_url: String::new(),
+            reasoning: false,
+            thinking_level_map: None,
+            input: vec![ModelInput::Text],
+            cost: ModelCost::default(),
+            context_window: 4096,
+            max_tokens: 1024,
+            headers: None,
+            compat: None,
+            extra: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn mock_provider() -> Arc<dyn Provider> {
+        struct NoopProvider;
+        impl Provider for NoopProvider {
+            fn stream(
+                &self,
+                _model: &Model,
+                _ctx: pi_ai::Context,
+                _opts: StreamOptions,
+            ) -> futures::stream::BoxStream<
+                'static,
+                Result<pi_ai::AssistantMessageEvent, ProviderError>,
+            > {
+                Box::pin(futures::stream::iter(Vec::new()))
+            }
+        }
+        Arc::new(NoopProvider)
+    }
+
+    /// A `BashOperations` that emits one chunk then exits 0.
+    struct ChunkedOps {
+        output: String,
+    }
+
+    impl BashOperations for ChunkedOps {
+        fn exec(
+            &self,
+            _command: String,
+            _cwd: PathBuf,
+            mut on_data: Box<dyn FnMut(Vec<u8>) + Send>,
+            _cancel: CancellationToken,
+            _timeout: Option<f64>,
+            _env: HashMap<String, String>,
+        ) -> BoxFuture<'static, Result<Option<i32>, pi_agent::ToolError>> {
+            let output = self.output.clone();
+            Box::pin(async move {
+                on_data(output.into_bytes());
+                Ok(Some(0))
+            })
+        }
+    }
+
+    fn make_session() -> TestResult<Arc<AgentSession>> {
+        let provider = mock_provider();
+        let config = AgentSessionConfig::test_config(provider, test_model())?;
+        Ok(AgentSession::new(config)?)
+    }
+
+    #[tokio::test]
+    async fn bash_execution_update_emitted_with_id() -> TestResult {
+        let session = make_session()?;
+        let events = Arc::new(Mutex::new(Vec::<AgentSessionEvent>::new()));
+        let ev_clone = Arc::clone(&events);
+        let _unsub = session.subscribe(move |event| {
+            ev_clone
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(event.clone());
+        });
+
+        let ops = Arc::new(ChunkedOps {
+            output: "hello world".to_owned(),
+        });
+        let options = ExecuteBashOptions {
+            id: Some("bash-1".to_owned()),
+            operations: Some(ops),
+            ..Default::default()
+        };
+        let _ = session
+            .execute_bash("echo hello", None::<fn(&str)>, options)
+            .await;
+
+        let updates: Vec<AgentSessionEvent> = events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|e| matches!(e, AgentSessionEvent::BashExecutionUpdate { .. }))
+            .cloned()
+            .collect();
+        let first = updates.first().ok_or("should emit at least one update")?;
+        match first {
+            AgentSessionEvent::BashExecutionUpdate { id, delta } => {
+                assert_eq!(id.as_deref(), Some("bash-1"));
+                assert!(delta.contains("hello"));
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bash_execution_update_emitted_without_id() -> TestResult {
+        let session = make_session()?;
+        let events = Arc::new(Mutex::new(Vec::<AgentSessionEvent>::new()));
+        let ev_clone = Arc::clone(&events);
+        let _unsub = session.subscribe(move |event| {
+            ev_clone
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(event.clone());
+        });
+
+        let ops = Arc::new(ChunkedOps {
+            output: "test output".to_owned(),
+        });
+        let options = ExecuteBashOptions {
+            id: None,
+            operations: Some(ops),
+            ..Default::default()
+        };
+        let _ = session
+            .execute_bash("echo test", None::<fn(&str)>, options)
+            .await;
+
+        let updates: Vec<AgentSessionEvent> = events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|e| matches!(e, AgentSessionEvent::BashExecutionUpdate { .. }))
+            .cloned()
+            .collect();
+        let first = updates.first().ok_or("should emit at least one update")?;
+        match first {
+            AgentSessionEvent::BashExecutionUpdate { id, delta } => {
+                assert!(id.is_none(), "id should be None when not provided");
+                assert!(delta.contains("test"));
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bash_execution_update_still_calls_original_callback() -> TestResult {
+        let session = make_session()?;
+        let received = Arc::new(Mutex::new(Vec::<String>::new()));
+        let recv_clone = Arc::clone(&received);
+        let on_chunk = move |delta: &str| {
+            recv_clone
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(delta.to_owned());
+        };
+
+        let ops = Arc::new(ChunkedOps {
+            output: "callback test".to_owned(),
+        });
+        let options = ExecuteBashOptions {
+            id: Some("cb-1".to_owned()),
+            operations: Some(ops),
+            ..Default::default()
+        };
+        let _ = session
+            .execute_bash("echo callback", Some(on_chunk), options)
+            .await;
+        let chunks = received
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(chunks[0].contains("callback"));
+        Ok(())
+    }
+    #[test]
+    fn chunk_channel_converts_cumulative_snapshots_to_deltas() {
+        let received = Arc::new(Mutex::new(Vec::<String>::new()));
+        let received_clone = Arc::clone(&received);
+        let (updates, _rx) = make_chunk_channel(Some(move |delta: &str| {
+            received_clone
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(delta.to_owned());
+        }));
+        let partial = |text: &str| pi_agent::AgentToolResult {
+            content: vec![pi_ai::ToolResultContent::Text(pi_ai::TextContent::new(
+                text,
+            ))],
+            details: serde_json::Value::Null,
+            added_tool_names: None,
+            terminate: None,
+        };
+
+        updates.send(partial("one"));
+        updates.send(partial("one"));
+        updates.send(partial("onetwo"));
+
+        let received = received
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(received.as_slice(), ["one", "two"]);
+    }
+
+    #[test]
+    fn chunk_channel_serializes_concurrent_sends_without_loss() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let concurrent = Arc::new(AtomicUsize::new(0));
+        let max_concurrent = Arc::new(AtomicUsize::new(0));
+        let received = Arc::new(Mutex::new(Vec::<String>::new()));
+
+        let concurrent_clone = Arc::clone(&concurrent);
+        let max_clone = Arc::clone(&max_concurrent);
+        let received_clone = Arc::clone(&received);
+
+        let (updates, _rx) = make_chunk_channel(Some(move |delta: &str| {
+            let prev = concurrent_clone.fetch_add(1, Ordering::SeqCst);
+            max_clone.fetch_max(prev + 1, Ordering::SeqCst);
+            // Yield to encourage overlap when the lock is not held.
+            std::thread::yield_now();
+            received_clone
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(delta.to_owned());
+            concurrent_clone.fetch_sub(1, Ordering::SeqCst);
+        }));
+
+        let updates = Arc::new(updates);
+        let partial = |text: &str| pi_agent::AgentToolResult {
+            content: vec![pi_ai::ToolResultContent::Text(pi_ai::TextContent::new(
+                text,
+            ))],
+            details: serde_json::Value::Null,
+            added_tool_names: None,
+            terminate: None,
+        };
+
+        // Fire several sends from different threads simultaneously. The
+        // single-mutex sink must serialize the callback so no two invocations
+        // overlap and every delta is delivered.
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let updates = Arc::clone(&updates);
+            handles.push(std::thread::spawn(move || {
+                updates.send(partial(&format!("chunk-{i}")));
+            }));
+        }
+        for handle in handles {
+            assert!(handle.join().is_ok(), "sender thread panicked");
+        }
+
+        assert_eq!(
+            max_concurrent.load(Ordering::SeqCst),
+            1,
+            "callback must be serialized, not concurrent"
+        );
+        let received = received
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            received.len(),
+            8,
+            "every concurrent delta must be delivered"
+        );
+    }
+
+    /// Regression: a panicking user callback must propagate the panic, must not
+    /// poison the sink mutex, must restore the callback, and must leave later
+    /// queued callbacks delivering in FIFO order.
+    #[test]
+    fn chunk_channel_callback_panic_restores_invariants_and_keeps_fifo() {
+        let received = Arc::new(Mutex::new(Vec::<String>::new()));
+        let received_clone = Arc::clone(&received);
+        let (updates, _rx) = make_chunk_channel(Some(move |delta: &str| {
+            received_clone
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(delta.to_owned());
+            if delta == "boom" {
+                std::panic::resume_unwind(Box::new("callback exploded on boom".to_owned()));
+            }
+        }));
+
+        let partial = |text: &str| pi_agent::AgentToolResult {
+            content: vec![pi_ai::ToolResultContent::Text(pi_ai::TextContent::new(
+                text,
+            ))],
+            details: serde_json::Value::Null,
+            added_tool_names: None,
+            terminate: None,
+        };
+
+        // First chunk delivered normally.
+        updates.send(partial("before"));
+
+        // Second chunk triggers the panic. It must propagate out of `send`.
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            updates.send(partial("beforeboom"));
+        }));
+        assert!(
+            panicked.is_err(),
+            "the callback panic must propagate out of send, not be swallowed"
+        );
+        let payload_msg: Option<&str> = panicked
+            .as_ref()
+            .err()
+            .and_then(|p| p.downcast_ref::<String>().map(String::as_str))
+            .or_else(|| {
+                panicked
+                    .as_ref()
+                    .err()
+                    .and_then(|p| p.downcast_ref::<&str>().copied())
+            });
+        assert_eq!(
+            payload_msg,
+            Some("callback exploded on boom"),
+            "the original panic payload must be resumed unchanged"
+        );
+
+        // After the panic, the sink must still be usable: the mutex is
+        // unpoisoned and the callback was restored. A later chunk must
+        // deliver in FIFO order relative to the already-received ones.
+        updates.send(partial("beforeboomafter"));
+
+        let received = received
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // "before" delivered; "boom" panicked after being pushed; "after"
+        // delivered. FIFO order preserved across the panic.
+        assert_eq!(
+            received.as_slice(),
+            ["before", "boom", "after"],
+            "callback must be restored and FIFO delivery must continue after a panic"
+        );
+    }
 }

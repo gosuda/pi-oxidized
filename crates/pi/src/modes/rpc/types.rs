@@ -216,7 +216,7 @@ pub enum StreamingBehavior {
 // RpcCommand (stdin)
 // ---------------------------------------------------------------------------
 
-/// All 31 known RPC commands, plus an unknown catch-all.
+/// All 32 known RPC commands, plus an unknown catch-all.
 ///
 /// Each known variant carries an optional correlation `id`. The unknown arm
 /// preserves the raw `type` string and remaining fields so the server can echo
@@ -297,6 +297,11 @@ pub enum RpcCommand {
     },
     /// Cycle to the next thinking level.
     CycleThinkingLevel {
+        /// Correlation id.
+        id: Option<String>,
+    },
+    /// List thinking levels supported by the current model.
+    GetAvailableThinkingLevels {
         /// Correlation id.
         id: Option<String>,
     },
@@ -451,6 +456,7 @@ impl RpcCommand {
             | Self::GetAvailableModels { id }
             | Self::SetThinkingLevel { id, .. }
             | Self::CycleThinkingLevel { id }
+            | Self::GetAvailableThinkingLevels { id }
             | Self::SetSteeringMode { id, .. }
             | Self::SetFollowUpMode { id, .. }
             | Self::Compact { id, .. }
@@ -490,6 +496,7 @@ impl RpcCommand {
             Self::GetAvailableModels { .. } => "get_available_models",
             Self::SetThinkingLevel { .. } => "set_thinking_level",
             Self::CycleThinkingLevel { .. } => "cycle_thinking_level",
+            Self::GetAvailableThinkingLevels { .. } => "get_available_thinking_levels",
             Self::SetSteeringMode { .. } => "set_steering_mode",
             Self::SetFollowUpMode { .. } => "set_follow_up_mode",
             Self::Compact { .. } => "compact",
@@ -584,6 +591,9 @@ fn serialize_rpc_command<S: Serializer>(
         }
         RpcCommand::CycleThinkingLevel { id } => {
             serialize_type_only(serializer, id.as_deref(), "cycle_thinking_level")
+        }
+        RpcCommand::GetAvailableThinkingLevels { id } => {
+            serialize_type_only(serializer, id.as_deref(), "get_available_thinking_levels")
         }
         RpcCommand::SetSteeringMode { id, mode } => {
             serialize_queue_mode(serializer, id.as_deref(), "set_steering_mode", *mode)
@@ -933,6 +943,7 @@ fn parse_known_command(
         "get_available_models" => Ok(RpcCommand::GetAvailableModels { id }),
         "set_thinking_level" => parse_set_thinking_level(obj, id),
         "cycle_thinking_level" => Ok(RpcCommand::CycleThinkingLevel { id }),
+        "get_available_thinking_levels" => Ok(RpcCommand::GetAvailableThinkingLevels { id }),
         "set_steering_mode" => parse_queue_mode_cmd(obj, id, true),
         "set_follow_up_mode" => parse_queue_mode_cmd(obj, id, false),
         "compact" => Ok(RpcCommand::Compact {
@@ -1185,6 +1196,11 @@ pub enum RpcResponseData {
         /// Available models.
         models: Vec<Model>,
     },
+    /// `{ levels: [...] }` from `get_available_thinking_levels`.
+    AvailableThinkingLevels {
+        /// Supported thinking levels for the current model.
+        levels: Vec<ModelThinkingLevel>,
+    },
     /// `cycle_thinking_level` result (or JSON `null`).
     CycleThinkingLevel(Option<CycleThinkingLevelData>),
     /// Compaction result.
@@ -1256,6 +1272,7 @@ impl RpcResponseData {
             )),
             "cycle_model" => parse_cycle_model_data(value),
             "get_available_models" => parse_available_models_data(value),
+            "get_available_thinking_levels" => parse_available_thinking_levels_data(value),
             "cycle_thinking_level" => parse_cycle_thinking_data(value),
             "compact" => Ok(Self::Compaction(
                 CompactionResult::deserialize(value).map_err(|e| e.to_string())?,
@@ -1301,6 +1318,14 @@ fn parse_available_models_data(value: &Value) -> Result<RpcResponseData, String>
         .ok_or_else(|| "get_available_models data missing models".to_owned())?;
     let models = Vec::<Model>::deserialize(models).map_err(|e| e.to_string())?;
     Ok(RpcResponseData::AvailableModels { models })
+}
+
+fn parse_available_thinking_levels_data(value: &Value) -> Result<RpcResponseData, String> {
+    let levels = value
+        .get("levels")
+        .ok_or_else(|| "get_available_thinking_levels data missing levels".to_owned())?;
+    let levels = Vec::<ModelThinkingLevel>::deserialize(levels).map_err(|e| e.to_string())?;
+    Ok(RpcResponseData::AvailableThinkingLevels { levels })
 }
 
 fn parse_cycle_thinking_data(value: &Value) -> Result<RpcResponseData, String> {
@@ -2453,6 +2478,7 @@ mod tests {
                 level: ModelThinkingLevel::High,
             },
             RpcCommand::CycleThinkingLevel { id: None },
+            RpcCommand::GetAvailableThinkingLevels { id: None },
             RpcCommand::SetSteeringMode {
                 id: None,
                 mode: QueueMode::All,
@@ -2511,10 +2537,10 @@ mod tests {
     }
 
     #[test]
-    fn all_31_known_command_types_roundtrip() -> TestResult {
+    fn all_32_known_command_types_roundtrip() -> TestResult {
         let samples = sample_commands();
-        if samples.len() != 31 {
-            return Err(fail(format!("expected 31 samples, got {}", samples.len())));
+        if samples.len() != 32 {
+            return Err(fail(format!("expected 32 samples, got {}", samples.len())));
         }
         for cmd in &samples {
             let rt = roundtrip_command(cmd)?;

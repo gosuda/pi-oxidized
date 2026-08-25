@@ -473,6 +473,99 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
+    // Semantics: the `ignore` crate follows gitignore rules — a pattern
+    // without a leading slash (e.g. `build/`) matches directories at ANY
+    // level, not just the root. So a root `.gitignore` with `build/` hides
+    // both `build/` and `nested/build/`. Conversely, a nested `.gitignore`
+    // with `ignored.txt` applies only within `nested/` and must NOT leak
+    // upward to hide a root `ignored.txt`.
+    //
+    // The input space is two booleans — four combinations — so iterate
+    // exhaustively reusing one Tokio runtime instead of proptest's
+    // duplicate-heavy sampling.
+    #[test]
+    fn gitignore_rules_hide_only_their_matching_tree() -> Result<(), String> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())?;
+        for (root_ignores_build, nested_ignores_file) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let dir = tempdir().map_err(|e| e.to_string())?;
+            fs::create_dir_all(dir.path().join("build")).map_err(|e| e.to_string())?;
+            fs::create_dir_all(dir.path().join("nested")).map_err(|e| e.to_string())?;
+            fs::create_dir_all(dir.path().join("nested/build")).map_err(|e| e.to_string())?;
+            fs::write(dir.path().join("visible.txt"), "visible").map_err(|e| e.to_string())?;
+            fs::write(dir.path().join("ignored.txt"), "root-ignored").map_err(|e| e.to_string())?;
+            fs::write(dir.path().join("build/generated.txt"), "generated")
+                .map_err(|e| e.to_string())?;
+            fs::write(dir.path().join("nested/kept.txt"), "kept").map_err(|e| e.to_string())?;
+            fs::write(dir.path().join("nested/ignored.txt"), "nested-ignored")
+                .map_err(|e| e.to_string())?;
+            fs::write(
+                dir.path().join("nested/build/generated.txt"),
+                "nested-generated",
+            )
+            .map_err(|e| e.to_string())?;
+            fs::write(
+                dir.path().join(".gitignore"),
+                if root_ignores_build { "build/\n" } else { "" },
+            )
+            .map_err(|e| e.to_string())?;
+            fs::write(
+                dir.path().join("nested/.gitignore"),
+                if nested_ignores_file {
+                    "ignored.txt\n"
+                } else {
+                    ""
+                },
+            )
+            .map_err(|e| e.to_string())?;
+
+            let text = runtime.block_on(async {
+                let tool = FindTool::new(dir.path());
+                let tool_result = run(
+                    &tool,
+                    &json!({"pattern": "**/*.txt", "path": dir.path().to_string_lossy()}),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                Ok::<_, String>(text_of(&tool_result))
+            })?;
+            let mut actual = text
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('['))
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            actual.sort();
+
+            // root ignored.txt is always visible — nested rule must not leak upward.
+            let mut expected = vec![
+                "ignored.txt".to_owned(),
+                "nested/kept.txt".to_owned(),
+                "visible.txt".to_owned(),
+            ];
+            // Root build/ rule (no leading slash) matches at any level, so it
+            // hides both build/generated.txt and nested/build/generated.txt.
+            if !root_ignores_build {
+                expected.push("build/generated.txt".to_owned());
+                expected.push("nested/build/generated.txt".to_owned());
+            }
+            if !nested_ignores_file {
+                expected.push("nested/ignored.txt".to_owned());
+            }
+            expected.sort();
+
+            assert_eq!(
+                actual, expected,
+                "root_ignores_build={root_ignores_build}, nested_ignores_file={nested_ignores_file}"
+            );
+        }
+        Ok(())
+    }
+
     fn fixture_schema() -> Result<Value, serde_json::Error> {
         let text = include_str!(
             "../../../../../.agent-tasks/pi-rust-rewrite/fixtures/tool-schemas/find.json"

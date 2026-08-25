@@ -856,9 +856,9 @@ mod tests {
         assert_eq!(report.clear_3j, 0);
         assert_eq!(report.sync_begin, 1);
         assert_eq!(report.sync_end, 1);
-        let delete = kitty_delete_id(9);
-        let delete_pos = find_subslice(bytes, &delete)
-            .ok_or_else(|| io::Error::other("missing Kitty delete"))?;
+        let delete = b"\x1b_Ga=d,d=I,i=9\x1b\\";
+        let delete_pos =
+            find_subslice(bytes, delete).ok_or_else(|| io::Error::other("missing Kitty delete"))?;
         let el2_pos =
             find_subslice(bytes, b"\x1b[2K").ok_or_else(|| io::Error::other("missing EL2"))?;
         assert!(delete_pos < el2_pos);

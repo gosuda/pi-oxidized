@@ -27,8 +27,8 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use super::config::{CONFIG_DIR_NAME, expand_tilde_path, get_agent_dir, resolve_path};
-use super::lockfile::LockGuard;
 use super::trust::DefaultProjectTrust;
+use pi_ai::lockfile::LockGuard;
 
 /// Default tokens reserved for prompt + response during compaction.
 pub const DEFAULT_COMPACTION_RESERVE_TOKENS: u64 = 16384;

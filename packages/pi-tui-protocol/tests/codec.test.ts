@@ -41,6 +41,24 @@ describe("constants", () => {
 			expect(decodeFrameStrStrict(encodeFrameString(frame).trimEnd())).toEqual(frame);
 		}
 	});
+
+	test("session.* open methods are rejected by strict decoding (Rust Method::parse parity)", () => {
+		// Rust treats session.* as open method strings (const &str), not Method
+		// enum variants — Method::parse returns None for them, so strict decoding
+		// (decode_frame_str_strict) rejects them. TypeScript must match.
+		const sessionMethods = [
+			"session.newSession", "session.fork", "session.navigateTree",
+			"session.switchSession", "session.reload", "session.replacementReady",
+			"session.replacementAbort",
+		] as const;
+		for (const method of sessionMethods) {
+			expect(METHODS).not.toContain(method);
+			expect(isMethod(method)).toBe(false);
+			const line = JSON.stringify({ id: 1, kind: "req", method, payload: {} });
+			expect(decodeFrameStr(line).method).toBe(method);
+			expect(() => decodeFrameStrStrict(line)).toThrow(ProtocolError);
+		}
+	});
 });
 
 describe("encode/decode", () => {
@@ -215,8 +233,40 @@ describe("shared fixtures", () => {
 			"session.setModel:res",
 			"ui.control:event",
 			"ui.state:event",
+			"session.setupEntries:req",
+			"session.setupEntries:res",
+			"session.replacementReady:event",
+			"session.replacementAbort:event",
 		]) {
 			expect(seen).toContain(key);
 		}
+	});
+
+	test("session.command fixtures cover legacy untagged and candidate-tagged actions", () => {
+		const text = readFileSync(fixturesPath, "utf8");
+		const legacy = new Set<string>();
+		const candidate = new Set<string>();
+		for (const line of text.split("\n")) {
+			if (line.trim() === "" || line.trimStart().startsWith("#")) {
+				continue;
+			}
+			const frame = decodeFrameStr(line);
+			if (frame.method !== "session.command" || frame.kind !== "event") {
+				continue;
+			}
+			const payload = frame.payload as Record<string, unknown>;
+			const action = payload["action"];
+			expect(typeof action).toBe("string");
+			const round = decodeFrameStr(encodeFrameString(frame).trimEnd());
+			expect(round.payload).toEqual(payload);
+			if ("replacementToken" in payload) {
+				expect(typeof payload["replacementToken"]).toBe("string");
+				candidate.add(action as string);
+			} else {
+				legacy.add(action as string);
+			}
+		}
+		expect([...legacy].sort()).toEqual(["sendMessage", "setSessionName", "shutdown"]);
+		expect([...candidate].sort()).toEqual(["sendMessage", "setSessionName", "shutdown"]);
 	});
 });

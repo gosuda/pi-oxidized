@@ -1155,6 +1155,7 @@ mod tests {
     use std::io;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use proptest::prelude::*;
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -1198,6 +1199,117 @@ mod tests {
 
     fn text_of_err(error: &ToolError) -> String {
         error.message().to_owned()
+    }
+
+    async fn wait_for_marked_pids(
+        marker: &Path,
+        expected: usize,
+    ) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+        for _ in 0..50 {
+            if let Ok(raw) = tokio::fs::read_to_string(marker).await {
+                let pids = raw
+                    .lines()
+                    .filter_map(|line| line.trim().parse().ok())
+                    .collect::<Vec<u32>>();
+                if pids.len() >= expected {
+                    return Ok(pids);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Err(io::Error::other("command did not record a descendant pid").into())
+    }
+
+    async fn assert_processes_exit(pids: &[u32]) -> Result<(), Box<dyn std::error::Error>> {
+        for &pid in pids {
+            for _ in 0..50 {
+                if !process_alive(pid) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            if process_alive(pid) {
+                return Err(io::Error::other(format!("descendant {pid} still alive")).into());
+            }
+        }
+        Ok(())
+    }
+    /// Build a nested `sleep 60` process tree `depth` levels deep, recording
+    /// each spawned pid into `marker`. Used by the timeout/cancel tree tests.
+    fn nested_tree_command(marker: &Path, depth: usize) -> String {
+        let marker_str = marker.display();
+        let mut command = format!("sleep 60 & echo $! >> '{marker_str}'; wait");
+        for _ in 1..depth {
+            command = format!("({command}) & echo $! >> '{marker_str}'; wait");
+        }
+        command
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 4, .. ProptestConfig::default() })]
+        #[test]
+        fn timeout_reaps_generated_process_tree(depth in 1_usize..4, timeout_tenths in 5_u8..9) {
+            let result: Result<(), String> = (|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| error.to_string())?;
+                runtime.block_on(async {
+                    let dir = tempdir().map_err(|error| error.to_string())?;
+                    let marker = dir.path().join("tree.pid");
+                    let command = nested_tree_command(&marker, depth);
+                    let tool = BashTool::new(dir.path());
+                    let timeout = f64::from(timeout_tenths) / 10.0;
+                    let err = expected_error(
+                        tool.execute(
+                            "1",
+                            json_map(json!({"command": command, "timeout": timeout})).map_err(|error| error.to_string())?,
+                            CancellationToken::new(),
+                            ToolUpdates::noop(),
+                        ).await,
+                        "timed command succeeded",
+                    ).map_err(|error| error.to_string())?;
+                    if !text_of_err(&err).contains("Command timed out") {
+                        return Err(text_of_err(&err));
+                    }
+                    let pids = wait_for_marked_pids(&marker, depth).await.map_err(|error| error.to_string())?;
+                    assert_processes_exit(&pids).await.map_err(|error| error.to_string())
+                })
+            })();
+            let error = result.as_ref().err().map_or("", String::as_str);
+            prop_assert!(result.is_ok(), "{error}");
+        }
+
+        #[test]
+        fn cancellation_aborts_generated_command(cancel_delay_ms in 0_u8..25) {
+            let result: Result<(), String> = (|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| error.to_string())?;
+                runtime.block_on(async {
+                    let dir = tempdir().map_err(|error| error.to_string())?;
+                    let marker = dir.path().join("cancel.pid");
+                    let marker_str = marker.display();
+                    let tool = BashTool::new(dir.path());
+                    let cancel = CancellationToken::new();
+                    let command = format!("sleep 60 & echo $! > '{marker_str}'; wait");
+                    let args = json_map(json!({"command": command, "timeout": 30.0})).map_err(|error| error.to_string())?;
+                    let task_cancel = cancel.clone();
+                    let join = tokio::spawn(async move { tool.execute("1", args, task_cancel, ToolUpdates::noop()).await });
+                    let pids = wait_for_marked_pids(&marker, 1).await.map_err(|error| error.to_string())?;
+                    tokio::time::sleep(Duration::from_millis(u64::from(cancel_delay_ms))).await;
+                    cancel.cancel();
+                    let err = expected_error(join.await.map_err(|error| error.to_string())?, "cancelled command succeeded").map_err(|error| error.to_string())?;
+                    if !text_of_err(&err).contains("Command aborted") {
+                        return Err(text_of_err(&err));
+                    }
+                    assert_processes_exit(&pids).await.map_err(|error| error.to_string())
+                })
+            })();
+            let error = result.as_ref().err().map_or("", String::as_str);
+            prop_assert!(result.is_ok(), "{error}");
+        }
     }
 
     #[test]
@@ -1357,23 +1469,31 @@ mod tests {
             text_of_err(&err)
         );
 
-        let mut child_pid = None;
-        for _ in 0..50 {
-            if marker.exists() {
-                let raw = tokio::fs::read_to_string(&marker).await?;
-                child_pid = raw.trim().parse::<u32>().ok();
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        if let Some(pid) = child_pid {
-            for _ in 0..50 {
-                if !process_alive(pid) {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            assert!(!process_alive(pid), "descendant {pid} still alive");
+        let pids = wait_for_marked_pids(&marker, 1).await?;
+        assert_processes_exit(&pids).await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timeout_reaps_nested_process_tree() -> Result<(), Box<dyn std::error::Error>> {
+        for depth in 1..=3 {
+            let dir = tempdir()?;
+            let marker = dir.path().join("nested.pid");
+            let command = nested_tree_command(&marker, depth);
+            let tool = BashTool::new(dir.path());
+            let err = expected_error(
+                tool.execute(
+                    "1",
+                    json_map(json!({"command": command, "timeout": 0.3}))?,
+                    CancellationToken::new(),
+                    ToolUpdates::noop(),
+                )
+                .await,
+                "timed command succeeded",
+            )?;
+            assert!(text_of_err(&err).contains("Command timed out"));
+            let pids = wait_for_marked_pids(&marker, depth).await?;
+            assert_processes_exit(&pids).await?;
         }
         Ok(())
     }
@@ -1394,15 +1514,7 @@ mod tests {
                 .await
         });
 
-        let mut child_pid = None;
-        for _ in 0..100 {
-            if marker.exists() {
-                let raw = tokio::fs::read_to_string(&marker).await?;
-                child_pid = raw.trim().parse::<u32>().ok();
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        let pids = wait_for_marked_pids(&marker, 1).await?;
         cancel.cancel();
         let err = expected_error(join.await?, "cancelled command succeeded")?;
         assert!(
@@ -1410,15 +1522,7 @@ mod tests {
             "{}",
             text_of_err(&err)
         );
-        if let Some(pid) = child_pid {
-            for _ in 0..50 {
-                if !process_alive(pid) {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            assert!(!process_alive(pid), "descendant {pid} still alive");
-        }
+        assert_processes_exit(&pids).await?;
         Ok(())
     }
 

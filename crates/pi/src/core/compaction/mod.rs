@@ -23,6 +23,7 @@ use std::fmt::Write as _;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::StreamExt;
 use pi_agent::AgentMessage;
@@ -115,6 +116,9 @@ pub struct CompactionResult {
     /// `true` when an extension hook supplied this result.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_hook: Option<bool>,
+    /// LLM usage from the summarization call(s), when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<pi_ai::Usage>,
 }
 
 /// Context-token estimate anchored on the last valid assistant usage.
@@ -250,6 +254,39 @@ pub type SummarizeStreamFn = Arc<
         > + Send
         + Sync,
 >;
+
+/// Upper bound on one summarization backoff, in milliseconds. Prevents a
+/// saturated `checked_shl` from turning a retry delay into an unbounded sleep.
+const MAX_RETRY_BACKOFF_MS: u64 = 60_000;
+
+/// Bounded retry settings for one standalone summarization request.
+///
+/// The initial request is not a retry. Enabled retries use
+/// `base_delay_ms * 2^(attempt - 1)` for 1-based attempts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SummarizationRetryPolicy {
+    /// Whether transient assistant errors may be retried.
+    pub enabled: bool,
+    /// Maximum retry attempts after the initial request.
+    pub max_retries: u32,
+    /// Base exponential-backoff delay in milliseconds.
+    pub base_delay_ms: u64,
+}
+
+type RetryScheduledFn = Arc<dyn Fn(u32, u32, u64, String) + Send + Sync>;
+
+/// Synchronous hooks around a summarization retry cycle.
+///
+/// `AgentSession` uses these to publish the TypeScript-compatible retry events.
+#[derive(Clone, Default)]
+pub struct SummarizationRetryCallbacks {
+    /// Called before each retry backoff. Arguments are attempt, maximum, delay, error.
+    pub on_retry_scheduled: Option<RetryScheduledFn>,
+    /// Called after backoff immediately before the retried request.
+    pub on_retry_attempt_start: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Called once after at least one retry was scheduled and the cycle ends.
+    pub on_retry_finished: Option<Arc<dyn Fn() + Send + Sync>>,
+}
 
 // ---------------------------------------------------------------------------
 // Token calculation
@@ -854,7 +891,7 @@ fn create_summarization_options(
     options
 }
 
-async fn complete_summarization(
+async fn complete_summarization_once(
     model: &Model,
     context: Context,
     options: StreamOptions,
@@ -867,12 +904,8 @@ async fn complete_summarization(
 
     while let Some(item) = stream.next().await {
         match item {
-            Ok(AssistantMessageEvent::Done { message, .. }) => {
-                return Ok(message);
-            }
-            Ok(AssistantMessageEvent::Error { error, .. }) => {
-                return Ok(error);
-            }
+            Ok(AssistantMessageEvent::Done { message, .. }) => return Ok(message),
+            Ok(AssistantMessageEvent::Error { error, .. }) => return Ok(error),
             Ok(other) => {
                 // Keep last partial as a fallback if the stream ends without Done.
                 if let Some(partial) = event_partial_message(&other) {
@@ -884,6 +917,132 @@ async fn complete_summarization(
     }
 
     last.ok_or_else(|| CompactionError::SummarizationFailed("Unknown error".to_owned()))
+}
+
+/// Retry one assistant-producing summarization call on transient assistant errors.
+///
+/// This ports the behavioural contract of TypeScript `retryAssistantCall`: an
+/// aborted response is terminal, only retryable error responses consume the
+/// budget, and `on_retry_finished` fires once only if a retry was scheduled.
+async fn retry_summarization_call<F>(
+    mut produce: F,
+    policy: Option<&SummarizationRetryPolicy>,
+    signal: Option<&CancellationToken>,
+    callbacks: Option<&SummarizationRetryCallbacks>,
+) -> Result<AssistantMessage, CompactionError>
+where
+    F: FnMut() -> Pin<Box<dyn Future<Output = Result<AssistantMessage, CompactionError>> + Send>>,
+{
+    let max_retries = policy
+        .filter(|policy| policy.enabled)
+        .map_or(0, |policy| policy.max_retries);
+    let mut attempt = 0_u32;
+    let mut retried = false;
+
+    let finish_callback = callbacks.and_then(|callbacks| callbacks.on_retry_finished.as_ref());
+
+    loop {
+        let response = match produce().await {
+            Ok(response) => response,
+            Err(error) => {
+                if retried && let Some(callback) = finish_callback {
+                    callback();
+                }
+                return Err(error);
+            }
+        };
+
+        if response.stop_reason == StopReason::Aborted {
+            if retried && let Some(callback) = finish_callback {
+                callback();
+            }
+            return Ok(response);
+        }
+
+        if response.stop_reason != StopReason::Error
+            || attempt >= max_retries
+            || !crate::core::agent_session::retry::is_retryable_assistant_error(&response)
+        {
+            if retried && let Some(callback) = finish_callback {
+                callback();
+            }
+            return Ok(response);
+        }
+
+        attempt = attempt.saturating_add(1);
+        retried = true;
+        let error_message = response
+            .error_message
+            .clone()
+            .unwrap_or_else(|| "Unknown error".to_owned());
+        let delay_ms = policy.map_or(0, |policy| {
+            let exponent = attempt.saturating_sub(1);
+            let multiplier = 1_u64.checked_shl(exponent).unwrap_or(u64::MAX);
+            policy
+                .base_delay_ms
+                .saturating_mul(multiplier)
+                .min(MAX_RETRY_BACKOFF_MS)
+        });
+
+        if let Some(callback) =
+            callbacks.and_then(|callbacks| callbacks.on_retry_scheduled.as_ref())
+        {
+            callback(attempt, max_retries, delay_ms, error_message);
+        }
+
+        let cancelled = if let Some(signal) = signal {
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_millis(delay_ms)) => false,
+                () = signal.cancelled() => true,
+            }
+        } else {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            false
+        };
+        if cancelled {
+            if let Some(callback) = finish_callback {
+                callback();
+            }
+            let mut aborted = response;
+            aborted.stop_reason = StopReason::Aborted;
+            aborted.error_message = None;
+            return Ok(aborted);
+        }
+
+        if let Some(callback) =
+            callbacks.and_then(|callbacks| callbacks.on_retry_attempt_start.as_ref())
+        {
+            callback();
+        }
+    }
+}
+
+async fn complete_summarization(
+    model: &Model,
+    context: Context,
+    options: StreamOptions,
+    stream_fn: &SummarizeStreamFn,
+    policy: Option<&SummarizationRetryPolicy>,
+    callbacks: Option<&SummarizationRetryCallbacks>,
+) -> Result<AssistantMessage, CompactionError> {
+    let signal = options.signal.clone();
+    let model = model.clone();
+    let stream_fn = Arc::clone(stream_fn);
+    retry_summarization_call(
+        move || {
+            let model = model.clone();
+            let context = context.clone();
+            let options = options.clone();
+            let stream_fn = Arc::clone(&stream_fn);
+            Box::pin(async move {
+                complete_summarization_once(&model, context, options, &stream_fn).await
+            })
+        },
+        policy,
+        signal.as_ref(),
+        callbacks,
+    )
+    .await
 }
 
 fn event_partial_message(event: &AssistantMessageEvent) -> Option<&AssistantMessage> {
@@ -940,6 +1099,37 @@ fn ensure_not_cancelled(signal: Option<&CancellationToken>) -> Result<(), Compac
     }
 }
 
+/// Combine two `Usage` records by summing all fields (mirrors TS `combineUsage`).
+#[must_use]
+pub fn combine_usage(first: &pi_ai::Usage, second: &pi_ai::Usage) -> pi_ai::Usage {
+    pi_ai::Usage {
+        input: first.input + second.input,
+        output: first.output + second.output,
+        cache_read: first.cache_read + second.cache_read,
+        cache_write: first.cache_write + second.cache_write,
+        cache_write1h: match (first.cache_write1h, second.cache_write1h) {
+            (Some(a), Some(b)) => Some(a + b),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        },
+        reasoning: match (first.reasoning, second.reasoning) {
+            (Some(a), Some(b)) => Some(a + b),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        },
+        total_tokens: first.total_tokens + second.total_tokens,
+        cost: pi_ai::UsageCost {
+            input: first.cost.input + second.cost.input,
+            output: first.cost.output + second.cost.output,
+            cache_read: first.cost.cache_read + second.cost.cache_read,
+            cache_write: first.cost.cache_write + second.cost.cache_write,
+            total: first.cost.total + second.cost.total,
+        },
+    }
+}
+
 /// Generate a summary of the conversation using the injected stream function.
 ///
 /// If `previous_summary` is provided, uses the update prompt. Custom
@@ -952,7 +1142,7 @@ fn ensure_not_cancelled(signal: Option<&CancellationToken>) -> Result<(), Compac
 pub async fn generate_summary(
     preparation: &CompactionPreparation,
     options: &CompactOptions<'_>,
-) -> Result<String, CompactionError> {
+) -> Result<(String, Option<pi_ai::Usage>), CompactionError> {
     ensure_not_cancelled(options.signal.as_ref())?;
 
     let max_tokens = history_max_tokens(preparation.settings.reserve_tokens, options.model);
@@ -1007,6 +1197,8 @@ pub async fn generate_summary(
         },
         completion_options,
         &options.stream_fn,
+        options.retry.as_ref(),
+        options.retry_callbacks.as_ref(),
     )
     .await?;
 
@@ -1023,13 +1215,13 @@ pub async fn generate_summary(
         return Err(CompactionError::SummarizationFailed(msg));
     }
 
-    Ok(assistant_text(&response))
+    Ok((assistant_text(&response), Some(response.usage)))
 }
 
 async fn generate_turn_prefix_summary(
     preparation: &CompactionPreparation,
     options: &CompactOptions<'_>,
-) -> Result<String, CompactionError> {
+) -> Result<(String, Option<pi_ai::Usage>), CompactionError> {
     ensure_not_cancelled(options.signal.as_ref())?;
 
     let max_tokens = turn_prefix_max_tokens(preparation.settings.reserve_tokens, options.model);
@@ -1062,6 +1254,8 @@ async fn generate_turn_prefix_summary(
             options.thinking_level,
         ),
         &options.stream_fn,
+        options.retry.as_ref(),
+        options.retry_callbacks.as_ref(),
     )
     .await?;
 
@@ -1078,7 +1272,7 @@ async fn generate_turn_prefix_summary(
         return Err(CompactionError::TurnPrefixSummarizationFailed(msg));
     }
 
-    Ok(assistant_text(&response))
+    Ok((assistant_text(&response), Some(response.usage)))
 }
 
 fn now_millis() -> i64 {
@@ -1093,18 +1287,28 @@ fn now_millis() -> i64 {
 async fn summarize_preparation(
     preparation: &CompactionPreparation,
     options: &CompactOptions<'_>,
-) -> Result<String, CompactionError> {
+) -> Result<(String, Option<pi_ai::Usage>), CompactionError> {
     if preparation.is_split_turn && !preparation.turn_prefix_messages.is_empty() {
-        let history_result = if preparation.messages_to_summarize.is_empty() {
-            "No prior history.".to_owned()
+        let (history_text, history_usage) = if preparation.messages_to_summarize.is_empty() {
+            ("No prior history.".to_owned(), None)
         } else {
             generate_summary(preparation, options).await?
         };
 
         ensure_not_cancelled(options.signal.as_ref())?;
-        let turn_prefix_result = generate_turn_prefix_summary(preparation, options).await?;
-        Ok(format!(
-            "{history_result}\n\n---\n\n**Turn Context (split turn):**\n\n{turn_prefix_result}"
+        let (turn_prefix_text, turn_prefix_usage) =
+            generate_turn_prefix_summary(preparation, options).await?;
+        let combined = match (history_usage, turn_prefix_usage) {
+            (Some(h), Some(t)) => Some(combine_usage(&h, &t)),
+            (Some(h), None) => Some(h),
+            (None, Some(t)) => Some(t),
+            (None, None) => None,
+        };
+        Ok((
+            format!(
+                "{history_text}\n\n---\n\n**Turn Context (split turn):**\n\n{turn_prefix_text}"
+            ),
+            combined,
         ))
     } else {
         generate_summary(preparation, options).await
@@ -1129,6 +1333,10 @@ pub struct CompactOptions<'a> {
     pub stream_fn: SummarizeStreamFn,
     /// Provider-scoped environment overrides.
     pub env: Option<BTreeMap<String, String>>,
+    /// Retry policy for each standalone summarization request.
+    pub retry: Option<SummarizationRetryPolicy>,
+    /// Lifecycle callbacks for transient summarization retries.
+    pub retry_callbacks: Option<SummarizationRetryCallbacks>,
     /// Extension hooks (default no-op).
     pub hooks: Option<&'a dyn CompactionHooks>,
 }
@@ -1168,7 +1376,7 @@ pub async fn compact(
         return Err(CompactionError::MissingFirstKeptId);
     }
 
-    let mut summary = summarize_preparation(preparation, &options).await?;
+    let (mut summary, usage) = summarize_preparation(preparation, &options).await?;
 
     ensure_not_cancelled(options.signal.as_ref())?;
 
@@ -1188,6 +1396,7 @@ pub async fn compact(
         estimated_tokens_after: None,
         details: Some(details_value),
         from_hook: None,
+        usage,
     };
 
     hooks.after_compact(&result, false).await?;
@@ -1731,6 +1940,8 @@ mod tests {
                     thinking_level: None,
                     stream_fn,
                     env: None,
+                    retry: None,
+                    retry_callbacks: None,
                     hooks: None,
                 },
             )
@@ -1819,6 +2030,8 @@ mod tests {
                     thinking_level: None,
                     stream_fn,
                     env: None,
+                    retry: None,
+                    retry_callbacks: None,
                     hooks: None,
                 },
             )
@@ -1869,6 +2082,8 @@ mod tests {
                     thinking_level: None,
                     stream_fn: mock_stream_fn("x", StopReason::Error),
                     env: None,
+                    retry: None,
+                    retry_callbacks: None,
                     hooks: None,
                 },
             )
@@ -1890,6 +2105,8 @@ mod tests {
                     thinking_level: None,
                     stream_fn: mock_stream_fn("x", StopReason::Stop),
                     env: None,
+                    retry: None,
+                    retry_callbacks: None,
                     hooks: None,
                 },
             )
@@ -1917,6 +2134,7 @@ mod tests {
                     estimated_tokens_after: None,
                     details: None,
                     from_hook: None,
+                    usage: None,
                 };
                 Box::pin(async move {
                     Ok(BeforeCompactResult {
@@ -1951,6 +2169,8 @@ mod tests {
                     thinking_level: None,
                     stream_fn: mock_stream_fn("should not run", StopReason::Stop),
                     env: None,
+                    retry: None,
+                    retry_callbacks: None,
                     hooks: Some(&hooks),
                 },
             )
@@ -1968,5 +2188,99 @@ mod tests {
         assert_eq!(DEFAULT_COMPACTION_SETTINGS.reserve_tokens, 16_384);
         assert_eq!(DEFAULT_COMPACTION_SETTINGS.keep_recent_tokens, 20_000);
         assert!(std::hint::black_box(DEFAULT_COMPACTION_SETTINGS).enabled);
+    }
+
+    #[tokio::test]
+    async fn retry_summarization_call_returns_terminal_attempt_usage() {
+        let policy = SummarizationRetryPolicy {
+            enabled: true,
+            max_retries: 1,
+            base_delay_ms: 0,
+        };
+
+        let mut call_count = 0_u32;
+        let result = retry_summarization_call(
+            move || {
+                let count = call_count;
+                call_count = call_count.saturating_add(1);
+                Box::pin(async move {
+                    if count == 0 {
+                        // Pinned TypeScript parity discards usage from retryable responses.
+                        let mut msg = AssistantMessage::new(
+                            "anthropic-messages",
+                            "anthropic",
+                            "claude-sonnet-4-5",
+                            1,
+                        );
+                        msg.stop_reason = StopReason::Error;
+                        msg.error_message = Some("overloaded_error".to_owned());
+                        msg.usage = Usage {
+                            input: 100,
+                            output: 50,
+                            cache_read: 10,
+                            cache_write: 5,
+                            cache_write1h: Some(3),
+                            reasoning: Some(20),
+                            total_tokens: 165,
+                            cost: pi_ai::UsageCost {
+                                input: 0.01,
+                                output: 0.02,
+                                cache_read: 0.001,
+                                cache_write: 0.005,
+                                total: 0.036,
+                            },
+                        };
+                        Ok(msg)
+                    } else {
+                        let mut msg = AssistantMessage::new(
+                            "anthropic-messages",
+                            "anthropic",
+                            "claude-sonnet-4-5",
+                            1,
+                        );
+                        msg.content = vec![AssistantContent::Text(TextContent::new("summary"))];
+                        msg.stop_reason = StopReason::Stop;
+                        msg.usage = Usage {
+                            input: 200,
+                            output: 100,
+                            cache_read: 20,
+                            cache_write: 10,
+                            cache_write1h: Some(7),
+                            reasoning: Some(40),
+                            total_tokens: 330,
+                            cost: pi_ai::UsageCost {
+                                input: 0.02,
+                                output: 0.04,
+                                cache_read: 0.002,
+                                cache_write: 0.01,
+                                total: 0.072,
+                            },
+                        };
+                        Ok(msg)
+                    }
+                })
+            },
+            Some(&policy),
+            None,
+            None,
+        )
+        .await;
+
+        let response = result_ok(result);
+
+        assert_eq!(response.stop_reason, StopReason::Stop);
+        assert_eq!(assistant_text(&response), "summary");
+        assert_eq!(response.usage.input, 200);
+        assert_eq!(response.usage.output, 100);
+        assert_eq!(response.usage.cache_read, 20);
+        assert_eq!(response.usage.cache_write, 10);
+        assert_eq!(response.usage.cache_write1h, Some(7));
+        assert_eq!(response.usage.reasoning, Some(40));
+        assert_eq!(response.usage.total_tokens, 330);
+        assert!((response.usage.cost.input - 0.02).abs() < 1e-9);
+        assert!((response.usage.cost.output - 0.04).abs() < 1e-9);
+        assert!((response.usage.cost.cache_read - 0.002).abs() < 1e-9);
+        assert!((response.usage.cost.cache_write - 0.01).abs() < 1e-9);
+        assert!((response.usage.cost.total - 0.072).abs() < 1e-9);
     }
 }

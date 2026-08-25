@@ -125,24 +125,24 @@ impl AgentSession {
         // append linearization point while keeping blocking I/O off Tokio workers.
         let mut sm = Arc::clone(&self.session_manager).lock_owned().await;
         let message = message.clone();
-        let persisted_entry = tokio::task::spawn_blocking(move || {
-            let id = match message.role() {
-                "custom" => Some(persist_custom_message(&mut sm, &message)?),
-                "user" | "assistant" | "toolResult" => Some(sm.append_message(&message)?),
+        tokio::task::spawn_blocking(move || {
+            match message.role() {
+                "custom" => {
+                    persist_custom_message(&mut sm, &message)?;
+                }
+                "user" | "assistant" | "toolResult" => {
+                    sm.append_message(&message)?;
+                }
                 // bashExecution / compactionSummary / branchSummary persist elsewhere
-                _ => None,
-            };
-            Ok::<_, SessionError>(id.and_then(|id| sm.get_entry(&id).cloned()))
+                _ => {}
+            }
+            Ok::<_, SessionError>(())
         })
         .await
         .map_err(|err| SessionError::Io {
             path: "session persistence worker".to_owned(),
             source: io::Error::other(err),
         })??;
-
-        if let Some(entry) = persisted_entry {
-            self.emit_public(AgentSessionEvent::EntryAppended { entry });
-        }
         Ok(())
     }
 

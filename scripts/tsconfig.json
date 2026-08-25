@@ -32,13 +32,12 @@
 		"tests/**/*.ts",
 		"verification/**/*.ts",
 		"bench-extension-scaling.ts",
+		"lean-scaling.ts",
 		"build-extension-host.ts",
 		"package-release.ts"
 	],
 	"exclude": [
-		"verification/extension.ts",
 		"verification/foundation.test.ts",
-		"verification/performance.ts",
 		"verification/e2e-smoke.ts",
 		"verification/pty.ts"
 	]

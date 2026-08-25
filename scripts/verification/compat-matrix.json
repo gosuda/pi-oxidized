@@ -181,7 +181,7 @@
 					"timeoutMs": 600000
 				}
 			],
-			"evidence": "scaling: terminal-input deadlines / fast onTerminalInput consume/rewrite stays under 5ms p99"
+			"evidence": "scaling: terminal-input deadlines / fast onTerminalInput consume/rewrite is deterministic over 120 IDs"
 		},
 		{
 			"id": "crash-isolation",
@@ -324,6 +324,20 @@
 			"evidence": "cargo pi-ext integration tests pass (scaling + extension invariants)"
 		},
 		{
+			"id": "product-release-build",
+			"surface": "release build",
+			"tier": "product",
+			"required": true,
+			"commands": [
+				{
+					"cwd": ".",
+					"argv": ["cargo", "build", "-p", "pi", "--release", "--locked"],
+					"timeoutMs": 1200000
+				}
+			],
+			"evidence": "release pi binary exists before the real interactive session interoperability smoke"
+		},
+		{
 			"id": "session-interop",
 			"surface": "session interoperability",
 			"tier": "product",
@@ -336,6 +350,36 @@
 				}
 			],
 			"evidence": "e2e-smoke: real Rust host flag, shortcut, dialogs, custom UI input/rerender, reload preservation, tools/steering/compaction/fork/resume, and upstream TypeScript session reopen steps pass"
+		},
+		{
+			"id": "session-v1-v2-v3-interop",
+			"surface": "generated v1/v2/v3 session interoperability",
+			"tier": "product",
+			"required": true,
+			"requires": [".references/pi"],
+			"commands": [
+				{
+					"cwd": ".",
+					"argv": ["bun", "run", "scripts/verification/session-interop.ts"],
+					"timeoutMs": 900000
+				}
+			],
+			"evidence": "generated source-pinned v1/v2/v3 fixtures migrate and continue/fork/clone through Rust SessionManager, preserve historical prefixes and opaque entries, then reopen unchanged in source-pinned TypeScript pi"
+		},
+		{
+			"id": "rpc-parity",
+			"surface": "rpc protocol parity",
+			"tier": "product",
+			"required": true,
+			"requires": [".references/pi"],
+			"commands": [
+				{
+					"cwd": ".",
+					"argv": ["bun", "run", "scripts/verification/rpc-parity.ts"],
+					"timeoutMs": 900000
+				}
+			],
+			"evidence": "every authoritative RPC command replays through Rust pi --mode rpc and source-pinned TypeScript pi with normalized response/event transcript equality"
 		},
 		{
 			"id": "flicker",
@@ -363,7 +407,7 @@
 					"timeoutMs": 600000
 				}
 			],
-			"evidence": "bench-extension-scaling reports zero/idle/active widget medians and terminal-input p99 within thresholds"
+			"evidence": "bench-extension-scaling reports zero/idle/active widget medians; enforces idle-vs-zero p99 and terminal-input thresholds"
 		},
 		{
 			"id": "performance",

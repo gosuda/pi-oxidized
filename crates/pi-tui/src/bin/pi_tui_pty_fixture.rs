@@ -329,7 +329,9 @@ async fn run_fixture(
             probe.feed(b"\x1b[?0u\x1b[?1;2c\x1b[6;10;20t\x1b]11;rgb:0000/0000/0000\x07\x1b[1;1R");
     }
 
-    let mut caps = TerminalCapabilities::detect();
+    let mut caps = tokio::task::spawn_blocking(TerminalCapabilities::detect)
+        .await
+        .map_err(|err| io::Error::other(format!("capability detection join failed: {err}")))?;
     caps.sync_output = sync_output;
     let cursor = probe.apply_to(&mut caps).unwrap_or((0, 0));
     set_kitty_protocol_active(caps.kitty_keyboard());

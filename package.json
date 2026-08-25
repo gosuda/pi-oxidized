@@ -15,6 +15,7 @@
 		"package-release:dry": "bun run scripts/package-release.ts --dry-run",
 		"verify:compatibility": "bun run scripts/verification/compat-matrix.ts",
 		"verify:e2e": "bun run scripts/verification/e2e-smoke.ts",
+		"verify:replacement": "bun run scripts/verification/e2e-smoke.ts --replacement-only",
 		"verify:performance": "bun run scripts/verification/performance.ts",
 		"verify:extension-scaling": "bun run scripts/bench-extension-scaling.ts"
 	},
