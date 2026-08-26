@@ -7,9 +7,7 @@ use std::time::{Duration, Instant};
 
 use avt::Vt;
 
-use crate::testkit::driver::{
-    DriverError, Geometry, OutputBatch, SettlePolicy, TerminalSnapshot,
-};
+use crate::testkit::driver::{DriverError, Geometry, OutputBatch, SettlePolicy, TerminalSnapshot};
 
 /// One chunk, or a terminal reader failure that must not validate as settle.
 pub(crate) type ReaderEvent = Result<Vec<u8>, std::io::Error>;

@@ -48,10 +48,7 @@ impl TerminalDriver for PosixPtyDriver {
         cmd.cwd(&spec.cwd);
         apply_env(&mut cmd, spec);
 
-        let child = pair
-            .slave
-            .spawn_command(cmd)
-            .map_err(DriverError::pty)?;
+        let child = pair.slave.spawn_command(cmd).map_err(DriverError::pty)?;
         drop(pair.slave);
 
         disable_pty_echo(pair.master.as_ref())?;

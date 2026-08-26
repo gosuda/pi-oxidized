@@ -45,10 +45,7 @@ impl TerminalDriver for ConPtyDriver {
         cmd.cwd(&spec.cwd);
         apply_env(&mut cmd, spec);
 
-        let child = pair
-            .slave
-            .spawn_command(cmd)
-            .map_err(DriverError::pty)?;
+        let child = pair.slave.spawn_command(cmd).map_err(DriverError::pty)?;
         drop(pair.slave);
 
         let mut writer = pair.master.take_writer().map_err(DriverError::pty)?;

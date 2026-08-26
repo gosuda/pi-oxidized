@@ -77,7 +77,9 @@ impl LaunchSpec {
     /// Validates argv and geometry invariants before launch.
     pub fn validate(&self) -> Result<(), DriverError> {
         if self.argv.is_empty() {
-            return Err(DriverError::InvalidSpec("argv must be non-empty".to_owned()));
+            return Err(DriverError::InvalidSpec(
+                "argv must be non-empty".to_owned(),
+            ));
         }
         if self.argv[0].is_empty() {
             return Err(DriverError::InvalidSpec(

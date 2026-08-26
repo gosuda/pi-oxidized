@@ -63,15 +63,18 @@ impl TerminalDriver for QemuUserSmokeDriver {
         apply_std_env(&mut cmd, spec);
 
         let mut child = cmd.spawn()?;
-        let stdin = child.stdin.take().ok_or_else(|| {
-            DriverError::Io(std::io::Error::other("qemu child stdin missing"))
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            DriverError::Io(std::io::Error::other("qemu child stdout missing"))
-        })?;
-        let stderr = child.stderr.take().ok_or_else(|| {
-            DriverError::Io(std::io::Error::other("qemu child stderr missing"))
-        })?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| DriverError::Io(std::io::Error::other("qemu child stdin missing")))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| DriverError::Io(std::io::Error::other("qemu child stdout missing")))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| DriverError::Io(std::io::Error::other("qemu child stderr missing")))?;
 
         // Probe replies are PTY-emulator artifacts and must never enter QEMU stdin.
         let writer: Box<dyn std::io::Write + Send> = Box::new(stdin);
