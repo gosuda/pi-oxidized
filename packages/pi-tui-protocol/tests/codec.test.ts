@@ -270,3 +270,81 @@ describe("shared fixtures", () => {
 		expect([...candidate].sort()).toEqual(["sendMessage", "setSessionName", "shutdown"]);
 	});
 });
+
+describe("witness manifest lockstep", () => {
+	// The single (method, kind) witness-manifest lockstep test (XC-2).
+	// Both language sides consume witness-manifest.json by name — parity
+	// does not create a second check.  Deleting any fixture line or
+	// mutating a modifier-combo key event kind breaks this test.
+	const manifestPath = join(
+		dirname(fileURLToPath(import.meta.url)),
+		"fixtures",
+		"witness-manifest.json",
+	);
+	const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
+		totalLines: number;
+		methodKindPairs: [string, string][];
+		modifierComboKeyEvents: {
+			code: string;
+			modifiers: Record<string, boolean>;
+			kind: string;
+		}[];
+	};
+
+	test("total non-blank line count matches manifest", () => {
+		const text = readFileSync(fixturesPath, "utf8");
+		let count = 0;
+		for (const line of text.split("\n")) {
+			if (line.trim() === "" || line.trimStart().startsWith("#")) {
+				continue;
+			}
+			count += 1;
+		}
+		expect(count).toBe(manifest.totalLines);
+	});
+
+	test("every manifest (method, kind) pair is witnessed in frames.jsonl", () => {
+		const text = readFileSync(fixturesPath, "utf8");
+		const seen = new Set<string>();
+		for (const line of text.split("\n")) {
+			if (line.trim() === "" || line.trimStart().startsWith("#")) {
+				continue;
+			}
+			const frame = decodeFrameStr(line);
+			seen.add(`${frame.method}:${frame.kind}`);
+		}
+		for (const [method, kind] of manifest.methodKindPairs) {
+			expect(seen).toContain(`${method}:${kind}`);
+		}
+		// Every seen pair must also be in the manifest (no untracked fixtures).
+		for (const key of seen) {
+			const [method, kind] = key.split(":");
+			expect(manifest.methodKindPairs).toContainEqual([method, kind]);
+		}
+	});
+
+	test("modifier-combo key events match manifest exactly", () => {
+		const text = readFileSync(fixturesPath, "utf8");
+		const keyEvents: typeof manifest.modifierComboKeyEvents = [];
+		for (const line of text.split("\n")) {
+			if (line.trim() === "" || line.trimStart().startsWith("#")) {
+				continue;
+			}
+			const frame = decodeFrameStr(line);
+			if (frame.method !== "uiEvent" || frame.kind !== "req") {
+				continue;
+			}
+			const payload = frame.payload as Record<string, unknown>;
+			const event = payload["event"] as Record<string, unknown>;
+			if (event["type"] !== "key") {
+				continue;
+			}
+			keyEvents.push({
+				code: event["code"] as string,
+				modifiers: (event["modifiers"] ?? {}) as Record<string, boolean>,
+				kind: (event["kind"] ?? "press") as string,
+			});
+		}
+		expect(keyEvents).toEqual(manifest.modifierComboKeyEvents);
+	});
+});

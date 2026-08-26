@@ -14,19 +14,26 @@
 {"id":10,"kind":"req","method":"editor","payload":{"title":"Edit","prefill":"draft"}}
 {"id":10,"kind":"res","method":"editor","payload":{"value":"final"}}
 {"id":11,"kind":"req","method":"notify","payload":{"message":"saved","type":"info"}}
+{"id":11,"kind":"res","method":"notify","payload":{"ok":true}}
 {"id":12,"kind":"req","method":"flags.set","payload":{"values":{"plan":true,"profile":"fast"}}}
 {"id":12,"kind":"res","method":"flags.set","payload":{"ok":true}}
 {"id":13,"kind":"req","method":"shortcut.execute","payload":{"key":"ctrl+alt+p"}}
 {"id":13,"kind":"res","method":"shortcut.execute","payload":{"handled":true}}
 {"id":14,"kind":"req","method":"uiEvent","payload":{"key":"widget.demo","generation":3,"event":{"type":"key","code":"enter","modifiers":{"ctrl":true},"kind":"press"},"data":"\r"}}
+{"id":14,"kind":"req","method":"uiEvent","payload":{"key":"widget.demo","generation":3,"event":{"type":"key","code":"a","modifiers":{"shift":true},"kind":"press"},"data":"A"}}
+{"id":14,"kind":"req","method":"uiEvent","payload":{"key":"widget.demo","generation":3,"event":{"type":"key","code":"b","modifiers":{"alt":true},"kind":"release"}}}
+{"id":14,"kind":"req","method":"uiEvent","payload":{"key":"widget.demo","generation":3,"event":{"type":"key","code":"c","modifiers":{"superKey":true},"kind":"repeat"}}}
+{"id":14,"kind":"req","method":"uiEvent","payload":{"key":"widget.demo","generation":3,"event":{"type":"key","code":"d","modifiers":{"ctrl":true,"shift":true},"kind":"release"},"data":""}}
 {"id":14,"kind":"req","method":"uiEvent","payload":{"key":"widget.demo","generation":3,"event":{"type":"paste","text":"a\nb"},"data":"a\nb"}}
 {"id":14,"kind":"req","method":"uiEvent","payload":{"key":"widget.demo","generation":3,"event":{"type":"focusGained"}}}
+{"id":14,"kind":"req","method":"uiEvent","payload":{"key":"widget.demo","generation":3,"event":{"type":"focusLost"}}}
 {"id":14,"kind":"req","method":"uiEvent","payload":{"key":"widget.demo","generation":3,"event":{"type":"resize","width":80,"height":24}}}
 {"id":13,"kind":"req","method":"terminalInput","payload":{"data":"x"}}
 {"id":13,"kind":"res","method":"terminalInput","payload":{"consume":true,"data":"y"}}
 {"id":14,"kind":"req","method":"measure","payload":{"key":"slot","width":80,"themeGeneration":1}}
 {"id":14,"kind":"res","method":"measure","payload":{"height":3}}
 {"id":15,"kind":"req","method":"render","payload":{"key":"slot","width":80,"themeGeneration":1}}
+{"id":15,"kind":"res","method":"render","payload":{"runs":[[{"text":"line1","style":{}}],[{"text":"line2","style":{"bold":true}}]]}}
 {"id":15,"kind":"error","method":"render","payload":{"code":"extension_error","message":"render failed","retryable":false}}
 {"id":0,"kind":"event","method":"theme.update","payload":{"theme":{"name":"dark","sourcePath":"/pkg/theme/dark.json","colorMode":"truecolor","fg":{"text":"#ededed","accent":39,"muted":""},"bg":{"selectedBg":"#0a0a0a"}},"terminalTheme":"light","themeMode":"auto","themeGeneration":42,"themes":[{"name":"mytheme","path":"/agent/themes/my-file.json","fileStem":"my-file","theme":{"name":"mytheme","colorMode":"256color","fg":{},"bg":{}}}]}}
 {"id":0,"kind":"event","method":"theme.set","payload":{"name":"light/dark","persist":true}}
