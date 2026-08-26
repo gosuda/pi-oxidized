@@ -57,3 +57,7 @@ proptest = { version = "=1.11.0", default-features = false, features = ["std"] }
 # test-util enables tokio::time::pause/advance for the spinner runtime test.
 tokio = { version = "=1.52.4", default-features = false, features = ["test-util"] }
 tempfile = "=3.27.0"
+
+[[bin]]
+name = "session-timing"
+path = "src/bin/session-timing.rs"
