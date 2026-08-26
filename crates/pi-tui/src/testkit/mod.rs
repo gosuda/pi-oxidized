@@ -25,6 +25,7 @@ pub use driver::{
     SettlePolicy, SettledFrame, TerminalDriver, TerminalSnapshot,
 };
 pub use profile::CapabilityProfile;
+pub use session::{RecordingError, RecordingSession};
 pub use transcript::DriverKind;
 
 #[cfg(windows)]
