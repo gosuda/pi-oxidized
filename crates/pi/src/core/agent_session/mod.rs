@@ -490,7 +490,7 @@ impl AgentSession {
                 after_tool_call: None,
                 on_payload: None,
                 on_response: None,
-                telemetry: crate::core::telemetry::resolve_session_telemetry(&config.settings_manager),
+                telemetry,
             });
             base.before_tool_call = Some(hooks.before_tool_call_hook());
             base.after_tool_call = Some(hooks.after_tool_call_hook());

@@ -292,10 +292,10 @@ fn encode_osc0_set_title(title: &str) -> Vec<u8> {
 /// WCAG 2.2 relative luminance for an sRGB 8-bit channel.
 fn channel_luminance(v: u8) -> f64 {
     let s = f64::from(v) / 255.0;
-    if s <= 0.03928 {
+    if s <= 0.04045 {
         s / 12.92
     } else {
-        ((s + 0.055) / 1.055).powi(2)
+        ((s + 0.055) / 1.055).powf(2.4)
     }
 }
 
@@ -355,17 +355,33 @@ fn fit(text: &str, width: usize) -> String {
     text.chars().take(width).collect()
 }
 
-/// Non-blocking stdin read for probe replies. Returns `None` when no data ready.
+/// Non-blocking stdin read for probe replies. Returns `None` when no data is ready.
 fn read_stdin_nonblocking() -> io::Result<Option<Vec<u8>>> {
-    use std::io::Read;
-    let mut buf = [0u8; 4096];
-    let mut stdin = io::stdin();
-    match stdin.read(&mut buf) {
-        Ok(0) => Ok(Some(Vec::new())),
-        Ok(n) => Ok(Some(buf[..n].to_vec())),
-        Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
-        Err(e) if e.kind() == io::ErrorKind::Interrupted => Ok(None),
-        Err(e) => Err(e),
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        use std::os::fd::AsFd;
+
+        let stdin = io::stdin();
+        let fd = stdin.as_fd();
+        let mut fds = [nix::poll::PollFd::new(fd, nix::poll::PollFlags::POLLIN)];
+        let n = nix::poll::poll(&mut fds, 0u8)
+            .map_err(|err| io::Error::other(format!("poll stdin: {err}")))?;
+        if n == 0 {
+            return Ok(None);
+        }
+        let mut buf = [0u8; 512];
+        let mut handle = stdin.lock();
+        match handle.read(&mut buf) {
+            Ok(0) => Ok(Some(Vec::new())),
+            Ok(n) => Ok(Some(buf[..n].to_vec())),
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(None)
     }
 }
 
@@ -647,10 +663,10 @@ async fn run_gauntlet(serve: bool, started: Instant) -> io::Result<ExitCode> {
         osc_bytes.starts_with(b"\x1b]0;") && osc_bytes.ends_with(&[0x07]),
         "OSC 0 sequence must be properly framed"
     );
-    // 4. No raw C0/C1 between the prefix and terminator.
-    let payload = &osc_bytes[4..osc_bytes.len() - 1];
+    // 4. No C0/C1 control characters in the sanitized payload (char-level,
+    //    not byte-level, to avoid false-positives on multi-byte UTF-8).
     assert!(
-        !payload.iter().any(|&b| b < 0x20 || b == 0x7f || (0x80..=0x9f).contains(&b)),
+        !sanitized.chars().any(char::is_control),
         "OSC 0 payload must contain no C0/C1 controls"
     );
 

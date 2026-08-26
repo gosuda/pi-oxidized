@@ -46,7 +46,6 @@ use super::tree::SummarizationAuth;
 use pi_agent::telemetry::{
     AiOperation, AiRequestStart, HarnessCompactionStart, SpanStatus,
     contained, start_ai_request_span, start_harness_compaction_span,
-    contained, start_ai_request_span, start_harness_compaction_span,
 };
 
 // ---------------------------------------------------------------------------
@@ -449,20 +448,47 @@ impl AgentSession {
         let pure_settings = settings_to_pure(settings);
 
         let path_refs: Vec<&SessionEntry> = path_entries.iter().collect();
-        let preparation = prepare_compaction(&path_refs, pure_settings)?;
+        let preparation = prepare_compaction(&path_refs, pure_settings).map_err(|err| {
+            contained(|| {
+                compaction_span.set_status(SpanStatus::Error {
+                    name: None,
+                    message: Some(err.to_string()),
+                });
+            }, || ());
+            drop(compaction_span);
+            err
+        })?;
         let Some(preparation) = preparation else {
             drop(compaction_span);
             return Ok(None);
         };
 
         // Resolve auth + stream inputs.
-        let inputs = self.resolve_compaction_inputs().await?;
+        let inputs = self.resolve_compaction_inputs().await.map_err(|err| {
+            contained(|| {
+                compaction_span.set_status(SpanStatus::Error {
+                    name: None,
+                    message: Some(err.to_string()),
+                });
+            }, || ());
+            drop(compaction_span);
+            err
+        })?;
 
         // Extension before_compact hook (cancellable).
         let runner = self.hooks.runner();
         if runner.has_handlers("session_before_compact") {
             let event = AgentSessionEvent::CompactionStart { reason };
-            let cancel = self.extension_before_compact(&runner, event).await?;
+            let cancel = self.extension_before_compact(&runner, event).await.map_err(|err| {
+                contained(|| {
+                    compaction_span.set_status(SpanStatus::Error {
+                        name: None,
+                        message: Some(err.to_string()),
+                    });
+                }, || ());
+                drop(compaction_span);
+                err
+            })?;
             if cancel.cancel {
                 drop(compaction_span);
                 return Err(CompactionError::Cancelled);
