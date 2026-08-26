@@ -6,12 +6,18 @@
  * pass bundle) or Class S (shipped-exposed / undecidable). Fail-closed: every
  * loader/runner/parser failure maps the affected check to undecidable and the
  * input to Class S. Emits pi.deps.exposure.v1 evidence without short-circuit.
+ *
+ * Operational disk quota (SEC-006): this process does not implement an in-process
+ * quota framework. ENOSPC and other nonzero infrastructure failures already fail
+ * closed through the Class S / CI path. Guaranteed reserved report space is
+ * infrastructure-owned and must be provisioned outside this classifier.
  */
 
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import {
 	appendFile,
+	cp,
 	lstat,
 	mkdir,
 	mkdtemp,
@@ -24,16 +30,24 @@ import {
 } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
+import ts from "typescript";
 
 import type { CommandRunner, Fs, RunResult } from "../release/runner.ts";
 import { SpawnRunner, realFs } from "../release/runner.ts";
+import { CANONICAL_REFERENCE_SHA } from "./alignment.ts";
 
 export const SCHEMA = "pi.deps.exposure.v1" as const;
 export const SENTINEL_OK = "DEPENDENCY_EXPOSURE_OK";
 export const SENTINEL_FAILED = "DEPENDENCY_EXPOSURE_FAILED_CLOSED";
 export const REPO_ROOT = resolve(import.meta.dirname, "../..");
-/** Convention used by locate/install probes; release argv/staging come from side authority. */
+/** Convention used by locate/install probes; release argv/staging come from trusted base authority. */
 export const HOST_PACKAGE_DIR = "packages/extension-host";
+/** Release authority modules compared byte-for-byte before any load/execute. */
+export const AUTHORITY_REL_PATHS = [
+	"scripts/release/targets.ts",
+	"scripts/release/host.ts",
+	"scripts/release/stage.ts",
+] as const;
 
 export const SURFACES = [
 	"package.json",
@@ -56,6 +70,7 @@ const KNOWN_COMPILE_SITES = new Set([
 	"packages/extension-host/tests/acceptance.test.ts",
 	"packages/extension-host/tests/bundled-modules.test.ts",
 	".github/workflows/release-verification.yml",
+	".github/workflows/musl-bakeoff.yml",
 	"scripts/tests/host.test.ts",
 	"scripts/verification/compat-matrix.json",
 	".outline/sdd/workflowz.json",
@@ -113,12 +128,19 @@ export interface Verdict {
 	readonly checks: Readonly<Record<CheckName, CheckResult>>;
 }
 
+export interface ReferenceProvenance {
+	readonly sha: string;
+	readonly snapshotRoot: string;
+	readonly fingerprint: string;
+}
+
 export interface ExposureReport {
 	readonly schema: typeof SCHEMA;
 	readonly decidedAt: string;
 	readonly base: string;
 	/** Immutable resolved HEAD SHA for the isolated head checkout. */
 	readonly head: string;
+	readonly reference?: ReferenceProvenance;
 	readonly verdicts: readonly Verdict[];
 	readonly overall: Overall;
 }
@@ -131,6 +153,8 @@ export interface ClassifyOptions {
 	readonly now?: () => Date;
 	readonly identity?: boolean;
 	readonly fs?: Fs;
+	/** Injected snapshot, or `"skip"` for hermetic fixtures without `.references/pi`. */
+	readonly reference?: ReferenceProvenance | "skip";
 }
 
 interface SideData {
@@ -407,6 +431,7 @@ function reportOf(
 	head: string,
 	verdicts: readonly Verdict[],
 	now: () => Date,
+	reference?: ReferenceProvenance,
 ): ExposureReport {
 	const overall: Overall = verdicts.length === 0
 		? "none"
@@ -418,6 +443,7 @@ function reportOf(
 		decidedAt: now().toISOString(),
 		base,
 		head,
+		...(reference !== undefined ? { reference } : {}),
 		verdicts,
 		overall,
 	};
@@ -607,8 +633,167 @@ export function expandScripts(
 	return expanded;
 }
 
-function escapeRegex(value: string): string {
-	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+function isTsCorpusPath(path: string): boolean {
+	return path.endsWith(".ts") || path.endsWith(".tsx") || path.endsWith(".mts") || path.endsWith(".cts");
+}
+
+function literalString(node: ts.Expression | undefined): string | undefined {
+	if (node === undefined) return undefined;
+	if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) return node.text;
+	return undefined;
+}
+
+function callCalleeName(expr: ts.Expression): string | undefined {
+	if (ts.isIdentifier(expr)) return expr.text;
+	if (ts.isPropertyAccessExpression(expr)) {
+		const object = callCalleeName(expr.expression);
+		return object === undefined ? undefined : `${object}.${expr.name.text}`;
+	}
+	return undefined;
+}
+
+const PROCESS_CALLEES = new Set([
+	"spawn",
+	"spawnSync",
+	"exec",
+	"execSync",
+	"execFile",
+	"execFileSync",
+	"Bun.spawn",
+	"Bun.spawnSync",
+	"child_process.spawn",
+	"child_process.spawnSync",
+	"child_process.exec",
+	"child_process.execSync",
+	"child_process.execFile",
+	"child_process.execFileSync",
+]);
+
+function analyzeTsCorpusFile(
+	name: string,
+	bins: readonly string[],
+	file: CorpusFile,
+): CheckResult | undefined {
+	const source = ts.createSourceFile(file.path, file.text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+	let undecidableDetail: string | undefined;
+	let hit: string | undefined;
+	const relevantLiteral = (value: string | undefined): boolean => {
+		if (value === undefined) return false;
+		return (
+			value === name
+			|| bins.includes(value)
+			|| value === `node_modules/${name}`
+			|| value.startsWith(`${name}/`)
+			|| value.endsWith(`/${name}`)
+			|| value.endsWith(`\\${name}`)
+		);
+	};
+	const visit = (node: ts.Node): void => {
+		if (hit !== undefined || undecidableDetail !== undefined) return;
+		if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
+			const spec = node.moduleSpecifier !== undefined && ts.isExpression(node.moduleSpecifier)
+				? literalString(node.moduleSpecifier)
+				: undefined;
+			if (relevantLiteral(spec) || spec === name || spec?.startsWith(`${name}/`)) {
+				hit = `${name} imported by shipped-byte producer ${file.path}`;
+				return;
+			}
+		}
+		if (ts.isCallExpression(node)) {
+			const callee = callCalleeName(node.expression);
+			if (callee !== undefined && PROCESS_CALLEES.has(callee)) {
+				const first = node.arguments[0];
+				const literal = literalString(first);
+				if (literal === undefined) {
+					// Generic runner seams (spawn(command, args)) are ignored unless this
+					// call also carries a package-relevant literal argv entry.
+					const relevantArg = node.arguments.some((arg) => {
+						if (ts.isArrayLiteralExpression(arg)) {
+							return arg.elements.some((element) => relevantLiteral(literalString(element)));
+						}
+						return relevantLiteral(literalString(arg));
+					});
+					if (relevantArg) {
+						undecidableDetail = `computed process invocation target involving ${name} in ${file.path}`;
+					}
+					return;
+				}
+				if (relevantLiteral(literal)) {
+					hit = `process invocation of ${literal} in ${file.path}`;
+					return;
+				}
+				for (const arg of node.arguments.slice(1)) {
+					if (ts.isArrayLiteralExpression(arg)) {
+						for (const element of arg.elements) {
+							const value = literalString(element);
+							if (value === undefined) {
+								// Spread/dynamic argv: fail closed only when another literal in
+								// this call already names the package/bin under review.
+								continue;
+							}
+							if (relevantLiteral(value)) {
+								hit = `process argv references ${value} in ${file.path}`;
+								return;
+							}
+						}
+					} else if (relevantLiteral(literalString(arg))) {
+						hit = `process argument references ${name} in ${file.path}`;
+						return;
+					}
+				}
+			}
+		}
+		if (ts.isTaggedTemplateExpression(node)) {
+			const tag = callCalleeName(node.tag);
+			if (tag === "Bun.$" || tag === "$") {
+				const text = node.template.getText(source);
+				if (text.includes(name) || bins.some((bin) => text.includes(bin))) {
+					undecidableDetail = `shell template invocation involving ${name} in ${file.path}`;
+					return;
+				}
+			}
+		}
+		ts.forEachChild(node, visit);
+	};
+	visit(source);
+	if (hit !== undefined) return fail(hit);
+	if (undecidableDetail !== undefined) return undecidable(undecidableDetail);
+	return undefined;
+}
+
+/** Controlled package-script / workflow command analysis (no negative token regex). */
+export function analyzeScriptCommandText(
+	name: string,
+	bins: readonly string[],
+	file: CorpusFile,
+): CheckResult | undefined {
+	const text = file.text;
+	const mentionsPackage = text.includes(name) || bins.some((bin) => bin.length > 0 && text.includes(bin));
+	// Ignore ambient GitHub Actions `${{ }}` expressions for computed-target checks.
+	const withoutGha = text.replace(/\$\{\{[\s\S]*?\}\}/g, " ");
+	if (mentionsPackage && /[`$]|\$\(|\$\{/.test(withoutGha)) {
+		return undecidable(`computed executable/script target involving ${name} in ${file.path}`);
+	}
+	// Static shell-ish tokens only: reject concatenation / unresolved wrappers when relevant.
+	if (mentionsPackage && (withoutGha.includes("eval ") || withoutGha.includes("xargs"))) {
+		return undecidable(`unresolved wrapper involving ${name} in ${file.path}`);
+	}
+	const tokens = text.split(/[\s;|&]+/).filter((token) => token.length > 0);
+	for (const token of tokens) {
+		const bare = token.replace(/^["']|["']$/g, "");
+		if (bare === name || bins.includes(bare) || (bare === "bunx" && tokens.includes(name))) {
+			return fail(`script token ${bare} references ${name} in ${file.path}`);
+		}
+		if (bare.startsWith(`${name}/`) || bare.endsWith(`/${name}`)) {
+			return fail(`script path references ${name} in ${file.path}`);
+		}
+	}
+	// Positive quoted package references (imports / dependency pins), not token lookarounds.
+	const quoted = new RegExp(String.raw`(^|[\s=:,\[])["'\x60]${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:/[^"'\x60]*)?["'\x60]`);
+	if (quoted.test(text)) {
+		return fail(`${name} referenced by shipped-byte producer ${file.path}`);
+	}
+	return undefined;
 }
 
 export function scanCorpusText(
@@ -616,23 +801,14 @@ export function scanCorpusText(
 	bins: readonly string[],
 	files: readonly CorpusFile[],
 ): CheckResult {
-	const escaped = escapeRegex(name);
-	const quoted = new RegExp(String.raw`["'\x60]` + escaped + String.raw`(?:[/"'\x60]|$)`);
 	for (const file of files) {
-		if (quoted.test(file.text)) {
-			return fail(`${name} referenced by shipped-byte producer ${file.path}`);
-		}
-		for (const bin of bins) {
-			const token = new RegExp(
-				`(^|[^\\w@./-])${escapeRegex(bin)}(?=$|[^\\w@./-])`,
-			);
-			if (token.test(file.text)) {
-				return fail(`bin ${bin} invoked by shipped-byte producer ${file.path}`);
-			}
-		}
+		const result = isTsCorpusPath(file.path)
+			? analyzeTsCorpusFile(name, bins, file)
+			: analyzeScriptCommandText(name, bins, file);
+		if (result !== undefined) return result;
 	}
 	return pass(
-		`no package import, quoted name, or bin token in ${files.length} release/CI corpus files`,
+		`no AST/script-data-flow reference in ${files.length} release/CI corpus files`,
 	);
 }
 
@@ -710,7 +886,53 @@ function asTargetPlan(value: unknown, index: number): SideTargetPlan {
 	};
 }
 
-/** Load release command/staging authority from one immutable checkout. Never reuse live-head imports. */
+export async function readAuthoritySourceBytes(
+	root: string,
+): Promise<Readonly<Record<string, string>>> {
+	const out: Record<string, string> = {};
+	for (const rel of AUTHORITY_REL_PATHS) {
+		const path = join(root, rel);
+		if (!existsSync(path)) throw new Error(`missing authority source ${rel} under ${root}`);
+		out[rel] = await readFile(path, "utf8");
+	}
+	return out;
+}
+
+/** Exact byte compare of release authority sources between two immutable checkouts. */
+export async function compareAuthoritySourceBytes(
+	baseRoot: string,
+	headRoot: string,
+): Promise<{ readonly equal: boolean; readonly detail: string }> {
+	const before = await readAuthoritySourceBytes(baseRoot);
+	const after = await readAuthoritySourceBytes(headRoot);
+	const changed: string[] = [];
+	for (const rel of AUTHORITY_REL_PATHS) {
+		if (before[rel] !== after[rel]) changed.push(rel);
+	}
+	if (changed.length > 0) {
+		return {
+			equal: false,
+			detail: `release authority source bytes changed (${changed.join(", ")}); classifying S before load`,
+		};
+	}
+	return { equal: true, detail: "release authority source bytes identical on base and head" };
+}
+
+/**
+ * SEC-001: never execute live-head or divergent head authority. If authority
+ * bytes differ, fail closed before import. When identical, load only the
+ * immutable trusted base checkout and reuse that module graph for both sides.
+ */
+export async function loadTrustedReleaseAuthority(
+	baseRoot: string,
+	headRoot: string,
+): Promise<SideReleaseAuthority> {
+	const comparison = await compareAuthoritySourceBytes(baseRoot, headRoot);
+	if (!comparison.equal) throw new Error(comparison.detail);
+	return loadSideReleaseAuthority(baseRoot);
+}
+
+/** Load release command/staging authority from one immutable trusted checkout. */
 export async function loadSideReleaseAuthority(root: string): Promise<SideReleaseAuthority> {
 	const resolved = resolve(root);
 	const cached = sideAuthorityCache.get(resolved);
@@ -783,19 +1005,20 @@ export function clearSideReleaseAuthorityCache(): void {
 export async function shippingBuildCommandsForSide(
 	root: string,
 	temp: string,
+	authority?: SideReleaseAuthority,
 ): Promise<readonly { name: string; args: readonly string[] }[]> {
-	const authority = await loadSideReleaseAuthority(root);
-	const commands: { name: string; args: readonly string[] }[] = authority.targetPlans.map((plan) => ({
+	const trusted = authority ?? await loadSideReleaseAuthority(root);
+	const commands: { name: string; args: readonly string[] }[] = trusted.targetPlans.map((plan) => ({
 		name: `compiled:${plan.rustTarget}`,
-		args: authority.hostBundleCommands(plan, temp).compiled,
+		args: trusted.hostBundleCommands(plan, temp).compiled,
 	}));
-	const firstPlan = authority.targetPlans[0];
+	const firstPlan = trusted.targetPlans[0];
 	if (firstPlan === undefined) throw new Error("side TARGET_PLANS is empty");
 	commands.push({
 		name: "runtime-bundle",
-		args: authority.hostBundleCommands(firstPlan, temp).runtimeBundle,
+		args: trusted.hostBundleCommands(firstPlan, temp).runtimeBundle,
 	});
-	const packageJsonPath = join(root, authority.hostPackageDir, "package.json");
+	const packageJsonPath = join(root, trusted.hostPackageDir, "package.json");
 	if (!existsSync(packageJsonPath)) {
 		throw new Error(`side host package.json missing: ${packageJsonPath}`);
 	}
@@ -813,8 +1036,9 @@ export async function shippingBuildCommandsForSide(
 async function shippingBuildCommands(
 	root: string,
 	temp: string,
+	authority: SideReleaseAuthority,
 ): Promise<readonly { name: string; args: readonly string[] }[]> {
-	return shippingBuildCommandsForSide(root, temp);
+	return shippingBuildCommandsForSide(root, temp, authority);
 }
 
 function replaceOutputArgs(args: readonly string[], output: string, metafile: string): string[] {
@@ -907,13 +1131,14 @@ async function buildSideEvidence(
 	side: "base" | "head",
 	root: string,
 	runner: CommandRunner,
+	authority: SideReleaseAuthority,
 ): Promise<readonly BundleEntryEvidence[]> {
 	const scratchRoot = join(root, "target", "deps-r2-meta");
 	await mkdir(scratchRoot, { recursive: true });
 	const temp = await mkdtemp(join(scratchRoot, `${side}-`));
 	try {
 		await installHost(root, runner);
-		const commands = await shippingBuildCommands(root, temp);
+		const commands = await shippingBuildCommands(root, temp, authority);
 		const entries: BundleEntryEvidence[] = [];
 		for (const command of commands) {
 			entries.push({ side, ...await runBuildGraph(root, runner, command.name, command.args, temp) });
@@ -928,16 +1153,18 @@ export async function buildBundleEvidence(
 	baseRoot: string,
 	headRoot: string,
 	runner: CommandRunner,
+	authority?: SideReleaseAuthority,
 ): Promise<BundleEvidence> {
 	try {
+		const trusted = authority ?? await loadTrustedReleaseAuthority(baseRoot, headRoot);
 		const baseDrift = await findUnknownCompileSites(baseRoot);
 		const headDrift = baseRoot === headRoot ? baseDrift : await findUnknownCompileSites(headRoot);
 		const drift = [...new Set([...baseDrift, ...headDrift])];
 		if (drift.length > 0) return { drift: `unknown bun compile/build site(s): ${drift.join(", ")}` };
-		const base = await buildSideEvidence("base", baseRoot, runner);
+		const base = await buildSideEvidence("base", baseRoot, runner, trusted);
 		const head = baseRoot === headRoot
 			? base.map((entry) => ({ ...entry, side: "head" as const }))
-			: await buildSideEvidence("head", headRoot, runner);
+			: await buildSideEvidence("head", headRoot, runner, trusted);
 		return { entries: [...base, ...head] };
 	} catch (error) {
 		return { error: errorText(error) };
@@ -1077,10 +1304,14 @@ function checkE3(
 	}
 }
 
-export async function stagedSourcesForSide(root: string, fs: Fs): Promise<readonly string[]> {
-	const authority = await loadSideReleaseAuthority(root);
+export async function stagedSourcesForSide(
+	root: string,
+	fs: Fs,
+	authority?: SideReleaseAuthority,
+): Promise<readonly string[]> {
+	const trusted = authority ?? await loadSideReleaseAuthority(root);
 	const sources: string[] = [];
-	for (const plan of authority.targetPlans) {
+	for (const plan of trusted.targetPlans) {
 		const common = {
 			plan,
 			version: "0.0.0",
@@ -1108,7 +1339,7 @@ export async function stagedSourcesForSide(root: string, fs: Fs): Promise<readon
 			},
 			bunRuntimePath: join(root, "target/runtime", plan.bunRuntimeName),
 		};
-		for (const input of [...authority.stagedInputs(compiled), ...authority.stagedInputs(runtime)]) {
+		for (const input of [...trusted.stagedInputs(compiled), ...trusted.stagedInputs(runtime)]) {
 			if (input.source.length > 0 && !input.source.startsWith("generated:")) {
 				sources.push(input.source);
 			}
@@ -1117,8 +1348,12 @@ export async function stagedSourcesForSide(root: string, fs: Fs): Promise<readon
 	return sources;
 }
 
-async function stagedSources(root: string, fs: Fs): Promise<readonly string[]> {
-	return stagedSourcesForSide(root, fs);
+async function stagedSources(
+	root: string,
+	fs: Fs,
+	authority: SideReleaseAuthority,
+): Promise<readonly string[]> {
+	return stagedSourcesForSide(root, fs, authority);
 }
 
 export function evaluateStaging(paths: readonly string[], staged: readonly string[]): CheckResult {
@@ -1134,20 +1369,33 @@ function cargoManifestPaths(name: string, graphs: readonly CargoGraph[]): string
 	);
 }
 
+export interface ExpandPathOptions {
+	readonly pinnedReferenceReal?: string;
+}
+
+function logicalUnderReferencesPi(logical: string, rootResolved: string, rootReal: string): boolean {
+	const candidates = [`${rootResolved}${sep}.references${sep}pi`, `${rootReal}${sep}.references${sep}pi`];
+	return candidates.some((prefix) => logical === prefix || logical.startsWith(`${prefix}${sep}`));
+}
+
 /**
- * Staging-path expansion: require an in-repo logical path and reject broken
- * symlinks, but keep external reals so shared outside targets still intersect.
- * Intentional worktree `.references` aliases remain classifiable.
+ * SEC-004: require in-repo logical paths; reject broken symlinks; reject external
+ * reals except the exact `.references/pi` logical subtree backed by the pinned
+ * immutable snapshot realpath.
  */
 export async function expandWithRealpaths(
 	paths: readonly string[],
 	repoRoot: string,
+	options: ExpandPathOptions = {},
 ): Promise<readonly string[]> {
 	const expanded: string[] = [];
 	const rootResolved = resolve(repoRoot);
 	const rootReal = await realpath(repoRoot).catch(() => rootResolved);
+	const pinnedCandidate = options.pinnedReferenceReal;
+	const pinnedReal = pinnedCandidate !== undefined
+		? await realpath(pinnedCandidate).catch(() => resolve(pinnedCandidate))
+		: undefined;
 	for (const path of paths) {
-		// lstat sees broken symlinks; existsSync does not.
 		try {
 			await lstat(path);
 		} catch {
@@ -1164,6 +1412,15 @@ export async function expandWithRealpaths(
 		} catch (error) {
 			throw new Error(`broken or unresolvable path ${logical}: ${errorText(error)}`);
 		}
+		const realInside = pathUnderRoot(real, rootResolved, rootReal);
+		if (!realInside) {
+			const allowedReference = pinnedReal !== undefined
+				&& logicalUnderReferencesPi(logical, rootResolved, rootReal)
+				&& (real === pinnedReal || real.startsWith(`${pinnedReal}${sep}`));
+			if (!allowedReference) {
+				throw new Error(`external realpath rejected: ${logical} -> ${real}`);
+			}
+		}
 		expanded.push(logical, real);
 	}
 	return [...new Set(expanded)];
@@ -1176,15 +1433,18 @@ async function checkE4(
 	head: SideData,
 	e1: CheckResult,
 	fs: Fs,
+	authority: SideReleaseAuthority,
+	reference?: ReferenceProvenance,
 ): Promise<CheckResult> {
 	try {
+		const expandOpts = { pinnedReferenceReal: reference?.snapshotRoot };
 		const stagedLogical = [
-			...await stagedSources(base.root, fs),
-			...await stagedSources(head.root, fs),
+			...await stagedSources(base.root, fs, authority),
+			...await stagedSources(head.root, fs, authority),
 		];
 		const staged = [
-			...await expandWithRealpaths(stagedLogical, base.root),
-			...await expandWithRealpaths(stagedLogical, head.root),
+			...await expandWithRealpaths(stagedLogical, base.root, expandOpts),
+			...await expandWithRealpaths(stagedLogical, head.root, expandOpts),
 		];
 		if (spec.kind === "tool") {
 			return spec.name === "bun-runtime"
@@ -1202,8 +1462,8 @@ async function checkE4(
 				locations.head.root,
 			];
 			const resolvedPackages = [
-				...await expandWithRealpaths(packagePaths, base.root),
-				...await expandWithRealpaths(packagePaths, head.root),
+				...await expandWithRealpaths(packagePaths, base.root, expandOpts),
+				...await expandWithRealpaths(packagePaths, head.root, expandOpts),
 			];
 			return evaluateStaging(resolvedPackages, staged);
 		}
@@ -1216,8 +1476,8 @@ async function checkE4(
 			return undecidable(`${spec.name} manifest directory cannot be mapped`);
 		}
 		const resolvedManifests = [
-			...await expandWithRealpaths(manifests, base.root),
-			...await expandWithRealpaths(manifests, head.root),
+			...await expandWithRealpaths(manifests, base.root, expandOpts),
+			...await expandWithRealpaths(manifests, head.root, expandOpts),
 		];
 		return evaluateStaging(resolvedManifests, staged);
 	} catch (error) {
@@ -1254,6 +1514,8 @@ async function classifyLoaded(
 	head: SideData,
 	bundles: BundleEvidence,
 	fs: Fs,
+	authority: SideReleaseAuthority,
+	reference?: ReferenceProvenance,
 ): Promise<readonly Verdict[]> {
 	const verdicts: Verdict[] = [];
 	for (const spec of specs) {
@@ -1280,7 +1542,7 @@ async function classifyLoaded(
 			E1: e1,
 			E2: checkE2(spec, locations, bundles),
 			E3: checkE3(spec, locations, base, head),
-			E4: await checkE4(spec, locations, base, head, e1, fs),
+			E4: await checkE4(spec, locations, base, head, e1, fs, authority, reference),
 		}));
 	}
 	return verdicts;
@@ -1317,10 +1579,106 @@ export async function resolveCommitSha(
 	return sha;
 }
 
+export async function fingerprintReferenceSnapshot(snapshotRoot: string, sha: string): Promise<string> {
+	const hash = createHash("sha256");
+	hash.update(sha);
+	hash.update("\0");
+	const provenanceFiles = [
+		"package-lock.json",
+		"package.json",
+		"packages/coding-agent/package.json",
+		"packages/agent/package.json",
+		"packages/ai/package.json",
+		"packages/tui/package.json",
+	];
+	for (const rel of provenanceFiles) {
+		hash.update(rel);
+		hash.update("\0");
+		try {
+			hash.update(await readFile(join(snapshotRoot, rel)));
+		} catch {
+			hash.update("<missing>");
+		}
+		hash.update("\0");
+	}
+	const files = await walkFiles(snapshotRoot);
+	for (const rel of [...files].sort()) {
+		hash.update(rel);
+		hash.update("\0");
+	}
+	hash.update(String(files.length));
+	return hash.digest("hex");
+}
+
+/**
+ * SEC-002: verify canonical pinned reference SHA + clean state, then freeze one
+ * content-addressed immutable snapshot of the verified tree (including installed
+ * deps needed for host graph builds). Never symlink the live `.references/pi`.
+ */
+export async function ensurePinnedReferenceSnapshot(
+	repoRoot: string,
+	runner: CommandRunner,
+): Promise<ReferenceProvenance> {
+	const live = join(repoRoot, ".references/pi");
+	if (!existsSync(live)) {
+		throw new Error("missing .references/pi; cannot build pinned reference snapshot");
+	}
+	const sha = await resolveCommitSha(live, "HEAD", runner);
+	if (sha !== CANONICAL_REFERENCE_SHA) {
+		throw new Error(`.references/pi HEAD is ${sha}, expected ${CANONICAL_REFERENCE_SHA}`);
+	}
+	const status = await runner.run("git", ["status", "--porcelain", "--untracked-files=all"], {
+		cwd: live,
+		rejectOnError: false,
+		timeoutMs: COMMAND_TIMEOUT_MS,
+		maxOutputBytes: MAX_OUTPUT_BYTES,
+	});
+	if (status.exitCode !== 0) {
+		throw new Error(`git status failed for .references/pi: ${status.stderr.slice(0, 500)}`);
+	}
+	if (status.stdout.trim().length > 0) {
+		throw new Error(
+			`.references/pi worktree is dirty; refusing live reference use:\n${status.stdout.trim()}`,
+		);
+	}
+	const snapshotRoot = join(repoRoot, "target", "deps-r2-refs", CANONICAL_REFERENCE_SHA);
+	const marker = join(snapshotRoot, ".deps-r2-reference-sha");
+	const liveReal = await realpath(live);
+	if (existsSync(marker)) {
+		const marked = (await readFile(marker, "utf8")).trim();
+		if (marked !== sha) {
+			await rm(snapshotRoot, { recursive: true, force: true });
+		}
+	}
+	if (!existsSync(marker)) {
+		await rm(snapshotRoot, { recursive: true, force: true });
+		await mkdir(dirname(snapshotRoot), { recursive: true });
+		await cp(liveReal, snapshotRoot, {
+			recursive: true,
+			filter: (source) => {
+				const base = basename(source);
+				return base !== ".git";
+			},
+		});
+		await writeFile(marker, `${sha}\n`, "utf8");
+	}
+	const fingerprint = await fingerprintReferenceSnapshot(snapshotRoot, sha);
+	return { sha, snapshotRoot, fingerprint };
+}
+
+async function bindPinnedReference(root: string, snapshot: ReferenceProvenance): Promise<void> {
+	const dest = join(root, ".references/pi");
+	if (existsSync(dest)) return;
+	await mkdir(join(root, ".references"), { recursive: true });
+	// Symlink the immutable snapshot only — never the live `.references/pi`.
+	await symlink(snapshot.snapshotRoot, dest, "dir");
+}
+
 export async function materializeBase(
 	repoRoot: string,
 	base: string,
 	runner: CommandRunner,
+	reference?: ReferenceProvenance,
 ): Promise<MaterializedBase> {
 	const sha = await resolveCommitSha(repoRoot, base, runner);
 	const scratchRoot = join(repoRoot, "target", "deps-r2-worktrees");
@@ -1331,10 +1689,8 @@ export async function materializeBase(
 	try {
 		await commandOk(runner, "git", ["worktree", "add", "--detach", root, sha], repoRoot);
 		added = true;
-		const reference = join(repoRoot, ".references/pi");
-		if (existsSync(reference) && !existsSync(join(root, ".references/pi"))) {
-			await mkdir(join(root, ".references"), { recursive: true });
-			await symlink(reference, join(root, ".references/pi"), "dir");
+		if (reference !== undefined) {
+			await bindPinnedReference(root, reference);
 		}
 		return {
 			root,
@@ -1534,25 +1890,35 @@ export async function classify(
 	let headMaterialized: MaterializedBase | undefined;
 	let reportedBase = options.base;
 	let reportedHead = "HEAD";
+	let reference: ReferenceProvenance | undefined;
 	let outcome: { report: ExposureReport; failedClosed: boolean } | undefined;
 	try {
 		reportedBase = await resolveCommitSha(repoRoot, options.base, runner);
 		reportedHead = await resolveCommitSha(repoRoot, "HEAD", runner);
+		if (options.reference === "skip") {
+			reference = undefined;
+		} else if (options.reference !== undefined) {
+			reference = options.reference;
+		} else {
+			reference = await ensurePinnedReferenceSnapshot(repoRoot, runner);
+		}
 		const headFingerprintBefore = await fingerprintHeadEvidence(repoRoot);
+		const referenceFingerprintBefore = reference?.fingerprint;
 		let baseRoot: string;
 		let headRoot: string;
 		if (options.identity) {
 			// Hermetic/tests: caller already isolated repoRoot; never used by ordinary CLI.
 			baseRoot = repoRoot;
 			headRoot = repoRoot;
+			if (reference !== undefined) await bindPinnedReference(baseRoot, reference);
 		} else {
 			await assertRelevantWorktreeClean(repoRoot, runner);
-			headMaterialized = await materializeBase(repoRoot, reportedHead, runner);
+			headMaterialized = await materializeBase(repoRoot, reportedHead, runner, reference);
 			headRoot = headMaterialized.root;
 			if (reportedBase === reportedHead) {
 				baseRoot = headRoot;
 			} else {
-				baseMaterialized = await materializeBase(repoRoot, reportedBase, runner);
+				baseMaterialized = await materializeBase(repoRoot, reportedBase, runner, reference);
 				baseRoot = baseMaterialized.root;
 			}
 		}
@@ -1561,23 +1927,31 @@ export async function classify(
 			: [...options.inputs];
 		const specs = [...new Set(rawInputs)].sort().map(parseInputSpec);
 		if (specs.length === 0) {
-			outcome = { report: reportOf(reportedBase, reportedHead, [], now), failedClosed: false };
+			outcome = { report: reportOf(reportedBase, reportedHead, [], now, reference), failedClosed: false };
 		} else {
 			const needCargo = specs.some((spec) => spec.kind === "cargo");
 			try {
+				const authority = await loadTrustedReleaseAuthority(baseRoot, headRoot);
 				const base = await loadSide(baseRoot, runner, needCargo);
 				const head = baseRoot === headRoot ? base : await loadSide(headRoot, runner, needCargo);
-				const bundles = await buildBundleEvidence(baseRoot, headRoot, runner);
-				const verdicts = await classifyLoaded(specs, base, head, bundles, fs);
+				const bundles = await buildBundleEvidence(baseRoot, headRoot, runner, authority);
+				const verdicts = await classifyLoaded(specs, base, head, bundles, fs, authority, reference);
 				const headFingerprintAfter = await fingerprintHeadEvidence(repoRoot);
-				if (headFingerprintBefore !== headFingerprintAfter) {
-					const detail = "head evidence drifted during classification; concurrent work mixed E1-E4 inputs";
+				const referenceFingerprintAfter = reference === undefined
+					? undefined
+					: await fingerprintReferenceSnapshot(reference.snapshotRoot, reference.sha);
+				if (
+					headFingerprintBefore !== headFingerprintAfter
+					|| referenceFingerprintBefore !== referenceFingerprintAfter
+				) {
+					const detail = "head/reference evidence drifted during classification; concurrent work mixed E1-E4 inputs";
 					outcome = {
 						report: reportOf(
 							reportedBase,
 							reportedHead,
 							specs.map((spec) => allUndecidable(spec.raw, detail)),
 							now,
+							reference,
 						),
 						failedClosed: true,
 					};
@@ -1586,7 +1960,7 @@ export async function classify(
 						CHECK_NAMES.some((name) => verdict.checks[name].status === "undecidable"),
 					);
 					outcome = {
-						report: reportOf(reportedBase, reportedHead, verdicts, now),
+						report: reportOf(reportedBase, reportedHead, verdicts, now, reference),
 						failedClosed,
 					};
 				}
@@ -1596,6 +1970,7 @@ export async function classify(
 					reportedHead,
 					specs.map((spec) => allUndecidable(spec.raw, `loader failure: ${errorText(error)}`)),
 					now,
+					reference,
 				);
 				outcome = { report, failedClosed: true };
 			}
@@ -1603,7 +1978,7 @@ export async function classify(
 	} catch (error) {
 		const detail = `classification catastrophe: ${errorText(error)}`;
 		const verdicts = requestedForCatastrophe(options.inputs).map((input) => allUndecidable(input, detail));
-		outcome = { report: reportOf(reportedBase, reportedHead, verdicts, now), failedClosed: true };
+		outcome = { report: reportOf(reportedBase, reportedHead, verdicts, now, reference), failedClosed: true };
 	} finally {
 		const cleanups: Array<Promise<void>> = [
 			cleanupMaterialized(baseMaterialized),
@@ -1621,12 +1996,13 @@ export async function classify(
 					reportedHead,
 					inputs.map((input) => allUndecidable(input, detail)),
 					now,
+					reference,
 				),
 				failedClosed: true,
 			};
 		}
 	}
-	return outcome ?? { report: reportOf(reportedBase, reportedHead, [], now), failedClosed: true };
+	return outcome ?? { report: reportOf(reportedBase, reportedHead, [], now, reference), failedClosed: true };
 }
 
 function stableReportEvidence(verdict: Verdict): string {
@@ -1703,7 +2079,8 @@ export async function selfTest(
 ): Promise<readonly string[]> {
 	const normalRunner = options.runner ?? new SpawnRunner();
 	// Never bun install/build in the live workspace: both sides run inside an isolated checkout.
-	const isolated = await materializeBase(repoRoot, "HEAD", normalRunner);
+	const reference = await ensurePinnedReferenceSnapshot(repoRoot, normalRunner);
+	const isolated = await materializeBase(repoRoot, "HEAD", normalRunner, reference);
 	try {
 		const normal = await classify({
 			base: "HEAD",
@@ -1711,6 +2088,7 @@ export async function selfTest(
 			repoRoot: isolated.root,
 			runner: normalRunner,
 			identity: true,
+			reference,
 			now: () => new Date("2026-08-26T00:00:00.000Z"),
 		});
 		const expected: Readonly<Record<string, ExposureClass>> = {
@@ -1735,6 +2113,7 @@ export async function selfTest(
 			repoRoot: isolated.root,
 			runner: new CrashingBuildRunner(normalRunner),
 			identity: true,
+			reference,
 			now: () => new Date("2026-08-26T00:00:00.000Z"),
 		});
 		const crashVerdict = crashed.report.verdicts[0];

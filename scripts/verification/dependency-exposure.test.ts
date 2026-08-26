@@ -14,6 +14,7 @@ import {
 	cargoLockChangedNames,
 	classify,
 	clearSideReleaseAuthorityCache,
+	compareAuthoritySourceBytes,
 	deriveAutoFromTexts,
 	escapeMarkdownCell,
 	evaluateCargoKinds,
@@ -29,7 +30,7 @@ import {
 	inputMatchesMetafile,
 	listCargoTomlPaths,
 	listHeadEvidencePaths,
-	loadSideReleaseAuthority,
+	loadTrustedReleaseAuthority,
 	materializeBase,
 	parseCargoLockIdentities,
 	parseCargoMetadata,
@@ -244,6 +245,7 @@ describe("dependency-exposure unit checks", () => {
 			repoRoot: REPO_ROOT,
 			runner: cargoReject,
 			identity: true,
+			reference: "skip",
 			now: () => new Date("2026-08-26T00:00:00.000Z"),
 		});
 		expect(cargo.failedClosed).toBe(true);
@@ -262,6 +264,7 @@ describe("dependency-exposure unit checks", () => {
 			repoRoot: REPO_ROOT,
 			runner: buildReject,
 			identity: true,
+			reference: "skip",
 			now: () => new Date("2026-08-26T00:00:00.000Z"),
 		});
 		expect(npm.failedClosed).toBe(true);
@@ -494,6 +497,7 @@ describe("dependency-exposure fail-closed integration", () => {
 			repoRoot: REPO_ROOT,
 			runner,
 			identity: false,
+			reference: "skip",
 			now: () => new Date("2026-08-26T00:00:00.000Z"),
 		});
 		expect(result.failedClosed).toBe(true);
@@ -534,6 +538,7 @@ describe("dependency-exposure fail-closed integration", () => {
 				repoRoot: isolated.root,
 				runner,
 				identity: true,
+			reference: "skip",
 				now: () => new Date("2026-08-26T00:00:00.000Z"),
 			});
 		} finally {
@@ -620,7 +625,7 @@ dependencies = [
 		expect(() => parseCargoLockIdentities(`[[package]]\nversion = "1.0.0"\n`)).toThrow(/unclassifiable|malformed/);
 	});
 
-	test("C: realpath staging rejects broken and escaping symlinks", async () => {
+	test("C/SEC-004: realpath rejects broken/external except pinned .references/pi snapshot", async () => {
 		const root = tempDir("pi-deps-r2-realpath-");
 		mkdirSync(join(root, "inside"), { recursive: true });
 		writeFileSync(join(root, "inside", "file.txt"), "ok");
@@ -630,20 +635,19 @@ dependencies = [
 		await expect(expandWithRealpaths([broken], root)).rejects.toThrow(/broken|unresolvable/);
 		const escape = join(root, "escape-link");
 		symlinkSync("/tmp", escape);
-		await expect(resolvePathPair(escape, root)).rejects.toThrow(/escapes repository root|ambiguous/);
-		// Staging expansion keeps in-repo logical paths and external reals so
-		// intentional worktree `.references` aliases remain classifiable.
-		const expandedEscape = await expandWithRealpaths([escape], root);
-		expect(expandedEscape).toContain(resolve(escape));
-		expect(expandedEscape.some((path) => path === resolve("/tmp") || path.startsWith(`${resolve("/tmp")}/`))).toBe(true);
-		const outside = tempDir("pi-deps-r2-outside-");
-		mkdirSync(join(outside, "examples"), { recursive: true });
-		writeFileSync(join(outside, "examples", "x.txt"), "x");
+		await expect(resolvePathPair(escape, root)).rejects.toThrow(/escapes repository root|ambiguous|external realpath/);
+		await expect(expandWithRealpaths([escape], root)).rejects.toThrow(/external realpath rejected/);
+		const pinned = tempDir("pi-deps-r2-pinned-ref-");
+		mkdirSync(join(pinned, "examples"), { recursive: true });
+		writeFileSync(join(pinned, "examples", "x.txt"), "x");
 		mkdirSync(join(root, ".references"), { recursive: true });
-		symlinkSync(outside, join(root, ".references", "pi"));
-		const refs = await expandWithRealpaths([join(root, ".references/pi/examples")], root);
+		symlinkSync(pinned, join(root, ".references", "pi"));
+		const refs = await expandWithRealpaths([join(root, ".references/pi/examples")], root, {
+			pinnedReferenceReal: pinned,
+		});
 		expect(refs).toContain(resolve(root, ".references/pi/examples"));
-		expect(refs).toContain(resolve(outside, "examples"));
+		expect(refs).toContain(resolve(pinned, "examples"));
+		await expect(expandWithRealpaths([join(root, ".references/pi/examples")], root)).rejects.toThrow(/external realpath rejected/);
 		const ok = await resolvePathPair(join(root, "inside"), root);
 		expect(ok.real.includes("inside")).toBe(true);
 	});
@@ -660,6 +664,7 @@ dependencies = [
 				return { exitCode: 0, stdout: "", stderr: "" };
 			}),
 			identity: true,
+			reference: "skip",
 			now: () => new Date("2026-08-26T00:00:00.000Z"),
 		});
 		expect(result.report.base).toBe("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
@@ -706,6 +711,7 @@ describe("dependency-exposure review wave-2 regressions", () => {
 				return { exitCode: 0, stdout: "", stderr: "" };
 			}),
 			identity: false,
+			reference: "skip",
 			now: () => new Date("2026-08-26T00:00:00.000Z"),
 		});
 		expect(dirty.failedClosed).toBe(true);
@@ -737,6 +743,7 @@ describe("dependency-exposure review wave-2 regressions", () => {
 			repoRoot: REPO_ROOT,
 			runner,
 			identity: false,
+			reference: "skip",
 			now: () => new Date("2026-08-26T00:00:00.000Z"),
 		});
 		expect(/^[0-9a-f]{40}$/i.test(result.report.head)).toBe(true);
@@ -778,13 +785,12 @@ describe("dependency-exposure review wave-2 regressions", () => {
 	});
 });
 
-describe("dependency-exposure side-local authority", () => {
+describe("dependency-exposure SEC-001 trusted authority", () => {
 	function writeAuthority(
 		root: string,
-		options: { readonly exposeEvil: boolean; readonly entry: string },
+		options: { readonly exposeEvil: boolean; readonly entry: string; readonly stageMarker?: string },
 	): void {
-		mkdirSync(join(root, "scripts/release"), { recursive: true });
-		mkdirSync(join(root, "packages/extension-host"), { recursive: true });
+		writeMinimalReleaseAuthority(root, options.entry);
 		mkdirSync(join(root, "node_modules/evil-dep"), { recursive: true });
 		writeFileSync(join(root, "node_modules/evil-dep/package.json"), JSON.stringify({ name: "evil-dep", version: "1.0.0" }));
 		writeFileSync(
@@ -795,51 +801,38 @@ describe("dependency-exposure side-local authority", () => {
 				},
 			}),
 		);
-		writeFileSync(
-			join(root, "scripts/release/targets.ts"),
-			`export const TARGET_PLANS = [{
-  rustTarget: "x86_64-unknown-linux-gnu",
-  bunTarget: "bun-linux-x64-baseline",
-  piBinaryName: "pi",
-  hostBinaryName: "pi-extension-host",
-  bunRuntimeName: "bun",
-  hostBundleName: "pi-extension-host.js",
-}];
-`,
-		);
-		writeFileSync(
-			join(root, "scripts/release/host.ts"),
-			`export const HOST_PACKAGE_DIR = "packages/extension-host";
-export function hostBundleCommands(plan, outDir) {
-  return {
-    compiled: ["build", "${options.entry}", "--compile", "--outfile", outDir + "/" + plan.hostBinaryName],
-    runtimeBundle: ["build", "${options.entry}", "--outfile", outDir + "/" + plan.hostBundleName],
-  };
-}
-`,
-		);
 		const extra = options.exposeEvil
 			? `{ kind: "extra", source: inputs.repoRoot + "/node_modules/evil-dep", destRel: "evil-dep", optional: false },`
 			: "";
+		const marker = options.stageMarker ?? "";
 		writeFileSync(
 			join(root, "scripts/release/stage.ts"),
 			`export function stagedInputs(inputs) {
   return [
     { kind: "rust-binary", source: inputs.piBinaryPath, destRel: inputs.plan.piBinaryName, optional: false },
     ${extra}
-    { kind: "manifest", source: "generated:release.json", destRel: "release.json", optional: false },
+    { kind: "manifest", source: "generated:release.json${marker}", destRel: "release.json", optional: false },
   ];
 }
 `,
 		);
 	}
 
-	test("P1: base staging/command exposes dep that head removes; live-head authority would false-E", async () => {
+	test("SEC-001: authority byte drift classifies S before load; identical bytes use trusted base for both", async () => {
 		const base = tempDir("pi-deps-r2-auth-base-");
-		const head = tempDir("pi-deps-r2-auth-head-");
+		const headSame = tempDir("pi-deps-r2-auth-head-same-");
+		const headDrift = tempDir("pi-deps-r2-auth-head-drift-");
 		writeAuthority(base, { exposeEvil: true, entry: "./src/with-evil.ts" });
-		writeAuthority(head, { exposeEvil: false, entry: "./src/main.ts" });
+		writeAuthority(headSame, { exposeEvil: true, entry: "./src/with-evil.ts" });
+		writeAuthority(headDrift, { exposeEvil: false, entry: "./src/main.ts", stageMarker: "-head" });
 
+		const drifted = await compareAuthoritySourceBytes(base, headDrift);
+		expect(drifted.equal).toBe(false);
+		await expect(loadTrustedReleaseAuthority(base, headDrift)).rejects.toThrow(/authority source bytes changed/);
+
+		const same = await compareAuthoritySourceBytes(base, headSame);
+		expect(same.equal).toBe(true);
+		const authority = await loadTrustedReleaseAuthority(base, headSame);
 		const baseSources = await stagedSourcesForSide(base, {
 			mkdir: async () => {},
 			rm: async () => {},
@@ -850,8 +843,8 @@ export function hostBundleCommands(plan, outDir) {
 			chmod: async () => {},
 			stat: async () => ({ isFile: true, isDir: false, size: 0, mode: 0 }),
 			readdir: async () => [],
-		});
-		const headSources = await stagedSourcesForSide(head, {
+		}, authority);
+		const headSources = await stagedSourcesForSide(headSame, {
 			mkdir: async () => {},
 			rm: async () => {},
 			writeFile: async () => {},
@@ -861,24 +854,39 @@ export function hostBundleCommands(plan, outDir) {
 			chmod: async () => {},
 			stat: async () => ({ isFile: true, isDir: false, size: 0, mode: 0 }),
 			readdir: async () => [],
-		});
+		}, authority);
 		const evil = join(base, "node_modules/evil-dep");
 		expect(baseSources.some((path) => path.includes("node_modules/evil-dep"))).toBe(true);
-		expect(headSources.some((path) => path.includes("node_modules/evil-dep"))).toBe(false);
-		// Side-local union preserves base exposure.
 		expect(evaluateStaging([evil], [...baseSources, ...headSources]).status).toBe("fail");
-		// Reusing only head authority against the base path would false-E.
-		expect(evaluateStaging([evil], headSources).status).toBe("pass");
+		const commands = await shippingBuildCommandsForSide(base, join(base, "out"), authority);
+		expect(commands.some((command) => command.args.includes("./src/with-evil.ts"))).toBe(true);
 
-		const baseCommands = await shippingBuildCommandsForSide(base, join(base, "out"));
-		const headCommands = await shippingBuildCommandsForSide(head, join(head, "out"));
-		expect(baseCommands.some((command) => command.args.includes("./src/with-evil.ts"))).toBe(true);
-		expect(headCommands.some((command) => command.args.includes("./src/with-evil.ts"))).toBe(false);
-		expect(headCommands.some((command) => command.args.includes("./src/main.ts"))).toBe(true);
-		// Loading each side's own modules keeps authorities distinct.
-		const baseAuth = await loadSideReleaseAuthority(base);
-		const headAuth = await loadSideReleaseAuthority(head);
-		expect(baseAuth.root).not.toBe(headAuth.root);
+		const result = await classify({
+			base: "HEAD",
+			inputs: ["npm:evil-dep"],
+			repoRoot: base,
+			runner: new RecordingRunner((call) => {
+				if (call.command === "git" && call.args[0] === "rev-parse") {
+					return { exitCode: 0, stdout: "dddddddddddddddddddddddddddddddddddddddd\n", stderr: "" };
+				}
+				return { exitCode: 0, stdout: "", stderr: "" };
+			}),
+			identity: true,
+			reference: "skip",
+			now: () => new Date("2026-08-26T00:00:00.000Z"),
+		});
+		// Fixture lacks full release corpus/graphs; loader/authority path must remain fail-closed S when probes fail,
+		// and must not execute divergent head authority modules.
+		expect(result.report.overall === "S" || result.failedClosed).toBe(true);
+	});
+});
+
+describe("dependency-exposure SEC-002/006", () => {
+	test("SEC-006 documents operational disk quota outside in-process enforcement", async () => {
+		const source = await Bun.file(new URL("./dependency-exposure.ts", import.meta.url)).text();
+		expect(source).toMatch(/Operational disk quota \(SEC-006\)/);
+		expect(source).toMatch(/ENOSPC/);
+		expect(source).toMatch(/infrastructure-owned/);
 	});
 });
 
@@ -917,6 +925,7 @@ describe("dependency-exposure platform-gated live probes", () => {
 			repoRoot: REPO_ROOT,
 			runner,
 			identity: true,
+			reference: "skip",
 			now: () => new Date("2026-08-26T00:00:00.000Z"),
 		});
 		expect(/^[0-9a-f]{40}$/i.test(result.report.base)).toBe(true);
