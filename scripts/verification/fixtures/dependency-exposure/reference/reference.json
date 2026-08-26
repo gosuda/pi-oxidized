@@ -1,0 +1,137 @@
+{
+	"schema": "pi.deps.exposure-reference.v1",
+	"capturedAt": "2026-08-26T19:19:35.668Z",
+	"captureHead": "b90362dc54dcc6f13650eae00c30829d9f137829",
+	"relevantTreeStatus": "M package.json",
+	"metafile": {
+		"projectionPath": "metafile-projection.json",
+		"sha256": "b2a700701ce4092d90690a4fe530b562fa0bc7ec9266586ce4ed81adad809afb",
+		"entry": "./src/main.ts",
+		"hostDirRel": "packages/extension-host",
+		"argv": [
+			"build",
+			"./src/main.ts",
+			"--compile",
+			"--minify",
+			"--compile-autoload-tsconfig",
+			"--compile-autoload-package-json",
+			"--target",
+			"bun-linux-x64-baseline",
+			"--outfile",
+			"/home/alpha/harness/pi-oxidized/scripts/verification/fixtures/dependency-exposure/reference/.capture-staging/pi-extension-host/pi-extension-host",
+			"--metafile=/home/alpha/harness/pi-oxidized/scripts/verification/fixtures/dependency-exposure/reference/.capture-staging/metafile.json"
+		],
+		"metafileSha256": "65ec0bca223646cf67ebb23c3de72caf1e54919f5b13e275ff03e4768d6ef51f"
+	},
+	"cargo": {
+		"projectionPath": "cargo-graph-projection.json",
+		"sha256": "1e0bca6335a8fdbfd1056e5d990312c20dafafcef039a41410b6ee869538c723",
+		"argv": [
+			"metadata",
+			"--format-version",
+			"1",
+			"--locked",
+			"--offline",
+			"--all-features"
+		]
+	},
+	"npmSurfaces": [
+		{
+			"path": "package.json",
+			"sha256": "9181983b7a563952579639fbcc59170b5e09ef135ba524fb9329f3395eb7c91b",
+			"packageName": "pi-oxidized",
+			"depFields": {
+				"dependencies": [
+					"ignore"
+				],
+				"optionalDependencies": [],
+				"peerDependencies": [],
+				"devDependencies": [
+					"@types/bun",
+					"typescript"
+				]
+			}
+		},
+		{
+			"path": "packages/extension-host/package.json",
+			"sha256": "f7e4f06be5f2e366e9a55c399d8826a2343133fa43fca251c67ba0a7d41278d1",
+			"packageName": "@earendil-works/pi-extension-host",
+			"depFields": {
+				"dependencies": [
+					"@earendil-works/pi-tui-protocol",
+					"jiti",
+					"typebox"
+				],
+				"optionalDependencies": [],
+				"peerDependencies": [],
+				"devDependencies": [
+					"@earendil-works/pi-agent-core",
+					"@earendil-works/pi-ai",
+					"@earendil-works/pi-coding-agent",
+					"@earendil-works/pi-tui",
+					"@types/bun",
+					"typebox",
+					"typescript"
+				]
+			}
+		},
+		{
+			"path": "packages/pi-tui-protocol/package.json",
+			"sha256": "0970f6c0830adf5dcbb7d08bf2ddbd64bcc90206985dd382bd973295d3bcd524",
+			"packageName": "@earendil-works/pi-tui-protocol",
+			"depFields": {
+				"dependencies": [],
+				"optionalDependencies": [],
+				"peerDependencies": [],
+				"devDependencies": [
+					"@types/bun",
+					"typescript"
+				]
+			}
+		}
+	],
+	"cargoFiles": [
+		{
+			"path": "Cargo.lock",
+			"sha256": "eb6aabafaa9afbfd62c41d9f36e6f11b811a8f32ef66c5ea8b5b1b90bc4ec898"
+		},
+		{
+			"path": "Cargo.toml",
+			"sha256": "71c07d5155a329f0c15c26ab737b573c2aee761aaa95543a48068aeb107c115b"
+		},
+		{
+			"path": "crates/pi-agent/Cargo.toml",
+			"sha256": "f67cbeb381bb39a9448c969b19134bbe94ab4d97f0bbf1570d47287bad00eabf"
+		},
+		{
+			"path": "crates/pi-ai/Cargo.toml",
+			"sha256": "ff62d6c78750fd4d2967850b47e8fda519abea686c707b27afeb160ec47c2c19"
+		},
+		{
+			"path": "crates/pi-ext/Cargo.toml",
+			"sha256": "190e724583c7a7583731b40a9b1d3d1ce7e8c4e6dbdaeaebe4eafe596a843587"
+		},
+		{
+			"path": "crates/pi-tui/Cargo.toml",
+			"sha256": "c47cbdc6d0b1d8751559cc50b6980a28d876548fdd8d0a5ec6e3b450dcc028e3"
+		},
+		{
+			"path": "crates/pi/Cargo.toml",
+			"sha256": "fbc6c1316462c1ba8395c5226a70c64317879ebd2d764b409ed3fbda1568f292"
+		}
+	],
+	"authority": [
+		{
+			"path": "scripts/release/host.ts",
+			"sha256": "a55843b0616a552e8843a21ffec4dcc88e3ae5bec09f04c954c0756a4f9d8e43"
+		},
+		{
+			"path": "scripts/release/targets.ts",
+			"sha256": "31f45ee4678ca41ecc28c0a88b153a02326fc3f9c7c6d3b6276d72d95f826c21"
+		},
+		{
+			"path": "scripts/release/stage.ts",
+			"sha256": "c7ca1a81197ae852f97f2cf2aa8e387b27c596856d393c604ddd54d59b59cba6"
+		}
+	]
+}

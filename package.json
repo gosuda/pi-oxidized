@@ -15,6 +15,7 @@
 		"package-release:dry": "bun run scripts/package-release.ts --dry-run",
 		"verify:alignment": "bun run scripts/verification/alignment.ts",
 		"verify:compatibility": "bun run scripts/verification/compat-matrix.ts",
+		"verify:dependency-exposure": "bun run scripts/verification/dependency-exposure.ts",
 		"verify:e2e": "bun run scripts/verification/e2e-smoke.ts",
 		"verify:map-ledger": "bun run scripts/verification/map.ts",
 		"verify:fog": "bun run scripts/verification/fog.ts",
