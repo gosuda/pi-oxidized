@@ -19,6 +19,7 @@
  *   --no-cargo               skip cargo build, but still compile host and archive
  *   --no-handshake           skip the host `hello` handshake verification
  *   --source-date-epoch <s>  override SOURCE_DATE_EPOCH for archive mtimes
+ *   --runtime-cache <dir>   offline cache for pinned Bun runtime assets
  *
  * Verification check 13 calls for, from the unpacked archive:
  *   - `pi --version` (binary runs and reports the workspace version)
@@ -135,7 +136,12 @@ async function main(): Promise<void> {
 				);
 			} else {
 				process.stdout.write(`  Provisioning checksum-verified Bun runtime ${args.plan.bunTarget}...\n`);
-				await provisionBunRuntime({ plan: args.plan, destination: bunRuntimePath, fs });
+				await provisionBunRuntime({
+					plan: args.plan,
+					destination: bunRuntimePath,
+					cacheDir: args.runtimeCache,
+					fs,
+				});
 			}
 		}
 

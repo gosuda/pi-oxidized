@@ -1,7 +1,7 @@
 import { dirname } from "node:path";
 
 import { decodeZipArchive, sha256Bytes } from "./archive.ts";
-import { realFs, type Fs } from "./runner.ts";
+import { realFs, safeJoinPath, type Fs } from "./runner.ts";
 import type { RustTarget, TargetPlan } from "./targets.ts";
 
 /** Bun version embedded in runtime-bundle release archives. */
@@ -92,24 +92,43 @@ export type RuntimeFetcher = (url: string) => Promise<RuntimeFetchResponse>;
 export interface ProvisionBunRuntimeOptions {
 	readonly plan: TargetPlan;
 	readonly destination: string;
+	/**
+	 * Offline pre-cache directory consulted BEFORE any fetch: the pinned
+	 * archive is read from `safeJoinPath(cacheDir, asset.fileName)`, and an
+	 * absent or unreadable entry falls through to the network. When set, any
+	 * fetch failure (non-OK response or a throwing fetcher) is wrapped into a
+	 * {@link BunRuntimeProvisionError} naming both the expected cache path and
+	 * the asset filename. Undefined keeps the online path unchanged.
+	 *
+	 * Accepted Windows cache contract (narrow; recorded in
+	 * https://github.com/metaphorics/pi-oxidized/issues/110#issuecomment-5426692845):
+	 * every cache byte is checksum-verified against the pinned sha256 before
+	 * extraction, so a path rebind can only yield the pinned bytes or the
+	 * identical `checksum mismatch` rejection; no native no-reparse handle is
+	 * taken.
+	 */
+	readonly cacheDir?: string;
+	/**
+	 * Checksum seam for focused tests; defaults to {@link sha256Bytes}. Needed
+	 * because the pinned official archive bytes are unforgeable offline.
+	 */
+	readonly digest?: (bytes: Uint8Array) => string;
 	readonly fs?: Fs;
 	readonly fetcher?: RuntimeFetcher;
 }
 
-/** Download, checksum, and extract the target-matching Bun executable. */
-export async function provisionBunRuntime(
+/**
+ * Verify, extract, and write one runtime archive. Cache hits and downloads
+ * share this path so corrupted bytes fail byte-identically at either source.
+ */
+async function installRuntimeArchive(
+	archive: Uint8Array,
+	asset: BunRuntimeAsset,
 	options: ProvisionBunRuntimeOptions,
+	fs: Fs,
+	digest: (bytes: Uint8Array) => string,
 ): Promise<string> {
-	const asset = bunRuntimeAsset(options.plan);
-	const fetcher = options.fetcher ?? ((url: string) => fetch(url));
-	const response = await fetcher(asset.url);
-	if (!response.ok) {
-		throw new BunRuntimeProvisionError(
-			`failed to download ${asset.url}: HTTP ${response.status}`,
-		);
-	}
-	const archive = new Uint8Array(await response.arrayBuffer());
-	const actualSha256 = sha256Bytes(archive);
+	const actualSha256 = digest(archive);
 	if (actualSha256 !== asset.sha256) {
 		throw new BunRuntimeProvisionError(
 			`checksum mismatch for ${asset.fileName}: expected ${asset.sha256}, got ${actualSha256}`,
@@ -124,11 +143,52 @@ export async function provisionBunRuntime(
 		);
 	}
 
-	const fs = options.fs ?? realFs;
 	await fs.mkdir(dirname(options.destination), { recursive: true });
 	await fs.writeFile(options.destination, runtime.data);
 	if (!options.plan.windows) await fs.chmod(options.destination, 0o755);
 	return options.destination;
+}
+
+/** Download, checksum, and extract the target-matching Bun executable. */
+export async function provisionBunRuntime(
+	options: ProvisionBunRuntimeOptions,
+): Promise<string> {
+	const asset = bunRuntimeAsset(options.plan);
+	const fetcher = options.fetcher ?? ((url: string) => fetch(url));
+	const digest = options.digest ?? sha256Bytes;
+	const fs = options.fs ?? realFs;
+
+	if (options.cacheDir !== undefined) {
+		const cachePath = safeJoinPath(options.cacheDir, asset.fileName);
+		let cached: Uint8Array | undefined;
+		try {
+			cached = await fs.readFile(cachePath);
+		} catch {
+			// Absent or unreadable cache entry: fall through to the fetch.
+		}
+		if (cached !== undefined) {
+			return await installRuntimeArchive(cached, asset, options, fs, digest);
+		}
+	}
+
+	let archive: Uint8Array;
+	try {
+		const response = await fetcher(asset.url);
+		if (!response.ok) {
+			throw new BunRuntimeProvisionError(
+				`failed to download ${asset.url}: HTTP ${response.status}`,
+			);
+		}
+		archive = new Uint8Array(await response.arrayBuffer());
+	} catch (error) {
+		if (options.cacheDir === undefined) throw error;
+		const cachePath = safeJoinPath(options.cacheDir, asset.fileName);
+		const reason = error instanceof Error ? error.message : String(error);
+		throw new BunRuntimeProvisionError(
+			`failed to fetch ${asset.fileName}: ${reason}; no usable offline cache entry at ${cachePath}`,
+		);
+	}
+	return await installRuntimeArchive(archive, asset, options, fs, digest);
 }
 
 /** Failure while selecting, downloading, or verifying a bundled Bun runtime. */

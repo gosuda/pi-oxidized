@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { decodeZipArchive, writeZip } from "../release/archive.ts";
+import { decodeZipArchive, sha256Bytes, writeZip } from "../release/archive.ts";
 import { smokeUnpacked } from "../package-release.ts";
 import {
 	helloRequestLine,
@@ -11,7 +11,13 @@ import {
 	HOST_PROTOCOL_VERSION,
 } from "../release/host.ts";
 import { RecordingRunner, type Fs, type RunResult } from "../release/runner.ts";
-import { BUN_RUNTIME_VERSION, bunRuntimeAsset, provisionBunRuntime } from "../release/runtime.ts";
+import {
+	BUN_RUNTIME_VERSION,
+	BunRuntimeProvisionError,
+	bunRuntimeAsset,
+	provisionBunRuntime,
+	type RuntimeFetcher,
+} from "../release/runtime.ts";
 import { planFor, RUST_TARGETS } from "../release/targets.ts";
 
 const FILE_STAT = { isFile: true, isDir: false, size: 1, mode: 0o755 } as const;
@@ -38,6 +44,49 @@ function existingFilesFs(paths: readonly string[]): Fs {
 			return [];
 		},
 	};
+}
+
+/** In-memory `Fs` fake serving `initial`; writes land in the returned `files`. */
+function memoryFs(
+	initial: Readonly<Record<string, Uint8Array>>,
+): Fs & { files: Map<string, Uint8Array> } {
+	const files = new Map(Object.entries(initial));
+	return {
+		files,
+		async mkdir() {},
+		async rm() {},
+		async writeFile(path, data) {
+			files.set(
+				path,
+				typeof data === "string" ? new TextEncoder().encode(data) : data,
+			);
+		},
+		async readFile(path) {
+			const data = files.get(path);
+			if (data === undefined) throw new Error(`ENOENT: ${path}`);
+			return data;
+		},
+		async copyFile() {},
+		async cp() {},
+		async chmod() {},
+		async stat(path) {
+			if (files.has(path)) return FILE_STAT;
+			throw new Error(`ENOENT: ${path}`);
+		},
+		async readdir() {
+			return [...files.keys()];
+		},
+	};
+}
+
+/** Await a promise expected to reject and surface the rejection as an Error. */
+async function rejectionOf(promise: Promise<unknown>): Promise<Error> {
+	return await promise.then(
+		() => {
+			throw new Error("expected the promise to reject");
+		},
+		(reason: unknown) => (reason instanceof Error ? reason : new Error(String(reason))),
+	);
 }
 
 function helloResult(
@@ -318,6 +367,115 @@ describe("pinned Bun runtime provisioning", () => {
 				}),
 			}),
 		).rejects.toThrow("checksum mismatch");
+	});
+
+	test("installs from a checksum-valid offline cache without fetching", async () => {
+		const plan = planFor("x86_64-unknown-linux-gnu");
+		const asset = bunRuntimeAsset(plan);
+		const work = mkdtempSync(join(tmpdir(), "pi-runtime-cache-"));
+		try {
+			const zipPath = join(work, asset.fileName);
+			const runtimeBytes = new TextEncoder().encode("cached-bun-runtime\n");
+			await writeZip(
+				[{ path: asset.runtimeMember, data: runtimeBytes, mode: 0o755 }],
+				zipPath,
+				{ sourceDateEpoch: 0 },
+			);
+			const fs = memoryFs({
+				[join("/cache", asset.fileName)]: new Uint8Array(readFileSync(zipPath)),
+			});
+			const destination = await provisionBunRuntime({
+				plan,
+				destination: "/out/bun",
+				cacheDir: "/cache",
+				fs,
+				// A throwing fetcher proves the cache is consulted before any
+				// fetch: a cache miss would surface as a wrapped fetch failure.
+				fetcher: () => Promise.reject(new Error("network unavailable")),
+				// The pinned official archive bytes are unforgeable offline, so
+				// the digest seam vouches for the hand-built archive instead.
+				digest: () => asset.sha256,
+			});
+			expect(destination).toBe("/out/bun");
+			expect(fs.files.get("/out/bun")).toEqual(runtimeBytes);
+		} finally {
+			rmSync(work, { recursive: true, force: true });
+		}
+	});
+
+	test("wraps non-OK and throwing fetch failures with cache path and filename", async () => {
+		const plan = planFor("x86_64-unknown-linux-gnu");
+		const asset = bunRuntimeAsset(plan);
+		const cachePath = join("/cache", asset.fileName);
+		const shared = {
+			plan,
+			destination: "/out/bun",
+			cacheDir: "/cache",
+			fs: memoryFs({}),
+		};
+
+		const nonOk = await rejectionOf(
+			provisionBunRuntime({
+				...shared,
+				fetcher: async () => ({
+					ok: false,
+					status: 503,
+					async arrayBuffer() {
+						return new ArrayBuffer(0);
+					},
+				}),
+			}),
+		);
+		expect(nonOk).toBeInstanceOf(BunRuntimeProvisionError);
+		expect(nonOk.message).toContain(cachePath);
+		expect(nonOk.message).toContain(asset.fileName);
+
+		const thrown = await rejectionOf(
+			provisionBunRuntime({
+				...shared,
+				fetcher: () => Promise.reject(new Error("DNS resolution failed")),
+			}),
+		);
+		expect(thrown).toBeInstanceOf(BunRuntimeProvisionError);
+		expect(thrown.message).toContain(cachePath);
+		expect(thrown.message).toContain(asset.fileName);
+	});
+
+	test("a corrupted cache entry rejects identically to a corrupted download", async () => {
+		const plan = planFor("x86_64-unknown-linux-gnu");
+		const asset = bunRuntimeAsset(plan);
+		const corrupt = Uint8Array.from([1, 2, 3]);
+		const expected = `checksum mismatch for ${asset.fileName}: expected ${asset.sha256}, got ${sha256Bytes(corrupt)}`;
+		const fetcher: RuntimeFetcher = async () => ({
+			ok: true,
+			status: 200,
+			async arrayBuffer() {
+				return corrupt.buffer;
+			},
+		});
+
+		const fromCache = await rejectionOf(
+			provisionBunRuntime({
+				plan,
+				destination: "/out/bun",
+				cacheDir: "/cache",
+				fs: memoryFs({ [join("/cache", asset.fileName)]: corrupt }),
+				fetcher,
+			}),
+		);
+		expect(fromCache).toBeInstanceOf(BunRuntimeProvisionError);
+		expect(fromCache.message).toBe(expected);
+
+		const fromDownload = await rejectionOf(
+			provisionBunRuntime({
+				plan,
+				destination: "/out/bun",
+				fs: existingFilesFs([]),
+				fetcher,
+			}),
+		);
+		expect(fromDownload).toBeInstanceOf(BunRuntimeProvisionError);
+		expect(fromDownload.message).toBe(expected);
 	});
 });
 
