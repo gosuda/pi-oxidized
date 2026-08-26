@@ -23,18 +23,17 @@ import {
 	writeFile,
 } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { pathToFileURL } from "node:url";
 
-import { HOST_PACKAGE_DIR, hostBundleCommands } from "../release/host.ts";
 import type { CommandRunner, Fs, RunResult } from "../release/runner.ts";
 import { SpawnRunner, realFs } from "../release/runner.ts";
-import type { AssembleInputs } from "../release/stage.ts";
-import { stagedInputs } from "../release/stage.ts";
-import { TARGET_PLANS } from "../release/targets.ts";
 
 export const SCHEMA = "pi.deps.exposure.v1" as const;
 export const SENTINEL_OK = "DEPENDENCY_EXPOSURE_OK";
 export const SENTINEL_FAILED = "DEPENDENCY_EXPOSURE_FAILED_CLOSED";
 export const REPO_ROOT = resolve(import.meta.dirname, "../..");
+/** Convention used by locate/install probes; release argv/staging come from side authority. */
+export const HOST_PACKAGE_DIR = "packages/extension-host";
 
 export const SURFACES = [
 	"package.json",
@@ -657,23 +656,150 @@ export async function findUnknownCompileSites(root: string): Promise<string[]> {
 	return witnesses;
 }
 
-async function shippingBuildCommands(
+interface SideTargetPlan {
+	readonly rustTarget: string;
+	readonly bunTarget: string;
+	readonly piBinaryName: string;
+	readonly hostBinaryName: string;
+	readonly bunRuntimeName: string;
+	readonly hostBundleName: string;
+}
+
+interface SideHostBundleCommands {
+	readonly compiled: readonly string[];
+	readonly runtimeBundle: readonly string[];
+}
+
+interface SideStagedInput {
+	readonly source: string;
+	readonly destRel: string;
+	readonly kind: string;
+	readonly optional: boolean;
+}
+
+interface SideReleaseAuthority {
+	readonly root: string;
+	readonly hostPackageDir: string;
+	readonly targetPlans: readonly SideTargetPlan[];
+	hostBundleCommands(plan: SideTargetPlan, outDir: string): SideHostBundleCommands;
+	stagedInputs(inputs: Record<string, unknown>): readonly SideStagedInput[];
+}
+
+const sideAuthorityCache = new Map<string, SideReleaseAuthority>();
+
+function asTargetPlan(value: unknown, index: number): SideTargetPlan {
+	const table = asTable(value);
+	if (
+		table === undefined ||
+		typeof table.rustTarget !== "string" ||
+		typeof table.bunTarget !== "string" ||
+		typeof table.piBinaryName !== "string" ||
+		typeof table.hostBinaryName !== "string" ||
+		typeof table.bunRuntimeName !== "string" ||
+		typeof table.hostBundleName !== "string"
+	) {
+		throw new Error(`side TARGET_PLANS[${index}] malformed`);
+	}
+	return {
+		rustTarget: table.rustTarget,
+		bunTarget: table.bunTarget,
+		piBinaryName: table.piBinaryName,
+		hostBinaryName: table.hostBinaryName,
+		bunRuntimeName: table.bunRuntimeName,
+		hostBundleName: table.hostBundleName,
+	};
+}
+
+/** Load release command/staging authority from one immutable checkout. Never reuse live-head imports. */
+export async function loadSideReleaseAuthority(root: string): Promise<SideReleaseAuthority> {
+	const resolved = resolve(root);
+	const cached = sideAuthorityCache.get(resolved);
+	if (cached !== undefined) return cached;
+	const targetsPath = join(resolved, "scripts/release/targets.ts");
+	const hostPath = join(resolved, "scripts/release/host.ts");
+	const stagePath = join(resolved, "scripts/release/stage.ts");
+	for (const path of [targetsPath, hostPath, stagePath]) {
+		if (!existsSync(path)) throw new Error(`missing side release authority module: ${path}`);
+	}
+	const [targetsMod, hostMod, stageMod] = await Promise.all([
+		import(pathToFileURL(targetsPath).href),
+		import(pathToFileURL(hostPath).href),
+		import(pathToFileURL(stagePath).href),
+	]);
+	const plansRaw = targetsMod.TARGET_PLANS;
+	if (!Array.isArray(plansRaw) || plansRaw.length === 0) {
+		throw new Error(`side TARGET_PLANS missing or empty under ${resolved}`);
+	}
+	if (typeof hostMod.hostBundleCommands !== "function") {
+		throw new Error(`side hostBundleCommands missing under ${resolved}`);
+	}
+	if (typeof stageMod.stagedInputs !== "function") {
+		throw new Error(`side stagedInputs missing under ${resolved}`);
+	}
+	const hostPackageDir = typeof hostMod.HOST_PACKAGE_DIR === "string"
+		? hostMod.HOST_PACKAGE_DIR
+		: HOST_PACKAGE_DIR;
+	const authority: SideReleaseAuthority = {
+		root: resolved,
+		hostPackageDir,
+		targetPlans: plansRaw.map(asTargetPlan),
+		hostBundleCommands: (plan, outDir) => {
+			const commands = hostMod.hostBundleCommands(plan, outDir) as SideHostBundleCommands;
+			if (!Array.isArray(commands.compiled) || !Array.isArray(commands.runtimeBundle)) {
+				throw new Error(`side hostBundleCommands returned malformed vectors under ${resolved}`);
+			}
+			return {
+				compiled: commands.compiled.map(String),
+				runtimeBundle: commands.runtimeBundle.map(String),
+			};
+		},
+		stagedInputs: (inputs) => {
+			const staged = stageMod.stagedInputs(inputs) as readonly SideStagedInput[];
+			if (!Array.isArray(staged)) {
+				throw new Error(`side stagedInputs returned non-array under ${resolved}`);
+			}
+			return staged.map((item, index) => {
+				if (typeof item?.source !== "string" || typeof item.destRel !== "string") {
+					throw new Error(`side stagedInputs[${index}] malformed under ${resolved}`);
+				}
+				return {
+					source: item.source,
+					destRel: item.destRel,
+					kind: typeof item.kind === "string" ? item.kind : "unknown",
+					optional: Boolean(item.optional),
+				};
+			});
+		},
+	};
+	sideAuthorityCache.set(resolved, authority);
+	return authority;
+}
+
+/** Test/helper seam: clear cached side authority modules between fixtures. */
+export function clearSideReleaseAuthorityCache(): void {
+	sideAuthorityCache.clear();
+}
+
+export async function shippingBuildCommandsForSide(
 	root: string,
 	temp: string,
 ): Promise<readonly { name: string; args: readonly string[] }[]> {
-	const commands: { name: string; args: readonly string[] }[] = TARGET_PLANS.map((plan) => ({
+	const authority = await loadSideReleaseAuthority(root);
+	const commands: { name: string; args: readonly string[] }[] = authority.targetPlans.map((plan) => ({
 		name: `compiled:${plan.rustTarget}`,
-		args: hostBundleCommands(plan, temp).compiled,
+		args: authority.hostBundleCommands(plan, temp).compiled,
 	}));
-	const firstPlan = TARGET_PLANS[0];
-	if (firstPlan === undefined) throw new Error("TARGET_PLANS is empty");
+	const firstPlan = authority.targetPlans[0];
+	if (firstPlan === undefined) throw new Error("side TARGET_PLANS is empty");
 	commands.push({
 		name: "runtime-bundle",
-		args: hostBundleCommands(firstPlan, temp).runtimeBundle,
+		args: authority.hostBundleCommands(firstPlan, temp).runtimeBundle,
 	});
-	const packageJson = asTable(
-		JSON.parse(await readFile(join(root, HOST_PACKAGE_DIR, "package.json"), "utf8")) as unknown,
-	);
+	const packageJsonPath = join(root, authority.hostPackageDir, "package.json");
+	if (!existsSync(packageJsonPath)) {
+		throw new Error(`side host package.json missing: ${packageJsonPath}`);
+	}
+	const packageJson = asTable(JSON.parse(await readFile(packageJsonPath, "utf8")) as unknown);
 	const build = asTable(packageJson?.scripts)?.build;
 	if (typeof build !== "string") throw new Error("extension-host package.json has no build script");
 	const tokens = build.trim().split(/\s+/);
@@ -682,6 +808,13 @@ async function shippingBuildCommands(
 	}
 	commands.push({ name: "package-script:build", args: tokens.slice(1) });
 	return commands;
+}
+
+async function shippingBuildCommands(
+	root: string,
+	temp: string,
+): Promise<readonly { name: string; args: readonly string[] }[]> {
+	return shippingBuildCommandsForSide(root, temp);
 }
 
 function replaceOutputArgs(args: readonly string[], output: string, metafile: string): string[] {
@@ -944,9 +1077,10 @@ function checkE3(
 	}
 }
 
-function stagedSources(root: string, fs: Fs): readonly string[] {
+export async function stagedSourcesForSide(root: string, fs: Fs): Promise<readonly string[]> {
+	const authority = await loadSideReleaseAuthority(root);
 	const sources: string[] = [];
-	for (const plan of TARGET_PLANS) {
+	for (const plan of authority.targetPlans) {
 		const common = {
 			plan,
 			version: "0.0.0",
@@ -960,12 +1094,12 @@ function stagedSources(root: string, fs: Fs): readonly string[] {
 			docsSource: join(root, "crates/pi/docs"),
 			examplesSource: join(root, ".references/pi/packages/coding-agent/examples"),
 			assetsSource: join(root, "crates/pi/assets"),
-		} satisfies Omit<AssembleInputs, "host" | "bunRuntimePath">;
-		const compiled: AssembleInputs = {
+		};
+		const compiled = {
 			...common,
 			host: { kind: "compiled", binaryPath: join(root, "target/host", plan.hostBinaryName) },
 		};
-		const runtime: AssembleInputs = {
+		const runtime = {
 			...common,
 			host: {
 				kind: "runtime-bundle",
@@ -974,13 +1108,17 @@ function stagedSources(root: string, fs: Fs): readonly string[] {
 			},
 			bunRuntimePath: join(root, "target/runtime", plan.bunRuntimeName),
 		};
-		for (const input of [...stagedInputs(compiled), ...stagedInputs(runtime)]) {
+		for (const input of [...authority.stagedInputs(compiled), ...authority.stagedInputs(runtime)]) {
 			if (input.source.length > 0 && !input.source.startsWith("generated:")) {
 				sources.push(input.source);
 			}
 		}
 	}
 	return sources;
+}
+
+async function stagedSources(root: string, fs: Fs): Promise<readonly string[]> {
+	return stagedSourcesForSide(root, fs);
 }
 
 export function evaluateStaging(paths: readonly string[], staged: readonly string[]): CheckResult {
@@ -1040,7 +1178,10 @@ async function checkE4(
 	fs: Fs,
 ): Promise<CheckResult> {
 	try {
-		const stagedLogical = [...stagedSources(base.root, fs), ...stagedSources(head.root, fs)];
+		const stagedLogical = [
+			...await stagedSources(base.root, fs),
+			...await stagedSources(head.root, fs),
+		];
 		const staged = [
 			...await expandWithRealpaths(stagedLogical, base.root),
 			...await expandWithRealpaths(stagedLogical, head.root),

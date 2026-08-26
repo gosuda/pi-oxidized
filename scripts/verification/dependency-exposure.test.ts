@@ -2,17 +2,18 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
 
-import { HOST_PACKAGE_DIR } from "../release/host.ts";
 import { RecordingRunner, SpawnRunner } from "../release/runner.ts";
 import {
 	REPO_ROOT,
 	SCHEMA,
 	SENTINEL_FAILED,
+	HOST_PACKAGE_DIR,
 	appendLedgerRows,
 	assertRelevantWorktreeClean,
 	buildBundleEvidence,
 	cargoLockChangedNames,
 	classify,
+	clearSideReleaseAuthorityCache,
 	deriveAutoFromTexts,
 	escapeMarkdownCell,
 	evaluateCargoKinds,
@@ -28,6 +29,7 @@ import {
 	inputMatchesMetafile,
 	listCargoTomlPaths,
 	listHeadEvidencePaths,
+	loadSideReleaseAuthority,
 	materializeBase,
 	parseCargoLockIdentities,
 	parseCargoMetadata,
@@ -37,12 +39,15 @@ import {
 	resolvePathPair,
 	scanCorpusText,
 	selfTest,
+	shippingBuildCommandsForSide,
+	stagedSourcesForSide,
 	verdictFromChecks,
 } from "./dependency-exposure.ts";
 
 const temps: string[] = [];
 
 afterEach(() => {
+	clearSideReleaseAuthorityCache();
 	while (temps.length > 0) {
 		const path = temps.pop();
 		if (path !== undefined) rmSync(path, { recursive: true, force: true });
@@ -56,6 +61,45 @@ function tempDir(prefix: string): string {
 	temps.push(path);
 	return path;
 }
+
+function writeMinimalReleaseAuthority(root: string, entry = "./src/main.ts"): void {
+	mkdirSync(join(root, "scripts/release"), { recursive: true });
+	mkdirSync(join(root, "packages/extension-host"), { recursive: true });
+	writeFileSync(
+		join(root, "scripts/release/targets.ts"),
+		`export const TARGET_PLANS = [{
+  rustTarget: "x86_64-unknown-linux-gnu",
+  bunTarget: "bun-linux-x64-baseline",
+  piBinaryName: "pi",
+  hostBinaryName: "pi-extension-host",
+  bunRuntimeName: "bun",
+  hostBundleName: "pi-extension-host.js",
+}];
+`,
+	);
+	writeFileSync(
+		join(root, "scripts/release/host.ts"),
+		`export const HOST_PACKAGE_DIR = "packages/extension-host";
+export function hostBundleCommands(plan, outDir) {
+  return {
+    compiled: ["build", "${entry}", "--compile", "--outfile", outDir + "/" + plan.hostBinaryName],
+    runtimeBundle: ["build", "${entry}", "--outfile", outDir + "/" + plan.hostBundleName],
+  };
+}
+`,
+	);
+	writeFileSync(
+		join(root, "scripts/release/stage.ts"),
+		`export function stagedInputs(inputs) {
+  return [
+    { kind: "rust-binary", source: inputs.piBinaryPath, destRel: inputs.plan.piBinaryName, optional: false },
+    { kind: "manifest", source: "generated:release.json", destRel: "release.json", optional: false },
+  ];
+}
+`,
+	);
+}
+
 
 function surface(path: string, deps: Record<string, Record<string, string>>) {
 	return parseNpmSurface(path, JSON.stringify(deps));
@@ -365,7 +409,7 @@ describe("dependency-exposure fail-closed integration", () => {
 
 	test("nonzero bun exit rejects even when metafile exists", async () => {
 		const root = tempDir("pi-deps-r2-nonzero-");
-		mkdirSync(join(root, "packages/extension-host"), { recursive: true });
+		writeMinimalReleaseAuthority(root);
 		writeFileSync(
 			join(root, "packages/extension-host/package.json"),
 			JSON.stringify({
@@ -514,7 +558,7 @@ describe("dependency-exposure security regressions", () => {
 			"postinstall",
 		]);
 		const root = tempDir("pi-deps-r2-lifecycle-");
-		mkdirSync(join(root, "packages/extension-host"), { recursive: true });
+		writeMinimalReleaseAuthority(root);
 		writeFileSync(
 			join(root, "packages/extension-host/package.json"),
 			JSON.stringify({
@@ -533,7 +577,7 @@ describe("dependency-exposure security regressions", () => {
 
 	test("A: successful install argv includes --ignore-scripts", async () => {
 		const root = tempDir("pi-deps-r2-ignore-");
-		mkdirSync(join(root, "packages/extension-host"), { recursive: true });
+		writeMinimalReleaseAuthority(root);
 		writeFileSync(
 			join(root, "packages/extension-host/package.json"),
 			JSON.stringify({
@@ -731,6 +775,110 @@ describe("dependency-exposure review wave-2 regressions", () => {
 		expect(parseInputSpec("cargo:serde").name).toBe("serde");
 		expect(parseInputSpec("tool:bun-runtime").name).toBe("bun-runtime");
 		expect(escapeMarkdownCell("a|b\nc\rd")).toBe("a\\|b c d");
+	});
+});
+
+describe("dependency-exposure side-local authority", () => {
+	function writeAuthority(
+		root: string,
+		options: { readonly exposeEvil: boolean; readonly entry: string },
+	): void {
+		mkdirSync(join(root, "scripts/release"), { recursive: true });
+		mkdirSync(join(root, "packages/extension-host"), { recursive: true });
+		mkdirSync(join(root, "node_modules/evil-dep"), { recursive: true });
+		writeFileSync(join(root, "node_modules/evil-dep/package.json"), JSON.stringify({ name: "evil-dep", version: "1.0.0" }));
+		writeFileSync(
+			join(root, "packages/extension-host/package.json"),
+			JSON.stringify({
+				scripts: {
+					build: `bun build ${options.entry} --compile --outfile dist/pi-extension-host`,
+				},
+			}),
+		);
+		writeFileSync(
+			join(root, "scripts/release/targets.ts"),
+			`export const TARGET_PLANS = [{
+  rustTarget: "x86_64-unknown-linux-gnu",
+  bunTarget: "bun-linux-x64-baseline",
+  piBinaryName: "pi",
+  hostBinaryName: "pi-extension-host",
+  bunRuntimeName: "bun",
+  hostBundleName: "pi-extension-host.js",
+}];
+`,
+		);
+		writeFileSync(
+			join(root, "scripts/release/host.ts"),
+			`export const HOST_PACKAGE_DIR = "packages/extension-host";
+export function hostBundleCommands(plan, outDir) {
+  return {
+    compiled: ["build", "${options.entry}", "--compile", "--outfile", outDir + "/" + plan.hostBinaryName],
+    runtimeBundle: ["build", "${options.entry}", "--outfile", outDir + "/" + plan.hostBundleName],
+  };
+}
+`,
+		);
+		const extra = options.exposeEvil
+			? `{ kind: "extra", source: inputs.repoRoot + "/node_modules/evil-dep", destRel: "evil-dep", optional: false },`
+			: "";
+		writeFileSync(
+			join(root, "scripts/release/stage.ts"),
+			`export function stagedInputs(inputs) {
+  return [
+    { kind: "rust-binary", source: inputs.piBinaryPath, destRel: inputs.plan.piBinaryName, optional: false },
+    ${extra}
+    { kind: "manifest", source: "generated:release.json", destRel: "release.json", optional: false },
+  ];
+}
+`,
+		);
+	}
+
+	test("P1: base staging/command exposes dep that head removes; live-head authority would false-E", async () => {
+		const base = tempDir("pi-deps-r2-auth-base-");
+		const head = tempDir("pi-deps-r2-auth-head-");
+		writeAuthority(base, { exposeEvil: true, entry: "./src/with-evil.ts" });
+		writeAuthority(head, { exposeEvil: false, entry: "./src/main.ts" });
+
+		const baseSources = await stagedSourcesForSide(base, {
+			mkdir: async () => {},
+			rm: async () => {},
+			writeFile: async () => {},
+			readFile: async () => new Uint8Array(),
+			copyFile: async () => {},
+			cp: async () => {},
+			chmod: async () => {},
+			stat: async () => ({ isFile: true, isDir: false, size: 0, mode: 0 }),
+			readdir: async () => [],
+		});
+		const headSources = await stagedSourcesForSide(head, {
+			mkdir: async () => {},
+			rm: async () => {},
+			writeFile: async () => {},
+			readFile: async () => new Uint8Array(),
+			copyFile: async () => {},
+			cp: async () => {},
+			chmod: async () => {},
+			stat: async () => ({ isFile: true, isDir: false, size: 0, mode: 0 }),
+			readdir: async () => [],
+		});
+		const evil = join(base, "node_modules/evil-dep");
+		expect(baseSources.some((path) => path.includes("node_modules/evil-dep"))).toBe(true);
+		expect(headSources.some((path) => path.includes("node_modules/evil-dep"))).toBe(false);
+		// Side-local union preserves base exposure.
+		expect(evaluateStaging([evil], [...baseSources, ...headSources]).status).toBe("fail");
+		// Reusing only head authority against the base path would false-E.
+		expect(evaluateStaging([evil], headSources).status).toBe("pass");
+
+		const baseCommands = await shippingBuildCommandsForSide(base, join(base, "out"));
+		const headCommands = await shippingBuildCommandsForSide(head, join(head, "out"));
+		expect(baseCommands.some((command) => command.args.includes("./src/with-evil.ts"))).toBe(true);
+		expect(headCommands.some((command) => command.args.includes("./src/with-evil.ts"))).toBe(false);
+		expect(headCommands.some((command) => command.args.includes("./src/main.ts"))).toBe(true);
+		// Loading each side's own modules keeps authorities distinct.
+		const baseAuth = await loadSideReleaseAuthority(base);
+		const headAuth = await loadSideReleaseAuthority(head);
+		expect(baseAuth.root).not.toBe(headAuth.root);
 	});
 });
 
