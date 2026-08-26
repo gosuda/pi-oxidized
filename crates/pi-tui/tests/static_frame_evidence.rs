@@ -66,7 +66,7 @@ fn static_frame_preserves_three_invariants_under_load() {
     // at 0s, so tick 0 should show only the kind label.
     let static_samples: Vec<(&str, &str)> = evidence
         .iter()
-        .filter(|(k, _)| k.starts_with("static_render_sample_tick="))
+        .filter(|(k, _)| k.starts_with("static_render_sample_") && k["static_render_sample_".len()..].chars().all(|c| c.is_ascii_digit()))
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
     assert!(
@@ -79,7 +79,7 @@ fn static_frame_preserves_three_invariants_under_load() {
             "static-sufficiency: rendered text at {key} must contain kind label {kind:?}, got {text:?}"
         );
         // Extract the tick number from the key.
-        let tick_str = key.strip_prefix("static_render_sample_tick=").unwrap_or("");
+        let tick_str = key.strip_prefix("static_render_sample_").unwrap_or("");
         let tick: usize = tick_str.parse().unwrap_or(0);
         let elapsed_at_tick = (tick + 1) as u64 * 80 / 1000;
         if elapsed_at_tick > 0 {
