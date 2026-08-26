@@ -521,4 +521,122 @@ mod tests {
         assert!(s.lines[0][0].style.link.is_none());
         assert!(s.had_rejections);
     }
+
+    // -----------------------------------------------------------------------
+    // XC-7 mutation witnesses (M12–M14)
+    //
+    // Each test encodes the correct behaviour so that applying the
+    // corresponding mutation causes the test to fail.
+    //
+    //   M12 — MAX_SLOT_LINES clamp loosened (4096→8192)
+    //   M13 — hyperlink scheme filter admits javascript:
+    //   M14 — sanitizer reuses parser state across pushes
+    //
+    // M11 (bypass sanitize on one inbound uiSlot path in the bridge) is
+    // witnessed in `crates/pi/src/core/extension_host/tests.rs`.
+    // -----------------------------------------------------------------------
+
+    /// Witness for M12: the line clamp must reject at exactly 4096 lines.
+    ///
+    /// Creates 5000 lines (between 4096 and 8192) and asserts the output is
+    /// clamped to 4096.  If `MAX_SLOT_LINES` is loosened to 8192 the 5000-line
+    /// input is no longer clamped and the hardcoded `assert_eq!(…, 4096)`
+    /// fails.
+    #[test]
+    fn witness_m12_line_clamp_at_4096() {
+        let lines: Vec<Vec<StyledRun>> = (0..5000).map(|_| vec![run("x")]).collect();
+        let s = sanitize_slot(&slot(lines));
+        // Hardcoded 4096 — NOT MAX_SLOT_LINES — so loosening the constant breaks this.
+        assert_eq!(s.lines.len(), 4096, "line count must clamp at 4096");
+        assert!(s.had_rejections, "oversize must set had_rejections");
+    }
+
+    /// Witness for M12 boundary: exactly 4096 lines is accepted without rejection.
+    #[test]
+    fn witness_m12_exactly_4096_lines_accepted() {
+        let lines: Vec<Vec<StyledRun>> = (0..4096).map(|_| vec![run("x")]).collect();
+        let s = sanitize_slot(&slot(lines));
+        assert_eq!(s.lines.len(), 4096);
+        assert!(!s.had_rejections, "exactly at the cap must not reject");
+    }
+
+    /// Witness for M13 (Rust side): `javascript:` hyperlink scheme is rejected.
+    ///
+    /// If the scheme filter in `Hyperlink::validate` is mutated to admit
+    /// `javascript:`, the link survives and `style.link.is_none()` fails.
+    #[test]
+    fn witness_m13_javascript_scheme_rejected() {
+        let mut styled = run("click");
+        styled.style.link = Some(Hyperlink {
+            id: None,
+            uri: "javascript:alert(document.cookie)".to_owned(),
+        });
+        let s = sanitize_slot(&slot(vec![vec![styled]]));
+        assert_eq!(s.lines[0][0].text, "click");
+        assert!(
+            s.lines[0][0].style.link.is_none(),
+            "javascript: link must be dropped"
+        );
+        assert!(s.had_rejections);
+    }
+
+    /// Witness for M13 (Rust side): `Hyperlink::validate` directly rejects
+    /// `javascript:`.
+    #[test]
+    fn witness_m13_validate_rejects_javascript() {
+        let link = Hyperlink {
+            id: None,
+            uri: "javascript:alert(1)".to_owned(),
+        };
+        assert!(link.validate().is_err(), "validate must reject javascript:");
+    }
+
+    /// Witness for M13 (Rust side): `data:` scheme is also rejected.
+    #[test]
+    fn witness_m13_data_scheme_rejected() {
+        let link = Hyperlink {
+            id: None,
+            uri: "data:text/html,<script>alert(1)</script>".to_owned(),
+        };
+        assert!(link.validate().is_err(), "validate must reject data:");
+    }
+
+    /// Witness for M14: parser state does not carry across `sanitize_slot`
+    /// calls.
+    ///
+    /// Slot 1 ends mid-CSI (`ESC [`); slot 2 begins with the continuation
+    /// bytes `31m`.  A fresh parser treats `31m` as plain text.  If the
+    /// parser is reused across pushes, the `31m` is consumed as a CSI
+    /// continuation and the text `31m normal` is not produced verbatim.
+    #[test]
+    fn witness_m14_fresh_parser_across_pushes() {
+        let s1 = sanitize_slot(&slot(vec![vec![run("x\u{1b}[")]]));
+        let s2 = sanitize_slot(&slot(vec![vec![run("31m normal")]]));
+        // Slot 1: the incomplete CSI is stripped.
+        assert_eq!(s1.lines[0][0].text, "x");
+        assert!(s1.had_rejections);
+        // Slot 2: fresh parser — "31m" is plain text, not a CSI continuation.
+        assert_eq!(s2.lines[0][0].text, "31m normal");
+        assert!(!s2.had_rejections);
+        assert!(!contains_control_bytes(s2.lines[0][0].text.as_bytes()));
+    }
+
+    /// Witness for M14: a burst of 50 slots with alternating mid-escape
+    /// endings never leaks control bytes or carries parser state forward.
+    #[test]
+    fn witness_m14_burst_no_state_leak() {
+        for i in 0..50u64 {
+            let text = if i % 2 == 0 { "a\u{1b}[" } else { "31m b" };
+            let s = sanitize_slot(&slot(vec![vec![run(text)]]));
+            for line in &s.lines {
+                for r in line {
+                    assert!(
+                        !contains_control_bytes(r.text.as_bytes()),
+                        "control leak at iteration {i}: {:?}",
+                        r.text
+                    );
+                }
+            }
+        }
+    }
 }

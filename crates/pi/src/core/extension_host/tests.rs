@@ -2992,3 +2992,71 @@ async fn runtime_set_shutdown_event_reaches_every_endpoint_without_reap_duplicat
     }
     Ok(())
 }
+
+// ===========================================================================
+// XC-7 M11 witness: bridge sanitization on every inbound uiSlot path
+//
+// If `forward_slot` is mutated to bypass `sanitize_slot`, hostile escape
+// sequences leak into the rendered slot.  This test pushes a hostile
+// `uiSlot` frame through the fake-host bridge and asserts the received
+// `SanitizedSlot` contains no control bytes.
+// ===========================================================================
+
+#[tokio::test]
+async fn witness_m11_bridge_sanitizes_hostile_ui_slot() -> R {
+    let (runner, host) = make_runner(full_snapshot()).await?;
+    let mut rx = runner.subscribe_slot("hostile");
+
+    let hostile_frame = Frame {
+        id: 0,
+        kind: FrameKind::Event,
+        method: "uiSlot".to_owned(),
+        payload: json!({
+            "key": "hostile",
+            "generation": 1,
+            "placement": "aboveEditor",
+            "height": 2,
+            "runs": [
+                [{"text": "ab\u{001b}["}, {"text": "31m cd"}],
+                [{"text": "\u{001b}]0;title\u{0007}ok\u{001b}P+q\u{001b}\\end"}]
+            ],
+            "focusable": false,
+        }),
+    };
+    host.emit(hostile_frame).await;
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), rx.changed())
+            .await
+            .is_ok(),
+        "hostile slot must be pushed"
+    );
+
+    let sanitized = rx
+        .borrow()
+        .clone()
+        .ok_or("slot should be present after push")?;
+
+    for line in &sanitized.lines {
+        for run in line {
+            assert!(
+                !pi_ext::sanitize::contains_control_bytes(run.text.as_bytes()),
+                "control bytes leaked through bridge: {:?}",
+                run.text
+            );
+        }
+    }
+
+    let joined: String = sanitized
+        .lines
+        .iter()
+        .flat_map(|line| line.iter())
+        .map(|r| r.text.as_str())
+        .collect();
+    assert!(joined.contains("ab"));
+    assert!(joined.contains("cd"));
+    assert!(joined.contains("ok"));
+    assert!(joined.contains("end"));
+    assert!(sanitized.had_rejections);
+    Ok(())
+}

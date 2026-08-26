@@ -357,3 +357,26 @@ describe("sanitize: stale-generation reset", () => {
 		expect(lines[0]?.[0]?.style?.fg).toBeUndefined();
 	});
 });
+
+// ---------------------------------------------------------------------------
+// XC-7 M13 witness (TypeScript side): javascript: scheme must be rejected.
+// If the scheme filter in applyOsc is mutated to admit javascript:, the link
+// survives and the assertion fails.
+// ---------------------------------------------------------------------------
+describe("sanitize: XC-7 M13 javascript scheme witness", () => {
+	test("javascript: URI via OSC 8 is always rejected", () => {
+		const runs = parseAnsiLine(`${ESC}]8;;javascript:alert(document.cookie)${BEL}click${ESC}]8;;${BEL}`);
+		expect(text(runs)).toBe("click");
+		expect(runs[0]?.style?.link).toBeUndefined();
+	});
+
+	test("javascript: URI with uppercase scheme is rejected", () => {
+		const runs = parseAnsiLine(`${ESC}]8;;JAVASCRIPT:alert(1)${BEL}x${ESC}]8;;${BEL}`);
+		expect(runs[0]?.style?.link).toBeUndefined();
+	});
+
+	test("javascript: URI with mixed case is rejected", () => {
+		const runs = parseAnsiLine(`${ESC}]8;;JavaScript:alert(1)${BEL}x${ESC}]8;;${BEL}`);
+		expect(runs[0]?.style?.link).toBeUndefined();
+	});
+});
