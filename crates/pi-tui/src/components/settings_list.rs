@@ -301,9 +301,11 @@ impl SettingsList {
         }
 
         if self.items.is_empty() {
-            lines.push(
-                (self.theme.hint)(self.empty_text.as_deref().unwrap_or("  No settings available")),
-            );
+            lines.push((self.theme.hint)(
+                self.empty_text
+                    .as_deref()
+                    .unwrap_or("  No settings available"),
+            ));
             self.add_hint_line(&mut lines, width);
             return lines;
         }

@@ -321,9 +321,7 @@ impl SelectList {
             let text = if self.items.is_empty() {
                 self.empty_text.as_deref()
             } else {
-                self.no_match_text
-                    .as_deref()
-                    .or(self.empty_text.as_deref())
+                self.no_match_text.as_deref().or(self.empty_text.as_deref())
             }
             .unwrap_or("  No matching commands");
             let mut lines = vec![(self.theme.no_match)(text)];
@@ -543,13 +541,13 @@ mod tests {
         assert!(strip_ansi(&empty_snap[1]).contains("esc to cancel"));
         let empty_h = with_hint.measure(60);
 
-        let mut without_hint =
-            SelectList::new(vec![], 5, SelectListTheme::default()).with_empty_text("  No matching models");
+        let mut without_hint = SelectList::new(vec![], 5, SelectListTheme::default())
+            .with_empty_text("  No matching models");
         let without_h = without_hint.measure(60);
         assert_eq!(empty_h, without_h + 1);
 
-        let mut nonempty = SelectList::new(items(), 5, SelectListTheme::default())
-            .with_hint("  esc to cancel");
+        let mut nonempty =
+            SelectList::new(items(), 5, SelectListTheme::default()).with_hint("  esc to cancel");
         let nonempty_h = nonempty.measure(60);
         let mut nonempty_plain = SelectList::new(items(), 5, SelectListTheme::default());
         let plain_h = nonempty_plain.measure(60);
@@ -563,8 +561,8 @@ mod tests {
         use std::sync::{Arc, Mutex};
         let cancelled = Arc::new(Mutex::new(false));
         let flag = Arc::clone(&cancelled);
-        let mut list = SelectList::new(items(), 5, SelectListTheme::default())
-            .with_hint("  esc to cancel");
+        let mut list =
+            SelectList::new(items(), 5, SelectListTheme::default()).with_hint("  esc to cancel");
         list.on_cancel = Some(Box::new(move || {
             *flag.lock().expect("lock") = true;
         }));
