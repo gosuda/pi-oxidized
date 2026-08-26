@@ -288,9 +288,6 @@ pub struct SessionSelector {
     list: SelectList,
     confirm: SessionDeleteConfirm,
     current_session_path: Option<String>,
-    /// Live search/filter query. `app.session.deleteNoninvasive` arms delete
-    /// only while this is empty; nonempty queries forward the chord unchanged.
-    search_query: String,
     /// Called when the user confirms a session row (not delete).
     pub on_select: Option<SessionItemCallback>,
     /// Called when the selector is cancelled while unconfirmed.
@@ -311,7 +308,6 @@ impl SessionSelector {
             list,
             confirm: SessionDeleteConfirm::Idle,
             current_session_path,
-            search_query: String::new(),
             on_select: None,
             on_cancel: None,
             on_delete: None,
@@ -324,18 +320,6 @@ impl SessionSelector {
     #[must_use]
     pub const fn confirm_state(&self) -> &SessionDeleteConfirm {
         &self.confirm
-    }
-
-    /// Current search/filter query (tests / diagnostics).
-    #[must_use]
-    pub fn search_query(&self) -> &str {
-        &self.search_query
-    }
-
-    /// Replace the live search query and refilter the list.
-    pub fn set_search_query(&mut self, query: impl Into<String>) {
-        self.search_query = query.into();
-        self.list.set_filter(&self.search_query);
     }
 
     fn set_confirm(&mut self, next: SessionDeleteConfirm) {
@@ -388,12 +372,8 @@ impl SessionSelector {
             self.start_delete_for_selected();
             return EventResult::Render;
         }
-        // Ctrl+Backspace is a nonempty-search-safe alias: arm only when the
-        // search query is empty; otherwise forward unchanged to SelectList.
+        // Ctrl+Backspace arms delete confirmation (alias for Ctrl+D).
         if kb.matches(key, "app.session.deleteNoninvasive") {
-            if !self.search_query.is_empty() {
-                return self.list.handle_event(&UiEvent::Key(*key));
-            }
             self.start_delete_for_selected();
             return EventResult::Render;
         }
@@ -826,7 +806,7 @@ mod tests {
     }
 
     #[test]
-    fn session_selector_ctrl_backspace_arms_only_when_search_empty() {
+    fn session_selector_ctrl_backspace_arms_delete() {
         with_session_delete_bindings(|| {
             let entries = vec![SessionPickerEntry {
                 value: "/tmp/other.jsonl".to_owned(),
@@ -838,7 +818,6 @@ mod tests {
                 crossterm::event::KeyCode::Backspace,
                 crossterm::event::KeyModifiers::CONTROL,
             ));
-            assert!(selector.search_query().is_empty());
             assert_eq!(selector.handle_event(&backspace), EventResult::Render);
             assert!(
                 matches!(selector.confirm_state(), SessionDeleteConfirm::Armed { path } if path == "/tmp/other.jsonl")
@@ -848,14 +827,6 @@ mod tests {
                 crossterm::event::KeyModifiers::NONE,
             ));
             assert_eq!(selector.handle_event(&esc), EventResult::Render);
-            assert!(!selector.confirm_state().is_armed());
-            selector.set_search_query("oth");
-            assert!(!selector.search_query().is_empty());
-            let forwarded = selector.handle_event(&backspace);
-            assert!(
-                matches!(forwarded, EventResult::Ignored | EventResult::Render),
-                "got {forwarded:?}"
-            );
             assert!(!selector.confirm_state().is_armed());
         });
     }
