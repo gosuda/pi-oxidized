@@ -12,6 +12,7 @@ import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import {
 	appendFile,
+	lstat,
 	mkdir,
 	mkdtemp,
 	readFile,
@@ -249,6 +250,21 @@ function pathIntersects(left: string, right: string): boolean {
 	return a === b || a.startsWith(`${b}${sep}`) || b.startsWith(`${a}${sep}`);
 }
 
+function pathUnderRoot(path: string, rootResolved: string, rootReal: string): boolean {
+	return (
+		path === rootResolved ||
+		path.startsWith(`${rootResolved}${sep}`) ||
+		path === rootReal ||
+		path.startsWith(`${rootReal}${sep}`)
+	);
+}
+
+/**
+ * Strict containment helper: both the logical path and its realpath must stay
+ * inside {@link repoRoot}. Staging expansion uses {@link expandWithRealpaths},
+ * because worktree `.references` symlinks intentionally resolve outside the
+ * detached checkout while their logical paths remain in-repo.
+ */
 export async function resolvePathPair(
 	logicalPath: string,
 	repoRoot: string,
@@ -260,12 +276,10 @@ export async function resolvePathPair(
 	} catch (error) {
 		throw new Error(`broken or unresolvable path ${logical}: ${errorText(error)}`);
 	}
-	const rootReal = await realpath(repoRoot).catch(() => resolve(repoRoot));
-	if (!(real === rootReal || real.startsWith(`${rootReal}${sep}`))) {
+	const rootResolved = resolve(repoRoot);
+	const rootReal = await realpath(repoRoot).catch(() => rootResolved);
+	if (!pathUnderRoot(logical, rootResolved, rootReal) || !pathUnderRoot(real, rootResolved, rootReal)) {
 		throw new Error(`path escapes repository root: ${logical} -> ${real}`);
-	}
-	if (logical !== real && !(logical === rootReal || logical.startsWith(`${rootReal}${sep}`))) {
-		throw new Error(`ambiguous escaping symlink alias: ${logical} -> ${real}`);
 	}
 	return { logical, real };
 }
@@ -917,18 +931,37 @@ function cargoManifestPaths(name: string, graphs: readonly CargoGraph[]): string
 	);
 }
 
-async function expandWithRealpaths(
+/**
+ * Staging-path expansion: require an in-repo logical path and reject broken
+ * symlinks, but keep external reals so shared outside targets still intersect.
+ * Intentional worktree `.references` aliases remain classifiable.
+ */
+export async function expandWithRealpaths(
 	paths: readonly string[],
 	repoRoot: string,
 ): Promise<readonly string[]> {
 	const expanded: string[] = [];
+	const rootResolved = resolve(repoRoot);
+	const rootReal = await realpath(repoRoot).catch(() => rootResolved);
 	for (const path of paths) {
-		if (!existsSync(path)) {
+		// lstat sees broken symlinks; existsSync does not.
+		try {
+			await lstat(path);
+		} catch {
 			expanded.push(resolve(path));
 			continue;
 		}
-		const pair = await resolvePathPair(path, repoRoot);
-		expanded.push(pair.logical, pair.real);
+		const logical = resolve(path);
+		if (!pathUnderRoot(logical, rootResolved, rootReal)) {
+			throw new Error(`path escapes repository root: ${logical}`);
+		}
+		let real: string;
+		try {
+			real = await realpath(logical);
+		} catch (error) {
+			throw new Error(`broken or unresolvable path ${logical}: ${errorText(error)}`);
+		}
+		expanded.push(logical, real);
 	}
 	return [...new Set(expanded)];
 }
@@ -944,9 +977,8 @@ async function checkE4(
 	try {
 		const stagedLogical = [...stagedSources(base.root, fs), ...stagedSources(head.root, fs)];
 		const staged = [
-			...await expandWithRealpaths(stagedLogical.filter((path) => existsSync(path)), base.root),
-			...await expandWithRealpaths(stagedLogical.filter((path) => existsSync(path)), head.root),
-			...stagedLogical.map((path) => resolve(path)),
+			...await expandWithRealpaths(stagedLogical, base.root),
+			...await expandWithRealpaths(stagedLogical, head.root),
 		];
 		if (spec.kind === "tool") {
 			return spec.name === "bun-runtime"

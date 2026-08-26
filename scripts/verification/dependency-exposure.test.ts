@@ -19,6 +19,7 @@ import {
 	evaluateSideAwareReachability,
 	evaluateStaging,
 	expandScripts,
+	expandWithRealpaths,
 	findLifecycleScripts,
 	findUnknownCompileSites,
 	inputMatchesMetafile,
@@ -566,9 +567,23 @@ dependencies = [
 		const broken = join(root, "broken-link");
 		symlinkSync(join(root, "missing-target"), broken);
 		await expect(resolvePathPair(broken, root)).rejects.toThrow(/broken|unresolvable/);
+		await expect(expandWithRealpaths([broken], root)).rejects.toThrow(/broken|unresolvable/);
 		const escape = join(root, "escape-link");
 		symlinkSync("/tmp", escape);
 		await expect(resolvePathPair(escape, root)).rejects.toThrow(/escapes repository root|ambiguous/);
+		// Staging expansion keeps in-repo logical paths and external reals so
+		// intentional worktree `.references` aliases remain classifiable.
+		const expandedEscape = await expandWithRealpaths([escape], root);
+		expect(expandedEscape).toContain(resolve(escape));
+		expect(expandedEscape.some((path) => path === resolve("/tmp") || path.startsWith(`${resolve("/tmp")}/`))).toBe(true);
+		const outside = tempDir("pi-deps-r2-outside-");
+		mkdirSync(join(outside, "examples"), { recursive: true });
+		writeFileSync(join(outside, "examples", "x.txt"), "x");
+		mkdirSync(join(root, ".references"), { recursive: true });
+		symlinkSync(outside, join(root, ".references", "pi"));
+		const refs = await expandWithRealpaths([join(root, ".references/pi/examples")], root);
+		expect(refs).toContain(resolve(root, ".references/pi/examples"));
+		expect(refs).toContain(resolve(outside, "examples"));
 		const ok = await resolvePathPair(join(root, "inside"), root);
 		expect(ok.real.includes("inside")).toBe(true);
 	});
@@ -601,10 +616,16 @@ describe("dependency-exposure platform-gated live probes", () => {
 		}
 	})();
 	test.skipIf(!cargoAvailable)("live cargo metadata: serde shipped, insta/proptest are E1-pass", async () => {
+		// Preserve immutable-base identity (D): forward real git rev-parse while
+		// still injecting live cargo metadata through the recording seam.
+		const realRunner = new SpawnRunner();
 		const runner = new RecordingRunner(async (call) => {
+			if (call.command === "git") {
+				return realRunner.run(call.command, call.args, call.options);
+			}
 			if (call.command !== "cargo") return { exitCode: 0, stdout: "", stderr: "" };
 			const real = Bun.spawnSync(["cargo", ...call.args], {
-				cwd: REPO_ROOT,
+				cwd: call.options?.cwd ?? REPO_ROOT,
 				stdout: "pipe",
 				stderr: "pipe",
 			});
@@ -621,8 +642,8 @@ describe("dependency-exposure platform-gated live probes", () => {
 			runner,
 			identity: true,
 			now: () => new Date("2026-08-26T00:00:00.000Z"),
-
 		});
+		expect(/^[0-9a-f]{40}$/i.test(result.report.base)).toBe(true);
 		const byInput = Object.fromEntries(result.report.verdicts.map((verdict) => [verdict.input, verdict]));
 		expect(byInput["cargo:serde"]?.checks.E1.status).toBe("fail");
 		expect(byInput["cargo:tempfile"]?.checks.E1.status).toBe("fail");
