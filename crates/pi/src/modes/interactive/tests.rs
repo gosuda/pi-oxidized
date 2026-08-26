@@ -1233,6 +1233,14 @@ fn rendered_key_hints_follow_rebinds() {
             plain.contains("Ctrl+M"),
             "overlay key column must render the capitalized rebind: {plain}"
         );
+        // Expanded header hints follow rebinds too.
+        state.header.expanded = true;
+        let buf = render_view(&state, 80, 60);
+        let plain = snapshot_buffer_plain(&buf, 80, 60).join("\n");
+        assert!(
+            plain.contains("Ctrl+M") && plain.contains("F9"),
+            "expanded header must render rebound keys: {plain}"
+        );
     });
 }
 

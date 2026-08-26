@@ -54,29 +54,39 @@ pub fn build_header(
 }
 
 /// The expanded keybinding hint markdown block (ports the reference hint list).
+///
+/// Every chord resolves from the process-global keybinding registry so rebound
+/// users see their own keys; slash-command and bash-syntax rows stay raw.
 #[must_use]
 pub fn expanded_hints(th: &ResolvedTheme) -> String {
     let _ = th;
+    use pi_tui::keybindings::key_display_text;
+
+    let cycle_models = [
+        key_display_text("app.model.cycleForward"),
+        key_display_text("app.model.cycleBackward"),
+    ]
+    .join(" / ");
     [
         "**Interrupt / exit**",
-        "- `Esc` — interrupt streaming / abort bash",
-        "- `Ctrl+C` — clear editor (press twice to exit)",
-        "- `Ctrl+D` — exit (when editor is empty)",
-        "- `Ctrl+Z` — suspend",
+        &format!("- `{}` — interrupt streaming / abort bash", key_display_text("app.interrupt")),
+        &format!("- `{}` — clear editor (press twice to exit)", key_display_text("app.clear")),
+        &format!("- `{}` — exit (when editor is empty)", key_display_text("app.exit")),
+        &format!("- `{}` — suspend", key_display_text("app.suspend")),
         "",
         "**Editing**",
-        "- `Shift+Tab` — cycle thinking level",
-        "- `Ctrl+L` — model selector",
-        "- `Ctrl+P` / `Shift+Ctrl+P` — cycle models",
-        "- `Ctrl+O` — toggle tool output",
-        "- `Ctrl+T` — toggle thinking",
-        "- `Ctrl+G` — external editor",
-        "- `Ctrl+X` — copy last assistant",
-        "- `Ctrl+V` — paste image / text",
+        &format!("- `{}` — cycle thinking level", key_display_text("app.thinking.cycle")),
+        &format!("- `{}` — model selector", key_display_text("app.model.select")),
+        &format!("- `{}` — cycle models", cycle_models),
+        &format!("- `{}` — toggle tool output", key_display_text("app.tools.expand")),
+        &format!("- `{}` — toggle thinking", key_display_text("app.thinking.toggle")),
+        &format!("- `{}` — external editor", key_display_text("app.editor.external")),
+        &format!("- `{}` — copy last assistant", key_display_text("app.message.copy")),
+        &format!("- `{}` — paste image / text", key_display_text("app.clipboard.pasteImage")),
         "",
         "**Queues & commands**",
-        "- `Alt+Enter` — queue follow-up",
-        "- `Alt+Up` — restore queued follow-up",
+        &format!("- `{}` — queue follow-up", key_display_text("app.message.followUp")),
+        &format!("- `{}` — restore queued follow-up", key_display_text("app.message.dequeue")),
         "- `!cmd` / `!!cmd` — bash (excluded from context with `!!`)",
         "- `/help` — slash commands",
     ]
