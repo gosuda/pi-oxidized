@@ -1,0 +1,808 @@
+name: REL-R1 musl toolchain bakeoff
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RUST_VERSION: "1.97.1"
+  BUN_VERSION: "1.3.14"
+  MUSL_APT_VERSION: "1.2.4-2"
+  ALPINE_VERSION: "3.24.1"
+  ALPINE_GCC_RUNTIME_VERSION: "15.2.0-r5"
+
+jobs:
+  x86_64-native:
+    name: Native x86_64 candidate A
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      RUST_TARGET: x86_64-unknown-linux-musl
+      BUN_COMPILE_TARGET: bun-linux-x64-musl-baseline
+      BUN_ASSET: bun-linux-x64-musl-baseline.zip
+      BUN_ASSET_SHA256: 56a7d6806cf155536c0178f0ea5fbd098e684fa509ebdb4fc0a7e19fb65382dc
+      ALPINE_ARCH: x86_64
+      ALPINE_ASSET: alpine-minirootfs-3.24.1-x86_64.tar.gz
+      ALPINE_ASSET_SHA256: 41f73e3cf5fa919b8aa5ca6b30dc48f0da2720776d7423e2a7748211456fe081
+      LIBSTDCXX_SHA256: 14c987b556f5385a5db18376e788c75f37d85321b8dc1920d926ea7daac1d6f6
+      LIBGCC_SHA256: 393dcd32629f06d7d85409c272d142d0c082772d10b87ef55ee82f47de3be637
+      MUSL_LOADER: ld-musl-x86_64.so.1
+      MUSL_PATH_FILE: /etc/ld-musl-x86_64.path
+      EVIDENCE: target/rel-r1-bakeoff/x86_64
+      STAGE: target/rel-r1-bakeoff/x86_64/stage
+      UNPACK: target/rel-r1-bakeoff/x86_64/unpacked
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: 1.97.1
+          targets: x86_64-unknown-linux-musl
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Initialize evidence
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$EVIDENCE/candidate-A" "$EVIDENCE/downloads" "$STAGE" "$UNPACK"
+          {
+            printf 'acquired_utc=%s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            printf 'runner_name=%s\nrunner_os=%s\nrunner_arch=%s\n' "$RUNNER_NAME" "$RUNNER_OS" "$RUNNER_ARCH"
+            printf 'image_os=%s\nimage_version=%s\n' "${ImageOS:-unknown}" "${ImageVersion:-unknown}"
+            rustc --version
+            bun --version
+          } | tee "$EVIDENCE/environment.txt"
+          cat > "$EVIDENCE/pins-ledger.tsv" <<'EOF'
+          artifact	url	sha256	acquired_utc	vendor_verification
+          EOF
+          cat > "$EVIDENCE/candidate-A/command.txt" <<'EOF'
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc CC_x86_64_unknown_linux_musl=musl-gcc cargo build -p pi --release --locked --target x86_64-unknown-linux-musl
+          EOF
+
+      - name: Candidate A - Ubuntu noble musl 1.2.4-2
+        id: candidate-a
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          exec > >(tee "$EVIDENCE/candidate-A/attempt.log") 2>&1
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            "musl-dev=$MUSL_APT_VERSION" "musl-tools=$MUSL_APT_VERSION"
+          test "$(dpkg-query -W -f='${Version}' musl-dev)" = "$MUSL_APT_VERSION"
+          test "$(dpkg-query -W -f='${Version}' musl-tools)" = "$MUSL_APT_VERSION"
+          dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\n' musl-dev musl-tools \
+            | tee "$EVIDENCE/candidate-A/packages.tsv"
+          printf '%s\n' 'integrity=distro-signed Ubuntu noble apt repository' \
+            > "$EVIDENCE/candidate-A/provenance.txt"
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
+          CC_x86_64_unknown_linux_musl=musl-gcc \
+            cargo build -p pi --release --locked --target "$RUST_TARGET"
+          printf 'A\n' > "$EVIDENCE/selected-candidate.txt"
+
+      - name: Build, package, and smoke unpacked x86_64 artifact
+        if: always()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          exec > >(tee "$EVIDENCE/acceptance.log") 2>&1
+
+          PI="target/$RUST_TARGET/release/pi"
+          test -x "$PI"
+          test -f "$EVIDENCE/selected-candidate.txt"
+
+          readelf -d "$PI" | tee "$EVIDENCE/pi-readelf-dynamic.txt"
+          if readelf -d "$PI" | grep -q '(NEEDED)'; then
+            echo 'pi contains a dynamic NEEDED entry' >&2
+            exit 1
+          fi
+          file "$PI" | tee "$EVIDENCE/pi-file.txt"
+          set +e
+          ldd "$PI" > "$EVIDENCE/pi-ldd.txt" 2>&1
+          ldd_status=$?
+          set -e
+          cat "$EVIDENCE/pi-ldd.txt"
+          grep -Fq 'not a dynamic executable' "$EVIDENCE/pi-ldd.txt"
+          printf 'ldd_exit=%s\n' "$ldd_status" >> "$EVIDENCE/pi-ldd.txt"
+
+          fetch() {
+            local url="$1" output="$2" expected="$3" verification="$4"
+            local acquired computed
+            acquired="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            curl --proto '=https' --tlsv1.2 --location --fail --show-error --silent \
+              --output "$output" "$url"
+            computed="$(sha256sum "$output" | cut -d ' ' -f 1)"
+            printf '%s  %s\n' "$expected" "$output" | sha256sum --check --strict
+            printf '%s\t%s\t%s\t%s\t%s\n' \
+              "$(basename "$output")" "$url" "$computed" "$acquired" "$verification" \
+              >> "$EVIDENCE/pins-ledger.tsv"
+          }
+
+          # env: cannot interpolate RUNNER_TEMP, so pin an absolute writable path here.
+          export USERLAND_DIR="$RUNNER_TEMP/pi-musl-userland/$ALPINE_ARCH"
+          ROOTFS="$RUNNER_TEMP/alpine-rootfs"
+          rm -rf "$ROOTFS" "$USERLAND_DIR"
+          mkdir -p "$ROOTFS/tmp" "$USERLAND_DIR"
+          alpine_url="https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/$ALPINE_ARCH/$ALPINE_ASSET"
+          fetch "$alpine_url" "$EVIDENCE/downloads/$ALPINE_ASSET" "$ALPINE_ASSET_SHA256" \
+            'matched Alpine vendor-published .sha256 value grounded 2026-08-26'
+          tar -tzf "$EVIDENCE/downloads/$ALPINE_ASSET" | grep -Fxq "./lib/$MUSL_LOADER"
+          tar -xzf "$EVIDENCE/downloads/$ALPINE_ASSET" -C "$ROOTFS"
+          sudo install -m 0755 "$ROOTFS/lib/$MUSL_LOADER" "/lib/$MUSL_LOADER"
+
+          assert_musl_resolution() {
+            local listing="$1"
+            local label="$2"
+            local pinned_loader="/lib/$MUSL_LOADER"
+            local allowed_prefix="$USERLAND_DIR/"
+            local line path
+            while IFS= read -r line || [[ -n "$line" ]]; do
+              [[ -z "$line" ]] && continue
+              if [[ "$line" == *'=>'* ]]; then
+                path="${line#*=> }"
+                path="${path%% (*}"
+                path="${path%"${path##*[![:space:]]}"}"
+              elif [[ "$line" =~ ^[[:space:]]*(/[^[:space:](]+) ]]; then
+                path="${BASH_REMATCH[1]}"
+              else
+                continue
+              fi
+              if [[ "$path" == "$pinned_loader" ]]; then
+                continue
+              fi
+              case "$path" in
+                "$allowed_prefix"*) ;;
+                *)
+                  printf 'resolved object outside isolated Alpine userland (%s): %s\n' "$label" "$path" >&2
+                  exit 1
+                  ;;
+              esac
+            done < "$listing"
+          }
+          assert_program_interpreter() {
+            local binary="$1"
+            local evidence="$2"
+            local label="$3"
+            local expected="/lib/$MUSL_LOADER"
+            local -a interpreters
+            readelf -lW "$binary" | tee "$evidence"
+            mapfile -t interpreters < <(
+              sed -n 's/^[[:space:]]*\[Requesting program interpreter: \(\/[^]]*\)\]$/\1/p' "$evidence"
+            )
+            if (( ${#interpreters[@]} != 1 )); then
+              printf 'expected exactly one PT_INTERP (%s), found %s for %s\n' \
+                "$expected" "${#interpreters[@]}" "$label" >&2
+              exit 1
+            fi
+            if [[ "${interpreters[0]}" != "$expected" ]]; then
+              printf 'unexpected PT_INTERP for %s: expected %s, got %s\n' \
+                "$label" "$expected" "${interpreters[0]}" >&2
+              exit 1
+            fi
+          }
+
+
+          # Content-addressed APK pins only: minirootfs keys reject current v3.24
+          # packages as UNTRUSTED; no index or apk-signature machinery.
+          # Every explicit direct download goes through fetch() (SHA + ledger row).
+          for package in libstdc++ libgcc; do
+            case "$package" in
+              'libstdc++') expected_sha="$LIBSTDCXX_SHA256" ;;
+              libgcc) expected_sha="$LIBGCC_SHA256" ;;
+              *) echo "unexpected package: $package" >&2; exit 1 ;;
+            esac
+            apk_name="$package-$ALPINE_GCC_RUNTIME_VERSION.apk"
+            apk_url="https://dl-cdn.alpinelinux.org/alpine/v3.24/main/$ALPINE_ARCH/$apk_name"
+            fetch "$apk_url" "$EVIDENCE/downloads/$apk_name" "$expected_sha"               'content-addressed SHA256 pin + acquisition date; .PKGINFO pkgname/pkgver/arch asserted before extract; no signature verification'
+            pkginfo_dir="$RUNNER_TEMP/pkginfo-$package"
+            rm -rf "$pkginfo_dir"
+            mkdir -p "$pkginfo_dir"
+            tar -xzf "$EVIDENCE/downloads/$apk_name" -C "$pkginfo_dir" .PKGINFO
+            grep -Fx "pkgname=$package" "$pkginfo_dir/.PKGINFO"
+            grep -Fx "pkgver=$ALPINE_GCC_RUNTIME_VERSION" "$pkginfo_dir/.PKGINFO"
+            grep -Fx "arch=$ALPINE_ARCH" "$pkginfo_dir/.PKGINFO"
+            cp "$pkginfo_dir/.PKGINFO" "$EVIDENCE/downloads/$package.PKGINFO"
+            tar -xzf "$EVIDENCE/downloads/$apk_name" -C "$USERLAND_DIR" usr/lib
+          done
+
+          test -e "$USERLAND_DIR/usr/lib/libstdc++.so.6"
+          test -e "$USERLAND_DIR/usr/lib/libgcc_s.so.1"
+          # Path file replaces musl defaults; keep ONLY the isolated Alpine userland.
+          printf '%s\n' "$USERLAND_DIR/usr/lib" \
+            | sudo tee "$MUSL_PATH_FILE"
+          test "$(tr -d '\n' < "$MUSL_PATH_FILE")" = "$USERLAND_DIR/usr/lib"
+          cat "$MUSL_PATH_FILE" | tee "$EVIDENCE/ld-musl.path"
+
+          (
+            cd packages/extension-host
+            bun install --frozen-lockfile
+            bun build ./src/main.ts --compile --minify \
+              --compile-autoload-tsconfig --compile-autoload-package-json \
+              --target "$BUN_COMPILE_TARGET" --outfile "$GITHUB_WORKSPACE/$STAGE/pi-extension-host"
+            bun build ./src/main.ts --target bun --minify \
+              --outfile "$GITHUB_WORKSPACE/$STAGE/pi-extension-host.js"
+          )
+          bun_url="https://github.com/oven-sh/bun/releases/download/bun-v$BUN_VERSION/$BUN_ASSET"
+          fetch "$bun_url" "$EVIDENCE/downloads/$BUN_ASSET" "$BUN_ASSET_SHA256" \
+            'matched official Bun v1.3.14 SHASUMS256.txt value grounded 2026-08-26'
+          unzip -Z1 "$EVIDENCE/downloads/$BUN_ASSET" | tee "$EVIDENCE/bun-archive-members.txt"
+          bun_extract="$RUNNER_TEMP/bun-runtime"
+          rm -rf "$bun_extract"
+          unzip -q "$EVIDENCE/downloads/$BUN_ASSET" -d "$bun_extract"
+          install -m 0755 "$bun_extract/${BUN_ASSET%.zip}/bun" "$STAGE/bun"
+          install -m 0755 "$PI" "$STAGE/pi"
+
+          readelf -d "$STAGE/pi-extension-host" | tee "$EVIDENCE/host-readelf-dynamic.txt"
+          assert_program_interpreter "$STAGE/pi-extension-host" \
+            "$EVIDENCE/host-interpreter.txt" staged-host
+          assert_program_interpreter "$STAGE/bun" \
+            "$EVIDENCE/runtime-interpreter.txt" staged-runtime
+          "/lib/$MUSL_LOADER" --list "$STAGE/pi-extension-host" \
+            | tee "$EVIDENCE/host-loader-resolution.txt"
+          assert_musl_resolution "$EVIDENCE/host-loader-resolution.txt" staged-host
+          "/lib/$MUSL_LOADER" --list "$STAGE/bun" \
+            | tee "$EVIDENCE/runtime-loader-resolution.txt"
+          assert_musl_resolution "$EVIDENCE/runtime-loader-resolution.txt" staged-runtime
+
+          tar -czf "$EVIDENCE/bakeoff.tar.gz" -C "$STAGE" .
+          rm -rf "$UNPACK"
+          mkdir -p "$UNPACK"
+          tar -xzf "$EVIDENCE/bakeoff.tar.gz" -C "$UNPACK"
+          tar -tzf "$EVIDENCE/bakeoff.tar.gz" | sort > "$EVIDENCE/archive-members.txt"
+
+          # Smoke under the same strict path: no host /lib,/usr/lib fallback.
+          test "$(tr -d '\n' < "$MUSL_PATH_FILE")" = "$USERLAND_DIR/usr/lib"
+          assert_program_interpreter "$UNPACK/pi-extension-host" \
+            "$EVIDENCE/unpacked-host-interpreter.txt" unpacked-host
+          assert_program_interpreter "$UNPACK/bun" \
+            "$EVIDENCE/unpacked-runtime-interpreter.txt" unpacked-runtime
+          "/lib/$MUSL_LOADER" --list "$UNPACK/pi-extension-host" \
+            | tee "$EVIDENCE/unpacked-host-loader-resolution.txt"
+          assert_musl_resolution "$EVIDENCE/unpacked-host-loader-resolution.txt" unpacked-host
+          "/lib/$MUSL_LOADER" --list "$UNPACK/bun" \
+            | tee "$EVIDENCE/unpacked-runtime-loader-resolution.txt"
+          assert_musl_resolution "$EVIDENCE/unpacked-runtime-loader-resolution.txt" unpacked-runtime
+
+          (
+            cd "$UNPACK"
+            ./pi --version | tee "$GITHUB_WORKSPACE/$EVIDENCE/pi-version.txt"
+            request='{"id":1,"kind":"req","method":"hello","payload":{"protocolVersion":1,"compatibilityVersion":"0.80.10"}}'
+            printf '%s\n' "$request" > "$GITHUB_WORKSPACE/$EVIDENCE/hello-compiled-request.jsonl"
+            printf '%s\n' "$request" | timeout 30 ./pi-extension-host \
+              > "$GITHUB_WORKSPACE/$EVIDENCE/hello-compiled-response.jsonl"
+            printf '%s\n' "$request" > "$GITHUB_WORKSPACE/$EVIDENCE/hello-runtime-request.jsonl"
+            printf '%s\n' "$request" | timeout 30 ./bun ./pi-extension-host.js \
+              > "$GITHUB_WORKSPACE/$EVIDENCE/hello-runtime-response.jsonl"
+          )
+
+          python3 - "$EVIDENCE/hello-compiled-response.jsonl" "$EVIDENCE/hello-runtime-response.jsonl" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          expected = {
+              "id": 1,
+              "kind": "res",
+              "method": "hello",
+              "payload": {
+                  "protocolVersion": 1,
+                  "compatibilityVersion": "0.80.10",
+              },
+          }
+          for name in sys.argv[1:]:
+              lines = pathlib.Path(name).read_text(encoding="utf-8").splitlines()
+              if not lines:
+                  raise SystemExit(f"{name}: empty hello response")
+              frame = json.loads(lines[0])
+              for field in ("id", "kind", "method"):
+                  if frame.get(field) != expected[field]:
+                      raise SystemExit(f"{name}: invalid {field}: {frame.get(field)!r}")
+              payload = frame.get("payload")
+              if not isinstance(payload, dict):
+                  raise SystemExit(f"{name}: payload is not an object")
+              for field, value in expected["payload"].items():
+                  if payload.get(field) != value:
+                      raise SystemExit(f"{name}: invalid payload.{field}: {payload.get(field)!r}")
+          PY
+          assert_direct_download_ledger() {
+            local selected
+            selected="$(tr -d '\n' < "$EVIDENCE/selected-candidate.txt")"
+            local -a expected=(
+              "$ALPINE_ASSET"
+              "libstdc++-$ALPINE_GCC_RUNTIME_VERSION.apk"
+              "libgcc-$ALPINE_GCC_RUNTIME_VERSION.apk"
+              "$BUN_ASSET"
+            )
+            if [[ "$selected" == "B" ]]; then
+              expected+=("$ZIG_ASSET" "cargo-zigbuild-$CARGO_ZIGBUILD_VERSION.crate")
+            elif [[ "$selected" != "A" ]]; then
+              printf 'unknown selected candidate for ledger gate: %s\n' "$selected" >&2
+              exit 1
+            fi
+            mapfile -t rows < <(tail -n +2 "$EVIDENCE/pins-ledger.tsv")
+            if (( ${#rows[@]} != ${#expected[@]} )); then
+              printf 'direct-download ledger row count mismatch: expected %s, got %s\n' \
+                "${#expected[@]}" "${#rows[@]}" >&2
+              printf 'ledger:\n' >&2
+              cat "$EVIDENCE/pins-ledger.tsv" >&2
+              exit 1
+            fi
+            local name found exp
+            for exp in "${expected[@]}"; do
+              found=0
+              for row in "${rows[@]}"; do
+                name="${row%%$'\t'*}"
+                if [[ "$name" == "$exp" ]]; then
+                  found=1
+                  break
+                fi
+              done
+              if (( found != 1 )); then
+                printf 'missing direct-download ledger row: %s\n' "$exp" >&2
+                cat "$EVIDENCE/pins-ledger.tsv" >&2
+                exit 1
+              fi
+            done
+            for row in "${rows[@]}"; do
+              name="${row%%$'\t'*}"
+              found=0
+              for exp in "${expected[@]}"; do
+                if [[ "$name" == "$exp" ]]; then
+                  found=1
+                  break
+                fi
+              done
+              if (( found != 1 )); then
+                printf 'unexpected direct-download ledger row: %s\n' "$name" >&2
+                cat "$EVIDENCE/pins-ledger.tsv" >&2
+                exit 1
+              fi
+            done
+            {
+              printf 'selected_candidate=%s\n' "$selected"
+              printf 'expected_count=%s\n' "${#expected[@]}"
+              printf 'expected_names=%s\n' "${expected[*]}"
+            } | tee "$EVIDENCE/direct-download-ledger-gate.txt"
+          }
+          assert_direct_download_ledger
+          printf 'PASS\n' > "$EVIDENCE/native-verdict.txt"
+
+      - name: Upload x86_64 bakeoff evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rel-r1-bakeoff-x86_64
+          path: target/rel-r1-bakeoff/x86_64
+          if-no-files-found: error
+          overwrite: true
+
+  aarch64-native:
+    name: Native aarch64 candidates A then B
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      RUST_TARGET: aarch64-unknown-linux-musl
+      BUN_COMPILE_TARGET: bun-linux-arm64-musl
+      BUN_ASSET: bun-linux-aarch64-musl.zip
+      BUN_ASSET_SHA256: b98e0ad3625c5c00d1d5b5ff55605c7adddbfae151861e68ade57b2d3b8703bb
+      ALPINE_ARCH: aarch64
+      ALPINE_ASSET: alpine-minirootfs-3.24.1-aarch64.tar.gz
+      ALPINE_ASSET_SHA256: f55a90f69052c5bd6f92cb09a8f47065970830b194c917a006fb94028e721259
+      LIBSTDCXX_SHA256: 2302e766d4e4926038ec166ecb85837ee884576115236ddb565e3a5fca4a11d7
+      LIBGCC_SHA256: 369aaa6e9d099a737bad6dd3e6c2fe7bb1547ca26d22b94ee0411228f709b403
+      MUSL_LOADER: ld-musl-aarch64.so.1
+      MUSL_PATH_FILE: /etc/ld-musl-aarch64.path
+      ZIG_VERSION: "0.16.0"
+      ZIG_ASSET: zig-aarch64-linux-0.16.0.tar.xz
+      ZIG_SHA256: ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17
+      CARGO_ZIGBUILD_VERSION: "0.23.0"
+      CARGO_ZIGBUILD_SHA256: 68c7df45b9d9934aaed5987fbf422b31419f81827b13a52251a61e1e772c6ff7
+      EVIDENCE: target/rel-r1-bakeoff/aarch64
+      STAGE: target/rel-r1-bakeoff/aarch64/stage
+      UNPACK: target/rel-r1-bakeoff/aarch64/unpacked
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: 1.97.1
+          targets: aarch64-unknown-linux-musl
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Initialize evidence
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$EVIDENCE/candidate-A" "$EVIDENCE/candidate-B" "$EVIDENCE/downloads" "$STAGE" "$UNPACK"
+          {
+            printf 'acquired_utc=%s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            printf 'runner_name=%s\nrunner_os=%s\nrunner_arch=%s\n' "$RUNNER_NAME" "$RUNNER_OS" "$RUNNER_ARCH"
+            printf 'image_os=%s\nimage_version=%s\n' "${ImageOS:-unknown}" "${ImageVersion:-unknown}"
+            rustc --version
+            bun --version
+          } | tee "$EVIDENCE/environment.txt"
+          cat > "$EVIDENCE/pins-ledger.tsv" <<'EOF'
+          artifact	url	sha256	acquired_utc	vendor_verification
+          EOF
+          cat > "$EVIDENCE/candidate-A/command.txt" <<'EOF'
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc CC_aarch64_unknown_linux_musl=musl-gcc cargo build -p pi --release --locked --target aarch64-unknown-linux-musl
+          EOF
+          cat > "$EVIDENCE/candidate-B/command.txt" <<'EOF'
+          env -u CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER -u CC_aarch64_unknown_linux_musl cargo zigbuild -p pi --release --locked --target aarch64-unknown-linux-musl
+          EOF
+
+      - name: Candidate A - Ubuntu noble musl 1.2.4-2
+        id: candidate-a
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          exec > >(tee "$EVIDENCE/candidate-A/attempt.log") 2>&1
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            "musl-dev=$MUSL_APT_VERSION" "musl-tools=$MUSL_APT_VERSION"
+          test "$(dpkg-query -W -f='${Version}' musl-dev)" = "$MUSL_APT_VERSION"
+          test "$(dpkg-query -W -f='${Version}' musl-tools)" = "$MUSL_APT_VERSION"
+          dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\n' musl-dev musl-tools \
+            | tee "$EVIDENCE/candidate-A/packages.tsv"
+          printf '%s\n' 'integrity=distro-signed Ubuntu noble apt repository' \
+            > "$EVIDENCE/candidate-A/provenance.txt"
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
+          CC_aarch64_unknown_linux_musl=musl-gcc \
+            cargo build -p pi --release --locked --target "$RUST_TARGET"
+          printf 'A\n' > "$EVIDENCE/selected-candidate.txt"
+
+      - name: Candidate B - pinned cargo-zigbuild
+        id: candidate-b
+        if: always() && steps.candidate-a.outcome == 'failure'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          exec > >(tee "$EVIDENCE/candidate-B/attempt.log") 2>&1
+          fetch() {
+            local url="$1" output="$2" expected="$3" verification="$4"
+            local acquired computed
+            acquired="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            curl --proto '=https' --tlsv1.2 --location --fail --show-error --silent \
+              --output "$output" "$url"
+            computed="$(sha256sum "$output" | cut -d ' ' -f 1)"
+            printf '%s  %s\n' "$expected" "$output" | sha256sum --check --strict
+            printf '%s\t%s\t%s\t%s\t%s\n' \
+              "$(basename "$output")" "$url" "$computed" "$acquired" "$verification" \
+              >> "$EVIDENCE/pins-ledger.tsv"
+          }
+          zig_url="https://ziglang.org/download/$ZIG_VERSION/$ZIG_ASSET"
+          fetch "$zig_url" "$EVIDENCE/downloads/$ZIG_ASSET" "$ZIG_SHA256" \
+            'matched ziglang.org 0.16.0 index.json shasum grounded 2026-08-26'
+          tar -xJf "$EVIDENCE/downloads/$ZIG_ASSET" -C "$RUNNER_TEMP"
+          export PATH="$RUNNER_TEMP/${ZIG_ASSET%.tar.xz}:$PATH"
+          zig version | tee "$EVIDENCE/candidate-B/zig-version.txt"
+          test "$(zig version)" = "$ZIG_VERSION"
+
+          crate="cargo-zigbuild-$CARGO_ZIGBUILD_VERSION.crate"
+          crate_url="https://static.crates.io/crates/cargo-zigbuild/$crate"
+          fetch "$crate_url" "$EVIDENCE/downloads/$crate" "$CARGO_ZIGBUILD_SHA256" \
+            'matched crates.io registry checksum for cargo-zigbuild 0.23.0 grounded 2026-08-26'
+          crate_source="$RUNNER_TEMP/cargo-zigbuild-$CARGO_ZIGBUILD_VERSION-source"
+          mkdir -p "$crate_source"
+          tar -xzf "$EVIDENCE/downloads/$crate" -C "$crate_source" --strip-components=1
+          cargo install --locked --path "$crate_source"
+          cargo zigbuild --version | tee "$EVIDENCE/candidate-B/cargo-zigbuild-version.txt"
+          env -u CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER \
+              -u CC_aarch64_unknown_linux_musl \
+              PATH="$RUNNER_TEMP/${ZIG_ASSET%.tar.xz}:$PATH" \
+            cargo zigbuild -p pi --release --locked --target "$RUST_TARGET"
+          printf 'B\n' > "$EVIDENCE/selected-candidate.txt"
+
+      - name: Build, package, and smoke unpacked aarch64 artifact
+        if: always()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          exec > >(tee "$EVIDENCE/acceptance.log") 2>&1
+
+          PI="target/$RUST_TARGET/release/pi"
+          test -x "$PI"
+          test -f "$EVIDENCE/selected-candidate.txt"
+
+          readelf -d "$PI" | tee "$EVIDENCE/pi-readelf-dynamic.txt"
+          if readelf -d "$PI" | grep -q '(NEEDED)'; then
+            echo 'pi contains a dynamic NEEDED entry' >&2
+            exit 1
+          fi
+          file "$PI" | tee "$EVIDENCE/pi-file.txt"
+          set +e
+          ldd "$PI" > "$EVIDENCE/pi-ldd.txt" 2>&1
+          ldd_status=$?
+          set -e
+          cat "$EVIDENCE/pi-ldd.txt"
+          grep -Fq 'not a dynamic executable' "$EVIDENCE/pi-ldd.txt"
+          printf 'ldd_exit=%s\n' "$ldd_status" >> "$EVIDENCE/pi-ldd.txt"
+
+          fetch() {
+            local url="$1" output="$2" expected="$3" verification="$4"
+            local acquired computed
+            acquired="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            curl --proto '=https' --tlsv1.2 --location --fail --show-error --silent \
+              --output "$output" "$url"
+            computed="$(sha256sum "$output" | cut -d ' ' -f 1)"
+            printf '%s  %s\n' "$expected" "$output" | sha256sum --check --strict
+            printf '%s\t%s\t%s\t%s\t%s\n' \
+              "$(basename "$output")" "$url" "$computed" "$acquired" "$verification" \
+              >> "$EVIDENCE/pins-ledger.tsv"
+          }
+
+          # env: cannot interpolate RUNNER_TEMP, so pin an absolute writable path here.
+          export USERLAND_DIR="$RUNNER_TEMP/pi-musl-userland/$ALPINE_ARCH"
+          ROOTFS="$RUNNER_TEMP/alpine-rootfs"
+          rm -rf "$ROOTFS" "$USERLAND_DIR"
+          mkdir -p "$ROOTFS/tmp" "$USERLAND_DIR"
+          alpine_url="https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/$ALPINE_ARCH/$ALPINE_ASSET"
+          fetch "$alpine_url" "$EVIDENCE/downloads/$ALPINE_ASSET" "$ALPINE_ASSET_SHA256" \
+            'matched Alpine vendor-published .sha256 value grounded 2026-08-26'
+          tar -tzf "$EVIDENCE/downloads/$ALPINE_ASSET" | grep -Fxq "./lib/$MUSL_LOADER"
+          tar -xzf "$EVIDENCE/downloads/$ALPINE_ASSET" -C "$ROOTFS"
+          sudo install -m 0755 "$ROOTFS/lib/$MUSL_LOADER" "/lib/$MUSL_LOADER"
+
+          assert_musl_resolution() {
+            local listing="$1"
+            local label="$2"
+            local pinned_loader="/lib/$MUSL_LOADER"
+            local allowed_prefix="$USERLAND_DIR/"
+            local line path
+            while IFS= read -r line || [[ -n "$line" ]]; do
+              [[ -z "$line" ]] && continue
+              if [[ "$line" == *'=>'* ]]; then
+                path="${line#*=> }"
+                path="${path%% (*}"
+                path="${path%"${path##*[![:space:]]}"}"
+              elif [[ "$line" =~ ^[[:space:]]*(/[^[:space:](]+) ]]; then
+                path="${BASH_REMATCH[1]}"
+              else
+                continue
+              fi
+              if [[ "$path" == "$pinned_loader" ]]; then
+                continue
+              fi
+              case "$path" in
+                "$allowed_prefix"*) ;;
+                *)
+                  printf 'resolved object outside isolated Alpine userland (%s): %s\n' "$label" "$path" >&2
+                  exit 1
+                  ;;
+              esac
+            done < "$listing"
+          }
+          assert_program_interpreter() {
+            local binary="$1"
+            local evidence="$2"
+            local label="$3"
+            local expected="/lib/$MUSL_LOADER"
+            local -a interpreters
+            readelf -lW "$binary" | tee "$evidence"
+            mapfile -t interpreters < <(
+              sed -n 's/^[[:space:]]*\[Requesting program interpreter: \(\/[^]]*\)\]$/\1/p' "$evidence"
+            )
+            if (( ${#interpreters[@]} != 1 )); then
+              printf 'expected exactly one PT_INTERP (%s), found %s for %s\n' \
+                "$expected" "${#interpreters[@]}" "$label" >&2
+              exit 1
+            fi
+            if [[ "${interpreters[0]}" != "$expected" ]]; then
+              printf 'unexpected PT_INTERP for %s: expected %s, got %s\n' \
+                "$label" "$expected" "${interpreters[0]}" >&2
+              exit 1
+            fi
+          }
+
+
+          # Content-addressed APK pins only: minirootfs keys reject current v3.24
+          # packages as UNTRUSTED; no index or apk-signature machinery.
+          # Every explicit direct download goes through fetch() (SHA + ledger row).
+          for package in libstdc++ libgcc; do
+            case "$package" in
+              'libstdc++') expected_sha="$LIBSTDCXX_SHA256" ;;
+              libgcc) expected_sha="$LIBGCC_SHA256" ;;
+              *) echo "unexpected package: $package" >&2; exit 1 ;;
+            esac
+            apk_name="$package-$ALPINE_GCC_RUNTIME_VERSION.apk"
+            apk_url="https://dl-cdn.alpinelinux.org/alpine/v3.24/main/$ALPINE_ARCH/$apk_name"
+            fetch "$apk_url" "$EVIDENCE/downloads/$apk_name" "$expected_sha"               'content-addressed SHA256 pin + acquisition date; .PKGINFO pkgname/pkgver/arch asserted before extract; no signature verification'
+            pkginfo_dir="$RUNNER_TEMP/pkginfo-$package"
+            rm -rf "$pkginfo_dir"
+            mkdir -p "$pkginfo_dir"
+            tar -xzf "$EVIDENCE/downloads/$apk_name" -C "$pkginfo_dir" .PKGINFO
+            grep -Fx "pkgname=$package" "$pkginfo_dir/.PKGINFO"
+            grep -Fx "pkgver=$ALPINE_GCC_RUNTIME_VERSION" "$pkginfo_dir/.PKGINFO"
+            grep -Fx "arch=$ALPINE_ARCH" "$pkginfo_dir/.PKGINFO"
+            cp "$pkginfo_dir/.PKGINFO" "$EVIDENCE/downloads/$package.PKGINFO"
+            tar -xzf "$EVIDENCE/downloads/$apk_name" -C "$USERLAND_DIR" usr/lib
+          done
+
+          test -e "$USERLAND_DIR/usr/lib/libstdc++.so.6"
+          test -e "$USERLAND_DIR/usr/lib/libgcc_s.so.1"
+          # Path file replaces musl defaults; keep ONLY the isolated Alpine userland.
+          printf '%s\n' "$USERLAND_DIR/usr/lib" \
+            | sudo tee "$MUSL_PATH_FILE"
+          test "$(tr -d '\n' < "$MUSL_PATH_FILE")" = "$USERLAND_DIR/usr/lib"
+          cat "$MUSL_PATH_FILE" | tee "$EVIDENCE/ld-musl.path"
+
+          (
+            cd packages/extension-host
+            bun install --frozen-lockfile
+            bun build ./src/main.ts --compile --minify \
+              --compile-autoload-tsconfig --compile-autoload-package-json \
+              --target "$BUN_COMPILE_TARGET" --outfile "$GITHUB_WORKSPACE/$STAGE/pi-extension-host"
+            bun build ./src/main.ts --target bun --minify \
+              --outfile "$GITHUB_WORKSPACE/$STAGE/pi-extension-host.js"
+          )
+          bun_url="https://github.com/oven-sh/bun/releases/download/bun-v$BUN_VERSION/$BUN_ASSET"
+          fetch "$bun_url" "$EVIDENCE/downloads/$BUN_ASSET" "$BUN_ASSET_SHA256" \
+            'matched official Bun v1.3.14 SHASUMS256.txt value grounded 2026-08-26'
+          unzip -Z1 "$EVIDENCE/downloads/$BUN_ASSET" | tee "$EVIDENCE/bun-archive-members.txt"
+          bun_extract="$RUNNER_TEMP/bun-runtime"
+          rm -rf "$bun_extract"
+          unzip -q "$EVIDENCE/downloads/$BUN_ASSET" -d "$bun_extract"
+          install -m 0755 "$bun_extract/${BUN_ASSET%.zip}/bun" "$STAGE/bun"
+          install -m 0755 "$PI" "$STAGE/pi"
+
+          readelf -d "$STAGE/pi-extension-host" | tee "$EVIDENCE/host-readelf-dynamic.txt"
+          assert_program_interpreter "$STAGE/pi-extension-host" \
+            "$EVIDENCE/host-interpreter.txt" staged-host
+          assert_program_interpreter "$STAGE/bun" \
+            "$EVIDENCE/runtime-interpreter.txt" staged-runtime
+          "/lib/$MUSL_LOADER" --list "$STAGE/pi-extension-host" \
+            | tee "$EVIDENCE/host-loader-resolution.txt"
+          assert_musl_resolution "$EVIDENCE/host-loader-resolution.txt" staged-host
+          "/lib/$MUSL_LOADER" --list "$STAGE/bun" \
+            | tee "$EVIDENCE/runtime-loader-resolution.txt"
+          assert_musl_resolution "$EVIDENCE/runtime-loader-resolution.txt" staged-runtime
+
+          tar -czf "$EVIDENCE/bakeoff.tar.gz" -C "$STAGE" .
+          rm -rf "$UNPACK"
+          mkdir -p "$UNPACK"
+          tar -xzf "$EVIDENCE/bakeoff.tar.gz" -C "$UNPACK"
+          tar -tzf "$EVIDENCE/bakeoff.tar.gz" | sort > "$EVIDENCE/archive-members.txt"
+
+          # Smoke under the same strict path: no host /lib,/usr/lib fallback.
+          test "$(tr -d '\n' < "$MUSL_PATH_FILE")" = "$USERLAND_DIR/usr/lib"
+          assert_program_interpreter "$UNPACK/pi-extension-host" \
+            "$EVIDENCE/unpacked-host-interpreter.txt" unpacked-host
+          assert_program_interpreter "$UNPACK/bun" \
+            "$EVIDENCE/unpacked-runtime-interpreter.txt" unpacked-runtime
+          "/lib/$MUSL_LOADER" --list "$UNPACK/pi-extension-host" \
+            | tee "$EVIDENCE/unpacked-host-loader-resolution.txt"
+          assert_musl_resolution "$EVIDENCE/unpacked-host-loader-resolution.txt" unpacked-host
+          "/lib/$MUSL_LOADER" --list "$UNPACK/bun" \
+            | tee "$EVIDENCE/unpacked-runtime-loader-resolution.txt"
+          assert_musl_resolution "$EVIDENCE/unpacked-runtime-loader-resolution.txt" unpacked-runtime
+
+          (
+            cd "$UNPACK"
+            ./pi --version | tee "$GITHUB_WORKSPACE/$EVIDENCE/pi-version.txt"
+            request='{"id":1,"kind":"req","method":"hello","payload":{"protocolVersion":1,"compatibilityVersion":"0.80.10"}}'
+            printf '%s\n' "$request" > "$GITHUB_WORKSPACE/$EVIDENCE/hello-compiled-request.jsonl"
+            printf '%s\n' "$request" | timeout 30 ./pi-extension-host \
+              > "$GITHUB_WORKSPACE/$EVIDENCE/hello-compiled-response.jsonl"
+            printf '%s\n' "$request" > "$GITHUB_WORKSPACE/$EVIDENCE/hello-runtime-request.jsonl"
+            printf '%s\n' "$request" | timeout 30 ./bun ./pi-extension-host.js \
+              > "$GITHUB_WORKSPACE/$EVIDENCE/hello-runtime-response.jsonl"
+          )
+
+          python3 - "$EVIDENCE/hello-compiled-response.jsonl" "$EVIDENCE/hello-runtime-response.jsonl" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          expected = {
+              "id": 1,
+              "kind": "res",
+              "method": "hello",
+              "payload": {
+                  "protocolVersion": 1,
+                  "compatibilityVersion": "0.80.10",
+              },
+          }
+          for name in sys.argv[1:]:
+              lines = pathlib.Path(name).read_text(encoding="utf-8").splitlines()
+              if not lines:
+                  raise SystemExit(f"{name}: empty hello response")
+              frame = json.loads(lines[0])
+              for field in ("id", "kind", "method"):
+                  if frame.get(field) != expected[field]:
+                      raise SystemExit(f"{name}: invalid {field}: {frame.get(field)!r}")
+              payload = frame.get("payload")
+              if not isinstance(payload, dict):
+                  raise SystemExit(f"{name}: payload is not an object")
+              for field, value in expected["payload"].items():
+                  if payload.get(field) != value:
+                      raise SystemExit(f"{name}: invalid payload.{field}: {payload.get(field)!r}")
+          PY
+          assert_direct_download_ledger() {
+            local selected
+            selected="$(tr -d '\n' < "$EVIDENCE/selected-candidate.txt")"
+            local -a expected=(
+              "$ALPINE_ASSET"
+              "libstdc++-$ALPINE_GCC_RUNTIME_VERSION.apk"
+              "libgcc-$ALPINE_GCC_RUNTIME_VERSION.apk"
+              "$BUN_ASSET"
+            )
+            if [[ "$selected" == "B" ]]; then
+              expected+=("$ZIG_ASSET" "cargo-zigbuild-$CARGO_ZIGBUILD_VERSION.crate")
+            elif [[ "$selected" != "A" ]]; then
+              printf 'unknown selected candidate for ledger gate: %s\n' "$selected" >&2
+              exit 1
+            fi
+            mapfile -t rows < <(tail -n +2 "$EVIDENCE/pins-ledger.tsv")
+            if (( ${#rows[@]} != ${#expected[@]} )); then
+              printf 'direct-download ledger row count mismatch: expected %s, got %s\n' \
+                "${#expected[@]}" "${#rows[@]}" >&2
+              printf 'ledger:\n' >&2
+              cat "$EVIDENCE/pins-ledger.tsv" >&2
+              exit 1
+            fi
+            local name found exp
+            for exp in "${expected[@]}"; do
+              found=0
+              for row in "${rows[@]}"; do
+                name="${row%%$'\t'*}"
+                if [[ "$name" == "$exp" ]]; then
+                  found=1
+                  break
+                fi
+              done
+              if (( found != 1 )); then
+                printf 'missing direct-download ledger row: %s\n' "$exp" >&2
+                cat "$EVIDENCE/pins-ledger.tsv" >&2
+                exit 1
+              fi
+            done
+            for row in "${rows[@]}"; do
+              name="${row%%$'\t'*}"
+              found=0
+              for exp in "${expected[@]}"; do
+                if [[ "$name" == "$exp" ]]; then
+                  found=1
+                  break
+                fi
+              done
+              if (( found != 1 )); then
+                printf 'unexpected direct-download ledger row: %s\n' "$name" >&2
+                cat "$EVIDENCE/pins-ledger.tsv" >&2
+                exit 1
+              fi
+            done
+            {
+              printf 'selected_candidate=%s\n' "$selected"
+              printf 'expected_count=%s\n' "${#expected[@]}"
+              printf 'expected_names=%s\n' "${expected[*]}"
+            } | tee "$EVIDENCE/direct-download-ledger-gate.txt"
+          }
+          assert_direct_download_ledger
+          printf 'PASS\n' > "$EVIDENCE/native-verdict.txt"
+
+      - name: Upload aarch64 bakeoff evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rel-r1-bakeoff-aarch64
+          path: target/rel-r1-bakeoff/aarch64
+          if-no-files-found: error
+          overwrite: true
