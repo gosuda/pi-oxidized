@@ -209,7 +209,7 @@ mod tests {
     fn env_wins_when_file_exists() -> R {
         let dir = tempdir()?;
         let env_host = dir.path().join("from-env");
-        fs::write(&env_host, b"#!bin\n")?;
+        write_exec(&env_host, b"#!bin\n")?;
         let asset = dir.path().join("pi-extension-host");
         fs::write(&asset, b"#!bin\n")?;
         let spec = resolve_with(env_host.to_str(), Some(asset.as_path()))?;
@@ -358,22 +358,38 @@ mod tests {
         let Ok(exe) = env::current_exe() else {
             return false;
         };
-        let mut path = std::ffi::OsString::from(dir);
-        if let Some(existing) = env::var_os("PATH") {
-            path.push(":");
-            path.push(existing);
-        }
+        let joined = match env::var_os("PATH") {
+            Some(existing) => match std::env::join_paths(
+                std::iter::once(dir.to_path_buf()).chain(std::env::split_paths(&existing)),
+            ) {
+                Ok(joined) => joined,
+                Err(_) => return false,
+            },
+            None => dir.to_path_buf().into_os_string(),
+        };
         let mut command = std::process::Command::new(exe);
         command
             .arg("--exact")
             .arg(format!("host::tests::{test_name}"))
             .arg("--test-threads=1")
             .env(M19_CHILD_MODE, mode)
-            .env("PATH", path);
+            .env("PATH", joined);
         for (key, value) in extra_env {
             command.env(key, value);
         }
         command.status().map(|status| status.success()).unwrap_or(false)
+    }
+
+    /// Writes `bytes` and marks the file executable so a PATH-search
+    /// mutation requiring the executable bit is also killed.
+    fn write_exec(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        fs::write(path, bytes)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
+        }
+        Ok(())
     }
 
     fn m19_guard() {
@@ -387,7 +403,7 @@ mod tests {
         m19_guard();
         let dir = tempdir()?;
         let stray = dir.path().join(format!("{DEFAULT_HOST_NAME}{HOST_EXE_SUFFIX}"));
-        fs::write(&stray, b"#!bin\n")?;
+        write_exec(&stray, b"#!bin\n")?;
         assert!(
             m19_rerun_with_path(dir.path(), "m19_no_path_fallback_when_file_exists_on_disk", "notconfigured", &[]),
             "resolver must stay NotConfigured even with a stray host binary on PATH"
@@ -400,7 +416,7 @@ mod tests {
         m19_guard();
         let dir = tempdir()?;
         let stray = dir.path().join(format!("{DEFAULT_HOST_NAME}{HOST_EXE_SUFFIX}"));
-        fs::write(&stray, b"#!bin\n")?;
+        write_exec(&stray, b"#!bin\n")?;
         fs::write(dir.path().join(DEFAULT_HOST_BUNDLE_NAME), b"bundle")?;
         assert!(
             m19_rerun_with_path(dir.path(), "m19_explicit_none_params_never_discover_stray_executable", "notconfigured", &[]),
@@ -414,9 +430,9 @@ mod tests {
         m19_guard();
         let dir = tempdir()?;
         let env_host = dir.path().join("explicit-host");
-        fs::write(&env_host, b"#!bin\n")?;
+        write_exec(&env_host, b"#!bin\n")?;
         let stray = dir.path().join(format!("{DEFAULT_HOST_NAME}{HOST_EXE_SUFFIX}"));
-        fs::write(&stray, b"#!bin\n")?;
+        write_exec(&stray, b"#!bin\n")?;
         let host_str = env_host.to_string_lossy().into_owned();
         assert!(
             m19_rerun_with_path(
