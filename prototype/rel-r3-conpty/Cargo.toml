@@ -1,0 +1,17 @@
+# REL-R3 throwaway harness (issue #115). Deliberately standalone: the empty
+# [workspace] table keeps this crate out of the repository workspace, so the
+# shipped crate graph and deny.toml surface are untouched. Not published, not
+# wired into CI; execution on windows-latest is owned by REL-T7 (#114).
+[workspace]
+
+[package]
+name = "rel-r3-conpty-witness"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+publish = false
+
+[dependencies]
+avt = "=0.18.0"
+portable-pty = "=0.9.0"
+sonic-rs = "=0.5.8"
