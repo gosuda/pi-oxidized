@@ -42,7 +42,7 @@ Current seams:
 
 ## Rationale (one line)
 
-Promoting `showHardwareCursor` to a first-class boolean setting matching upstream reference behavior satisfies issue #25's parity-first rule, eliminates undocumented env-only divergence, and resolves WSL/WezTerm CJK IME anchoring without compromising compatibility in standard terminals.
+Promoting `showHardwareCursor` to a first-class boolean setting matching upstream reference behavior satisfies issue #25's parity-first rule, eliminates the writer's undocumented env-only runtime wiring divergence, and resolves WSL/WezTerm CJK IME anchoring without compromising compatibility in standard terminals.
 
 ## Invariant and sign-off traceability (issue #25)
 
@@ -60,7 +60,7 @@ This decision is made against the issue #25 terminal interaction and settings co
 ## Ownership boundary
 
 - No Rust source change, settings schema alteration, persistence modification, or runtime wiring lands under TUI-G2. This ticket records only the policy decision in `docs/TUI-G2-hardware-cursor-policy.md`.
-- All settings persistence, runtime propagation, and settings-selector UI wiring changes remain routed to their designated implementation tickets under the issue #25 governance framework.
+- The existing settings schema and persistence support remain unchanged. Runtime propagation, writer semantics, and settings-selector UI wiring are follow-on implementation work outside this decision-only commit and must be tracked explicitly before implementation.
 - Settings and persistence changes cannot be smuggled into polish or refactoring tickets.
 
 ## Deterministic verification contract (TUI-V2 / TUI-P1)
