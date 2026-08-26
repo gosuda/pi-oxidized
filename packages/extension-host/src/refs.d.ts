@@ -368,6 +368,7 @@ declare module "@earendil-works/pi-coding-agent" {
 		details?: unknown;
 		isError?: boolean;
 		usage?: unknown;
+		terminate?: boolean;
 	}
 	export interface BeforeAgentStartEventResult {
 		message?: unknown;

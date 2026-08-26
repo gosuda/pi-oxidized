@@ -135,8 +135,16 @@ describe("XC-6 hook-dispatch semantics lattice witnesses", () => {
 
 	test("M10 mutation: removing terminate from ToolCallEventResult fails the witness", () => {
 		const mutated = INPUTS.refsSource.replace(
-			/terminate\s*\?\s*:\s*boolean/,
-			"/* removed */",
+			/(interface ToolCallEventResult[\s\S]*?)terminate\s*\?\s*:\s*boolean/,
+			"$1/* removed */",
+		);
+		expect(verifyToolCallTerminateForwarding(mutated, INPUTS.hostSource, INPUTS.leanSource)).not.toEqual([]);
+	});
+
+	test("M10 mutation: removing terminate from ToolResultEventResult fails the witness", () => {
+		const mutated = INPUTS.refsSource.replace(
+			/(interface ToolResultEventResult[\s\S]*?)terminate\s*\?\s*:\s*boolean/,
+			"$1/* removed */",
 		);
 		expect(verifyToolCallTerminateForwarding(mutated, INPUTS.hostSource, INPUTS.leanSource)).not.toEqual([]);
 	});

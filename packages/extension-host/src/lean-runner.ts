@@ -1668,6 +1668,9 @@ export class LeanRunner {
 							current["isError"] = r["isError"];
 							response["isError"] = r["isError"];
 						}
+						if (r["terminate"] !== undefined) {
+							response["terminate"] = r["terminate"];
+						}
 					});
 					await this.client.respond(id, eventType as Method, response);
 					return;
@@ -1793,9 +1796,10 @@ export class LeanRunner {
 				case "before_provider_headers": {
 					const headers = payload["headers"];
 					if (!isRecord(headers)) throw new Error("before_provider_headers.headers is required");
-					// Handlers mutate `headers` in place; a null value deletes that
-					// header. The return value is ignored (matching upstream
-					// emitBeforeProviderHeaders). The mutated headers are echoed back.
+					// Handlers mutate `headers` in place (add/modify/delete keys).
+					// The return value is ignored (matching upstream
+					// emitBeforeProviderHeaders). The mutated headers are echoed
+					// back; null-value header deletion is a provider-layer concern.
 					await this.runHooks(
 						eventType,
 						{ type: eventType, headers },

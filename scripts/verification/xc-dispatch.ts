@@ -297,18 +297,12 @@ export function verifyBeforeProviderHeadersInPlace(
 			"M9: lean-runner.ts missing before_provider_headers case with runHooks call",
 		);
 	}
-	// Lean: responds with { headers }
-	if (!/case "before_provider_headers"[\s\S]*?headers\s*\}/.test(leanSource)) {
+	// Lean: responds with { headers } — match the client.respond line specifically
+	if (!/client\.respond\s*\(\s*id\s*,\s*eventType[^)]*,\s*\{\s*headers\s*\}/.test(leanSource)) {
 		violations.push(
 			"M9: lean-runner.ts before_provider_headers case missing { headers } response",
 		);
 	}
-
-	// refs.d.ts: emitBeforeProviderHeaders in the interface
-	if (!/emitBeforeProviderHeaders\s*\(/.test(hostSource)) {
-		// This is fine — the method is called through the runner interface
-	}
-
 	return violations;
 }
 
@@ -333,8 +327,8 @@ export function verifyToolCallTerminateForwarding(
 ): string[] {
 	const violations: string[] = [];
 
-	// refs.d.ts: terminate field in ToolCallEventResult
-	if (!/interface ToolCallEventResult[\s\S]*?terminate\s*\?\s*:\s*boolean/.test(refsSource)) {
+	// refs.d.ts: terminate field in ToolCallEventResult (bounded to not cross into ToolResultEventResult)
+	if (!/interface ToolCallEventResult\s*\{[^}]*?terminate\s*\?\s*:\s*boolean/.test(refsSource)) {
 		violations.push(
 			"M10: refs.d.ts ToolCallEventResult missing terminate?: boolean field",
 		);
@@ -361,6 +355,27 @@ export function verifyToolCallTerminateForwarding(
 		);
 	}
 
+
+	// refs.d.ts: terminate field in ToolResultEventResult (Rust AfterToolCallWire consumes it)
+	if (!/interface ToolResultEventResult\s*\{[^}]*?terminate\s*\?\s*:\s*boolean/.test(refsSource)) {
+		violations.push(
+			"M10: refs.d.ts ToolResultEventResult missing terminate?: boolean field",
+		);
+	}
+
+	// Host: tool_result forwards terminate from hook result
+	if (!/case "tool_result"[\s\S]*?result\["terminate"\]/.test(hostSource)) {
+		violations.push(
+			"M10: host.ts tool_result case missing terminate forwarding",
+		);
+	}
+
+	// Lean: tool_result forwards terminate from hook result
+	if (!/case "tool_result"[\s\S]*?r\["terminate"\]/.test(leanSource)) {
+		violations.push(
+			"M10: lean-runner.ts tool_result case missing terminate forwarding",
+		);
+	}
 	return violations;
 }
 
