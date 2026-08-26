@@ -2,7 +2,7 @@
 //! deterministic `NativeExtension` adapter.
 //!
 //! Drives the production `pi_ext::server::serve_io` over an in-memory tokio
-//! duplex pair, replaying the byte-identical frame corpus of
+//! duplex pair, replaying the frame shapes and id layout of the corpus in
 //! `scripts/bench-extension-scaling.ts` (hello, session_start,
 //! zero/100-idle/20-active, 300-request fast stream, slow/fast queue
 //! locality) and passing the same correctness assertions through the
@@ -10,7 +10,8 @@
 //! locality, and non-retryable errors.
 //!
 //! The test contains zero benchmark-specific frame decoding, server loop
-//! construction, or protocol method registry — it uses only the production
+//! construction, or protocol method registry — it uses only production
+//! modules (`server`, `protocol`, `adapters::methods`) and the production
 //! `serve_io`, `encode_frame`, and `decode_frame_str` entry points.
 //! Verifiable by import and grep audit (see `no_benchmark_specific_code_audit`).
 
@@ -223,21 +224,14 @@ impl NativeExtension for ScalingAdapter {
         Box::pin(async move {
             let _ = updates.send(json!({ "stage": "running" }));
 
-            // Cooperative cancellation: wait for cancel or a short yield.
-            tokio::select! {
-                biased;
-                () = cancel.cancelled() => {
-                    cancelled.store(true, Ordering::SeqCst);
-                    return Ok(json!({ "content": [], "isError": false }));
-                }
-                () = tokio::time::sleep(Duration::from_millis(2)) => {}
-            }
-
+            // Cooperative cancellation: wait for cancel deterministically.
+            // The cancellation test sends tool.cancel after observing the
+            // toolUpdate event, so the token always fires before this
+            // future resolves. No sleep fallback — the test is deterministic.
+            cancel.cancelled().await;
+            cancelled.store(true, Ordering::SeqCst);
             let _ = call.name;
-            Ok(json!({
-                "content": [{ "type": "text", "text": "done" }],
-                "isError": false,
-            }))
+            Ok(json!({ "content": [], "isError": false }))
         })
     }
 
@@ -935,14 +929,72 @@ async fn full_corpus_replay_id_correlation() -> R {
     Ok(())
 }
 
+/// Prepare and validate: the adapter's fixed prepare/validate results
+/// must flow through the production server with correct id correlation
+/// and the `prepared`/`validated` flags set.
+#[tokio::test]
+async fn prepare_validate_fixed_results_id_correlation() -> R {
+    let (ext, handles) = ScalingAdapter::new(LoadProfile::Active20, TerminalInputMode::Fast);
+    let (mut peer, server) = spawn_server(ext, ServerConfig::default());
+
+    peer.hello().await?;
+    let _ack = peer.recv().await?;
+    let _load_res = peer.load(2).await?;
+    let _ss_res = peer.session_start(3).await?;
+    let _ = collect_ui_slot_keys(&mut peer, Duration::from_millis(500)).await;
+
+    // tool.prepare
+    let prep_res = peer.request(200, methods::TOOL_PREPARE, json!({
+        "name": "tool.0",
+        "args": { "input": "hello" },
+    })).await?;
+    assert_eq!(prep_res.id, 200, "prepare response must correlate");
+    assert_eq!(prep_res.kind, FrameKind::Res);
+    assert_eq!(
+        prep_res.payload["args"]["prepared"], true,
+        "adapter must set prepared flag"
+    );
+    assert_eq!(
+        prep_res.payload["args"]["input"], "hello",
+        "adapter must echo original args"
+    );
+
+    // tool.validate
+    let val_res = peer.request(201, methods::TOOL_VALIDATE, json!({
+        "name": "tool.0",
+        "args": { "input": "hello", "prepared": true },
+    })).await?;
+    assert_eq!(val_res.id, 201, "validate response must correlate");
+    assert_eq!(val_res.kind, FrameKind::Res);
+    assert_eq!(
+        val_res.payload["args"]["validated"], true,
+        "adapter must set validated flag"
+    );
+
+    assert_eq!(
+        handles.prepare_calls.load(Ordering::SeqCst), 1,
+        "prepare must be called once"
+    );
+    assert_eq!(
+        handles.validate_calls.load(Ordering::SeqCst), 1,
+        "validate must be called once"
+    );
+
+    drop(peer);
+    let result = tokio::time::timeout(TIMEOUT, server).await??;
+    assert!(result.is_ok());
+    Ok(())
+}
+
 /// Grep / import audit: verify the test contains zero benchmark-specific
 /// frame decoding, server loop construction, or protocol method registry.
 ///
 /// This is a compile-time and source audit: the test imports only from
-/// `pi_ext::server` and `pi_ext::protocol` (production modules), uses
-/// only `encode_frame` / `decode_frame_str` for frame I/O, and drives
-/// only the production `serve_io` entry point. No custom frame decoder,
-/// server loop, or method dispatch exists in this file.
+/// production modules (`pi_ext::server`, `pi_ext::protocol`,
+/// `pi_ext::adapters::methods`), uses only `encode_frame` /
+/// `decode_frame_str` for frame I/O, and drives only the production
+/// `serve_io` entry point. No custom frame decoder, server loop, or
+/// method dispatch exists in this file.
 #[tokio::test]
 async fn no_benchmark_specific_code_audit() -> R {
     // The test file itself is the audit artifact. Verify at runtime that
