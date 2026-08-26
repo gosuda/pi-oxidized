@@ -26,8 +26,8 @@ A schema-v1 artifact (`TranscriptArtifact` in `crates/pi-tui/src/testkit/transcr
 
 All enumerations serialize with kebab-case values (`serde(rename_all = "kebab-case")` in `crates/pi-tui/src/testkit/transcript.rs`):
 
-- **`Scenario`** (13 variants):
-  - *Fixture (4)*: `fixture-stream-settle`, `fixture-resize-ladder`, `fixture-resize-storm`, `fixture-paste-cursor`.
+- **`Scenario`** (14 variants):
+  - *Fixture (5)*: `fixture-stream-settle`, `fixture-resize-ladder`, `fixture-resize-storm`, `fixture-paste-cursor`, `fixture-ext-gauntlet`.
   - *Product (9)*: `cold-start`, `wizard`, `trust-selector`, `trust-dialog`, `streaming`, `selectors`, `overlays`, `product-resize-ladder`, `product-resize-storm`.
 - **`RowTier`** (2 variants): `local`, `tier-n`.
 - **`RowId`** (5 variants): `gnu-x64`, `gnu-arm64`, `darwin-x64`, `darwin-arm64`, `windows-x64`.
@@ -107,21 +107,21 @@ The validator decodes `rawBytesB64` and `context`, runs `normalize_raw_bytes`, a
 ### Driver and runner row constraints
 `validate_driver_row_pairing` (`crates/pi-tui/src/testkit/validate.rs`) enforces:
 
-| Runner row ID (`RowId`) | Platform | Required driver (`TierN`) | Local driver allowed |
+| Runner row ID (`RowId`) | Platform | Required driver (`TierN`) | Typical local driver |
 |---|---|---|---|
 | `gnu-x64` | Linux x86-64 | `DriverKind::PosixPty` | `PosixPty`, `QemuUserSmoke` |
 | `gnu-arm64` | Linux AArch64 | `DriverKind::PosixPty` | `PosixPty`, `QemuUserSmoke` |
 | `darwin-x64` | macOS x86-64 | `DriverKind::PosixPty` | `PosixPty` |
 | `darwin-arm64` | macOS Apple Silicon | `DriverKind::PosixPty` | `PosixPty` |
-| `windows-x64` | Windows x86-64 | `DriverKind::ConPty` | `ConPty` only |
+| `windows-x64` | Windows x86-64 | `DriverKind::ConPty` | `ConPty` only (enforced on `TierN` and local) |
 
-`RowTier::TierN` artifacts require a non-empty `runner_image` string (`ValidatorError::TierNMissingRunnerImage`).
+The TierN column is validator-enforced; on the local tier only `windows-x64` hard-requires `ConPty` — the remaining local "typical" pairings are guidance, not asserted.
 
 ### QEMU contingency rules
 `QemuUserSmokeDriver` (`crates/pi-tui/src/testkit/qemu.rs`) executes binaries via piped stdio (`DriverSession` only, never `RenderSession`).
 1. Mode must be `TranscriptMode::Contingency` (`ValidatorError::QemuNonContingencyMode`).
 2. Claims must be a subset of `{ ClaimClass::Execution, ClaimClass::Protocol }` (`ValidatorError::QemuClaimOutsideAllowed`).
-3. Render-class events (`Snapshot`, `Resize`, `ResizeStorm`) and claims (`Render`, `Pty`, `SynchronizedOutput`, `NoClear`, `Snapshot`) are forbidden (`ValidatorError::QemuSnapshotOrRenderClaim`).
+3. Render-class events (`Snapshot`, `Resize`, `ResizeStorm`) are forbidden (`ValidatorError::QemuSnapshotOrRenderClaim`); render-class *claims* (and any claim outside `Execution`/`Protocol`) are rejected earlier by rule 2 as `ValidatorError::QemuClaimOutsideAllowed`.
 4. `RowTier::TierN` is prohibited for QEMU artifacts (`ValidatorError::QemuTierN`).
 
 ## 7. Repeatability gate (k >= 3) and settle policies
@@ -135,16 +135,15 @@ The validator decodes `rawBytesB64` and `context`, runs `normalize_raw_bytes`, a
 ## 8. Corpus scenarios, prerequisites, and validator CLI
 
 ### Scenario matrix and artifact layout
-Transcripts land at `target/verification/tui-transcripts/<row>/<scenario>/run-{1,2,3}/transcript.artifact.json` (`write_artifact` in `crates/pi/tests/tui_transcripts.rs`).
+Transcripts land at `target/verification/tui-transcripts/<row>/<scenario>/run-{1,2,3}/transcript.artifact.json` (`write_artifact` in both corpus tests). The validator CLI requires the `.artifact.json` suffix (`is_artifact_file`), so any other filename (e.g. bare `artifact.json`) is invisible to directory scans — keep writers and validator on this one spelling.
 
 | Corpus | Scenarios | Primary assertions and flow | Prerequisites |
 |---|---|---|---|
 | **Fixture** (`crates/pi-tui/tests/transcript_fixture.rs`) | `stream-settle`<br>`resize-ladder`<br>`resize-storm`<br>`paste-cursor` | Deterministic VT state, OSC transaction markers, balanced `no-clear`, paste and cursor handling | `pi_tui_pty_fixture` binary (`crates/pi-tui/src/bin/pi_tui_pty_fixture.rs`) |
-| **Product** (`crates/pi/tests/tui_transcripts.rs`) | `cold-start`<br>`wizard`<br>`trust-selector`<br>`trust-dialog`<br>`streaming`<br>`selectors`<br>`overlays`<br>`product-resize-ladder`<br>`product-resize-storm` | Startup prompts, theme selection, streaming output, `/resume` selector, `/trust` selector, resize resilience to 1x1 | `CARGO_BIN_EXE_pi`, extension host (`pi-extension-host`), test extension (`verification-profile`) |
+| **Extension gauntlet** (`crates/pi-tui/tests/transcript_ext_gauntlet.rs`) | `ext-gauntlet` | Extension UI gauntlet with sanitization floor (`fixture-ext-gauntlet`) | `pi_tui_ext_fixture` binary (`crates/pi-tui/src/bin/pi_tui_ext_fixture.rs`) |
+| **Product** (`crates/pi/tests/tui_transcripts.rs`) | `cold-start`<br>`wizard`<br>`trust-selector`<br>`streaming`<br>`selectors`<br>`overlays`<br>`product-resize-ladder`<br>`product-resize-storm` | Startup prompts, theme selection, streaming output, `/resume` selector, `/trust` selector, resize resilience to 1x1 | `CARGO_BIN_EXE_pi`, extension host (`pi-extension-host`), test extension (`verification-profile`) |
 
-### Trust selector and trust dialog mechanics
-- `Scenario::TrustSelector` (`run_trust_selector` in `crates/pi/tests/tui_transcripts.rs`): Bootstraps a trust-requiring workspace. Presses Enter on the `"Trust project folder?"` prompt, asserts that `ProjectTrustStore` persisted the decision in `trust.json`, verifies that the project prompt resource loads, opens the `/trust` selector to verify the default project trust surface, and dismisses the selector with Escape.
-- `Scenario::TrustDialog` (`run_trust_dialog` in `crates/pi/tests/tui_transcripts.rs`): Bootstraps a trust-requiring workspace. Presses Escape on the `"Trust project folder?"` prompt, asserts that no trust decision is persisted, verifies that the project prompt resource remains inaccessible, opens the `/trust` selector, dismisses the selector, and exits.
+`Scenario::TrustDialog` exists in the closed enumeration (§2) but is **not** exercised by the current product corpus: production interactive boot passes `ui: None` into `resolve_project_trusted`, so the interactive `TrustUi` prompt never renders (named limitation `limitation:absent-production-interactive-TrustUi-prompt`, asserted in `run_trust_selector`). `trust-selector` instead verifies the boot-trust observation surface: no interactive prompt appears under `--approve`, `/trust` surfaces `Default project trust`, and Escape dismisses it.
 
 ### Validator CLI
 `pi_tui_transcript_validator` (`crates/pi-tui/src/bin/pi_tui_transcript_validator.rs`):
@@ -154,6 +153,5 @@ cargo run -p pi-tui --bin pi_tui_transcript_validator -- <path-to-artifact.json 
 Recursively scans for `*.artifact.json`. Fails (exit code 1) on any validation error or if zero artifacts match.
 
 ## 9. Current evidence boundary
-
-- **Local Host Evidence**: Fully supported across Unix (`PosixPtyDriver` in `crates/pi-tui/src/testkit/posix.rs`) and Windows (`ConPtyDriver` in `crates/pi-tui/src/testkit/conpty.rs`).
-- **Tier-N Five-Runner CI Evidence**: **PENDING**. The schema, driver interfaces, validator rules, and corpus suites are implemented; multi-runner CI artifacts from all five Tier N platforms are not yet committed.
+- **Local Host Evidence**: Fixture corpus (`crates/pi-tui/tests/transcript_fixture.rs`) and extension gauntlet (`crates/pi-tui/tests/transcript_ext_gauntlet.rs`) run headless and green with `cargo test -p pi-tui --features testkit`: all four fixture scenarios record through the width ladder 80x24 → 1x1 and the 24-size resize storm, k=3 byte-identical canonical bytes and digests; the ext gauntlet records the sanitization-floor corpus. Product corpus (`crates/pi/tests/tui_transcripts.rs`) is implemented but currently **blocked before first assertions**: the product renders its opening frame and never reaches the ready chrome (`type a message to begin`) under the verification launch. Verified at the corpus-landing commit itself (`678c878`) with both the pre-xc-6 and xc-6 extension-host builds, warm and cold `HOME` bun caches — the stall predates this harness work and is product-side (extension-provider registration to first full paint), not a driver, schema, or validator defect. Product-corpus artifacts from an earlier working state exist under `target/verification/tui-transcripts/local/` and validate cleanly (24/24 `PASS` via the validator CLI, including the freshly regenerated fixture artifacts).
+- **Tier-N Five-Runner CI Evidence**: **PENDING**. The schema, driver interfaces, validator rules, and corpus suites are implemented; `PI_TUI_TIER_ROW=tier-n/<row>@<image>` selects the row and enforces non-empty `runner_image` (`ValidatorError::TierNMissingRunnerImage`), and local runs structurally cannot claim Tier N (`write_artifact` + test assertion). Multi-runner CI artifacts from all five Tier N platforms are not yet committed.
