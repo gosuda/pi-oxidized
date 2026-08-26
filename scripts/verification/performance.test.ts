@@ -3,7 +3,29 @@ import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSy
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnPty } from "./pty.ts";
-import { HarnessFailure, frameObservation, terminateAndRequireCleanExit } from "./performance.ts";
+import {
+	HarnessFailure,
+	ProcTreeSampler,
+	assembleProcessMemoryReading,
+	distribution,
+	exitCodeForFailure,
+	frameObservation,
+	observeProcessTreeMemory,
+	parseProcStatusPeakRssText,
+	parseSmapsRollupText,
+	planMemorySampleStarts,
+	processTreeIdentity,
+	recordEntrypointHarnessFailure,
+	sampleProcessTreeMemoryWindow,
+	terminateAndRequireCleanExit,
+	validateMemoryCoverage,
+} from "./performance.ts";
+import {
+	NOISE_EXIT_CODE,
+	NOISE_RELATIVE_SPREAD_LIMIT,
+	NoiseRejection,
+	requireQuiet,
+} from "../statistics.ts";
 
 // T33: after capturing the first frame, the performance verifier must send
 // /quit and require a clean process exit. The finally force-kill remains
@@ -183,4 +205,462 @@ describe.skipIf(isWindows)("performance first-frame lifecycle", () => {
 			await pty.terminate();
 		}
 	}, 15_000);
+});
+
+describe("distribution additive noise fields", () => {
+	test("adds exact population stddev and median-relative spread", () => {
+		const result = distribution([1, 2, 3, 4, 5]);
+		expect(result.count).toBe(5);
+		expect(result.median).toBe(3);
+		expect(result.p95).toBe(4.8);
+		expect(result.p99).toBe(4.96);
+		expect(result.min).toBe(1);
+		expect(result.max).toBe(5);
+		expect(result.stddev).toBe(Math.sqrt(2));
+		expect(result.relativeSpread).toBe(Math.sqrt(2) / 3);
+	});
+
+	test("constant zero is quiet; nonconstant median zero is undefined", () => {
+		expect(distribution([0, 0, 0])).toEqual({
+			count: 3,
+			median: 0,
+			p95: 0,
+			p99: 0,
+			min: 0,
+			max: 0,
+			stddev: 0,
+			relativeSpread: 0,
+		});
+		const noisyZero = distribution([0, 0, 1]);
+		expect(noisyZero.median).toBe(0);
+		expect(noisyZero.stddev).toBeGreaterThan(0);
+		expect(noisyZero.relativeSpread).toBeNull();
+	});
+
+	test("boundary relative spread 0.20 is quiet and epsilon above rejects", () => {
+		expect(() =>
+			requireQuiet([
+				{
+					label: "boundary",
+					count: 2,
+					median: 10,
+					stddev: 2,
+					relativeSpread: NOISE_RELATIVE_SPREAD_LIMIT,
+				},
+			]),
+		).not.toThrow();
+		expect(() =>
+			requireQuiet([
+				{
+					label: "noisy",
+					count: 2,
+					median: 10,
+					stddev: 2.0000001,
+					relativeSpread: NOISE_RELATIVE_SPREAD_LIMIT + Number.EPSILON,
+				},
+			]),
+		).toThrow(NoiseRejection);
+	});
+});
+
+describe("exitCodeForFailure mapping", () => {
+	test("maps NoiseRejection to 2 and other failures to 1", () => {
+		const rejection = new NoiseRejection([
+			{
+				label: "x",
+				count: 1,
+				median: 1,
+				stddev: 1,
+				relativeSpread: 1,
+			},
+		]);
+		expect(exitCodeForFailure(rejection)).toBe(NOISE_EXIT_CODE);
+		expect(exitCodeForFailure(new HarnessFailure("statistics", "bad"))).toBe(1);
+		expect(exitCodeForFailure(new Error("threshold-like"))).toBe(1);
+		expect(rejection).toBeInstanceOf(Error);
+		expect(rejection.name).toBe("NoiseRejection");
+		expect(rejection instanceof HarnessFailure).toBe(false);
+	});
+});
+
+describe("process memory parsers", () => {
+	test("parseSmapsRollupText requires both fields and multiplies by 1024", () => {
+		const parsed = parseSmapsRollupText("Rss: 10 kB\nPss: 7 kB\n");
+		expect(parsed).toEqual({ rssBytes: 10 * 1024, pssBytes: 7 * 1024 });
+		expect(parseSmapsRollupText("Rss: 10 kB\n")).toBeUndefined();
+		expect(parseSmapsRollupText("Pss: 7 kB\n")).toBeUndefined();
+		expect(parseSmapsRollupText("not-a-rollup")).toBeUndefined();
+	});
+
+	test("parseProcStatusPeakRssText reads VmHWM bytes or undefined", () => {
+		expect(parseProcStatusPeakRssText("VmHWM:\t12 kB\nVmRSS:\t8 kB\n")).toBe(12 * 1024);
+		expect(parseProcStatusPeakRssText("VmRSS:\t8 kB\n")).toBeUndefined();
+		expect(parseProcStatusPeakRssText("garbage")).toBeUndefined();
+	});
+});
+
+describe("process tree identity", () => {
+	test("same pid with different startTime stays distinct", () => {
+		expect(processTreeIdentity(42, "100")).toBe("42:100");
+		expect(processTreeIdentity(42, "100")).not.toBe(processTreeIdentity(42, "101"));
+	});
+});
+
+describe("timed CPU sampler purity", () => {
+	test("ProcTreeSampler body does not read smaps_rollup or status", () => {
+		const source = readFileSync(PERFORMANCE_MODULE, "utf8");
+		const start = source.indexOf("export class ProcTreeSampler");
+		const end = source.indexOf("function totalTicks", start);
+		expect(start).toBeGreaterThanOrEqual(0);
+		expect(end).toBeGreaterThan(start);
+		const body = source.slice(start, end);
+		expect(body).not.toContain("smaps_rollup");
+		expect(body).not.toContain("/status");
+		expect(body).not.toContain("parseSmaps");
+		expect(body).not.toContain("observeProcessTreeMemory");
+		expect(body).not.toContain("readProcFile");
+	});
+
+	test("snapshot is a pure read and does not advance procSamples", async () => {
+		const child = Bun.spawn({
+			cmd: [bunExecutable, "-e", "setInterval(() => {}, 1000)"],
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+		try {
+			const sampler = new ProcTreeSampler(child.pid!, 20);
+			await Bun.sleep(25);
+			const first = sampler.snapshot();
+			const second = sampler.snapshot();
+			expect(second.procSamples).toBe(first.procSamples);
+			expect(second.observedProcesses).toBe(first.observedProcesses);
+			expect(second.maxOwnTicks.size).toBe(first.maxOwnTicks.size);
+			expect("memory" in second).toBe(false);
+			await sampler.stop();
+		} finally {
+			child.kill();
+			await child.exited;
+		}
+	}, 15_000);
+});
+
+describe("startup versus idle memory labels", () => {
+	test("idle lane uses startupSumVmHwmBytes as non-simultaneous lifetime upper bound", () => {
+		const source = readFileSync(PERFORMANCE_MODULE, "utf8");
+		expect(source).toContain("startupSumVmHwmBytes");
+		expect(source).toContain("steadyWindowMaxTreeRssBytes");
+		expect(source).toContain("steadyWindowMaxTreePssBytes");
+		expect(source).toContain("non-simultaneous sum of per-identity VmHWM");
+		expect(source).not.toMatch(/startupPeakRssBytes/);
+		expect(source).not.toMatch(/idlePeakRssBytes/);
+		const idleArtifact = source.slice(source.indexOf("idleProcessTreeMemory"));
+		expect(idleArtifact).toContain("startupSumVmHwm");
+		expect(idleArtifact).toContain("steadyWindowRss");
+		expect(idleArtifact).toContain("steadyWindowPss");
+		expect(idleArtifact).toContain("lifetime upper bound");
+		expect(idleArtifact).not.toMatch(/\bidlePeak/);
+	});
+});
+
+describe("pre-memory verdict ordering", () => {
+	test("evaluates requireQuiet and blockers before memory collectors", () => {
+		const source = readFileSync(PERFORMANCE_MODULE, "utf8");
+		const mainStart = source.indexOf("async function main()");
+		const main = source.slice(mainStart);
+		const quiet = main.indexOf("requireQuiet([");
+		const evaluated = main.indexOf("const evaluatedVerdict");
+		const streamMem = main.indexOf("collectStreamLoadMemorySamples()");
+		const idleMem = main.indexOf("collectIdleMemorySamples()");
+		expect(quiet).toBeGreaterThan(0);
+		expect(evaluated).toBeGreaterThan(quiet);
+		expect(streamMem).toBeGreaterThan(evaluated);
+		expect(idleMem).toBeGreaterThan(streamMem);
+		expect(main.indexOf("after evaluated verdict")).toBeGreaterThan(streamMem);
+	});
+});
+
+describe("absolute memory sample schedule", () => {
+	test("plans starts strictly before the deadline with no overrun slot", () => {
+		expect(planMemorySampleStarts(1000, 50)).toEqual(
+			Array.from({ length: 20 }, (_, index) => index * 50),
+		);
+		expect(planMemorySampleStarts(1000, 50).every((offset) => offset < 1000)).toBe(true);
+		expect(planMemorySampleStarts(100, 50)).toEqual([0, 50]);
+		expect(planMemorySampleStarts(50, 50)).toEqual([0]);
+		expect(planMemorySampleStarts(0, 50)).toEqual([]);
+	});
+});
+
+describe("process memory assembly policy", () => {
+	test("discards identity races when reconfirm startTime differs", () => {
+		const result = assembleProcessMemoryReading({
+			pid: 7,
+			initialStartTime: "100",
+			root: false,
+			smaps: { kind: "ok", text: "Rss: 10 kB\nPss: 7 kB\n" },
+			status: { kind: "ok", text: "VmHWM:\t12 kB\n" },
+			reconfirm: { kind: "ok", text: "7 (cmd) R 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 999" },
+		});
+		expect(result).toEqual({ kind: "discard-identity-race" });
+	});
+
+	test("live-root access denial is incomplete access-denied", () => {
+		const result = assembleProcessMemoryReading({
+			pid: 1,
+			initialStartTime: "100",
+			root: true,
+			smaps: { kind: "access-denied" },
+			status: { kind: "ok", text: "VmHWM:\t12 kB\n" },
+			reconfirm: { kind: "ok", text: "1 (cmd) R 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 100" },
+		});
+		expect(result.kind).toBe("incomplete");
+		if (result.kind === "incomplete") {
+			expect(result.reason).toBe("access-denied");
+		}
+	});
+
+	test("live-root parse failure is incomplete parse", () => {
+		const result = assembleProcessMemoryReading({
+			pid: 1,
+			initialStartTime: "100",
+			root: true,
+			smaps: { kind: "ok", text: "Rss: 10 kB\n" },
+			status: { kind: "ok", text: "VmHWM:\t12 kB\n" },
+			reconfirm: { kind: "ok", text: "1 (cmd) R 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 100" },
+		});
+		expect(result.kind).toBe("incomplete");
+		if (result.kind === "incomplete") {
+			expect(result.reason).toBe("parse");
+		}
+	});
+
+	test("descendant vanish after reconfirm is vanished not incomplete", () => {
+		const result = assembleProcessMemoryReading({
+			pid: 9,
+			initialStartTime: "100",
+			root: false,
+			smaps: { kind: "ok", text: "Rss: 10 kB\nPss: 7 kB\n" },
+			status: { kind: "ok", text: "VmHWM:\t12 kB\n" },
+			reconfirm: { kind: "vanished" },
+		});
+		expect(result).toEqual({ kind: "vanished" });
+	});
+
+	test("validateMemoryCoverage fails when live identities lack complete memory", () => {
+		expect(() =>
+			validateMemoryCoverage(
+				{
+					processes: [],
+					treeRssBytes: 0,
+					treePssBytes: 0,
+					sumPeakRssBytes: 0,
+					observedLiveIdentities: 1,
+					identitiesWithCompleteMemory: 0,
+					vanishedDescendants: 0,
+					coverageComplete: false,
+				},
+				"memory-coverage",
+			),
+		).toThrow(HarnessFailure);
+	});
+});
+
+describe.skipIf(isWindows)("process-tree memory observation", () => {
+	test("populates complete coverage for a live synthetic root", async () => {
+		const child = Bun.spawn({
+			cmd: [bunExecutable, "-e", "setInterval(() => {}, 1000)"],
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+		try {
+			const observation = observeProcessTreeMemory(child.pid!, "synthetic-memory");
+			expect(observation.coverageComplete).toBe(true);
+			expect(observation.identitiesWithCompleteMemory).toBe(observation.observedLiveIdentities);
+			expect(observation.treeRssBytes).toBeGreaterThan(0);
+			expect(observation.treePssBytes).toBeGreaterThan(0);
+			expect(observation.sumPeakRssBytes).toBeGreaterThan(0);
+		} finally {
+			child.kill();
+			await child.exited;
+		}
+	}, 15_000);
+});
+
+describe("memory-path child enumeration policy", () => {
+	function statText(pid: number, startTime: string): string {
+		return `${pid} (cmd) R ${Array.from({ length: 18 }, () => "0").concat(startTime).join(" ")}`;
+	}
+
+	test("child EACCES on a live parent fails hard", () => {
+		let statReads = 0;
+		expect(() =>
+			observeProcessTreeMemory(1, "child-eacces", {
+				readProcFile: (path) => {
+					if (path === "/proc/1/stat") {
+						statReads += 1;
+						return { kind: "ok", text: statText(1, "100") };
+					}
+					if (path.endsWith("smaps_rollup")) return { kind: "ok", text: "Rss: 10 kB\nPss: 7 kB\n" };
+					if (path.endsWith("status")) return { kind: "ok", text: "VmHWM:\t12 kB\n" };
+					return { kind: "vanished" };
+				},
+				enumerateChildren: () => ({ kind: "access-denied", detail: "/proc/1/task EACCES" }),
+			}),
+		).toThrow(/denied children enumeration/);
+		expect(statReads).toBeGreaterThan(0);
+	});
+
+	test("reused parent identity does not enqueue children", () => {
+		let childEnumCalls = 0;
+		let statReads = 0;
+		expect(() =>
+			observeProcessTreeMemory(1, "identity-race", {
+				readProcFile: (path) => {
+					if (path === "/proc/1/stat") {
+						statReads += 1;
+						if (statReads === 1) return { kind: "ok", text: statText(1, "100") };
+						return { kind: "ok", text: statText(1, "999") };
+					}
+					if (path.endsWith("smaps_rollup")) return { kind: "ok", text: "Rss: 10 kB\nPss: 7 kB\n" };
+					if (path.endsWith("status")) return { kind: "ok", text: "VmHWM:\t12 kB\n" };
+					return { kind: "vanished" };
+				},
+				enumerateChildren: () => {
+					childEnumCalls += 1;
+					return { kind: "ok", children: [2] };
+				},
+			}),
+		).toThrow(HarnessFailure);
+		expect(childEnumCalls).toBe(0);
+	});
+});
+
+describe("memory window coverage aggregation", () => {
+	function statText(pid: number, startTime: string): string {
+		return `${pid} (cmd) R ${Array.from({ length: 18 }, () => "0").concat(startTime).join(" ")}`;
+	}
+
+	test("records planned cadence, per-sample observations, and max-record indices", async () => {
+		let ticks = 0;
+		const rssKbValues = [10, 30, 20];
+		const window = await sampleProcessTreeMemoryWindow(1, "agg-window", 150, 50, {
+			readProcFile: (path) => {
+				if (path.endsWith("/stat")) return { kind: "ok", text: statText(1, "100") };
+				if (path.endsWith("smaps_rollup")) {
+					const rssKb = rssKbValues[Math.min(ticks, rssKbValues.length - 1)]!;
+					return { kind: "ok", text: `Rss: ${rssKb} kB\nPss: ${Math.floor(rssKb / 2)} kB\n` };
+				}
+				if (path.endsWith("status")) return { kind: "ok", text: "VmHWM:\t40 kB\n" };
+				return { kind: "vanished" };
+			},
+			enumerateChildren: () => {
+				ticks += 1;
+				return { kind: "ok", children: [] };
+			},
+		});
+		expect(window.plannedSampleStartsMs).toEqual([0, 50, 100]);
+		expect(window.observations.length).toBe(window.aggregateCoverage.samples);
+		expect(window.sampleStartOffsetsMs.length).toBe(window.observations.length);
+		expect(window.sampleStartOffsetsMs.every((offset) => offset < 150)).toBe(true);
+		expect(window.aggregateCoverage.allSamplesCoverageComplete).toBe(true);
+		expect(window.aggregateCoverage.observedLiveIdentitiesMax).toBeGreaterThan(0);
+		expect(window.maxTreeRss.sampleIndex).toBeGreaterThanOrEqual(0);
+		expect(window.maxTreeRss.sampleIndex).toBeLessThan(window.observations.length);
+		expect(window.maxTreeRss.bytes).toBe(window.observations[window.maxTreeRss.sampleIndex]!.treeRssBytes);
+		expect(window.maxTreePss.bytes).toBe(window.observations[window.maxTreePss.sampleIndex]!.treePssBytes);
+		expect(window.maxTreeRss.startOffsetMs).toBe(window.sampleStartOffsetsMs[window.maxTreeRss.sampleIndex]);
+		expect(window.maxTreeRss.bytes).toBe(30 * 1024);
+	});
+});
+
+describe("post-enumeration parent identity recheck", () => {
+	function statText(pid: number, startTime: string): string {
+		return `${pid} (cmd) R ${Array.from({ length: 18 }, () => "0").concat(startTime).join(" ")}`;
+	}
+
+	test("parent startTime change after child enum discards children", () => {
+		let parentStatReads = 0;
+		let childReads = 0;
+		const observation = observeProcessTreeMemory(1, "post-enum-change", {
+			readProcFile: (path) => {
+				if (path === "/proc/1/stat") {
+					parentStatReads += 1;
+					// initial + assemble reconfirm stay stable; post-enum recheck flips identity
+					if (parentStatReads <= 2) return { kind: "ok", text: statText(1, "100") };
+					return { kind: "ok", text: statText(1, "999") };
+				}
+				if (path === "/proc/2/stat" || path === "/proc/2/smaps_rollup" || path === "/proc/2/status") {
+					childReads += 1;
+					return { kind: "ok", text: path.endsWith("stat") ? statText(2, "200") : path.endsWith("status") ? "VmHWM:\t12 kB\n" : "Rss: 4 kB\nPss: 3 kB\n" };
+				}
+				if (path.endsWith("smaps_rollup")) return { kind: "ok", text: "Rss: 10 kB\nPss: 7 kB\n" };
+				if (path.endsWith("status")) return { kind: "ok", text: "VmHWM:\t12 kB\n" };
+				return { kind: "vanished" };
+			},
+			enumerateChildren: (pid) => {
+				if (pid === 1) return { kind: "ok", children: [2] };
+				return { kind: "ok", children: [] };
+			},
+		});
+		expect(observation.processes.map((process) => process.pid)).toEqual([1]);
+		expect(childReads).toBe(0);
+		expect(parentStatReads).toBeGreaterThanOrEqual(3);
+	});
+
+	test("parent vanish after child enum discards children", () => {
+		let parentStatReads = 0;
+		let childReads = 0;
+		const observation = observeProcessTreeMemory(1, "post-enum-vanish", {
+			readProcFile: (path) => {
+				if (path === "/proc/1/stat") {
+					parentStatReads += 1;
+					if (parentStatReads <= 2) return { kind: "ok", text: statText(1, "100") };
+					return { kind: "vanished" };
+				}
+				if (path.startsWith("/proc/2/")) {
+					childReads += 1;
+					return { kind: "ok", text: path.endsWith("stat") ? statText(2, "200") : path.endsWith("status") ? "VmHWM:\t12 kB\n" : "Rss: 4 kB\nPss: 3 kB\n" };
+				}
+				if (path.endsWith("smaps_rollup")) return { kind: "ok", text: "Rss: 10 kB\nPss: 7 kB\n" };
+				if (path.endsWith("status")) return { kind: "ok", text: "VmHWM:\t12 kB\n" };
+				return { kind: "vanished" };
+			},
+			enumerateChildren: (pid) => (pid === 1 ? { kind: "ok", children: [2] } : { kind: "ok", children: [] }),
+		});
+		expect(observation.processes.map((process) => process.pid)).toEqual([1]);
+		expect(childReads).toBe(0);
+	});
+});
+
+describe("entrypoint harness failure preserves threshold blockers", () => {
+	test("appends harness failure without replacing evaluated blockers", () => {
+		const target = {
+			pass: true,
+			blockers: [
+				"Rust native keypress-to-paint p99: 12.000 ms >= required 10.000 ms (median 8.000 ms, p95 11.000 ms, 20 samples)",
+			],
+		};
+		recordEntrypointHarnessFailure(
+			target,
+			new HarnessFailure("idle-memory", "process-tree memory coverage incomplete: 0/1 live identities had complete Rss/Pss/VmHWM"),
+		);
+		expect(target.pass).toBe(false);
+		expect(target.blockers).toHaveLength(2);
+		expect(target.blockers[0]).toContain("keypress-to-paint p99");
+		expect(target.blockers[1]).toBe(
+			"idle-memory: process-tree memory coverage incomplete: 0/1 live identities had complete Rss/Pss/VmHWM",
+		);
+		expect(target.failure).toEqual({
+			stage: "idle-memory",
+			message: "process-tree memory coverage incomplete: 0/1 live identities had complete Rss/Pss/VmHWM",
+		});
+	});
+
+	test("entrypoint catch records via preserve-and-append helper", () => {
+		const source = readFileSync(PERFORMANCE_MODULE, "utf8");
+		const catchStart = source.indexOf("if (import.meta.main)");
+		const catchBody = source.slice(catchStart);
+		expect(catchBody).toContain("recordEntrypointHarnessFailure(artifact, failure)");
+		expect(catchBody).not.toMatch(/artifact\.blockers = \[`\$\{stage\}: \$\{failure\.message\}`\]/);
+	});
 });

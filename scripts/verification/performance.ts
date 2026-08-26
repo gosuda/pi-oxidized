@@ -12,6 +12,16 @@ import {
 import { arch, platform, release } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { PTY_KEYS, type PtyProcess, type PtySnapshot, spawnPty } from "./pty.ts";
+import {
+	NOISE_EXIT_CODE,
+	NoiseRejection,
+	REMEDIATION_LADDER,
+	formatNoiseRejection,
+	requireQuiet,
+	spreadStats,
+	type NoisyDistribution,
+} from "../statistics.ts";
+
 
 const REPOSITORY_ROOT = resolve(import.meta.dirname, "../..");
 const ARTIFACT_PATH = resolve(REPOSITORY_ROOT, "target/bench/performance-comparison.json");
@@ -76,6 +86,13 @@ const VERSION_SPEEDUP_TARGET = 3;
 const FIRST_FRAME_SPEEDUP_TARGET = 3;
 const STREAM_CPU_SPEEDUP_TARGET = 2;
 const KEYPRESS_P99_TARGET_MS = 5;
+const IDLE_MEMORY_STABILIZATION_MS = 500;
+const IDLE_MEMORY_SAMPLE_WINDOW_MS = 1_000;
+const IDLE_MEMORY_SAMPLES = 5;
+const MEMORY_SAMPLE_INTERVAL_MS = 50;
+const STREAM_MEMORY_SAMPLES = 5;
+const STREAM_MEMORY_SAMPLE_WINDOW_MS = 1_000;
+
 
 const implementationNames = ["rust", "typescript"] as const;
 type Implementation = (typeof implementationNames)[number];
@@ -88,13 +105,17 @@ interface Distribution {
 	readonly p99: number;
 	readonly min: number;
 	readonly max: number;
+	readonly stddev: number;
+	readonly relativeSpread: number | null;
 }
 
-interface ProcCpuSnapshot {
+
+interface ProcTreeSnapshot {
 	readonly maxOwnTicks: ReadonlyMap<string, number>;
 	readonly procSamples: number;
 	readonly observedProcesses: number;
 }
+
 
 interface ProcessObservation {
 	readonly pid: number;
@@ -102,6 +123,7 @@ interface ProcessObservation {
 	readonly ownTicks: number;
 	readonly children: readonly number[];
 }
+
 
 interface VersionSample {
 	readonly kind: SampleKind;
@@ -113,6 +135,7 @@ interface VersionSample {
 	readonly output: string;
 }
 
+
 interface FirstFrameSample {
 	readonly kind: SampleKind;
 	readonly wallMs: number;
@@ -123,6 +146,7 @@ interface FirstFrameSample {
 	readonly frameBytes: number;
 	readonly detection: "synchronized-output" | "row-local-fallback";
 }
+
 
 interface StreamTurnSample {
 	readonly sampleId: string;
@@ -145,6 +169,7 @@ interface StreamTurnSample {
 	readonly sessionJsonlFiles: readonly string[];
 	readonly sessionSha256: string;
 }
+
 
 type StreamTurnMeasurement = Omit<
 	StreamTurnSample,
@@ -198,6 +223,10 @@ interface PerformanceArtifact {
 	};
 	harness: Record<string, string | number | boolean | readonly string[] | Record<string, number>>;
 	measurements: Record<string, object>;
+	noise?: {
+		readonly rejections: readonly NoisyDistribution[];
+		readonly remediation: readonly string[];
+	};
 	failure?: {
 		stage: string;
 		message: string;
@@ -363,6 +392,12 @@ function machineMetadata(): Record<string, string | readonly string[]> {
 			`check 9 requires Linux x86_64 /proc sampling, found ${platform()} ${arch()}`,
 		);
 	}
+	if (readOptional("/proc/self/smaps_rollup") === undefined) {
+		throw new HarnessFailure(
+			"host-validation",
+			"kernel lacks smaps_rollup (requires Linux >= 4.15); PSS instrumentation cannot run",
+		);
+	}
 	return {
 		os: platform(),
 		arch: arch(),
@@ -404,6 +439,460 @@ function parseProcStat(pid: number): Omit<ProcessObservation, "children"> | unde
 	const startTime = fields[19];
 	if (!Number.isSafeInteger(userTicks) || !Number.isSafeInteger(systemTicks) || !startTime) return undefined;
 	return { pid, startTime, ownTicks: userTicks + systemTicks };
+}
+
+export function parseSmapsRollupText(
+	text: string,
+): { readonly rssBytes: number; readonly pssBytes: number } | undefined {
+	let rssKb: number | undefined;
+	let pssKb: number | undefined;
+	for (const line of text.split("\n")) {
+		const rssMatch = /^Rss:\s+(\d+)\s+kB\s*$/.exec(line);
+		if (rssMatch) {
+			rssKb = Number.parseInt(rssMatch[1] ?? "", 10);
+			continue;
+		}
+		const pssMatch = /^Pss:\s+(\d+)\s+kB\s*$/.exec(line);
+		if (pssMatch) pssKb = Number.parseInt(pssMatch[1] ?? "", 10);
+	}
+	if (
+		rssKb === undefined ||
+		pssKb === undefined ||
+		!Number.isFinite(rssKb) ||
+		!Number.isFinite(pssKb)
+	) {
+		return undefined;
+	}
+	return { rssBytes: rssKb * 1024, pssBytes: pssKb * 1024 };
+}
+
+export function parseProcStatusPeakRssText(text: string): number | undefined {
+	for (const line of text.split("\n")) {
+		const match = /^VmHWM:\s+(\d+)\s+kB\s*$/.exec(line);
+		if (!match) continue;
+		const kb = Number.parseInt(match[1] ?? "", 10);
+		return Number.isFinite(kb) ? kb * 1024 : undefined;
+	}
+	return undefined;
+}
+
+export type ProcReadOutcome =
+	| { readonly kind: "ok"; readonly text: string }
+	| { readonly kind: "vanished" }
+	| { readonly kind: "access-denied" }
+	| { readonly kind: "error"; readonly message: string };
+
+export function readProcFile(path: string): ProcReadOutcome {
+	try {
+		return { kind: "ok", text: readFileSync(path, "utf8") };
+	} catch (error) {
+		if (error instanceof Error && "code" in error) {
+			if (error.code === "ENOENT" || error.code === "ESRCH") return { kind: "vanished" };
+			if (error.code === "EACCES") return { kind: "access-denied" };
+		}
+		return {
+			kind: "error",
+			message: errorMessage(error instanceof Error ? error : String(error)),
+		};
+	}
+}
+
+export type ProcessMemoryAssembly =
+	| {
+			readonly kind: "complete";
+			readonly reading: {
+				readonly pid: number;
+				readonly startTime: string;
+				readonly rssBytes: number;
+				readonly pssBytes: number;
+				readonly peakRssBytes: number;
+			};
+	  }
+	| { readonly kind: "discard-identity-race" }
+	| { readonly kind: "vanished" }
+	| { readonly kind: "incomplete"; readonly reason: "access-denied" | "parse" | "unsupported" | "error"; readonly detail: string };
+
+export function assembleProcessMemoryReading(input: {
+	readonly pid: number;
+	readonly initialStartTime: string;
+	readonly root: boolean;
+	readonly smaps: ProcReadOutcome;
+	readonly status: ProcReadOutcome;
+	readonly reconfirm: ProcReadOutcome;
+}): ProcessMemoryAssembly {
+	if (input.reconfirm.kind === "vanished") return { kind: "vanished" };
+	if (input.reconfirm.kind === "access-denied") {
+		return { kind: "incomplete", reason: "access-denied", detail: `/proc/${input.pid}/stat reconfirm EACCES` };
+	}
+	if (input.reconfirm.kind !== "ok") {
+		return { kind: "incomplete", reason: "error", detail: input.reconfirm.message };
+	}
+	const close = input.reconfirm.text.lastIndexOf(")");
+	if (close < 0) return { kind: "incomplete", reason: "parse", detail: `stat parse failed for pid ${input.pid}` };
+	const fields = input.reconfirm.text.slice(close + 2).trimEnd().split(" ");
+	const startTime = fields[19];
+	if (!startTime) return { kind: "incomplete", reason: "parse", detail: `stat startTime missing for pid ${input.pid}` };
+	if (startTime !== input.initialStartTime) return { kind: "discard-identity-race" };
+
+	if (input.smaps.kind === "vanished" || input.status.kind === "vanished") return { kind: "vanished" };
+	if (input.smaps.kind === "access-denied" || input.status.kind === "access-denied") {
+		return {
+			kind: "incomplete",
+			reason: "access-denied",
+			detail: `memory access denied for pid ${input.pid}`,
+		};
+	}
+	if (input.smaps.kind !== "ok") {
+		return { kind: "incomplete", reason: "error", detail: input.smaps.message };
+	}
+	if (input.status.kind !== "ok") {
+		return { kind: "incomplete", reason: "error", detail: input.status.message };
+	}
+	const current = parseSmapsRollupText(input.smaps.text);
+	const peakRssBytes = parseProcStatusPeakRssText(input.status.text);
+	if (!current || peakRssBytes === undefined) {
+		return {
+			kind: "incomplete",
+			reason: "parse",
+			detail: `incomplete Rss/Pss/VmHWM parse for pid ${input.pid}`,
+		};
+	}
+	return {
+		kind: "complete",
+		reading: {
+			pid: input.pid,
+			startTime: input.initialStartTime,
+			rssBytes: current.rssBytes,
+			pssBytes: current.pssBytes,
+			peakRssBytes,
+		},
+	};
+}
+
+export interface ProcessTreeMemoryObservation {
+	readonly processes: readonly {
+		readonly pid: number;
+		readonly startTime: string;
+		readonly rssBytes: number;
+		readonly pssBytes: number;
+		readonly peakRssBytes: number;
+	}[];
+	readonly treeRssBytes: number;
+	readonly treePssBytes: number;
+	readonly sumPeakRssBytes: number;
+	readonly observedLiveIdentities: number;
+	readonly identitiesWithCompleteMemory: number;
+	readonly vanishedDescendants: number;
+	readonly coverageComplete: boolean;
+}
+
+export type ChildEnumeration =
+	| { readonly kind: "ok"; readonly children: readonly number[] }
+	| { readonly kind: "vanished" }
+	| { readonly kind: "access-denied"; readonly detail: string }
+	| { readonly kind: "error"; readonly detail: string };
+
+export function enumerateProcessChildrenStrict(pid: number): ChildEnumeration {
+	let tasks: string[];
+	try {
+		tasks = readdirSync(`/proc/${pid}/task`);
+	} catch (error) {
+		if (error instanceof Error && "code" in error) {
+			if (error.code === "ENOENT" || error.code === "ESRCH") return { kind: "vanished" };
+			if (error.code === "EACCES") {
+				return { kind: "access-denied", detail: `/proc/${pid}/task EACCES` };
+			}
+		}
+		return {
+			kind: "error",
+			detail: errorMessage(error instanceof Error ? error : String(error)),
+		};
+	}
+	const result = new Set<number>();
+	for (const task of tasks) {
+		if (!/^\d+$/.test(task)) continue;
+		const childrenPath = `/proc/${pid}/task/${task}/children`;
+		const raw = readProcFile(childrenPath);
+		if (raw.kind === "vanished") continue;
+		if (raw.kind === "access-denied") {
+			return { kind: "access-denied", detail: `${childrenPath} EACCES` };
+		}
+		if (raw.kind !== "ok") {
+			return { kind: "error", detail: `${childrenPath}: ${raw.message}` };
+		}
+		for (const child of raw.text.trim().split(/\s+/)) {
+			if (!child) continue;
+			const value = Number.parseInt(child, 10);
+			if (!Number.isSafeInteger(value) || value <= 0) {
+				return { kind: "error", detail: `${childrenPath} produced unparsable child id ${child}` };
+			}
+			result.add(value);
+		}
+	}
+	return { kind: "ok", children: [...result] };
+}
+
+export function validateMemoryCoverage(observation: ProcessTreeMemoryObservation, label: string): void {
+	if (!observation.coverageComplete) {
+		throw new HarnessFailure(
+			label,
+			`process-tree memory coverage incomplete: ${observation.identitiesWithCompleteMemory}/${observation.observedLiveIdentities} live identities had complete Rss/Pss/VmHWM`,
+		);
+	}
+}
+
+export interface MemoryObservationDeps {
+	readonly readProcFile?: typeof readProcFile;
+	readonly enumerateChildren?: typeof enumerateProcessChildrenStrict;
+}
+
+export function observeProcessTreeMemory(
+	rootPid: number,
+	label: string,
+	deps: MemoryObservationDeps = {},
+): ProcessTreeMemoryObservation {
+	const read = deps.readProcFile ?? readProcFile;
+	const enumerateChildren = deps.enumerateChildren ?? enumerateProcessChildrenStrict;
+	const pending = [rootPid];
+	const visited = new Set<number>();
+	const processes: ProcessTreeMemoryObservation["processes"][number][] = [];
+	let vanishedDescendants = 0;
+	let incompleteLive = 0;
+
+	while (pending.length > 0) {
+		const pid = pending.pop();
+		if (pid === undefined || visited.has(pid)) continue;
+		visited.add(pid);
+		const isRoot = pid === rootPid;
+		const initialRaw = read(`/proc/${pid}/stat`);
+		if (initialRaw.kind === "vanished") {
+			if (isRoot) {
+				throw new HarnessFailure(label, `live root pid ${pid} vanished before memory observation`);
+			}
+			vanishedDescendants += 1;
+			continue;
+		}
+		if (initialRaw.kind === "access-denied") {
+			throw new HarnessFailure(label, `live process pid ${pid} denied /proc/stat access`);
+		}
+		if (initialRaw.kind !== "ok") {
+			throw new HarnessFailure(label, `live process pid ${pid} stat read failed: ${initialRaw.message}`);
+		}
+		const close = initialRaw.text.lastIndexOf(")");
+		if (close < 0) {
+			throw new HarnessFailure(label, `live process pid ${pid} produced unparsable /proc/stat`);
+		}
+		const fields = initialRaw.text.slice(close + 2).trimEnd().split(" ");
+		const initialStartTime = fields[19];
+		if (!initialStartTime) {
+			throw new HarnessFailure(label, `live process pid ${pid} omitted startTime`);
+		}
+
+		const assembled = assembleProcessMemoryReading({
+			pid,
+			initialStartTime,
+			root: isRoot,
+			smaps: read(`/proc/${pid}/smaps_rollup`),
+			status: read(`/proc/${pid}/status`),
+			reconfirm: read(`/proc/${pid}/stat`),
+		});
+		if (assembled.kind === "discard-identity-race") {
+			// Reused/discarded identity must not contribute descendants.
+			continue;
+		}
+		if (assembled.kind === "vanished") {
+			if (isRoot) {
+				throw new HarnessFailure(label, `live root pid ${pid} vanished during memory observation`);
+			}
+			vanishedDescendants += 1;
+			continue;
+		}
+
+		// Identity is revalidated (startTime matched). Only then enumerate children.
+		const children = enumerateChildren(pid);
+		if (children.kind === "vanished") {
+			if (isRoot) {
+				throw new HarnessFailure(label, `live root pid ${pid} vanished while enumerating children`);
+			}
+			vanishedDescendants += 1;
+			continue;
+		}
+		if (children.kind === "access-denied") {
+			throw new HarnessFailure(
+				label,
+				`persistently live process pid ${pid} denied children enumeration: ${children.detail}`,
+			);
+		}
+		if (children.kind !== "ok") {
+			throw new HarnessFailure(
+				label,
+				`persistently live process pid ${pid} children enumeration failed: ${children.detail}`,
+			);
+		}
+
+		// Re-read parent identity after enumeration; vanish/startTime change discards children.
+		const postEnumStat = read(`/proc/${pid}/stat`);
+		let enqueueChildren = false;
+		if (postEnumStat.kind === "ok") {
+			const postClose = postEnumStat.text.lastIndexOf(")");
+			if (postClose >= 0) {
+				const postFields = postEnumStat.text.slice(postClose + 2).trimEnd().split(" ");
+				const postStartTime = postFields[19];
+				if (postStartTime === initialStartTime) enqueueChildren = true;
+			}
+		}
+		if (enqueueChildren) {
+			for (const child of children.children) pending.push(child);
+		}
+
+		if (assembled.kind === "incomplete") {
+			incompleteLive += 1;
+			throw new HarnessFailure(
+				label,
+				`persistently live process pid ${pid} lacked complete memory (${assembled.reason}): ${assembled.detail}`,
+			);
+		}
+		processes.push(assembled.reading);
+	}
+
+	const treeRssBytes = processes.reduce((sum, process) => sum + process.rssBytes, 0);
+	const treePssBytes = processes.reduce((sum, process) => sum + process.pssBytes, 0);
+	const sumPeakRssBytes = processes.reduce((sum, process) => sum + process.peakRssBytes, 0);
+	const observedLiveIdentities = processes.length + incompleteLive;
+	const observation: ProcessTreeMemoryObservation = {
+		processes,
+		treeRssBytes,
+		treePssBytes,
+		sumPeakRssBytes,
+		observedLiveIdentities,
+		identitiesWithCompleteMemory: processes.length,
+		vanishedDescendants,
+		coverageComplete: incompleteLive === 0 && processes.length > 0,
+	};
+	validateMemoryCoverage(observation, label);
+	return observation;
+}
+
+export function planMemorySampleStarts(windowMs: number, intervalMs: number): readonly number[] {
+	if (windowMs <= 0 || intervalMs <= 0) return [];
+	const starts: number[] = [];
+	for (let offset = 0; offset < windowMs; offset += intervalMs) starts.push(offset);
+	return starts;
+}
+
+export interface MemoryWindowMaxRecord {
+	readonly bytes: number;
+	readonly sampleIndex: number;
+	readonly startOffsetMs: number;
+}
+
+export interface MemoryWindowResult {
+	readonly observations: readonly ProcessTreeMemoryObservation[];
+	readonly sampleStartOffsetsMs: readonly number[];
+	readonly plannedSampleStartsMs: readonly number[];
+	readonly achievedMeanCadenceMs: number | null;
+	readonly maxTreeRss: MemoryWindowMaxRecord;
+	readonly maxTreePss: MemoryWindowMaxRecord;
+	readonly aggregateCoverage: {
+		readonly samples: number;
+		readonly observedLiveIdentitiesMax: number;
+		readonly identitiesWithCompleteMemoryMin: number;
+		readonly vanishedDescendantsTotal: number;
+		readonly allSamplesCoverageComplete: boolean;
+	};
+}
+
+export async function sampleProcessTreeMemoryWindow(
+	rootPid: number,
+	label: string,
+	windowMs: number,
+	intervalMs: number,
+	deps: MemoryObservationDeps = {},
+): Promise<MemoryWindowResult> {
+	const origin = performance.now();
+	const deadline = origin + windowMs;
+	const plannedSampleStartsMs = planMemorySampleStarts(windowMs, intervalMs);
+	const observations: ProcessTreeMemoryObservation[] = [];
+	const sampleStartOffsetsMs: number[] = [];
+
+	for (const plannedOffset of plannedSampleStartsMs) {
+		const target = origin + plannedOffset;
+		if (target >= deadline) break;
+		const now = performance.now();
+		if (now < target) await Bun.sleep(target - now);
+		const actualStart = performance.now();
+		if (actualStart >= deadline) break;
+		sampleStartOffsetsMs.push(actualStart - origin);
+		observations.push(observeProcessTreeMemory(rootPid, label, deps));
+	}
+
+	if (observations.length === 0) {
+		throw new HarnessFailure(label, `memory sampling window produced zero samples before deadline (${windowMs}ms)`);
+	}
+
+	let maxTreeRss: MemoryWindowMaxRecord = {
+		bytes: observations[0]!.treeRssBytes,
+		sampleIndex: 0,
+		startOffsetMs: sampleStartOffsetsMs[0]!,
+	};
+	let maxTreePss: MemoryWindowMaxRecord = {
+		bytes: observations[0]!.treePssBytes,
+		sampleIndex: 0,
+		startOffsetMs: sampleStartOffsetsMs[0]!,
+	};
+	let observedLiveIdentitiesMax = observations[0]!.observedLiveIdentities;
+	let identitiesWithCompleteMemoryMin = observations[0]!.identitiesWithCompleteMemory;
+	let vanishedDescendantsTotal = 0;
+	let allSamplesCoverageComplete = true;
+	for (const [index, observation] of observations.entries()) {
+		vanishedDescendantsTotal += observation.vanishedDescendants;
+		allSamplesCoverageComplete &&= observation.coverageComplete;
+		if (observation.observedLiveIdentities > observedLiveIdentitiesMax) {
+			observedLiveIdentitiesMax = observation.observedLiveIdentities;
+		}
+		if (observation.identitiesWithCompleteMemory < identitiesWithCompleteMemoryMin) {
+			identitiesWithCompleteMemoryMin = observation.identitiesWithCompleteMemory;
+		}
+		if (observation.treeRssBytes > maxTreeRss.bytes) {
+			maxTreeRss = {
+				bytes: observation.treeRssBytes,
+				sampleIndex: index,
+				startOffsetMs: sampleStartOffsetsMs[index]!,
+			};
+		}
+		if (observation.treePssBytes > maxTreePss.bytes) {
+			maxTreePss = {
+				bytes: observation.treePssBytes,
+				sampleIndex: index,
+				startOffsetMs: sampleStartOffsetsMs[index]!,
+			};
+		}
+	}
+
+	let achievedMeanCadenceMs: number | null = null;
+	if (sampleStartOffsetsMs.length >= 2) {
+		let gapSum = 0;
+		for (let index = 1; index < sampleStartOffsetsMs.length; index += 1) {
+			gapSum += sampleStartOffsetsMs[index]! - sampleStartOffsetsMs[index - 1]!;
+		}
+		achievedMeanCadenceMs = gapSum / (sampleStartOffsetsMs.length - 1);
+	}
+
+	return {
+		observations,
+		sampleStartOffsetsMs,
+		plannedSampleStartsMs,
+		achievedMeanCadenceMs,
+		maxTreeRss,
+		maxTreePss,
+		aggregateCoverage: {
+			samples: observations.length,
+			observedLiveIdentitiesMax,
+			identitiesWithCompleteMemoryMin,
+			vanishedDescendantsTotal,
+			allSamplesCoverageComplete,
+		},
+	};
 }
 
 function processChildren(pid: number): readonly number[] {
@@ -450,7 +939,11 @@ function observeProcessTree(rootPid: number): readonly ProcessObservation[] {
 	return result;
 }
 
-class ProcTreeSampler {
+export function processTreeIdentity(pid: number, startTime: string): string {
+	return `${pid}:${startTime}`;
+}
+
+export class ProcTreeSampler {
 	readonly #maximumOwnTicks = new Map<string, number>();
 	readonly #observedIdentities = new Set<string>();
 	#procSamples = 0;
@@ -465,8 +958,7 @@ class ProcTreeSampler {
 		this.#completed = this.#sampleLoop();
 	}
 
-	snapshot(): ProcCpuSnapshot {
-		this.#sample();
+	snapshot(): ProcTreeSnapshot {
 		return {
 			maxOwnTicks: new Map(this.#maximumOwnTicks),
 			procSamples: this.#procSamples,
@@ -474,7 +966,7 @@ class ProcTreeSampler {
 		};
 	}
 
-	async stop(): Promise<ProcCpuSnapshot> {
+	async stop(): Promise<ProcTreeSnapshot> {
 		this.#running = false;
 		await this.#completed;
 		return this.snapshot();
@@ -490,7 +982,7 @@ class ProcTreeSampler {
 	#sample(): void {
 		this.#procSamples += 1;
 		for (const process of observeProcessTree(this.rootPid)) {
-			const identity = `${process.pid}:${process.startTime}`;
+			const identity = processTreeIdentity(process.pid, process.startTime);
 			this.#observedIdentities.add(identity);
 			const previous = this.#maximumOwnTicks.get(identity) ?? 0;
 			if (process.ownTicks > previous) this.#maximumOwnTicks.set(identity, process.ownTicks);
@@ -498,13 +990,13 @@ class ProcTreeSampler {
 	}
 }
 
-function totalTicks(snapshot: ProcCpuSnapshot): number {
+function totalTicks(snapshot: ProcTreeSnapshot): number {
 	let ticks = 0;
 	for (const value of snapshot.maxOwnTicks.values()) ticks += value;
 	return ticks;
 }
 
-function cpuMillisecondsBetween(before: ProcCpuSnapshot, after: ProcCpuSnapshot, ticksPerSecond: number): number {
+function cpuMillisecondsBetween(before: ProcTreeSnapshot, after: ProcTreeSnapshot, ticksPerSecond: number): number {
 	let delta = 0;
 	for (const [identity, afterTicks] of after.maxOwnTicks) {
 		delta += Math.max(0, afterTicks - (before.maxOwnTicks.get(identity) ?? 0));
@@ -512,7 +1004,7 @@ function cpuMillisecondsBetween(before: ProcCpuSnapshot, after: ProcCpuSnapshot,
 	return (delta * 1_000) / ticksPerSecond;
 }
 
-function cpuMilliseconds(snapshot: ProcCpuSnapshot, ticksPerSecond: number): number {
+function cpuMilliseconds(snapshot: ProcTreeSnapshot, ticksPerSecond: number): number {
 	return (totalTicks(snapshot) * 1_000) / ticksPerSecond;
 }
 
@@ -658,7 +1150,7 @@ function streamingSessionEvidence(
 	};
 }
 
-function distribution(values: readonly number[]): Distribution {
+export function distribution(values: readonly number[]): Distribution {
 	if (values.length === 0 || values.some((value) => !Number.isFinite(value) || value < 0)) {
 		throw new HarnessFailure("statistics", "distribution requires finite non-negative samples");
 	}
@@ -673,14 +1165,39 @@ function distribution(values: readonly number[]): Distribution {
 		if (lowerValue === undefined || upperValue === undefined) throw new HarnessFailure("statistics", "quantile index escaped sample range");
 		return lowerValue + (upperValue - lowerValue) * (position - lower);
 	};
+	const median = quantile(0.5);
+	const spread = spreadStats(values, median);
 	return {
 		count: sorted.length,
-		median: quantile(0.5),
+		median,
 		p95: quantile(0.95),
 		p99: quantile(0.99),
 		min: sorted[0] ?? 0,
 		max: sorted.at(-1) ?? 0,
+		stddev: spread.stddev,
+		relativeSpread: spread.relativeSpread,
 	};
+}
+
+
+export function recordEntrypointHarnessFailure(
+	target: {
+		pass: boolean;
+		blockers: string[];
+		failure?: { stage: string; message: string };
+	},
+	failure: Error,
+): void {
+	const stage = failure instanceof HarnessFailure ? failure.stage : "unexpected";
+	const harnessBlocker = `${stage}: ${failure.message}`;
+	target.pass = false;
+	target.failure = { stage, message: failure.message };
+	// Preserve any already-evaluated threshold blockers; append harness failure.
+	target.blockers = [...target.blockers, harnessBlocker];
+}
+
+export function exitCodeForFailure(error: unknown): 1 | 2 {
+	return error instanceof NoiseRejection ? NOISE_EXIT_CODE : 1;
 }
 
 function speedup(rust: Distribution, typescript: Distribution): number {
@@ -1130,6 +1647,190 @@ async function collectFirstFrameSamples(
 	return result;
 }
 
+
+interface IdleMemorySample {
+	readonly implementation: Implementation;
+	readonly steadyWindowMaxTreeRssBytes: number;
+	readonly steadyWindowMaxTreePssBytes: number;
+	readonly steadyWindowMaxTreeRss: MemoryWindowMaxRecord;
+	readonly steadyWindowMaxTreePss: MemoryWindowMaxRecord;
+	readonly startupSumVmHwmBytes: number;
+	readonly memorySamples: number;
+	readonly sampleStartOffsetsMs: readonly number[];
+	readonly plannedSampleStartsMs: readonly number[];
+	readonly achievedMeanCadenceMs: number | null;
+	readonly observations: readonly ProcessTreeMemoryObservation[];
+	readonly aggregateCoverage: MemoryWindowResult["aggregateCoverage"];
+	readonly ptyRootPid: number;
+}
+
+interface StreamLoadMemorySample {
+	readonly implementation: Implementation;
+	readonly sampleId: string;
+	readonly loadWindowMaxTreeRssBytes: number;
+	readonly loadWindowMaxTreePssBytes: number;
+	readonly loadWindowMaxTreeRss: MemoryWindowMaxRecord;
+	readonly loadWindowMaxTreePss: MemoryWindowMaxRecord;
+	readonly sumPeakRssBytes: number;
+	readonly memorySamples: number;
+	readonly sampleStartOffsetsMs: readonly number[];
+	readonly plannedSampleStartsMs: readonly number[];
+	readonly achievedMeanCadenceMs: number | null;
+	readonly observations: readonly ProcessTreeMemoryObservation[];
+	readonly aggregateCoverage: MemoryWindowResult["aggregateCoverage"];
+	readonly ptyRootPid: number;
+}
+
+async function runIdleMemorySample(implementation: Implementation): Promise<IdleMemorySample> {
+	const label = `idle-memory:${implementation}`;
+	const sandbox = temporaryDirectory(`idle-memory-${implementation}`);
+	mkdirSync(join(sandbox, "home"), { recursive: true });
+	const pty = spawnPty({
+		argv: [binaryFor(implementation), ...extensionFreeArgs],
+		cwd: sandbox,
+		env: benchmarkEnvironment(sandbox),
+		size: { columns: 100, rows: 32 },
+	});
+	try {
+		await pty.waitFor((candidate) => frameObservation(candidate) !== undefined, {
+			deadlineMs: 20_000,
+			source: "raw",
+		});
+		await Bun.sleep(IDLE_MEMORY_STABILIZATION_MS);
+		const startup = observeProcessTreeMemory(pty.pid, `${label}:startup`);
+		// Sum of per-identity VmHWM values: non-simultaneous lifetime upper bound, not a concurrent peak.
+		const startupSumVmHwmBytes = startup.sumPeakRssBytes;
+		const window = await sampleProcessTreeMemoryWindow(
+			pty.pid,
+			`${label}:steady-window`,
+			IDLE_MEMORY_SAMPLE_WINDOW_MS,
+			MEMORY_SAMPLE_INTERVAL_MS,
+		);
+		await terminateAndRequireCleanExit(pty, label);
+		return {
+			implementation,
+			steadyWindowMaxTreeRssBytes: window.maxTreeRss.bytes,
+			steadyWindowMaxTreePssBytes: window.maxTreePss.bytes,
+			steadyWindowMaxTreeRss: window.maxTreeRss,
+			steadyWindowMaxTreePss: window.maxTreePss,
+			startupSumVmHwmBytes,
+			memorySamples: window.aggregateCoverage.samples,
+			sampleStartOffsetsMs: window.sampleStartOffsetsMs,
+			plannedSampleStartsMs: window.plannedSampleStartsMs,
+			achievedMeanCadenceMs: window.achievedMeanCadenceMs,
+			observations: window.observations,
+			aggregateCoverage: window.aggregateCoverage,
+			ptyRootPid: pty.pid,
+		};
+	} catch (error) {
+		throw new HarnessFailure(
+			label,
+			`${errorMessage(error instanceof Error ? error : String(error))}\nPTY tail:\n${tail(pty.snapshot().rawText, 4_000)}`,
+		);
+	} finally {
+		await pty.terminate();
+	}
+}
+
+async function collectIdleMemorySamples(): Promise<ImplementationMeasurements<IdleMemorySample>> {
+	const result: Record<Implementation, IdleMemorySample[]> = { rust: [], typescript: [] };
+	status("collecting extension-free idle process-tree memory samples");
+	for (let sample = 0; sample < IDLE_MEMORY_SAMPLES; sample += 1) {
+		for (const implementation of implementationOrder(sample)) {
+			result[implementation].push(await runIdleMemorySample(implementation));
+		}
+	}
+	return result;
+}
+
+async function runStreamLoadMemorySample(
+	implementation: Implementation,
+	sampleId: string,
+): Promise<StreamLoadMemorySample> {
+	const label = `stream-memory:${implementation}:${sampleId}`;
+	const sandbox = temporaryDirectory(`stream-memory-${implementation}-${sampleId}`);
+	mkdirSync(join(sandbox, "home"), { recursive: true });
+	const finalMarker = `PI_CHECK9_STREAM_MEMORY_${implementation}_${sampleId.replaceAll("-", "_")}`;
+	const pty = spawnPty({
+		argv: [binaryFor(implementation), ...streamingArgs],
+		cwd: sandbox,
+		env: {
+			...benchmarkEnvironment(sandbox),
+			PI_VERIFICATION_MODE: "text",
+			PI_VERIFICATION_CHUNK_COUNT: String(STREAM_CHUNKS),
+			PI_VERIFICATION_CHUNK_DELAY_MS: String(STREAM_CHUNK_DELAY_MS),
+			PI_VERIFICATION_FINAL_MARKER: finalMarker,
+		},
+		size: { columns: 100, rows: 40 },
+	});
+	try {
+		await pty.waitFor((snapshot) => frameObservation(snapshot) !== undefined, {
+			deadlineMs: 20_000,
+			source: "raw",
+		});
+		const promptOutputOffset = pty.snapshot().rawText.length;
+		const prompt = `check 9 memory-${implementation}-${sampleId}`;
+		pty.writeKeys("\x1b[200~", prompt, "\x1b[201~");
+		await pty.waitFor(
+			(snapshot) => {
+				const promptOutput = snapshot.rawText.slice(promptOutputOffset);
+				return countOccurrences(promptOutput, SYNC_BEGIN) > 0;
+			},
+			{ deadlineMs: 5_000, source: "raw" },
+		);
+		const streamOutputOffset = pty.snapshot().rawText.length;
+		pty.writeKeys(PTY_KEYS.enter);
+		const windowPromise = sampleProcessTreeMemoryWindow(
+			pty.pid,
+			`${label}:load-window`,
+			STREAM_MEMORY_SAMPLE_WINDOW_MS,
+			MEMORY_SAMPLE_INTERVAL_MS,
+		);
+		await pty.waitFor(
+			(snapshot) => snapshot.rawText.slice(streamOutputOffset).includes(finalMarker),
+			{ deadlineMs: 30_000, source: "raw" },
+		);
+		const window = await windowPromise;
+		await Bun.sleep(100);
+		await terminateAndRequireCleanExit(pty, label);
+		return {
+			implementation,
+			sampleId,
+			loadWindowMaxTreeRssBytes: window.maxTreeRss.bytes,
+			loadWindowMaxTreePssBytes: window.maxTreePss.bytes,
+			loadWindowMaxTreeRss: window.maxTreeRss,
+			loadWindowMaxTreePss: window.maxTreePss,
+			sumPeakRssBytes: window.observations.at(-1)?.sumPeakRssBytes ?? 0,
+			memorySamples: window.aggregateCoverage.samples,
+			sampleStartOffsetsMs: window.sampleStartOffsetsMs,
+			plannedSampleStartsMs: window.plannedSampleStartsMs,
+			achievedMeanCadenceMs: window.achievedMeanCadenceMs,
+			observations: window.observations,
+			aggregateCoverage: window.aggregateCoverage,
+			ptyRootPid: pty.pid,
+		};
+	} catch (error) {
+		throw new HarnessFailure(
+			label,
+			`${errorMessage(error instanceof Error ? error : String(error))}\nPTY tail:\n${tail(pty.snapshot().rawText, 8_000)}`,
+		);
+	} finally {
+		await pty.terminate();
+	}
+}
+
+async function collectStreamLoadMemorySamples(): Promise<ImplementationMeasurements<StreamLoadMemorySample>> {
+	const result: Record<Implementation, StreamLoadMemorySample[]> = { rust: [], typescript: [] };
+	status("collecting streaming-load process-tree memory samples");
+	for (let sample = 0; sample < STREAM_MEMORY_SAMPLES; sample += 1) {
+		for (const implementation of implementationOrder(sample)) {
+			const sampleId = `memory-${String(sample + 1).padStart(3, "0")}`;
+			result[implementation].push(await runStreamLoadMemorySample(implementation, sampleId));
+		}
+	}
+	return result;
+}
+
 async function collectStreamSamples(ticksPerSecond: number): Promise<ImplementationMeasurements<StreamTurnSample>> {
 	const result: Record<Implementation, StreamTurnSample[]> = { rust: [], typescript: [] };
 	status("warming identical shared-extension streaming fixture");
@@ -1207,7 +1908,14 @@ async function main(): Promise<void> {
 		ptyDriver: "scripts/verification/pty.ts PtyProcess",
 		processTreeCpuSource: "/proc/<pid>/stat plus /proc/<pid>/task/*/children rooted at PtyProcess.pid",
 		processTreeAccounting: "1ms sampling; maximum observed own utime+stime per (pid,starttime); interval delta across all observed identities",
+		processTreeMemorySource: "/proc/<pid>/smaps_rollup Rss/Pss plus /proc/<pid>/status VmHWM per (pid,starttime)",
+		processTreeMemoryAccounting:
+			"post-verdict fresh-process memory lane only; absolute monotonic (performance.now) non-gating sample-start schedule; idle steady-window maxima from current RSS/PSS with max-record sample index/offset; startupSumVmHwmBytes is the non-simultaneous sum of per-identity VmHWM at stabilization (lifetime upper bound, not an idle/concurrent peak); per-sample observations plus aggregate window coverage; coverage required for every persistently live identity",
 		procSampleIntervalMs: PROC_SAMPLE_INTERVAL_MS,
+		memorySampleIntervalMs: MEMORY_SAMPLE_INTERVAL_MS,
+		idleMemoryStabilizationMs: IDLE_MEMORY_STABILIZATION_MS,
+		idleMemorySampleWindowMs: IDLE_MEMORY_SAMPLE_WINDOW_MS,
+		streamMemorySampleWindowMs: STREAM_MEMORY_SAMPLE_WINDOW_MS,
 		clockTicksPerSecond: ticksPerSecond,
 		quantileMethod: "R-7 linear interpolation",
 		coldCacheMethod: "sync once per cold group, then posix_fadvise(POSIX_FADV_DONTNEED) on the implementation executable before every cold sample",
@@ -1350,6 +2058,86 @@ async function main(): Promise<void> {
 		stable: sourceStable,
 	};
 
+	requireQuiet([
+		{
+			label: "cold pi --version wall (rust)",
+			count: versionSummary.rust.cold.count,
+			median: versionSummary.rust.cold.median,
+			stddev: versionSummary.rust.cold.stddev,
+			relativeSpread: versionSummary.rust.cold.relativeSpread,
+		},
+		{
+			label: "cold pi --version wall (typescript)",
+			count: versionSummary.typescript.cold.count,
+			median: versionSummary.typescript.cold.median,
+			stddev: versionSummary.typescript.cold.stddev,
+			relativeSpread: versionSummary.typescript.cold.relativeSpread,
+		},
+		{
+			label: "warm pi --version wall (rust)",
+			count: versionSummary.rust.warm.count,
+			median: versionSummary.rust.warm.median,
+			stddev: versionSummary.rust.warm.stddev,
+			relativeSpread: versionSummary.rust.warm.relativeSpread,
+		},
+		{
+			label: "warm pi --version wall (typescript)",
+			count: versionSummary.typescript.warm.count,
+			median: versionSummary.typescript.warm.median,
+			stddev: versionSummary.typescript.warm.stddev,
+			relativeSpread: versionSummary.typescript.warm.relativeSpread,
+		},
+		{
+			label: "cold extension-free first-frame wall (rust)",
+			count: firstFrameSummary.rust.cold.count,
+			median: firstFrameSummary.rust.cold.median,
+			stddev: firstFrameSummary.rust.cold.stddev,
+			relativeSpread: firstFrameSummary.rust.cold.relativeSpread,
+		},
+		{
+			label: "cold extension-free first-frame wall (typescript)",
+			count: firstFrameSummary.typescript.cold.count,
+			median: firstFrameSummary.typescript.cold.median,
+			stddev: firstFrameSummary.typescript.cold.stddev,
+			relativeSpread: firstFrameSummary.typescript.cold.relativeSpread,
+		},
+		{
+			label: "warm extension-free first-frame wall (rust)",
+			count: firstFrameSummary.rust.warm.count,
+			median: firstFrameSummary.rust.warm.median,
+			stddev: firstFrameSummary.rust.warm.stddev,
+			relativeSpread: firstFrameSummary.rust.warm.relativeSpread,
+		},
+		{
+			label: "warm extension-free first-frame wall (typescript)",
+			count: firstFrameSummary.typescript.warm.count,
+			median: firstFrameSummary.typescript.warm.median,
+			stddev: firstFrameSummary.typescript.warm.stddev,
+			relativeSpread: firstFrameSummary.typescript.warm.relativeSpread,
+		},
+		{
+			label: "streaming-tail provider-frame CPU (rust)",
+			count: streamSummary.rust.count,
+			median: streamSummary.rust.median,
+			stddev: streamSummary.rust.stddev,
+			relativeSpread: streamSummary.rust.relativeSpread,
+		},
+		{
+			label: "streaming-tail provider-frame CPU (typescript)",
+			count: streamSummary.typescript.count,
+			median: streamSummary.typescript.median,
+			stddev: streamSummary.typescript.stddev,
+			relativeSpread: streamSummary.typescript.relativeSpread,
+		},
+		{
+			label: "rust native keypress-to-paint",
+			count: keypressSummary.count,
+			median: keypressSummary.median,
+			stddev: keypressSummary.stddev,
+			relativeSpread: keypressSummary.relativeSpread,
+		},
+	]);
+
 	const blockers: string[] = [];
 	if (artifact.build.sourceFingerprints.buildRegenerated?.rust) {
 		blockers.push(
@@ -1426,10 +2214,69 @@ async function main(): Promise<void> {
 		);
 	}
 
-	artifact.blockers = blockers;
-	artifact.pass = blockers.length === 0;
+	const evaluatedVerdict = {
+		blockers,
+		pass: blockers.length === 0,
+	} as const;
+	artifact.blockers = evaluatedVerdict.blockers;
+	artifact.pass = evaluatedVerdict.pass;
 	writeArtifact();
-	if (blockers.length > 0) throw new ThresholdFailure(blockers);
+
+	// Non-gating memory collectors run only after noise + threshold verdict evaluation.
+	const streamLoadMemorySamples = await collectStreamLoadMemorySamples();
+	artifact.measurements.streamProcessTreeMemory = {
+		unit: "bytes",
+		definition:
+			"fresh-process streaming-load memory lane after evaluated verdict; absolute monotonic (performance.now) non-gating sample-start schedule; lane measurement, not a claim",
+		sampleIntervalMs: MEMORY_SAMPLE_INTERVAL_MS,
+		sampleWindowMs: STREAM_MEMORY_SAMPLE_WINDOW_MS,
+		samplesPerImplementation: STREAM_MEMORY_SAMPLES,
+		summary: {
+			rust: {
+				loadWindowRss: distribution(streamLoadMemorySamples.rust.map((sample) => sample.loadWindowMaxTreeRssBytes)),
+				loadWindowPss: distribution(streamLoadMemorySamples.rust.map((sample) => sample.loadWindowMaxTreePssBytes)),
+			},
+			typescript: {
+				loadWindowRss: distribution(
+					streamLoadMemorySamples.typescript.map((sample) => sample.loadWindowMaxTreeRssBytes),
+				),
+				loadWindowPss: distribution(
+					streamLoadMemorySamples.typescript.map((sample) => sample.loadWindowMaxTreePssBytes),
+				),
+			},
+		},
+		rawSamples: streamLoadMemorySamples,
+	};
+
+	const idleMemorySamples = await collectIdleMemorySamples();
+	artifact.measurements.idleProcessTreeMemory = {
+		unit: "bytes",
+		definition:
+			"extension-free steady-state after first frame; steady-window peaks are current RSS/PSS maxima correlated by max-record sample index/offset; startupSumVmHwmBytes is the non-simultaneous sum of per-identity VmHWM at stabilization (lifetime upper bound, not an idle/concurrent peak); per-sample observations plus aggregate window coverage; lane measurement, not a claim",
+		stabilizationWindowMs: IDLE_MEMORY_STABILIZATION_MS,
+		sampleIntervalMs: MEMORY_SAMPLE_INTERVAL_MS,
+		sampleWindowMs: IDLE_MEMORY_SAMPLE_WINDOW_MS,
+		summary: {
+			rust: {
+				steadyWindowRss: distribution(idleMemorySamples.rust.map((sample) => sample.steadyWindowMaxTreeRssBytes)),
+				steadyWindowPss: distribution(idleMemorySamples.rust.map((sample) => sample.steadyWindowMaxTreePssBytes)),
+				startupSumVmHwm: distribution(idleMemorySamples.rust.map((sample) => sample.startupSumVmHwmBytes)),
+			},
+			typescript: {
+				steadyWindowRss: distribution(
+					idleMemorySamples.typescript.map((sample) => sample.steadyWindowMaxTreeRssBytes),
+				),
+				steadyWindowPss: distribution(
+					idleMemorySamples.typescript.map((sample) => sample.steadyWindowMaxTreePssBytes),
+				),
+				startupSumVmHwm: distribution(idleMemorySamples.typescript.map((sample) => sample.startupSumVmHwmBytes)),
+			},
+		},
+		rawSamples: idleMemorySamples,
+	};
+	writeArtifact();
+
+	if (evaluatedVerdict.blockers.length > 0) throw new ThresholdFailure(evaluatedVerdict.blockers);
 	process.stdout.write(`check 9 passed; artifact: ${ARTIFACT_PATH}\n`);
 }
 
@@ -1438,15 +2285,25 @@ if (import.meta.main) {
 		await main();
 	} catch (error) {
 		const failure = error instanceof Error ? error : new Error(String(error));
-		if (!(failure instanceof ThresholdFailure)) {
-			const stage = failure instanceof HarnessFailure ? failure.stage : "unexpected";
+		if (failure instanceof NoiseRejection) {
 			artifact.pass = false;
-			artifact.blockers = [`${stage}: ${failure.message}`];
-			artifact.failure = { stage, message: failure.message };
+			artifact.noise = {
+				rejections: failure.noisy,
+				remediation: REMEDIATION_LADDER,
+			};
 			writeArtifact();
+			process.stderr.write(
+				`check 9 rejected as noise:\n${formatNoiseRejection(failure.noisy)}\nartifact: ${ARTIFACT_PATH}\n`,
+			);
+			process.exitCode = exitCodeForFailure(failure);
+		} else {
+			if (!(failure instanceof ThresholdFailure)) {
+				recordEntrypointHarnessFailure(artifact, failure);
+				writeArtifact();
+			}
+			process.stderr.write(`check 9 failed:\n${failure.message}\nartifact: ${ARTIFACT_PATH}\n`);
+			process.exitCode = exitCodeForFailure(failure);
 		}
-		process.stderr.write(`check 9 failed:\n${failure.message}\nartifact: ${ARTIFACT_PATH}\n`);
-		process.exitCode = 1;
 	} finally {
 		for (const path of temporaryDirectories) rmSync(path, { recursive: true, force: true });
 	}
