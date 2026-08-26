@@ -5,9 +5,10 @@ use serde_json::Value;
 use thiserror::Error;
 
 use super::transcript::{
-    ClaimClass, CanonicalEvent, DriverKind, EventKind, NORMALIZATION_TABLE_V1, NormalizationAuditContext,
-    NormalizationContext, NormalizationKind, RowId, RowTier, SCHEMA_ID, TranscriptArtifact, TranscriptMode,
-    detected_volatile_kinds, digest_canonical, normalize_raw_bytes,
+    CanonicalEvent, ClaimClass, DriverKind, EventKind, NORMALIZATION_TABLE_V1,
+    NormalizationAuditContext, NormalizationContext, NormalizationKind, RowId, RowTier, SCHEMA_ID,
+    TranscriptArtifact, TranscriptMode, detected_volatile_kinds, digest_canonical,
+    normalize_raw_bytes,
 };
 
 const TIMING_LIKE_FIELDS: &[&str] = &[
@@ -189,12 +190,14 @@ fn validate_rules(artifact: &TranscriptArtifact) -> Result<(), ValidatorError> {
     }
 
     for (index, event) in events.iter().enumerate() {
-        let expected = u32::try_from(index).map_err(|_| ValidatorError::SequenceGapOrOrder(index))?;
+        let expected =
+            u32::try_from(index).map_err(|_| ValidatorError::SequenceGapOrOrder(index))?;
         if event.seq() != expected {
             return Err(ValidatorError::SequenceGapOrOrder(index));
         }
         match event {
-            CanonicalEvent::Snapshot { cols, rows, .. } | CanonicalEvent::Resize { cols, rows, .. } => {
+            CanonicalEvent::Snapshot { cols, rows, .. }
+            | CanonicalEvent::Resize { cols, rows, .. } => {
                 reject_zero_geometry(*cols, *rows)?;
             }
             CanonicalEvent::ResizeStorm { sizes, .. } => {
@@ -230,7 +233,8 @@ fn validate_rules(artifact: &TranscriptArtifact) -> Result<(), ValidatorError> {
         }
     }
 
-    let digest = digest_canonical(artifact).map_err(|error| ValidatorError::Parse(error.to_string()))?;
+    let digest =
+        digest_canonical(artifact).map_err(|error| ValidatorError::Parse(error.to_string()))?;
     if digest != artifact.digest {
         return Err(ValidatorError::DigestMismatch);
     }
@@ -340,7 +344,9 @@ fn validate_output_audits(artifact: &TranscriptArtifact) -> Result<(), Validator
     Ok(())
 }
 
-fn context_from_audit(audit: &NormalizationAuditContext) -> Result<NormalizationContext, ValidatorError> {
+fn context_from_audit(
+    audit: &NormalizationAuditContext,
+) -> Result<NormalizationContext, ValidatorError> {
     Ok(NormalizationContext {
         home: decode_optional_b64(audit.home_b64.as_deref())?,
         cwd: decode_optional_b64(audit.cwd_b64.as_deref())?,
@@ -359,12 +365,12 @@ fn decode_optional_b64(value: Option<&str>) -> Result<Option<Vec<u8>>, Validator
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::transcript::{
-        CapabilityProfile, DriverDescriptor, Geometry, NormalizationContext, NormalizationEntry,
-        OutputAudit, NormalizationAuditContext, RowId, RunnerRow, Scenario, TimingEnvelope,
-        TranscriptRecorder, TranscriptSpec,
+        CapabilityProfile, DriverDescriptor, Geometry, NormalizationAuditContext,
+        NormalizationContext, NormalizationEntry, OutputAudit, RowId, RunnerRow, Scenario,
+        TimingEnvelope, TranscriptRecorder, TranscriptSpec,
     };
+    use super::*;
 
     fn valid_posix() -> Result<TranscriptArtifact, Box<dyn std::error::Error>> {
         let mut recorder = TranscriptRecorder::new(TranscriptSpec {
@@ -417,7 +423,10 @@ mod tests {
         artifact.schema = "pi-tui-transcript/0".to_owned();
         artifact.digest = digest_canonical(&artifact)?;
         let error = validate_artifact(&artifact).err().ok_or("wrong schema")?;
-        assert_eq!(error, ValidatorError::WrongSchema("pi-tui-transcript/0".to_owned()));
+        assert_eq!(
+            error,
+            ValidatorError::WrongSchema("pi-tui-transcript/0".to_owned())
+        );
         Ok(())
     }
 
@@ -461,7 +470,10 @@ mod tests {
             .ok_or("canonical")?
             .insert("wallMs".to_owned(), Value::from(12));
         let error = validate_value(&value).err().ok_or("timing field")?;
-        assert_eq!(error, ValidatorError::TimingLikeCanonicalField("wallMs".to_owned()));
+        assert_eq!(
+            error,
+            ValidatorError::TimingLikeCanonicalField("wallMs".to_owned())
+        );
         Ok(())
     }
 
@@ -474,16 +486,18 @@ mod tests {
             .ok_or("timing")?
             .insert("events".to_owned(), Value::Array(Vec::new()));
         let error = validate_value(&value).err().ok_or("canonical field")?;
-        assert_eq!(error, ValidatorError::CanonicalLikeTimingField("events".to_owned()));
+        assert_eq!(
+            error,
+            ValidatorError::CanonicalLikeTimingField("events".to_owned())
+        );
         Ok(())
     }
 
     #[test]
     fn rejects_unenumerated_detected_volatile_data() -> Result<(), Box<dyn std::error::Error>> {
         let mut artifact = valid_posix()?;
-        artifact.timing.raw_log_b64 = BASE64.encode(
-            b"session 550e8400-e29b-41d4-a716-446655440000 at 2024-01-02T03:04:05Z",
-        );
+        artifact.timing.raw_log_b64 =
+            BASE64.encode(b"session 550e8400-e29b-41d4-a716-446655440000 at 2024-01-02T03:04:05Z");
         artifact.canonical.normalizations.clear();
         artifact.digest = digest_canonical(&artifact)?;
         let error = validate_artifact(&artifact).err().ok_or("volatile")?;
@@ -526,7 +540,10 @@ mod tests {
         artifact.claims = vec![ClaimClass::Execution, ClaimClass::Render];
         artifact.digest = digest_canonical(&artifact)?;
         let error = validate_artifact(&artifact).err().ok_or("claim")?;
-        assert_eq!(error, ValidatorError::QemuClaimOutsideAllowed(ClaimClass::Render));
+        assert_eq!(
+            error,
+            ValidatorError::QemuClaimOutsideAllowed(ClaimClass::Render)
+        );
         Ok(())
     }
 
@@ -595,7 +612,10 @@ mod tests {
         }
         artifact.digest = digest_canonical(&artifact)?;
         let error = validate_artifact(&artifact).err().ok_or("snapshot claim")?;
-        assert_eq!(error, ValidatorError::QemuClaimOutsideAllowed(ClaimClass::Snapshot));
+        assert_eq!(
+            error,
+            ValidatorError::QemuClaimOutsideAllowed(ClaimClass::Snapshot)
+        );
         Ok(())
     }
 
@@ -632,10 +652,12 @@ mod tests {
         let artifact = recorder.finish()?;
         validate_artifact(&artifact)?;
         assert_eq!(artifact.mode, TranscriptMode::Contingency);
-        assert!(artifact
-            .claims
-            .iter()
-            .all(|claim| matches!(claim, ClaimClass::Execution | ClaimClass::Protocol)));
+        assert!(
+            artifact
+                .claims
+                .iter()
+                .all(|claim| matches!(claim, ClaimClass::Execution | ClaimClass::Protocol))
+        );
         Ok(())
     }
 
@@ -693,7 +715,9 @@ mod tests {
             .ok_or("audit")?;
         artifact.timing.output_audits.push(duplicate);
         artifact.digest = digest_canonical(&artifact)?;
-        let error = validate_artifact(&artifact).err().ok_or("duplicate audit")?;
+        let error = validate_artifact(&artifact)
+            .err()
+            .ok_or("duplicate audit")?;
         assert_eq!(error, ValidatorError::DuplicateOutputAudit(1));
         Ok(())
     }
@@ -701,11 +725,7 @@ mod tests {
     #[test]
     fn rejects_raw_output_audit_mismatch() -> Result<(), Box<dyn std::error::Error>> {
         let mut artifact = valid_posix()?;
-        let audit = artifact
-            .timing
-            .output_audits
-            .first_mut()
-            .ok_or("audit")?;
+        let audit = artifact.timing.output_audits.first_mut().ok_or("audit")?;
         audit.raw_bytes_b64 = BASE64.encode(b"tampered-raw");
         artifact.digest = digest_canonical(&artifact)?;
         let error = validate_artifact(&artifact).err().ok_or("raw mismatch")?;
@@ -743,7 +763,9 @@ mod tests {
         let mut artifact = valid_posix()?;
         artifact.geometry.cols = 0;
         artifact.digest = digest_canonical(&artifact)?;
-        let error = validate_artifact(&artifact).err().ok_or("artifact geometry")?;
+        let error = validate_artifact(&artifact)
+            .err()
+            .ok_or("artifact geometry")?;
         assert_eq!(error, ValidatorError::ZeroGeometry { cols: 0, rows: 24 });
 
         let mut artifact = valid_posix()?;
@@ -759,7 +781,9 @@ mod tests {
         );
         renumber(&mut artifact)?;
         artifact.digest = digest_canonical(&artifact)?;
-        let error = validate_artifact(&artifact).err().ok_or("snapshot geometry")?;
+        let error = validate_artifact(&artifact)
+            .err()
+            .ok_or("snapshot geometry")?;
         assert_eq!(error, ValidatorError::ZeroGeometry { cols: 0, rows: 24 });
 
         let mut artifact = valid_posix()?;
@@ -773,7 +797,9 @@ mod tests {
         );
         renumber(&mut artifact)?;
         artifact.digest = digest_canonical(&artifact)?;
-        let error = validate_artifact(&artifact).err().ok_or("resize geometry")?;
+        let error = validate_artifact(&artifact)
+            .err()
+            .ok_or("resize geometry")?;
         assert_eq!(error, ValidatorError::ZeroGeometry { cols: 0, rows: 12 });
 
         let mut artifact = valid_posix()?;

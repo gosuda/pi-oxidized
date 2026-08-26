@@ -370,18 +370,19 @@ pub fn normalize_raw_bytes(raw: &[u8], context: &NormalizationContext) -> Normal
     let mut bytes = raw.to_vec();
     let mut applied = BTreeSet::new();
 
-    replace_context(
-        &mut bytes,
-        context.home.as_deref(),
-        b"<HOME>",
-        NormalizationKind::PathHome,
-        &mut applied,
-    );
+    // Replace the more specific path first when CWD is nested under HOME.
     replace_context(
         &mut bytes,
         context.cwd.as_deref(),
         b"<CWD>",
         NormalizationKind::PathCwd,
+        &mut applied,
+    );
+    replace_context(
+        &mut bytes,
+        context.home.as_deref(),
+        b"<HOME>",
+        NormalizationKind::PathHome,
         &mut applied,
     );
     normalize_tokens(&mut bytes, &mut applied);
@@ -483,7 +484,10 @@ fn normalize_text(text: &str, context: &NormalizationContext) -> (String, Vec<No
     }
 }
 
-fn match_volatile_at(bytes: &[u8], index: usize) -> Option<(usize, NormalizationKind, &'static [u8])> {
+fn match_volatile_at(
+    bytes: &[u8],
+    index: usize,
+) -> Option<(usize, NormalizationKind, &'static [u8])> {
     if let Some(len) = match_uuid_at(bytes, index) {
         return Some((len, NormalizationKind::IdSession, b"<SESSION>"));
     }
@@ -543,10 +547,13 @@ fn match_relative_time_at(bytes: &[u8], index: usize) -> Option<usize> {
 
 fn is_uuid(token: &[u8]) -> bool {
     token.len() == 36
-        && [8, 13, 18, 23].into_iter().all(|index| token[index] == b'-')
-        && token.iter().enumerate().all(|(index, byte)| {
-            [8, 13, 18, 23].contains(&index) || byte.is_ascii_hexdigit()
-        })
+        && [8, 13, 18, 23]
+            .into_iter()
+            .all(|index| token[index] == b'-')
+        && token
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| [8, 13, 18, 23].contains(&index) || byte.is_ascii_hexdigit())
 }
 
 fn is_iso8601(token: &[u8]) -> bool {
@@ -705,13 +712,16 @@ impl TranscriptRecorder {
             });
         }
         let seq = self.take_seq()?;
-        self.artifact.canonical.events.push(CanonicalEvent::Snapshot {
-            seq,
-            cols,
-            rows,
-            cursor,
-            lines: normalized_lines,
-        });
+        self.artifact
+            .canonical
+            .events
+            .push(CanonicalEvent::Snapshot {
+                seq,
+                cols,
+                rows,
+                cursor,
+                lines: normalized_lines,
+            });
         Ok(true)
     }
 
@@ -864,26 +874,26 @@ mod tests {
         )?;
         value.exit(Some(0), true)?;
         let artifact = value.finish()?;
-        let output = artifact
-            .canonical
-            .events
-            .get(1)
-            .ok_or("missing output")?;
+        let output = artifact.canonical.events.get(1).ok_or("missing output")?;
         let CanonicalEvent::Output { bytes_b64, .. } = output else {
             return Err("wrong event".into());
         };
         let decoded = BASE64.decode(bytes_b64)?;
         assert_eq!(decoded, b"<HOME>/project <SESSION>");
-        assert!(artifact
-            .canonical
-            .normalizations
-            .iter()
-            .any(|entry| entry.kind == NormalizationKind::PathHome));
-        assert!(artifact
-            .canonical
-            .normalizations
-            .iter()
-            .any(|entry| entry.kind == NormalizationKind::IdSession));
+        assert!(
+            artifact
+                .canonical
+                .normalizations
+                .iter()
+                .any(|entry| entry.kind == NormalizationKind::PathHome)
+        );
+        assert!(
+            artifact
+                .canonical
+                .normalizations
+                .iter()
+                .any(|entry| entry.kind == NormalizationKind::IdSession)
+        );
         assert_eq!(artifact.digest, digest_canonical(&artifact)?);
         assert_eq!(artifact.timing.output_audits.len(), 1);
         Ok(())
@@ -917,21 +927,27 @@ mod tests {
             return Err("missing snapshot".into());
         };
         assert_eq!(lines[0], "cwd=<CWD>");
-        assert!(artifact
-            .canonical
-            .normalizations
-            .iter()
-            .any(|entry| entry.kind == NormalizationKind::PathHome));
-        assert!(artifact
-            .canonical
-            .normalizations
-            .iter()
-            .any(|entry| entry.kind == NormalizationKind::PathCwd));
-        assert!(artifact
-            .canonical
-            .normalizations
-            .iter()
-            .any(|entry| entry.kind == NormalizationKind::SnapshotTrailingSpaceTrim));
+        assert!(
+            artifact
+                .canonical
+                .normalizations
+                .iter()
+                .any(|entry| entry.kind == NormalizationKind::PathHome)
+        );
+        assert!(
+            artifact
+                .canonical
+                .normalizations
+                .iter()
+                .any(|entry| entry.kind == NormalizationKind::PathCwd)
+        );
+        assert!(
+            artifact
+                .canonical
+                .normalizations
+                .iter()
+                .any(|entry| entry.kind == NormalizationKind::SnapshotTrailingSpaceTrim)
+        );
         Ok(())
     }
 
@@ -959,15 +975,17 @@ mod tests {
             },
         );
         assert_eq!(normalized.bytes, b"prefix\xff<HOME>\xfe suffix");
-        assert!(normalized
-            .applied
-            .iter()
-            .any(|entry| entry.kind == NormalizationKind::PathHome));
+        assert!(
+            normalized
+                .applied
+                .iter()
+                .any(|entry| entry.kind == NormalizationKind::PathHome)
+        );
     }
 
     #[test]
-    fn claims_are_sorted_and_deduplicated_before_digest()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn claims_are_sorted_and_deduplicated_before_digest() -> Result<(), Box<dyn std::error::Error>>
+    {
         let mut value = TranscriptRecorder::new(TranscriptSpec {
             scenario: Scenario::ColdStart,
             row: RunnerRow {
@@ -1044,10 +1062,12 @@ mod tests {
     fn relative_time_phrase_is_normalized() {
         let normalized = normalize_raw_bytes(b"done 5ms ago", &NormalizationContext::default());
         assert_eq!(normalized.bytes, b"done <AGO>");
-        assert!(normalized
-            .applied
-            .iter()
-            .any(|entry| entry.kind == NormalizationKind::TimeRelative));
+        assert!(
+            normalized
+                .applied
+                .iter()
+                .any(|entry| entry.kind == NormalizationKind::TimeRelative)
+        );
     }
 
     fn complete(mut value: TranscriptRecorder) -> Result<TranscriptArtifact, TranscriptError> {

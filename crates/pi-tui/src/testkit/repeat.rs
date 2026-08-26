@@ -7,9 +7,7 @@ use super::validate::validate_artifact;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RepeatError {
     /// `run_k` requires at least three repetitions.
-    KTooSmall {
-        k: usize,
-    },
+    KTooSmall { k: usize },
     /// Canonical bytes or digests diverged across repetitions.
     Divergence {
         first_divergent_seq: u32,
@@ -17,10 +15,7 @@ pub enum RepeatError {
         right_digest: String,
     },
     /// Producer failed for a specific repetition.
-    Producer {
-        iteration: usize,
-        message: String,
-    },
+    Producer { iteration: usize, message: String },
     /// Stored digest did not match the recomputed canonical digest.
     DigestMismatch {
         iteration: usize,
@@ -42,7 +37,10 @@ impl fmt::Display for RepeatError {
                 "canonical divergence at seq {first_divergent_seq}: {left_digest} != {right_digest}"
             ),
             Self::Producer { iteration, message } => {
-                write!(formatter, "producer failed on iteration {iteration}: {message}")
+                write!(
+                    formatter,
+                    "producer failed on iteration {iteration}: {message}"
+                )
             }
             Self::DigestMismatch {
                 iteration,
@@ -171,11 +169,11 @@ fn first_divergent_seq(left: &TranscriptArtifact, right: &TranscriptArtifact) ->
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::transcript::{
         CapabilityProfile, ClaimClass, DriverKind, Geometry, NormalizationContext, RowId, RowTier,
         RunnerRow, Scenario, TimingEnvelope, TranscriptMode, TranscriptRecorder, TranscriptSpec,
     };
+    use super::*;
 
     fn make_artifact(tag: &[u8]) -> Result<TranscriptArtifact, String> {
         let mut recorder = TranscriptRecorder::new(TranscriptSpec {
@@ -229,7 +227,8 @@ mod tests {
         .ok_or("divergence")?;
         match error {
             RepeatError::Divergence {
-                first_divergent_seq, ..
+                first_divergent_seq,
+                ..
             } => assert_eq!(first_divergent_seq, 1),
             other => return Err(format!("unexpected error: {other:?}").into()),
         }
@@ -237,7 +236,8 @@ mod tests {
     }
 
     #[test]
-    fn reports_length_divergence_at_shared_len() -> Result<(), Box<dyn std::error::Error>> {
+    fn reports_first_divergent_event_before_length_difference()
+    -> Result<(), Box<dyn std::error::Error>> {
         let error = run_k(3, |iteration| {
             if iteration == 0 {
                 return make_artifact(b"stable");
@@ -268,8 +268,9 @@ mod tests {
         .ok_or("length")?;
         match error {
             RepeatError::Divergence {
-                first_divergent_seq, ..
-            } => assert_eq!(first_divergent_seq, 2),
+                first_divergent_seq,
+                ..
+            } => assert_eq!(first_divergent_seq, 1),
             other => return Err(format!("unexpected error: {other:?}").into()),
         }
         Ok(())

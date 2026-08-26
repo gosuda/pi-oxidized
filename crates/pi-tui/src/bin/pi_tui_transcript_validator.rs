@@ -10,7 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use pi_tui::testkit::validate::{validate_bytes, ValidatorError};
+use pi_tui::testkit::validate::{ValidatorError, validate_bytes};
 
 fn main() -> ExitCode {
     let mut args = env::args().skip(1);
@@ -35,10 +35,7 @@ fn run(path: &Path) -> Result<(), u8> {
         1
     })?;
     if artifacts.is_empty() {
-        eprintln!(
-            "FAIL {}: no *.artifact.json files found",
-            path.display()
-        );
+        eprintln!("FAIL {}: no *.artifact.json files found", path.display());
         return Err(1);
     }
 
@@ -73,7 +70,10 @@ fn collect_artifacts(path: &Path) -> Result<Vec<PathBuf>, String> {
         ));
     }
     if !metadata.is_dir() {
-        return Err(format!("path is neither file nor directory: {}", path.display()));
+        return Err(format!(
+            "path is neither file nor directory: {}",
+            path.display()
+        ));
     }
 
     let mut artifacts = Vec::new();
