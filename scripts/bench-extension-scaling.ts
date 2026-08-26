@@ -29,6 +29,15 @@ import idleFactory from "../packages/extension-host/fixtures/extensions/idle.ts"
 import widgetActiveFactory from "../packages/extension-host/fixtures/extensions/widget-active.ts";
 import terminalInputFastFactory from "../packages/extension-host/fixtures/extensions/terminal-input-fast.ts";
 import terminalInputSlowFactory from "../packages/extension-host/fixtures/extensions/terminal-input-slow.ts";
+import {
+	NOISE_EXIT_CODE,
+	NoiseRejection,
+	REMEDIATION_LADDER,
+	formatNoiseRejection,
+	requireQuiet,
+	spreadStats,
+} from "./statistics.ts";
+
 
 class FrameCollector {
 	readonly frames: Frame[] = [];
@@ -150,18 +159,22 @@ function percentile(sorted: number[], p: number): number {
 	return sorted[idx] ?? 0;
 }
 
-function stats(samples: number[]) {
+export function stats(samples: number[]) {
 	const sorted = [...samples].sort((a, b) => a - b);
 	const mean =
 		sorted.length === 0
 			? 0
 			: sorted.reduce((acc, v) => acc + v, 0) / sorted.length;
+	const median = percentile(sorted, 50);
+	const spread = spreadStats(samples, median);
 	return {
-		median: percentile(sorted, 50),
+		median,
 		p95: percentile(sorted, 95),
 		p99: percentile(sorted, 99),
 		mean,
 		n: sorted.length,
+		stddev: spread.stddev,
+		relativeSpread: spread.relativeSpread,
 	};
 }
 
@@ -411,6 +424,90 @@ async function main(): Promise<void> {
 		failures.push("extensionError must be non-retryable");
 	}
 
+	try {
+		requireQuiet([
+			{
+				label: "zero keypress",
+				count: zeroKeyStats.n,
+				median: zeroKeyStats.median,
+				stddev: zeroKeyStats.stddev,
+				relativeSpread: zeroKeyStats.relativeSpread,
+			},
+			{
+				label: "idle100 keypress",
+				count: idleKeyStats.n,
+				median: idleKeyStats.median,
+				stddev: idleKeyStats.stddev,
+				relativeSpread: idleKeyStats.relativeSpread,
+			},
+			{
+				label: "zero frame",
+				count: zeroFrameStats.n,
+				median: zeroFrameStats.median,
+				stddev: zeroFrameStats.stddev,
+				relativeSpread: zeroFrameStats.relativeSpread,
+			},
+			{
+				label: "idle100 frame",
+				count: idleFrameStats.n,
+				median: idleFrameStats.median,
+				stddev: idleFrameStats.stddev,
+				relativeSpread: idleFrameStats.relativeSpread,
+			},
+			{
+				label: "fast terminalInput",
+				count: fastStats.n,
+				median: fastStats.median,
+				stddev: fastStats.stddev,
+				relativeSpread: fastStats.relativeSpread,
+			},
+		]);
+	} catch (error) {
+		if (!(error instanceof NoiseRejection)) throw error;
+		const artifact = {
+			check: 8,
+			name: "extension-scaling",
+			warmups,
+			samples,
+			thresholds: {
+				idleWithinPctOfZero: 10,
+				fastTerminalInputP99Ms: 5,
+				slowTerminalInputTimeoutMs: EXTENSION_INPUT_TIMEOUT_MS,
+				inputQueueCapacity: EXTENSION_INPUT_QUEUE_CAPACITY,
+			},
+			machine: machineMetadata(),
+			results: {
+				zero: { keypress: zeroKeyStats, frame: zeroFrameStats },
+				idle100: { keypress: idleKeyStats, frame: idleFrameStats },
+				active20: {
+					keypress: activeKeyStats,
+					frame: activeFrameStats,
+					widgetKeys: activeKeys.length,
+				},
+				fastTerminalInput: fastStats,
+				slowTerminalInput: {
+					firstMs: slowFirstMs,
+					secondMs: slowSecondMs,
+					activeHandlersAfter: activeAfter,
+					firstPayload: slowFirstPayload,
+					secondPayload: slowSecondPayload,
+				},
+			},
+			pass: false,
+			failures,
+			noise: {
+				rejections: error.noisy,
+				remediation: REMEDIATION_LADDER,
+			},
+		};
+		const outDir = resolve(process.cwd(), "target", "bench");
+		mkdirSync(outDir, { recursive: true });
+		const outPath = resolve(outDir, "extension-scaling.json");
+		writeFileSync(outPath, `${JSON.stringify(artifact, null, 2)}\n`);
+		process.stderr.write(`NOISE:\n${formatNoiseRejection(error.noisy)}\n`);
+		process.exit(NOISE_EXIT_CODE);
+	}
+
 	const artifact = {
 		check: 8,
 		name: "extension-scaling",
@@ -463,4 +560,6 @@ async function main(): Promise<void> {
 	}
 }
 
-await main();
+if (import.meta.main) {
+	await main();
+}
