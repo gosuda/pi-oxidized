@@ -47,3 +47,7 @@ path = "src/bin/pi_tui_pty_fixture.rs"
 name = "pi_tui_transcript_validator"
 path = "src/bin/pi_tui_transcript_validator.rs"
 required-features = ["testkit"]
+
+[[bin]]
+name = "pi_tui_ext_fixture"
+path = "src/bin/pi_tui_ext_fixture.rs"

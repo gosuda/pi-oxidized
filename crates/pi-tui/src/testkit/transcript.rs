@@ -32,6 +32,11 @@ pub enum Scenario {
     FixtureResizeStorm,
     /// Exercises paste and cursor reporting against the deterministic fixture.
     FixturePasteCursor,
+    /// Exercises the extension-UI gauntlet: railed messages, widget slots,
+    /// stacked overlays with focus restore, HostUiRequest dialogs, extension
+    /// footer shortcuts, hostile setTheme sanitization, and OSC 0 title
+    /// injection with C0/C1 and >256 UTF-8 bytes.
+    FixtureExtGauntlet,
     /// Captures product startup before interactive input.
     ColdStart,
     /// Captures the first-run configuration flow.
