@@ -164,7 +164,11 @@ fn build_chat(state: &ViewState, md_theme: &MarkdownTheme) -> Box<dyn Component>
         stack.push(Box::new(Text::with_padding(
             state.theme.fg(
                 super::theme::ThemeColor::Dim,
-                "? shortcuts · ctrl+o expand tools · shift+tab thinking",
+                &format!(
+                    "/hotkeys shortcuts · {} expand tools · {} thinking",
+                    pi_tui::keybindings::key_text("app.tools.expand"),
+                    pi_tui::keybindings::key_text("app.thinking.cycle")
+                ),
             ),
             messages::CONTENT_INDENT,
             0,

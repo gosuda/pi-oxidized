@@ -211,7 +211,16 @@ pub fn build_shortcut_overlay(
             CONTENT_INDENT,
             0,
         )));
-        push_shortcut_hints(&mut stack, extension_hints, th);
+        // Extension rows carry raw key strings; render them display-formatted
+        // like the reference extension hotkeys table (interactive-mode.ts:6347).
+        let display_hints: Vec<ShortcutHint> = extension_hints
+            .iter()
+            .map(|hint| ShortcutHint {
+                key: pi_tui::keybindings::format_key_text(&hint.key, true),
+                action: hint.action.clone(),
+            })
+            .collect();
+        push_shortcut_hints(&mut stack, &display_hints, th);
     }
     Box::new(stack)
 }
@@ -232,29 +241,41 @@ fn push_shortcut_hints(
 }
 
 /// Default shortcut hint rows (ports the reference keybinding table).
+///
+/// Every key column resolves from the process-global keybinding registry so
+/// rebound users see their own chords; slash-command rows stay raw.
 #[must_use]
 pub fn default_shortcut_hints() -> Vec<ShortcutHint> {
-    use super::state::ShortcutHint;
+    use pi_tui::keybindings::key_display_text;
+
+    let cycle_models = [
+        key_display_text("app.model.cycleForward"),
+        key_display_text("app.model.cycleBackward"),
+    ]
+    .join(" / ");
     [
-        ("Esc", "Interrupt / abort"),
-        ("Ctrl+C", "Clear editor (×2 to exit)"),
-        ("Ctrl+D", "Exit"),
-        ("Shift+Tab", "Cycle thinking"),
-        ("Ctrl+L", "Model selector"),
-        ("Ctrl+P", "Cycle models"),
-        ("Ctrl+O", "Toggle tool output"),
-        ("Ctrl+T", "Toggle thinking"),
-        ("Ctrl+G", "External editor"),
-        ("Ctrl+X", "Copy last assistant"),
-        ("Alt+Enter", "Queue follow-up"),
-        ("Alt+Up", "Restore follow-up"),
-        ("Ctrl+V", "Paste image/text"),
-        ("/help", "Slash commands"),
-        ("? , /hotkeys", "This overlay"),
+        (key_display_text("app.interrupt"), "Interrupt / abort"),
+        (key_display_text("app.clear"), "Clear editor (×2 to exit)"),
+        (key_display_text("app.exit"), "Exit"),
+        (key_display_text("app.thinking.cycle"), "Cycle thinking"),
+        (key_display_text("app.model.select"), "Model selector"),
+        (cycle_models, "Cycle models"),
+        (key_display_text("app.tools.expand"), "Toggle tool output"),
+        (key_display_text("app.thinking.toggle"), "Toggle thinking"),
+        (key_display_text("app.editor.external"), "External editor"),
+        (key_display_text("app.message.copy"), "Copy last assistant"),
+        (key_display_text("app.message.followUp"), "Queue follow-up"),
+        (key_display_text("app.message.dequeue"), "Restore follow-up"),
+        (
+            key_display_text("app.clipboard.pasteImage"),
+            "Paste image/text",
+        ),
+        ("/help".to_owned(), "Slash commands"),
+        ("/hotkeys".to_owned(), "This overlay"),
     ]
     .into_iter()
     .map(|(key, action)| ShortcutHint {
-        key: key.to_owned(),
+        key,
         action: action.to_owned(),
     })
     .collect()

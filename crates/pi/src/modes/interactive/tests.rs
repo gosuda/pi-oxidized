@@ -135,20 +135,24 @@ fn empty_state_renders_canonical_section_order() {
 
 #[test]
 fn empty_state_snapshot_widths() {
-    let state = base_state();
-    insta::assert_snapshot!("empty_state_widths", triple_plain(&state));
+    crate::core::keybindings::with_global_app_keybindings(|| {
+        let state = base_state();
+        insta::assert_snapshot!("empty_state_widths", triple_plain(&state));
+    });
 }
 
 #[test]
 fn loading_state_snapshot() {
-    let mut state = base_state();
-    state.status = Some(SessionStatus {
-        kind: StatusKind::Working,
-        frame: 0,
-        elapsed_secs: 0,
-        message: "Working…".to_owned(),
+    crate::core::keybindings::with_global_app_keybindings(|| {
+        let mut state = base_state();
+        state.status = Some(SessionStatus {
+            kind: StatusKind::Working,
+            frame: 0,
+            elapsed_secs: 0,
+            message: "Working…".to_owned(),
+        });
+        insta::assert_snapshot!("loading_state_widths", triple_plain(&state));
     });
-    insta::assert_snapshot!("loading_state_widths", triple_plain(&state));
 }
 
 #[test]
@@ -170,49 +174,56 @@ fn error_state_snapshot() {
 
 #[test]
 fn streaming_state_snapshot() {
-    let mut state = base_state();
-    state.streaming = true;
-    state.status = Some(SessionStatus {
-        kind: StatusKind::Working,
-        frame: 3,
-        elapsed_secs: 0,
-        message: "Working…".to_owned(),
+    crate::core::keybindings::with_global_app_keybindings(|| {
+        let mut state = base_state();
+        state.streaming = true;
+        state.status = Some(SessionStatus {
+            kind: StatusKind::Working,
+            frame: 3,
+            elapsed_secs: 0,
+            message: "Working…".to_owned(),
+        });
+        let partial = assistant_text("Generating a response…");
+        state
+            .messages
+            .push(StateMessageView::streaming_assistant(partial));
+        insta::assert_snapshot!("streaming_state_widths", triple_plain(&state));
     });
-    let partial = assistant_text("Generating a response…");
-    state
-        .messages
-        .push(StateMessageView::streaming_assistant(partial));
-    insta::assert_snapshot!("streaming_state_widths", triple_plain(&state));
 }
 
 #[test]
 fn compact_state_snapshot() {
-    let mut state = base_state();
-    state.status = Some(SessionStatus {
-        kind: StatusKind::Compaction,
-        frame: 0,
-        elapsed_secs: 0,
-        message: "Compacting context…".to_owned(),
+    crate::core::keybindings::with_global_app_keybindings(|| {
+        let mut state = base_state();
+        state.status = Some(SessionStatus {
+            kind: StatusKind::Compaction,
+            frame: 0,
+            elapsed_secs: 0,
+            message: "Compacting context…".to_owned(),
+        });
+        state
+            .messages
+            .push(StateMessageView::Compaction(CompactionSummaryView {
+                summary: "Earlier discussion covered the theme system and footer layout."
+                    .to_owned(),
+                tokens_before: 180_000,
+            }));
+        insta::assert_snapshot!("compact_state_widths", triple_plain(&state));
     });
-    state
-        .messages
-        .push(StateMessageView::Compaction(CompactionSummaryView {
-            summary: "Earlier discussion covered the theme system and footer layout.".to_owned(),
-            tokens_before: 180_000,
-        }));
-    insta::assert_snapshot!("compact_state_widths", triple_plain(&state));
 }
 
 #[test]
 fn retry_state_snapshot() {
-    let mut state = base_state();
-    state.status = Some(SessionStatus {
-        kind: StatusKind::Retry,
-        frame: 5,
-        elapsed_secs: 0,
-        message: "Retrying…".to_owned(),
+    crate::core::keybindings::with_global_app_keybindings(|| {
+        let mut state = base_state();
+        state.status = Some(SessionStatus {
+            kind: StatusKind::Retry,
+            frame: 5,
+            elapsed_secs: 0,
+            message: "Retrying…".to_owned(),
+        });
+        insta::assert_snapshot!("retry_state_widths", triple_plain(&state));
     });
-    insta::assert_snapshot!("retry_state_widths", triple_plain(&state));
 }
 
 #[test]
@@ -253,32 +264,34 @@ fn bash_state_snapshot() {
 
 #[test]
 fn queue_state_snapshot() {
-    let mut state = base_state();
-    state.streaming = true;
-    state.status = Some(SessionStatus {
-        kind: StatusKind::Working,
-        frame: 0,
-        elapsed_secs: 0,
-        message: "Working…".to_owned(),
+    crate::core::keybindings::with_global_app_keybindings(|| {
+        let mut state = base_state();
+        state.streaming = true;
+        state.status = Some(SessionStatus {
+            kind: StatusKind::Working,
+            frame: 0,
+            elapsed_secs: 0,
+            message: "Working…".to_owned(),
+        });
+        state.pending = PendingQueue {
+            steering: vec![PendingMessage {
+                kind: PendingKind::Steering,
+                text: "remember to add tests".to_owned(),
+            }],
+            follow_up: vec![
+                PendingMessage {
+                    kind: PendingKind::FollowUp,
+                    text: "now run clippy".to_owned(),
+                },
+                PendingMessage {
+                    kind: PendingKind::FollowUp,
+                    text: "then commit".to_owned(),
+                },
+            ],
+            follow_up_mode: QueueMode::All,
+        };
+        insta::assert_snapshot!("queue_state_widths", triple_plain(&state));
     });
-    state.pending = PendingQueue {
-        steering: vec![PendingMessage {
-            kind: PendingKind::Steering,
-            text: "remember to add tests".to_owned(),
-        }],
-        follow_up: vec![
-            PendingMessage {
-                kind: PendingKind::FollowUp,
-                text: "now run clippy".to_owned(),
-            },
-            PendingMessage {
-                kind: PendingKind::FollowUp,
-                text: "then commit".to_owned(),
-            },
-        ],
-        follow_up_mode: QueueMode::All,
-    };
-    insta::assert_snapshot!("queue_state_widths", triple_plain(&state));
 }
 
 // ---------------------------------------------------------------------------
@@ -576,40 +589,44 @@ fn tool_error_uses_heavy_rail_glyph() {
 
 #[test]
 fn shortcut_overlay_snapshot() {
-    let mut state = base_state();
-    state.overlay = Some(Overlay {
-        kind: OverlayKind::ShortcutHelp,
-        lines: Vec::new(),
-        height: 20,
+    crate::core::keybindings::with_global_app_keybindings(|| {
+        let mut state = base_state();
+        state.overlay = Some(Overlay {
+            kind: OverlayKind::ShortcutHelp,
+            lines: Vec::new(),
+            height: 20,
+        });
+        let buf = render_view(&state, 80, 40);
+        let plain = snapshot_buffer_plain(&buf, 80, 40).join("\n");
+        assert!(
+            plain.contains("Keyboard shortcuts"),
+            "shortcut overlay must render: {plain}"
+        );
+        assert!(plain.contains("Escape"));
     });
-    let buf = render_view(&state, 80, 40);
-    let plain = snapshot_buffer_plain(&buf, 80, 40).join("\n");
-    assert!(
-        plain.contains("Keyboard shortcuts"),
-        "shortcut overlay must render: {plain}"
-    );
-    assert!(plain.contains("Esc"));
 }
 
 #[test]
 fn shortcut_overlay_shows_extensions_only_when_present() {
-    let mut state = base_state();
-    state.overlay = Some(Overlay {
-        kind: OverlayKind::ShortcutHelp,
-        lines: Vec::new(),
-        height: 20,
-    });
-    let plain = snapshot_buffer_plain(&render_view(&state, 80, 40), 80, 40).join("\n");
-    assert!(!plain.contains("Extensions"));
+    crate::core::keybindings::with_global_app_keybindings(|| {
+        let mut state = base_state();
+        state.overlay = Some(Overlay {
+            kind: OverlayKind::ShortcutHelp,
+            lines: Vec::new(),
+            height: 20,
+        });
+        let plain = snapshot_buffer_plain(&render_view(&state, 80, 40), 80, 40).join("\n");
+        assert!(!plain.contains("Extensions"));
 
-    state.extension_shortcuts.push(ShortcutHint {
-        key: "ctrl+y".to_owned(),
-        action: "Extension action".to_owned(),
+        state.extension_shortcuts.push(ShortcutHint {
+            key: "ctrl+y".to_owned(),
+            action: "Extension action".to_owned(),
+        });
+        let plain = snapshot_buffer_plain(&render_view(&state, 80, 40), 80, 40).join("\n");
+        assert!(plain.contains("Extensions"));
+        assert!(plain.contains("Ctrl+Y"));
+        assert!(plain.contains("Extension action"));
     });
-    let plain = snapshot_buffer_plain(&render_view(&state, 80, 40), 80, 40).join("\n");
-    assert!(plain.contains("Extensions"));
-    assert!(plain.contains("ctrl+y"));
-    assert!(plain.contains("Extension action"));
 }
 
 #[test]
@@ -1007,19 +1024,21 @@ fn auth_progress_renders_every_stage() {
 
 #[test]
 fn compaction_and_retry_messages_match_reference() {
-    use crate::modes::interactive::status::{compaction_message, retry_message};
-    assert_eq!(
-        compaction_message(CompactionReason::Manual),
-        "Compacting context… (Esc to cancel)"
-    );
-    assert_eq!(
-        compaction_message(CompactionReason::Overflow),
-        "Context overflow detected, auto-compacting… (Esc to cancel)"
-    );
-    assert_eq!(
-        retry_message(2, 3, 5),
-        "Retrying (2/3) in 5s… (Esc to cancel)"
-    );
+    crate::core::keybindings::with_global_app_keybindings(|| {
+        use crate::modes::interactive::status::{compaction_message, retry_message};
+        assert_eq!(
+            compaction_message(CompactionReason::Manual),
+            "Compacting context… (escape to cancel)"
+        );
+        assert_eq!(
+            compaction_message(CompactionReason::Overflow),
+            "Context overflow detected, auto-compacting… (escape to cancel)"
+        );
+        assert_eq!(
+            retry_message(2, 3, 5),
+            "Retrying (2/3) in 5s… (escape to cancel)"
+        );
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1104,9 +1123,117 @@ fn resources_diagnostics_widgets_sections_present() {
 #[test]
 fn default_shortcut_hints_are_nonempty() {
     use crate::modes::interactive::startup::default_shortcut_hints;
-    let hints: Vec<ShortcutHint> = default_shortcut_hints();
-    assert!(!hints.is_empty());
-    assert!(hints.iter().any(|h| h.key == "Esc"));
+    crate::core::keybindings::with_global_app_keybindings(|| {
+        let hints: Vec<ShortcutHint> = default_shortcut_hints();
+        assert!(!hints.is_empty());
+        assert!(hints.iter().any(|h| h.key == "Escape"));
+        // The overlay row is the raw slash command — not the legacy
+        // `? , /hotkeys` pair with its stray space.
+        assert!(
+            hints
+                .iter()
+                .any(|h| h.key == "/hotkeys" && h.action == "This overlay")
+        );
+        for hint in &hints {
+            assert!(
+                !hint.key.contains('?') && !hint.key.contains(", "),
+                "key column must be one clean key: {}",
+                hint.key
+            );
+        }
+    });
+}
+
+#[test]
+fn rendered_key_hints_follow_rebinds() {
+    use crate::modes::interactive::messages::ToolMessageView;
+    use crate::modes::interactive::tool_renderer::{
+        ToolCallView, ToolPhase, ToolResultView, ToolState,
+    };
+
+    crate::core::keybindings::with_global_app_keybindings(|| {
+        // Rebind two hinted actions; every rendered site must follow.
+        let mut user = pi_tui::keybindings::KeybindingsConfig::new();
+        user.insert(
+            "app.tools.expand".to_owned(),
+            vec![pi_tui::keys::KeyId::from_raw("ctrl+m")],
+        );
+        user.insert(
+            "app.thinking.cycle".to_owned(),
+            vec![pi_tui::keys::KeyId::from_raw("f9")],
+        );
+        pi_tui::keybindings::set_keybindings(pi_tui::keybindings::KeybindingsManager::new(
+            crate::core::keybindings::app_keybindings(),
+            user,
+        ));
+
+        // Empty-state header hint renders the rebound keys.
+        let mut state = base_state();
+        let buf = render_view(&state, 80, 30);
+        let plain = snapshot_buffer_plain(&buf, 80, 30).join("\n");
+        assert!(
+            plain.contains("/hotkeys shortcuts · ctrl+m expand tools · f9 thinking"),
+            "empty-state hint must render rebound keys: {plain}"
+        );
+
+        // Tool-collapse hint (15 result lines → 12 preview + 3 hidden).
+        state.messages.push(StateMessageView::Tool(ToolMessageView {
+            renderer: "read".to_owned(),
+            state: ToolState {
+                call: ToolCallView {
+                    name: "read".to_owned(),
+                    id: "call_1".to_owned(),
+                    args_summary: "path: src/lib.rs".to_owned(),
+                    raw_args: serde_json::json!({ "path": "src/lib.rs" }),
+                },
+                result: Some(ToolResultView {
+                    text: (1..=15)
+                        .map(|i| format!("line {i}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    truncated: false,
+                    full_output_path: None,
+                    images: Vec::new(),
+                    error: None,
+                }),
+                expanded: false,
+                phase: ToolPhase::Success,
+            },
+        }));
+        let buf = render_view(&state, 80, 40);
+        let plain = snapshot_buffer_plain(&buf, 80, 40).join("\n");
+        assert!(
+            plain.contains("… 3 more lines · ctrl+m"),
+            "tool collapse hint must render the rebound expand key: {plain}"
+        );
+
+        // Status cancel hint still resolves app.interrupt from the registry.
+        state.status = Some(SessionStatus {
+            kind: StatusKind::Working,
+            frame: 0,
+            elapsed_secs: 0,
+            message: "Working…".to_owned(),
+        });
+        let buf = render_view(&state, 80, 40);
+        let plain = snapshot_buffer_plain(&buf, 80, 40).join("\n");
+        assert!(
+            plain.contains("· escape to cancel"),
+            "status cancel hint must resolve app.interrupt: {plain}"
+        );
+
+        // Shortcut overlay renders the rebound key capitalized.
+        state.overlay = Some(Overlay {
+            kind: OverlayKind::ShortcutHelp,
+            lines: Vec::new(),
+            height: 20,
+        });
+        let buf = render_view(&state, 80, 40);
+        let plain = snapshot_buffer_plain(&buf, 80, 40).join("\n");
+        assert!(
+            plain.contains("Ctrl+M"),
+            "overlay key column must render the capitalized rebind: {plain}"
+        );
+    });
 }
 
 #[test]
