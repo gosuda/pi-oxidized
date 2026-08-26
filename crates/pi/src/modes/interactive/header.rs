@@ -40,7 +40,7 @@ pub fn build_header(
     } else {
         let onboarding = data.onboarding.clone().unwrap_or_default();
         let compact = if onboarding.is_empty() {
-            format!("{logo}  •  type a message, `/` for commands, `?` for help")
+            format!("{logo}  •  type a message to begin")
         } else {
             format!("{logo}  •  {onboarding}")
         };

@@ -156,7 +156,7 @@ fn build_chat(state: &ViewState, md_theme: &MarkdownTheme) -> Box<dyn Component>
         stack.push(Box::new(Text::with_padding(
             state.theme.fg(
                 super::theme::ThemeColor::Dim,
-                "Type a message, or / for commands.",
+                "Pi can explain its own features and look up its docs. Ask it how to use or extend Pi.",
             ),
             messages::CONTENT_INDENT,
             0,

@@ -804,12 +804,12 @@ fn scoped_models_selector_marks_enabled() {
 #[test]
 fn selector_builders_render_named_empty_copy_and_exit_hint() {
     use crate::modes::interactive::selectors::{
-        build_auth_selector, build_config_selector, build_model_selector, build_session_picker,
-        build_settings_selector, build_tree_selector, SELECTOR_EXIT_HINT,
+        SELECTOR_EXIT_HINT, build_auth_selector, build_config_selector, build_model_selector,
+        build_session_picker, build_settings_selector, build_tree_selector,
     };
     use crate::modes::interactive::state::{
-        AuthSelectorEntry, ConfigSelectorEntry, ModelSelectorEntry, SessionPickerEntry, SettingsRow,
-        TreeEntry,
+        AuthSelectorEntry, ConfigSelectorEntry, ModelSelectorEntry, SessionPickerEntry,
+        SettingsRow, TreeEntry,
     };
 
     let cases: Vec<(&str, Box<dyn pi_tui::component::Component>)> = vec![
@@ -856,7 +856,6 @@ fn selector_builders_render_named_empty_copy_and_exit_hint() {
         );
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Resize + theme fallback

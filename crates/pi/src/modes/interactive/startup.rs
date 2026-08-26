@@ -129,7 +129,7 @@ pub fn build_first_time_setup_with_selection(
         FIRST_RUN_STEP_FAMILY => "Choose a theme family.\nHighlight previews live; Enter confirms.",
         FIRST_RUN_STEP_MODE => "Choose a theme mode.\nAuto matches the terminal background.",
         FIRST_RUN_STEP_ANALYTICS => {
-            "Enable anonymous usage analytics?\n(you can change this in settings)"
+            "Opt-in to anonymous usage data sharing?\nOpting in stores a tracking identifier in settings.json and enables anonymous\nusage analytics. This helps us to better debug, reproduce, and resolve issues\nand bugs within Pi. You can observe what is shared using /privacy and make\nchanges anytime in settings.json."
         }
         _ => "Setup complete. Type a message to begin.",
     };
