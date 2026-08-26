@@ -11,7 +11,7 @@
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { REQUIRED_TOOL_NAMES, selectPortableToolParameters } from "../generate-tool-schemas.ts";
+import { REQUIRED_TOOL_NAMES, loadCanonicalToolRegistry, selectPortableToolParameters } from "../generate-tool-schemas.ts";
 
 export const REPO_ROOT = resolve(import.meta.dirname, "../..");
 
@@ -109,7 +109,7 @@ export function readReferenceHead(root: string): string {
 	}
 }
 
-export function loadAlignmentInputs(root: string): AlignmentInputs {
+export async function loadAlignmentInputs(root: string): Promise<AlignmentInputs> {
 	const files: Record<string, string> = {};
 	for (const path of PIN_LITERAL_PATHS) {
 		try {
@@ -118,18 +118,11 @@ export function loadAlignmentInputs(root: string): AlignmentInputs {
 			// verifyPinLiterals reports missing files
 		}
 	}
-	const registryTools: Record<string, unknown> = {};
-	for (const name of REQUIRED_TOOL_NAMES) {
-		registryTools[name] = { parameters: { type: "object", properties: { path: { type: "string" } } } };
-	}
-	// Probe tolerance against the known reference-only platform tool without importing the registry.
-	registryTools.powershell = {
-		parameters: { type: "object", properties: { command: { type: "string" } } },
-	};
+	const { definitions } = await loadCanonicalToolRegistry();
 	return {
 		files,
 		referenceHead: readReferenceHead(root),
-		registryTools,
+		registryTools: definitions,
 	};
 }
 
@@ -142,8 +135,8 @@ export function runAlignmentWitnesses(inputs: AlignmentInputs): string[] {
 	];
 }
 
-function main(): void {
-	const violations = runAlignmentWitnesses(loadAlignmentInputs(REPO_ROOT));
+async function main(): Promise<void> {
+	const violations = runAlignmentWitnesses(await loadAlignmentInputs(REPO_ROOT));
 	if (violations.length > 0) {
 		console.error(`alignment witness suite failed with ${violations.length} violation(s):`);
 		for (const violation of violations) console.error(`  - ${violation}`);

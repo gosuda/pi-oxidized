@@ -230,6 +230,14 @@ async function resolvePinnedTypeboxEntry(pin: string): Promise<string> {
 }
 
 function registerTypeboxPin(typeboxEntry: string): void {
+	if (registeredTypeboxEntry === typeboxEntry) {
+		return;
+	}
+	if (registeredTypeboxEntry !== undefined) {
+		fail(
+			`missing prerequisite: typebox already pinned to ${registeredTypeboxEntry}; cannot re-pin to ${typeboxEntry}`,
+		);
+	}
 	const globalScope: { Bun?: BunPluginHost } = globalThis;
 	if (globalScope.Bun === undefined) {
 		fail("missing prerequisite: Bun plugin API unavailable");
@@ -240,7 +248,11 @@ function registerTypeboxPin(typeboxEntry: string): void {
 			build.onResolve({ filter: /^typebox$/ }, () => ({ path: typeboxEntry }));
 		},
 	});
+	registeredTypeboxEntry = typeboxEntry;
 }
+
+/** Typebox entry the single `pi-pin-typebox` plugin registration rewrites to. */
+let registeredTypeboxEntry: string | undefined;
 
 /** Select only Rust-owned portable schemas and reject an incomplete reference registry. */
 export function selectPortableToolParameters(
@@ -263,7 +275,29 @@ export function selectPortableToolParameters(
 	return parametersByTool;
 }
 
-async function loadToolParameters(): Promise<Record<string, unknown>> {
+/** Registry loaded through the generator's single ownership point: pin, plugin, import, execute. */
+export interface LoadedToolRegistry {
+	/** Raw ToolDefinition map returned by the pinned reference registry. */
+	readonly definitions: Record<string, unknown>;
+	/** Exact typebox version enforced by the reference authorities. */
+	readonly typeboxPin: string;
+	/** Pinned typebox entry the plugin rewrites `typebox` imports to. */
+	readonly typeboxEntry: string;
+}
+
+/**
+ * Load the canonical reference tool registry the generator (and the VER-ALIGN
+ * witness) treat as source of truth. Registers the exact pinned typebox plugin,
+ * dynamically imports the pinned registry, validates its factory shape, and
+ * executes it with the fixture cwd — returning the raw definition map. This is
+ * the only place registry loading happens; the generator's output and the
+ * alignment acceptance witness both consume it.
+ */
+export async function loadCanonicalToolRegistry(): Promise<LoadedToolRegistry> {
+	assertBunRuntime();
+	const typeboxPin = await readPinnedTypeboxVersion();
+	const typeboxEntry = await resolvePinnedTypeboxEntry(typeboxPin);
+	registerTypeboxPin(typeboxEntry);
 	await assertPathReadable(REFERENCE_TOOLS_INDEX, "reference tool registry");
 	let registry: unknown;
 	try {
@@ -286,11 +320,7 @@ async function loadToolParameters(): Promise<Record<string, unknown>> {
 	if (!isPlainObject(definitions)) {
 		fail("missing prerequisite: reference createAllToolDefinitions did not return a tool map");
 	}
-	try {
-		return selectPortableToolParameters(definitions);
-	} catch (error) {
-		fail(error instanceof Error ? error.message : String(error));
-	}
+	return { definitions, typeboxPin, typeboxEntry };
 }
 
 /**
@@ -411,12 +441,8 @@ async function writeAtomically(path: string, contents: string, counter: number):
 }
 
 async function main(): Promise<void> {
-	assertBunRuntime();
-	const pin = await readPinnedTypeboxVersion();
-	const typeboxEntry = await resolvePinnedTypeboxEntry(pin);
-	registerTypeboxPin(typeboxEntry);
-
-	const parametersByTool = await loadToolParameters();
+	const { definitions, typeboxPin, typeboxEntry } = await loadCanonicalToolRegistry();
+	const parametersByTool = selectPortableToolParameters(definitions);
 	const { encodedByTool, strippedTotals } = buildEncodedSchemas(parametersByTool);
 
 	await mkdir(OUTPUT_DIR, { recursive: true });
@@ -448,7 +474,7 @@ async function main(): Promise<void> {
 	process.stdout.write(
 		[
 			`Wrote ${REQUIRED_TOOL_NAMES.length} tool schemas to ${OUTPUT_DIR}`,
-			`typebox: ${pin} (${typeboxEntry})`,
+			`typebox: ${typeboxPin} (${typeboxEntry})`,
 			`source: ${REFERENCE_TOOLS_INDEX}`,
 			...summaryLines,
 			`normalization: stripped ${strippedReport === "" ? "nothing (no $schema/title/format keys present)" : strippedReport}; object keys sorted recursively; array order preserved`,

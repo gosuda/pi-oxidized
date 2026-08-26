@@ -1,5 +1,3 @@
-import { describe, expect, test } from "bun:test";
-import { REQUIRED_TOOL_NAMES, selectPortableToolParameters } from "../generate-tool-schemas.ts";
 import {
 	CANONICAL_REFERENCE_SHA,
 	PIN_LITERAL_PATHS,
@@ -11,6 +9,13 @@ import {
 	verifyPortableToolSelection,
 	verifyReferenceCheckout,
 } from "./alignment.ts";
+import { describe, expect, test } from "bun:test";
+
+import {
+	REQUIRED_TOOL_NAMES,
+	loadCanonicalToolRegistry,
+	selectPortableToolParameters,
+} from "../generate-tool-schemas.ts";
 
 function parametersFor(names: readonly string[]): Record<string, unknown> {
 	const definitions: Record<string, unknown> = {};
@@ -26,8 +31,8 @@ describe("VER-ALIGN reference pin", () => {
 		expect(STALE_REFERENCE_SHA).toBe("4488ad55c18f07ae89a489096c90de8667b3adfb");
 	});
 
-	test("owned pin files carry the canonical SHA twice in workflow and once in reconstruct", () => {
-		const inputs = loadAlignmentInputs(REPO_ROOT);
+	test("owned pin files carry the canonical SHA twice in workflow and once in reconstruct", async () => {
+		const inputs = await loadAlignmentInputs(REPO_ROOT);
 		expect(verifyPinLiterals(inputs.files)).toEqual([]);
 		for (const path of PIN_LITERAL_PATHS) {
 			expect(inputs.files[path]).toContain(CANONICAL_REFERENCE_SHA);
@@ -87,7 +92,34 @@ describe("VER-ALIGN portable tool selection", () => {
 });
 
 describe("VER-ALIGN acceptance path", () => {
-	test("runAlignmentWitnesses is green against the repository", () => {
-		expect(runAlignmentWitnesses(loadAlignmentInputs(REPO_ROOT))).toEqual([]);
+	test("runAlignmentWitnesses is green against the repository", async () => {
+		expect(runAlignmentWitnesses(await loadAlignmentInputs(REPO_ROOT))).toEqual([]);
+	});
+
+	test("acceptance selection defends against real-registry mutations", async () => {
+		const { definitions } = await loadCanonicalToolRegistry();
+
+		// Removing a required real registry entry must fail the acceptance witness.
+		const missing = { ...definitions };
+		delete missing.ls;
+		expect(
+			verifyPortableToolSelection(missing).some((problem) => problem.includes("ls")),
+		).toBe(true);
+
+		// The acceptance path must never retain a reference-only entry. The real
+		// registry does carry platform-only tools (e.g. powershell), so selection
+		// proving it drops them is a real, non-tautological mutation defence.
+		const selected = selectPortableToolParameters({ ...definitions });
+		const retainedReferenceOnly = Object.keys(definitions).filter(
+			(name) =>
+				!(REQUIRED_TOOL_NAMES as readonly string[]).includes(name) &&
+				Object.hasOwn(selected, name),
+		);
+		expect(retainedReferenceOnly).toEqual([]);
+		expect(
+			Object.keys(definitions).some(
+				(name) => !(REQUIRED_TOOL_NAMES as readonly string[]).includes(name),
+			),
+		).toBe(true);
 	});
 });
