@@ -424,6 +424,20 @@
 			"evidence": "scripts/verification/performance.ts produces target/bench/performance-comparison.json and meets speedup thresholds"
 		},
 		{
+			"id": "docs-evidence",
+			"surface": "documentation evidence",
+			"tier": "unit",
+			"required": true,
+			"commands": [
+				{
+					"cwd": ".",
+					"argv": ["bun", "run", "scripts/verification/docs-evidence.ts"],
+					"timeoutMs": 120000
+				}
+			],
+			"evidence": "docs-evidence checker validates every ledger row against the EXT-24 inventory and exits 0"
+		},
+		{
 			"id": "release-x86_64-linux",
 			"surface": "release",
 			"tier": "release",

@@ -123,6 +123,11 @@ jobs:
           bun run check
           bun test scripts
 
+      - name: Doc-evidence ledger check
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: bun run scripts/verification/docs-evidence.ts
+
       # The full correctness and same-machine performance signal runs once;
       # the remaining four jobs stay focused on target-specific packaging.
       - name: Generate session fixtures
