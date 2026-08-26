@@ -319,53 +319,114 @@ mod tests {
     }
 
     // ──────────────────────────────────────────────────────────────────
-    // XC-9 / M19: host-resolution witness — never search PATH
-    // ──────────────────────────────────────────────────────────────────
+    // ───────────────────────────────────────────────────────────────────
+    // XC-9 / M19: host-resolution witness — never search PATH.
+    //
+    // A PATH-search mutation reads `PATH` at resolution time, so the witness
+    // plants a stray `pi-extension-host` executable on the child's `PATH`
+    // via a re-executed test process (in-process env mutation is unavailable:
+    // the workspace sets `unsafe_code = "forbid"`). The child asserts the
+    // resolver still reports `NotConfigured` / honors the env override.
+    // ───────────────────────────────────────────────────────────────────
+
+    /// Marker env var switching the test binary into M19 child mode.
+    const M19_CHILD_MODE: &str = "XC9_M19_CHILD_MODE";
+    /// Env var carrying the env-override host path into child mode.
+    const M19_ENV_HOST: &str = "XC9_M19_ENV_HOST";
+
+    fn m19_child_exit() -> ! {
+        let mode = env::var(M19_CHILD_MODE).unwrap_or_default();
+        let ok = match mode.as_str() {
+            "notconfigured" => {
+                matches!(resolve_with_fallback(None, None, None, None), Err(HostError::NotConfigured { .. }))
+            }
+            "envwins" => match env::var(M19_ENV_HOST) {
+                Ok(host) => match resolve_with_fallback(Some(host.as_str()), None, None, None) {
+                    Ok(spec) => matches!(spec.source, HostSource::Env(_)),
+                    Err(_) => false,
+                },
+                Err(_) => false,
+            },
+            _ => false,
+        };
+        std::process::exit(if ok { 0 } else { 1 });
+    }
+
+    /// Re-runs only `test_name` in a child process with `dir` prepended to
+    /// `PATH`. Returns whether the child exited successfully.
+    fn m19_rerun_with_path(dir: &Path, test_name: &str, mode: &str, extra_env: &[(&str, &str)]) -> bool {
+        let Ok(exe) = env::current_exe() else {
+            return false;
+        };
+        let mut path = std::ffi::OsString::from(dir);
+        if let Some(existing) = env::var_os("PATH") {
+            path.push(":");
+            path.push(existing);
+        }
+        let mut command = std::process::Command::new(exe);
+        command
+            .arg("--exact")
+            .arg(format!("host::tests::{test_name}"))
+            .arg("--test-threads=1")
+            .env(M19_CHILD_MODE, mode)
+            .env("PATH", path);
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+        command.status().map(|status| status.success()).unwrap_or(false)
+    }
+
+    fn m19_guard() {
+        if env::var_os(M19_CHILD_MODE).is_some() {
+            m19_child_exit();
+        }
+    }
 
     #[test]
     fn m19_no_path_fallback_when_file_exists_on_disk() -> R {
+        m19_guard();
         let dir = tempdir()?;
         let stray = dir.path().join(format!("{DEFAULT_HOST_NAME}{HOST_EXE_SUFFIX}"));
-        fs::write(&stray, b"#!bin
-")?;
-        match resolve_with_fallback(None, None, None, None) {
-            Err(HostError::NotConfigured { env: ENV_HOST }) => Ok(()),
-            other => Err(std::io::Error::other(format!(
-                "expected NotConfigured (no PATH fallback), got {other:?}"
-            ))
-            .into()),
-        }
+        fs::write(&stray, b"#!bin\n")?;
+        assert!(
+            m19_rerun_with_path(dir.path(), "m19_no_path_fallback_when_file_exists_on_disk", "notconfigured", &[]),
+            "resolver must stay NotConfigured even with a stray host binary on PATH"
+        );
+        Ok(())
     }
 
     #[test]
     fn m19_explicit_none_params_never_discover_stray_executable() -> R {
+        m19_guard();
         let dir = tempdir()?;
         let stray = dir.path().join(format!("{DEFAULT_HOST_NAME}{HOST_EXE_SUFFIX}"));
-        fs::write(&stray, b"#!bin
-")?;
-        let stray_bundle = dir.path().join(DEFAULT_HOST_BUNDLE_NAME);
-        fs::write(&stray_bundle, b"bundle")?;
-        match resolve_with_fallback(None, None, None, None) {
-            Err(HostError::NotConfigured { env: ENV_HOST }) => Ok(()),
-            other => Err(std::io::Error::other(format!(
-                "expected NotConfigured, got {other:?}"
-            ))
-            .into()),
-        }
+        fs::write(&stray, b"#!bin\n")?;
+        fs::write(dir.path().join(DEFAULT_HOST_BUNDLE_NAME), b"bundle")?;
+        assert!(
+            m19_rerun_with_path(dir.path(), "m19_explicit_none_params_never_discover_stray_executable", "notconfigured", &[]),
+            "resolver must stay NotConfigured even with stray host + bundle on PATH"
+        );
+        Ok(())
     }
 
     #[test]
     fn m19_env_overrides_never_fall_through_to_path() -> R {
+        m19_guard();
         let dir = tempdir()?;
         let env_host = dir.path().join("explicit-host");
-        fs::write(&env_host, b"#!bin
-")?;
+        fs::write(&env_host, b"#!bin\n")?;
         let stray = dir.path().join(format!("{DEFAULT_HOST_NAME}{HOST_EXE_SUFFIX}"));
-        fs::write(&stray, b"#!bin
-")?;
-        let spec = resolve_with_fallback(env_host.to_str(), None, None, None)?;
-        assert_eq!(spec.source, HostSource::Env(env_host.clone()), "env must win, never PATH");
-        assert_eq!(spec.program, env_host);
+        fs::write(&stray, b"#!bin\n")?;
+        let host_str = env_host.to_string_lossy().into_owned();
+        assert!(
+            m19_rerun_with_path(
+                dir.path(),
+                "m19_env_overrides_never_fall_through_to_path",
+                "envwins",
+                &[(M19_ENV_HOST, host_str.as_str())],
+            ),
+            "env override must win over any PATH discovery"
+        );
         Ok(())
     }
 }
