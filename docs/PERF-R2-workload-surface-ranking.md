@@ -25,7 +25,7 @@ Lanes that fail any criterion carry no trusted baseline and are marked according
 
 ## Workload lane inventory
 
-Eleven lanes span the five crates. Lanes 1 through 4 are measured by `scripts/verification/performance.ts` (check 9). Lane 5 is measured by `scripts/bench-extension-scaling.ts` (check 8). Lane 6 is a Rust-only correctness suite. Lanes 7 through 10 are D8-blocked pending sibling tasks. Lane 11 is an artifact-size comparison.
+Eleven lanes span the five crates. Lanes 1 through 4 are measured by `scripts/verification/performance.ts` (check 9). Lane 5 is measured by `scripts/bench-extension-scaling.ts` (check 8). Lane 6 is a Rust-only correctness suite. Lane 8 is measured by `scripts/bench-tool-dispatch.ts` (PERF-T5). Lanes 7, 9, and 10 are D8-blocked pending sibling tasks. Lane 11 is an artifact-size comparison.
 
 ### Lane 1: Startup `--version` (paired comparative)
 
@@ -254,31 +254,32 @@ All per-frame units are hot. The static scenario measures pure recomposition chu
 
 Claim class: D8-blocked. Upstream-only; no symmetric Rust benchmark. PERF-T3 (#89) will build the Rust peer with the same tree, viewport, warmups, frame count, and scenarios. Until then, this lane is an explicit non-claim.
 
-### Lane 8: Tool dispatch (D8-blocked)
+### Lane 8: Tool dispatch (paired comparative)
 
 | Field | Value |
 |---|---|
 | Crates | `pi` (entry), `pi-agent` (dispatch), `pi-ai` (tool schema) |
-| Existing | `scripts/verification/e2e-smoke.ts` functional `read`/`edit`/`bash` tool dispatch |
-| Rust | No timed dispatch-only benchmark (PERF-T5 #93 is open) |
-| TS | No matched timed tool-dispatch path |
+| Script | `scripts/bench-tool-dispatch.ts` (PERF-T5) |
+| Rust worker | `target/release/pi_tool_dispatch_bench` driving `pi_agent::execute_tool_calls` in-process |
+| TypeScript worker | `scripts/bench-tool-dispatch.ts --worker` driving upstream `runAgentLoop` (`.references/pi`, `executeToolCalls` is module-private) |
+| Tool | `noop`: JSON Schema `{path: string minLength 1, count: integer 1..64}`, required `path`, no additional properties; one partial update per call |
+| Samples | 10 per implementation, fresh process each, alternating order (`implementationOrder`) |
+| Unit | milliseconds per tool call, slice = `tool_execution_start` event → tool-result message session append |
+| Boundary | Argument validation, tool start/update/end events, result construction, and session append (assistant-with-tool-call append pre-slice, tool-result append in-slice on both implementations); loop/stream overhead sits outside the slice |
+| Real tools | `read`/`edit`/`bash` dispatch stays with `scripts/verification/e2e-smoke.ts` (separate end-to-end confirmation) |
 
-Trusted baseline: none. The e2e-smoke script proves compatibility (tools dispatch and persist results), not performance. No isolated timed boundary exists.
+Trusted baseline (from `target/bench/tool-dispatch.json`, 2026-08-27, Xeon Gold 6138):
 
-Ranked time share: per-tool-call during tool-heavy turns. Ranked 4/11 by session time share (dominant during tool execution, idle during streaming).
+| Distribution | Median (ms/call) | Rel. spread | Noise gate |
+|---|---|---|---|
+| Rust wall | 0.024123 | 5.13% | pass |
+| TypeScript wall | 0.018652 | 5.71% | pass |
+| Rust CPU | 0.05 | 5.52% | pass |
+| TypeScript CPU | 0.102231 | 4.05% | pass |
 
-Hot/cold unit split:
+All four distributions pass the noise gate; per-implementation collection wall exceeds 1 s (10 samples × 10 000 calls each); order alternates per sample.
 
-| Unit | Hot/cold | Rationale |
-|---|---|---|
-| Argument validation | Hot | Per-tool-call; input-scaling |
-| Tool dispatch (start/update/end events) | Hot | Per-tool-call |
-| Result construction + session append | Hot | Per-tool-call |
-| Real filesystem/shell work | Cold | Unavoidable but varies independently of dispatch |
-
-The dispatch-only path (argument validation, dispatch, result construction) is hot. Real filesystem/shell work is cold (unavoidable but not implementation-dependent).
-
-Claim class: D8-blocked. Functional input exists; no isolated timed dispatch-only boundary. PERF-T5 (#93) will add a no-op deterministic tool benchmark on both implementations. Until then, this lane is an explicit non-claim.
+Claim class: paired comparative. Wall ratio TS/Rust 0.77x (TypeScript's slice is faster in wall time); CPU ratio TS/Rust 2.04x (Rust uses half the CPU per call). Recorded as lane data — the Rust dispatch slice pays tokio task-spawn scheduling for the production parallel batch path, while upstream executes the batch on promises. Both implementations reject the shared invalid payload (`count: 999`) during argument validation with `update=0` and an error result per call; upstream additionally coerces mistyped primitives (TypeBox `Value.Convert`) where Rust rejects them — a recorded validation divergence, kept out of the timed payload.
 
 ### Lane 9: Session persistence/reopen (D8-blocked)
 
@@ -408,7 +409,7 @@ Four lanes (1, 2, 3, 11) have trusted baselines. Three are paired comparative ti
 | `pi-ai` | 2, 3, 8, 9, 10 | 2, 3 | none | 8, 9, 10 |
 | `pi-agent` | 3, 8 | 3 | none | 8 |
 
-All five crates have at least one paired comparative lane with a trusted baseline (lane 3 crosses all five crates). `pi-agent` has no standalone lane; its tool-dispatch path (lane 8) is D8-blocked.
+All five crates have at least one paired comparative lane with a trusted baseline (lane 3 crosses all five crates). `pi-agent` has no standalone lane; its tool-dispatch path is measured through lane 8 (`pi` entry, `pi-agent` dispatch).
 
 ## Evidence provenance
 
@@ -416,6 +417,7 @@ All five crates have at least one paired comparative lane with a trusted baselin
 - `target/bench/extension-scaling.json`: check 8 artifact, generated 2026-08-26T14:18:43Z on this machine.
 - `scripts/verification/performance.ts`: workload definitions, sample counts, noise gate integration, alternating order (`implementationOrder`), memory instrumentation (`observeProcessTreeMemory`, `sampleProcessTreeMemoryWindow`).
 - `scripts/bench-extension-scaling.ts`: extension-host scaling scenarios, noise gate integration.
+- `scripts/bench-tool-dispatch.ts`: paired dispatch-only tool benchmark (lane 8), noise gate integration, artifact `target/bench/tool-dispatch.json`.
 - `scripts/statistics.ts`: `NOISE_RELATIVE_SPREAD_LIMIT = 0.2`, `requireQuiet`, `REMEDIATION_LADDER`.
 - `crates/pi-ext/tests/serve_io_scaling.rs`: Rust production `serve_io` scaling correctness suite.
 - `.references/pi/packages/tui/test/render-churn-bench.ts`: upstream render-churn parameters (100x30, 20 warmups, 300 frames, static + editor).
