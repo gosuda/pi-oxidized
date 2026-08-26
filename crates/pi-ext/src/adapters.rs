@@ -1989,6 +1989,12 @@ mod tests {
         Ok(())
     }
 
+    /// M4 witness: tool registration is first-wins. A duplicate name returns
+    /// `false` and does not overwrite the existing entry.
+    ///
+    /// Mutation: change `register_tool` to last-wins (overwrite on duplicate)
+    /// → second call returns `true` and replaces → `tools().len()` is still 1
+    /// but the first entry's data is lost and the `!` assert fails.
     #[tokio::test]
     async fn registry_first_registration_wins() {
         let mut registry = Registry::new();

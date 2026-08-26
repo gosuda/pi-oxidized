@@ -714,6 +714,43 @@ async fn registry_first_registration_wins_for_duplicates() -> R {
     Ok(())
 }
 
+/// M5 witness: command suffix disambiguation is observable in the Rust
+/// registry. The TypeScript host's `resolveRegisteredCommands` assigns
+/// unique invocation names (`cmd:1`, `cmd:2`) to duplicate command names
+/// before serializing the snapshot. The Rust side stores these
+/// already-disambiguated names via first-wins on the *invocation name*.
+///
+/// Mutation: drop the suffix (send `cmd` twice instead of `cmd:1`/`cmd:2`)
+/// → first-wins deduplicates to one → `cmd:2` is absent → test fails.
+#[tokio::test]
+async fn command_suffix_disambiguation_observed() -> R {
+    let snapshot = json!({
+        "commands": [
+            {"name": "cmd:1", "description": "first cmd", "source": "/ext/a.ts"},
+            {"name": "cmd:2", "description": "second cmd", "source": "/ext/b.ts"}
+        ],
+        "handlers": ["tool_call"],
+    });
+    let (runner, _host) = make_runner(snapshot).await?;
+    let registry = runner.registry();
+    let commands = registry.commands();
+    assert_eq!(
+        commands.len(),
+        2,
+        "suffix-disambiguated commands must both survive first-wins dedup"
+    );
+    assert_eq!(commands[0].name, "cmd:1");
+    assert_eq!(commands[0].description.as_deref(), Some("first cmd"));
+    assert_eq!(commands[1].name, "cmd:2");
+    assert_eq!(commands[1].description.as_deref(), Some("second cmd"));
+    assert_eq!(
+        runner.get_registered_commands(),
+        vec!["cmd:1", "cmd:2"],
+        "invocation names must be observable via get_registered_commands"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn shortcut_order_and_extension_metadata_are_preserved() -> R {
     let snapshot = json!({

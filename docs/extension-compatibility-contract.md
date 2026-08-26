@@ -182,6 +182,73 @@ rules. Mode 1 renderers are deduplicated by `type:name`, first seen wins. Mode 2
 hooks fan out: every handler for a discriminant is appended and fired. The host
 and lean snapshots expose only handlers present in the canonical set below.
 
+### 6.1 Registry flattening analysis (XC-5, issue #38)
+
+**Research question:** Does Rust-side first-wins-everywhere in
+`crates/pi-ext/src/adapters.rs::Registry` (lines 1128-1183) flatten the
+observable Mode 1 command-suffix (`:1`/`:2`/`:3`) and shortcut
+later-override-unless-reserved rules?
+
+**Answer: No genuine divergence.** The layer division is clean:
+
+1. **Command suffix disambiguation (Rule 2, Mode 1):** The TypeScript host
+   performs suffix assignment in
+   `.references/pi/packages/coding-agent/src/core/extensions/runner.ts::
+   resolveRegisteredCommands` (lines 603-636) *before* the snapshot is
+   serialized. The Rust side receives already-disambiguated invocation names
+   as `CommandWire.name` (`crates/pi/src/core/extension_host.rs::CommandWire`,
+   line 299; consumed at `build_snapshot`, lines 509-516). The Rust
+   `Registry::register_command` (adapters.rs:1137-1143) applies first-wins on
+   the *invocation name*, which is correct: two extensions registering
+   `cmd` produce `cmd:1` and `cmd:2` in the wire, so both are stored. If the
+   host dropped disambiguation and sent `cmd` twice, first-wins would
+   deduplicate to one — but that is a host bug, not a Rust-side flattening.
+
+   `witness (M5): crates/pi/src/core/extension_host/tests.rs::
+   command_suffix_disambiguation_observed` — sends `cmd:1` and `cmd:2` in the
+   snapshot and asserts both survive in the registry. Mutation: drop the
+   suffix (send `cmd` twice) → first-wins keeps one → test fails.
+
+2. **Shortcut later-override-unless-reserved (Rule 4, Mode 1):** The
+   TypeScript host resolves restricted built-ins in
+   `.references/pi/packages/coding-agent/src/core/extensions/runner.ts::
+   getShortcuts` (lines 494-536): shortcuts with `restrictOverride === true`
+   are skipped (line 511), and later extension registrations replace earlier
+   ones (line 533). The Rust product layer does **not** rely on
+   `Registry::register_shortcut` (which is first-wins, adapters.rs:1146-1152)
+   for dispatch. Instead, `crates/pi/src/core/extension_host.rs::
+   RegistrySnapshot.raw_shortcuts` (line 466) preserves *every* shortcut
+   registration in order, and dispatch iterates endpoints last-first and
+   matches keys against `raw_shortcuts` membership
+   (`crates/pi/src/core/extension_runtime_set.rs` shortcut dispatch); within
+   an endpoint the host applies last-wins. The
+   `Registry` shortcut list is a first-wins legacy/superset view, not the
+   dispatch source.
+
+   `witness (M6): scripts/verification/xc-matrix.test.ts::
+   reserved_shortcut_guard_present` — statically verifies the
+   `restrictOverride === true` skip guard exists in the reference
+   `runner.ts::getShortcuts`. Mutation: remove the guard → static check
+   fails.
+
+3. **Tool first-wins (Rule 1, both modes):** The Rust
+   `Registry::register_tool` (adapters.rs:1128-1134) implements first-wins.
+   The host already deduplicates (`getAllRegisteredTools`, runner.ts:451-461);
+   the Rust side is the trust boundary for a duplicated name.
+
+   `witness (M4): crates/pi-ext/src/adapters.rs::tests::
+   registry_first_registration_wins` (line 1999) and
+   `crates/pi/src/core/extension_host/tests.rs::
+   registry_first_registration_wins_for_duplicates` (line 697). Mutation:
+   change `register_tool` to last-wins → duplicate returns `true` and
+   overwrites → both tests fail.
+
+**Conclusion:** The Rust-side first-wins-everywhere does not flatten the
+Mode 1 command-suffix or shortcut later-override-unless-reserved rules
+because those rules are resolved in the TypeScript host before the snapshot
+reaches Rust, and the product layer uses `raw_shortcuts` (not `Registry`)
+for shortcut dispatch. No semantic change is required.
+
 ## 7. Canonical 33-hook classification
 
 The canonical lifecycle event set is exactly the following 33 discriminants, in
@@ -341,9 +408,11 @@ mirror/fixture/mutation-checker surfaces and the A8 audit-record slot:
 - The mirror/fixture/mutation-checker surfaces:
   `packages/pi-tui-protocol/tests/fixtures/frames.jsonl` (the shared cross-language
   wire witness that cross-locks `Method`, `ALL_EVENT_TYPES`, and the lean lists),
-  and the mutation checker `scripts/verification/parity.ts` (with
-  `compat-matrix.json`), which verify the mirror cannot become a competing
-  protocol authority.
+  `packages/pi-tui-protocol/tests/fixtures/witness-manifest.json` (the single
+  `(method, kind)` witness manifest consumed by name by both language sides —
+  parity does not create a second check), and the mutation checker
+  `scripts/verification/parity.ts` (with `compat-matrix.json`), which verify the
+  mirror cannot become a competing protocol authority.
 - The A8 audit-record slot: `docs/PARITY_LEDGER.md` row A8 ("Upstream ./compat
   legacy global provider registry"), status **parity-blocked**.
 
