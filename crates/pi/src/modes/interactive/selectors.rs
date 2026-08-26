@@ -13,7 +13,6 @@ use std::collections::BTreeMap;
 use pi_tui::component::Component;
 use pi_tui::components::{SelectItem, SelectList, SettingItem, SettingsList, SettingsListOptions};
 
-
 use super::state::{
     AuthSelectorEntry, ConfigSelectorEntry, ModelSelectorEntry, SelectorKind, SessionPickerEntry,
     SettingsRow, TreeEntry,
@@ -44,27 +43,16 @@ pub const EXTENSION_EMPTY_COPY: SelectorEmptyCopy = SelectorEmptyCopy {
 /// Canonical per-flow empty-state copy. Exhaustive over [`SelectorKind`].
 #[must_use]
 pub fn selector_empty_copy(kind: SelectorKind) -> SelectorEmptyCopy {
+    let both = |text| SelectorEmptyCopy {
+        empty: text,
+        no_match: text,
+    };
     match kind {
-        SelectorKind::Model | SelectorKind::ScopedModels => SelectorEmptyCopy {
-            empty: "  No matching models",
-            no_match: "  No matching models",
-        },
-        SelectorKind::Theme => SelectorEmptyCopy {
-            empty: "  No matching themes",
-            no_match: "  No matching themes",
-        },
-        SelectorKind::Session => SelectorEmptyCopy {
-            empty: "  No sessions found",
-            no_match: "  No sessions found",
-        },
-        SelectorKind::Tree => SelectorEmptyCopy {
-            empty: "  No entries found",
-            no_match: "  No entries found",
-        },
-        SelectorKind::Fork => SelectorEmptyCopy {
-            empty: "  No user messages found",
-            no_match: "  No user messages found",
-        },
+        SelectorKind::Model | SelectorKind::ScopedModels => both("  No matching models"),
+        SelectorKind::Theme => both("  No matching themes"),
+        SelectorKind::Session => both("  No sessions found"),
+        SelectorKind::Tree => both("  No entries found"),
+        SelectorKind::Fork => both("  No user messages found"),
         SelectorKind::Auth => SelectorEmptyCopy {
             empty: "  No providers available",
             no_match: "  No matching providers",
@@ -77,22 +65,25 @@ pub fn selector_empty_copy(kind: SelectorKind) -> SelectorEmptyCopy {
             empty: "  No settings available",
             no_match: "  No matching settings",
         },
-        SelectorKind::Config => SelectorEmptyCopy {
-            empty: "  No resources found",
-            no_match: "  No resources found",
-        },
-        SelectorKind::ImportConfirm | SelectorKind::ImportCwdConfirm => SelectorEmptyCopy {
-            empty: "  No matching options",
-            no_match: "  No matching options",
-        },
+        SelectorKind::Config => both("  No resources found"),
+        SelectorKind::ImportConfirm | SelectorKind::ImportCwdConfirm => {
+            both("  No matching options")
+        }
     }
 }
 
-fn apply_select_list_copy(list: SelectList, kind: SelectorKind) -> SelectList {
-    let copy = selector_empty_copy(kind);
+pub(super) fn apply_select_list_copy(list: SelectList, copy: SelectorEmptyCopy) -> SelectList {
     list.with_empty_text(copy.empty)
         .with_no_match_text(copy.no_match)
         .with_hint(SELECTOR_EXIT_HINT)
+}
+
+pub(super) fn apply_settings_list_copy(
+    list: SettingsList,
+    copy: SelectorEmptyCopy,
+) -> SettingsList {
+    list.with_empty_text(copy.empty)
+        .with_no_match_text(copy.no_match)
 }
 
 // ---------------------------------------------------------------------------
@@ -105,7 +96,7 @@ pub fn build_model_selector(entries: &[ModelSelectorEntry], selected: usize) -> 
     let items = entries.iter().map(model_item).collect::<Vec<_>>();
     let mut list = apply_select_list_copy(
         SelectList::new(items, SELECTOR_MAX_VISIBLE, theme::select_list_theme()),
-        SelectorKind::Model,
+        selector_empty_copy(SelectorKind::Model),
     );
     list.set_selected_index(selected);
     Box::new(list)
@@ -117,7 +108,7 @@ pub fn build_session_picker(entries: &[SessionPickerEntry], selected: usize) -> 
     let items = entries.iter().map(session_item).collect::<Vec<_>>();
     let mut list = apply_select_list_copy(
         SelectList::new(items, SELECTOR_MAX_VISIBLE, theme::select_list_theme()),
-        SelectorKind::Session,
+        selector_empty_copy(SelectorKind::Session),
     );
     list.set_selected_index(selected);
     Box::new(list)
@@ -129,7 +120,7 @@ pub fn build_auth_selector(entries: &[AuthSelectorEntry], selected: usize) -> Bo
     let items = entries.iter().map(auth_item).collect::<Vec<_>>();
     let mut list = apply_select_list_copy(
         SelectList::new(items, SELECTOR_MAX_VISIBLE, theme::select_list_theme()),
-        SelectorKind::Auth,
+        selector_empty_copy(SelectorKind::Auth),
     );
     list.set_selected_index(selected);
     Box::new(list)
@@ -153,7 +144,7 @@ pub fn build_scoped_models_selector(
         .collect::<Vec<_>>();
     let mut list = apply_select_list_copy(
         SelectList::new(items, SELECTOR_MAX_VISIBLE, theme::select_list_theme()),
-        SelectorKind::ScopedModels,
+        selector_empty_copy(SelectorKind::ScopedModels),
     );
     list.set_selected_index(selected);
     Box::new(list)
@@ -171,7 +162,7 @@ pub fn build_tree_selector(entries: &[TreeEntry], selected: usize) -> Box<dyn Co
         .collect::<Vec<_>>();
     let mut list = apply_select_list_copy(
         SelectList::new(items, SELECTOR_MAX_VISIBLE, theme::select_list_theme()),
-        SelectorKind::Tree,
+        selector_empty_copy(SelectorKind::Tree),
     );
     list.set_selected_index(selected);
     Box::new(list)
@@ -201,18 +192,17 @@ fn auth_item(e: &AuthSelectorEntry) -> SelectItem {
 pub fn build_settings_selector(rows: &[SettingsRow], selected: usize) -> Box<dyn Component> {
     let _ = selected;
     let items = rows.iter().map(setting_item).collect::<Vec<_>>();
-    let options = SettingsListOptions::default();
-    let copy = selector_empty_copy(SelectorKind::Settings);
-    let list = SettingsList::new(
-        items,
-        SELECTOR_MAX_VISIBLE,
-        theme::settings_list_theme(),
-        |_id, _value| {},
-        || {},
-        &options,
-    )
-    .with_empty_text(copy.empty)
-    .with_no_match_text(copy.no_match);
+    let list = apply_settings_list_copy(
+        SettingsList::new(
+            items,
+            SELECTOR_MAX_VISIBLE,
+            theme::settings_list_theme(),
+            |_id, _value| {},
+            || {},
+            &SettingsListOptions::default(),
+        ),
+        selector_empty_copy(SelectorKind::Settings),
+    );
     Box::new(list)
 }
 
@@ -224,18 +214,17 @@ pub fn build_config_selector(
 ) -> Box<dyn Component> {
     let _ = selected;
     let items = entries.iter().map(setting_item).collect::<Vec<_>>();
-    let options = SettingsListOptions::default();
-    let copy = selector_empty_copy(SelectorKind::Config);
-    let list = SettingsList::new(
-        items,
-        SELECTOR_MAX_VISIBLE,
-        theme::settings_list_theme(),
-        |_id, _value| {},
-        || {},
-        &options,
-    )
-    .with_empty_text(copy.empty)
-    .with_no_match_text(copy.no_match);
+    let list = apply_settings_list_copy(
+        SettingsList::new(
+            items,
+            SELECTOR_MAX_VISIBLE,
+            theme::settings_list_theme(),
+            |_id, _value| {},
+            || {},
+            &SettingsListOptions::default(),
+        ),
+        selector_empty_copy(SelectorKind::Config),
+    );
     Box::new(list)
 }
 
@@ -252,8 +241,9 @@ fn setting_item(row: &SettingsRow) -> SettingItem {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::state::SelectorKind;
+    use super::super::view::{render_component, snapshot_buffer_plain};
+    use super::*;
 
     const ALL_KINDS: &[SelectorKind] = &[
         SelectorKind::Model,
@@ -271,37 +261,196 @@ mod tests {
         SelectorKind::Logout,
     ];
 
-    #[test]
-    fn selector_empty_copy_is_exhaustive_and_noun_specific() {
-        for &kind in ALL_KINDS {
-            let copy = selector_empty_copy(kind);
-            assert!(!copy.empty.trim().is_empty(), "{kind:?} empty");
-            assert!(!copy.no_match.trim().is_empty(), "{kind:?} no_match");
-            assert!(
-                !copy.empty.contains("No matching commands"),
-                "{kind:?} must not use generic fallback"
-            );
-            assert!(
-                !copy.no_match.contains("No matching commands"),
-                "{kind:?} must not use generic fallback"
-            );
-            // Noun-ish content: every empty string mentions a concrete noun token.
-            let blob = format!("{} {}", copy.empty, copy.no_match).to_ascii_lowercase();
-            let has_noun = [
-                "model",
-                "theme",
-                "session",
-                "entr",
-                "user message",
-                "provider",
-                "setting",
-                "resource",
-                "option",
-            ]
-            .iter()
-            .any(|noun| blob.contains(noun));
-            assert!(has_noun, "{kind:?} copy lacks noun: {blob}");
+    #[derive(Clone, Copy)]
+    enum HelperBoundary {
+        /// Runtime/builders route through [`apply_select_list_copy`].
+        Select,
+        /// Runtime/builders route through [`apply_settings_list_copy`].
+        Settings,
+    }
+
+    /// Exact expected copy + which helper boundary runtime/builders use.
+    fn expected_mapping(kind: SelectorKind) -> (SelectorEmptyCopy, HelperBoundary) {
+        match kind {
+            SelectorKind::Model | SelectorKind::ScopedModels => (
+                SelectorEmptyCopy {
+                    empty: "  No matching models",
+                    no_match: "  No matching models",
+                },
+                HelperBoundary::Select,
+            ),
+            SelectorKind::Theme => (
+                SelectorEmptyCopy {
+                    empty: "  No matching themes",
+                    no_match: "  No matching themes",
+                },
+                HelperBoundary::Select,
+            ),
+            SelectorKind::Session => (
+                SelectorEmptyCopy {
+                    empty: "  No sessions found",
+                    no_match: "  No sessions found",
+                },
+                HelperBoundary::Select,
+            ),
+            SelectorKind::Tree => (
+                SelectorEmptyCopy {
+                    empty: "  No entries found",
+                    no_match: "  No entries found",
+                },
+                HelperBoundary::Select,
+            ),
+            SelectorKind::Fork => (
+                SelectorEmptyCopy {
+                    empty: "  No user messages found",
+                    no_match: "  No user messages found",
+                },
+                HelperBoundary::Select,
+            ),
+            SelectorKind::Auth => (
+                SelectorEmptyCopy {
+                    empty: "  No providers available",
+                    no_match: "  No matching providers",
+                },
+                HelperBoundary::Select,
+            ),
+            SelectorKind::Logout => (
+                SelectorEmptyCopy {
+                    empty: "  No providers logged in. Use /login first.",
+                    no_match: "  No matching providers",
+                },
+                HelperBoundary::Select,
+            ),
+            SelectorKind::Settings | SelectorKind::Trust => (
+                SelectorEmptyCopy {
+                    empty: "  No settings available",
+                    no_match: "  No matching settings",
+                },
+                HelperBoundary::Settings,
+            ),
+            SelectorKind::Config => (
+                SelectorEmptyCopy {
+                    empty: "  No resources found",
+                    no_match: "  No resources found",
+                },
+                HelperBoundary::Settings,
+            ),
+            SelectorKind::ImportConfirm | SelectorKind::ImportCwdConfirm => (
+                SelectorEmptyCopy {
+                    empty: "  No matching options",
+                    no_match: "  No matching options",
+                },
+                HelperBoundary::Select,
+            ),
         }
-        assert_eq!(ALL_KINDS.len(), 13, "update ALL_KINDS when SelectorKind grows");
+    }
+
+    fn plain_empty(comp: &mut dyn Component) -> String {
+        let buf = render_component(comp, 80);
+        snapshot_buffer_plain(&buf, 80, buf.area().height).join("\n")
+    }
+
+    /// Exhaustive guard: every [`SelectorKind`] maps, and the helper boundary
+    /// used by runtime/builders renders that copy (builders where they exist).
+    #[test]
+    fn selector_kind_mapping_is_exhaustive_at_helper_boundary() {
+        assert_eq!(
+            ALL_KINDS.len(),
+            13,
+            "update ALL_KINDS when SelectorKind grows"
+        );
+
+        for &kind in ALL_KINDS {
+            let (expected, boundary) = expected_mapping(kind);
+            let copy = selector_empty_copy(kind);
+            assert_eq!(copy, expected, "{kind:?} selector_empty_copy drift");
+            assert!(
+                !copy.empty.contains("No matching commands")
+                    && !copy.no_match.contains("No matching commands"),
+                "{kind:?} must not use generic fallback"
+            );
+
+            let plain = match boundary {
+                HelperBoundary::Select => {
+                    // Prefer dedicated builders when they exist (same helper path).
+                    let mut comp: Box<dyn Component> = match kind {
+                        SelectorKind::Model => build_model_selector(&[], 0),
+                        SelectorKind::Session => build_session_picker(&[], 0),
+                        SelectorKind::Auth => build_auth_selector(&[], 0),
+                        SelectorKind::ScopedModels => {
+                            build_scoped_models_selector(&[], &BTreeMap::new(), 0)
+                        }
+                        SelectorKind::Tree => build_tree_selector(&[], 0),
+                        // Runtime Theme / Fork / Import* / Logout: apply_select_list_copy.
+                        _ => Box::new(apply_select_list_copy(
+                            SelectList::new(
+                                vec![],
+                                SELECTOR_MAX_VISIBLE,
+                                theme::select_list_theme(),
+                            ),
+                            copy,
+                        )),
+                    };
+                    plain_empty(comp.as_mut())
+                }
+                HelperBoundary::Settings => {
+                    let mut comp: Box<dyn Component> = match kind {
+                        SelectorKind::Settings => build_settings_selector(&[], 0),
+                        SelectorKind::Config => build_config_selector(&[], 0),
+                        // Runtime Trust: apply_settings_list_copy.
+                        _ => Box::new(apply_settings_list_copy(
+                            SettingsList::new(
+                                vec![],
+                                SELECTOR_MAX_VISIBLE,
+                                theme::settings_list_theme(),
+                                |_id, _value| {},
+                                || {},
+                                &SettingsListOptions::default(),
+                            ),
+                            copy,
+                        )),
+                    };
+                    plain_empty(comp.as_mut())
+                }
+            };
+
+            assert!(
+                plain.contains(expected.empty.trim()),
+                "{kind:?} empty copy missing in helper/builder render:\n{plain}"
+            );
+            assert!(
+                !plain.contains("No matching commands"),
+                "{kind:?} generic fallback leaked:\n{plain}"
+            );
+            match boundary {
+                HelperBoundary::Select => assert!(
+                    plain.contains(SELECTOR_EXIT_HINT.trim()),
+                    "{kind:?} select exit hint missing:\n{plain}"
+                ),
+                HelperBoundary::Settings => assert!(
+                    plain.contains("Esc to cancel"),
+                    "{kind:?} settings Esc hint missing:\n{plain}"
+                ),
+            }
+        }
+
+        // Extension lists have no SelectorKind; runtime uses EXTENSION_EMPTY_COPY.
+        let mut extension = apply_select_list_copy(
+            SelectList::new(vec![], SELECTOR_MAX_VISIBLE, theme::select_list_theme()),
+            EXTENSION_EMPTY_COPY,
+        );
+        let plain = plain_empty(&mut extension);
+        assert!(
+            plain.contains(EXTENSION_EMPTY_COPY.empty.trim()),
+            "extension empty copy missing:\n{plain}"
+        );
+        assert!(
+            plain.contains(SELECTOR_EXIT_HINT.trim()),
+            "extension exit hint missing:\n{plain}"
+        );
+        assert!(
+            !plain.contains("No matching commands"),
+            "extension leaked generic fallback:\n{plain}"
+        );
     }
 }

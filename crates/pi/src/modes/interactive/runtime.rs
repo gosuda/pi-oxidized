@@ -2384,10 +2384,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         self.install_confirm_selector(
             super::state::SelectorKind::ImportConfirm,
             &prompt,
-            Self::confirm_items(
-                "Yes, replace current session",
-                "No, keep current session",
-            ),
+            Self::confirm_items("Yes, replace current session", "No, keep current session"),
         );
         ActionOutcome::Repaint
     }
@@ -2446,10 +2443,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 self.install_confirm_selector(
                     super::state::SelectorKind::ImportCwdConfirm,
                     &prompt,
-                    Self::confirm_items(
-                        "Yes, continue in current cwd",
-                        "No, cancel import",
-                    ),
+                    Self::confirm_items("Yes, continue in current cwd", "No, cancel import"),
                 );
             }
             Err(error) => {
@@ -3207,13 +3201,13 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                     .into_iter()
                     .map(|value| SelectItem::new(value.clone(), value))
                     .collect();
-                let mut list = Self::apply_selector_copy(
+                let mut list = super::selectors::apply_select_list_copy(
                     pi_tui::components::SelectList::new(
                         items,
                         super::selectors::SELECTOR_MAX_VISIBLE,
                         super::theme::select_list_theme(),
                     ),
-                    kind,
+                    super::selectors::selector_empty_copy(kind),
                 );
                 list.set_selected_index(0);
                 let select_tx = self.select_tx.clone();
@@ -3238,28 +3232,18 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         }
     }
 
-    fn apply_selector_copy(
-        list: pi_tui::components::SelectList,
-        kind: super::state::SelectorKind,
-    ) -> pi_tui::components::SelectList {
-        let copy = super::selectors::selector_empty_copy(kind);
-        list.with_empty_text(copy.empty)
-            .with_no_match_text(copy.no_match)
-            .with_hint(super::selectors::SELECTOR_EXIT_HINT)
-    }
-
     fn build_select_list(
         &self,
         kind: super::state::SelectorKind,
         items: Vec<pi_tui::components::SelectItem>,
     ) -> Box<dyn Component> {
-        let mut list = Self::apply_selector_copy(
+        let mut list = super::selectors::apply_select_list_copy(
             pi_tui::components::SelectList::new(
                 items,
                 super::selectors::SELECTOR_MAX_VISIBLE,
                 super::theme::select_list_theme(),
             ),
-            kind,
+            super::selectors::selector_empty_copy(kind),
         );
         list.set_selected_index(0);
         let select_tx = self.select_tx.clone();
@@ -3306,8 +3290,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             .collect();
         let change_tx = self.settings_change_tx.clone();
         let cancel_tx = self.cancel_tx.clone();
-        let copy = super::selectors::selector_empty_copy(kind);
-        Box::new(
+        Box::new(super::selectors::apply_settings_list_copy(
             pi_tui::components::SettingsList::new(
                 items,
                 super::selectors::SELECTOR_MAX_VISIBLE,
@@ -3319,10 +3302,9 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                     let _ = cancel_tx.send(());
                 },
                 &pi_tui::components::SettingsListOptions::default(),
-            )
-            .with_empty_text(copy.empty)
-            .with_no_match_text(copy.no_match),
-        )
+            ),
+            super::selectors::selector_empty_copy(kind),
+        ))
     }
 
     fn build_extension_select_list(
@@ -3330,14 +3312,14 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         title: &str,
         items: Vec<pi_tui::components::SelectItem>,
     ) -> Box<dyn Component> {
-        let mut list = pi_tui::components::SelectList::new(
-            items,
-            super::selectors::SELECTOR_MAX_VISIBLE,
-            super::theme::select_list_theme(),
-        )
-        .with_empty_text(super::selectors::EXTENSION_EMPTY_COPY.empty)
-        .with_no_match_text(super::selectors::EXTENSION_EMPTY_COPY.no_match)
-        .with_hint(super::selectors::SELECTOR_EXIT_HINT);
+        let mut list = super::selectors::apply_select_list_copy(
+            pi_tui::components::SelectList::new(
+                items,
+                super::selectors::SELECTOR_MAX_VISIBLE,
+                super::theme::select_list_theme(),
+            ),
+            super::selectors::EXTENSION_EMPTY_COPY,
+        );
         list.set_selected_index(0);
         let select_tx = self.extension_select_tx.clone();
         list.on_select = Some(Box::new(move |item| {
@@ -9879,11 +9861,11 @@ mod tests {
                 value: "true".to_owned(),
             })
             .await;
-        assert_eq!(rt.active_selector_kind, Some(SelectorKind::ImportCwdConfirm));
-        let mut sel = rt
-            .active_selector
-            .take()
-            .expect("cwd confirm selector");
+        assert_eq!(
+            rt.active_selector_kind,
+            Some(SelectorKind::ImportCwdConfirm)
+        );
+        let mut sel = rt.active_selector.take().expect("cwd confirm selector");
         let area = Rect::new(0, 0, 80, 12);
         let mut buffer = Buffer::empty(area);
         sel.render(area, &mut buffer);
