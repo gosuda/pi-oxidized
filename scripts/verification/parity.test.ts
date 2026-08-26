@@ -15,6 +15,7 @@ import {
 	verifyCapabilityLedger,
 	verifyCrateBoundaries,
 	verifyGraduatedTicketDag,
+	verifyLedgerOracleMatchesPins,
 	verifyWorkspaceTopology,
 } from "./parity.ts";
 
@@ -358,6 +359,19 @@ describe("parity witness suite", () => {
 		expect(hasViolation(violations, "missing pinned AgentLoopConfig literal site crates/pi-agent/src/agent.rs:62-88")).toBe(
 			true,
 		);
+	});
+
+	test("ledger oracle desync from pins fails the witness", () => {
+		const violations = verifyLedgerOracleMatchesPins(
+			"The shared arbitration oracle is exactly five `AgentLoopConfig` literal sites: `crates/pi-agent/src/run.rs:836-861`.",
+		);
+		expect(violations.join("\n")).toContain("ledger oracle states");
+		expect(violations.join("\n")).toContain("but pins are");
+	});
+
+	test("missing oracle sentence fails the witness", () => {
+		const violations = verifyLedgerOracleMatchesPins("No oracle here.");
+		expect(violations).toEqual(["ledger oracle sentence is missing"]);
 	});
 
 	test("a sixth literal site fails the AgentLoopConfig site witness", () => {

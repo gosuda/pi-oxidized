@@ -724,6 +724,29 @@ export function verifyAgentLoopConfigSites(sites: readonly AgentLoopConfigSite[]
 	return violations;
 }
 
+const ORACLE_BACKTICK_RE = /`([^`]+)`/g;
+const ORACLE_SITE_RE = /^([-\w./]+):(\d+)-(\d+)$/;
+
+/**
+ * The oracle sentence in docs/PARITY_LEDGER.md states the same five sites as
+ * PINNED_AGENT_LOOP_CONFIG_SITES; a re-pin that moves one authority and not
+ * the other must fail the witness instead of drifting silently.
+ */
+export function verifyLedgerOracleMatchesPins(ledgerText: string): string[] {
+	const line = ledgerText.split("\n").find((candidate) => candidate.includes("shared arbitration oracle"));
+	if (line === undefined) return ["ledger oracle sentence is missing"];
+	const stated: string[] = [];
+	for (const match of line.matchAll(ORACLE_BACKTICK_RE)) {
+		const token = match[1] ?? "";
+		if (ORACLE_SITE_RE.test(token)) stated.push(token);
+	}
+	const pinned = PINNED_AGENT_LOOP_CONFIG_SITES.map((pin) => `${pin.path}:${pin.start}-${pin.end}`);
+	if (stated.join(", ") !== pinned.join(", ")) {
+		return [`ledger oracle states [${stated.join(", ")}] but pins are [${pinned.join(", ")}]`];
+	}
+	return [];
+}
+
 // ============================================================================
 // Repository collection and orchestration
 // ============================================================================
@@ -809,6 +832,9 @@ export function runParityWitnesses(root: string): string[] {
 		"agent-loop-config-sites",
 		[...sources.problems, ...verifyAgentLoopConfigSites(enumerateAgentLoopConfigSites(sources.files))],
 	);
+	if (ledgerText !== null) {
+		add("agent-loop-config-sites", verifyLedgerOracleMatchesPins(ledgerText));
+	}
 
 	return violations;
 }
