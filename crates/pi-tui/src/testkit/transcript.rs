@@ -883,6 +883,92 @@ impl TranscriptRecorder {
         Ok(true)
     }
 
+    /// Records one settled output boundary and its snapshot as one atomic pair.
+    ///
+    /// Both consecutive sequence numbers are reserved before any raw log,
+    /// normalization, audit, or event mutation. QEMU recorders record only the
+    /// output event and return `false`, matching [`Self::snapshot`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TranscriptError::SequenceOverflow`] when either required
+    /// sequence number is unavailable.
+    pub fn output_and_snapshot(
+        &mut self,
+        chunks: &[&[u8]],
+        cols: u16,
+        rows: u16,
+        cursor: [u16; 2],
+        lines: Vec<String>,
+        context: &NormalizationContext,
+    ) -> Result<bool, TranscriptError> {
+        if self.artifact.driver.kind == DriverKind::QemuUserSmoke {
+            self.output(chunks, context)?;
+            return Ok(false);
+        }
+
+        let output_seq = self.next_seq;
+        let snapshot_seq = output_seq
+            .checked_add(1)
+            .ok_or(TranscriptError::SequenceOverflow)?;
+        let advanced = snapshot_seq
+            .checked_add(1)
+            .ok_or(TranscriptError::SequenceOverflow)?;
+
+        let raw_len = chunks.iter().map(|chunk| chunk.len()).sum();
+        let mut raw = Vec::with_capacity(raw_len);
+        for chunk in chunks {
+            raw.extend_from_slice(chunk);
+        }
+        let normalized = normalize_raw_bytes(&raw, context);
+
+        let mut trimmed = false;
+        let mut normalized_lines = Vec::with_capacity(lines.len());
+        let mut snapshot_applied = Vec::new();
+        for line in lines {
+            let (mut value, applied) = normalize_text(&line, context);
+            snapshot_applied.extend(applied);
+            let len = value.len();
+            value.truncate(value.trim_end_matches(' ').len());
+            trimmed |= len != value.len();
+            normalized_lines.push(value);
+        }
+
+        self.next_seq = advanced;
+        self.raw_log.extend_from_slice(&raw);
+        self.applied.extend(normalized.applied.iter().copied());
+        self.applied.extend(snapshot_applied);
+        if trimmed {
+            self.applied.insert(NormalizationEntry {
+                kind: NormalizationKind::SnapshotTrailingSpaceTrim,
+            });
+        }
+        self.output_audits.push(OutputAudit {
+            event_seq: output_seq,
+            raw_bytes_b64: BASE64.encode(&raw),
+            context: NormalizationAuditContext {
+                home_b64: context.home.as_ref().map(|value| BASE64.encode(value)),
+                cwd_b64: context.cwd.as_ref().map(|value| BASE64.encode(value)),
+            },
+            applied: normalized.applied.clone(),
+        });
+        self.artifact.canonical.events.push(CanonicalEvent::Output {
+            seq: output_seq,
+            bytes_b64: BASE64.encode(normalized.bytes),
+        });
+        self.artifact
+            .canonical
+            .events
+            .push(CanonicalEvent::Snapshot {
+                seq: snapshot_seq,
+                cols,
+                rows,
+                cursor,
+                lines: normalized_lines,
+            });
+        Ok(true)
+    }
+
     /// Records one resize. Returns `false` without appending for QEMU recorders.
     ///
     /// # Errors
@@ -964,6 +1050,11 @@ impl TranscriptRecorder {
             .checked_add(1)
             .ok_or(TranscriptError::SequenceOverflow)?;
         Ok(seq)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_next_seq_for_test(&mut self, seq: u32) {
+        self.next_seq = seq;
     }
 }
 
@@ -1245,6 +1336,96 @@ mod tests {
                 .iter()
                 .any(|entry| entry.kind == NormalizationKind::TimeRelative)
         );
+    }
+
+    #[test]
+    fn output_and_snapshot_assigns_consecutive_sequences() -> Result<(), TranscriptError> {
+        let mut value = recorder(DriverKind::PosixPty);
+        value.spawn(vec!["pi".to_owned()], &NormalizationContext::default())?;
+        assert!(value.output_and_snapshot(
+            &[b"ready"],
+            80,
+            24,
+            [1, 2],
+            vec!["ready  ".to_owned()],
+            &NormalizationContext::default(),
+        )?);
+        assert_eq!(value.next_seq, 3);
+        assert_eq!(value.artifact.canonical.events.len(), 3);
+        assert_eq!(value.artifact.canonical.events[1].seq(), 1);
+        assert_eq!(value.artifact.canonical.events[2].seq(), 2);
+        assert_eq!(value.raw_log, b"ready");
+        assert_eq!(value.output_audits.len(), 1);
+        assert!(
+            value
+                .applied
+                .iter()
+                .any(|entry| entry.kind == NormalizationKind::SnapshotTrailingSpaceTrim)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn output_and_snapshot_rejects_max_minus_one_without_mutation()
+    -> Result<(), TranscriptError> {
+        let mut value = recorder(DriverKind::PosixPty);
+        value.spawn(vec!["pi".to_owned()], &NormalizationContext::default())?;
+        let events_before = value.artifact.canonical.events.clone();
+        let raw_before = value.raw_log.clone();
+        let audits_before = value.output_audits.clone();
+        let applied_before = value.applied.clone();
+        value.force_next_seq_for_test(u32::MAX - 1);
+        let error = value
+            .output_and_snapshot(
+                &[b"/home/alice/ready"],
+                80,
+                24,
+                [0, 0],
+                vec!["/home/alice/ready  ".to_owned()],
+                &NormalizationContext {
+                    home: Some(b"/home/alice".to_vec()),
+                    cwd: None,
+                },
+            )
+            .expect_err("expected sequence overflow at u32::MAX-1");
+        assert!(matches!(error, TranscriptError::SequenceOverflow));
+        assert_eq!(value.next_seq, u32::MAX - 1);
+        assert_eq!(value.artifact.canonical.events, events_before);
+        assert_eq!(value.raw_log, raw_before);
+        assert_eq!(value.output_audits, audits_before);
+        assert_eq!(value.applied, applied_before);
+        Ok(())
+    }
+
+    #[test]
+    fn output_and_snapshot_rejects_max_without_mutation() -> Result<(), TranscriptError> {
+        let mut value = recorder(DriverKind::PosixPty);
+        value.spawn(vec!["pi".to_owned()], &NormalizationContext::default())?;
+        let events_before = value.artifact.canonical.events.clone();
+        let raw_before = value.raw_log.clone();
+        let audits_before = value.output_audits.clone();
+        let applied_before = value.applied.clone();
+        value.force_next_seq_for_test(u32::MAX);
+        let error = value
+            .output_and_snapshot(
+                &[b"/home/alice/ready"],
+                80,
+                24,
+                [0, 0],
+                vec!["/home/alice/ready  ".to_owned()],
+                &NormalizationContext {
+                    home: Some(b"/home/alice".to_vec()),
+                    cwd: None,
+                },
+            )
+            .expect_err("expected sequence overflow at u32::MAX");
+        assert!(matches!(error, TranscriptError::SequenceOverflow));
+        assert_eq!(value.next_seq, u32::MAX);
+        assert_eq!(value.artifact.canonical.events, events_before);
+        assert_eq!(value.raw_log, raw_before);
+        assert_eq!(value.output_audits, audits_before);
+        assert_eq!(value.applied, applied_before);
+        Ok(())
     }
 
     fn complete(mut value: TranscriptRecorder) -> Result<TranscriptArtifact, TranscriptError> {

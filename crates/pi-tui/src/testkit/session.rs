@@ -53,6 +53,11 @@ impl<S: DriverSession> RecordingSession<S> {
         })
     }
 
+    #[cfg(test)]
+    fn force_next_seq(&mut self, seq: u32) {
+        self.recorder.force_next_seq_for_test(seq);
+    }
+
     /// Writes one input boundary and records it after the driver accepts it.
     ///
     /// # Errors
@@ -222,9 +227,8 @@ impl<S: RenderSession> RecordingSession<S> {
         let cursor_row = u16::try_from(frame.snapshot.cursor_row).map_err(|_| {
             DriverError::InvalidSpec("snapshot cursor row exceeds u16".to_owned())
         })?;
-        self.recorder
-            .output(&[frame.batch.bytes.as_slice()], context)?;
-        self.recorder.snapshot(
+        self.recorder.output_and_snapshot(
+            &[frame.batch.bytes.as_slice()],
             frame.snapshot.geometry.cols,
             frame.snapshot.geometry.rows,
             [cursor_col, cursor_row],
@@ -958,6 +962,45 @@ mod tests {
         assert_eq!(kinds(&artifact), vec![EventKind::Spawn, EventKind::Exit]);
         assert!(artifact.timing.output_audits.is_empty());
         assert_eq!(artifact.timing.raw_log_b64, "");
+        Ok(())
+    }
+
+    #[test]
+    fn settled_frame_seq_overflow_records_no_output_or_snapshot() -> Result<(), RecordingError> {
+        let context = NormalizationContext::default();
+        for boundary in [u32::MAX - 1, u32::MAX] {
+            let mut session = RecordingSession::new(
+                FakeRender {
+                    inner: FakeDriver {
+                        output: b"visible".to_vec(),
+                        ..FakeDriver::default()
+                    },
+                    lines: vec!["visible".to_owned()],
+                    ..FakeRender::default()
+                },
+                recorder(DriverKind::PosixPty),
+                vec!["pi".to_owned()],
+                &context,
+            )?;
+            session.force_next_seq(boundary);
+            assert!(matches!(
+                session.read_settled_frame(
+                    &SettlePolicy::default(),
+                    |bytes| bytes == b"visible",
+                    &context,
+                ),
+                Err(RecordingError::Transcript(TranscriptError::SequenceOverflow))
+            ));
+            // Overflow leaves the post-spawn sequence unused; restore it so close
+            // can record exit without inventing events from the rejected settle.
+            session.force_next_seq(1);
+            session.close()?;
+            let artifact = session.finish()?;
+            assert_eq!(kinds(&artifact), vec![EventKind::Spawn, EventKind::Exit]);
+            assert!(artifact.timing.output_audits.is_empty());
+            assert_eq!(artifact.timing.raw_log_b64, "");
+            assert!(artifact.canonical.normalizations.is_empty());
+        }
         Ok(())
     }
 }
