@@ -438,6 +438,20 @@
 			"evidence": "docs-evidence checker validates every ledger row against the EXT-24 inventory and exits 0"
 		},
 		{
+			"id": "xc-deadline",
+			"surface": "extension-compatibility deadline/cancellation/isolation/stale-guard",
+			"tier": "unit",
+			"required": true,
+			"commands": [
+				{
+					"cwd": ".",
+					"argv": ["bun", "test", "scripts/verification/xc-deadline.test.ts"],
+					"timeoutMs": 120000
+				}
+			],
+			"evidence": "XC-8 deadline/cancellation/isolation/stale-guard mutation witnesses (M15–M18 + navigateTree summarize exemption) pass"
+		},
+		{
 			"id": "release-x86_64-linux",
 			"surface": "release",
 			"tier": "release",
