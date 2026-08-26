@@ -12,11 +12,16 @@
 //! the evidence markers from the output stream, and asserts the three
 //! invariants that the static-frame path must preserve under load:
 //!
-//! 1. **Static-sufficiency** — kind label + elapsed counter visible and correct.
+//! 1. **Static-sufficiency** — the kind label + elapsed counter is rendered
+//!    by the real `Loader::render` into a ratatui `Buffer` at sampled ticks;
+//!    the drawn text is emitted as evidence and asserted here.
 //! 2. **Anti-chatter** — `Loader::advance` returns `false` for single-frame
 //!    indicator (zero frame-animation repaints).
 //! 3. **Tick repaint-suppression** — under load, sub-second ticks do not
-//!    trigger repaints; only elapsed-second boundary changes do.
+//!    trigger repaints; only elapsed-second boundary changes do. This is
+//!    validated against simulated per-configuration logic (frame modulus =
+//!    indicator's frame count) that TUI-T11 (#78) would implement; the
+//!    current `tick_status_indicator` always cycles mod 10.
 //!
 //! This is evidence for TUI-G1 (#49) and TUI-T11 (#78); no settings change
 //! lands here.
@@ -33,12 +38,14 @@ use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 
 const INITIAL_COLS: u16 = 80;
 const INITIAL_ROWS: u16 = 24;
+const HARD_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[test]
 fn static_frame_preserves_three_invariants_under_load() {
     let evidence = drive_static_frame_fixture();
 
-    // 1. Static-sufficiency: kind label and elapsed counter are present.
+    // 1. Static-sufficiency: kind label and elapsed counter are present in
+    //    the rendered output at sampled ticks.
     let kind = evidence.get("kind_label").expect("missing kind_label");
     assert!(
         !kind.is_empty(),
@@ -53,6 +60,35 @@ fn static_frame_preserves_three_invariants_under_load() {
         total_elapsed > 0,
         "static-sufficiency: elapsed counter must advance past 0, got {total_elapsed}"
     );
+
+    // Verify rendered text samples contain the kind label and (for non-zero
+    // elapsed) the elapsed counter. The real renderer suppresses the counter
+    // at 0s, so tick 0 should show only the kind label.
+    let static_samples: Vec<(&str, &str)> = evidence
+        .iter()
+        .filter(|(k, _)| k.starts_with("static_render_sample_tick="))
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    assert!(
+        !static_samples.is_empty(),
+        "static-sufficiency: expected at least one rendered text sample"
+    );
+    for (key, text) in &static_samples {
+        assert!(
+            text.contains(kind),
+            "static-sufficiency: rendered text at {key} must contain kind label {kind:?}, got {text:?}"
+        );
+        // Extract the tick number from the key.
+        let tick_str = key.strip_prefix("static_render_sample_tick=").unwrap_or("");
+        let tick: usize = tick_str.parse().unwrap_or(0);
+        let elapsed_at_tick = (tick + 1) as u64 * 80 / 1000;
+        if elapsed_at_tick > 0 {
+            assert!(
+                text.contains(&format!("{elapsed_at_tick}s")),
+                "static-sufficiency: rendered text at {key} must contain elapsed counter {elapsed_at_tick}s, got {text:?}"
+            );
+        }
+    }
 
     // 2. Anti-chatter: single-frame Loader::advance never returns true.
     let static_advance_true: usize = evidence
@@ -79,7 +115,8 @@ fn static_frame_preserves_three_invariants_under_load() {
 
     // 3. Tick repaint-suppression: status-level repaints for the static path
     //    equal the number of elapsed-second boundary crossings, not the
-    //    total tick count.
+    //    total tick count. This is simulated per-configuration logic (frame
+    //    modulus = indicator's frame count) that TUI-T11 would implement.
     let status_static_repaints: usize = evidence
         .get("status_static_repaints")
         .expect("missing status_static_repaints")
@@ -170,10 +207,22 @@ fn drive_static_frame_fixture() -> HashMap<String, String> {
         }
     });
 
-    // Wait for the child to finish first — the fixture runs in < 1ms, so
-    // the reader thread may disconnect before a concurrent read loop can
-    // drain the channel.
-    let _ = child.wait();
+    // Wait for the child to finish, with a hard timeout to avoid hanging
+    // the test forever on a wedged fixture.
+    let wait_deadline = Instant::now() + HARD_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if Instant::now() > wait_deadline {
+                    let _ = child.kill();
+                    panic!("fixture did not exit within {HARD_TIMEOUT:?}");
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) => panic!("child wait failed: {err}"),
+        }
+    }
 
     // Drain any remaining data from the channel.
     let mut raw = Vec::new();
@@ -202,6 +251,9 @@ fn drive_static_frame_fixture() -> HashMap<String, String> {
     evidence
 }
 
+// Re-export Instant for the wait deadline.
+use std::time::Instant;
+
 fn static_frame_fixture_binary() -> PathBuf {
     if let Ok(path) = std::env::var("CARGO_BIN_EXE_pi_tui_static_frame_fixture") {
         return PathBuf::from(path);
@@ -213,7 +265,7 @@ fn static_frame_fixture_binary() -> PathBuf {
     candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target"));
     candidates.push(PathBuf::from("target"));
     let bin_name = static_frame_bin_name();
-    for root in candidates {
+    for root in &candidates {
         for profile in ["debug", "release"] {
             let path = root.join(profile).join(bin_name);
             if path.exists() {
@@ -233,15 +285,23 @@ fn static_frame_fixture_binary() -> PathBuf {
         .status()
         .unwrap_or_else(|err| panic!("failed to build fixture: {err}"));
     assert!(status.success(), "fixture build failed");
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/debug")
-        .join(bin_name);
-    assert!(
-        path.exists(),
-        "fixture binary missing after build at {}",
-        path.display()
+    // Re-scan candidate roots after build (handles CARGO_TARGET_DIR).
+    for root in &candidates {
+        for profile in ["debug", "release"] {
+            let path = root.join(profile).join(bin_name);
+            if path.exists() {
+                return path;
+            }
+        }
+    }
+    panic!(
+        "fixture binary missing after build; searched: {}",
+        candidates
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
     );
-    path
 }
 
 fn static_frame_bin_name() -> &'static str {
