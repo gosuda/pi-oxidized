@@ -6,18 +6,7 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-use crate::testkit::profile::CapabilityProfile;
-
-pub use super::transcript::DriverKind;
-
-/// Non-zero terminal geometry requested at launch or resize.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Geometry {
-    /// Column count; must be non-zero.
-    pub cols: u16,
-    /// Row count; must be non-zero.
-    pub rows: u16,
-}
+pub use super::transcript::{CapabilityProfile, DriverKind, Geometry};
 
 impl Geometry {
     /// Creates a geometry, rejecting zero dimensions.

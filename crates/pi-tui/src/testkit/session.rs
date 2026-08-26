@@ -11,9 +11,12 @@ use crate::testkit::driver::{
     DriverError, Geometry, OutputBatch, SettlePolicy, TerminalSnapshot,
 };
 
+/// One chunk, or a terminal reader failure that must not validate as settle.
+pub(crate) type ReaderEvent = Result<Vec<u8>, std::io::Error>;
+
 /// Byte channel fed by one or more reader threads.
 pub(crate) struct ReaderPump {
-    rx: Receiver<Vec<u8>>,
+    rx: Receiver<ReaderEvent>,
     joins: Vec<JoinHandle<()>>,
 }
 
@@ -29,11 +32,15 @@ impl ReaderPump {
             let mut buf = [0u8; 8192];
             loop {
                 match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => break,
                     Ok(n) => {
-                        if tx.send(buf[..n].to_vec()).is_err() {
+                        if tx.send(Ok(buf[..n].to_vec())).is_err() {
                             break;
                         }
+                    }
+                    Err(err) => {
+                        let _ = tx.send(Err(err));
+                        break;
                     }
                 }
             }
@@ -44,38 +51,33 @@ impl ReaderPump {
         }
     }
 
-    /// Builds a pump that merges multiple readers into one boundary stream.
-    pub(crate) fn from_readers<R>(readers: Vec<R>) -> Self
-    where
-        R: Read + Send + 'static,
-    {
-        let (tx, rx) = mpsc::channel();
-        let mut joins = Vec::with_capacity(readers.len());
-        for mut reader in readers {
-            let tx = tx.clone();
-            joins.push(thread::spawn(move || {
-                let mut buf = [0u8; 8192];
-                loop {
-                    match reader.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            if tx.send(buf[..n].to_vec()).is_err() {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }));
-        }
-        drop(tx);
-        Self { rx, joins }
-    }
-
-    /// Joins every reader thread, ignoring thread panics.
-    pub(crate) fn join(&mut self) {
+    /// Joins every reader thread, surfacing the first panic as an I/O error.
+    pub(crate) fn join(&mut self) -> Result<(), DriverError> {
+        let mut first_err: Option<DriverError> = None;
         for join in self.joins.drain(..) {
-            let _ = join.join();
+            if let Err(panic) = join.join() {
+                let msg = panic_message(&panic);
+                if first_err.is_none() {
+                    first_err = Some(DriverError::Io(std::io::Error::other(format!(
+                        "reader thread panicked: {msg}"
+                    ))));
+                }
+            }
         }
+        match first_err {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+}
+
+fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(msg) = panic.downcast_ref::<&str>() {
+        (*msg).to_owned()
+    } else if let Some(msg) = panic.downcast_ref::<String>() {
+        msg.clone()
+    } else {
+        "unknown panic payload".to_owned()
     }
 }
 
@@ -151,29 +153,34 @@ impl SessionIo {
         Ok(self.ledger.take_batch())
     }
 
-    pub(crate) fn shutdown_readers(&mut self) {
+    pub(crate) fn close_writer(&mut self) {
+        drop(self.writer.take());
+    }
+
+    /// Joins reader threads. Explicit close must propagate panics; Drop may ignore.
+    pub(crate) fn join_readers(&mut self) -> Result<(), DriverError> {
         if let Some(mut pump) = self.pump.take() {
-            // Dropping the writer first encourages EOF on PTY/pipe readers.
-            drop(self.writer.take());
-            pump.join();
+            pump.join()
         } else {
-            drop(self.writer.take());
+            Ok(())
         }
     }
 }
 
 impl Drop for SessionIo {
     fn drop(&mut self) {
-        if !self.closed {
-            self.shutdown_readers();
-            self.closed = true;
-        }
+        // Never join readers here: a still-live child can keep the reader blocked.
+        // Session Drop/close must terminate/wait the child before join_readers().
+        self.close_writer();
+        self.closed = true;
+        // Dropping JoinHandle detaches; EOF arrives after the child exits.
+        drop(self.pump.take());
     }
 }
 
 /// Quiescence-bounded read: predicate then quiet window, else ceiling error.
 pub(crate) fn settle_read<F>(
-    rx: &Receiver<Vec<u8>>,
+    rx: &Receiver<ReaderEvent>,
     ledger: &mut OutputLedger,
     policy: &SettlePolicy,
     predicate: &mut F,
@@ -197,12 +204,18 @@ where
 
         let wait = remaining_wait(policy, started, matched, last_data);
         match rx.recv_timeout(wait) {
-            Ok(chunk) => {
+            Ok(Ok(chunk)) => {
                 ledger.push(&chunk);
                 last_data = Instant::now();
                 if !matched {
                     matched = predicate(ledger.pending());
                 }
+            }
+            Ok(Err(err)) => {
+                return Err(DriverError::Io(std::io::Error::new(
+                    err.kind(),
+                    format!("reader failed before settle: {err}"),
+                )));
             }
             Err(RecvTimeoutError::Timeout) => {
                 if matched && last_data.elapsed() >= policy.quiet {
@@ -213,7 +226,7 @@ where
                 }
             }
             Err(RecvTimeoutError::Disconnected) => {
-                // Drain is complete. Accept only if the predicate already matched.
+                // Clean EOF only. Accept only if the predicate already matched.
                 if matched {
                     return Ok(());
                 }

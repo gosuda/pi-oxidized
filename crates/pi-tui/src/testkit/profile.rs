@@ -4,36 +4,17 @@ use std::collections::BTreeMap;
 
 use super::transcript::DriverKind;
 
-/// Pinned terminal capability profiles.
-///
-/// This enum is closed: new profiles require an explicit table update.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum CapabilityProfile {
-    /// `TERM=xterm-256color` with `COLORTERM=truecolor`.
-    Xterm256Truecolor,
-    /// `TERM=xterm-256color` without truecolor advertisement.
-    Xterm256,
-    /// Minimal dumb terminal.
-    Dumb,
-    /// Terminal.app-class profile (`xterm-256color`).
-    TerminalApp,
-    /// iTerm2-class profile with truecolor.
-    Iterm2Truecolor,
-    /// Windows Terminal VT with truecolor.
-    WindowsTerminalVt,
-    /// Conhost VT profile that denies DEC 2026 synchronized-output probes.
-    ConhostVtDec2026Fallback,
-}
+pub use super::transcript::CapabilityProfile;
 
 impl CapabilityProfile {
     /// Stable profile name used in artifacts and tables.
     pub fn name(self) -> &'static str {
         match self {
-            Self::Xterm256Truecolor => "xterm-256-truecolor",
-            Self::Xterm256 => "xterm-256",
+            Self::Xterm256ColorTruecolor => "xterm256-color-truecolor",
+            Self::Xterm256Color => "xterm256-color",
             Self::Dumb => "dumb",
             Self::TerminalApp => "terminal-app",
-            Self::Iterm2Truecolor => "iterm2-truecolor",
+            Self::Iterm2 => "iterm2",
             Self::WindowsTerminalVt => "windows-terminal-vt",
             Self::ConhostVtDec2026Fallback => "conhost-vt-dec2026-fallback",
         }
@@ -41,7 +22,16 @@ impl CapabilityProfile {
 
     /// Looks up a profile by its stable name.
     pub fn from_name(name: &str) -> Option<Self> {
-        Self::all().into_iter().find(|profile| profile.name() == name)
+        match name {
+            "xterm256-color-truecolor" => Some(Self::Xterm256ColorTruecolor),
+            "xterm256-color" => Some(Self::Xterm256Color),
+            "dumb" => Some(Self::Dumb),
+            "terminal-app" => Some(Self::TerminalApp),
+            "iterm2" => Some(Self::Iterm2),
+            "windows-terminal-vt" => Some(Self::WindowsTerminalVt),
+            "conhost-vt-dec2026-fallback" => Some(Self::ConhostVtDec2026Fallback),
+            _ => None,
+        }
     }
 
     /// Exhaustive profile table in declaration order.
@@ -53,17 +43,17 @@ impl CapabilityProfile {
     pub fn env(self) -> BTreeMap<String, String> {
         let mut env = BTreeMap::new();
         match self {
-            Self::Xterm256Truecolor => {
+            Self::Xterm256ColorTruecolor => {
                 env.insert("TERM".to_owned(), "xterm-256color".to_owned());
                 env.insert("COLORTERM".to_owned(), "truecolor".to_owned());
             }
-            Self::Xterm256 | Self::TerminalApp => {
+            Self::Xterm256Color | Self::TerminalApp => {
                 env.insert("TERM".to_owned(), "xterm-256color".to_owned());
             }
             Self::Dumb => {
                 env.insert("TERM".to_owned(), "dumb".to_owned());
             }
-            Self::Iterm2Truecolor => {
+            Self::Iterm2 => {
                 env.insert("TERM".to_owned(), "xterm-256color".to_owned());
                 env.insert("COLORTERM".to_owned(), "truecolor".to_owned());
                 env.insert("TERM_PROGRAM".to_owned(), "iTerm.app".to_owned());
@@ -114,11 +104,11 @@ impl CapabilityProfile {
 }
 
 const PROFILE_TABLE: [CapabilityProfile; 7] = [
-    CapabilityProfile::Xterm256Truecolor,
-    CapabilityProfile::Xterm256,
+    CapabilityProfile::Xterm256ColorTruecolor,
+    CapabilityProfile::Xterm256Color,
     CapabilityProfile::Dumb,
     CapabilityProfile::TerminalApp,
-    CapabilityProfile::Iterm2Truecolor,
+    CapabilityProfile::Iterm2,
     CapabilityProfile::WindowsTerminalVt,
     CapabilityProfile::ConhostVtDec2026Fallback,
 ];

@@ -3,8 +3,9 @@
 //! The session intentionally implements only [`DriverSession`]. Render verbs are
 //! inexpressible at the type level.
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::process::{Command, Stdio};
+use std::thread::{self, JoinHandle};
 
 use super::transcript::DriverKind;
 use crate::testkit::driver::{
@@ -72,22 +73,16 @@ impl TerminalDriver for QemuUserSmokeDriver {
             DriverError::Io(std::io::Error::other("qemu child stderr missing"))
         })?;
 
-        // Probe replies are PTY-oriented; for pipes they are best-effort stdin writes.
-        let mut writer: Box<dyn std::io::Write + Send> = Box::new(stdin);
-        let probe = spec.profile.probe_reply();
-        if !probe.is_empty() {
-            writer.write_all(probe)?;
-            writer.flush()?;
-        }
-
-        let pump = ReaderPump::from_readers(vec![
-            Box::new(stdout) as Box<dyn std::io::Read + Send>,
-            Box::new(stderr) as Box<dyn std::io::Read + Send>,
-        ]);
+        // Probe replies are PTY-emulator artifacts and must never enter QEMU stdin.
+        let writer: Box<dyn std::io::Write + Send> = Box::new(stdin);
+        // Canonical reads are stdout-only; stderr is drained on a diagnostic path.
+        let pump = ReaderPump::from_reader(stdout);
+        let stderr_join = thread::spawn(move || drain_diagnostic_stderr(stderr));
 
         Ok(QemuUserSmokeSession {
             child: Some(child),
             io: SessionIo::new(writer, pump),
+            stderr_join: Some(stderr_join),
         })
     }
 }
@@ -96,6 +91,7 @@ impl TerminalDriver for QemuUserSmokeDriver {
 pub struct QemuUserSmokeSession {
     child: Option<std::process::Child>,
     io: SessionIo,
+    stderr_join: Option<JoinHandle<()>>,
 }
 
 impl QemuUserSmokeSession {
@@ -105,6 +101,24 @@ impl QemuUserSmokeSession {
         } else {
             Ok(())
         }
+    }
+
+    fn join_stderr(&mut self) -> Result<(), DriverError> {
+        if let Some(join) = self.stderr_join.take() {
+            if let Err(panic) = join.join() {
+                let msg = if let Some(s) = panic.downcast_ref::<&str>() {
+                    (*s).to_owned()
+                } else if let Some(s) = panic.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown panic payload".to_owned()
+                };
+                return Err(DriverError::Io(std::io::Error::other(format!(
+                    "qemu stderr drain panicked: {msg}"
+                ))));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -127,9 +141,20 @@ impl DriverSession for QemuUserSmokeSession {
     fn close(mut self) -> Result<ExitStatus, DriverError> {
         self.ensure_open()?;
         self.io.closed = true;
-        self.io.shutdown_readers();
+        // Writer EOF first, then wait for the child, then drain/join readers.
+        self.io.close_writer();
         let mut child = self.child.take().ok_or(DriverError::Closed)?;
-        let status = child.wait()?;
+        let wait_result = child.wait().map_err(|err| {
+            DriverError::Io(std::io::Error::new(
+                err.kind(),
+                format!("qemu child wait failed: {err}"),
+            ))
+        });
+        let join_result = self.io.join_readers();
+        let stderr_result = self.join_stderr();
+        let status = wait_result?;
+        join_result?;
+        stderr_result?;
         Ok(status.into())
     }
 }
@@ -138,11 +163,23 @@ impl Drop for QemuUserSmokeSession {
     fn drop(&mut self) {
         if !self.io.closed {
             self.io.closed = true;
-            self.io.shutdown_readers();
+            self.io.close_writer();
             if let Some(mut child) = self.child.take() {
                 let _ = child.kill();
                 let _ = child.wait();
             }
+            let _ = self.io.join_readers();
+            let _ = self.join_stderr();
+        }
+    }
+}
+
+fn drain_diagnostic_stderr(mut stderr: impl Read) {
+    let mut buf = [0u8; 8192];
+    loop {
+        match stderr.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
         }
     }
 }

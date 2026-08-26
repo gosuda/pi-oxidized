@@ -8,7 +8,7 @@ use std::os::fd::AsFd;
 
 use nix::sys::termios::{LocalFlags, SetArg, tcgetattr, tcsetattr};
 use portable_pty::unix::UnixPtySystem;
-use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{CommandBuilder, MasterPty, PtySize, PtySystem};
 
 use super::transcript::DriverKind;
 use crate::testkit::driver::{
@@ -112,9 +112,18 @@ impl DriverSession for PosixPtySession {
     fn close(mut self) -> Result<ExitStatus, DriverError> {
         self.ensure_open()?;
         self.io.closed = true;
-        self.io.shutdown_readers();
+        // Writer EOF first, then wait for the child, then join the reader.
+        self.io.close_writer();
         let mut child = self.child.take().ok_or(DriverError::Closed)?;
-        let status = child.wait().map_err(DriverError::Io)?;
+        let wait_result = child.wait().map_err(|err| {
+            DriverError::Io(std::io::Error::new(
+                err.kind(),
+                format!("posix pty child wait failed: {err}"),
+            ))
+        });
+        let join_result = self.io.join_readers();
+        let status = wait_result?;
+        join_result?;
         Ok(status.into())
     }
 }
@@ -160,11 +169,12 @@ impl Drop for PosixPtySession {
     fn drop(&mut self) {
         if !self.io.closed {
             self.io.closed = true;
-            self.io.shutdown_readers();
+            self.io.close_writer();
             if let Some(mut child) = self.child.take() {
                 let _ = child.kill();
                 let _ = child.wait();
             }
+            let _ = self.io.join_readers();
         }
     }
 }
