@@ -478,6 +478,17 @@ mirror/fixture/mutation-checker surfaces and the A8 audit-record slot:
 - The A8 audit-record slot: `docs/PARITY_LEDGER.md` row A8 ("Upstream ./compat
   legacy global provider registry"), status **witnessed**.
 
+- The A8 extension-import legacy-surface audit record (XC-3 / issue #54):
+  `packages/extension-host/tests/xc3-legacy-surface-audit.test.ts` — the
+  executable witness proving alias inventory completeness (virtual-modules
+  resolve map + refs.d.ts ambient declarations, diff-checked), corpus scan
+  reproducibility (zero explicit compat-surface imports among checked-in
+  fixtures, with bundled-modules.test.ts and the resolve map as positive
+  consumption witnesses), positive alias witnesses (Mode 1 resolution of
+  @earendil-works/pi-ai/compat and each @mariozechner/* legacy spelling),
+  and the negative Mode 2 lexical-exclusion witness. This record is held
+  strictly as input to the parity A8 adjudication.
+
 These surfaces are **consumed read-only** everywhere else in the repository;
 protocol files (`packages/pi-tui-protocol/src/types.ts`,
 `crates/pi-ext/src/protocol.rs`), fixtures, verification scripts, `.references`,
