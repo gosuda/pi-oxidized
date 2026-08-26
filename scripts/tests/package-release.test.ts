@@ -260,7 +260,9 @@ describe("pinned Bun runtime provisioning", () => {
 	test("maps every release target to a checksum-pinned official asset", () => {
 		const expectedFile: Readonly<Record<(typeof RUST_TARGETS)[number], string>> = {
 			"x86_64-unknown-linux-gnu": "bun-linux-x64-baseline.zip",
+			"x86_64-unknown-linux-musl": "bun-linux-x64-musl-baseline.zip",
 			"aarch64-unknown-linux-gnu": "bun-linux-aarch64.zip",
+			"aarch64-unknown-linux-musl": "bun-linux-aarch64-musl.zip",
 			"x86_64-apple-darwin": "bun-darwin-x64-baseline.zip",
 			"aarch64-apple-darwin": "bun-darwin-aarch64.zip",
 			"x86_64-pc-windows-msvc": "bun-windows-x64-baseline.zip",
@@ -274,6 +276,30 @@ describe("pinned Bun runtime provisioning", () => {
 			expect(asset.runtimeMember).toEndWith(`/${plan.bunRuntimeName}`);
 			expect(asset.url).toContain(`/bun-v${BUN_RUNTIME_VERSION}/`);
 		}
+	});
+
+	test("pins the exact musl runtime assets and filenames", () => {
+		const x64 = bunRuntimeAsset(planFor("x86_64-unknown-linux-musl"));
+		expect(x64.bunTarget).toBe("bun-linux-x64-musl-baseline");
+		expect(x64.fileName).toBe("bun-linux-x64-musl-baseline.zip");
+		expect(x64.sha256).toBe(
+			"56a7d6806cf155536c0178f0ea5fbd098e684fa509ebdb4fc0a7e19fb65382dc",
+		);
+		expect(x64.runtimeMember).toBe("bun-linux-x64-musl-baseline/bun");
+		expect(x64.url).toBe(
+			`https://github.com/oven-sh/bun/releases/download/bun-v${BUN_RUNTIME_VERSION}/bun-linux-x64-musl-baseline.zip`,
+		);
+
+		const arm64 = bunRuntimeAsset(planFor("aarch64-unknown-linux-musl"));
+		expect(arm64.bunTarget).toBe("bun-linux-arm64-musl");
+		expect(arm64.fileName).toBe("bun-linux-aarch64-musl.zip");
+		expect(arm64.sha256).toBe(
+			"b98e0ad3625c5c00d1d5b5ff55605c7adddbfae151861e68ade57b2d3b8703bb",
+		);
+		expect(arm64.runtimeMember).toBe("bun-linux-aarch64-musl/bun");
+		expect(arm64.url).toBe(
+			`https://github.com/oven-sh/bun/releases/download/bun-v${BUN_RUNTIME_VERSION}/bun-linux-aarch64-musl.zip`,
+		);
 	});
 
 	test("rejects downloaded runtime bytes before extraction when checksum differs", async () => {

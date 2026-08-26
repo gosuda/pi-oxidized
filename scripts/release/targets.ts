@@ -1,5 +1,5 @@
 /**
- * Cross-target release plan: maps one of the five supported Rust target
+ * Cross-target release plan: maps one of the seven supported Rust target
  * triples to its Bun host compile target, archive format, and the binary
  * names that the release script must assemble beside each other.
  *
@@ -8,15 +8,18 @@
  */
 
 /**
- * The five Rust target triples the master plan supports for release.
+ * The seven Rust target triples the master plan supports for release.
  *
  * (Verification check 13: `x86_64-unknown-linux-gnu`,
- * `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`,
+ * `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-gnu`,
+ * `aarch64-unknown-linux-musl`, `x86_64-apple-darwin`,
  * `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`.)
  */
 export const RUST_TARGETS = [
 	"x86_64-unknown-linux-gnu",
+	"x86_64-unknown-linux-musl",
 	"aarch64-unknown-linux-gnu",
+	"aarch64-unknown-linux-musl",
 	"x86_64-apple-darwin",
 	"aarch64-apple-darwin",
 	"x86_64-pc-windows-msvc",
@@ -35,6 +38,14 @@ export type OsFamily = "linux" | "darwin" | "windows";
 export type Arch = "x86_64" | "aarch64";
 
 /**
+ * C standard library / runtime environment encoded in the Rust triple's env
+ * segment. Musl triples carry `musl`; GNU/Windows triples carry `gnu`/`msvc`;
+ * triples without an env segment (Apple Darwin) resolve to `unknown` so the
+ * libc dimension is explicit for every supported OS.
+ */
+export type Libc = "gnu" | "musl" | "msvc" | "unknown";
+
+/**
  * A fully-resolved release target: every downstream phase (cargo build, host
  * compile, archive, naming, manifest) reads from this object so there is a
  * single source of truth the tests can pin.
@@ -43,14 +54,17 @@ export interface TargetPlan {
 	/** Rust triple passed to `cargo build --target`. */
 	readonly rustTarget: RustTarget;
 	/**
-	 * Bun compile target (`bun-<os>-<arch>[-baseline]`). x86_64 targets use
-	 * `-baseline` to avoid Bun's AVX2 floor; arm64 targets are standard.
+	 * Bun compile target (`bun-<os>-<arch>[-musl][-baseline]`). x86_64
+	 * targets use `-baseline` to avoid Bun's AVX2 floor; arm64 targets are
+	 * standard. Musl targets insert `-musl` after the architecture.
 	 */
 	readonly bunTarget: string;
 	/** OS family. */
 	readonly os: OsFamily;
 	/** CPU architecture. */
 	readonly arch: Arch;
+	/** C standard library from the triple's env segment. */
+	readonly libc: Libc;
 	/** Archive container. Windows uses zip; everything else tar.gz. */
 	readonly archive: ArchiveKind;
 	/** `true` when the binaries carry an `.exe` suffix. */
@@ -65,7 +79,7 @@ export interface TargetPlan {
 	readonly bunRuntimeName: string;
 	/** Released host JavaScript bundle used by the fallback path. */
 	readonly hostBundleName: string;
-	/** Directory prefix inside the archive (`pi-<os>-<arch>[-base]`). */
+	/** Directory prefix inside the archive (`pi-<os>-<arch>[-musl][-base]`). */
 	readonly archiveDir: string;
 }
 
@@ -77,17 +91,22 @@ function buildPlan(triple: RustTarget): TargetPlan {
 	const darwin = triple.includes("-apple-darwin");
 	const os: OsFamily = windows ? "windows" : darwin ? "darwin" : "linux";
 	const arch: Arch = triple.startsWith("aarch64") ? "aarch64" : "x86_64";
+	const env = triple.split("-")[3];
+	const libc: Libc =
+		env === "musl" ? "musl" : env === "msvc" ? "msvc" : env === "gnu" ? "gnu" : "unknown";
 	const exe = windows ? ".exe" : "";
 	const bunArch = arch === "aarch64" ? "arm64" : "x64";
 	const bunOs = os === "darwin" ? "darwin" : os === "windows" ? "windows" : "linux";
 	const baseline = arch === "x86_64" ? `-${X64_BASELINE_SUFFIX}` : "";
+	const musl = libc === "musl" ? "-musl" : "";
 	const archiveDirArch = arch === "aarch64" ? "arm64" : "x64";
 	const archiveDirBase = arch === "x86_64" ? "-base" : "";
 	return {
 		rustTarget: triple,
-		bunTarget: `bun-${bunOs}-${bunArch}${baseline}`,
+		bunTarget: `bun-${bunOs}-${bunArch}${musl}${baseline}`,
 		os,
 		arch,
+		libc,
 		archive: windows ? "zip" : "tar.gz",
 		windows,
 		darwin,
@@ -95,7 +114,7 @@ function buildPlan(triple: RustTarget): TargetPlan {
 		hostBinaryName: `pi-extension-host${exe}`,
 		bunRuntimeName: `bun${exe}`,
 		hostBundleName: "pi-extension-host.js",
-		archiveDir: `pi-${os}-${archiveDirArch}${archiveDirBase}`,
+		archiveDir: `pi-${os}-${archiveDirArch}${musl}${archiveDirBase}`,
 	};
 }
 

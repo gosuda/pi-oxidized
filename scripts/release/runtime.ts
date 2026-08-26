@@ -28,10 +28,20 @@ const ASSET_PINS: Readonly<Record<RustTarget, AssetPin>> = {
 		fileName: "bun-linux-x64-baseline.zip",
 		sha256: "a063908ae08b7852ca10939bbdc6ceed3ddabce8fb9402dce83d65d73b36e6c7",
 	},
+	"x86_64-unknown-linux-musl": {
+		bunTarget: "bun-linux-x64-musl-baseline",
+		fileName: "bun-linux-x64-musl-baseline.zip",
+		sha256: "56a7d6806cf155536c0178f0ea5fbd098e684fa509ebdb4fc0a7e19fb65382dc",
+	},
 	"aarch64-unknown-linux-gnu": {
 		bunTarget: "bun-linux-arm64",
 		fileName: "bun-linux-aarch64.zip",
 		sha256: "a27ffb63a8310375836e0d6f668ae17fa8d8d18b88c37c821c65331973a19a3b",
+	},
+	"aarch64-unknown-linux-musl": {
+		bunTarget: "bun-linux-arm64-musl",
+		fileName: "bun-linux-aarch64-musl.zip",
+		sha256: "b98e0ad3625c5c00d1d5b5ff55605c7adddbfae151861e68ade57b2d3b8703bb",
 	},
 	"x86_64-apple-darwin": {
 		bunTarget: "bun-darwin-x64-baseline",

@@ -13,7 +13,7 @@
  * Usage:
  *   bun run scripts/package-release.ts --target <triple> [--out <dir>] [--dry-run]
  *
- *   --target <triple>        one of the five supported Rust triples
+ *   --target <triple>        one of the seven supported Rust triples
  *   --out / --out-dir <dir>  output directory (default: <cwd>/dist/release)
  *   --dry-run                skip cargo + host build; assemble from stub binaries
  *   --no-cargo               skip cargo build, but still compile host and archive
