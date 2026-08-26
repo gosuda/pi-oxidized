@@ -106,21 +106,13 @@ describe("XC-3: extension-import legacy-surface audit", () => {
 	const aliasKeys = extractAliasKeys();
 
 	test("alias inventory: every resolve-map key and every ambient module declaration appears in the record", () => {
-		// The audit record is the union of all three sources, sorted and deduped.
-		const record = Array.from(
-			new Set([...virtualModuleKeys, ...aliasKeys, ...ambientModules]),
-		).sort();
+		// The audit record is the deduped union of all three sources.
+		const allKeys = [...virtualModuleKeys, ...aliasKeys, ...ambientModules];
+		const record = Array.from(new Set(allKeys)).sort();
 
-		// Every key from each source must be in the record.
-		for (const key of virtualModuleKeys) {
-			expect(record).toContain(key);
-		}
-		for (const key of aliasKeys) {
-			expect(record).toContain(key);
-		}
-		for (const key of ambientModules) {
-			expect(record).toContain(key);
-		}
+		// The record size must equal the deduped input size — proves no
+		// unexpected key was silently dropped or duplicated by the union.
+		expect(record.length).toBe(new Set(allKeys).size);
 
 		// The record is non-empty and contains the expected legacy-surface keys.
 		expect(record.length).toBeGreaterThan(0);
@@ -243,26 +235,24 @@ describe("XC-3: extension-import legacy-surface audit", () => {
 		);
 
 		for (const mod of earendilAmbient) {
-			// pi-coding-agent-full is opaque-bundle-only (no alias needed).
-			if (mod === "pi-coding-agent-full") continue;
 			// utils/json-parse.ts is a narrow typed declaration, not aliased.
-		if (mod === "@earendil-works/pi-ai/utils/json-parse.ts") continue;
-		// pi-coding-agent/builtins is a subpath ambient declaration resolved
-		// via tsconfig path mapping, not a jiti alias key.
-		if (mod === "@earendil-works/pi-coding-agent/builtins") continue;
+			if (mod === "@earendil-works/pi-ai/utils/json-parse.ts") continue;
+			// pi-coding-agent/builtins is a subpath ambient declaration resolved
+			// via tsconfig path mapping, not a jiti alias key.
+			if (mod === "@earendil-works/pi-coding-agent/builtins") continue;
 			expect(aliasKeys).toContain(mod);
 		}
 
 		// Conversely, every @earendil-works/* alias key that is a package
 		// import (not typebox) should have an ambient declaration OR be an
 		// opaque bundle.
-	const opaqueBundles: Readonly<Record<string, true>> = {
-		"pi-coding-agent-full": true,
-		"@earendil-works/pi-agent-core": true,
-		"@earendil-works/pi-tui": true,
-		"@earendil-works/pi-ai/oauth": true,
-		"@earendil-works/pi-ai/providers/all": true,
-	};
+		const opaqueBundles: Readonly<Record<string, true>> = {
+			"pi-coding-agent-full": true,
+			"@earendil-works/pi-agent-core": true,
+			"@earendil-works/pi-tui": true,
+			"@earendil-works/pi-ai/oauth": true,
+			"@earendil-works/pi-ai/providers/all": true,
+		};
 
 		for (const key of aliasKeys) {
 			if (!key.startsWith("@earendil-works/") && !key.startsWith("@mariozechner/")) continue;
