@@ -940,9 +940,9 @@ export function runMapLedgerChecks(inputs: MapLedgerInputs): string[] {
 
 	const doc = parseExecutionMap(inputs.mapText);
 	add("map-document", doc.problems);
-	if (doc.headerHash !== null && doc.headerHash !== SNAPSHOT_STRUCTURAL_SHA256) {
+	if (doc.headerHash === null || doc.headerHash !== SNAPSHOT_STRUCTURAL_SHA256) {
 		add("structural-hash", [
-			`${MAP_DOC_PATH} header hash ${doc.headerHash} does not match the pinned ${SNAPSHOT_STRUCTURAL_SHA256}`,
+			`${MAP_DOC_PATH} header must state exactly the pinned snapshot structural sha256 ${SNAPSHOT_STRUCTURAL_SHA256}`,
 		]);
 	}
 

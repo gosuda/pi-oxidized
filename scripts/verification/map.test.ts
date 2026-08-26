@@ -306,6 +306,16 @@ describe("execution map ledger (MAP-1)", () => {
 		).toBe(true);
 	});
 
+	test("mutation: deleting the doc header hash line fails the structural pin", () => {
+		const headerLine = MAP_TEXT.split("\n").find((line) => line.includes("Snapshot structural sha256:"));
+		if (headerLine === undefined) throw new Error("map document must state the snapshot structural hash");
+		const mutated = MAP_TEXT.replace(headerLine, "");
+		const violations = run(mutated);
+		expect(
+			violations.some((entry) => entry.startsWith("[structural-hash]") && entry.includes("header must state")),
+		).toBe(true);
+	});
+
 	test("mutation: a dangling external reference fails resolution", () => {
 		const mutated = editRow(MAP_TEXT, "DEPS-G1", addBlocker("EXT-13"));
 		const violations = run(mutated);
