@@ -112,6 +112,8 @@ pub struct SettingsList {
     on_cancel: SettingsCancelCallback,
     search_input: Option<Input>,
     search_enabled: bool,
+    empty_text: Option<String>,
+    no_match_text: Option<String>,
     submenu: Option<Box<dyn Component>>,
     submenu_item_index: Option<usize>,
     pending_submenu_value: Option<Arc<Mutex<Option<SubmenuDone>>>>,
@@ -141,12 +143,28 @@ impl SettingsList {
             on_cancel: Box::new(on_cancel),
             search_input: search_enabled.then(Input::new),
             search_enabled,
+            empty_text: None,
+            no_match_text: None,
             submenu: None,
             submenu_item_index: None,
             pending_submenu_value: None,
             pending_submenu_id: None,
             cache: None,
         }
+    }
+
+    /// Override the message shown when the list has no items.
+    #[must_use]
+    pub fn with_empty_text(mut self, text: impl Into<String>) -> Self {
+        self.empty_text = Some(text.into());
+        self
+    }
+
+    /// Override the message shown when filtering produces no matches.
+    #[must_use]
+    pub fn with_no_match_text(mut self, text: impl Into<String>) -> Self {
+        self.no_match_text = Some(text.into());
+        self
     }
 
     /// Update an item's current value by id.
@@ -283,17 +301,21 @@ impl SettingsList {
         }
 
         if self.items.is_empty() {
-            lines.push((self.theme.hint)("  No settings available"));
-            if self.search_enabled {
-                self.add_hint_line(&mut lines, width);
-            }
+            lines.push(
+                (self.theme.hint)(self.empty_text.as_deref().unwrap_or("  No settings available")),
+            );
+            self.add_hint_line(&mut lines, width);
             return lines;
         }
 
         let display_len = self.display_items().len();
         if display_len == 0 {
             lines.push(truncate_to_width(
-                &(self.theme.hint)("  No matching settings"),
+                &(self.theme.hint)(
+                    self.no_match_text
+                        .as_deref()
+                        .unwrap_or("  No matching settings"),
+                ),
                 width,
                 "...",
                 false,
@@ -532,6 +554,68 @@ mod tests {
         );
         let snap = render_snapshot(&mut list, 60);
         assert!(snap.iter().any(|l| strip_ansi(l).contains("No settings")));
+    }
+
+    #[test]
+    fn empty_search_disabled_still_shows_esc_hint() {
+        let mut list = SettingsList::new(
+            vec![],
+            5,
+            SettingsListTheme::default(),
+            |_, _| {},
+            || {},
+            &SettingsListOptions {
+                enable_search: false,
+            },
+        );
+        let snap = render_snapshot(&mut list, 60);
+        let joined = snap
+            .iter()
+            .map(|l| strip_ansi(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("Esc to cancel"),
+            "search-disabled empty list must show exit hint: {joined}"
+        );
+    }
+
+    #[test]
+    fn empty_and_no_match_overrides_render() {
+        let mut empty = SettingsList::new(
+            vec![],
+            5,
+            SettingsListTheme::default(),
+            |_, _| {},
+            || {},
+            &SettingsListOptions::default(),
+        )
+        .with_empty_text("  No resources found");
+        let empty_snap = render_snapshot(&mut empty, 60);
+        assert!(
+            empty_snap
+                .iter()
+                .any(|l| strip_ansi(l).contains("No resources found"))
+        );
+
+        let mut filtered = SettingsList::new(
+            sample_items(),
+            5,
+            SettingsListTheme::default(),
+            |_, _| {},
+            || {},
+            &SettingsListOptions {
+                enable_search: true,
+            },
+        )
+        .with_no_match_text("  No resources found");
+        filtered.apply_filter("zzz");
+        let filtered_snap = render_snapshot(&mut filtered, 60);
+        assert!(
+            filtered_snap
+                .iter()
+                .any(|l| strip_ansi(l).contains("No resources found"))
+        );
     }
 
     #[test]

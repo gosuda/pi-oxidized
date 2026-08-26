@@ -110,6 +110,9 @@ pub struct SelectList {
     max_visible: usize,
     theme: SelectListTheme,
     layout: SelectListLayoutOptions,
+    empty_text: Option<String>,
+    no_match_text: Option<String>,
+    hint: Option<String>,
     /// Called when the user confirms a selection.
     pub on_select: Option<SelectItemCallback>,
     /// Called when the user cancels.
@@ -131,6 +134,9 @@ impl SelectList {
             max_visible: max_visible.max(1),
             theme,
             layout: SelectListLayoutOptions::default(),
+            empty_text: None,
+            no_match_text: None,
+            hint: None,
             on_select: None,
             on_cancel: None,
             on_selection_change: None,
@@ -142,6 +148,27 @@ impl SelectList {
     #[must_use]
     pub fn with_layout(mut self, layout: SelectListLayoutOptions) -> Self {
         self.layout = layout;
+        self
+    }
+
+    /// Override the message shown when the list has no items.
+    #[must_use]
+    pub fn with_empty_text(mut self, text: impl Into<String>) -> Self {
+        self.empty_text = Some(text.into());
+        self
+    }
+
+    /// Override the message shown when filtering produces no matches.
+    #[must_use]
+    pub fn with_no_match_text(mut self, text: impl Into<String>) -> Self {
+        self.no_match_text = Some(text.into());
+        self
+    }
+
+    /// Append a persistent hint row.
+    #[must_use]
+    pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
         self
     }
 
@@ -291,7 +318,19 @@ impl SelectList {
     fn render_lines(&self, width: u16) -> Vec<String> {
         let width = usize::from(width);
         if self.filtered.is_empty() {
-            return vec![(self.theme.no_match)("  No matching commands")];
+            let text = if self.items.is_empty() {
+                self.empty_text.as_deref()
+            } else {
+                self.no_match_text
+                    .as_deref()
+                    .or(self.empty_text.as_deref())
+            }
+            .unwrap_or("  No matching commands");
+            let mut lines = vec![(self.theme.no_match)(text)];
+            if let Some(hint) = &self.hint {
+                lines.push((self.theme.no_match)(hint));
+            }
+            return lines;
         }
 
         let primary_column_width = self.primary_column_width();
@@ -321,6 +360,10 @@ impl SelectList {
             let scroll = format!("  ({}/{})", self.selected_index + 1, len);
             let truncated = truncate_to_width(&scroll, width.saturating_sub(2), "", false);
             lines.push((self.theme.scroll_info)(&truncated));
+        }
+
+        if let Some(hint) = &self.hint {
+            lines.push((self.theme.no_match)(hint));
         }
         lines
     }
@@ -460,5 +503,73 @@ mod tests {
         let mut list = SelectList::new(items(), 5, SelectListTheme::default());
         list.set_filter("cmd1");
         assert!(list.filtered.iter().all(|i| i.value.starts_with("cmd1")));
+    }
+
+    #[test]
+    fn empty_text_renders_for_zero_items() {
+        let mut list = SelectList::new(vec![], 5, SelectListTheme::default())
+            .with_empty_text("  No matching models");
+        let snap = render_snapshot(&mut list, 60);
+        assert!(strip_ansi(&snap[0]).contains("No matching models"));
+        assert!(!strip_ansi(&snap[0]).contains("No matching commands"));
+    }
+
+    #[test]
+    fn no_match_text_used_when_filter_empties_list() {
+        let mut list = SelectList::new(items(), 5, SelectListTheme::default())
+            .with_empty_text("  No matching models")
+            .with_no_match_text("  No matching providers");
+        list.set_filter("zzz");
+        let snap = render_snapshot(&mut list, 60);
+        let line = strip_ansi(&snap[0]);
+        assert!(line.contains("No matching providers"), "{line}");
+        assert!(!line.contains("No matching models"), "{line}");
+    }
+
+    #[test]
+    fn library_fallback_still_shows_no_matching_commands() {
+        let mut list = SelectList::new(vec![], 5, SelectListTheme::default());
+        let snap = render_snapshot(&mut list, 60);
+        assert!(strip_ansi(&snap[0]).contains("No matching commands"));
+    }
+
+    #[test]
+    fn hint_appends_once_in_empty_and_nonempty_and_grows_height() {
+        let mut with_hint = SelectList::new(vec![], 5, SelectListTheme::default())
+            .with_empty_text("  No matching models")
+            .with_hint("  esc to cancel");
+        let empty_snap = render_snapshot(&mut with_hint, 60);
+        assert_eq!(empty_snap.len(), 2);
+        assert!(strip_ansi(&empty_snap[1]).contains("esc to cancel"));
+        let empty_h = with_hint.measure(60);
+
+        let mut without_hint =
+            SelectList::new(vec![], 5, SelectListTheme::default()).with_empty_text("  No matching models");
+        let without_h = without_hint.measure(60);
+        assert_eq!(empty_h, without_h + 1);
+
+        let mut nonempty = SelectList::new(items(), 5, SelectListTheme::default())
+            .with_hint("  esc to cancel");
+        let nonempty_h = nonempty.measure(60);
+        let mut nonempty_plain = SelectList::new(items(), 5, SelectListTheme::default());
+        let plain_h = nonempty_plain.measure(60);
+        assert_eq!(nonempty_h, plain_h + 1);
+        let snap = render_snapshot(&mut nonempty, 60);
+        assert!(strip_ansi(snap.last().expect("hint row")).contains("esc to cancel"));
+    }
+
+    #[test]
+    fn escape_still_cancels_with_hint_set() {
+        use std::sync::{Arc, Mutex};
+        let cancelled = Arc::new(Mutex::new(false));
+        let flag = Arc::clone(&cancelled);
+        let mut list = SelectList::new(items(), 5, SelectListTheme::default())
+            .with_hint("  esc to cancel");
+        list.on_cancel = Some(Box::new(move || {
+            *flag.lock().expect("lock") = true;
+        }));
+        let esc = UiEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(list.handle_event(&esc), EventResult::Consumed);
+        assert!(*cancelled.lock().expect("lock"));
     }
 }

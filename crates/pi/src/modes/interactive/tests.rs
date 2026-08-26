@@ -801,6 +801,63 @@ fn scoped_models_selector_marks_enabled() {
     assert!(plain.contains("[x]"), "enabled model shows [x]: {plain}");
 }
 
+#[test]
+fn selector_builders_render_named_empty_copy_and_exit_hint() {
+    use crate::modes::interactive::selectors::{
+        build_auth_selector, build_config_selector, build_model_selector, build_session_picker,
+        build_settings_selector, build_tree_selector, SELECTOR_EXIT_HINT,
+    };
+    use crate::modes::interactive::state::{
+        AuthSelectorEntry, ConfigSelectorEntry, ModelSelectorEntry, SessionPickerEntry, SettingsRow,
+        TreeEntry,
+    };
+
+    let cases: Vec<(&str, Box<dyn pi_tui::component::Component>)> = vec![
+        (
+            "  No matching models",
+            build_model_selector(&[] as &[ModelSelectorEntry], 0),
+        ),
+        (
+            "  No sessions found",
+            build_session_picker(&[] as &[SessionPickerEntry], 0),
+        ),
+        (
+            "  No providers available",
+            build_auth_selector(&[] as &[AuthSelectorEntry], 0),
+        ),
+        (
+            "  No entries found",
+            build_tree_selector(&[] as &[TreeEntry], 0),
+        ),
+        (
+            "  No settings available",
+            build_settings_selector(&[] as &[SettingsRow], 0),
+        ),
+        (
+            "  No resources found",
+            build_config_selector(&[] as &[ConfigSelectorEntry], 0),
+        ),
+    ];
+
+    for (expected, mut comp) in cases {
+        let buf = render_component(comp.as_mut(), 80);
+        let plain = snapshot_buffer_plain(&buf, 80, buf.area().height).join("\n");
+        assert!(
+            plain.contains(expected.trim()),
+            "expected `{expected}` in:\n{plain}"
+        );
+        assert!(
+            plain.contains(SELECTOR_EXIT_HINT.trim()) || plain.contains("Esc to cancel"),
+            "exit hint missing for `{expected}`:\n{plain}"
+        );
+        assert!(
+            !plain.contains("No matching commands"),
+            "generic fallback leaked for `{expected}`:\n{plain}"
+        );
+    }
+}
+
+
 // ---------------------------------------------------------------------------
 // Resize + theme fallback
 // ---------------------------------------------------------------------------

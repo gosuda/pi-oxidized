@@ -2384,7 +2384,10 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         self.install_confirm_selector(
             super::state::SelectorKind::ImportConfirm,
             &prompt,
-            Self::confirm_items(),
+            Self::confirm_items(
+                "Yes, replace current session",
+                "No, keep current session",
+            ),
         );
         ActionOutcome::Repaint
     }
@@ -2443,7 +2446,10 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 self.install_confirm_selector(
                     super::state::SelectorKind::ImportCwdConfirm,
                     &prompt,
-                    Self::confirm_items(),
+                    Self::confirm_items(
+                        "Yes, continue in current cwd",
+                        "No, cancel import",
+                    ),
                 );
             }
             Err(error) => {
@@ -2478,10 +2484,10 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     }
 
     /// Yes/No items for a built-in confirm selector (`"true"`/`"false"` values).
-    fn confirm_items() -> Vec<pi_tui::components::SelectItem> {
+    fn confirm_items(yes_label: &str, no_label: &str) -> Vec<pi_tui::components::SelectItem> {
         vec![
-            pi_tui::components::SelectItem::new("true", "Yes"),
-            pi_tui::components::SelectItem::new("false", "No"),
+            pi_tui::components::SelectItem::new("true", yes_label),
+            pi_tui::components::SelectItem::new("false", no_label),
         ]
     }
 
@@ -3201,10 +3207,13 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                     .into_iter()
                     .map(|value| SelectItem::new(value.clone(), value))
                     .collect();
-                let mut list = pi_tui::components::SelectList::new(
-                    items,
-                    super::selectors::SELECTOR_MAX_VISIBLE,
-                    super::theme::select_list_theme(),
+                let mut list = Self::apply_selector_copy(
+                    pi_tui::components::SelectList::new(
+                        items,
+                        super::selectors::SELECTOR_MAX_VISIBLE,
+                        super::theme::select_list_theme(),
+                    ),
+                    kind,
                 );
                 list.set_selected_index(0);
                 let select_tx = self.select_tx.clone();
@@ -3229,15 +3238,28 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         }
     }
 
+    fn apply_selector_copy(
+        list: pi_tui::components::SelectList,
+        kind: super::state::SelectorKind,
+    ) -> pi_tui::components::SelectList {
+        let copy = super::selectors::selector_empty_copy(kind);
+        list.with_empty_text(copy.empty)
+            .with_no_match_text(copy.no_match)
+            .with_hint(super::selectors::SELECTOR_EXIT_HINT)
+    }
+
     fn build_select_list(
         &self,
         kind: super::state::SelectorKind,
         items: Vec<pi_tui::components::SelectItem>,
     ) -> Box<dyn Component> {
-        let mut list = pi_tui::components::SelectList::new(
-            items,
-            super::selectors::SELECTOR_MAX_VISIBLE,
-            super::theme::select_list_theme(),
+        let mut list = Self::apply_selector_copy(
+            pi_tui::components::SelectList::new(
+                items,
+                super::selectors::SELECTOR_MAX_VISIBLE,
+                super::theme::select_list_theme(),
+            ),
+            kind,
         );
         list.set_selected_index(0);
         let select_tx = self.select_tx.clone();
@@ -3268,7 +3290,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
 
     fn build_settings_list(
         &self,
-        _kind: super::state::SelectorKind,
+        kind: super::state::SelectorKind,
         rows: Vec<super::state::SettingsRow>,
     ) -> Box<dyn Component> {
         let items = rows
@@ -3284,18 +3306,23 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             .collect();
         let change_tx = self.settings_change_tx.clone();
         let cancel_tx = self.cancel_tx.clone();
-        Box::new(pi_tui::components::SettingsList::new(
-            items,
-            super::selectors::SELECTOR_MAX_VISIBLE,
-            super::theme::settings_list_theme(),
-            move |id: &str, value: &str| {
-                let _ = change_tx.send((id.to_owned(), value.to_owned()));
-            },
-            move || {
-                let _ = cancel_tx.send(());
-            },
-            &pi_tui::components::SettingsListOptions::default(),
-        ))
+        let copy = super::selectors::selector_empty_copy(kind);
+        Box::new(
+            pi_tui::components::SettingsList::new(
+                items,
+                super::selectors::SELECTOR_MAX_VISIBLE,
+                super::theme::settings_list_theme(),
+                move |id: &str, value: &str| {
+                    let _ = change_tx.send((id.to_owned(), value.to_owned()));
+                },
+                move || {
+                    let _ = cancel_tx.send(());
+                },
+                &pi_tui::components::SettingsListOptions::default(),
+            )
+            .with_empty_text(copy.empty)
+            .with_no_match_text(copy.no_match),
+        )
     }
 
     fn build_extension_select_list(
@@ -3307,7 +3334,10 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             items,
             super::selectors::SELECTOR_MAX_VISIBLE,
             super::theme::select_list_theme(),
-        );
+        )
+        .with_empty_text(super::selectors::EXTENSION_EMPTY_COPY.empty)
+        .with_no_match_text(super::selectors::EXTENSION_EMPTY_COPY.no_match)
+        .with_hint(super::selectors::SELECTOR_EXIT_HINT);
         list.set_selected_index(0);
         let select_tx = self.extension_select_tx.clone();
         list.on_select = Some(Box::new(move |item| {
@@ -6827,6 +6857,7 @@ mod tests {
         fork_selected_text: Arc<std::sync::Mutex<Option<String>>>,
         reload_diagnostics: Arc<std::sync::Mutex<Vec<String>>>,
         extension_runner: Option<Arc<ExtensionRuntimeSet>>,
+        import_missing_cwd: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl FakeHost {
@@ -6847,6 +6878,7 @@ mod tests {
                 fork_selected_text: Arc::new(std::sync::Mutex::new(None)),
                 reload_diagnostics: Arc::new(std::sync::Mutex::new(Vec::new())),
                 extension_runner: None,
+                import_missing_cwd: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             };
             (host, log)
         }
@@ -6860,6 +6892,10 @@ mod tests {
                 .logout_options
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = options;
+        }
+
+        fn set_import_missing_cwd(&self, missing: bool) {
+            self.import_missing_cwd.store(missing, Ordering::SeqCst);
         }
 
         fn set_clone_nothing(&self, nothing: bool) {
@@ -7158,7 +7194,13 @@ mod tests {
         ) -> BoxFuture<'_, Result<bool, ImportError>> {
             let log = Arc::clone(&self.log);
             let owned = path.to_owned();
+            let missing = self.import_missing_cwd.load(Ordering::SeqCst);
             Box::pin(async move {
+                if missing {
+                    return Err(ImportError::MissingCwd {
+                        fallback_cwd: "/tmp/fallback".to_owned(),
+                    });
+                }
                 log.imports.lock().await.push(owned);
                 Ok(true)
             })
@@ -9784,6 +9826,96 @@ mod tests {
             rt.view.messages.last(),
             Some(MessageView::Custom(custom))
                 if custom.custom_type == "import" && custom.text.contains("Session imported from")
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn import_confirm_shows_consequence_labels_and_defaults_to_yes() -> TestResult {
+        let (mut rt, _log) = try_make_runtime()?;
+        let _ = rt
+            .submit_text("/import session.jsonl".to_owned(), false)
+            .await;
+        assert_eq!(rt.active_selector_kind, Some(SelectorKind::ImportConfirm));
+        let editor = std::mem::replace(&mut rt.editor, Editor::with_defaults());
+        let selector = rt.active_selector.take();
+        let mut root = rt.build_root(editor, selector);
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buffer = Buffer::empty(area);
+        root.render(area, &mut buffer);
+        let visible = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(
+            visible.contains("Yes, replace current session"),
+            "missing yes label: {visible}"
+        );
+        assert!(
+            visible.contains("No, keep current session"),
+            "missing no label: {visible}"
+        );
+        assert!(
+            visible.contains("→ Yes, replace current session")
+                || visible.contains("→Yes, replace current session"),
+            "default selection must remain Yes/true at index 0: {visible}"
+        );
+        assert!(visible.contains("esc to cancel"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn import_cwd_confirm_shows_consequence_labels_and_false_cancels() -> TestResult {
+        let (mut rt, log) = try_make_runtime()?;
+        rt.session.set_import_missing_cwd(true);
+        let _ = rt
+            .submit_text("/import session.jsonl".to_owned(), false)
+            .await;
+        // Accept replace confirm so run_import hits MissingCwd.
+        let _ = rt
+            .dispatch_action(ViewAction::SelectConfirmed {
+                selector: SelectorKind::ImportConfirm,
+                value: "true".to_owned(),
+            })
+            .await;
+        assert_eq!(rt.active_selector_kind, Some(SelectorKind::ImportCwdConfirm));
+        let mut sel = rt
+            .active_selector
+            .take()
+            .expect("cwd confirm selector");
+        let area = Rect::new(0, 0, 80, 12);
+        let mut buffer = Buffer::empty(area);
+        sel.render(area, &mut buffer);
+        let visible = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(
+            visible.contains("Yes, continue in current cwd"),
+            "missing yes label: {visible}"
+        );
+        assert!(
+            visible.contains("No, cancel import"),
+            "missing no label: {visible}"
+        );
+        assert!(
+            visible.contains("→ Yes, continue in current cwd")
+                || visible.contains("→Yes, continue in current cwd"),
+            "default selection must remain Yes/true at index 0: {visible}"
+        );
+        let _ = rt
+            .dispatch_action(ViewAction::SelectConfirmed {
+                selector: SelectorKind::ImportCwdConfirm,
+                value: "false".to_owned(),
+            })
+            .await;
+        assert!(log.imports.lock().await.is_empty());
+        assert!(matches!(
+            rt.view.messages.last(),
+            Some(MessageView::Custom(custom))
+                if custom.custom_type == "import" && custom.text.contains("Import cancelled")
         ));
         Ok(())
     }
