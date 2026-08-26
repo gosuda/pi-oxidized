@@ -2,7 +2,6 @@ import { describe, expect, test } from "bun:test";
 
 import {
 	CommandFailedError,
-	CommandOutputLimitError,
 	CommandTimeoutError,
 	OK_RUN,
 	PathTraversalError,
@@ -97,50 +96,6 @@ describe("SpawnRunner integration", () => {
 			expect(caught.command).toBe("sh");
 			expect(caught.timeoutMs).toBe(100);
 			expect(caught.stdout).toBe("started");
-		}
-		expect(Date.now() - started).toBeLessThan(5_000);
-	});
-
-	test("kills a child once combined output exceeds maxOutputBytes", async () => {
-		const runner = new SpawnRunner();
-		let caught: unknown;
-		try {
-			await runner.run(
-				"sh",
-				["-c", "while true; do printf 'xxxxxxxx'; done"],
-				{ maxOutputBytes: 64, rejectOnError: false },
-			);
-		} catch (err) {
-			caught = err;
-		}
-		expect(caught).toBeInstanceOf(CommandOutputLimitError);
-		if (caught instanceof CommandOutputLimitError) {
-			expect(caught.command).toBe("sh");
-			expect(caught.maxOutputBytes).toBe(64);
-			const retained = Buffer.byteLength(caught.stdout) + Buffer.byteLength(caught.stderr);
-			expect(retained).toBeLessThanOrEqual(64);
-			expect(retained).toBeGreaterThan(0);
-		}
-	});
-
-	test("SEC-005: retention ceiling throws without awaiting a detached pipe holder", async () => {
-		const runner = new SpawnRunner();
-		const started = Date.now();
-		let caught: unknown;
-		try {
-			// Fifo writer keeps the pipe open after the process is killed unless readers are destroyed.
-			await runner.run(
-				"sh",
-				["-c", "yes xxxxxxxxx | dd bs=1 status=none"],
-				{ maxOutputBytes: 32, rejectOnError: false },
-			);
-		} catch (err) {
-			caught = err;
-		}
-		expect(caught).toBeInstanceOf(CommandOutputLimitError);
-		if (caught instanceof CommandOutputLimitError) {
-			const retained = Buffer.byteLength(caught.stdout) + Buffer.byteLength(caught.stderr);
-			expect(retained).toBeLessThanOrEqual(32);
 		}
 		expect(Date.now() - started).toBeLessThan(5_000);
 	});

@@ -42,12 +42,6 @@ export interface RunOptions {
 	readonly rejectOnError?: boolean;
 	/** Positive deadline in milliseconds. On expiry the process tree is killed. */
 	readonly timeoutMs?: number;
-	/**
-	 * Hard combined retention ceiling for stdout+stderr. Retention stops at the
-	 * cap, readers are destroyed, the process tree is terminated, and the runner
-	 * throws without awaiting an escaped pipe holder.
-	 */
-	readonly maxOutputBytes?: number;
 }
 
 /**
@@ -74,31 +68,6 @@ export class CommandFailedError extends Error {
 		this.args = args;
 		this.exitCode = res.exitCode;
 		this.stderr = res.stderr;
-	}
-}
-
-/** Raised after combined stdout+stderr exceeds {@link RunOptions.maxOutputBytes}. */
-export class CommandOutputLimitError extends Error {
-	readonly command: string;
-	readonly args: readonly string[];
-	readonly maxOutputBytes: number;
-	readonly stdout: string;
-	readonly stderr: string;
-
-	constructor(
-		command: string,
-		args: readonly string[],
-		maxOutputBytes: number,
-		stdout: string,
-		stderr: string,
-	) {
-		super(`Command "${command}" exceeded maxOutputBytes=${maxOutputBytes}`);
-		this.name = "CommandOutputLimitError";
-		this.command = command;
-		this.args = args;
-		this.maxOutputBytes = maxOutputBytes;
-		this.stdout = stdout;
-		this.stderr = stderr;
 	}
 }
 
@@ -173,12 +142,6 @@ export class SpawnRunner implements CommandRunner {
 		) {
 			throw new RangeError(`timeoutMs must be positive, got ${options.timeoutMs}`);
 		}
-		if (
-			options.maxOutputBytes !== undefined &&
-			(!Number.isFinite(options.maxOutputBytes) || options.maxOutputBytes <= 0)
-		) {
-			throw new RangeError(`maxOutputBytes must be positive, got ${options.maxOutputBytes}`);
-		}
 		const env = options.env ? { ...process.env, ...options.env } : { ...process.env };
 		const child = spawn(command, [...args], {
 			cwd: options.cwd,
@@ -199,99 +162,28 @@ export class SpawnRunner implements CommandRunner {
 		// pipe while we are still reading the other cannot deadlock.
 		let stdout = "";
 		let stderr = "";
-		let retainedBytes = 0;
-		let outputLimited = false;
-		const limit = options.maxOutputBytes;
-		const limited = Promise.withResolvers<void>();
-		const timedOutGate = Promise.withResolvers<void>();
-		const destroyReaders = (): void => {
-			try { child.stdout?.destroy(); } catch { /* ignore */ }
-			try { child.stderr?.destroy(); } catch { /* ignore */ }
-		};
-		const tripLimit = (): void => {
-			if (outputLimited || limit === undefined) return;
-			outputLimited = true;
-			destroyReaders();
-			void terminateProcessTree(child);
-			limited.resolve();
-		};
-		const retainChunk = (target: "stdout" | "stderr", chunk: Buffer | string): void => {
-			if (outputLimited) return;
-			const raw = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk;
-			if (limit === undefined) {
-				const text = raw.toString("utf8");
-				if (target === "stdout") stdout += text;
-				else stderr += text;
-				retainedBytes += raw.byteLength;
-				return;
-			}
-			const remaining = limit - retainedBytes;
-			if (remaining <= 0) {
-				tripLimit();
-				return;
-			}
-			const keep = raw.subarray(0, Math.min(raw.byteLength, remaining));
-			const text = keep.toString("utf8");
-			if (target === "stdout") stdout += text;
-			else stderr += text;
-			retainedBytes += keep.byteLength;
-			if (raw.byteLength > keep.byteLength) tripLimit();
-		};
 		const drainStdout = (async () => {
 			if (!child.stdout) return;
-			try {
-				for await (const chunk of child.stdout) {
-					retainChunk("stdout", chunk);
-					if (outputLimited) return;
-				}
-			} catch {
-				// Reader may be destroyed at the retention ceiling.
-			}
+			for await (const chunk of child.stdout) stdout += chunk.toString("utf8");
 		})();
 		const drainStderr = (async () => {
 			if (!child.stderr) return;
-			try {
-				for await (const chunk of child.stderr) {
-					retainChunk("stderr", chunk);
-					if (outputLimited) return;
-				}
-			} catch {
-				// Reader may be destroyed at the retention ceiling.
-			}
+			for await (const chunk of child.stderr) stderr += chunk.toString("utf8");
 		})();
 		let timedOut = false;
 		const timeout = options.timeoutMs === undefined
 			? undefined
 			: setTimeout(() => {
 				timedOut = true;
-				destroyReaders();
 				void terminateProcessTree(child);
-				timedOutGate.resolve();
 			}, options.timeoutMs);
-		// Keep the timeout handle referenced so an otherwise-idle wait cannot drop it.
-		const winner = await Promise.race([
-			exit.promise.then((code) => ({ kind: "exit" as const, code })),
-			limited.promise.then(() => ({ kind: "limit" as const })),
-			timedOutGate.promise.then(() => ({ kind: "timeout" as const })),
-		]);
+		timeout?.unref();
+		const exitCode = await exit.promise;
 		if (timeout !== undefined) clearTimeout(timeout);
-		if (winner.kind === "limit" || outputLimited) {
-			if (limit === undefined) throw new Error("output limited without maxOutputBytes");
-			// Do not await drains/exit: an escaped pipe holder must not block throw.
-			void Promise.allSettled([drainStdout, drainStderr, exit.promise]);
-			if (retainedBytes > limit) {
-				throw new Error(`internal retention invariant broken: retained=${retainedBytes} > cap=${limit}`);
-			}
-			throw new CommandOutputLimitError(command, args, limit, stdout, stderr);
-		}
-		if (winner.kind === "timeout" || timedOut) {
-			await Promise.allSettled([drainStdout, drainStderr, exit.promise]);
-			if (options.timeoutMs !== undefined) {
-				throw new CommandTimeoutError(command, args, options.timeoutMs, stdout, stderr);
-			}
-		}
 		await Promise.all([drainStdout, drainStderr]);
-		const exitCode = winner.kind === "exit" ? winner.code : await exit.promise;
+		if (timedOut && options.timeoutMs !== undefined) {
+			throw new CommandTimeoutError(command, args, options.timeoutMs, stdout, stderr);
+		}
 		const result: RunResult = { exitCode, stdout, stderr };
 		if (options.rejectOnError && exitCode !== 0) {
 			throw new CommandFailedError(result, command, args);
