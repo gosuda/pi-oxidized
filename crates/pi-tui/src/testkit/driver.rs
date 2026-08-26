@@ -10,6 +10,10 @@ pub use super::transcript::{CapabilityProfile, DriverKind, Geometry};
 
 impl Geometry {
     /// Creates a geometry, rejecting zero dimensions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DriverError::InvalidSpec`] when either dimension is zero.
     pub fn new(cols: u16, rows: u16) -> Result<Self, DriverError> {
         if cols == 0 || rows == 0 {
             return Err(DriverError::InvalidSpec(
@@ -34,6 +38,10 @@ pub struct SettlePolicy {
 
 impl SettlePolicy {
     /// Builds a policy, requiring a non-zero ceiling not shorter than quiet.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DriverError::InvalidSpec`] when the ceiling is zero or shorter than quiet.
     pub fn new(quiet: Duration, ceiling: Duration) -> Result<Self, DriverError> {
         if ceiling == Duration::ZERO {
             return Err(DriverError::InvalidSpec(
@@ -75,6 +83,10 @@ pub struct LaunchSpec {
 
 impl LaunchSpec {
     /// Validates argv and geometry invariants before launch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DriverError::InvalidSpec`] when argv or geometry is invalid.
     pub fn validate(&self) -> Result<(), DriverError> {
         if self.argv.is_empty() {
             return Err(DriverError::InvalidSpec(
@@ -133,11 +145,13 @@ pub struct ExitStatus {
 
 impl ExitStatus {
     /// Returns true when the process exited with code 0 and no signal.
+    #[must_use]
     pub fn success(&self) -> bool {
         self.signal.is_none() && self.code == 0
     }
 
     /// Builds an exit status from a numeric code.
+    #[must_use]
     pub fn from_code(code: u32) -> Self {
         Self { code, signal: None }
     }
@@ -202,7 +216,8 @@ pub enum DriverError {
 
 impl DriverError {
     /// Converts a `portable-pty`/`anyhow` style error into [`DriverError::Pty`].
-    pub fn pty(error: impl ToString) -> Self {
+    #[must_use]
+    pub fn pty(error: &impl ToString) -> Self {
         Self::Pty(error.to_string())
     }
 }

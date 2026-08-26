@@ -24,6 +24,10 @@ pub struct QemuUserSmokeDriver {
 
 impl QemuUserSmokeDriver {
     /// Creates a driver with an explicit QEMU argv prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DriverError::InvalidSpec`] when the prefix lacks a non-empty binary.
     pub fn new(qemu_prefix: Vec<String>) -> Result<Self, DriverError> {
         if qemu_prefix.is_empty() || qemu_prefix[0].is_empty() {
             return Err(DriverError::InvalidSpec(
@@ -34,6 +38,7 @@ impl QemuUserSmokeDriver {
     }
 
     /// Returns the configured QEMU argv prefix.
+    #[must_use]
     pub fn qemu_prefix(&self) -> &[String] {
         &self.qemu_prefix
     }
@@ -107,19 +112,19 @@ impl QemuUserSmokeSession {
     }
 
     fn join_stderr(&mut self) -> Result<(), DriverError> {
-        if let Some(join) = self.stderr_join.take() {
-            if let Err(panic) = join.join() {
-                let msg = if let Some(s) = panic.downcast_ref::<&str>() {
-                    (*s).to_owned()
-                } else if let Some(s) = panic.downcast_ref::<String>() {
-                    s.clone()
-                } else {
-                    "unknown panic payload".to_owned()
-                };
-                return Err(DriverError::Io(std::io::Error::other(format!(
-                    "qemu stderr drain panicked: {msg}"
-                ))));
-            }
+        if let Some(join) = self.stderr_join.take()
+            && let Err(panic) = join.join()
+        {
+            let msg = if let Some(s) = panic.downcast_ref::<&str>() {
+                (*s).to_owned()
+            } else if let Some(s) = panic.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic payload".to_owned()
+            };
+            return Err(DriverError::Io(std::io::Error::other(format!(
+                "qemu stderr drain panicked: {msg}"
+            ))));
         }
         Ok(())
     }

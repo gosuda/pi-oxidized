@@ -8,6 +8,7 @@ pub use super::transcript::CapabilityProfile;
 
 impl CapabilityProfile {
     /// Stable profile name used in artifacts and tables.
+    #[must_use]
     pub fn name(self) -> &'static str {
         match self {
             Self::Xterm256ColorTruecolor => "xterm256-color-truecolor",
@@ -21,6 +22,7 @@ impl CapabilityProfile {
     }
 
     /// Looks up a profile by its stable name.
+    #[must_use]
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "xterm256-color-truecolor" => Some(Self::Xterm256ColorTruecolor),
@@ -35,11 +37,13 @@ impl CapabilityProfile {
     }
 
     /// Exhaustive profile table in declaration order.
+    #[must_use]
     pub fn all() -> &'static [Self] {
         &PROFILE_TABLE
     }
 
     /// Environment variables contributed by this profile.
+    #[must_use]
     pub fn env(self) -> BTreeMap<String, String> {
         let mut env = BTreeMap::new();
         match self {
@@ -47,7 +51,7 @@ impl CapabilityProfile {
                 env.insert("TERM".to_owned(), "xterm-256color".to_owned());
                 env.insert("COLORTERM".to_owned(), "truecolor".to_owned());
             }
-            Self::Xterm256Color | Self::TerminalApp => {
+            Self::Xterm256Color | Self::TerminalApp | Self::ConhostVtDec2026Fallback => {
                 env.insert("TERM".to_owned(), "xterm-256color".to_owned());
             }
             Self::Dumb => {
@@ -63,14 +67,12 @@ impl CapabilityProfile {
                 env.insert("COLORTERM".to_owned(), "truecolor".to_owned());
                 env.insert("WT_SESSION".to_owned(), "testkit".to_owned());
             }
-            Self::ConhostVtDec2026Fallback => {
-                env.insert("TERM".to_owned(), "xterm-256color".to_owned());
-            }
         }
         env
     }
 
     /// Pinned probe-reply bytes written immediately after PTY spawn.
+    #[must_use]
     pub fn probe_reply(self) -> &'static [u8] {
         match self {
             // Deny synchronized-output / DEC 2026 style probes; keep DA/cursor replies.
@@ -83,11 +85,13 @@ impl CapabilityProfile {
     }
 
     /// Whether this profile expects synchronized-output wrapping support.
+    #[must_use]
     pub fn expects_synchronized_output(self) -> bool {
         !matches!(self, Self::Dumb | Self::ConhostVtDec2026Fallback)
     }
 
     /// Preferred driver kind for this profile on the current host.
+    #[must_use]
     pub fn preferred_driver_kind(self) -> DriverKind {
         match self {
             Self::WindowsTerminalVt | Self::ConhostVtDec2026Fallback => DriverKind::ConPty,

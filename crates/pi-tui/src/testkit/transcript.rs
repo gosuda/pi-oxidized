@@ -1,3 +1,5 @@
+//! Schema-v1 transcript types, canonical encoding, and recorder normalization.
+
 use std::collections::BTreeSet;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -22,18 +24,31 @@ pub const NORMALIZATION_TABLE_V1: &[NormalizationKind] = &[
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Scenario {
+    /// Exercises stream settling against the deterministic fixture.
     FixtureStreamSettle,
+    /// Exercises ordered resize behavior against the deterministic fixture.
     FixtureResizeLadder,
+    /// Exercises resize coalescing against the deterministic fixture.
     FixtureResizeStorm,
+    /// Exercises paste and cursor reporting against the deterministic fixture.
     FixturePasteCursor,
+    /// Captures product startup before interactive input.
     ColdStart,
+    /// Captures the first-run configuration flow.
     Wizard,
+    /// Captures project trust selection.
     TrustSelector,
+    /// Captures the project trust confirmation dialog.
     TrustDialog,
+    /// Captures incremental model output.
     Streaming,
+    /// Captures interactive selection controls.
     Selectors,
+    /// Captures layered product surfaces.
     Overlays,
+    /// Captures product behavior across ordered resizes.
     ProductResizeLadder,
+    /// Captures product behavior while resizes are coalesced.
     ProductResizeStorm,
 }
 
@@ -41,7 +56,9 @@ pub enum Scenario {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RowTier {
+    /// Evidence produced directly on a supported host.
     Local,
+    /// Evidence produced on a pinned CI runner image.
     TierN,
 }
 
@@ -49,10 +66,15 @@ pub enum RowTier {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RowId {
+    /// GNU/Linux on x86-64.
     GnuX64,
+    /// GNU/Linux on `AArch64`.
     GnuArm64,
+    /// macOS on x86-64.
     DarwinX64,
+    /// macOS on Apple silicon.
     DarwinArm64,
+    /// Windows on x86-64.
     WindowsX64,
 }
 
@@ -60,9 +82,12 @@ pub enum RowId {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DriverKind {
+    /// Records through a POSIX pseudoterminal.
     PosixPty,
+    /// Records through the Windows pseudoconsole API.
     #[serde(rename = "conpty")]
     ConPty,
+    /// Records execution-only contingency evidence through QEMU user mode.
     QemuUserSmoke,
 }
 
@@ -70,7 +95,9 @@ pub enum DriverKind {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TranscriptMode {
+    /// Primary evidence captured by a native terminal driver.
     Standard,
+    /// Reduced evidence captured when a native runner is unavailable.
     Contingency,
 }
 
@@ -78,12 +105,19 @@ pub enum TranscriptMode {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ClaimClass {
+    /// The child launched and completed with the recorded status.
     Execution,
+    /// The child exchanged the recorded terminal protocol bytes.
     Protocol,
+    /// The exchange occurred through a pseudoterminal.
     Pty,
+    /// The artifact includes renderer-derived evidence.
     Render,
+    /// Output used synchronized-update semantics.
     SynchronizedOutput,
+    /// Rendering avoided destructive screen clears.
     NoClear,
+    /// The artifact includes a settled visible-frame snapshot.
     Snapshot,
 }
 
@@ -91,12 +125,19 @@ pub enum ClaimClass {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CapabilityProfile {
+    /// xterm-256color with true-color capability advertised.
     Xterm256ColorTruecolor,
+    /// Baseline xterm-256color capabilities.
     Xterm256Color,
+    /// Minimal terminal without interactive capabilities.
     Dumb,
+    /// macOS Terminal-compatible capabilities.
     TerminalApp,
+    /// iTerm2-compatible capabilities.
     Iterm2,
+    /// Windows Terminal-compatible VT capabilities.
     WindowsTerminalVt,
+    /// Conhost profile that denies DEC synchronized-output support.
     ConhostVtDec2026Fallback,
 }
 
@@ -104,12 +145,19 @@ pub enum CapabilityProfile {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum EventKind {
+    /// Child process launch boundary.
     Spawn,
+    /// Bytes sent to the child.
     Input,
+    /// Bytes observed from the child.
     Output,
+    /// Settled visible-frame observation.
     Snapshot,
+    /// Single terminal resize.
     Resize,
+    /// Coalesced terminal resize sequence.
     ResizeStorm,
+    /// Child process termination boundary.
     Exit,
 }
 
@@ -117,12 +165,19 @@ pub enum EventKind {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum NormalizationKind {
+    /// Replaces the runner's home directory with a stable token.
     PathHome,
+    /// Replaces the runner's working directory with a stable token.
     PathCwd,
+    /// Replaces ISO-8601 timestamps with a stable token.
     TimeIso8601,
+    /// Replaces relative duration text with a stable token.
     TimeRelative,
+    /// Replaces session UUIDs with a stable token.
     IdSession,
+    /// Removes insignificant trailing snapshot spaces.
     SnapshotTrailingSpaceTrim,
+    /// Retains only the terminal size observable after a resize storm.
     ResizeCollapse,
 }
 
@@ -130,8 +185,11 @@ pub enum NormalizationKind {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct RunnerRow {
+    /// Determines whether native or pinned-runner evidence rules apply.
     pub tier: RowTier,
+    /// Selects the platform contract used to validate the driver pairing.
     pub id: RowId,
+    /// Pins the CI environment for tier-N evidence.
     pub runner_image: Option<String>,
 }
 
@@ -139,7 +197,9 @@ pub struct RunnerRow {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Geometry {
+    /// Visible terminal width in character cells.
     pub cols: u16,
+    /// Visible terminal height in character cells.
     pub rows: u16,
 }
 
@@ -147,6 +207,7 @@ pub struct Geometry {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct DriverDescriptor {
+    /// Identifies which transport semantics constrain the artifact.
     pub kind: DriverKind,
 }
 
@@ -154,13 +215,16 @@ pub struct DriverDescriptor {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct NormalizationEntry {
+    /// Names the pinned transform needed to reproduce canonical bytes.
     pub kind: NormalizationKind,
 }
 
 /// Runtime values required by path normalizers. This never enters canonical content.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct NormalizationContext {
+    /// Raw home-directory bytes replaced by [`NormalizationKind::PathHome`].
     pub home: Option<Vec<u8>>,
+    /// Raw working-directory bytes replaced by [`NormalizationKind::PathCwd`].
     pub cwd: Option<Vec<u8>>,
 }
 
@@ -168,37 +232,63 @@ pub struct NormalizationContext {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum CanonicalEvent {
+    /// Records the normalized command line at process launch.
     Spawn {
+        /// Monotonic event position within the transcript.
         seq: u32,
+        /// Normalized argument vector, including the program at index zero.
         argv: Vec<String>,
     },
+    /// Records one input boundary.
     Input {
+        /// Monotonic event position within the transcript.
         seq: u32,
+        /// Exact input bytes encoded as standard base64.
         bytes_b64: String,
     },
+    /// Records normalized output for one input boundary.
     Output {
+        /// Monotonic event position within the transcript.
         seq: u32,
+        /// Canonical output bytes encoded as standard base64.
         bytes_b64: String,
     },
+    /// Records the visible frame after output reaches quiescence.
     Snapshot {
+        /// Monotonic event position within the transcript.
         seq: u32,
+        /// Width used to derive the frame.
         cols: u16,
+        /// Height used to derive the frame.
         rows: u16,
+        /// Zero-based cursor column and row.
         cursor: [u16; 2],
+        /// Visible lines after pinned snapshot normalization.
         lines: Vec<String>,
     },
+    /// Records one observable terminal-size transition.
     Resize {
+        /// Monotonic event position within the transcript.
         seq: u32,
+        /// Width after the transition.
         cols: u16,
+        /// Height after the transition.
         rows: u16,
     },
+    /// Records the final observable size from a burst of resizes.
     ResizeStorm {
+        /// Monotonic event position within the transcript.
         seq: u32,
+        /// Canonicalized size sequence, normally containing only the final size.
         sizes: Vec<Geometry>,
     },
+    /// Records the child termination boundary.
     Exit {
+        /// Monotonic event position within the transcript.
         seq: u32,
+        /// Numeric child exit code when the platform supplied one.
         code: Option<i32>,
+        /// Cross-platform success classification.
         success: bool,
     },
 }
@@ -237,7 +327,9 @@ impl CanonicalEvent {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct CanonicalDoc {
+    /// Ordered canonical events, starting at sequence zero.
     pub events: Vec<CanonicalEvent>,
+    /// Distinct normalizations applied while building those events.
     pub normalizations: Vec<NormalizationEntry>,
 }
 
@@ -245,8 +337,11 @@ pub struct CanonicalDoc {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ChunkTiming {
+    /// Canonical output event this chunk contributed to.
     pub event_seq: u32,
+    /// Observed byte count before normalization.
     pub byte_len: u64,
+    /// Milliseconds since the preceding chunk or boundary.
     pub delta_ms: u64,
 }
 
@@ -254,7 +349,9 @@ pub struct ChunkTiming {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct AbortCeiling {
+    /// Configured settle deadline in milliseconds.
     pub ceiling_ms: u64,
+    /// Elapsed milliseconds when the deadline fired.
     pub observed_ms: u64,
 }
 
@@ -262,7 +359,9 @@ pub struct AbortCeiling {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct NormalizationAuditContext {
+    /// Base64 home path used for re-deriving the audited output.
     pub home_b64: Option<String>,
+    /// Base64 working directory used for re-deriving the audited output.
     pub cwd_b64: Option<String>,
 }
 
@@ -270,9 +369,13 @@ pub struct NormalizationAuditContext {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct OutputAudit {
+    /// Canonical output sequence this raw evidence reconstructs.
     pub event_seq: u32,
+    /// Unnormalized observed bytes encoded as standard base64.
     pub raw_bytes_b64: String,
+    /// Exact path context needed to reproduce the normalization.
     pub context: NormalizationAuditContext,
+    /// Normalizations applied while producing the canonical output.
     pub applied: Vec<NormalizationEntry>,
 }
 
@@ -280,11 +383,17 @@ pub struct OutputAudit {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct TimingEnvelope {
+    /// End-to-end wall time for the recording, outside the digest.
     pub wall_ms: u64,
+    /// Per-chunk timing observations excluded from canonical bytes.
     pub chunk_log: Vec<ChunkTiming>,
+    /// Quiet-window durations that completed successfully.
     pub settle_windows_ms: Vec<u64>,
+    /// Present only when a settle attempt hit its hard ceiling.
     pub abort_ceiling: Option<AbortCeiling>,
+    /// Concatenated raw PTY/stdio log encoded as standard base64.
     pub raw_log_b64: String,
+    /// Raw-to-canonical reconstruction evidence for every output event.
     pub output_audits: Vec<OutputAudit>,
 }
 
@@ -292,16 +401,27 @@ pub struct TimingEnvelope {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct TranscriptArtifact {
+    /// Must equal [`SCHEMA_ID`] for validators to accept the artifact.
     pub schema: String,
+    /// Scenario this recording was produced for.
     pub scenario: Scenario,
+    /// Runner metadata excluded from the canonical digest.
     pub row: RunnerRow,
+    /// Initial terminal geometry for the recording.
     pub geometry: Geometry,
+    /// Capability profile that shaped env and probe replies.
     pub capability_profile: CapabilityProfile,
+    /// Transport that captured the recording.
     pub driver: DriverDescriptor,
+    /// Whether this is primary or contingency evidence.
     pub mode: TranscriptMode,
+    /// Behaviors the recording is allowed to assert.
     pub claims: Vec<ClaimClass>,
+    /// Digested event document.
     pub canonical: CanonicalDoc,
+    /// SHA-256 digest over the canonical encoding.
     pub digest: String,
+    /// Non-canonical timing and audit envelope.
     pub timing: TimingEnvelope,
 }
 
@@ -322,13 +442,19 @@ struct CanonicalDigestInput<'a> {
 /// Serialization or construction failure.
 #[derive(Debug, thiserror::Error)]
 pub enum TranscriptError {
+    /// Canonical encoding failed while building digest input.
     #[error("canonical JSON serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
+    /// More than `u32::MAX` events were appended to one recorder.
     #[error("event sequence overflowed u32")]
     SequenceOverflow,
 }
 
 /// Produces compact deterministic JSON for exactly the digested fields.
+///
+/// # Errors
+///
+/// Returns [`TranscriptError::Serialization`] when the digest input cannot be encoded.
 pub fn encode_canonical(artifact: &TranscriptArtifact) -> Result<Vec<u8>, TranscriptError> {
     let input = CanonicalDigestInput {
         schema: &artifact.schema,
@@ -345,6 +471,10 @@ pub fn encode_canonical(artifact: &TranscriptArtifact) -> Result<Vec<u8>, Transc
 }
 
 /// Computes the schema-v1 SHA-256 digest over canonical encoding.
+///
+/// # Errors
+///
+/// Returns [`TranscriptError::Serialization`] when canonical encoding fails.
 pub fn digest_canonical(artifact: &TranscriptArtifact) -> Result<String, TranscriptError> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let digest = Sha256::digest(encode_canonical(artifact)?);
@@ -360,7 +490,9 @@ pub fn digest_canonical(artifact: &TranscriptArtifact) -> Result<String, Transcr
 /// Result of applying byte-level schema-v1 normalization.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NormalizedBytes {
+    /// Bytes after applying every triggered schema-v1 transform.
     pub bytes: Vec<u8>,
+    /// Distinct transforms that changed the input.
     pub applied: Vec<NormalizationEntry>,
 }
 
@@ -473,7 +605,7 @@ pub(crate) fn detected_volatile_kinds(raw: &[u8]) -> BTreeSet<NormalizationKind>
 fn has_user_home_path(raw: &[u8]) -> bool {
     find_subslice(raw, b"/home/").is_some()
         || find_subslice(raw, b"/Users/").is_some()
-        || find_subslice(raw, br#"\Users\"#).is_some()
+        || find_subslice(raw, br"\Users\").is_some()
 }
 
 fn normalize_text(text: &str, context: &NormalizationContext) -> (String, Vec<NormalizationEntry>) {
@@ -576,13 +708,21 @@ pub struct TranscriptRecorder {
 /// Named construction inputs for [`TranscriptRecorder`].
 #[derive(Clone, Debug)]
 pub struct TranscriptSpec {
+    /// Scenario identity stamped onto the finished artifact.
     pub scenario: Scenario,
+    /// Runner identity excluded from the digest.
     pub row: RunnerRow,
+    /// Initial geometry recorded before any resize events.
     pub geometry: Geometry,
+    /// Capability profile stamped onto the finished artifact.
     pub capability_profile: CapabilityProfile,
+    /// Transport used for capture; also constrains allowed claims.
     pub driver_kind: DriverKind,
+    /// Requested evidence mode; QEMU forces contingency.
     pub mode: TranscriptMode,
+    /// Requested claims; QEMU narrows them to the allowed set.
     pub claims: Vec<ClaimClass>,
+    /// Initial non-canonical timing envelope.
     pub timing: TimingEnvelope,
 }
 
@@ -625,6 +765,11 @@ impl TranscriptRecorder {
         }
     }
 
+    /// Records the spawn boundary after normalizing argv path tokens.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TranscriptError::SequenceOverflow`] when the event sequence is exhausted.
     pub fn spawn(
         &mut self,
         argv: Vec<String>,
@@ -644,6 +789,11 @@ impl TranscriptRecorder {
         Ok(())
     }
 
+    /// Records one input boundary with exact base64 payload bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TranscriptError::SequenceOverflow`] when the event sequence is exhausted.
     pub fn input(&mut self, bytes: &[u8]) -> Result<(), TranscriptError> {
         let seq = self.take_seq()?;
         self.artifact.canonical.events.push(CanonicalEvent::Input {
@@ -654,6 +804,10 @@ impl TranscriptRecorder {
     }
 
     /// Normalizes and merges output since the preceding input boundary into one event.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TranscriptError::SequenceOverflow`] when the event sequence is exhausted.
     pub fn output(
         &mut self,
         chunks: &[&[u8]],
@@ -685,6 +839,10 @@ impl TranscriptRecorder {
     }
 
     /// Records a settled snapshot. QEMU recorders cannot add render events.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TranscriptError::SequenceOverflow`] when the event sequence is exhausted.
     pub fn snapshot(
         &mut self,
         cols: u16,
@@ -702,7 +860,7 @@ impl TranscriptRecorder {
             let (mut value, applied) = normalize_text(&line, context);
             self.applied.extend(applied);
             let len = value.len();
-            value = value.trim_end_matches(' ').to_owned();
+            value.truncate(value.trim_end_matches(' ').len());
             trimmed |= len != value.len();
             normalized_lines.push(value);
         }
@@ -725,6 +883,11 @@ impl TranscriptRecorder {
         Ok(true)
     }
 
+    /// Records one resize. Returns `false` without appending for QEMU recorders.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TranscriptError::SequenceOverflow`] when the event sequence is exhausted.
     pub fn resize(&mut self, cols: u16, rows: u16) -> Result<bool, TranscriptError> {
         if self.artifact.driver.kind == DriverKind::QemuUserSmoke {
             return Ok(false);
@@ -737,7 +900,12 @@ impl TranscriptRecorder {
         Ok(true)
     }
 
-    pub fn resize_storm(&mut self, sizes: Vec<Geometry>) -> Result<bool, TranscriptError> {
+    /// Records a resize storm, collapsing intermediate sizes when present.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TranscriptError::SequenceOverflow`] when the event sequence is exhausted.
+    pub fn resize_storm(&mut self, sizes: &[Geometry]) -> Result<bool, TranscriptError> {
         if self.artifact.driver.kind == DriverKind::QemuUserSmoke {
             return Ok(false);
         }
@@ -758,6 +926,11 @@ impl TranscriptRecorder {
         Ok(true)
     }
 
+    /// Records the exit boundary for the child process.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TranscriptError::SequenceOverflow`] when the event sequence is exhausted.
     pub fn exit(&mut self, code: Option<i32>, success: bool) -> Result<(), TranscriptError> {
         let seq = self.take_seq()?;
         self.artifact
@@ -768,6 +941,10 @@ impl TranscriptRecorder {
     }
 
     /// Finalizes normalization metadata, raw audit bytes, and digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TranscriptError::Serialization`] when the final digest cannot be encoded.
     pub fn finish(mut self) -> Result<TranscriptArtifact, TranscriptError> {
         self.artifact.claims = {
             let claims: BTreeSet<_> = self.artifact.claims.into_iter().collect();

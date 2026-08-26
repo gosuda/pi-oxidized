@@ -35,7 +35,7 @@ impl TerminalDriver for ConPtyDriver {
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .map_err(DriverError::pty)?;
+            .map_err(|err| DriverError::pty(&err))?;
 
         let mut argv = Vec::with_capacity(spec.argv.len());
         for arg in &spec.argv {
@@ -45,11 +45,11 @@ impl TerminalDriver for ConPtyDriver {
         cmd.cwd(&spec.cwd);
         apply_env(&mut cmd, spec);
 
-        let child = pair.slave.spawn_command(cmd).map_err(DriverError::pty)?;
+        let child = pair.slave.spawn_command(cmd).map_err(|err| DriverError::pty(&err))?;
         drop(pair.slave);
 
-        let mut writer = pair.master.take_writer().map_err(DriverError::pty)?;
-        let reader = pair.master.try_clone_reader().map_err(DriverError::pty)?;
+        let mut writer = pair.master.take_writer().map_err(|err| DriverError::pty(&err))?;
+        let reader = pair.master.try_clone_reader().map_err(|err| DriverError::pty(&err))?;
 
         let probe = spec.profile.probe_reply();
         if !probe.is_empty() {
@@ -131,7 +131,7 @@ impl RenderSession for ConPtySession {
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .map_err(DriverError::pty)?;
+            .map_err(|err| DriverError::pty(&err))?;
         self.geometry = geometry;
         Ok(())
     }

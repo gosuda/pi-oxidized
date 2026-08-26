@@ -7,8 +7,11 @@ pub mod driver;
 pub mod profile;
 pub mod session;
 
+/// Deterministic k-run comparison for transcript producers.
 pub mod repeat;
+/// Schema-v1 transcript types, canonical encoding, and recorder normalization.
 pub mod transcript;
+/// Schema-v1 transcript artifact validation and evidence rules.
 pub mod validate;
 
 #[cfg(windows)]

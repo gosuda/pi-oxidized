@@ -1,3 +1,5 @@
+//! Deterministic k-run comparison for transcript producers.
+
 use std::fmt;
 
 use super::transcript::{TranscriptArtifact, digest_canonical, encode_canonical};
@@ -7,19 +9,33 @@ use super::validate::validate_artifact;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RepeatError {
     /// `run_k` requires at least three repetitions.
-    KTooSmall { k: usize },
+    KTooSmall {
+        /// Requested repetition count that was rejected.
+        k: usize,
+    },
     /// Canonical bytes or digests diverged across repetitions.
     Divergence {
+        /// First event sequence where two repetitions disagreed.
         first_divergent_seq: u32,
+        /// Digest observed from the baseline repetition.
         left_digest: String,
+        /// Digest observed from the diverging repetition.
         right_digest: String,
     },
     /// Producer failed for a specific repetition.
-    Producer { iteration: usize, message: String },
+    Producer {
+        /// Zero-based repetition that failed.
+        iteration: usize,
+        /// Display text from the producer error.
+        message: String,
+    },
     /// Stored digest did not match the recomputed canonical digest.
     DigestMismatch {
+        /// Zero-based repetition whose stored digest failed.
         iteration: usize,
+        /// Digest embedded in the produced artifact.
         stored: String,
+        /// Digest recomputed from canonical encoding.
         computed: String,
     },
 }
@@ -59,13 +75,21 @@ impl std::error::Error for RepeatError {}
 /// Successful k-run comparison result.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RepeatReport {
+    /// Number of identical repetitions that succeeded.
     pub k: usize,
+    /// Shared digest across every successful repetition.
     pub digest: String,
+    /// Shared canonical encoding bytes across every successful repetition.
     pub canonical_bytes: Vec<u8>,
 }
 
 /// Runs `producer` exactly `k` times (`k >= 3`) and requires byte-identical
 /// canonical encodings and equal digests. Returns the first divergent sequence.
+///
+/// # Errors
+///
+/// Returns [`RepeatError`] when `k` is too small, a producer fails, digests
+/// disagree with stored values, or canonical bytes diverge across runs.
 pub fn run_k<F, E>(k: usize, mut producer: F) -> Result<RepeatReport, RepeatError>
 where
     F: FnMut(usize) -> Result<TranscriptArtifact, E>,

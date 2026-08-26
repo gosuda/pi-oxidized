@@ -1,3 +1,5 @@
+//! Schema-v1 transcript artifact validation and evidence rules.
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -49,56 +51,95 @@ const CANONICAL_LIKE_FIELDS: &[&str] = &[
 /// Validation failure for a schema-v1 transcript artifact.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum ValidatorError {
+    /// Top-level JSON could not be parsed into a value or artifact.
     #[error("JSON parse failed: {0}")]
     Parse(String),
+    /// A field outside the closed schema-v1 shape was present.
     #[error("unknown field: {0}")]
     UnknownField(String),
+    /// The artifact declared a schema id other than [`super::transcript::SCHEMA_ID`].
     #[error("wrong schema id: {0}")]
     WrongSchema(String),
+    /// Canonical event sequences were not contiguous starting at zero.
     #[error("event sequence gap or disorder at index {0}")]
     SequenceGapOrOrder(usize),
+    /// A valid artifact must begin with spawn and end with exit.
     #[error("missing spawn or exit boundary events")]
     MissingSpawnOrExit,
+    /// Stored digest did not match a fresh canonical digest.
     #[error("digest mismatch")]
     DigestMismatch,
+    /// Timing-only data leaked into the digested canonical document.
     #[error("timing-like field present in canonical content: {0}")]
     TimingLikeCanonicalField(String),
+    /// Canonical-only data leaked into the non-digested timing envelope.
     #[error("canonical-like field present in timing envelope: {0}")]
     CanonicalLikeTimingField(String),
+    /// Raw output contained volatility that was never enumerated as applied.
     #[error("detected volatile data without enumerated normalization: {0:?}")]
     UnenumeratedVolatile(NormalizationKind),
+    /// Tier-N evidence requires an explicit pinned runner image.
     #[error("tier-n artifact is missing runnerImage")]
     TierNMissingRunnerImage,
+    /// QEMU smoke recordings are contingency evidence only.
     #[error("qemu-user-smoke artifacts must use contingency mode")]
     QemuNonContingencyMode,
+    /// QEMU smoke may claim only Execution and Protocol.
     #[error("qemu-user-smoke claim outside Execution/Protocol: {0:?}")]
     QemuClaimOutsideAllowed(ClaimClass),
+    /// QEMU smoke cannot assert renderer or snapshot evidence.
     #[error("qemu-user-smoke artifact must not include snapshot or render evidence")]
     QemuSnapshotOrRenderClaim,
+    /// Applied normalization is outside the pinned schema-v1 table.
     #[error("normalization entry is outside NORMALIZATION_TABLE_V1: {0:?}")]
     UnknownNormalization(NormalizationKind),
+    /// Every canonical output event needs matching raw-audit evidence.
     #[error("missing output audit for seq {0}")]
     MissingOutputAudit(u32),
+    /// Output audits must be unique per canonical output sequence.
     #[error("duplicate output audit for seq {0}")]
     DuplicateOutputAudit(u32),
+    /// An audit referenced an output sequence that does not exist.
     #[error("extra output audit for seq {0}")]
     ExtraOutputAudit(u32),
+    /// Re-normalizing audit bytes did not reproduce the canonical output.
     #[error("output audit mismatch for seq {0}")]
     OutputAuditMismatch(u32),
+    /// Geometry must be non-zero in both dimensions.
     #[error("geometry has zero cols or rows: {cols}x{rows}")]
-    ZeroGeometry { cols: u16, rows: u16 },
+    ZeroGeometry {
+        /// Observed column count.
+        cols: u16,
+        /// Observed row count.
+        rows: u16,
+    },
+    /// QEMU smoke is incompatible with tier-N runner rows.
     #[error("qemu-user-smoke artifacts cannot use tier-n rows")]
     QemuTierN,
+    /// Driver kind does not match the platform row contract.
     #[error("driver/row pairing mismatch: row={row:?} driver={driver:?}")]
-    DriverRowMismatch { row: RowId, driver: DriverKind },
+    DriverRowMismatch {
+        /// Runner row recorded in the artifact.
+        row: RowId,
+        /// Driver kind recorded in the artifact.
+        driver: DriverKind,
+    },
 }
 
 /// Validates a typed schema-v1 artifact.
+///
+/// # Errors
+///
+/// Returns the first [`ValidatorError`] raised by the schema-v1 rule set.
 pub fn validate_artifact(artifact: &TranscriptArtifact) -> Result<(), ValidatorError> {
     validate_rules(artifact)
 }
 
 /// Parses JSON bytes and validates the resulting artifact.
+///
+/// # Errors
+///
+/// Returns parse, unknown-field, or schema-rule failures.
 pub fn validate_bytes(bytes: &[u8]) -> Result<TranscriptArtifact, ValidatorError> {
     let value: Value = serde_json::from_slice(bytes).map_err(|error| {
         let message = error.to_string();
@@ -112,6 +153,10 @@ pub fn validate_bytes(bytes: &[u8]) -> Result<TranscriptArtifact, ValidatorError
 }
 
 /// Validates a JSON value, including cross-contamination field checks.
+///
+/// # Errors
+///
+/// Returns cross-contamination, parse, or schema-rule failures.
 pub fn validate_value(value: &Value) -> Result<TranscriptArtifact, ValidatorError> {
     reject_cross_contamination(value)?;
     let artifact: TranscriptArtifact = serde_json::from_value(value.clone()).map_err(|error| {
