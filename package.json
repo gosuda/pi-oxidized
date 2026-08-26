@@ -21,6 +21,7 @@
 		"verify:performance": "bun run scripts/verification/performance.ts",
 		"verify:style-ledger": "bun run scripts/verification/style-ledger.ts",
 		"verify:syntect-ignores": "bun run scripts/verification/syntect-ignores.ts",
+		"verify:dependencies": "bun run scripts/verification/dependency-exposure.ts",
 		"verify:extension-scaling": "bun run scripts/bench-extension-scaling.ts"
 	},
 	"devDependencies": {
