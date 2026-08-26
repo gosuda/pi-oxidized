@@ -2798,6 +2798,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "pi-bench-alloc"
+version = "0.1.0"
+
+[[package]]
 name = "pi-ext"
 version = "0.1.0"
 dependencies = [
@@ -2827,6 +2831,7 @@ dependencies = [
  "futures",
  "insta",
  "nix 0.31.3",
+ "pi-bench-alloc",
  "portable-pty",
  "proptest",
  "pulldown-cmark",
