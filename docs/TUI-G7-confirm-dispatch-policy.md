@@ -4,9 +4,10 @@
 - **Decision type:** recorded policy decision, not implementation
 - **Status:** APPROVED (pins settled by ReviewTuiG7Policy)
 - **Measurement:** TUI-V2 measures landed dispatch semantics after execution
-- **Implementation:** scoped to separate ticket `TUI-G7-IMPL` (not published or complete here)
+- **Implementation:** [#146][issue-146] (`TUI-G7-IMPL`), not complete here
 
 [issue-61]: https://github.com/metaphorics/pi-oxidized/issues/61
+[issue-146]: https://github.com/metaphorics/pi-oxidized/issues/146
 
 ## 1. Scope, authority, and parity doctrine
 
@@ -65,7 +66,7 @@ Closing a selector or overlay is mutually exclusive by construction (`close_sele
 
 ## 7. Implementation specification: TUI-G7-IMPL
 
-Implementation is deferred to standalone execution ticket `TUI-G7-IMPL`.
+Implementation is assigned to standalone execution ticket [#146][issue-146] (`TUI-G7-IMPL`).
 
 ### Owned files
 - `crates/pi-tui/src/components/editor/mod.rs`
