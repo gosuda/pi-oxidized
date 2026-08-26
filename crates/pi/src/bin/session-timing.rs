@@ -158,7 +158,11 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
 }
 
 fn run(args: &[String]) -> Result<ExitCode, String> {
-    let config = parse_args(args)?;
+    let config = match parse_args(args) {
+        Ok(c) => c,
+        Err(e) if e == "__help__" => return Ok(ExitCode::from(0)),
+        Err(e) => return Err(e),
+    };
 
     let mut results = Vec::new();
 
@@ -322,19 +326,10 @@ fn append_entries(path: &PathBuf, count: usize) -> Result<(), String> {
 
     for i in 0..count {
         let text = format!("message-{i:06}");
-        let msg = if i % 2 == 0 {
-            AgentMessage::Llm(Box::new(Message::User(UserMessage::new(
-                UserMessageContent::Text(text),
-                0,
-            ))))
-        } else {
-            // Append a simple assistant-like message via custom entry to avoid
-            // needing a full AssistantMessage construction.
-            AgentMessage::Llm(Box::new(Message::User(UserMessage::new(
-                UserMessageContent::Text(text),
-                0,
-            ))))
-        };
+        let msg = AgentMessage::Llm(Box::new(Message::User(UserMessage::new(
+            UserMessageContent::Text(text),
+            0,
+        ))));
         sm.append_message(&msg)
             .map_err(|e| format!("append message {i}: {e}"))?;
     }
@@ -365,7 +360,7 @@ fn sha256_prefix(path: &PathBuf) -> Result<String, String> {
 
     use sha2::{Digest, Sha256};
     let hash = Sha256::digest(&buf);
-    Ok(hex_encode(&hash[..16]))
+    Ok(hex_encode(&hash[..8]))
 }
 
 fn hex_encode(bytes: &[u8]) -> String {

@@ -106,9 +106,9 @@ function peakRssBytes(): number {
 	return 0;
 }
 
-function sha256Prefix(path: string): string {
+export function sha256Prefix(path: string): string {
 	const content = readFileSync(path);
-	return createHash("sha256").digest(content).digest("hex").slice(0, SHA256_PREFIX_LENGTH);
+	return createHash("sha256").update(content).digest("hex").slice(0, SHA256_PREFIX_LENGTH);
 }
 
 function temporaryDirectory(label: string): string {
@@ -129,54 +129,107 @@ async function runRustLane(
 	cache: CacheKind,
 	outdir: string,
 ): Promise<SampleRecord[]> {
-	const args = [
-		RUST_BINARY,
-		"--mode",
-		lane,
-		"--entries",
-		String(entries),
-		"--samples",
-		String(cache === "cold" ? COLD_SAMPLE_COUNT : SAMPLE_COUNT),
-		"--warmups",
-		String(WARMUP_COUNT),
-		"--outdir",
-		outdir,
-		"--json",
-	];
-	if (cache === "cold") args.push("--cold");
-
-	const result = Bun.spawnSync(args, {
-		stdout: "pipe",
-		stderr: "pipe",
-		cwd: REPOSITORY_ROOT,
-	});
-
-	if (result.exitCode !== 0 && result.exitCode !== 2) {
-		const stderr = new TextDecoder().decode(result.stderr).trim();
-		throw new Error(`Rust session-timing ${lane}/${cache}/${entries} exited ${result.exitCode}: ${stderr}`);
-	}
-
-	const stdout = new TextDecoder().decode(result.stdout).trim();
+	const sampleCount = cache === "cold" ? COLD_SAMPLE_COUNT : SAMPLE_COUNT;
 	const records: SampleRecord[] = [];
-	for (const line of stdout.split("\n")) {
-		const trimmed = line.trim();
-		if (!trimmed) continue;
-		try {
-			const parsed = JSON.parse(trimmed);
-			if (parsed.sample) {
-				records.push({
-					lane,
-					implementation: "rust",
-					cache,
-					entries,
-					index: parsed.sample.index,
-					wallMs: parsed.sample.wallMs,
-					sha256Prefix: parsed.sample.sha256Prefix,
-					peakRssBytes: parsed.sample.peakRssBytes ?? 0,
-				});
+
+	if (cache === "cold") {
+		// Cold-cache: spawn a fresh process per sample, dropping the executable's
+		// page cache before each spawn so the binary loads from disk every time.
+		for (let idx = 0; idx < sampleCount; idx++) {
+			runCacheDrop(RUST_BINARY);
+			const args = [
+				RUST_BINARY,
+				"--mode",
+				lane,
+				"--entries",
+				String(entries),
+				"--samples",
+				"1",
+				"--warmups",
+				"0",
+				"--outdir",
+				outdir,
+				"--json",
+				"--cold",
+			];
+			const result = Bun.spawnSync(args, {
+				stdout: "pipe",
+				stderr: "pipe",
+				cwd: REPOSITORY_ROOT,
+			});
+			if (result.exitCode !== 0 && result.exitCode !== 2) {
+				const stderr = new TextDecoder().decode(result.stderr).trim();
+				throw new Error(`Rust session-timing ${lane}/cold/${entries} sample ${idx} exited ${result.exitCode}: ${stderr}`);
 			}
-		} catch {
-			// Skip non-JSON lines (summary objects, etc.)
+			const stdout = new TextDecoder().decode(result.stdout).trim();
+			for (const line of stdout.split("\n")) {
+				const trimmed = line.trim();
+				if (!trimmed) continue;
+				try {
+					const parsed = JSON.parse(trimmed);
+					if (parsed.sample) {
+						records.push({
+							lane,
+							implementation: "rust",
+							cache,
+							entries,
+							index: idx,
+							wallMs: parsed.sample.wallMs,
+							sha256Prefix: parsed.sample.sha256Prefix,
+							peakRssBytes: parsed.sample.peakRssBytes ?? 0,
+						});
+					}
+				} catch {
+					// Skip non-JSON lines (summary objects, etc.)
+				}
+			}
+		}
+	} else {
+		// Warm-cache: single process, all samples in-process
+		const args = [
+			RUST_BINARY,
+			"--mode",
+			lane,
+			"--entries",
+			String(entries),
+			"--samples",
+			String(sampleCount),
+			"--warmups",
+			String(WARMUP_COUNT),
+			"--outdir",
+			outdir,
+			"--json",
+		];
+		const result = Bun.spawnSync(args, {
+			stdout: "pipe",
+			stderr: "pipe",
+			cwd: REPOSITORY_ROOT,
+		});
+		if (result.exitCode !== 0 && result.exitCode !== 2) {
+			const stderr = new TextDecoder().decode(result.stderr).trim();
+			throw new Error(`Rust session-timing ${lane}/warm/${entries} exited ${result.exitCode}: ${stderr}`);
+		}
+		const stdout = new TextDecoder().decode(result.stdout).trim();
+		for (const line of stdout.split("\n")) {
+			const trimmed = line.trim();
+			if (!trimmed) continue;
+			try {
+				const parsed = JSON.parse(trimmed);
+				if (parsed.sample) {
+					records.push({
+						lane,
+						implementation: "rust",
+						cache,
+						entries,
+						index: parsed.sample.index,
+						wallMs: parsed.sample.wallMs,
+						sha256Prefix: parsed.sample.sha256Prefix,
+						peakRssBytes: parsed.sample.peakRssBytes ?? 0,
+					});
+				}
+			} catch {
+				// Skip non-JSON lines (summary objects, etc.)
+			}
 		}
 	}
 	return records;
@@ -234,14 +287,16 @@ async function runTsAppendLane(
 	const sampleCount = cache === "cold" ? COLD_SAMPLE_COUNT : SAMPLE_COUNT;
 	const records: SampleRecord[] = [];
 
-	// Warmups
-	for (let w = 0; w < WARMUP_COUNT; w++) {
+	// Warmups (warm only)
+	if (cache === "warm") {
+		for (let w = 0; w < WARMUP_COUNT; w++) {
 		const path = resolve(outdir, `ts-warmup-append-${w}.jsonl`);
 		const sm = SessionManager.create(outdir, outdir);
 		for (let i = 0; i < entries; i++) {
 			sm.appendMessage({ role: "user", content: [{ type: "text", text: `message-${String(i).padStart(6, "0")}` }] });
 		}
 		try { rmSync(path, { force: true }); } catch { /* */ }
+		}
 	}
 
 	for (let idx = 0; idx < sampleCount; idx++) {
@@ -281,12 +336,15 @@ async function runTsReopenLane(
 	const records: SampleRecord[] = [];
 	const expectedHash = sha256Prefix(sessionPath);
 
-	// Warmups
-	for (let w = 0; w < WARMUP_COUNT; w++) {
-		SessionManager.open(sessionPath);
+	// Warmups (warm only — cold samples start from an unprimed cache)
+	if (cache === "warm") {
+		for (let w = 0; w < WARMUP_COUNT; w++) {
+			SessionManager.open(sessionPath);
+		}
 	}
 
 	for (let idx = 0; idx < sampleCount; idx++) {
+		if (cache === "cold") runCacheDrop(sessionPath);
 		const start = performance.now();
 		SessionManager.open(sessionPath);
 		const wallMs = performance.now() - start;
@@ -351,11 +409,8 @@ async function main(): Promise<void> {
 		for (const lane of ["append", "reopen"] as const) {
 			for (const cache of ["warm", "cold"] as const) {
 				status(`entries=${entries} lane=${lane} cache=${cache}: Rust`);
-				const rustSamples = await runRustLane(lane, entries, cache, rustDir);
-				if (cache === "cold") {
-					for (const s of rustSamples) runCacheDrop(RUST_BINARY);
-				}
-				allSamples.push(...rustSamples);
+			const rustSamples = await runRustLane(lane, entries, cache, rustDir);
+			allSamples.push(...rustSamples);
 
 				status(`entries=${entries} lane=${lane} cache=${cache}: TypeScript`);
 				let tsSamples: SampleRecord[];

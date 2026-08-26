@@ -455,7 +455,6 @@ impl AgentSession {
                     message: Some(err.to_string()),
                 });
             }, || ());
-            drop(compaction_span);
             err
         })?;
         let Some(preparation) = preparation else {
@@ -471,7 +470,6 @@ impl AgentSession {
                     message: Some(err.to_string()),
                 });
             }, || ());
-            drop(compaction_span);
             err
         })?;
 
@@ -486,7 +484,6 @@ impl AgentSession {
                         message: Some(err.to_string()),
                     });
                 }, || ());
-                drop(compaction_span);
                 err
             })?;
             if cancel.cancel {

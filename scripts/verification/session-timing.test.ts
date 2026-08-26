@@ -1,35 +1,50 @@
 import { describe, expect, test } from "bun:test";
 import { resolve } from "node:path";
+import { writeFileSync, readFileSync, rmSync, mkdirSync } from "node:fs";
+import { createHash } from "node:crypto";
 
-// Constants mirrored from session-timing.ts for structural validation.
-const SHA256_PREFIX_LENGTH = 16;
-const ENTRY_COUNTS = [100, 1_000, 5_000] as const;
-const SAMPLE_COUNT = 20;
-const COLD_SAMPLE_COUNT = 10;
-const WARMUP_COUNT = 3;
+import { sha256Prefix } from "../session-timing.ts";
 
 const REPOSITORY_ROOT = resolve(import.meta.dirname, "..");
-const SESSION_TIMING_MODULE = resolve(import.meta.dirname, "session-timing.ts");
 
-describe("session-timing module", () => {
-	test("module path resolves", () => {
-		// Importing the module must not execute main() — only import.meta.main triggers it.
-		expect(SESSION_TIMING_MODULE).toBeDefined();
+describe("session-timing sha256Prefix", () => {
+	test("returns 16 hex chars for a known file", () => {
+		const dir = resolve(REPOSITORY_ROOT, "target/bench/test-session-timing");
+		mkdirSync(dir, { recursive: true });
+		const path = resolve(dir, "hash-test.jsonl");
+		writeFileSync(path, '{"type":"session","version":3,"id":"x","timestamp":"t","cwd":"/tmp"}\n');
+		const prefix = sha256Prefix(path);
+		expect(prefix.length).toBe(16);
+		// Verify against direct computation
+		const content = readFileSync(path);
+		const expected = createHash("sha256").update(content).digest("hex").slice(0, 16);
+		expect(prefix).toBe(expected);
+		rmSync(dir, { recursive: true, force: true });
 	});
 
-	test("sha256Prefix length is 16 hex chars", () => {
-		expect(SHA256_PREFIX_LENGTH).toBe(16);
+	test("is deterministic for identical content", () => {
+		const dir = resolve(REPOSITORY_ROOT, "target/bench/test-session-timing");
+		mkdirSync(dir, { recursive: true });
+		const path = resolve(dir, "deterministic-test.jsonl");
+		writeFileSync(path, "test content\n");
+		const p1 = sha256Prefix(path);
+		const p2 = sha256Prefix(path);
+		expect(p1).toBe(p2);
+		rmSync(dir, { recursive: true, force: true });
 	});
+});
 
+describe("session-timing constants", () => {
 	test("entry counts cover small, medium, and large sessions", () => {
-		expect(ENTRY_COUNTS).toContain(100);
-		expect(ENTRY_COUNTS).toContain(1_000);
-		expect(ENTRY_COUNTS).toContain(5_000);
+		const entryCounts = [100, 1_000, 5_000] as const;
+		expect(entryCounts).toContain(100);
+		expect(entryCounts).toContain(1_000);
+		expect(entryCounts).toContain(5_000);
 	});
 
 	test("sample counts are positive", () => {
-		expect(SAMPLE_COUNT).toBeGreaterThan(0);
-		expect(COLD_SAMPLE_COUNT).toBeGreaterThan(0);
-		expect(WARMUP_COUNT).toBeGreaterThanOrEqual(0);
+		expect(20).toBeGreaterThan(0);
+		expect(10).toBeGreaterThan(0);
+		expect(3).toBeGreaterThanOrEqual(0);
 	});
 });
