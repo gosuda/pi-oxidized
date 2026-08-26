@@ -21,7 +21,7 @@ Lanes that fail any criterion carry no trusted baseline and are marked according
 |---|---|
 | **Paired comparative** | Both Rust and TypeScript execute the same workload with alternating order; the TypeScript/Rust median ratio is a valid "materially better" claim. |
 | **Single-implementation regression floor** | Only one implementation is measured; the distribution is a regression floor for that implementation, not a comparative win. |
-| **D8-blocked** | Functional evidence exists but no symmetric timed boundary is available; the lane is an explicit non-claim until a sibling task (PERF-T3/T4/T5/T6/T7) builds the missing peer or instrumentation. "D8" refers to the disposition-8 lanes in the [issue #13 ranked plan](https://github.com/metaphorics/pi-oxidized/issues/13): lanes whose disposition blocks comparative claims. |
+| **D8-blocked** | Functional evidence exists but no symmetric timed boundary is available; the lane is an explicit non-claim until a sibling task (PERF-T3/T4/T5/T6/T7) builds the missing peer or instrumentation. "D8" refers to decision D8 in [issue #22](https://github.com/metaphorics/pi-oxidized/issues/22): the unsupported-claims registry that lists idle memory, isolated persistence, tool dispatch, layout/recomposition, pure paint, total footprint, and extension-host scaling as non-claims until named instrumentation lands. |
 
 ## Workload lane inventory
 
@@ -109,7 +109,7 @@ Claim class: paired comparative. Speedup TS/Rust: cold 2.27x, warm 2.42x.
 
 | Field | Value |
 |---|---|
-| Crates | `pi` (entry), `pi-tui` (render), `pi-ext` (extension protocol), `pi-ai` (event reduction) |
+| Crates | `pi` (entry), `pi-tui` (render), `pi-ext` (extension protocol), `pi-ai` (event reduction), `pi-agent` (agent loop) |
 | Script | `scripts/verification/performance.ts` measurements.streamingTailFrameCpu |
 | Fixture | `scripts/verification/extension.ts` emits 256 deterministic text-delta frames at 2 ms spacing |
 | Samples | 3 whole-process warmups + 20 measured fresh-process samples per implementation |
@@ -181,7 +181,7 @@ Claim class: single-implementation regression floor. The p99 threshold is 5 ms (
 | Alternating order | N/A (single-implementation) |
 | Unit | milliseconds wall time (request-to-response, frame CPU) |
 
-Trusted baseline: none. All five measured distributions fail the noise gate:
+Trusted baseline: none. All seven measured timed distributions fail the noise gate:
 
 | Distribution | Median (ms) | Rel. spread | Noise gate |
 |---|---|---|---|
@@ -189,9 +189,11 @@ Trusted baseline: none. All five measured distributions fail the noise gate:
 | idle100 keypress | 0.019 | 28.9% | FAIL |
 | zero frame | 0.028 | 94.0% | FAIL |
 | idle100 frame | 0.018 | 37.9% | FAIL |
+| active20 keypress | 0.017 | 48.7% | FAIL |
+| active20 frame | 0.018 | 34.4% | FAIL |
 | fast terminalInput | 0.024 | 46.5% | FAIL |
 
-The entire artifact is rejected as noise. Sub-millisecond medians with high jitter are inherent to the current sample size and input granularity. Collection wall per scenario is < 1 s.
+The artifact is rejected as noise (the `requireQuiet` gating set covers five distributions; the active20 keypress and frame distributions are reported in the artifact but not gated by the script). Sub-millisecond medians with high jitter are inherent to the current sample size and input granularity. Collection wall per scenario is < 1 s.
 
 Ranked time share: per-input-event overhead. During active interaction with extensions, this is per-keystroke overhead. Ranked 5/11 by session time share (amortized over the extension fan-out).
 
@@ -406,7 +408,7 @@ Four lanes (1, 2, 3, 11) have trusted baselines. Three are paired comparative ti
 | `pi-ai` | 2, 3, 8, 9, 10 | 2, 3 | none | 8, 9, 10 |
 | `pi-agent` | 3, 8 | 3 | none | 8 |
 
-All five crates have at least one paired comparative lane with a trusted baseline (lanes 2 and 3 cross all crates). `pi-agent` has no standalone lane; its tool-dispatch path (lane 8) is D8-blocked.
+All five crates have at least one paired comparative lane with a trusted baseline (lane 3 crosses all five crates). `pi-agent` has no standalone lane; its tool-dispatch path (lane 8) is D8-blocked.
 
 ## Evidence provenance
 
@@ -418,5 +420,6 @@ All five crates have at least one paired comparative lane with a trusted baselin
 - `crates/pi-ext/tests/serve_io_scaling.rs`: Rust production `serve_io` scaling correctness suite.
 - `.references/pi/packages/tui/test/render-churn-bench.ts`: upstream render-churn parameters (100x30, 20 warmups, 300 frames, static + editor).
 - Issue #13 comment: ranked comparative workload and floor plan (10 lanes with dispositions).
+- Issue #22 comment: performance superiority acceptance decisions D1 through D9, including D8 unsupported-claims registry.
 - Issue #85 (PERF-T1, closed): noise gate and process memory instrumentation.
 - Issues #86, #88, #89, #91, #93, #95: open sibling tasks that unblock D8-blocked lanes.
