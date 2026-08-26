@@ -468,7 +468,7 @@ fn length_stop_reason_renders_error() {
     let buf = render_view(&state, 80, 30);
     let plain = snapshot_buffer_plain(&buf, 80, 30).join("\n");
     assert!(
-        plain.contains("maximum output token limit"),
+        plain.contains("Response was truncated before completion"),
         "length stop reason must surface error: {plain}"
     );
 }

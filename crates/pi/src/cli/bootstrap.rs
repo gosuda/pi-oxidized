@@ -919,7 +919,7 @@ async fn finish_bootstrap(
                 return fail(
                     io,
                     state.should_take_over_stdout,
-                    &format!("Error: failed to read stdin: {err}"),
+                    &format!("Error: failed to read stdin ({err})"),
                 )
                 .into_outcome();
             }

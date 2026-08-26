@@ -287,7 +287,7 @@ fn push_assistant_stop_reason(
             out.push(Box::new(Text::with_padding(
                 theme.fg(
                     ThemeColor::Error,
-                    "Error: Model stopped because it reached the maximum output token limit. The response may be incomplete.",
+                    "Response was truncated before completion.",
                 ),
                 CONTENT_INDENT,
                 0,
