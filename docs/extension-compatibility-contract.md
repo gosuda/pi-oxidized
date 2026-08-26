@@ -80,6 +80,30 @@ terminating error in both the host and the lean runner.
 The asymmetry is a settled compatibility property, not an oversight (doctrine
 line `AGENTS.md` line 10).
 
+### 3.1 Handshake asymmetry matrix (XC-4, issue #42)
+
+The 3-mode × 3-hello-shape matrix below consolidates every cell. "✓" means the
+mode validates that field; "—" means the field is ignored. Each cell carries a
+witness test and a mutation that would break it.
+
+| Mode | `protocolVersion` | `compatibilityVersion` | Witness (green) | Mutation |
+| --- | --- | --- | --- | --- |
+| Mode 1 (host.ts) | ✓ reject on mismatch | ✓ reject on mismatch | `packages/extension-host/tests/host.test.ts::compatibility version mismatch terminates host` | **M3:** drop the compat check → host.test.ts compat-mismatch test fails; `scripts/verification/xc-handshake.test.ts::M3 mutation: dropping the compat check` fails |
+| Mode 2 (lean-runner.ts) | ✓ reject on mismatch | — ignore | `packages/extension-host/tests/lean.test.ts::matching protocolVersion acks even with a foreign compatibilityVersion` | **M1:** add `compatibilityVersion === "0.80.10"` requirement → lean.test.ts foreign-compat hello test fails; `scripts/verification/xc-handshake.test.ts::M1 mutation: adding a compat requirement` fails |
+| Mode 3 (server.rs) | ✓ reject on mismatch | — ignore | `crates/pi-ext/src/server.rs::hello_answers_with_compiled_constants_and_ignores_compatibility` | **M2:** add `compatibility_version` check to `validate_hello` → server foreign-compat hello test fails; `scripts/verification/xc-handshake.test.ts::M2 mutation: adding a compat requirement` fails |
+
+**Foreign-compat acceptance (Mode 2 + Mode 3):** both the lean and native
+endpoints accept a `hello` whose `compatibilityVersion` differs from
+`COMPATIBILITY_VERSION` (or is absent entirely), as long as `protocolVersion`
+matches. This is the settled asymmetry: only Mode 1 pins the TypeScript
+runtime version.
+
+`witness (static): scripts/verification/xc-handshake.ts` — three static
+witnesses (`verifyHostCompatCheck`, `verifyLeanProtocolOnly`,
+`verifyServerProtocolOnly`) that verify each mode's handshake code matches the
+matrix. `scripts/verification/xc-handshake.test.ts` proves mutations M1–M3
+each fail their named witness.
+
 ## 4. Host resolution and discovery/packaging precedence
 
 The TypeScript extension host is resolved ONLY from `PI_EXTENSION_HOST` or
@@ -354,13 +378,21 @@ The UI slot wire surfaces (`UiSlot`, `SanitizedSlot`, `SlotPlacement`,
 
 ## 10. Deadlines, cancellation, error isolation, stale guard
 
+Each rule below carries a `witness:` to the implementing source and a
+`mutation:` reference to the XC-8 witness that proves the guard is load-bearing
+(`scripts/verification/xc-deadline.ts`).
+
 - **Mutable hook deadline:** lifecycle hooks must respond within **30 s**.
   `witness: packages/extension-host/src/host.ts::EXTENSION_HOOK_TIMEOUT_MS =
   30_000` (line 108).
+  `mutation: M15-adjacent — verifyHookDeadlineConstant`.
 - **Terminal-input deadline:** terminal `onTerminalInput` consume/rewrite must
-  respond within **4 ms**, through the sequential input actor.
+  respond within **4 ms**, through the sequential input actor (capacity 64).
   `witness: packages/extension-host/src/host.ts::EXTENSION_INPUT_TIMEOUT_MS = 4`
-  (line 116), `::EXTENSION_INPUT_QUEUE_CAPACITY = 64` (line 118).
+  (line 116), `::EXTENSION_INPUT_QUEUE_CAPACITY = 64` (line 118),
+  `::invokeTerminalHandler` timeout race (lines 1445-1450).
+  `mutation: M15 — verifyTerminalInputDeadline` (scaling p99/deadline assertions
+  in `tests/scaling.test.ts` line 539).
 - **Shortcut cancellation and single-flight:** each shortcut execution receives
   its own `AbortController`. Host disposal aborts the active controller. A
   second dispatch for the same key returns `{ handled: true }` without starting
@@ -376,12 +408,37 @@ The UI slot wire surfaces (`UiSlot`, `SanitizedSlot`, `SlotPlacement`,
   remaining handlers and correlated request to continue. Only an error that
   escapes lifecycle request processing returns a correlated non-retryable
   `extension_error` response (`host.ts::handleLifecycleHook`, lines 1052-1058;
-  `lean-runner.ts::runHooks`, lines 1583-1600).
+  `lean-runner.ts::runHooks`, lines 1583-1600;
+  `lean-runner.ts::handleLifecycleHook`, lines 1815-1821).
+  `mutation: M16 — verifyErrorIsolation` (crash isolation suite in
+  `tests/acceptance.test.ts` lines 305-504).
 - **Stale-command-context guard:** a captured `pi`/command context is invalid
   after `newSession`/`fork`/`switchSession`/`reload`; the marker message must be
-  surfaced verbatim on misuse.
+  surfaced verbatim on misuse. `captureReplacementToken` calls `markStale?.()`
+  before any token-shaped early return; `createCommandContext` has a guard that
+  throws `STALE_COMMAND_CONTEXT_MESSAGE` when the stale flag is set or the
+  runner has been replaced.
   `witness: packages/extension-host/src/host.ts::STALE_COMMAND_CONTEXT_MESSAGE`
-  (line 112).
+  (line 112), `::captureReplacementToken` markStale call (line 2817),
+  `::createCommandContext` guard (lines 2968-2971).
+  `mutation: M17 — verifyStaleReplacementTokenGuard` (per-command replacement
+  staleness suite in `tests/host.test.ts` lines 1277-1374).
+- **Cancel routing:** `tool.cancel` and `provider.cancel` events route the
+  abort to the specific in-flight controller keyed by request id. The handler
+  extracts `requestId` from the payload, guards against `undefined`, and calls
+  `.abort()` only on the matching `inFlightTools`/`inFlightProviders` entry.
+  `witness: packages/extension-host/src/host.ts::handleControlEvent`
+  (lines 2191-2198), `lean-runner.ts::handleControlEvent` (lines 1916-1924).
+  `mutation: M18 — verifyCancelRouting` (tool.cancel tests in
+  `tests/lean.test.ts` lines 924-1044).
+
+### Contract exemption table
+
+| Exemption | Intent | Witness |
+| --- | --- | --- |
+| `navigateTree` `summarize: true` omits the 30 s hook deadline | A provider-backed branch summary can legitimately exceed 30 s; only non-summarizing navigation stays under the generic timeout | `host.ts::navigateTree` conditional timeout `summarize ? {} : { timeoutMs: EXTENSION_HOOK_TIMEOUT_MS }` (lines 2927-2930); intent comment at lines 2927-2929; witnessed by `verifyNavigateTreeSummarizeExemption` in `scripts/verification/xc-deadline.ts` |
+
+No unwitnessed timing contract rows remain.
 
 ## 11. Explicit non-contracts
 
