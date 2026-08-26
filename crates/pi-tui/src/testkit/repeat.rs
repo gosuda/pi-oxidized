@@ -1,6 +1,7 @@
 use std::fmt;
 
-use super::transcript::{TranscriptArtifact, encode_canonical};
+use super::transcript::{TranscriptArtifact, digest_canonical, encode_canonical};
+use super::validate::validate_artifact;
 
 /// Failure while repeating a transcript producer.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -20,6 +21,12 @@ pub enum RepeatError {
         iteration: usize,
         message: String,
     },
+    /// Stored digest did not match the recomputed canonical digest.
+    DigestMismatch {
+        iteration: usize,
+        stored: String,
+        computed: String,
+    },
 }
 
 impl fmt::Display for RepeatError {
@@ -37,6 +44,14 @@ impl fmt::Display for RepeatError {
             Self::Producer { iteration, message } => {
                 write!(formatter, "producer failed on iteration {iteration}: {message}")
             }
+            Self::DigestMismatch {
+                iteration,
+                stored,
+                computed,
+            } => write!(
+                formatter,
+                "stored digest mismatch on iteration {iteration}: stored={stored} computed={computed}"
+            ),
         }
     }
 }
@@ -62,30 +77,31 @@ where
         return Err(RepeatError::KTooSmall { k });
     }
 
-    let first = producer(0).map_err(|error| RepeatError::Producer {
-        iteration: 0,
-        message: error.to_string(),
-    })?;
+    let first = produce_checked(0, &mut producer)?;
     let first_bytes = encode_canonical(&first).map_err(|error| RepeatError::Producer {
         iteration: 0,
         message: error.to_string(),
     })?;
-    let first_digest = first.digest.clone();
+    let first_digest = digest_canonical(&first).map_err(|error| RepeatError::Producer {
+        iteration: 0,
+        message: error.to_string(),
+    })?;
 
     for iteration in 1..k {
-        let artifact = producer(iteration).map_err(|error| RepeatError::Producer {
-            iteration,
-            message: error.to_string(),
-        })?;
+        let artifact = produce_checked(iteration, &mut producer)?;
         let bytes = encode_canonical(&artifact).map_err(|error| RepeatError::Producer {
             iteration,
             message: error.to_string(),
         })?;
-        if bytes != first_bytes || artifact.digest != first_digest {
+        let digest = digest_canonical(&artifact).map_err(|error| RepeatError::Producer {
+            iteration,
+            message: error.to_string(),
+        })?;
+        if bytes != first_bytes || digest != first_digest {
             return Err(RepeatError::Divergence {
                 first_divergent_seq: first_divergent_seq(&first, &artifact),
                 left_digest: first_digest,
-                right_digest: artifact.digest,
+                right_digest: digest,
             });
         }
     }
@@ -95,6 +111,36 @@ where
         digest: first_digest,
         canonical_bytes: first_bytes,
     })
+}
+
+fn produce_checked<F, E>(
+    iteration: usize,
+    producer: &mut F,
+) -> Result<TranscriptArtifact, RepeatError>
+where
+    F: FnMut(usize) -> Result<TranscriptArtifact, E>,
+    E: fmt::Display,
+{
+    let artifact = producer(iteration).map_err(|error| RepeatError::Producer {
+        iteration,
+        message: error.to_string(),
+    })?;
+    let computed = digest_canonical(&artifact).map_err(|error| RepeatError::Producer {
+        iteration,
+        message: error.to_string(),
+    })?;
+    if computed != artifact.digest {
+        return Err(RepeatError::DigestMismatch {
+            iteration,
+            stored: artifact.digest,
+            computed,
+        });
+    }
+    validate_artifact(&artifact).map_err(|error| RepeatError::Producer {
+        iteration,
+        message: error.to_string(),
+    })?;
+    Ok(artifact)
 }
 
 fn first_divergent_seq(left: &TranscriptArtifact, right: &TranscriptArtifact) -> u32 {
@@ -128,91 +174,117 @@ mod tests {
     use super::*;
     use super::super::transcript::{
         CapabilityProfile, ClaimClass, DriverKind, Geometry, NormalizationContext, RowId, RowTier,
-        RunnerRow, Scenario, TimingEnvelope, TranscriptMode, TranscriptRecorder,
+        RunnerRow, Scenario, TimingEnvelope, TranscriptMode, TranscriptRecorder, TranscriptSpec,
     };
 
-    fn make_artifact(tag: &[u8]) -> TranscriptArtifact {
-        let mut recorder = TranscriptRecorder::new(
-            Scenario::FixtureStreamSettle,
-            RunnerRow {
+    fn make_artifact(tag: &[u8]) -> Result<TranscriptArtifact, String> {
+        let mut recorder = TranscriptRecorder::new(TranscriptSpec {
+            scenario: Scenario::FixtureStreamSettle,
+            row: RunnerRow {
                 tier: RowTier::Local,
                 id: RowId::GnuX64,
                 runner_image: None,
             },
-            Geometry { cols: 80, rows: 24 },
-            CapabilityProfile::Xterm256Color,
-            DriverKind::PosixPty,
-            TranscriptMode::Standard,
-            vec![ClaimClass::Execution],
-            TimingEnvelope::default(),
-        );
-        recorder.spawn(vec!["pi".to_owned()]).expect("spawn");
+            geometry: Geometry { cols: 80, rows: 24 },
+            capability_profile: CapabilityProfile::Xterm256Color,
+            driver_kind: DriverKind::PosixPty,
+            mode: TranscriptMode::Standard,
+            claims: vec![ClaimClass::Execution],
+            timing: TimingEnvelope::default(),
+        });
+        recorder
+            .spawn(vec!["pi".to_owned()], &NormalizationContext::default())
+            .map_err(|error| error.to_string())?;
         recorder
             .output(&[tag], &NormalizationContext::default())
-            .expect("output");
-        recorder.exit(Some(0), true).expect("exit");
-        recorder.finish().expect("finish")
+            .map_err(|error| error.to_string())?;
+        recorder
+            .exit(Some(0), true)
+            .map_err(|error| error.to_string())?;
+        recorder.finish().map_err(|error| error.to_string())
     }
 
     #[test]
-    fn rejects_k_below_three() {
-        let error = run_k(2, |_| Ok::<_, &'static str>(make_artifact(b"ok"))).expect_err("k");
+    fn rejects_k_below_three() -> Result<(), Box<dyn std::error::Error>> {
+        let error = run_k(2, |_| make_artifact(b"ok")).err().ok_or("k")?;
         assert_eq!(error, RepeatError::KTooSmall { k: 2 });
+        Ok(())
     }
 
     #[test]
-    fn accepts_identical_runs() {
-        let report = run_k(3, |_| Ok::<_, &'static str>(make_artifact(b"stable"))).expect("ok");
+    fn accepts_identical_runs() -> Result<(), Box<dyn std::error::Error>> {
+        let report = run_k(3, |_| make_artifact(b"stable"))?;
         assert_eq!(report.k, 3);
         assert!(!report.digest.is_empty());
         assert!(!report.canonical_bytes.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn reports_first_divergent_sequence() {
+    fn reports_first_divergent_sequence() -> Result<(), Box<dyn std::error::Error>> {
         let error = run_k(3, |iteration| {
-            Ok::<_, &'static str>(make_artifact(if iteration == 0 { b"same" } else { b"other" }))
+            make_artifact(if iteration == 0 { b"same" } else { b"other" })
         })
-        .expect_err("divergence");
+        .err()
+        .ok_or("divergence")?;
         match error {
             RepeatError::Divergence {
                 first_divergent_seq, ..
             } => assert_eq!(first_divergent_seq, 1),
-            other => panic!("unexpected error: {other:?}"),
+            other => return Err(format!("unexpected error: {other:?}").into()),
         }
+        Ok(())
     }
 
     #[test]
-    fn reports_length_divergence_at_shared_len() {
+    fn reports_length_divergence_at_shared_len() -> Result<(), Box<dyn std::error::Error>> {
         let error = run_k(3, |iteration| {
             if iteration == 0 {
-                Ok(make_artifact(b"stable"))
-            } else {
-                let mut recorder = TranscriptRecorder::new(
-                    Scenario::FixtureStreamSettle,
-                    RunnerRow {
-                        tier: RowTier::Local,
-                        id: RowId::GnuX64,
-                        runner_image: None,
-                    },
-                    Geometry { cols: 80, rows: 24 },
-                    CapabilityProfile::Xterm256Color,
-                    DriverKind::PosixPty,
-                    TranscriptMode::Standard,
-                    vec![ClaimClass::Execution],
-                    TimingEnvelope::default(),
-                );
-                recorder.spawn(vec!["pi".to_owned()]).expect("spawn");
-                recorder.exit(Some(0), true).expect("exit");
-                Ok(recorder.finish().expect("finish"))
+                return make_artifact(b"stable");
             }
+            let mut recorder = TranscriptRecorder::new(TranscriptSpec {
+                scenario: Scenario::FixtureStreamSettle,
+                row: RunnerRow {
+                    tier: RowTier::Local,
+                    id: RowId::GnuX64,
+                    runner_image: None,
+                },
+                geometry: Geometry { cols: 80, rows: 24 },
+                capability_profile: CapabilityProfile::Xterm256Color,
+                driver_kind: DriverKind::PosixPty,
+                mode: TranscriptMode::Standard,
+                claims: vec![ClaimClass::Execution],
+                timing: TimingEnvelope::default(),
+            });
+            recorder
+                .spawn(vec!["pi".to_owned()], &NormalizationContext::default())
+                .map_err(|error| error.to_string())?;
+            recorder
+                .exit(Some(0), true)
+                .map_err(|error| error.to_string())?;
+            recorder.finish().map_err(|error| error.to_string())
         })
-        .expect_err("length");
+        .err()
+        .ok_or("length")?;
         match error {
             RepeatError::Divergence {
                 first_divergent_seq, ..
             } => assert_eq!(first_divergent_seq, 2),
-            other => panic!("unexpected error: {other:?}"),
+            other => return Err(format!("unexpected error: {other:?}").into()),
         }
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_forged_equal_stored_digests() -> Result<(), Box<dyn std::error::Error>> {
+        let error = run_k(3, |iteration| {
+            let mut artifact = make_artifact(if iteration == 0 { b"alpha" } else { b"beta" })?;
+            artifact.digest = "sha256:forged-equal-across-runs".to_owned();
+            Ok::<_, String>(artifact)
+        })
+        .err()
+        .ok_or("forged")?;
+        assert!(matches!(error, RepeatError::DigestMismatch { .. }));
+        Ok(())
     }
 }
