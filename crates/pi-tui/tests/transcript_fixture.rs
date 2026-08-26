@@ -434,7 +434,7 @@ fn artifact_path(row_label: &str, scenario_dir: &str, iteration: usize) -> PathB
         .join(row_label)
         .join(scenario_dir)
         .join(format!("run-{}", iteration + 1))
-        .join("artifact.json")
+        .join("transcript.artifact.json")
 }
 
 fn write_artifact(
