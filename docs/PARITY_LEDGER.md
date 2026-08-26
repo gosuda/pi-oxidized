@@ -33,7 +33,7 @@ Statuses are evidence-bearing: `landed` names an existing owner seam; `folded` r
 | T1 | Differential rendering engine | pi-tui | frame.rs, terminal/ | frame buffer | landed | Rendering remains product-agnostic. |
 | T2 | Terminal state management | pi-tui | terminal/, link.rs, keys.rs | Terminal capability | landed | Raw mode, alternate screen, ANSI, OSC, and keyboard protocols share one owner. |
 | T3 | Terminal image rendering | pi-tui | image.rs, terminal/caps.rs | ImageProtocol | landed | Kitty, iTerm2, and fallback selection stay behind terminal capabilities. |
-| T4 | LaTeX math rendering | pi-tui | components/markdown.rs | markdown math path | planned | Strategy remains Rust-native with no JavaScript engine in the native binary. |
+| T4 | LaTeX math rendering | pi-tui | components/markdown.rs | markdown math path | planned | Strategy decided in docs/PAR-MATH-latex-strategy.md (issue #36): Rust-native port of the upstream latex.ts layout engine with raw-literal fallback, no JavaScript engine, no new crate; implementation routed to PAR-MATH (issue #37). |
 | T5 | Markdown rendering | pi-tui | components/markdown.rs, text/ | styled text | landed | Width, wrapping, and ANSI handling are framework concerns. |
 | T6 | Layout and widgets | pi-tui | component.rs, components/, layout.rs, overlay.rs, focus.rs | Component and UiEvent | landed | The event set remains closed and product-agnostic. |
 | T7 | Keybindings manager and key parsing | pi-tui | keybindings.rs, keys.rs | parsed key event | landed | Product default bindings remain in pi. |
