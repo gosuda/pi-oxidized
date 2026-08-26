@@ -172,6 +172,23 @@ describe("parity witness suite", () => {
 		);
 	});
 
+	test("inherited workspace alias fails the topology witness", () => {
+		const directory = writeFixtureRepo(temporaryDirectory("parity-inherited-alias-"));
+		const rootManifestPath = join(directory, "Cargo.toml");
+		writeFileSync(
+			rootManifestPath,
+			`${readFileSync(rootManifestPath, "utf8")}\n[workspace.dependencies]\nrender = { package = "pi-tui", path = "crates/pi-tui" }\n`,
+		);
+		const agentManifestPath = join(directory, "crates/pi-agent/Cargo.toml");
+		writeFileSync(
+			agentManifestPath,
+			`${readFileSync(agentManifestPath, "utf8")}render = { workspace = true }\n`,
+		);
+		expect(hasViolation(runParityWitnesses(directory), "unexpected internal dependency edge pi-agent -> pi-tui")).toBe(
+			true,
+		);
+	});
+
 	test("pi_tui reference in pi-agent fails the crate boundary witness", () => {
 		const directory = writeFixtureRepo(temporaryDirectory("parity-pi-tui-"), {
 			piAgentProbeSource: "use pi_tui::layout::SizeValue;\n",

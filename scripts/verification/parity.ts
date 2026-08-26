@@ -102,35 +102,59 @@ function collectDependencyTable(
 	value: TomlValue | undefined,
 	members: ReadonlySet<string>,
 	names: Set<string>,
+	workspaceDependencies: TomlTable | undefined,
 ): void {
 	const table = asTomlTable(value);
 	if (table === undefined) return;
 	for (const [key, specification] of Object.entries(table)) {
 		const fields = asTomlTable(specification);
-		const packageName = typeof fields?.package === "string" ? fields.package : key;
+		const inherited =
+			fields?.workspace === true ? asTomlTable(workspaceDependencies?.[key]) : undefined;
+		const packageName =
+			typeof inherited?.package === "string"
+				? inherited.package
+				: typeof fields?.package === "string"
+					? fields.package
+					: key;
 		if (members.has(packageName)) names.add(packageName);
 	}
 }
 
-function collectDependencyGroups(table: TomlTable, members: ReadonlySet<string>, names: Set<string>): void {
-	for (const name of DEPENDENCY_TABLES) collectDependencyTable(table[name], members, names);
+function collectDependencyGroups(
+	table: TomlTable,
+	members: ReadonlySet<string>,
+	names: Set<string>,
+	workspaceDependencies: TomlTable | undefined,
+): void {
+	for (const name of DEPENDENCY_TABLES) {
+		collectDependencyTable(table[name], members, names, workspaceDependencies);
+	}
 }
 
-export function parseInternalDependencyNames(crateManifest: string, members: readonly string[]): string[] {
+export function parseInternalDependencyNames(
+	crateManifest: string,
+	members: readonly string[],
+	rootManifest?: string,
+): string[] {
 	let manifest: TomlTable;
+	let workspaceDependencies: TomlTable | undefined;
 	try {
 		manifest = parseToml(crateManifest);
+		if (rootManifest !== undefined) {
+			const workspace = asTomlTable(parseToml(rootManifest).workspace);
+			workspaceDependencies = asTomlTable(workspace?.dependencies);
+		}
 	} catch {
 		return [];
 	}
 	const names = new Set<string>();
 	const memberSet = new Set(members);
-	collectDependencyGroups(manifest, memberSet, names);
+	collectDependencyGroups(manifest, memberSet, names, workspaceDependencies);
 	const targets = asTomlTable(manifest.target);
 	if (targets !== undefined) {
 		for (const target of Object.values(targets)) {
 			const table = asTomlTable(target);
-			if (table !== undefined) collectDependencyGroups(table, memberSet, names);
+			if (table !== undefined) collectDependencyGroups(table, memberSet, names, workspaceDependencies);
 		}
 	}
 	return [...names].sort();
@@ -161,7 +185,7 @@ export function loadWorkspaceTopology(root: string): WorkspaceTopology {
 			problems.push(`crate manifest ${manifestPath} is not readable`);
 			continue;
 		}
-		for (const dependency of parseInternalDependencyNames(manifest, FIXED_WORKSPACE_MEMBERS)) {
+		for (const dependency of parseInternalDependencyNames(manifest, FIXED_WORKSPACE_MEMBERS, rootManifest)) {
 			edges.add(`${crate} -> ${dependency}`);
 		}
 	}
