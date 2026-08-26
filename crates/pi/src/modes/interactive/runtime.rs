@@ -6650,15 +6650,7 @@ pub async fn run_interactive_mode(
 
     // Resolve the startup theme from settings + the just-probed terminal
     // polarity (replaces the static dark default).
-    options.theme = startup_theme(
-        host_arc.as_ref(),
-        options.terminal_theme,
-        if options.caps.true_color {
-            super::theme::ColorMode::Truecolor
-        } else {
-            super::theme::ColorMode::Palette256
-        },
-    );
+    options.theme = startup_theme(host_arc.as_ref(), options.terminal_theme);
     let mut rt = InteractiveRuntime::new(tui, input, host_arc, &options);
     // Bridge replacements dispose the old session from a task outside this
     // loop. Mark that closure before teardown, then rebind after the host
