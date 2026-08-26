@@ -1790,6 +1790,20 @@ export class LeanRunner {
 					await this.client.respond(id, eventType as Method, discovered);
 					return;
 				}
+				case "before_provider_headers": {
+					const headers = payload["headers"];
+					if (!isRecord(headers)) throw new Error("before_provider_headers.headers is required");
+					// Handlers mutate `headers` in place; a null value deletes that
+					// header. The return value is ignored (matching upstream
+					// emitBeforeProviderHeaders). The mutated headers are echoed back.
+					await this.runHooks(
+						eventType,
+						{ type: eventType, headers },
+						() => void 0,
+					);
+					await this.client.respond(id, eventType as Method, { headers });
+					return;
+				}
 				case "session_before_switch":
 				case "session_before_fork":
 				case "session_before_compact":

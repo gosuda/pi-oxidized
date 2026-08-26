@@ -168,6 +168,7 @@ function mode1Factory(withHook: boolean): InlineExtension[] {
 		pi.on("input", (event) => {
 			const input = event as typeof event & { type: string; text: string; images?: unknown };
 			observe({ type: input.type, text: input.text, images: input.images, source: input.source });
+			if (input.text === "handled-text") return { action: "handled" };
 			return { action: "transform", text: `${input.text} rewritten` };
 		});
 		pi.on("resources_discover" as string, (...args: unknown[]) => {
@@ -179,6 +180,18 @@ function mode1Factory(withHook: boolean): InlineExtension[] {
 			const [event] = args as [{ type: string }];
 			observe({ type: event.type });
 			return { cancel: true, reason: "endpoint conformance" };
+		});
+		pi.on("before_provider_headers" as string, (...args: unknown[]) => {
+			const [event] = args as [{ type: string; headers: Record<string, string | null> }];
+			observe({ type: event.type, headers: event.headers });
+			// In-place mutation: null deletes a header, new keys are added.
+			delete event.headers["X-Delete-Me"];
+			event.headers["X-Injected"] = "from-hook";
+		});
+		pi.on("tool_call", (event) => {
+			if (event.toolCallId === "terminate-call") {
+				return { block: true, reason: "terminate test", terminate: true };
+			}
 		});
 		pi.registerShortcut("ctrl+shift+e", {
 			handler() {
@@ -398,5 +411,81 @@ describe("extension endpoint conformance", () => {
 		];
 		expect(await run("mode1")).toEqual(expected);
 		expect(await run("mode2")).toEqual(expected);
+	});
+
+	test("before_provider_headers in-place mutation and null-delete match", async () => {
+		const run = async (mode: "mode1" | "mode2") => {
+			(globalThis as Record<string, unknown>)[OBSERVATIONS] = [];
+			const link = await openEndpoint(mode, true);
+			try {
+				const res = await link.request(50, "before_provider_headers", {
+					headers: {
+						"X-Keep": "keep-val",
+						"X-Delete-Me": "delete-val",
+					},
+				});
+				return res.payload;
+			} finally {
+				await link.finish();
+			}
+		};
+		const expected = {
+			headers: {
+				"X-Keep": "keep-val",
+				"X-Injected": "from-hook",
+			},
+		};
+		const mode1 = await run("mode1");
+		const mode2 = await run("mode2");
+		expect(mode1).toEqual(expected);
+		expect(mode2).toEqual(expected);
+		expect(mode2).toEqual(mode1);
+	});
+
+	test("tool_call block with terminate forwards through both modes", async () => {
+		const run = async (mode: "mode1" | "mode2") => {
+			(globalThis as Record<string, unknown>)[OBSERVATIONS] = [];
+			const link = await openEndpoint(mode, true);
+			try {
+				const res = await link.request(51, "tool_call", {
+					toolName: "echo",
+					toolCallId: "terminate-call",
+					input: { text: "hi" },
+				});
+				return res.payload;
+			} finally {
+				await link.finish();
+			}
+		};
+		const mode1 = await run("mode1");
+		const mode2 = await run("mode2");
+		// Both modes must forward block, reason, terminate, and the mutated input.
+		expect(mode1["block"]).toBe(true);
+		expect(mode1["terminate"]).toBe(true);
+		expect(mode1["reason"]).toBe("terminate test");
+		expect(mode1["input"]).toEqual({ text: "hi", fromHook: "tool-call" });
+		expect(mode2).toEqual(mode1);
+	});
+
+	test("input handled short-circuit matches across modes", async () => {
+		const run = async (mode: "mode1" | "mode2") => {
+			(globalThis as Record<string, unknown>)[OBSERVATIONS] = [];
+			const link = await openEndpoint(mode, true);
+			try {
+				const res = await link.request(52, "input", {
+					text: "handled-text",
+					source: "interactive",
+				});
+				return res.payload;
+			} finally {
+				await link.finish();
+			}
+		};
+		const expected = { action: "handled" };
+		const mode1 = await run("mode1");
+		const mode2 = await run("mode2");
+		expect(mode1).toEqual(expected);
+		expect(mode2).toEqual(expected);
+		expect(mode2).toEqual(mode1);
 	});
 });

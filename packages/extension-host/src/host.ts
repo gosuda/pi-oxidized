@@ -1035,6 +1035,15 @@ export class ExtensionHost {
 					);
 					await this.client.respond(id, eventType as Method, result ?? {});
 					return;
+				case "before_provider_headers": {
+					const headers = payload["headers"];
+					if (!isRecord(headers)) throw new Error("before_provider_headers.headers is required");
+					const result = await runner.emitBeforeProviderHeaders(
+						headers as Record<string, string | null>,
+					);
+					await this.client.respond(id, eventType as Method, { headers: result });
+					return;
+				}
 				case "session_before_compact":
 				case "session_compact":
 				case "thinking_level_select":

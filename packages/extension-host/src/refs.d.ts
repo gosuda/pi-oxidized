@@ -361,6 +361,7 @@ declare module "@earendil-works/pi-coding-agent" {
 	export interface ToolCallEventResult {
 		block?: boolean;
 		reason?: string;
+		terminate?: boolean;
 	}
 	export interface ToolResultEventResult {
 		content?: unknown[];
@@ -546,6 +547,7 @@ declare module "@earendil-works/pi-coding-agent" {
 		emitResourcesDiscover(cwd: string, reason: string): Promise<unknown>;
 		emitToolCall(event: ToolCallEvent): Promise<ToolCallEventResult | undefined>;
 		emitToolResult(event: ToolResultEvent): Promise<ToolResultEventResult | undefined>;
+		emitBeforeProviderHeaders(headers: Record<string, string | null>): Promise<Record<string, string | null>>;
 		emitBeforeAgentStart(
 			prompt: string,
 			images: unknown[] | undefined,

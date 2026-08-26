@@ -29,6 +29,9 @@ export default {
 		tool_call: (event) => {
 			observe({ type: event.type, toolName: event.toolName, toolCallId: event.toolCallId, input: event.input });
 			event.input.fromHook = "tool-call";
+			if (event.toolCallId === "terminate-call") {
+				return { block: true, reason: "terminate test", terminate: true };
+			}
 		},
 		tool_result: (event) => {
 			observe({
@@ -52,6 +55,7 @@ export default {
 		},
 		input: (event) => {
 			observe({ type: event.type, text: event.text, images: event.images, source: event.source });
+			if (event.text === "handled-text") return { action: "handled" };
 			return { action: "transform", text: `${event.text} rewritten` };
 		},
 		resources_discover: (event) => {
@@ -61,6 +65,12 @@ export default {
 		session_before_tree: (event) => {
 			observe({ type: event.type });
 			return { cancel: true, reason: "endpoint conformance" };
+		},
+		before_provider_headers: (event) => {
+			observe({ type: event.type, headers: event.headers });
+			// In-place mutation: null deletes a header, new keys are added.
+			delete event.headers["X-Delete-Me"];
+			event.headers["X-Injected"] = "from-hook";
 		},
 	},
 	shortcuts: [

@@ -331,6 +331,33 @@ Both arrays are identical and both end at `input`. Any boundary that adds or
 removes a discriminant MUST update both arrays in lockstep and re-verify parity
 (see [Ownership](#ownership)).
 
+### 7.1 Dispatch-semantics lattice (XC-6, issue #55)
+
+Each of the 33 discriminants belongs to one or more dispatch-semantics
+classes. The lattice is defined in
+`scripts/verification/xc-dispatch.ts::DISCRIMINANT_LATTICE` and verified by
+`scripts/verification/xc-dispatch.test.ts`:
+
+- **notification**: handlers fire, results discarded, response `{ ok: true }`
+- **chain**: last non-null result wins (e.g. `session_before_*` without cancel)
+- **fold**: running values threaded to later handlers (e.g. `input`,
+  `before_agent_start`, `tool_result`, `message_end`, `tool_call`)
+- **cancellable**: handler can short-circuit via `cancel`/`block`/`handled`
+  (e.g. `session_before_*`, `input`, `tool_call`, `message_update`)
+- **in-place**: handler mutates the input object directly (e.g. `tool_call`
+  input, `before_provider_headers` headers)
+
+Mutations M7–M10 prove the load-bearing dispatch semantics:
+
+| Mutation | What breaks | Witness |
+|----------|-------------|---------|
+| **M7** | tool_call ignores in-place input mutation (comparison dropped) | `scripts/verification/xc-dispatch.test.ts::M7 mutation: dropping canonicalJsonEqual from host fails the witness`; `packages/extension-host/tests/endpoint-conformance.test.ts::tool_call block with terminate forwards through both modes` |
+| **M8** | input 'handled' no longer short-circuits (`return false` dropped) | `scripts/verification/xc-dispatch.test.ts::M8 mutation: dropping 'return false' from lean input handled fails the witness`; `packages/extension-host/tests/endpoint-conformance.test.ts::input handled short-circuit matches across modes` |
+| **M9** | null header value no longer deletes the header (specialized case removed) | `scripts/verification/xc-dispatch.test.ts::M9 mutation: removing before_provider_headers case from host fails the witness`; `packages/extension-host/tests/endpoint-conformance.test.ts::before_provider_headers in-place mutation and null-delete match` |
+| **M10** | tool_call block ignores terminate (field dropped from result type or response) | `scripts/verification/xc-dispatch.test.ts::M10 mutation: removing terminate from ToolCallEventResult fails the witness`; `packages/extension-host/tests/endpoint-conformance.test.ts::tool_call block with terminate forwards through both modes` |
+
+`scripts/verification/xc-dispatch.ts` proves mutations M7–M10 statically.
+
 ## 8. Tools, commands, flags, shortcuts, providers wire shapes
 
 The full registry snapshot (`RegistrySnapshotWire` consumed by Rust
