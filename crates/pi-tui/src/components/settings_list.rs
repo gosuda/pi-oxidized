@@ -8,7 +8,7 @@ use ratatui::layout::Rect;
 use crate::component::{Component, EventResult, UiEvent};
 use crate::fuzzy::fuzzy_filter;
 use crate::keybindings::get_keybindings;
-use crate::text::{truncate_to_width, visible_width, wrap_text_with_ansi};
+use crate::text::{truncate_with_marker, visible_width, wrap_text_with_ansi};
 
 use super::input::Input;
 use super::util::paint_lines;
@@ -273,7 +273,7 @@ impl SettingsList {
             "  Enter/Space to change · Esc to cancel"
         };
         let styled = (self.theme.hint)(text);
-        lines.push(truncate_to_width(&styled, width, "...", false));
+        lines.push(truncate_with_marker(&styled, width, false));
     }
 
     fn render_main_list(&mut self, width: u16) -> Vec<String> {
@@ -312,14 +312,13 @@ impl SettingsList {
 
         let display_len = self.display_items().len();
         if display_len == 0 {
-            lines.push(truncate_to_width(
+            lines.push(truncate_with_marker(
                 &(self.theme.hint)(
                     self.no_match_text
                         .as_deref()
                         .unwrap_or("  No matching settings"),
                 ),
                 width,
-                "...",
                 false,
             ));
             self.add_hint_line(&mut lines, width);
@@ -358,19 +357,18 @@ impl SettingsList {
             let used = prefix_width + max_label_width + visible_width(separator);
             let value_max = width.saturating_sub(used).saturating_sub(2);
             let value_text = (self.theme.value)(
-                &truncate_to_width(&item.current_value, value_max, "", false),
+                &truncate_with_marker(&item.current_value, value_max, false),
                 is_selected,
             );
             let row = format!("{prefix}{label_text}{separator}{value_text}");
-            lines.push(truncate_to_width(&row, width, "...", false));
+            lines.push(truncate_with_marker(&row, width, false));
         }
 
         if start > 0 || end < display_len {
             let scroll = format!("  ({}/{})", self.selected_index + 1, display_len);
-            lines.push((self.theme.hint)(&truncate_to_width(
+            lines.push((self.theme.hint)(&truncate_with_marker(
                 &scroll,
                 width.saturating_sub(2),
-                "",
                 false,
             )));
         }
@@ -679,5 +677,88 @@ mod tests {
         for w in [24_u16, 60, 80, 120] {
             let _ = render_snapshot(&mut list, w);
         }
+    }
+
+    #[test]
+    fn truncation_marks_long_values_without_ascii_ellipsis() {
+        use crate::text::{TRUNCATION_MARKER, visible_width};
+
+        let items = vec![SettingItem {
+            id: "path".into(),
+            label: "Path".into(),
+            description: None,
+            current_value: "非常に長い設定値と👍とe\u{0301}".repeat(8),
+            values: None,
+            submenu: None,
+        }];
+        let mut list = SettingsList::new(
+            items,
+            5,
+            SettingsListTheme::default(),
+            |_, _| {},
+            || {},
+            &SettingsListOptions::default(),
+        );
+        for width in [16_u16, 24, 40] {
+            let snap = render_snapshot(&mut list, width);
+            let joined = snap
+                .iter()
+                .map(|s| strip_ansi(s))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                joined.contains(TRUNCATION_MARKER),
+                "width={width} missing marker: {joined}"
+            );
+            assert!(!joined.contains("..."), "width={width}: {joined}");
+            for row in &snap {
+                assert!(
+                    visible_width(&strip_ansi(row)) <= usize::from(width),
+                    "width={width} overflow: {}",
+                    strip_ansi(row)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn exact_fit_value_has_no_truncation_marker() {
+        use crate::text::{TRUNCATION_MARKER, truncate_with_marker};
+
+        let value = "abcdef";
+        assert_eq!(
+            truncate_with_marker(value, visible_width(value), false),
+            value
+        );
+        assert!(
+            !truncate_with_marker(value, visible_width(value), false).contains(TRUNCATION_MARKER)
+        );
+
+        let mut list = SettingsList::new(
+            vec![SettingItem {
+                id: "theme".into(),
+                label: "Theme".into(),
+                description: None,
+                current_value: "dark".into(),
+                values: Some(vec!["dark".into(), "light".into()]),
+                submenu: None,
+            }],
+            5,
+            SettingsListTheme::default(),
+            |_, _| {},
+            || {},
+            &SettingsListOptions::default(),
+        );
+        let snap = render_snapshot(&mut list, 80);
+        let joined = snap
+            .iter()
+            .map(|s| strip_ansi(s))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("dark"), "{joined}");
+        assert!(
+            !joined.contains(TRUNCATION_MARKER),
+            "exact-fit settings row must not mark omission: {joined}"
+        );
     }
 }

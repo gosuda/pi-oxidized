@@ -5,7 +5,7 @@ use ratatui::layout::Rect;
 
 use crate::component::{Component, EventResult, UiEvent};
 use crate::keybindings::get_keybindings;
-use crate::text::{truncate_to_width, visible_width};
+use crate::text::{truncate_with_marker, visible_width};
 
 use super::util::paint_lines;
 
@@ -258,9 +258,9 @@ impl SelectList {
                 is_selected,
             })
         } else {
-            truncate_to_width(display, max_width, "", false)
+            truncate_with_marker(display, max_width, false)
         };
-        truncate_to_width(&truncated, max_width, "", false)
+        truncate_with_marker(&truncated, max_width, false)
     }
 
     fn normalize_single_line(text: &str) -> String {
@@ -296,7 +296,7 @@ impl SelectList {
             let description_start = prefix_width + truncated_value_width + spacing_len;
             let remaining = width.saturating_sub(description_start).saturating_sub(2);
             if remaining > MIN_DESCRIPTION_WIDTH {
-                let truncated_desc = truncate_to_width(desc, remaining, "", false);
+                let truncated_desc = truncate_with_marker(desc, remaining, false);
                 if is_selected {
                     let full = format!("{prefix}{truncated_value}{spacing}{truncated_desc}");
                     return (self.theme.selected_text)(&full);
@@ -356,7 +356,7 @@ impl SelectList {
 
         if start > 0 || end < len {
             let scroll = format!("  ({}/{})", self.selected_index + 1, len);
-            let truncated = truncate_to_width(&scroll, width.saturating_sub(2), "", false);
+            let truncated = truncate_with_marker(&scroll, width.saturating_sub(2), false);
             lines.push((self.theme.scroll_info)(&truncated));
         }
 
@@ -569,5 +569,65 @@ mod tests {
         let esc = UiEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(list.handle_event(&esc), EventResult::Consumed);
         assert!(*cancelled.lock().expect("lock"));
+    }
+
+    #[test]
+    fn truncation_marks_omission_and_exact_fit_stays_clean() {
+        use crate::text::{TRUNCATION_MARKER, truncate_with_marker, visible_width};
+
+        let long = "abcdefghij";
+        let truncated = truncate_with_marker(long, 6, false);
+        assert!(truncated.contains(TRUNCATION_MARKER), "{truncated}");
+        assert!(visible_width(&truncated) <= 6, "{truncated}");
+        assert_ne!(strip_ansi(&truncated), long);
+
+        let exact = truncate_with_marker("abcdef", 6, false);
+        assert_eq!(exact, "abcdef");
+        assert!(!exact.contains(TRUNCATION_MARKER));
+
+        assert_eq!(truncate_with_marker("abcdef", 0, false), "");
+        let one = truncate_with_marker("abcdef", 1, false);
+        assert_eq!(strip_ansi(&one), TRUNCATION_MARKER);
+        assert_eq!(visible_width(&one), 1);
+    }
+
+    #[test]
+    fn rendered_rows_mark_cjk_emoji_and_combining_truncation() {
+        use crate::text::{TRUNCATION_MARKER, visible_width};
+
+        let items = vec![
+            SelectItem::new("cjk", "命令命令命令命令命令命令")
+                .with_description("説明説明説明説明説明"),
+            SelectItem::new("emoji", "👍👍👍👍👍👍👍👍").with_description("⚡️⚡️⚡️⚡️⚡️"),
+            SelectItem::new(
+                "combining",
+                "e\u{0301}e\u{0301}e\u{0301}e\u{0301}e\u{0301}e\u{0301}e\u{0301}e\u{0301}",
+            )
+            .with_description("a\u{0308}a\u{0308}a\u{0308}a\u{0308}"),
+        ];
+        let mut list = SelectList::new(items, 5, SelectListTheme::default());
+        for width in [10_u16, 12, 16] {
+            let snap = render_snapshot(&mut list, width);
+            for row in &snap {
+                let plain = strip_ansi(row);
+                assert!(
+                    visible_width(&plain) <= usize::from(width),
+                    "width={width} row={plain:?}"
+                );
+            }
+            let joined = snap
+                .iter()
+                .map(|s| strip_ansi(s))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                joined.contains(TRUNCATION_MARKER),
+                "expected truncation marker at width {width}: {joined}"
+            );
+            assert!(
+                !joined.contains("..."),
+                "ascii ellipsis must not appear: {joined}"
+            );
+        }
     }
 }

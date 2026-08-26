@@ -125,7 +125,7 @@ impl Text {
             let with_margins = format!("{left}{line}{right}");
             // If margins already exceed width (tiny terminal), still clamp.
             let clamped = if visible_width(&with_margins) > usize::from(width) {
-                crate::text::truncate_to_width(&with_margins, usize::from(width), "", false)
+                crate::text::truncate_with_marker(&with_margins, usize::from(width), false)
             } else {
                 with_margins
             };
@@ -221,5 +221,21 @@ mod tests {
         let snap = render_snapshot(&mut t, 40);
         let plain = strip_ansi(&snap[0]);
         assert!(plain.contains("a   b") || plain.starts_with("a   b"));
+    }
+
+    #[test]
+    fn tiny_width_clamp_marks_omission() {
+        use crate::text::{TRUNCATION_MARKER, visible_width};
+
+        let mut t = Text::with_padding("hello-world-内容-👍", 3, 0);
+        let snap = render_snapshot(&mut t, 6);
+        assert!(!snap.is_empty());
+        let plain = strip_ansi(&snap[0]);
+        assert!(
+            plain.contains(TRUNCATION_MARKER),
+            "expected marker in {plain}"
+        );
+        assert!(visible_width(&plain) <= 6, "{plain}");
+        assert!(!plain.contains("..."), "{plain}");
     }
 }
