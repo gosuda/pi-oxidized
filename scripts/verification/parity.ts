@@ -402,19 +402,20 @@ const LEDGER_STATUSES: readonly string[] = [
 	"host-owned",
 	"dev-only",
 	"parity-blocked",
+	"witnessed",
 	"extension-plan-owned",
 ];
-
 const A8_CHECKLIST_TOKENS: readonly string[] = [
 	"upstream export map",
 	"upstream source surface",
 	"downstream importer corpus",
 	"extension-host routing",
 	"executable negative witnesses",
+	"delete-not-port",
+	"compat-audit.ts",
 ];
-
 const SPECIAL_STATUS_REQUIREMENTS: Readonly<Record<string, string>> = {
-	A8: "parity-blocked",
+	A8: "witnessed",
 	E1: "extension-plan-owned",
 };
 

@@ -508,6 +508,20 @@
 			"evidence": "x86_64-windows release unpack smoke is not run on the linux dev host",
 			"rationale": "Windows PE binaries cannot be executed or fully validated on the linux development host; the target is built and smoke-tested on windows CI runners.",
 			"citation": "scripts/release/targets.ts RUST_TARGETS includes x86_64-pc-windows-msvc"
+		},
+		{
+			"id": "compat-audit-witness",
+			"surface": "parity",
+			"tier": "unit",
+			"required": true,
+			"commands": [
+				{
+					"cwd": ".",
+					"argv": ["bun", "run", "scripts/verification/compat-audit.ts"],
+					"timeoutMs": 60000
+				}
+			],
+			"evidence": "PAR-COMPAT-AUDIT five-witness suite passes: source evidence, downstream importers, extension-host routing, config corpus, Rust-surface negative"
 		}
 	]
 }

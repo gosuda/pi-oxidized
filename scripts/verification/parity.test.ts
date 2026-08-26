@@ -241,12 +241,12 @@ describe("parity witness suite", () => {
 	});
 
 	test("A8 status drift fails the ledger witness", () => {
-		const drifted = LEDGER_TEXT.replace("compatibility audit | parity-blocked", "compatibility audit | landed");
-		expect(hasViolation(verifyCapabilityLedger(drifted), 'capability A8 status must be "parity-blocked"')).toBe(true);
+		const drifted = LEDGER_TEXT.replace("compatibility audit | witnessed", "compatibility audit | landed");
+		expect(hasViolation(verifyCapabilityLedger(drifted), 'capability A8 status must be "witnessed"')).toBe(true);
 	});
 
 	test("A8 evidence checklist truncation fails the ledger witness", () => {
-		const truncated = LEDGER_TEXT.replace("executable negative witnesses", "negative witnesses");
+		const truncated = LEDGER_TEXT.replace("delete-not-port", "port");
 		expect(hasViolation(verifyCapabilityLedger(truncated), "capability A8 evidence checklist is missing")).toBe(true);
 	});
 

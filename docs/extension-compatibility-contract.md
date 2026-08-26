@@ -150,14 +150,19 @@ mode). Both strategies yield identical surfaces
 `@earendil-works/pi-ai` deliberately maps to the `./compat` entry — the legacy
 global provider-registry surface is served through this alias.
 
-**A8 disposition (parity-blocked):** the upstream `./compat` legacy global
-provider registry is owned by the parity plan and is **parity-blocked**, meaning
-it cannot advance without its evidence checklist (upstream export map, upstream
-source surface, downstream importer corpus, extension-host routing, and
-executable negative witnesses).
+**A8 disposition (witnessed):** the upstream `./compat` legacy global
+provider registry is owned by the parity plan and is **witnessed**, meaning
+the evidence checklist (upstream export map, upstream source surface,
+downstream importer corpus, extension-host routing, and executable negative
+witnesses) has been satisfied with all five witnesses green
+(`scripts/verification/compat-audit.ts`, issue #59). The ruling is
+delete-not-port: the `./compat` surface is served by the JS bundle's npm
+dependency, not the Rust port; no Rust-surface consumer exists; env-key
+resolution is already in A7 (`auth/env_keys.rs`); and `Model.compat` is
+already adapter-local in `types.rs`.
 `witness: docs/PARITY_LEDGER.md::row A8` — "Upstream ./compat legacy global
-provider registry", owner `pi-ai`, status **parity-blocked**, module
-`auth/config_value.rs or deletion ledger`. The host routes this surface through
+provider registry", owner `pi-ai`, status **witnessed**, module
+`deletion ledger`. The host routes this surface through
 the `@earendil-works/pi-ai/*` aliases above
 (`packages/extension-host/src/virtual-modules.ts` lines 49-50, 86-87) and consumes
 the legacy registry via `validateToolArguments` from
@@ -471,7 +476,7 @@ mirror/fixture/mutation-checker surfaces and the A8 audit-record slot:
   `scripts/verification/parity.ts` (with `compat-matrix.json`), which verify the
   mirror cannot become a competing protocol authority.
 - The A8 audit-record slot: `docs/PARITY_LEDGER.md` row A8 ("Upstream ./compat
-  legacy global provider registry"), status **parity-blocked**.
+  legacy global provider registry"), status **witnessed**.
 
 These surfaces are **consumed read-only** everywhere else in the repository;
 protocol files (`packages/pi-tui-protocol/src/types.ts`,
