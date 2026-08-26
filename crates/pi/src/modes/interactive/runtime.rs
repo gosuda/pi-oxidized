@@ -448,13 +448,33 @@ pub trait SessionHost: Send + Sync + 'static {
         &self,
     ) -> BoxFuture<'_, Result<Vec<super::state::ModelSelectorEntry>, String>>;
 
+    /// Current session file path for the active-session delete guard.
+    ///
+    /// Implementations must await the session manager lock (never `try_lock`
+    /// and disable the guard on contention). Callers canonicalize the result
+    /// when building the session selector.
+    fn current_session_file(&self) -> BoxFuture<'_, Option<String>> {
+        Box::pin(async { None })
+    }
+
+    /// Delete a session file, confirming via the session selector's inline
+    /// delete confirmation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable message when the file cannot be removed.
+    fn delete_session(&self, path: &str) -> BoxFuture<'_, Result<(), String>>;
+
     /// Fetch the recent sessions for the session picker.
     fn get_session_entries(
         &self,
     ) -> BoxFuture<'_, Result<Vec<super::state::SessionPickerEntry>, String>>;
 
     /// Fetch the session tree (entries with depth) for the tree selector.
-    fn get_tree_entries(&self) -> BoxFuture<'_, Result<Vec<super::state::TreeEntry>, String>>;
+    fn get_tree_entries(
+        &self,
+        filter: super::selectors::TreeFilterMode,
+    ) -> BoxFuture<'_, Result<Vec<super::state::TreeEntry>, String>>;
 
     /// Fetch the user-message fork list (tree entries, only user messages).
     fn get_fork_entries(&self) -> BoxFuture<'_, Result<Vec<super::state::TreeEntry>, String>>;
@@ -1244,6 +1264,22 @@ pub struct InteractiveRuntime<W: Write, S: SessionHost> {
     /// Pending selector cancels.
     cancel_rx: mpsc::UnboundedReceiver<()>,
     cancel_tx: mpsc::UnboundedSender<()>,
+    /// Active tree-selector filter mode (toggled by `app.tree.filter.*`).
+    tree_filter: super::selectors::TreeFilterMode,
+    /// Pending session-delete confirmations (paths to remove).
+    session_delete_rx: mpsc::UnboundedReceiver<String>,
+    session_delete_tx: mpsc::UnboundedSender<String>,
+    /// Errors emitted by the inline session-delete confirmation (e.g. active
+    /// session blocked).
+    session_selector_error_rx: mpsc::UnboundedReceiver<String>,
+    session_selector_error_tx: mpsc::UnboundedSender<String>,
+    /// Confirm-hint placeholder updates from the session selector
+    /// (`Some(path)` when armed, `None` when cleared).
+    session_confirm_rx: mpsc::UnboundedReceiver<Option<String>>,
+    session_confirm_tx: mpsc::UnboundedSender<Option<String>>,
+    /// Editor placeholder saved while delete confirmation shows its hint;
+    /// restored when cleared or the selector closes.
+    session_delete_hint_restore: Option<String>,
     /// Pending settings-row changes emitted by the live settings list.
     settings_change_rx: mpsc::UnboundedReceiver<(String, String)>,
     settings_change_tx: mpsc::UnboundedSender<(String, String)>,
@@ -1416,6 +1452,10 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         let (select_tx, select_rx) =
             mpsc::unbounded_channel::<(super::state::SelectorKind, String)>();
         let (cancel_tx, cancel_rx) = mpsc::unbounded_channel::<()>();
+        let (session_delete_tx, session_delete_rx) = mpsc::unbounded_channel::<String>();
+        let (session_selector_error_tx, session_selector_error_rx) =
+            mpsc::unbounded_channel::<String>();
+        let (session_confirm_tx, session_confirm_rx) = mpsc::unbounded_channel::<Option<String>>();
         let (settings_change_tx, settings_change_rx) =
             mpsc::unbounded_channel::<(String, String)>();
         let (theme_preview_tx, theme_preview_rx) = mpsc::unbounded_channel::<String>();
@@ -1487,6 +1527,14 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             select_tx,
             cancel_rx,
             cancel_tx,
+            tree_filter: super::selectors::TreeFilterMode::default(),
+            session_delete_rx,
+            session_delete_tx,
+            session_selector_error_rx,
+            session_selector_error_tx,
+            session_confirm_rx,
+            session_confirm_tx,
+            session_delete_hint_restore: None,
             settings_change_rx,
             settings_change_tx,
             theme_preview_rx,
@@ -1951,23 +1999,116 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             self.handle_settings_change(&id, &value).await;
             settings_mutated = true;
         }
-        while let Ok(selection) = self.theme_preview_rx.try_recv() {
-            self.preview_theme_selection(&selection);
-            settings_mutated = true;
+        // Drain inline session-delete confirmations and confirm-hint updates
+        // from the live `SessionSelector`.
+        let mut session_mutated = false;
+        while let Ok(path) = self.session_delete_rx.try_recv() {
+            match self.session.delete_session(&path).await {
+                Ok(()) => {
+                    // Refresh the session picker in place, keeping the selector
+                    // focused on the updated row list.
+                    if let Ok(component) = self
+                        .load_selector_component(super::state::SelectorKind::Session)
+                        .await
+                    {
+                        self.active_selector = Some(component);
+                        self.active_selector_kind = Some(super::state::SelectorKind::Session);
+                        self.view.focus = FocusArea::Selector;
+                    }
+                    self.push_notice("session", format!("Deleted session {path}"));
+                }
+                Err(error) => {
+                    self.last_error = Some(error.clone());
+                    self.push_notice("session", format!("Failed to delete session: {error}"));
+                }
+            }
+            session_mutated = true;
+        }
+        while let Ok(error) = self.session_selector_error_rx.try_recv() {
+            self.last_error = Some(error);
+            session_mutated = true;
+        }
+        while let Ok(confirm) = self.session_confirm_rx.try_recv() {
+            match confirm {
+                Some(_) if self.session_delete_hint_restore.is_none() => {
+                    // First arm: save the real placeholder, show the delete hint.
+                    self.session_delete_hint_restore = Some(self.view.editor.placeholder.clone());
+                    self.view.editor.placeholder =
+                        "Delete session? <enter> confirm \u{b7} <esc> cancel".to_owned();
+                }
+                None => {
+                    if let Some(placeholder) = self.session_delete_hint_restore.take() {
+                        self.view.editor.placeholder = placeholder;
+                    }
+                }
+                _ => {}
+            }
+            session_mutated = true;
+        }
+
+        // Tree-filter chords (ctrl+d / ctrl+t / ctrl+u / ctrl+l) while the tree
+        // selector is focused: retarget the filter and reload, treated as
+        // handled so the mapper never turns them into an Exit or app action.
+        let mut tree_filter_handled = false;
+        if self.active_selector_kind == Some(super::state::SelectorKind::Tree)
+            && !editor_result.is_handled()
+            && let UiEvent::Key(key_event) = &event
+        {
+            let keybindings = self.mapper.keybindings();
+            for binding in [
+                "app.tree.filter.default",
+                "app.tree.filter.noTools",
+                "app.tree.filter.userOnly",
+                "app.tree.filter.labeledOnly",
+            ] {
+                if keybindings.matches(key_event, binding) {
+                    if let Some(next) = self.tree_filter.apply_binding(binding) {
+                        self.tree_filter = next;
+                    }
+                    if let Ok(component) = self
+                        .load_selector_component(super::state::SelectorKind::Tree)
+                        .await
+                    {
+                        self.active_selector = Some(component);
+                        self.active_selector_kind = Some(super::state::SelectorKind::Tree);
+                        self.view.focus = FocusArea::Selector;
+                    }
+                    tree_filter_handled = true;
+                    break;
+                }
+            }
         }
 
         // Map app-level keys (skipped when the focused component already
         // handled the event — including selector confirm/cancel).
-        actions.extend(self.mapper.map(
-            &event,
-            &self.view,
-            &live_text,
-            &expanded_text,
-            &mut self.input_state,
-            editor_result.is_handled(),
-        ));
+        if !tree_filter_handled {
+            actions.extend(self.mapper.map(
+                &event,
+                &self.view,
+                &live_text,
+                &expanded_text,
+                &mut self.input_state,
+                editor_result.is_handled(),
+            ));
+        }
 
-        let mut needs_immediate_repaint = editor_result.needs_render() || settings_mutated;
+        // A pending extension *input* dialog owns the live editor; strip only
+        // named `app.exit` (AppExit / Ctrl+D). Unconditional Exit from double
+        // Ctrl+C or `/quit` must still shut down.
+        if matches!(
+            self.pending_extension_dialog
+                .as_ref()
+                .map(|dialog| &dialog.request),
+            Some(HostUiRequest::Input { .. })
+        ) {
+            actions.retain(|action| !matches!(action, ViewAction::AppExit));
+        }
+
+        let mut needs_immediate_repaint = editor_result.needs_render()
+            || settings_mutated
+            || session_mutated
+            || tree_filter_handled;
+
         for action in actions {
             let outcome = self.dispatch_action(action).await;
             if matches!(outcome, ActionOutcome::Repaint) {
@@ -2090,7 +2231,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             } => self.dispatch_bash(&command, exclude_from_context).await,
             ViewAction::Interrupt => self.dispatch_interrupt().await,
             ViewAction::ClearEditor => self.clear_editor(),
-            ViewAction::Exit => ActionOutcome::Exit,
+            ViewAction::Exit | ViewAction::AppExit => ActionOutcome::Exit,
             ViewAction::Suspend => ActionOutcome::Suspend,
             ViewAction::CycleThinking { .. } => {
                 self.record_err(self.session.cycle_thinking_level().await);
@@ -2328,12 +2469,13 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             );
             return ActionOutcome::Repaint;
         }
-        let items = options
-            .iter()
-            .map(|option| {
-                pi_tui::components::SelectItem::new(option.id.clone(), option.name.clone())
-            })
-            .collect();
+        // Selection values are internal list indices — never provider IDs —
+        // so Cancel (0) cannot collide with any credential namespace.
+        // Index 0 = Cancel; indices 1..=N map into `logout_options[0..N)`.
+        let mut items = vec![pi_tui::components::SelectItem::new("0", "Cancel")];
+        items.extend(options.iter().enumerate().map(|(idx, option)| {
+            pi_tui::components::SelectItem::new((idx + 1).to_string(), option.name.clone())
+        }));
         self.logout_options = options;
         self.install_confirm_selector(
             super::state::SelectorKind::Logout,
@@ -2345,12 +2487,23 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
 
     /// Apply a `/logout` selection: remove the chosen credential and report
     /// (message wording per credential kind, ports the OAuth-selector callback).
-    async fn handle_logout_confirm(&mut self, provider_id: &str) -> ActionOutcome {
-        let option = self
-            .logout_options
-            .iter()
-            .find(|option| option.id == provider_id)
-            .cloned();
+    ///
+    /// `value` is an internal selection index (`"0"` = Cancel, `"1..N"` =
+    /// `logout_options[N-1]`). Invalid / non-numeric values fail closed.
+    async fn handle_logout_confirm(&mut self, value: &str) -> ActionOutcome {
+        let Ok(index) = value.parse::<usize>() else {
+            self.logout_options.clear();
+            self.close_selector();
+            return ActionOutcome::Repaint;
+        };
+        if index == 0 {
+            self.logout_options.clear();
+            self.close_selector();
+            return ActionOutcome::Repaint;
+        }
+        let option = index
+            .checked_sub(1)
+            .and_then(|i| self.logout_options.get(i).cloned());
         self.logout_options.clear();
         self.close_selector();
         let Some(option) = option else {
@@ -3046,9 +3199,13 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     }
 
     fn close_selector(&mut self) {
+        if let Some(placeholder) = self.session_delete_hint_restore.take() {
+            self.view.editor.placeholder = placeholder;
+        }
         if let Some(placeholder) = self.confirm_saved_placeholder.take() {
             self.view.editor.placeholder = placeholder;
         }
+        self.logout_options.clear();
         self.view.overlay = None;
         self.view.extension_overlay_slot = None;
         self.active_selector = None;
@@ -3103,6 +3260,13 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     }
 
     async fn open_selector(&mut self, kind: super::state::SelectorKind) -> ActionOutcome {
+        if kind == super::state::SelectorKind::Tree {
+            self.tree_filter = super::selectors::TreeFilterMode::default();
+        }
+        // Opening a selector supersedes any in-flight delete confirm hint.
+        if let Some(placeholder) = self.session_delete_hint_restore.take() {
+            self.view.editor.placeholder = placeholder;
+        }
         match self.load_selector_component(kind).await {
             Ok(component) => {
                 self.active_selector = Some(component);
@@ -3139,17 +3303,18 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             }
             super::state::SelectorKind::Session => {
                 let entries = self.session.get_session_entries().await?;
-                let items = entries
-                    .into_iter()
-                    .map(|entry| {
-                        SelectItem::new(entry.value, entry.label)
-                            .with_description(entry.description.unwrap_or_default())
-                    })
-                    .collect();
-                Ok(self.build_select_list(kind, items))
+                // Await the live session path (lock contention waits) and
+                // canonicalize so symlink aliases still hit the delete guard.
+                let current = self.session.current_session_file().await.map(|path| {
+                    std::fs::canonicalize(&path)
+                        .ok()
+                        .map(|canon| canon.to_string_lossy().into_owned())
+                        .unwrap_or(path)
+                });
+                Ok(self.build_session_selector(&entries, current))
             }
             super::state::SelectorKind::Tree => {
-                let entries = self.session.get_tree_entries().await?;
+                let entries = self.session.get_tree_entries(self.tree_filter).await?;
                 Ok(self.build_tree_select_list(kind, entries))
             }
             super::state::SelectorKind::Fork => {
@@ -3270,6 +3435,39 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             })
             .collect();
         self.build_select_list(kind, items)
+    }
+
+    /// Build the session selector with inline delete confirmation, wiring its
+    /// callbacks to the runtime channels (select / cancel / delete / error /
+    /// confirm-hint).
+    fn build_session_selector(
+        &self,
+        entries: &[super::state::SessionPickerEntry],
+        current_session_path: Option<String>,
+    ) -> Box<dyn Component> {
+        let select_tx = self.select_tx.clone();
+        let cancel_tx = self.cancel_tx.clone();
+        let delete_tx = self.session_delete_tx.clone();
+        let error_tx = self.session_selector_error_tx.clone();
+        let confirm_tx = self.session_confirm_tx.clone();
+        let mut selector =
+            super::selectors::build_session_selector_component(entries, 0, current_session_path);
+        selector.on_select = Some(Box::new(move |item| {
+            let _ = select_tx.send((super::state::SelectorKind::Session, item.value.clone()));
+        }));
+        selector.on_cancel = Some(Box::new(move || {
+            let _ = cancel_tx.send(());
+        }));
+        selector.on_delete = Some(Box::new(move |path| {
+            let _ = delete_tx.send(path);
+        }));
+        selector.on_error = Some(Box::new(move |error| {
+            let _ = error_tx.send(error);
+        }));
+        selector.on_confirm_change = Some(Box::new(move |state| {
+            let _ = confirm_tx.send(state);
+        }));
+        Box::new(selector)
     }
 
     fn build_settings_list(
@@ -5681,6 +5879,22 @@ impl SessionHost for AgentSessionHost {
         })
     }
 
+    fn current_session_file(&self) -> BoxFuture<'_, Option<String>> {
+        let session = self.read_session();
+        Box::pin(async move {
+            let manager = session.session_manager();
+            // Await the lock: contention must delay selector build, never
+            // silently disable the active-session delete guard.
+            let guard = manager.lock().await;
+            guard.get_session_file().map(str::to_owned)
+        })
+    }
+
+    fn delete_session(&self, path: &str) -> BoxFuture<'_, Result<(), String>> {
+        let path = path.to_owned();
+        Box::pin(async move { std::fs::remove_file(&path).map_err(|error| error.to_string()) })
+    }
+
     fn get_session_entries(
         &self,
     ) -> BoxFuture<'_, Result<Vec<super::state::SessionPickerEntry>, String>> {
@@ -5722,14 +5936,17 @@ impl SessionHost for AgentSessionHost {
         })
     }
 
-    fn get_tree_entries(&self) -> BoxFuture<'_, Result<Vec<super::state::TreeEntry>, String>> {
+    fn get_tree_entries(
+        &self,
+        filter: super::selectors::TreeFilterMode,
+    ) -> BoxFuture<'_, Result<Vec<super::state::TreeEntry>, String>> {
         let session = self.read_session();
         Box::pin(async move {
             let manager = session.session_manager();
             let sm = manager.lock().await;
             let tree = sm.get_tree();
             let mut out = Vec::new();
-            flatten_tree_nodes(&tree, 0, &mut out);
+            flatten_tree_nodes_filtered(&tree, 0, filter, &mut out);
             Ok(out)
         })
     }
@@ -6173,26 +6390,71 @@ fn runtime_err_to_string(err: &AgentSessionRuntimeError) -> String {
     err.to_string()
 }
 
-fn flatten_tree_nodes(
+fn flatten_tree_nodes_filtered(
     nodes: &[crate::core::sessions::SessionTreeNode],
     depth: usize,
+    filter: super::selectors::TreeFilterMode,
     out: &mut Vec<super::state::TreeEntry>,
 ) {
     for node in nodes {
-        let id = node.entry.id().unwrap_or("").to_owned();
-        let label = node
-            .label
-            .clone()
-            .unwrap_or_else(|| tree_entry_label(&node.entry));
-        if !id.is_empty() {
-            out.push(super::state::TreeEntry {
-                value: id,
-                label,
-                depth,
-            });
+        if session_entry_matches_tree_filter(&node.entry, node.label.as_deref(), filter) {
+            let id = node.entry.id().unwrap_or("").to_owned();
+            let label = node
+                .label
+                .clone()
+                .unwrap_or_else(|| tree_entry_label(&node.entry));
+            if !id.is_empty() {
+                out.push(super::state::TreeEntry {
+                    value: id,
+                    label,
+                    depth,
+                });
+            }
         }
-        flatten_tree_nodes(&node.children, depth.saturating_add(1), out);
+        flatten_tree_nodes_filtered(&node.children, depth.saturating_add(1), filter, out);
     }
+}
+
+/// Whether a tree node passes the active [`TreeFilterMode`] visibility rule.
+///
+/// - [`Default`](super::selectors::TreeFilterMode::Default): hide settings /
+///   bookkeeping entries (`model_change`, `thinking_level_change`,
+///   `session_info`, extension `custom`).
+/// - [`NoTools`](super::selectors::TreeFilterMode::NoTools): Default plus hide
+///   `toolResult` transcript messages.
+/// - [`UserOnly`](super::selectors::TreeFilterMode::UserOnly): `user` messages
+///   only.
+/// - [`LabeledOnly`](super::selectors::TreeFilterMode::LabeledOnly): nodes
+///   carrying an explicit label.
+fn session_entry_matches_tree_filter(
+    entry: &crate::core::sessions::SessionEntry,
+    label: Option<&str>,
+    filter: super::selectors::TreeFilterMode,
+) -> bool {
+    use crate::core::sessions::SessionEntry;
+    match filter {
+        super::selectors::TreeFilterMode::Default => !session_entry_is_bookkeeping(entry),
+        super::selectors::TreeFilterMode::NoTools => {
+            !session_entry_is_bookkeeping(entry) && !session_entry_is_tool_result(entry)
+        }
+        super::selectors::TreeFilterMode::UserOnly => {
+            matches!(entry, SessionEntry::Message(message) if message.message.role() == "user")
+        }
+        super::selectors::TreeFilterMode::LabeledOnly => label.is_some(),
+    }
+}
+
+/// True for settings / bookkeeping entries hidden by the default tree view.
+fn session_entry_is_bookkeeping(entry: &crate::core::sessions::SessionEntry) -> bool {
+    matches!(
+        entry.discriminant(),
+        "model_change" | "thinking_level_change" | "session_info" | "custom"
+    )
+}
+
+/// True for `toolResult` transcript messages (hidden by the NoTools filter).
+fn session_entry_is_tool_result(entry: &crate::core::sessions::SessionEntry) -> bool {
+    matches!(entry, crate::core::sessions::SessionEntry::Message(message) if message.message.role() == "toolResult")
 }
 
 fn tree_entry_label(entry: &crate::core::sessions::SessionEntry) -> String {
@@ -6823,6 +7085,7 @@ mod tests {
         themes: std::sync::Mutex<Vec<(String, ThemeMode)>>,
         settings_changes: std::sync::Mutex<Vec<(String, String)>>,
         first_runs: std::sync::Mutex<Vec<crate::core::platform::first_run::FirstRunSelection>>,
+        deleted_sessions: Mutex<Vec<String>>,
     }
 
     struct FakeHost {
@@ -6840,6 +7103,10 @@ mod tests {
         reload_diagnostics: Arc<std::sync::Mutex<Vec<String>>>,
         extension_runner: Option<Arc<ExtensionRuntimeSet>>,
         import_missing_cwd: Arc<std::sync::atomic::AtomicBool>,
+        current_session_path: Arc<std::sync::Mutex<Option<String>>>,
+        /// Held by tests to simulate session-manager lock contention.
+        session_file_gate: Arc<tokio::sync::Mutex<()>>,
+        session_entries: Arc<std::sync::Mutex<Vec<super::state::SessionPickerEntry>>>,
     }
 
     impl FakeHost {
@@ -6861,6 +7128,9 @@ mod tests {
                 reload_diagnostics: Arc::new(std::sync::Mutex::new(Vec::new())),
                 extension_runner: None,
                 import_missing_cwd: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                current_session_path: Arc::new(std::sync::Mutex::new(None)),
+                session_file_gate: Arc::new(tokio::sync::Mutex::new(())),
+                session_entries: Arc::new(std::sync::Mutex::new(Vec::new())),
             };
             (host, log)
         }
@@ -6908,6 +7178,24 @@ mod tests {
                 .reload_diagnostics
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = diagnostics;
+        }
+
+        fn session_file_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
+            Arc::clone(&self.session_file_gate)
+        }
+
+        fn set_current_session_path(&self, path: Option<String>) {
+            *self
+                .current_session_path
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = path;
+        }
+
+        fn set_session_entries(&self, entries: Vec<super::state::SessionPickerEntry>) {
+            *self
+                .session_entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = entries;
         }
     }
 
@@ -7259,19 +7547,55 @@ mod tests {
             })
         }
 
-        fn get_session_entries(
-            &self,
-        ) -> BoxFuture<'_, Result<Vec<super::state::SessionPickerEntry>, String>> {
-            Box::pin(async {
-                Ok(vec![super::state::SessionPickerEntry {
-                    value: "/tmp/sess.jsonl".to_owned(),
-                    label: "fixture session".to_owned(),
-                    description: None,
-                }])
+        fn current_session_file(&self) -> BoxFuture<'_, Option<String>> {
+            let path = Arc::clone(&self.current_session_path);
+            let gate = Arc::clone(&self.session_file_gate);
+            Box::pin(async move {
+                let _gate = gate.lock().await;
+                path.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
             })
         }
 
-        fn get_tree_entries(&self) -> BoxFuture<'_, Result<Vec<super::state::TreeEntry>, String>> {
+        fn delete_session(&self, path: &str) -> BoxFuture<'_, Result<(), String>> {
+            let log = Arc::clone(&self.log);
+            let session_entries = Arc::clone(&self.session_entries);
+            let owned = path.to_owned();
+            Box::pin(async move {
+                log.deleted_sessions.lock().await.push(owned.clone());
+                session_entries
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .retain(|entry| entry.value != owned);
+                Ok(())
+            })
+        }
+
+        fn get_session_entries(
+            &self,
+        ) -> BoxFuture<'_, Result<Vec<super::state::SessionPickerEntry>, String>> {
+            let session_entries = Arc::clone(&self.session_entries);
+            Box::pin(async move {
+                let entries = session_entries
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                if entries.is_empty() {
+                    return Ok(vec![super::state::SessionPickerEntry {
+                        value: "/tmp/sess.jsonl".to_owned(),
+                        label: "fixture session".to_owned(),
+                        description: None,
+                    }]);
+                }
+                Ok(entries)
+            })
+        }
+
+        fn get_tree_entries(
+            &self,
+            _filter: crate::modes::interactive::selectors::TreeFilterMode,
+        ) -> BoxFuture<'_, Result<Vec<super::state::TreeEntry>, String>> {
             Box::pin(async {
                 Ok(vec![super::state::TreeEntry {
                     value: "root".to_owned(),
@@ -7404,6 +7728,22 @@ mod tests {
         let mut rt = InteractiveRuntime::new(tui, input, Arc::new(host), &options);
         let _ = rt.paint_now();
         Ok((rt, log))
+    }
+
+    /// Runtime under the shared app-keybinding lock (T-G7 chord tests).
+    fn try_make_g7_runtime() -> Result<
+        (
+            crate::core::keybindings::GlobalAppKeybindingsGuard,
+            InteractiveRuntime<SharedWriter, FakeHost>,
+            Arc<ActionLog>,
+        ),
+        String,
+    > {
+        let guard = crate::core::keybindings::lock_global_app_keybindings();
+        let (mut rt, log) = try_make_runtime()?;
+        rt.mapper
+            .set_keybindings(crate::core::keybindings::app_keybindings_defaults());
+        Ok((guard, rt, log))
     }
 
     #[tokio::test]
@@ -9919,10 +10259,11 @@ mod tests {
         ]);
         let _ = rt.dispatch_action(ViewAction::Logout).await;
         assert_eq!(rt.active_selector_kind, Some(SelectorKind::Logout));
+        // Index 1 = first credential (Cancel is 0).
         let _ = rt
             .dispatch_action(ViewAction::SelectConfirmed {
                 selector: SelectorKind::Logout,
-                value: "anthropic".to_owned(),
+                value: "1".to_owned(),
             })
             .await;
         assert_eq!(
@@ -9936,10 +10277,11 @@ mod tests {
         ));
         // Second round exercises the API-key wording.
         let _ = rt.dispatch_action(ViewAction::Logout).await;
+        // Index 2 = second credential while FakeHost keeps both options.
         let _ = rt
             .dispatch_action(ViewAction::SelectConfirmed {
                 selector: SelectorKind::Logout,
-                value: "openai".to_owned(),
+                value: "2".to_owned(),
             })
             .await;
         assert!(matches!(
@@ -9962,6 +10304,455 @@ mod tests {
             Some(MessageView::Custom(custom))
                 if custom.custom_type == "logout" && custom.text.contains("No stored credentials")
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn logout_cancel_sentinel_enter_is_silent_no_removal() -> TestResult {
+        let (_kb_guard, mut rt, log) = try_make_g7_runtime()?;
+        rt.session
+            .set_logout_options(vec![super::state::LogoutOption {
+                id: "anthropic".to_owned(),
+                name: "Anthropic".to_owned(),
+                is_oauth: true,
+            }]);
+        let _ = rt.dispatch_action(ViewAction::Logout).await;
+        assert_eq!(rt.active_selector_kind, Some(SelectorKind::Logout));
+
+        // Cancel is index 0; Enter confirms the sentinel.
+        let message_count_before = rt.view.messages.len();
+        rt.step_ui(key(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .map_err(|error| format!("logout cancel enter failed: {error}"))?;
+        assert!(rt.active_selector_kind.is_none());
+        assert!(log.logout_ids.lock().await.is_empty());
+        assert_eq!(rt.view.messages.len(), message_count_before);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn logout_cancel_esc_is_silent_no_removal() -> TestResult {
+        let (_kb_guard, mut rt, log) = try_make_g7_runtime()?;
+        rt.session
+            .set_logout_options(vec![super::state::LogoutOption {
+                id: "anthropic".to_owned(),
+                name: "Anthropic".to_owned(),
+                is_oauth: true,
+            }]);
+        let _ = rt.dispatch_action(ViewAction::Logout).await;
+        let message_count_before = rt.view.messages.len();
+        rt.step_ui(key(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .map_err(|error| format!("logout cancel esc failed: {error}"))?;
+        assert!(rt.active_selector_kind.is_none());
+        assert!(log.logout_ids.lock().await.is_empty());
+        assert_eq!(rt.view.messages.len(), message_count_before);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn logout_removes_provider_even_when_id_collides_with_old_sentinel_string() -> TestResult
+    {
+        let (_kb_guard, mut rt, log) = try_make_g7_runtime()?;
+        let colliding = "__pi.internal.logout.cancel__".to_owned();
+        rt.session
+            .set_logout_options(vec![super::state::LogoutOption {
+                id: colliding.clone(),
+                name: "Colliding Provider".to_owned(),
+                is_oauth: false,
+            }]);
+        let _ = rt.dispatch_action(ViewAction::Logout).await;
+        assert_eq!(rt.active_selector_kind, Some(SelectorKind::Logout));
+        // Index 1 is the credential row; Cancel remains index 0.
+        let _ = rt
+            .dispatch_action(ViewAction::SelectConfirmed {
+                selector: SelectorKind::Logout,
+                value: "1".to_owned(),
+            })
+            .await;
+        assert_eq!(log.logout_ids.lock().await.as_slice(), &[colliding]);
+        assert!(matches!(
+            rt.view.messages.last(),
+            Some(MessageView::Custom(custom))
+                if custom.custom_type == "logout"
+                    && custom.text.contains("Removed stored API key for Colliding Provider")
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn logout_invalid_index_fails_closed_without_removal() -> TestResult {
+        let (_kb_guard, mut rt, log) = try_make_g7_runtime()?;
+        rt.session
+            .set_logout_options(vec![super::state::LogoutOption {
+                id: "anthropic".to_owned(),
+                name: "Anthropic".to_owned(),
+                is_oauth: true,
+            }]);
+        let _ = rt.dispatch_action(ViewAction::Logout).await;
+        let message_count_before = rt.view.messages.len();
+        let _ = rt
+            .dispatch_action(ViewAction::SelectConfirmed {
+                selector: SelectorKind::Logout,
+                value: "99".to_owned(),
+            })
+            .await;
+        assert!(rt.active_selector_kind.is_none());
+        assert!(log.logout_ids.lock().await.is_empty());
+        assert_eq!(rt.view.messages.len(), message_count_before);
+
+        let _ = rt.dispatch_action(ViewAction::Logout).await;
+        let message_count_before = rt.view.messages.len();
+        let _ = rt
+            .dispatch_action(ViewAction::SelectConfirmed {
+                selector: SelectorKind::Logout,
+                value: "anthropic".to_owned(),
+            })
+            .await;
+        assert!(rt.active_selector_kind.is_none());
+        assert!(log.logout_ids.lock().await.is_empty());
+        assert_eq!(rt.view.messages.len(), message_count_before);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn logout_defaults_to_cancel_sentinel_row() -> TestResult {
+        let (_kb_guard, mut rt, _log) = try_make_g7_runtime()?;
+        rt.session
+            .set_logout_options(vec![super::state::LogoutOption {
+                id: "anthropic".to_owned(),
+                name: "Anthropic".to_owned(),
+                is_oauth: true,
+            }]);
+        let _ = rt.dispatch_action(ViewAction::Logout).await;
+        let editor = std::mem::replace(&mut rt.editor, Editor::with_defaults());
+        let selector = rt.active_selector.take();
+        let mut root = rt.build_root(editor, selector);
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buffer = Buffer::empty(area);
+        root.render(area, &mut buffer);
+        let visible = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(visible.contains("Cancel"), "missing Cancel row: {visible}");
+        assert!(
+            visible.contains("→ Cancel") || visible.contains("→Cancel"),
+            "Cancel must be the default landing row: {visible}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_selector_ctrl_d_arms_enter_deletes_and_esc_hierarchy() -> TestResult {
+        let (_kb_guard, mut rt, log) = try_make_g7_runtime()?;
+        rt.session
+            .set_current_session_path(Some("/tmp/active.jsonl".to_owned()));
+        rt.session.set_session_entries(vec![
+            super::state::SessionPickerEntry {
+                value: "/tmp/active.jsonl".to_owned(),
+                label: "active".to_owned(),
+                description: None,
+            },
+            super::state::SessionPickerEntry {
+                value: "/tmp/other.jsonl".to_owned(),
+                label: "other".to_owned(),
+                description: None,
+            },
+        ]);
+        let _ = rt.open_selector(SelectorKind::Session).await;
+        assert_eq!(rt.active_selector_kind, Some(SelectorKind::Session));
+        assert!(!rt.exited);
+
+        // Move off the active session so Ctrl+D can arm delete.
+        rt.step_ui(key(KeyCode::Down, KeyModifiers::NONE))
+            .await
+            .map_err(|error| format!("session down failed: {error}"))?;
+        rt.step_ui(key(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .await
+            .map_err(|error| format!("session ctrl+d failed: {error}"))?;
+        assert!(!rt.exited);
+        assert!(
+            rt.view.editor.placeholder.contains("Delete session?"),
+            "expected delete hint, got {}",
+            rt.view.editor.placeholder
+        );
+
+        // First Esc clears only the confirmation.
+        let saved_placeholder = rt.view.editor.placeholder.clone();
+        rt.step_ui(key(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .map_err(|error| format!("session first esc failed: {error}"))?;
+        assert_eq!(rt.active_selector_kind, Some(SelectorKind::Session));
+        assert_ne!(rt.view.editor.placeholder, saved_placeholder);
+        assert!(!rt.view.editor.placeholder.contains("Delete session?"));
+
+        // Re-arm and confirm deletion.
+        rt.step_ui(key(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .await
+            .map_err(|error| format!("session re-arm failed: {error}"))?;
+        rt.step_ui(key(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .map_err(|error| format!("session delete enter failed: {error}"))?;
+        assert_eq!(
+            log.deleted_sessions.lock().await.as_slice(),
+            &["/tmp/other.jsonl".to_owned()]
+        );
+        assert_eq!(rt.active_selector_kind, Some(SelectorKind::Session));
+
+        // Fresh selector: Esc closes the picker.
+        rt.step_ui(key(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .map_err(|error| format!("session close esc failed: {error}"))?;
+        assert!(rt.active_selector_kind.is_none());
+        assert_eq!(rt.view.focus, FocusArea::Editor);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_selector_blocks_active_delete_via_runtime() -> TestResult {
+        let (_kb_guard, mut rt, log) = try_make_g7_runtime()?;
+        rt.session
+            .set_current_session_path(Some("/tmp/active.jsonl".to_owned()));
+        rt.session
+            .set_session_entries(vec![super::state::SessionPickerEntry {
+                value: "/tmp/active.jsonl".to_owned(),
+                label: "active".to_owned(),
+                description: None,
+            }]);
+        let _ = rt.open_selector(SelectorKind::Session).await;
+        rt.step_ui(key(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .await
+            .map_err(|error| format!("active delete ctrl+d failed: {error}"))?;
+        assert!(!rt.exited);
+        assert!(log.deleted_sessions.lock().await.is_empty());
+        assert_eq!(
+            rt.last_error.as_deref(),
+            Some("Cannot delete the currently active session")
+        );
+        assert!(!rt.view.editor.placeholder.contains("Delete session?"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_selector_waits_on_held_session_file_gate_then_guards() -> TestResult {
+        let (_kb_guard, mut rt, log) = try_make_g7_runtime()?;
+        let tmp = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let active = tmp.path().join("active.jsonl");
+        std::fs::write(&active, "{}").map_err(|e| e.to_string())?;
+        let active_s = active.to_string_lossy().into_owned();
+        rt.session.set_current_session_path(Some(active_s.clone()));
+        rt.session
+            .set_session_entries(vec![super::state::SessionPickerEntry {
+                value: active_s.clone(),
+                label: "active".to_owned(),
+                description: None,
+            }]);
+
+        let gate = rt.session.session_file_gate();
+        let held = gate.lock().await;
+        let open = {
+            // Open selector while gate held — must await, not skip the guard.
+            let fut = rt.open_selector(SelectorKind::Session);
+            tokio::pin!(fut);
+            // Poll once so it parks on the gate.
+            let poll = futures::future::poll_fn(|cx| match fut.as_mut().poll(cx) {
+                std::task::Poll::Ready(v) => std::task::Poll::Ready(Some(v)),
+                std::task::Poll::Pending => std::task::Poll::Ready(None),
+            })
+            .await;
+            assert!(
+                poll.is_none(),
+                "open_selector must wait while session file gate is held"
+            );
+            drop(held);
+            fut.await
+        };
+        let _ = open;
+        assert_eq!(rt.active_selector_kind, Some(SelectorKind::Session));
+        rt.step_ui(key(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .await
+            .map_err(|error| format!("gated active delete failed: {error}"))?;
+        assert!(log.deleted_sessions.lock().await.is_empty());
+        assert_eq!(
+            rt.last_error.as_deref(),
+            Some("Cannot delete the currently active session")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_selector_blocks_active_delete_via_symlink_path() -> TestResult {
+        let (_kb_guard, mut rt, log) = try_make_g7_runtime()?;
+        let tmp = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let real = tmp.path().join("real-active.jsonl");
+        std::fs::write(&real, "{}").map_err(|e| e.to_string())?;
+        let link = tmp.path().join("link-active.jsonl");
+        std::os::unix::fs::symlink(&real, &link).map_err(|e| e.to_string())?;
+        let real_s = real.to_string_lossy().into_owned();
+        let link_s = link.to_string_lossy().into_owned();
+        // Active path recorded as the real file; selector lists the symlink.
+        rt.session.set_current_session_path(Some(real_s));
+        rt.session
+            .set_session_entries(vec![super::state::SessionPickerEntry {
+                value: link_s,
+                label: "active-link".to_owned(),
+                description: None,
+            }]);
+        let _ = rt.open_selector(SelectorKind::Session).await;
+        rt.step_ui(key(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .await
+            .map_err(|error| format!("symlink active delete failed: {error}"))?;
+        assert!(log.deleted_sessions.lock().await.is_empty());
+        assert_eq!(
+            rt.last_error.as_deref(),
+            Some("Cannot delete the currently active session")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_selector_still_deletes_non_active_session() -> TestResult {
+        let (_kb_guard, mut rt, log) = try_make_g7_runtime()?;
+        let tmp = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let active = tmp.path().join("active.jsonl");
+        let other = tmp.path().join("other.jsonl");
+        std::fs::write(&active, "{}").map_err(|e| e.to_string())?;
+        std::fs::write(&other, "{}").map_err(|e| e.to_string())?;
+        let active_s = active.to_string_lossy().into_owned();
+        let other_s = other.to_string_lossy().into_owned();
+        rt.session.set_current_session_path(Some(active_s.clone()));
+        rt.session.set_session_entries(vec![
+            super::state::SessionPickerEntry {
+                value: active_s,
+                label: "active".to_owned(),
+                description: None,
+            },
+            super::state::SessionPickerEntry {
+                value: other_s.clone(),
+                label: "other".to_owned(),
+                description: None,
+            },
+        ]);
+        let _ = rt.open_selector(SelectorKind::Session).await;
+        // Move to the non-active row.
+        rt.step_ui(key(KeyCode::Down, KeyModifiers::NONE))
+            .await
+            .map_err(|error| format!("move to other failed: {error}"))?;
+        rt.step_ui(key(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .await
+            .map_err(|error| format!("arm other delete failed: {error}"))?;
+        rt.step_ui(key(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .map_err(|error| format!("confirm other delete failed: {error}"))?;
+        assert_eq!(log.deleted_sessions.lock().await.as_slice(), &[other_s]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tree_filter_chords_update_mode_without_exiting() -> TestResult {
+        let (_kb_guard, mut rt, _log) = try_make_g7_runtime()?;
+        let _ = rt.open_selector(SelectorKind::Tree).await;
+        assert_eq!(
+            rt.tree_filter,
+            crate::modes::interactive::selectors::TreeFilterMode::Default
+        );
+
+        for (chord, expected) in [
+            (
+                't',
+                crate::modes::interactive::selectors::TreeFilterMode::NoTools,
+            ),
+            (
+                'u',
+                crate::modes::interactive::selectors::TreeFilterMode::UserOnly,
+            ),
+            (
+                'l',
+                crate::modes::interactive::selectors::TreeFilterMode::LabeledOnly,
+            ),
+            (
+                'd',
+                crate::modes::interactive::selectors::TreeFilterMode::Default,
+            ),
+        ] {
+            rt.step_ui(key(KeyCode::Char(chord), KeyModifiers::CONTROL))
+                .await
+                .map_err(|error| format!("tree filter ctrl+{chord} failed: {error}"))?;
+            assert!(!rt.exited, "ctrl+{chord} must not exit while tree is open");
+            assert_eq!(rt.tree_filter, expected);
+            assert_eq!(rt.active_selector_kind, Some(SelectorKind::Tree));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn extension_input_ctrl_d_does_not_exit() -> TestResult {
+        let (_kb_guard, mut rt, _log) = try_make_g7_runtime()?;
+        rt.begin_extension_dialog(HostUiRequest::Input {
+            id: 42,
+            request: pi_ext::protocol::InputRequest {
+                title: "Extension input".to_owned(),
+                placeholder: Some("value".to_owned()),
+                options_meta: pi_ext::protocol::DialogOptions::default(),
+            },
+        })
+        .await;
+        assert!(rt.editor.get_text().is_empty());
+        rt.step_ui(key(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .await
+            .map_err(|error| format!("extension input ctrl+d failed: {error}"))?;
+        assert!(!rt.exited);
+        assert!(rt.pending_extension_dialog.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn extension_input_second_ctrl_c_still_exits() -> TestResult {
+        let (_kb_guard, mut rt, _log) = try_make_g7_runtime()?;
+        rt.begin_extension_dialog(HostUiRequest::Input {
+            id: 44,
+            request: pi_ext::protocol::InputRequest {
+                title: "Extension input".to_owned(),
+                placeholder: Some("value".to_owned()),
+                options_meta: pi_ext::protocol::DialogOptions::default(),
+            },
+        })
+        .await;
+        // First Ctrl+C clears/interrupts; second within the double-tap window exits.
+        rt.step_ui(key(KeyCode::Char('c'), KeyModifiers::CONTROL))
+            .await
+            .map_err(|error| format!("extension input first ctrl+c failed: {error}"))?;
+        assert!(!rt.exited);
+        rt.step_ui(key(KeyCode::Char('c'), KeyModifiers::CONTROL))
+            .await
+            .map_err(|error| format!("extension input second ctrl+c failed: {error}"))?;
+        assert!(
+            rt.exited,
+            "double Ctrl+C must exit even during extension Input"
+        );
+        assert_eq!(rt.exit_kind, InteractiveExit::Clean);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_extension_editor_ctrl_d_exits() -> TestResult {
+        let (_kb_guard, mut rt, _log) = try_make_g7_runtime()?;
+        rt.begin_extension_dialog(HostUiRequest::Editor {
+            id: 43,
+            request: pi_ext::protocol::EditorRequest {
+                title: "Extension editor".to_owned(),
+                prefill: None,
+            },
+        })
+        .await;
+        assert!(rt.editor.get_text().is_empty());
+        rt.step_ui(key(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .await
+            .map_err(|error| format!("extension editor ctrl+d failed: {error}"))?;
+        assert!(rt.exited);
+        assert_eq!(rt.exit_kind, InteractiveExit::Clean);
         Ok(())
     }
 

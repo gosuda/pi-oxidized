@@ -649,8 +649,12 @@ pub enum ViewAction {
     Interrupt,
     /// Clear the editor.
     ClearEditor,
-    /// Exit the application (Ctrl+D on empty editor or double Ctrl+C).
+    /// Unconditional application exit (double Ctrl+C / `/quit`).
     Exit,
+    /// Named `app.exit` (default Ctrl+D on empty editor). Distinct from
+    /// [`Exit`] so extension Input dialogs can suppress only this chord
+    /// without blocking the unconditional double-Ctrl+C shutdown.
+    AppExit,
     /// Suspend the process (Ctrl+Z).
     Suspend,
     /// Cycle the thinking level forward/backward.

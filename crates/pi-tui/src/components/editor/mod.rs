@@ -1566,6 +1566,9 @@ impl Editor {
         event: &KeyEvent,
         kb: &crate::keybindings::KeybindingsManager,
     ) -> Option<EventResult> {
+        if kb.matches(event, "app.exit") && self.get_text().is_empty() {
+            return Some(EventResult::Ignored);
+        }
         if kb.matches(event, "tui.input.copy") {
             return Some(EventResult::Ignored);
         }
@@ -2622,5 +2625,49 @@ mod tests {
         );
         assert_ne!(editor.get_cursor(), before);
         Ok(())
+    }
+
+    #[test]
+    fn empty_ctrl_d_falls_through_when_app_exit_bound() {
+        let previous = crate::keybindings::get_keybindings();
+        let mut defs = crate::keybindings::tui_keybindings();
+        defs.insert(
+            "app.exit",
+            crate::keybindings::KeybindingDefinition {
+                default_keys: vec![crate::keys::KeyId::from("ctrl+d")],
+                description: Some("Exit when editor is empty"),
+            },
+        );
+        crate::keybindings::set_keybindings(crate::keybindings::KeybindingsManager::new(
+            defs,
+            crate::keybindings::KeybindingsConfig::new(),
+        ));
+
+        let mut ed = Editor::with_defaults();
+        assert!(ed.get_text().is_empty());
+        assert_eq!(
+            ed.handle_event(&UiEvent::Key(ctrl('d'))),
+            EventResult::Ignored
+        );
+
+        ed.set_text(" ");
+        ed.set_cursor_col(0);
+        assert_eq!(
+            ed.handle_event(&UiEvent::Key(ctrl('d'))),
+            EventResult::Render
+        );
+        assert_eq!(ed.get_text(), "");
+
+        crate::keybindings::set_keybindings(previous);
+    }
+
+    #[test]
+    fn delete_key_on_empty_still_forward_deletes() {
+        let mut ed = Editor::with_defaults();
+        assert!(ed.get_text().is_empty());
+        assert_eq!(
+            ed.handle_event(&UiEvent::Key(press(KeyCode::Delete))),
+            EventResult::Render
+        );
     }
 }
