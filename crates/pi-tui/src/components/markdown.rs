@@ -8,7 +8,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
 use crate::component::{Component, EventResult, UiEvent};
-use crate::link::hyperlink;
+use crate::link::hyperlink_capped;
 use crate::text::{
     is_image_line, strip_trailing_partial_closing_fence, visible_width, wrap_text_with_ansi,
 };
@@ -621,7 +621,7 @@ impl<'a> MarkdownRenderer<'a> {
         };
         let styled = (self.theme.link)(&(self.theme.underline)(&self.link_text));
         let rendered = if self.options.hyperlinks {
-            hyperlink(&styled, &href)
+            hyperlink_capped(&styled, &href, None)
         } else {
             let comparable = href.strip_prefix("mailto:").unwrap_or(&href);
             if self.link_text == href || self.link_text == comparable {
@@ -2099,6 +2099,64 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(joined.contains("example.com") || joined.contains("label"));
+    }
+
+    #[test]
+    fn link_hyperlink_enabled_hides_url() {
+        let mut m = Markdown::new(
+            "[label](https://example.com)",
+            0,
+            0,
+            MarkdownTheme::default(),
+            DefaultTextStyle::default(),
+            MarkdownOptions {
+                hyperlinks: true,
+                ..Default::default()
+            },
+        );
+        let snap = render_snapshot(&mut m, 80);
+        let plain_text: String = snap.iter().map(|s| strip_ansi(s)).collect::<Vec<_>>().join("\n");
+        assert!(plain_text.contains("label"));
+        assert!(!plain_text.contains("(https://example.com)"));
+    }
+
+    #[test]
+    fn link_hyperlink_disabled_shows_url_in_parens() {
+        let mut m = Markdown::new(
+            "[label](https://example.com)",
+            0,
+            0,
+            MarkdownTheme::default(),
+            DefaultTextStyle::default(),
+            MarkdownOptions {
+                hyperlinks: false,
+                ..Default::default()
+            },
+        );
+        let snap = render_snapshot(&mut m, 80);
+        let plain_text: String = snap.iter().map(|s| strip_ansi(s)).collect::<Vec<_>>().join("\n");
+        assert!(plain_text.contains("label"));
+        assert!(plain_text.contains("(https://example.com)"));
+    }
+
+    #[test]
+    fn link_hyperlink_capped_falls_back_on_oversized_uri() {
+        let long_uri = format!("https://example.com/{}", "x".repeat(2048));
+        let mut m = Markdown::new(
+            &format!("[label]({long_uri})"),
+            0,
+            0,
+            MarkdownTheme::default(),
+            DefaultTextStyle::default(),
+            MarkdownOptions {
+                hyperlinks: true,
+                ..Default::default()
+            },
+        );
+        let snap = render_snapshot(&mut m, 80);
+        let plain_text: String = snap.iter().map(|s| strip_ansi(s)).collect::<Vec<_>>().join("\n");
+        assert!(plain_text.contains("label"));
+        assert!(!plain_text.contains(&long_uri));
     }
 
     #[test]

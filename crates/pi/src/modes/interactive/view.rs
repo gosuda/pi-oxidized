@@ -58,7 +58,10 @@ pub struct ComposedView {
 /// theme is installed thread-locally for the duration of composition.
 #[must_use]
 pub fn compose(state: &ViewState) -> ComposedView {
-    theme::with_theme(state.theme.clone(), || compose_inner(state))
+    theme::with_theme(
+        state.theme.clone(),
+        || theme::with_hyperlinks(state.hyperlinks, || compose_inner(state)),
+    )
 }
 
 fn compose_inner(state: &ViewState) -> ComposedView {

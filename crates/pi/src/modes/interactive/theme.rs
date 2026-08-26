@@ -18,7 +18,7 @@
 //! `theme_invalid_falls_back_to_dark` test.
 
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
@@ -532,6 +532,23 @@ thread_local! {
     static CURRENT: RefCell<Option<Arc<ResolvedTheme>>> = const { RefCell::new(None) };
 }
 
+thread_local! {
+    /// Hyperlink capability read by [`user_markdown_options`]. `false` ⇒
+    /// plain `text (url)` fallback. Set by [`with_hyperlinks`] during view
+    /// composition; mirrors the reference's environmental `getCapabilities()`.
+    static HYPERLINKS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Install `enabled` as the thread-local hyperlink capability for the
+/// duration of `f`. Re-entrant; restores the prior value on drop.
+pub fn with_hyperlinks<R>(enabled: bool, f: impl FnOnce() -> R) -> R {
+    let prior = HYPERLINKS.with(|cell| cell.get());
+    HYPERLINKS.with(|cell| cell.set(enabled));
+    let r = f();
+    HYPERLINKS.with(|cell| cell.set(prior));
+    r
+}
+
 /// Install `theme` as the thread-local current theme for the duration of `f`.
 ///
 /// Re-entrant; restores the prior theme on drop. Use this around any render
@@ -987,13 +1004,16 @@ fn slot_for_stack(stack: &ScopeStack) -> Option<ThemeColor> {
         .find_map(|(selector, slot)| selector.does_match(stack.as_slice()).map(|_| *slot))
 }
 
-/// Markdown options matching the user-message renderer.
+/// Markdown options matching the user-message renderer. The hyperlink flag
+/// is read from the thread-local set by [`with_hyperlinks`] during view
+/// composition, mirroring the reference's environmental
+/// `getCapabilities().hyperlinks` check.
 #[must_use]
 pub fn user_markdown_options() -> MarkdownOptions {
     MarkdownOptions {
         preserve_ordered_list_markers: true,
         preserve_backslash_escapes: true,
-        hyperlinks: false,
+        hyperlinks: HYPERLINKS.with(|cell| cell.get()),
     }
 }
 
@@ -1659,11 +1679,16 @@ pub fn parse_theme_pair(raw: &str) -> Option<(String, String)> {
 ///   other variant; `None` or a failed pair load keeps the base name.
 ///
 /// `want_dark = mode == Dark || (mode == Auto && terminal == Dark)`.
+///
+/// `color_mode` drives the render depth: callers pass `ColorMode::Truecolor`
+/// when `caps.true_color` is set and `ColorMode::Palette256` otherwise,
+/// mirroring the reference `createTheme` capability default (theme.ts:630).
 #[must_use]
 pub fn resolve_active_theme(
     raw: Option<&str>,
     mode: ThemeMode,
     terminal: TerminalTheme,
+    color_mode: ColorMode,
 ) -> Arc<ResolvedTheme> {
     let want_dark = match mode {
         ThemeMode::Dark => true,
@@ -1673,14 +1698,14 @@ pub fn resolve_active_theme(
     let base = raw.unwrap_or("dark");
     if let Some((light, dark)) = parse_theme_pair(base) {
         let member = if want_dark { dark } else { light };
-        return load_or_dark(&member, ColorMode::Truecolor);
+        return load_or_dark(&member, color_mode);
     }
     if let Some(paired) = paired_name(base, want_dark)
-        && let Ok(theme) = load_by_name(&paired, ColorMode::Truecolor)
+        && let Ok(theme) = load_by_name(&paired, color_mode)
     {
         return theme;
     }
-    load_or_dark(base, ColorMode::Truecolor)
+    load_or_dark(base, color_mode)
 }
 
 /// A discoverable theme: display name plus its JSON path when file-backed.
@@ -2042,19 +2067,19 @@ mod tests {
             // Unset raw setting: base "dark", flipped by polarity.
             let expected = if want_dark { "dark" } else { "light" };
             assert_eq!(
-                resolve_active_theme(None, mode, terminal).name,
+                resolve_active_theme(None, mode, terminal, ColorMode::Truecolor).name,
                 expected,
                 "unset raw, {mode:?}/{terminal:?}"
             );
             assert_eq!(
-                resolve_active_theme(Some("dark"), mode, terminal).name,
+                resolve_active_theme(Some("dark"), mode, terminal, ColorMode::Truecolor).name,
                 expected,
                 "base dark, {mode:?}/{terminal:?}"
             );
             // Plain suffixed name: paired_name flips within the family.
             let expected = if want_dark { "antd-dark" } else { "antd-light" };
             assert_eq!(
-                resolve_active_theme(Some("antd-light"), mode, terminal).name,
+                resolve_active_theme(Some("antd-light"), mode, terminal, ColorMode::Truecolor).name,
                 expected,
                 "base antd-light, {mode:?}/{terminal:?}"
             );
@@ -2062,13 +2087,13 @@ mod tests {
             // pair "dark/light" means {light: dark-theme, dark: light-theme}.
             let expected = if want_dark { "light" } else { "dark" };
             assert_eq!(
-                resolve_active_theme(Some("dark/light"), mode, terminal).name,
+                resolve_active_theme(Some("dark/light"), mode, terminal, ColorMode::Truecolor).name,
                 expected,
                 "reversed pair, {mode:?}/{terminal:?}"
             );
             // Unknown pair members fall back per-member to built-in dark.
             assert_eq!(
-                resolve_active_theme(Some("solarized-light/gruvbox-dark"), mode, terminal).name,
+                resolve_active_theme(Some("solarized-light/gruvbox-dark"), mode, terminal, ColorMode::Truecolor).name,
                 "dark",
                 "unknown pair members, {mode:?}/{terminal:?}"
             );
@@ -2079,25 +2104,67 @@ mod tests {
     fn resolve_active_theme_member_failure_falls_back_per_member() {
         // Dark member loads; light member is unknown and falls back to dark.
         assert_eq!(
-            resolve_active_theme(Some("nope/m3-dark"), ThemeMode::Dark, TerminalTheme::Dark).name,
+            resolve_active_theme(Some("nope/m3-dark"), ThemeMode::Dark, TerminalTheme::Dark, ColorMode::Truecolor).name,
             "m3-dark"
         );
         assert_eq!(
-            resolve_active_theme(Some("nope/m3-dark"), ThemeMode::Light, TerminalTheme::Dark).name,
+            resolve_active_theme(Some("nope/m3-dark"), ThemeMode::Light, TerminalTheme::Dark, ColorMode::Truecolor).name,
             "dark"
         );
         // Unpaired custom name that does not exist: load_or_dark fallback.
         assert_eq!(
-            resolve_active_theme(Some("mytheme"), ThemeMode::Auto, TerminalTheme::Light).name,
+            resolve_active_theme(Some("mytheme"), ThemeMode::Auto, TerminalTheme::Light, ColorMode::Truecolor).name,
             "dark"
         );
         // Paired name whose counterpart does not exist keeps the base.
         // ("classic-light" pairs to "classic-dark", both exist; use a fake
         // family to hit the fallback.)
         assert_eq!(
-            resolve_active_theme(Some("ghost-light"), ThemeMode::Dark, TerminalTheme::Dark).name,
+            resolve_active_theme(Some("ghost-light"), ThemeMode::Dark, TerminalTheme::Dark, ColorMode::Truecolor).name,
             "dark",
             "ghost-dark fails to load, ghost-light fails to load, dark fallback"
+        );
+    }
+
+    /// TUI-T2 oracle: `resolve_active_theme` with `ColorMode::Palette256`
+    /// (forced-256 mode, simulating `caps.true_color == false`) must produce
+    /// 256-color SGR sequences, not truecolor. This verifies the capability
+    /// drives downsampling on every theme load path.
+    #[test]
+    fn resolve_active_theme_forced_256_emits_palette_sgr() {
+        let theme = resolve_active_theme(
+            None,
+            ThemeMode::Dark,
+            TerminalTheme::Dark,
+            ColorMode::Palette256,
+        );
+        assert_eq!(theme.mode(), ColorMode::Palette256);
+        let ansi = theme.fg_ansi(ThemeColor::Accent);
+        assert!(
+            ansi.contains("\x1b[38;5;") || !ansi.contains("\x1b[38;"),
+            "forced-256 mode must emit 256-color SGR, got: {ansi:?}"
+        );
+        assert!(
+            !ansi.contains("\x1b[38;2;"),
+            "forced-256 mode must not emit truecolor SGR, got: {ansi:?}"
+        );
+    }
+
+    /// TUI-T2 oracle: `resolve_active_theme` with `ColorMode::Truecolor`
+    /// (simulating `caps.true_color == true`) must produce truecolor SGR.
+    #[test]
+    fn resolve_active_theme_truecolor_emits_24bit_sgr() {
+        let theme = resolve_active_theme(
+            None,
+            ThemeMode::Dark,
+            TerminalTheme::Dark,
+            ColorMode::Truecolor,
+        );
+        assert_eq!(theme.mode(), ColorMode::Truecolor);
+        let ansi = theme.fg_ansi(ThemeColor::Accent);
+        assert!(
+            ansi.contains("\x1b[38;2;"),
+            "truecolor mode must emit 24-bit SGR, got: {ansi:?}"
         );
     }
 
@@ -2843,5 +2910,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn user_markdown_options_defaults_to_no_hyperlinks() {
+        let opts = user_markdown_options();
+        assert!(!opts.hyperlinks);
+        assert!(opts.preserve_ordered_list_markers);
+        assert!(opts.preserve_backslash_escapes);
+    }
+
+    #[test]
+    fn with_hyperlinks_propagates_to_user_markdown_options() {
+        with_hyperlinks(true, || {
+            assert!(user_markdown_options().hyperlinks);
+        });
+        assert!(!user_markdown_options().hyperlinks);
+    }
+
+    #[test]
+    fn with_hyperlinks_is_reentrant_and_restores_prior() {
+        with_hyperlinks(false, || {
+            with_hyperlinks(true, || {
+                assert!(user_markdown_options().hyperlinks);
+            });
+            assert!(!user_markdown_options().hyperlinks);
+        });
     }
 }

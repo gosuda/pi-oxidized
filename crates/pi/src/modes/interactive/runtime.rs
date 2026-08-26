@@ -1585,10 +1585,10 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         view.width = options.size.0;
         view.height = options.size.1;
         view.quiet = options.quiet;
+        view.hyperlinks = options.caps.hyperlinks;
         view.resize(options.size.0, options.size.1);
         view
     }
-
     // ----- Public accessors (driver seam) -----
 
     /// Borrow the view state (tests / driver seam).
@@ -6447,7 +6447,7 @@ fn flatten_tree_nodes_filtered(
 /// Whether a tree node passes the active [`TreeFilterMode`] visibility rule.
 ///
 /// - [`Default`](super::selectors::TreeFilterMode::Default): hide settings /
-///   bookkeeping entries (`model_change`, `thinking_level_change`,
+///   bookkeeping entries (`label`, `model_change`, `thinking_level_change`,
 ///   `session_info`, extension `custom`).
 /// - [`NoTools`](super::selectors::TreeFilterMode::NoTools): Default plus hide
 ///   `toolResult` transcript messages.
@@ -6477,7 +6477,11 @@ fn session_entry_matches_tree_filter(
 fn session_entry_is_bookkeeping(entry: &crate::core::sessions::SessionEntry) -> bool {
     matches!(
         entry.discriminant(),
-        "model_change" | "thinking_level_change" | "session_info" | "custom"
+        "label"
+            | "model_change"
+            | "thinking_level_change"
+            | "session_info"
+            | "custom"
     )
 }
 

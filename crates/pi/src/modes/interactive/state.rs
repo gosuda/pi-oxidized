@@ -80,6 +80,10 @@ pub struct ViewState {
     /// Whether the working indicator is shown at agent start. Persisted across
     /// turns so `ui.setWorkingVisible(false)` is honored at `AgentStart`.
     pub working_visible: bool,
+    /// Whether the terminal advertises OSC 8 hyperlink support. Read by
+    /// view composition via [`super::theme::with_hyperlinks`] so every
+    /// markdown surface honors the same capability.
+    pub hyperlinks: bool,
 }
 
 /// Header view-model data.
@@ -578,6 +582,7 @@ impl ViewState {
             first_run_mode: None,
             working_message: None,
             working_visible: true,
+            hyperlinks: false,
         }
     }
 

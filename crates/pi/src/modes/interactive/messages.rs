@@ -13,7 +13,7 @@ use pi_tui::component::Component;
 use pi_tui::components::{Markdown, Rail, Spacer, Text};
 
 use super::theme::{
-    self, MarkdownOptions, MarkdownTheme, ResolvedTheme, ThemeColor, user_markdown_options,
+    self, MarkdownTheme, ResolvedTheme, ThemeColor, user_markdown_options,
 };
 use super::tool_renderer::{ToolPhase, ToolState};
 /// Shared left-edge indent for unrailed content (column 2; D3).
@@ -203,7 +203,7 @@ fn push_assistant_content_blocks(
                         0,
                         md_theme.clone(),
                         theme::default_text_style(),
-                        MarkdownOptions::default(),
+                        user_markdown_options(),
                     )));
                 }
             }
@@ -265,7 +265,7 @@ fn push_thinking_components(
             0,
             md_theme.clone(),
             thinking_text_style(),
-            MarkdownOptions::default(),
+            user_markdown_options(),
         )));
     }
     if has_after {
@@ -470,7 +470,7 @@ pub fn build_custom(
         0,
         md_theme.clone(),
         custom_text_style(),
-        MarkdownOptions::default(),
+        user_markdown_options(),
     )));
     let mut stack = ColumnStack::new();
     stack.push(Box::new(Spacer::new(1)));
@@ -497,7 +497,7 @@ pub fn build_compaction(
         0,
         md_theme.clone(),
         theme::default_text_style(),
-        MarkdownOptions::default(),
+        user_markdown_options(),
     )));
     let mut stack = ColumnStack::new();
     stack.push(Box::new(Spacer::new(1)));
@@ -524,7 +524,7 @@ pub fn build_branch(
         0,
         md_theme.clone(),
         theme::default_text_style(),
-        MarkdownOptions::default(),
+        user_markdown_options(),
     )));
     let mut stack = ColumnStack::new();
     stack.push(Box::new(Spacer::new(1)));
@@ -551,7 +551,7 @@ pub fn build_skill(
         0,
         md_theme.clone(),
         custom_text_style(),
-        MarkdownOptions::default(),
+        user_markdown_options(),
     )));
     let mut stack = ColumnStack::new();
     stack.push(Box::new(Spacer::new(1)));

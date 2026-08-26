@@ -10,7 +10,7 @@ use pi_tui::components::{Markdown, Spacer, Text};
 
 use super::messages::CONTENT_INDENT;
 use super::state::{LoadedResource, ShortcutHint, StartupDiagnostics};
-use super::theme::{self, MarkdownOptions, MarkdownTheme, ResolvedTheme, ThemeColor};
+use super::theme::{self, MarkdownTheme, ResolvedTheme, ThemeColor, user_markdown_options};
 use crate::core::settings::ThemeMode;
 
 // ---------------------------------------------------------------------------
@@ -139,7 +139,7 @@ pub fn build_first_time_setup_with_selection(
         0,
         md_theme,
         theme::default_text_style(),
-        MarkdownOptions::default(),
+        user_markdown_options(),
     )));
 
     let options: Vec<String> = match step {
@@ -299,7 +299,7 @@ pub fn build_changelog(
         0,
         md_theme,
         theme::default_text_style(),
-        MarkdownOptions::default(),
+        user_markdown_options(),
     )));
     Box::new(stack)
 }
