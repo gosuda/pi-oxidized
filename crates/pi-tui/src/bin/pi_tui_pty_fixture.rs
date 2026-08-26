@@ -247,6 +247,7 @@ fn run() -> io::Result<ExitCode> {
     let args: Vec<String> = env::args().skip(1).collect();
     let mut exit_mode = ExitMode::Success;
     let mut sync_output = true;
+    let mut serve = false;
     for arg in &args {
         if let Some(mode) = arg.strip_prefix("--exit=") {
             exit_mode = ExitMode::parse(mode).ok_or_else(|| {
@@ -257,10 +258,12 @@ fn run() -> io::Result<ExitCode> {
             })?;
         } else if arg == "--no-sync" {
             sync_output = false;
+        } else if arg == "--serve" {
+            serve = true;
         } else if arg == "--help" {
             writeln!(
                 io::stdout(),
-                "pi_tui_pty_fixture [--exit=success|abort|provider-error|panic|sigint] [--no-sync]"
+                "pi_tui_pty_fixture [--exit=success|abort|provider-error|panic|sigint] [--no-sync] [--serve]"
             )?;
             return Ok(ExitCode::SUCCESS);
         } else {
@@ -281,13 +284,14 @@ fn run() -> io::Result<ExitCode> {
         .build()
         .map_err(|err| io::Error::other(format!("runtime: {err}")))?;
 
-    runtime.block_on(async move { run_fixture(exit_mode, sync_output, started).await })
+    runtime.block_on(async move { run_fixture(exit_mode, sync_output, serve, started).await })
 }
 
 #[allow(clippy::too_many_lines)]
 async fn run_fixture(
     exit_mode: ExitMode,
     sync_output: bool,
+    serve: bool,
     started: Instant,
 ) -> io::Result<ExitCode> {
     // Do not hold `stdout.lock()` across the lifetime of the fixture: `Tui`
@@ -544,6 +548,13 @@ async fn run_fixture(
     root.plugin = "DONE-MARKER".into();
     commit_with_deadline(&mut tui, Txn::Frame, &mut root, started)?;
 
+    if serve {
+        root.status = "serving".into();
+        root.plugin = "SERVE-READY".into();
+        commit_with_deadline(&mut tui, Txn::Frame, &mut root, started)?;
+        serve_live_events(&mut input, &mut tui, &mut root, started).await?;
+    }
+
     // Publish write accounting on the wire for the harness (outside stage-3).
     {
         let log = write_log
@@ -627,6 +638,62 @@ async fn run_fixture(
                 Ok(ExitCode::from(130))
             }
         }
+    }
+}
+
+async fn serve_live_events(
+    input: &mut TerminalInput,
+    tui: &mut Tui<StdoutOwner>,
+    root: &mut FixtureRoot,
+    started: Instant,
+) -> io::Result<()> {
+    let mut pending = None;
+    loop {
+        let event = match pending.take() {
+            Some(event) => event,
+            None => match input.recv().await {
+                Some(event) => event,
+                None => return Ok(()),
+            },
+        };
+
+        let UiEvent::Resize { width, height } = event else {
+            // portable-pty's UnixMasterWriter Drop sends newline+VEOT as the
+            // master-EOF stand-in; in raw mode that arrives as Ctrl+D, not a
+            // kernel stdin EOF, so treat it as the serve terminator.
+            if let UiEvent::Key(key) = &event
+                && key.code == KeyCode::Char('d')
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+            {
+                return Ok(());
+            }
+            handle_ui_event(tui, root, &event, started)?;
+            continue;
+        };
+
+        // Coalesce a back-to-back resize storm into one note_resize + Reanchor.
+        let mut latest = (width, height);
+        let _ = root.handle_event(&UiEvent::Resize { width, height });
+        tokio::task::yield_now().await;
+        while let Some(next) = input.try_recv() {
+            match next {
+                UiEvent::Resize { width, height } => {
+                    latest = (width, height);
+                    let _ = root.handle_event(&UiEvent::Resize { width, height });
+                }
+                other => {
+                    pending = Some(other);
+                    break;
+                }
+            }
+        }
+        tui.note_resize(latest.0.max(1), latest.1.max(1));
+        commit_with_deadline(
+            tui,
+            Txn::Reanchor(ReanchorCause::Resize),
+            root,
+            started,
+        )?;
     }
 }
 
