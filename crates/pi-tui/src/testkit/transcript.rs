@@ -818,22 +818,27 @@ impl TranscriptRecorder {
         for chunk in chunks {
             raw.extend_from_slice(chunk);
         }
-        self.raw_log.extend_from_slice(&raw);
         let normalized = normalize_raw_bytes(&raw, context);
-        self.applied.extend(normalized.applied.iter().copied());
-        let seq = self.take_seq()?;
-        self.output_audits.push(OutputAudit {
-            event_seq: seq,
+        let applied = normalized.applied;
+        let audit = OutputAudit {
+            event_seq: 0,
             raw_bytes_b64: BASE64.encode(&raw),
             context: NormalizationAuditContext {
                 home_b64: context.home.as_ref().map(|value| BASE64.encode(value)),
                 cwd_b64: context.cwd.as_ref().map(|value| BASE64.encode(value)),
             },
-            applied: normalized.applied.clone(),
-        });
+            applied: applied.clone(),
+        };
+        let bytes_b64 = BASE64.encode(normalized.bytes);
+        let seq = self.take_seq()?;
+        let mut audit = audit;
+        audit.event_seq = seq;
+        self.raw_log.extend_from_slice(&raw);
+        self.applied.extend(applied);
+        self.output_audits.push(audit);
         self.artifact.canonical.events.push(CanonicalEvent::Output {
             seq,
-            bytes_b64: BASE64.encode(normalized.bytes),
+            bytes_b64,
         });
         Ok(())
     }
@@ -996,12 +1001,13 @@ impl TranscriptRecorder {
             return Ok(false);
         }
         let collapsed = sizes.last().copied().into_iter().collect::<Vec<_>>();
-        if sizes.len() > collapsed.len() {
+        let collapse = sizes.len() > collapsed.len();
+        let seq = self.take_seq()?;
+        if collapse {
             self.applied.insert(NormalizationEntry {
                 kind: NormalizationKind::ResizeCollapse,
             });
         }
-        let seq = self.take_seq()?;
         self.artifact
             .canonical
             .events
@@ -1425,6 +1431,96 @@ mod tests {
         assert_eq!(value.raw_log, raw_before);
         assert_eq!(value.output_audits, audits_before);
         assert_eq!(value.applied, applied_before);
+        Ok(())
+    }
+
+    fn snapshot_recorder_state(
+        value: &TranscriptRecorder,
+    ) -> (
+        u32,
+        Vec<CanonicalEvent>,
+        Vec<u8>,
+        Vec<OutputAudit>,
+        BTreeSet<NormalizationEntry>,
+    ) {
+        (
+            value.next_seq,
+            value.artifact.canonical.events.clone(),
+            value.raw_log.clone(),
+            value.output_audits.clone(),
+            value.applied.clone(),
+        )
+    }
+
+    fn assert_recorder_state_unchanged(
+        value: &TranscriptRecorder,
+        before: &(
+            u32,
+            Vec<CanonicalEvent>,
+            Vec<u8>,
+            Vec<OutputAudit>,
+            BTreeSet<NormalizationEntry>,
+        ),
+    ) {
+        let after = snapshot_recorder_state(value);
+        assert_eq!(after.0, before.0, "next_seq mutated");
+        assert_eq!(after.1, before.1, "canonical events mutated");
+        assert_eq!(after.2, before.2, "raw_log mutated");
+        assert_eq!(after.3, before.3, "output_audits mutated");
+        assert_eq!(after.4, before.4, "applied normalizations mutated");
+    }
+
+    #[test]
+    fn output_rejects_sequence_overflow_without_mutation() -> Result<(), TranscriptError> {
+        let mut value = recorder(DriverKind::PosixPty);
+        value.spawn(vec!["pi".to_owned()], &NormalizationContext::default())?;
+        // Seed one successful output so overflow must preserve existing audits/raw/applied.
+        value.output(
+            &[b"prefix"],
+            &NormalizationContext {
+                home: Some(b"/home/alice".to_vec()),
+                cwd: Some(b"/home/alice/project".to_vec()),
+            },
+        )?;
+        value.force_next_seq_for_test(u32::MAX);
+        let before = snapshot_recorder_state(&value);
+        let error = value
+            .output(
+                &[b"/home/alice/project/ready"],
+                &NormalizationContext {
+                    home: Some(b"/home/alice".to_vec()),
+                    cwd: Some(b"/home/alice/project".to_vec()),
+                },
+            )
+            .expect_err("expected sequence overflow");
+        assert!(matches!(error, TranscriptError::SequenceOverflow));
+        assert_recorder_state_unchanged(&value, &before);
+        // Mutation-capable payload would have extended raw_log and applied PathHome/PathCwd.
+        assert_eq!(value.raw_log, b"prefix");
+        assert_eq!(value.output_audits.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn resize_storm_rejects_sequence_overflow_without_mutation() -> Result<(), TranscriptError> {
+        let mut value = recorder(DriverKind::PosixPty);
+        value.spawn(vec!["pi".to_owned()], &NormalizationContext::default())?;
+        assert!(value.resize_storm(&[Geometry { cols: 80, rows: 24 }])?);
+        value.force_next_seq_for_test(u32::MAX);
+        let before = snapshot_recorder_state(&value);
+        let error = value
+            .resize_storm(&[
+                Geometry { cols: 40, rows: 12 },
+                Geometry { cols: 20, rows: 8 },
+                Geometry { cols: 10, rows: 4 },
+            ])
+            .expect_err("expected sequence overflow");
+        assert!(matches!(error, TranscriptError::SequenceOverflow));
+        assert_recorder_state_unchanged(&value, &before);
+        assert!(!value
+            .applied
+            .iter()
+            .any(|entry| entry.kind == NormalizationKind::ResizeCollapse));
         Ok(())
     }
 
