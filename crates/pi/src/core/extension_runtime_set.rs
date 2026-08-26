@@ -7842,4 +7842,57 @@ pub(crate) mod tests {
         second_host.wait_for_exit().await?;
         Ok(())
     }
+
+    // ──────────────────────────────────────────────────────────────────
+    // XC-9 / M21: spawn-flags witness — endpoint classification and argv
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn m21_spawn_flags_builtin_compat_no_no_builtins_flag() -> TestResult {
+        let plans = plan_endpoints(&[classified(ExtensionRuntime::TsCompat, "ext.ts")]);
+        let resolved = Ok(HostSpec {
+            source: HostSource::Env(PathBuf::from("/bun")),
+            program: PathBuf::from("/bun"),
+            args: vec!["/bundle/pi-extension-host.js".to_owned()],
+        });
+        let spec = endpoint_host_spec(&plans[0], Some(&resolved))?;
+        assert!(!spec.args.contains(&"--no-builtins".to_owned()), "builtin compat must not get --no-builtins");
+        Ok(())
+    }
+
+    #[test]
+    fn m21_spawn_flags_native_endpoint_empty_args() -> TestResult {
+        let plans = plan_endpoints(&[classified(ExtensionRuntime::Native, "/native-ext")]);
+        let spec = endpoint_host_spec(&plans[0], None)?;
+        assert!(spec.args.is_empty(), "native endpoint must have empty args");
+        Ok(())
+    }
+
+    #[test]
+    fn m21_spawn_flags_mjs_produces_diagnostic_not_compat_plan() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let mjs = temp.path().join("prebundled.mjs");
+        std::fs::write(&mjs, "export default {}")?;
+        let (classified, diagnostics) = classify_paths(&[mjs.to_string_lossy().into_owned()]);
+        assert!(classified.is_empty(), ".mjs must not produce a classified extension");
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].message.contains("lean runner"), "diagnostic must mention lean runner");
+        Ok(())
+    }
+
+    #[test]
+    fn m21_spawn_flags_ts_file_classified_as_ts_compat() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let ts = temp.path().join("extension.ts");
+        std::fs::write(&ts, "export default {}")?;
+        let (classified, diagnostics) = classify_paths(&[ts.to_string_lossy().into_owned()]);
+        assert!(diagnostics.is_empty());
+        assert_eq!(classified.len(), 1);
+        assert_eq!(classified[0].runtime, ExtensionRuntime::TsCompat);
+        let plans = plan_endpoints(&classified);
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].kind, EndpointKind::TsCompat);
+        Ok(())
+    }
+
 }

@@ -116,6 +116,12 @@ pub enum ManifestError {
     #[cfg(unix)]
     #[error("native extension entry is not executable: {path}")]
     NativeEntryNotExecutable { path: PathBuf },
+    /// A prebundled `.mjs` file cannot be loaded through the TypeScript-compat
+    /// host (Mode 1). Prebundled ESM modules require the lean runner (Mode 2),
+    /// which is not yet wired through the Rust endpoint planner. Rejecting
+    /// `.mjs` here prevents accidental Mode 1 classification (M21).
+    #[error("prebundled .mjs extension requires lean runner routing, not Mode 1 compat: {path}")]
+    UnsupportedPrebundledMjs { path: PathBuf },
 }
 
 const MANIFEST_FILE_NAME: &str = "pi-extension.json";
@@ -134,6 +140,9 @@ struct DirectoryManifest {
 ///
 /// A file and a directory without [`MANIFEST_FILE_NAME`] retain the discovery
 /// string exactly, preserving the compatibility extension path contract.
+/// Prebundled `.mjs` files are rejected: they require lean-runner (Mode 2)
+/// routing, not the TypeScript-compat host (Mode 1). This prevents accidental
+/// Mode 1 classification of prebundled ESM modules (M21 witness).
 pub fn classify(discovered: &str) -> Result<ClassifiedExtension, ManifestError> {
     let discovered_path = Path::new(discovered);
     let metadata = fs::metadata(discovered_path).map_err(|source| ManifestError::Inspect {
@@ -142,6 +151,11 @@ pub fn classify(discovered: &str) -> Result<ClassifiedExtension, ManifestError> 
     })?;
 
     if metadata.is_file() {
+        if discovered_path.extension().is_some_and(|ext| ext == "mjs") {
+            return Err(ManifestError::UnsupportedPrebundledMjs {
+                path: discovered_path.to_path_buf(),
+            });
+        }
         return Ok(compat(discovered));
     }
     if !metadata.is_dir() {
@@ -671,4 +685,33 @@ mod tests {
             "InspectEntry must not be labeled as canonicalization, got: {msg}"
         );
     }
+
+    // ──────────────────────────────────────────────────────────────────
+    // XC-9 / M21: classification witness — .mjs not Mode 1 compat
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn m21_prebundled_mjs_rejected_not_ts_compat() -> TestResult {
+        let temp = tempdir()?;
+        let mjs = temp.path().join("prebundled.mjs");
+        fs::write(&mjs, "export default {}")?;
+        let discovered = mjs.to_str().ok_or("non-UTF-8 temp path")?;
+        match classify(discovered) {
+            Err(ManifestError::UnsupportedPrebundledMjs { .. }) => Ok(()),
+            other => Err(format!("expected UnsupportedPrebundledMjs, got {other:?}").into()),
+        }
+    }
+
+    #[test]
+    fn m21_ts_and_js_files_remain_ts_compat() -> TestResult {
+        let temp = tempdir()?;
+        for ext in ["plugin.ts", "plugin.js"] {
+            let file = temp.path().join(ext);
+            fs::write(&file, "export default {}")?;
+            let discovered = file.to_str().ok_or("non-UTF-8 temp path")?;
+            assert_eq!(classify(discovered)?.runtime, ExtensionRuntime::TsCompat, "{ext} must be TsCompat");
+        }
+        Ok(())
+    }
+
 }

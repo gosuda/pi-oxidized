@@ -298,7 +298,7 @@ fn overlay_vendor_export_backgrounds(theme: &mut ExportTheme, name: &str) {
 /// Headless export resolution: Auto/pair settings pick the dark member.
 #[must_use]
 pub fn resolve_export_theme(raw: Option<&str>, mode: ThemeMode) -> ExportTheme {
-    let resolved = resolve_active_theme(raw, mode, TerminalTheme::Dark);
+    let resolved = resolve_active_theme(raw, mode, TerminalTheme::Dark, super::theme::ColorMode::Truecolor);
     let mut theme = ExportTheme::from_resolved(&resolved);
     overlay_vendor_export_backgrounds(&mut theme, resolved.name.as_ref());
     theme

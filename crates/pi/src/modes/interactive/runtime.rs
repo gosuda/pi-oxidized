@@ -3806,7 +3806,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     pub(crate) fn apply_theme_from_settings(&mut self) {
         let (raw, mode) = self.session.theme_settings();
         let resolved =
-            super::theme::resolve_active_theme(raw.as_deref(), mode, self.terminal_theme);
+            super::theme::resolve_active_theme(raw.as_deref(), mode, self.terminal_theme, super::theme::ColorMode::Truecolor);
         self.apply_theme(resolved);
     }
 
@@ -3849,7 +3849,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             if let Err(error) = self.session.persist_theme(&name, mode) {
                 self.last_error = Some(error);
             }
-            super::theme::resolve_active_theme(Some(&name), mode, self.terminal_theme)
+            super::theme::resolve_active_theme(Some(&name), mode, self.terminal_theme, super::theme::ColorMode::Truecolor)
         } else {
             super::theme::load_or_dark(&name, super::theme::ColorMode::Truecolor)
         };
@@ -3892,7 +3892,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         let storage = super::theme::theme_selection_to_storage(selection);
         let (_, mode) = self.session.theme_settings();
         let resolved =
-            super::theme::resolve_active_theme(Some(&storage), mode, self.terminal_theme);
+            super::theme::resolve_active_theme(Some(&storage), mode, self.terminal_theme, super::theme::ColorMode::Truecolor);
         self.apply_theme(resolved);
     }
 
@@ -4015,7 +4015,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         };
         let storage = super::theme::theme_selection_to_storage(&family);
         let resolved =
-            super::theme::resolve_active_theme(Some(&storage), mode, self.terminal_theme);
+            super::theme::resolve_active_theme(Some(&storage), mode, self.terminal_theme, super::theme::ColorMode::Truecolor);
         self.apply_theme(resolved);
     }
 
@@ -5080,7 +5080,7 @@ fn startup_theme<S: SessionHost + ?Sized>(
     terminal: TerminalTheme,
 ) -> Arc<ResolvedTheme> {
     let (raw_theme, theme_mode) = session.theme_settings();
-    super::theme::resolve_active_theme(raw_theme.as_deref(), theme_mode, terminal)
+    super::theme::resolve_active_theme(raw_theme.as_deref(), theme_mode, terminal, super::theme::ColorMode::Truecolor)
 }
 
 /// Polarity mode implied by a raw theme setting an extension just set:

@@ -317,4 +317,55 @@ mod tests {
             .into()),
         }
     }
+
+    // ──────────────────────────────────────────────────────────────────
+    // XC-9 / M19: host-resolution witness — never search PATH
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn m19_no_path_fallback_when_file_exists_on_disk() -> R {
+        let dir = tempdir()?;
+        let stray = dir.path().join(format!("{DEFAULT_HOST_NAME}{HOST_EXE_SUFFIX}"));
+        fs::write(&stray, b"#!bin
+")?;
+        match resolve_with_fallback(None, None, None, None) {
+            Err(HostError::NotConfigured { env: ENV_HOST }) => Ok(()),
+            other => Err(std::io::Error::other(format!(
+                "expected NotConfigured (no PATH fallback), got {other:?}"
+            ))
+            .into()),
+        }
+    }
+
+    #[test]
+    fn m19_explicit_none_params_never_discover_stray_executable() -> R {
+        let dir = tempdir()?;
+        let stray = dir.path().join(format!("{DEFAULT_HOST_NAME}{HOST_EXE_SUFFIX}"));
+        fs::write(&stray, b"#!bin
+")?;
+        let stray_bundle = dir.path().join(DEFAULT_HOST_BUNDLE_NAME);
+        fs::write(&stray_bundle, b"bundle")?;
+        match resolve_with_fallback(None, None, None, None) {
+            Err(HostError::NotConfigured { env: ENV_HOST }) => Ok(()),
+            other => Err(std::io::Error::other(format!(
+                "expected NotConfigured, got {other:?}"
+            ))
+            .into()),
+        }
+    }
+
+    #[test]
+    fn m19_env_overrides_never_fall_through_to_path() -> R {
+        let dir = tempdir()?;
+        let env_host = dir.path().join("explicit-host");
+        fs::write(&env_host, b"#!bin
+")?;
+        let stray = dir.path().join(format!("{DEFAULT_HOST_NAME}{HOST_EXE_SUFFIX}"));
+        fs::write(&stray, b"#!bin
+")?;
+        let spec = resolve_with_fallback(env_host.to_str(), None, None, None)?;
+        assert_eq!(spec.source, HostSource::Env(env_host.clone()), "env must win, never PATH");
+        assert_eq!(spec.program, env_host);
+        Ok(())
+    }
 }
