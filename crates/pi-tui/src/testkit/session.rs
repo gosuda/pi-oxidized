@@ -11,8 +11,10 @@ use crate::testkit::driver::{
     DriverError, DriverSession, ExitStatus, Geometry, OutputBatch, RenderSession, SettlePolicy,
     SettledFrame, TerminalSnapshot,
 };
+use crate::testkit::qemu::QemuUserSmokeSession;
 use crate::testkit::transcript::{
-    NormalizationContext, TranscriptArtifact, TranscriptError, TranscriptRecorder,
+    ClaimClass, DriverKind, NormalizationContext, TranscriptArtifact, TranscriptError,
+    TranscriptRecorder, TranscriptSpec,
 };
 
 /// Failure from either the live terminal driver or transcript construction.
@@ -37,12 +39,7 @@ pub struct RecordingSession<S: DriverSession> {
 }
 
 impl<S: DriverSession> RecordingSession<S> {
-    /// Starts recording an already-open session with the caller's launch identity.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RecordingError::Transcript`] if the spawn event cannot be recorded.
-    pub fn new(
+    fn from_recorder(
         session: S,
         mut recorder: TranscriptRecorder,
         argv: Vec<String>,
@@ -121,7 +118,52 @@ impl<S: DriverSession> RecordingSession<S> {
     }
 }
 
+fn constrain_qemu_spec(mut spec: TranscriptSpec) -> TranscriptSpec {
+    spec.driver_kind = DriverKind::QemuUserSmoke;
+    spec.claims
+        .retain(|claim| matches!(claim, ClaimClass::Execution | ClaimClass::Protocol));
+    spec
+}
+
+impl RecordingSession<QemuUserSmokeSession> {
+    /// Starts a non-render QEMU recording with claims constrained to observable evidence.
+    ///
+    /// The driver kind is forced to QEMU smoke, and render-only claims are
+    /// discarded before the recorder is constructed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecordingError::Transcript`] if the spawn event cannot be recorded.
+    pub fn new_qemu(
+        session: QemuUserSmokeSession,
+        spec: TranscriptSpec,
+        argv: Vec<String>,
+        context: &NormalizationContext,
+    ) -> Result<Self, RecordingError> {
+        Self::from_recorder(
+            session,
+            TranscriptRecorder::new(constrain_qemu_spec(spec)),
+            argv,
+            context,
+        )
+    }
+}
+
 impl<S: RenderSession> RecordingSession<S> {
+    /// Starts recording an already-open render session with the caller's launch identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecordingError::Transcript`] if the spawn event cannot be recorded.
+    pub fn new(
+        session: S,
+        recorder: TranscriptRecorder,
+        argv: Vec<String>,
+        context: &NormalizationContext,
+    ) -> Result<Self, RecordingError> {
+        Self::from_recorder(session, recorder, argv, context)
+    }
+
     /// Resizes the live terminal, then records the successful transition.
     ///
     /// # Errors
@@ -170,14 +212,18 @@ impl<S: RenderSession> RecordingSession<S> {
     {
         let session = self.session.as_mut().ok_or(DriverError::Closed)?;
         let frame = session.read_settled_frame(policy, predicate)?;
-        self.recorder
-            .output(&[frame.batch.bytes.as_slice()], context)?;
+        Geometry::new(
+            frame.snapshot.geometry.cols,
+            frame.snapshot.geometry.rows,
+        )?;
         let cursor_col = u16::try_from(frame.snapshot.cursor_col).map_err(|_| {
             DriverError::InvalidSpec("snapshot cursor column exceeds u16".to_owned())
         })?;
         let cursor_row = u16::try_from(frame.snapshot.cursor_row).map_err(|_| {
             DriverError::InvalidSpec("snapshot cursor row exceeds u16".to_owned())
         })?;
+        self.recorder
+            .output(&[frame.batch.bytes.as_slice()], context)?;
         self.recorder.snapshot(
             frame.snapshot.geometry.cols,
             frame.snapshot.geometry.rows,
@@ -495,8 +541,8 @@ pub(crate) fn apply_std_env(
 mod tests {
     use super::*;
     use crate::testkit::transcript::{
-        CanonicalEvent, ClaimClass, DriverKind, EventKind, RunnerRow, RowId, RowTier, Scenario,
-        TimingEnvelope, TranscriptMode, TranscriptSpec,
+        CanonicalEvent, EventKind, RunnerRow, RowId, RowTier, Scenario, TimingEnvelope,
+        TranscriptMode,
     };
     use crate::testkit::CapabilityProfile;
 
@@ -550,6 +596,8 @@ mod tests {
         geometry: Geometry,
         fail_resize: bool,
         lines: Vec<String>,
+        cursor_col: usize,
+        cursor_row: usize,
     }
 
     impl Default for FakeRender {
@@ -559,6 +607,8 @@ mod tests {
                 geometry: Geometry { cols: 80, rows: 24 },
                 fail_resize: false,
                 lines: Vec::new(),
+                cursor_col: 1,
+                cursor_row: 2,
             }
         }
     }
@@ -613,8 +663,8 @@ mod tests {
                 batch,
                 snapshot: TerminalSnapshot {
                     geometry: self.geometry,
-                    cursor_col: 1,
-                    cursor_row: 2,
+                    cursor_col: self.cursor_col,
+                    cursor_row: self.cursor_row,
                     cursor_visible: true,
                     lines: self.lines.clone(),
                 },
@@ -622,8 +672,8 @@ mod tests {
         }
     }
 
-    fn recorder(driver: DriverKind) -> TranscriptRecorder {
-        TranscriptRecorder::new(TranscriptSpec {
+    fn transcript_spec(driver: DriverKind, claims: Vec<ClaimClass>) -> TranscriptSpec {
+        TranscriptSpec {
             scenario: Scenario::FixtureStreamSettle,
             row: RunnerRow {
                 tier: RowTier::Local,
@@ -634,9 +684,16 @@ mod tests {
             capability_profile: CapabilityProfile::Xterm256Color,
             driver_kind: driver,
             mode: TranscriptMode::Standard,
-            claims: vec![ClaimClass::Execution, ClaimClass::Render],
+            claims,
             timing: TimingEnvelope::default(),
-        })
+        }
+    }
+
+    fn recorder(driver: DriverKind) -> TranscriptRecorder {
+        TranscriptRecorder::new(transcript_spec(
+            driver,
+            vec![ClaimClass::Execution, ClaimClass::Render],
+        ))
     }
 
     fn kinds(artifact: &TranscriptArtifact) -> Vec<EventKind> {
@@ -651,7 +708,7 @@ mod tests {
     #[test]
     fn driver_only_fake_records_exact_base_sequence() -> Result<(), RecordingError> {
         let context = NormalizationContext::default();
-        let mut session = RecordingSession::new(
+        let mut session = RecordingSession::from_recorder(
             FakeDriver {
                 output: b"chunk-a chunk-b".to_vec(),
                 ..FakeDriver::default()
@@ -661,9 +718,11 @@ mod tests {
             &context,
         )?;
         session.write(b"hello")?;
-        let batch = session.read_output(&SettlePolicy::default(), |bytes| {
-            bytes.windows(7).any(|window| window == b"chunk-b")
-        }, &context)?;
+        let batch = session.read_output(
+            &SettlePolicy::default(),
+            |bytes| bytes.windows(7).any(|window| window == b"chunk-b"),
+            &context,
+        )?;
         assert_eq!(batch.bytes, b"chunk-a chunk-b");
         let status = session.close()?;
         assert!(status.success());
@@ -698,7 +757,7 @@ mod tests {
     #[test]
     fn failed_driver_operations_add_no_events() -> Result<(), RecordingError> {
         let context = NormalizationContext::default();
-        let mut session = RecordingSession::new(
+        let mut session = RecordingSession::from_recorder(
             FakeDriver {
                 fail_write: true,
                 fail_read: true,
@@ -727,7 +786,7 @@ mod tests {
     #[test]
     fn finish_requires_successful_close() -> Result<(), RecordingError> {
         let context = NormalizationContext::default();
-        let session = RecordingSession::new(
+        let session = RecordingSession::from_recorder(
             FakeDriver::default(),
             recorder(DriverKind::QemuUserSmoke),
             vec!["pi".to_owned()],
@@ -738,7 +797,7 @@ mod tests {
             Err(RecordingError::FinishBeforeClose)
         ));
 
-        let mut session = RecordingSession::new(
+        let mut session = RecordingSession::from_recorder(
             FakeDriver {
                 fail_close: true,
                 ..FakeDriver::default()
@@ -747,10 +806,7 @@ mod tests {
             vec!["pi".to_owned()],
             &context,
         )?;
-        assert!(matches!(
-            session.close(),
-            Err(RecordingError::Driver(_))
-        ));
+        assert!(matches!(session.close(), Err(RecordingError::Driver(_))));
         assert!(matches!(
             session.finish(),
             Err(RecordingError::FinishBeforeClose)
@@ -833,4 +889,75 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn qemu_constructor_strips_render_claims() -> Result<(), RecordingError> {
+        let context = NormalizationContext::default();
+        let spec = constrain_qemu_spec(transcript_spec(
+            DriverKind::PosixPty,
+            vec![
+                ClaimClass::Execution,
+                ClaimClass::Render,
+                ClaimClass::Protocol,
+                ClaimClass::Snapshot,
+                ClaimClass::Pty,
+            ],
+        ));
+        assert_eq!(spec.driver_kind, DriverKind::QemuUserSmoke);
+        assert_eq!(
+            spec.claims,
+            vec![ClaimClass::Execution, ClaimClass::Protocol]
+        );
+        let mut session = RecordingSession::from_recorder(
+            FakeDriver::default(),
+            TranscriptRecorder::new(spec),
+            vec!["qemu-pi".to_owned()],
+            &context,
+        )?;
+        session.close()?;
+        let artifact = session.finish()?;
+        assert_eq!(artifact.driver.kind, DriverKind::QemuUserSmoke);
+        assert_eq!(artifact.mode, TranscriptMode::Contingency);
+        assert_eq!(
+            artifact.claims,
+            vec![ClaimClass::Execution, ClaimClass::Protocol]
+        );
+        assert_eq!(kinds(&artifact), vec![EventKind::Spawn, EventKind::Exit]);
+        assert!(artifact.timing.output_audits.is_empty());
+        assert_eq!(artifact.timing.raw_log_b64, "");
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_snapshot_cursor_records_no_output() -> Result<(), RecordingError> {
+        let context = NormalizationContext::default();
+        let mut session = RecordingSession::new(
+            FakeRender {
+                inner: FakeDriver {
+                    output: b"visible".to_vec(),
+                    ..FakeDriver::default()
+                },
+                lines: vec!["visible".to_owned()],
+                cursor_col: usize::from(u16::MAX) + 1,
+                cursor_row: 2,
+                ..FakeRender::default()
+            },
+            recorder(DriverKind::PosixPty),
+            vec!["pi".to_owned()],
+            &context,
+        )?;
+        assert!(matches!(
+            session.read_settled_frame(
+                &SettlePolicy::default(),
+                |bytes| bytes == b"visible",
+                &context,
+            ),
+            Err(RecordingError::Driver(_))
+        ));
+        session.close()?;
+        let artifact = session.finish()?;
+        assert_eq!(kinds(&artifact), vec![EventKind::Spawn, EventKind::Exit]);
+        assert!(artifact.timing.output_audits.is_empty());
+        assert_eq!(artifact.timing.raw_log_b64, "");
+        Ok(())
+    }
 }
