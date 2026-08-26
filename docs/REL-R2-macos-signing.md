@@ -46,8 +46,7 @@ reference. The image snapshot current on 2026-08-26 is `20260727.0377.1`, macOS
   the Xcode/CLT install and are present on both runner labels. Version of the `notarytool`
   client therefore tracks the Xcode/CLT on the image (16.4 default at this snapshot; newer
   Xcode 26.x may be selected via `xcode-select -s`).
-- The image's Rust toolchain is **1.97.1** — identical to the release workflow's pinned
-  toolchain, so the existing darwin build legs are already aligned.
+- The image's Rust toolchain is identical to the release workflow's pinned toolchain (see [compatibility.md](compatibility.md)), so the existing darwin build legs are already aligned.
 
 Runner specification (GitHub hosted-runner reference): `macos-15-intel` = Intel, 4 vCPU,
 14 GB RAM; `macos-15` = Apple Silicon (M1), 3 vCPU, 7 GB RAM. Images update weekly; exact

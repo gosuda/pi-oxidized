@@ -44,7 +44,7 @@ not modify `scripts/release/**`, `packages/**`, `crates/**`, `deny.toml`, or
 | x86_64 — loader isolation | **EXECUTED** | `ld-musl --list` resolves only to `$USERLAND/usr/lib` + pinned loader; default-path control fails |
 | x86_64 — compiled hello smoke | **EXECUTED** | ack JSON fields match exactly |
 | x86_64 — runtime hello smoke | **EXECUTED** | ack JSON fields match exactly |
-| x86_64 — pi --version | **EXECUTED** | `0.1.0` |
+| x86_64 — pi --version | **EXECUTED** | workspace version (see [compatibility.md](compatibility.md)) |
 | x86_64 — ledger gate | **EXECUTED** | 6/6 expected artifacts, row count match |
 | aarch64 Candidate A — build | **SOURCE-DERIVED** | Launchpad confirms noble arm64 `musl-dev`/`musl-tools` 1.2.4-2 Published; same recipe as x86_64; pending REL-T3 CI |
 | aarch64 — all gates | **SOURCE-DERIVED** | pins verified by download on x86_64; build+smoke pending REL-T3 CI on `ubuntu-24.04-arm` |
@@ -197,7 +197,7 @@ Ack fields that must match exactly (not a substring check):
 - `method == "hello"`
 - `id == 1`
 - `payload.protocolVersion == 1`
-- `payload.compatibilityVersion == "0.80.10"`
+- `payload.compatibilityVersion` matches the pinned value (see [compatibility.md](compatibility.md))
 
 All three smoke commands (`pi --version`, compiled hello, runtime hello) run
 only against a freshly unpacked archive, with cwd inside the unpack directory,
@@ -267,7 +267,7 @@ and only after unpacked exact `PT_INTERP` equality to `/lib/$MUSL_LOADER` and
 | `alpine-minirootfs-3.24.1-x86_64.tar.gz` | `https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/alpine-minirootfs-3.24.1-x86_64.tar.gz` | `41f73e3cf5fa919b8aa5ca6b30dc48f0da2720776d7423e2a7748211456fe081` | 2026-08-26T19:00:01Z | Alpine vendor `.sha256` sidecar (re-verified 2026-08-27) |
 | `libstdc++-15.2.0-r5.apk` (x86_64) | `https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libstdc++-15.2.0-r5.apk` | `14c987b556f5385a5db18376e788c75f37d85321b8dc1920d926ea7daac1d6f6` | 2026-08-26T19:00:02Z | content-addressed SHA256 pin + acquisition date; `.PKGINFO` asserted; no signature verification |
 | `libgcc-15.2.0-r5.apk` (x86_64) | `https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libgcc-15.2.0-r5.apk` | `393dcd32629f06d7d85409c272d142d0c082772d10b87ef55ee82f47de3be637` | 2026-08-26T19:00:02Z | content-addressed SHA256 pin + acquisition date; `.PKGINFO` asserted; no signature verification |
-| `bun-linux-x64-musl-baseline.zip` | `https://github.com/oven-sh/bun/releases/download/bun-v1.3.14/bun-linux-x64-musl-baseline.zip` | `56a7d6806cf155536c0178f0ea5fbd098e684fa509ebdb4fc0a7e19fb65382dc` | 2026-08-26T19:00:03Z | Bun v1.3.14 `SHASUMS256.txt` (re-verified 2026-08-27) |
+| `bun-linux-x64-musl-baseline.zip` | `https://github.com/oven-sh/bun/releases/download/bun-v<BUN_RUNTIME_VERSION>/bun-linux-x64-musl-baseline.zip` (version in [compatibility.md](compatibility.md)) | `56a7d6806cf155536c0178f0ea5fbd098e684fa509ebdb4fc0a7e19fb65382dc` | 2026-08-26T19:00:03Z | Bun runtime `SHASUMS256.txt` (re-verified 2026-08-27) |
 
 ### aarch64 (pins verified by download 2026-08-27; build+smoke pending REL-T3 CI)
 
@@ -276,7 +276,7 @@ and only after unpacked exact `PT_INTERP` equality to `/lib/$MUSL_LOADER` and
 | `alpine-minirootfs-3.24.1-aarch64.tar.gz` | `https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/aarch64/alpine-minirootfs-3.24.1-aarch64.tar.gz` | `f55a90f69052c5bd6f92cb09a8f47065970830b194c917a006fb94028e721259` | 2026-08-26T19:00:55Z | Alpine vendor `.sha256` sidecar (re-verified 2026-08-27) |
 | `libstdc++-15.2.0-r5.apk` (aarch64) | `https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/libstdc++-15.2.0-r5.apk` | `2302e766d4e4926038ec166ecb85837ee884576115236ddb565e3a5fca4a11d7` | 2026-08-26T19:00:55Z | content-addressed SHA256 pin + acquisition date; `.PKGINFO` asserted; no signature verification |
 | `libgcc-15.2.0-r5.apk` (aarch64) | `https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/libgcc-15.2.0-r5.apk` | `369aaa6e9d099a737bad6dd3e6c2fe7bb1547ca26d22b94ee0411228f709b403` | 2026-08-26T19:00:56Z | content-addressed SHA256 pin + acquisition date; `.PKGINFO` asserted; no signature verification |
-| `bun-linux-aarch64-musl.zip` | `https://github.com/oven-sh/bun/releases/download/bun-v1.3.14/bun-linux-aarch64-musl.zip` | `b98e0ad3625c5c00d1d5b5ff55605c7adddbfae151861e68ade57b2d3b8703bb` | 2026-08-26T19:01:03Z | Bun v1.3.14 `SHASUMS256.txt` (re-verified 2026-08-27) |
+| `bun-linux-aarch64-musl.zip` | `https://github.com/oven-sh/bun/releases/download/bun-v<BUN_RUNTIME_VERSION>/bun-linux-aarch64-musl.zip` (version in [compatibility.md](compatibility.md)) | `b98e0ad3625c5c00d1d5b5ff55605c7adddbfae151861e68ade57b2d3b8703bb` | 2026-08-26T19:01:03Z | Bun runtime `SHASUMS256.txt` (re-verified 2026-08-27) |
 
 ### aarch64 Candidate B pins (source-derived; conditional backup only)
 
@@ -289,8 +289,8 @@ and only after unpacked exact `PT_INTERP` equality to `/lib/$MUSL_LOADER` and
 
 | Artifact | Pin / version | Vendor verification |
 |---|---|---|
-| Rust toolchain | `1.97.1` via `dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4` | action SHA pin reused from `release-verification.yml` |
-| Bun toolchain | `1.3.14` via `oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6` | action SHA pin reused from `release-verification.yml` |
+| Rust toolchain | pinned version (see [compatibility.md](compatibility.md)) via `dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4` | action SHA pin reused from `release-verification.yml` |
+| Bun toolchain | pinned version (see [compatibility.md](compatibility.md)) via `oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6` | action SHA pin reused from `release-verification.yml` |
 | `actions/checkout` | `34e114876b0b11c390a56381ad16ebd13914f8d5` | reused from `release-verification.yml` |
 | `actions/upload-artifact` | `ea165f8d65b6e75b540449e92b4886f43607fa02` | reused from `release-verification.yml` |
 | Ubuntu musl packages | `musl-dev=1.2.4-2`, `musl-tools=1.2.4-2` | exact apt versions; fail on drift |
@@ -495,7 +495,7 @@ form:
 - Issue #102 (REL-R1) and issue #112 (REL-T3)
 - `.github/workflows/release-verification.yml` — action SHA pins reused here
 - `scripts/release/host.ts` — compiled / runtime-bundle argv and hello ack contract
-- Bun v1.3.14 `SHASUMS256.txt` (re-verified 2026-08-27)
+- Bun runtime `SHASUMS256.txt` (version in [compatibility.md](compatibility.md); re-verified 2026-08-27)
 - Alpine v3.24.1 release directories for `x86_64` / `aarch64` (minirootfs vendor
   `.sha256`); Alpine `libstdc++` / `libgcc` `15.2.0-r5` APKs pinned by
   committed content SHA256 (no APKINDEX / apk-signature path — minirootfs keys

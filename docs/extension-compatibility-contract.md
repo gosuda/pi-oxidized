@@ -22,7 +22,7 @@ are explicitly **not** (see [Non-contracts](#non-contracts)).
 | Constant | Value | Witness |
 | --- | --- | --- |
 | `PROTOCOL_VERSION` | `1` | `packages/pi-tui-protocol/src/types.ts::PROTOCOL_VERSION` (line 10); mirrored `crates/pi-ext/src/protocol.rs::PROTOCOL_VERSION` (line 257), asserted equal in `pi-ext` unit test at `protocol.rs` line 2138 |
-| `COMPATIBILITY_VERSION` | `"0.80.10"` | `packages/pi-tui-protocol/src/types.ts::COMPATIBILITY_VERSION` (line 13); `packages/extension-host/src/version.ts::COMPATIBILITY_VERSION`; mirrored `crates/pi-ext/src/protocol.rs::COMPATIBILITY_VERSION` (line 260), asserted at `protocol.rs` line 2139 |
+| `COMPATIBILITY_VERSION` | see [docs/compatibility.md](compatibility.md) | `packages/pi-tui-protocol/src/types.ts::COMPATIBILITY_VERSION` (line 13); `packages/extension-host/src/version.ts::COMPATIBILITY_VERSION`; mirrored `crates/pi-ext/src/protocol.rs::COMPATIBILITY_VERSION` (line 260), asserted at `protocol.rs` line 2139 |
 | `MAX_FRAME_BYTES` | `8 * 1024 * 1024` | `packages/pi-tui-protocol/src/types.ts::MAX_FRAME_BYTES` (line 16); mirrored `crates/pi-ext/src/protocol.rs::MAX_FRAME_BYTES` (line 263), asserted at `protocol.rs` line 2140 |
 
 One frame is a single JSON object on one line, at most `MAX_FRAME_BYTES` UTF-8
@@ -89,7 +89,7 @@ witness test and a mutation that would break it.
 | Mode | `protocolVersion` | `compatibilityVersion` | Witness (green) | Mutation |
 | --- | --- | --- | --- | --- |
 | Mode 1 (host.ts) | ✓ reject on mismatch | ✓ reject on mismatch | `packages/extension-host/tests/host.test.ts::compatibility version mismatch terminates host` | **M3:** drop the compat check → host.test.ts compat-mismatch test fails; `scripts/verification/xc-handshake.test.ts::M3 mutation: dropping the compat check` fails |
-| Mode 2 (lean-runner.ts) | ✓ reject on mismatch | — ignore | `packages/extension-host/tests/lean.test.ts::matching protocolVersion acks even with a foreign compatibilityVersion` | **M1:** add `compatibilityVersion === "0.80.10"` requirement → lean.test.ts foreign-compat hello test fails; `scripts/verification/xc-handshake.test.ts::M1 mutation: adding a compat requirement` fails |
+| Mode 2 (lean-runner.ts) | ✓ reject on mismatch | — ignore | `packages/extension-host/tests/lean.test.ts::matching protocolVersion acks even with a foreign compatibilityVersion` | **M1:** add `compatibilityVersion === COMPATIBILITY_VERSION` requirement → lean.test.ts foreign-compat hello test fails; `scripts/verification/xc-handshake.test.ts::M1 mutation: adding a compat requirement` fails |
 | Mode 3 (server.rs) | ✓ reject on mismatch | — ignore | `crates/pi-ext/src/server.rs::hello_answers_with_compiled_constants_and_ignores_compatibility` | **M2:** add `compatibility_version` check to `validate_hello` → server foreign-compat hello test fails; `scripts/verification/xc-handshake.test.ts::M2 mutation: adding a compat requirement` fails |
 
 **Foreign-compat acceptance (Mode 2 + Mode 3):** both the lean and native

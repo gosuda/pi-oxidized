@@ -28,7 +28,9 @@
 		"verify:style-ledger": "bun run scripts/verification/style-ledger.ts",
 		"verify:syntect-ignores": "bun run scripts/verification/syntect-ignores.ts",
 		"verify:snippets": "bun run scripts/verification/snippet-harness.ts",
-		"verify:extension-scaling": "bun run scripts/bench-extension-scaling.ts"
+		"verify:extension-scaling": "bun run scripts/bench-extension-scaling.ts",
+		"gen:compat-docs": "bun run scripts/verification/generate-compat-docs.ts",
+		"verify:compat-docs": "bun run scripts/verification/generate-compat-docs.ts"
 	},
 	"devDependencies": {
 		"@types/bun": "1.3.9",
