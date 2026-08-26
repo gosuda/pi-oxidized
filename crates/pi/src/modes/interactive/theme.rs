@@ -2359,4 +2359,489 @@ mod tests {
         assert_eq!(language_from_path("Makefile"), None);
         assert_eq!(language_from_path("x.kt"), None);
     }
+
+    // -----------------------------------------------------------------------
+    // Native palette admission: WCAG contrast + CIEDE2000 drift oracle
+    // -----------------------------------------------------------------------
+
+    /// Ten rendered ThemeColor/ThemeBg pairs from the palette oracle.
+    const NATIVE_CONTRAST_PAIRS: [(ThemeColor, ThemeBg, &str); 10] = [
+        (ThemeColor::Text, ThemeBg::SelectedBg, "Text/SelectedBg"),
+        (
+            ThemeColor::UserMessageText,
+            ThemeBg::UserMessageBg,
+            "UserMessageText/UserMessageBg",
+        ),
+        (
+            ThemeColor::CustomMessageText,
+            ThemeBg::CustomMessageBg,
+            "CustomMessageText/CustomMessageBg",
+        ),
+        (
+            ThemeColor::CustomMessageLabel,
+            ThemeBg::CustomMessageBg,
+            "CustomMessageLabel/CustomMessageBg",
+        ),
+        (
+            ThemeColor::Text,
+            ThemeBg::ToolPendingBg,
+            "Text/ToolPendingBg",
+        ),
+        (
+            ThemeColor::Text,
+            ThemeBg::ToolSuccessBg,
+            "Text/ToolSuccessBg",
+        ),
+        (ThemeColor::Text, ThemeBg::ToolErrorBg, "Text/ToolErrorBg"),
+        (
+            ThemeColor::ToolOutput,
+            ThemeBg::ToolPendingBg,
+            "ToolOutput/ToolPendingBg",
+        ),
+        (
+            ThemeColor::ToolOutput,
+            ThemeBg::ToolSuccessBg,
+            "ToolOutput/ToolSuccessBg",
+        ),
+        (
+            ThemeColor::ToolOutput,
+            ThemeBg::ToolErrorBg,
+            "ToolOutput/ToolErrorBg",
+        ),
+    ];
+
+    const REQUIRED_NATIVE_CONTRAST_PAIRS: [(ThemeColor, ThemeBg, &str); 10] = [
+        (ThemeColor::Text, ThemeBg::SelectedBg, "Text/SelectedBg"),
+        (
+            ThemeColor::UserMessageText,
+            ThemeBg::UserMessageBg,
+            "UserMessageText/UserMessageBg",
+        ),
+        (
+            ThemeColor::CustomMessageText,
+            ThemeBg::CustomMessageBg,
+            "CustomMessageText/CustomMessageBg",
+        ),
+        (
+            ThemeColor::CustomMessageLabel,
+            ThemeBg::CustomMessageBg,
+            "CustomMessageLabel/CustomMessageBg",
+        ),
+        (
+            ThemeColor::Text,
+            ThemeBg::ToolPendingBg,
+            "Text/ToolPendingBg",
+        ),
+        (
+            ThemeColor::Text,
+            ThemeBg::ToolSuccessBg,
+            "Text/ToolSuccessBg",
+        ),
+        (ThemeColor::Text, ThemeBg::ToolErrorBg, "Text/ToolErrorBg"),
+        (
+            ThemeColor::ToolOutput,
+            ThemeBg::ToolPendingBg,
+            "ToolOutput/ToolPendingBg",
+        ),
+        (
+            ThemeColor::ToolOutput,
+            ThemeBg::ToolSuccessBg,
+            "ToolOutput/ToolSuccessBg",
+        ),
+        (
+            ThemeColor::ToolOutput,
+            ThemeBg::ToolErrorBg,
+            "ToolOutput/ToolErrorBg",
+        ),
+    ];
+
+    /// Six named CIEDE2000 phase separations, rounded to two decimals.
+    #[derive(Clone, Copy, Debug)]
+    struct NativeDeltaEOracle {
+        muted_success: f64,
+        muted_error: f64,
+        success_error: f64,
+        tool_pending_success_bg: f64,
+        tool_pending_error_bg: f64,
+        tool_success_error_bg: f64,
+    }
+
+    impl NativeDeltaEOracle {
+        const fn named_pairs(self) -> [(&'static str, f64); 6] {
+            [
+                ("Muted/Success", self.muted_success),
+                ("Muted/Error", self.muted_error),
+                ("Success/Error", self.success_error),
+                ("ToolPendingBg/ToolSuccessBg", self.tool_pending_success_bg),
+                ("ToolPendingBg/ToolErrorBg", self.tool_pending_error_bg),
+                ("ToolSuccessBg/ToolErrorBg", self.tool_success_error_bg),
+            ]
+        }
+    }
+
+    /// Drift-only CIEDE2000 oracle for every non-default built-in asset.
+    const NATIVE_DELTA_E_ORACLES: [(&str, NativeDeltaEOracle); 8] = [
+        (
+            "classic-dark",
+            NativeDeltaEOracle {
+                muted_success: 28.44,
+                muted_error: 24.20,
+                success_error: 46.06,
+                tool_pending_success_bg: 14.89,
+                tool_pending_error_bg: 11.30,
+                tool_success_error_bg: 21.40,
+            },
+        ),
+        (
+            "classic-light",
+            NativeDeltaEOracle {
+                muted_success: 21.58,
+                muted_error: 23.22,
+                success_error: 46.30,
+                tool_pending_success_bg: 9.52,
+                tool_pending_error_bg: 4.76,
+                tool_success_error_bg: 9.82,
+            },
+        ),
+        (
+            "motion-dark",
+            NativeDeltaEOracle {
+                muted_success: 33.19,
+                muted_error: 37.34,
+                success_error: 76.54,
+                tool_pending_success_bg: 15.68,
+                tool_pending_error_bg: 14.30,
+                tool_success_error_bg: 33.30,
+            },
+        ),
+        (
+            "motion-light",
+            NativeDeltaEOracle {
+                muted_success: 28.95,
+                muted_error: 30.93,
+                success_error: 73.11,
+                tool_pending_success_bg: 8.50,
+                tool_pending_error_bg: 8.65,
+                tool_success_error_bg: 18.54,
+            },
+        ),
+        (
+            "m3-dark",
+            NativeDeltaEOracle {
+                muted_success: 32.36,
+                muted_error: 16.31,
+                success_error: 48.87,
+                tool_pending_success_bg: 30.81,
+                tool_pending_error_bg: 29.46,
+                tool_success_error_bg: 55.76,
+            },
+        ),
+        (
+            "m3-light",
+            NativeDeltaEOracle {
+                muted_success: 32.31,
+                muted_error: 29.55,
+                success_error: 63.00,
+                tool_pending_success_bg: 31.02,
+                tool_pending_error_bg: 9.43,
+                tool_success_error_bg: 38.41,
+            },
+        ),
+        (
+            "antd-dark",
+            NativeDeltaEOracle {
+                muted_success: 34.18,
+                muted_error: 24.82,
+                success_error: 58.07,
+                tool_pending_success_bg: 12.62,
+                tool_pending_error_bg: 12.59,
+                tool_success_error_bg: 27.57,
+            },
+        ),
+        (
+            "antd-light",
+            NativeDeltaEOracle {
+                muted_success: 34.25,
+                muted_error: 35.31,
+                success_error: 72.23,
+                tool_pending_success_bg: 9.46,
+                tool_pending_error_bg: 5.70,
+                tool_success_error_bg: 14.46,
+            },
+        ),
+    ];
+
+    fn srgb_channel_to_linear(channel: f64) -> f64 {
+        let c = channel / 255.0;
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    fn relative_luminance(rgb: Rgb) -> f64 {
+        let r = srgb_channel_to_linear(f64::from(rgb.0));
+        let g = srgb_channel_to_linear(f64::from(rgb.1));
+        let b = srgb_channel_to_linear(f64::from(rgb.2));
+        0.2126 * r + 0.7152 * g + 0.0722 * b
+    }
+
+    /// WCAG 2.1 contrast ratio from unrounded relative luminances.
+    fn contrast_ratio(a: Rgb, b: Rgb) -> f64 {
+        let l1 = relative_luminance(a);
+        let l2 = relative_luminance(b);
+        let (lighter, darker) = if l1 >= l2 { (l1, l2) } else { (l2, l1) };
+        (lighter + 0.05) / (darker + 0.05)
+    }
+
+    // Standard color-space equations are clearest in their published notation.
+    #[allow(clippy::many_single_char_names)]
+    fn srgb_to_xyz_d65(rgb: Rgb) -> (f64, f64, f64) {
+        let r = srgb_channel_to_linear(f64::from(rgb.0));
+        let g = srgb_channel_to_linear(f64::from(rgb.1));
+        let b = srgb_channel_to_linear(f64::from(rgb.2));
+        let x = 0.412_456_4 * r + 0.357_576_1 * g + 0.180_437_5 * b;
+        let y = 0.212_672_9 * r + 0.715_152_2 * g + 0.072_175_0 * b;
+        let z = 0.019_333_9 * r + 0.119_192_0 * g + 0.950_304_1 * b;
+        (x, y, z)
+    }
+
+    // Standard color-space equations are clearest in their published notation.
+    #[allow(clippy::many_single_char_names)]
+    fn xyz_d65_to_lab(x: f64, y: f64, z: f64) -> (f64, f64, f64) {
+        // D65 reference white.
+        let xr = x / 0.95047;
+        let yr = y / 1.00000;
+        let zr = z / 1.08883;
+        let epsilon = 216.0 / 24389.0;
+        let kappa = 24389.0 / 27.0;
+        let f = |t: f64| {
+            if t > epsilon {
+                t.cbrt()
+            } else {
+                (kappa * t + 16.0) / 116.0
+            }
+        };
+        let fx = f(xr);
+        let fy = f(yr);
+        let fz = f(zr);
+        let l = 116.0 * fy - 16.0;
+        let a = 500.0 * (fx - fy);
+        let b = 200.0 * (fy - fz);
+        (l, a, b)
+    }
+
+    fn srgb_to_lab_d65(rgb: Rgb) -> (f64, f64, f64) {
+        let (x, y, z) = srgb_to_xyz_d65(rgb);
+        xyz_d65_to_lab(x, y, z)
+    }
+
+    fn hypot2(a: f64, b: f64) -> f64 {
+        (a * a + b * b).sqrt()
+    }
+
+    fn atan2_deg(y: f64, x: f64) -> f64 {
+        if x == 0.0 && y == 0.0 {
+            0.0
+        } else {
+            y.atan2(x).to_degrees().rem_euclid(360.0)
+        }
+    }
+
+    /// CIEDE2000 color difference (Sharma et al.), pure f64.
+    fn ciede2000(rgb1: Rgb, rgb2: Rgb) -> f64 {
+        ciede2000_lab(srgb_to_lab_d65(rgb1), srgb_to_lab_d65(rgb2))
+    }
+
+    // CIEDE2000 uses these symbols in the standard formula and reference corpus.
+    #[allow(clippy::many_single_char_names)]
+    fn ciede2000_lab((l1, a1, b1): (f64, f64, f64), (l2, a2, b2): (f64, f64, f64)) -> f64 {
+        let c1 = hypot2(a1, b1);
+        let c2 = hypot2(a2, b2);
+        let c_bar = f64::midpoint(c1, c2);
+        let c_bar7 = c_bar.powi(7);
+        let g = 0.5 * (1.0 - (c_bar7 / (c_bar7 + 25.0_f64.powi(7))).sqrt());
+        let a1p = (1.0 + g) * a1;
+        let a2p = (1.0 + g) * a2;
+        let c1p = hypot2(a1p, b1);
+        let c2p = hypot2(a2p, b2);
+        let h1p = atan2_deg(b1, a1p);
+        let h2p = atan2_deg(b2, a2p);
+
+        let delta_l = l2 - l1;
+        let delta_c = c2p - c1p;
+        let delta_h = if c1p * c2p == 0.0 {
+            0.0
+        } else {
+            let mut dh = h2p - h1p;
+            if dh > 180.0 {
+                dh -= 360.0;
+            } else if dh < -180.0 {
+                dh += 360.0;
+            }
+            dh
+        };
+        let delta_big_h = 2.0 * (c1p * c2p).sqrt() * (delta_h.to_radians() / 2.0).sin();
+
+        let l_bar = f64::midpoint(l1, l2);
+        let c_bar_p = f64::midpoint(c1p, c2p);
+        let h_bar_p = if c1p * c2p == 0.0 {
+            h1p + h2p
+        } else if (h1p - h2p).abs() <= 180.0 {
+            f64::midpoint(h1p, h2p)
+        } else if h1p + h2p < 360.0 {
+            (h1p + h2p + 360.0) / 2.0
+        } else {
+            (h1p + h2p - 360.0) / 2.0
+        };
+
+        let t = 1.0 - 0.17 * (h_bar_p - 30.0).to_radians().cos()
+            + 0.24 * (2.0 * h_bar_p).to_radians().cos()
+            + 0.32 * (3.0 * h_bar_p + 6.0).to_radians().cos()
+            - 0.20 * (4.0 * h_bar_p - 63.0).to_radians().cos();
+        let sl = 1.0 + (0.015 * (l_bar - 50.0).powi(2)) / (20.0 + (l_bar - 50.0).powi(2)).sqrt();
+        let sc = 1.0 + 0.045 * c_bar_p;
+        let sh = 1.0 + 0.015 * c_bar_p * t;
+        let c_bar_p7 = c_bar_p.powi(7);
+        let rt = -2.0
+            * (c_bar_p7 / (c_bar_p7 + 25.0_f64.powi(7))).sqrt()
+            * (60.0 * (-((h_bar_p - 275.0) / 25.0).powi(2)).exp())
+                .to_radians()
+                .sin();
+
+        let dl = delta_l / sl;
+        let dc = delta_c / sc;
+        let dh = delta_big_h / sh;
+        (dl * dl + dc * dc + dh * dh + rt * dc * dh).sqrt()
+    }
+
+    fn round2(value: f64) -> f64 {
+        (value * 100.0).round() / 100.0
+    }
+
+    fn measured_delta_e_pairs(theme: &ResolvedTheme) -> [(&'static str, f64); 6] {
+        [
+            (
+                "Muted/Success",
+                ciede2000(
+                    theme.fg_rgb(ThemeColor::Muted),
+                    theme.fg_rgb(ThemeColor::Success),
+                ),
+            ),
+            (
+                "Muted/Error",
+                ciede2000(
+                    theme.fg_rgb(ThemeColor::Muted),
+                    theme.fg_rgb(ThemeColor::Error),
+                ),
+            ),
+            (
+                "Success/Error",
+                ciede2000(
+                    theme.fg_rgb(ThemeColor::Success),
+                    theme.fg_rgb(ThemeColor::Error),
+                ),
+            ),
+            (
+                "ToolPendingBg/ToolSuccessBg",
+                ciede2000(
+                    theme.bg_rgb(ThemeBg::ToolPendingBg),
+                    theme.bg_rgb(ThemeBg::ToolSuccessBg),
+                ),
+            ),
+            (
+                "ToolPendingBg/ToolErrorBg",
+                ciede2000(
+                    theme.bg_rgb(ThemeBg::ToolPendingBg),
+                    theme.bg_rgb(ThemeBg::ToolErrorBg),
+                ),
+            ),
+            (
+                "ToolSuccessBg/ToolErrorBg",
+                ciede2000(
+                    theme.bg_rgb(ThemeBg::ToolSuccessBg),
+                    theme.bg_rgb(ThemeBg::ToolErrorBg),
+                ),
+            ),
+        ]
+    }
+
+    #[test]
+    fn ciede2000_matches_sharma_reference_pairs() {
+        let cases = [
+            (
+                (50.0000, 2.6772, -79.7751),
+                (50.0000, 0.0000, -82.7485),
+                2.0425,
+            ),
+            (
+                (50.0000, 3.1571, -77.2803),
+                (50.0000, 0.0000, -82.7485),
+                2.8615,
+            ),
+            (
+                (50.0000, 2.8361, -74.0200),
+                (50.0000, 0.0000, -82.7485),
+                3.4412,
+            ),
+            (
+                (50.0000, -1.3802, -84.2814),
+                (50.0000, 0.0000, -82.7485),
+                1.0000,
+            ),
+        ];
+
+        for (first, second, expected) in cases {
+            let measured = ciede2000_lab(first, second);
+            assert!(
+                (measured - expected).abs() < 0.0001,
+                "measured={measured:.4} expected={expected:.4}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_palette_contrast_and_delta_e_oracle() {
+        let audited_assets = NATIVE_DELTA_E_ORACLES.map(|(asset, _)| asset);
+        assert_eq!(
+            audited_assets.as_slice(),
+            &BUILT_IN_THEME_NAMES[2..],
+            "every retained non-default built-in must carry a numeric oracle"
+        );
+        assert_eq!(
+            NATIVE_CONTRAST_PAIRS, REQUIRED_NATIVE_CONTRAST_PAIRS,
+            "the complete rendered contrast matrix must remain measured"
+        );
+
+        for (asset, oracle) in NATIVE_DELTA_E_ORACLES {
+            let theme = built_in_theme(asset);
+            assert!(theme.is_some(), "{asset} intern missing");
+            let Some(theme) = theme else {
+                continue;
+            };
+
+            for &(fg, bg, pair) in &NATIVE_CONTRAST_PAIRS {
+                let measured = contrast_ratio(theme.fg_rgb(fg), theme.bg_rgb(bg));
+                assert!(
+                    measured >= 4.5,
+                    "asset={asset} pair={pair} measured={measured} requirement>=4.5"
+                );
+            }
+
+            let measured_pairs = measured_delta_e_pairs(&theme);
+            let expected_pairs = oracle.named_pairs();
+            assert_eq!(measured_pairs.len(), expected_pairs.len());
+            for ((pair, measured), (expected_pair, expected)) in
+                measured_pairs.into_iter().zip(expected_pairs)
+            {
+                assert_eq!(pair, expected_pair);
+                let rounded = round2(measured);
+                assert!(
+                    (rounded - expected).abs() < f64::EPSILON,
+                    "asset={asset} pair={pair} measured={rounded:.2} requirement={expected:.2}"
+                );
+            }
+        }
+    }
 }
