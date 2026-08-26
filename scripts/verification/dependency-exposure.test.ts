@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join, resolve, sep } from "node:path";
 
 import { HOST_PACKAGE_DIR } from "../release/host.ts";
 import { RecordingRunner, SpawnRunner } from "../release/runner.ts";
@@ -9,10 +9,12 @@ import {
 	SCHEMA,
 	SENTINEL_FAILED,
 	appendLedgerRows,
+	assertRelevantWorktreeClean,
 	buildBundleEvidence,
 	cargoLockChangedNames,
 	classify,
 	deriveAutoFromTexts,
+	escapeMarkdownCell,
 	evaluateCargoKinds,
 	evaluateMetafileReachability,
 	evaluateNpmMembership,
@@ -22,7 +24,10 @@ import {
 	expandWithRealpaths,
 	findLifecycleScripts,
 	findUnknownCompileSites,
+	fingerprintHeadEvidence,
 	inputMatchesMetafile,
+	listCargoTomlPaths,
+	listHeadEvidencePaths,
 	materializeBase,
 	parseCargoLockIdentities,
 	parseCargoMetadata,
@@ -315,7 +320,7 @@ describe("dependency-exposure fail-closed integration", () => {
 			schema: SCHEMA,
 			decidedAt: "2026-08-26T00:00:00.000Z",
 			base: "HEAD",
-			head: "worktree" as const,
+			head: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 			overall: "S" as const,
 			verdicts: [verdictFromChecks("npm:x", {
 				E1: { status: "undecidable", detail: "boom" },
@@ -332,7 +337,7 @@ describe("dependency-exposure fail-closed integration", () => {
 			schema: SCHEMA,
 			decidedAt: "2026-08-26T00:00:00.000Z",
 			base: "HEAD",
-			head: "worktree" as const,
+			head: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 			overall: "E" as const,
 			verdicts: [verdictFromChecks("npm:@types/bun", {
 				E1: { status: "pass", detail: "ok" },
@@ -349,6 +354,13 @@ describe("dependency-exposure fail-closed integration", () => {
 			...ok,
 			schema: "not.a.schema" as typeof SCHEMA,
 		})).rejects.toThrow(/structurally invalid report schema/);
+
+		const noNl = join(tempDir("pi-deps-r2-ledger-nl-"), "ledger.md");
+		writeFileSync(noNl, "| Date (UTC) | Change | Base→Head | Input | Class | E1 | E2 | E3 | E4 | Evidence sha256 |");
+		await appendLedgerRows(noNl, failed);
+		const normalized = readFileSync(noNl, "utf8");
+		expect(normalized.startsWith("| Date (UTC) | Change | Base→Head | Input | Class | E1 | E2 | E3 | E4 | Evidence sha256 |\n| ")).toBe(true);
+		expect(normalized).toContain("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
 	});
 
 	test("nonzero bun exit rejects even when metafile exists", async () => {
@@ -416,6 +428,9 @@ describe("dependency-exposure fail-closed integration", () => {
 		let removedPath: string | undefined;
 		const runner = {
 			async run(command: string, args: readonly string[], options?: Parameters<SpawnRunner["run"]>[2]) {
+				if (command === "git" && args[0] === "status" && args.includes("--porcelain")) {
+					return { exitCode: 0, stdout: "", stderr: "" };
+				}
 				if (command === "git" && args[0] === "worktree" && args[1] === "remove") {
 					removedPath = args.includes("--force") ? args[3] : args[2];
 					return { exitCode: 1, stdout: "", stderr: "remove refused" };
@@ -441,6 +456,7 @@ describe("dependency-exposure fail-closed integration", () => {
 		expect(result.report.overall).toBe("S");
 		expect(result.report.verdicts[0]?.checks.E1.status).toBe("undecidable");
 		expect(result.report.verdicts[0]?.checks.E1.detail).toMatch(/worktree cleanup failure|remove refused/);
+		expect(/^[0-9a-f]{40}$/i.test(result.report.head)).toBe(true);
 		expect(removedPath).toBeDefined();
 		if (removedPath !== undefined) {
 			expect(existsSync(removedPath)).toBe(false);
@@ -603,6 +619,118 @@ dependencies = [
 			now: () => new Date("2026-08-26T00:00:00.000Z"),
 		});
 		expect(result.report.base).toBe("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+		expect(result.report.head).toBe("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+	});
+});
+
+describe("dependency-exposure review wave-2 regressions", () => {
+	test("1: head fingerprint includes every non-excluded Cargo.toml; path-set drift changes digest", async () => {
+		const root = tempDir("pi-deps-r2-cargo-fp-");
+		mkdirSync(join(root, "crates", "alpha"), { recursive: true });
+		writeFileSync(join(root, "Cargo.toml"), "[workspace]\nmembers=[\"crates/alpha\"]\n");
+		writeFileSync(join(root, "crates/alpha/Cargo.toml"), "[package]\nname=\"alpha\"\nversion=\"0.1.0\"\n");
+		const paths = await listCargoTomlPaths(root);
+		expect(paths).toEqual(["Cargo.toml", "crates/alpha/Cargo.toml"]);
+		const evidence = await listHeadEvidencePaths(root);
+		expect(evidence).toContain("Cargo.toml");
+		expect(evidence).toContain("crates/alpha/Cargo.toml");
+		const before = await fingerprintHeadEvidence(root);
+		mkdirSync(join(root, "crates", "beta"), { recursive: true });
+		writeFileSync(join(root, "crates/beta/Cargo.toml"), "[package]\nname=\"beta\"\nversion=\"0.1.0\"\n");
+		const after = await fingerprintHeadEvidence(root);
+		expect(after).not.toBe(before);
+		expect(await listCargoTomlPaths(root)).toEqual([
+			"Cargo.toml",
+			"crates/alpha/Cargo.toml",
+			"crates/beta/Cargo.toml",
+		]);
+	});
+
+	test("2: ordinary classify refuses dirty head and never bun install/builds in live root", async () => {
+		const liveHost = resolve(join(REPO_ROOT, HOST_PACKAGE_DIR));
+		const dirty = await classify({
+			base: "HEAD",
+			inputs: ["npm:@types/bun"],
+			repoRoot: REPO_ROOT,
+			runner: new RecordingRunner((call) => {
+				if (call.command === "git" && call.args[0] === "rev-parse") {
+					return { exitCode: 0, stdout: "cccccccccccccccccccccccccccccccccccccccc\n", stderr: "" };
+				}
+				if (call.command === "git" && call.args[0] === "status") {
+					return { exitCode: 0, stdout: " M Cargo.toml\n", stderr: "" };
+				}
+				return { exitCode: 0, stdout: "", stderr: "" };
+			}),
+			identity: false,
+			now: () => new Date("2026-08-26T00:00:00.000Z"),
+		});
+		expect(dirty.failedClosed).toBe(true);
+		expect(dirty.report.head).toBe("cccccccccccccccccccccccccccccccccccccccc");
+		expect(dirty.report.verdicts[0]?.checks.E1.detail).toMatch(/dirty|refusing live-root/);
+
+		const real = new SpawnRunner();
+		const installBuildCwds: string[] = [];
+		const runner = {
+			async run(command: string, args: readonly string[], options?: Parameters<SpawnRunner["run"]>[2]) {
+				if (command === "git" && args[0] === "status" && args.includes("--porcelain")) {
+					return { exitCode: 0, stdout: "", stderr: "" };
+				}
+				if (command === "bun" && (args[0] === "install" || args[0] === "build")) {
+					installBuildCwds.push(resolve(options?.cwd ?? ""));
+					if (args[0] === "install") return { exitCode: 0, stdout: "", stderr: "" };
+					const metaArg = args.find((arg) => arg.startsWith("--metafile="));
+					if (metaArg !== undefined) {
+						writeFileSync(metaArg.slice("--metafile=".length), JSON.stringify({ inputs: {} }));
+					}
+					return { exitCode: 0, stdout: "", stderr: "" };
+				}
+				return real.run(command, args, options);
+			},
+		};
+		const result = await classify({
+			base: "HEAD",
+			inputs: ["npm:@types/bun"],
+			repoRoot: REPO_ROOT,
+			runner,
+			identity: false,
+			now: () => new Date("2026-08-26T00:00:00.000Z"),
+		});
+		expect(/^[0-9a-f]{40}$/i.test(result.report.head)).toBe(true);
+		expect(installBuildCwds.length).toBeGreaterThan(0);
+		expect(installBuildCwds.every((cwd) => cwd !== liveHost)).toBe(true);
+		expect(installBuildCwds.every((cwd) => cwd.includes(`${sep}deps-r2-worktrees${sep}`) || cwd.includes("/deps-r2-worktrees/"))).toBe(true);
+	});
+
+	test("3: record append inserts exactly one EOF newline when ledger lacks one", async () => {
+		const ledger = join(tempDir("pi-deps-r2-eof-"), "ledger.md");
+		writeFileSync(ledger, "header-without-newline");
+		await appendLedgerRows(ledger, {
+			schema: SCHEMA,
+			decidedAt: "2026-08-26T00:00:00.000Z",
+			base: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			head: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+			overall: "S",
+			verdicts: [verdictFromChecks("npm:x", {
+				E1: { status: "undecidable", detail: "boom|line\nfeed" },
+				E2: { status: "pass", detail: "ok" },
+				E3: { status: "pass", detail: "ok" },
+				E4: { status: "pass", detail: "ok" },
+			})],
+		});
+		const text = readFileSync(ledger, "utf8");
+		expect(text.startsWith("header-without-newline\n| ")).toBe(true);
+		expect(text).not.toContain("header-without-newline\n\n|");
+	});
+
+	test("4: input identifier grammar rejects injection; markdown cells escape pipes/newlines", () => {
+		expect(() => parseInputSpec("npm:foo|bar")).toThrow(/invalid npm package identifier/);
+		expect(() => parseInputSpec("npm:foo\nbar")).toThrow(/invalid npm package identifier/);
+		expect(() => parseInputSpec("cargo:serde;rm")).toThrow(/invalid cargo crate identifier/);
+		expect(() => parseInputSpec("tool:not-a-tool")).toThrow(/invalid or unknown tool id/);
+		expect(parseInputSpec("npm:@types/bun").name).toBe("@types/bun");
+		expect(parseInputSpec("cargo:serde").name).toBe("serde");
+		expect(parseInputSpec("tool:bun-runtime").name).toBe("bun-runtime");
+		expect(escapeMarkdownCell("a|b\nc\rd")).toBe("a\\|b c d");
 	});
 });
 

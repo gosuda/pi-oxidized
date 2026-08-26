@@ -118,7 +118,8 @@ export interface ExposureReport {
 	readonly schema: typeof SCHEMA;
 	readonly decidedAt: string;
 	readonly base: string;
-	readonly head: "worktree";
+	/** Immutable resolved HEAD SHA for the isolated head checkout. */
+	readonly head: string;
 	readonly verdicts: readonly Verdict[];
 	readonly overall: Overall;
 }
@@ -299,7 +300,12 @@ async function fingerprintPaths(root: string, paths: readonly string[]): Promise
 	return hash.digest("hex");
 }
 
-async function fingerprintHeadEvidence(root: string): Promise<string> {
+export async function listCargoTomlPaths(root: string): Promise<string[]> {
+	const files = await walkFiles(root);
+	return files.filter((path) => path === "Cargo.toml" || path.endsWith("/Cargo.toml")).sort();
+}
+
+async function listReleaseAndWorkflowPaths(root: string): Promise<string[]> {
 	const releaseDir = join(root, "scripts/release");
 	const releaseFiles = existsSync(releaseDir)
 		? (await readdir(releaseDir, { withFileTypes: true }))
@@ -312,7 +318,50 @@ async function fingerprintHeadEvidence(root: string): Promise<string> {
 			.filter((entry) => entry.isFile() && /\.ya?ml$/.test(entry.name))
 			.map((entry) => `.github/workflows/${entry.name}`)
 		: [];
-	return fingerprintPaths(root, [...HEAD_DRIFT_PATHS, ...releaseFiles, ...workflowFiles, `${HOST_PACKAGE_DIR}/package.json`]);
+	return [...releaseFiles, ...workflowFiles];
+}
+
+/** Stable relative path set whose content must not drift during classification. */
+export async function listHeadEvidencePaths(root: string): Promise<string[]> {
+	const cargoTomls = await listCargoTomlPaths(root);
+	const releaseWorkflows = await listReleaseAndWorkflowPaths(root);
+	return [...new Set([
+		...HEAD_DRIFT_PATHS,
+		...releaseWorkflows,
+		`${HOST_PACKAGE_DIR}/package.json`,
+		...cargoTomls,
+	])].sort();
+}
+
+export async function fingerprintHeadEvidence(root: string): Promise<string> {
+	return fingerprintPaths(root, await listHeadEvidencePaths(root));
+}
+
+export async function assertRelevantWorktreeClean(
+	repoRoot: string,
+	runner: CommandRunner,
+): Promise<void> {
+	const paths = await listHeadEvidencePaths(repoRoot);
+	const result = await runner.run(
+		"git",
+		["status", "--porcelain", "--untracked-files=all", "--", ...paths],
+		{ cwd: repoRoot, rejectOnError: false, timeoutMs: COMMAND_TIMEOUT_MS, maxOutputBytes: MAX_OUTPUT_BYTES },
+	);
+	if (result.exitCode !== 0) {
+		throw new Error(`git status failed while proving clean evidence paths: ${result.stderr.slice(0, 500)}`);
+	}
+	const dirty = result.stdout.trim();
+	if (dirty.length > 0) {
+		throw new Error(`relevant worktree paths are dirty; refusing live-root classification:\n${dirty}`);
+	}
+}
+
+const NPM_NAME_RE = /^(?:@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/;
+const CARGO_NAME_RE = /^[A-Za-z][A-Za-z0-9_-]*$/;
+const TOOL_NAME_RE = /^[a-z][a-z0-9-]*$/;
+
+export function escapeMarkdownCell(value: string): string {
+	return value.replace(/\r\n|\r|\n/g, " ").replace(/\|/g, "\\|");
 }
 
 export function parseInputSpec(raw: string): InputSpec {
@@ -326,6 +375,17 @@ export function parseInputSpec(raw: string): InputSpec {
 		throw new Error(`invalid input kind "${kind}" in "${raw}"`);
 	}
 	if (name.trim() !== name || name.length === 0) throw new Error(`invalid empty or padded input "${raw}"`);
+	if (kind === "npm" && !NPM_NAME_RE.test(name)) {
+		throw new Error(`invalid npm package identifier "${name}"`);
+	}
+	if (kind === "cargo" && !CARGO_NAME_RE.test(name)) {
+		throw new Error(`invalid cargo crate identifier "${name}"`);
+	}
+	if (kind === "tool") {
+		if (!TOOL_NAME_RE.test(name) || !Object.hasOwn(TOOL_FILES, name)) {
+			throw new Error(`invalid or unknown tool id "${name}"`);
+		}
+	}
 	return { kind, name, raw: `${kind}:${name}` };
 }
 
@@ -343,7 +403,12 @@ function allUndecidable(input: string, detail: string): Verdict {
 	});
 }
 
-function reportOf(base: string, verdicts: readonly Verdict[], now: () => Date): ExposureReport {
+function reportOf(
+	base: string,
+	head: string,
+	verdicts: readonly Verdict[],
+	now: () => Date,
+): ExposureReport {
 	const overall: Overall = verdicts.length === 0
 		? "none"
 		: verdicts.some((verdict) => verdict.class === "S")
@@ -353,7 +418,7 @@ function reportOf(base: string, verdicts: readonly Verdict[], now: () => Date): 
 		schema: SCHEMA,
 		decidedAt: now().toISOString(),
 		base,
-		head: "worktree",
+		head,
 		verdicts,
 		overall,
 	};
@@ -1311,6 +1376,12 @@ function requestedForCatastrophe(inputs: readonly string[]): readonly string[] {
 	return inputs.length === 0 ? ["auto"] : inputs;
 }
 
+async function cleanupMaterialized(
+	materialized: MaterializedBase | undefined,
+): Promise<void> {
+	if (materialized !== undefined) await materialized.cleanup();
+}
+
 export async function classify(
 	options: ClassifyOptions,
 ): Promise<{ report: ExposureReport; failedClosed: boolean }> {
@@ -1318,45 +1389,70 @@ export async function classify(
 	const runner = options.runner ?? new SpawnRunner();
 	const now = options.now ?? (() => new Date());
 	const fs = options.fs ?? realFs;
-	let materialized: MaterializedBase | undefined;
+	let baseMaterialized: MaterializedBase | undefined;
+	let headMaterialized: MaterializedBase | undefined;
 	let reportedBase = options.base;
+	let reportedHead = "HEAD";
 	let outcome: { report: ExposureReport; failedClosed: boolean } | undefined;
 	try {
 		reportedBase = await resolveCommitSha(repoRoot, options.base, runner);
+		reportedHead = await resolveCommitSha(repoRoot, "HEAD", runner);
 		const headFingerprintBefore = await fingerprintHeadEvidence(repoRoot);
-		const baseRoot = options.identity
-			? repoRoot
-			: (materialized = await materializeBase(repoRoot, reportedBase, runner)).root;
-		if (materialized !== undefined) reportedBase = materialized.sha;
+		let baseRoot: string;
+		let headRoot: string;
+		if (options.identity) {
+			// Hermetic/tests: caller already isolated repoRoot; never used by ordinary CLI.
+			baseRoot = repoRoot;
+			headRoot = repoRoot;
+		} else {
+			await assertRelevantWorktreeClean(repoRoot, runner);
+			headMaterialized = await materializeBase(repoRoot, reportedHead, runner);
+			headRoot = headMaterialized.root;
+			if (reportedBase === reportedHead) {
+				baseRoot = headRoot;
+			} else {
+				baseMaterialized = await materializeBase(repoRoot, reportedBase, runner);
+				baseRoot = baseMaterialized.root;
+			}
+		}
 		const rawInputs = options.inputs.includes("auto")
-			? [...options.inputs.filter((input) => input !== "auto"), ...await deriveAutoInputs(baseRoot, repoRoot)]
+			? [...options.inputs.filter((input) => input !== "auto"), ...await deriveAutoInputs(baseRoot, headRoot)]
 			: [...options.inputs];
 		const specs = [...new Set(rawInputs)].sort().map(parseInputSpec);
 		if (specs.length === 0) {
-			outcome = { report: reportOf(reportedBase, [], now), failedClosed: false };
+			outcome = { report: reportOf(reportedBase, reportedHead, [], now), failedClosed: false };
 		} else {
 			const needCargo = specs.some((spec) => spec.kind === "cargo");
 			try {
 				const base = await loadSide(baseRoot, runner, needCargo);
-				const head = baseRoot === repoRoot ? base : await loadSide(repoRoot, runner, needCargo);
-				const bundles = await buildBundleEvidence(baseRoot, repoRoot, runner);
+				const head = baseRoot === headRoot ? base : await loadSide(headRoot, runner, needCargo);
+				const bundles = await buildBundleEvidence(baseRoot, headRoot, runner);
 				const verdicts = await classifyLoaded(specs, base, head, bundles, fs);
 				const headFingerprintAfter = await fingerprintHeadEvidence(repoRoot);
 				if (headFingerprintBefore !== headFingerprintAfter) {
 					const detail = "head evidence drifted during classification; concurrent work mixed E1-E4 inputs";
 					outcome = {
-						report: reportOf(reportedBase, specs.map((spec) => allUndecidable(spec.raw, detail)), now),
+						report: reportOf(
+							reportedBase,
+							reportedHead,
+							specs.map((spec) => allUndecidable(spec.raw, detail)),
+							now,
+						),
 						failedClosed: true,
 					};
 				} else {
 					const failedClosed = verdicts.some((verdict) =>
 						CHECK_NAMES.some((name) => verdict.checks[name].status === "undecidable"),
 					);
-					outcome = { report: reportOf(reportedBase, verdicts, now), failedClosed };
+					outcome = {
+						report: reportOf(reportedBase, reportedHead, verdicts, now),
+						failedClosed,
+					};
 				}
 			} catch (error) {
 				const report = reportOf(
 					reportedBase,
+					reportedHead,
 					specs.map((spec) => allUndecidable(spec.raw, `loader failure: ${errorText(error)}`)),
 					now,
 				);
@@ -1366,27 +1462,30 @@ export async function classify(
 	} catch (error) {
 		const detail = `classification catastrophe: ${errorText(error)}`;
 		const verdicts = requestedForCatastrophe(options.inputs).map((input) => allUndecidable(input, detail));
-		outcome = { report: reportOf(reportedBase, verdicts, now), failedClosed: true };
+		outcome = { report: reportOf(reportedBase, reportedHead, verdicts, now), failedClosed: true };
 	} finally {
-		if (materialized !== undefined) {
-			try {
-				await materialized.cleanup();
-			} catch (cleanupError) {
-				const detail = `worktree cleanup failure: ${errorText(cleanupError)}`;
-				const inputs = outcome?.report.verdicts.map((verdict) => verdict.input)
-					?? requestedForCatastrophe(options.inputs);
-				outcome = {
-					report: reportOf(
-						reportedBase,
-						inputs.map((input) => allUndecidable(input, detail)),
-						now,
-					),
-					failedClosed: true,
-				};
-			}
+		const cleanups: Array<Promise<void>> = [
+			cleanupMaterialized(baseMaterialized),
+			cleanupMaterialized(headMaterialized),
+		];
+		const cleanupResults = await Promise.allSettled(cleanups);
+		const cleanupError = cleanupResults.find((result) => result.status === "rejected");
+		if (cleanupError !== undefined && cleanupError.status === "rejected") {
+			const detail = `worktree cleanup failure: ${errorText(cleanupError.reason)}`;
+			const inputs = outcome?.report.verdicts.map((verdict) => verdict.input)
+				?? requestedForCatastrophe(options.inputs);
+			outcome = {
+				report: reportOf(
+					reportedBase,
+					reportedHead,
+					inputs.map((input) => allUndecidable(input, detail)),
+					now,
+				),
+				failedClosed: true,
+			};
 		}
 	}
-	return outcome ?? { report: reportOf(reportedBase, [], now), failedClosed: true };
+	return outcome ?? { report: reportOf(reportedBase, reportedHead, [], now), failedClosed: true };
 }
 
 function stableReportEvidence(verdict: Verdict): string {
@@ -1420,10 +1519,26 @@ export async function appendLedgerRows(path: string, report: ExposureReport): Pr
 		.map((verdict) => {
 			const hash = createHash("sha256").update(stableReportEvidence(verdict)).digest("hex");
 			const statuses = CHECK_NAMES.map((name) => verdict.checks[name].status);
-			return `| ${date} | dependency-exposure | ${report.base}→worktree | ${verdict.input} | ${verdict.class} | ${statuses.join(" | ")} | ${hash} |\n`;
+			const cells = [
+				date,
+				"dependency-exposure",
+				`${report.base}→${report.head}`,
+				verdict.input,
+				verdict.class,
+				...statuses,
+				hash,
+			].map((cell) => escapeMarkdownCell(String(cell)));
+			return `| ${cells.join(" | ")} |\n`;
 		})
 		.join("");
-	await appendFile(path, rows, "utf8");
+	let prefix = "";
+	try {
+		const existing = await readFile(path, "utf8");
+		if (existing.length > 0 && !existing.endsWith("\n")) prefix = "\n";
+	} catch {
+		// appendFile creates the file when absent
+	}
+	await appendFile(path, `${prefix}${rows}`, "utf8");
 }
 
 class CrashingBuildRunner implements CommandRunner {
