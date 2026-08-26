@@ -78,11 +78,12 @@ function matchRoute(method: string, hostname: string, pathname: string): Fixture
 			return route;
 		}
 	}
-	// Fallback: partial pathname match (for dynamic paths like /models/{id}/policy)
+	// Fallback: partial match on hostname+pathname (for dynamic paths like /models/{id}/policy)
 	for (const route of fixture.routes) {
 		const routeMethod = route.method.toUpperCase();
 		const routePattern = route.pattern;
-		if (method.toUpperCase() === routeMethod && pathname.startsWith(routePattern)) {
+		const fullPath = `${hostname}${pathname}`;
+		if (method.toUpperCase() === routeMethod && fullPath.startsWith(routePattern)) {
 			return route;
 		}
 	}

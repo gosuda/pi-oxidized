@@ -91,9 +91,13 @@ async function runProvider(provider: ManifestProvider): Promise<RunResult> {
 	// Device-code flows reach their prompt quickly; browser-PKCE flows
 	// need time for callback server setup before the manual_code prompt.
 	Bun.sleep(2000).then(() => {
-		proc.stdin.write(stdinContent);
-		proc.stdin.flush();
-		proc.stdin.end();
+		try {
+			proc.stdin.write(stdinContent);
+			proc.stdin.flush();
+			proc.stdin.end();
+		} catch {
+			// Child process already exited — stdin pipe closed
+		}
 	});
 
 	const [stdout, stderr, exitCode] = await Promise.all([
@@ -164,8 +168,8 @@ function normalizeStdout(text: string): string {
 		.replace(/\/oauth\/callback\/[0-9a-f-]{36}/g, "/oauth/callback/<UUID>")
 		.replace(/%2Foauth%2Fcallback%2F[0-9a-f-]{36}/g, "%2Foauth%2Fcallback%2F<UUID>")
 		// Replace ports in callback URLs (ephemeral ports) — both raw and URL-encoded
-		.replace(/(?:localhost|127\.0\.0\.1):\d+/g, "$1:<PORT>")
-		.replace(/%3A\d+/g, "%3A<PORT>");
+		.replace(/(localhost|127\.0\.0\.1):\d+/g, "$1:<PORT>")
+		.replace(/(localhost|127\.0\.0\.1)%3A\d+/g, "$1%3A<PORT>");
 }
 
 function diffResults(golden: RunResult, actual: RunResult): string[] {
