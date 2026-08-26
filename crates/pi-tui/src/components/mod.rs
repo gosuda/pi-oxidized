@@ -12,7 +12,6 @@ mod select_list;
 mod settings_list;
 mod spacer;
 mod text;
-mod truncated_text;
 
 pub mod util;
 
@@ -29,4 +28,3 @@ pub use select_list::{
 pub use settings_list::{SettingItem, SettingsList, SettingsListOptions, SettingsListTheme};
 pub use spacer::Spacer;
 pub use text::Text;
-pub use truncated_text::TruncatedText;

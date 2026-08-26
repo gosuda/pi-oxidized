@@ -3,7 +3,7 @@
 Status: Ratified (decision-only; no source changes by this task)
 Issue: [TUI-G3 #40](https://github.com/metaphorics/pi-oxidized/issues/40)
 Stable ID: `TUI-G3`
-Follow-on owners: TUI-T7 (#69) — inert theme slots + TruncatedText; TUI-T4 (#65) — EditorBorder wiring; TUI-G4 (#35) — alt-screen / scroll-view.
+Follow-on owners: TUI-T7 (#69) — KEEP nine theme slots + delete TruncatedText; TUI-T4 (#65) — EditorBorder wiring; TUI-G4 (#35) — alt-screen / scroll-view.
 Blocked by: [Audit canonical terminal interaction flows #25](https://github.com/metaphorics/pi-oxidized/issues/25)
 
 ## 1. Decision
@@ -29,20 +29,20 @@ TUI-G3 is a decision record only: it changes **no source**. Every consumption, d
 
 ## 3. Disposition of inert surfaces
 
-The following dispositions are ratified; any structural change executes only under the named follow-on task. `KEEP` means the token remains part of the schema and wire contract and must not be deleted without a schema-compatible migration decided in the named task.
+The following dispositions are ratified; any structural change executes only under the named follow-on task. `KEEP` means the token remains part of the schema and wire contract because `REQUIRED_COLORS` and HTML export consume it, and must not be deleted without a schema-compatible migration.
 
 | Surface | Source symbol / path | Currently | Disposition | Owner |
 |---|---|---|---|---|
-| ThemeBg::SelectedBg | theme.rs enum line 151; `ALL_BG` line 218; `ALL_BG_SLOTS` line 1862; `REQUIRED_COLORS` line 1769 | Resolved by `resolve_owned`; **no terminal render path reads it** | **KEEP** — schema/wire-required token; terminal-inert today | TUI-T7 #69 |
-| ThemeBg::ScrollbarThumb | theme.rs enum line 153; `ALL_BG` line 219; `ALL_BG_SLOTS` line 1863 | Optional key, falls back to `selectedBg` (theme.rs lines 1338-1341); **no terminal scrollbar paints it** | **KEEP** — schema/wire token consumed by fallback and tests; scroll-view usage domain is alt-screen | TUI-T7 #69 (+ TUI-G4 #35 domain) |
-| ThemeBg::UserMessageBg | theme.rs enum line 155; `ALL_BG` line 220; `ALL_BG_SLOTS` line 1864; `REQUIRED_COLORS` line 1770 | **Inert in terminal** — `build_user` paints a `BorderAccent` rail, no bg slab | **KEEP** — schema-required; wire-or-drop decision deferred | TUI-T7 #69 |
-| ThemeBg::CustomMessageBg | theme.rs enum line 157; `ALL_BG` line 221; `ALL_BG_SLOTS` line 1865; `REQUIRED_COLORS` line 1773 | **Inert in terminal** — `build_custom` paints a `CustomMessageLabel` rail, no bg slab | **KEEP** — schema-required; wire-or-drop decision deferred | TUI-T7 #69 |
-| ThemeBg::ToolPendingBg | theme.rs enum line 159; `ALL_BG` line 222; `ALL_BG_SLOTS` line 1866; `REQUIRED_COLORS` line 1778 | **Inert in terminal** — tool blocks use phase-colored foreground rails, no bg slab | **KEEP** — schema-required; wire-or-drop decision deferred | TUI-T7 #69 |
-| ThemeBg::ToolSuccessBg | theme.rs enum line 161; `ALL_BG` line 223; `ALL_BG_SLOTS` line 1867; `REQUIRED_COLORS` line 1779 | **Inert in terminal** — success rendered via `ThemeColor::Success` rail foreground | **KEEP** — schema-required; wire-or-drop decision deferred | TUI-T7 #69 |
-| ThemeBg::ToolErrorBg | theme.rs enum line 163; `ALL_BG` line 224; `ALL_BG_SLOTS` line 1868; `REQUIRED_COLORS` line 1780 | **Inert in terminal** — error rendered via `ThemeColor::Error` heavy rail foreground | **KEEP** — schema-required; wire-or-drop decision deferred | TUI-T7 #69 |
-| userMessageText | theme.rs `ThemeColor::UserMessageText` line 76; `ALL_FG` line 179; `ALL_FG_SLOTS` line 1824; `REQUIRED_COLORS` line 1772; `make_fg` line 586 | Registered and resolved, but **no render path consumes it** — user blocks color via `BorderAccent` | **KEEP** — schema-required; wire-or-drop decision deferred | TUI-T7 #69 |
-| customMessageText | theme.rs `ThemeColor::CustomMessageText` line 78; `ALL_FG` line 180; `ALL_FG_SLOTS` line 1825; `REQUIRED_COLORS` line 1774; `make_fg` line 587 | Registered and resolved, but **no render path consumes it** — custom blocks color via `CustomMessageLabel` | **KEEP** — schema-required; wire-or-drop decision deferred | TUI-T7 #69 |
-| TruncatedText | `crates/pi-tui/src/components/truncated_text.rs` (struct line 12) | **Zero callsites** outside its own module; referenced only by re-export (`crates/pi-tui/src/components/mod.rs` line 32) and its own unit tests | **DELETE** — dispose unless a follow-on wires it; decision ratified now, removal deferred | TUI-T7 #69 |
+| ThemeBg::SelectedBg | theme.rs enum line 151; `ALL_BG` line 218; `ALL_BG_SLOTS` line 1862; `REQUIRED_COLORS` line 1769 | Resolved by `resolve_owned`; **no terminal render path reads it** | **KEEP** — `REQUIRED_COLORS` member; HTML export emits `--selectedBg` via `ExportTheme::from_resolved` (`export_html/mod.rs` lines 219-240) | TUI-T7 #69 |
+| ThemeBg::ScrollbarThumb | theme.rs enum line 153; `ALL_BG` line 219; `ALL_BG_SLOTS` line 1863 | Optional key, falls back to `selectedBg` (theme.rs lines 1338-1341); **no terminal scrollbar paints it** | **KEEP** — HTML export emits `--scrollbarThumb` via `bg_slot_names`/`from_resolved`; optional outside `REQUIRED_COLORS` with `selectedBg` fallback | TUI-T7 #69 (+ TUI-G4 #35 domain) |
+| ThemeBg::UserMessageBg | theme.rs enum line 155; `ALL_BG` line 220; `ALL_BG_SLOTS` line 1864; `REQUIRED_COLORS` line 1770 | **Inert in terminal** — `build_user` paints a `BorderAccent` rail, no bg slab | **KEEP** — `REQUIRED_COLORS` member; HTML export emits `--userMessageBg` and `generate_html` derives page/card/info from it (`export_html/mod.rs` lines 572-577) | TUI-T7 #69 |
+| ThemeBg::CustomMessageBg | theme.rs enum line 157; `ALL_BG` line 221; `ALL_BG_SLOTS` line 1865; `REQUIRED_COLORS` line 1773 | **Inert in terminal** — `build_custom` paints a `CustomMessageLabel` rail, no bg slab | **KEEP** — `REQUIRED_COLORS` member; HTML export emits `--customMessageBg` via `from_resolved` | TUI-T7 #69 |
+| ThemeBg::ToolPendingBg | theme.rs enum line 159; `ALL_BG` line 222; `ALL_BG_SLOTS` line 1866; `REQUIRED_COLORS` line 1778 | **Inert in terminal** — tool blocks use phase-colored foreground rails, no bg slab | **KEEP** — `REQUIRED_COLORS` member; HTML export emits `--toolPendingBg` via `from_resolved` | TUI-T7 #69 |
+| ThemeBg::ToolSuccessBg | theme.rs enum line 161; `ALL_BG` line 223; `ALL_BG_SLOTS` line 1867; `REQUIRED_COLORS` line 1779 | **Inert in terminal** — success rendered via `ThemeColor::Success` rail foreground | **KEEP** — `REQUIRED_COLORS` member; HTML export emits `--toolSuccessBg` via `from_resolved` | TUI-T7 #69 |
+| ThemeBg::ToolErrorBg | theme.rs enum line 163; `ALL_BG` line 224; `ALL_BG_SLOTS` line 1868; `REQUIRED_COLORS` line 1780 | **Inert in terminal** — error rendered via `ThemeColor::Error` heavy rail foreground | **KEEP** — `REQUIRED_COLORS` member; HTML export emits `--toolErrorBg` via `from_resolved` | TUI-T7 #69 |
+| userMessageText | theme.rs `ThemeColor::UserMessageText` line 76; `ALL_FG` line 179; `ALL_FG_SLOTS` line 1824; `REQUIRED_COLORS` line 1772; `make_fg` line 586 | Registered and resolved, but **no render path consumes it** — user blocks color via `BorderAccent` | **KEEP** — `REQUIRED_COLORS` member; HTML export emits `--userMessageText` via `from_resolved` | TUI-T7 #69 |
+| customMessageText | theme.rs `ThemeColor::CustomMessageText` line 78; `ALL_FG` line 180; `ALL_FG_SLOTS` line 1825; `REQUIRED_COLORS` line 1774; `make_fg` line 587 | Registered and resolved, but **no render path consumes it** — custom blocks color via `CustomMessageLabel` | **KEEP** — `REQUIRED_COLORS` member; HTML export emits `--customMessageText` via `from_resolved` | TUI-T7 #69 |
+| TruncatedText | was `crates/pi-tui/src/components/truncated_text.rs`; re-export was `components/mod.rs` | **Zero callsites** outside its own module | **DELETED** — module and public re-export removed under TUI-T7 #69; no alias/shim | TUI-T7 #69 |
 | EditorBorder::Muted | written in runtime.rs line 4481 (thinking-level off ⊢ Muted); asserted in tests line 7413 | Written into `view.editor.border`; **no paint path reads the editor border** | **WIRE** — editor must consume EditorBorder via EditorTheme so Muted renders | TUI-T4 #65 |
 | EditorBorder::Bash | written in runtime.rs `dispatch_bash` line 2620 and sync line 4479; asserted in tests line 7397 | Write-only state; **no paint path reads it** | **WIRE** — editor must consume EditorBorder via EditorTheme so Bash renders | TUI-T4 #65 |
 | EditorBorder::Thinking | written in runtime.rs sync line 4483; asserted in tests line 7702 | Write-only state; **no paint path reads it** | **WIRE** — editor must consume EditorBorder via EditorTheme so Thinking renders | TUI-T4 #65 |
@@ -50,18 +50,18 @@ The following dispositions are ratified; any structural change executes only und
 
 ### Notes
 
-The eight required inert slots (`SelectedBg`, `UserMessageBg`, `CustomMessageBg`, `ToolPendingBg`, `ToolSuccessBg`, `ToolErrorBg`, `userMessageText`, `customMessageText`) are members of `REQUIRED_COLORS` (theme.rs line 1758). `ThemeJson::from_value` hard-fails a theme that omits any required slot (`ThemeError::MissingColor`, line 1315), so these tokens cannot be removed without a coordinated schema migration. This is why their disposition is **KEEP** under TUI-G3 with the wire-or-drop structural decision deferred.
-- `scrollbarThumb` is the one background slot not in `REQUIRED_COLORS`; the parser synthesizes it from `selectedBg` when absent (theme.rs lines 1338-1341). It is retained as a schema/wire token and its only plausible terminal renderer (an alt-screen scroll thumb) lives in TUI-G4's domain.
+The eight required inert slots (`SelectedBg`, `UserMessageBg`, `CustomMessageBg`, `ToolPendingBg`, `ToolSuccessBg`, `ToolErrorBg`, `userMessageText`, `customMessageText`) are members of `REQUIRED_COLORS` (theme.rs line 1758). `ThemeJson::from_value` hard-fails a theme that omits any required slot (`ThemeError::MissingColor`, line 1315). HTML export consumes all nine slots (those eight plus `ScrollbarThumb`) through `ExportTheme::from_resolved`, which walks `fg_slot_names`/`bg_slot_names` into CSS variables (`export_html/mod.rs` lines 219-240); `generate_html` also reads `userMessageBg` to derive page/card/info backgrounds (lines 572-577). TUI-T7 #69 therefore ratifies **KEEP** for all nine live theme slots.
+- `scrollbarThumb` is the one background slot not in `REQUIRED_COLORS`; the parser synthesizes it from `selectedBg` when absent (theme.rs lines 1338-1341). It remains a schema/wire token exported to HTML; its only plausible terminal renderer (an alt-screen scroll thumb) lives in TUI-G4's domain.
 The EditorBorder family and `EditorTheme.border_color` form the single genuinely write-only surface: the runtime maintains the border state faithfully (and its tests pin it), but the `Editor` is constructed with the identity theme, so the state never reaches a glyph. Wiring is TUI-T4's job, not TUI-G3's.
 
 ## 4. Deferred execution owners
 
 Everything that would change a `.rs` file is out of scope for TUI-G3 and is routed to exactly one follow-on decision track:
 
-- **TUI-T7 (#69)** — owns: wiring or deleting the inert `ThemeBg` slots and `userMessageText`/`customMessageText` (either rendering them or removing them with a schema-compatible migration), and disposing `TruncatedText`.
+- **TUI-T7 (#69)** — executed: **KEEP** the nine theme slots (eight `REQUIRED_COLORS` members plus `ScrollbarThumb`) because schema parse and HTML export consume them; **DELETED** zero-caller `TruncatedText` (module + re-export, no shim).
 - **TUI-T4 (#65)** — owns: making the live editor consume `EditorBorder` state via `EditorTheme` instead of `EditorTheme::default()` at `runtime.rs:1358`.
 - **TUI-G4 (#35)** — owns: the alt-screen / scroll-view surface, the only domain where a `scrollbarThumb` renderer would ever exist.
 
 ## 5. Scope
 
-TUI-G3 changes no source. The rails, the theme resolver, the editor, and `truncated_text` are each owned by the tasks above and are untouched here. This record is the only deliverable of TUI-G3.
+TUI-G3 changes no source. The rails, the theme resolver, and the editor are each owned by the tasks above and are untouched here. `TruncatedText` deletion and the nine-slot KEEP ratification execute under TUI-T7. This record is the only deliverable of TUI-G3.
