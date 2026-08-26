@@ -26,9 +26,7 @@ const EXPECTED_TRIPLES = [
  * Frozen exhaustive expectation for every derived field of every supported
  * plan. A deliberate change to any field must update this table.
  */
-const EXPECTED_PLANS: ReadonlyArray<
-	Readonly<Record<keyof TargetPlan, string | boolean>>
-> = [
+const EXPECTED_PLANS = [
 	{
 		rustTarget: "x86_64-unknown-linux-gnu",
 		bunTarget: "bun-linux-x64-baseline",
@@ -134,7 +132,7 @@ const EXPECTED_PLANS: ReadonlyArray<
 		hostBundleName: "pi-extension-host.js",
 		archiveDir: "pi-windows-x64-base",
 	},
-];
+] as const satisfies readonly TargetPlan[];
 
 describe("targets", () => {
 	test("lists exactly seven master-plan triples in stable order", () => {
