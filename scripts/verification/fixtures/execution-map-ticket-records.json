@@ -1,0 +1,1818 @@
+{
+  "version": 2,
+  "repository": "metaphorics/pi-oxidized",
+  "canonicalIssue": 12,
+  "sourceHash": "sha256:8ab7e57344727c59a722359adb852c6a8e4d98c53fee4df48fe103ffaf5aadfd",
+  "sourceRecordCount": 131,
+  "taskCount": 115,
+  "externalCount": 16,
+  "records": [
+    {
+      "stableId": "EXT-13",
+      "kind": "external",
+      "issue": 13,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/13",
+      "title": "Establish comparative performance workloads and floors",
+      "question": "Which representative upstream-versus-Rust workloads can be reproduced for startup, model streaming, tool dispatch, extension RPC, session persistence, layout, and paint, and what unavoidable floor applies to each?",
+      "acceptance": null,
+      "nativeParent": "ROOT-12",
+      "blockers": []
+    },
+    {
+      "stableId": "EXT-14",
+      "kind": "external",
+      "issue": 14,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/14",
+      "title": "Ground all pinned versions from release channels",
+      "question": "What are the current stable or LTS versions, release dates, support dates, maintenance state, and primary-source links for every language, runtime, dependency, build tool, test tool, and platform baseline the port pins?",
+      "acceptance": null,
+      "nativeParent": "ROOT-12",
+      "blockers": []
+    },
+    {
+      "stableId": "EXT-15",
+      "kind": "external",
+      "issue": 15,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/15",
+      "title": "Inventory upstream runtime package capabilities",
+      "question": "Which shipped runtime capabilities and public contracts exist in the refreshed .references/pi baseline, separated from tests, examples, evals, build tooling, and release tooling?",
+      "acceptance": null,
+      "nativeParent": "ROOT-12",
+      "blockers": []
+    },
+    {
+      "stableId": "EXT-16",
+      "kind": "external",
+      "issue": 16,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/16",
+      "title": "Define documentation synchronization evidence",
+      "question": "Which executable examples, behavior transcripts, version references, changelog entries, compatibility matrices, and release instructions must prove docs match the final Rust product?",
+      "acceptance": null,
+      "nativeParent": "ROOT-12",
+      "blockers": [
+        "EXT-24",
+        "EXT-20",
+        "EXT-26"
+      ]
+    },
+    {
+      "stableId": "EXT-17",
+      "kind": "external",
+      "issue": 17,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/17",
+      "title": "Define native terminal interface quality bar",
+      "question": "Which canonical terminal flows may be redesigned, which behaviors remain compatible, and what evidence proves accessibility, layout, writing, typography, color, polish, density, and motion quality?",
+      "acceptance": null,
+      "nativeParent": "ROOT-12",
+      "blockers": [
+        "EXT-25"
+      ]
+    },
+    {
+      "stableId": "EXT-18",
+      "kind": "external",
+      "issue": 18,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/18",
+      "title": "Map runtime capabilities to five crate owners",
+      "question": "Which one of pi-ai, pi-agent, pi-ext, pi-tui, or pi must own each upstream runtime capability while preserving the fixed workspace dependency topology?",
+      "acceptance": null,
+      "nativeParent": "ROOT-12",
+      "blockers": [
+        "EXT-15"
+      ]
+    },
+    {
+      "stableId": "EXT-19",
+      "kind": "external",
+      "issue": 19,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/19",
+      "title": "Define TypeScript extension compatibility contract",
+      "question": "Which imports, serialized frames, callbacks, lifecycle rules, provider hooks, UI hooks, errors, ordering guarantees, and packaging behaviors must existing TypeScript extensions observe unchanged?",
+      "acceptance": null,
+      "nativeParent": "ROOT-12",
+      "blockers": [
+        "EXT-15",
+        "EXT-18"
+      ]
+    },
+    {
+      "stableId": "EXT-20",
+      "kind": "external",
+      "issue": 20,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/20",
+      "title": "Define complete Rust port parity boundary",
+      "question": "Does complete parity mean every shipped runtime package, every product-reachable behavior, or only the four extension-authority packages, and which non-runtime repository surfaces are excluded?",
+      "acceptance": null,
+      "nativeParent": "ROOT-12",
+      "blockers": [
+        "EXT-15",
+        "EXT-18"
+      ]
+    },
+    {
+      "stableId": "EXT-21",
+      "kind": "external",
+      "issue": 21,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/21",
+      "title": "Audit current dependency freshness and licenses",
+      "question": "Which Rust and TypeScript dependencies are patch, minor, or major versions behind, vulnerable, yanked, unmaintained, bloated for current use, or license-incompatible?",
+      "acceptance": null,
+      "nativeParent": "ROOT-12",
+      "blockers": [
+        "EXT-14"
+      ]
+    },
+    {
+      "stableId": "EXT-22",
+      "kind": "external",
+      "issue": 22,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/22",
+      "title": "Define performance superiority acceptance",
+      "question": "Which per-workload floor multiples, relative speedups, absolute latency or throughput budgets, allocation limits, startup budgets, and artifact-size limits define materially better performance?",
+      "acceptance": null,
+      "nativeParent": "ROOT-12",
+      "blockers": [
+        "EXT-13"
+      ]
+    },
+    {
+      "stableId": "EXT-23",
+      "kind": "external",
+      "issue": 23,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/23",
+      "title": "Define dependency upgrade policy",
+      "question": "Which current pins stay because repository floors win, which patch and minor updates batch, which majors migrate separately, and which unmaintained or bloated dependencies are replaced?",
+      "acceptance": null,
+      "nativeParent": "ROOT-12",
+      "blockers": [
+        "EXT-14",
+        "EXT-21"
+      ]
+    },
+    {
+      "stableId": "EXT-24",
+      "kind": "external",
+      "issue": 24,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/24",
+      "title": "Map public documentation and release surfaces",
+      "question": "Which upstream and Rust documentation, examples, CLI help, changelogs, package metadata, release artifacts, and platform instructions must remain synchronized with the final port contract?",
+      "acceptance": null,
+      "nativeParent": "ROOT-12",
+      "blockers": [
+        "EXT-15"
+      ]
+    },
+    {
+      "stableId": "EXT-25",
+      "kind": "external",
+      "issue": 25,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/25",
+      "title": "Audit canonical terminal interaction flows",
+      "question": "What are the canonical terminal flows and their empty, loading, error, narrow-width, keyboard, focus, and long-content states in the upstream and current Rust product?",
+      "acceptance": null,
+      "nativeParent": "ROOT-12",
+      "blockers": [
+        "EXT-15"
+      ]
+    },
+    {
+      "stableId": "EXT-26",
+      "kind": "external",
+      "issue": 26,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/26",
+      "title": "Define supported release platforms",
+      "question": "Which operating systems, architectures, terminals, shells, package formats, and offline or sidecar modes are release-blocking?",
+      "acceptance": null,
+      "nativeParent": "ROOT-12",
+      "blockers": [
+        "EXT-14"
+      ]
+    },
+    {
+      "stableId": "EXT-27",
+      "kind": "external",
+      "issue": 27,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/27",
+      "title": "Inventory TypeScript extension observable contracts",
+      "question": "Which TypeScript extension imports, registration surfaces, lifecycle events, tool and command hooks, provider hooks, UI frames, errors, ordering guarantees, cancellation behavior, discovery paths, and packaged-host assumptions are observable contracts at reference commit 8fa7eebd235355522c8104166b4f1f959b4e2f10?",
+      "acceptance": null,
+      "nativeParent": "ROOT-12",
+      "blockers": [
+        "EXT-15"
+      ]
+    },
+    {
+      "stableId": "EXT-28",
+      "kind": "external",
+      "issue": 28,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/28",
+      "title": "Inventory supported build and release platforms",
+      "question": "Which operating systems, CPU architectures, terminals, shells, runtime sidecars, package formats, archives, and offline modes are supported or exercised by the refreshed reference and current Rust release machinery?",
+      "acceptance": null,
+      "nativeParent": "ROOT-12",
+      "blockers": [
+        "EXT-14"
+      ]
+    },
+    {
+      "stableId": "PAR-LEDGER",
+      "kind": "execution",
+      "issue": 29,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/29",
+      "title": "[PAR-LEDGER] Build parity ledger and boundary witness suite",
+      "question": "Land docs/PARITY_LEDGER.md with all 57 capability IDs (A1–A11, G1–G11 with folds, T1–T9, E1–E4, C1–C18, R1–R4) mapped to owner crate/module/seam/status — with A8 status parity-blocked carrying its evidence checklist, A9 recorded as the upstream OAuth-CLI surface, E1 naming the mirror/fixture lockstep witness as extension-plan-owned, and R1–R4 entries recording the pinned platform contract (#[cfg(unix)] unix adapter/listener, portable neutral surface, typed EndpointSpecError::UnsupportedOnPlatform, merge-blocking Windows-target compile check of the transport-neutral surface) — plus automated witnesses: five-member workspace, fixed edge set, no pi_ext/pi_tui in pi-agent, no `use pi::` in pi-ext, no duplicate capability ID, the graduated-ticket DAG check (stable IDs, every blocked_by resolvable, no cycles, no missing nodes), and the AgentLoopConfig enumeration witness pinning EXACTLY FIVE literal sites (agent.rs:62-88, config.rs:360-389, run.rs:835-861, schedule.rs:902-928, pi agent_session/mod.rs:463-489) as the shared arbitration oracle. Zero product-code changes; acceptance is the audit + witnesses passing on one command.",
+      "acceptance": "- The ticket question is resolved with repository evidence and its parent plan's acceptance gates pass.",
+      "nativeParent": "EXT-20",
+      "blockers": []
+    },
+    {
+      "stableId": "PAR-WIRE",
+      "kind": "execution",
+      "issue": 30,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/30",
+      "title": "[PAR-WIRE] Decide remote-session wire format — upstream CBOR vs landed JSONL",
+      "question": "Compare, against upstream pi-protocol at 8fa7eeb and the landed modes/rpc JSONL framing: full message-universe fidelity (ClientMessage/ServerMessage/Command/CommandResult/ServerEvent/ServerSnapshot/ProtocolError + codes, protocol v1), interop with any TS client, 4-byte BE length-prefix (16 MiB max) framing overhead and encode/decode cost class, strict RFC 8949 CBOR with configurable limits vs JSONL, and golden-fixture testability. Deliverable: ledger-recorded decision with the rejected option's rationale plus a fixture corpus from 8fa7eeb; explicitly does NOT reopen C4. Implementation owner is pi::remote regardless of outcome.",
+      "acceptance": "- The ticket question is resolved with repository evidence and its parent plan's acceptance gates pass.",
+      "nativeParent": "EXT-20",
+      "blockers": [
+        "PAR-LEDGER"
+      ]
+    },
+    {
+      "stableId": "PAR-CODEC",
+      "kind": "execution",
+      "issue": 31,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/31",
+      "title": "[PAR-CODEC] Port pi::remote codec, framing, and schemas — codec-layer errors only (R1–R2)",
+      "question": "Create crates/pi/src/remote/{codec.rs,framing.rs,schemas.rs} per the RT-WIRE ruling: complete upstream schemas.ts message set, 4-byte BE length-prefix framing with 16 MiB default max and incremental decode, byte-exact golden roundtrip against 8fa7eeb vectors, typed errors (never panics) for oversized/truncated/unknown-discriminant/version-mismatch frames — fully portable, zero cfg branches. Error surface is ONLY typed CodecError/FrameError — this layer cannot originate disposed/detached/ownership states; an absence witness asserts no ByteTransport/factory/EndpointSpec/client-taxonomy symbol exists after this phase. Boundary: codec/framing/schemas + tests only.",
+      "acceptance": "- The ticket question is resolved with repository evidence and its parent plan's acceptance gates pass.",
+      "nativeParent": "EXT-20",
+      "blockers": [
+        "PAR-WIRE"
+      ]
+    },
+    {
+      "stableId": "PAR-SERVER",
+      "kind": "execution",
+      "issue": 32,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/32",
+      "title": "[PAR-SERVER] pi::remote multi-session server (portable) with #[cfg(unix)] unix listener preset (R4)",
+      "question": "Implement remote/server.rs per upstream server.ts/sessions.ts with zero cfg branches (portable core): multi-session AgentSession hosting, attach-before-mutate, lease/lock tracking, broadcast exactly-once per attached listener, idle disposal at zero attachments, disconnect survival, session mutation ONLY through AgentSession's public C15 surface (no encoding/migration logic — G8 owns it); plus the unix listener preset per upstream transports/unix/preset.ts with module/re-exports/tests #[cfg(unix)]-gated, sharing transport.rs's typed EndpointSpecError::UnsupportedOnPlatform for a unix listen spec on non-Unix (one typed error owner — no second convention). Acceptance: two-client integration over in-memory transport on every target (exclusive-lease rejection, re-attach after detach, broadcast exactly-once, mid-request disconnect) PLUS the required real unix-socket run on the Unix tier; cfg-gated test pins the typed non-Unix result; the Windows-target compile check covers server.rs with the preset absent; structural witness that pi::remote reaches no persistence/migration imports.",
+      "acceptance": "- The ticket question is resolved with repository evidence and its parent plan's acceptance gates pass.",
+      "nativeParent": "EXT-20",
+      "blockers": [
+        "PAR-CLIENT"
+      ]
+    },
+    {
+      "stableId": "PAR-CLIENT",
+      "kind": "execution",
+      "issue": 33,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/33",
+      "title": "[PAR-CLIENT] pi::remote ByteTransport with portable neutral surface + #[cfg(unix)] unix adapter + client + five-class errors (R3)",
+      "question": "ONE commit: remote/transport.rs carrying the ByteTransport trait + handlers per upstream transport.ts (construction-at-client-lifecycle shape; no automatic reconnect) AND the portable EndpointSpec enum declared unconditionally AND the single fallible build_transport surface returning the typed EndpointSpecError::UnsupportedOnPlatform { kind, os } when a Unix-socket spec is built under cfg NOT(unix) — distinct from the five runtime classes; remote/transport/in_memory.rs unconditional; remote/transport/unix.rs with module + re-exports + tests #[cfg(unix)]-gated (both REAL adapters on the Unix tier in the same commit so the seam is real immediately); remote/client.rs transport-neutral with ZERO cfg branches: shared|exclusive leases per session-handle.ts, monotonic request correlation, listener subscription, detach ≠ disconnect, carrying the five-class typed taxonomy PiClientDisposedError/PiDisconnectedError/PiServerError/PiSessionOwnershipError/PiSessionDetachedError with server ProtocolError codes mapped into ownership/server classes AT THE CLIENT SEAM. Acceptance: in-memory tests for lease conflict, detach-reattach, typed mid-request disconnect; every transport failure maps to exactly one typed variant (table pinned by test); cfg-gated test pins the typed UnsupportedOnPlatform result on non-Unix (no panic/untyped string); exactly two adapters compile/run on the Unix tier; cfg-discipline witness (unix APIs only inside gated code) green; MERGE-BLOCKING Windows-target compile check of the transport-neutral surface (x86_64-pc-windows-msvc) passes with the unix module absent; real Unix-socket run retained on the Unix tier.",
+      "acceptance": "- The ticket question is resolved with repository evidence and its parent plan's acceptance gates pass.",
+      "nativeParent": "EXT-20",
+      "blockers": [
+        "PAR-CODEC"
+      ]
+    },
+    {
+      "stableId": "PAR-FOLD",
+      "kind": "execution",
+      "issue": 34,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/34",
+      "title": "[PAR-FOLD] Duplicate-fold and callsite-migration sweep",
+      "question": "Prove the fold on disk: pi-agent carries no tools/compaction/prompt/system-prompt/skills modules; exactly one owner per C5/G4/G3/G8; prompts reach pi-agent only via AgentLoopConfig; no ExecutionEnv-shaped trait anywhere; cancellation-determinism test proves cancellation aborts drain/queue exactly once through concrete pi tools; config-value single-owner witness green after the wrapper deletion; AgentLoopConfig enumeration witness green at exactly FIVE sites all carrying the telemetry field. Migrate straggler callsites inside single-owner modules; no new shims.",
+      "acceptance": "- The ticket question is resolved with repository evidence and its parent plan's acceptance gates pass.",
+      "nativeParent": "EXT-20",
+      "blockers": [
+        "PAR-TEL",
+        "PAR-CLI",
+        "PAR-COMPAT-DISPO"
+      ]
+    },
+    {
+      "stableId": "TUI-G4",
+      "kind": "execution",
+      "issue": 35,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/35",
+      "title": "[TUI-G4] Alt-screen / scroll-view scope classification",
+      "question": "Confirm TuiAltScreen (fullscreen scroll-view, mouse capture, search overlay, flash confirmations, prompt navigation) as deferred-by-design roadmap gap — reclassifying five missing affordances from gap to roadmap — or pull it into issue #12 scope",
+      "acceptance": "- Each of the five missing affordances is recorded as either deferred-by-design roadmap or pulled into issue #12 scope; no implementation decision left implicit",
+      "nativeParent": "EXT-17",
+      "blockers": [
+        "EXT-25",
+        "TUI-G3"
+      ]
+    },
+    {
+      "stableId": "PAR-MATH-RESEARCH",
+      "kind": "execution",
+      "issue": 36,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/36",
+      "title": "[PAR-MATH-RESEARCH] Research KaTeX-class math port strategy for pi-tui",
+      "question": "Choose the T4 strategy: Rust-native layout engine vs reduced TeX→unicode, scored on coverage of transcript-emitted math, bundle/dependency cost (no JS engine), and the pi-tui product-agnostic invariant; if full coverage is rejected, specify the reduced contract exactly (rendered subsets vs literal fallback) — that specification becomes the settled observable contract consumed by terminal-polish and maximum-performance.",
+      "acceptance": "- The ticket question is resolved with repository evidence and its parent plan's acceptance gates pass.",
+      "nativeParent": "EXT-20",
+      "blockers": [
+        "PAR-LEDGER"
+      ]
+    },
+    {
+      "stableId": "PAR-MATH",
+      "kind": "execution",
+      "issue": 37,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/37",
+      "title": "[PAR-MATH] Implement pi-tui math rendering per settled strategy (T4)",
+      "question": "Build the math path in pi-tui components/markdown.rs per RT-MATH-RESEARCH's ruling, rendering into the Buffer/Cell differential pipeline with product-agnostic signatures, plus host-tier real-PTY rendering evidence for representative inline/block math. Acceptance: PTY-verified rendering, zero new pi-tui workspace deps, ledger updated with the rendered-vs-fallback contract.",
+      "acceptance": "- The ticket question is resolved with repository evidence and its parent plan's acceptance gates pass.",
+      "nativeParent": "EXT-20",
+      "blockers": [
+        "PAR-MATH-RESEARCH"
+      ]
+    },
+    {
+      "stableId": "XC-5",
+      "kind": "execution",
+      "issue": 38,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/38",
+      "title": "[XC-5] Reconcile pi-ext Registry conflict semantics against the registration conflict matrix",
+      "question": "Trace command/shortcut registration flow into Rust snapshots (SessionCommandInfoWire, Registry in adapters.rs) to decide whether Rust-side first-wins-everywhere flattens the observable command-suffix (:2/:3) and shortcut later-override-unless-reserved rules, and document the layer division — or expose a genuine divergence requiring a semantic change?",
+      "acceptance": "- Mutation M4: host/adapters tool registration becomes last-wins → first-registration-wins witness fails (adapters.rs:1993 or host snapshot test)\n- Mutation M5: command suffix disambiguation dropped → conformance test observing cmd:2 fails\n- Mutation M6: reserved-shortcut guard removed → reserved-override rejection witness fails\n- Research question about Registry flattening answered in the contract document with file:line evidence; no unresolved ambiguity shipped in the contract",
+      "nativeParent": "EXT-19",
+      "blockers": [
+        "XC-1"
+      ]
+    },
+    {
+      "stableId": "PAR-CLOSE",
+      "kind": "execution",
+      "issue": 39,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/39",
+      "title": "[PAR-CLOSE] Close the parity ledger and ratify the boundary (finalize issue #20)",
+      "question": "Flip every planned-new ledger entry to landed after its phase acceptance passes, finalize the deletion ledger (config_value wrapper + A8 disposition with evidence IDs), run the full one-command gate (all witness suites + all phase test suites + ledger audit + ticket DAG + the AgentLoopConfig enumeration witness at count = FIVE + the merge-blocking Windows-target compile check of pi::remote's transport-neutral surface + cfg-discipline witnesses), execute the extension plan's named mirror lockstep witness read-only, and post the boundary answer on issue #20 — parity = all nine runtime packages' capabilities at behavior level folded at deep-module interfaces, with the A8 adjudication method/result and the non-runtime exclusion enumeration — then hand the ledger to documentation-sync, maximum-performance, seven-platform-release, and extension-compatibility as their owner table. Hard-fails while A8 is parity-blocked.",
+      "acceptance": "- The ticket question is resolved with repository evidence and its parent plan's acceptance gates pass.",
+      "nativeParent": "EXT-20",
+      "blockers": [
+        "PAR-FOLD",
+        "PAR-CLIENT",
+        "PAR-SERVER",
+        "PAR-COMPAT-AUDIT",
+        "PAR-COMPAT-DISPO",
+        "PAR-PTY-GRILL",
+        "XC-2"
+      ]
+    },
+    {
+      "stableId": "TUI-G3",
+      "kind": "execution",
+      "issue": 40,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/40",
+      "title": "[TUI-G3] Rail-only doctrine, dead-token disposition, and editor-state consumption (Routed decision: public tokens + state ownership)",
+      "question": "Ratify rail-only chrome and decide disposition of the nine inert slots (7 ThemeBg + userMessageText + customMessageText), scrollbarThumb, zero-callsite TruncatedText, and the write-only EditorBorder family including whether the live Editor may consume EditorBorder state via EditorTheme (today EditorTheme::default() at runtime.rs:1358) — public-token and state-ownership changes, executed only as follow-on tasks to this decision",
+      "acceptance": "- Rail-only chrome ratified and an explicit delete-or-wire disposition recorded for every inert slot, scrollbarThumb, TruncatedText, and the EditorBorder family\n- All consumption/deletion work is assigned to follow-on tasks; nothing executes under the polish phase",
+      "nativeParent": "EXT-17",
+      "blockers": [
+        "EXT-25"
+      ]
+    },
+    {
+      "stableId": "XC-2",
+      "kind": "execution",
+      "issue": 41,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/41",
+      "title": "[XC-2] Close frames.jsonl witness gaps and own the single witness-manifest lockstep proof",
+      "question": "Research notify ack semantics from host/client/server code, then add the missing golden fixtures (render res, notify ack, focusLost, key release/repeat, shift/alt/super/combined modifiers) and the THE single required (method, kind) witness-manifest lockstep test that fails when any fixture line disappears on both language sides — and record in the contract that parity consumes this witness by name rather than creating a second check?",
+      "acceptance": "- Mutation: delete any single fixture line from frames.jsonl → the witness-manifest test fails on the TS side and shared_fixtures_cover_bridge_methods_typed (or the new manifest check) fails on the Rust side; restore and both green\n- Mutation: change a new modifier-combo fixture (e.g. ctrl+shift) to press-only → both-language round-trip tests fail\n- cargo test -p pi-ext --locked green; bun test packages/pi-tui-protocol/tests green\n- frames.jsonl remains valid single-frame-per-line JSONL and both language suites decode all lines",
+      "nativeParent": "EXT-19",
+      "blockers": [
+        "XC-1"
+      ]
+    },
+    {
+      "stableId": "XC-4",
+      "kind": "execution",
+      "issue": 42,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/42",
+      "title": "[XC-4] Pin the three-mode handshake asymmetry matrix with mutation witnesses",
+      "question": "Consolidate the 3-mode × 3-hello-shape matrix so Mode 1 validates protocolVersion+compatibilityVersion while Modes 2 and 3 validate protocolVersion only, fill any missing cells (foreign-compat acceptance on lean and native endpoints), and prove mutations M1–M3 each fail their named witness?",
+      "acceptance": "- Mutation M1: lean-runner.ts handshake additionally requires compatibilityVersion === \"0.80.10\" → lean.test.ts protocol-only hello test fails; revert\n- Mutation M2: server.rs hello validation additionally requires compatibilityVersion → the native-server foreign-compat hello test fails; revert\n- Mutation M3: host.ts drops the compatibilityVersion check → host.test.ts compatibility-mismatch rejection test fails; revert\n- Matrix table in the contract document lists all cells with green witnesses",
+      "nativeParent": "EXT-19",
+      "blockers": [
+        "XC-1"
+      ]
+    },
+    {
+      "stableId": "XC-7",
+      "kind": "execution",
+      "issue": 43,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/43",
+      "title": "[XC-7] Prove the Rust sanitization trust boundary on every inbound uiSlot path",
+      "question": "Attempt to route an unsanitized uiSlot through the host→bridge→render path (escape split across runs and generations, javascript: link, oversized slot); if the boundary holds, lock the wiring witness plus clamp/strip-table mutations M11–M14 — if it does not, report the bypass before any fix?",
+      "acceptance": "- Mutation M11: bypass sanitize on one inbound uiSlot path in the bridge → the hostile cross-generation witness fails\n- Mutation M12: MAX slot lines clamp loosened (4096→8192) in sanitize.rs → clamps witness fails\n- Mutation M13: hyperlink scheme filter admits javascript: → sanitization witness fails (both sanitize sides as applicable)\n- Mutation M14: sanitizer reuses parser state across pushes → fresh ground-state witness fails\n- cargo test -p pi-ext --locked and crates/pi extension host tests green",
+      "nativeParent": "EXT-19",
+      "blockers": [
+        "XC-1"
+      ]
+    },
+    {
+      "stableId": "XC-8",
+      "kind": "execution",
+      "issue": 44,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/44",
+      "title": "[XC-8] Pin deadline, cancellation, error-isolation, and stale-guard witnesses",
+      "question": "Consolidate 30s hook/RPC deadlines, the navigateTree summarize:true unbounded exemption (witness or documented intent), 4ms/64-capacity input actor, tool.cancel/provider.cancel generation-token routing, fail-open extensionError emission, stale replacement token and STALE_COMMAND_CONTEXT_MESSAGE guards, and prove mutations M15–M18?",
+      "acceptance": "- Mutation M15: terminal-input 4ms deadline disabled → scaling tests fail on both sides (p99/deadline assertions)\n- Mutation M16: hook throw crashes host instead of emitting extensionError → crash isolation witness fails\n- Mutation M17: stale replacement token accepted → assistant-delta stale-token witness fails\n- Mutation M18: generation-token check dropped from cancel routing → the cancel race witness fails (adapters race tests)\n- Contract exemption table (navigateTree summarize) is either witnessed or documented with intent; no unwitnessed timing contract rows",
+      "nativeParent": "EXT-19",
+      "blockers": [
+        "XC-1"
+      ]
+    },
+    {
+      "stableId": "PAR-COMPAT-DISPO",
+      "kind": "execution",
+      "issue": 45,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/45",
+      "title": "[PAR-COMPAT-DISPO] Execute compat disposition and delete the dead config_value wrapper",
+      "question": "Apply RT-COMPAT-AUDIT's ruling exactly (deletion entry with witness IDs, or minimized port behind pi-ai auth/ with 8fa7eeb fixtures — never a global-registry module), and delete the dead 179-line crates/pi/src/core/config_value.rs (proven zero internal callers; model_runtime.rs imports pi_ai::auth::config_value directly) recording the inline ruling; install the permanent single-owner witness (one parser, one command cache) in the standard gate. No compatibility surface survives without a ledger entry.",
+      "acceptance": "- The ticket question is resolved with repository evidence and its parent plan's acceptance gates pass.",
+      "nativeParent": "EXT-20",
+      "blockers": [
+        "PAR-COMPAT-AUDIT"
+      ]
+    },
+    {
+      "stableId": "PAR-PTY-GRILL",
+      "kind": "execution",
+      "issue": 46,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/46",
+      "title": "[PAR-PTY-GRILL] Grill runtime-dependent UI claims with host-tier PTY evidence",
+      "question": "Adjudicate the landed T1–T3/T9 runtime claims (differential-rendering parity, Kitty keyboard/graphics probing, image fallbacks, OSC52 clipboard, math rendering) with real host-tier PTY evidence; rule verified/unverified per claim and re-scope unverified ones in the ledger as explicit open parity gaps rather than unstated assumptions. Evidence only — fixes route to terminal-polish; cross-target transcript topology is the sibling plans' burden, not claimed here.",
+      "acceptance": "- The ticket question is resolved with repository evidence and its parent plan's acceptance gates pass.",
+      "nativeParent": "EXT-20",
+      "blockers": [
+        "PAR-LEDGER",
+        "PAR-MATH"
+      ]
+    },
+    {
+      "stableId": "XC-9",
+      "kind": "execution",
+      "issue": 47,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/47",
+      "title": "[XC-9] Pin discovery, packaging, and source-pinned host-resolution witnesses",
+      "question": "Consolidate witnesses for discovery roots and precedence (pi-extension.json > package.json > auto-scan), ts-compat|native classification, single-file ESM, prebundled .mjs→--lean routing, spawn CLI flags (-e/-C/--lean), and host resolution (PI_EXTENSION_HOST > sibling assets, never PATH), and prove mutations M19–M21?",
+      "acceptance": "- Mutation M19: host.rs falls back to a PATH search → host-resolution witness fails\n- Mutation M20: discovery precedence flipped (package.json checked before pi-extension.json) → discovery precedence witness fails\n- Mutation M21: prebundled .mjs extension classified as Mode 1 compat → classification/spawn-flags witness fails\n- cargo test -p pi --locked (scoped to discovery/runtime-set suites) and cargo test -p pi-ext --locked green",
+      "nativeParent": "EXT-19",
+      "blockers": [
+        "XC-1"
+      ]
+    },
+    {
+      "stableId": "PAR-CLI-PROTO",
+      "kind": "execution",
+      "issue": 48,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/48",
+      "title": "[PAR-CLI-PROTO] Hermetic pi-ai CLI parity harness prototype",
+      "question": "Define and prove the replay seam for the A9 binary BEFORE porting it: generate the OAuth-capable provider matrix from upstream builtinProviders() (auth.oauth != null) at 8fa7eeb; build a mock-OAuth endpoint harness per provider (device-code/authorize/token/callback emulation) with pinned fixture streams and regeneration command; scripted-stdin readline driving; expected stdout/stderr/exit-code/auth.json goldens produced by running upstream dist/cli.js itself against the harness (self-verifying oracle); name any provider whose flow cannot be faithfully replayed into a credential-gated live CI tier while the hermetic matrix stays merge-blocking. Deliverable is the harness + fixtures + matrix manifest; no crates/pi-ai changes.",
+      "acceptance": "- The ticket question is resolved with repository evidence and its parent plan's acceptance gates pass.",
+      "nativeParent": "EXT-20",
+      "blockers": [
+        "PAR-LEDGER"
+      ]
+    },
+    {
+      "stableId": "TUI-G1",
+      "kind": "execution",
+      "issue": 49,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/49",
+      "title": "[TUI-G1] Reduced-motion and spinner opt-out policy (Routed decision: settings category)",
+      "question": "Env/setting opt-out rendering the static frame (kind label + elapsed counter), match upstream's no-gate behavior as deliberate parity deviation, or implement a terminal motion gate — decided against the automated anti-chatter/static-sufficiency invariants and the named manual Orca/VoiceOver sign-off protocol; TUI-T11 implementation follows this decision in its own ticket, never under this polish ticket",
+      "acceptance": "- Decision recorded: opt-out mechanism vs deliberate parity deviation, with one-line rationale traceable to the invariants and sign-off protocol\n- T11 implementation is bound to its own follow-up ticket and zero settings diffs land under the polish phase",
+      "nativeParent": "EXT-17",
+      "blockers": [
+        "EXT-25"
+      ]
+    },
+    {
+      "stableId": "TUI-G5",
+      "kind": "execution",
+      "issue": 50,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/50",
+      "title": "[TUI-G5] Copy policy ledger — capitalization, terminology, error taxonomy, empty states",
+      "question": "Pin the style table: sentence-case prose + Title-case keys; extension vs package vs package-resource noun; log in to vs login vs log into; the Unknown-error fallback taxonomy; one no-model remediation family (/login vs models.json guidance); per-flow selector empty-state strings replacing the noun-mismatched `No matching commands`; ellipsis glyph U+2026 vs '...'; notice template shape; CLI stderr register; canonical onboarding line and first-run consent copy",
+      "acceptance": "- The style table pins every enumerated axis (case, noun ledger, login forms, Unknown-error taxonomy, no-model remediation family, per-flow empty states, ellipsis glyph, notice template, CLI stderr register, onboarding/consent copy) with zero pending ambiguities",
+      "nativeParent": "EXT-17",
+      "blockers": [
+        "EXT-25"
+      ]
+    },
+    {
+      "stableId": "PAR-CLI",
+      "kind": "execution",
+      "issue": 51,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/51",
+      "title": "[PAR-CLI] Add pi-ai crate-local OAuth CLI binary ([[bin]])",
+      "question": "Port upstream bin pi-ai (src/cli.ts at 8fa7eeb) as a [[bin]] target in crates/pi-ai/Cargo.toml: commands help|--help|-h, list, login [provider]; readline 1-indexed selection; URL/device-code/progress console output in upstream ordering; credentials to auth.json in cwd via the A7 auth store; exit(1) text classes 'Unknown command: <cmd>', 'Unknown provider: <id>', 'Invalid selection'. Acceptance: full hermetic matrix from RT-CLI-PROTO green (auth.json + exit/text byte-compared to goldens); metadata witness proves zero new workspace edges and no imports from pi/pi-agent/pi-ext/pi-tui.",
+      "acceptance": "- The ticket question is resolved with repository evidence and its parent plan's acceptance gates pass.",
+      "nativeParent": "EXT-20",
+      "blockers": [
+        "PAR-CLI-PROTO"
+      ]
+    },
+    {
+      "stableId": "XC-1",
+      "kind": "execution",
+      "issue": 52,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/52",
+      "title": "[XC-1] Author TypeScript extension compatibility contract document",
+      "question": "Write docs/extension-compatibility-contract.md enumerating every settled serialized-and-observable boundary (constants/envelope, method registry, three-mode handshake asymmetry, discovery/packaging precedence, host resolution, full Mode 1 virtual-module alias import surface including pi-ai/compat with A8 disposition marker, five-rule registration conflict matrix, canonical 33-hook classification, tools/commands/flags/shortcuts/providers shapes, UI slots + sanitization clamps, deadlines/cancellation/error isolation/stale guard, explicit non-contracts, plus the statement that this plan solely owns the mirror/fixture/mutation checker surfaces), each with witness + mutation references, plus one AGENTS.md pointer line?",
+      "acceptance": "- Document exists and every rule line resolves to at least one existing-or-ticketed witness (mechanical check: grep the doc for witness links and confirm each cited test name exists in the cited file)\n- Document contains the ownership demarcation statement naming the single mirror/fixture/mutation-checker surfaces and the A8 audit-record slot\n- Contract document contains the full 33-discriminant list matching ALL_EVENT_TYPES in host.ts and LEAN_EVENT_TYPES in lean-api.ts exactly (diff of extracted lists)\n- AGENTS.md doctrine lines remain byte-stable except the added pointer (sync-docs evidence boundary respected)",
+      "nativeParent": "EXT-19",
+      "blockers": [
+        "EXT-15"
+      ]
+    },
+    {
+      "stableId": "TUI-G2",
+      "kind": "execution",
+      "issue": 53,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/53",
+      "title": "[TUI-G2] Hardware cursor as first-class setting (Routed decision: settings + focus categories)",
+      "question": "Promote PI_HARDWARE_CURSOR (writer.rs:217, undocumented debug env) to a documented setting as the canonical focus-visibility affordance — a settings/persistence change hence routed — vs keep cursor hidden with styled focus indicators only; decision must specify the deterministic check (cursor-position assertion in canonical schema-v1 snapshots, not timing-dependent captures) that proves the chosen affordance",
+      "acceptance": "- Setting-vs-indicators verdict recorded together with the deterministic canonical-snapshot assertion that proves the chosen affordance\n- No persistence or settings diff is gated on the polish ticket",
+      "nativeParent": "EXT-17",
+      "blockers": [
+        "EXT-25",
+        "TUI-G1"
+      ]
+    },
+    {
+      "stableId": "XC-3",
+      "kind": "execution",
+      "issue": 54,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/54",
+      "title": "[XC-3] Produce the A8 extension-import legacy-surface audit record for the parity A8 adjudication",
+      "question": "Enumerate every resolver entry ('@earendil-works/pi-ai', '/oauth', '/providers/all', '@mariozechner/*' spellings), scan the extension fixtures/examples/docs corpus (deduplicated), pin keeping alias witnesses, and produce the audit record of which extension import forms can reach the legacy ./compat surface at each alias — held strictly as input, with the delete-vs-port decision and adversarial resolution reserved for parity's A8 adjudication ticket?",
+      "acceptance": "- Alias inventory is complete and diff-checked: every key in the virtual-modules.ts resolve map and every ambient module declaration in refs.d.ts appears in the record (mechanical extraction diff)\n- Corpus scan results are reproducible (the scan command is recorded) and the candidate import set is enumerated exactly — today zero candidates among checked-in fixtures/examples, with bundled-modules.test.ts and the resolve map as the positive consumption witnesses\n- Positive alias witnesses green: importing a legacy-surface function through @earendil-works/pi-ai/compat (and each legacy mariozechner spelling) resolves to the expected module in Mode 1; negative witness green: the same specifier is rejected by the Mode 2 lexical exclusion\n- Audit record handed to the parity A8 adjudication ticket and cross-linked from the contract document appendix slot",
+      "nativeParent": "EXT-19",
+      "blockers": [
+        "XC-1"
+      ]
+    },
+    {
+      "stableId": "XC-6",
+      "kind": "execution",
+      "issue": 55,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/55",
+      "title": "[XC-6] Build the hook-dispatch semantics lattice for all 33 lifecycle discriminants",
+      "question": "Classify every discriminant (notification/chain/fold/cancellable/in-place), add missing witnesses for before_provider_headers null-deletes-header and tool_call terminate handling (plus any others the gap audit finds), extend Mode1/Mode2 endpoint-conformance parity, and prove mutations M7–M10?",
+      "acceptance": "- Mutation M7: tool_call ignores in-place input mutation → tool-call-reorder witness fails\n- Mutation M8: input 'handled' no longer short-circuits → input witness fails\n- Mutation M9: null header value no longer deletes the header → before_provider_headers witness fails (witness added in this phase if none existed)\n- Mutation M10: tool_call block ignores terminate → terminate witness fails (added if absent)\n- Every mutable-hook class has ≥1 witness in host/lean/endpoint-conformance suites; bun test packages/extension-host/tests green",
+      "nativeParent": "EXT-19",
+      "blockers": [
+        "XC-1"
+      ]
+    },
+    {
+      "stableId": "TUI-G8",
+      "kind": "execution",
+      "issue": 56,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/56",
+      "title": "[TUI-G8] Narrow-width viewport floor policy (Routed decision: viewport policy)",
+      "question": "Decide the supported viewport floor below the initial 20-column clamp for live resizes (refuse-and-blank gracefully under a threshold vs best-effort wrap) using the TUI-P1 harness ladder transcripts as evidence; policy decision only — implementation follows in its own task ticket, while TUI-V4 still measures current behavior invariance under this polish ticket",
+      "acceptance": "- Floor policy decided from sub-20-column ladder transcripts and recorded; implementation bound to its own task ticket while V4 measures current invariance",
+      "nativeParent": "EXT-17",
+      "blockers": [
+        "EXT-25",
+        "TUI-P1"
+      ]
+    },
+    {
+      "stableId": "TUI-T6",
+      "kind": "execution",
+      "issue": 57,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/57",
+      "title": "[TUI-T6] Consequence-repeating confirm LABELS and selector empty aisles (Classifier: PASS — copy only; selection semantics routed to TUI-G7)",
+      "question": "Replace bare Yes/No on import-replace and missing-cwd confirms (runtime.rs:2483, 3347) with consequence-repeating label strings, and give each selector flow its named empty-state string with an exit key — label/copy surfaces only; default-selection and Esc-semantics changes are explicitly excluded and owned by TUI-G7",
+      "acceptance": "- Consequence-repeating labels replace bare Yes/No at the named confirm sites and each selector flow has its named empty-state string with an exit key\n- Zero default-selection or Esc-semantics changes in the diff — those remain owned by G7",
+      "nativeParent": "EXT-17",
+      "blockers": [
+        "TUI-G5"
+      ]
+    },
+    {
+      "stableId": "TUI-P2",
+      "kind": "execution",
+      "issue": 58,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/58",
+      "title": "[TUI-P2] Deterministic contrast measurement prototype",
+      "question": "Resolve settled-frame fg/bg pairs (text, dim, muted, thinkingText, toolOutput, quote, link suffix, diff add/remove, syntax, border/rail hues) from canonical schema-v1 snapshots (never timing-dependent captures) to RGB via the pinned 256-palette table and report numeric WCAG ratios and ΔE2000 rung deltas on dark+light terminals in truecolor+forced-256, flagging every pair below the pinned thresholds (4.5 / 3.0 / 1.3 / ΔE2000 2.3 + ratio 1.25)",
+      "acceptance": "- Numeric WCAG ratio and ΔE2000 report per inspected fg/bg pair on dark+light and truecolor+forced-256, computed over canonical snapshots with every below-threshold pair flagged",
+      "nativeParent": "EXT-17",
+      "blockers": [
+        "TUI-P1"
+      ]
+    },
+    {
+      "stableId": "PAR-COMPAT-AUDIT",
+      "kind": "execution",
+      "issue": 59,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/59",
+      "title": "[PAR-COMPAT-AUDIT] Source/corpus ./compat compatibility audit (parity blocker, A8)",
+      "question": "Adjudicate upstream ai ./compat at 8fa7eeb before any deletion: (1) source evidence — exports map + sideEffects, compat.ts full export/side-effect/env-key/ADC-path inventory verbatim; (2) downstream-import evidence — exhaustive importer enumeration across the pinned checkout, each classified TS-side-runtime vs Rust-surface (confirmed set is TS-only: coding-agent src, agent tests, examples; prove no Rust-surface consumer); (3) extension-host consumption — the pi-ext host bundle / extension compatibility contract DOES surface the legacy ./compat alias to extensions through Mode 1 per the extension plan's positive evidence (record the explicit routing: served by JS bundle's npm dependency, NOT the Rust port; the disposition DECISION remains reserved to this audit); (4) config corpus — env-key coverage matrix attributing env resolution to A7 auth (any observable NO ports behind auth/ with one parser/one cache), Model.compat keys already adapter-local; (5) executable negative witnesses committed and green. Ruling: delete-not-port ONLY with all witnesses green; otherwise minimized port behind auth/. Output: ledger flip of A8 from parity-blocked to witnessed status; #20 may not close before this.",
+      "acceptance": "- The ticket question is resolved with repository evidence and its parent plan's acceptance gates pass.",
+      "nativeParent": "EXT-20",
+      "blockers": [
+        "PAR-LEDGER"
+      ]
+    },
+    {
+      "stableId": "XC-CLOSE",
+      "kind": "execution",
+      "issue": 60,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/60",
+      "title": "[XC-CLOSE] Close issue #19 with contract, witness, mutation-proof, and A8-delivery evidence after parity ratification",
+      "question": "After parity ratification consumes the named witnesses, run the full witness sweep green, produce the disposable-worktree mutation log showing all 22 mutations failing their named witnesses before revert, verify compat-matrix tier references, and post the closure comment to issue #19 stating the contract path, sole-ownership demarcation, evidence, the A8 audit-delivery link, the #20 ratification reference, and the open G4 map dependency?",
+      "acceptance": "- All witness suites green in one run; zero skipped witness rows in the contract document (no rule without a witness or an explicit deferred-ticket link)\n- Mutation log shows 22/22 mutations observed failing their named witness before revert\n- Compat-matrix tier references confirmed by name (no second check surface added for mirrors already owned here)\n- Issue #19 closed with the evidence comment AFTER parity ratification consumed the named witnesses; the comment states the A8 audit delivery and the #20 reference\n- Contract document linked from AGENTS.md and the issue",
+      "nativeParent": "EXT-19",
+      "blockers": [
+        "XC-2",
+        "XC-3",
+        "XC-4",
+        "XC-5",
+        "XC-6",
+        "XC-7",
+        "XC-8",
+        "XC-9",
+        "PAR-CLOSE"
+      ]
+    },
+    {
+      "stableId": "TUI-G7",
+      "kind": "execution",
+      "issue": 61,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/61",
+      "title": "[TUI-G7] Confirm dialog default-selection and Esc semantics (Routed decision: focus/navigation + dispatch)",
+      "question": "Set the navigation policy split from TUI-T6: default landing selection and Esc==No on every Confirm dialog incl. extension confirms (runtime.rs:3345-3354), plus the ctrl+d exit-vs-delete-session dispatch precedence per selector context — a dispatch/focus contract decided here and measured by TUI-V2, changing dispatch semantics only in its own execution ticket",
+      "acceptance": "- Landing selection and Esc semantics decided for every Confirm dialog including extension confirms; ctrl+d precedence ruled per selector context; any dispatch-semantics change assigned to its own execution ticket",
+      "nativeParent": "EXT-17",
+      "blockers": [
+        "EXT-25",
+        "TUI-G5"
+      ]
+    },
+    {
+      "stableId": "TUI-R2",
+      "kind": "execution",
+      "issue": 62,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/62",
+      "title": "[TUI-R2] Terminal width-table divergence survey",
+      "question": "Which parity-gate terminals (kitty, iTerm2, WezTerm, Terminal.app, Windows Terminal, alacritty) diverge from the width.rs contract (ambiguous=1, wide=2, ZWJ/VS16/RI emoji forced to 2, Thai/Lao AM +1) — driven by the named manual emulator spot-check protocol with schema-v1 captures and binary per-scenario verdicts — and which divergences become a documented parity-gated terminal list rather than fixes",
+      "acceptance": "- Per-terminal divergence table against width.rs with binary verdicts from the manual emulator spot-check protocol\n- Each divergence resolved to a parity-gated terminal list or limitations-table entry — never a per-terminal code special case",
+      "nativeParent": "EXT-17",
+      "blockers": []
+    },
+    {
+      "stableId": "TUI-G6",
+      "kind": "execution",
+      "issue": 63,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/63",
+      "title": "[TUI-G6] Color doctrine — capability-driven depth, hyperlinks, extension guardrails",
+      "question": "Wire caps.true_color into theme loads (reference parity, theme.ts:630) as a classifier-Pass presentation fix or record deliberate divergence; honor caps.hyperlinks in markdown surfaces or keep hardcoded-off; define extension setTheme guardrails (text==bg warning at the pinned 4.5 threshold, error/success hue swap) or accept unchecked palettes; exact-cube vs 55+40*v approximation for HTML export",
+      "acceptance": "- Rulings recorded for true_color wiring (fix vs recorded divergence), hyperlink policy, extension setTheme guardrails, and the HTML-export 256 quantization rule",
+      "nativeParent": "EXT-17",
+      "blockers": [
+        "EXT-25"
+      ]
+    },
+    {
+      "stableId": "TUI-T8",
+      "kind": "execution",
+      "issue": 64,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/64",
+      "title": "[TUI-T8] Truncation-honesty glyph unification (Classifier: PASS — presentation)",
+      "question": "Unify truncation marking (ellipsis vs zero-width cut vs pad) across select_list.rs:234/236, text.rs:128, settings_list.rs, editor/mod.rs:1918 so no content silently disappears without an ellipsis marker, and verify ctrl+o expansion recovers full content per-block and per-message as a presentation check using existing dispatch",
+      "acceptance": "- Truncation marking is unified across the four named sites so no content disappears without an ellipsis marker\n- ctrl+o expansion is verified to recover full content per-block and per-message using existing dispatch only",
+      "nativeParent": "EXT-17",
+      "blockers": [
+        "EXT-25",
+        "TUI-G5"
+      ]
+    },
+    {
+      "stableId": "TUI-T4",
+      "kind": "execution",
+      "issue": 65,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/65",
+      "title": "[TUI-T4] Editor border thinking/bash colors — EXECUTED ONLY IN ITS OWN DECISION TRACK (Classifier: ROUTE — state ownership)",
+      "question": "Either the fix lands as a small decision per its own ticket: make the live Editor consume EditorBorder state (Muted/Bash/Thinking(level)) via EditorTheme instead of EditorTheme::default() (runtime.rs:1358), restoring shift+tab/bash border color behavior — state-consumption change, hence permanently outside the polish implementation phase",
+      "acceptance": "- Executed only in its own ticket after the G3 ruling: the live Editor consumes EditorBorder state via EditorTheme and shift+tab/bash border colors are restored\n- Zero corresponding diff under the polish ticket's implementation phase",
+      "nativeParent": "EXT-17",
+      "blockers": [
+        "TUI-G3"
+      ]
+    },
+    {
+      "stableId": "TUI-R1",
+      "kind": "execution",
+      "issue": 66,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/66",
+      "title": "[TUI-R1] Provenance audit of non-default built-in palettes",
+      "question": "Locate the upstream source of the classic/motion/m3/antd theme families outside the inspected reference dirs and diff their hex values, or classify them as new palettes requiring full numeric contrast measurement (WCAG 2.1 + ΔE2000 oracle) in both polarities before they remain built-ins",
+      "acceptance": "- Upstream provenance located with hex diffs recorded, or each family reclassified as a new palette with full WCAG + ΔE2000 measurement in both polarities before remaining a built-in",
+      "nativeParent": "EXT-17",
+      "blockers": []
+    },
+    {
+      "stableId": "TUI-P1",
+      "kind": "execution",
+      "issue": 67,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/67",
+      "title": "[TUI-P1] Portable PTY harness with deterministic schema v1, driver interface, and width ladder",
+      "question": "Can one TerminalDriver trait with PosixPTY (portable-pty posix), ConPTY (CreatePseudoConsole), and QemuUserSmoke adapters record validator-clean schema-v1 transcripts of cold start, wizard, trust dialog, streaming, selectors, overlays, and resize storms at 80x24 down to 1x1, headless on the five named Tier N runners — with canonical logical-sequence ordering, quiescence-bounded deterministic settling, normalized event batching, volatile-field normalization before digest, k≥3 repeatability producing byte-identical canonical content and digest, timing values quarantined in the non-canonical envelope, and qemu-user artifacts structurally barred from render claims",
+      "acceptance": "- Validator-clean schema-v1 transcripts of the named scenario corpus on the five Tier N runners with canonical ordering, quiescence settle, normalization before digest, and k≥3 byte-identical repeatability\n- QemuUserSmoke artifacts are structurally barred from render-class claims and labeled contingency mode",
+      "nativeParent": "EXT-17",
+      "blockers": [
+        "EXT-25"
+      ]
+    },
+    {
+      "stableId": "TUI-T5",
+      "kind": "execution",
+      "issue": 68,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/68",
+      "title": "[TUI-T5] Error-copy remediation pack (Classifier: PASS — copy)",
+      "question": "Apply the TUI-G5 style table to: `Error: Unknown error` fallback taxonomy (messages.rs:297-312), bash-guard sentence case + `Press Esc to cancel it first.` recovery (runtime.rs:2617), OAuth failure recovery clause (progress.rs:105-123), normalized no-model remediation family, length-stop copy with recovery hint, trust.rs register unification, lowercase CLI stderr fragments and double-colon chains",
+      "acceptance": "- The G5 style table is applied at every enumerated copy site (Unknown-error fallback, bash guard, OAuth recovery, no-model remediation family, length-stop hint, trust register, CLI stderr) with the regulated-capitalization and taxonomy rules visible in each diff",
+      "nativeParent": "EXT-17",
+      "blockers": [
+        "TUI-G5"
+      ]
+    },
+    {
+      "stableId": "TUI-T7",
+      "kind": "execution",
+      "issue": 69,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/69",
+      "title": "[TUI-T7] Dead-token and dead-code cleanup — EXECUTED ONLY IN ITS OWN DECISION TRACK (Classifier: ROUTE — public tokens)",
+      "question": "Per the TUI-G3 ruling and in its own ticket: delete or wire the inert ThemeBg/userMessageText/customMessageText/scrollbarThumb slots and dispose of TruncatedText, removing or consuming inert theme slots — a public-token and crate-public-API change, never staged under polish",
+      "acceptance": "- Per the G3 ruling, every inert slot is deleted or wired and TruncatedText is disposed of in T7's own ticket — nothing staged under the polish ticket",
+      "nativeParent": "EXT-17",
+      "blockers": [
+        "TUI-G3"
+      ]
+    },
+    {
+      "stableId": "TUI-P3",
+      "kind": "execution",
+      "issue": 70,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/70",
+      "title": "[TUI-P3] Extension-UI gauntlet fixture",
+      "question": "Drive the extension visual surface end-to-end: custom railed messages, widget slots, stacked overlays with focus restore, HostUiRequest confirm/select/input dialogs, extension shortcuts in the footer, hostile setTheme (bad hex, contrast below the pinned 4.5 rule, hue swaps), OSC 0 title injection with C0/C1 and >256 UTF-8 bytes — confirming sanitization floors hold on real terminals per repeatability-clean schema-v1 transcripts",
+      "acceptance": "- End-to-end extension-UI gauntlet results proving sanitization floors hold on real terminals, evidenced by repeatability-clean schema-v1 transcripts",
+      "nativeParent": "EXT-17",
+      "blockers": [
+        "TUI-P1"
+      ]
+    },
+    {
+      "stableId": "PAR-TEL",
+      "kind": "execution",
+      "issue": 71,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/71",
+      "title": "[PAR-TEL] Implement pi-agent::telemetry with single injected no-fail context (all FIVE literals migrated)",
+      "question": "Add crates/pi-agent/src/telemetry.rs mirroring upstream packages/telemetry + agent harness/telemetry.ts: AI and HARNESS schema tables with pinned attribute sets, TelemetryContext/TelemetrySpan traits (synchronous once-only callbacks, post-settlement-ignore), shared NOOP + in-memory contexts, boundary-level panic/failure containment, and typed span starters at the existing loop event points (agent.rs run lifecycle, run.rs turn/provider-request, schedule.rs tool start/end). Inject via ONE field telemetry: Arc<dyn TelemetryContext> on AgentLoopConfig (config.rs:175-226) defaulting to NOOP — structural enumeration at the current tree proves EXACTLY FIVE literal construction sites and all five migrate in the same compiling commit: agent.rs:62-88 (default_base_config), config.rs:360-389, run.rs:835-861, schedule.rs:902-928 (test sample_config), and pi agent_session/mod.rs:463-489 (session fallback → resolved context); clone-derived configs are not literals. The count 'five' is used consistently in outcomes, atomic boundary, and acceptance, and supersedes any 'six' count in downstream arbitration. Wire pi: new core/telemetry.rs exporter adapter behind C18, AgentSession threading, and compaction (core/agent_session/compaction.rs + core/compaction/) emitting pi.harness.compaction/step + summarization pi.ai.request spans through the SAME Arc read from session state. Acceptance: pi-agent manifest byte-identical; panic/error-context tests prove identical run outcomes vs noop; compaction-span test green; enumeration witness green at count = 5 with all five literals carrying the field; no per-event callback fields exist.",
+      "acceptance": "- The ticket question is resolved with repository evidence and its parent plan's acceptance gates pass.",
+      "nativeParent": "EXT-20",
+      "blockers": [
+        "PAR-LEDGER"
+      ]
+    },
+    {
+      "stableId": "TUI-V6",
+      "kind": "execution",
+      "issue": 72,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/72",
+      "title": "[TUI-V6] Accessibility evidence: automated invariants on all Tier N rows + named manual screen-reader sign-off",
+      "question": "Automated lane over canonical content: notice-persistence (transient notice text present in ≥1 settled frame; the 2s urgency window asserted only as a measured field against the timing envelope with a pinned tolerance), static sufficiency (kind + elapsed + cancel hint in every spinner-status frame), and anti-chatter (identical announcement string ≤1 settled frame between content changes per settled stage, counted over logical sequence numbers) pass on every Tier N transcript row; manual lane: pinned Ubuntu 24.04 + Orca (AT-SPI terminal) and macOS + VoiceOver (Terminal.app) runs of the 8-scenario script (cold start, wizard, /login, streaming, interrupt, error, resize, selector), speech-log artifacts captured and paired with transcripts, binary per-scenario checklist verdicts, named sign-off owner recorded; if the manual lane cannot be scheduled before close, TUI-V6 closes only with an explicitly flagged degraded-verdict limitation row",
+      "acceptance": "- Automated three invariants pass on the canonical content of every Tier N row, with all timing windows quarantined as tolerated measured fields\n- Manual Orca/VoiceOver 8-scenario sign-off executed with speech logs, binary per-scenario verdicts, and recorded owner — or an explicitly flagged degraded-verdict limitation row",
+      "nativeParent": "EXT-17",
+      "blockers": [
+        "TUI-P1",
+        "TUI-G1",
+        "TUI-G2"
+      ]
+    },
+    {
+      "stableId": "TUI-T3",
+      "kind": "execution",
+      "issue": 73,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/73",
+      "title": "[TUI-T3] Hyperlink capability surfaces (Classifier: PASS — presentation at existing surfaces)",
+      "question": "Wire caps.hyperlinks into MarkdownOptions (theme.rs:996) and changelog/update link surfaces, with the hyperlink_capped validation fallback keeping plain `text (url)` on non-capable terminals, per the TUI-G6 ruling",
+      "acceptance": "- Hyperlink capability is honored on markdown and changelog/update surfaces per the G6 ruling, with the plain `text (url)` fallback verified on non-capable terminals",
+      "nativeParent": "EXT-17",
+      "blockers": [
+        "TUI-G6"
+      ]
+    },
+    {
+      "stableId": "TUI-T2",
+      "kind": "execution",
+      "issue": 74,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/74",
+      "title": "[TUI-T2] Capability-driven color depth (Classifier: PASS — existing-token selection at existing render sites)",
+      "question": "Wire caps.true_color into every theme load path (runtime.rs:3621, theme.rs:1673-1684, export_html/mod.rs:258) so 256-color-only terminals receive rgb_to_256-downsampled SGR like the reference, verified by the TUI-P2 numeric oracle in forced-256 mode; no token schema change",
+      "acceptance": "- caps.true_color drives downsampling on every theme load path and the P2 numeric oracle confirms forced-256 output at the pinned thresholds\n- No token schema change is included in the diff",
+      "nativeParent": "EXT-17",
+      "blockers": [
+        "TUI-G6"
+      ]
+    },
+    {
+      "stableId": "TUI-T10",
+      "kind": "execution",
+      "issue": 75,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/75",
+      "title": "[TUI-T10] Onboarding and first-run copy (Classifier: PASS — copy)",
+      "question": "Implement the canonical onboarding line and editor placeholder from the five variants (header.rs:43, view.rs:159+167, state.rs:563, startup.rs:134), restore or record divergence for the reference 4-line analytics disclosure and tagline, fix the `(you can change this in settings)` casing and `usage analytics`/`usage data` mismatch",
+      "acceptance": "- The canonical onboarding line and placeholder chosen in G5 are applied at all named sites; analytics disclosure/tagline divergence is restored or explicitly recorded; casing and analytics/data wording mismatches are fixed",
+      "nativeParent": "EXT-17",
+      "blockers": [
+        "TUI-G5"
+      ]
+    },
+    {
+      "stableId": "TUI-V1",
+      "kind": "execution",
+      "issue": 76,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/76",
+      "title": "[TUI-V1] Two-tier state-matrix conformance (Classifier: PASS — measurement)",
+      "question": "Do empty, loading, retry, queue, streaming, error, focus-marked, and extension-UI states render per the quality bar in schema-v1 transcripts on exactly the five Tier N conformance rows (gnu-x64/arm64 posix, darwin-x64/arm64 posix, windows-x64 ConPTY) — every row carrying a k≥3 repeatability record with identical canonical content and digest — while the two mandatory musl release rows carry only host-native artifact execution, static-link/unpack/integrity, and compiled-host plus bundled-Bun-fallback JSONL protocol smoke (no PTY/render/synchronized-output/no-clear claims; QEMU contingency mode labeled where used) with their named limitations recorded; per-row verdict or filed defect",
+      "acceptance": "- Per-row pass/defect verdict on the full state matrix for all five Tier N rows, each backed by a k≥3 repeatability record with identical canonical content and digest\n- Both musl release rows assert only their four packaging/protocol axes with the verbatim absence line and any QEMU contingency labeled — never an interaction claim",
+      "nativeParent": "EXT-17",
+      "blockers": [
+        "TUI-P1",
+        "EXT-26",
+        "TUI-T1",
+        "TUI-T5"
+      ]
+    },
+    {
+      "stableId": "TUI-V2",
+      "kind": "execution",
+      "issue": 77,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/77",
+      "title": "[TUI-V2] Keyboard and focus gauntlet within current dispatch semantics (Classifier: PASS — measurement; semantics changes routed to TUI-G7)",
+      "question": "Keyboard-only completion of first-run wizard, /login, selectors, /tree, /settings, /import, /logout, streaming interrupt; ctrl+d resolution order PROVEN (not changed) in each selector context via canonical transcript content; overlay-over-overlay focus restore and cancelled create-agent focus; rebind reflection in every rendered hint",
+      "acceptance": "- Every named keyboard-only flow completes end-to-end in canonical transcripts; ctrl+d resolution order is proven per selector context from canonical content, and focus restore after overlay-over-overlay and cancelled create-agent is verified\n- Every rendered hint reflects rebinding; zero dispatch-semantics changes (those belong to G7)",
+      "nativeParent": "EXT-17",
+      "blockers": [
+        "TUI-T1",
+        "TUI-G2"
+      ]
+    },
+    {
+      "stableId": "TUI-T11",
+      "kind": "execution",
+      "issue": 78,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/78",
+      "title": "[TUI-T11] Reduced-motion implementation — EXECUTED ONLY IN ITS OWN DECISION TRACK (Classifier: ROUTE — settings/persistence)",
+      "question": "Land the TUI-G1 mechanism (env/setting or detected signal) rendering the static frame while preserving elapsed counter, cancel hint, and tick repaint-suppression — a new setting/persistence surface, hence its own ticket gated on the TUI-G1 decision and TUI-P4 prototype evidence",
+      "acceptance": "- The G1-chosen mechanism renders the static frame preserving elapsed counter, cancel hint, and tick repaint-suppression, gated on the G1 decision and P4 evidence, in T11's own ticket",
+      "nativeParent": "EXT-17",
+      "blockers": [
+        "TUI-G1",
+        "TUI-P4"
+      ]
+    },
+    {
+      "stableId": "TUI-V5",
+      "kind": "execution",
+      "issue": 79,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/79",
+      "title": "[TUI-V5] Theme and contrast matrix with numeric oracle",
+      "question": "OSC 11 / COLORFGBG / fallback polarity detection, mid-session background switch with extension theme.update, slash-pair fallback, thinking-ramp adjacent-rung verdicts by ΔE2000 ≥ 2.3 AND ratio ≥ 1.25, context-percent escalation and accent-adjacent rail hue collisions by WCAG ratio on rendered pairs (never inferred), and degraded-terminal SGR inspection — every row reported as a number against its pinned threshold over canonical snapshots",
+      "acceptance": "- Every polarity switch, ramp rung, escalation, and rail-hue verdict is reported as a number against its pinned threshold, computed over rendered canonical snapshot pairs — never inferred",
+      "nativeParent": "EXT-17",
+      "blockers": [
+        "TUI-P2",
+        "TUI-T2"
+      ]
+    },
+    {
+      "stableId": "TUI-T1",
+      "kind": "execution",
+      "issue": 80,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/80",
+      "title": "[TUI-T1] Derive all rendered key hints from the keybinding registry (Classifier: PASS — presentation truthfulness)",
+      "question": "Replace hardcoded hint literals (view.rs:167, status.rs:35/61, tool_renderers.rs:55, startup.rs hotkeys overlay) with keyText-equivalent lookups so rebound keys render truthfully, fixing the stray-space `\"? , /hotkeys\"` key column — rendered-copy change only; no dispatch or binding change",
+      "acceptance": "- All rendered key hints derive from the keybinding registry so rebound keys render truthfully at every named site\n- The stray-space hint column is fixed and a diff audit shows zero dispatch or binding precedence changes",
+      "nativeParent": "EXT-17",
+      "blockers": [
+        "EXT-25",
+        "TUI-G5"
+      ]
+    },
+    {
+      "stableId": "TUI-V3",
+      "kind": "execution",
+      "issue": 81,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/81",
+      "title": "[TUI-V3] Unicode and width gauntlet on real terminals",
+      "question": "CJK, ZWJ emoji (family), regional indicators, variation-selector emoji, combining accents, and Thai/Lao AM vowels in editor, assistant markdown, overlays, and paste-atomic segments keep rails and table borders column-aligned and the cursor drift-free across the parity-gate terminals, evidence pinned by the manual emulator spot-check protocol with binary per-scenario verdicts",
+      "acceptance": "- The Unicode gauntlet keeps rails and table borders column-aligned and the cursor drift-free across the parity-gate terminals, with binary per-scenario verdicts recorded under the manual emulator spot-check protocol",
+      "nativeParent": "EXT-17",
+      "blockers": [
+        "TUI-P1",
+        "TUI-R2"
+      ]
+    },
+    {
+      "stableId": "TUI-CLOSE",
+      "kind": "execution",
+      "issue": 82,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/82",
+      "title": "[TUI-CLOSE] Close terminal polish track with consolidated evidence",
+      "question": "Run the single consolidated better-interface review and five-row Tier N evidence gate, prove every retained change stayed within polish classification, index routed redesign decisions, close issue #17, and publish the deterministic transcript/contrast/accessibility evidence.",
+      "acceptance": "- Zero open HIGH findings within the settled polish scope\n- Five canonical Tier N rows pass deterministic transcript evidence\n- Both musl rows carry packaging/protocol claims only\n- Every Route-class item is linked to its separate decision ticket",
+      "nativeParent": "EXT-17",
+      "blockers": [
+        "TUI-G1",
+        "TUI-G2",
+        "TUI-G3",
+        "TUI-G4",
+        "TUI-G5",
+        "TUI-G6",
+        "TUI-G7",
+        "TUI-G8",
+        "TUI-R1",
+        "TUI-R2",
+        "TUI-V1",
+        "TUI-V2",
+        "TUI-V3",
+        "TUI-V4",
+        "TUI-V5",
+        "TUI-V6",
+        "TUI-T6",
+        "TUI-T8",
+        "TUI-T4",
+        "TUI-T7",
+        "TUI-P3",
+        "TUI-T3",
+        "TUI-T10",
+        "TUI-T11",
+        "TUI-T9",
+        "TUI-P4"
+      ]
+    },
+    {
+      "stableId": "TUI-T9",
+      "kind": "execution",
+      "issue": 83,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/83",
+      "title": "[TUI-T9] Narrow-width floor implementation — EXECUTED ONLY IN ITS OWN DECISION TRACK (Classifier: ROUTE — viewport policy)",
+      "question": "Implement the floor policy chosen by TUI-G8 (refuse-and-blank vs best-effort wrap below 20 columns), exercising selectors, footer shedding, dialogs, and resize-storm coalescing down to 1x1 — tracked separately; the polish ticket itself only measures current behavior via TUI-V4",
+      "acceptance": "- The G8-chosen floor policy is implemented with selectors, footer shedding, dialogs, and resize-storm coalescing exercised down to 1x1 in T9's own ticket\n- The polish ticket carries no viewport-policy diff; only V4 measurement",
+      "nativeParent": "EXT-17",
+      "blockers": [
+        "TUI-G8"
+      ]
+    },
+    {
+      "stableId": "TUI-P4",
+      "kind": "execution",
+      "issue": 84,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/84",
+      "title": "[TUI-P4] Static-frame spinner prototype",
+      "question": "Does a static-frame path (kind label + elapsed counter, no frame animation, gated by the TUI-G1 decision) preserve the static-sufficiency and anti-chatter invariants and repaint-suppression semantics in a live PTY session under load — evidence feed for TUI-G1/TUI-T11 only; no settings change lands here",
+      "acceptance": "- Live-PTT evidence that the static-frame path preserves static-sufficiency, anti-chatter, and tick repaint-suppression under load; delivered as evidence for G1/T11 with no settings change landed",
+      "nativeParent": "EXT-17",
+      "blockers": [
+        "TUI-G1"
+      ]
+    },
+    {
+      "stableId": "PERF-T1",
+      "kind": "execution",
+      "issue": 85,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/85",
+      "title": "[PERF-T1] Instrument the noise gate and process memory in the verification runners",
+      "question": "Can scripts/verification/performance.ts and scripts/bench-extension-scaling.ts emit stddev/relative-spread per distribution, reject any verdict-feeding distribution with stddev > 20% of median as a distinct noise outcome with the four-step remediation ladder, and sample process-tree RSS/PSS (smaps_rollup) plus peak RSS (VmHWM) with fixed stabilization windows — without changing any existing gate semantics on quiet distributions?",
+      "acceptance": "- The ticket question is resolved with repository evidence and its parent plan's acceptance gates pass.",
+      "nativeParent": "EXT-22",
+      "blockers": [
+        "PERF-R18"
+      ]
+    },
+    {
+      "stableId": "PERF-T4",
+      "kind": "execution",
+      "issue": 86,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/86",
+      "title": "[PERF-T4] Add isolated session append and reopen timing lanes",
+      "question": "Can append-only and reopen-only timing lanes on pre-generated v3 JSONL sessions at fixed entry/byte counts (warm and explicit cold-cache), with SHA-256 prefix preservation verified per sample and peak memory reported, be produced for both Rust and the reference CLI?",
+      "acceptance": "- The ticket question is resolved with repository evidence and its parent plan's acceptance gates pass.",
+      "nativeParent": "EXT-22",
+      "blockers": [
+        "PERF-T1"
+      ]
+    },
+    {
+      "stableId": "TUI-V4",
+      "kind": "execution",
+      "issue": 87,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/87",
+      "title": "[TUI-V4] Resize storm, settle, and progressive-disclosure integrity (measurement of current viewport semantics)",
+      "question": "Rapid 20↔160↔30 column and sub-20 storms yield exactly one coalesced reanchor per storm with zero clear bytes, viewport stays anchored, settled scrollback appears once with no gaps or doubled rows, and `... N more lines · ctrl+o` cues remain fully visible at 20 and 40 columns — asserted on canonical content via the deterministic quiescence settle rule, with storm durations reported only as tolerated measured fields; the surviving measure under this ticket, any floor change executes under TUI-T9 after TUI-G8",
+      "acceptance": "- Resize storms yield exactly one coalesced reanchor with zero clear bytes and single, gapless settled scrollback on canonical content via the quiescence settle rule\n- Progressive-disclosure cues stay fully visible at 20 and 40 columns; storm durations are reported only as tolerated measured fields",
+      "nativeParent": "EXT-17",
+      "blockers": [
+        "TUI-P1",
+        "TUI-G8"
+      ]
+    },
+    {
+      "stableId": "PERF-T6",
+      "kind": "execution",
+      "issue": 88,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/88",
+      "title": "[PERF-T6] Extension-host scaling lane on production serve_io with a deterministic NativeExtension adapter",
+      "question": "Does the Rust scaling lane drive production pi_ext::server::serve_io (crates/pi-ext/src/server.rs:966) over an in-memory duplex or OS pipe pair, with a deterministic NativeExtension adapter (the seam at server.rs:568) implementing fixed snapshot/prepare/validate/execute results and cooperative cancellation, replaying the byte-identical frame corpus of scripts/bench-extension-scaling.ts (hello, session_start, zero/100-idle/20-active, 300-request fast stream, slow/fast queue locality), passing the same correctness assertions through the production server (protocolVersion handshake, id correlation, timeout locality, non-retryable errors) — and contain zero benchmark-specific frame decoding, server loop construction, or protocol method registry, verifiable by import and grep audit?",
+      "acceptance": "- The ticket question is resolved with repository evidence and its parent plan's acceptance gates pass.",
+      "nativeParent": "EXT-22",
+      "blockers": [
+        "PERF-T1"
+      ]
+    },
+    {
+      "stableId": "PERF-T3",
+      "kind": "execution",
+      "issue": 89,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/89",
+      "title": "[PERF-T3] Build the Rust render-churn benchmark matching the upstream TUI churn workload",
+      "question": "Can pi-tui execute the upstream render-churn workload symmetrically — 100x30 viewport, the 150-line transcript/dock tree, 20 warmups, 300 frames, static and one-character-editor scenarios, null-sink terminal — reporting wall ms/frame and allocated bytes/frame paired with the upstream numbers, with parameters diff-checked against .references/pi/packages/tui/test/render-churn-bench.ts?",
+      "acceptance": "- The ticket question is resolved with repository evidence and its parent plan's acceptance gates pass.",
+      "nativeParent": "EXT-22",
+      "blockers": [
+        "PERF-T1"
+      ]
+    },
+    {
+      "stableId": "PERF-R2",
+      "kind": "execution",
+      "issue": 90,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/90",
+      "title": "[PERF-R2] Rank the repo-wide performance workload surface with trusted baselines",
+      "question": "Across pi, pi-tui, pi-ext, pi-ai, and pi-agent, which measurable workload lanes exist, what is each lane's trusted baseline (median with stddev < 20% of median, >=1s wall clock, alternating order), its ranked time share, its written hot/cold unit split (>=5% of time or input-scaling = hot), and its claim class (paired comparative, single-implementation regression floor, or D8-blocked)?",
+      "acceptance": "- The ticket question is resolved with repository evidence and its parent plan's acceptance gates pass.",
+      "nativeParent": "EXT-22",
+      "blockers": [
+        "PERF-T1"
+      ]
+    },
+    {
+      "stableId": "PERF-T7",
+      "kind": "execution",
+      "issue": 91,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/91",
+      "title": "[PERF-T7] Define symmetric install-footprint accounting",
+      "question": "What accounting (launcher bytes, Rust runtime assets, upstream dist bundle plus shipped dependencies) makes an installed-size comparison semantically equal across the native Rust and Bun/Node reference artifacts, and what does each side measure under that contract before any footprint number is quoted?",
+      "acceptance": "- The ticket question is resolved with repository evidence and its parent plan's acceptance gates pass.",
+      "nativeParent": "EXT-22",
+      "blockers": [
+        "PERF-T1"
+      ]
+    },
+    {
+      "stableId": "PERF-G13",
+      "kind": "execution",
+      "issue": 92,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/92",
+      "title": "[PERF-G13] Audit iteration, rollback, and exhaustion discipline on the campaign",
+      "question": "Is every landed iteration's >=1.05x median win measured fresh against its immediate pre-iteration baseline with stddev < 20%; did every win above 2x floor trigger a further materially distinct iteration on the same unit (no unit closed as 'rebuilt-with-win'); is every sub-1.05x candidate fully reverted with no partial structure; does every CONSTRAINED-ABOVE-FLOOR record reconcile E1 with the measured median, show two-or-infeasible distinct designs in E2, include an E3 floor revalidation, and name a dominant residual term in E4 that actually matches the largest E1 component; and did any landing regress a release minimum that should have blocked the commit?",
+      "acceptance": "- The ticket question is resolved with repository evidence and its parent plan's acceptance gates pass.",
+      "nativeParent": "EXT-22",
+      "blockers": [
+        "PERF-T11"
+      ]
+    },
+    {
+      "stableId": "PERF-T5",
+      "kind": "execution",
+      "issue": 93,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/93",
+      "title": "[PERF-T5] Add a dispatch-only tool benchmark with no-op deterministic tools on both implementations",
+      "question": "Can per-call dispatch CPU/wall be timed with deterministic in-process tools exercising identical argument validation, tool start/update/end events, result construction, and session append on both Rust and a matched upstream path, keeping real read/edit/bash as a separate end-to-end confirmation?",
+      "acceptance": "- The ticket question is resolved with repository evidence and its parent plan's acceptance gates pass.",
+      "nativeParent": "EXT-22",
+      "blockers": [
+        "PERF-T1"
+      ]
+    },
+    {
+      "stableId": "PERF-R9",
+      "kind": "execution",
+      "issue": 94,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/94",
+      "title": "[PERF-R9] Write per-hot-unit floor ledgers with cost decompositions and blind-derivation contracts",
+      "question": "For every hot unit: what is the contract sourced from call sites/tests/signatures (never internals), the computed floor with shown arithmetic, the measured cost, the headroom multiple, the initial cost decomposition attributing measured time to floor terms vs named addressable-overhead categories (summing to the measured cost), and the interior/boundary consumer classification with unresolved channels named — yielding the ordered OPEN list (units > 2x floor, descending time share) and the AT-FLOOR list?",
+      "acceptance": "- The ticket question is resolved with repository evidence and its parent plan's acceptance gates pass.",
+      "nativeParent": "EXT-22",
+      "blockers": [
+        "PERF-R2",
+        "PERF-R8"
+      ]
+    },
+    {
+      "stableId": "PERF-R8",
+      "kind": "execution",
+      "issue": 95,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/95",
+      "title": "[PERF-R8] Measure paired baselines on the newly symmetric lanes",
+      "question": "What are the trusted paired baselines (both distributions, stddev < 20% of median, same machine, alternating order) on each newly symmetric lane — layout/recomposition, persistence append/reopen, tool dispatch, idle memory, extension-host scaling, install footprint — and which units do they add to or remove from the hot list?",
+      "acceptance": "- The ticket question is resolved with repository evidence and its parent plan's acceptance gates pass.",
+      "nativeParent": "EXT-22",
+      "blockers": [
+        "PERF-T3",
+        "PERF-T4",
+        "PERF-T5",
+        "PERF-T6",
+        "PERF-T7"
+      ]
+    },
+    {
+      "stableId": "PERF-G12",
+      "kind": "execution",
+      "issue": 96,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/96",
+      "title": "[PERF-G12] Audit divergence classifications and boundary answers of rebuilt targets",
+      "question": "For every landed or reverted iteration: does the branch-by-branch walk classify each replaced behavior essential or residue with a sound reason (no silently deleted edge case, guard, ordering guarantee, or error semantic), and was every published surface (wire format, session JSONL v3 header/compaction/tree markers, extension RPC, serialized names/fields) touched only after a recorded explicit yes — none on silence, none after a no?",
+      "acceptance": "- The ticket question is resolved with repository evidence and its parent plan's acceptance gates pass.",
+      "nativeParent": "EXT-22",
+      "blockers": [
+        "PERF-T11"
+      ]
+    },
+    {
+      "stableId": "PERF-T11",
+      "kind": "execution",
+      "issue": 97,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/97",
+      "title": "[PERF-T11] Execute the iterative hot-unit rebuild campaign, one atomic commit per iteration",
+      "question": "For each OPEN unit in ledger order, iterated until terminal: was each candidate derived blind from contract/floor/decomposition (data layout first), every replaced branch classified essential/residue with a reason, every boundary surface answered explicitly before being touched, the pinned workload re-run — keeping wins >=1.05x median (recomputing the multiple: AT-FLOOR if <=2x, else logging the win as intermediate and iterating again on the SAME unit with a materially distinct design) and fully reverting sub-1.05x candidates with measurements recorded — until every unit is AT-FLOOR or CONSTRAINED-ABOVE-FLOOR with a complete E1-E4 exhaustion record (reconciled cost decomposition, two-or-infeasible distinct designs, floor revalidation, named dominant residual), each iteration landed as exactly one atomic commit with verifier green and residue deleted?",
+      "acceptance": "- The ticket question is resolved with repository evidence and its parent plan's acceptance gates pass.",
+      "nativeParent": "EXT-22",
+      "blockers": [
+        "PERF-R9",
+        "PERF-G10"
+      ]
+    },
+    {
+      "stableId": "PERF-G10",
+      "kind": "execution",
+      "issue": 98,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/98",
+      "title": "[PERF-G10] Audit floor ledgers and cost decompositions",
+      "question": "Does every hot-unit ledger's floor include all unavoidable bytes, syscalls, round-trips, and algorithmic lower bounds its contract implies; does any ledger understate work to justify a rebuild or overstate the floor to certify AT-FLOOR falsely; does every decomposition category carry a measurement method and reconcile with the unit's measured total; and is any contract term sourced from the unit's own internals instead of its callers?",
+      "acceptance": "- The ticket question is resolved with repository evidence and its parent plan's acceptance gates pass.",
+      "nativeParent": "EXT-22",
+      "blockers": [
+        "PERF-R9"
+      ]
+    },
+    {
+      "stableId": "PERF-G16",
+      "kind": "execution",
+      "issue": 99,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/99",
+      "title": "[PERF-G16] Audit the final performance claims against the non-claim registry and claim vocabulary",
+      "question": "Does every performance statement in the final evidence bundle name its claim class, gate, artifact, and evidence fields; quote only distributions with stddev < 20% of median; state each lane's achieved multiple over floor as a number; restrict 'proven to the floor' to AT-FLOOR lanes; attach to every above-2x lane its unresolved-gap record (dominant residual term, attempted designs, floor-revalidation outcome, contract constraint); quote no intermediate iteration as a final speed; keep launcher bytes labeled 'executable artifact size'; never present Rust-only keypress p99 or single-host scaling as comparative wins; and confirm each D8 entry as either measurable-with-artifact or still an explicit non-claim?",
+      "acceptance": "- The ticket question is resolved with repository evidence and its parent plan's acceptance gates pass.",
+      "nativeParent": "EXT-22",
+      "blockers": [
+        "PERF-T11",
+        "PERF-T14"
+      ]
+    },
+    {
+      "stableId": "PERF-T14",
+      "kind": "execution",
+      "issue": 100,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/100",
+      "title": "[PERF-T14] Grade every cold unit fixed, at-floor, or left",
+      "question": "Does every unit on the written cold lists carry exactly one verdict — fixed (naming the non-time cost removed: larger-N complexity, allocations, redundant IO, startup/build cost, artifact size, dependency weight), at floor, or left with reason — with verifier green per fix and zero verdicts outstanding?",
+      "acceptance": "- The ticket question is resolved with repository evidence and its parent plan's acceptance gates pass.",
+      "nativeParent": "EXT-22",
+      "blockers": [
+        "PERF-T11"
+      ]
+    },
+    {
+      "stableId": "PERF-G15",
+      "kind": "execution",
+      "issue": 101,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/101",
+      "title": "[PERF-G15] Audit cold-path verdicts for complexity-bought microseconds",
+      "question": "Did any cold fix add a branch, cache, or configuration knob to buy speed (rejected per the method — reclassify as left and remove it), does every fixed verdict name a real removed cost, and did any cold change secretly reshape a landed hot unit or touch a CONSTRAINED unit's named dominant residual term instead of re-entering Phase 5 discipline?",
+      "acceptance": "- The ticket question is resolved with repository evidence and its parent plan's acceptance gates pass.",
+      "nativeParent": "EXT-22",
+      "blockers": [
+        "PERF-T14"
+      ]
+    },
+    {
+      "stableId": "REL-R1",
+      "kind": "execution",
+      "issue": 102,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/102",
+      "title": "[REL-R1] Bake off the musl toolchain and userland provisioning",
+      "question": "Which per-arch musl C toolchain and which per-arch musl userland provisioning recipe actually build pi (including aws-lc-sys and zstd) and execute the compiled Bun musl sidecar plus the pinned Bun runtime? Candidates: on x86_64, apt musl-tools + a sha256-pinned Alpine minirootfs-derived libstdc++ set with /etc/ld-musl-x86_64.path; on aarch64, apt musl-tools on ubuntu-24.04-arm (primary), plus a sha256-pinned musl.cc cross tarball or cargo-zigbuild as backup, with the same userland recipe for aarch64 Alpine packages.",
+      "acceptance": "- The winning recipe builds static pi (zero readelf NEEDED, ldd 'not a dynamic executable') and executes the real bun-linux-x64-musl-baseline / bun-linux-aarch64-musl sidecar and the pinned runtime through the hello protocol smoke on each arch's runner/userland — protocol smoke only, no PTY or terminal behavior of any kind.\n- It records sha256 pins and acquisition dates for every downloaded artifact.\n- The losing backup is deleted from the recipe before the REL-T3 commit.",
+      "nativeParent": "EXT-26",
+      "blockers": []
+    },
+    {
+      "stableId": "PERF-R18",
+      "kind": "execution",
+      "issue": 103,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/103",
+      "title": "[PERF-R18] Pre-flight — confirm plan prerequisites not already landed upstream (external node: issue #12 map, status open)",
+      "question": "Before Phase 1 commits: is the local base current against origin, are scripts/verification/performance.ts and scripts/bench-extension-scaling.ts still free of stddev/noise-gate and memory-sampling implementations (no sibling track landed them), and does crates/pi-ext/src/server.rs still expose serve_io and the NativeExtension seam at the cited signatures — so PERF-T1 through PERF-T7 build on fact rather than stale assumptions? (This ticket models the settled external prerequisites; if any check fails, its finding blocks the affected PERF ticket and is routed to the map owner.)",
+      "acceptance": "- The ticket question is resolved with repository evidence and its parent plan's acceptance gates pass.",
+      "nativeParent": "EXT-22",
+      "blockers": []
+    },
+    {
+      "stableId": "REL-T2",
+      "kind": "execution",
+      "issue": 104,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/104",
+      "title": "[REL-T2] Pin Bun 1.3.14 musl fallback-runtime assets",
+      "question": "Add the two musl entries to scripts/release/runtime.ts ASSET_PINS using the bun-v1.3.14 SHASUMS256.txt-verified digests: bun-linux-x64-musl-baseline.zip sha256 56a7d6806cf155536c0178f0ea5fbd098e684fa509ebdb4fc0a7e19fb65382dc and bun-linux-aarch64-musl.zip sha256 b98e0ad3625c5c00d1d5b5ff55605c7adddbfae151861e68ade57b2d3b8703bb.",
+      "acceptance": "- bunRuntimeAsset resolves each musl plan to the correct URL/runtimeMember.\n- The checksum path verifies a real or seam-injected fixture of the actual asset byte stream; a corrupted stream raises BunRuntimeProvisionError with the mismatch message.\n- The plan/pin mismatch guard is pinned by focused runtime tests.",
+      "nativeParent": "EXT-26",
+      "blockers": [
+        "REL-T1"
+      ]
+    },
+    {
+      "stableId": "PERF-CLOSE",
+      "kind": "execution",
+      "issue": 105,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/105",
+      "title": "[PERF-CLOSE] Assemble final performance acceptance evidence for issue #22",
+      "question": "Does the closing acceptance run produce performance-comparison.json, extension-scaling.json (via the production serve_io harness), and e2e evidence with all gates green — release minima (3x/3x/2x/5ms, thresholdValid) verified as minima, the campaign ledger showing every hot unit AT-FLOOR or CONSTRAINED-ABOVE-FLOOR with complete E1-E4 records, every intermediate win above 2x followed by a distinct-design iteration, every cold unit graded, per-lane achieved multiples and unresolved gaps published, and the registry closed — sufficient to close issue #22 with 'go as fast as you can go' proven lane-by-lane rather than asserted?",
+      "acceptance": "- The ticket question is resolved with repository evidence and its parent plan's acceptance gates pass.",
+      "nativeParent": "EXT-22",
+      "blockers": [
+        "PERF-G12",
+        "PERF-G13",
+        "PERF-G15",
+        "PERF-G16"
+      ]
+    },
+    {
+      "stableId": "REL-T1",
+      "kind": "execution",
+      "issue": 106,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/106",
+      "title": "[REL-T1] Extend the release target model to seven triples",
+      "question": "Grow scripts/release/targets.ts RUST_TARGETS from the current five triples to seven and buildPlan with an explicit libc dimension.",
+      "acceptance": "- planFor('x86_64-unknown-linux-musl') returns bunTarget bun-linux-x64-musl-baseline, os linux, archive tar.gz, archiveDir pi-linux-x64-musl-base; planFor('aarch64-unknown-linux-musl') returns bunTarget bun-linux-aarch64-musl and pi-linux-arm64-musl.\n- The five existing plans' every derived field remains byte-identical.\n- Focused targets tests pin all seven plans and InvalidTargetError behavior for non-listed triples.",
+      "nativeParent": "EXT-26",
+      "blockers": [
+        "VER-ALIGN"
+      ]
+    },
+    {
+      "stableId": "REL-T4",
+      "kind": "execution",
+      "issue": 108,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/108",
+      "title": "[REL-T4] Wire seven legs, native runners, musl gates, and the five Tier N witnesses into release-verification.yml",
+      "question": "Extend the workflow to seven legs with explicit native-runner verification; the aarch64 legs run natively (no QEMU outside the feature-flagged contingency); each musl leg runs cargo build, compiled-host build for its bun target, the static-link gate, the archive-whitelist gate, pass1/pass2 diff, unpack smoke (artifact's own pi --version + compiled-sidecar hello), bundled-fallback hello from inside the same unpacked archive, and the userland-execute proof — with zero interaction steps; the five Tier N rows each wire their archive-driven witness (host-pty + pty_no_flicker-anchored on x86_64-gnu, portable-pty posix_openpt on aarch64-gnu and both darwin legs, ConPTY on windows per REL-R3/REL-T7).",
+      "acceptance": "- All seven legs green in one run; every leg uploads its archive + .sha256 sidecar.\n- Exactly five legs execute interaction witnesses and exactly the two musl legs execute the packaging/protocol step set alone; each Tier N artifact records its runner label plus resolved runner image version.\n- Aarch64 legs verify the runner image is a native arm64 image before proceeding and fail loudly otherwise.\n- The five pre-existing non-musl legs keep their current step semantics otherwise.",
+      "nativeParent": "EXT-26",
+      "blockers": [
+        "REL-T3",
+        "TUI-CLOSE"
+      ]
+    },
+    {
+      "stableId": "REL-T8",
+      "kind": "execution",
+      "issue": 109,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/109",
+      "title": "[REL-T8] Attest build provenance for the seven archives",
+      "question": "Add SLSA build-provenance attestation for all seven archives: commit-sha-pinned attestation action, id-token permission, per-archive subjects (each tar.gz/zip plus its .sha256 sidecar), and a verification step over every bundle on GitHub-hosted runners. Attested archives are the docs-staged artifacts produced after REL-DOCS.",
+      "acceptance": "- An attestation bundle exists per archive and the verification step passes on GitHub-hosted runners.\n- The action version is re-grounded from the release channel before landing.",
+      "nativeParent": "EXT-26",
+      "blockers": [
+        "REL-T4",
+        "REL-DOCS"
+      ]
+    },
+    {
+      "stableId": "REL-T6",
+      "kind": "execution",
+      "issue": 110,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/110",
+      "title": "[REL-T6] Offline pre-cache for the Bun fallback runtime",
+      "question": "Give provisionBunRuntime a pre-cache input consulted before any fetch, checksum-verified through ASSET_PINS.",
+      "acceptance": "- With the fetch seam forced to fail, package-release for each of the seven targets completes the runtime-bundle path network-free when a checksum-valid cache exists.\n- Without cache it raises BunRuntimeProvisionError naming the expected cache location and asset filename.\n- A corrupted cache fails identically to a corrupted download; online behavior without cache unchanged.",
+      "nativeParent": "EXT-26",
+      "blockers": [
+        "REL-T2"
+      ]
+    },
+    {
+      "stableId": "REL-DOCS",
+      "kind": "execution",
+      "issue": 111,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/111",
+      "title": "[REL-DOCS] Stage documentation into the seven release archives",
+      "question": "Wire scripts/package-release.ts to pass docs/ into assembleRelease's docsSource seam for every target plan; extend scripts/release/stage.ts so every archive stages the docs tree and release.json's per-file digest table covers each staged docs/, README.md, and CHANGELOG.md member; land the release-path gate that fails any build (dry-run and full) whose root CHANGELOG.md is missing or its `## [Unreleased]` section is empty. This is the sole release-owned documentation-packaging node; the documentation track verifies consume-only and owns zero packaging code.",
+      "acceptance": "- Release-path tests prove all seven archives contain docs/, README.md, CHANGELOG.md, and release.json with matching per-file digests — one deleted docs file caught by mutation.\n- The CHANGELOG gate fails and passes exactly as described in dry-run and full builds.\n- Zero references to examplesSource or an examples/ tree.\n- Lands strictly before release closure so REL-T8 attestation subjects, the platforms document, and the documentation track's consume-only verification all see docs-staged archives.",
+      "nativeParent": "EXT-26",
+      "blockers": [
+        "REL-T4",
+        "REL-T6"
+      ]
+    },
+    {
+      "stableId": "REL-T3",
+      "kind": "execution",
+      "issue": 112,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/112",
+      "title": "[REL-T3] Provision musl toolchains and userland in CI recipes",
+      "question": "Land reproducible recipes: x86_64 via musl-tools/musl-dev with CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc and CC_x86_64_unknown_linux_musl=musl-gcc; aarch64 via apt musl-tools on ubuntu-24.04-arm (or the REL-R1 backup) with the parallel env vars; provision the per-arch musl userland (loader path and pinned Alpine musl-libstdc++/libgcc set) so Bun musl artifacts execute.",
+      "acceptance": "- Clean-environment builds of both musl targets succeed, including aws-lc-sys and zstd.\n- pi passes the static-link gate (zero readelf NEEDED, ldd 'not a dynamic executable').\n- Both Bun artifacts execute the hello protocol smoke under the userland — execution/protocol evidence only.\n- Every downloaded artifact is sha256-verified with version and date recorded.",
+      "nativeParent": "EXT-26",
+      "blockers": [
+        "REL-R1",
+        "REL-T2"
+      ]
+    },
+    {
+      "stableId": "REL-T5",
+      "kind": "execution",
+      "issue": 113,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/113",
+      "title": "[REL-T5] Land compat-matrix 0.2.0 with seven release target rows and tier-accurate terminology",
+      "question": "Update scripts/verification/compat-matrix.json to 0.2.0: add release-x86_64-linux-musl (required locally for packaging/protocol scope; musl userland prerequisite named) and release-aarch64-linux-musl (excluded locally, CI witness natively on ubuntu-24.04-arm), bringing release target rows to exactly seven; the five Tier N rows keep terminal-conformance terminology and the two musl rows carry the verbatim absence line (no PTY/render/synchronized-output/no-clear); correct every existing rationale to match actual runner mechanics — especially replacing 'cross-compile + QEMU' and any false 'native runner' claim on aarch64 with the true native-run-on-ubuntu-24.04-arm description.",
+      "acceptance": "- validateMatrix passes; selectRows returns exactly seven release target rows of which exactly five carry Tier N claims.\n- release-x86_64-linux-musl runs locally with the musl userland and fails with a clear prerequisite diagnostic without it.\n- Every excluded row names its actual CI witness; exactly two rows are locally required and five excluded.\n- The musl absence line is byte-identical across matrix, compat matrix, and platforms document.",
+      "nativeParent": "EXT-26",
+      "blockers": [
+        "REL-T4"
+      ]
+    },
+    {
+      "stableId": "REL-T7",
+      "kind": "execution",
+      "issue": 114,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/114",
+      "title": "[REL-T7] Wire the Windows ConPTY witness or escalate the topology reopen",
+      "question": "If REL-R3 is go, wire the ConPTY witness into the windows-latest leg as the fifth Tier N row with its named assertions (pi.exe --version, host hello, REL-R3-recorded terminal-behavior assertions, console-mode cleanup, taskkill-tree teardown), completing the settled five-row topology; if REL-R3 is no-go, record the prototype findings verbatim and raise the topology reopen as a blocking release objection rather than weakening the row in place.",
+      "acceptance": "- On the go path, the windows-latest leg executes the packed pi.exe under ConPTY and captures the transcript with the R3-recorded assertions — the fifth and final Tier N row green.\n- On the no-go path, the topology reopen is recorded as a blocking objection with REL-R3's verbatim findings; no four-row Tier N topology ships.\n- Process-tree teardown is proven against the archive's actual process tree with taskkill /pid /t /f, not generic kills.",
+      "nativeParent": "EXT-26",
+      "blockers": [
+        "REL-R3",
+        "REL-T4"
+      ]
+    },
+    {
+      "stableId": "REL-R3",
+      "kind": "execution",
+      "issue": 115,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/115",
+      "title": "[REL-R3] Prototype the Windows ConPTY interaction witness",
+      "question": "Can the unpacked pi.exe on windows-latest be driven under ConPTY via portable-pty's ConPTY backend with deterministic spawn, 120x30 sizing, scripted input echo, render/synchronized-output/no-clear-equivalent assertion capture, and taskkill /pid /t /f process-tree teardown?",
+      "acceptance": "- A throwaway harness on windows-latest captures a transcript containing the scripted input and the host hello handshake from the actual archive's pi.exe.\n- It records ConPTY behavior (resize/alt-buffer/event semantics) and whether it stays deterministic, and delivers a go/no-go for wiring it as the fifth Tier N row.\n- A no-go is recorded verbatim and escalated as a topology-reopen blocking objection — never a silent four-row release.",
+      "nativeParent": "EXT-26",
+      "blockers": []
+    },
+    {
+      "stableId": "REL-T9",
+      "kind": "execution",
+      "issue": 116,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/116",
+      "title": "[REL-T9] Write the supported-platforms document with dated pins, verbatim tier language, and limitations",
+      "question": "Author the supported release platforms reference covering: the seven triples and their native-runner map (ubuntu-latest / ubuntu-24.04-arm / macos-15/intel / windows-latest) with runner-image verification behavior; the verbatim statement that exactly five rows are Tier N terminal-conformance rows, that the two musl legs carry only host-native execution, static-link/unpack/integrity, and the two-mode JSONL protocol smokes, and the musl absence line verbatim; the QEMU packaging/protocol-only contingency label; the archive/checksum/release.json contract including docs-staged contents and per-file digest coverage; compiled vs runtime-bundle host modes and the offline pre-cache rule; the musl link model (pi fully static, Bun dynamic-against-musl, loader/libstdc++ contract); Windows ConPTY + taskkill guarantees; the unsigned-macOS decision with Gatekeeper/quarantine instructions; and the dated Bun-bump procedure re-pinning all seven assets plus the Alpine userland pins.",
+      "acceptance": "- Every normative sentence cites a code line, manifest field, workflow step, or dated channel pin.\n- The five-row Tier N statement and musl absence line appear byte-identically in the matrix, compat matrix, and document.\n- No platform claim lacks a citation.",
+      "nativeParent": "EXT-26",
+      "blockers": [
+        "REL-T5",
+        "REL-T6",
+        "REL-T7",
+        "REL-T8",
+        "REL-DOCS"
+      ]
+    },
+    {
+      "stableId": "DEPS-R1",
+      "kind": "execution",
+      "issue": 117,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/117",
+      "title": "[DEPS-R1] Re-ground dependency bins against live registries before any upgrade executes",
+      "question": "On execution date, what are the current stable versions, yank/advisory state, and license status of every member of bins P, M, X, and the Rust toolchain — producing re-dated bins that replace the 2026-08-26 schedule, an SBOM baseline, the pinned seven-target post-audit lane recipe, and a per-member exposure-record seed for the invariant ledger?",
+      "acceptance": "- Every bin member carries an execution-date 'latest stable' citation against live crates.io/npm/rust-lang channels; zero members execute from remembered 2026-08-26 values.\n- Zero yanked versions and zero active advisories among scheduled targets, or affected members are diverted to the DEPS-R2 out-of-band CVE path with the divergence and Class S/E verdict recorded.\n- Bins list explicitly re-dated; any pair whose latest moved is updated and re-binned per the binning rule (same-major patch → P; same-major ≥1.0 minor → M; any 0.x minor step, any major step, toolchain channel → X).\n- The seven-target post-audit lane recipe is pinned from the landed EXT-26 release-track artifacts (five build/test triples + per-musl-artifact build, static-link, archive unpack, QEMU/native handshake smoke) and referenced — not re-implemented — by every later phase; if EXT-26 has not landed, no epoch may start.\n- SBOM baseline snapshot captured so per-epoch SBOM diffs have an anchor; license re-verification of all direct pins against the deny.toml allowlist done.\n- No schedule-affecting repo edits; output is the re-dated schedule, SBOM baseline, pinned lane recipe, and exposure-record seed.",
+      "nativeParent": "EXT-23",
+      "blockers": [
+        "EXT-23",
+        "PAR-CLOSE",
+        "EXT-26"
+      ]
+    },
+    {
+      "stableId": "REL-R2",
+      "kind": "execution",
+      "issue": 118,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/118",
+      "title": "[REL-R2] Research the signed and notarized macOS release channel",
+      "question": "What would shipping signed and notarized x86_64-apple-darwin and aarch64-apple-darwin archives require, and which pieces are available now? Inventory the Developer ID Application certificate and Apple Developer Program membership status, the secrets topology for GitHub macos-15[-intel] runners, and the current hardened-runtime + codesign + notarytool submit + staple + spctl verification chain — re-grounding tool versions from the release channel.",
+      "acceptance": "- A dated evidence document states which credentials exist versus must be provisioned, the exact runner-side steps and their versions, and a go/no-go record.\n- It does not gate or modify the unsigned seven-target definition.",
+      "nativeParent": "EXT-26",
+      "blockers": []
+    },
+    {
+      "stableId": "REL-CLOSE",
+      "kind": "execution",
+      "issue": 119,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/119",
+      "title": "[REL-CLOSE] Grill the seven-platform release proof (release closer)",
+      "question": "Adversarially audit the landed seven-platform definition against this resolution. Per platform: archive determinism and two-pass checksums; the unpack smoke really exercising that platform's binaries (no host-binary shortcut); both musl legs actually executing the compiled extension host AND the bundled Bun fallback inside the unpacked artifact under the provisioned userland; pi fully static on musl with the static-link gate live at CI time; every shipped musl ELF passing the glibc-whitelist gate; exactly five Tier N rows with every PTY/render/synchronized-output/no-clear claim mapped to one of the five named native runners — and zero such claims on musl legs, zero from QEMU, zero elsewhere; every Tier N artifact carrying its runner label plus resolved image version; Windows teardown/taskkill behavior preserved; unsigned-macOS contract matching documentation; offline cache never silently degrading; compat-matrix terminology accurate with exactly seven release target rows (five Tier N, two musl, two locally required, five excluded); SLSA covering all seven subjects; all seven archives containing the staged docs/ tree, README.md, and CHANGELOG.md with release.json digest coverage and the CHANGELOG release-path gate live, with no packaging implementation leaked to the documentation track.",
+      "acceptance": "- Each axis maps to a green, accurately described witness or is returned as a blocking objection — no softened rewording of gaps.\n- The row counts (seven targets, five Tier N, two musl, seven archives) reconcile across code, workflow, matrix, and document.\n- Resolves only with REL-DOCS resolved — the closure chain cannot bypass the documentation-staging node.",
+      "nativeParent": "EXT-26",
+      "blockers": [
+        "REL-T4",
+        "REL-T5",
+        "REL-T6",
+        "REL-T7",
+        "REL-T8",
+        "REL-DOCS",
+        "REL-T9",
+        "REL-R2"
+      ]
+    },
+    {
+      "stableId": "DEPS-X1",
+      "kind": "execution",
+      "issue": 120,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/120",
+      "title": "[DEPS-X1] Major: base64 0.22.1 → 0.23.x with Engine-API migration evidence",
+      "question": "Assemble the migration dossier from primary 0.23 documents (breaking changes, pre-seeded callsite census across pi-ai/pi-tui/pi, codemod check, license re-check) and land exactly one `chore(deps)!: bump base64 …` commit with all Engine-API callsites migrated, fixture behavior unchanged, and the seven-target + musl post-audit green.",
+      "acceptance": "- The migration-evidence dossier exists before the first code edit: primary upstream CHANGELOG/MIGRATION read; removed/renamed/default-changed APIs listed; codemod check; deprecations-as-errors run; license re-check; difft lockfile review — and is linked from the commit.\n- Exactly one dependency changes in one commit `chore(deps)!: bump base64 0.22.1→<re-grounded 0.23.x>`; zero unrelated behavior or finding fixes in the commit.\n- Every enumerated Engine-API callsite migrated (pi-ai auth/oauth/pkce.rs:9, auth/oauth/openai_codex.rs:13-14, providers/bedrock_converse_stream.rs:1352, providers/openai_codex_responses.rs:1304-1307; pi-tui image.rs:186,459; pi core/export_html/mod.rs:613, core/platform/clipboard.rs:187, core/tools/read.rs:11-12) and covered by its existing test path; census confirms no un-migrated call sites remain.\n- Encode/decode observable behavior unchanged on existing fixtures.\n- Per-major post-audit green: cargo deny, npm scans, SBOM diff, difft, seven-target verification including both musl artifacts, and performance non-regression vs the post-Bin-M baseline.\n- A separate generated-doc-only commit follows iff a generator-consumed constant moved.",
+      "nativeParent": "EXT-23",
+      "blockers": [
+        "DEPS-B2"
+      ]
+    },
+    {
+      "stableId": "DEPS-B1",
+      "kind": "execution",
+      "issue": 121,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/121",
+      "title": "[DEPS-B1] Bin P: patch sweep (9 Rust crates + npm ignore) in one commit",
+      "question": "Apply all re-grounded patch updates as one `chore(deps): patch sweep` commit with lockfiles, passing the full --locked workspace suite, bun tests, cargo deny check, npm advisory scan, SBOM diff, difft review, performance non-regression gate, and seven-target verification including both musl artifacts — followed by a generated-doc-only commit iff a generator-consumed constant moved.",
+      "acceptance": "- One commit `chore(deps): patch sweep` moves all re-grounded Bin P members (futures, globset, ignore, jiff, schemars, serde, serde_json, thiserror, tokio-util, npm ignore) plus Cargo.lock and bun.lock together; feature tables unchanged.\n- cargo fmt --check, cargo clippy --workspace --all-targets --locked -D warnings, cargo test --workspace --all-targets --no-fail-fast --locked, bun run check, bun test all green; `bun install --frozen-lockfile` succeeds.\n- difft of Cargo.lock shows only patch-level bumps (plus unavoidable identical-class transitive bumps); unexpected major/minor transitive churn investigated and reverted or justified in the commit message.\n- Post-audit green: cargo deny check with both syntect-transitive ignores still load-bearing; npm advisory scan on all three package.json surfaces clean; SBOM diff vs the DEPS-R1 baseline fully explained.\n- Seven-target verification green on the new lockfile with per-musl-artifact build, static-link, unpack, and handshake-smoke evidence recorded (not merely 'CI build succeeded').\n- Performance non-regression vs the pre-sweep baseline within the workload contract noise band (RSD < 20%); commit contains zero behavior changes; a separate generated-doc-only commit follows iff a generator-consumed constant moved.",
+      "nativeParent": "EXT-23",
+      "blockers": [
+        "DEPS-R1"
+      ]
+    },
+    {
+      "stableId": "DEPS-X2",
+      "kind": "execution",
+      "issue": 122,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/122",
+      "title": "[DEPS-X2] Major: serde-saphyr 0.0.29 → 1.1.x with frontmatter fixture parity",
+      "question": "Prove the 0.0.x→1.x stabilization's parse-behavior parity on the single-module surface (crates/pi/src/core/resources/frontmatter.rs:74,130) against TypeScript-reference fixtures using primary upstream migration documents, then land exactly one `chore(deps)!: bump serde-saphyr …` commit with the seven-target + musl post-audit green.",
+      "acceptance": "- The migration dossier (primary upstream migration documents for the 0.0.x→1.x stabilization; removed/renamed/default-changed behaviors; codemod check; license re-check; difft review) exists before the first code edit and is linked from the commit.\n- Frontmatter fixtures pass byte-parity/semantic-parity against the TypeScript reference behavior before the bump lands.\n- Exactly one dependency changes in one commit `chore(deps)!: bump serde-saphyr 0.0.29→<re-grounded 1.1.x>`; the single-module surface (crates/pi/src/core/resources/frontmatter.rs:74,130) is confirmed by census with no new call sites.\n- Per-major post-audit green: cargo deny, npm scans, SBOM diff, difft, seven-target verification including both musl artifacts, performance non-regression vs the post-Bin-M baseline.\n- A separate generated-doc-only commit follows iff a generator-consumed constant moved.",
+      "nativeParent": "EXT-23",
+      "blockers": [
+        "DEPS-B2"
+      ]
+    },
+    {
+      "stableId": "DEPS-B2",
+      "kind": "execution",
+      "issue": 123,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/123",
+      "title": "[DEPS-B2] Bin M: minor sweep with per-member primary changelogs and behavioral smoke",
+      "question": "Read every member's primary upstream changelog, apply all re-grounded minors (aws-config, aws-sdk-bedrockruntime, google-cloud-auth, tokio across all five manifests + dev variants, uuid, @types/bun, typebox) as one `chore(deps): minor sweep` commit, gated on verify:compatibility + verify:e2e smoke, TS checks, post-audit with SBOM diff, performance non-regression, and seven-target verification including both musl artifacts — recording per-member E1–E4 exposure evidence (typebox, @types/bun) for the invariant ledger while keeping the full lane regardless of verdict.",
+      "acceptance": "- Per-member primary-changelog summaries (from the upstream project's own CHANGELOG/release notes — not aggregators) are in the commit message or linked notes; default-changed and deprecated items and their dispositions named explicitly.\n- One commit `chore(deps): minor sweep` moves all re-grounded minors plus lockfiles; `default-features = false` discipline retained with feature sets re-enumerated.\n- tokio proof includes verify:compatibility + verify:e2e provider smoke, not just unit tests; tsc checks + bun test green in packages/extension-host and packages/pi-tui-protocol for the TS-facing minors.\n- Per-member E1–E4 classification evidence recorded for both npm minors (typebox bundler-metafile reachability re-verified on execution date) and referenced from the commit notes; the full seven-target lane ran regardless of verdict.\n- cargo deny check, npm advisory scans, SBOM diff, and difft green; `multiple-versions = \"warn\"` bans output eyeballed, not just exit code; performance non-regression vs the post-Bin-P baseline (regressions block and bisect within the batch).\n- Zero behavior changes beyond minor-release mechanical compat fixes; no unrelated fixes ride along; a separate generated-doc-only commit follows iff a generator-consumed constant moved.",
+      "nativeParent": "EXT-23",
+      "blockers": [
+        "DEPS-B1"
+      ]
+    },
+    {
+      "stableId": "DEPS-T1",
+      "kind": "execution",
+      "issue": 124,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/124",
+      "title": "[DEPS-T1] Toolchain: Rust 1.97.1 → re-grounded stable (≥1.98.0) as its own atomic unit",
+      "question": "Bump rust-toolchain.toml channel, Cargo.toml rust-version, and the CI toolchain pin together in one `chore(toolchain)!: bump rust …` commit, green under workspace lints on the new compiler, immediately followed by a separate generated-doc-only commit rerunning the docs compatibility generator, with the closing full audit (deny, advisories, SBOM, difft, freshness re-scan, performance, seven-target incl. both musl artifacts) passing.",
+      "acceptance": "- One commit `chore(toolchain)!: bump rust 1.97.1→<re-grounded stable ≥1.98.0>` bumps rust-toolchain.toml channel, Cargo.toml rust-version, and the CI toolchain pin together; they agree (MSRV consistency).\n- cargo fmt, clippy --locked, and test --locked green on the new channel across the workspace under the workspace lints (deny correctness + unwrap_used); new-toolchain lint findings fixed mechanically in the same commit and listed in its message; zero new warnings-as-errors from lint-set changes left open.\n- The immediately-following separate `docs(compat): regenerate …` commit contains exclusively re-run generator output against the final constants (docs/compatibility.md and generated tables) — hand-edited content in that commit fails the audit.\n- Bun/Node engine floors (>=1.3.0, >=22.19.0) untouched; no Bun binary/bundler version change rides along (any such change is Class S by definition and out of this unit's scope).\n- Closing full audit green: cargo deny, npm advisory scans, SBOM end-to-end diff vs the DEPS-R1 baseline, difft of both final lockfiles, freshness re-scan with re-dated residual bins, syntect ignore status confirmed, performance non-regression vs the pre-epoch baseline within RSD < 20%, and the full seven-target verification re-run on the final tree — the last epoch's dual-musl proof is the closing record.\n- Any new-deny lint findings between compiler versions are fixed mechanically, not suppressed.",
+      "nativeParent": "EXT-23",
+      "blockers": [
+        "DEPS-X1",
+        "DEPS-X2",
+        "DEPS-X3"
+      ]
+    },
+    {
+      "stableId": "DEPS-X3",
+      "kind": "execution",
+      "issue": 125,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/125",
+      "title": "[DEPS-X3] Major: typescript 5.9.3 → 7.0.x across all three manifests",
+      "question": "Complete the native-compiler migration evidence from primary TypeScript release documents (two-major changelog, compat matrix, bundler semantics) and land exactly one `chore(deps)!: bump typescript …` commit with tsc checks, extension-host `bun build --compile`, and e2e green, plus the seven-target + musl post-audit run in full (no Class E claim for this epoch's majors) — no config loosening shortcuts.",
+      "acceptance": "- The migration dossier covers the two-major native-compiler jump from primary TypeScript release documents across all three manifests (root, extension-host, pi-tui-protocol), including tsc checks, `bun build --compile` bundler semantics (packages/extension-host build script), peer/runtime compatibility matrix, codemod check, and license re-check — and exists before the first code edit.\n- Exactly one dependency changes in one commit `chore(deps)!: bump typescript 5.9.3→<re-grounded 7.0.x>`; zero unrelated changes.\n- tsc noEmit checks green in all three packages; extension-host `bun build --compile` produces a working host; full extension-host + protocol build/check/e2e validation passes.\n- No `skipLibCheck`-style suppressions, loosened tsc config, or other shortcuts added.\n- The full seven-target + musl post-audit ran and is recorded — typescript remains Class S in this epoch with no Class E claim — plus cargo deny, npm scans, SBOM diff, difft, and performance non-regression vs the post-Bin-M baseline.\n- A separate generated-doc-only commit follows iff a generator-consumed constant moved.",
+      "nativeParent": "EXT-23",
+      "blockers": [
+        "DEPS-B2"
+      ]
+    },
+    {
+      "stableId": "DEPS-R3",
+      "kind": "execution",
+      "issue": 126,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/126",
+      "title": "[DEPS-R3] Watch: retire syntect-transitive deny.toml ignores on the qualifying syntect release",
+      "question": "Has a syntect release shipped that drops bincode (RUSTSEC-2025-0141) and yaml-rust/yaml-rust2 (RUSTSEC-2024-0320)? On the first such release, upgrade syntect and remove both deny.toml ignores in the same commit, with `unused-ignored-advisory = \"deny\"` as the enforcement tripwire, as a Class S change with the full seven-target post-audit.",
+      "acceptance": "- The watch is evaluated at every epoch's freshness re-scan; until a qualifying syntect release exists, both ignores remain present and every post-audit confirms them still load-bearing (syntect 5.3.0 transitive chain).\n- When a syntect release drops the bincode and yaml-rust transitive pulls, syntect is upgraded and both deny.toml ignores are removed in the same commit.\n- `unused-ignored-advisory = \"deny\"` (deny.toml) serves as the automatic tripwire detecting stale ignores between evaluations.\n- The retirement change is classified Class S and runs the full post-audit: cargo deny check, npm advisory scans, SBOM diff, difft of both lockfiles, performance gate, and seven-target verification including both musl artifacts.\n- The qualifying syntect release is cited in the commit message and the invariant ledger records the change.",
+      "nativeParent": "EXT-23",
+      "blockers": []
+    },
+    {
+      "stableId": "DEPS-G1",
+      "kind": "execution",
+      "issue": 127,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/127",
+      "title": "[DEPS-G1] Future major: ratatui + crossterm coupled unit (three-crate backend pairing)",
+      "question": "When a ratatui release drops the crossterm_0_29 feature pairing, what does the coupled ratatui+crossterm migration require across pi, pi-ext, and pi-tui — including the real PTY evidence the TUI surface demands — as one atomic major commit with the full seven-target post-audit?",
+      "acceptance": "- The coupled rule is codified in this policy: ratatui and crossterm never move independently; a future ratatui major implicitly carries a crossterm major because upgrading crossterm alone breaks the crossterm_0_29 feature pairing in three crates (crates/pi-tui/Cargo.toml, crates/pi-ext/Cargo.toml, crates/pi/Cargo.toml).\n- The migration dossier assembles before the first edit: primary upstream changelog/migration for both crate lines, callsite census across pi, pi-ext, and pi-tui, codemod check, deprecations-as-errors, license re-check, peer compat matrix.\n- Real PTY evidence the TUI surface demands (not headless-stub approximations) is produced for the backend pairing change.\n- The migration lands as exactly one atomic major commit `chore(deps)!: bump ratatui+crossterm …`, triggering the full Class S post-audit including seven-target verification with both musl artifacts and the performance non-regression gate.\n- A separate generated-doc-only commit follows iff a generator-consumed constant moved.",
+      "nativeParent": "EXT-23",
+      "blockers": [
+        "PAR-CLOSE",
+        "EXT-23"
+      ]
+    },
+    {
+      "stableId": "DEPS-R2",
+      "kind": "execution",
+      "issue": 128,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/128",
+      "title": "[DEPS-R2] Stand up the out-of-band CVE/yanked-version remediation runbook with the shipped-exposure predicate checker",
+      "question": "Codify the fastest-correct-path process for CVE/yanked remediation that supersedes cadence and epoch scheduling, land the fail-closed shipped-exposure predicate checker (E1 field/edge position via package.json surfaces + cargo metadata dep-graph diff; E2 zero bundler-metafile reachability on every compiled-host entry; E3 no shipped-byte production incl. scripts/release/CI staging exclusions; E4 no archive staging), and classify each remediation Class S/E from it: Class S (any shipped dependency, non-exempt lockfile subgraph, shipped-byte-producing toolchain, compiled host, or bundled runtime — explicitly including npm/Bun remediations such as typebox or extension-host runtime deps and Bun runtime version bumps) runs the full seven-target post-audit including both musl artifact build/static-link/unpack/handshake proofs, non-compressible, alongside never-compressible lockfile law, cargo deny/advisory scans, and SBOM diff; Class E (complete E1–E4 bundle) skips only the seven-target lane; compressible gates are changelog depth and cross-fix batching, never the lane itself for Class S; divergent fixes route back into the bin schedule with their verdicts recorded in the invariant ledger.",
+      "acceptance": "- The runbook codifies that CVE/yank remediation supersedes cadence and epoch scheduling at any point in the campaign, with diversion recorded and the fix routed back into the bin schedule afterward.\n- The Class S / Class E decision table is recorded over shipped inputs, not ecosystems: npm/Bun remediations (typebox, extension-host runtime dependencies, Bun binary/bundler or embedded-runtime version bumps) are explicitly Class S and run the full seven-target lane; no Rust-touching carve-out exists.\n- The fail-closed predicate checker is landed and operational: E1 field/edge position (npm devDependencies-only across all three package.json surfaces; Rust `kind = \"dev\"` edges only via cargo metadata dep-graph diff, never manifest text); E2 zero bundler-metafile reachability for every `--compile` entry vs the pre-change metafile; E3 no shipped-byte production (scripts/release/** and CI staging invocation scan); E4 no archive staging (staged-input table enumerated from the assembly script source).\n- Fail-closed behavior is demonstrated on a synthetic probe: a deliberately tool-shaped input that crashes or makes a check undecidable yields Class S, not exemption.\n- The checker is wired into the remediation runbook's tooling and the CI manifest/lockfile-path checks; its classifications of known members (typebox expecting Class S; @types/bun expecting its recorded verdict) are sanity-checked.\n- Permanence rules recorded: lockfile law (frozen installs + difft), advisory scans, and SBOM diff are never class-dependent; only the seven-target lane is skippable for Class E; compressible gates are changelog depth and cross-fix batching, never the lane; every verdict is logged per change in the invariant ledger (per-change, never a permanent package label).",
+      "nativeParent": "EXT-23",
+      "blockers": [
+        "EXT-23"
+      ]
+    },
+    {
+      "stableId": "DOC-A",
+      "kind": "execution",
+      "issue": 129,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/129",
+      "title": "[DOC-A] Doc-evidence ledger and closed-class sync-boundary checker",
+      "question": "Land the doc-evidence program foundation in exactly two atomic commits. A1 (new files only): scripts/verification/docs-evidence.json ledger enumerating every surface from the EXT-24 inventory (root policy docs, 29+3 reference corpus topics, crate/package README slots, CLI help surfaces, CHANGELOG slots, version references, compatibility matrices, release instructions, generated artifacts, platform matrix), docs-evidence.ts checker entrypoint, docs-evidence-runners.ts implementing the seven closed evidence classes (version-pin, generated-block, fenced-compile, transcript-claim, matrix-count, review-only-prose, changelog-unreleased), scripts/tests/docs-evidence.test.ts, and docs/evidence.md — zero changes to existing files, no row may carry a command/argv string, sidecars bind contentHash+toolVersion+runId and staleness fails the run, sync-docs auto-edits confined to registered version-pin labels and ## [Unreleased] appends, exactly one reference-pin literal (8fa7eebd235355522c8104166b4f1f959b4e2f10) enforced. A2 (wiring only): one compat-matrix.json row invoking the checker plus the CI call-site, after A1 passes.",
+      "acceptance": "- bun run scripts/verification/docs-evidence.ts exits 0 on the current tree and nonzero under a mutation suite asserted individually per class: missing runner param, unknown class name, tampered contentHash, stale toolVersion, runId older than a required re-proof, arbitrary command field present, review-only surface edited without matching non-stale evidence\n- Ledger row count equals the EXT-24 inventory surface count asserted programmatically against the inventory artifact, and every row carries an owner and a closed class\n- A1 commit contains exactly the six named new files; A2 commit contains exactly the compat-matrix row and CI wiring; no other files appear in either\n- Exactly one reference-pin literal (8fa7eebd235355522c8104166b4f1f959b4e2f10) is recorded; a test injects the stale hash 4488ad55c18f07ae89a489096c90de8667b3adfb into a scratch ledger fixture and asserts the checker fails",
+      "nativeParent": "EXT-16",
+      "blockers": [
+        "EXT-24",
+        "VER-ALIGN"
+      ]
+    },
+    {
+      "stableId": "DEPS-D1",
+      "kind": "execution",
+      "issue": 130,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/130",
+      "title": "[DEPS-D1] Closing audit and generated-doc handoff to DOC-F",
+      "question": "Publish the final constants, the generated-doc-only commit SHA, the closing-audit evidence, and the shipped-change invariant ledger (every shipped-input change carrying seven-target incl. both musl artifacts or a complete E1–E4 bundle) as the record that satisfies the DOC-F → DEPS-D1 blocking edge, so the documentation plan's final all-scope audit runs only on final, post-upgrade constants.",
+      "acceptance": "- The invariant-ledger git-log audit over the shipped-input path set (all Cargo.toml/Cargo.lock, all three package.json surfaces, bun.lock, rust-toolchain.toml, CI toolchain pins, compiled-host build scripts, scripts/release staging inputs) passes: every change carries either seven-target evidence incl. both musl artifacts — explicitly including any npm/Bun remediation, extension-host or protocol runtime-dependency change, Bun binary/bundler version change, or toolchain change — or a complete recorded E1–E4 exemption bundle; zero with neither; zero exempt by author judgment alone.\n- Any Class E claim carrying an absent or incomplete bundle is reclassified Class S retroactively and the seven-target lane runs before closure.\n- Commit history contains exactly the prescribed atomic units; zero upgrade work mixed into parity/behavior/optimization commits and zero behavior work inside upgrade commits (git-log audit of manifest/lockfile/toolchain paths vs behavior paths).\n- Closing full audit evidence package (deny, advisories, SBOM final diff, difft, freshness re-scan, performance, final seven-target incl. both musl artifacts) is published with the final constants and the generated-doc-only commit SHA.\n- The DOC-F → DEPS-D1 blocker edge is satisfied and recorded in the ticket DAG before the documentation plan's final audit starts.\n- All graduated tickets carry stable DEPS-* IDs and every blocked_by resolves by exact ID (EXT-23, PAR-CLOSE, EXT-26, DEPS-*); no unresolved prose-alias blockers remain.",
+      "nativeParent": "EXT-23",
+      "blockers": [
+        "DEPS-T1"
+      ]
+    },
+    {
+      "stableId": "DOC-G1",
+      "kind": "execution",
+      "issue": 132,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/132",
+      "title": "[DOC-G1] Fenced-snippet extraction and compile harness prototype",
+      "question": "Can one harness type-check Rust fenced snippets (rustdoc doctests) and TypeScript extension snippets (bun transpile plus import resolution against packages/pi-tui-protocol exports: PROTOCOL_VERSION, COMPATIBILITY_VERSION, Frame, Method, METHODS, ProtocolClient, Codec, and the landed extension contract) against the live workspace with deterministic failure attribution to doc:line — and what is the smallest harness-owned fixture shape (post-API-landing, under scripts/verification/fixtures/docs-snippets/, never derived from or referencing the five excluded example products) that exercises each documented public entrypoint without becoming a product?",
+      "acceptance": "- Prototype compiles both lanes (rust-doctest and ts-ext-snippet) against the live workspace with doc:line-attributed deterministic failures\n- Smallest fixture contract recorded per documented public entrypoint; fixture forbidden from referencing or copying any excluded example product\n- Go/no-go findings and the lane runner interfaces recorded for DOC-D consumption",
+      "nativeParent": "EXT-16",
+      "blockers": [
+        "DOC-A"
+      ]
+    },
+    {
+      "stableId": "DOC-D",
+      "kind": "execution",
+      "issue": 133,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/133",
+      "title": "[DOC-D] Fenced-snippet compile harness, minimal contract fixtures, and crate READMEs",
+      "question": "Land the fenced-compile harness per DOC-G1 (two lanes extending docs-evidence-runners.ts), harness-owned minimal fixtures under scripts/verification/fixtures/docs-snippets/ (declared in the ledger as fenced-compile dependencies; allowed only for already-landed public APIs; forbidden from referencing or copying the excluded example products), crate READMEs documenting public imports and the fixed workspace topology (pi-agent->pi-ai; pi-ext->{pi-ai,pi-agent,pi-tui}; pi->{pi-ai,pi-agent,pi-ext,pi-tui}; pi-ai/pi-tui dependency-free, generated from workspace Cargo.toml edges so AGENTS.md and READMEs share one source), and public import tables generated from each crate's lib.rs surface and each package's export map — plus CI matrix wiring. Handshake symmetry statements cite one owner doc; other docs reference it. Boundary excludes: any example-product port, any examples/ tree, and any behavior change to crates, packages, or the extension host.",
+      "acceptance": "- CI runs the snippet harness over every docs/ and README file; a doc containing a stale import fails on compile, not review\n- cargo test --doc -p <crate> passes for all five Rust crates\n- A test enumerates imports across all registered fences and asserts resolution against live workspace exports in both lanes (rust-doctest, ts-ext-snippet)\n- A ledger assertion proves zero rows and zero fixtures reference any excluded example-product name and that no examples/ directory exists in the tree",
+      "nativeParent": "EXT-16",
+      "blockers": [
+        "DOC-C",
+        "PAR-CLOSE"
+      ]
+    },
+    {
+      "stableId": "MAP-1",
+      "kind": "execution",
+      "issue": 134,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/134",
+      "title": "[MAP-1] Build the canonical stable-ID DAG registry consuming the published ticket records",
+      "question": "Land docs/EXECUTION_MAP.md with one row per sibling ticket, the seven track-closer rows (PAR-CLOSE, XC-CLOSE, TUI-CLOSE, PERF-CLOSE, REL-CLOSE, DEPS-D1, DOC-F), the sibling-owned REL-DOCS row registered exactly once (release track #26 T10) plus the VER-ALIGN row, the external nodes (EXT-14/EXT-21/EXT-24/EXT-25/EXT-23/EXT-26), and MAP-ROOT; every blocked_by as exact canonical IDs only, including the closure edges REL-CLOSE<-REL-DOCS and DOC-F<-{PAR-CLOSE, XC-CLOSE, TUI-CLOSE, PERF-CLOSE, REL-CLOSE, REL-DOCS, DEPS-D1}; and a one-command graph tool that ingests the same published ticket records (never a shadow graph) asserting zero missing nodes, zero duplicate IDs, zero aliases, acyclicity, full reachability from MAP-ROOT and into MAP-6, all four graduation modalities populated, and zero closure paths bypassing REL-DOCS (required-edge membership plus dominance/delete-node simulation).",
+      "acceptance": "- The graph tool runs on one command against the published ticket records and reports zero missing nodes, zero duplicate IDs, zero aliases, zero cycles, zero orphan nodes, full MAP-ROOT-to-MAP-6 connectivity, and zero closure paths bypassing REL-DOCS.\n- Row count equals sibling graduate tickets + map tickets + the seven closers + external nodes + the single REL-DOCS row + the single VER-ALIGN row; every blocked_by resolves to exactly one existing row; 'EXT-PARITY', 'REL-PKGDOC', 'REL-T10', 'REL-G1', any S-suffixed 'DOCS-*' spelling, and 'six struct-literal' appear nowhere in the registry, arbitration text, or published ticket fields; REL-DOCS appears in exactly one row's ID field.\n- A per-invariant mutation suite proves each assertion fails loudly: drop the REL-CLOSE<-REL-DOCS edge -> bypass failure; rename one REL-DOCS reference -> missing-node failure; add a row duplicating an existing node under a second name -> duplicate/alias failure; remove one of DOC-F's required prerequisite edges -> missing-required-edge failure; introduce any cycle -> acyclicity failure.\n- The telemetry migration surface is pinned at exactly five AgentLoopConfig struct-literal sites: pi-agent/src/agent.rs, pi-agent/src/config.rs, pi-agent/src/run.rs, pi-agent/src/schedule.rs, pi/src/core/agent_session/mod.rs.\n- Atomic boundary held: docs/EXECUTION_MAP.md + the graph-check tool/test and its fixtures only; zero edits to crates/*/src, scripts/release/*, .github/workflows/*, or any sibling plan implementation.",
+      "nativeParent": "ROOT-12",
+      "blockers": []
+    },
+    {
+      "stableId": "DOC-G2",
+      "kind": "execution",
+      "issue": 135,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/135",
+      "title": "[DOC-G2] Adversarial review of the doc-evidence program before DOC-C/D/E fan out",
+      "question": "Adversarially audit the landed DOC-A/DOC-B evidence program before the corpus, harness, and release-consume phases fan out. Which surface can still drift undetected: stale sidecars reused after code changes (contentHash recompute), a TS/Rust constant fork accepted by a single-source read, generated-doc-only dependency commits touching non-DOC-B-owned blocks, fixtures quietly accreting example-product behavior (inject a disguised example-product import), Unreleased entries without commit evidence, or a docs phase quietly regaining release-packaging implementation scope that REL-DOCS owns — and does the checker catch each injected drift with a named failing mutation?",
+      "acceptance": "- Each injected drift class is caught by a named failing mutation, or returned as a blocking objection — no softened rewording of gaps\n- Stale-sidecar reuse, constant-fork acceptance, out-of-band deps doc edits, disguised example-product imports, and evidence-free Unreleased entries all produce distinct checker failures\n- Any fix lands inside DOC-A/DOC-B boundaries; verdict recorded and gates DOC-C/DOC-E start",
+      "nativeParent": "EXT-16",
+      "blockers": [
+        "DOC-A",
+        "DOC-B",
+        "DOC-G1"
+      ]
+    },
+    {
+      "stableId": "DOC-E",
+      "kind": "execution",
+      "issue": 136,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/136",
+      "title": "[DOC-E] CHANGELOG discipline, release instructions, generated-artifact guards, seven-row platform matrix (consume-only)",
+      "question": "Land consume-only release evidence surfaces — hard-blocked on REL-CLOSE with no fallback branch. Root CHANGELOG.md keeps ## [Unreleased] as the only sync-docs auto-appendable section, with a docs-owned consumer test proving REL-DOCS's release gate: package-release (dry-run and full build) fails when CHANGELOG.md is absent or its Unreleased section is empty, for every release build (gate implementation lives on the release track, never here). docs/release.md carries every release command in fenced blocks extraction-tested through parseReleaseArgs/dry-run so instructions cannot name a flag the parser rejects. The platform support matrix is generated from landed RUST_TARGETS/TARGET_PLANS (triple, bunTarget incl. -baseline, archive kind, archiveDir — all seven triples incl. both musl) and cross-asserted entry-for-entry against the landed release-verification CI matrix. Each scripts/generate-*.ts rerun is a byte-stable offline no-op (generated-block rows); release.json semantics are generated from the stage.ts type, not paraphrased; the extension compatibility narrative cites the extension track's frames.jsonl as evidence. Boundary excludes scripts/release/* and .github/workflows/* entirely.",
+      "acceptance": "- bun run scripts/package-release.ts --target <each of the seven triples> --dry-run succeeds (consume-only execution of landed release tooling) and the docs/release.md extraction test passes for every fenced command\n- Platform matrix row count == landed RUST_TARGETS.length == 7 and matches the landed CI matrix exactly (single assertion fails on divergence)\n- The release-path CHANGELOG gate is proven present by the consumer test in both dry-run and full-build modes; generate-*.ts idempotence assertions exit clean in CI\n- A boundary audit of the phase commit proves no file under scripts/release/ or .github/workflows/ was touched",
+      "nativeParent": "EXT-16",
+      "blockers": [
+        "DOC-B",
+        "DOC-C",
+        "REL-CLOSE"
+      ]
+    },
+    {
+      "stableId": "DOC-C",
+      "kind": "execution",
+      "issue": 137,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/137",
+      "title": "[DOC-C] User-doc corpus port with behavior-transcript evidence",
+      "question": "Port the user-doc corpus (docs/ tree: 29 coding-agent + 3 agent-core topics + index, enumerated at checker time from .references/pi at the settled pin — never hardcoded) with per-topic evidence sidecars under docs/evidence/<topic>.json and fresh transcript artifacts under target/verification/ from the existing harnesses (e2e-smoke, rpc-parity, pty, runtime, session-interop). docs/index.md lists a topic only with a non-stale sidecar; unprovable topics land under a pending list, never aspirational prose. Every behavior claim maps to a transcript-claim row (CLI help tables from executed --help snapshots of target/release/pi, session formats vs session-interop fixtures, JSON stream vs rpc-parity, provider/config vs e2e-smoke, release-script CLI vs the parseReleaseArgs flag set). Terminal-visual topics (tui, windows, termux, tmux, terminal-setup) carry sidecars bound to the terminal track's versioned transcript schema, claim nothing beyond landed TUI-CLOSE/EXT-25 evidence, and cannot be registered earlier; .references/pi is read-only; zero edits to terminal schema, harness internals, crates, or packages; prose is review-only with evidence attached, never auto-fixed.",
+      "acceptance": "- bun run scripts/verification/docs-evidence.ts proves every shipped docs/ topic has at least one non-stale sidecar whose harness executed in the current run (fresh artifact under target/verification/ bound by contentHash + runId)\n- Index topic list equals the reference corpus enumerated at the pinned commit 8fa7eebd235355522c8104166b4f1f959b4e2f10 (count computed, not hardcoded); CLI help tables and their snapshot source derive from the same artifact\n- Every fenced example in ported topics is registered with the DOC-D fenced-compile harness by path (cross-ledger assertion); inline imports reference only landed public entrypoints (pi-ai, pi-agent, pi; extension-host '.', './sanitize', './protocol'; pi-tui-protocol '.')\n- Terminal-visual topic sidecars carry the terminal transcript schema's toolVersion and grades consistent with the landed evidence; attempts to register those topics before TUI-CLOSE/EXT-25 land fail the checker",
+      "nativeParent": "EXT-16",
+      "blockers": [
+        "DOC-A",
+        "DOC-B",
+        "DOC-G2",
+        "PAR-CLOSE",
+        "XC-CLOSE",
+        "TUI-CLOSE",
+        "EXT-25"
+      ]
+    },
+    {
+      "stableId": "DOC-F",
+      "kind": "execution",
+      "issue": 138,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/138",
+      "title": "[DOC-F] Publication verification, root README, final generated-docs rerun, all-scope audit (consume-only)",
+      "question": "Close the documentation track after every sibling track and the dependency campaign land. Root README.md mirrors the reference structure (package catalog, development workflow, binary builds, supply-chain policy) with every claim ledger-linked. Verify REL-DOCS landed consume-only: a docs-owned test runs the landed release tooling (dry-run across all seven triples plus consuming the REL-CLOSE verification artifacts) against the final docs/ tree and asserts every one of the seven archives contains docs/, README.md, CHANGELOG.md, and release.json whose per-file digest table covers every documentation member, with evidence sidecars binding each surface's contentHash to the release runId. Execute the final DOC-B regeneration after DEPS-D1's last toolchain commit and prove byte-stability. Run the full-tree sync-docs audit (zero HIGH/MEDIUM, enumerated LOW dispositions, retained artifact) and attach the ledger, matrix doc, sidecar set, and CI artifact to issue #16 as the evidence answer. Boundary owns only README/generated-doc/evidence outputs: zero files under scripts/release/ or .github/workflows/; no examplesSource, no examples/ tree.",
+      "acceptance": "- All seven release archives (dry-run output plus consumed REL-CLOSE verification artifacts) contain docs/, README.md, CHANGELOG.md, release.json, and matching .sha256 sidecars and pass checksum verification — asserted consume-only with zero files under scripts/release/ or .github/workflows/ edited\n- The DOC-B regeneration after the dependencies track's final toolchain commit is byte-stable\n- All-scope sync-docs report: zero HIGH, zero MEDIUM; every LOW item has an explicit owner disposition; report retained as the evidence artifact\n- Root README crate catalog rows equal the workspace members array (asserted)\n- Every ledger row is status present with a non-stale sidecar; the final CI artifact names the runId covering all rows\n- Phase start re-verified against all seven gates (PAR-CLOSE, XC-CLOSE, TUI-CLOSE, PERF-CLOSE, REL-CLOSE, REL-DOCS, DEPS-D1) from artifacts, not prose status; the ledger refuses to mark rows final while any gate is open",
+      "nativeParent": "EXT-16",
+      "blockers": [
+        "PAR-CLOSE",
+        "XC-CLOSE",
+        "TUI-CLOSE",
+        "PERF-CLOSE",
+        "REL-CLOSE",
+        "REL-DOCS",
+        "DEPS-D1",
+        "DOC-D",
+        "DOC-E"
+      ]
+    },
+    {
+      "stableId": "DOC-B",
+      "kind": "execution",
+      "issue": 139,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/139",
+      "title": "[DOC-B] Pinned-version and compatibility-matrix generation",
+      "question": "Land scripts/verification/generate-compat-docs.ts and the generated docs/compatibility.md blocks it owns: workspace version (Cargo.toml + root package.json cross-checked equal), pi-tui-protocol and extension-host versions, PROTOCOL_VERSION and COMPATIBILITY_VERSION (TS/Rust double-owner constants cross-asserted equal inside the generator — a disagreement fails generation), BUN_RUNTIME_VERSION, RELEASE_MANIFEST_SCHEMA, engine floors (node>=22.19.0, bun>=1.3.0, rust-version), and the settled reference pin, with a machine-readable section embedding the compat-matrix.json row inventory as metadata. Snapshot-generated surfaces (telemetry docs, model catalog) classify as generated-block rows; the sync-docs safe-fix whitelist narrows to this generator's blocks plus registered badge/version lines; constants the dependency campaign will change are consumed only through version-pin ledger rows pointing at this generator.",
+      "acceptance": "- Two consecutive generator runs produce a byte-identical docs/compatibility.md and CI fails on any committed/generated drift\n- Every registered pin constant appears in the generated doc exactly once; a test asserts no semver literal appears that is absent from registered source constants\n- TS/Rust double-owner constants (PROTOCOL_VERSION, COMPATIBILITY_VERSION) cross-asserted equal; disagreement fails generation\n- After each dependency epoch commit, rerunning the generator in a generated-doc-only commit is byte-stable everywhere except the changed constant's block; the final rerun after the last toolchain commit passes before DOC-F starts\n- No hand-edited version number exists anywhere else in the docs tree",
+      "nativeParent": "EXT-16",
+      "blockers": [
+        "DOC-A",
+        "EXT-14",
+        "EXT-21"
+      ]
+    },
+    {
+      "stableId": "MAP-4",
+      "kind": "execution",
+      "issue": 140,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/140",
+      "title": "[MAP-4] Encode the six integration sequencing gates as registry predicates",
+      "question": "Encode G-FREEZE, G-MIRROR, G-RELINFRA, G-PARCLOSE, G-DEPCLOSE, and G-ALLTRACKS as mechanical predicates over registry node statuses keyed on actual resolution — G-FREEZE (PAR-P1 frozen) unblocks DEPS start, PERF floor ledgers, and the REL target model; G-MIRROR (XC-P2 established) precedes PAR ratification; G-RELINFRA (EXT-26 available) precedes TUI V-proof, DEPS post-epoch re-gate, and DOC-E/DOC-F; G-PARCLOSE precedes XC-CLOSE and DOC-C; G-DEPCLOSE precedes DOC-F; G-ALLTRACKS (all seven closers resolved) precedes MAP-5 — plus the dependency-law edges (no epoch before PAR-CLOSE and EXT-23; every shipped-artifact remediation re-gates on the EXT-26 both-musl seven-target proof) and the G-RELDOCS predicate (REL-DOCS resolved before REL-CLOSE or DOC-F may resolve, realized as the registry closure edges).",
+      "acceptance": "- Gate predicates evaluate mechanically over actual node resolution; a simulated out-of-order status fails the check: a DEPS node marked ready before PAR-CLOSE resolves, and REL-CLOSE or DOC-F marked resolved while REL-DOCS is still open.\n- No track-start edge contradicts the wayfinder ordering: parity before dependency; extension mirror before parity ratification; release infrastructure before terminal proof; documentation staging before release or documentation closure.\n- Atomic boundary held: registry gate-predicate definitions plus their checker only; the map schedules, it does not execute sibling tracks.",
+      "nativeParent": "ROOT-12",
+      "blockers": [
+        "MAP-2",
+        "MAP-3"
+      ]
+    },
+    {
+      "stableId": "MAP-3",
+      "kind": "execution",
+      "issue": 141,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/141",
+      "title": "[MAP-3] Stand up the Decisions-so-far index, map update rules, and fog-graduation lint",
+      "question": "Land the append-only Decisions-so-far index on #12 (every settled wayfinder decision and every closed frontier decision with its owning stable ticket ID and the rejected option's one-line rationale; a decision reopens only via a new ticket, never an implementation PR), the update rule that re-runs the graph check against the unchanged published records on every status flip (including the alias and REL-DOCS-bypass assertions) and forbids inline scope creep, and a fog-graduation lint that blocks #12 closure while any shipped-surface fog node is ungraduated.",
+      "acceptance": "- The index lists every settled wayfinder decision plus each closed frontier decision with an owner ID and rejected-option rationale.\n- The fog lint confirms no shipped-surface fog node is ungraduated.\n- A dry-run status flip on one node re-triggers the graph check against the unchanged published records, and the same run still reports zero aliases and zero REL-DOCS bypass paths.\n- Atomic boundary held: #12 index/protocol sections plus the fog/decision lint tool only; no sibling scope edits.",
+      "nativeParent": "ROOT-12",
+      "blockers": [
+        "MAP-1"
+      ]
+    },
+    {
+      "stableId": "MAP-2",
+      "kind": "execution",
+      "issue": 142,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/142",
+      "title": "[MAP-2] Ratify the fifteen arbitration rulings (telemetry fixed at five sites; cfg(unix) and REL-DOCS folded in) and insert binding edges",
+      "question": "Do AR1-AR15 each close their cited review finding while assigning exactly one owning sibling ticket ID and adding only integration edges — including AR3's five-site telemetry boundary (agent.rs, config.rs, run.rs, schedule.rs, pi/src/core/agent_session/mod.rs), AR2's cfg(unix) platform contract for PAR-P6 transports (Unix gated, transport-neutral client plus in-memory adapter portable to windows-msvc, typed result on non-Unix, same commit), AR1's mirror lockstep witness owned solely by XC-P2, and AR5's REL-DOCS ownership with DOC-F consume-only plus the binding edges REL-CLOSE blocked_by REL-DOCS and DOC-F blocked_by REL-DOCS, REL-CLOSE, and DOC-F's existing closure prerequisites?",
+      "acceptance": "- Each of the fifteen rulings closes at least one review finding and names exactly one owner; a cross-check shows no surface ends with two owners (mirror witness = XC, release constants plus documentation staging = REL under the single REL-DOCS row, extension-host endpoint = pi-ext, config-value = one parser/one cache, telemetry = PAR at five sites).\n- The DAG re-passes MAP-1's graph check after edge insertion: still acyclic, all blocked_by values exact canonical IDs, zero duplicates, zero aliases, full reachability, zero REL-DOCS bypass paths.\n- Binding edges are inserted exactly as specified: XC mirror witness precedes PAR ratification; DOC-A depends on VER-ALIGN; DOC-E/DOC-F depend on REL constants read-only; DOC-F depends on DEPS-D1; TUI V-proof depends on EXT-26 plus the portable transcript harness; PERF scaling lane bound to pi_ext::server::serve_io.\n- Atomic boundary held: arbitration ruling records on #12 plus registry edge/owner updates only; no sibling implementation, no witness code authored here.",
+      "nativeParent": "ROOT-12",
+      "blockers": [
+        "MAP-1"
+      ]
+    },
+    {
+      "stableId": "MAP-6",
+      "kind": "execution",
+      "issue": 143,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/143",
+      "title": "[MAP-6] Close issue #12 on a green graph and green ledger",
+      "question": "Close #12 with a comment linking the canonical registry, the Decisions-so-far index, the six gate results (including G-RELDOCS), every track closer by stable ID (PAR-CLOSE, XC-CLOSE, TUI-CLOSE, PERF-CLOSE, REL-CLOSE, DEPS-D1, DOC-F) marked resolved, the single REL-DOCS row marked resolved, and the single green nine-witness ledger run; flip all registry statuses to closed and confirm no shipped-surface fog node remains ungraduated and every frontier decision appears in the index with a rejected-option rationale.",
+      "acceptance": "- All seven track-closer nodes resolved AND the MAP-5 ledger green on one command; the graph check at closure reports the DAG fully closed with no open shipped-surface node, zero aliases, and the REL-DOCS dominance invariant intact.\n- The #12 closing comment cites the exact command and its green output as the single global closing proof.\n- Atomic boundary held: issue #12 closure comment plus final registry status flips only.",
+      "nativeParent": "ROOT-12",
+      "blockers": [
+        "MAP-5"
+      ]
+    },
+    {
+      "stableId": "MAP-5",
+      "kind": "execution",
+      "issue": 144,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/144",
+      "title": "[MAP-5] Execute the final nine-witness cross-plan gate ledger against the final tree (single global closing gate)",
+      "question": "Run W1-W9 on one command against the final workspace tree after DOC-F lands: W1 fixed topology (exactly five workspace members; edges pi-agent->pi-ai, pi-ext->{pi-ai,pi-agent,pi-tui}, pi->all four; pi-ai/pi-tui zero workspace deps); W2 deep-module ownership; W3 observable extension compatibility (invoke the XC-owned mirror lockstep and witness lattices, mutations demonstrably caught); W4 PTY polish scope (AR11 gate clean); W5 floor-seeking performance (invoke PERF's per-lane report, AR12); W6 dependency/docs ordering (generator re-ran after DEPS-T1 and before DOC-F; no mixed behavior+upgrade commit; graph re-check confirms zero aliases and zero REL-DOCS bypass on the final records); W7 seven-target release incl. both musl (invoke REL's seven-leg workflow: build, static-link, QEMU/native unpack, compiled extension host, bundled Bun incl. sidecar-cannot-execute fallback, SHA-256 pins with mismatch guard, provenance attested, post-epoch re-gates green); W8 cleanup/minimalism; W9 no-shim (no compatibility shims, no second parser/cache/owner, config_value and A8 dispositions executed).",
+      "acceptance": "- One command runs W1-W9 against the final tree and reports all nine green; each witness prints the sibling artifact/command it invoked so nothing is silently stubbed.\n- W3, W5, and W7 are shown to call the sibling-owned check by name/path (never a map-local copy), and a targeted mutation to each of the W1, W3, and W7 surfaces makes the ledger fail, proving it is load-bearing and non-duplicating.\n- W6's graph re-check inside the ledger still reports zero aliases and zero REL-DOCS bypass paths on the final published records, so a late registry mutation cannot reopen the alias or bypass under a green nine-witness run.\n- Atomic boundary held: the ledger aggregator script/test plus its invocation wiring only; it authors no product code and duplicates no sibling witness logic.",
+      "nativeParent": "ROOT-12",
+      "blockers": [
+        "MAP-4",
+        "PAR-CLOSE",
+        "XC-CLOSE",
+        "TUI-CLOSE",
+        "PERF-CLOSE",
+        "REL-CLOSE",
+        "DEPS-D1",
+        "DOC-F",
+        "REL-R2",
+        "DEPS-R3",
+        "DEPS-R2",
+        "DEPS-G1",
+        "DOC-D",
+        "DOC-E"
+      ]
+    },
+    {
+      "stableId": "VER-ALIGN",
+      "kind": "execution",
+      "issue": 145,
+      "url": "https://github.com/metaphorics/pi-oxidized/issues/145",
+      "title": "[VER-ALIGN] Align workflow reference pin to canonical baseline",
+      "question": "Update the verification-owned stale reference checkout and literal to the settled .references/pi commit 8fa7eebd235355522c8104166b4f1f959b4e2f10 before any dependent documentation, parity, or release evidence runs.",
+      "acceptance": "- Every verification and workflow reference literal resolves to 8fa7eebd235355522c8104166b4f1f959b4e2f10\n- The reference checkout command reproduces that commit\n- No generated reference artifact is hand-edited",
+      "nativeParent": "ROOT-12",
+      "blockers": []
+    }
+  ]
+}
