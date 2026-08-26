@@ -858,6 +858,7 @@ mod tests {
             after_tool_call: None,
             on_payload: None,
             on_response: None,
+            telemetry: crate::telemetry::noop_context(),
         }
     }
 

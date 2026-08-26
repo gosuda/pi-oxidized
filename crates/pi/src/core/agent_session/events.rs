@@ -23,6 +23,18 @@ pub enum CompactionReason {
     Overflow,
 }
 
+impl CompactionReason {
+    /// Wire discriminant.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Threshold => "threshold",
+            Self::Overflow => "overflow",
+        }
+    }
+}
+
 /// Source of a summarization retry attempt (mirrors TS `_summarizationRetryCallbacks`).
 ///
 /// `branchSummary` carries no reason; `compaction` carries the trigger reason.

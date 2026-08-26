@@ -14,6 +14,7 @@ pub mod queue;
 pub mod run;
 pub mod schedule;
 pub mod state;
+pub mod telemetry;
 pub mod tool;
 
 pub use agent::{Agent, AgentOptions};
@@ -41,6 +42,11 @@ pub use schedule::{
     execute_tool_calls, fail_tool_calls_from_truncated_message, should_terminate_tool_batch,
 };
 pub use state::{AgentState, AgentStateSnapshot};
+pub use telemetry::{
+    AGENT_TELEMETRY_SCHEMAS, AI_TELEMETRY_SCHEMA, AttributeValue, HARNESS_TELEMETRY_SCHEMA,
+    InMemoryTelemetryContext, RecordedEvent, RecordedSpan, SpanAttributes, SpanOptions,
+    SpanStatus, TelemetryContext, TelemetrySchema, TelemetrySpan, noop_context,
+};
 pub use tool::{
     AgentTool, AgentToolResult, ToolExecutionMode, ToolUpdates, error_tool_result, to_pi_tool,
 };

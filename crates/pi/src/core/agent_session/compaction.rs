@@ -43,6 +43,11 @@ use super::AgentSession;
 use super::events::{AgentSessionEvent, CompactionReason, SummarizationRetrySource};
 use super::extension_runner::ExtensionRunner;
 use super::tree::SummarizationAuth;
+use pi_agent::telemetry::{
+    AiOperation, AiRequestStart, HarnessCompactionStart, SpanStatus,
+    contained, start_ai_request_span, start_harness_compaction_span,
+    contained, start_ai_request_span, start_harness_compaction_span,
+};
 
 // ---------------------------------------------------------------------------
 // Resolved auth + stream source for compaction
@@ -419,6 +424,20 @@ impl AgentSession {
     ) -> Result<Option<CompactionResult>, CompactionError> {
         let model = self.model();
 
+        // Start a pi.harness.compaction span through the session telemetry
+        // context. The span is contained: a panicking telemetry backend
+        // degrades to a no-op span and never affects the compaction outcome.
+        let session_id = self.session_id().await;
+        let compaction_span = start_harness_compaction_span(
+            self.telemetry.as_ref(),
+            HarnessCompactionStart {
+                session_id: session_id.clone(),
+                lane_name: "main".to_owned(),
+                operation_id: format!("compaction-{}", reason.as_str()),
+                recovery: will_retry,
+            },
+        );
+
         // Snapshot path entries + settings under the session-manager lock,
         // then release before any await.
         let (path_entries, settings) = {
@@ -432,6 +451,7 @@ impl AgentSession {
         let path_refs: Vec<&SessionEntry> = path_entries.iter().collect();
         let preparation = prepare_compaction(&path_refs, pure_settings)?;
         let Some(preparation) = preparation else {
+            drop(compaction_span);
             return Ok(None);
         };
 
@@ -444,6 +464,7 @@ impl AgentSession {
             let event = AgentSessionEvent::CompactionStart { reason };
             let cancel = self.extension_before_compact(&runner, event).await?;
             if cancel.cancel {
+                drop(compaction_span);
                 return Err(CompactionError::Cancelled);
             }
             if let Some(replacement) = cancel.compaction {
@@ -451,6 +472,7 @@ impl AgentSession {
                 // invoking the pure summariser.
                 let mut replacement = replacement;
                 replacement.from_hook = Some(true);
+                drop(compaction_span);
                 return self
                     .finalize_compaction_result(replacement, true, reason, will_retry, &abort_token)
                     .await
@@ -463,6 +485,18 @@ impl AgentSession {
         let retry = self.summarization_retry_policy();
         let retry_callbacks =
             self.summarization_retry_callbacks(SummarizationRetrySource::Compaction { reason });
+
+        let ai_span = start_ai_request_span(
+            compaction_span.as_ref(),
+            AiRequestStart {
+                operation: AiOperation::Stream,
+                provider: model.provider.clone(),
+                model: model.id.clone(),
+                api: model.provider.clone(),
+                streaming: true,
+                deferred: None,
+            },
+        );
 
         let result = compaction::compact(
             &preparation,
@@ -480,7 +514,28 @@ impl AgentSession {
                 hooks: None,
             },
         )
-        .await?;
+        .await;
+
+        match &result {
+            Ok(_) => {
+                contained(|| ai_span.set_status(SpanStatus::Ok), || ());
+            }
+            Err(err) => {
+                contained(
+                    || {
+                        ai_span.set_status(SpanStatus::Error {
+                            name: None,
+                            message: Some(err.to_string()),
+                        });
+                    },
+                    || (),
+                );
+            }
+        }
+        drop(ai_span);
+        drop(compaction_span);
+
+        let result = result?;
 
         // Persist + rebuild + extension session_compact.
         self.finalize_compaction_result(result, false, reason, will_retry, &abort_token)

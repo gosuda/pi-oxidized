@@ -422,6 +422,8 @@ pub struct AgentSession {
     /// is held across `.await`; acquire it before any `lock_inner()`, never
     /// hold `lock_inner` across an await.
     pub(super) bind_lock: AsyncMutex<()>,
+    /// Shared telemetry context for span emission (same Arc as agent config).
+    pub(super) telemetry: Arc<dyn pi_agent::telemetry::TelemetryContext>,
 }
 
 /// Errors from [`AgentSession::new`].
@@ -460,6 +462,8 @@ impl AgentSession {
                 .model
                 .clone()
                 .unwrap_or_else(pi_agent::state::default_model);
+            let telemetry =
+                crate::core::telemetry::resolve_session_telemetry(&config.settings_manager);
             let mut base = config.base_config.unwrap_or_else(|| AgentLoopConfig {
                 model: model.clone(),
                 reasoning: None,
@@ -486,6 +490,7 @@ impl AgentSession {
                 after_tool_call: None,
                 on_payload: None,
                 on_response: None,
+                telemetry: crate::core::telemetry::resolve_session_telemetry(&config.settings_manager),
             });
             base.before_tool_call = Some(hooks.before_tool_call_hook());
             base.after_tool_call = Some(hooks.after_tool_call_hook());
@@ -500,6 +505,7 @@ impl AgentSession {
                 provider,
             })
         };
+        let telemetry = agent.telemetry();
 
         let retry = config.settings_manager.get_retry_settings();
         let compaction = config.settings_manager.get_compaction_settings();
@@ -531,6 +537,7 @@ impl AgentSession {
             runtime_handle: Mutex::new(None),
             extension_registry_cancel: CancellationToken::new(),
             bind_lock: AsyncMutex::new(()),
+            telemetry,
         });
 
         // Build the initial tool registry from configured base tools and active

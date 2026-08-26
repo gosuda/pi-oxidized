@@ -223,6 +223,8 @@ pub struct AgentLoopConfig {
     pub on_payload: Option<OnPayloadFn>,
     /// Optional response inspection callback.
     pub on_response: Option<OnResponseFn>,
+    /// Telemetry context for span emission. Defaults to no-op.
+    pub telemetry: Arc<dyn crate::telemetry::TelemetryContext>,
 }
 
 impl AgentLoopConfig {
@@ -386,6 +388,7 @@ mod tests {
             after_tool_call: None,
             on_payload: None,
             on_response: None,
+            telemetry: crate::telemetry::noop_context(),
         }
     }
 

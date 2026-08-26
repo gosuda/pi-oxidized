@@ -85,6 +85,7 @@ fn default_base_config() -> AgentLoopConfig {
         after_tool_call: None,
         on_payload: None,
         on_response: None,
+        telemetry: crate::telemetry::noop_context(),
     }
 }
 
@@ -298,6 +299,12 @@ impl Agent {
     pub fn clear_queues(&self) {
         lock(&self.inner.steering).clear();
         lock(&self.inner.follow_up).clear();
+    }
+
+    /// Returns the telemetry context from the base config.
+    #[must_use]
+    pub fn telemetry(&self) -> Arc<dyn crate::telemetry::TelemetryContext> {
+        Arc::clone(&self.inner.base_config.telemetry)
     }
 
     /// Returns true when either queue still contains pending messages.
