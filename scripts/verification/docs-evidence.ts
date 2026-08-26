@@ -33,6 +33,7 @@ import {
 	checkStaleness,
 	isEvidenceClass,
 	runEvidence,
+	scanForExampleProductImports,
 } from "./docs-evidence-runners.ts";
 
 export const REPO_ROOT = resolve(import.meta.dirname, "../..");
@@ -266,6 +267,12 @@ export function runCheck(
 		problems.push(
 			`[inventory] ledger has ${ledger.rows.length} rows, inventory has ${expectedCount} surfaces`,
 		);
+	}
+
+	// 2b. Scan for disguised example-product imports (DOC-G2 adversarial hardening)
+	const importFindings = scanForExampleProductImports(root);
+	for (const finding of importFindings) {
+		problems.push(`[example-product-import] ${finding}`);
 	}
 
 	// 3. Run each row's evidence class runner

@@ -18,7 +18,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 // ---------------------------------------------------------------------------
@@ -379,6 +379,12 @@ export function runChangelogUnreleased(row: LedgerRow, root: string, runId: stri
 	const rest = content.slice(idx);
 	const nextSection = rest.slice(3).search(/^## /m);
 	const section = nextSection === -1 ? rest : rest.slice(0, nextSection + 3);
+	// Check for evidence-free Unreleased entries (DOC-G2 adversarial hardening)
+	const evidenceProblems = checkUnreleasedEntriesHaveEvidence(row.id, section);
+	if (evidenceProblems.length > 0) {
+		return failResult(row, runId, ...evidenceProblems);
+	}
+
 	return okResult(row, sha256(section), runId);
 }
 
@@ -466,4 +472,92 @@ export function checkStaleness(
 
 function escapeRegex(s: string): string {
 	return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// ---------------------------------------------------------------------------
+// DOC-G2 adversarial hardening: evidence-free Unreleased entry detection
+// ---------------------------------------------------------------------------
+
+/** Patterns that count as commit evidence in a CHANGELOG bullet entry. */
+const COMMIT_SHA_RE = /\b[0-9a-f]{7,40}\b/i;
+const ISSUE_REF_RE = /\[#\d+\]|\(#\d+\)/;
+const URL_RE = /https?:\/\/./;
+
+/**
+ * Check that every bullet entry under ## [Unreleased] carries commit evidence
+ * (a commit SHA, a PR/issue reference like [#NNN], or a URL).
+ * Returns a list of problem strings for entries that lack all three.
+ */
+export function checkUnreleasedEntriesHaveEvidence(
+	rowId: string,
+	section: string,
+): string[] {
+	const problems: string[] = [];
+	for (const line of section.split("\n")) {
+		if (!/^\s*[-*]\s+\S/.test(line)) continue;
+		if (COMMIT_SHA_RE.test(line) || ISSUE_REF_RE.test(line) || URL_RE.test(line)) continue;
+		problems.push(
+			`[${rowId}] evidence-free Unreleased entry (no commit SHA, PR/issue ref, or URL): ${line.trim()}`,
+		);
+	}
+	return problems;
+}
+
+// ---------------------------------------------------------------------------
+// DOC-G2 adversarial hardening: disguised example-product import detection
+// ---------------------------------------------------------------------------
+
+/** Directories whose .ts files are scanned for disguised example-product imports. */
+export const EXAMPLE_PRODUCT_SCAN_DIRS = [
+	"scripts/tests",
+	"scripts/verification",
+] as const;
+
+/** Path segment that identifies the example-product (reference corpus) tree. */
+export const EXAMPLE_PRODUCT_MARKER = ".references/pi/";
+
+/**
+ * Scan test and verification .ts files for value import statements referencing
+ * the example-product tree (.references/pi/).  A disguised import accretes
+ * example-product behavior into the evidence program and is a drift class
+ * the checker must catch.  Type-only imports are skipped (erased at runtime).
+ *
+ * Returns a list of findings: "file:line — disguised example-product import".
+ */
+export function scanForExampleProductImports(root: string): string[] {
+	const findings: string[] = [];
+	for (const dir of EXAMPLE_PRODUCT_SCAN_DIRS) {
+		scanDirForExampleProductImports(join(root, dir), findings);
+	}
+	return findings;
+}
+
+function scanDirForExampleProductImports(dir: string, findings: string[]): void {
+	if (!existsSync(dir)) return;
+	for (const entry of readdirSync(dir)) {
+		const fullPath = join(dir, entry);
+		let stat;
+		try {
+			stat = statSync(fullPath);
+		} catch {
+			continue;
+		}
+		if (stat.isDirectory()) {
+			scanDirForExampleProductImports(fullPath, findings);
+		} else if (entry.endsWith(".ts")) {
+			const content = readFileSync(fullPath, "utf8");
+			const lines = content.split("\n");
+			for (let i = 0; i < lines.length; i++) {
+				const line = lines[i];
+				if (line === undefined) continue;
+				// Flag value imports/re-exports (not type-only) referencing the example-product tree.
+				// Type-only imports are erased at runtime and do not accrete behavior.
+				const isValueImport = /^\s*import\s(?!type\s)/.test(line);
+				const isValueReExport = /^\s*export\s+(?!type\s).*\bfrom\s/.test(line);
+				if (line.includes(EXAMPLE_PRODUCT_MARKER) && (isValueImport || isValueReExport)) {
+					findings.push(`${fullPath}:${i + 1} — disguised example-product import`);
+				}
+			}
+		}
+	}
 }

@@ -2789,7 +2789,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             .enqueue_bash(command.to_owned(), exclude_from_context)
             .await
         {
-            self.last_error = Some("a bash command is already running".to_owned());
+            self.last_error = Some("A bash command is already running. Press Esc to cancel it first.".to_owned());
             return ActionOutcome::Repaint;
         }
         self.view.editor.border = EditorBorder::Bash;
@@ -6003,7 +6003,7 @@ impl SessionHost for AgentSessionHost {
             Ok(vec![super::state::SettingsRow {
                 id: "defaultProjectTrust".to_owned(),
                 label: "Default project trust".to_owned(),
-                description: Some("Trust policy for newly discovered project dirs".to_owned()),
+                description: Some("Fallback behavior when no extension or saved trust decision decides project trust".to_owned()),
                 current_value: format!("{trust:?}").to_lowercase(),
                 values: Some(vec![
                     "ask".to_owned(),
@@ -7786,7 +7786,7 @@ mod tests {
         let _ = rt.dispatch_bash("second", false).await;
         assert_eq!(
             rt.last_error.as_deref(),
-            Some("a bash command is already running")
+            Some("A bash command is already running. Press Esc to cancel it first.")
         );
         tokio::time::timeout(Duration::from_secs(1), log.bash_started.notified())
             .await
