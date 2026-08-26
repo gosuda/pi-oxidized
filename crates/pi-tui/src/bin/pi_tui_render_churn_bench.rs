@@ -48,16 +48,19 @@ const FRAMES: usize = 300;
 
 /// Writer that discards all output, mirroring `NullTerminal` in the upstream
 /// benchmark.  Keeps terminal I/O out of the measurement.
-struct NullWriter;
+struct NullWriter {
+    bytes_written: u64,
+}
 
 impl NullWriter {
     const fn new() -> Self {
-        Self
+        Self { bytes_written: 0 }
     }
 }
 
 impl Write for NullWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.bytes_written += u64::try_from(buf.len()).unwrap_or(u64::MAX);
         Ok(buf.len())
     }
 

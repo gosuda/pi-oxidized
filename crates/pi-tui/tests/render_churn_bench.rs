@@ -15,58 +15,23 @@
 //! It also asserts the benchmark produces non-zero results (wall time and
 //! allocation) for both scenarios, proving the workload actually executes.
 
-use std::path::PathBuf;
 use std::process::Command;
 
 use serde_json::Value;
 
-/// Build the benchmark binary in release mode and return its path.
-///
-/// Follows the repo convention from `transcript_ext_gauntlet.rs`: build the
-/// fixture binary before spawning it, so the test works on a clean checkout
-/// and never validates a stale binary.
-fn ensure_bench_binary() -> PathBuf {
-    // If CARGO_BIN_EXE is set (running via cargo test), use that.
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_pi_tui_render_churn_bench") {
-        let path = PathBuf::from(path);
-        if path.exists() {
-            return path;
-        }
-    }
-
-    // Build the binary in release mode.
-    let status = Command::new("cargo")
-        .args([
-            "build",
-            "-p",
-            "pi-tui",
-            "--bin",
-            "pi_tui_render_churn_bench",
-            "--release",
-        ])
-        .status()
-        .unwrap_or_else(|e| panic!("failed to spawn cargo build: {e}"));
-    assert!(
-        status.success(),
-        "cargo build for benchmark binary failed"
-    );
-
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/release/pi_tui_render_churn_bench");
-    assert!(
-        path.exists(),
-        "benchmark binary missing after build at {}",
-        path.display()
-    );
-    path
+/// Path to the benchmark binary (built in release mode).
+fn bench_binary() -> String {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    format!("{manifest_dir}/../../target/release/pi_tui_render_churn_bench")
 }
 
 /// Run the benchmark binary and parse the `__BENCH_JSON__` output.
+#[expect(clippy::unwrap_used, clippy::expect_used, reason = "test-only code")]
 fn run_bench() -> Value {
-    let binary = ensure_bench_binary();
+    let binary = bench_binary();
     let output = Command::new(&binary)
         .output()
-        .unwrap_or_else(|e| panic!("failed to spawn benchmark binary: {e}"));
+        .unwrap_or_else(|e| panic!("failed to spawn benchmark binary {binary}: {e}"));
 
     assert!(
         output.status.success(),
@@ -94,6 +59,7 @@ fn json_f64(v: &Value) -> Option<f64> {
 }
 
 #[test]
+#[expect(clippy::expect_used, reason = "test-only assertions")]
 fn benchmark_parameters_match_upstream() {
     let json = run_bench();
 
@@ -126,7 +92,7 @@ fn benchmark_parameters_match_upstream() {
     // Transcript: 150 lines (matches buildTranscript loop 0..150)
     let transcript_lines = json["transcriptLines"]
         .as_u64()
-        .unwrap_or_else(|| panic!("transcriptLines must be present"));
+        .expect("transcriptLines must be present");
     assert!(
         transcript_lines >= 150,
         "transcript must have at least 150 source lines, got {transcript_lines}"
@@ -163,15 +129,16 @@ fn benchmark_produces_nonzero_results_for_both_scenarios() {
 }
 
 #[test]
+#[expect(clippy::expect_used, reason = "test-only assertions")]
 fn editor_scenario_allocates_more_than_static() {
     let json = run_bench();
 
     let static_alloc = json["scenarios"]["static"]["allocatedBytes"]
         .as_u64()
-        .unwrap_or_else(|| panic!("static allocatedBytes must be present"));
+        .expect("static allocatedBytes must be present");
     let editor_alloc = json["scenarios"]["editor"]["allocatedBytes"]
         .as_u64()
-        .unwrap_or_else(|| panic!("editor allocatedBytes must be present"));
+        .expect("editor allocatedBytes must be present");
 
     // The editor scenario appends one character per frame, invalidating the
     // editor cache and causing additional allocation.  It should allocate

@@ -1,0 +1,492 @@
+=== TUI-P2 Deterministic Contrast Measurement Report ===
+
+Thresholds (pinned):
+  WCAG AA normal text:  >= 4.5
+  WCAG AA large text:   >= 3
+  WCAG minimum:        >= 1.3
+  CIEDE2000:           >= 2.3 (and WCAG ratio >= 1.25)
+
+--- dark / truecolor ---
+fg-slot                  bg-slot          category   wcag-ratio deltaE2000  flags
+------------------------------------------------------------------------------------------
+text                     default          text          17.9375    91.2958  OK
+dim                      default          text           8.0307    52.7943  OK
+muted                    default          text           8.0307    52.7943  OK
+thinkingText             default          text           8.0307    52.7943  OK
+toolOutput               default          text          17.9375    91.2958  OK
+mdQuote                  default          quote         17.9375    91.2958  OK
+mdLinkUrl                default          link-suffix     8.0307    52.7943  OK
+mdLink                   default          link           8.3861    59.2845  OK
+mdHeading                default          markdown       8.3861    59.2845  OK
+mdCode                   default          markdown       6.8136    54.6641  OK
+mdCodeBlock              default          markdown      17.9375    91.2958  OK
+mdListBullet             default          markdown       8.3861    59.2845  OK
+mdHr                     default          markdown       1.5464    11.8041  wcag-aa-normal<4.5, wcag-aa-large<3.0
+toolDiffAdded            default          diff-add       9.5701    65.9840  OK
+toolDiffRemoved          default          diff-remove     5.2751    49.0034  OK
+toolDiffContext          default          diff-context    17.9375    91.2958  OK
+syntaxComment            default          syntax         8.0307    52.7943  OK
+syntaxKeyword            default          syntax        19.1587    95.4845  OK
+syntaxFunction           default          syntax         7.1471    56.5416  OK
+syntaxVariable           default          syntax        17.9375    91.2958  OK
+syntaxString             default          syntax        19.4165    97.5031  OK
+syntaxNumber             default          syntax         9.2201    64.3841  OK
+syntaxType               default          syntax        10.0219    65.9528  OK
+syntaxOperator           default          syntax         8.0307    52.7943  OK
+syntaxPunctuation        default          syntax         8.0307    52.7943  OK
+border                   default          border         2.1902    19.1914  wcag-aa-normal<4.5, wcag-aa-large<3.0
+borderMuted              default          border         1.5464    11.8041  wcag-aa-normal<4.5, wcag-aa-large<3.0
+borderAccent             default          border         4.6928    46.2174  OK
+mdQuoteBorder            default          border         2.1902    19.1914  wcag-aa-normal<4.5, wcag-aa-large<3.0
+mdCodeBlockBorder        default          border         1.5464    11.8041  wcag-aa-normal<4.5, wcag-aa-large<3.0
+thinkingOff              default          border         8.0307    52.7943  OK
+thinkingMinimal          default          border         8.0307    52.7943  OK
+thinkingLow              default          border         8.3861    59.2845  OK
+thinkingMedium           default          border        10.0219    65.9528  OK
+thinkingHigh             default          border         9.2201    64.3841  OK
+thinkingXhigh            default          border         5.2751    49.0034  OK
+thinkingMax              default          border         5.2751    49.0034  OK
+bashMode                 default          border        10.0219    65.9528  OK
+accent                   default          accent         8.3861    59.2845  OK
+success                  default          status         9.5701    65.9840  OK
+error                    default          status         5.2751    49.0034  OK
+warning                  default          status        11.6202    73.5018  OK
+toolTitle                default          tool           8.3861    59.2845  OK
+userMessageText          userMessageBg    user-message    14.8662    83.8805  OK
+customMessageText        customMessageBg  custom-message    14.8502    85.3723  OK
+customMessageLabel       customMessageBg  custom-message     6.9355    51.8879  OK
+toolOutput               toolPendingBg    tool-pending    14.8662    83.8805  OK
+toolOutput               toolSuccessBg    tool-success    14.1350    82.6834  OK
+toolOutput               toolErrorBg      tool-error    15.0448    86.6781  OK
+toolDiffAdded            toolSuccessBg    diff-add-on-success-bg     7.5414    56.4661  OK
+toolDiffRemoved          toolErrorBg      diff-remove-on-error-bg     4.4244    39.6181  wcag-aa-normal<4.5
+text                     selectedBg       selected      12.4266    72.8859  OK
+accent                   selectedBg       selected       5.8097    51.5469  OK
+toolTitle                toolPendingBg    tool-pending     6.9503    55.1185  OK
+toolTitle                toolSuccessBg    tool-success     6.6084    61.6022  OK
+toolTitle                toolErrorBg      tool-error     7.0338    61.2072  OK
+
+  flagged: 6 / 56 pairs
+
+--- dark / forced-256 ---
+fg-slot                  bg-slot          category   wcag-ratio deltaE2000  flags
+------------------------------------------------------------------------------------------
+text                     default          text          18.0999    91.8583  OK
+dim                      default          text           7.8383    51.9482  OK
+muted                    default          text           7.8383    51.9482  OK
+thinkingText             default          text           7.8383    51.9482  OK
+toolOutput               default          text          18.0999    91.8583  OK
+mdQuote                  default          quote         18.0999    91.8583  OK
+mdLinkUrl                default          link-suffix     7.8383    51.9482  OK
+mdLink                   default          link           9.0626    61.5978  OK
+mdHeading                default          markdown       9.0626    61.5978  OK
+mdCode                   default          markdown       7.2387    56.0433  OK
+mdCodeBlock              default          markdown      18.0999    91.8583  OK
+mdListBullet             default          markdown       9.0626    61.5978  OK
+mdHr                     default          markdown       1.5911    12.4370  wcag-aa-normal<4.5, wcag-aa-large<3.0
+toolDiffAdded            default          diff-add      10.8854    70.8819  OK
+toolDiffRemoved          default          diff-remove     7.0541    55.5595  OK
+toolDiffContext          default          diff-context    18.0999    91.8583  OK
+syntaxComment            default          syntax         7.8383    51.9482  OK
+syntaxKeyword            default          syntax        19.6374    97.6812  OK
+syntaxFunction           default          syntax         6.9703    56.6009  OK
+syntaxVariable           default          syntax        18.0999    91.8583  OK
+syntaxString             default          syntax        19.1747    97.2279  OK
+syntaxNumber             default          syntax        10.0214    67.2804  OK
+syntaxType               default          syntax        11.3392    71.1542  OK
+syntaxOperator           default          syntax         7.8383    51.9482  OK
+syntaxPunctuation        default          syntax         7.8383    51.9482  OK
+border                   default          border         2.1561    18.8643  wcag-aa-normal<4.5, wcag-aa-large<3.0
+borderMuted              default          border         1.5911    12.4370  wcag-aa-normal<4.5, wcag-aa-large<3.0
+borderAccent             default          border         4.0809    44.7152  wcag-aa-normal<4.5
+mdQuoteBorder            default          border         2.1561    18.8643  wcag-aa-normal<4.5, wcag-aa-large<3.0
+mdCodeBlockBorder        default          border         1.5911    12.4370  wcag-aa-normal<4.5, wcag-aa-large<3.0
+thinkingOff              default          border         7.8383    51.9482  OK
+thinkingMinimal          default          border         7.8383    51.9482  OK
+thinkingLow              default          border         9.0626    61.5978  OK
+thinkingMedium           default          border        11.3392    71.1542  OK
+thinkingHigh             default          border        10.0214    67.2804  OK
+thinkingXhigh            default          border         7.0541    55.5595  OK
+thinkingMax              default          border         7.0541    55.5595  OK
+bashMode                 default          border        11.3392    71.1542  OK
+accent                   default          accent         9.0626    61.5978  OK
+success                  default          status        10.8854    70.8819  OK
+error                    default          status         7.0541    55.5595  OK
+warning                  default          status        11.3840    72.6429  OK
+toolTitle                default          tool           9.0626    61.5978  OK
+userMessageText          userMessageBg    user-message    14.6885    82.6426  OK
+customMessageText        customMessageBg  custom-message    15.5331    90.4379  OK
+customMessageLabel       customMessageBg  custom-message     7.5512    52.9759  OK
+toolOutput               toolPendingBg    tool-pending    14.6885    82.6426  OK
+toolOutput               toolSuccessBg    tool-success    18.0999    91.8583  OK
+toolOutput               toolErrorBg      tool-error    12.1755    75.4889  OK
+toolDiffAdded            toolSuccessBg    diff-add-on-success-bg    10.8854    70.8819  OK
+toolDiffRemoved          toolErrorBg      diff-remove-on-error-bg     4.7452    39.4572  OK
+text                     selectedBg       selected      13.0436    75.1839  OK
+accent                   selectedBg       selected       6.5309    54.6611  OK
+toolTitle                toolPendingBg    tool-pending     7.3545    57.0153  OK
+toolTitle                toolSuccessBg    tool-success     9.0626    61.5978  OK
+toolTitle                toolErrorBg      tool-error     6.0963    65.0783  OK
+
+  flagged: 6 / 56 pairs
+
+--- light / truecolor ---
+fg-slot                  bg-slot          category   wcag-ratio deltaE2000  flags
+------------------------------------------------------------------------------------------
+text                     default          text          17.9278    88.8844  OK
+dim                      default          text           4.5422    36.8588  OK
+muted                    default          text           8.4532    54.3706  OK
+thinkingText             default          text           8.4532    54.3706  OK
+toolOutput               default          text           8.4532    54.3706  OK
+mdQuote                  default          quote          8.4532    54.3706  OK
+mdLinkUrl                default          link-suffix     3.2340    28.1800  wcag-aa-normal<4.5
+mdLink                   default          link           5.3557    49.7842  OK
+mdHeading                default          markdown       5.3557    49.7842  OK
+mdCode                   default          markdown       5.7839    51.0735  OK
+mdCodeBlock              default          markdown       8.4532    54.3706  OK
+mdListBullet             default          markdown       5.3557    49.7842  OK
+mdHr                     default          markdown       1.2030     4.3157  wcag-aa-normal<4.5, wcag-aa-large<3.0, wcag-minimum<1.3
+toolDiffAdded            default          diff-add       5.2480    47.9467  OK
+toolDiffRemoved          default          diff-remove     5.4123    50.7431  OK
+toolDiffContext          default          diff-context     8.4532    54.3706  OK
+syntaxComment            default          syntax         3.2340    28.1800  wcag-aa-normal<4.5
+syntaxKeyword            default          syntax         5.3557    49.7842  OK
+syntaxFunction           default          syntax         7.7765    60.3470  OK
+syntaxVariable           default          syntax        17.9278    88.8844  OK
+syntaxString             default          syntax         5.2480    47.9467  OK
+syntaxNumber             default          syntax         5.6153    49.8760  OK
+syntaxType               default          syntax         5.2383    46.3116  OK
+syntaxOperator           default          syntax         8.4532    54.3706  OK
+syntaxPunctuation        default          syntax         8.4532    54.3706  OK
+border                   default          border         1.6559    11.8704  wcag-aa-normal<4.5, wcag-aa-large<3.0
+borderMuted              default          border         1.2030     4.3157  wcag-aa-normal<4.5, wcag-aa-large<3.0, wcag-minimum<1.3
+borderAccent             default          border         4.5057    46.3765  OK
+mdQuoteBorder            default          border         1.6559    11.8704  wcag-aa-normal<4.5, wcag-aa-large<3.0
+mdCodeBlockBorder        default          border         1.2030     4.3157  wcag-aa-normal<4.5, wcag-aa-large<3.0, wcag-minimum<1.3
+thinkingOff              default          border         2.3779    20.5894  wcag-aa-normal<4.5, wcag-aa-large<3.0
+thinkingMinimal          default          border         8.4532    54.3706  OK
+thinkingLow              default          border         5.3557    49.7842  OK
+thinkingMedium           default          border         5.2383    46.3116  OK
+thinkingHigh             default          border         5.6153    49.8760  OK
+thinkingXhigh            default          border         5.4123    50.7431  OK
+thinkingMax              default          border         5.4123    50.7431  OK
+bashMode                 default          border         5.2383    46.3116  OK
+accent                   default          accent         4.5057    46.3765  OK
+success                  default          status         5.2480    47.9467  OK
+error                    default          status         4.0459    45.2530  wcag-aa-normal<4.5
+warning                  default          status         5.6153    49.8760  OK
+toolTitle                default          tool           5.3557    49.7842  OK
+userMessageText          userMessageBg    user-message    16.0142    87.0366  OK
+customMessageText        customMessageBg  custom-message    16.6075    87.8743  OK
+customMessageLabel       customMessageBg  custom-message     4.7970    42.4445  OK
+toolOutput               toolPendingBg    tool-pending     7.5509    52.2047  OK
+toolOutput               toolSuccessBg    tool-success     7.9814    54.3595  OK
+toolOutput               toolErrorBg      tool-error     7.5435    52.7357  OK
+toolDiffAdded            toolSuccessBg    diff-add-on-success-bg     4.9551    43.5060  OK
+toolDiffRemoved          toolErrorBg      diff-remove-on-error-bg     4.8298    47.1997  OK
+text                     selectedBg       selected      14.3644    83.4883  OK
+accent                   selectedBg       selected       3.6101    42.6712  wcag-aa-normal<4.5
+toolTitle                toolPendingBg    tool-pending     4.7840    47.8328  OK
+toolTitle                toolSuccessBg    tool-success     5.0568    53.9136  OK
+toolTitle                toolErrorBg      tool-error     4.7793    48.4911  OK
+
+  flagged: 10 / 56 pairs
+
+--- light / forced-256 ---
+fg-slot                  bg-slot          category   wcag-ratio deltaE2000  flags
+------------------------------------------------------------------------------------------
+text                     default          text          18.7337    92.5588  OK
+dim                      default          text           4.5422    36.8588  OK
+muted                    default          text           8.3211    53.8804  OK
+thinkingText             default          text           8.3211    53.8804  OK
+toolOutput               default          text           8.3211    53.8804  OK
+mdQuote                  default          quote          8.3211    53.8804  OK
+mdLinkUrl                default          link-suffix     3.4522    29.8202  wcag-aa-normal<4.5
+mdLink                   default          link           5.8041    51.3932  OK
+mdHeading                default          markdown       5.8041    51.3932  OK
+mdCode                   default          markdown       5.1792    49.0672  OK
+mdCodeBlock              default          markdown       8.3211    53.8804  OK
+mdListBullet             default          markdown       5.8041    51.3932  OK
+mdHr                     default          markdown       1.1602     3.4666  wcag-aa-normal<4.5, wcag-aa-large<3.0, wcag-minimum<1.3
+toolDiffAdded            default          diff-add       4.5348    44.0429  OK
+toolDiffRemoved          default          diff-remove     5.3993    51.1516  OK
+toolDiffContext          default          diff-context     8.3211    53.8804  OK
+syntaxComment            default          syntax         3.4522    29.8202  wcag-aa-normal<4.5
+syntaxKeyword            default          syntax         5.8041    51.3932  OK
+syntaxFunction           default          syntax         6.9734    57.8506  OK
+syntaxVariable           default          syntax        18.7337    92.5588  OK
+syntaxString             default          syntax         4.5348    44.0429  OK
+syntaxNumber             default          syntax         4.7089    45.9858  OK
+syntaxType               default          syntax         4.5348    44.0429  OK
+syntaxOperator           default          syntax         8.3211    53.8804  OK
+syntaxPunctuation        default          syntax         8.3211    53.8804  OK
+border                   default          border         1.7081    12.6106  wcag-aa-normal<4.5, wcag-aa-large<3.0
+borderMuted              default          border         1.1602     3.4666  wcag-aa-normal<4.5, wcag-aa-large<3.0, wcag-minimum<1.3
+borderAccent             default          border         5.1459    50.2168  OK
+mdQuoteBorder            default          border         1.7081    12.6106  wcag-aa-normal<4.5, wcag-aa-large<3.0
+mdCodeBlockBorder        default          border         1.1602     3.4666  wcag-aa-normal<4.5, wcag-aa-large<3.0, wcag-minimum<1.3
+thinkingOff              default          border         2.3779    20.5894  wcag-aa-normal<4.5, wcag-aa-large<3.0
+thinkingMinimal          default          border         8.3211    53.8804  OK
+thinkingLow              default          border         5.8041    51.3932  OK
+thinkingMedium           default          border         4.5348    44.0429  OK
+thinkingHigh             default          border         4.7089    45.9858  OK
+thinkingXhigh            default          border         5.3993    51.1516  OK
+thinkingMax              default          border         5.3993    51.1516  OK
+bashMode                 default          border         4.5348    44.0429  OK
+accent                   default          accent         5.1459    50.2168  OK
+success                  default          status         4.5348    44.0429  OK
+error                    default          status         3.8765    43.9540  wcag-aa-normal<4.5
+warning                  default          status         4.7089    45.9858  OK
+toolTitle                default          tool           5.8041    51.3932  OK
+userMessageText          userMessageBg    user-message    16.1465    88.6197  OK
+customMessageText        customMessageBg  custom-message    18.7337    92.5588  OK
+customMessageLabel       customMessageBg  custom-message     4.5178    45.7705  OK
+toolOutput               toolPendingBg    tool-pending     7.1719    51.0082  OK
+toolOutput               toolSuccessBg    tool-success     8.3211    53.8804  OK
+toolOutput               toolErrorBg      tool-error     8.3211    53.8804  OK
+toolDiffAdded            toolSuccessBg    diff-add-on-success-bg     4.5348    44.0429  OK
+toolDiffRemoved          toolErrorBg      diff-remove-on-error-bg     5.3993    51.1516  OK
+text                     selectedBg       selected      14.7340    84.1196  OK
+accent                   selectedBg       selected       4.0473    46.2096  wcag-aa-normal<4.5
+toolTitle                toolPendingBg    tool-pending     5.0025    48.8015  OK
+toolTitle                toolSuccessBg    tool-success     5.8041    51.3932  OK
+toolTitle                toolErrorBg      tool-error     5.8041    51.3932  OK
+
+  flagged: 10 / 56 pairs
+
+=== Rung Deltas (truecolor → forced-256) ===
+
+fg-slot                  bg-slot          polarity        fg-tc     fg-256      bg-tc     bg-256
+------------------------------------------------------------------------------------------
+text                     default          dark          #ededed    #eeeeee    #000000    #000000
+                                                           fg ΔE=  0.2112  bg ΔE=  0.0000
+dim                      default          dark          #a0a0a0    #9e9e9e    #000000    #000000
+                                                           fg ΔE=  0.6160  bg ΔE=  0.0000
+muted                    default          dark          #a0a0a0    #9e9e9e    #000000    #000000
+                                                           fg ΔE=  0.6160  bg ΔE=  0.0000
+thinkingText             default          dark          #a0a0a0    #9e9e9e    #000000    #000000
+                                                           fg ΔE=  0.6160  bg ΔE=  0.0000
+toolOutput               default          dark          #ededed    #eeeeee    #000000    #000000
+                                                           fg ΔE=  0.2112  bg ΔE=  0.0000
+mdQuote                  default          dark          #ededed    #eeeeee    #000000    #000000
+                                                           fg ΔE=  0.2112  bg ΔE=  0.0000
+mdLinkUrl                default          dark          #a0a0a0    #9e9e9e    #000000    #000000
+                                                           fg ΔE=  0.6160  bg ΔE=  0.0000
+mdLink                   default          dark          #50a8ff    #5fafff    #000000    #000000
+                                                           fg ΔE=  2.0540  bg ΔE=  0.0000
+mdHeading                default          dark          #50a8ff    #5fafff    #000000    #000000
+                                                           fg ΔE=  2.0540  bg ΔE=  0.0000
+mdCode                   default          dark          #ff518d    #ff5f87    #000000    #000000
+                                                           fg ΔE=  3.6703  bg ΔE=  0.0000
+mdCodeBlock              default          dark          #ededed    #eeeeee    #000000    #000000
+                                                           fg ΔE=  0.2112  bg ΔE=  0.0000
+mdListBullet             default          dark          #50a8ff    #5fafff    #000000    #000000
+                                                           fg ΔE=  2.0540  bg ΔE=  0.0000
+mdHr                     default          dark          #2e2e2e    #303030    #000000    #000000
+                                                           fg ΔE=  0.6383  bg ΔE=  0.0000
+toolDiffAdded            default          dark          #00ca52    #00d75f    #000000    #000000
+                                                           fg ΔE=  3.2633  bg ΔE=  0.0000
+toolDiffRemoved          default          dark          #f13242    #ff5f5f    #000000    #000000
+                                                           fg ΔE=  8.1858  bg ΔE=  0.0000
+toolDiffContext          default          dark          #ededed    #eeeeee    #000000    #000000
+                                                           fg ΔE=  0.2112  bg ΔE=  0.0000
+syntaxComment            default          dark          #a0a0a0    #9e9e9e    #000000    #000000
+                                                           fg ΔE=  0.6160  bg ΔE=  0.0000
+syntaxKeyword            default          dark          #ebf6ff    #d7ffff    #000000    #000000
+                                                           fg ΔE= 11.0909  bg ΔE=  0.0000
+syntaxFunction           default          dark          #c472fb    #d75fff    #000000    #000000
+                                                           fg ΔE=  4.1600  bg ΔE=  0.0000
+syntaxVariable           default          dark          #ededed    #eeeeee    #000000    #000000
+                                                           fg ΔE=  0.2112  bg ΔE=  0.0000
+syntaxString             default          dark          #daffe5    #d7ffd7    #000000    #000000
+                                                           fg ΔE=  4.0132  bg ΔE=  0.0000
+syntaxNumber             default          dark          #e99c00    #d7af00    #000000    #000000
+                                                           fg ΔE= 10.9281  bg ΔE=  0.0000
+syntaxType               default          dark          #00c9b5    #00d7af    #000000    #000000
+                                                           fg ΔE=  6.3370  bg ΔE=  0.0000
+syntaxOperator           default          dark          #a0a0a0    #9e9e9e    #000000    #000000
+                                                           fg ΔE=  0.6160  bg ΔE=  0.0000
+syntaxPunctuation        default          dark          #a0a0a0    #9e9e9e    #000000    #000000
+                                                           fg ΔE=  0.6160  bg ΔE=  0.0000
+border                   default          dark          #454545    #444444    #000000    #000000
+                                                           fg ΔE=  0.3343  bg ΔE=  0.0000
+borderMuted              default          dark          #2e2e2e    #303030    #000000    #000000
+                                                           fg ΔE=  0.6383  bg ΔE=  0.0000
+borderAccent             default          dark          #0071f6    #005fff    #000000    #000000
+                                                           fg ΔE=  6.4214  bg ΔE=  0.0000
+mdQuoteBorder            default          dark          #454545    #444444    #000000    #000000
+                                                           fg ΔE=  0.3343  bg ΔE=  0.0000
+mdCodeBlockBorder        default          dark          #2e2e2e    #303030    #000000    #000000
+                                                           fg ΔE=  0.6383  bg ΔE=  0.0000
+thinkingOff              default          dark          #a0a0a0    #9e9e9e    #000000    #000000
+                                                           fg ΔE=  0.6160  bg ΔE=  0.0000
+thinkingMinimal          default          dark          #a0a0a0    #9e9e9e    #000000    #000000
+                                                           fg ΔE=  0.6160  bg ΔE=  0.0000
+thinkingLow              default          dark          #50a8ff    #5fafff    #000000    #000000
+                                                           fg ΔE=  2.0540  bg ΔE=  0.0000
+thinkingMedium           default          dark          #00c9b5    #00d7af    #000000    #000000
+                                                           fg ΔE=  6.3370  bg ΔE=  0.0000
+thinkingHigh             default          dark          #e99c00    #d7af00    #000000    #000000
+                                                           fg ΔE= 10.9281  bg ΔE=  0.0000
+thinkingXhigh            default          dark          #f13242    #ff5f5f    #000000    #000000
+                                                           fg ΔE=  8.1858  bg ΔE=  0.0000
+thinkingMax              default          dark          #f13242    #ff5f5f    #000000    #000000
+                                                           fg ΔE=  8.1858  bg ΔE=  0.0000
+bashMode                 default          dark          #00c9b5    #00d7af    #000000    #000000
+                                                           fg ΔE=  6.3370  bg ΔE=  0.0000
+accent                   default          dark          #50a8ff    #5fafff    #000000    #000000
+                                                           fg ΔE=  2.0540  bg ΔE=  0.0000
+success                  default          dark          #00ca52    #00d75f    #000000    #000000
+                                                           fg ΔE=  3.2633  bg ΔE=  0.0000
+error                    default          dark          #f13242    #ff5f5f    #000000    #000000
+                                                           fg ΔE=  8.1858  bg ΔE=  0.0000
+warning                  default          dark          #ffb200    #ffaf00    #000000    #000000
+                                                           fg ΔE=  1.0720  bg ΔE=  0.0000
+toolTitle                default          dark          #50a8ff    #5fafff    #000000    #000000
+                                                           fg ΔE=  2.0540  bg ΔE=  0.0000
+userMessageText          userMessageBg    dark          #ededed    #eeeeee    #1a1a1a    #1c1c1c
+                                                           fg ΔE=  0.2112  bg ΔE=  0.6282
+customMessageText        customMessageBg  dark          #ededed    #eeeeee    #06193a    #00005f
+                                                           fg ΔE=  0.2112  bg ΔE= 12.6591
+customMessageLabel       customMessageBg  dark          #c58af9    #d787ff    #06193a    #00005f
+                                                           fg ΔE=  3.2676  bg ΔE= 12.6591
+toolOutput               toolPendingBg    dark          #ededed    #eeeeee    #1a1a1a    #1c1c1c
+                                                           fg ΔE=  0.2112  bg ΔE=  0.6282
+toolOutput               toolSuccessBg    dark          #ededed    #eeeeee    #00250a    #000000
+                                                           fg ΔE=  0.2112  bg ΔE= 20.0777
+toolOutput               toolErrorBg      dark          #ededed    #eeeeee    #330a11    #5f0000
+                                                           fg ΔE=  0.2112  bg ΔE= 13.7154
+toolDiffAdded            toolSuccessBg    dark          #00ca52    #00d75f    #00250a    #000000
+                                                           fg ΔE=  3.2633  bg ΔE= 20.0777
+toolDiffRemoved          toolErrorBg      dark          #f13242    #ff5f5f    #330a11    #5f0000
+                                                           fg ΔE=  8.1858  bg ΔE= 13.7154
+text                     selectedBg       dark          #ededed    #eeeeee    #292929    #262626
+                                                           fg ΔE=  0.2112  bg ΔE=  0.9481
+accent                   selectedBg       dark          #50a8ff    #5fafff    #292929    #262626
+                                                           fg ΔE=  2.0540  bg ΔE=  0.9481
+toolTitle                toolPendingBg    dark          #50a8ff    #5fafff    #1a1a1a    #1c1c1c
+                                                           fg ΔE=  2.0540  bg ΔE=  0.6282
+toolTitle                toolSuccessBg    dark          #50a8ff    #5fafff    #00250a    #000000
+                                                           fg ΔE=  2.0540  bg ΔE= 20.0777
+toolTitle                toolErrorBg      dark          #50a8ff    #5fafff    #330a11    #5f0000
+                                                           fg ΔE=  2.0540  bg ΔE= 13.7154
+text                     default          light         #171717    #121212    #ffffff    #ffffff
+                                                           fg ΔE=  1.3812  bg ΔE=  0.0000
+dim                      default          light         #767676    #767676    #ffffff    #ffffff
+                                                           fg ΔE=  0.0000  bg ΔE=  0.0000
+muted                    default          light         #4d4d4d    #4e4e4e    #ffffff    #ffffff
+                                                           fg ΔE=  0.3431  bg ΔE=  0.0000
+thinkingText             default          light         #4d4d4d    #4e4e4e    #ffffff    #ffffff
+                                                           fg ΔE=  0.3431  bg ΔE=  0.0000
+toolOutput               default          light         #4d4d4d    #4e4e4e    #ffffff    #ffffff
+                                                           fg ΔE=  0.3431  bg ΔE=  0.0000
+mdQuote                  default          light         #4d4d4d    #4e4e4e    #ffffff    #ffffff
+                                                           fg ΔE=  0.3431  bg ΔE=  0.0000
+mdLinkUrl                default          light         #8f8f8f    #8a8a8a    #ffffff    #ffffff
+                                                           fg ΔE=  1.7331  bg ΔE=  0.0000
+mdLink                   default          light         #0064e2    #005fd7    #ffffff    #ffffff
+                                                           fg ΔE=  2.1349  bg ΔE=  0.0000
+mdHeading                default          light         #0064e2    #005fd7    #ffffff    #ffffff
+                                                           fg ΔE=  2.1349  bg ΔE=  0.0000
+mdCode                   default          light         #c41562    #d7005f    #ffffff    #ffffff
+                                                           fg ΔE=  4.2085  bg ΔE=  0.0000
+mdCodeBlock              default          light         #4d4d4d    #4e4e4e    #ffffff    #ffffff
+                                                           fg ΔE=  0.3431  bg ΔE=  0.0000
+mdListBullet             default          light         #0064e2    #005fd7    #ffffff    #ffffff
+                                                           fg ΔE=  2.1349  bg ΔE=  0.0000
+mdHr                     default          light         #eaeaea    #eeeeee    #ffffff    #ffffff
+                                                           fg ΔE=  0.8499  bg ΔE=  0.0000
+toolDiffAdded            default          light         #107d32    #00875f    #ffffff    #ffffff
+                                                           fg ΔE=  9.5618  bg ΔE=  0.0000
+toolDiffRemoved          default          light         #d60020    #d70000    #ffffff    #ffffff
+                                                           fg ΔE=  5.2656  bg ΔE=  0.0000
+toolDiffContext          default          light         #4d4d4d    #4e4e4e    #ffffff    #ffffff
+                                                           fg ΔE=  0.3431  bg ΔE=  0.0000
+syntaxComment            default          light         #8f8f8f    #8a8a8a    #ffffff    #ffffff
+                                                           fg ΔE=  1.7331  bg ΔE=  0.0000
+syntaxKeyword            default          light         #0064e2    #005fd7    #ffffff    #ffffff
+                                                           fg ΔE=  2.1349  bg ΔE=  0.0000
+syntaxFunction           default          light         #7c00c9    #8700d7    #ffffff    #ffffff
+                                                           fg ΔE=  2.6211  bg ΔE=  0.0000
+syntaxVariable           default          light         #171717    #121212    #ffffff    #ffffff
+                                                           fg ΔE=  1.3812  bg ΔE=  0.0000
+syntaxString             default          light         #107d32    #00875f    #ffffff    #ffffff
+                                                           fg ΔE=  9.5618  bg ΔE=  0.0000
+syntaxNumber             default          light         #a64f00    #af5f00    #ffffff    #ffffff
+                                                           fg ΔE=  6.0029  bg ΔE=  0.0000
+syntaxType               default          light         #007a6e    #00875f    #ffffff    #ffffff
+                                                           fg ΔE=  9.9849  bg ΔE=  0.0000
+syntaxOperator           default          light         #4d4d4d    #4e4e4e    #ffffff    #ffffff
+                                                           fg ΔE=  0.3431  bg ΔE=  0.0000
+syntaxPunctuation        default          light         #4d4d4d    #4e4e4e    #ffffff    #ffffff
+                                                           fg ΔE=  0.3431  bg ΔE=  0.0000
+border                   default          light         #c9c9c9    #c6c6c6    #ffffff    #ffffff
+                                                           fg ΔE=  0.7467  bg ΔE=  0.0000
+borderMuted              default          light         #eaeaea    #eeeeee    #ffffff    #ffffff
+                                                           fg ΔE=  0.8499  bg ΔE=  0.0000
+borderAccent             default          light         #0070f7    #005fff    #ffffff    #ffffff
+                                                           fg ΔE=  6.0213  bg ΔE=  0.0000
+mdQuoteBorder            default          light         #c9c9c9    #c6c6c6    #ffffff    #ffffff
+                                                           fg ΔE=  0.7467  bg ΔE=  0.0000
+mdCodeBlockBorder        default          light         #eaeaea    #eeeeee    #ffffff    #ffffff
+                                                           fg ΔE=  0.8499  bg ΔE=  0.0000
+thinkingOff              default          light         #a8a8a8    #a8a8a8    #ffffff    #ffffff
+                                                           fg ΔE=  0.0000  bg ΔE=  0.0000
+thinkingMinimal          default          light         #4d4d4d    #4e4e4e    #ffffff    #ffffff
+                                                           fg ΔE=  0.3431  bg ΔE=  0.0000
+thinkingLow              default          light         #0064e2    #005fd7    #ffffff    #ffffff
+                                                           fg ΔE=  2.1349  bg ΔE=  0.0000
+thinkingMedium           default          light         #007a6e    #00875f    #ffffff    #ffffff
+                                                           fg ΔE=  9.9849  bg ΔE=  0.0000
+thinkingHigh             default          light         #a64f00    #af5f00    #ffffff    #ffffff
+                                                           fg ΔE=  6.0029  bg ΔE=  0.0000
+thinkingXhigh            default          light         #d60020    #d70000    #ffffff    #ffffff
+                                                           fg ΔE=  5.2656  bg ΔE=  0.0000
+thinkingMax              default          light         #d60020    #d70000    #ffffff    #ffffff
+                                                           fg ΔE=  5.2656  bg ΔE=  0.0000
+bashMode                 default          light         #007a6e    #00875f    #ffffff    #ffffff
+                                                           fg ΔE=  9.9849  bg ΔE=  0.0000
+accent                   default          light         #0070f7    #005fff    #ffffff    #ffffff
+                                                           fg ΔE=  6.0213  bg ΔE=  0.0000
+success                  default          light         #107d32    #00875f    #ffffff    #ffffff
+                                                           fg ΔE=  9.5618  bg ΔE=  0.0000
+error                    default          light         #fc0035    #ff005f    #ffffff    #ffffff
+                                                           fg ΔE= 10.1471  bg ΔE=  0.0000
+warning                  default          light         #a64f00    #af5f00    #ffffff    #ffffff
+                                                           fg ΔE=  6.0029  bg ΔE=  0.0000
+toolTitle                default          light         #0064e2    #005fd7    #ffffff    #ffffff
+                                                           fg ΔE=  2.1349  bg ΔE=  0.0000
+userMessageText          userMessageBg    light         #171717    #121212    #f2f2f2    #eeeeee
+                                                           fg ΔE=  1.3812  bg ΔE=  0.8365
+customMessageText        customMessageBg  light         #171717    #121212    #f0f7ff    #ffffff
+                                                           fg ΔE=  1.3812  bg ΔE=  4.6834
+customMessageLabel       customMessageBg  light         #8e4ec6    #875fd7    #f0f7ff    #ffffff
+                                                           fg ΔE=  5.6449  bg ΔE=  4.6834
+toolOutput               toolPendingBg    light         #4d4d4d    #4e4e4e    #f2f2f2    #eeeeee
+                                                           fg ΔE=  0.3431  bg ΔE=  0.8365
+toolOutput               toolSuccessBg    light         #4d4d4d    #4e4e4e    #ecfdec    #ffffff
+                                                           fg ΔE=  0.3431  bg ΔE= 10.8946
+toolOutput               toolErrorBg      light         #4d4d4d    #4e4e4e    #ffeef0    #ffffff
+                                                           fg ΔE=  0.3431  bg ΔE=  8.0449
+toolDiffAdded            toolSuccessBg    light         #107d32    #00875f    #ecfdec    #ffffff
+                                                           fg ΔE=  9.5618  bg ΔE= 10.8946
+toolDiffRemoved          toolErrorBg      light         #d60020    #d70000    #ffeef0    #ffffff
+                                                           fg ΔE=  5.2656  bg ΔE=  8.0449
+text                     selectedBg       light         #171717    #121212    #e6e6e6    #e4e4e4
+                                                           fg ΔE=  1.3812  bg ΔE=  0.4372
+accent                   selectedBg       light         #0070f7    #005fff    #e6e6e6    #e4e4e4
+                                                           fg ΔE=  6.0213  bg ΔE=  0.4372
+toolTitle                toolPendingBg    light         #0064e2    #005fd7    #f2f2f2    #eeeeee
+                                                           fg ΔE=  2.1349  bg ΔE=  0.8365
+toolTitle                toolSuccessBg    light         #0064e2    #005fd7    #ecfdec    #ffffff
+                                                           fg ΔE=  2.1349  bg ΔE= 10.8946
+toolTitle                toolErrorBg      light         #0064e2    #005fd7    #ffeef0    #ffffff
+                                                           fg ΔE=  2.1349  bg ΔE=  8.0449
+
+=== Summary ===
+  total pairs measured: 224
+  below WCAG AA normal (4.5): 32
+  below WCAG AA large (3.0):  22
+  below WCAG minimum (1.3):   6
+  below ΔE2000+ratio (2.3+1.25): 0
+  total flagged:              32
