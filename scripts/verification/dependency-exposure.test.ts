@@ -40,6 +40,7 @@ import {
 	resolvePathPair,
 	scanCorpusText,
 	selfTest,
+	runSelfTestMode,
 	shippingBuildCommandsForSide,
 	stagedSourcesForSide,
 	verdictFromChecks,
@@ -555,6 +556,37 @@ describe("dependency-exposure fail-closed integration", () => {
 		expect(first).toEqual([]);
 		expect(second).toEqual([]);
 	}, 1_200_000);
+
+	test("wave-3: self-test mode throws still emit DEPENDENCY_EXPOSURE_FAILED_CLOSED", async () => {
+		const errors: string[] = [];
+		const logs: string[] = [];
+		const originalError = console.error;
+		const originalLog = console.log;
+		console.error = (...args: unknown[]) => {
+			errors.push(args.map(String).join(" "));
+		};
+		console.log = (...args: unknown[]) => {
+			logs.push(args.map(String).join(" "));
+		};
+		try {
+			const code = await runSelfTestMode(async () => {
+				throw new Error("injected self-test setup failure");
+			});
+			expect(code).toBe(1);
+			expect(errors.some((line) => line.includes("injected self-test setup failure"))).toBe(true);
+			expect(errors.some((line) => line.includes(SENTINEL_FAILED))).toBe(true);
+			expect(logs.some((line) => line.includes("DEPENDENCY_EXPOSURE_OK"))).toBe(false);
+
+			errors.length = 0;
+			const violationCode = await runSelfTestMode(async () => ["mutated: expected E, found S"]);
+			expect(violationCode).toBe(1);
+			expect(errors).toContain("mutated: expected E, found S");
+			expect(errors).toContain(SENTINEL_FAILED);
+		} finally {
+			console.error = originalError;
+			console.log = originalLog;
+		}
+	});
 });
 
 describe("dependency-exposure security regressions", () => {

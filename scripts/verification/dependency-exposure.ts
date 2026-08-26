@@ -2160,6 +2160,29 @@ function parseCli(argv: readonly string[]): CliArgs {
 	return { mode: "classify", base, inputs, jsonPath, recordPath };
 }
 
+/**
+ * Self-test CLI path: every setup/classification throw must still emit the
+ * fail-closed sentinel and exit 1 (runbook contract).
+ */
+export async function runSelfTestMode(
+	run: () => Promise<readonly string[]> = selfTest,
+): Promise<number> {
+	try {
+		const violations = await run();
+		if (violations.length === 0) {
+			console.log(SENTINEL_OK);
+			return 0;
+		}
+		for (const violation of violations) console.error(violation);
+		console.error(SENTINEL_FAILED);
+		return 1;
+	} catch (error) {
+		console.error(`self-test failed: ${errorText(error)}`);
+		console.error(SENTINEL_FAILED);
+		return 1;
+	}
+}
+
 async function main(): Promise<number> {
 	let cli: CliArgs;
 	try {
@@ -2170,14 +2193,7 @@ async function main(): Promise<number> {
 		return 1;
 	}
 	if (cli.mode === "self-test") {
-		const violations = await selfTest();
-		if (violations.length === 0) {
-			console.log(SENTINEL_OK);
-			return 0;
-		}
-		for (const violation of violations) console.error(violation);
-		console.error(SENTINEL_FAILED);
-		return 1;
+		return runSelfTestMode(selfTest);
 	}
 	const result = await classify({ base: cli.base ?? "", inputs: cli.inputs });
 	const json = `${JSON.stringify(result.report, null, 2)}\n`;
