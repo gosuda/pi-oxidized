@@ -19,6 +19,7 @@
 		"verify:e2e": "bun run scripts/verification/e2e-smoke.ts",
 		"verify:map-ledger": "bun run scripts/verification/map.ts",
 		"verify:fog": "bun run scripts/verification/fog.ts",
+		"verify:arbitration": "bun run scripts/verification/arbitration.ts",
 		"verify:replacement": "bun run scripts/verification/e2e-smoke.ts --replacement-only",
 		"verify:parity": "bun run scripts/verification/parity.ts",
 		"verify:performance": "bun run scripts/verification/performance.ts",
