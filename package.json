@@ -13,6 +13,7 @@
 		"build:extension-host": "bun run scripts/build-extension-host.ts",
 		"package-release": "bun run scripts/package-release.ts",
 		"package-release:dry": "bun run scripts/package-release.ts --dry-run",
+		"verify:alignment": "bun run scripts/verification/alignment.ts",
 		"verify:compatibility": "bun run scripts/verification/compat-matrix.ts",
 		"verify:e2e": "bun run scripts/verification/e2e-smoke.ts",
 		"verify:replacement": "bun run scripts/verification/e2e-smoke.ts --replacement-only",

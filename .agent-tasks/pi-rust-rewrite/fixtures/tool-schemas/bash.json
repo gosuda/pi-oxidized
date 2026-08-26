@@ -1,0 +1,16 @@
+{
+  "properties": {
+    "command": {
+      "description": "Shell command to execute",
+      "type": "string"
+    },
+    "timeout": {
+      "description": "Timeout in seconds (optional, no default timeout)",
+      "type": "number"
+    }
+  },
+  "required": [
+    "command"
+  ],
+  "type": "object"
+}

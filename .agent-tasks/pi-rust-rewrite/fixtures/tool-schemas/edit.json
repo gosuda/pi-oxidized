@@ -1,0 +1,34 @@
+{
+  "properties": {
+    "edits": {
+      "description": "One or more targeted replacements. Each edit is matched against the original file, not incrementally. Do not include overlapping or nested edits. If two changes touch the same block or nearby lines, merge them into one edit instead.",
+      "items": {
+        "properties": {
+          "newText": {
+            "description": "Replacement text for this targeted edit.",
+            "type": "string"
+          },
+          "oldText": {
+            "description": "Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "oldText",
+          "newText"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "path": {
+      "description": "Path to the file to edit (relative or absolute)",
+      "type": "string"
+    }
+  },
+  "required": [
+    "path",
+    "edits"
+  ],
+  "type": "object"
+}

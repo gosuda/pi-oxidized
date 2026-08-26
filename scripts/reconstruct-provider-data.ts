@@ -41,7 +41,7 @@ const LOCK_INITIALIZING_GRACE_MS = 30_000;
 const LOCK_OWNER_FILE = "owner.json";
 const DATA_MANIFEST_FILE = ".manifest.json";
 const MANIFEST_SCHEMA_VERSION = 3;
-// UTC time of the newest provider snapshot commit in pinned reference 4488ad55.
+// UTC time of the newest provider snapshot commit in pinned reference 8fa7eebd235355522c8104166b4f1f959b4e2f10.
 const PINNED_PROVIDER_DATA_GENERATED_AT = "2026-07-30T07:01:42.000Z";
 const LOCK_OWNER_VERSION = 2;
 /**

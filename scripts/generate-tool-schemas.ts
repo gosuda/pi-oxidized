@@ -5,8 +5,10 @@
  * Source of truth: the checked-in reference tool registry at
  * `.references/pi/packages/coding-agent/src/core/tools/index.ts`. The reference
  * factories are executed under Bun and each ToolDefinition's TypeBox `parameters`
- * schema is dumped as JSON for the seven built-in tools in registry order
- * (read, bash, edit, write, grep, find, ls) to
+ * schema is dumped as JSON for the seven portable built-in tools
+ * (read, bash, edit, write, grep, find, ls). The generator selects those seven
+ * from the canonical registry, fails when any required tool is absent, and
+ * tolerates reference-only platform tools such as `powershell`. Output lands in
  * `.agent-tasks/pi-rust-rewrite/fixtures/tool-schemas/<tool>.json`.
  *
  * The TypeBox version determines the emitted JSON, so bare `typebox` imports are
@@ -53,8 +55,8 @@ const REFERENCE_TYPEBOX_DIRS = [
 ] as const;
 const OUTPUT_DIR = join(REPO_ROOT, ".agent-tasks/pi-rust-rewrite/fixtures/tool-schemas");
 
-/** Registry order from the reference `createAllToolDefinitions`; also the emission order. */
-const TOOL_NAMES = ["read", "bash", "edit", "write", "grep", "find", "ls"] as const;
+/** The Rust surface owns these portable tools even when the reference adds platform-only tools. */
+export const REQUIRED_TOOL_NAMES = ["read", "bash", "edit", "write", "grep", "find", "ls"] as const;
 
 /** Nondeterministic metadata keys stripped by the documented normalization. */
 const STRIPPED_METADATA_KEYS: Record<string, true> = {
@@ -240,6 +242,27 @@ function registerTypeboxPin(typeboxEntry: string): void {
 	});
 }
 
+/** Select only Rust-owned portable schemas and reject an incomplete reference registry. */
+export function selectPortableToolParameters(
+	definitions: Record<string, unknown>,
+): Record<string, unknown> {
+	const missing = REQUIRED_TOOL_NAMES.filter((name) => !Object.hasOwn(definitions, name));
+	if (missing.length > 0) {
+		throw new Error(
+			`missing prerequisite: reference tool registry lacks required tools: ${missing.join(", ")}`,
+		);
+	}
+	const parametersByTool: Record<string, unknown> = {};
+	for (const name of REQUIRED_TOOL_NAMES) {
+		const definition = definitions[name];
+		if (!isPlainObject(definition) || definition.parameters === undefined) {
+			throw new Error(`missing prerequisite: reference tool "${name}" has no parameters schema`);
+		}
+		parametersByTool[name] = definition.parameters;
+	}
+	return parametersByTool;
+}
+
 async function loadToolParameters(): Promise<Record<string, unknown>> {
 	await assertPathReadable(REFERENCE_TOOLS_INDEX, "reference tool registry");
 	let registry: unknown;
@@ -263,22 +286,11 @@ async function loadToolParameters(): Promise<Record<string, unknown>> {
 	if (!isPlainObject(definitions)) {
 		fail("missing prerequisite: reference createAllToolDefinitions did not return a tool map");
 	}
-	const actual = Object.keys(definitions).sort();
-	const expected = [...TOOL_NAMES].sort();
-	if (actual.join("") !== expected.join("")) {
-		fail(
-			`missing prerequisite: reference tool set mismatch (expected ${expected.join(", ")}; got ${actual.join(", ")})`,
-		);
+	try {
+		return selectPortableToolParameters(definitions);
+	} catch (error) {
+		fail(error instanceof Error ? error.message : String(error));
 	}
-	const parametersByTool: Record<string, unknown> = {};
-	for (const name of TOOL_NAMES) {
-		const definition = definitions[name];
-		if (!isPlainObject(definition) || definition.parameters === undefined) {
-			fail(`missing prerequisite: reference tool "${name}" has no parameters schema`);
-		}
-		parametersByTool[name] = definition.parameters;
-	}
-	return parametersByTool;
 }
 
 /**
@@ -359,7 +371,7 @@ function buildEncodedSchemas(parametersByTool: Record<string, unknown>): {
 } {
 	const encodedByTool: Record<string, string> = {};
 	const strippedTotals: Record<string, number> = {};
-	for (const name of TOOL_NAMES) {
+	for (const name of REQUIRED_TOOL_NAMES) {
 		// JSON round-trip drops TypeBox symbol keys and non-JSON values.
 		const jsonValue: unknown = JSON.parse(JSON.stringify(parametersByTool[name]));
 		if (!isPlainObject(jsonValue)) {
@@ -410,8 +422,11 @@ async function main(): Promise<void> {
 	await mkdir(OUTPUT_DIR, { recursive: true });
 	const summaryLines: string[] = [];
 	let counter = 0;
-	for (const name of TOOL_NAMES) {
+	for (const name of REQUIRED_TOOL_NAMES) {
 		const encoded = encodedByTool[name];
+		if (encoded === undefined) {
+			fail(`internal error: missing encoded schema for ${name}`);
+		}
 		counter += 1;
 		await writeAtomically(join(OUTPUT_DIR, `${name}.json`), encoded, counter);
 		const parsed: unknown = JSON.parse(encoded);
@@ -432,7 +447,7 @@ async function main(): Promise<void> {
 	.join(" ");
 	process.stdout.write(
 		[
-			`Wrote ${TOOL_NAMES.length} tool schemas to ${OUTPUT_DIR}`,
+			`Wrote ${REQUIRED_TOOL_NAMES.length} tool schemas to ${OUTPUT_DIR}`,
 			`typebox: ${pin} (${typeboxEntry})`,
 			`source: ${REFERENCE_TOOLS_INDEX}`,
 			...summaryLines,
@@ -441,4 +456,4 @@ async function main(): Promise<void> {
 	);
 }
 
-await main();
+if (import.meta.main) await main();
