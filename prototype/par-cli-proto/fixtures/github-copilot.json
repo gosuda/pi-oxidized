@@ -1,0 +1,64 @@
+{
+  "provider": "github-copilot",
+  "routes": [
+    {
+      "method": "POST",
+      "pattern": "github.com/login/device/code",
+      "responses": [
+        {
+          "status": 200,
+          "body": {
+            "device_code": "mock-copilot-device-code",
+            "user_code": "MOCK-CODE",
+            "verification_uri": "https://github.com/login/device",
+            "interval": 1,
+            "expires_in": 900
+          }
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "pattern": "github.com/login/oauth/access_token",
+      "responses": [
+        {
+          "status": 200,
+          "body": { "error": "authorization_pending" }
+        },
+        {
+          "status": 200,
+          "body": {
+            "access_token": "mock-github-access-token",
+            "token_type": "bearer",
+            "scope": "read:user"
+          }
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "pattern": "api.github.com/copilot_internal/v2/token",
+      "responses": [
+        {
+          "status": 200,
+          "body": {
+            "token": "mock-copilot-token;proxy-ep=api.individual.githubcopilot.com;other=stuff",
+            "expires_at": 9999999999
+          }
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "pattern": "api.individual.githubcopilot.com/models",
+      "responses": [
+        {
+          "status": 200,
+          "body": {
+            "data": []
+          }
+        }
+      ]
+    }
+  ]
+}

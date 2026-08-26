@@ -1,0 +1,51 @@
+{
+  "provider": "openai-codex",
+  "routes": [
+    {
+      "method": "POST",
+      "pattern": "auth.openai.com/api/accounts/deviceauth/usercode",
+      "responses": [
+        {
+          "status": 200,
+          "body": {
+            "device_auth_id": "mock-openai-device-auth-id",
+            "user_code": "OPENAI-MOCK",
+            "interval": 1
+          }
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "pattern": "auth.openai.com/api/accounts/deviceauth/token",
+      "responses": [
+        {
+          "status": 403,
+          "body": { "error": "deviceauth_authorization_pending" }
+        },
+        {
+          "status": 200,
+          "body": {
+            "authorization_code": "mock-openai-auth-code",
+            "code_verifier": "mock-openai-code-verifier"
+          }
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "pattern": "auth.openai.com/oauth/token",
+      "responses": [
+        {
+          "status": 200,
+          "body": {
+            "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoibW9jay1hY2NvdW50LWlkIn19.mock-signature",
+            "refresh_token": "mock-openai-codex-refresh-token",
+            "expires_in": 3600,
+            "token_type": "Bearer"
+          }
+        }
+      ]
+    }
+  ]
+}

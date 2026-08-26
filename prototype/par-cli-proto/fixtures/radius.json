@@ -1,0 +1,51 @@
+{
+  "provider": "radius",
+  "routes": [
+    {
+      "method": "GET",
+      "pattern": "radius.pi.dev/v1/oauth",
+      "responses": [
+        {
+          "status": 200,
+          "body": {
+            "authorizationEndpoint": "https://radius.pi.dev/oauth/authorize"
+          }
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "pattern": "radius.pi.dev/v1/oauth/device",
+      "responses": [
+        {
+          "status": 200,
+          "body": {
+            "device_code": "mock-radius-device-code",
+            "user_code": "RADIUS-MOCK",
+            "verification_uri": "https://radius.pi.dev/device",
+            "interval": 1,
+            "expires_in": 900
+          }
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "pattern": "radius.pi.dev/v1/oauth/token",
+      "responses": [
+        {
+          "status": 400,
+          "body": { "error": "authorization_pending" }
+        },
+        {
+          "status": 200,
+          "body": {
+            "access_token": "mock-radius-access-token",
+            "refresh_token": "mock-radius-refresh-token",
+            "expires_in": 3600
+          }
+        }
+      ]
+    }
+  ]
+}

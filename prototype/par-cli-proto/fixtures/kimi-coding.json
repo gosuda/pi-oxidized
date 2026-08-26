@@ -1,0 +1,40 @@
+{
+  "provider": "kimi-coding",
+  "routes": [
+    {
+      "method": "POST",
+      "pattern": "auth.kimi.com/api/oauth/device_authorization",
+      "responses": [
+        {
+          "status": 200,
+          "body": {
+            "device_code": "mock-kimi-device-code",
+            "user_code": "KIMI-MOCK",
+            "verification_uri": "https://auth.kimi.com/device",
+            "verification_uri_complete": "https://auth.kimi.com/device?user_code=KIMI-MOCK",
+            "interval": 1,
+            "expires_in": 900
+          }
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "pattern": "auth.kimi.com/api/oauth/token",
+      "responses": [
+        {
+          "status": 400,
+          "body": { "error": "authorization_pending" }
+        },
+        {
+          "status": 200,
+          "body": {
+            "access_token": "mock-kimi-access-token",
+            "refresh_token": "mock-kimi-refresh-token",
+            "expires_in": 3600
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,1 @@
+http://localhost:53692/callback?code=mock-anthropic-auth-code
