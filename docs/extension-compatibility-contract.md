@@ -39,7 +39,7 @@ The allowlisted bridge and host-control method set is fixed and ordered.
 - TypeScript allowlist: `packages/pi-tui-protocol/src/types.ts::METHODS` (line 45) —
   `hello, toolUpdate, providerEvent, uiSlot, disposeSlot, extensionError, select,
   confirm, input, editor, notify, terminalInput, flags.set, shortcut.execute,
-  uiEvent, measure, render`. `::isMethod` (line 73) rejects anything not on the
+  uiEvent, measure, render`. `::isMethod` (line 68) rejects anything not on the
   allowlist.
 - Rust typed mirror: `crates/pi-ext/src/protocol.rs::Method::ALL` (lines
   410-426) contains fifteen enum variants. `flags.set` and `shortcut.execute`
@@ -135,7 +135,7 @@ executable negative witnesses).
 provider registry", owner `pi-ai`, status **parity-blocked**, module
 `auth/config_value.rs or deletion ledger`. The host routes this surface through
 the `@earendil-works/pi-ai/*` aliases above
-(`packages/extension-host/src/virtual-modules.ts` lines 47-48, 88-89) and consumes
+(`packages/extension-host/src/virtual-modules.ts` lines 49-50, 86-87) and consumes
 the legacy registry via `validateToolArguments` from
 `@earendil-works/pi-ai/compat`
 (`packages/extension-host/src/host.ts` import, module doc region).
@@ -167,7 +167,7 @@ Witnesses:
   (lines 494-536): restricted built-ins are skipped and later extension
   registrations replace earlier ones. Host dispatch walks extensions from the
   last index in `packages/extension-host/src/host.ts::handleShortcutExecute`
-  (lines 861-865), so the same later-registration rule is observable over JSONL.
+  (lines 860-866), so the same later-registration rule is observable over JSONL.
 - Mode 1 provider re-registration is defined by
   `.references/pi/packages/coding-agent/src/core/model-runtime.ts::registerProvider`
   (lines 742-777): validation runs first, then defined fields merge over the
@@ -186,8 +186,8 @@ and lean snapshots expose only handlers present in the canonical set below.
 
 The canonical lifecycle event set is exactly the following 33 discriminants, in
 this exact order, and they are the byte-diff-equal of BOTH
-`ALL_EVENT_TYPES` (`packages/extension-host/src/host.ts`, lines 71-101) and
-`LEAN_EVENT_TYPES` (`packages/extension-host/src/lean-api.ts`, lines 18-50). The
+`ALL_EVENT_TYPES` (`packages/extension-host/src/host.ts`, lines 71-105) and
+`LEAN_EVENT_TYPES` (`packages/extension-host/src/lean-api.ts`, lines 18-52). The
 host classifies a registered handler as a `handlers` item in the registry
 snapshot only for discriminants in this set
 (`packages/extension-host/src/host.ts::buildRegistrySnapshot`, `handlers` field,
@@ -289,18 +289,18 @@ The UI slot wire surfaces (`UiSlot`, `SanitizedSlot`, `SlotPlacement`,
 
 - **Mutable hook deadline:** lifecycle hooks must respond within **30 s**.
   `witness: packages/extension-host/src/host.ts::EXTENSION_HOOK_TIMEOUT_MS =
-  30_000` (line 105).
+  30_000` (line 108).
 - **Terminal-input deadline:** terminal `onTerminalInput` consume/rewrite must
   respond within **4 ms**, through the sequential input actor.
   `witness: packages/extension-host/src/host.ts::EXTENSION_INPUT_TIMEOUT_MS = 4`
-  (line 113), `::EXTENSION_INPUT_QUEUE_CAPACITY = 64` (line 116).
+  (line 116), `::EXTENSION_INPUT_QUEUE_CAPACITY = 64` (line 118).
 - **Shortcut cancellation and single-flight:** each shortcut execution receives
   its own `AbortController`. Host disposal aborts the active controller. A
   second dispatch for the same key returns `{ handled: true }` without starting
   another invocation and without aborting the active one.
   `witness: packages/extension-host/src/host.ts::handleShortcutExecute`
-  (single-flight return at lines 869-876; controller and signal at lines
-  891-898) and host disposal (line 3153).
+  (single-flight return at lines 873-877; controller and signal at lines
+  878-899) and host disposal (line 3153).
 - **Error isolation:** a detached shortcut failure emits a per-extension
   `extensionError` notification and does not stop the host; aborted or disposed
   shortcut executions suppress that notification
@@ -308,7 +308,7 @@ The UI slot wire surfaces (`UiSlot`, `SanitizedSlot`, `SlotPlacement`,
   failures are isolated inside the runner, emit `extensionError`, and allow the
   remaining handlers and correlated request to continue. Only an error that
   escapes lifecycle request processing returns a correlated non-retryable
-  `extension_error` response (`host.ts::handleLifecycleHook`, lines 1038-1044;
+  `extension_error` response (`host.ts::handleLifecycleHook`, lines 1052-1058;
   `lean-runner.ts::runHooks`, lines 1583-1600).
 - **Stale-command-context guard:** a captured `pi`/command context is invalid
   after `newSession`/`fork`/`switchSession`/`reload`; the marker message must be
