@@ -20,6 +20,7 @@
 		"verify:parity": "bun run scripts/verification/parity.ts",
 		"verify:performance": "bun run scripts/verification/performance.ts",
 		"verify:style-ledger": "bun run scripts/verification/style-ledger.ts",
+		"verify:syntect-ignores": "bun run scripts/verification/syntect-ignores.ts",
 		"verify:extension-scaling": "bun run scripts/bench-extension-scaling.ts"
 	},
 	"devDependencies": {
