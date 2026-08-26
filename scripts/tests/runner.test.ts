@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import {
 	CommandFailedError,
+	CommandOutputLimitError,
 	CommandTimeoutError,
 	OK_RUN,
 	PathTraversalError,
@@ -98,6 +99,26 @@ describe("SpawnRunner integration", () => {
 			expect(caught.stdout).toBe("started");
 		}
 		expect(Date.now() - started).toBeLessThan(5_000);
+	});
+
+	test("kills a child once combined output exceeds maxOutputBytes", async () => {
+		const runner = new SpawnRunner();
+		let caught: unknown;
+		try {
+			await runner.run(
+				"sh",
+				["-c", "while true; do printf 'xxxxxxxx'; done"],
+				{ maxOutputBytes: 64, rejectOnError: false },
+			);
+		} catch (err) {
+			caught = err;
+		}
+		expect(caught).toBeInstanceOf(CommandOutputLimitError);
+		if (caught instanceof CommandOutputLimitError) {
+			expect(caught.command).toBe("sh");
+			expect(caught.maxOutputBytes).toBe(64);
+			expect(Buffer.byteLength(caught.stdout) + Buffer.byteLength(caught.stderr)).toBeGreaterThan(64);
+		}
 	});
 
 	test("rejects non-positive deadlines before spawning", async () => {

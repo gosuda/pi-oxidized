@@ -42,6 +42,12 @@ export interface RunOptions {
 	readonly rejectOnError?: boolean;
 	/** Positive deadline in milliseconds. On expiry the process tree is killed. */
 	readonly timeoutMs?: number;
+	/**
+	 * Optional ceiling on combined stdout+stderr bytes captured before the
+	 * process tree is killed. Prevents unbounded accumulation from hostile
+	 * or runaway children.
+	 */
+	readonly maxOutputBytes?: number;
 }
 
 /**
@@ -68,6 +74,31 @@ export class CommandFailedError extends Error {
 		this.args = args;
 		this.exitCode = res.exitCode;
 		this.stderr = res.stderr;
+	}
+}
+
+/** Raised after combined stdout+stderr exceeds {@link RunOptions.maxOutputBytes}. */
+export class CommandOutputLimitError extends Error {
+	readonly command: string;
+	readonly args: readonly string[];
+	readonly maxOutputBytes: number;
+	readonly stdout: string;
+	readonly stderr: string;
+
+	constructor(
+		command: string,
+		args: readonly string[],
+		maxOutputBytes: number,
+		stdout: string,
+		stderr: string,
+	) {
+		super(`Command "${command}" exceeded maxOutputBytes=${maxOutputBytes}`);
+		this.name = "CommandOutputLimitError";
+		this.command = command;
+		this.args = args;
+		this.maxOutputBytes = maxOutputBytes;
+		this.stdout = stdout;
+		this.stderr = stderr;
 	}
 }
 
@@ -142,6 +173,12 @@ export class SpawnRunner implements CommandRunner {
 		) {
 			throw new RangeError(`timeoutMs must be positive, got ${options.timeoutMs}`);
 		}
+		if (
+			options.maxOutputBytes !== undefined &&
+			(!Number.isFinite(options.maxOutputBytes) || options.maxOutputBytes <= 0)
+		) {
+			throw new RangeError(`maxOutputBytes must be positive, got ${options.maxOutputBytes}`);
+		}
 		const env = options.env ? { ...process.env, ...options.env } : { ...process.env };
 		const child = spawn(command, [...args], {
 			cwd: options.cwd,
@@ -162,13 +199,30 @@ export class SpawnRunner implements CommandRunner {
 		// pipe while we are still reading the other cannot deadlock.
 		let stdout = "";
 		let stderr = "";
+		let capturedBytes = 0;
+		let outputLimited = false;
+		const noteChunk = (chunk: Buffer | string): void => {
+			if (options.maxOutputBytes === undefined || outputLimited) return;
+			const size = typeof chunk === "string" ? Buffer.byteLength(chunk) : chunk.byteLength;
+			capturedBytes += size;
+			if (capturedBytes > options.maxOutputBytes) {
+				outputLimited = true;
+				void terminateProcessTree(child);
+			}
+		};
 		const drainStdout = (async () => {
 			if (!child.stdout) return;
-			for await (const chunk of child.stdout) stdout += chunk.toString("utf8");
+			for await (const chunk of child.stdout) {
+				noteChunk(chunk);
+				stdout += chunk.toString("utf8");
+			}
 		})();
 		const drainStderr = (async () => {
 			if (!child.stderr) return;
-			for await (const chunk of child.stderr) stderr += chunk.toString("utf8");
+			for await (const chunk of child.stderr) {
+				noteChunk(chunk);
+				stderr += chunk.toString("utf8");
+			}
 		})();
 		let timedOut = false;
 		const timeout = options.timeoutMs === undefined
@@ -181,6 +235,9 @@ export class SpawnRunner implements CommandRunner {
 		const exitCode = await exit.promise;
 		if (timeout !== undefined) clearTimeout(timeout);
 		await Promise.all([drainStdout, drainStderr]);
+		if (outputLimited && options.maxOutputBytes !== undefined) {
+			throw new CommandOutputLimitError(command, args, options.maxOutputBytes, stdout, stderr);
+		}
 		if (timedOut && options.timeoutMs !== undefined) {
 			throw new CommandTimeoutError(command, args, options.timeoutMs, stdout, stderr);
 		}

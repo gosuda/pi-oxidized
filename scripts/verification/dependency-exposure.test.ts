@@ -1,6 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 import { HOST_PACKAGE_DIR } from "../release/host.ts";
@@ -11,6 +10,7 @@ import {
 	SENTINEL_FAILED,
 	appendLedgerRows,
 	buildBundleEvidence,
+	cargoLockChangedNames,
 	classify,
 	deriveAutoFromTexts,
 	evaluateCargoKinds,
@@ -19,13 +19,16 @@ import {
 	evaluateSideAwareReachability,
 	evaluateStaging,
 	expandScripts,
+	findLifecycleScripts,
 	findUnknownCompileSites,
 	inputMatchesMetafile,
 	materializeBase,
+	parseCargoLockIdentities,
 	parseCargoMetadata,
 	parseInputSpec,
 	parseMetafile,
 	parseNpmSurface,
+	resolvePathPair,
 	scanCorpusText,
 	selfTest,
 	verdictFromChecks,
@@ -41,7 +44,9 @@ afterEach(() => {
 });
 
 function tempDir(prefix: string): string {
-	const path = mkdtempSync(join(tmpdir(), prefix));
+	const scratch = join(REPO_ROOT, "target", "deps-r2-tmp");
+	mkdirSync(scratch, { recursive: true });
+	const path = mkdtempSync(join(scratch, prefix));
 	temps.push(path);
 	return path;
 }
@@ -302,7 +307,7 @@ describe("dependency-exposure fail-closed integration", () => {
 		expect(JSON.parse(readFileSync(out, "utf8")).schema).toBe(SCHEMA);
 	});
 
-	test("--record rejects failed-closed reports and accepts successful classification rows", async () => {
+	test("--record appends fail-closed undecidable Class S and rejects only structural invalidity", async () => {
 		const ledger = join(tempDir("pi-deps-r2-ledger-"), "DEPS_INVARIANT_LEDGER.md");
 		writeFileSync(ledger, "| Date (UTC) | Change | Base→Head | Input | Class | E1 | E2 | E3 | E4 | Evidence sha256 |\n");
 		const failed = {
@@ -318,7 +323,10 @@ describe("dependency-exposure fail-closed integration", () => {
 				E4: { status: "pass", detail: "ok" },
 			})],
 		};
-		await expect(appendLedgerRows(ledger, failed)).rejects.toThrow(/failed-closed|incomplete/);
+		await appendLedgerRows(ledger, failed);
+		const afterFailed = readFileSync(ledger, "utf8");
+		expect(afterFailed).toContain("npm:x");
+		expect(afterFailed).toContain("| S | undecidable | pass | pass | pass |");
 		const ok = {
 			schema: SCHEMA,
 			decidedAt: "2026-08-26T00:00:00.000Z",
@@ -336,7 +344,10 @@ describe("dependency-exposure fail-closed integration", () => {
 		const text = readFileSync(ledger, "utf8");
 		expect(text).toContain("npm:@types/bun");
 		expect(text).toContain("| E | pass | pass | pass | pass |");
-		expect(text.match(/npm:@types\/bun/g)?.length).toBe(1);
+		await expect(appendLedgerRows(ledger, {
+			...ok,
+			schema: "not.a.schema" as typeof SCHEMA,
+		})).rejects.toThrow(/structurally invalid report schema/);
 	});
 
 	test("nonzero bun exit rejects even when metafile exists", async () => {
@@ -372,12 +383,14 @@ describe("dependency-exposure fail-closed integration", () => {
 		const baseLoc = {
 			packageJson: "/base/packages/old-proto/package.json",
 			root: "/base/packages/old-proto",
+			aliases: ["/base/packages/old-proto"],
 			prefixes: ["../old-proto/", "node_modules/pkg/"],
 			bins: [],
 		};
 		const headLoc = {
 			packageJson: "/head/packages/new-proto/package.json",
 			root: "/head/packages/new-proto",
+			aliases: ["/head/packages/new-proto"],
 			prefixes: ["../new-proto/", "node_modules/pkg/"],
 			bins: [],
 		};
@@ -476,6 +489,106 @@ describe("dependency-exposure fail-closed integration", () => {
 		expect(first).toEqual([]);
 		expect(second).toEqual([]);
 	}, 1_200_000);
+});
+
+describe("dependency-exposure security regressions", () => {
+	test("A: install uses --ignore-scripts and lifecycle scripts fail closed", async () => {
+		expect(findLifecycleScripts(JSON.stringify({ scripts: { postinstall: "node x.js", build: "bun build" } }))).toEqual([
+			"postinstall",
+		]);
+		const root = tempDir("pi-deps-r2-lifecycle-");
+		mkdirSync(join(root, "packages/extension-host"), { recursive: true });
+		writeFileSync(
+			join(root, "packages/extension-host/package.json"),
+			JSON.stringify({
+				scripts: {
+					postinstall: "node ./evil.js",
+					build: "bun build ./src/main.ts --compile --outfile dist/pi-extension-host",
+				},
+			}),
+		);
+		const runner = new RecordingRunner(() => ({ exitCode: 0, stdout: "", stderr: "" }));
+		const evidence = await buildBundleEvidence(root, root, runner);
+		expect(evidence.error).toMatch(/lifecycle scripts|ignore-scripts/);
+		const install = runner.calls.find((call) => call.command === "bun" && call.args[0] === "install");
+		expect(install).toBeUndefined();
+	});
+
+	test("A: successful install argv includes --ignore-scripts", async () => {
+		const root = tempDir("pi-deps-r2-ignore-");
+		mkdirSync(join(root, "packages/extension-host"), { recursive: true });
+		writeFileSync(
+			join(root, "packages/extension-host/package.json"),
+			JSON.stringify({
+				scripts: { build: "bun build ./src/main.ts --compile --outfile dist/pi-extension-host" },
+			}),
+		);
+		const runner = new RecordingRunner((call) => {
+			if (call.command === "bun" && call.args[0] === "install") {
+				return { exitCode: 0, stdout: "", stderr: "" };
+			}
+			if (call.command === "bun" && call.args[0] === "build") {
+				const metaArg = call.args.find((arg) => arg.startsWith("--metafile="));
+				if (metaArg !== undefined) {
+					writeFileSync(metaArg.slice("--metafile=".length), JSON.stringify({ inputs: {} }));
+				}
+				return { exitCode: 0, stdout: "", stderr: "" };
+			}
+			return { exitCode: 0, stdout: "", stderr: "" };
+		});
+		await buildBundleEvidence(root, root, runner);
+		const install = runner.calls.find((call) => call.command === "bun" && call.args[0] === "install");
+		expect(install?.args).toEqual(["install", "--ignore-scripts", "--frozen-lockfile"]);
+		expect(install?.options?.maxOutputBytes).toBeGreaterThan(0);
+	});
+
+	test("B: cargo lock auto-diff preserves identity/integrity fields", () => {
+		const before = `[[package]]
+name = "serde"
+version = "1.0.0"
+source = "registry+https://example"
+checksum = "aaa"
+dependencies = [
+ "serde_derive",
+]
+`;
+		const checksumOnly = before.replace('checksum = "aaa"', 'checksum = "bbb"');
+		expect(cargoLockChangedNames(before, checksumOnly)).toEqual(["serde"]);
+		const depsOnly = before.replace('"serde_derive"', '"serde_derive",\n "pkg"');
+		expect(cargoLockChangedNames(before, depsOnly)).toEqual(["serde"]);
+		expect(() => parseCargoLockIdentities(`[[package]]\nversion = "1.0.0"\n`)).toThrow(/unclassifiable|malformed/);
+	});
+
+	test("C: realpath staging rejects broken and escaping symlinks", async () => {
+		const root = tempDir("pi-deps-r2-realpath-");
+		mkdirSync(join(root, "inside"), { recursive: true });
+		writeFileSync(join(root, "inside", "file.txt"), "ok");
+		const broken = join(root, "broken-link");
+		symlinkSync(join(root, "missing-target"), broken);
+		await expect(resolvePathPair(broken, root)).rejects.toThrow(/broken|unresolvable/);
+		const escape = join(root, "escape-link");
+		symlinkSync("/tmp", escape);
+		await expect(resolvePathPair(escape, root)).rejects.toThrow(/escapes repository root|ambiguous/);
+		const ok = await resolvePathPair(join(root, "inside"), root);
+		expect(ok.real.includes("inside")).toBe(true);
+	});
+
+	test("D: classify reports immutable base SHA", async () => {
+		const result = await classify({
+			base: "HEAD",
+			inputs: ["npm:@deps-r2/nonexistent"],
+			repoRoot: REPO_ROOT,
+			runner: new RecordingRunner((call) => {
+				if (call.command === "git" && call.args[0] === "rev-parse") {
+					return { exitCode: 0, stdout: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", stderr: "" };
+				}
+				return { exitCode: 0, stdout: "", stderr: "" };
+			}),
+			identity: true,
+			now: () => new Date("2026-08-26T00:00:00.000Z"),
+		});
+		expect(result.report.base).toBe("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+	});
 });
 
 describe("dependency-exposure platform-gated live probes", () => {

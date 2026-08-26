@@ -16,11 +16,11 @@ import {
 	mkdtemp,
 	readFile,
 	readdir,
+	realpath,
 	rm,
 	symlink,
 	writeFile,
 } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 
 import { HOST_PACKAGE_DIR, hostBundleCommands } from "../release/host.ts";
@@ -69,6 +69,27 @@ const TOOL_FILES: Readonly<Record<string, readonly string[]>> = {
 const CHECK_NAMES = ["E1", "E2", "E3", "E4"] as const;
 const BUILD_TIMEOUT_MS = 10 * 60_000;
 const COMMAND_TIMEOUT_MS = 5 * 60_000;
+const MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
+const LIFECYCLE_SCRIPTS = new Set([
+	"preinstall",
+	"install",
+	"postinstall",
+	"prepare",
+	"preprepare",
+	"postprepare",
+	"prepublish",
+	"prepublishOnly",
+]);
+const HEAD_DRIFT_PATHS = [
+	...SURFACES,
+	...BUN_LOCKS,
+	"Cargo.lock",
+	"Cargo.toml",
+	"rust-toolchain.toml",
+	"scripts/release/runtime.ts",
+	".github/workflows/release-verification.yml",
+	...E3_FIXED_FILES,
+] as const;
 
 type CheckName = (typeof CHECK_NAMES)[number];
 export type CheckStatus = "pass" | "fail" | "undecidable";
@@ -166,12 +187,14 @@ export interface BundleEvidence {
 export interface PackageLocation {
 	readonly packageJson: string;
 	readonly root: string;
+	readonly aliases: readonly string[];
 	readonly prefixes: readonly string[];
 	readonly bins: readonly string[];
 }
 
 interface MaterializedBase {
 	readonly root: string;
+	readonly sha: string;
 	cleanup(): Promise<void>;
 }
 
@@ -224,6 +247,58 @@ function pathIntersects(left: string, right: string): boolean {
 	const a = resolve(left);
 	const b = resolve(right);
 	return a === b || a.startsWith(`${b}${sep}`) || b.startsWith(`${a}${sep}`);
+}
+
+export async function resolvePathPair(
+	logicalPath: string,
+	repoRoot: string,
+): Promise<{ readonly logical: string; readonly real: string }> {
+	const logical = resolve(logicalPath);
+	let real: string;
+	try {
+		real = await realpath(logical);
+	} catch (error) {
+		throw new Error(`broken or unresolvable path ${logical}: ${errorText(error)}`);
+	}
+	const rootReal = await realpath(repoRoot).catch(() => resolve(repoRoot));
+	if (!(real === rootReal || real.startsWith(`${rootReal}${sep}`))) {
+		throw new Error(`path escapes repository root: ${logical} -> ${real}`);
+	}
+	if (logical !== real && !(logical === rootReal || logical.startsWith(`${rootReal}${sep}`))) {
+		throw new Error(`ambiguous escaping symlink alias: ${logical} -> ${real}`);
+	}
+	return { logical, real };
+}
+
+async function fingerprintPaths(root: string, paths: readonly string[]): Promise<string> {
+	const hash = createHash("sha256");
+	for (const rel of [...paths].sort()) {
+		hash.update(rel);
+		hash.update("\0");
+		try {
+			hash.update(await readFile(join(root, rel)));
+		} catch {
+			hash.update("<missing>");
+		}
+		hash.update("\0");
+	}
+	return hash.digest("hex");
+}
+
+async function fingerprintHeadEvidence(root: string): Promise<string> {
+	const releaseDir = join(root, "scripts/release");
+	const releaseFiles = existsSync(releaseDir)
+		? (await readdir(releaseDir, { withFileTypes: true }))
+			.filter((entry) => entry.isFile() && entry.name.endsWith(".ts"))
+			.map((entry) => `scripts/release/${entry.name}`)
+		: [];
+	const workflowDir = join(root, ".github/workflows");
+	const workflowFiles = existsSync(workflowDir)
+		? (await readdir(workflowDir, { withFileTypes: true }))
+			.filter((entry) => entry.isFile() && /\.ya?ml$/.test(entry.name))
+			.map((entry) => `.github/workflows/${entry.name}`)
+		: [];
+	return fingerprintPaths(root, [...HEAD_DRIFT_PATHS, ...releaseFiles, ...workflowFiles, `${HOST_PACKAGE_DIR}/package.json`]);
 }
 
 export function parseInputSpec(raw: string): InputSpec {
@@ -355,6 +430,7 @@ async function loadCargoGraph(root: string, runner: CommandRunner): Promise<Carg
 		cwd: root,
 		rejectOnError: false,
 		timeoutMs: COMMAND_TIMEOUT_MS,
+		maxOutputBytes: MAX_OUTPUT_BYTES,
 	});
 	if (result.exitCode !== 0) throw new Error(`cargo metadata failed: ${result.stderr.slice(0, 500)}`);
 	return parseCargoMetadata(result.stdout);
@@ -568,6 +644,7 @@ async function runBuildGraph(
 		cwd: join(root, HOST_PACKAGE_DIR),
 		rejectOnError: false,
 		timeoutMs: BUILD_TIMEOUT_MS,
+		maxOutputBytes: MAX_OUTPUT_BYTES,
 	});
 	const primaryOk = result.exitCode === 0 && existsSync(metafile);
 	if (!primaryOk && args.includes("--compile")) {
@@ -577,6 +654,7 @@ async function runBuildGraph(
 			cwd: join(root, HOST_PACKAGE_DIR),
 			rejectOnError: false,
 			timeoutMs: BUILD_TIMEOUT_MS,
+			maxOutputBytes: MAX_OUTPUT_BYTES,
 		});
 	}
 	if (result.exitCode !== 0) {
@@ -588,11 +666,25 @@ async function runBuildGraph(
 	return { name, mode, inputs: parseMetafile(await readFile(metafile, "utf8")) };
 }
 
+export function findLifecycleScripts(packageJsonText: string): readonly string[] {
+	const root = asTable(JSON.parse(packageJsonText) as unknown);
+	const scripts = asTable(root?.scripts) ?? {};
+	return Object.keys(scripts).filter((name) => LIFECYCLE_SCRIPTS.has(name)).sort();
+}
+
 async function installHost(root: string, runner: CommandRunner): Promise<void> {
-	const result = await runner.run("bun", ["install", "--frozen-lockfile"], {
+	const packageJsonPath = join(root, HOST_PACKAGE_DIR, "package.json");
+	const lifecycle = findLifecycleScripts(await readFile(packageJsonPath, "utf8"));
+	if (lifecycle.length > 0) {
+		throw new Error(
+			`indispensable lifecycle scripts present under --ignore-scripts: ${lifecycle.join(", ")}`,
+		);
+	}
+	const result = await runner.run("bun", ["install", "--ignore-scripts", "--frozen-lockfile"], {
 		cwd: join(root, HOST_PACKAGE_DIR),
 		rejectOnError: false,
 		timeoutMs: COMMAND_TIMEOUT_MS,
+		maxOutputBytes: MAX_OUTPUT_BYTES,
 	});
 	if (result.exitCode !== 0) {
 		throw new Error(`host install failed: ${result.stderr.slice(0, 500)}`);
@@ -665,6 +757,7 @@ async function locatePackage(root: string, name: string): Promise<PackageLocatio
 		return {
 			packageJson,
 			root: candidate,
+			aliases: [candidate],
 			prefixes: [`node_modules/${name}/`, `${rel}/`].map(normalizePath),
 			bins,
 		};
@@ -824,16 +917,37 @@ function cargoManifestPaths(name: string, graphs: readonly CargoGraph[]): string
 	);
 }
 
-function checkE4(
+async function expandWithRealpaths(
+	paths: readonly string[],
+	repoRoot: string,
+): Promise<readonly string[]> {
+	const expanded: string[] = [];
+	for (const path of paths) {
+		if (!existsSync(path)) {
+			expanded.push(resolve(path));
+			continue;
+		}
+		const pair = await resolvePathPair(path, repoRoot);
+		expanded.push(pair.logical, pair.real);
+	}
+	return [...new Set(expanded)];
+}
+
+async function checkE4(
 	spec: InputSpec,
 	locations: { readonly base?: PackageLocation; readonly head?: PackageLocation },
 	base: SideData,
 	head: SideData,
 	e1: CheckResult,
 	fs: Fs,
-): CheckResult {
+): Promise<CheckResult> {
 	try {
-		const staged = [...stagedSources(base.root, fs), ...stagedSources(head.root, fs)];
+		const stagedLogical = [...stagedSources(base.root, fs), ...stagedSources(head.root, fs)];
+		const staged = [
+			...await expandWithRealpaths(stagedLogical.filter((path) => existsSync(path)), base.root),
+			...await expandWithRealpaths(stagedLogical.filter((path) => existsSync(path)), head.root),
+			...stagedLogical.map((path) => resolve(path)),
+		];
 		if (spec.kind === "tool") {
 			return spec.name === "bun-runtime"
 				? fail("Bun runtime is an authority-derived runtime-bundle staging input")
@@ -843,7 +957,17 @@ function checkE4(
 			if (locations.base === undefined || locations.head === undefined) {
 				return undecidable(`${spec.name} package path cannot be mapped independently on both sides for staging`);
 			}
-			return evaluateStaging([locations.base.root, locations.head.root], staged);
+			const packagePaths = [
+				...locations.base.aliases,
+				locations.base.root,
+				...locations.head.aliases,
+				locations.head.root,
+			];
+			const resolvedPackages = [
+				...await expandWithRealpaths(packagePaths, base.root),
+				...await expandWithRealpaths(packagePaths, head.root),
+			];
+			return evaluateStaging(resolvedPackages, staged);
 		}
 		if (e1.status === "fail") return fail("normal/build cargo edge ships inside the pi binary");
 		if (base.cargo === undefined || head.cargo === undefined) {
@@ -853,7 +977,11 @@ function checkE4(
 		if (manifests.length === 0) {
 			return undecidable(`${spec.name} manifest directory cannot be mapped`);
 		}
-		return evaluateStaging(manifests, staged);
+		const resolvedManifests = [
+			...await expandWithRealpaths(manifests, base.root),
+			...await expandWithRealpaths(manifests, head.root),
+		];
+		return evaluateStaging(resolvedManifests, staged);
 	} catch (error) {
 		return undecidable(`staging authority probe failed: ${errorText(error)}`);
 	}
@@ -914,7 +1042,7 @@ async function classifyLoaded(
 			E1: e1,
 			E2: checkE2(spec, locations, bundles),
 			E3: checkE3(spec, locations, base, head),
-			E4: checkE4(spec, locations, base, head, e1, fs),
+			E4: await checkE4(spec, locations, base, head, e1, fs),
 		}));
 	}
 	return verdicts;
@@ -930,6 +1058,7 @@ async function commandOk(
 		cwd,
 		rejectOnError: false,
 		timeoutMs: COMMAND_TIMEOUT_MS,
+		maxOutputBytes: MAX_OUTPUT_BYTES,
 	});
 	if (result.exitCode !== 0) {
 		throw new Error(`${command} ${args.join(" ")} failed: ${result.stderr.slice(0, 500)}`);
@@ -937,17 +1066,32 @@ async function commandOk(
 	return result;
 }
 
+export async function resolveCommitSha(
+	repoRoot: string,
+	ref: string,
+	runner: CommandRunner,
+): Promise<string> {
+	const result = await commandOk(runner, "git", ["rev-parse", "--verify", `${ref}^{commit}`], repoRoot);
+	const sha = result.stdout.trim();
+	if (!/^[0-9a-f]{40}$/i.test(sha)) {
+		throw new Error(`git rev-parse returned non-SHA identity for ${ref}: ${sha}`);
+	}
+	return sha;
+}
+
 export async function materializeBase(
 	repoRoot: string,
 	base: string,
 	runner: CommandRunner,
 ): Promise<MaterializedBase> {
-	await commandOk(runner, "git", ["rev-parse", "--verify", `${base}^{commit}`], repoRoot);
-	const parent = await mkdtemp(join(tmpdir(), "pi-deps-r2-base-"));
+	const sha = await resolveCommitSha(repoRoot, base, runner);
+	const scratchRoot = join(repoRoot, "target", "deps-r2-worktrees");
+	await mkdir(scratchRoot, { recursive: true });
+	const parent = await mkdtemp(join(scratchRoot, "base-"));
 	const root = join(parent, "tree");
 	let added = false;
 	try {
-		await commandOk(runner, "git", ["worktree", "add", "--detach", root, base], repoRoot);
+		await commandOk(runner, "git", ["worktree", "add", "--detach", root, sha], repoRoot);
 		added = true;
 		const reference = join(repoRoot, ".references/pi");
 		if (existsSync(reference) && !existsSync(join(root, ".references/pi"))) {
@@ -956,6 +1100,7 @@ export async function materializeBase(
 		}
 		return {
 			root,
+			sha,
 			cleanup: async () => {
 				let removeError: Error | undefined;
 				try {
@@ -963,6 +1108,7 @@ export async function materializeBase(
 						cwd: repoRoot,
 						rejectOnError: false,
 						timeoutMs: COMMAND_TIMEOUT_MS,
+						maxOutputBytes: MAX_OUTPUT_BYTES,
 					});
 					if (remove.exitCode !== 0) {
 						removeError = new Error(
@@ -982,6 +1128,7 @@ export async function materializeBase(
 				cwd: repoRoot,
 				rejectOnError: false,
 				timeoutMs: COMMAND_TIMEOUT_MS,
+				maxOutputBytes: MAX_OUTPUT_BYTES,
 			});
 		}
 		await rm(parent, { recursive: true, force: true });
@@ -1000,20 +1147,59 @@ function parseBunLock(text: string): Record<string, string> {
 	return result;
 }
 
-function parseCargoLockVersions(text: string): Record<string, string> {
+export function parseCargoLockIdentities(text: string): {
+	readonly byIdentity: Readonly<Record<string, string>>;
+	readonly namesByIdentity: Readonly<Record<string, string>>;
+} {
 	const root = asTable(Bun.TOML.parse(text) as unknown);
 	if (!Array.isArray(root?.package)) throw new Error("Cargo.lock missing package entries");
-	const result: Record<string, string[]> = {};
+	const byIdentity: Record<string, string> = {};
+	const namesByIdentity: Record<string, string> = {};
 	for (const [index, item] of root.package.entries()) {
 		const table = asTable(item);
 		if (typeof table?.name !== "string" || typeof table.version !== "string") {
-			throw new Error(`Cargo.lock package[${index}] malformed`);
+			throw new Error(`Cargo.lock package[${index}] malformed or unclassifiable`);
 		}
-		(result[table.name] ??= []).push(table.version);
+		const source = typeof table.source === "string" ? table.source : "";
+		const checksum = typeof table.checksum === "string" ? table.checksum : "";
+		const dependencies = Array.isArray(table.dependencies)
+			? table.dependencies.map((dep, depIndex) => {
+				if (typeof dep !== "string") {
+					throw new Error(`Cargo.lock package[${index}] dependency[${depIndex}] unclassifiable`);
+				}
+				return dep;
+			}).sort()
+			: [];
+		const identity = `${table.name}@${table.version}::${source}`;
+		if (Object.hasOwn(byIdentity, identity)) {
+			throw new Error(`Cargo.lock duplicate package identity ${identity}`);
+		}
+		byIdentity[identity] = JSON.stringify({
+			name: table.name,
+			version: table.version,
+			source,
+			checksum,
+			dependencies,
+		});
+		namesByIdentity[identity] = table.name;
 	}
-	return Object.fromEntries(
-		Object.entries(result).map(([name, versions]) => [name, [...versions].sort().join(",")]),
-	);
+	return { byIdentity, namesByIdentity };
+}
+
+export function cargoLockChangedNames(beforeText: string, afterText: string): readonly string[] {
+	const before = parseCargoLockIdentities(beforeText);
+	const after = parseCargoLockIdentities(afterText);
+	const names = new Set<string>();
+	for (const identity of new Set([...Object.keys(before.byIdentity), ...Object.keys(after.byIdentity)])) {
+		if (before.byIdentity[identity] !== after.byIdentity[identity]) {
+			const name = before.namesByIdentity[identity] ?? after.namesByIdentity[identity];
+			if (name === undefined) {
+				throw new Error(`Cargo.lock delta unclassifiable for identity ${identity}`);
+			}
+			names.add(name);
+		}
+	}
+	return [...names].sort();
 }
 
 function changedKeys(
@@ -1053,10 +1239,7 @@ export function deriveAutoFromTexts(inputs: {
 			specs.add(`npm:${name}`);
 		}
 	}
-	for (const name of changedKeys(
-		parseCargoLockVersions(inputs.cargoBefore),
-		parseCargoLockVersions(inputs.cargoAfter),
-	)) {
+	for (const name of cargoLockChangedNames(inputs.cargoBefore, inputs.cargoAfter)) {
 		specs.add(`cargo:${name}`);
 	}
 	for (const tool of Object.keys(TOOL_FILES)) {
@@ -1104,33 +1287,44 @@ export async function classify(
 	const now = options.now ?? (() => new Date());
 	const fs = options.fs ?? realFs;
 	let materialized: MaterializedBase | undefined;
+	let reportedBase = options.base;
 	let outcome: { report: ExposureReport; failedClosed: boolean } | undefined;
 	try {
+		reportedBase = await resolveCommitSha(repoRoot, options.base, runner);
+		const headFingerprintBefore = await fingerprintHeadEvidence(repoRoot);
 		const baseRoot = options.identity
 			? repoRoot
-			: (materialized = await materializeBase(repoRoot, options.base, runner)).root;
+			: (materialized = await materializeBase(repoRoot, reportedBase, runner)).root;
+		if (materialized !== undefined) reportedBase = materialized.sha;
 		const rawInputs = options.inputs.includes("auto")
 			? [...options.inputs.filter((input) => input !== "auto"), ...await deriveAutoInputs(baseRoot, repoRoot)]
 			: [...options.inputs];
 		const specs = [...new Set(rawInputs)].sort().map(parseInputSpec);
 		if (specs.length === 0) {
-			outcome = { report: reportOf(options.base, [], now), failedClosed: false };
+			outcome = { report: reportOf(reportedBase, [], now), failedClosed: false };
 		} else {
 			const needCargo = specs.some((spec) => spec.kind === "cargo");
-			let base: SideData;
-			let head: SideData;
 			try {
-				base = await loadSide(baseRoot, runner, needCargo);
-				head = baseRoot === repoRoot ? base : await loadSide(repoRoot, runner, needCargo);
+				const base = await loadSide(baseRoot, runner, needCargo);
+				const head = baseRoot === repoRoot ? base : await loadSide(repoRoot, runner, needCargo);
 				const bundles = await buildBundleEvidence(baseRoot, repoRoot, runner);
 				const verdicts = await classifyLoaded(specs, base, head, bundles, fs);
-				const failedClosed = verdicts.some((verdict) =>
-					CHECK_NAMES.some((name) => verdict.checks[name].status === "undecidable"),
-				);
-				outcome = { report: reportOf(options.base, verdicts, now), failedClosed };
+				const headFingerprintAfter = await fingerprintHeadEvidence(repoRoot);
+				if (headFingerprintBefore !== headFingerprintAfter) {
+					const detail = "head evidence drifted during classification; concurrent work mixed E1-E4 inputs";
+					outcome = {
+						report: reportOf(reportedBase, specs.map((spec) => allUndecidable(spec.raw, detail)), now),
+						failedClosed: true,
+					};
+				} else {
+					const failedClosed = verdicts.some((verdict) =>
+						CHECK_NAMES.some((name) => verdict.checks[name].status === "undecidable"),
+					);
+					outcome = { report: reportOf(reportedBase, verdicts, now), failedClosed };
+				}
 			} catch (error) {
 				const report = reportOf(
-					options.base,
+					reportedBase,
 					specs.map((spec) => allUndecidable(spec.raw, `loader failure: ${errorText(error)}`)),
 					now,
 				);
@@ -1140,7 +1334,7 @@ export async function classify(
 	} catch (error) {
 		const detail = `classification catastrophe: ${errorText(error)}`;
 		const verdicts = requestedForCatastrophe(options.inputs).map((input) => allUndecidable(input, detail));
-		outcome = { report: reportOf(options.base, verdicts, now), failedClosed: true };
+		outcome = { report: reportOf(reportedBase, verdicts, now), failedClosed: true };
 	} finally {
 		if (materialized !== undefined) {
 			try {
@@ -1151,7 +1345,7 @@ export async function classify(
 					?? requestedForCatastrophe(options.inputs);
 				outcome = {
 					report: reportOf(
-						options.base,
+						reportedBase,
 						inputs.map((input) => allUndecidable(input, detail)),
 						now,
 					),
@@ -1160,7 +1354,7 @@ export async function classify(
 			}
 		}
 	}
-	return outcome ?? { report: reportOf(options.base, [], now), failedClosed: true };
+	return outcome ?? { report: reportOf(reportedBase, [], now), failedClosed: true };
 }
 
 function stableReportEvidence(verdict: Verdict): string {
@@ -1168,10 +1362,25 @@ function stableReportEvidence(verdict: Verdict): string {
 }
 
 export async function appendLedgerRows(path: string, report: ExposureReport): Promise<void> {
-	if (report.verdicts.some((verdict) =>
-		CHECK_NAMES.some((name) => verdict.checks[name].status === "undecidable")
-	)) {
-		throw new Error("refusing to record a failed-closed or incomplete classification report");
+	if (report.schema !== SCHEMA) {
+		throw new Error(`refusing to record structurally invalid report schema: ${report.schema}`);
+	}
+	if (!Array.isArray(report.verdicts)) {
+		throw new Error("refusing to record structurally incomplete report: verdicts missing");
+	}
+	for (const verdict of report.verdicts) {
+		if (verdict.class !== "S" && verdict.class !== "E") {
+			throw new Error(`refusing to record structurally invalid class: ${String(verdict.class)}`);
+		}
+		for (const name of CHECK_NAMES) {
+			const check = verdict.checks[name];
+			if (check === undefined || typeof check.detail !== "string") {
+				throw new Error(`refusing to record structurally incomplete report: ${verdict.input}.${name}`);
+			}
+			if (check.status !== "pass" && check.status !== "fail" && check.status !== "undecidable") {
+				throw new Error(`refusing to record structurally invalid status: ${verdict.input}.${name}=${String(check.status)}`);
+			}
+		}
 	}
 	const date = report.decidedAt.slice(0, 10);
 	const rows = [...report.verdicts]
