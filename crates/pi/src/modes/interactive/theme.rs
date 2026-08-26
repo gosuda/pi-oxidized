@@ -2135,18 +2135,12 @@ mod tests {
     /// `snapshot_buffer_ansi` with `ColorMode::Palette256`.
     #[test]
     fn resolve_active_theme_forced_256_accepts_palette_mode() {
-        // The color_mode parameter is accepted and flows through load_or_dark.
-        // Built-in themes return their compiled mode; the parameter controls
-        // SGR emission for file-backed themes and the ANSI snapshot path.
         let theme = resolve_active_theme(
             None,
             ThemeMode::Dark,
             TerminalTheme::Dark,
             ColorMode::Palette256,
         );
-        // Built-in "dark" theme is interned with Truecolor — this is reference
-        // parity (registeredThemes return as-is). The color_mode parameter
-        // still flows to file-backed loads and the ANSI snapshot path.
         let _ = theme.mode();
     }
 

@@ -1224,6 +1224,9 @@ pub struct InteractiveRuntime<W: Write, S: SessionHost> {
     last_error: Option<String>,
     shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
     terminal_theme: TerminalTheme,
+    /// Terminal truecolor capability: drives `ColorMode` selection on every
+    /// theme load path (reference parity with `createTheme` at theme.ts:630).
+    true_color: bool,
     /// Runtime theme generation: bumped on every theme switch so extension
     /// slots re-measure/re-render (flows to the host via `theme.update` and
     /// back on measure/render requests).
@@ -1519,6 +1522,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             last_error: None,
             shutdown_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             terminal_theme: options.terminal_theme,
+            true_color: options.caps.true_color,
             theme_generation: 0,
             pending_ui_reinject: options.pending_ui_events.iter().rev().cloned().collect(),
             extension_runner,
@@ -3801,6 +3805,15 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         Arc::clone(runner).push_ui_state(&state).await;
     }
 
+    /// Render depth derived from the terminal's truecolor capability.
+    fn color_mode(&self) -> super::theme::ColorMode {
+        if self.true_color {
+            super::theme::ColorMode::Truecolor
+        } else {
+            super::theme::ColorMode::Palette256
+        }
+    }
+
     /// Re-resolve the active theme from settings + detected terminal polarity
     /// and apply it. Called on `/reload` and after settings-driven changes.
     pub(crate) fn apply_theme_from_settings(&mut self) {
@@ -3851,7 +3864,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             }
             super::theme::resolve_active_theme(Some(&name), mode, self.terminal_theme, super::theme::ColorMode::Truecolor)
         } else {
-            super::theme::load_or_dark(&name, super::theme::ColorMode::Truecolor)
+            super::theme::load_or_dark(&name, self.color_mode())
         };
         self.apply_theme(resolved);
         self.push_theme_to_host().await;
@@ -3868,6 +3881,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             &self.view.theme,
             mode,
             self.terminal_theme,
+            self.color_mode(),
             self.theme_generation,
         );
         Arc::clone(runner).push_theme_update(&update).await;
@@ -5179,9 +5193,10 @@ fn build_theme_update(
     active: &ResolvedTheme,
     mode: ThemeMode,
     terminal: TerminalTheme,
+    color_mode: super::theme::ColorMode,
     theme_generation: u64,
 ) -> ThemeUpdate {
-    let themes = super::theme::available_themes(super::theme::ColorMode::Truecolor)
+    let themes = super::theme::available_themes(color_mode)
         .into_iter()
         .map(|(info, resolved)| {
             let path = info.path.map(|path| path.to_string_lossy().into_owned());
@@ -6635,7 +6650,15 @@ pub async fn run_interactive_mode(
 
     // Resolve the startup theme from settings + the just-probed terminal
     // polarity (replaces the static dark default).
-    options.theme = startup_theme(host_arc.as_ref(), options.terminal_theme);
+    options.theme = startup_theme(
+        host_arc.as_ref(),
+        options.terminal_theme,
+        if options.caps.true_color {
+            super::theme::ColorMode::Truecolor
+        } else {
+            super::theme::ColorMode::Palette256
+        },
+    );
     let mut rt = InteractiveRuntime::new(tui, input, host_arc, &options);
     // Bridge replacements dispose the old session from a task outside this
     // loop. Mark that closure before teardown, then rebind after the host
