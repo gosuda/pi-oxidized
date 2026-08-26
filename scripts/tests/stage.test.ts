@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { assembleRelease } from "../release/stage.ts";
+import { assembleRelease, stagedInputs } from "../release/stage.ts";
 import { planFor } from "../release/targets.ts";
 import type { Fs, FsStat } from "../release/runner.ts";
 
@@ -228,5 +228,72 @@ describe("assembleRelease", () => {
 		await expect(
 			assembleRelease("/staging", { ...inputs, bunRuntimePath: "/missing/bun" }),
 		).rejects.toThrow("ENOENT: /missing/bun");
+	});
+});
+
+describe("stagedInputs", () => {
+	test("exposes the ordered staging authority for compiled and fallback hosts", () => {
+		const plan = planFor("aarch64-unknown-linux-gnu");
+		const base = {
+			plan,
+			version: "1.0.0",
+			piBinaryPath: "/workspace/target/aarch64-unknown-linux-gnu/release/pi",
+			repoRoot: "/workspace",
+			fs: new MemoryFs(),
+			sourceDateEpoch: 1000,
+			compatibilityVersion: "0.8",
+			protocolVersion: 1,
+			createdAt: "2024-01-01T00:00:00Z",
+			docsSource: "/workspace/docs",
+			examplesSource: "/workspace/examples",
+			assetsSource: "/workspace/assets",
+			extraFiles: [{ src: "/tmp/extra.txt", dest: "notes/extra.txt" }],
+		};
+
+		expect(
+			stagedInputs({
+				...base,
+				host: { kind: "compiled", binaryPath: "/staging/pi-extension-host" },
+			}).map((entry) => [entry.kind, entry.source, entry.destRel, entry.optional]),
+		).toEqual([
+			["rust-binary", base.piBinaryPath, "pi", false],
+			["host-binary", "/staging/pi-extension-host", "pi-extension-host", false],
+			["metadata-file", "/workspace/CHANGELOG.md", "CHANGELOG.md", true],
+			["metadata-file", "/workspace/README.md", "README.md", true],
+			["metadata-file", "/workspace/LICENSE", "LICENSE", true],
+			["metadata-file", "/workspace/LICENSE-MIT", "LICENSE-MIT", true],
+			["tree", "/workspace/docs", "docs", true],
+			["tree", "/workspace/examples", "examples", true],
+			["tree", "/workspace/assets", "assets", true],
+			["tree", "/workspace/crates/pi/assets/theme", "theme", true],
+			["extra", "/tmp/extra.txt", "notes/extra.txt", false],
+			["manifest", "generated:release.json", "release.json", false],
+		]);
+
+		expect(
+			stagedInputs({
+				...base,
+				host: {
+					kind: "runtime-bundle",
+					runtimePath: "/staging/bun",
+					scriptPath: "/staging/pi-extension-host.js",
+				},
+				bunRuntimePath: "/official/bun",
+			}).map((entry) => [entry.kind, entry.source, entry.destRel, entry.optional]),
+		).toEqual([
+			["rust-binary", base.piBinaryPath, "pi", false],
+			["host-bundle", "/staging/pi-extension-host.js", "pi-extension-host.js", false],
+			["bun-runtime", "/official/bun", "bun", false],
+			["metadata-file", "/workspace/CHANGELOG.md", "CHANGELOG.md", true],
+			["metadata-file", "/workspace/README.md", "README.md", true],
+			["metadata-file", "/workspace/LICENSE", "LICENSE", true],
+			["metadata-file", "/workspace/LICENSE-MIT", "LICENSE-MIT", true],
+			["tree", "/workspace/docs", "docs", true],
+			["tree", "/workspace/examples", "examples", true],
+			["tree", "/workspace/assets", "assets", true],
+			["tree", "/workspace/crates/pi/assets/theme", "theme", true],
+			["extra", "/tmp/extra.txt", "notes/extra.txt", false],
+			["manifest", "generated:release.json", "release.json", false],
+		]);
 	});
 });

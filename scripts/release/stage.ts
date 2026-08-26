@@ -93,6 +93,93 @@ export interface AssembleInputs {
 	readonly extraFiles?: readonly { readonly src: string; readonly dest: string }[];
 }
 
+/** One ordered source-to-archive operation performed by {@link assembleRelease}. */
+export interface StagedInput {
+	readonly kind:
+		| "rust-binary"
+		| "host-binary"
+		| "host-bundle"
+		| "bun-runtime"
+		| "metadata-file"
+		| "tree"
+		| "extra"
+		| "manifest";
+	readonly source: string;
+	readonly destRel: string;
+	readonly optional: boolean;
+}
+
+/** Ordered staging authority for one release assembly. */
+export function stagedInputs(inputs: AssembleInputs): readonly StagedInput[] {
+	const staged: StagedInput[] = [
+		{
+			kind: "rust-binary",
+			source: inputs.piBinaryPath,
+			destRel: inputs.plan.piBinaryName,
+			optional: false,
+		},
+	];
+	if (inputs.host.kind === "compiled") {
+		staged.push({
+			kind: "host-binary",
+			source: inputs.host.binaryPath,
+			destRel: inputs.plan.hostBinaryName,
+			optional: false,
+		});
+	} else {
+		staged.push(
+			{
+				kind: "host-bundle",
+				source: inputs.host.scriptPath,
+				destRel: inputs.plan.hostBundleName,
+				optional: false,
+			},
+			{
+				kind: "bun-runtime",
+				source: inputs.bunRuntimePath ?? "",
+				destRel: inputs.plan.bunRuntimeName,
+				optional: false,
+			},
+		);
+	}
+	for (const name of ["CHANGELOG.md", "README.md", "LICENSE", "LICENSE-MIT"]) {
+		staged.push({
+			kind: "metadata-file",
+			source: `${inputs.repoRoot}/${name}`,
+			destRel: name,
+			optional: true,
+		});
+	}
+	for (const [source, destRel] of [
+		[inputs.docsSource, "docs"],
+		[inputs.examplesSource, "examples"],
+		[inputs.assetsSource, "assets"],
+		[`${inputs.repoRoot}/crates/pi/assets/theme`, "theme"],
+	] as const) {
+		staged.push({
+			kind: "tree",
+			source: source ?? "",
+			destRel,
+			optional: true,
+		});
+	}
+	for (const extra of inputs.extraFiles ?? []) {
+		staged.push({
+			kind: "extra",
+			source: extra.src,
+			destRel: normalizeArchiveRel(extra.dest),
+			optional: false,
+		});
+	}
+	staged.push({
+		kind: "manifest",
+		source: "generated:release.json",
+		destRel: "release.json",
+		optional: false,
+	});
+	return staged;
+}
+
 /** Result of {@link assembleRelease}: staging directory + manifest. */
 export interface AssembledRelease {
 	/** Absolute path to the staged archive-root directory. */
@@ -178,92 +265,116 @@ export async function assembleRelease(
 	const used = new UsedPaths();
 	const copied: ManifestFile[] = [];
 
-	// 1. Rust binary.
-	copied.push(
-		await copyBinary(fs, inputs.piBinaryPath, archiveDir, plan.piBinaryName, true, plan.windows, used),
-	);
-
-	// 2. Host sidecar (or fallback runtime+bundle).
-	for (const f of await copyHostArtifact(inputs, archiveDir, used)) copied.push(f);
-
-	// 3. Optional top-level metadata files. Missing files are skipped silently
-	// (the master plan does not mandate any particular README / LICENSE
-	// layout for the archive; release-time bundles can ship a subset).
-	for (const name of ["CHANGELOG.md", "README.md", "LICENSE", "LICENSE-MIT"]) {
-		const f = await copyOptionalFile(fs, inputs.repoRoot, archiveDir, name, used);
-		if (f) copied.push(f);
-	}
-
-	// 4. Recursive doc/example/asset trees.
-	for (const f of await copyTreeOptional(fs, inputs.docsSource, archiveDir, "docs", used)) {
-		copied.push(f);
-	}
-	for (const f of await copyTreeOptional(fs, inputs.examplesSource, archiveDir, "examples", used)) {
-		copied.push(f);
-	}
-	for (const f of await copyTreeOptional(fs, inputs.assetsSource, archiveDir, "assets", used)) {
-		copied.push(f);
-	}
-	for (const f of await copyTreeOptional(
-		fs,
-		`${inputs.repoRoot}/crates/pi/assets/theme`,
-		archiveDir,
-		"theme",
-		used,
-	)) {
-		copied.push(f);
-	}
-
-	// 5. Caller-supplied extras (tests use this for deterministic content).
-	if (inputs.extraFiles) {
-		for (const extra of inputs.extraFiles) {
-			const destRel = normalizeArchiveRel(extra.dest);
-			used.assertNotReserved(destRel);
-			used.claim(destRel);
-			const data = await fs.readFile(extra.src);
-			const dest = safeJoinPath(archiveDir, destRel);
-			await fs.mkdir(dest.split("/").slice(0, -1).join("/"), { recursive: true });
-			await fs.writeFile(dest, data);
-			copied.push(manifestEntryFromData(data, destRel, false));
+	for (const staged of stagedInputs(inputs)) {
+		switch (staged.kind) {
+			case "rust-binary":
+			case "host-binary":
+			case "host-bundle":
+			case "bun-runtime": {
+				if (staged.kind === "bun-runtime" && staged.source.length === 0) {
+					throw new ReleaseVerifyError(
+						`runtime-bundle host requires bunRuntimePath for ${plan.rustTarget}`,
+					);
+				}
+				const executable =
+					staged.kind === "rust-binary" ||
+					staged.kind === "host-binary" ||
+					staged.kind === "bun-runtime";
+				const file = await copyBinary(
+					fs,
+					staged.source,
+					archiveDir,
+					staged.destRel,
+					executable,
+					staged.optional,
+					plan.windows,
+					used,
+				);
+				if (file) copied.push(file);
+				break;
+			}
+			case "metadata-file": {
+				const file = await copyStagedFile(
+					fs,
+					staged.source,
+					archiveDir,
+					staged.destRel,
+					staged.optional,
+					used,
+				);
+				if (file) copied.push(file);
+				break;
+			}
+			case "tree":
+				for (const file of await copyTreeOptional(
+					fs,
+					staged.source,
+					archiveDir,
+					staged.destRel,
+					staged.optional,
+					used,
+				)) {
+					copied.push(file);
+				}
+				break;
+			case "extra": {
+				used.assertNotReserved(staged.destRel);
+				const data = await readStagedFile(fs, staged.source, staged.optional);
+				if (data) {
+					used.claim(staged.destRel);
+					const dest = safeJoinPath(archiveDir, staged.destRel);
+					await fs.mkdir(dest.split("/").slice(0, -1).join("/"), { recursive: true });
+					await fs.writeFile(dest, data);
+					copied.push(manifestEntryFromData(data, staged.destRel, false));
+				}
+				break;
+			}
+			case "manifest": {
+				if (staged.optional) {
+					throw new ReleaseVerifyError("release manifest cannot be optional");
+				}
+				await verifyNoHostInPi(fs, inputs.piBinaryPath, inputs.host);
+				await verifyExecutableBits(fs, plan, archiveDir, inputs.host);
+				const manifest: ReleaseManifest = {
+					schema: RELEASE_MANIFEST_SCHEMA,
+					version: inputs.version,
+					rustTarget: plan.rustTarget,
+					bunTarget: plan.bunTarget,
+					hostKind: inputs.host.kind,
+					compatibilityVersion: inputs.compatibilityVersion,
+					protocolVersion: inputs.protocolVersion,
+					sourceDateEpoch: inputs.sourceDateEpoch,
+					createdAt: inputs.createdAt,
+					files: copied
+						.slice()
+						.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0)),
+				};
+				used.claim(staged.destRel);
+				await fs.writeFile(
+					safeJoinPath(archiveDir, staged.destRel),
+					JSON.stringify(manifest, null, 2) + "\n",
+				);
+				return { stagingDir: archiveDir, manifest };
+			}
 		}
 	}
-
-	// Verification gate: no host bytes inside the Rust binary.
-	await verifyNoHostInPi(fs, inputs.piBinaryPath, inputs.host);
-
-	// Verification gate: binaries present and (on POSIX) executable.
-	await verifyExecutableBits(fs, plan, archiveDir, inputs.host);
-
-	const manifest: ReleaseManifest = {
-		schema: RELEASE_MANIFEST_SCHEMA,
-		version: inputs.version,
-		rustTarget: plan.rustTarget,
-		bunTarget: plan.bunTarget,
-		hostKind: inputs.host.kind,
-		compatibilityVersion: inputs.compatibilityVersion,
-		protocolVersion: inputs.protocolVersion,
-		sourceDateEpoch: inputs.sourceDateEpoch,
-		createdAt: inputs.createdAt,
-		files: copied.slice().sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0)),
-	};
-	const manifestPath = safeJoinPath(archiveDir, "release.json");
-	used.claim("release.json");
-	await fs.writeFile(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
-	return { stagingDir: archiveDir, manifest };
+	throw new ReleaseVerifyError("staging plan omitted release manifest");
 }
 
-/** Copy a single binary into the staging tree, preserving the exec bit. */
+/** Copy a binary into the staging tree, preserving the executable bit. */
 async function copyBinary(
 	fs: Fs,
 	srcPath: string,
 	archiveDir: string,
 	destName: string,
 	executable: boolean,
+	optional: boolean,
 	isWindows: boolean,
 	used: UsedPaths,
-): Promise<ManifestFile> {
+): Promise<ManifestFile | null> {
+	const data = await readStagedFile(fs, srcPath, optional);
+	if (!data) return null;
 	used.claim(destName);
-	const data = await fs.readFile(srcPath);
 	const dest = safeJoinPath(archiveDir, destName);
 	await fs.writeFile(dest, data);
 	// Windows has no chmod; the archive writer carries the bit via
@@ -278,78 +389,63 @@ async function copyBinary(
 	return manifestEntryFromData(data, destName, executable);
 }
 
-/** Copy the host artifact(s) into the staging tree. */
-async function copyHostArtifact(
-	inputs: AssembleInputs,
-	archiveDir: string,
-	used: UsedPaths,
-): Promise<ManifestFile[]> {
-	const { fs, plan, host } = inputs;
-	const out: ManifestFile[] = [];
-	if (host.kind === "compiled") {
-		out.push(
-			await copyBinary(fs, host.binaryPath, archiveDir, plan.hostBinaryName, true, plan.windows, used),
-		);
-		return out;
+/** Read a staged file, returning `null` only when its source is optional. */
+async function readStagedFile(
+	fs: Fs,
+	src: string,
+	optional: boolean,
+): Promise<Uint8Array | null> {
+	try {
+		return await fs.readFile(src);
+	} catch (error) {
+		if (optional) return null;
+		throw error;
 	}
-	// runtime-bundle fallback: ship script + the official Bun runtime.
-	out.push(
-		await copyBinary(fs, host.scriptPath, archiveDir, plan.hostBundleName, false, plan.windows, used),
-	);
-	const runtimePath = inputs.bunRuntimePath;
-	if (!runtimePath) {
-		throw new ReleaseVerifyError(
-			`runtime-bundle host requires bunRuntimePath for ${plan.rustTarget}`,
-		);
-	}
-	out.push(
-		await copyBinary(fs, runtimePath, archiveDir, plan.bunRuntimeName, true, plan.windows, used),
-	);
-	return out;
 }
 
-/** Copy one optional top-level metadata file; returns `null` if absent. */
-async function copyOptionalFile(
+/** Copy one staged file; optional sources can be absent. */
+async function copyStagedFile(
 	fs: Fs,
-	repoRoot: string,
+	src: string,
 	archiveDir: string,
-	name: string,
+	destRel: string,
+	optional: boolean,
 	used: UsedPaths,
 ): Promise<ManifestFile | null> {
-	const src = `${repoRoot}/${name}`;
-	let data: Uint8Array;
-	try {
-		data = await fs.readFile(src);
-	} catch {
-		return null;
-	}
-	used.claim(name);
-	const dest = safeJoinPath(archiveDir, name);
+	const data = await readStagedFile(fs, src, optional);
+	if (!data) return null;
+	used.claim(destRel);
+	const dest = safeJoinPath(archiveDir, destRel);
 	await fs.writeFile(dest, data);
-	return manifestEntryFromData(data, name, false);
+	return manifestEntryFromData(data, destRel, false);
 }
 
 /**
  * Recursively copy `src` into `<archiveDir>/<destSubdir>/`, returning one
- * manifest entry per file. If `src` is `undefined` or does not exist, returns
- * an empty array (caller can ship a subset).
+ * manifest entry per file. Optional missing sources produce no entries.
  */
 async function copyTreeOptional(
 	fs: Fs,
 	src: string | undefined,
 	archiveDir: string,
 	destSubdir: string,
+	optional: boolean,
 	used: UsedPaths,
 ): Promise<ManifestFile[]> {
-	if (!src) return [];
-	let exists = true;
-	try {
-		const s = await fs.stat(src);
-		if (!s.isDir) exists = false;
-	} catch {
-		exists = false;
+	if (!src) {
+		if (optional) return [];
+		throw new ReleaseVerifyError(`required staged tree has no source: ${destSubdir}`);
 	}
-	if (!exists) return [];
+	try {
+		const stat = await fs.stat(src);
+		if (!stat.isDir) {
+			if (optional) return [];
+			throw new ReleaseVerifyError(`required staged tree is not a directory: ${src}`);
+		}
+	} catch (error) {
+		if (optional) return [];
+		throw error;
+	}
 
 	const destRoot = safeJoinPath(archiveDir, destSubdir);
 	await fs.cp(src, destRoot, { recursive: true });

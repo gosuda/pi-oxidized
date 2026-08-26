@@ -74,9 +74,50 @@ export class HostBuildError extends Error {
 	}
 }
 
+/** Relative workspace path used for every shipping host build. */
+export const HOST_PACKAGE_DIR = "packages/extension-host";
+
+/** Shipping `bun build` argument vectors used by the release host path. */
+export interface HostBundleCommands {
+	readonly compiled: readonly string[];
+	readonly runtimeBundle: readonly string[];
+}
+
+/**
+ * Single authority for both shipping host bundle commands: the compiled
+ * sidecar argv and the runtime-bundle fallback argv.
+ */
+export function hostBundleCommands(plan: TargetPlan, outDir: string): HostBundleCommands {
+	const compiledOut = join(outDir, plan.hostBinaryName);
+	const bundleOut = join(outDir, plan.hostBundleName);
+	return {
+		compiled: [
+			"build",
+			"./src/main.ts",
+			"--compile",
+			"--minify",
+			"--compile-autoload-tsconfig",
+			"--compile-autoload-package-json",
+			"--target",
+			plan.bunTarget,
+			"--outfile",
+			compiledOut,
+		],
+		runtimeBundle: [
+			"build",
+			"./src/main.ts",
+			"--target",
+			"bun",
+			"--minify",
+			"--outfile",
+			bundleOut,
+		],
+	};
+}
+
 /** Absolute path to the host package directory inside the workspace. */
 function hostPackageDir(repoRoot: string): string {
-	return resolve(repoRoot, "packages/extension-host");
+	return resolve(repoRoot, HOST_PACKAGE_DIR);
 }
 
 /** Absolute path to a per-target staging subdirectory. */
@@ -158,22 +199,12 @@ async function compileSidecar(
 	plan: TargetPlan,
 	runner: CommandRunner,
 ): Promise<RunResult> {
-	return runner.run(
-		"bun",
-		[
-			"build",
-			"./src/main.ts",
-			"--compile",
-			"--minify",
-			"--compile-autoload-tsconfig",
-			"--compile-autoload-package-json",
-			"--target",
-			plan.bunTarget,
-			"--outfile",
-			outPath,
-		],
-		{ cwd: hostDir, rejectOnError: false, timeoutMs: HOST_BUILD_TIMEOUT_MS },
-	);
+	const { compiled } = hostBundleCommands(plan, dirname(outPath));
+	return runner.run("bun", [...compiled], {
+		cwd: hostDir,
+		rejectOnError: false,
+		timeoutMs: HOST_BUILD_TIMEOUT_MS,
+	});
 }
 
 /**
@@ -337,19 +368,12 @@ async function tryRuntimeBundlePath(
 ): Promise<HostArtifact | undefined> {
 	const scriptPath = join(outDir, options.plan.hostBundleName);
 	if (existsSync(scriptPath)) await rm(scriptPath, { force: true });
-	const res = await runner.run(
-		"bun",
-		[
-			"build",
-			"./src/main.ts",
-			"--target",
-			"bun",
-			"--minify",
-			"--outfile",
-			scriptPath,
-		],
-		{ cwd: hostDir, rejectOnError: false, timeoutMs: HOST_BUILD_TIMEOUT_MS },
-	);
+	const { runtimeBundle } = hostBundleCommands(options.plan, outDir);
+	const res = await runner.run("bun", [...runtimeBundle], {
+		cwd: hostDir,
+		rejectOnError: false,
+		timeoutMs: HOST_BUILD_TIMEOUT_MS,
+	});
 	if (res.exitCode !== 0 || !existsSync(scriptPath)) return undefined;
 	const runtimePath = join(outDir, options.plan.bunRuntimeName);
 	// Caller is responsible for populating `runtimePath` (from the official

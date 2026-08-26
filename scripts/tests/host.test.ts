@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-import { buildHost, isHelloAckLine } from "../release/host.ts";
+import { buildHost, hostBundleCommands, isHelloAckLine } from "../release/host.ts";
 import { OK_RUN, RecordingRunner, type RunResult } from "../release/runner.ts";
 import { planFor } from "../release/targets.ts";
 
@@ -218,6 +218,36 @@ describe("buildHost", () => {
 			join(work, "host", plan.rustTarget, plan.hostBundleName),
 		);
 		expect(runner.calls.every((call) => (call.options?.timeoutMs ?? 0) > 0)).toBe(true);
+	});
+});
+
+describe("hostBundleCommands", () => {
+	test("exposes compiled and runtime-bundle argv from one authority", () => {
+		const plan = planFor("x86_64-unknown-linux-gnu");
+		const outDir = "/staging/host/x86_64-unknown-linux-gnu";
+		const commands = hostBundleCommands(plan, outDir);
+
+		expect(commands.compiled).toEqual([
+			"build",
+			"./src/main.ts",
+			"--compile",
+			"--minify",
+			"--compile-autoload-tsconfig",
+			"--compile-autoload-package-json",
+			"--target",
+			plan.bunTarget,
+			"--outfile",
+			join(outDir, plan.hostBinaryName),
+		]);
+		expect(commands.runtimeBundle).toEqual([
+			"build",
+			"./src/main.ts",
+			"--target",
+			"bun",
+			"--minify",
+			"--outfile",
+			join(outDir, plan.hostBundleName),
+		]);
 	});
 });
 
