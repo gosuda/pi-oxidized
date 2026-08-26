@@ -287,7 +287,7 @@ fn check_server_discriminant(value: &CborValue) -> Result<(), CodecError> {
 fn validate_client_message(msg: &ClientMessage) -> Result<(), CodecError> {
     if let ClientMessage::Hello { version } = msg {
         if *version != PROTOCOL_VERSION {
-            return Err(CodecError::VersionMismatch { expected: PROTOCOL_VERSION, got: *version });
+            return Err(CodecError::VersionMismatch { expected: PROTOCOL_VERSION as u64, got: *version as u64 });
         }
     }
     Ok(())
@@ -296,7 +296,7 @@ fn validate_client_message(msg: &ClientMessage) -> Result<(), CodecError> {
 fn validate_server_message(msg: &ServerMessage) -> Result<(), CodecError> {
     if let ServerMessage::Hello { version, .. } = msg {
         if *version != PROTOCOL_VERSION {
-            return Err(CodecError::VersionMismatch { expected: PROTOCOL_VERSION, got: *version });
+            return Err(CodecError::VersionMismatch { expected: PROTOCOL_VERSION as u64, got: *version as u64 });
         }
     }
     Ok(())
@@ -307,7 +307,7 @@ fn validate_server_message(msg: &ServerMessage) -> Result<(), CodecError> {
 // ---------------------------------------------------------------------------
 
 #[must_use]
-pub fn is_supported_protocol_version(version: u64) -> bool { version == PROTOCOL_VERSION }
+pub fn is_supported_protocol_version(version: u64) -> bool { version == PROTOCOL_VERSION as u64 }
 
 pub fn encode_client_message(msg: &ClientMessage, options: Option<FrameDecoderOptions>) -> Result<Vec<u8>, CodecError> {
     let opts = CborOptions::from_frame(options);
