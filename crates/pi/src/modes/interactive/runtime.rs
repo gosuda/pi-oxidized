@@ -88,7 +88,7 @@ use super::state::{
     PendingMessage, SessionStatus, StartupDiagnostic, StatusKind, ViewAction, ViewState,
     WidgetSlot,
 };
-use super::theme::ResolvedTheme;
+use super::theme::{ResolvedTheme, ThemeColor};
 use super::view::{ComposedSection, compose};
 
 /// Maximum time the runtime will wait for one [`Tui::commit`] before declaring
@@ -1391,7 +1391,9 @@ fn build_initial_editor(
     submit_tx: mpsc::UnboundedSender<String>,
 ) -> Editor {
     let mut editor = Editor::new(
-        &pi_tui::components::editor::EditorTheme::default(),
+        &pi_tui::components::editor::EditorTheme {
+            border_color: editor_border_color(EditorBorder::Muted),
+        },
         &EditorOptions {
             padding_x: 1,
             autocomplete_max_visible: 5,
@@ -1402,6 +1404,26 @@ fn build_initial_editor(
         let _ = submit_tx.send(text);
     }));
     editor
+}
+
+/// Map a semantic editor border to its themed border painter.
+///
+/// The `fn` pointer resolves [`super::theme::current`] at call time, so live
+/// theme switches and previews repaint without reassignment.
+fn editor_border_color(border: EditorBorder) -> fn(&str) -> String {
+    match border {
+        EditorBorder::Muted => super::theme::make_fg(ThemeColor::BorderMuted),
+        EditorBorder::Bash => super::theme::make_fg(ThemeColor::BashMode),
+        EditorBorder::Thinking(level) => super::theme::make_fg(match level {
+            pi_ai::ModelThinkingLevel::Off => ThemeColor::ThinkingOff,
+            pi_ai::ModelThinkingLevel::Minimal => ThemeColor::ThinkingMinimal,
+            pi_ai::ModelThinkingLevel::Low => ThemeColor::ThinkingLow,
+            pi_ai::ModelThinkingLevel::Medium => ThemeColor::ThinkingMedium,
+            pi_ai::ModelThinkingLevel::High => ThemeColor::ThinkingHigh,
+            pi_ai::ModelThinkingLevel::Xhigh => ThemeColor::ThinkingXhigh,
+            pi_ai::ModelThinkingLevel::Max => ThemeColor::ThinkingMax,
+        }),
+    }
 }
 
 impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
@@ -2771,6 +2793,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             return ActionOutcome::Repaint;
         }
         self.view.editor.border = EditorBorder::Bash;
+        self.sync_editor_border();
         ActionOutcome::Repaint
     }
 
@@ -4348,9 +4371,15 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         self.rebind_extension_channels().await;
     }
 
+    /// Re-apply the semantic border painter to the live editor.
+    fn sync_editor_border(&mut self) {
+        self.editor.border_color = editor_border_color(self.view.editor.border);
+    }
+
     async fn refresh_footer(&mut self) {
         let snapshot = self.session.footer_snapshot().await;
         project_footer(&mut self.view, &snapshot);
+        self.sync_editor_border();
     }
 
     /// Clear selector focus before process suspension.
@@ -8065,6 +8094,110 @@ mod tests {
             view.editor.border,
             EditorBorder::Thinking(pi_ai::ModelThinkingLevel::High)
         );
+    }
+
+    #[test]
+    fn editor_border_color_maps_semantic_states_to_existing_tokens() {
+        super::super::theme::set_current(super::super::theme::dark());
+        const PROBE: &str = "─";
+        let expect = |color: ThemeColor| super::super::theme::make_fg(color)(PROBE);
+
+        assert_eq!(
+            editor_border_color(EditorBorder::Muted)(PROBE),
+            expect(ThemeColor::BorderMuted)
+        );
+        assert_eq!(
+            editor_border_color(EditorBorder::Bash)(PROBE),
+            expect(ThemeColor::BashMode)
+        );
+        for (level, token) in [
+            (pi_ai::ModelThinkingLevel::Off, ThemeColor::ThinkingOff),
+            (
+                pi_ai::ModelThinkingLevel::Minimal,
+                ThemeColor::ThinkingMinimal,
+            ),
+            (pi_ai::ModelThinkingLevel::Low, ThemeColor::ThinkingLow),
+            (
+                pi_ai::ModelThinkingLevel::Medium,
+                ThemeColor::ThinkingMedium,
+            ),
+            (pi_ai::ModelThinkingLevel::High, ThemeColor::ThinkingHigh),
+            (pi_ai::ModelThinkingLevel::Xhigh, ThemeColor::ThinkingXhigh),
+            (pi_ai::ModelThinkingLevel::Max, ThemeColor::ThinkingMax),
+        ] {
+            assert_eq!(
+                editor_border_color(EditorBorder::Thinking(level))(PROBE),
+                expect(token)
+            );
+        }
+
+        // The three semantic states must be visibly distinct (dark theme:
+        // borderMuted ≠ bashMode ≠ thinkingHigh — bashMode and thinkingMedium
+        // intentionally share a teal in this theme, so probe thinkingHigh).
+        assert_ne!(
+            expect(ThemeColor::BorderMuted),
+            expect(ThemeColor::BashMode)
+        );
+        assert_ne!(
+            expect(ThemeColor::BorderMuted),
+            expect(ThemeColor::ThinkingHigh)
+        );
+        assert_ne!(
+            expect(ThemeColor::BashMode),
+            expect(ThemeColor::ThinkingHigh)
+        );
+    }
+
+    #[tokio::test]
+    async fn live_editor_border_painter_tracks_footer_and_bash_transitions() -> Result<(), String> {
+        let (mut rt, _log) = make_runtime();
+        let themed = |color: ThemeColor| super::super::theme::make_fg(color)("─");
+
+        assert_eq!(
+            (rt.editor().border_color)("─"),
+            themed(ThemeColor::BorderMuted),
+            "initial live border must paint through BorderMuted"
+        );
+
+        let mut footer = SessionFooterSnapshot {
+            thinking_level: pi_ai::ModelThinkingLevel::High,
+            ..SessionFooterSnapshot::default()
+        };
+        project_footer(&mut rt.view, &footer);
+        rt.sync_editor_border();
+        assert_eq!(
+            rt.view.editor.border,
+            EditorBorder::Thinking(pi_ai::ModelThinkingLevel::High)
+        );
+        assert_eq!(
+            (rt.editor().border_color)("─"),
+            themed(ThemeColor::ThinkingHigh)
+        );
+
+        footer.bash_running = true;
+        project_footer(&mut rt.view, &footer);
+        rt.sync_editor_border();
+        assert_eq!(rt.view.editor.border, EditorBorder::Bash);
+        assert_eq!(
+            (rt.editor().border_color)("─"),
+            themed(ThemeColor::BashMode)
+        );
+
+        // The mapping reaches painted cells: the full top border row carries the
+        // token's RGB, not a hardcoded color.
+        let area = Rect::new(0, 0, 12, 3);
+        let mut buffer = Buffer::empty(area);
+        rt.editor_mut().render(area, &mut buffer);
+        let super::super::theme::Rgb(r, g, b) =
+            super::super::theme::current().fg_rgb(ThemeColor::BashMode);
+        for x in 0..area.width {
+            let cell = buffer
+                .cell((x, 0))
+                .ok_or_else(|| format!("missing border cell ({x}, 0)"))?;
+            assert_eq!(cell.symbol(), "─");
+            assert_eq!(cell.fg, ratatui::style::Color::Rgb(r, g, b));
+        }
+        Ok(())
     }
 
     #[tokio::test]

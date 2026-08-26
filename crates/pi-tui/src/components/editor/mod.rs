@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::component::{Component, EventResult, UiEvent};
+use crate::components::util::paint_line;
 use crate::editor_support::{
     ATTACHMENT_AUTOCOMPLETE_DEBOUNCE_MS, AutocompleteItem, AutocompleteProvider,
     AutocompleteSuggestions, CursorPlacement, DEFAULT_AUTOCOMPLETE_TRIGGER_CHARACTERS, History,
@@ -1772,7 +1773,13 @@ impl Editor {
         } else {
             "─".repeat(usize::from(width))
         };
-        paint_plain(buf, area.x, y, width, &top);
+        paint_line(
+            area.x,
+            y,
+            usize::from(width),
+            buf,
+            &(self.border_color)(&top),
+        );
         y.saturating_add(1)
     }
 
@@ -1797,7 +1804,13 @@ impl Editor {
         } else {
             "─".repeat(usize::from(width))
         };
-        paint_plain(buf, area.x, y, width, &bottom);
+        paint_line(
+            area.x,
+            y,
+            usize::from(width),
+            buf,
+            &(self.border_color)(&bottom),
+        );
         y.saturating_add(1)
     }
 
@@ -2146,16 +2159,6 @@ impl Component for Editor {
     }
 }
 
-fn paint_plain(buf: &mut Buffer, x: u16, y: u16, width: u16, text: &str) {
-    for (i, ch) in text.chars().enumerate() {
-        let cx = x.saturating_add(u16::try_from(i).unwrap_or(u16::MAX));
-        if cx >= x + width {
-            break;
-        }
-        buf[(cx, y)].set_symbol(&ch.to_string());
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2388,6 +2391,35 @@ mod tests {
         ed.set_text("hello");
         let h = ed.measure(40);
         assert!(h >= 3);
+    }
+
+    #[test]
+    fn border_color_styles_top_and_bottom_frame() -> Result<(), String> {
+        fn magenta(s: &str) -> String {
+            format!("\u{1b}[35m{s}\u{1b}[39m")
+        }
+        let mut editor = Editor::with_defaults();
+        editor.border_color = magenta;
+        editor.set_text("hello");
+
+        let area = Rect::new(0, 0, 12, 3);
+        let mut buffer = Buffer::empty(area);
+        editor.render(area, &mut buffer);
+
+        for y in [0_u16, 2] {
+            for x in 0..area.width {
+                let cell = buffer
+                    .cell((x, y))
+                    .ok_or_else(|| format!("missing border cell ({x}, {y})"))?;
+                assert_eq!(cell.symbol(), "─");
+                assert_eq!(cell.fg, ratatui::style::Color::Magenta);
+            }
+        }
+        let body = buffer
+            .cell((1, 1))
+            .ok_or_else(|| "missing body cell".to_owned())?;
+        assert_eq!(body.fg, ratatui::style::Color::Reset);
+        Ok(())
     }
 
     #[test]
