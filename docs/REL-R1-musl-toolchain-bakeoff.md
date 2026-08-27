@@ -453,11 +453,13 @@ HTTP/1.1 404 Not Found
 
 ---
 
-## 8. REL-T3 handoff notes
+## 8. REL-T3 handoff notes — RESOLVED
 
 Two latent defects were found in the unexecuted `musl-bakeoff.yml` workflow
 script during local execution. REL-T3 must fix these before relying on the CI
-form:
+form: **all four are fixed** (commit `0767ae6`, plus execution-discovered
+defects 5-6 in `abc64a7` and pinned-reference provisioning in `daeb68d`);
+each fix is proven by the executed evidence in §11, not by inspection alone:
 
 1. **`.PKGINFO` format**: The workflow's `grep -Fx "pkgname=$package"` uses
    `key=value` but Alpine `.PKGINFO` uses `key = value` (with spaces). Fix:
@@ -485,8 +487,8 @@ form:
 
 | Arch | Candidate A | Candidate B | Candidate C | QEMU | Verdict |
 |---|---|---|---|---|---|
-| x86_64 | **PASS** (executed locally 2026-08-27) | not in scope | deleted | excluded | **PASS** |
-| aarch64 | source-derived; pending REL-T3 CI | conditional backup; pending | deleted | excluded | **PENDING CI** |
+| x86_64 | **PASS** (executed locally 2026-08-27; re-executed in a clean container by REL-T3 2026-08-27, §11) | not in scope | deleted | excluded | **PASS** |
+| aarch64 | ARM-native; pending CI (billing-locked, §11) | **CROSS-PASS** — build+static+provision+pins executed by REL-T3 2026-08-27, §11; native smoke pending ARM64 | deleted | excluded | **CROSS-PASS / native smoke PENDING ARM64** |
 
 ---
 
@@ -509,3 +511,79 @@ form:
 - musl `ldso/dynlink.c` path-file replacement semantics
 - GitHub runner-images README — `ubuntu-24.04-arm` availability
 - musl.cc HTTP probe — no checksums (404), stale tarball (2021-11-23)
+
+---
+
+## 11. REL-T3 execution evidence (2026-08-27)
+
+Commits on `feat/ver-align-canonical-pin`: `0767ae6` (handoff defects 1-4),
+`699f4db` (rm -rf guards), `abc64a7` (execution-discovered defects 5-6),
+`daeb68d` (pinned TypeScript reference provisioning). Independent review:
+CLEAN (no Critical/Important/Minor findings).
+
+### CI dispatch — blocked externally
+
+`gh workflow run musl-bakeoff.yml --ref feat/ver-align-canonical-pin` → run
+33054055228 (2026-08-27T08:26:40Z) failed in 8s: "The job was not started
+because your account is locked due to a billing issue" — the same external
+blocker REL-R1 recorded (run 32986086665). Re-dispatch after unlock.
+
+### x86_64 — EXECUTED in a clean ubuntu:24.04 container (Candidate A, PASS)
+
+The fixed workflow's x86_64 run blocks (init evidence / candidate A /
+acceptance) were extracted verbatim from `daeb68d` and executed in
+`docker run ubuntu:24.04`. Only adaptations: Actions → sha256-verified
+rustup-init + Bun 1.3.14 SHASUMS256.txt toolchain provisioning (ledgered),
+`sudo` dropped (container root), `RUNNER_TEMP→/tmp/runner`,
+`GITHUB_WORKSPACE→/work`, `CARGO_BUILD_JOBS=8` (4-vCPU runner shape).
+
+- `apt musl-dev/musl-tools 1.2.4-2` pinned install; packages.tsv recorded.
+- `cargo build -p pi --release --locked --target x86_64-unknown-linux-musl`
+  exit 0 (aws-lc-sys, zstd-sys compiled clean under musl-gcc); 7m24s cold.
+- Static gate: `readelf -d` zero NEEDED entries; `file` → "static-pie
+  linked, stripped"; `ldd` → "statically linked" (defect-3 fix proven).
+- Alpine minirootfs 3.24.1 + libstdc++/libgcc 15.2.0-r5 APKs sha256-verified;
+  spaced `.PKGINFO` asserts passed (defect-1 fix proven); loader installed
+  to `/lib/ld-musl-x86_64.so.1`; `/etc/ld-musl-x86_64.path` → isolated
+  userland only.
+- Sidecar built with relative `--outfile ../../$STAGE/pi-extension-host`
+  (defect-4 fix proven); staged+unpacked PT_INTERP exactly
+  `/lib/ld-musl-x86_64.so.1` for sidecar and Bun runtime; loader `--list`
+  isolation gates passed (defect-2 fix exercised).
+- Hello protocol smokes (unpacked): the compiled sidecar and `./bun
+  pi-extension-host.js` both acked
+  `{"id":1,"kind":"res","method":"hello","payload":{"protocolVersion":1,"compatibilityVersion":"0.80.10"}}`.
+- `./pi --version` → `0.1.0`.
+- Ledger gate: 4/4 direct downloads (minirootfs, 2 APKs, Bun zip), each
+  sha256 + `acquired_utc` recorded; toolchain ledger (rustup-init,
+  bun-linux-x64.zip) sha256-verified against vendor sidecars.
+- Verdict: `PASS`.
+
+### aarch64 — CROSS-PASS in a clean ubuntu:24.04 container (Candidate B)
+
+Candidate A is ARM-native by construction (issue #112: "apt musl-tools on
+ubuntu-24.04-arm"); the x86_64 host executed the issue-sanctioned REL-R1
+backup: cargo-zigbuild 0.23.0 + Zig 0.16.0, both sha256-pinned (Zig via the
+host-appropriate `zig-x86_64-linux-0.16.0.tar.xz` archive of the same
+pinned version; shasum from ziglang.org `download/index.json`, acquired
+2026-08-27 — the workflow's aarch64 archive pin `ea4b09bf…` re-verified
+against the same index).
+
+- `cargo zigbuild -p pi --release --locked --target
+  aarch64-unknown-linux-musl` exit 0 (aws-lc-sys, zstd cross-built via zig);
+  `cargo-zigbuild --version` → `cargo-zigbuild 0.23.0` (defect-5 fix).
+- Static gate: `readelf -d` zero NEEDED; `file` → "ARM aarch64 … statically
+  linked, stripped"; `ldd` → "not a dynamic executable".
+- Userland: aarch64 minirootfs + APK pins verified; spaced `.PKGINFO`
+  asserts passed; loader copied to `/lib/ld-musl-aarch64.so.1`;
+  `/etc/ld-musl-aarch64.path` → isolated userland.
+- Sidecar cross-compiled from the x64 Bun toolchain with `--target
+  bun-linux-arm64-musl`; staged+unpacked PT_INTERP exactly
+  `/lib/ld-musl-aarch64.so.1` for sidecar and Bun runtime.
+- Ledger gate: 6/6 (minirootfs, 2 APKs, Bun zip, Zig tarball, zigbuild crate).
+- Skips (structurally impossible on x86_64; recorded in
+  `native-execution-skips.txt`): loader `--list`, both hello smokes —
+  they require native ARM64; QEMU is excluded by §QEMU doctrine; Actions
+  runners are billing-locked (run 33054055228).
+- Verdict: `CROSS-PASS (build+static+provision+pins; native execution
+  pending ARM64)`.
