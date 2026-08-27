@@ -91,12 +91,17 @@ compiles. Verified mechanics per move:
 lines per crate and surface (src includes the `src/bin` fixture binaries,
 split out below):
 
-| Crate | src | tests | fixture bins | Total | Files |
+| Crate | src | tests | fixture bins | Total | Files (≥1 counted line) |
 | --- | --- | --- | --- | --- | --- |
-| pi-tui | 79 | 3 | 18 | 100 | 26 (terminal/, components/, frame.rs, overlay.rs, focus.rs, link.rs, component.rs, keys.rs, keybindings.rs, 7 fixture bins) |
-| pi | 27 | 0 | 0 | 27 | 8 (modes/interactive/{runtime,view,messages,selectors,tests}.rs, cli/{trust,config}_selector.rs, modes/interactive/input.rs) |
-| pi-ext | 5 | 2 | 0 | 7 | 2 (adapters.rs, protocol.rs; tests/scaling.rs) |
-| **Total** | **111** | **5** | **18** | **134** | 36 files |
+| pi-tui | 79 | 3 | 18 | 100 | 33 = 24 src + 7 fixture bins + 2 tests (frame, 12 components, terminal/{backend,input,probe,guard,writer}, overlay, focus, link, component, keys, keybindings; tests: pty_no_flicker, pty_grill_adjudication) |
+| pi | 27 | 0 | 0 | 27 | 6 (modes/interactive/{runtime,messages,selectors,input,view}.rs, cli/trust_selector.rs) |
+| pi-ext | 5 | 2 | 0 | 7 | 2 (src/adapters.rs, tests/scaling.rs) |
+| **Total** | **111** | **5** | **18** | **134** | **41 files** |
+
+Files referencing either crate without a counted `use` line exist and are part
+of the §3 API surface (pi: modes/interactive/tests.rs, cli/config_selector.rs;
+pi-tui: tests/static_frame_evidence.rs; pi-ext: src/protocol.rs) — outside the
+line census but inside the migration's blast radius.
 
 API surface the future major can break (distinct module paths in use):
 
