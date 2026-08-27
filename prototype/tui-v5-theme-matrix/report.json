@@ -1,0 +1,1820 @@
+{
+  "summary": {
+    "rungTotal": 24,
+    "polarityTotal": 11,
+    "sgrTotal": 24,
+    "pairFallbackCount": 2,
+    "rungPassing": 8,
+    "polarityClassified": 10,
+    "pairFallbackTotal": 14,
+    "railHueTotal": 100,
+    "railHuePassing": 94
+  },
+  "pairFallbackVerdicts": [
+    {
+      "resolvedMember": "dark",
+      "wantDark": true,
+      "fallbackUsed": false,
+      "rawSetting": "dark"
+    },
+    {
+      "resolvedMember": "light",
+      "rawSetting": "dark",
+      "wantDark": false,
+      "fallbackUsed": false
+    },
+    {
+      "rawSetting": "light",
+      "resolvedMember": "dark",
+      "wantDark": true,
+      "fallbackUsed": false
+    },
+    {
+      "fallbackUsed": false,
+      "wantDark": false,
+      "rawSetting": "light",
+      "resolvedMember": "light"
+    },
+    {
+      "wantDark": true,
+      "rawSetting": "dark/light",
+      "fallbackUsed": false,
+      "resolvedMember": "light"
+    },
+    {
+      "fallbackUsed": false,
+      "wantDark": false,
+      "rawSetting": "dark/light",
+      "resolvedMember": "dark"
+    },
+    {
+      "resolvedMember": "dark",
+      "rawSetting": "light/dark",
+      "wantDark": true,
+      "fallbackUsed": false
+    },
+    {
+      "rawSetting": "light/dark",
+      "wantDark": false,
+      "resolvedMember": "light",
+      "fallbackUsed": false
+    },
+    {
+      "fallbackUsed": false,
+      "rawSetting": "antd-light",
+      "wantDark": true,
+      "resolvedMember": "antd-dark"
+    },
+    {
+      "wantDark": false,
+      "fallbackUsed": false,
+      "resolvedMember": "antd-light",
+      "rawSetting": "antd-light"
+    },
+    {
+      "wantDark": true,
+      "rawSetting": "unknown-name",
+      "fallbackUsed": true,
+      "resolvedMember": "dark"
+    },
+    {
+      "rawSetting": "unknown-name",
+      "resolvedMember": "dark",
+      "wantDark": false,
+      "fallbackUsed": true
+    },
+    {
+      "rawSetting": "solarized-light/gruvbox-dark",
+      "resolvedMember": "gruvbox-dark",
+      "wantDark": true,
+      "fallbackUsed": false
+    },
+    {
+      "rawSetting": "solarized-light/gruvbox-dark",
+      "fallbackUsed": false,
+      "resolvedMember": "solarized-light",
+      "wantDark": false
+    }
+  ],
+  "rungVerdicts": [
+    {
+      "upper": "thinkingMinimal",
+      "polarity": "dark",
+      "passesDe2000": false,
+      "deltaE2000": 0.0,
+      "upperRgb": "#a0a0a0",
+      "colorMode": "truecolor",
+      "passesBoth": false,
+      "passesRatio": false,
+      "lowerRgb": "#a0a0a0",
+      "wcagRatio": 1.0,
+      "lower": "thinkingOff"
+    },
+    {
+      "passesDe2000": true,
+      "lowerRgb": "#a0a0a0",
+      "upper": "thinkingLow",
+      "upperRgb": "#50a8ff",
+      "lower": "thinkingMinimal",
+      "passesBoth": false,
+      "deltaE2000": 23.737518881465125,
+      "polarity": "dark",
+      "colorMode": "truecolor",
+      "wcagRatio": 1.0442673157973545,
+      "passesRatio": false
+    },
+    {
+      "lowerRgb": "#50a8ff",
+      "passesRatio": false,
+      "lower": "thinkingLow",
+      "colorMode": "truecolor",
+      "polarity": "dark",
+      "deltaE2000": 32.418995440177234,
+      "passesBoth": false,
+      "upper": "thinkingMedium",
+      "wcagRatio": 1.1950537477738408,
+      "passesDe2000": true,
+      "upperRgb": "#00c9b5"
+    },
+    {
+      "polarity": "dark",
+      "upper": "thinkingHigh",
+      "deltaE2000": 45.149122616548524,
+      "lower": "thinkingMedium",
+      "colorMode": "truecolor",
+      "lowerRgb": "#00c9b5",
+      "passesDe2000": true,
+      "wcagRatio": 1.0869601440058274,
+      "upperRgb": "#e99c00",
+      "passesBoth": false,
+      "passesRatio": false
+    },
+    {
+      "colorMode": "truecolor",
+      "lowerRgb": "#e99c00",
+      "deltaE2000": 38.42107085988423,
+      "upperRgb": "#f13242",
+      "upper": "thinkingXhigh",
+      "passesDe2000": true,
+      "lower": "thinkingHigh",
+      "passesBoth": true,
+      "wcagRatio": 1.747867511936397,
+      "polarity": "dark",
+      "passesRatio": true
+    },
+    {
+      "colorMode": "truecolor",
+      "wcagRatio": 1.0,
+      "upperRgb": "#f13242",
+      "passesBoth": false,
+      "passesRatio": false,
+      "lowerRgb": "#f13242",
+      "passesDe2000": false,
+      "lower": "thinkingXhigh",
+      "polarity": "dark",
+      "deltaE2000": 0.0,
+      "upper": "thinkingMax"
+    },
+    {
+      "passesDe2000": false,
+      "wcagRatio": 1.0,
+      "passesBoth": false,
+      "upper": "thinkingMinimal",
+      "passesRatio": false,
+      "upperRgb": "#9e9e9e",
+      "colorMode": "forced-256",
+      "lowerRgb": "#9e9e9e",
+      "deltaE2000": 0.0,
+      "lower": "thinkingOff",
+      "polarity": "dark"
+    },
+    {
+      "colorMode": "forced-256",
+      "deltaE2000": 23.111674302191958,
+      "passesRatio": false,
+      "polarity": "dark",
+      "lowerRgb": "#9e9e9e",
+      "lower": "thinkingMinimal",
+      "upper": "thinkingLow",
+      "wcagRatio": 1.1561922063968075,
+      "passesBoth": false,
+      "passesDe2000": true,
+      "upperRgb": "#5fafff"
+    },
+    {
+      "deltaE2000": 36.666176375524984,
+      "colorMode": "forced-256",
+      "upper": "thinkingMedium",
+      "lowerRgb": "#5fafff",
+      "passesRatio": true,
+      "lower": "thinkingLow",
+      "passesDe2000": true,
+      "wcagRatio": 1.2512131739377388,
+      "passesBoth": true,
+      "upperRgb": "#00d7af",
+      "polarity": "dark"
+    },
+    {
+      "lower": "thinkingMedium",
+      "wcagRatio": 1.131498659404583,
+      "deltaE2000": 38.30752441856074,
+      "passesBoth": false,
+      "colorMode": "forced-256",
+      "passesDe2000": true,
+      "polarity": "dark",
+      "lowerRgb": "#00d7af",
+      "upperRgb": "#d7af00",
+      "upper": "thinkingHigh",
+      "passesRatio": false
+    },
+    {
+      "polarity": "dark",
+      "lower": "thinkingHigh",
+      "upper": "thinkingXhigh",
+      "deltaE2000": 44.4520346687619,
+      "passesRatio": true,
+      "passesBoth": true,
+      "passesDe2000": true,
+      "wcagRatio": 1.420643779797408,
+      "lowerRgb": "#d7af00",
+      "colorMode": "forced-256",
+      "upperRgb": "#ff5f5f"
+    },
+    {
+      "colorMode": "forced-256",
+      "upper": "thinkingMax",
+      "passesRatio": false,
+      "lowerRgb": "#ff5f5f",
+      "polarity": "dark",
+      "upperRgb": "#ff5f5f",
+      "deltaE2000": 0.0,
+      "passesBoth": false,
+      "lower": "thinkingXhigh",
+      "wcagRatio": 1.0,
+      "passesDe2000": false
+    },
+    {
+      "wcagRatio": 3.554945594979705,
+      "passesBoth": true,
+      "deltaE2000": 36.040175936081134,
+      "lowerRgb": "#a8a8a8",
+      "passesRatio": true,
+      "upperRgb": "#4d4d4d",
+      "colorMode": "truecolor",
+      "lower": "thinkingOff",
+      "polarity": "light",
+      "passesDe2000": true,
+      "upper": "thinkingMinimal"
+    },
+    {
+      "wcagRatio": 1.5783565422186367,
+      "polarity": "light",
+      "passesBoth": true,
+      "lower": "thinkingMinimal",
+      "upper": "thinkingLow",
+      "passesRatio": true,
+      "deltaE2000": 29.870284823677693,
+      "upperRgb": "#0064e2",
+      "colorMode": "truecolor",
+      "passesDe2000": true,
+      "lowerRgb": "#4d4d4d"
+    },
+    {
+      "passesRatio": false,
+      "passesBoth": false,
+      "wcagRatio": 1.022418723708472,
+      "upperRgb": "#007a6e",
+      "deltaE2000": 35.82496381030311,
+      "passesDe2000": true,
+      "polarity": "light",
+      "lowerRgb": "#0064e2",
+      "colorMode": "truecolor",
+      "lower": "thinkingLow",
+      "upper": "thinkingMedium"
+    },
+    {
+      "wcagRatio": 1.0719773303394924,
+      "upper": "thinkingHigh",
+      "upperRgb": "#a64f00",
+      "passesDe2000": true,
+      "polarity": "light",
+      "lowerRgb": "#007a6e",
+      "lower": "thinkingMedium",
+      "passesRatio": false,
+      "deltaE2000": 45.24875088189531,
+      "passesBoth": false,
+      "colorMode": "truecolor"
+    },
+    {
+      "passesRatio": false,
+      "lower": "thinkingHigh",
+      "lowerRgb": "#a64f00",
+      "passesDe2000": true,
+      "wcagRatio": 1.0375138953871974,
+      "polarity": "light",
+      "deltaE2000": 19.149614037515676,
+      "colorMode": "truecolor",
+      "upperRgb": "#d60020",
+      "upper": "thinkingXhigh",
+      "passesBoth": false
+    },
+    {
+      "lower": "thinkingXhigh",
+      "lowerRgb": "#d60020",
+      "upperRgb": "#d60020",
+      "deltaE2000": 0.0,
+      "wcagRatio": 1.0,
+      "upper": "thinkingMax",
+      "passesDe2000": false,
+      "passesRatio": false,
+      "passesBoth": false,
+      "polarity": "light",
+      "colorMode": "truecolor"
+    },
+    {
+      "colorMode": "forced-256",
+      "deltaE2000": 35.56847766532786,
+      "passesDe2000": true,
+      "polarity": "light",
+      "wcagRatio": 3.499394878915783,
+      "upperRgb": "#4e4e4e",
+      "passesRatio": true,
+      "upper": "thinkingMinimal",
+      "passesBoth": true,
+      "lowerRgb": "#a8a8a8",
+      "lower": "thinkingOff"
+    },
+    {
+      "upperRgb": "#005fd7",
+      "colorMode": "forced-256",
+      "passesRatio": true,
+      "passesBoth": true,
+      "lowerRgb": "#4e4e4e",
+      "passesDe2000": true,
+      "lower": "thinkingMinimal",
+      "upper": "thinkingLow",
+      "polarity": "light",
+      "wcagRatio": 1.4336616773263802,
+      "deltaE2000": 28.716738535797322
+    },
+    {
+      "colorMode": "forced-256",
+      "upperRgb": "#00875f",
+      "lowerRgb": "#005fd7",
+      "passesBoth": true,
+      "wcagRatio": 1.2798924659497897,
+      "deltaE2000": 44.22773684811961,
+      "passesDe2000": true,
+      "polarity": "light",
+      "upper": "thinkingMedium",
+      "passesRatio": true,
+      "lower": "thinkingLow"
+    },
+    {
+      "deltaE2000": 45.318392505056444,
+      "lower": "thinkingMedium",
+      "lowerRgb": "#00875f",
+      "passesBoth": false,
+      "upper": "thinkingHigh",
+      "polarity": "light",
+      "wcagRatio": 1.038379086932427,
+      "passesRatio": false,
+      "colorMode": "forced-256",
+      "passesDe2000": true,
+      "upperRgb": "#af5f00"
+    },
+    {
+      "wcagRatio": 1.1466187227113331,
+      "lower": "thinkingHigh",
+      "deltaE2000": 19.84488957866444,
+      "passesDe2000": true,
+      "upperRgb": "#d70000",
+      "upper": "thinkingXhigh",
+      "polarity": "light",
+      "passesRatio": false,
+      "passesBoth": false,
+      "colorMode": "forced-256",
+      "lowerRgb": "#af5f00"
+    },
+    {
+      "passesRatio": false,
+      "lower": "thinkingXhigh",
+      "passesBoth": false,
+      "colorMode": "forced-256",
+      "passesDe2000": false,
+      "upper": "thinkingMax",
+      "deltaE2000": 0.0,
+      "wcagRatio": 1.0,
+      "upperRgb": "#d70000",
+      "lowerRgb": "#d70000",
+      "polarity": "light"
+    }
+  ],
+  "polarityVerdicts": [
+    {
+      "detectedDark": true,
+      "input": "rgb:0000/0000/0000",
+      "verdict": "classified",
+      "bt601Luminance": 0,
+      "source": "OSC11 rgb dark"
+    },
+    {
+      "verdict": "classified",
+      "input": "rgb:ffff/ffff/ffff",
+      "detectedDark": false,
+      "source": "OSC11 rgb light",
+      "bt601Luminance": 255
+    },
+    {
+      "verdict": "classified",
+      "bt601Luminance": 0,
+      "source": "OSC11 hex6 dark",
+      "input": "#000000",
+      "detectedDark": true
+    },
+    {
+      "bt601Luminance": 255,
+      "input": "#ffffff",
+      "detectedDark": false,
+      "verdict": "classified",
+      "source": "OSC11 hex6 light"
+    },
+    {
+      "bt601Luminance": 0,
+      "source": "OSC11 hex12 dark",
+      "detectedDark": true,
+      "verdict": "classified",
+      "input": "#000000000000"
+    },
+    {
+      "detectedDark": false,
+      "source": "OSC11 hex12 light",
+      "input": "#ffffffffffff",
+      "bt601Luminance": 255,
+      "verdict": "classified"
+    },
+    {
+      "bt601Luminance": 128,
+      "input": "#808080",
+      "verdict": "classified",
+      "source": "OSC11 mid-gray",
+      "detectedDark": false
+    },
+    {
+      "detectedDark": false,
+      "input": "COLORFGBG:0;15",
+      "verdict": "classified",
+      "source": "COLORFGBG light-bg",
+      "bt601Luminance": 255
+    },
+    {
+      "source": "COLORFGBG dark-bg",
+      "detectedDark": true,
+      "bt601Luminance": 0,
+      "input": "COLORFGBG:15;0",
+      "verdict": "classified"
+    },
+    {
+      "input": "COLORFGBG:0;default;15",
+      "bt601Luminance": 255,
+      "source": "COLORFGBG 3-part light",
+      "detectedDark": false,
+      "verdict": "classified"
+    },
+    {
+      "input": "",
+      "source": "fallback none",
+      "verdict": "fallback-dark",
+      "bt601Luminance": null,
+      "detectedDark": null
+    }
+  ],
+  "sgrVerdicts": [
+    {
+      "polarity": "dark",
+      "forced256Rgb": "#eeeeee",
+      "deltaE2000": 0.21119318402423057,
+      "forced256Sgr": "\u001b[38;5;255m",
+      "slot": "text",
+      "truecolorRgb": "#ededed",
+      "truecolorSgr": "\u001b[38;2;237;237;237m"
+    },
+    {
+      "truecolorSgr": "\u001b[38;2;80;168;255m",
+      "forced256Rgb": "#5fafff",
+      "polarity": "dark",
+      "slot": "accent",
+      "forced256Sgr": "\u001b[38;5;75m",
+      "truecolorRgb": "#50a8ff",
+      "deltaE2000": 2.0539517045889175
+    },
+    {
+      "deltaE2000": 8.185776321690375,
+      "forced256Rgb": "#ff5f5f",
+      "truecolorRgb": "#f13242",
+      "slot": "error",
+      "forced256Sgr": "\u001b[38;5;203m",
+      "polarity": "dark",
+      "truecolorSgr": "\u001b[38;2;241;50;66m"
+    },
+    {
+      "truecolorRgb": "#00ca52",
+      "polarity": "dark",
+      "slot": "success",
+      "forced256Sgr": "\u001b[38;5;41m",
+      "deltaE2000": 3.263302557761653,
+      "truecolorSgr": "\u001b[38;2;0;202;82m",
+      "forced256Rgb": "#00d75f"
+    },
+    {
+      "truecolorRgb": "#ffb200",
+      "polarity": "dark",
+      "forced256Rgb": "#ffaf00",
+      "truecolorSgr": "\u001b[38;2;255;178;0m",
+      "forced256Sgr": "\u001b[38;5;214m",
+      "deltaE2000": 1.072001301429267,
+      "slot": "warning"
+    },
+    {
+      "polarity": "dark",
+      "forced256Rgb": "#444444",
+      "truecolorSgr": "\u001b[38;2;69;69;69m",
+      "truecolorRgb": "#454545",
+      "slot": "border",
+      "forced256Sgr": "\u001b[38;5;238m",
+      "deltaE2000": 0.3342851804872239
+    },
+    {
+      "forced256Rgb": "#5fafff",
+      "truecolorRgb": "#50a8ff",
+      "polarity": "dark",
+      "truecolorSgr": "\u001b[38;2;80;168;255m",
+      "slot": "thinkingLow",
+      "forced256Sgr": "\u001b[38;5;75m",
+      "deltaE2000": 2.0539517045889175
+    },
+    {
+      "polarity": "dark",
+      "forced256Rgb": "#d7af00",
+      "deltaE2000": 10.92809351400231,
+      "truecolorRgb": "#e99c00",
+      "truecolorSgr": "\u001b[38;2;233;156;0m",
+      "slot": "thinkingHigh",
+      "forced256Sgr": "\u001b[38;5;178m"
+    },
+    {
+      "deltaE2000": 8.185776321690375,
+      "truecolorRgb": "#f13242",
+      "forced256Sgr": "\u001b[38;5;203m",
+      "forced256Rgb": "#ff5f5f",
+      "slot": "thinkingMax",
+      "truecolorSgr": "\u001b[38;2;241;50;66m",
+      "polarity": "dark"
+    },
+    {
+      "polarity": "dark",
+      "deltaE2000": 3.670297998270853,
+      "truecolorRgb": "#ff518d",
+      "forced256Sgr": "\u001b[38;5;204m",
+      "truecolorSgr": "\u001b[38;2;255;81;141m",
+      "forced256Rgb": "#ff5f87",
+      "slot": "mdCode"
+    },
+    {
+      "forced256Sgr": "\u001b[38;5;195m",
+      "slot": "syntaxKeyword",
+      "truecolorRgb": "#ebf6ff",
+      "truecolorSgr": "\u001b[38;2;235;246;255m",
+      "polarity": "dark",
+      "forced256Rgb": "#d7ffff",
+      "deltaE2000": 11.090859944293266
+    },
+    {
+      "truecolorRgb": "#daffe5",
+      "slot": "syntaxString",
+      "polarity": "dark",
+      "truecolorSgr": "\u001b[38;2;218;255;229m",
+      "forced256Sgr": "\u001b[38;5;194m",
+      "forced256Rgb": "#d7ffd7",
+      "deltaE2000": 4.013178214511536
+    },
+    {
+      "slot": "text",
+      "forced256Sgr": "\u001b[38;5;233m",
+      "polarity": "light",
+      "forced256Rgb": "#121212",
+      "truecolorRgb": "#171717",
+      "deltaE2000": 1.3812477250678399,
+      "truecolorSgr": "\u001b[38;2;23;23;23m"
+    },
+    {
+      "truecolorSgr": "\u001b[38;2;0;112;247m",
+      "truecolorRgb": "#0070f7",
+      "forced256Sgr": "\u001b[38;5;27m",
+      "forced256Rgb": "#005fff",
+      "polarity": "light",
+      "deltaE2000": 6.021304117494539,
+      "slot": "accent"
+    },
+    {
+      "deltaE2000": 10.147131264535714,
+      "polarity": "light",
+      "forced256Rgb": "#ff005f",
+      "truecolorSgr": "\u001b[38;2;252;0;53m",
+      "forced256Sgr": "\u001b[38;5;197m",
+      "truecolorRgb": "#fc0035",
+      "slot": "error"
+    },
+    {
+      "truecolorSgr": "\u001b[38;2;16;125;50m",
+      "polarity": "light",
+      "forced256Sgr": "\u001b[38;5;29m",
+      "truecolorRgb": "#107d32",
+      "forced256Rgb": "#00875f",
+      "deltaE2000": 9.561849376318069,
+      "slot": "success"
+    },
+    {
+      "forced256Sgr": "\u001b[38;5;130m",
+      "truecolorSgr": "\u001b[38;2;166;79;0m",
+      "forced256Rgb": "#af5f00",
+      "deltaE2000": 6.002852675963099,
+      "polarity": "light",
+      "slot": "warning",
+      "truecolorRgb": "#a64f00"
+    },
+    {
+      "polarity": "light",
+      "truecolorSgr": "\u001b[38;2;201;201;201m",
+      "forced256Sgr": "\u001b[38;5;251m",
+      "truecolorRgb": "#c9c9c9",
+      "deltaE2000": 0.7466735538205806,
+      "slot": "border",
+      "forced256Rgb": "#c6c6c6"
+    },
+    {
+      "forced256Rgb": "#005fd7",
+      "polarity": "light",
+      "truecolorRgb": "#0064e2",
+      "forced256Sgr": "\u001b[38;5;26m",
+      "truecolorSgr": "\u001b[38;2;0;100;226m",
+      "slot": "thinkingLow",
+      "deltaE2000": 2.1349189468236296
+    },
+    {
+      "slot": "thinkingHigh",
+      "truecolorRgb": "#a64f00",
+      "forced256Sgr": "\u001b[38;5;130m",
+      "polarity": "light",
+      "truecolorSgr": "\u001b[38;2;166;79;0m",
+      "forced256Rgb": "#af5f00",
+      "deltaE2000": 6.002852675963099
+    },
+    {
+      "deltaE2000": 5.265609924961439,
+      "forced256Sgr": "\u001b[38;5;160m",
+      "polarity": "light",
+      "truecolorSgr": "\u001b[38;2;214;0;32m",
+      "slot": "thinkingMax",
+      "forced256Rgb": "#d70000",
+      "truecolorRgb": "#d60020"
+    },
+    {
+      "deltaE2000": 4.208524096733894,
+      "truecolorRgb": "#c41562",
+      "polarity": "light",
+      "truecolorSgr": "\u001b[38;2;196;21;98m",
+      "slot": "mdCode",
+      "forced256Rgb": "#d7005f",
+      "forced256Sgr": "\u001b[38;5;161m"
+    },
+    {
+      "forced256Rgb": "#005fd7",
+      "truecolorSgr": "\u001b[38;2;0;100;226m",
+      "polarity": "light",
+      "deltaE2000": 2.1349189468236296,
+      "truecolorRgb": "#0064e2",
+      "slot": "syntaxKeyword",
+      "forced256Sgr": "\u001b[38;5;26m"
+    },
+    {
+      "slot": "syntaxString",
+      "forced256Rgb": "#00875f",
+      "truecolorSgr": "\u001b[38;2;16;125;50m",
+      "forced256Sgr": "\u001b[38;5;29m",
+      "polarity": "light",
+      "truecolorRgb": "#107d32",
+      "deltaE2000": 9.561849376318069
+    }
+  ],
+  "railHueVerdicts": [
+    {
+      "polarity": "dark",
+      "deltaE2000": 44.4323708043134,
+      "fgSlot": "accent",
+      "fgRgb": "#50a8ff",
+      "railSlot": "border",
+      "railRgb": "#454545",
+      "wcagRatio": 3.828898083148504,
+      "colorMode": "truecolor",
+      "passesWcag": true
+    },
+    {
+      "passesWcag": true,
+      "deltaE2000": 50.34655841064743,
+      "colorMode": "truecolor",
+      "railRgb": "#2e2e2e",
+      "wcagRatio": 5.422950524713773,
+      "fgRgb": "#50a8ff",
+      "fgSlot": "accent",
+      "railSlot": "borderMuted",
+      "polarity": "dark"
+    },
+    {
+      "fgRgb": "#50a8ff",
+      "railRgb": "#0071f6",
+      "wcagRatio": 1.7870184953031063,
+      "colorMode": "truecolor",
+      "polarity": "dark",
+      "fgSlot": "accent",
+      "railSlot": "borderAccent",
+      "passesWcag": true,
+      "deltaE2000": 17.513630900069877
+    },
+    {
+      "wcagRatio": 3.828898083148504,
+      "railRgb": "#454545",
+      "colorMode": "truecolor",
+      "railSlot": "mdQuoteBorder",
+      "deltaE2000": 44.4323708043134,
+      "passesWcag": true,
+      "fgSlot": "accent",
+      "fgRgb": "#50a8ff",
+      "polarity": "dark"
+    },
+    {
+      "railRgb": "#2e2e2e",
+      "passesWcag": true,
+      "polarity": "dark",
+      "railSlot": "mdCodeBlockBorder",
+      "deltaE2000": 50.34655841064743,
+      "colorMode": "truecolor",
+      "fgRgb": "#50a8ff",
+      "wcagRatio": 5.422950524713773,
+      "fgSlot": "accent"
+    },
+    {
+      "deltaE2000": 55.51751881283731,
+      "fgRgb": "#ededed",
+      "wcagRatio": 8.189782588112807,
+      "passesWcag": true,
+      "polarity": "dark",
+      "fgSlot": "text",
+      "railSlot": "border",
+      "railRgb": "#454545",
+      "colorMode": "truecolor"
+    },
+    {
+      "colorMode": "truecolor",
+      "wcagRatio": 11.599364835268066,
+      "deltaE2000": 69.41350040564637,
+      "railRgb": "#2e2e2e",
+      "fgRgb": "#ededed",
+      "polarity": "dark",
+      "fgSlot": "text",
+      "passesWcag": true,
+      "railSlot": "borderMuted"
+    },
+    {
+      "railSlot": "borderAccent",
+      "railRgb": "#0071f6",
+      "fgSlot": "text",
+      "deltaE2000": 43.49418724380246,
+      "colorMode": "truecolor",
+      "passesWcag": true,
+      "polarity": "dark",
+      "fgRgb": "#ededed",
+      "wcagRatio": 3.822325023975128
+    },
+    {
+      "colorMode": "truecolor",
+      "polarity": "dark",
+      "fgRgb": "#ededed",
+      "wcagRatio": 8.189782588112807,
+      "deltaE2000": 55.51751881283731,
+      "passesWcag": true,
+      "railSlot": "mdQuoteBorder",
+      "fgSlot": "text",
+      "railRgb": "#454545"
+    },
+    {
+      "fgSlot": "text",
+      "passesWcag": true,
+      "railRgb": "#2e2e2e",
+      "wcagRatio": 11.599364835268066,
+      "railSlot": "mdCodeBlockBorder",
+      "fgRgb": "#ededed",
+      "deltaE2000": 69.41350040564637,
+      "polarity": "dark",
+      "colorMode": "truecolor"
+    },
+    {
+      "railRgb": "#454545",
+      "polarity": "dark",
+      "wcagRatio": 3.6665880711060397,
+      "fgSlot": "muted",
+      "deltaE2000": 35.95704440682756,
+      "passesWcag": true,
+      "colorMode": "truecolor",
+      "fgRgb": "#a0a0a0",
+      "railSlot": "border"
+    },
+    {
+      "deltaE2000": 42.733624183273285,
+      "polarity": "dark",
+      "fgSlot": "muted",
+      "colorMode": "truecolor",
+      "railRgb": "#2e2e2e",
+      "fgRgb": "#a0a0a0",
+      "passesWcag": true,
+      "railSlot": "borderMuted",
+      "wcagRatio": 5.193067371425923
+    },
+    {
+      "railRgb": "#0071f6",
+      "fgSlot": "muted",
+      "railSlot": "borderAccent",
+      "fgRgb": "#a0a0a0",
+      "wcagRatio": 1.7112653707241818,
+      "polarity": "dark",
+      "deltaE2000": 31.688396883462424,
+      "passesWcag": true,
+      "colorMode": "truecolor"
+    },
+    {
+      "fgSlot": "muted",
+      "fgRgb": "#a0a0a0",
+      "railRgb": "#454545",
+      "polarity": "dark",
+      "wcagRatio": 3.6665880711060397,
+      "deltaE2000": 35.95704440682756,
+      "railSlot": "mdQuoteBorder",
+      "passesWcag": true,
+      "colorMode": "truecolor"
+    },
+    {
+      "passesWcag": true,
+      "polarity": "dark",
+      "colorMode": "truecolor",
+      "deltaE2000": 42.733624183273285,
+      "wcagRatio": 5.193067371425923,
+      "fgRgb": "#a0a0a0",
+      "railSlot": "mdCodeBlockBorder",
+      "fgSlot": "muted",
+      "railRgb": "#2e2e2e"
+    },
+    {
+      "colorMode": "truecolor",
+      "passesWcag": true,
+      "deltaE2000": 35.95704440682756,
+      "fgSlot": "dim",
+      "fgRgb": "#a0a0a0",
+      "polarity": "dark",
+      "railSlot": "border",
+      "wcagRatio": 3.6665880711060397,
+      "railRgb": "#454545"
+    },
+    {
+      "colorMode": "truecolor",
+      "fgRgb": "#a0a0a0",
+      "fgSlot": "dim",
+      "passesWcag": true,
+      "polarity": "dark",
+      "railSlot": "borderMuted",
+      "railRgb": "#2e2e2e",
+      "wcagRatio": 5.193067371425923,
+      "deltaE2000": 42.733624183273285
+    },
+    {
+      "fgSlot": "dim",
+      "fgRgb": "#a0a0a0",
+      "polarity": "dark",
+      "colorMode": "truecolor",
+      "passesWcag": true,
+      "railSlot": "borderAccent",
+      "deltaE2000": 31.688396883462424,
+      "railRgb": "#0071f6",
+      "wcagRatio": 1.7112653707241818
+    },
+    {
+      "fgSlot": "dim",
+      "passesWcag": true,
+      "polarity": "dark",
+      "fgRgb": "#a0a0a0",
+      "colorMode": "truecolor",
+      "railRgb": "#454545",
+      "railSlot": "mdQuoteBorder",
+      "deltaE2000": 35.95704440682756,
+      "wcagRatio": 3.6665880711060397
+    },
+    {
+      "fgSlot": "dim",
+      "colorMode": "truecolor",
+      "passesWcag": true,
+      "wcagRatio": 5.193067371425923,
+      "fgRgb": "#a0a0a0",
+      "deltaE2000": 42.733624183273285,
+      "railRgb": "#2e2e2e",
+      "railSlot": "mdCodeBlockBorder",
+      "polarity": "dark"
+    },
+    {
+      "railRgb": "#454545",
+      "wcagRatio": 3.828898083148504,
+      "colorMode": "truecolor",
+      "deltaE2000": 44.4323708043134,
+      "fgSlot": "toolTitle",
+      "polarity": "dark",
+      "passesWcag": true,
+      "railSlot": "border",
+      "fgRgb": "#50a8ff"
+    },
+    {
+      "fgRgb": "#50a8ff",
+      "colorMode": "truecolor",
+      "passesWcag": true,
+      "wcagRatio": 5.422950524713773,
+      "fgSlot": "toolTitle",
+      "railSlot": "borderMuted",
+      "railRgb": "#2e2e2e",
+      "polarity": "dark",
+      "deltaE2000": 50.34655841064743
+    },
+    {
+      "passesWcag": true,
+      "colorMode": "truecolor",
+      "fgSlot": "toolTitle",
+      "deltaE2000": 17.513630900069877,
+      "railRgb": "#0071f6",
+      "polarity": "dark",
+      "fgRgb": "#50a8ff",
+      "railSlot": "borderAccent",
+      "wcagRatio": 1.7870184953031063
+    },
+    {
+      "fgSlot": "toolTitle",
+      "fgRgb": "#50a8ff",
+      "deltaE2000": 44.4323708043134,
+      "wcagRatio": 3.828898083148504,
+      "railRgb": "#454545",
+      "passesWcag": true,
+      "railSlot": "mdQuoteBorder",
+      "colorMode": "truecolor",
+      "polarity": "dark"
+    },
+    {
+      "wcagRatio": 5.422950524713773,
+      "railSlot": "mdCodeBlockBorder",
+      "deltaE2000": 50.34655841064743,
+      "fgRgb": "#50a8ff",
+      "polarity": "dark",
+      "fgSlot": "toolTitle",
+      "colorMode": "truecolor",
+      "railRgb": "#2e2e2e",
+      "passesWcag": true
+    },
+    {
+      "railSlot": "border",
+      "railRgb": "#444444",
+      "polarity": "dark",
+      "deltaE2000": 46.718678875057996,
+      "passesWcag": true,
+      "fgRgb": "#5fafff",
+      "colorMode": "forced-256",
+      "wcagRatio": 4.203205746229904,
+      "fgSlot": "accent"
+    },
+    {
+      "polarity": "dark",
+      "wcagRatio": 5.695656531031287,
+      "fgRgb": "#5fafff",
+      "deltaE2000": 52.27044643443538,
+      "colorMode": "forced-256",
+      "railRgb": "#303030",
+      "passesWcag": true,
+      "fgSlot": "accent",
+      "railSlot": "borderMuted"
+    },
+    {
+      "fgSlot": "accent",
+      "railSlot": "borderAccent",
+      "wcagRatio": 2.220736730020022,
+      "colorMode": "forced-256",
+      "deltaE2000": 24.936045864238505,
+      "railRgb": "#005fff",
+      "fgRgb": "#5fafff",
+      "passesWcag": true,
+      "polarity": "dark"
+    },
+    {
+      "deltaE2000": 46.718678875057996,
+      "passesWcag": true,
+      "fgRgb": "#5fafff",
+      "fgSlot": "accent",
+      "colorMode": "forced-256",
+      "polarity": "dark",
+      "wcagRatio": 4.203205746229904,
+      "railRgb": "#444444",
+      "railSlot": "mdQuoteBorder"
+    },
+    {
+      "railSlot": "mdCodeBlockBorder",
+      "colorMode": "forced-256",
+      "wcagRatio": 5.695656531031287,
+      "fgRgb": "#5fafff",
+      "fgSlot": "accent",
+      "deltaE2000": 52.27044643443538,
+      "railRgb": "#303030",
+      "polarity": "dark",
+      "passesWcag": true
+    },
+    {
+      "colorMode": "forced-256",
+      "fgSlot": "text",
+      "fgRgb": "#eeeeee",
+      "deltaE2000": 56.2283792913777,
+      "polarity": "dark",
+      "wcagRatio": 8.394684818012273,
+      "railRgb": "#444444",
+      "passesWcag": true,
+      "railSlot": "border"
+    },
+    {
+      "wcagRatio": 11.375422545647979,
+      "fgRgb": "#eeeeee",
+      "railSlot": "borderMuted",
+      "fgSlot": "text",
+      "railRgb": "#303030",
+      "polarity": "dark",
+      "colorMode": "forced-256",
+      "passesWcag": true,
+      "deltaE2000": 68.21662074475857
+    },
+    {
+      "railSlot": "borderAccent",
+      "fgRgb": "#eeeeee",
+      "fgSlot": "text",
+      "railRgb": "#005fff",
+      "polarity": "dark",
+      "deltaE2000": 47.7285310313589,
+      "passesWcag": true,
+      "wcagRatio": 4.435277746996496,
+      "colorMode": "forced-256"
+    },
+    {
+      "passesWcag": true,
+      "polarity": "dark",
+      "wcagRatio": 8.394684818012273,
+      "colorMode": "forced-256",
+      "railSlot": "mdQuoteBorder",
+      "fgRgb": "#eeeeee",
+      "deltaE2000": 56.2283792913777,
+      "fgSlot": "text",
+      "railRgb": "#444444"
+    },
+    {
+      "fgSlot": "text",
+      "railSlot": "mdCodeBlockBorder",
+      "polarity": "dark",
+      "wcagRatio": 11.375422545647979,
+      "fgRgb": "#eeeeee",
+      "deltaE2000": 68.21662074475857,
+      "railRgb": "#303030",
+      "passesWcag": true,
+      "colorMode": "forced-256"
+    },
+    {
+      "deltaE2000": 35.3672648538258,
+      "wcagRatio": 3.6353866796325347,
+      "fgRgb": "#9e9e9e",
+      "passesWcag": true,
+      "polarity": "dark",
+      "colorMode": "forced-256",
+      "railSlot": "border",
+      "fgSlot": "muted",
+      "railRgb": "#444444"
+    },
+    {
+      "fgSlot": "muted",
+      "railRgb": "#303030",
+      "deltaE2000": 41.25557141067244,
+      "fgRgb": "#9e9e9e",
+      "colorMode": "forced-256",
+      "railSlot": "borderMuted",
+      "polarity": "dark",
+      "wcagRatio": 4.926219446489268,
+      "passesWcag": true
+    },
+    {
+      "fgSlot": "muted",
+      "deltaE2000": 34.98374460554642,
+      "passesWcag": true,
+      "railRgb": "#005fff",
+      "colorMode": "forced-256",
+      "wcagRatio": 1.9207331771771694,
+      "fgRgb": "#9e9e9e",
+      "polarity": "dark",
+      "railSlot": "borderAccent"
+    },
+    {
+      "passesWcag": true,
+      "wcagRatio": 3.6353866796325347,
+      "deltaE2000": 35.3672648538258,
+      "polarity": "dark",
+      "fgRgb": "#9e9e9e",
+      "railRgb": "#444444",
+      "fgSlot": "muted",
+      "railSlot": "mdQuoteBorder",
+      "colorMode": "forced-256"
+    },
+    {
+      "railRgb": "#303030",
+      "passesWcag": true,
+      "deltaE2000": 41.25557141067244,
+      "colorMode": "forced-256",
+      "railSlot": "mdCodeBlockBorder",
+      "fgSlot": "muted",
+      "polarity": "dark",
+      "wcagRatio": 4.926219446489268,
+      "fgRgb": "#9e9e9e"
+    },
+    {
+      "railSlot": "border",
+      "deltaE2000": 35.3672648538258,
+      "polarity": "dark",
+      "wcagRatio": 3.6353866796325347,
+      "fgRgb": "#9e9e9e",
+      "passesWcag": true,
+      "railRgb": "#444444",
+      "fgSlot": "dim",
+      "colorMode": "forced-256"
+    },
+    {
+      "fgRgb": "#9e9e9e",
+      "polarity": "dark",
+      "passesWcag": true,
+      "colorMode": "forced-256",
+      "fgSlot": "dim",
+      "deltaE2000": 41.25557141067244,
+      "railRgb": "#303030",
+      "railSlot": "borderMuted",
+      "wcagRatio": 4.926219446489268
+    },
+    {
+      "colorMode": "forced-256",
+      "wcagRatio": 1.9207331771771694,
+      "deltaE2000": 34.98374460554642,
+      "fgRgb": "#9e9e9e",
+      "fgSlot": "dim",
+      "railSlot": "borderAccent",
+      "railRgb": "#005fff",
+      "polarity": "dark",
+      "passesWcag": true
+    },
+    {
+      "colorMode": "forced-256",
+      "railSlot": "mdQuoteBorder",
+      "passesWcag": true,
+      "wcagRatio": 3.6353866796325347,
+      "deltaE2000": 35.3672648538258,
+      "railRgb": "#444444",
+      "fgSlot": "dim",
+      "polarity": "dark",
+      "fgRgb": "#9e9e9e"
+    },
+    {
+      "polarity": "dark",
+      "passesWcag": true,
+      "fgSlot": "dim",
+      "railSlot": "mdCodeBlockBorder",
+      "wcagRatio": 4.926219446489268,
+      "deltaE2000": 41.25557141067244,
+      "colorMode": "forced-256",
+      "fgRgb": "#9e9e9e",
+      "railRgb": "#303030"
+    },
+    {
+      "polarity": "dark",
+      "railSlot": "border",
+      "passesWcag": true,
+      "fgRgb": "#5fafff",
+      "deltaE2000": 46.718678875057996,
+      "wcagRatio": 4.203205746229904,
+      "fgSlot": "toolTitle",
+      "colorMode": "forced-256",
+      "railRgb": "#444444"
+    },
+    {
+      "colorMode": "forced-256",
+      "fgRgb": "#5fafff",
+      "passesWcag": true,
+      "railSlot": "borderMuted",
+      "railRgb": "#303030",
+      "deltaE2000": 52.27044643443538,
+      "polarity": "dark",
+      "wcagRatio": 5.695656531031287,
+      "fgSlot": "toolTitle"
+    },
+    {
+      "fgSlot": "toolTitle",
+      "railRgb": "#005fff",
+      "wcagRatio": 2.220736730020022,
+      "deltaE2000": 24.936045864238505,
+      "polarity": "dark",
+      "fgRgb": "#5fafff",
+      "railSlot": "borderAccent",
+      "colorMode": "forced-256",
+      "passesWcag": true
+    },
+    {
+      "deltaE2000": 46.718678875057996,
+      "passesWcag": true,
+      "railSlot": "mdQuoteBorder",
+      "fgRgb": "#5fafff",
+      "fgSlot": "toolTitle",
+      "wcagRatio": 4.203205746229904,
+      "colorMode": "forced-256",
+      "railRgb": "#444444",
+      "polarity": "dark"
+    },
+    {
+      "fgRgb": "#5fafff",
+      "colorMode": "forced-256",
+      "railSlot": "mdCodeBlockBorder",
+      "deltaE2000": 52.27044643443538,
+      "railRgb": "#303030",
+      "polarity": "dark",
+      "wcagRatio": 5.695656531031287,
+      "passesWcag": true,
+      "fgSlot": "toolTitle"
+    },
+    {
+      "railSlot": "border",
+      "fgRgb": "#0070f7",
+      "colorMode": "truecolor",
+      "passesWcag": true,
+      "deltaE2000": 38.149892568295634,
+      "railRgb": "#c9c9c9",
+      "fgSlot": "accent",
+      "wcagRatio": 2.7209296934491483,
+      "polarity": "light"
+    },
+    {
+      "railSlot": "borderMuted",
+      "fgRgb": "#0070f7",
+      "railRgb": "#eaeaea",
+      "fgSlot": "accent",
+      "wcagRatio": 3.7452602204225824,
+      "colorMode": "truecolor",
+      "polarity": "light",
+      "passesWcag": true,
+      "deltaE2000": 43.27848976563078
+    },
+    {
+      "polarity": "light",
+      "colorMode": "truecolor",
+      "fgRgb": "#0070f7",
+      "fgSlot": "accent",
+      "railRgb": "#0070f7",
+      "deltaE2000": 0.0,
+      "passesWcag": false,
+      "railSlot": "borderAccent",
+      "wcagRatio": 1.0
+    },
+    {
+      "polarity": "light",
+      "colorMode": "truecolor",
+      "wcagRatio": 2.7209296934491483,
+      "fgRgb": "#0070f7",
+      "fgSlot": "accent",
+      "railSlot": "mdQuoteBorder",
+      "deltaE2000": 38.149892568295634,
+      "railRgb": "#c9c9c9",
+      "passesWcag": true
+    },
+    {
+      "fgSlot": "accent",
+      "fgRgb": "#0070f7",
+      "wcagRatio": 3.7452602204225824,
+      "passesWcag": true,
+      "colorMode": "truecolor",
+      "deltaE2000": 43.27848976563078,
+      "railSlot": "mdCodeBlockBorder",
+      "polarity": "light",
+      "railRgb": "#eaeaea"
+    },
+    {
+      "passesWcag": true,
+      "railRgb": "#c9c9c9",
+      "colorMode": "truecolor",
+      "fgRgb": "#171717",
+      "wcagRatio": 10.82633960366216,
+      "deltaE2000": 68.66505654680975,
+      "railSlot": "border",
+      "polarity": "light",
+      "fgSlot": "text"
+    },
+    {
+      "wcagRatio": 14.902060552318812,
+      "colorMode": "truecolor",
+      "deltaE2000": 84.94451834128427,
+      "fgSlot": "text",
+      "railRgb": "#eaeaea",
+      "railSlot": "borderMuted",
+      "fgRgb": "#171717",
+      "passesWcag": true,
+      "polarity": "light"
+    },
+    {
+      "railSlot": "borderAccent",
+      "polarity": "light",
+      "deltaE2000": 42.88822448033766,
+      "wcagRatio": 3.978911924746685,
+      "colorMode": "truecolor",
+      "railRgb": "#0070f7",
+      "fgRgb": "#171717",
+      "fgSlot": "text",
+      "passesWcag": true
+    },
+    {
+      "railRgb": "#c9c9c9",
+      "fgSlot": "text",
+      "polarity": "light",
+      "railSlot": "mdQuoteBorder",
+      "passesWcag": true,
+      "fgRgb": "#171717",
+      "deltaE2000": 68.66505654680975,
+      "wcagRatio": 10.82633960366216,
+      "colorMode": "truecolor"
+    },
+    {
+      "wcagRatio": 14.902060552318812,
+      "deltaE2000": 84.94451834128427,
+      "fgSlot": "text",
+      "fgRgb": "#171717",
+      "polarity": "light",
+      "passesWcag": true,
+      "colorMode": "truecolor",
+      "railRgb": "#eaeaea",
+      "railSlot": "mdCodeBlockBorder"
+    },
+    {
+      "deltaE2000": 44.393476230122715,
+      "wcagRatio": 5.10474359733872,
+      "colorMode": "truecolor",
+      "railSlot": "border",
+      "fgRgb": "#4d4d4d",
+      "passesWcag": true,
+      "polarity": "light",
+      "fgSlot": "muted",
+      "railRgb": "#c9c9c9"
+    },
+    {
+      "railSlot": "borderMuted",
+      "passesWcag": true,
+      "polarity": "light",
+      "deltaE2000": 50.803507781152874,
+      "railRgb": "#eaeaea",
+      "fgSlot": "muted",
+      "colorMode": "truecolor",
+      "fgRgb": "#4d4d4d",
+      "wcagRatio": 7.026492884619214
+    },
+    {
+      "polarity": "light",
+      "railRgb": "#0070f7",
+      "deltaE2000": 32.288700385282084,
+      "railSlot": "borderAccent",
+      "fgRgb": "#4d4d4d",
+      "fgSlot": "muted",
+      "colorMode": "truecolor",
+      "passesWcag": true,
+      "wcagRatio": 1.8761027194597457
+    },
+    {
+      "polarity": "light",
+      "deltaE2000": 44.393476230122715,
+      "fgSlot": "muted",
+      "passesWcag": true,
+      "railSlot": "mdQuoteBorder",
+      "railRgb": "#c9c9c9",
+      "wcagRatio": 5.10474359733872,
+      "colorMode": "truecolor",
+      "fgRgb": "#4d4d4d"
+    },
+    {
+      "wcagRatio": 7.026492884619214,
+      "railSlot": "mdCodeBlockBorder",
+      "fgRgb": "#4d4d4d",
+      "colorMode": "truecolor",
+      "fgSlot": "muted",
+      "polarity": "light",
+      "passesWcag": true,
+      "deltaE2000": 50.803507781152874,
+      "railRgb": "#eaeaea"
+    },
+    {
+      "railSlot": "border",
+      "wcagRatio": 2.7429779200878617,
+      "fgSlot": "dim",
+      "fgRgb": "#767676",
+      "colorMode": "truecolor",
+      "polarity": "light",
+      "deltaE2000": 25.672405242323535,
+      "railRgb": "#c9c9c9",
+      "passesWcag": true
+    },
+    {
+      "fgRgb": "#767676",
+      "railSlot": "borderMuted",
+      "deltaE2000": 32.85436654382415,
+      "railRgb": "#eaeaea",
+      "passesWcag": true,
+      "colorMode": "truecolor",
+      "wcagRatio": 3.7756087981016178,
+      "polarity": "light",
+      "fgSlot": "dim"
+    },
+    {
+      "railSlot": "borderAccent",
+      "polarity": "light",
+      "railRgb": "#0070f7",
+      "colorMode": "truecolor",
+      "wcagRatio": 1.0081031960112001,
+      "fgRgb": "#767676",
+      "deltaE2000": 28.41692581819108,
+      "passesWcag": false,
+      "fgSlot": "dim"
+    },
+    {
+      "polarity": "light",
+      "fgSlot": "dim",
+      "wcagRatio": 2.7429779200878617,
+      "railSlot": "mdQuoteBorder",
+      "passesWcag": true,
+      "deltaE2000": 25.672405242323535,
+      "colorMode": "truecolor",
+      "fgRgb": "#767676",
+      "railRgb": "#c9c9c9"
+    },
+    {
+      "passesWcag": true,
+      "railRgb": "#eaeaea",
+      "deltaE2000": 32.85436654382415,
+      "fgSlot": "dim",
+      "fgRgb": "#767676",
+      "railSlot": "mdCodeBlockBorder",
+      "wcagRatio": 3.7756087981016178,
+      "polarity": "light",
+      "colorMode": "truecolor"
+    },
+    {
+      "deltaE2000": 41.17101417609258,
+      "colorMode": "truecolor",
+      "polarity": "light",
+      "passesWcag": true,
+      "fgRgb": "#0064e2",
+      "wcagRatio": 3.2342144888018605,
+      "railSlot": "border",
+      "fgSlot": "toolTitle",
+      "railRgb": "#c9c9c9"
+    },
+    {
+      "passesWcag": true,
+      "fgSlot": "toolTitle",
+      "deltaE2000": 46.591980588014316,
+      "colorMode": "truecolor",
+      "railRgb": "#eaeaea",
+      "railSlot": "borderMuted",
+      "polarity": "light",
+      "wcagRatio": 4.451777970738054,
+      "fgRgb": "#0064e2"
+    },
+    {
+      "deltaE2000": 4.888931313989226,
+      "railRgb": "#0070f7",
+      "railSlot": "borderAccent",
+      "polarity": "light",
+      "colorMode": "truecolor",
+      "fgSlot": "toolTitle",
+      "fgRgb": "#0064e2",
+      "passesWcag": false,
+      "wcagRatio": 1.1886431672925932
+    },
+    {
+      "colorMode": "truecolor",
+      "fgRgb": "#0064e2",
+      "wcagRatio": 3.2342144888018605,
+      "railSlot": "mdQuoteBorder",
+      "railRgb": "#c9c9c9",
+      "passesWcag": true,
+      "polarity": "light",
+      "deltaE2000": 41.17101417609258,
+      "fgSlot": "toolTitle"
+    },
+    {
+      "railSlot": "mdCodeBlockBorder",
+      "deltaE2000": 46.591980588014316,
+      "wcagRatio": 4.451777970738054,
+      "colorMode": "truecolor",
+      "fgRgb": "#0064e2",
+      "fgSlot": "toolTitle",
+      "railRgb": "#eaeaea",
+      "polarity": "light",
+      "passesWcag": true
+    },
+    {
+      "railSlot": "border",
+      "colorMode": "forced-256",
+      "passesWcag": true,
+      "railRgb": "#c6c6c6",
+      "fgRgb": "#005fff",
+      "polarity": "light",
+      "deltaE2000": 41.444256028920435,
+      "fgSlot": "accent",
+      "wcagRatio": 3.012639260918151
+    },
+    {
+      "passesWcag": true,
+      "railSlot": "borderMuted",
+      "fgSlot": "accent",
+      "railRgb": "#eeeeee",
+      "fgRgb": "#005fff",
+      "wcagRatio": 4.435277746996496,
+      "polarity": "light",
+      "colorMode": "forced-256",
+      "deltaE2000": 47.7285310313589
+    },
+    {
+      "passesWcag": false,
+      "railRgb": "#005fff",
+      "railSlot": "borderAccent",
+      "fgRgb": "#005fff",
+      "fgSlot": "accent",
+      "polarity": "light",
+      "colorMode": "forced-256",
+      "wcagRatio": 1.0,
+      "deltaE2000": 0.0
+    },
+    {
+      "passesWcag": true,
+      "fgRgb": "#005fff",
+      "railSlot": "mdQuoteBorder",
+      "wcagRatio": 3.012639260918151,
+      "railRgb": "#c6c6c6",
+      "colorMode": "forced-256",
+      "fgSlot": "accent",
+      "deltaE2000": 41.444256028920435,
+      "polarity": "light"
+    },
+    {
+      "railSlot": "mdCodeBlockBorder",
+      "fgRgb": "#005fff",
+      "passesWcag": true,
+      "fgSlot": "accent",
+      "deltaE2000": 47.7285310313589,
+      "colorMode": "forced-256",
+      "railRgb": "#eeeeee",
+      "polarity": "light",
+      "wcagRatio": 4.435277746996496
+    },
+    {
+      "railSlot": "border",
+      "passesWcag": true,
+      "wcagRatio": 10.967427376306768,
+      "polarity": "light",
+      "fgSlot": "text",
+      "fgRgb": "#121212",
+      "colorMode": "forced-256",
+      "railRgb": "#c6c6c6",
+      "deltaE2000": 68.0344491558683
+    },
+    {
+      "wcagRatio": 16.146502243056023,
+      "deltaE2000": 88.61969230573374,
+      "railRgb": "#eeeeee",
+      "colorMode": "forced-256",
+      "fgRgb": "#121212",
+      "railSlot": "borderMuted",
+      "polarity": "light",
+      "fgSlot": "text",
+      "passesWcag": true
+    },
+    {
+      "passesWcag": true,
+      "deltaE2000": 42.536214104086746,
+      "fgSlot": "text",
+      "wcagRatio": 3.6404715023743877,
+      "fgRgb": "#121212",
+      "railRgb": "#005fff",
+      "railSlot": "borderAccent",
+      "colorMode": "forced-256",
+      "polarity": "light"
+    },
+    {
+      "passesWcag": true,
+      "polarity": "light",
+      "railSlot": "mdQuoteBorder",
+      "fgRgb": "#121212",
+      "deltaE2000": 68.0344491558683,
+      "wcagRatio": 10.967427376306768,
+      "colorMode": "forced-256",
+      "railRgb": "#c6c6c6",
+      "fgSlot": "text"
+    },
+    {
+      "railSlot": "mdCodeBlockBorder",
+      "deltaE2000": 88.61969230573374,
+      "railRgb": "#eeeeee",
+      "fgSlot": "text",
+      "colorMode": "forced-256",
+      "polarity": "light",
+      "fgRgb": "#121212",
+      "passesWcag": true,
+      "wcagRatio": 16.146502243056023
+    },
+    {
+      "passesWcag": true,
+      "deltaE2000": 43.214555010528585,
+      "wcagRatio": 4.871495402151539,
+      "railSlot": "border",
+      "polarity": "light",
+      "railRgb": "#c6c6c6",
+      "fgSlot": "muted",
+      "colorMode": "forced-256",
+      "fgRgb": "#4e4e4e"
+    },
+    {
+      "railRgb": "#eeeeee",
+      "colorMode": "forced-256",
+      "fgRgb": "#4e4e4e",
+      "polarity": "light",
+      "wcagRatio": 7.171929089569638,
+      "passesWcag": true,
+      "railSlot": "borderMuted",
+      "deltaE2000": 51.008177537761725,
+      "fgSlot": "muted"
+    },
+    {
+      "colorMode": "forced-256",
+      "wcagRatio": 1.6170191583664322,
+      "railRgb": "#005fff",
+      "fgRgb": "#4e4e4e",
+      "deltaE2000": 32.2215761911241,
+      "fgSlot": "muted",
+      "passesWcag": true,
+      "railSlot": "borderAccent",
+      "polarity": "light"
+    },
+    {
+      "deltaE2000": 43.214555010528585,
+      "railSlot": "mdQuoteBorder",
+      "polarity": "light",
+      "railRgb": "#c6c6c6",
+      "wcagRatio": 4.871495402151539,
+      "colorMode": "forced-256",
+      "fgRgb": "#4e4e4e",
+      "passesWcag": true,
+      "fgSlot": "muted"
+    },
+    {
+      "fgRgb": "#4e4e4e",
+      "railRgb": "#eeeeee",
+      "colorMode": "forced-256",
+      "passesWcag": true,
+      "fgSlot": "muted",
+      "deltaE2000": 51.008177537761725,
+      "polarity": "light",
+      "wcagRatio": 7.171929089569638,
+      "railSlot": "mdCodeBlockBorder"
+    },
+    {
+      "wcagRatio": 2.6591980420661487,
+      "passesWcag": true,
+      "deltaE2000": 24.956560753166045,
+      "fgSlot": "dim",
+      "railRgb": "#c6c6c6",
+      "fgRgb": "#767676",
+      "railSlot": "border",
+      "polarity": "light",
+      "colorMode": "forced-256"
+    },
+    {
+      "polarity": "light",
+      "fgRgb": "#767676",
+      "railSlot": "borderMuted",
+      "fgSlot": "dim",
+      "wcagRatio": 3.914933345600143,
+      "colorMode": "forced-256",
+      "deltaE2000": 33.647777344428874,
+      "passesWcag": true,
+      "railRgb": "#eeeeee"
+    },
+    {
+      "fgRgb": "#767676",
+      "deltaE2000": 30.335307217441166,
+      "railRgb": "#005fff",
+      "wcagRatio": 1.1329127102460503,
+      "colorMode": "forced-256",
+      "polarity": "light",
+      "passesWcag": false,
+      "railSlot": "borderAccent",
+      "fgSlot": "dim"
+    },
+    {
+      "fgRgb": "#767676",
+      "passesWcag": true,
+      "polarity": "light",
+      "railSlot": "mdQuoteBorder",
+      "colorMode": "forced-256",
+      "fgSlot": "dim",
+      "deltaE2000": 24.956560753166045,
+      "wcagRatio": 2.6591980420661487,
+      "railRgb": "#c6c6c6"
+    },
+    {
+      "wcagRatio": 3.914933345600143,
+      "passesWcag": true,
+      "railRgb": "#eeeeee",
+      "fgRgb": "#767676",
+      "polarity": "light",
+      "colorMode": "forced-256",
+      "railSlot": "mdCodeBlockBorder",
+      "deltaE2000": 33.647777344428874,
+      "fgSlot": "dim"
+    },
+    {
+      "wcagRatio": 3.3979393319882396,
+      "fgRgb": "#005fd7",
+      "colorMode": "forced-256",
+      "deltaE2000": 42.115194584446044,
+      "polarity": "light",
+      "railRgb": "#c6c6c6",
+      "railSlot": "border",
+      "fgSlot": "toolTitle",
+      "passesWcag": true
+    },
+    {
+      "fgSlot": "toolTitle",
+      "passesWcag": true,
+      "polarity": "light",
+      "deltaE2000": 48.801543822234215,
+      "railRgb": "#eeeeee",
+      "colorMode": "forced-256",
+      "fgRgb": "#005fd7",
+      "wcagRatio": 5.002525493284085,
+      "railSlot": "borderMuted"
+    },
+    {
+      "fgSlot": "toolTitle",
+      "deltaE2000": 5.3964335148794405,
+      "passesWcag": false,
+      "railSlot": "borderAccent",
+      "wcagRatio": 1.1278945262608913,
+      "polarity": "light",
+      "colorMode": "forced-256",
+      "fgRgb": "#005fd7",
+      "railRgb": "#005fff"
+    },
+    {
+      "colorMode": "forced-256",
+      "deltaE2000": 42.115194584446044,
+      "wcagRatio": 3.3979393319882396,
+      "passesWcag": true,
+      "fgSlot": "toolTitle",
+      "polarity": "light",
+      "railSlot": "mdQuoteBorder",
+      "fgRgb": "#005fd7",
+      "railRgb": "#c6c6c6"
+    },
+    {
+      "railSlot": "mdCodeBlockBorder",
+      "colorMode": "forced-256",
+      "fgRgb": "#005fd7",
+      "deltaE2000": 48.801543822234215,
+      "polarity": "light",
+      "wcagRatio": 5.002525493284085,
+      "railRgb": "#eeeeee",
+      "passesWcag": true,
+      "fgSlot": "toolTitle"
+    }
+  ],
+  "schema": "tui-v5-theme-matrix/1",
+  "thresholds": {
+    "de2000Ratio": 1.25,
+    "wcagAaLarge": 3.0,
+    "de2000": 2.3,
+    "wcagMinimum": 1.3,
+    "wcagAaNormal": 4.5
+  }
+}

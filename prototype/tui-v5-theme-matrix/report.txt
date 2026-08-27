@@ -1,0 +1,221 @@
+=== TUI-V5 Theme and Contrast Matrix Report ===
+
+Thresholds (pinned):
+  Thinking-ramp: ΔE2000 >= 2.3 AND WCAG ratio >= 1.25
+  Rail-hue collision: WCAG ratio >= 1.3 (minimum)
+  WCAG AA normal: >= 4.5  AA large: >= 3
+
+--- 1. Polarity Detection (OSC 11 / COLORFGBG / fallback) ---
+
+source                       input                               dark?      bt601-lum  verdict
+----------------------------------------------------------------------------------------------------
+OSC11 rgb dark               rgb:0000/0000/0000                   true              0  classified
+OSC11 rgb light              rgb:ffff/ffff/ffff                  false            255  classified
+OSC11 hex6 dark              #000000                              true              0  classified
+OSC11 hex6 light             #ffffff                             false            255  classified
+OSC11 hex12 dark             #000000000000                        true              0  classified
+OSC11 hex12 light            #ffffffffffff                       false            255  classified
+OSC11 mid-gray               #808080                             false            128  classified
+COLORFGBG light-bg           COLORFGBG:0;15                      false            255  classified
+COLORFGBG dark-bg            COLORFGBG:15;0                       true              0  classified
+COLORFGBG 3-part light       COLORFGBG:0;default;15              false            255  classified
+fallback none                                                     none              —  fallback-dark
+
+  classified: 10/11
+
+--- 2. Thinking-Ramp Adjacent-Rung Verdicts ---
+
+lower                upper                polarity   color-mode   deltaE2000 wcag-ratio   passDE    passR passBoth
+--------------------------------------------------------------------------------------------------------------
+thinkingOff          thinkingMinimal      dark       truecolor        0.0000     1.0000        ✗        ✗        ✗
+thinkingMinimal      thinkingLow          dark       truecolor       23.7375     1.0443        ✓        ✗        ✗
+thinkingLow          thinkingMedium       dark       truecolor       32.4190     1.1951        ✓        ✗        ✗
+thinkingMedium       thinkingHigh         dark       truecolor       45.1491     1.0870        ✓        ✗        ✗
+thinkingHigh         thinkingXhigh        dark       truecolor       38.4211     1.7479        ✓        ✓        ✓
+thinkingXhigh        thinkingMax          dark       truecolor        0.0000     1.0000        ✗        ✗        ✗
+thinkingOff          thinkingMinimal      dark       forced-256       0.0000     1.0000        ✗        ✗        ✗
+thinkingMinimal      thinkingLow          dark       forced-256      23.1117     1.1562        ✓        ✗        ✗
+thinkingLow          thinkingMedium       dark       forced-256      36.6662     1.2512        ✓        ✓        ✓
+thinkingMedium       thinkingHigh         dark       forced-256      38.3075     1.1315        ✓        ✗        ✗
+thinkingHigh         thinkingXhigh        dark       forced-256      44.4520     1.4206        ✓        ✓        ✓
+thinkingXhigh        thinkingMax          dark       forced-256       0.0000     1.0000        ✗        ✗        ✗
+thinkingOff          thinkingMinimal      light      truecolor       36.0402     3.5549        ✓        ✓        ✓
+thinkingMinimal      thinkingLow          light      truecolor       29.8703     1.5784        ✓        ✓        ✓
+thinkingLow          thinkingMedium       light      truecolor       35.8250     1.0224        ✓        ✗        ✗
+thinkingMedium       thinkingHigh         light      truecolor       45.2488     1.0720        ✓        ✗        ✗
+thinkingHigh         thinkingXhigh        light      truecolor       19.1496     1.0375        ✓        ✗        ✗
+thinkingXhigh        thinkingMax          light      truecolor        0.0000     1.0000        ✗        ✗        ✗
+thinkingOff          thinkingMinimal      light      forced-256      35.5685     3.4994        ✓        ✓        ✓
+thinkingMinimal      thinkingLow          light      forced-256      28.7167     1.4337        ✓        ✓        ✓
+thinkingLow          thinkingMedium       light      forced-256      44.2277     1.2799        ✓        ✓        ✓
+thinkingMedium       thinkingHigh         light      forced-256      45.3184     1.0384        ✓        ✗        ✗
+thinkingHigh         thinkingXhigh        light      forced-256      19.8449     1.1466        ✓        ✗        ✗
+thinkingXhigh        thinkingMax          light      forced-256       0.0000     1.0000        ✗        ✗        ✗
+
+  passing both: 8/24
+
+--- 3. Accent-Adjacent Rail Hue Collisions ---
+
+fg-slot          rail-slot            polarity   color-mode   wcag-ratio deltaE2000     fg-rgb     pass
+--------------------------------------------------------------------------------------------------------------
+accent           border               dark       truecolor        3.8289    44.4324    #50a8ff        ✓
+accent           borderMuted          dark       truecolor        5.4230    50.3466    #50a8ff        ✓
+accent           borderAccent         dark       truecolor        1.7870    17.5136    #50a8ff        ✓
+accent           mdQuoteBorder        dark       truecolor        3.8289    44.4324    #50a8ff        ✓
+accent           mdCodeBlockBorder    dark       truecolor        5.4230    50.3466    #50a8ff        ✓
+text             border               dark       truecolor        8.1898    55.5175    #ededed        ✓
+text             borderMuted          dark       truecolor       11.5994    69.4135    #ededed        ✓
+text             borderAccent         dark       truecolor        3.8223    43.4942    #ededed        ✓
+text             mdQuoteBorder        dark       truecolor        8.1898    55.5175    #ededed        ✓
+text             mdCodeBlockBorder    dark       truecolor       11.5994    69.4135    #ededed        ✓
+muted            border               dark       truecolor        3.6666    35.9570    #a0a0a0        ✓
+muted            borderMuted          dark       truecolor        5.1931    42.7336    #a0a0a0        ✓
+muted            borderAccent         dark       truecolor        1.7113    31.6884    #a0a0a0        ✓
+muted            mdQuoteBorder        dark       truecolor        3.6666    35.9570    #a0a0a0        ✓
+muted            mdCodeBlockBorder    dark       truecolor        5.1931    42.7336    #a0a0a0        ✓
+dim              border               dark       truecolor        3.6666    35.9570    #a0a0a0        ✓
+dim              borderMuted          dark       truecolor        5.1931    42.7336    #a0a0a0        ✓
+dim              borderAccent         dark       truecolor        1.7113    31.6884    #a0a0a0        ✓
+dim              mdQuoteBorder        dark       truecolor        3.6666    35.9570    #a0a0a0        ✓
+dim              mdCodeBlockBorder    dark       truecolor        5.1931    42.7336    #a0a0a0        ✓
+toolTitle        border               dark       truecolor        3.8289    44.4324    #50a8ff        ✓
+toolTitle        borderMuted          dark       truecolor        5.4230    50.3466    #50a8ff        ✓
+toolTitle        borderAccent         dark       truecolor        1.7870    17.5136    #50a8ff        ✓
+toolTitle        mdQuoteBorder        dark       truecolor        3.8289    44.4324    #50a8ff        ✓
+toolTitle        mdCodeBlockBorder    dark       truecolor        5.4230    50.3466    #50a8ff        ✓
+accent           border               dark       forced-256       4.2032    46.7187    #5fafff        ✓
+accent           borderMuted          dark       forced-256       5.6957    52.2704    #5fafff        ✓
+accent           borderAccent         dark       forced-256       2.2207    24.9360    #5fafff        ✓
+accent           mdQuoteBorder        dark       forced-256       4.2032    46.7187    #5fafff        ✓
+accent           mdCodeBlockBorder    dark       forced-256       5.6957    52.2704    #5fafff        ✓
+text             border               dark       forced-256       8.3947    56.2284    #eeeeee        ✓
+text             borderMuted          dark       forced-256      11.3754    68.2166    #eeeeee        ✓
+text             borderAccent         dark       forced-256       4.4353    47.7285    #eeeeee        ✓
+text             mdQuoteBorder        dark       forced-256       8.3947    56.2284    #eeeeee        ✓
+text             mdCodeBlockBorder    dark       forced-256      11.3754    68.2166    #eeeeee        ✓
+muted            border               dark       forced-256       3.6354    35.3673    #9e9e9e        ✓
+muted            borderMuted          dark       forced-256       4.9262    41.2556    #9e9e9e        ✓
+muted            borderAccent         dark       forced-256       1.9207    34.9837    #9e9e9e        ✓
+muted            mdQuoteBorder        dark       forced-256       3.6354    35.3673    #9e9e9e        ✓
+muted            mdCodeBlockBorder    dark       forced-256       4.9262    41.2556    #9e9e9e        ✓
+dim              border               dark       forced-256       3.6354    35.3673    #9e9e9e        ✓
+dim              borderMuted          dark       forced-256       4.9262    41.2556    #9e9e9e        ✓
+dim              borderAccent         dark       forced-256       1.9207    34.9837    #9e9e9e        ✓
+dim              mdQuoteBorder        dark       forced-256       3.6354    35.3673    #9e9e9e        ✓
+dim              mdCodeBlockBorder    dark       forced-256       4.9262    41.2556    #9e9e9e        ✓
+toolTitle        border               dark       forced-256       4.2032    46.7187    #5fafff        ✓
+toolTitle        borderMuted          dark       forced-256       5.6957    52.2704    #5fafff        ✓
+toolTitle        borderAccent         dark       forced-256       2.2207    24.9360    #5fafff        ✓
+toolTitle        mdQuoteBorder        dark       forced-256       4.2032    46.7187    #5fafff        ✓
+toolTitle        mdCodeBlockBorder    dark       forced-256       5.6957    52.2704    #5fafff        ✓
+accent           border               light      truecolor        2.7209    38.1499    #0070f7        ✓
+accent           borderMuted          light      truecolor        3.7453    43.2785    #0070f7        ✓
+accent           borderAccent         light      truecolor        1.0000     0.0000    #0070f7        ✗
+accent           mdQuoteBorder        light      truecolor        2.7209    38.1499    #0070f7        ✓
+accent           mdCodeBlockBorder    light      truecolor        3.7453    43.2785    #0070f7        ✓
+text             border               light      truecolor       10.8263    68.6651    #171717        ✓
+text             borderMuted          light      truecolor       14.9021    84.9445    #171717        ✓
+text             borderAccent         light      truecolor        3.9789    42.8882    #171717        ✓
+text             mdQuoteBorder        light      truecolor       10.8263    68.6651    #171717        ✓
+text             mdCodeBlockBorder    light      truecolor       14.9021    84.9445    #171717        ✓
+muted            border               light      truecolor        5.1047    44.3935    #4d4d4d        ✓
+muted            borderMuted          light      truecolor        7.0265    50.8035    #4d4d4d        ✓
+muted            borderAccent         light      truecolor        1.8761    32.2887    #4d4d4d        ✓
+muted            mdQuoteBorder        light      truecolor        5.1047    44.3935    #4d4d4d        ✓
+muted            mdCodeBlockBorder    light      truecolor        7.0265    50.8035    #4d4d4d        ✓
+dim              border               light      truecolor        2.7430    25.6724    #767676        ✓
+dim              borderMuted          light      truecolor        3.7756    32.8544    #767676        ✓
+dim              borderAccent         light      truecolor        1.0081    28.4169    #767676        ✗
+dim              mdQuoteBorder        light      truecolor        2.7430    25.6724    #767676        ✓
+dim              mdCodeBlockBorder    light      truecolor        3.7756    32.8544    #767676        ✓
+toolTitle        border               light      truecolor        3.2342    41.1710    #0064e2        ✓
+toolTitle        borderMuted          light      truecolor        4.4518    46.5920    #0064e2        ✓
+toolTitle        borderAccent         light      truecolor        1.1886     4.8889    #0064e2        ✗
+toolTitle        mdQuoteBorder        light      truecolor        3.2342    41.1710    #0064e2        ✓
+toolTitle        mdCodeBlockBorder    light      truecolor        4.4518    46.5920    #0064e2        ✓
+accent           border               light      forced-256       3.0126    41.4443    #005fff        ✓
+accent           borderMuted          light      forced-256       4.4353    47.7285    #005fff        ✓
+accent           borderAccent         light      forced-256       1.0000     0.0000    #005fff        ✗
+accent           mdQuoteBorder        light      forced-256       3.0126    41.4443    #005fff        ✓
+accent           mdCodeBlockBorder    light      forced-256       4.4353    47.7285    #005fff        ✓
+text             border               light      forced-256      10.9674    68.0344    #121212        ✓
+text             borderMuted          light      forced-256      16.1465    88.6197    #121212        ✓
+text             borderAccent         light      forced-256       3.6405    42.5362    #121212        ✓
+text             mdQuoteBorder        light      forced-256      10.9674    68.0344    #121212        ✓
+text             mdCodeBlockBorder    light      forced-256      16.1465    88.6197    #121212        ✓
+muted            border               light      forced-256       4.8715    43.2146    #4e4e4e        ✓
+muted            borderMuted          light      forced-256       7.1719    51.0082    #4e4e4e        ✓
+muted            borderAccent         light      forced-256       1.6170    32.2216    #4e4e4e        ✓
+muted            mdQuoteBorder        light      forced-256       4.8715    43.2146    #4e4e4e        ✓
+muted            mdCodeBlockBorder    light      forced-256       7.1719    51.0082    #4e4e4e        ✓
+dim              border               light      forced-256       2.6592    24.9566    #767676        ✓
+dim              borderMuted          light      forced-256       3.9149    33.6478    #767676        ✓
+dim              borderAccent         light      forced-256       1.1329    30.3353    #767676        ✗
+dim              mdQuoteBorder        light      forced-256       2.6592    24.9566    #767676        ✓
+dim              mdCodeBlockBorder    light      forced-256       3.9149    33.6478    #767676        ✓
+toolTitle        border               light      forced-256       3.3979    42.1152    #005fd7        ✓
+toolTitle        borderMuted          light      forced-256       5.0025    48.8015    #005fd7        ✓
+toolTitle        borderAccent         light      forced-256       1.1279     5.3964    #005fd7        ✗
+toolTitle        mdQuoteBorder        light      forced-256       3.3979    42.1152    #005fd7        ✓
+toolTitle        mdCodeBlockBorder    light      forced-256       5.0025    48.8015    #005fd7        ✓
+
+  passing WCAG minimum: 94/100
+
+--- 4. Degraded-Terminal SGR Inspection ---
+
+slot                 polarity   truecolor-sgr        forced256-sgr        deltaE2000
+------------------------------------------------------------------------------------------
+text                 dark       [38;2;237;237;237m  [38;5;255m              0.2112
+accent               dark       [38;2;80;168;255m   [38;5;75m               2.0540
+error                dark       [38;2;241;50;66m    [38;5;203m              8.1858
+success              dark       [38;2;0;202;82m     [38;5;41m               3.2633
+warning              dark       [38;2;255;178;0m    [38;5;214m              1.0720
+border               dark       [38;2;69;69;69m     [38;5;238m              0.3343
+thinkingLow          dark       [38;2;80;168;255m   [38;5;75m               2.0540
+thinkingHigh         dark       [38;2;233;156;0m    [38;5;178m             10.9281
+thinkingMax          dark       [38;2;241;50;66m    [38;5;203m              8.1858
+mdCode               dark       [38;2;255;81;141m   [38;5;204m              3.6703
+syntaxKeyword        dark       [38;2;235;246;255m  [38;5;195m             11.0909
+syntaxString         dark       [38;2;218;255;229m  [38;5;194m              4.0132
+text                 light      [38;2;23;23;23m     [38;5;233m              1.3812
+accent               light      [38;2;0;112;247m    [38;5;27m               6.0213
+error                light      [38;2;252;0;53m     [38;5;197m             10.1471
+success              light      [38;2;16;125;50m    [38;5;29m               9.5618
+warning              light      [38;2;166;79;0m     [38;5;130m              6.0029
+border               light      [38;2;201;201;201m  [38;5;251m              0.7467
+thinkingLow          light      [38;2;0;100;226m    [38;5;26m               2.1349
+thinkingHigh         light      [38;2;166;79;0m     [38;5;130m              6.0029
+thinkingMax          light      [38;2;214;0;32m     [38;5;160m              5.2656
+mdCode               light      [38;2;196;21;98m    [38;5;161m              4.2085
+syntaxKeyword        light      [38;2;0;100;226m    [38;5;26m               2.1349
+syntaxString         light      [38;2;16;125;50m    [38;5;29m               9.5618
+
+  total slots inspected: 24
+
+--- 5. Slash-Pair Fallback ---
+
+raw-setting                               want-dark resolved-member        fallback
+-------------------------------------------------------------------------------------
+dark                                           true dark                      false
+dark                                          false light                     false
+light                                          true dark                      false
+light                                         false light                     false
+dark/light                                     true light                     false
+dark/light                                    false dark                      false
+light/dark                                     true dark                      false
+light/dark                                    false light                     false
+antd-light                                     true antd-dark                 false
+antd-light                                    false antd-light                false
+unknown-name                                   true dark                       true
+unknown-name                                  false dark                       true
+solarized-light/gruvbox-dark                   true gruvbox-dark              false
+solarized-light/gruvbox-dark                  false solarized-light           false
+
+  fallbacks used: 2/14
+
+=== Summary ===
+  polarity classified: 10/11
+  thinking-ramp passing both: 8/24
+  rail-hue passing WCAG min: 94/100
+  SGR slots inspected: 24
+  slash-pair fallbacks: 2/14
