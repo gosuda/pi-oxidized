@@ -507,7 +507,7 @@ function scanConfigValueOwnership(repoRoot: string) {
 
 	for (const file of rustFiles) {
 		const rel = file.replace(repoRoot + "/", "");
-		if (file.endsWith("config_value.rs")) modules.push(rel);
+		if (file.endsWith("config_value.rs") || file.endsWith(join("config_value", "mod.rs"))) modules.push(rel);
 		const source = readFileSync(file, "utf8");
 		if (source.includes("fn parse_config_value_reference")) parserFiles.push(rel);
 		if (source.includes("static COMMAND_CACHE")) cacheFiles.push(rel);
@@ -515,7 +515,7 @@ function scanConfigValueOwnership(repoRoot: string) {
 		const lines = source.split("\n");
 		for (let i = 0; i < lines.length; i++) {
 			const line = stripLineComment(lines[i] ?? "");
-			if (/^\s*(pub\s+)?mod\s+config_value\b/.test(line) && rel !== join("crates", "pi-ai", "src", "auth", "mod.rs")) {
+			if (/^\s*(pub(?:\s*\([$\w]+\))?\s+)?mod\s+config_value\b/.test(line) && rel !== join("crates", "pi-ai", "src", "auth", "mod.rs")) {
 				strayDeclarations.push(`${rel}:${i + 1}: ${line.trim()}`);
 			}
 		}

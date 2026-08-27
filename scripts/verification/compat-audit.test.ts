@@ -244,6 +244,19 @@ describe("compat audit witness suite", () => {
 		).toBe(true);
 	});
 
+	test("pub(crate) directory-form second module fails single-owner witness", () => {
+		const dir = temporaryDirectory("compat-dispo-crate-mod-");
+		writeNested(join(dir, CANONICAL_CONFIG_VALUE), canonicalConfigValueSource());
+		writeNested(
+			join(dir, "crates", "pi", "src", "core", "config_value", "mod.rs"),
+			"pub fn resolve_config_value() {}\n",
+		);
+		writeNested(join(dir, "crates", "pi", "src", "core", "mod.rs"), "pub(crate) mod config_value;\n");
+		const violations = verifyConfigValueSingleOwner(dir);
+		expect(violations.some((v) => v.includes("exactly one config_value module"))).toBe(true);
+		expect(violations.some((v) => v.includes("second config_value module declared"))).toBe(true);
+	});
+
 	// --- Cleanup ---
 
 	test("cleanup temporary directories", () => {
