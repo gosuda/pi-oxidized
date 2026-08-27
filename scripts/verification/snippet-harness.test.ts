@@ -3,6 +3,8 @@ import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+	assertFenceImportsResolve,
+	enumerateFenceImports,
 	EXCLUDED_EXAMPLE_PRODUCTS,
 	REQUIRED_SNIPPET_FIXTURES,
 	REPO_ROOT,
@@ -16,6 +18,7 @@ import {
 	runSnippetHarness,
 	runTypeScriptLane,
 	validateSourcePath,
+	verifyNoExamplesDirectory,
 	verifyNoExcludedExampleProducts,
 	verifyRequiredSnippetFixtures,
 	wrapRustSnippet,
@@ -314,4 +317,71 @@ describe("snippet harness e2e", () => {
 		},
 		{ timeout: 600_000 },
 	);
+});
+
+describe("DOC-D: import resolution across registered fences", () => {
+	test("every fence import resolves against live workspace exports in both lanes", () => {
+		const violations = assertFenceImportsResolve(REPO_ROOT);
+		expect(violations).toEqual([]);
+	});
+
+	test("enumerateFenceImports covers both rust and ts lanes", () => {
+		const { imports } = enumerateFenceImports(REPO_ROOT);
+		const rustImports = imports.filter((imp) => imp.lane === "rust");
+		const tsImports = imports.filter((imp) => imp.lane === "ts");
+		expect(rustImports.length).toBeGreaterThan(0);
+		expect(tsImports.length).toBeGreaterThan(0);
+		for (const imp of imports) {
+			expect(imp.fenceId).toMatch(/^scripts\/verification\/fixtures\/docs-snippets\//);
+			expect(imp.specifier.length).toBeGreaterThan(0);
+		}
+	});
+
+	test("stale import in a fence fails resolution", () => {
+		const root = temporaryDirectory("snippet-import-res-");
+		const fixtureDir = "scripts/verification/fixtures/docs-snippets/rust";
+		mkdirSync(join(root, fixtureDir), { recursive: true });
+		writeFileSync(join(root, fixtureDir, "stale.md"), "```rust\nuse pi_ai::nonexistent_symbol;\n\nfn main() { let _ = nonexistent_symbol(); }\n```\n");
+		const violations = assertFenceImportsResolve(root);
+		expect(violations.some((v) => v.includes("nonexistent_symbol"))).toBe(true);
+	});
+});
+
+describe("DOC-D: ledger assertion for excluded products and examples/ directory", () => {
+	test("zero fixtures reference any excluded example-product name", () => {
+		expect(verifyNoExcludedExampleProducts(REPO_ROOT)).toEqual([]);
+		for (const name of EXCLUDED_EXAMPLE_PRODUCTS) {
+			expect(NEGATIVE_SOURCE.includes(name)).toBe(false);
+		}
+	});
+
+	test("zero ledger rows reference any excluded example-product name", () => {
+		const ledger = JSON.parse(readFileSync(join(REPO_ROOT, "scripts/verification/docs-evidence.json"), "utf8"));
+		for (const row of ledger.rows) {
+			const rowStr = JSON.stringify(row);
+			for (const name of EXCLUDED_EXAMPLE_PRODUCTS) {
+				expect(rowStr.includes(name)).toBe(false);
+			}
+		}
+	});
+
+	test("no examples/ directory exists in the tree", () => {
+		const violations = verifyNoExamplesDirectory(REPO_ROOT);
+		expect(violations).toEqual([]);
+	});
+
+	test("examples/ directory detection fires on a planted directory", () => {
+		const root = temporaryDirectory("snippet-examples-");
+		mkdirSync(join(root, "examples"), { recursive: true });
+		const violations = verifyNoExamplesDirectory(root);
+		expect(violations.some((v) => v.includes("examples/"))).toBe(true);
+	});
+
+	test("examples/ under excluded directories are not flagged", () => {
+		const root = temporaryDirectory("snippet-examples-excluded-");
+		mkdirSync(join(root, "target/debug/examples"), { recursive: true });
+		mkdirSync(join(root, "node_modules/some-pkg/examples"), { recursive: true });
+		const violations = verifyNoExamplesDirectory(root);
+		expect(violations).toEqual([]);
+	});
 });
