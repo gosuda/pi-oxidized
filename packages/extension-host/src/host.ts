@@ -1001,7 +1001,7 @@ export class ExtensionHost {
 						if (result["content"] !== undefined) response["content"] = result["content"];
 						if (result["details"] !== undefined) response["details"] = result["details"];
 						if (result["isError"] !== undefined) response["isError"] = result["isError"];
-						if (result["usage"] !== undefined) response["usage"] = result["usage"];
+						if (result["terminate"] !== undefined) response["terminate"] = result["terminate"];
 					}
 					await this.client.respond(id, eventType as Method, response);
 					return;
