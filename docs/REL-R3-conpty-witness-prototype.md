@@ -248,7 +248,7 @@ portable-pty's `WinChild::kill` is `TerminateProcess(handle, 1)` on the
 **direct child only** — no job object, no tree walk (vendored `win/mod.rs:41-57`).
 Its published 0.9.0 form, recorded verbatim:
 
-```rust
+```rust,ignore
 let res = unsafe { TerminateProcess(proc.as_raw_handle() as _, 1) };
 let err = IoError::last_os_error();
 if res != 0 { Err(err) } else { Ok(()) }
