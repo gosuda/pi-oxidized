@@ -10,6 +10,7 @@ import {
 	verifyExtensionHostRouting,
 	verifyConfigCorpus,
 	verifyNoRustCompatConsumer,
+	verifyConfigValueSingleOwner,
 	runCompatAuditWitnesses,
 } from "./compat-audit.ts";
 
@@ -172,6 +173,75 @@ describe("compat audit witness suite", () => {
 		writeNested(join(crateDir, "mod.rs"), "pub mod compat;\n");
 		const violations = verifyNoRustCompatConsumer(dir);
 		expect(violations.some((v) => v.includes("mod compat"))).toBe(true);
+	});
+
+	// --- Witness 6: PAR-COMPAT-DISPO single-owner ---
+
+	const CANONICAL_CONFIG_VALUE = join("crates", "pi-ai", "src", "auth", "config_value.rs");
+
+	function canonicalConfigValueSource(): string {
+		return readFileSync(join(REPO_ROOT, CANONICAL_CONFIG_VALUE), "utf8");
+	}
+
+	test("config-value single-owner witness passes on real repo", () => {
+		expect(verifyConfigValueSingleOwner(REPO_ROOT)).toEqual([]);
+	});
+
+	test("resurrected pi core wrapper fails single-owner witness", () => {
+		const dir = temporaryDirectory("compat-dispo-wrapper-");
+		writeNested(join(dir, CANONICAL_CONFIG_VALUE), canonicalConfigValueSource());
+		writeNested(
+			join(dir, "crates", "pi", "src", "core", "config_value.rs"),
+			"pub fn resolve_config_value() {}\n",
+		);
+		writeNested(join(dir, "crates", "pi", "src", "core", "mod.rs"), "pub mod config_value;\n");
+		const violations = verifyConfigValueSingleOwner(dir);
+		expect(violations.some((v) => v.includes("exactly one config_value module"))).toBe(true);
+		expect(violations.some((v) => v.includes("second config_value module declared"))).toBe(true);
+	});
+
+	test("second command cache static fails single-owner witness", () => {
+		const dir = temporaryDirectory("compat-dispo-cache-");
+		writeNested(join(dir, CANONICAL_CONFIG_VALUE), canonicalConfigValueSource());
+		writeNested(
+			join(dir, "crates", "pi", "src", "core", "mod.rs"),
+			"static COMMAND_CACHE: LazyLock<Mutex<HashMap<String, Option<String>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));\n",
+		);
+		const violations = verifyConfigValueSingleOwner(dir);
+		expect(violations.some((v) => v.includes("exactly one process-wide command cache"))).toBe(true);
+		expect(violations.some((v) => v.includes("crates/pi/src/core/mod.rs"))).toBe(true);
+	});
+
+	test("second parser definition fails single-owner witness", () => {
+		const dir = temporaryDirectory("compat-dispo-parser-");
+		writeNested(join(dir, CANONICAL_CONFIG_VALUE), canonicalConfigValueSource());
+		writeNested(
+			join(dir, "crates", "pi", "src", "core", "model_runtime.rs"),
+			"fn parse_config_value_reference(config: &str) -> usize { config.len() }\n",
+		);
+		const violations = verifyConfigValueSingleOwner(dir);
+		expect(violations.some((v) => v.includes("exactly one config-value parser"))).toBe(true);
+		expect(violations.some((v) => v.includes("crates/pi/src/core/model_runtime.rs"))).toBe(true);
+	});
+
+	test("missing canonical module fails single-owner witness", () => {
+		const dir = temporaryDirectory("compat-dispo-missing-");
+		writeNested(join(dir, "crates", "pi", "src", "lib.rs"), "pub mod core;\n");
+		const violations = verifyConfigValueSingleOwner(dir);
+		expect(violations.some((v) => v.includes("found: none"))).toBe(true);
+	});
+
+	test("local config_value import outside auth fails single-owner witness", () => {
+		const dir = temporaryDirectory("compat-dispo-import-");
+		writeNested(join(dir, CANONICAL_CONFIG_VALUE), canonicalConfigValueSource());
+		writeNested(
+			join(dir, "crates", "pi", "src", "core", "model_runtime.rs"),
+			"use crate::core::config_value::resolve_config_value;\n",
+		);
+		const violations = verifyConfigValueSingleOwner(dir);
+		expect(
+			violations.some((v) => v.includes("imports a local config_value module instead of pi_ai::auth::config_value")),
+		).toBe(true);
 	});
 
 	// --- Cleanup ---

@@ -2,7 +2,7 @@
 /**
  * PAR-COMPAT-AUDIT witness suite (issue #59).
  *
- * Five executable negative witnesses adjudicate the upstream `./compat`
+ * Six executable negative witnesses adjudicate the upstream `./compat`
  * legacy global provider registry (ledger row A8) before any deletion or
  * port decision.  Each witness returns an empty array when green; any
  * non-empty result is a violation that blocks the A8 ledger flip.
@@ -16,6 +16,10 @@
  *     (`auth/env_keys.rs`); `Model.compat` already adapter-local in Rust.
  *  5. Rust-surface negative witness — no Rust source references the
  *     `./compat` module.
+ *  6. PAR-COMPAT-DISPO single-owner witness — the dead
+ *     `pi::core::config_value` wrapper stays deleted; exactly one parser
+ *     and one process-wide command cache exist, both owned by
+ *     `crates/pi-ai/src/auth/config_value.rs`.
  */
 
 import { readFileSync, readdirSync, statSync } from "node:fs";
@@ -461,6 +465,117 @@ export function verifyNoRustCompatConsumer(repoRoot: string): string[] {
 }
 
 // ---------------------------------------------------------------------------
+// PAR-COMPAT-DISPO witness: single-owner config-value resolution (issue #45)
+// ---------------------------------------------------------------------------
+
+/** The one module allowed to parse config values and own the command cache. */
+const CANONICAL_CONFIG_VALUE = join("crates", "pi-ai", "src", "auth", "config_value.rs");
+
+/** Siblings inside the auth module may `use super::config_value`. */
+const AUTH_DIR = join("crates", "pi-ai", "src", "auth");
+
+function isWithin(path: string, dir: string): boolean {
+	const relative = path.startsWith(dir + "/") || path.startsWith(dir + "\\");
+	return relative;
+}
+
+/** Cut a Rust line at the first `//` that is outside a string literal. */
+function stripLineComment(line: string): string {
+	let inString = false;
+	for (let i = 0; i < line.length; i++) {
+		const ch = line[i];
+		if (ch === '"') inString = !inString;
+		if (ch === '/' && line[i + 1] === '/' && !inString) return line.slice(0, i);
+	}
+	return line;
+}
+
+/**
+ * Scan every Rust source under crates/ and attribute each single-owner
+ * definition (parser, command cache, cache-clear) to its defining file.
+ * Paths are repo-root relative with forward slashes.
+ */
+function scanConfigValueOwnership(repoRoot: string) {
+	const cratesDir = join(repoRoot, "crates");
+	const rustFiles = listFilesRecursive(cratesDir, ".rs");
+	const modules: string[] = [];
+	const parserFiles: string[] = [];
+	const cacheFiles: string[] = [];
+	const clearFiles: string[] = [];
+	const strayDeclarations: string[] = [];
+	const strayImports: string[] = [];
+
+	for (const file of rustFiles) {
+		const rel = file.replace(repoRoot + "/", "");
+		if (file.endsWith("config_value.rs")) modules.push(rel);
+		const source = readFileSync(file, "utf8");
+		if (source.includes("fn parse_config_value_reference")) parserFiles.push(rel);
+		if (source.includes("static COMMAND_CACHE")) cacheFiles.push(rel);
+		if (source.includes("fn clear_config_value_cache")) clearFiles.push(rel);
+		const lines = source.split("\n");
+		for (let i = 0; i < lines.length; i++) {
+			const line = stripLineComment(lines[i] ?? "");
+			if (/^\s*(pub\s+)?mod\s+config_value\b/.test(line) && rel !== join("crates", "pi-ai", "src", "auth", "mod.rs")) {
+				strayDeclarations.push(`${rel}:${i + 1}: ${line.trim()}`);
+			}
+		}
+		const codeOnly = lines.map((l) => stripLineComment(l ?? "")).join("\n");
+		if (!isWithin(rel, AUTH_DIR) && /\b(?:crate|super|self)(?:::\w+)*::config_value\b|\bpi::core::config_value\b/.test(codeOnly)) {
+			strayImports.push(rel);
+		}
+	}
+	return { modules, parserFiles, cacheFiles, clearFiles, strayDeclarations, strayImports };
+}
+
+/**
+ * Witness 6 — the PAR-COMPAT-DISPO delete-not-port disposition, made
+ * permanent: the dead `pi::core::config_value` HashMap-shaped wrapper stays
+ * deleted, and config-value resolution keeps exactly one parser and one
+ * process-wide command cache, both in `pi-ai/src/auth/config_value.rs`.
+ */
+export function verifyConfigValueSingleOwner(repoRoot: string): string[] {
+	const violations: string[] = [];
+	const ownership = scanConfigValueOwnership(repoRoot);
+
+	if (ownership.modules.length !== 1 || ownership.modules[0] !== CANONICAL_CONFIG_VALUE) {
+		violations.push(
+			`expected exactly one config_value module (${CANONICAL_CONFIG_VALUE}); found: ${
+				ownership.modules.length === 0 ? "none" : ownership.modules.join(", ")
+			}`,
+		);
+	}
+	if (ownership.parserFiles.length !== 1 || ownership.parserFiles[0] !== CANONICAL_CONFIG_VALUE) {
+		violations.push(
+			`expected exactly one config-value parser in ${CANONICAL_CONFIG_VALUE}; found: ${
+				ownership.parserFiles.length === 0 ? "none" : ownership.parserFiles.join(", ")
+			}`,
+		);
+	}
+	if (ownership.cacheFiles.length !== 1 || ownership.cacheFiles[0] !== CANONICAL_CONFIG_VALUE) {
+		violations.push(
+			`expected exactly one process-wide command cache (static COMMAND_CACHE) in ${CANONICAL_CONFIG_VALUE}; found: ${
+				ownership.cacheFiles.length === 0 ? "none" : ownership.cacheFiles.join(", ")
+			}`,
+		);
+	}
+	if (ownership.clearFiles.length !== 1 || ownership.clearFiles[0] !== CANONICAL_CONFIG_VALUE) {
+		violations.push(
+			`expected exactly one clear_config_value_cache definition in ${CANONICAL_CONFIG_VALUE}; found: ${
+				ownership.clearFiles.length === 0 ? "none" : ownership.clearFiles.join(", ")
+			}`,
+		);
+	}
+	for (const declaration of ownership.strayDeclarations) {
+		violations.push(`second config_value module declared outside the canonical auth owner: ${declaration}`);
+	}
+	for (const file of ownership.strayImports) {
+		violations.push(`${file}: imports a local config_value module instead of pi_ai::auth::config_value`);
+	}
+
+	return violations;
+}
+
+// ---------------------------------------------------------------------------
 // Orchestration
 // ---------------------------------------------------------------------------
 
@@ -491,6 +606,9 @@ export function runCompatAuditWitnesses(repoRoot: string): string[] {
 
 	// Witness 5: Rust-surface negative
 	add("rust-negative", verifyNoRustCompatConsumer(repoRoot));
+
+	// Witness 6: PAR-COMPAT-DISPO single-owner disposition
+	add("config-value-single-owner", verifyConfigValueSingleOwner(repoRoot));
 
 	return violations;
 }
