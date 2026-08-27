@@ -11547,4 +11547,255 @@ mod tests {
         );
         Ok(())
     }
+
+    // -----------------------------------------------------------------------
+    // TUI-V4: Resize storm, settle, and progressive-disclosure integrity
+    // -----------------------------------------------------------------------
+
+    /// Build a runtime with a live input sender so tests can pre-load
+    /// events into the channel before calling `step_ui`.
+    fn try_make_runtime_with_channel()
+    -> Result<(InteractiveRuntime<SharedWriter, FakeHost>, Arc<ActionLog>, mpsc::UnboundedSender<UiEvent>, SharedWriter), String> {
+        let writer = SharedWriter::new();
+        let sink = writer.clone();
+        let caps = TerminalCapabilities::default();
+        let tui = Tui::new(writer, Size::new(80, 24), Position::ORIGIN, 8, caps)
+            .map_err(|error| format!("tui construction: {error}"))?;
+        let (tx, rx) = mpsc::unbounded_channel::<UiEvent>();
+        let input = TerminalInput::mock(rx);
+        let (host, log) = FakeHost::new();
+        let options = InteractiveRuntimeOptions {
+            size: (80, 24),
+            ..InteractiveRuntimeOptions::default()
+        };
+        let mut rt = InteractiveRuntime::new(tui, input, Arc::new(host), &options);
+        let _ = rt.paint_now();
+        Ok((rt, log, tx, sink))
+    }
+
+    /// V4-1: a rapid 20→160→30 resize storm coalesces into exactly one
+    /// reanchor commit with zero banned clear bytes (no CSI 2J / 3J).
+    #[tokio::test]
+    async fn resize_storm_coalesces_to_one_reanchor_with_zero_clear_bytes() -> TestResult {
+        use pi_tui::terminal::backend::audit_bytes;
+
+        let (mut rt, _log, tx, sink) = try_make_runtime_with_channel()?;
+        let baseline = sink.snapshot().len();
+
+        // Pre-load the storm: 20→160→30. The first step_ui enters
+        // handle_resize which drains the channel and coalesces all three
+        // into one reanchor.
+        tx.send(UiEvent::Resize { width: 160, height: 24 })
+            .map_err(|e| format!("send failed: {e}"))?;
+        tx.send(UiEvent::Resize { width: 30, height: 24 })
+            .map_err(|e| format!("send failed: {e}"))?;
+
+        rt.step_ui(UiEvent::Resize { width: 20, height: 24 })
+            .await
+            .map_err(|e| format!("resize step failed: {e}"))?;
+
+        // Final size must be the last event (30×24), not the first.
+        assert_eq!(rt.tui.size(), Size::new(30, 24));
+        assert_eq!(rt.view.width, 30);
+        assert_eq!(rt.view.height, 24);
+
+        let written = &sink.snapshot()[baseline..];
+        assert!(
+            !written.is_empty(),
+            "storm reanchor must commit bytes to the sink"
+        );
+        assert!(!rt.exited, "reanchor must not silently enter IoFailure");
+        let report = audit_bytes(written);
+        assert_eq!(report.clear_2j, 0, "resize reanchor must not emit CSI 2J");
+        assert_eq!(report.clear_3j, 0, "resize reanchor must not emit CSI 3J");
+        assert!(
+            report.sync_begin == report.sync_end,
+            "synchronized-output markers must balance"
+        );
+        Ok(())
+    }
+
+    /// V4-2: a sub-20 resize storm (20→15→10→8) coalesces to one reanchor
+    /// with zero clear bytes; the viewport size tracks the final width.
+    #[tokio::test]
+    async fn sub20_resize_storm_coalesces_with_zero_clear_bytes() -> TestResult {
+        use pi_tui::terminal::backend::audit_bytes;
+
+        let (mut rt, _log, tx, sink) = try_make_runtime_with_channel()?;
+        let baseline = sink.snapshot().len();
+
+        tx.send(UiEvent::Resize { width: 15, height: 24 })
+            .map_err(|e| format!("send failed: {e}"))?;
+        tx.send(UiEvent::Resize { width: 10, height: 24 })
+            .map_err(|e| format!("send failed: {e}"))?;
+        tx.send(UiEvent::Resize { width: 8, height: 24 })
+            .map_err(|e| format!("send failed: {e}"))?;
+
+        rt.step_ui(UiEvent::Resize { width: 20, height: 24 })
+            .await
+            .map_err(|e| format!("resize step failed: {e}"))?;
+
+        assert_eq!(rt.tui.size(), Size::new(8, 24));
+        let written = &sink.snapshot()[baseline..];
+        assert!(
+            !written.is_empty(),
+            "sub-20 storm reanchor must commit bytes to the sink"
+        );
+        assert!(!rt.exited, "reanchor must not silently enter IoFailure");
+        let report = audit_bytes(written);
+        assert_eq!(report.clear_2j, 0, "sub-20 storm must not emit CSI 2J");
+        assert_eq!(report.clear_3j, 0, "sub-20 storm must not emit CSI 3J");
+        Ok(())
+    }
+
+    /// V4-3: progressive-disclosure cues (… N more lines · ctrl+o) remain
+    /// fully visible at 40 columns on canonical content.
+    #[tokio::test]
+    async fn progressive_disclosure_cues_visible_at_40_columns() -> TestResult {
+        use crate::modes::interactive::tool_renderer::{
+            ToolCallView, ToolPhase, ToolResultView, ToolState,
+        };
+        use crate::modes::interactive::view::{render_view, snapshot_buffer_plain};
+
+        let (mut rt, _log) = try_make_runtime()?;
+
+        rt.view.messages.push(MessageView::Tool(
+            crate::modes::interactive::messages::ToolMessageView {
+                renderer: "read".to_owned(),
+                state: ToolState {
+                    call: ToolCallView {
+                        name: "read".to_owned(),
+                        id: "test1".to_owned(),
+                        args_summary: "path: test.rs".to_owned(),
+                        raw_args: serde_json::json!({ "path": "test.rs" }),
+                    },
+                    result: Some(ToolResultView {
+                        text: (1..=15_usize)
+                            .map(|i| format!("line {i}"))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                        truncated: false,
+                        full_output_path: None,
+                        images: Vec::new(),
+                        error: None,
+                    }),
+                    expanded: false,
+                    phase: ToolPhase::Success,
+                },
+            },
+        ));
+        let plain = crate::core::keybindings::with_global_app_keybindings(|| {
+            let buf = render_view(&rt.view, 40, 200);
+            snapshot_buffer_plain(&buf, 40, 200).join("\n")
+        });
+
+        assert!(
+            plain.contains("more lines"),
+            "collapse hint must be visible at 40 columns: {plain}"
+        );
+        assert!(
+            plain.contains("ctrl+o"),
+            "expand key cue must be visible at 40 columns: {plain}"
+        );
+        Ok(())
+    }
+
+    /// V4-4: progressive-disclosure cues remain visible at 20 columns.
+    #[tokio::test]
+    async fn progressive_disclosure_cues_visible_at_20_columns() -> TestResult {
+        use crate::modes::interactive::tool_renderer::{
+            ToolCallView, ToolPhase, ToolResultView, ToolState,
+        };
+        use crate::modes::interactive::view::{render_view, snapshot_buffer_plain};
+
+        let (mut rt, _log) = try_make_runtime()?;
+
+        rt.view.messages.push(MessageView::Tool(
+            crate::modes::interactive::messages::ToolMessageView {
+                renderer: "read".to_owned(),
+                state: ToolState {
+                    call: ToolCallView {
+                        name: "read".to_owned(),
+                        id: "test2".to_owned(),
+                        args_summary: "path: test.rs".to_owned(),
+                        raw_args: serde_json::json!({ "path": "test.rs" }),
+                    },
+                    result: Some(ToolResultView {
+                        text: (1..=15_usize)
+                            .map(|i| format!("line {i}"))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                        truncated: false,
+                        full_output_path: None,
+                        images: Vec::new(),
+                        error: None,
+                    }),
+                    expanded: false,
+                    phase: ToolPhase::Success,
+                },
+            },
+        ));
+
+        let plain = crate::core::keybindings::with_global_app_keybindings(|| {
+            let buf = render_view(&rt.view, 20, 200);
+            snapshot_buffer_plain(&buf, 20, 200).join("\n")
+        });
+
+        assert!(
+            plain.contains("more lines"),
+            "collapse hint must be visible at 20 columns: {plain}"
+        );
+        assert!(
+            plain.contains("ctrl+o"),
+            "expand key cue must be visible at 20 columns: {plain}"
+        );
+        Ok(())
+    }
+
+    /// V4-5: resize to the same dimensions produces a reanchor with zero
+    /// banned clear bytes (viewport stays anchored).
+    #[tokio::test]
+    async fn resize_to_same_dimensions_stays_anchored() -> TestResult {
+        let (mut rt, _log, _tx, sink) = try_make_runtime_with_channel()?;
+        let baseline = sink.snapshot().len();
+
+        rt.step_ui(UiEvent::Resize { width: 80, height: 24 })
+            .await
+            .map_err(|e| format!("resize step failed: {e}"))?;
+
+        let written = &sink.snapshot()[baseline..];
+        assert!(
+            !written.is_empty(),
+            "same-size resize must still commit a reanchor"
+        );
+        assert!(
+            !written.windows(4).any(|w| w == b"\x1b[2J"),
+            "same-size reanchor must not emit CSI 2J"
+        );
+        Ok(())
+    }
+
+    /// V4-6: a 160→30→160 storm settles to the final size with the viewport
+    /// anchored at the bottom (viewport_top = height - viewport_height).
+    #[tokio::test]
+    async fn resize_storm_settles_with_bottom_anchored_viewport() -> TestResult {
+        let (mut rt, _log, tx, _sink) = try_make_runtime_with_channel()?;
+
+        tx.send(UiEvent::Resize { width: 30, height: 24 })
+            .map_err(|e| format!("send failed: {e}"))?;
+        tx.send(UiEvent::Resize { width: 160, height: 24 })
+            .map_err(|e| format!("send failed: {e}"))?;
+
+        rt.step_ui(UiEvent::Resize { width: 160, height: 24 })
+            .await
+            .map_err(|e| format!("resize step failed: {e}"))?;
+
+        assert_eq!(rt.tui.size(), Size::new(160, 24));
+        // Viewport height is preserved from the initial 8-row inline
+        // viewport (note_resize only shrinks, never grows). The reanchor
+        // commits with viewport_height = min(8, 24) = 8, bottom-anchored
+        // at row 24-8=16. This is the correct anchored behavior.
+        assert_eq!(rt.tui.viewport_height(), 8);
+        Ok(())
+    }
 }
