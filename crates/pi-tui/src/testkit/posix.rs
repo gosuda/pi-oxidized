@@ -53,20 +53,30 @@ impl TerminalDriver for PosixPtyDriver {
 
         disable_pty_echo(pair.master.as_ref())?;
 
-        let mut writer = pair.master.take_writer().map_err(|err| DriverError::pty(&err))?;
+        let raw_writer = pair.master.take_writer().map_err(|err| DriverError::pty(&err))?;
         let reader = pair.master.try_clone_reader().map_err(|err| DriverError::pty(&err))?;
 
+        // Wrap in SharedWriter so the DSR auto-responder can share the single
+        // PTY master writer (portable-pty allows only one take_writer call).
+        let shared = crate::testkit::session::SharedWriter::new(raw_writer);
+        let dsr_writer = shared.clone_handle();
+
+        // Write probe reply through the shared writer.
         let probe = spec.profile.probe_reply();
         if !probe.is_empty() {
-            writer.write_all(probe)?;
-            writer.flush()?;
+            let mut w = shared.clone_handle();
+            w.write_all(probe)?;
+            w.flush()?;
         }
 
-        let pump = crate::testkit::session::ReaderPump::from_reader(reader);
+        let pump = crate::testkit::session::ReaderPump::from_reader_with_dsr_responder(
+            reader,
+            dsr_writer,
+        );
         Ok(PosixPtySession {
             master: pair.master,
             child: Some(child),
-            io: SessionIo::new(writer, pump),
+            io: SessionIo::new(Box::new(shared), pump),
             geometry: spec.geometry,
         })
     }

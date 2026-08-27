@@ -1,7 +1,9 @@
 //! Shared reader pumping, quiescence settling, cleanup, and AVT snapshots.
 
 use std::io::{Read, Write};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -239,6 +241,37 @@ impl<S: RenderSession> RecordingSession<S> {
     }
 }
 
+
+/// Shared writer that allows multiple owners to write to the same underlying
+/// PTY master. Used to give the DSR auto-responder thread its own write handle
+/// without calling `take_writer` twice (which portable-pty forbids).
+pub(crate) struct SharedWriter {
+    inner: Arc<Mutex<Box<dyn Write + Send>>>,
+}
+
+impl SharedWriter {
+    pub(crate) fn new(writer: Box<dyn Write + Send>) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(writer)),
+        }
+    }
+
+    /// Clones the shared handle for use by another thread.
+    pub(crate) fn clone_handle(&self) -> SharedWriter {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl Write for SharedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.lock().unwrap().write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.lock().unwrap().flush()
+    }
+}
 /// One chunk, or a terminal reader failure that must not validate as settle.
 pub(crate) type ReaderEvent = Result<Vec<u8>, std::io::Error>;
 
@@ -254,15 +287,66 @@ impl ReaderPump {
     where
         R: Read + Send + 'static,
     {
+        Self::from_reader_inner(reader, None)
+    }
+
+    /// Builds a pump that auto-responds to DSR cursor-position queries (`\x1b[6n`)
+    /// by writing `\x1b[1;1R` back to the child via `responder`.
+    ///
+    /// Extension hosts and TUI probes emit `\x1b[6n` during boot. Without a reply
+    /// the child blocks indefinitely, causing the harness settle to hit its
+    /// ceiling. The responder writer must write to the child's stdin (PTY master).
+    pub(crate) fn from_reader_with_dsr_responder<R, W>(reader: R, responder: W) -> Self
+    where
+        R: Read + Send + 'static,
+        W: Write + Send + 'static,
+    {
+        Self::from_reader_inner(reader, Some(Box::new(responder)))
+    }
+
+    fn from_reader_inner<R>(reader: R, mut responder: Option<Box<dyn Write + Send>>) -> Self
+    where
+        R: Read + Send + 'static,
+    {
         let (tx, rx) = mpsc::channel();
         let join = thread::spawn(move || {
             let mut reader = reader;
             let mut buf = [0u8; 8192];
+            // Residual tail from the previous chunk for cross-chunk DSR detection.
+            // `\x1b[6n` is 4 bytes; keeping 3 residual bytes covers any split.
+            let mut residual: Vec<u8> = Vec::new();
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        if tx.send(Ok(buf[..n].to_vec())).is_err() {
+                        let chunk = &buf[..n];
+
+                        // Auto-respond to any DSR cursor-position queries.
+                        if let Some(w) = &mut responder {
+                            let scan: Vec<u8> = residual
+                                .iter()
+                                .chain(chunk.iter())
+                                .copied()
+                                .collect();
+                            let needle = b"\x1b[6n";
+                            let mut idx = 0;
+                            while let Some(pos) = scan[idx..].windows(needle.len()).position(|w| w == needle) {
+                                let abs = idx + pos;
+                                // Only respond to matches that start at or after
+                                // the residual boundary so we don't double-respond.
+                                if abs >= residual.len().saturating_sub(needle.len() - 1) {
+                                    let _ = w.write_all(b"\x1b[1;1R");
+                                    let _ = w.flush();
+                                }
+                                idx = abs + needle.len();
+                            }
+                            // Update residual to the tail of this chunk.
+                            let take = chunk.len().min(needle.len() - 1);
+                            residual.clear();
+                            residual.extend_from_slice(&chunk[chunk.len() - take..]);
+                        }
+
+                        if tx.send(Ok(chunk.to_vec())).is_err() {
                             break;
                         }
                     }
@@ -1002,5 +1086,98 @@ mod tests {
             assert!(artifact.canonical.normalizations.is_empty());
         }
         Ok(())
+    }
+
+    /// DSR auto-responder writes `\x1b[1;1R` for each `\x1b[6n` in the stream.
+    #[test]
+    fn dsr_responder_replies_to_cursor_query() {
+        use std::io::Cursor;
+        use std::sync::{Arc, Mutex};
+
+        // Input: some text, a DSR query, more text, another DSR query.
+        let input = b"hello\x1b[6nworld\x1b[6n!";
+        let reader = Cursor::new(input.to_vec());
+
+        let received: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&received);
+        let responder = DsrSink(sink);
+
+        let pump = ReaderPump::from_reader_with_dsr_responder(reader, responder);
+
+        // Drain all chunks from the channel.
+        let mut collected = Vec::new();
+        while let Ok(Ok(chunk)) = pump.rx.recv_timeout(Duration::from_secs(1)) {
+            collected.extend_from_slice(&chunk);
+        }
+
+        // The raw data passes through unchanged.
+        assert_eq!(&collected[..], &input[..]);
+
+        // Two DSR replies were written.
+        let replies = received.lock().unwrap();
+        assert_eq!(
+            &replies[..],
+            b"\x1b[1;1R\x1b[1;1R",
+            "expected two DSR replies"
+        );
+    }
+
+    /// DSR auto-responder handles queries split across chunk boundaries.
+    #[test]
+    fn dsr_responder_handles_cross_chunk_split() {
+        use std::sync::{Arc, Mutex};
+        struct SplitReader {
+            chunks: Vec<Vec<u8>>,
+            idx: usize,
+        }
+        impl Read for SplitReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.idx >= self.chunks.len() {
+                    return Ok(0);
+                }
+                let chunk = &self.chunks[self.idx];
+                let n = chunk.len().min(buf.len());
+                buf[..n].copy_from_slice(&chunk[..n]);
+                self.idx += 1;
+                Ok(n)
+            }
+        }
+
+        let reader = SplitReader {
+            chunks: vec![
+                b"abc\x1b".to_vec(),  // partial: ESC at end
+                b"[6n".to_vec(),      // rest of DSR query
+                b"def".to_vec(),      // normal text
+            ],
+            idx: 0,
+        };
+
+        let received: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&received);
+        let responder = DsrSink(sink);
+
+        let pump = ReaderPump::from_reader_with_dsr_responder(reader, responder);
+
+        let mut collected = Vec::new();
+        while let Ok(Ok(chunk)) = pump.rx.recv_timeout(Duration::from_secs(1)) {
+            collected.extend_from_slice(&chunk);
+        }
+
+        assert_eq!(&collected[..], b"abc\x1b[6ndef");
+
+        let replies = received.lock().unwrap();
+        assert_eq!(&replies[..], b"\x1b[1;1R", "expected one DSR reply for split query");
+    }
+
+    /// Writer sink that captures bytes for DSR reply verification.
+    struct DsrSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl Write for DsrSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 }
