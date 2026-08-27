@@ -551,7 +551,7 @@ export function verifyNoExamplesDirectory(root: string): string[] {
 }
 
 /** Rust crate identifiers that can appear in `use` statements. */
-const RUST_CRATE_IDENTIFIERS = RUST_CRATES.map(([identifier]) => identifier);
+const RUST_CRATE_IDENTIFIERS: readonly string[] = RUST_CRATES.map(([identifier]) => identifier);
 
 /** TypeScript package specifiers that can appear in `import` statements. */
 const TS_PACKAGE_SPECIFIERS = [

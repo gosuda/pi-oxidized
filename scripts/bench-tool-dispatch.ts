@@ -318,12 +318,12 @@ const noopTool: AgentTool<any> = {
 			onUpdate({
 				content: [{ type: "text", text: "noop progress" }],
 				details: { kind: "noop-progress", count },
-			} satisfies AgentToolResult);
+			} satisfies AgentToolResult<{ kind: "noop-progress"; count: number }>);
 		}
 		return {
 			content: [{ type: "text", text: `noop ok: ${input.path} x${count}` }],
 			details: { kind: "noop", path: input.path, count },
-		} satisfies AgentToolResult;
+		} satisfies AgentToolResult<{ kind: "noop"; path: string; count: number }>;
 	},
 };
 
@@ -399,13 +399,19 @@ async function runWorkerBlock(
 	}
 	const sorted = [...slicesMs].sort((a, b) => a - b);
 	const totalMs = slicesMs.reduce((sum, value) => sum + value, 0);
+	const medianMs = sorted[Math.floor(calls / 2)];
+	const minMs = sorted[0];
+	const maxMs = sorted[calls - 1];
+	if (medianMs === undefined || minMs === undefined || maxMs === undefined) {
+		throw new Error(`block ${blockIndex}: no timed slices for calls=${calls}`);
+	}
 	return {
 		index: blockIndex,
 		calls,
 		wallMsPerCall: totalMs / calls,
-		wallMedianNs: Math.round(sorted[Math.floor(calls / 2)] * 1_000_000),
-		wallMinNs: Math.round(sorted[0] * 1_000_000),
-		wallMaxNs: Math.round(sorted[calls - 1] * 1_000_000),
+		wallMedianNs: Math.round(medianMs * 1_000_000),
+		wallMinNs: Math.round(minMs * 1_000_000),
+		wallMaxNs: Math.round(maxMs * 1_000_000),
 		cpuMsPerCall: (cpuDelta.user + cpuDelta.system) / 1000 / calls,
 	};
 }

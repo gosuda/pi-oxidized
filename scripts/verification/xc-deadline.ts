@@ -67,7 +67,7 @@ export function verifyHookDeadlineConstant(hostSource: string): string[] {
 			"EXTENSION_HOOK_TIMEOUT_MS constant is missing from host.ts — " +
 				"the 30 s mutable hook deadline is not pinned",
 		);
-	} else if (Number.parseInt(match[1].replace(/_/g, ""), 10) !== 30_000) {
+	} else if (Number.parseInt((match[1] ?? "").replace(/_/g, ""), 10) !== 30_000) {
 		violations.push(
 			`EXTENSION_HOOK_TIMEOUT_MS is ${match[1]}, expected 30000 — ` +
 				"the hook deadline value drifted from 30 s",
@@ -95,7 +95,7 @@ export function verifyInputQueueCapacity(hostSource: string): string[] {
 			"EXTENSION_INPUT_QUEUE_CAPACITY constant is missing from host.ts — " +
 				"the capacity-64 terminal-input queue bound is not pinned",
 		);
-	} else if (Number.parseInt(match[1].replace(/_/g, ""), 10) !== 64) {
+	} else if (Number.parseInt((match[1] ?? "").replace(/_/g, ""), 10) !== 64) {
 		violations.push(
 			`EXTENSION_INPUT_QUEUE_CAPACITY is ${match[1]}, expected 64 — ` +
 				"the queue capacity drifted from 64",
@@ -134,7 +134,7 @@ export function verifyTerminalInputDeadline(
 			"EXTENSION_INPUT_TIMEOUT_MS constant is missing from host.ts — " +
 				"the terminal-input 4 ms deadline is not pinned",
 		);
-	} else if (Number.parseInt(timeoutConstMatch[1].replace(/_/g, ""), 10) !== 4) {
+	} else if (Number.parseInt((timeoutConstMatch[1] ?? "").replace(/_/g, ""), 10) !== 4) {
 		violations.push(
 			`EXTENSION_INPUT_TIMEOUT_MS is ${timeoutConstMatch[1]}, expected 4 — ` +
 				"the terminal-input deadline value drifted",
@@ -299,7 +299,7 @@ export function verifyStaleReplacementTokenGuard(
 		/captureReplacementToken\s*=\s*\([\s\S]*?\)\s*:\s*string\s*\|\s*undefined\s*=>\s*\{([\s\S]*?)\n\t\t\};/,
 	);
 	if (captureFnMatch) {
-		const body = captureFnMatch[1];
+		const body = captureFnMatch[1] ?? "";
 		const markStaleIdx = body.search(/markStale\s*\?\.\s*\(\s*\)/);
 		const tokenIdx = body.search(/payload\s*\[\s*["']replacementToken["']\s*\]/);
 		if (markStaleIdx !== -1 && tokenIdx !== -1 && markStaleIdx > tokenIdx) {

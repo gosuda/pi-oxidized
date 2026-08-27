@@ -86,14 +86,14 @@ export function verifyHostCompatCheck(source: string): string[] {
 	if (compatLineIdx === -1) {
 		// Already reported by checksCompat above.
 	} else {
-		const compatIndent = hostLines[compatLineIdx].search(/\S/);
+		const compatIndent = (hostLines[compatLineIdx] ?? "").search(/\S/);
 		let foundTerminate = false;
 		for (let i = compatLineIdx + 1; i < hostLines.length; i++) {
-			const indent = hostLines[i].search(/\S/);
-			if (indent >= 0 && indent <= compatIndent && hostLines[i].trim() !== "") {
+			const indent = (hostLines[i] ?? "").search(/\S/);
+			if (indent >= 0 && indent <= compatIndent && (hostLines[i] ?? "").trim() !== "") {
 				break;
 			}
-			if (/this\.terminate/.test(hostLines[i])) {
+			if (/this\.terminate/.test(hostLines[i] ?? "")) {
 				foundTerminate = true;
 				break;
 			}

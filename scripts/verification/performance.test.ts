@@ -566,9 +566,9 @@ describe("memory window coverage aggregation", () => {
 		expect(window.aggregateCoverage.observedLiveIdentitiesMax).toBeGreaterThan(0);
 		expect(window.maxTreeRss.sampleIndex).toBeGreaterThanOrEqual(0);
 		expect(window.maxTreeRss.sampleIndex).toBeLessThan(window.observations.length);
-		expect(window.maxTreeRss.bytes).toBe(window.observations[window.maxTreeRss.sampleIndex]!.treeRssBytes);
-		expect(window.maxTreePss.bytes).toBe(window.observations[window.maxTreePss.sampleIndex]!.treePssBytes);
-		expect(window.maxTreeRss.startOffsetMs).toBe(window.sampleStartOffsetsMs[window.maxTreeRss.sampleIndex]);
+		expect(window.observations[window.maxTreeRss.sampleIndex]?.treeRssBytes).toBe(window.maxTreeRss.bytes);
+		expect(window.observations[window.maxTreePss.sampleIndex]?.treePssBytes).toBe(window.maxTreePss.bytes);
+		expect(window.maxTreeRss.startOffsetMs).toBe(window.sampleStartOffsetsMs[window.maxTreeRss.sampleIndex] ?? -1);
 		expect(window.maxTreeRss.bytes).toBe(30 * 1024);
 	});
 });
@@ -634,7 +634,7 @@ describe("post-enumeration parent identity recheck", () => {
 
 describe("entrypoint harness failure preserves threshold blockers", () => {
 	test("appends harness failure without replacing evaluated blockers", () => {
-		const target = {
+		const target: Parameters<typeof recordEntrypointHarnessFailure>[0] = {
 			pass: true,
 			blockers: [
 				"Rust native keypress-to-paint p99: 12.000 ms >= required 10.000 ms (median 8.000 ms, p95 11.000 ms, 20 samples)",

@@ -145,7 +145,7 @@ export function verifyLatticeCompleteness(
 		violations.push("ALL_EVENT_TYPES array not found in host.ts");
 		return violations;
 	}
-	const hostDiscriminants = match[1]
+	const hostDiscriminants = match[1] ?? ""
 		.split(",")
 		.map((s) => s.trim().replace(/["']/g, ""))
 		.filter((s) => s.length > 0);

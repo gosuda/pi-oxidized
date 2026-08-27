@@ -631,7 +631,14 @@ declare module "@earendil-works/pi-ai" {
 			total: number;
 		};
 	}
-	export type StopReason = "stop" | "length" | "toolUse" | "error" | "aborted";
+	export type StopReason = "pending" | "stop" | "length" | "toolUse" | "error" | "aborted" | "deferred";
+
+	/** Bridge-local tool shape mirroring the pinned pi-ai Tool (name/description/parameters). */
+	export interface Tool<TParameters = unknown> {
+		name: string;
+		description: string;
+		parameters: TParameters;
+	}
 
 	/** Bridge-local message shapes mirroring the pinned pi-ai types. */
 	export interface AssistantMessage {

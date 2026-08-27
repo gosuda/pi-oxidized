@@ -73,7 +73,7 @@ interface SessionTimingArtifact {
 	readonly sha256PrefixLength: number;
 	readonly samples: readonly SampleRecord[];
 	readonly summary: readonly SummaryRecord[];
-	readonly pass: boolean;
+	pass: boolean;
 }
 
 function status(message: string): void {
@@ -84,7 +84,12 @@ function distribution(values: readonly number[]) {
 	const sorted = [...values].sort((a, b) => a - b);
 	const count = sorted.length;
 	if (count === 0) return { count, median: 0, min: 0, max: 0, p95: 0, p99: 0, ...spreadStats([], 0) };
-	const median = count % 2 === 0 ? (sorted[count / 2 - 1] + sorted[count / 2]) / 2 : sorted[Math.floor(count / 2)];
+	const at = (i: number): number => {
+		const value = sorted[i];
+		if (value === undefined) throw new Error(`distribution: missing sorted[${i}] for count=${count}`);
+		return value;
+	};
+	const median = count % 2 === 0 ? (at(count / 2 - 1) + at(count / 2)) / 2 : at(Math.floor(count / 2));
 	const { stddev, relativeSpread } = spreadStats(values, median);
 	const p95 = sorted[Math.min(count - 1, Math.floor(count * 0.95))];
 	const p99 = sorted[Math.min(count - 1, Math.floor(count * 0.99))];
@@ -279,7 +284,10 @@ async function loadReferenceSessionManager(): Promise<{
 }
 
 async function runTsAppendLane(
-	SessionManager: { create(cwd: string, sessionDir?: string): TsSessionManager },
+	SessionManager: {
+		create(cwd: string, sessionDir?: string): TsSessionManager;
+		open(path: string, sessionDir?: string): TsSessionManager;
+	},
 	entries: number,
 	cache: CacheKind,
 	outdir: string,

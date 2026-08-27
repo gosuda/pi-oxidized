@@ -64,7 +64,7 @@ export function verifyReservedShortcutGuard(source: string): string[] {
 				"reserved action names",
 		);
 	} else {
-		const entries = reservedListMatch[1]
+		const entries = reservedListMatch[1] ?? ""
 			.split(",")
 			.map((s) => s.trim().replace(/["'`]/g, ""))
 			.filter((s) => s.length > 0);
@@ -87,15 +87,15 @@ export function verifyReservedShortcutGuard(source: string): string[] {
 	if (guardLineIdx === -1) {
 		// Already reported by guardPattern above.
 	} else {
-		const guardIndent = lines[guardLineIdx].search(/\S/);
+		const guardIndent = (lines[guardLineIdx] ?? "").search(/\S/);
 		let foundContinue = false;
 		for (let i = guardLineIdx + 1; i < lines.length; i++) {
-			const indent = lines[i].search(/\S/);
-			if (indent >= 0 && indent <= guardIndent && lines[i].trim() !== "") {
+			const indent = (lines[i] ?? "").search(/\S/);
+			if (indent >= 0 && indent <= guardIndent && (lines[i] ?? "").trim() !== "") {
 				// Reached a line at the same or lesser indent — block ended.
 				break;
 			}
-			if (/^\s*continue\b/.test(lines[i])) {
+			if (/^\s*continue\b/.test(lines[i] ?? "")) {
 				foundContinue = true;
 				break;
 			}
