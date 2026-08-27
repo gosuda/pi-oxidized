@@ -521,7 +521,7 @@
 					"timeoutMs": 60000
 				}
 			],
-			"evidence": "PAR-COMPAT-AUDIT five-witness suite passes: source evidence, downstream importers, extension-host routing, config corpus, Rust-surface negative"
+			"evidence": "PAR-COMPAT-AUDIT five-witness suite passes: source evidence, downstream importers, extension-host routing, config corpus, Rust-surface negative; PAR-COMPAT-DISPO deletion entry: dead pi::core::config_value wrapper deleted (delete-not-port ruling) and witness 6 config-value-single-owner pins one parser + one command cache in crates/pi-ai/src/auth/config_value.rs"
 		}
 	]
 }
