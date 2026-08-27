@@ -24,10 +24,13 @@ recorded artifact, never over timing:
 
 1. **Notice persistence.** The transient notice text (product
    `push_notice("export", …)` payload shape: railed `[export]` label plus
-   text) must be present in at least one settled frame. The fixture holds
-   the notice across a content tick (`NOTICE-TICK 1`), so persistence is
-   canonical content visible in the first two settled frames, not a timing
-   accident.
+   text) must be present in at least one settled frame. The fixture
+   renders the notice in its first two settled frames whose non-notice
+   content differs (`NOTICE-TICK 1`), so persistence is canonical content
+   across a scripted content change. Scope note: the fixture draws the
+   notice line itself (no product `push_notice` code path runs under the
+   PTY harness), so this lane proves the invariant's detection surface,
+   not the product notice code.
 2. **Static sufficiency.** Every spinner-status frame, meaning a settled
    frame carrying a line that ends with the product `status_message`
    cancel-hint suffix (` to cancel`), must carry the kind label, the
@@ -54,10 +57,17 @@ Teeth: each invariant has synthetic negative probes
 `static_sufficiency_fails_on_missing_elapsed_or_kind`,
 `anti_chatter_fails_on_repeated_announcement_inside_a_stage`) proving the
 checker fails on the mutated shapes (missing notice frame, spinner line
-without elapsed counter, spinner line without kind label, identical
-announcement held across two consecutive settled frames of one stage) and
-passes the boundary cases (stage-split repeats, post-content-change
-repeats, non-spinner frames ignored).
+whose elapsed counter is missing while the kind label stays valid,
+spinner line without kind label, identical announcement held across two
+consecutive settled frames of one stage) and passes the boundary cases
+(stage-split repeats, post-content-change repeats, non-spinner frames
+ignored; the cancel hint itself is guaranteed by the spinner-line
+classification). Scope note on anti-chatter: the step-gated corpus
+records exactly one settled frame per stage (deterministic settle at real
+input boundaries), so the cross-frame comparison inside a stage is
+exercised by the synthetic probes, while the corpus proves the pass path
+and the input-boundary stage grouping over real transcripts. The verdict
+record discloses this shape (`corpusShape`).
 
 ### Timing quarantine (measured fields)
 
@@ -68,11 +78,16 @@ content or the digest (the timing envelope is excluded from
 
 | Measured field | Nominal | Tolerance | Source |
 |---|---|---|---|
-| `noticeUrgencyWindowMs` | 2000 | observed at most 10 000 ms (the settle-abort ceiling); a value beyond the band is a measurement-channel failure, never a content verdict | wall span between the first and last notice-carrying settled frames, from the settle wall offsets |
+| `noticeUrgencyWindowMs` | 2000 | observed at most 10 000 ms (the settle-abort ceiling); a value beyond the band is a measurement-channel failure, never a content verdict | wall span between the two notice-carrying settled frames, from the settle wall offsets (dominated by the 120 ms settle quiet window) |
 
 The observed value is recorded per row in
 `target/verification/tui-transcripts/<row>/a11y-gauntlet/verdict.json`
-under `measuredFields` with verdict `tolerated`.
+under `measuredFields` with verdict `tolerated`. Scope note: the fixture
+drives no urgency timer (the product renders notices as persistent
+transcript rows; the 2 s figure is the quality bar's nominal reference,
+not a product constant), so this measured field proves the quarantine
+channel itself (timing-envelope-only, tolerance-banded, digest-neutral),
+not product urgency behavior.
 
 ## 2. Automated lane evidence
 

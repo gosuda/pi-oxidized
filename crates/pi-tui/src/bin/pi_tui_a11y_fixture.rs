@@ -7,8 +7,9 @@
 //! anti-chatter):
 //!
 //! - `notice`             — railed transient notice (product `push_notice`
-//!                          shape: rail + `[export]` label + text) that
-//!                          persists across an intra-stage content tick
+//!                          shape: rail + `[export]` label + text) present
+//!                          in two settled frames whose non-notice content
+//!                          differs (a scripted content change)
 //! - `spinner-working`    — real [`Loader`], pinned frame, product
 //!                          `status_message` shape with kind + elapsed +
 //!                          cancel hint, elapsed stepping 4s → 5s → 6s

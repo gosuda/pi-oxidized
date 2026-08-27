@@ -79,7 +79,7 @@ pub enum Scenario {
     /// dispatch semantics (no semantics changes; those belong to TUI-G7).
     KeyboardGauntlet,
     /// Exercises the accessibility gauntlet (TUI-V6): transient-notice
-    /// persistence across a content tick, spinner-status frames carrying
+    /// persistence across a scripted content change, spinner-status frames carrying
     /// kind + elapsed + cancel hint, and anti-chatter announcement
     /// sequencing per settled stage — the three automated accessibility
     /// invariants over canonical settled content, with the notice urgency

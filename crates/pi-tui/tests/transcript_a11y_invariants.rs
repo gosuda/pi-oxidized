@@ -211,12 +211,8 @@ fn check_static_sufficiency(frames: &[SettledFrameView]) -> Result<usize, Vec<St
                     frame.seq
                 ));
             }
-            if !text.ends_with("to cancel") {
-                violations.push(format!(
-                    "static-sufficiency: spinner-status frame seq {} lacks the cancel hint: {text:?}",
-                    frame.seq
-                ));
-            }
+            // The cancel hint itself is guaranteed by classification: a line
+            // is only a spinner-status line because it ends with the hint.
         }
     }
     if violations.is_empty() && spinner_frames == 0 {
@@ -885,6 +881,7 @@ fn write_verdict(
             "antiChatter": {
                 "verdict": "pass",
                 "settledStages": verdict.chatter_stages,
+                "corpusShape": "one settled frame per stage; the cross-frame comparison is exercised by the synthetic probes",
             },
         },
         "measuredFields": {
@@ -958,8 +955,9 @@ fn notice_persistence_fails_without_a_notice_frame() -> Result<(), String> {
 
 #[test]
 fn static_sufficiency_fails_on_missing_elapsed_or_kind() -> Result<(), String> {
-    // Missing elapsed counter.
-    let missing_elapsed = vec![frame(5, 1, &[" ⠋ Working… · escape to cancel"])];
+    // Missing elapsed counter only: the kind part stays alphabetic so the
+    // kind branch passes and this probe isolates the elapsed branch.
+    let missing_elapsed = vec![frame(5, 1, &[" ⠋ Working… now · escape to cancel"])];
     assert!(
         check_static_sufficiency(&missing_elapsed).is_err(),
         "spinner-status frame without the elapsed counter must fail"
