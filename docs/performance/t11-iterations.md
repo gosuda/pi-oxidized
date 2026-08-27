@@ -402,3 +402,102 @@ musl gauntlet harnesses green); `cargo clippy --release -p pi-tui
 **Not touched (out of scope, file-disjoint)**: `scripts/` (DEPS lane),
 `docs/TUI-CLOSE-*` (TUI-CLOSE), `packages/extension-host` (XC-CLOSE),
 `.github/workflows/` (REL-T4 lane), `pi/src/modes/interactive/runtime.rs`.
+
+## Iteration 6 — `render-churn-recomposition` (Design F: pooled claim tables)
+
+Commit: see `git log` (`perf(t11)`). Date 2026-08-28. Base `1e6b5b7`
+(TUI-T9 floor merged over iteration 5's `dee3103`; the T9 commit touches
+the interactive runtime's narrow-width gate, not the claim path).
+
+**Derivation** (shape reserved in iteration 5's terminal reservation —
+"per-frame claim table rebuild in `commit_frame` (a candidate Design F:
+pooled/reused claim vectors)" — and re-derived here from the allocation
+decomposition before implementation, honestly noting the post-iteration-5
+claim bodies were read for the branch classification after the derivation
+was written down): after A–E, the static scenario still allocated
+4.56 KiB/frame with zero content change. Data layout: the allocation is
+not per-frame *data* — it is per-frame *storage* for a table whose shape
+is a pure function of viewport geometry. Each frame paid (a) a fresh
+outer table `vec![Vec::new(); rows]` in `install_prior`, (b) a first-push
+`Vec` allocation in every row a claimant touched (~29 rows × 128 B), and
+(c) the end-of-frame drop of the consumed prior table (the same row
+buffers dealloc'd). None of those bytes depend on frame content: rows are
+cleared and refilled with bounded claim multisets every frame. Design F
+makes the tables a two-slot pool owned by the writer: `RowClaims` gains
+`install_pooled(prior, frame)` (installs caller-cleared scratch rows,
+capacity retained) and `into_tables()` (returns both tables instead of
+dropping the consumed prior); `commit_frame` clears the pooled scratch in
+place before composition, and after `emit_frame_diff` returns the consumed
+prior table to the pool for the next frame. A geometry change (realign
+branch, first frame) rebuilds the pool at the new absolute row count;
+`suspend_row_claims` keeps `install_prior` semantics untouched.
+
+**Boundary answers** (explicit, before touching): emitted bytes unchanged
+— written-bytes metric byte-identical (10500/11656 B); probe/record/claim
+set-equality semantics unchanged (pooled rows are cleared before install,
+so no stale claim can be read; the round trip is pinned by
+`pooled_tables_round_trip_preserves_probe_and_starts_cleared`); the skip
+license (Design B/E) reads only the prior table, which is exactly the
+previous frame's recorded claims; no wire/format surface touched; the
+allocation *profile* is the design target (static 4660 → 100 B/frame).
+
+**Branch classification** (divergence audit of the replaced machinery):
+
+| Original branch | Classification | Reason |
+|---|---|---|
+| per-frame `vec![Vec::new(); rows]` frame table in `install_prior` | residue | table shape is a pure function of viewport geometry, not frame data |
+| first-push row `Vec` allocation per touched row per frame | residue | bounded reusable storage; steady-state claim multiset ≤ rows × claimants |
+| end-of-frame drop of the consumed prior table | residue | same storage serves as the next frame's table after an in-place clear |
+| in-place row `clear()` of pooled rows (new) | essential | replaces the alloc/dealloc pair with a length reset at the same correctness |
+| pool rebuild on geometry change / first frame | essential | claim tables are indexed by absolute terminal row; length must track geometry |
+| prior-row probe (Design B/E skip license) | essential | unchanged |
+| claim record + `contains` dedup | essential | claim set construction; unchanged |
+
+**Measurements** (pinned workload, `pi_tui_render_churn_bench`, release,
+`taskset -c 20-40`, 20 warmup / 300 frames, 100x30, 150 lines; baseline
+re-measured this session on `1e6b5b7` with the same-session binary; box
+bimodally contended — load average ~8 on 80 cores with build bursts;
+interleaved A/B pairs so bursts hit both sides). Pre-declared estimator:
+min of the first 7 pairs (iteration-5 protocol). Supplementary: 34 total
+interleaved pairs with clean-cluster medians (cluster cut 1.9x side-min,
+iteration-3 precedent).
+
+| Scenario | Before (µs/frame) | After (µs/frame) | Win min-of-7 | Win clean-median | Win min-of-34 | Allocated before → after | Written |
+|---|---|---|---|---|---|---|---|
+| static | 2.98 | 1.94 | **1.54x** | 3.21 → 2.09 = **1.54x** | 2.95 → 1.85 = **1.60x** | 4660 → 100 B/frame (**-46.6x**) | 10500 → 10500 B (identical) |
+| editor | 15.4 | 13.9 | **1.11x** | 15.8 → 14.4 = **1.10x** | 14.5 → 13.6 = **1.06x** | 12855 → 8295 B/frame (**-4.45 KiB/frame**) | 11656 → 11656 B (identical) |
+
+Win gate >=1.05x: **passed on both scenarios under the pre-declared
+min-of-7 and under the clean-cluster medians** (static 1.54x/1.54x,
+editor 1.11x/1.10x); the editor min-of-34 (1.06x) also clears. Disclosed
+plainly: naive median-of-34 is 0.63x/0.56x — a cluster-mixture artifact
+of bursty contention (the interleaved NEW runs drew 14 clean-tier vs
+BASE's 19 of 34 by scheduler luck), not a regression signal: the static
+tiers are fully disjoint (BASE clean worst 4.98 < NEW contended best
+6.32; every BASE clean run is slower than every NEW clean run), and the
+deterministic allocation drop (4.45 KiB/frame on editor, 98% of static
+allocation) is contention-immune evidence the removed work is real.
+Editor>static allocation ordering still holds (8.10 > 0.10 KiB/frame).
+
+**Recomputed multiple**: editor ~13.9 µs (clean median 14.4) vs the
+ledger's 1.5 µs floor ≈ **9x — still OPEN** (>2x ⇒ logged as
+intermediate). Named dominant residual, unchanged from iteration 5: the
+upstream-faithful bench-side `EditorSim` per-frame rebuild (borders +
+text row re-materialized on every text miss — out of unit scope per
+iteration 1/3 precedent), then the changed-line derive + 3-row damage
+diff. The terminal E1–E4 exhaustion record with the G10-Finding-5 floor
+revalidation (recomputed from the replacement's own per-line measurement)
+remains the unit's closing work.
+
+**Verification**: 396/396 pi-tui lib tests (395 + the new pooled
+round-trip contract test); full release suite green (render-churn
+verification 3 — parameter parity, non-zero results, editor>static
+allocation ordering; no-flicker PTY 5; grill adjudication 8; theme 5;
+static-frame-evidence 1); `cargo clippy --release -p pi-tui --lib
+--locked` findings on the changed files are identical to the base commit
+(3 pre-existing; zero new).
+
+**Not touched (out of scope, file-disjoint)**: `scripts/` (DEPS lane),
+`docs/TUI-CLOSE-*` (TUI-CLOSE), `packages/extension-host` (XC-CLOSE),
+`.github/workflows/` (REL-T4 lane), `pi/src/modes/interactive/runtime.rs`,
+`docs/performance/floors/` (PERF-R9/G10 lane).

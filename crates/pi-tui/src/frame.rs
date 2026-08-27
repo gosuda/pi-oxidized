@@ -169,16 +169,25 @@ impl RowClaims {
         }
     }
 
-    /// Take the prior-frame claims, leaving this frame's recorded claims.
-    #[must_use]
-    pub fn take_prior(&mut self) -> Vec<Vec<RowClaim>> {
-        std::mem::take(&mut self.prior)
+    /// Install `prior` as the prior-frame claims with a pooled frame table
+    /// (PERF-T11 Design F).
+    ///
+    /// The writer owns a scratch table whose rows retain their capacity
+    /// across frames (cleared here in place by the caller), so steady-state
+    /// composition allocates nothing for claim bookkeeping.
+    pub fn install_pooled(&mut self, prior: Vec<Vec<RowClaim>>, frame: Vec<Vec<RowClaim>>) {
+        self.prior = prior;
+        self.frame = frame;
     }
 
-    /// Take this frame's recorded claims, leaving empty rows.
+    /// Consume into the `(prior, frame)` tables so the writer can pool them
+    /// for the next frame (Design F).
     #[must_use]
-    pub fn take_frame(&mut self) -> Vec<Vec<RowClaim>> {
-        std::mem::take(&mut self.frame)
+    pub fn into_tables(mut self) -> (Vec<Vec<RowClaim>>, Vec<Vec<RowClaim>>) {
+        (
+            std::mem::take(&mut self.prior),
+            std::mem::take(&mut self.frame),
+        )
     }
 
     /// Install `prior` as the prior-frame claims, resetting frame state.
@@ -383,8 +392,8 @@ pub fn suspend_row_claims<R>(f: impl FnOnce() -> R) -> R {
 #[cfg(test)]
 mod tests {
     use super::{
-        FrameAnnotations, RawRegion, push_raw_region, set_cursor, with_annotations,
-        with_current_annotations,
+        FrameAnnotations, RawRegion, RowClaims, push_raw_region, set_cursor,
+        with_annotations, with_current_annotations,
     };
 
     use std::cell::RefCell;
@@ -415,5 +424,35 @@ mod tests {
         });
         assert_eq!(slot.borrow().cursor(), Some(Position { x: 1, y: 2 }));
         assert!(with_current_annotations(|_| ()).is_none());
+    }
+
+    #[test]
+    fn pooled_tables_round_trip_preserves_probe_and_starts_cleared() {
+        // PERF-T11 Design F: the writer installs a pooled scratch table,
+        // records claims, then recovers both tables — the frame table
+        // becomes the next frame's prior, the consumed prior table's rows
+        // are cleared (capacity retained) and become the next scratch.
+        let mut claims = RowClaims::default();
+        claims.install_pooled(vec![Vec::new(); 2], vec![Vec::new(); 2]);
+        claims.record_line(0, 0, 10, 7, false);
+        claims.record_line(1, 2, 8, 9, true);
+        let (consumed_prior, frame) = claims.into_tables();
+        assert!(consumed_prior.iter().all(Vec::is_empty));
+        assert_eq!(frame[0].len(), 1);
+
+        let mut scratch = consumed_prior;
+        for row in &mut scratch {
+            row.clear();
+        }
+        let mut next = RowClaims::default();
+        next.install_pooled(frame, scratch);
+
+        let regionless = next.probe_line(0, 0, 10, 7);
+        assert!(regionless.matched && !regionless.linked);
+        let linked = next.probe_line(1, 2, 8, 9);
+        assert!(linked.matched && linked.linked);
+        next.record_line(0, 0, 10, 7, false);
+        let (_, frame2) = next.into_tables();
+        assert_eq!(frame2[0].len(), 1);
     }
 }

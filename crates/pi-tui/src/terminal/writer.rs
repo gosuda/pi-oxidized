@@ -182,6 +182,10 @@ pub struct Tui<W: Write> {
     /// The in-place render buffer is diffed against this per damaged row.
     grid: Buffer,
     prior_claims: Vec<Vec<RowClaim>>,
+    /// Pooled frame-side claim table (PERF-T11 Design F): rows retain their
+    /// capacity across frames so steady-state claim recording does not
+    /// allocate.
+    scratch_claims: Vec<Vec<RowClaim>>,
     hardware_cursor: bool,
 }
 
@@ -220,6 +224,7 @@ impl<W: Write> Tui<W> {
             state: ViewportState::new(size, cursor, viewport_height),
             coalescer: Coalescer::new(),
             write_count: 0,
+            scratch_claims: Vec::new(),
             last_payload: Vec::new(),
             grid: Buffer::default(),
             prior_claims: Vec::new(),
@@ -333,7 +338,20 @@ impl<W: Write> Tui<W> {
         }
 
         let mut row_claims = RowClaims::default();
-        row_claims.install_prior(std::mem::take(&mut self.prior_claims));
+        // Design F: the frame-side claim table is pooled across frames —
+        // rows are cleared in place (capacity retained), so steady-state
+        // composition allocates nothing for claim bookkeeping. A geometry
+        // change (or first frame) rebuilds the pool at the new row count.
+        let rows_needed = usize::from(frame_area.bottom());
+        let mut frame_table = std::mem::take(&mut self.scratch_claims);
+        if frame_table.len() == rows_needed {
+            for row in &mut frame_table {
+                row.clear();
+            }
+        } else {
+            frame_table = vec![Vec::new(); rows_needed];
+        }
+        row_claims.install_pooled(std::mem::take(&mut self.prior_claims), frame_table);
         annotations.borrow_mut().install_row_claims(row_claims);
         {
             let terminal = &mut self.terminal;
@@ -348,13 +366,17 @@ impl<W: Write> Tui<W> {
         }
 
         let mut collected = annotations.into_inner();
-        let mut row_claims = collected.take_row_claims();
+        let row_claims = collected.take_row_claims();
         let (cursor, raw_regions) = collected.into_parts();
-
-        let frame_claims = row_claims.take_frame();
-        let prior_claims = row_claims.take_prior();
-        self.emit_frame_diff(&prior_claims, &frame_claims, frame_area)?;
-        self.prior_claims = frame_claims;
+        let (mut prior_table, frame_table) = row_claims.into_tables();
+        self.emit_frame_diff(&prior_table, &frame_table, frame_area)?;
+        self.prior_claims = frame_table;
+        // Design F: the consumed prior table returns to the pool; its rows
+        // keep the capacity this frame's recording will reuse next frame.
+        for row in &mut prior_table {
+            row.clear();
+        }
+        self.scratch_claims = prior_table;
 
         // Cursor sequence mirrors ratatui's `apply_buffer_with_cursor`:
         // updates, then show/set or hide, then the backend flush. Full-row
