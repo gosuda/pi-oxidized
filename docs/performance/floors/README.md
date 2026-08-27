@@ -20,9 +20,9 @@
 | [render-churn-recomposition.md](render-churn-recomposition.md) | Component tree recomposition; layout calculation | 7 | 212 us/frame editor (R8 + fresh) | ~1.5 us | ~141x | OPEN |
 | [terminal-paint.md](terminal-paint.md) | Terminal diff/encode/write (paint); NullTerminal write; first synchronized paint | 2, 3, 4, 7 | 26.5 us/frame amortized (subtraction) | 0.64 us | ~7.5x paint-only (block 41x) | OPEN |
 | [stream-frame-pipeline.md](stream-frame-pipeline.md) | Provider frame decode; assistant state reduction; incremental visible content update | 3 | not separable (see ledger) | 0.15-0.2 us/frame each | unproven | OPEN (fail-closed) |
-| [tool-dispatch-slice.md](tool-dispatch-slice.md) | Argument validation; tool start/update/end events; result construction + append | 8 | 24.12 us/call wall (R8 artifact) | 4.97 us | 4.85x | OPEN |
+| [tool-dispatch-slice.md](tool-dispatch-slice.md) | Argument validation; tool start/update/end events; result construction + append | 8 | 24.12 us/call wall (R8 artifact) | 4.29 us | 5.62x | OPEN |
 | [startup-version-path.md](startup-version-path.md) | CLI argument parsing; version lookup; one output write + clean exit | 1 | 0.37 ms in-process CPU (callgrind) | 0.15 us | ~2480x (CPU) | OPEN |
-| [first-frame-init.md](first-frame-init.md) | Argument parsing + config construction; model/provider construction; TUI construction + layout | 2 | 243.61 ms lane (R2, trusted) | ~2 ms | ~122x | OPEN |
+| [first-frame-init.md](first-frame-init.md) | Argument parsing + config construction; model/provider construction; TUI construction + layout | 2 | 243.61 ms lane (R2, trusted) | ~1.50 ms | ~162.4x | OPEN |
 | [extension-rpc-dispatch.md](extension-rpc-dispatch.md) | JSONL frame encode/decode; request correlation; host loop dispatch; widget callback + UI-slot traffic | 5, 6 | none trusted (Rust untimed; TS noisy) | ~1 us/req | unproven | OPEN (fail-closed) |
 | [keypress-dispatch.md](keypress-dispatch.md) | PTY key write; input dispatch to state mutation | 4 | 1.935 ms median (NOISE FAIL, rs 27%) | ~13 us | unproven | OPEN (fail-closed) |
 | [memory-resource-units.md](memory-resource-units.md) | Terminal state; stream-load memory growth | 10 | none (artifact incomplete, R8) | bytes-class | unproven | OPEN (fail-closed) |
@@ -40,10 +40,10 @@ state.
 1. `render-churn-recomposition` — rank-3 lane, per-frame during all rendering, ~141x floor; the single largest sustained multiple.
 2. `terminal-paint` — component of the rank-1 stream lane, ~7.5x paint-only (its recompose+paint block ~41x over the write floor).
 3. `stream-frame-pipeline` (decode / reduce / visible-update) — rank-1 lane components; multiples unproven, measurement prerequisite first (per-process CPU split pi vs extension host, turn-phase attribution).
-4. `tool-dispatch-slice` — rank-4 lane, 4.85x.
+4. `tool-dispatch-slice` — rank-4 lane, 5.62x.
 5. `session-append` — rank-6 lane, 4.91x per entry (and O(n^2) scan term growing with session length).
 6. `session-reopen` — rank-6 lane, 7.79x per entry.
-7. `first-frame-init` — rank-7 lane, ~122x; one-time per session.
+7. `first-frame-init` — rank-7 lane, ~162.4x; one-time per session.
 8. `extension-rpc-dispatch` — rank-5 lane; measurement prerequisite (timed `serve_io` lane).
 9. `keypress-dispatch` — rank-2 interactive lane; measurement remediation (noise gate) prerequisite.
 10. `startup-version-path` — rank-8 lane; enormous CPU multiple, de-minimis absolute time; addressable category is runtime construction on the fast-exit path.

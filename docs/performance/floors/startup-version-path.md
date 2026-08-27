@@ -5,7 +5,7 @@ write + clean exit*. State: **OPEN**, ~2480x on in-process CPU (de-minimis absol
 
 ## Contract (from call sites, tests, signatures — never internals)
 
-- Argument parsing is a hand-rolled single-pass parser (crates/pi/src/cli/args.rs:141-223); `--version` sets `flags.version` (args.rs:278).
+- Argument parsing is a hand-rolled single-pass parser (crates/pi/src/cli/args.rs:225-279 (Args struct at :148)); `--version` sets `flags.version` (args.rs:278).
 - `initialize_bootstrap` prints `VERSION` and exits 0 (crates/pi/src/cli/bootstrap.rs:484-487); `VERSION = env!(CARGO_PKG_VERSION)` (config.rs:23) — a compile-time constant, so *version lookup* is a constant read.
 - The lane harness spawns one fresh PTY per sample and measures spawn-to-exit wall (performance.ts runVersionSample :1283-1317); the exit-0 + version-text observable is the contract (D3).
 

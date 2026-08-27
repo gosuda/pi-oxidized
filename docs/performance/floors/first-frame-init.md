@@ -22,7 +22,7 @@ config + 10-adapter registry + Tui construction      ~0.5 ms (data-driven struct
                                                         achievable cost; no network on the offline path)
 first paint transaction                               ~0.64 us (terminal-paint floor)
                                                     ---------
-floor                                               ~2 ms
+floor                                               ~1.50 ms
 ```
 
 No contract term forces TLS-root loading, per-frame registration, or any wait beyond
@@ -33,7 +33,7 @@ the probe round trip on this path.
 Trusted lane baseline (R2): **243.61 ms cold / 248.36 ms warm** (the 4.75 ms cold-warm
 delta proves the lane is wait-bound, not cache-bound).
 
-**Multiple = 243.61 / 2 ~= 122x => OPEN.**
+**Multiple = 243.61 / 1.50 ~= 162.4x => OPEN.**
 
 ## Cost decomposition (sums to 243.6 ms)
 

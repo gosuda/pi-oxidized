@@ -24,7 +24,7 @@ typed parse of tool arguments (~60 B)         ~300 ns   (achievable parse consta
 result message construction                    ~200 ns
 one session append: serialize 170 B + write    3639.6 ns  (276.2 + 3363.4, session-append constants)
                                             ---------
-floor                                       ~4.97 us/call
+floor                                       4289.6 ns ~= 4.29 us/call
 ```
 
 One worker-task spawn is owed by the bounded-parallelism contract but costs no syscall
@@ -35,7 +35,7 @@ at floor (task reuse is achievable); it is booked as overhead, not floor.
 Trusted artifact (R8): Rust wall median **24.12 us/call** (rs 5.13%), CPU 49 us/call;
 fresh callgrind corroborates 251.1 kIr/call ~= 24.1 us at the 10.6 kIr/us calibration.
 
-**Multiple = 24.12 / 4.97 = 4.85x => OPEN.**
+**Multiple = 24.12 / 4.29 ~= 5.62x => OPEN.**
 
 ## Cost decomposition (sums to 24.12 us/call)
 
