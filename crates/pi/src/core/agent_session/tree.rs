@@ -1159,7 +1159,7 @@ mod tests {
     fn export_test_session(cwd: &str) -> TestResult<Arc<AgentSession>> {
         use crate::core::settings::{Settings, SettingsManagerCreateOptions};
 
-        let session_manager = SessionManager::create(cwd, None, None)?;
+        let session_manager = SessionManager::create(cwd, Some(cwd), None)?;
         let mut settings_manager = SettingsManager::in_memory(
             &Settings::default(),
             SettingsManagerCreateOptions {
