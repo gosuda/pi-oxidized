@@ -52,12 +52,14 @@ commit.
 The ledgers were authored against worktree 48696b5; commits landing between
 48696b5 and the branch tip moved ~15 anchors by +6..+21 lines (runtime.rs
 uniform +15/+21; schedule.rs +12; pi_tool_dispatch_bench.rs +10;
-bench-extension-scaling.ts +20; pty.ts -11), and
+bench-extension-scaling.ts +20), and
 `crates/pi-agent/src/tools/tool.rs` was renamed to `crates/pi-agent/src/tool.rs`
 (line 234 unchanged). Every cited symbol still existed — the census found zero
 fabricated citations — but stale anchors mislead a blind Phase-5 derivation.
 Fixed by the re-anchor commit: 30 anchors updated, all verified against the
-landing tree by scripted check (30/30 resolve, 0 misses). Drift table for the
+landing tree by scripted check; the independent review of this audit then
+corrected two same-name mis-anchors the script's first-match logic could not
+distinguish (see the note under the drift table). Drift table for the
 record:
 
 | Anchor | cited | @48696b5 | @HEAD (re-anchored) |
@@ -72,14 +74,24 @@ record:
 | runtime.rs `needs_immediate_repaint` / paint kick | 2157-2159 | — | 2148 / 2174 |
 | runtime.rs `InputMapper::map` | 2110 | 2110 | 2126 |
 | runtime.rs guard/Tui::new/probe/InteractiveRuntime::new | 6602-6656 | — | 6622/6643/6630/6685 |
-| writer.rs `write_stage3_frame` | 544-573 | — | 550-578 |
+| writer.rs `write_stage3_frame` | 544-573 | 550-568 | 550-568 |
 | schedule.rs `emit_tool_execution_end` | 816 | 816 | 828 |
 | schedule.rs `tool_result_message` | 850 | 850 | 847 |
 | pi_tool_dispatch_bench.rs sink `emit` | 192 | 192 | 200 |
-| pty.ts `writeKeys` | 145 | 145 | 134 |
 | bench-extension-scaling.ts measure* | 161/205 | 161/205 | 181/209 |
-| host.ts 4 ms race | 1456 | 1456 | 1449 |
 | extension.ts streamVerification / push | 225 / 292 | 177 / (wrong) | 178 / 210 |
+
+Two citation corrections from the independent review of this audit: pty.ts and
+host.ts are byte-identical between 48696b5 and HEAD (`git diff` empty) — their
+original anchors were imprecise, not drifted. `writeKeys` is the method
+definition at pty.ts:145-155 (the first re-anchor pass had followed a
+same-name call site at :134); the host.ts 4 ms race is `Promise.race` +
+`setTimeout(EXTENSION_INPUT_TIMEOUT_MS)` at :1454-1457. The same review
+caught an R9 arithmetic slip repeated here initially: 251.1 kIr/call at the
+10.6 kIr/us calibration is 23.7 us, not 24.1 us — corrected in
+tool-dispatch-slice.md and the README constants table (the 24.12 us wall
+median and the 5.62x multiple are unaffected; the corroboration now reads as
+23.7 vs 24.12, within 2%).
 
 Anchors not listed were exact at both trees (e.g. sessions/mod.rs:662, 540-542,
 445-503, 1505-1523; writer.rs:283-343, 522; backend.rs:275-284;
@@ -173,7 +185,8 @@ Share arithmetic spot-checks reproduce: append serde pipeline
 remainder (18.337 - 2.063 - 3.363) ✓; has_assistant 37.5/379.4 = 9.9% ✓;
 churn Ir shares 24/13/11.7/13.9/3.9/2.6 sum 69.1 with residual 30.9% = 65.5
 (listed 65.4, rounding) ✓; dispatch Ir 5.274 G/21k = 251.1 kIr/call at the
-10.6 kIr/us calibration = 24.1 us corroborating the 24.12 wall median ✓;
+10.6 kIr/us calibration = 23.7 us corroborating the 24.12 wall median (within
+2%; the R9 text said 24.1 — corrected here and in the ledgers) ✓;
 first-frame 200.6 M Ir / 10.6 kIr/us = 18.9 ms ✓, rustls 20.2/200.6 = 10.1% ✓;
 version loader 14.4% of 3.95 M Ir = 53.7 us ✓. Terminal-paint's amortization
 is honest and shown: 212 us x <=32 paints / 256 frames = 26.5 us/frame, paint

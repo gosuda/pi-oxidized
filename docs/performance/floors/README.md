@@ -90,7 +90,7 @@ output framing, extension RPC frames) is touched without a recorded explicit con
 | append syscalls per entry | 1 openat + 1 write + 1 close | strace -c census |
 | render churn | static 0.209 / editor 0.214 ms/frame; 25.6/28.3 KiB alloc; 35/39 B written per frame | fresh attrib-build run |
 | Ir/wall calibration | ~10.6 kIr/us (1.348 G Ir over 126.7 ms native churn) | callgrind vs native wall |
-| dispatch | 5.274 G Ir / 21k calls = 251.1 kIr/call ~= 24.1 us at calibration | callgrind |
+| dispatch | 5.274 G Ir / 21k calls = 251.1 kIr/call ~= 23.7 us at calibration | callgrind |
 
 Trusted lane baselines quoted by the ledgers (R2/R8 artifacts): stream 1.133 ms
 CPU/frame, first frame 243.61 ms cold / 248.36 ms warm, `--version` 40.07 ms cold /

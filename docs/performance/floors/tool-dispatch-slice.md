@@ -33,7 +33,7 @@ at floor (task reuse is achievable); it is booked as overhead, not floor.
 ## Measured cost
 
 Trusted artifact (R8): Rust wall median **24.12 us/call** (rs 5.13%), CPU 49 us/call;
-fresh callgrind corroborates 251.1 kIr/call ~= 24.1 us at the 10.6 kIr/us calibration.
+fresh callgrind corroborates 251.1 kIr/call ~= 23.7 us at the 10.6 kIr/us calibration.
 
 **Multiple = 24.12 / 4.29 ~= 5.62x => OPEN.**
 

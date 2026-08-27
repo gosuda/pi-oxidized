@@ -6,7 +6,7 @@ measurement noise-rejected).**
 
 ## Contract (from call sites, tests, signatures — never internals)
 
-- Harness side: one key write per sample into the child PTY (scripts/verification/pty.ts writeKeys :134-144); boundary = PTY key write to first complete synchronized-output paint (performance.ts runKeypressBenchmark :1492-1524, frameObservation :1010-1030); immediate repaint bypasses the background coalescer (inputPaintBypassesBackgroundCoalescer, performance.ts :1926).
+- Harness side: one key write per sample into the child PTY (scripts/verification/pty.ts writeKeys :145-155); boundary = PTY key write to first complete synchronized-output paint (performance.ts runKeypressBenchmark :1492-1524, frameObservation :1010-1030); immediate repaint bypasses the background coalescer (inputPaintBypassesBackgroundCoalescer, performance.ts :1926).
 - Input leg: the crossterm EventStream is owned by one task (crates/pi-tui/src/terminal/input.rs:142); `Event::Key` maps to `UiEvent::Key` (:225) and is published to an mpsc; `TerminalInput::recv` (:56) awaits it.
 - Dispatch leg: the run loop's `tokio::select!` input arm (crates/pi/src/modes/interactive/runtime.rs:1757-1764) -> `handle_ui_event` (:1977-2177): editor event handling, InputMapper map (:2126), action dispatch (:2153-2172), and `needs_immediate_repaint` kicks `paint_frame` (:2148, :2174).
 - State mutation: `dispatch_action` (:2261) applies ViewActions (paste, clear, focus, ...) to view/editor state.

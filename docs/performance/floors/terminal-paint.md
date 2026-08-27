@@ -8,7 +8,7 @@ output)* (lane 2). State: **OPEN**, ~7.5x paint-only floor (~41x on the recompos
 
 - `Tui::commit` -> `commit_frame` (crates/pi-tui/src/terminal/writer.rs:283-343): per committed frame, the caller is owed a correct cell diff encoded as terminal bytes with cursor positioning.
 - Synchronized-output framing: every emitted frame is wrapped `ESC[?2026h ... ESC[?2026l` (backend.rs:275-284); sync-begin/end balance is test-pinned (crates/pi-tui/tests/pty_no_flicker.rs:236-290); probe-before-sync pinned at pty_no_flicker.rs:54-66.
-- `stage3_write` performs `write_all` + `flush` per frame (writer.rs:522 via write_stage3_frame :550-578) — one complete write transaction per frame is the observable contract the harness detects (performance.ts frameObservation 1010-1044 keys on the SYNC_END-terminated chunk).
+- `stage3_write` performs `write_all` + `flush` per frame (writer.rs:522 via write_stage3_frame :550-568) — one complete write transaction per frame is the observable contract the harness detects (performance.ts frameObservation 1010-1044 keys on the SYNC_END-terminated chunk).
 - Consumers: interactive repaint (runtime.rs:4548), stream partial paints (coalescer <=16 ms, runtime.rs:104 BACKGROUND_COALESCE_WINDOW, armed :2193), keypress immediate repaints (runtime.rs:2148, :2174).
 
 Boundary classification: the escape-byte stream and the DEC 2026 framing are
