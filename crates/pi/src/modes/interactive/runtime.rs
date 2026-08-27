@@ -120,6 +120,15 @@ const OSC0_SET_TITLE_PREFIX: &[u8] = b"\x1b]0;";
 /// BEL terminates an OSC sequence.
 const OSC_BEL: u8 = 0x07;
 
+/// Minimum viewport width for readable rendering (TUI-G8 floor policy).
+///
+/// When a live resize reports `width < VIEWPORT_WIDTH_FLOOR`, the runtime
+/// accepts the event (updates the size cache and [`ViewState`]) but blanks
+/// the render area instead of wrapping content into an unreadable viewport.
+/// Rendering resumes immediately when width returns to ≥ floor. Matches the
+/// initial-size clamp in [`initial_terminal_size`].
+pub const VIEWPORT_WIDTH_FLOOR: u16 = 20;
+
 /// Sanitize extension-supplied terminal title text for OSC 0 emission.
 ///
 /// Drops every [`char::is_control`] scalar and stops before the sanitized
@@ -958,6 +967,11 @@ fn render_bottom_clipped(
 
 impl Component for InteractiveRoot {
     fn measure(&mut self, width: u16) -> u16 {
+        // TUI-G8 floor policy: below 20 columns the render is blanked,
+        // so the measured height is zero — no content cells are emitted.
+        if width < VIEWPORT_WIDTH_FLOOR {
+            return 0;
+        }
         let pre_height = self.pre_editor.iter_mut().fold(0_u16, |height, section| {
             height.saturating_add(section.component.measure(width))
         });
@@ -980,6 +994,13 @@ impl Component for InteractiveRoot {
     }
 
     fn render(&mut self, area: Rect, buf: &mut Buffer) {
+        // TUI-G8 floor policy: refuse to render below 20 columns. The resize
+        // event is still accepted (size cache and ViewState updated in
+        // `handle_resize`); only the render is suppressed so the viewport
+        // blanks instead of wrapping into an unreadable state.
+        if area.width < VIEWPORT_WIDTH_FLOOR {
+            return;
+        }
         let pre_heights = self
             .pre_editor
             .iter_mut()
@@ -6567,7 +6588,7 @@ fn tree_entry_label(entry: &crate::core::sessions::SessionEntry) -> String {
 /// Returns `(80, 24)` when the size cannot be queried (non-tty stdout).
 fn initial_terminal_size() -> (u16, u16) {
     match crossterm::terminal::size() {
-        Ok((width, height)) => (width.clamp(20, 1024), height.clamp(1, 256)),
+        Ok((width, height)) => (width.clamp(VIEWPORT_WIDTH_FLOOR, 1024), height.clamp(1, 256)),
         Err(_) => (80, 24),
     }
 }
@@ -7121,6 +7142,7 @@ mod tests {
     use super::*;
     use crate::core::agent_session::events::AgentSessionEvent;
     use crate::modes::interactive::state::SelectorKind;
+    use crate::modes::interactive::view::render_view;
 
     type TestResult = Result<(), String>;
 
@@ -11544,6 +11566,226 @@ mod tests {
         assert_eq!(
             written,
             encode_osc0_set_title("safe\x07\x1b]1;evil\x07\u{009b}ok")
+        );
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // TUI-T9: narrow-width viewport floor policy (TUI-G8)
+    // -----------------------------------------------------------------------
+
+    /// Helper: true when every cell in `buf` is a blank (space or empty).
+    fn buffer_is_blank(buf: &Buffer) -> bool {
+        buf.content()
+            .iter()
+            .all(|cell| cell.symbol() == " " || cell.symbol() == "")
+    }
+
+    /// A live resize to width < 20 blanks the render area (no content cells).
+    #[tokio::test]
+    async fn floor_blanks_render_below_20() -> TestResult {
+        let (mut rt, _log) = try_make_runtime()?;
+        // Normal render at 80 has content.
+        let buf = render_view(&rt.view, 80, 24);
+        assert!(
+            !buffer_is_blank(&buf),
+            "80-column render must have content"
+        );
+        // Resize below floor.
+        rt.step_ui(UiEvent::Resize {
+            width: 10,
+            height: 24,
+        })
+        .await
+        .map_err(|e| format!("resize to 10 failed: {e}"))?;
+        // render_view must blank below floor.
+        let buf = render_view(&rt.view, 10, 24);
+        assert!(
+            buffer_is_blank(&buf),
+            "10-column render must be blank (floor policy)"
+        );
+        Ok(())
+    }
+
+    /// A subsequent resize to width ≥ 20 resumes normal rendering immediately.
+    #[tokio::test]
+    async fn floor_resumes_at_20() -> TestResult {
+        let (mut rt, _log) = try_make_runtime()?;
+        // Shrink below floor then restore.
+        rt.step_ui(UiEvent::Resize {
+            width: 10,
+            height: 24,
+        })
+        .await
+        .map_err(|e| format!("resize to 10 failed: {e}"))?;
+        rt.step_ui(UiEvent::Resize {
+            width: 80,
+            height: 24,
+        })
+        .await
+        .map_err(|e| format!("resize back to 80 failed: {e}"))?;
+        let buf = render_view(&rt.view, 80, 24);
+        assert!(
+            !buffer_is_blank(&buf),
+            "80-column render after restore must have content"
+        );
+        Ok(())
+    }
+
+    /// The Tui size cache and ViewState dimensions track the raw reported size
+    /// at all times — the floor is a render-time gate, not a stored clamp.
+    #[tokio::test]
+    async fn floor_tracks_raw_dimensions() -> TestResult {
+        let (mut rt, _log) = try_make_runtime()?;
+        rt.step_ui(UiEvent::Resize {
+            width: 8,
+            height: 3,
+        })
+        .await
+        .map_err(|e| format!("resize to 8×3 failed: {e}"))?;
+        assert_eq!(rt.tui.size(), Size::new(8, 3), "Tui size cache must be raw");
+        assert_eq!(rt.view.width, 8, "ViewState width must be raw");
+        assert_eq!(rt.view.height, 3, "ViewState height must be raw");
+        Ok(())
+    }
+
+    /// The floor blanks the render even when a selector is open.
+    #[tokio::test]
+    async fn floor_blanks_with_selector_open() -> TestResult {
+        let (mut rt, _log) = try_make_runtime()?;
+        // Open a confirm selector (no async session call needed).
+        rt.install_confirm_selector(
+            SelectorKind::Logout,
+            "Select a credential to remove",
+            vec![
+                pi_tui::components::SelectItem::new("cancel", "Cancel"),
+                pi_tui::components::SelectItem::new("1", "anthropic"),
+            ],
+        );
+        assert!(rt.active_selector.is_some(), "selector must be open");
+        // Resize below floor.
+        rt.step_ui(UiEvent::Resize {
+            width: 12,
+            height: 24,
+        })
+        .await
+        .map_err(|e| format!("resize to 12 failed: {e}"))?;
+        // Build root and render at 12 columns — must be blank.
+        let editor = std::mem::replace(&mut rt.editor, Editor::with_defaults());
+        let selector = rt.active_selector.take();
+        let mut root = rt.build_root(editor, selector);
+        let area = Rect::new(0, 0, 12, 24);
+        let mut buffer = Buffer::empty(area);
+        root.render(area, &mut buffer);
+        assert!(
+            buffer_is_blank(&buffer),
+            "selector render at 12 columns must be blank (floor policy)"
+        );
+        Ok(())
+    }
+
+    /// The floor blanks the render even when an overlay (dialog) is open.
+    #[tokio::test]
+    async fn floor_blanks_with_overlay_open() -> TestResult {
+        let (mut rt, _log) = try_make_runtime()?;
+        rt.open_overlay(OverlayKind::Login);
+        assert!(rt.view.overlay.is_some(), "overlay must be open");
+        // Resize below floor.
+        rt.step_ui(UiEvent::Resize {
+            width: 15,
+            height: 24,
+        })
+        .await
+        .map_err(|e| format!("resize to 15 failed: {e}"))?;
+        // render_view must blank below floor even with overlay.
+        let buf = render_view(&rt.view, 15, 24);
+        assert!(
+            buffer_is_blank(&buf),
+            "overlay render at 15 columns must be blank (floor policy)"
+        );
+        Ok(())
+    }
+
+    /// Resize-storm coalescing down to 1×1: multiple sub-floor resizes
+    /// coalesce into one reanchor, the final state is blank, and raw
+    /// dimensions are tracked at 1×1.
+    #[tokio::test]
+    async fn floor_storm_coalescing_to_1x1() -> TestResult {
+        let (mut rt, _log) = try_make_runtime()?;
+        // Feed a storm of resize events by calling handle_resize directly
+        // (step_ui processes one at a time; handle_resize drains the queue).
+        // First resize enters handle_resize which drains queued events.
+        let (tx, rx) = mpsc::unbounded_channel::<UiEvent>();
+        rt.input = TerminalInput::mock(rx);
+        // Queue the storm: 20→10→5→1.
+        tx.send(UiEvent::Resize {
+            width: 10,
+            height: 10,
+        })
+        .map_err(|e| format!("send resize 10 failed: {e}"))?;
+        tx.send(UiEvent::Resize {
+            width: 5,
+            height: 5,
+        })
+        .map_err(|e| format!("send resize 5 failed: {e}"))?;
+        tx.send(UiEvent::Resize {
+            width: 1,
+            height: 1,
+        })
+        .map_err(|e| format!("send resize 1 failed: {e}"))?;
+        // Process the first resize — handle_resize drains and coalesces.
+        rt.step_ui(UiEvent::Resize {
+            width: 10,
+            height: 10,
+        })
+        .await
+        .map_err(|e| format!("storm first resize failed: {e}"))?;
+        // After coalescing, the final dimensions must be 1×1 (raw).
+        assert_eq!(rt.tui.size(), Size::new(1, 1), "storm must coalesce to 1×1");
+        assert_eq!(rt.view.width, 1, "ViewState width must be 1 after storm");
+        assert_eq!(rt.view.height, 1, "ViewState height must be 1 after storm");
+        // Render at 1 column must be blank.
+        let buf = render_view(&rt.view, 1, 1);
+        assert!(
+            buffer_is_blank(&buf),
+            "1×1 render must be blank (floor policy)"
+        );
+        Ok(())
+    }
+
+    /// InteractiveRoot::measure returns 0 below the floor — no content height
+    /// is allocated, so the commit path writes zero rows.
+    #[tokio::test]
+    async fn floor_measure_returns_zero_below_20() -> TestResult {
+        let (mut rt, _log) = try_make_runtime()?;
+        let editor = std::mem::replace(&mut rt.editor, Editor::with_defaults());
+        let selector = rt.active_selector.take();
+        let mut root = rt.build_root(editor, selector);
+        // Above floor: measure > 0.
+        let h = root.measure(80);
+        assert!(h > 0, "measure at 80 must be > 0, got {h}");
+        // Below floor: measure == 0.
+        let h = root.measure(10);
+        assert_eq!(h, 0, "measure at 10 must be 0 (floor policy)");
+        let h = root.measure(1);
+        assert_eq!(h, 0, "measure at 1 must be 0 (floor policy)");
+        Ok(())
+    }
+
+    /// The boundary: width exactly 20 renders content (floor is < 20, not ≤ 20).
+    #[tokio::test]
+    async fn floor_boundary_20_renders_content() -> TestResult {
+        let (mut rt, _log) = try_make_runtime()?;
+        let buf = render_view(&rt.view, 20, 24);
+        assert!(
+            !buffer_is_blank(&buf),
+            "20-column render must have content (floor is < 20)"
+        );
+        // 19 must be blank.
+        let buf = render_view(&rt.view, 19, 24);
+        assert!(
+            buffer_is_blank(&buf),
+            "19-column render must be blank (floor is < 20)"
         );
         Ok(())
     }
