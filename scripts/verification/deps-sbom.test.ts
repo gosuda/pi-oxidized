@@ -86,16 +86,18 @@ describe("SBOM content structure", () => {
 	test("every scheduled bin member is pinned at its from-version", () => {
 		const { content } = baselineSnapshot();
 		const rustIds = new Set(content.rust.packages.map((p) => `${p.name}@${p.version}`));
-		for (const id of [
-			"futures@0.3.32",
-			"globset@0.4.19",
-			"ignore@0.4.30",
-			"jiff@0.2.32",
-			"schemars@1.2.1",
-			"serde@1.0.228",
-			"serde_json@1.0.150",
-			"thiserror@2.0.18",
-			"tokio-util@0.7.18",
+		const fromVersions = [
+			// Re-anchored by the Bin P patch sweep (4e10a0a): these are the
+			// from-versions every later epoch diffs against.
+			"futures@0.3.34",
+			"globset@0.4.20",
+			"ignore@0.4.33",
+			"jiff@0.2.35",
+			"schemars@1.2.2",
+			"serde@1.0.229",
+			"serde_json@1.0.151",
+			"thiserror@2.0.20",
+			"tokio-util@0.7.19",
 			"aws-config@1.9.0",
 			"aws-sdk-bedrockruntime@1.136.0",
 			"google-cloud-auth@1.14.0",
@@ -103,13 +105,14 @@ describe("SBOM content structure", () => {
 			"uuid@1.24.0",
 			"base64@0.22.1",
 			"serde-saphyr@0.0.29",
-		]) {
+		];
+		for (const id of fromVersions) {
 			expect(rustIds.has(id)).toBe(true);
 		}
 		const rootLock = new Set(
 			(content.npm.lockfiles[0]?.packages ?? []).map((p) => `${p.name}@${p.version}`),
 		);
-		expect(rootLock.has("ignore@7.0.5")).toBe(true);
+		expect(rootLock.has("ignore@7.0.6")).toBe(true);
 		expect(rootLock.has("typescript@5.9.3")).toBe(true);
 		expect(rootLock.has("@types/bun@1.3.9")).toBe(true);
 		const hostLock = new Set(
@@ -139,7 +142,7 @@ describe("SBOM drift detection", () => {
 		const live = mutable();
 		const serde = live.rust.packages.find((p) => p.name === "serde");
 		if (serde === undefined) throw new Error("fixture lost serde");
-		serde.version = "1.0.229";
+		serde.version = "1.0.230";
 		expect(verifySnapshot(snapshot, live).some((d) => d.includes("serde"))).toBe(true);
 
 		const toolchainMoved = mutable();
