@@ -71,6 +71,13 @@ pub enum Scenario {
     /// compositing, and paste-atomic segments; asserts column alignment of
     /// rails and table borders and drift-free cursor placement.
     FixtureUnicodeGauntlet,
+    /// Exercises the keyboard and focus gauntlet (TUI-V2): keyboard-only
+    /// first-run wizard completion, slash-command selector flows (/login,
+    /// /tree, /settings, /import, /logout), per-context ctrl+d resolution
+    /// order proofs, streaming interrupt, overlay-over-overlay focus
+    /// restore, and rebind reflection in rendered hints — within current
+    /// dispatch semantics (no semantics changes; those belong to TUI-G7).
+    KeyboardGauntlet,
 }
 
 /// Evidence tier for the runner that produced an artifact.
