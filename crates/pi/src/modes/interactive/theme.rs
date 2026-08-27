@@ -2126,13 +2126,35 @@ mod tests {
         );
     }
 
-    /// TUI-T2 oracle: `resolve_active_theme` accepts a `color_mode` parameter
-    /// that flows through to `load_or_dark` / `load_by_name`. For built-in
-    /// (interned) themes the mode is baked at compile time (reference parity:
-    /// `registeredThemes.get(name)` returns as-is), so this test verifies the
-    /// parameter is accepted. The 256-color downsampling itself is verified
-    /// by `ansi_snapshot_emits_palette256` in `tests.rs` which exercises
-    /// `snapshot_buffer_ansi` with `ColorMode::Palette256`.
+    /// TUI-T2 numeric oracle: a theme resolved under forced-256
+    /// (`ColorMode::Palette256`) must emit `rgb_to_256`-downsampled
+    /// `\x1b[38;5;` SGR — never 24-bit `\x1b[38;2;`. Built-in themes are
+    /// interned at compile time in Truecolor (reference parity:
+    /// `registeredThemes.get(name)` returns as-is), so the numeric check
+    /// resolves a theme JSON through the same engine the
+    /// `resolve_active_theme` `color_mode` parameter feeds (`load_by_name`
+    /// → `ThemeJson::resolve`).
+    #[test]
+    fn forced_256_resolution_downsamples_hex_colors() -> TestResult {
+        let parsed = parsed_theme(&[("accent", serde_json::json!("#0a0b0c"))])?;
+        let theme = parsed
+            .resolve_owned(ColorMode::Palette256)
+            .map_err(|error| format!("palette theme should resolve: {error}"))?;
+        assert_eq!(theme.mode(), ColorMode::Palette256);
+        let expected = format!("\x1b[38;5;{}m", rgb_to_256(Rgb(10, 11, 12)));
+        assert_eq!(theme.fg_ansi(ThemeColor::Accent), expected);
+
+        let truecolor = parsed
+            .resolve_owned(ColorMode::Truecolor)
+            .map_err(|error| format!("truecolor theme should resolve: {error}"))?;
+        assert_eq!(truecolor.fg_ansi(ThemeColor::Accent), "\x1b[38;2;10;11;12m");
+        Ok(())
+    }
+
+    /// `resolve_active_theme` accepts the `color_mode` parameter and threads
+    /// it to the loader; built-in names come back interned at Truecolor
+    /// regardless (reference parity), which is why the numeric 256 oracle
+    /// above resolves a theme JSON instead of a built-in name.
     #[test]
     fn resolve_active_theme_forced_256_accepts_palette_mode() {
         let theme = resolve_active_theme(
@@ -2141,7 +2163,12 @@ mod tests {
             TerminalTheme::Dark,
             ColorMode::Palette256,
         );
-        let _ = theme.mode();
+        assert_eq!(theme.name, "dark");
+        assert_eq!(
+            theme.mode(),
+            ColorMode::Truecolor,
+            "built-ins are interned at Truecolor (reference parity)"
+        );
     }
 
     /// TUI-T2 oracle: `resolve_active_theme` with `ColorMode::Truecolor`

@@ -3819,7 +3819,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     pub(crate) fn apply_theme_from_settings(&mut self) {
         let (raw, mode) = self.session.theme_settings();
         let resolved =
-            super::theme::resolve_active_theme(raw.as_deref(), mode, self.terminal_theme, super::theme::ColorMode::Truecolor);
+            super::theme::resolve_active_theme(raw.as_deref(), mode, self.terminal_theme, self.color_mode());
         self.apply_theme(resolved);
     }
 
@@ -3862,7 +3862,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             if let Err(error) = self.session.persist_theme(&name, mode) {
                 self.last_error = Some(error);
             }
-            super::theme::resolve_active_theme(Some(&name), mode, self.terminal_theme, super::theme::ColorMode::Truecolor)
+            super::theme::resolve_active_theme(Some(&name), mode, self.terminal_theme, self.color_mode())
         } else {
             super::theme::load_or_dark(&name, self.color_mode())
         };
@@ -3906,7 +3906,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         let storage = super::theme::theme_selection_to_storage(selection);
         let (_, mode) = self.session.theme_settings();
         let resolved =
-            super::theme::resolve_active_theme(Some(&storage), mode, self.terminal_theme, super::theme::ColorMode::Truecolor);
+            super::theme::resolve_active_theme(Some(&storage), mode, self.terminal_theme, self.color_mode());
         self.apply_theme(resolved);
     }
 
@@ -4029,7 +4029,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         };
         let storage = super::theme::theme_selection_to_storage(&family);
         let resolved =
-            super::theme::resolve_active_theme(Some(&storage), mode, self.terminal_theme, super::theme::ColorMode::Truecolor);
+            super::theme::resolve_active_theme(Some(&storage), mode, self.terminal_theme, self.color_mode());
         self.apply_theme(resolved);
     }
 
@@ -5092,9 +5092,10 @@ fn buffer_plain_lines(buffer: &Buffer, width: u16, height: u16) -> Vec<(String, 
 fn startup_theme<S: SessionHost + ?Sized>(
     session: &S,
     terminal: TerminalTheme,
+    color_mode: super::theme::ColorMode,
 ) -> Arc<ResolvedTheme> {
     let (raw_theme, theme_mode) = session.theme_settings();
-    super::theme::resolve_active_theme(raw_theme.as_deref(), theme_mode, terminal, super::theme::ColorMode::Truecolor)
+    super::theme::resolve_active_theme(raw_theme.as_deref(), theme_mode, terminal, color_mode)
 }
 
 /// Polarity mode implied by a raw theme setting an extension just set:
@@ -6649,8 +6650,18 @@ pub async fn run_interactive_mode(
         .await;
 
     // Resolve the startup theme from settings + the just-probed terminal
-    // polarity (replaces the static dark default).
-    options.theme = startup_theme(host_arc.as_ref(), options.terminal_theme);
+    // polarity (replaces the static dark default); the render depth follows
+    // the probed truecolor capability (256-color-only terminals get
+    // downsampled SGR).
+    options.theme = startup_theme(
+        host_arc.as_ref(),
+        options.terminal_theme,
+        if options.caps.true_color {
+            super::theme::ColorMode::Truecolor
+        } else {
+            super::theme::ColorMode::Palette256
+        },
+    );
     let mut rt = InteractiveRuntime::new(tui, input, host_arc, &options);
     // Bridge replacements dispose the old session from a task outside this
     // loop. Mark that closure before teardown, then rebind after the host
