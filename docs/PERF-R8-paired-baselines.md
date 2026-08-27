@@ -92,68 +92,86 @@ baseline. It now carries a trusted paired baseline.
 | Rust runner | `target/release/session-timing` (PERF-T4) |
 | TypeScript runner | Bun-side SessionManager harness in `scripts/session-timing.ts` |
 | SHA-256 prefix | Verified per sample (186 distinct prefixes across 360 samples, 0 missing) |
-| Alternating order | Yes — `implementationOrder` alternates per sample index |
+| Alternating order | No — blocked order per cell (all Rust samples, then all TypeScript samples per entry count); sequential drift is not cancelled |
 | Artifact | `target/bench/session-timing.json` (generated 2026-08-27) |
 
-Trusted baseline (wall ms, distributions that pass the noise gate):
+Distributions that pass the noise gate (population stddev / median, matching the artifact's `relativeSpread`):
 
 | Lane | Impl | Cache | Entries | Median (ms) | Rel. spread | Gate | Peak RSS (MB) |
 |------|------|-------|---------|-------------|-------------|------|---------------|
-| append | rust | cold | 100 | 5.191 | 15.06% | PASS | 2.2 |
-| append | rust | cold | 5000 | 135.571 | 6.42% | PASS | 5.7 |
-| append | rust | warm | 1000 | 15.023 | 19.96% | PASS | 3.2 |
-| append | rust | warm | 5000 | 116.416 | 3.14% | PASS | 6.2 |
-| append | ts | cold | 5000 | 154.541 | 7.07% | PASS | 95.1 |
-| append | ts | warm | 1000 | 14.413 | 9.42% | PASS | 65.7 |
-| append | ts | warm | 5000 | 134.552 | 6.88% | PASS | 86.8 |
-| reopen | rust | cold | 1000 | 14.811 | 7.50% | PASS | 4.7 |
-| reopen | rust | cold | 5000 | 38.331 | 14.80% | PASS | 15.3 |
-| reopen | rust | warm | 1000 | 4.578 | 1.89% | PASS | 4.9 |
-| reopen | rust | warm | 5000 | 26.210 | 13.83% | PASS | 16.0 |
+| append | rust | cold | 100 | 5.191 | 14.29% | PASS | 2.2 |
+| append | rust | cold | 5000 | 135.571 | 6.09% | PASS | 5.7 |
+| append | rust | warm | 1000 | 15.023 | 19.45% | PASS | 3.2 |
+| append | rust | warm | 5000 | 116.416 | 3.06% | PASS | 6.2 |
+| append | ts | cold | 5000 | 154.541 | 6.71% | PASS | 95.1 |
+| append | ts | warm | 1000 | 14.413 | 9.18% | PASS | 65.7 |
+| append | ts | warm | 5000 | 134.552 | 6.70% | PASS | 86.8 |
+| reopen | rust | cold | 1000 | 14.811 | 7.12% | PASS | 4.7 |
+| reopen | rust | cold | 5000 | 38.331 | 14.04% | PASS | 15.3 |
+| reopen | rust | warm | 1000 | 4.578 | 1.84% | PASS | 4.9 |
+| reopen | rust | warm | 5000 | 26.210 | 13.48% | PASS | 16.0 |
 
 Distributions that fail the noise gate (no trusted baseline for these cells):
 
 | Lane | Impl | Cache | Entries | Median (ms) | Rel. spread | Gate |
 |------|------|-------|---------|-------------|-------------|------|
-| append | rust | cold | 1000 | 29.121 | 22.53% | FAIL |
-| append | rust | warm | 100 | 3.344 | 168.62% | FAIL |
-| append | ts | cold | 100 | 1.654 | 38.41% | FAIL |
-| append | ts | cold | 1000 | 16.307 | 25.92% | FAIL |
-| append | ts | warm | 100 | 1.152 | 63.87% | FAIL |
-| reopen | rust | cold | 100 | 2.060 | 22.42% | FAIL |
-| reopen | rust | warm | 100 | 0.853 | 35.68% | FAIL |
-| reopen | ts | cold | 100 | 0.743 | 84.44% | FAIL |
-| reopen | ts | cold | 1000 | 3.899 | 21.47% | FAIL |
-| reopen | ts | cold | 5000 | 16.257 | 28.71% | FAIL |
-| reopen | ts | warm | 100 | 0.391 | 208.72% | FAIL |
-| reopen | ts | warm | 1000 | 1.551 | 79.90% | FAIL |
-| reopen | ts | warm | 5000 | 7.292 | 26.15% | FAIL |
+| append | rust | cold | 1000 | 29.121 | 21.38% | FAIL |
+| append | rust | warm | 100 | 3.344 | 164.35% | FAIL |
+| append | ts | cold | 100 | 1.654 | 36.44% | FAIL |
+| append | ts | cold | 1000 | 16.307 | 24.59% | FAIL |
+| append | ts | warm | 100 | 1.152 | 62.26% | FAIL |
+| reopen | rust | cold | 100 | 2.060 | 21.27% | FAIL |
+| reopen | rust | warm | 100 | 0.853 | 34.78% | FAIL |
+| reopen | ts | cold | 100 | 0.743 | 80.11% | FAIL |
+| reopen | ts | cold | 1000 | 3.899 | 20.37% | FAIL |
+| reopen | ts | cold | 5000 | 16.257 | 27.24% | FAIL |
+| reopen | ts | warm | 100 | 0.391 | 203.44% | FAIL |
+| reopen | ts | warm | 1000 | 1.551 | 77.88% | FAIL |
+| reopen | ts | warm | 5000 | 7.292 | 25.48% | FAIL |
 
 The 100-entry cells fail because sub-millisecond to low-millisecond medians
 have inherently high jitter at the current sample count (20 warm, 10 cold).
 The TypeScript reopen lane fails at all entry counts — the Bun-side
 SessionManager harness has higher variance in file I/O scheduling. The
-5000-entry append cells pass for both implementations and produce the only
-fully paired trusted baselines.
+5000-entry append cells pass for both implementations and also meet the
+collection-wall criterion (>= 1 s per implementation). The 1000-entry warm
+append cell also passes the noise gate on both sides, but it collects < 1 s
+per implementation. All three are recorded as paired measurements (not fully
+trusted baselines) because the harness runs blocked order, not alternating
+per sample, so sequential drift is not cancelled.
 
-Paired trusted baselines (both implementations pass noise gate):
+Because the harness runs blocked order (not alternating), these cells do not
+meet all three trusted-baseline criteria from PERF-R2 — they meet the noise
+gate and (for the 5000-entry cells) the collection-wall criterion, but not
+the alternating-order criterion.
 
-| Lane | Cache | Entries | Rust median (ms) | TS median (ms) | TS/Rust ratio |
-|------|-------|---------|------------------|-----------------|---------------|
-| append | cold | 5000 | 135.571 | 154.541 | 1.14x |
-| append | warm | 1000 | 15.023 | 14.413 | 0.96x |
-| append | warm | 5000 | 116.416 | 134.552 | 1.16x |
+Paired measurements (both implementations pass noise gate; blocked order, not alternating):
 
-Claim class: paired comparative. At 5000 entries, Rust append is 14-16%
-faster than TypeScript in both cold and warm cache. At 1000 warm entries,
-the two are within 4% (TS slightly faster). Peak RSS: Rust 2-16 MB vs
-TypeScript 52-105 MB across all cells — Rust uses 6-15x less memory for
-session persistence.
+| Lane | Cache | Entries | Rust median (ms) | TS median (ms) | TS/Rust ratio | Collection wall (Rust / TS) |
+|------|-------|---------|------------------|-----------------|---------------|----------------------------|
+| append | cold | 5000 | 135.571 | 154.541 | 1.14x | 1.36 s / 1.55 s (>= 1 s) |
+| append | warm | 1000 | 15.023 | 14.413 | 0.96x | 0.30 s / 0.29 s (< 1 s) |
+| append | warm | 5000 | 116.416 | 134.552 | 1.16x | 2.33 s / 2.69 s (>= 1 s) |
+
+Of these, only the two 5000-entry append cells meet the collection-wall
+criterion (>= 1 s per implementation). The 1000-entry warm cell passes the
+noise gate but collects < 1 s per implementation and uses blocked order, so
+it does not meet all three trusted-baseline criteria.
+
+Claim class: paired measurement with methodology gap (blocked order, not
+alternating). At 5000 entries, Rust append is 14-16% faster than TypeScript
+in both cold and warm cache. At 1000 warm entries, the two are within 4%
+(TS slightly faster). Peak RSS: Rust 2-16 MB vs TypeScript 52-105 MB across
+all cells — Rust uses ~7-25x less memory for session persistence.
+
 
 Hot list impact: **adds** JSONL append (hot, per-turn, >= 5% of time during
 append at 1000+ entries) and reopen (hot, per-session, >= 5% of time during
 reopen at 1000+ entries). **Removes** nothing — this lane was D8-blocked in
 PERF-R2. The 100-entry cells are cold-only noise and do not feed a verdict.
+The blocked-order methodology gap means these are paired measurements, not
+fully trusted baselines under the R2 criteria; re-running with per-index
+alternation would upgrade them.
 
 ## Lane 8: Tool dispatch (paired comparative)
 
@@ -288,8 +306,8 @@ time-share metric. It does not add or remove units from the hot list.
 ## Updated hot list
 
 The hot list from PERF-R2 ranked eleven lanes by session time share. PERF-R8
-adds trusted baselines to two previously D8-blocked lanes and confirms one
-existing baseline. No units are removed.
+adds paired baselines or paired measurements to two previously D8-blocked
+lanes and confirms one existing baseline. No units are removed.
 
 | Rank | Lane | Claim class | Time share | Trusted baseline | Change from R2 |
 |------|------|-------------|------------|------------------|----------------|
@@ -298,7 +316,7 @@ existing baseline. No units are removed.
 | 3 | Render churn | Paired comparative | Per-frame during render | **Yes (R8)** | **Added** |
 | 4 | Tool dispatch | Paired comparative | Per-turn amortized | Yes (R2, confirmed R8) | Confirmed |
 | 5 | Extension-host scaling | Regression floor | Per-input-event | No (noise gate FAIL) | No change |
-| 6 | Session append/reopen | Paired comparative | Per-turn + per-session | **Yes (R8, partial)** | **Added** |
+| 6 | Session append/reopen | Paired measurement (methodology gap) | Per-turn + per-session | **Partial (R8)** | **Added** |
 | 7 | First frame | Paired comparative | One-time per session | Yes (R2) | No change |
 | 8 | Startup --version | Paired comparative | One-time startup | Yes (R2) | No change |
 | 9 | Idle/stream memory | Non-gating measurement | Resource, not time | No (artifact incomplete) | No change |
@@ -307,7 +325,7 @@ existing baseline. No units are removed.
 
 ### Lanes with trusted baselines after R8
 
-Six lanes now have trusted baselines (up from four in R2):
+Seven lanes now have trusted baselines or paired measurements (up from five in R2's amended text — R2's summary tables listed four, but R2's Lane 8 section was amended to record a fifth):
 
 | Lane | Rust median | TS median | TS/Rust ratio | Noise gate | Type |
 |------|-------------|-----------|---------------|------------|------|
@@ -320,9 +338,9 @@ Six lanes now have trusted baselines (up from four in R2):
 | 7: Render churn editor | 0.212 ms/frame | 0.243 ms/frame | 1.15x | PASS | Paired comparative |
 | 8: Tool dispatch wall | 0.024 ms/call | 0.018 ms/call | 0.75x | PASS | Paired comparative |
 | 8: Tool dispatch CPU | 0.049 ms/call | 0.100 ms/call | 2.04x | PASS | Paired comparative |
-| 9: Append 5k cold | 135.57 ms | 154.54 ms | 1.14x | PASS | Paired comparative |
-| 9: Append 5k warm | 116.42 ms | 134.55 ms | 1.16x | PASS | Paired comparative |
-| 9: Append 1k warm | 15.02 ms | 14.41 ms | 0.96x | PASS | Paired comparative |
+| 9: Append 5k cold | 135.57 ms | 154.54 ms | 1.14x | PASS | Paired measurement (blocked order) |
+| 9: Append 5k warm | 116.42 ms | 134.55 ms | 1.16x | PASS | Paired measurement (blocked order) |
+| 9: Append 1k warm | 15.02 ms | 14.41 ms | 0.96x | PASS | Paired measurement (blocked order, < 1 s wall) |
 | 11: Launcher bytes | 27.4 MB | 93.4 MB | 3.41x | N/A | Paired comparative |
 
 ### Lanes without trusted baselines after R8
@@ -340,7 +358,7 @@ Six lanes now have trusted baselines (up from four in R2):
 
 - `target/bench/performance-comparison.json`: check 9 artifact, generated 2026-08-26T14:22:29Z on this machine (Xeon Gold 6138, powersave governor).
 - `target/bench/extension-scaling.json`: check 8 artifact, generated 2026-08-26T14:18:43Z.
-- `target/bench/session-timing.json`: PERF-T4 artifact, generated 2026-08-27T15:48Z. 360 samples (180 rust, 180 typescript), 186 distinct SHA-256 prefixes, 0 missing.
+- `target/bench/session-timing.json`: PERF-T4 artifact, generated 2026-08-27T06:48Z. 360 samples (180 rust, 180 typescript), 186 distinct SHA-256 prefixes, 0 missing.
 - `target/bench/tool-dispatch.json`: PERF-T5 artifact, generated 2026-08-27T08:15:45Z. 10 samples x 10 000 calls, alternating order.
 - `target/bench/install-footprint.json`: PERF-T7 artifact, generated 2026-08-27T08:22:17Z (incomplete — runner blocked by extension-host typecheck failure).
 - Render-churn (lane 7): 10 inline runs per implementation, 2026-08-27, Xeon Gold 6138. Rust binary `target/release/pi_tui_render_churn_bench`, TS script `.references/pi/packages/tui/test/render-churn-bench.ts`.
