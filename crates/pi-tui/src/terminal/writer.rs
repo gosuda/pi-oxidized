@@ -14,7 +14,7 @@ use ratatui::widgets::Widget;
 use ratatui::{Terminal, TerminalOptions, Viewport};
 
 use crate::component::Component;
-use crate::frame::{FrameAnnotations, with_annotations};
+use crate::frame::{FrameAnnotations, with_annotations, with_current_annotations};
 use crate::terminal::backend::{
     GuardedBackend, audit_bytes, encode_full_row_prefix, wrap_synchronized,
 };
@@ -310,8 +310,10 @@ impl<W: Write> Tui<W> {
                     let render_area =
                         Rect::new(frame_area.x, frame_area.y, frame_area.width, height);
                     root.render(render_area, frame.buffer_mut());
-                    if hardware_cursor && let Some(pos) = annotations.borrow().cursor() {
-                        frame.set_cursor_position(pos);
+                    if hardware_cursor {
+                        if let Some(pos) = with_current_annotations(|a| a.cursor()).flatten() {
+                            frame.set_cursor_position(pos);
+                        }
                     }
                 })
             });
