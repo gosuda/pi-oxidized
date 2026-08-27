@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 
-use ratatui::buffer::{Buffer, CellDiffOption};
+use ratatui::buffer::{Buffer, Cell, CellDiffOption};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use unicode_segmentation::UnicodeSegmentation;
@@ -499,14 +499,10 @@ fn replay_derived(derived: &DerivedLine, line: &str, x: u16, y: u16, buf: &mut B
             PaintedOp::Sym { start, end, style } => {
                 let (start, end) = (start as usize, end as usize);
                 if end > start && end <= line.len() {
-                    cell.set_symbol(&line[start..end]);
-                    cell.set_style(style);
+                    apply_sym(cell, y, cx, &line[start..end], style);
                 }
             }
-            PaintedOp::Cont => {
-                cell.reset();
-                cell.set_diff_option(CellDiffOption::Skip);
-            }
+            PaintedOp::Cont => apply_cont(cell, y, cx),
         }
     }
     blank_span(
@@ -516,6 +512,47 @@ fn replay_derived(derived: &DerivedLine, line: &str, x: u16, y: u16, buf: &mut B
         buf,
     );
     replay_regions(derived, x, y);
+}
+
+/// Apply a grapheme-cell op with compare-before-write (PERF-T11
+/// terminal-paint Design B): when the cell already holds the incoming
+/// content, both writes are value-identical no-ops and are skipped;
+/// otherwise the column is recorded as changed and the original writes
+/// run. `set_style` patches (Some fields, modifier insert/remove), so the
+/// patch is evaluated field-wise to decide `changed` — an unchanged cell
+/// keeps byte-identical state, and every recorded column provably differs
+/// from the pre-paint (snapshot-equal) buffer content.
+fn apply_sym(cell: &mut Cell, y: u16, cx: u16, symbol: &str, style: Style) {
+    let mut changed = cell.symbol() != symbol;
+    changed |= style.fg.is_some_and(|c| cell.fg != c);
+    changed |= style.bg.is_some_and(|c| cell.bg != c);
+    changed |= style.underline_color.is_some_and(|c| cell.underline_color != c);
+    changed |= cell.modifier & style.add_modifier != style.add_modifier;
+    changed |= cell.modifier & style.sub_modifier != Modifier::empty();
+    if changed {
+        crate::frame::record_change(y, cx);
+        cell.set_symbol(symbol);
+        cell.set_style(style);
+    }
+}
+
+/// Apply a continuation op (reset + diff-skip) with compare-before-write
+/// (Design B). `symbol()` normalizes the empty symbol to `" "`, matching
+/// the reset target observably.
+#[allow(deprecated)]
+fn apply_cont(cell: &mut Cell, y: u16, cx: u16) {
+    let unchanged = cell.symbol() == " "
+        && cell.fg == Color::Reset
+        && cell.bg == Color::Reset
+        && cell.underline_color == Color::Reset
+        && cell.modifier == Modifier::empty()
+        && cell.diff_option == CellDiffOption::Skip
+        && !cell.skip;
+    if !unchanged {
+        crate::frame::record_change(y, cx);
+        cell.reset();
+        cell.set_diff_option(CellDiffOption::Skip);
+    }
 }
 
 /// Re-push hyperlink region templates translated to `(x, y)` (skip path).
@@ -532,10 +569,24 @@ fn replay_regions(derived: &DerivedLine, x: u16, y: u16) {
 
 /// Reset `[from, to)` on row `y` to default cells, reproducing the
 /// reset-buffer semantics the in-place render buffer no longer provides.
+///
+/// Design B: compare-before-write — already-default cells skip the reset,
+/// changed columns are recorded for the commit walk's narrowed window.
+#[allow(deprecated)]
 fn blank_span(from: u16, to: u16, y: u16, buf: &mut Buffer) {
     for col in from..to {
         if let Some(cell) = buf.cell_mut((col, y)) {
-            cell.reset();
+            let unchanged = cell.symbol() == " "
+                && cell.fg == Color::Reset
+                && cell.bg == Color::Reset
+                && cell.underline_color == Color::Reset
+                && cell.modifier == Modifier::empty()
+                && cell.diff_option == CellDiffOption::None
+                && !cell.skip;
+            if !unchanged {
+                crate::frame::record_change(y, col);
+                cell.reset();
+            }
         }
     }
 }
@@ -616,8 +667,7 @@ fn derive_line(x: u16, y: u16, max_width: usize, buf: &mut Buffer, line: &str) -
         let cell_style = style.to_style();
         let cell_x = x.saturating_add(u16::try_from(col).unwrap_or(u16::MAX));
         if let Some(cell) = buf.cell_mut((cell_x, y)) {
-            cell.set_symbol(grapheme);
-            cell.set_style(cell_style);
+            apply_sym(cell, y, cell_x, grapheme, cell_style);
         }
         derived.ops.push((
             u16::try_from(col).unwrap_or(u16::MAX),
@@ -630,8 +680,7 @@ fn derive_line(x: u16, y: u16, max_width: usize, buf: &mut Buffer, line: &str) -
         for extra in 1..gw {
             let cx = x.saturating_add(u16::try_from(col + extra).unwrap_or(u16::MAX));
             if let Some(cell) = buf.cell_mut((cx, y)) {
-                cell.reset();
-                cell.set_diff_option(CellDiffOption::Skip);
+                apply_cont(cell, y, cx);
             }
             derived.ops.push((
                 u16::try_from(col + extra).unwrap_or(u16::MAX),

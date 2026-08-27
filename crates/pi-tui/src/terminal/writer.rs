@@ -226,6 +226,10 @@ pub struct Tui<W: Write> {
     /// capacity across frames so steady-state claim recording does not
     /// allocate.
     scratch_claims: Vec<Vec<RowClaim>>,
+    /// Pooled frame-side changed-column table (PERF-T11 terminal-paint
+    /// Design B): the producer-fed per-row damage ranges, reset in place
+    /// across frames like the claim pool.
+    changes_scratch: Vec<Option<(u16, u16)>>,
     /// Pooled frame update set (PERF-T11 terminal-paint Design A): the
     /// `(x, y, Cell)` list is taken per frame and returned after the
     /// backend encode, so steady-state paint allocates nothing for it.
@@ -274,6 +278,7 @@ impl<W: Write> Tui<W> {
             coalescer: Coalescer::new(),
             write_count: 0,
             scratch_claims: Vec::new(),
+            changes_scratch: Vec::new(),
             updates_scratch: Vec::new(),
             frame_scratch: Vec::new(),
             comp_scratch: None,
@@ -394,6 +399,8 @@ impl<W: Write> Tui<W> {
         // rows are cleared in place (capacity retained), so steady-state
         // composition allocates nothing for claim bookkeeping. A geometry
         // change (or first frame) rebuilds the pool at the new row count.
+        // Terminal-paint Design B pools the changed-column table the same
+        // way (slots reset to `None` in place).
         let rows_needed = usize::from(frame_area.bottom());
         let mut frame_table = std::mem::take(&mut self.scratch_claims);
         if frame_table.len() == rows_needed {
@@ -403,7 +410,19 @@ impl<W: Write> Tui<W> {
         } else {
             frame_table = vec![Vec::new(); rows_needed];
         }
-        row_claims.install_pooled(std::mem::take(&mut self.prior_claims), frame_table);
+        let mut changes_table = std::mem::take(&mut self.changes_scratch);
+        if changes_table.len() == rows_needed {
+            for slot in &mut changes_table {
+                *slot = None;
+            }
+        } else {
+            changes_table = vec![None; rows_needed];
+        }
+        row_claims.install_pooled(
+            std::mem::take(&mut self.prior_claims),
+            frame_table,
+            changes_table,
+        );
         annotations.borrow_mut().install_row_claims(row_claims);
         {
             let terminal = &mut self.terminal;
@@ -420,10 +439,10 @@ impl<W: Write> Tui<W> {
         let mut collected = annotations.into_inner();
         let row_claims = collected.take_row_claims();
         let (cursor, raw_regions) = collected.into_parts();
-        let (mut prior_table, frame_table) = row_claims.into_tables();
+        let (mut prior_table, frame_table, mut changes_table) = row_claims.into_tables();
         let paint_timed = paint_timer_on();
         let paint_t0 = paint_timed.then(Instant::now);
-        self.emit_frame_diff(&prior_table, &frame_table, frame_area)?;
+        self.emit_frame_diff(&prior_table, &frame_table, &changes_table, frame_area)?;
         self.prior_claims = frame_table;
         // Design F: the consumed prior table returns to the pool; its rows
         // keep the capacity this frame's recording will reuse next frame.
@@ -431,6 +450,10 @@ impl<W: Write> Tui<W> {
             row.clear();
         }
         self.scratch_claims = prior_table;
+        for slot in &mut changes_table {
+            *slot = None;
+        }
+        self.changes_scratch = changes_table;
         let paint_t1 = paint_timed.then(Instant::now);
 
         // Cursor sequence mirrors ratatui's `apply_buffer_with_cursor`:
@@ -510,10 +533,18 @@ impl<W: Write> Tui<W> {
     /// spans of vanished claimants (not covered by a current claim), diff
     /// against the emitted snapshot with ratatui's own per-cell semantics,
     /// and sync the snapshot.
+    ///
+    /// PERF-T11 terminal-paint Design B: on rows whose every writer is a
+    /// recording line painter, the walk window narrows from the claim-span
+    /// union to the producer-recorded changed columns (`narrowed_walk_span`);
+    /// anything else keeps the Design A span. Debug builds assert full-row
+    /// snapshot exactness on narrowed rows, so a missed recording fails
+    /// every debug test, not the wire.
     fn emit_frame_diff(
         &mut self,
         prior: &[Vec<RowClaim>],
         frame: &[Vec<RowClaim>],
+        changes: &[Option<(u16, u16)>],
         area: Rect,
     ) -> io::Result<()> {
         let width = usize::from(area.width);
@@ -543,16 +574,24 @@ impl<W: Write> Tui<W> {
                 let row_y = u16::try_from(y_abs).unwrap_or(u16::MAX);
                 let current = self.terminal.current_buffer_mut();
                 blank_vanished_spans(prior_row, frame_row, row_y, width, current);
-                let (from, to) = row_walk_span(prior_row, frame_row, width);
-                push_row_diff(
-                    &mut self.grid.content[start..end],
-                    &current.content[start..end],
-                    row_y,
-                    area.x,
-                    from,
-                    to,
-                    &mut updates,
-                );
+                let outer = row_walk_span(prior_row, frame_row, width);
+                let change = changes.get(y_abs).copied().flatten();
+                let (from, to) = narrowed_walk_span(prior_row, frame_row, change, outer);
+                let prev = &mut self.grid.content[start..end];
+                let next = &current.content[start..end];
+                push_row_diff(prev, next, row_y, area.x, from, to, &mut updates);
+                #[cfg(debug_assertions)]
+                if (from, to) != outer {
+                    // Narrowed window: the producer feed claims everything
+                    // outside the recorded columns is unchanged, so the
+                    // whole row must be snapshot-exact after the walk.
+                    for (p, n) in prev.iter().zip(next.iter()) {
+                        debug_assert!(
+                            p == n,
+                            "narrowed walk left row {row_y} snapshot-stale outside {from}..{to}"
+                        );
+                    }
+                }
             }
         }
         let result = self
@@ -841,6 +880,67 @@ fn row_walk_span(prior: &[RowClaim], frame: &[RowClaim], width: usize) -> (usize
         return full;
     }
     (lo.min(width), hi.min(width))
+}
+
+/// Narrow a damaged row's walk window to the producer-recorded changed
+/// columns (PERF-T11 terminal-paint Design B).
+///
+/// The narrowing is trusted only when the row's writers are exactly the
+/// recording painters, so every write this frame went through a
+/// compare-before-write:
+///
+/// - every current claimant is a keyed line claim (`paint_line` paths —
+///   opaque and foreign writers do not record, so their rows keep the
+///   outer span), and
+/// - every vanished prior claimant's span is fully covered by one current
+///   line span — the same condition under which `blank_vanished_spans`
+///   writes nothing, so the repaint's compare-before-write saw that
+///   content and recorded anything it actually changed. An uncovered (or
+///   foreign) vanished span keeps the outer span.
+///
+/// Under those conditions a `None` record means the repaint changed
+/// nothing (empty window); a recorded range is clamped into the outer
+/// span. `Cell::eq` still runs at every walked column, so an
+/// over-record can only cost time, never change the emitted bytes.
+/// Debug builds verify the proof per damaged row (`emit_frame_diff`).
+fn narrowed_walk_span(
+    prior: &[RowClaim],
+    frame: &[RowClaim],
+    change: Option<(u16, u16)>,
+    outer: (usize, usize),
+) -> (usize, usize) {
+    if frame.is_empty() || outer.0 >= outer.1 {
+        return outer;
+    }
+    if !frame.iter().all(RowClaim::is_line) {
+        return outer;
+    }
+    for claim in prior {
+        if frame.contains(claim) {
+            continue;
+        }
+        let Some((x, span_width)) = claim.span() else {
+            return outer;
+        };
+        let from = usize::from(x);
+        let to = from.saturating_add(usize::from(span_width));
+        let covered = frame.iter().any(|current| {
+            current.span().is_some_and(|(cx, cw)| {
+                let cfrom = usize::from(cx);
+                let cto = cfrom.saturating_add(usize::from(cw));
+                cfrom <= from && to <= cto
+            })
+        });
+        if !covered {
+            return outer;
+        }
+    }
+    let Some((lo, hi)) = change else {
+        return (outer.0, outer.0);
+    };
+    let from = usize::from(lo);
+    let to = usize::from(hi).saturating_add(1);
+    (from.clamp(outer.0, outer.1), to.clamp(outer.0, outer.1))
 }
 
 /// Blank the spans of vanished claimants on one row.
@@ -1266,6 +1366,62 @@ mod tests {
         assert_eq!(row_walk_span(&[line(4, 8)], &[], 100), (0, 100));
         // Spans clamp to the row width.
         assert_eq!(row_walk_span(&[], &[line(90, 20)], 100), (90, 100));
+    }
+
+    /// `narrowed_walk_span` (terminal-paint Design B): recorded columns
+    /// clamp into the outer span; opaque/foreign claimants, uncovered
+    /// vanished spans, and claim-less frames keep the outer span; a
+    /// `None` record yields an empty window.
+    #[test]
+    fn narrowed_walk_span_trusts_only_recorded_rows() {
+        let line = |x: u16, w: u16| RowClaim::Line {
+            x,
+            width: w,
+            key: 7,
+            linked: false,
+        };
+        let opaque = |x: u16, w: u16| RowClaim::Opaque { x, width: w };
+        // All-line frame: the recorded range clamps into the outer span.
+        assert_eq!(
+            narrowed_walk_span(&[], &[line(0, 100)], Some((40, 43)), (0, 100)),
+            (40, 44)
+        );
+        // Over-record beyond the outer span clamps on both edges.
+        assert_eq!(
+            narrowed_walk_span(&[], &[line(10, 10)], Some((0, 99)), (10, 20)),
+            (10, 20)
+        );
+        // No recorded change: empty window (repaint changed nothing).
+        assert_eq!(
+            narrowed_walk_span(&[], &[line(0, 100)], None, (0, 100)),
+            (0, 0)
+        );
+        // An opaque frame claimant keeps the outer span.
+        assert_eq!(
+            narrowed_walk_span(&[], &[opaque(0, 100)], Some((40, 43)), (0, 100)),
+            (0, 100)
+        );
+        // A vanished prior span not covered by a current line span keeps
+        // the outer span (blanking may write there unrecorded).
+        assert_eq!(
+            narrowed_walk_span(&[line(50, 10)], &[line(0, 10)], Some((2, 5)), (0, 10)),
+            (0, 10)
+        );
+        // A vanished prior span fully inside a current line span narrows.
+        assert_eq!(
+            narrowed_walk_span(&[line(0, 8)], &[line(0, 10)], Some((9, 9)), (0, 10)),
+            (9, 10)
+        );
+        // A vanished foreign prior claim keeps the outer span.
+        assert_eq!(
+            narrowed_walk_span(&[RowClaim::Foreign], &[line(0, 100)], Some((1, 2)), (0, 100)),
+            (0, 100)
+        );
+        // Claim-less frames (suspended recording) keep the outer span.
+        assert_eq!(
+            narrowed_walk_span(&[], &[], Some((1, 2)), (0, 100)),
+            (0, 100)
+        );
     }
 
     #[derive(Default)]

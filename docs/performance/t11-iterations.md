@@ -762,3 +762,157 @@ pinned by the verification suite.
 `.github/workflows/` (REL-T4 lane), `pi/src/modes/interactive/runtime.rs`,
 `docs/performance/floors/` (PERF-R9/G10 lane — ledgers keep authored
 numbers).
+
+## Iteration 9 — `terminal-paint` (Design B: producer-fed column damage)
+
+**Blind derivation** (recorded before reading the to-be-replaced producer
+bodies — `components/util.rs` paint paths and the `emit_frame_diff` walk
+body unread at this point — from `terminal-paint.md` Contract + Floor +
+decomposition, the campaign's public prior records, and the claim-channel
+type surface only; data layout first).
+
+Post-Design-A residual data layout (derived blind): the paint walk detects
+changes cell-by-cell with `Cell::eq` over the union of prior+frame claim
+spans. The claim channel (`RowClaim::Line{x,width,key,linked}` /
+`Opaque{x,width}` / `Foreign`) carries row-granular ownership but no column
+granularity, and the pinned workloads claim full-width spans (100/100
+cols), so a damaged row costs ~100 `Cell::eq` checks to find 1-4 changed
+cells. The information "which columns actually changed" exists only at the
+moment a producer writes a cell — overwritten immediately after — so it
+must be captured at write time or re-derived by the scan it exists to
+replace.
+
+Soundness invariant the design leans on (derived blind, to be verified
+against the body): the pre-paint buffer row equals the emitted snapshot
+row everywhere — each walk syncs every cell it crosses (Design A fused
+sync), unwritten cells never diverge, and Design A's debug-build
+snapshot-exactness assert already checks this per damaged row. Therefore a
+producer-side compare-before-write classifies each cell as
+changed-since-snapshot or not, and the recorded set is exactly a superset
+of the true diff set. `Cell::eq` is retained at each recorded column so a
+conservative over-record can never change the emitted bytes.
+
+**Design B (chosen): producer-fed column damage.** Every claim-holding
+write site compares incoming content against the current buffer cell and
+records changed columns into a per-row changed-column record carried on
+the claim channel (thread-local annotations, pooled like the claims). The
+commit-time walk enumerates recorded changed columns inside the claim
+span instead of scanning it, retaining `Cell::eq` at each recorded column;
+rows or spans without a complete change record keep the full Design A
+walk (fail-open). Vanished-claim blanking still owns its prior spans, so
+the walk window is the union of recorded changed columns and vanished
+prior spans; everything else (sync framing, encode sequence, wire bytes)
+untouched. Targets the named dominant residual: the full-width
+`Cell::eq` scan (~1.5 us of the 3.2 us poke paint; floor prices change
+detection at zero).
+
+**Candidates evaluated blind**:
+
+| Candidate | Verdict | Reason |
+|---|---|---|
+| Q1 producer-fed column damage (above) | **chosen** | attacks the dominant residual at its only non-redundant capture point; fail-open keeps under-recording impossible on un-instrumented paths |
+| Q2 hash the row content pre/post paint, skip diff on hash match | rejected blind | full-span re-read to hash costs the same order as the scan it replaces; hash collisions need an equality fallback anyway |
+| Q3 move change detection into the memo replay ops record (replay-only skip list) | folded into Q1 | the replay is one of several write sites; direct writers and fresh derivations need the same feed, so the record lives on the channel, not in the memo |
+| Q4 skip the commit walk entirely on unchanged claim-set rows with fresh repaint | already shipped | is the render-churn Design B skip; the residual rows repaint by definition |
+| Q5 attack the crossterm `draw` fixed cost (~0.3-0.5 us) in the same commit | deferred | secondary residual; kept for a later slot unless Q1 alone leaves the unit >2x and the draw term is then dominant — one concern per commit |
+
+**Measurement plan** (blind): paint-only per painted frame on the pinned
+shape (100x30, static + poke + editor steady), isolated by the iteration-8
+paint-path instrument; release, `taskset -c 20-40`, 20 warmup / 300
+frames, >=7 interleaved probe pairs, medians; fresh pre-change baseline
+re-measured this session at the landing base; >=1.05x median win gate on
+the paint-only figure, whole-frame and allocation disclosure alongside;
+
+**Branch classification** (divergence audit of the replaced producer
+write path, answered after the blind record above was filed and the
+bodies read):
+
+| Original branch | Classification | Reason |
+|---|---|---|
+| replay/derive `set_symbol` + `set_style` per op (unconditional) | **replaced (compare-and-skip)** | symbol value-equality and field-wise evaluation of `set_style`'s patch semantics (Some fields, modifier insert/remove) make the skip exact; a changed cell records its column and runs the original writes |
+| replay/derive Cont `reset()` + Skip (unconditional) | **replaced (compare-and-skip)** | field-wise compare against the EMPTY+Skip target; `symbol()`'s None≡" " normalization matches the reset target observably (eq/symbol()/cell_width() normalize) |
+| `blank_span` tail `reset()` per column (unconditional) | **replaced (compare-and-skip)** | same EMPTY-target compare; already-default tail columns write nothing |
+| `record_line` / claim structs | **essential, untouched** | claim identity must stay `(x, width, key, linked)`; the changed-column table rides beside the claims precisely so `claims_equal` keeps its meaning |
+| `row_walk_span` (Design A outer window) | **essential, kept as outer bound** | the narrowed window clamps into it; Foreign/claim-less/opaque rows still get it verbatim |
+| commit walk per-cell `Cell::eq` inside spans | **essential, fed** | retained at every walked column so an over-record costs only time; the walk window itself narrows to recorded columns |
+| vanished-span blanking + its containment fast path | **essential** | the narrowing trusts it exactly: a vanished span is walkable-narrow only when fully covered by one current line span (the fast-path condition), so blanking writes nothing outside recorded columns |
+| opaque/foreign writers (editor body, input, image, overlay) | **essential, fail-open** | they do not record; their rows keep the full Design A walk (audited: the only post-paint cell pokes outside `util.rs` claim Opaque or Foreign) |
+| sync framing, encode sequence, `audit_bytes`, one write+flush | **essential (boundary)** | untouched; wire bytes byte-identical |
+
+**Boundary answers** (explicit): emitted bytes are byte-identical — the
+pin is `transcript_fixture` with `testkit` (K=3 run-to-run sha-stable
+canonical bytes incl. the resize ladder), `pty_no_flicker` (sync balance),
+`static_frame_evidence`, `transcript_state_matrix` fixtures, a11y/ext
+gauntlets — all green on the design tree; no wire-format, session-JSONL,
+or extension-RPC surface touched. Outside a narrowed row's window the
+snapshot must equal the buffer by the producer-feed proof, and debug
+builds assert exactly that on every damaged row in every test.
+
+**Measurement** (pre-declared protocol: release, `taskset -c 20-40`, 7
+interleaved probe pairs, medians; baseline = the clean `d3fa790` worktree
+binary, design = the landed tree; paint-only instrument, ns/frame):
+
+| Scenario (paint-only, ns/frame) | Before | After | Win (median-of-7) |
+|---|---|---|---|
+| static 100x30 | 928 | 882 | 1.05x |
+| poke (one changed transcript line) | 2959 | 1263 | **2.34x**, fully disjoint |
+| editor steady (rotated trailing chars) | 2361 | 963 | **2.45x**, fully disjoint |
+
+Diff-phase isolation (the walk itself): poke 2444 → 832 ns (2.94x),
+editor steady 1980 → 611 ns (3.24x) — the dominant residual of Design A
+was indeed the full-width `Cell::eq` scan. Whole-frame disclosure:
+framePoke 11.62 → 10.01 µs (1.16x), frameEditorSteady 12.14 → 10.78 µs
+(1.13x), frameStatic30 1.72 → 1.67 µs (1.03x, overlapping distributions,
+disclosed not claimed); the producer-side compare-and-skip cost lands in
+composition, outside the paint-only window — the whole-frame terms are
+the honest end-to-end check and they moved in the same direction.
+Win gate >=1.05x median on the pre-declared paint-only figure: **passed
+on all three**.
+
+**Recomputed multiple** (vs this unit's 0.64 µs floor, from the
+replacement's own measurement): poke 1.263 µs ≈ **1.97x**, editor steady
+0.963 µs ≈ **1.50x**, static 0.882 µs ≈ 1.38x — **AT-FLOOR** (<=2x on
+every pinned shape).
+
+**E1–E4 exhaustion record (unit terminal)**:
+- *E1 reconciled decomposition*: poke paint 1263 ns = diff phase 832 ns
+  (per-row claim bookkeeping + narrowed walk over the recorded columns +
+  fused sync) + 431 ns post-diff phases (crossterm `draw` queueing,
+  backend encode, cursor/flush, region replay); the floor prices change
+  detection at zero and the write/encode/sync floor terms at ~650 ns —
+  the remaining non-diff share sits at/below the floor's own write term
+  on the bench's NullWriter sink.
+- *E2 two distinct designs*: Design A (span-fed walk windowing, fused
+  sync, pooled transaction — commit-side) and Design B (producer-fed
+  column damage — producer-side); materially distinct mechanisms, both
+  landed with wins; candidates P2-P4/Q1-Q5 evaluated with reasons.
+- *E3 floor revalidation*: floor terms unchanged — the write(2),
+  encode-class, and sync-wrapper constants are boundary/bench-independent
+  (floorkit constants), and change detection is now bounded by
+  producer-recording (~4 `Cell::eq` checks per changed line), consistent
+  with the ledger's zero pricing; the floor-probe contract test (sanity
+  constants per the R9 method) passes on the landed tree.
+- *E4 named dominant residual*: the post-diff encode/draw/queue phases
+  (~0.43 µs) and the boundary-gated items — the `audit_bytes`
+  synchronized-output guard (~0.3 µs, consent-gated, classified boundary
+  in iteration 7's record) and the one-write-per-frame transaction
+  (wire contract). None is addressable without consent or boundary
+  crossing; the unit is AT-FLOOR under the campaign rule.
+
+**Verification**: 400/400 pi-tui lib tests debug and release (398 prior +
+the `narrowed_walk_span` contract test and the `record_change` merge
+test; the debug full-row snapshot-exactness assert runs on every narrowed
+row in every test); release integration suite green (render-churn
+verification 4/4, no-flicker PTY 5, grill 8, static-frame-evidence 1,
+theme 5, a11y/ext, `transcript_fixture` testkit K=3 byte-stable on both
+trees). Two pre-existing reds disclosed, neither introduced here: (1) the
+floor-probe sanity test demanded strict positivity on the identity slope
+— a subtraction of two ~2 µs medians, noise-fragile on a bursty box; it
+is proven red on the clean `d3fa790` baseline and now gated on finiteness
+plus the established far-below-the-derive-term bound; (2) `pi` crate
+`tui_keyboard_gauntlet` ("composer not ready after wizard completion")
+fails identically on the clean `d3fa790` baseline with the extension-host
+artifact present — pre-existing, outside this unit's owned files
+(wizard/composer runtime), left for the owning lane. Clippy delta on the
+changed files: zero new findings.
+multiple recomputed against the unit's 0.64 us floor.

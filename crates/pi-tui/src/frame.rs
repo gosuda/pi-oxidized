@@ -87,16 +87,27 @@ impl PriorLine {
     };
 }
 
+/// Writer-side pooling tables: prior-frame claims, frame claims, and the
+/// frame-side changed-column ranges (PERF-T11 terminal-paint Design B).
+pub type ClaimTables = (Vec<Vec<RowClaim>>, Vec<Vec<RowClaim>>, Vec<Option<(u16, u16)>>);
+
+
 /// Per-row claim bookkeeping for one frame render.
 ///
 /// `prior` holds the previous frame's claims (installed by the writer before
 /// composition); `frame` collects this frame's claims row by row.
+/// `frame_changes` carries the producer-fed column damage (PERF-T11
+/// terminal-paint Design B): the merged inclusive column range of cells a
+/// recording painter actually changed on each frame row.
 #[derive(Debug, Default, Clone)]
 pub struct RowClaims {
     /// Claims carried over from the previous frame, indexed by row.
     prior: Vec<Vec<RowClaim>>,
+
     /// Claims recorded during this frame, indexed by row.
     frame: Vec<Vec<RowClaim>>,
+    /// Merged changed-column range per frame row (Design B).
+    frame_changes: Vec<Option<(u16, u16)>>,
 }
 
 impl RowClaims {
@@ -106,11 +117,37 @@ impl RowClaims {
         Self {
             prior: vec![Vec::new(); rows],
             frame: vec![Vec::new(); rows],
+            frame_changes: vec![None; rows],
         }
     }
 
-    /// Probe the prior-frame claim for a line about to paint on row `y`.
-    ///
+    /// Record one changed column on frame row `y` (PERF-T11 terminal-paint
+    /// Design B): merge the column into the row's changed range. Recording
+    /// painters call this when a compare-before-write finds the incoming
+    /// content differs from the current cell; the commit walk narrows to
+    /// the recorded range and re-checks each recorded cell, so an
+    /// over-record can change only performance, never the emitted bytes.
+    pub fn record_change(&mut self, y: u16, col: u16) {
+        if let Some(slot) = self.frame_changes.get_mut(usize::from(y)) {
+            *slot = match *slot {
+                Some((lo, hi)) => Some((lo.min(col), hi.max(col))),
+                None => Some((col, col)),
+            };
+        }
+    }
+
+    /// Borrowed changed-column range for frame row `y` (writer, commit time).
+    #[must_use]
+    pub fn frame_change(&self, y: usize) -> Option<(u16, u16)> {
+        self.frame_changes.get(y).copied().flatten()
+    }
+
+    /// Frame-side changed-column table (writer, commit time).
+    #[must_use]
+    pub fn frame_changes(&self) -> &[Option<(u16, u16)>] {
+        &self.frame_changes
+    }
+
     /// The match license requires the identical claim in the prior frame AND
     /// that every prior claim on the row is a line claim: a foreign or
     /// opaque writer owned part of the row, so the row's prior final content
@@ -175,18 +212,25 @@ impl RowClaims {
     /// The writer owns a scratch table whose rows retain their capacity
     /// across frames (cleared here in place by the caller), so steady-state
     /// composition allocates nothing for claim bookkeeping.
-    pub fn install_pooled(&mut self, prior: Vec<Vec<RowClaim>>, frame: Vec<Vec<RowClaim>>) {
+    pub fn install_pooled(
+        &mut self,
+        prior: Vec<Vec<RowClaim>>,
+        frame: Vec<Vec<RowClaim>>,
+        frame_changes: Vec<Option<(u16, u16)>>,
+    ) {
         self.prior = prior;
         self.frame = frame;
+        self.frame_changes = frame_changes;
     }
 
-    /// Consume into the `(prior, frame)` tables so the writer can pool them
-    /// for the next frame (Design F).
+    /// Consume into the writer's pooling tables so they can be reused for
+    /// the next frame (Design F; changes pooled by terminal-paint Design B).
     #[must_use]
-    pub fn into_tables(mut self) -> (Vec<Vec<RowClaim>>, Vec<Vec<RowClaim>>) {
+    pub fn into_tables(mut self) -> ClaimTables {
         (
             std::mem::take(&mut self.prior),
             std::mem::take(&mut self.frame),
+            std::mem::take(&mut self.frame_changes),
         )
     }
 
@@ -194,6 +238,7 @@ impl RowClaims {
     pub fn install_prior(&mut self, prior: Vec<Vec<RowClaim>>) {
         self.prior = prior;
         self.frame = vec![Vec::new(); self.prior.len()];
+        self.frame_changes = vec![None; self.prior.len()];
     }
 }
 
@@ -347,6 +392,19 @@ pub fn record_line(y: u16, x: u16, width: u16, key: u128, linked: bool) {
     });
 }
 
+/// Record one changed column on frame row `y` (no-op outside a frame).
+///
+/// PERF-T11 terminal-paint Design B: recording painters call this when a
+/// compare-before-write finds the write changes the cell, feeding the
+/// commit walk's narrowed window. Suspended-recording scratch renders may
+/// still record: their rows carry no frame claims, so the writer never
+/// narrows them.
+pub fn record_change(y: u16, col: u16) {
+    let _ = with_current_annotations(|annotations| {
+        annotations.row_claims_mut().record_change(y, col)
+    });
+}
+
 /// Record opaque row-span claims for the current frame (no-op outside).
 pub fn claim_opaque_span(area: Rect) {
     let _ = with_current_annotations(|annotations| {
@@ -433,26 +491,45 @@ mod tests {
         // becomes the next frame's prior, the consumed prior table's rows
         // are cleared (capacity retained) and become the next scratch.
         let mut claims = RowClaims::default();
-        claims.install_pooled(vec![Vec::new(); 2], vec![Vec::new(); 2]);
+        claims.install_pooled(vec![Vec::new(); 2], vec![Vec::new(); 2], vec![None; 2]);
         claims.record_line(0, 0, 10, 7, false);
         claims.record_line(1, 2, 8, 9, true);
-        let (consumed_prior, frame) = claims.into_tables();
+        let (consumed_prior, frame, changes) = claims.into_tables();
         assert!(consumed_prior.iter().all(Vec::is_empty));
         assert_eq!(frame[0].len(), 1);
+        assert_eq!(changes, vec![None; 2]);
 
         let mut scratch = consumed_prior;
         for row in &mut scratch {
             row.clear();
         }
         let mut next = RowClaims::default();
-        next.install_pooled(frame, scratch);
+        next.install_pooled(frame, scratch, changes);
 
         let regionless = next.probe_line(0, 0, 10, 7);
         assert!(regionless.matched && !regionless.linked);
         let linked = next.probe_line(1, 2, 8, 9);
         assert!(linked.matched && linked.linked);
         next.record_line(0, 0, 10, 7, false);
-        let (_, frame2) = next.into_tables();
+        let (_, frame2, _) = next.into_tables();
         assert_eq!(frame2[0].len(), 1);
+    }
+
+    #[test]
+    fn record_change_merges_into_per_row_range() {
+        // PERF-T11 terminal-paint Design B: changed columns merge into one
+        // inclusive range per row; rows without recordings stay `None`;
+        // out-of-table rows are ignored (the writer never narrows them).
+        let mut claims = RowClaims::with_rows(2);
+        assert_eq!(claims.frame_change(0), None);
+        claims.record_change(0, 41);
+        claims.record_change(0, 44);
+        claims.record_change(0, 42);
+        assert_eq!(claims.frame_change(0), Some((41, 44)));
+        claims.record_change(1, 7);
+        assert_eq!(claims.frame_change(1), Some((7, 7)));
+        claims.record_change(9, 3);
+        assert_eq!(claims.frame_change(9), None);
+        assert_eq!(claims.frame_changes().len(), 2);
     }
 }
