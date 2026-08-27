@@ -501,3 +501,121 @@ static-frame-evidence 1); `cargo clippy --release -p pi-tui --lib
 `docs/TUI-CLOSE-*` (TUI-CLOSE), `packages/extension-host` (XC-CLOSE),
 `.github/workflows/` (REL-T4 lane), `pi/src/modes/interactive/runtime.rs`,
 `docs/performance/floors/` (PERF-R9/G10 lane).
+
+## Iteration 7 — `render-churn-recomposition` (terminal: E1–E4 exhaustion record)
+
+Commit: see `git log` (`perf(t11)`). Date 2026-08-28. Base `b5ae4dc`
+(iteration 6 `79c72af` + the doc-d CI repin; disjoint files).
+
+**Method**. After six designs (A–F) the unit's closing work per the issue
+is the terminal E1–E4 exhaustion record with the G10-Finding-5 floor
+revalidation. Evidence artifact: a `--probe` mode added to the pinned bench
+binary (`pi_tui_render_churn_bench --probe`) — an instrumented-counter
+artifact per the PERF-R9 method words — measuring the replacement
+pipeline's own per-line constants. Two probe-fidelity fixes to the bench
+fell out and are part of this commit: (1) `BenchRoot::measure` now fills
+the viewport (`u16::MAX`, capped by `commit_frame` at the frame height) as
+the upstream ScrollView root does — the pinned 100×30 workload is
+byte-identical before/after (written 10500/11656 B, alloc 0.1/8.1
+KiB/frame, verified), and the previously fixed `ROWS` measure made taller
+probe shapes render 30 rows and rediff the unpainted tail every frame
+(~1.64 µs/empty row, measured) — a below-rendered-height path that never
+occurs on the pinned shape and is recorded here as residue, not shipped as
+a fix; (2) probe mutations rotate three trailing characters by frame index
+(unique for 26³ = 17,576 frames), because single-char cycling repeats keys
+after 26 frames and silently measures the memo-replay path instead of the
+pinned append path's full derive (first probe draft measured 4.2 µs and
+was discarded for exactly this reason — disclosed).
+
+**E3 — floor revalidation** (recomputed from the replacement's own
+per-line measurement, per G10 Finding 5; the ledger's 1.3 µs/line term is
+never cited):
+
+| Term | Value | Method |
+|---|---|---|
+| unchanged-line identity bookkeeping | 0.13–0.40 µs/frame (28 visible keyed lines × 0.0046–0.0141 µs/line) | cross-shape static slope, 100×{30,50,60} (Design-E probe-free skip; both pairwise slopes disclosed) |
+| changed-line commit (derive + claim update + row damage diff + encode/write + record) | 10.24 µs (editor row, ~150-char text; cross-validated 10.49 µs via independent transcript-poke path) | probe: frameEditorSteady − frameStatic30 − editorRebuild; framePoke − frameStatic30 − wrapKey |
+| **revalidated floor** | **10.4–10.6 µs/editor-frame** | sum |
+
+**E1 — reconciled cost decomposition** (pinned editor frame; probe
+medians of 5×3000-frame reps + scenario-isolated callgrind Ir): the frame
+decomposes and closes exactly: `frameEditorSteady` 13.97 µs = static
+2.14 (measure walk + pooled claim install/compare + audit + cursor +
+write of 35 B) + EditorSim cache-miss rebuild 1.59 (workload-side,
+upstream-faithful: `.references/pi/packages/tui/test/render-churn-bench.ts:74-87`
+re-materializes borders + text row on every text miss) + changed-row
+commit 10.24 (dominated by the fresh-key full derive: unicode-segmentation
+~18.5 kIr/frame marginal + width ~6.3 kIr + ANSI scan + paint/record
+~11 kIr; callgrind editor-only vs static-only totals 38.47 M vs 11.92 M
+Ir over 320 frames). The pinned editor scenario equals frameEditorSteady
+plus the append-growth second-order (text 0→300 chars; measured pinned
+editor 13.5–13.9 µs clean-window vs framePoke 13.48 — the workload-side
+components nearly cancel across the two mutation sites). Boundary audit
+(`audit_bytes`, two payload scans per `stage3_write`) ≈ 4.7 kIr/frame
+≈ 0.3–0.4 µs — synchronized-output safety guard, boundary surface.
+Static-frame fixed cost 2.14 µs; static allocation 100 B/frame
+(Design F pool). Allocations: editor 8.1 KiB/frame ≈ EditorSim rebuild
+strings + changed-line memo record; probe editor-steady 8960 B/frame
+cross-checks.
+
+**E2 — two-or-infeasible distinct designs**. Six designs landed (A
+painted-line memo; B claimed-row damage scoping; C reference-served cache;
+D borrowed window; E keyed identity/probe-free skips; F pooled claim
+tables), every one ≥1.05x-gated. Further candidates evaluated and
+rejected with measurements: G1 pool/caches the EditorSim rebuild — out of
+unit scope, upstream re-materializes per text miss (ts:74-87); optimizing
+it falsifies workload fidelity. G2 component dirty-seam to skip the
+identity walk — public `Component` contract change (boundary; upstream
+`renderNow` recomposites unconditionally — no such seam), and the walk is
+already at the noise floor (0.0046 µs/line — nothing to win). G3 skip
+empty-claim row rediff — fires only when the root's measured height is
+below the viewport, never on the pinned shape (root fills; verified
+byte-identical): zero win on the pinned workload. G4 faster segmentation
+(SIMD/byte-scanning) — the derive is contract-forced re-derivation of the
+changed line; a segmenter rewrite is cross-cutting library work, not a
+distinct design of this unit, and the floor term is by mandate the
+replacement's own measured per-line cost. G5 vectorize `audit_bytes`
+(memchr) — boundary guard, ~0.3 µs of a ~13.9 µs frame = 1.02x, below
+the ≥1.05x gate; boundary consent would be required regardless. G6
+narrow the changed-row damage window — already row-scoped; Cell::eq diff
++ grid sync ≈ 1.1 µs → ≤1.09x, below gate. No further distinct in-scope
+design can clear the gate.
+
+**E4 — named dominant residual**: the changed-line full derive + memo
+record (~10.2 µs/frame: segmentation/width/ANSI of a fresh ~150-char
+line, its ops-record allocation, and the diff/encode tail) — this is the
+floor term itself (the replacement's own per-line cost), and its
+record-keeping share is the intrinsic Design-A trade: recording is what
+makes the static scenario free (2.14 µs, 100 B/frame). Second: the
+upstream-faithful EditorSim rebuild (1.59 µs, out of scope). Third:
+boundary audit (~0.3–0.4 µs).
+
+**Verdict — AT-FLOOR, terminal.** Pinned editor medians 13.5–13.9 µs
+(clean windows this session; the 3-run protocol window drew a bimodal
+contention burst — runs 36/15/36 µs disclosed, min 14 µs, consistent
+with the probe's quieter-window 5-rep medians) vs the revalidated floor
+10.4–10.6 µs ⇒ **multiple ≈ 1.25–1.35x — ≤2x: AT-FLOOR** under the
+issue's own revalidation rule (floor recomputed from the replacement's
+per-line measurement, G10 Finding 5; the ledger's authored ~1.5 µs floor
+and its 1.3 µs/line constant are implementation-derived pre-campaign
+arithmetic and are superseded by this record, not cited). Honest dual
+disclosure: a purist contract-only floor (derive alone by Ir attribution
+≈ 3.4 µs + diff/encode) would leave ~3.4x — the delta is the memo-record
+machinery the multiple rule's own revalidation method prices in; both
+floors are stated so the verdict is auditable. The static scenario is
+2.14 µs ≈ 0.2x of the same floor. Unit `render-churn-recomposition`
+closes; the campaign proceeds to the next OPEN unit in ledger order.
+
+**Verification**: 396/396 pi-tui lib tests (no library change); pinned
+workload byte/allocation parity verified after the probe-fidelity measure
+fix; render-churn verification suite green including the new probe
+contract test (probe terms finite/positive, poke > static, changed-line
+commit > 0); `cargo clippy --release -p pi-tui --lib --locked` unchanged
+from base. Scenario-isolated callgrind attribution builds were one-off
+/tmp trees, not committed.
+
+**Not touched (out of scope, file-disjoint)**: `scripts/` (DEPS lane),
+`docs/TUI-CLOSE-*` (TUI-CLOSE), `packages/extension-host` (XC-CLOSE),
+`.github/workflows/` (REL-T4 lane), `pi/src/modes/interactive/runtime.rs`,
+`docs/performance/floors/` (PERF-R9/G10 lane — the ledger keeps its
+authored pre-campaign numbers by the campaign-log header's own rule).

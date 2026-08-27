@@ -148,3 +148,88 @@ fn editor_scenario_allocates_more_than_static() {
         "editor scenario ({editor_alloc} bytes) should allocate more than static ({static_alloc} bytes)"
     );
 }
+
+/// Run the benchmark binary in `--probe` mode and parse `__PROBE_JSON__`
+/// (PERF-T11 iteration 7 floor-probe contract).
+#[expect(clippy::unwrap_used, clippy::expect_used, reason = "test-only code")]
+fn run_probe() -> Value {
+    let output = Command::new(bench_binary())
+        .arg("--probe")
+        .output()
+        .expect("benchmark binary must run with --probe");
+    assert!(output.status.success(), "--probe run failed");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let marker = "__PROBE_JSON__\n";
+    let start = stdout
+        .find(marker)
+        .unwrap_or_else(|| panic!("no __PROBE_JSON__ marker in probe output:\n{stdout}"));
+    let body = stdout[start + marker.len()..].trim_end();
+    serde_json::from_str(body).expect("probe JSON must parse")
+}
+
+#[test]
+#[expect(clippy::expect_used, reason = "test-only assertions")]
+fn floor_probe_reports_sane_constants() {
+    let probe = run_probe();
+    let measured = &probe["measured"];
+    let derived = &probe["derived"];
+
+    let term = |v: &Value| -> f64 {
+        let value = json_f64(v).expect("probe term must be a number");
+        assert!(
+            value.is_finite() && value > 0.0,
+            "probe term must be finite and positive, got {value}"
+        );
+        value
+    };
+
+    // Every measured/derived term present, finite, positive.
+    let static30 = term(&measured["frameStatic30Us"]);
+    let poke = term(&measured["framePokeUs"]);
+    let steady = term(&measured["frameEditorSteadyUs"]);
+    term(&measured["frameStatic50Us"]);
+    term(&measured["frameStatic60Us"]);
+    term(&measured["wrapKeyUsPerLine"]);
+    term(&measured["editorRebuildUs"]);
+    let slope = term(&derived["identitySlopeUsPerLine"]);
+    term(&derived["changedLineCommitUs"]);
+    term(&derived["editorRowCommitUs"]);
+
+    // Sanity relations pinning the exhaustion-record arithmetic.
+    assert!(poke > static30, "a changed-line frame must cost more than static");
+    assert!(steady > static30, "editor steady frame must cost more than static");
+    assert!(
+        slope < 1.0,
+        "identity slope must be far below the pre-campaign 1.3 µs/line derive term"
+    );
+    assert_eq!(
+        derived["visibleLines30"].as_u64(),
+        Some(25),
+        "30-row viewport shows 25 transcript lines over the 5-row dock"
+    );
+
+    // Pin the exhaustion-record arithmetic itself: every derived term must
+    // recompute from the emitted measured fields (within the JSON's
+    // four-decimal rounding tolerance) — a wrong operand or sign in the
+    // probe's formulas must fail here, not just look plausible.
+    let close = |a: f64, b: f64| (a - b).abs() <= 1e-3;
+    let wrap_key = term(&measured["wrapKeyUsPerLine"]);
+    let rebuild = term(&measured["editorRebuildUs"]);
+    let commit = term(&derived["changedLineCommitUs"]);
+    let row_commit = term(&derived["editorRowCommitUs"]);
+    assert!(
+        close(commit, poke - static30 - wrap_key),
+        "changedLineCommit {commit} must equal poke {poke} - static {static30} - wrapKey {wrap_key}"
+    );
+    assert!(
+        close(row_commit, steady - static30 - rebuild),
+        "editorRowCommit {row_commit} must equal steady {steady} - static {static30} - rebuild {rebuild}"
+    );
+    let v30 = json_f64(&derived["visibleLines30"]).expect("visible30");
+    let v50 = json_f64(&derived["visibleLines50"]).expect("visible50");
+    let static50 = term(&measured["frameStatic50Us"]);
+    assert!(
+        close(slope, (static50 - static30) / (v50 - v30)),
+        "identitySlope {slope} must equal (static50 {static50} - static30 {static30}) / (visible {v50} - {v30})"
+    );
+}

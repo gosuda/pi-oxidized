@@ -96,6 +96,26 @@ impl EditorSim {
     }
 }
 
+impl EditorSim {
+    /// Floor-probe helper: rotate the last three characters by the frame
+    /// index so the content is unique for 26³ = 17,576 frames — every frame
+    /// is a fresh key (the pinned append scenario's path: memo miss, full
+    /// derive) — while the length, and therefore the rebuild's format cost,
+    /// stays at steady state. Probe-only; the pinned scenario appends.
+    fn rotate_unique(&mut self, i: usize) {
+        let rot = |i: usize| 97 + u8::try_from(i % 26).unwrap_or(0);
+        let n = self.text.len();
+        if n < 3 {
+            return;
+        }
+        let mut bytes = self.text.clone().into_bytes();
+        bytes[n - 3] = rot(i);
+        bytes[n - 2] = rot(i / 26);
+        bytes[n - 1] = rot(i / 676);
+        self.text = String::from_utf8(bytes).unwrap_or_default();
+    }
+}
+
 impl Component for EditorSim {
     fn measure(&mut self, width: u16) -> u16 {
         let lines = self.lines_for_width(width);
@@ -213,6 +233,39 @@ impl Transcript {
         }
         self.cached_wrapped.as_deref().unwrap_or(&[])
     }
+
+    /// Floor-probe mutation (PERF-T11 exhaustion record): rotate the last
+    /// three characters of the last transcript line by the frame index —
+    /// content is unique for 26³ = 17,576 frames (every frame is a fresh
+    /// key: memo miss, full derive, exactly the pinned append path) — while
+    /// the length, and therefore the wrapped shape, stays constant. Re-wrap
+    /// + re-key only that line in the cached window. Probe-only.
+    fn poke(&mut self, i: usize) {
+        let idx = self.lines.len() - 1;
+        let rot = |i: usize| 97 + u8::try_from(i % 26).unwrap_or(0);
+        {
+            let line = &mut self.lines[idx];
+            let n = line.len();
+            if n < 3 {
+                return;
+            }
+            let mut bytes = line.clone().into_bytes();
+            bytes[n - 3] = rot(i);
+            bytes[n - 2] = rot(i / 26);
+            bytes[n - 1] = rot(i / 676);
+            *line = String::from_utf8(bytes).unwrap_or_default();
+        }
+        if let (Some(wrapped), Some(width)) = (&mut self.cached_wrapped, self.cached_width) {
+            let rewrapped =
+                pi_tui::text::wrap_text_with_ansi(&self.lines[idx], usize::from(width));
+            // The poked line is ~85 chars at width 100 — always one wrapped
+            // line; the guard keeps the probe total if that ever changes.
+            if rewrapped.len() == 1 {
+                let last = wrapped.len() - 1;
+                wrapped[last] = KeyedLine::new(rewrapped[0].clone(), width);
+            }
+        }
+    }
 }
 
 // ── Layout root: VStack [ ScrollView(transcript), dock VStack ] ───────────
@@ -257,7 +310,16 @@ impl BenchRoot {
 
 impl Component for BenchRoot {
     fn measure(&mut self, _width: u16) -> u16 {
-        ROWS
+        // Fill the viewport, as the upstream VStack [ScrollView, dock] root
+        // does: the scroll view expands to the remaining height at any
+        // terminal size (`commit_frame` caps at `frame_area.height`). The
+        // pinned 100×30 workload is unchanged (min(fill, 30) = 30); the
+        // floor probe's cross-shape runs previously rendered a fixed 30 rows
+        // and rediffed the unpainted tail every frame (~1.6 µs/row of
+        // empty-claim row diff — measured, and recorded in the iteration-7
+        // log as a below-rendered-height path that never occurs on the
+        // pinned shape).
+        u16::MAX
     }
 
     fn render(&mut self, area: Rect, buf: &mut Buffer) {
@@ -361,7 +423,309 @@ fn report(name: &str, result: &ScenarioResult) {
     );
 }
 
+// ── Floor probe (PERF-T11 exhaustion record) ──────────────────────────────
+//
+// Instrumented-counter artifact measuring the replacement pipeline's own
+// per-line constants, per the PERF-R9 method words ("instrumented counters
+// = committed runner/bench artifacts") and G10 Finding 5 (the floor's
+// per-line term must be recomputed from the replacement's own measurement,
+// never cited from the pre-campaign implementation).
+//
+// Terms (release, µs, median of PROBE_REPS reps of PROBE_FRAMES production
+// frames or PROBE_TIGHT_ITERS tight-loop ops):
+//   frameStatic{30,50,60}  static production frames at 100×{30,50,60} — the
+//                          per-frame identity walk; the cross-shape slope
+//                          isolates the per-visible-line identity cost.
+//   framePoke              production frames with one transcript line's
+//                          content changed in place (`Transcript::poke`) —
+//                          adds exactly one changed line through the
+//                          production path (fresh key, claim mismatch,
+//                          derive, one-row damage diff, encode, write).
+//   wrapKeyPerLine         tight loop: `wrap_text_with_ansi` +
+//                          `KeyedLine::new` on one ~85-col styled line —
+//                          the workload-side constant for producing a
+//                          changed line's wrapped content.
+//   editorRebuild          tight loop: `EditorSim` cache-miss rebuild at
+//                          the pinned workload's steady text length — the
+//                          workload-side editor constant (upstream
+//                          re-materializes borders + text row on every
+//                          text miss: render-churn-bench.ts:74-87).
+//
+// Derived: identitySlope = ΔframeStatic / Δvisible; changedLineCommit =
+// framePoke − frameStatic30 − wrapKeyPerLine (the commit path's per-changed-
+// line cost: derive + one-row damage diff + encode/write, workload-side
+// re-wrap subtracted).
+//
+// Probe reps use 3000 frames (vs the pinned 300) purely for timer stability
+// at the ~2 µs/frame scale; frame semantics are identical.
+
+const PROBE_FRAMES: usize = 3000;
+const PROBE_WARMUP: usize = 200;
+const PROBE_REPS: usize = 5;
+const PROBE_TIGHT_ITERS: usize = 20_000;
+const PROBE_TIGHT_WARMUP: usize = 2_000;
+
+struct ProbeFrame {
+    us_per_frame: f64,
+    bytes_per_frame: f64,
+    written_per_frame: f64,
+}
+
+fn run_probe_frames(
+    tui: &mut Tui<NullWriter>,
+    root: &mut BenchRoot,
+    frames: usize,
+    frame: impl Fn(usize, &mut BenchRoot),
+) -> ProbeFrame {
+    let alloc_before = CountingAllocator::read();
+    let mut written: u64 = 0;
+    let start = Instant::now();
+    for i in 0..frames {
+        frame(i, root);
+        if tui.commit(Txn::Frame, root).is_ok() {
+            written = written.saturating_add(u64::try_from(tui.last_payload().len()).unwrap_or(u64::MAX));
+        }
+    }
+    let us = start.elapsed().as_secs_f64() * 1e6;
+    let alloc_after = CountingAllocator::read();
+    let n = frames as f64;
+    ProbeFrame {
+        us_per_frame: us / n,
+        bytes_per_frame: alloc_after.bytes_since(alloc_before) as f64 / n,
+        written_per_frame: written as f64 / n,
+    }
+}
+
+fn median_of(vals: &mut [f64]) -> f64 {
+    vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = vals.len() / 2;
+    if vals.len() % 2 == 1 {
+        vals[mid]
+    } else {
+        (vals[mid - 1] + vals[mid]) / 2.0
+    }
+}
+
+fn fresh_tui(rows: u16) -> Tui<NullWriter> {
+    let caps = TerminalCapabilities::default();
+    match Tui::new(
+        NullWriter::new(),
+        Size::new(COLUMNS, rows),
+        Position::ORIGIN,
+        rows,
+        caps,
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("Failed to create Tui: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Median static-frame cost at a given viewport height (µs/frame, bytes/frame).
+fn probe_static_shape(rows: u16) -> (f64, f64, f64) {
+    let mut times = Vec::with_capacity(PROBE_REPS);
+    let mut allocs = Vec::with_capacity(PROBE_REPS);
+    let mut written = Vec::with_capacity(PROBE_REPS);
+    for _ in 0..PROBE_REPS {
+        let mut tui = fresh_tui(rows);
+        let mut root = BenchRoot::new();
+        for _ in 0..PROBE_WARMUP {
+            let _ = tui.commit(Txn::Frame, &mut root);
+        }
+        let r = run_probe_frames(&mut tui, &mut root, PROBE_FRAMES, |_i, _root| {});
+        times.push(r.us_per_frame);
+        allocs.push(r.bytes_per_frame);
+        written.push(r.written_per_frame);
+    }
+    (
+        median_of(&mut times),
+        median_of(&mut allocs),
+        median_of(&mut written),
+    )
+}
+
+/// Median one-changed-line frame cost at the pinned shape (µs/frame, bytes/frame, written bytes/frame).
+fn probe_poke() -> (f64, f64, f64) {
+    let mut times = Vec::with_capacity(PROBE_REPS);
+    let mut allocs = Vec::with_capacity(PROBE_REPS);
+    let mut written = Vec::with_capacity(PROBE_REPS);
+    for _ in 0..PROBE_REPS {
+        let mut tui = fresh_tui(ROWS);
+        let mut root = BenchRoot::new();
+        for _ in 0..PROBE_WARMUP {
+            let _ = tui.commit(Txn::Frame, &mut root);
+        }
+        let r = run_probe_frames(&mut tui, &mut root, PROBE_FRAMES, |i, root| {
+            root.transcript.poke(i);
+        });
+        times.push(r.us_per_frame);
+        allocs.push(r.bytes_per_frame);
+        written.push(r.written_per_frame);
+    }
+    (
+        median_of(&mut times),
+        median_of(&mut allocs),
+        median_of(&mut written),
+    )
+}
+
+/// Median editor-frame cost at steady text length (µs/frame, bytes/frame):
+/// rotate three of the editor's trailing characters by frame index instead
+/// the EditorSim rebuild, the changed text row, the damage diff, and the
+/// encode all run at the pinned workload's average text length (~150 chars)
+/// with no growth drift. The pinned editor scenario minus this equals the
+/// append-growth effect (workload-side).
+fn probe_editor_steady() -> (f64, f64) {
+    let mut times = Vec::with_capacity(PROBE_REPS);
+    let mut allocs = Vec::with_capacity(PROBE_REPS);
+    for _ in 0..PROBE_REPS {
+        let mut tui = fresh_tui(ROWS);
+        let mut root = BenchRoot::new();
+        // Grow to the pinned workload's average editor text length first.
+        for i in 0..150 {
+            root.editor
+                .append(char::from_u32(97 + (i % 26) as u32).unwrap_or('a'));
+        }
+        for _ in 0..PROBE_WARMUP {
+            let _ = tui.commit(Txn::Frame, &mut root);
+        }
+        let r = run_probe_frames(&mut tui, &mut root, PROBE_FRAMES, |i, root| {
+            root.editor.rotate_unique(i);
+        });
+        times.push(r.us_per_frame);
+        allocs.push(r.bytes_per_frame);
+    }
+    (median_of(&mut times), median_of(&mut allocs))
+}
+
+/// Tight loop: wrap + key one ~85-col styled transcript line (µs/op).
+fn probe_wrap_key() -> f64 {
+    let styled = "\x1b[1m\x1b[36muser 0\x1b[39m\x1b[22m message with some \
+                  \x1b[33mstyled\x1b[39m content padding padding";
+    let mut sink = 0u64;
+    for _ in 0..PROBE_TIGHT_WARMUP {
+        let wrapped = pi_tui::text::wrap_text_with_ansi(styled, usize::from(COLUMNS));
+        let keyed = KeyedLine::new(wrapped[0].clone(), COLUMNS);
+        sink = sink.wrapping_add(u64::try_from(keyed.line().len()).unwrap_or(0));
+    }
+    let mut times = Vec::with_capacity(PROBE_REPS);
+    for _ in 0..PROBE_REPS {
+        let start = Instant::now();
+        for _ in 0..PROBE_TIGHT_ITERS {
+            let wrapped = pi_tui::text::wrap_text_with_ansi(styled, usize::from(COLUMNS));
+            let keyed = KeyedLine::new(wrapped[0].clone(), COLUMNS);
+            sink = sink.wrapping_add(u64::try_from(keyed.line().len()).unwrap_or(0));
+        }
+        times.push(start.elapsed().as_secs_f64() * 1e6 / PROBE_TIGHT_ITERS as f64);
+    }
+    std::hint::black_box(sink);
+    median_of(&mut times)
+}
+
+/// Tight loop: EditorSim cache-miss rebuild at steady text length (µs/op).
+fn probe_editor_rebuild() -> f64 {
+    // Seed to the pinned workload's average text length (~150 chars over
+    // 300 appended frames), then rotate the last char per op so content
+    // changes (cache miss) while length — and therefore format cost — stays
+    // at steady state.
+    let mut editor = EditorSim::new();
+    for _ in 0..150 {
+        editor.append('x');
+    }
+    let rotate = |i: usize, editor: &mut EditorSim| {
+        editor.rotate_unique(i);
+    };
+    for i in 0..PROBE_TIGHT_WARMUP {
+        rotate(i, &mut editor);
+        std::hint::black_box(editor.lines_for_width(COLUMNS).len());
+    }
+    let mut times = Vec::with_capacity(PROBE_REPS);
+    for _ in 0..PROBE_REPS {
+        let start = Instant::now();
+        for i in 0..PROBE_TIGHT_ITERS {
+            rotate(i, &mut editor);
+            std::hint::black_box(editor.lines_for_width(COLUMNS).len());
+        }
+        times.push(start.elapsed().as_secs_f64() * 1e6 / PROBE_TIGHT_ITERS as f64);
+    }
+    median_of(&mut times)
+}
+
+fn run_probe() -> ExitCode {
+    let (static30, static30_bytes, static30_written) = probe_static_shape(30);
+    let (static50, _, _) = probe_static_shape(50);
+    let (static60, _, _) = probe_static_shape(60);
+    let (poke, poke_bytes, poke_written) = probe_poke();
+    let (editor_steady, editor_steady_bytes) = probe_editor_steady();
+    let wrap_key = probe_wrap_key();
+    let editor_rebuild = probe_editor_rebuild();
+
+    let mut root = BenchRoot::new();
+    let dock = root.dock_height(COLUMNS);
+    let visible = |rows: u16| f64::from(rows.saturating_sub(dock));
+    let slope_30_50 = (static50 - static30) / (visible(50) - visible(30));
+    let slope_50_60 = (static60 - static50) / (visible(60) - visible(50));
+    let changed_line_commit = poke - static30 - wrap_key;
+    // The editor row's own changed-line commit at its true shape (~150-char
+    // text row): steady-frame cost minus the static frame minus the
+    // workload-side rebuild.
+    let editor_row_commit = editor_steady - static30 - editor_rebuild;
+
+    println!("floor probe (reps={PROBE_REPS} × {PROBE_FRAMES} frames; tight {PROBE_TIGHT_ITERS} ops)");
+    println!("  frameStatic30   {static30:8.3} µs/frame  ({static30_bytes:6.0} B/frame, {static30_written:5.1} B written)");
+    println!("  frameStatic50   {static50:8.3} µs/frame");
+    println!("  frameStatic60   {static60:8.3} µs/frame");
+    println!("  framePoke       {poke:8.3} µs/frame  ({poke_bytes:6.0} B/frame, {poke_written:5.1} B written)");
+    println!("  frameEditorSteady {editor_steady:6.3} µs/frame  ({editor_steady_bytes:6.0} B/frame)");
+    println!("  wrapKeyPerLine  {wrap_key:8.3} µs/line   (workload-side)");
+    println!("  editorRebuild   {editor_rebuild:8.3} µs/frame (workload-side)");
+    println!("  identitySlope   {slope_30_50:8.4} µs/visible-line (30↔50; 50↔60 {slope_50_60:.4})");
+    println!("  changedLineCommit {changed_line_commit:6.3} µs/changed-line (poke − static − wrapKey)");
+    println!("  editorRowCommit {editor_row_commit:6.3} µs/changed-line (steady − static − rebuild)");
+
+    let json = format!(
+        "\n__PROBE_JSON__\n{{\
+         \"framesPerRep\": {PROBE_FRAMES},\
+         \"reps\": {PROBE_REPS},\
+         \"tightIters\": {PROBE_TIGHT_ITERS},\
+         \"measured\": {{\
+         \"frameStatic30Us\": {static30:.4},\
+         \"frameStatic50Us\": {static50:.4},\
+         \"frameStatic60Us\": {static60:.4},\
+         \"framePokeUs\": {poke:.4},\
+         \"frameEditorSteadyUs\": {editor_steady:.4},\
+         \"frameEditorSteadyBytesPerFrame\": {editor_steady_bytes:.1},\
+         \"frameStatic30WrittenPerFrame\": {static30_written:.1},\
+         \"framePokeWrittenPerFrame\": {poke_written:.1},\
+         \"wrapKeyUsPerLine\": {wrap_key:.4},\
+         \"editorRebuildUs\": {editor_rebuild:.4}\
+         }},\
+         \"derived\": {{\
+         \"dockHeight\": {dock},\
+         \"visibleLines30\": {v30},\
+         \"visibleLines50\": {v50},\
+         \"visibleLines60\": {v60},\
+         \"identitySlopeUsPerLine\": {slope_30_50:.5},\
+         \"identitySlope50to60UsPerLine\": {slope_50_60:.5},\
+         \"changedLineCommitUs\": {changed_line_commit:.4},\
+         \"editorRowCommitUs\": {editor_row_commit:.4}\
+         }}\
+         }}",
+        v30 = visible(30),
+        v50 = visible(50),
+        v60 = visible(60),
+    );
+    println!("{json}");
+    ExitCode::SUCCESS
+}
+
 fn main() -> ExitCode {
+    if std::env::args().any(|arg| arg == "--probe") {
+        return run_probe();
+    }
+
     let caps = TerminalCapabilities::default();
     let outer = NullWriter::new();
     let size = Size::new(COLUMNS, ROWS);
