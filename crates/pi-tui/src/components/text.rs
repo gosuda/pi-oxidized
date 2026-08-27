@@ -85,20 +85,23 @@ impl Text {
         self.cache = None;
     }
 
-    fn lines_for_width(&mut self, width: u16) -> Vec<String> {
-        if let Some(cache) = &self.cache
-            && cache.width == width
-            && cache.content == self.content
-        {
-            return cache.lines.clone();
+    fn lines_for_width(&mut self, width: u16) -> &[String] {
+        let cache_hit = match &self.cache {
+            Some(cache) => cache.width == width && cache.content == self.content,
+            None => false,
+        };
+        if !cache_hit {
+            let lines = self.render_lines(width);
+            self.cache = Some(RenderCache {
+                content: self.content.clone(),
+                width,
+                lines,
+            });
         }
-        let lines = self.render_lines(width);
-        self.cache = Some(RenderCache {
-            content: self.content.clone(),
-            width,
-            lines: lines.clone(),
-        });
-        lines
+        self.cache
+            .as_ref()
+            .map(|cache| cache.lines.as_slice())
+            .unwrap_or_default()
     }
 
     fn render_lines(&self, width: u16) -> Vec<String> {
@@ -161,7 +164,7 @@ impl Component for Text {
 
     fn render(&mut self, area: Rect, buf: &mut Buffer) {
         let lines = self.lines_for_width(area.width);
-        paint_lines(area, buf, &lines);
+        paint_lines(area, buf, lines);
     }
 
     fn handle_event(&mut self, _event: &UiEvent) -> EventResult {

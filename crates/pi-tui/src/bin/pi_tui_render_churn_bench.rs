@@ -103,7 +103,7 @@ impl Component for EditorSim {
 
     fn render(&mut self, area: Rect, buf: &mut Buffer) {
         let lines = self.lines_for_width(area.width);
-        pi_tui::components::util::paint_lines(area, buf, &lines);
+        pi_tui::components::util::paint_lines(area, buf, lines);
     }
 
     fn handle_event(&mut self, _event: &UiEvent) -> EventResult {
@@ -118,27 +118,24 @@ impl Component for EditorSim {
 }
 
 impl EditorSim {
-    fn lines_for_width(&mut self, width: u16) -> Vec<String> {
-        if let (Some(cached_text), Some(cached_width), Some(cached_lines)) =
-            (&self.cached_text, self.cached_width, &self.cached_lines)
-        {
-            if *cached_text == self.text && cached_width == width {
-                return cached_lines.clone();
-            }
+    fn lines_for_width(&mut self, width: u16) -> &[String] {
+        let cache_hit = self.cached_width == Some(width)
+            && self.cached_text.as_deref() == Some(self.text.as_str());
+        if !cache_hit {
+            let border = format!(
+                "\x1b[90m{}\x1b[39m",
+                "─".repeat(usize::from(width.max(2).saturating_sub(2)))
+            );
+            let lines = vec![
+                border.clone(),
+                format!(" > {}▌", self.text),
+                border,
+            ];
+            self.cached_text = Some(self.text.clone());
+            self.cached_width = Some(width);
+            self.cached_lines = Some(lines);
         }
-        let border = format!(
-            "\x1b[90m{}\x1b[39m",
-            "─".repeat(usize::from(width.max(2).saturating_sub(2)))
-        );
-        let lines = vec![
-            border.clone(),
-            format!(" > {}▌", self.text),
-            border,
-        ];
-        self.cached_text = Some(self.text.clone());
-        self.cached_width = Some(width);
-        self.cached_lines = Some(lines.clone());
-        lines
+        self.cached_lines.as_deref().unwrap_or(&[])
     }
 }
 
@@ -182,7 +179,7 @@ impl Component for Transcript {
 
     fn render(&mut self, area: Rect, buf: &mut Buffer) {
         let lines = self.lines_for_width(area.width);
-        pi_tui::components::util::paint_lines(area, buf, &lines);
+        pi_tui::components::util::paint_lines(area, buf, lines);
     }
 
     fn handle_event(&mut self, _event: &UiEvent) -> EventResult {
@@ -196,24 +193,19 @@ impl Component for Transcript {
 }
 
 impl Transcript {
-    fn lines_for_width(&mut self, width: u16) -> Vec<String> {
-        if let (Some(cached_width), Some(cached_wrapped)) =
-            (self.cached_width, &self.cached_wrapped)
-        {
-            if cached_width == width {
-                return cached_wrapped.clone();
+    fn lines_for_width(&mut self, width: u16) -> &[String] {
+        if self.cached_width != Some(width) {
+            // Wrap each transcript line to width using the same text wrapper.
+            let content_width = usize::from(width.max(1));
+            let mut wrapped = Vec::with_capacity(self.lines.len() * 2);
+            for line in &self.lines {
+                let wrapped_lines = pi_tui::text::wrap_text_with_ansi(line, content_width);
+                wrapped.extend(wrapped_lines);
             }
+            self.cached_width = Some(width);
+            self.cached_wrapped = Some(wrapped);
         }
-        // Wrap each transcript line to width using the same text wrapper.
-        let content_width = usize::from(width.max(1));
-        let mut wrapped = Vec::with_capacity(self.lines.len() * 2);
-        for line in &self.lines {
-            let wrapped_lines = pi_tui::text::wrap_text_with_ansi(line, content_width);
-            wrapped.extend(wrapped_lines);
-        }
-        self.cached_width = Some(width);
-        self.cached_wrapped = Some(wrapped.clone());
-        wrapped
+        self.cached_wrapped.as_deref().unwrap_or(&[])
     }
 }
 

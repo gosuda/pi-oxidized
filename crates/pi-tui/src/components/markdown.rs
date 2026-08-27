@@ -318,20 +318,23 @@ impl Markdown {
         }
     }
 
-    fn lines_for_width(&mut self, width: u16) -> Vec<String> {
-        if let Some(cache) = &self.cache
-            && cache.width == width
-            && cache.text == self.text
-        {
-            return cache.lines.clone();
+    fn lines_for_width(&mut self, width: u16) -> &[String] {
+        let cache_hit = match &self.cache {
+            Some(cache) => cache.width == width && cache.text == self.text,
+            None => false,
+        };
+        if !cache_hit {
+            let lines = self.render_lines(width);
+            self.cache = Some(Cache {
+                text: self.text.clone(),
+                width,
+                lines,
+            });
         }
-        let lines = self.render_lines(width);
-        self.cache = Some(Cache {
-            text: self.text.clone(),
-            width,
-            lines: lines.clone(),
-        });
-        lines
+        self.cache
+            .as_ref()
+            .map(|cache| cache.lines.as_slice())
+            .unwrap_or_default()
     }
 }
 
@@ -343,7 +346,7 @@ impl Component for Markdown {
 
     fn render(&mut self, area: Rect, buf: &mut Buffer) {
         let lines = self.lines_for_width(area.width);
-        paint_lines(area, buf, &lines);
+        paint_lines(area, buf, lines);
     }
 
     fn handle_event(&mut self, _event: &UiEvent) -> EventResult {

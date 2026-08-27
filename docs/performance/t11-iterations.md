@@ -169,3 +169,88 @@ base commit and unrelated (verified by stash-and-rerun at base).
 (TUI-CLOSE). `pi/src/modes/interactive/runtime.rs` touched only in
 `render_bottom_clipped` (claim suspension + opaque claims) — TUI-V4 has
 landed and no sibling owns it.
+
+## Iteration 3 — `render-churn-recomposition` (Design C: reference-served line cache)
+
+Commit: see `git log` (`perf(t11)`). Date 2026-08-28.
+
+**Blind derivation** (from the ledger decomposition + iteration 2's residual
+note, before re-reading the component bodies): the ledger's residual class
+"allocator + memcpy + core remainder (~31.4%)" and iteration 2's record —
+"the editor scenario's dominant allocation remains the bench's own
+workload-side `Vec<String>` clone of 150 lines per frame" — point at the
+measure/render seam: cached wrapped lines are re-materialized as an owned
+`Vec<String>` on every serve. Data layout: serve the cache **by borrow** —
+`lines_for_width` returns `&[String]` straight out of the cache; the miss
+path stores the freshly built vector by move (no double clone); the hit path
+allocates nothing. This restores the upstream contract exactly: the reference
+bench's `EditorSim.linesForWidth` returns `this.cachedLines` — a reference
+return, zero copies (`.references/pi/packages/tui/test/render-churn-bench.ts:80-87`).
+The same pattern ships in the production components on the identical seam
+(`Text::lines_for_width`, `Markdown::lines_for_width` — each called from
+`measure` and `render` every frame), so the fix is product work, not bench
+cosmetics: `text.rs`/`markdown.rs` get the borrowed serve, and the bench
+stand-ins (`EditorSim`, `Transcript`) with it.
+
+**Boundary answers** (explicit, before touching): `paint_lines` receives the
+identical `&[String]` content in the identical order — emitted bytes
+unchanged (bench written-bytes metric byte-identical, 10500/11656 total =
+35/38.85 B/frame); `measure` returns the identical `u16` length (layout
+heights unchanged); cache identity predicate unchanged (width + content
+equality) and `invalidate()` still drops the cache, so invalidation semantics
+are preserved; no wire/format surface touched (the seam is interior per the
+ledger's boundary classification).
+
+**Branch classification** (divergence audit of the replaced branches):
+
+| Original branch | Classification | Reason |
+|---|---|---|
+| hit-path `cache.lines.clone()` | residue | serving identical cached content through an owned deep copy; upstream serves a reference |
+| miss-path `lines.clone()` into the cache | residue | double materialization; the fresh vector is stored by move instead |
+| `render_lines(width)` rebuild on content/width change | essential | derivation must happen on a genuine miss; unchanged |
+| cache identity check (width + content equality) | essential | correctness of the cache; unchanged |
+| `measure` length / `paint_lines` cell writes | essential | unchanged behavior, now fed a borrowed slice |
+
+**Measurements** (pinned workload, `pi_tui_render_churn_bench`, release,
+`taskset -c 20-40`, 20 warmup / 300 frames, 100x30, 150 lines; 7 runs per
+side, fresh baselines re-measured this session on ae0595d before the change;
+the box was contended during measurement — load ~10, bimodal run
+distributions — so the contention-robust min-of-7 is the paired estimator,
+medians and cluster RSDs disclosed):
+
+| Scenario | Before (µs/frame) | After (µs/frame) | Win (min-of-7) | Win (median-of-7) | Allocated before -> after | Written before -> after |
+|---|---|---|---|---|---|---|
+| static | 14.3 (min) / 36.8 (median) | 8.2 (min) / 23.3 (median) | 1.75x | 1.58x | 24.7 -> 5.4 KiB/frame | 10500 -> 10500 B |
+| editor | 29.0 (min) / 41.8 (median) | 19.2 (min) / 35.7 (median) | 1.51x | 1.17x | 33.1 -> 13.4 KiB/frame | 11656 -> 11656 B |
+
+Clean-cluster RSDs: baseline static ~4.7%, editor ~8.4%; after static ~6.5%,
+editor ~10.7% — all < 20%. Win gate >=1.05x median: **passed on both
+scenarios under both estimators**. Written bytes are byte-identical — the
+wire surface is unchanged.
+
+**Recomputed multiple**: editor 19.2 us vs the ledger's 1.5 us floor ≈
+**12.8x — still OPEN** (>2x ⇒ logged as intermediate; the unit iterates
+again). Per G10 Finding 5 the terminal exhaustion record must recompute the
+floor from the replacement's own per-line measurement, not cite the
+implementation-derived 1.3 us/line term.
+
+**Next design (reserved, materially distinct — Design D)**: the remaining
+static-scenario allocation (5.4 KiB/frame) is the bench root's visible-window
+materialization — `visible: Vec<String> = all_lines[start..].iter().cloned()
+.collect()` per frame — a deep copy where the upstream `ScrollView` window is
+a shallow `.slice()` of references. Design D serves the window as a borrow
+(`&all_lines[start..]`), restoring upstream workload fidelity; the residual
+after that is measured for the E1-E4 exhaustion record.
+
+**Verification**: 395/395 pi-tui lib tests + integration suites green
+(render-churn verification 3 — including editor>static allocation ordering,
+which still holds: 13.4 > 5.4 KiB/frame; no-flicker PTY 5; state matrix;
+theme 5; static-frame-evidence 1); `cargo clippy -p pi-tui --all-targets
+--release --locked` clean on the changed files (the one new `needless_borrow`
+the change introduced was fixed in-commit; remaining clippy warnings are
+pre-existing in untouched files).
+
+**Not touched (out of scope, file-disjoint)**: `scripts/` (DEPS lane),
+`docs/TUI-CLOSE-*` (TUI-CLOSE), `packages/extension-host` (XC-CLOSE).
+`pi/src/modes/interactive/runtime.rs` untouched this iteration (its
+transcript path renders through the already-fixed `Text`/`Markdown` seam).
