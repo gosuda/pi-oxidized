@@ -141,7 +141,7 @@ and the first two extension steps of that run:
   "machine": {
     "platform": "linux",
     "arch": "x64",
-    "bunVersion": "1.4.0"
+    "bunVersion": "<bun>"
   },
   "paths": {
     "rustBinary": "/target/release/pi",
@@ -157,9 +157,9 @@ and the first two extension steps of that run:
     "markerCount": 32,
     "rustProfile": "rust-compatibility-profile",
     "typescriptProfile": "typescript-compatibility-profile",
-    "rustInitialInstance": "2059190:1787820776315",
-    "rustReloadInstance": "2061596:1787820797649",
-    "typescriptInstance": "2061946:1787820800428"
+    "rustInitialInstance": "<instance>",
+    "rustReloadInstance": "<instance>",
+    "typescriptInstance": "<instance>"
   },
   "steps": [
     {
@@ -169,7 +169,7 @@ and the first two extension steps of that run:
       "detail": {
         "session": "sessions/<ts>.jsonl",
         "entries": 14,
-        "sha256": "5fbc4593b831f3a0fb06535e9da2a744eae7d6e5e1add2d12f493f0b9d25d810"
+        "sha256": "<sha256>"
       }
     },
     {

@@ -1226,7 +1226,7 @@
 			"class": "transcript-claim",
 			"params": {
 				"source": "target/verification/docs-topics/harness/e2e-session.jsonl",
-				"claim": "\"firstKeptEntryId\":\"<id>\""
+				"claim": "\"firstKeptEntryId\": \"<id>\""
 			}
 		},
 		{

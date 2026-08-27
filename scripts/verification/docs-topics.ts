@@ -309,15 +309,17 @@ export function normalizeHarnessText(text: string, rootAbs: string): string {
 		.replace(/run-[A-Za-z0-9_-]+/g, "run-<latest>")
 		.replace(/\d{4}-\d{2}-\d{2}T[0-9:.\\-]+Z(?:_[0-9a-f-]+)?/g, "<ts>")
 		.replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/g, "<uuid>")
-		.replace(/"id":"[0-9a-f]{8}"/g, '"id":"<id>"')
-		.replace(/"([a-zA-Z]*)Id":"[0-9a-f]{8}"/g, '"$1Id":"<id>"')
-		.replace(/"([a-zA-Z]*)Instance":"[^"]*"/g, '"$1Instance":"<instance>"')
-		.replace(/"bunVersion":"[^"]*"/g, '"bunVersion":"<bun>"')
-		.replace(/"sha256":"[0-9a-f]{12,}"/g, '"sha256":"<sha256>"')
-		.replace(/"timestamp":\d{12,}/g, '"timestamp":<ms>')
-		.replace(/"timestamp":"20\d\d-[^"]*"/g, '"timestamp":"<ts>"')
-		.replace(/"startedAt":"[^"]*"/g, '"startedAt":"<ts>"')
-		.replace(/"finishedAt":"[^"]*"/g, '"finishedAt":"<ts>"');
+		.replace(/"id"\s*:\s*"[0-9a-f]{8}"/g, '"id": "<id>"')
+		.replace(/"([a-zA-Z]*)Id"\s*:\s*"[0-9a-f]{8}"/g, '"$1Id": "<id>"')
+		.replace(/"([a-zA-Z]*)Instance"\s*:\s*"[^"]*"/g, '"$1Instance": "<instance>"')
+		.replace(/"instance"\s*:\s*"[^"]*"/g, '"instance": "<instance>"')
+		.replace(/\b\d{1,10}:\d{12,}\b/g, "<instance>")
+		.replace(/"bunVersion"\s*:\s*"[^"]*"/g, '"bunVersion": "<bun>"')
+		.replace(/"sha256[A-Za-z]*"\s*:\s*"[0-9a-f]{12,}"/g, '"sha256": "<sha256>"')
+		.replace(/"timestamp"\s*:\s*\d{12,}/g, '"timestamp": <ms>')
+		.replace(/"timestamp"\s*:\s*"20\d\d-[^"]*"/g, '"timestamp": "<ts>"')
+		.replace(/"startedAt"\s*:\s*"[^"]*"/g, '"startedAt": "<ts>"')
+		.replace(/"finishedAt"\s*:\s*"[^"]*"/g, '"finishedAt": "<ts>"');
 }
 
 /**

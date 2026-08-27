@@ -70,12 +70,12 @@ rewritten by the Rust session layer as:
 
 ```text
 {"type":"session","version":3,"id":"<uuid>","timestamp":"<ts>","cwd":"/tmp/pi-fixtures/cwd"}
-{"type":"message","id":"<id>","parentId":null,"timestamp":"<ts>","message":{"role":"user","content":"V1 U1.","timestamp":<ms>}}
-{"type":"message","id":"<id>","parentId":"<id>","timestamp":"<ts>","message":{"role":"assistant","content":[{"type":"text","text":"V1 A1."}],"api":"anthropic-messages","provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":10,"output":5,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"total":0.0}},"stopReason":"stop","timestamp":<ms>}}
-{"type":"message","id":"<id>","parentId":"<id>","timestamp":"<ts>","message":{"role":"user","content":"V1 U2.","timestamp":<ms>}}
-{"type":"message","id":"<id>","parentId":"<id>","timestamp":"<ts>","message":{"role":"assistant","content":[{"type":"text","text":"V1 A2."}],"api":"anthropic-messages","provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":10,"output":5,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"total":0.0}},"stopReason":"stop","timestamp":<ms>}}
-{"type":"message","id":"<id>","parentId":"<id>","timestamp":"<ts>","message":{"role":"user","content":"V1 U3 kept.","timestamp":<ms>}}
-{"type":"message","id":"<id>","parentId":"<id>","timestamp":"<ts>","message":{"role":"assistant","content":[{"type":"text","text":"V1 A3 kept."}],"api":"anthropic-messages","provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":10,"output":5,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"total":0.0}},"stopReason":"stop","timestamp":<ms>}}
+{"type":"message","id": "<id>","parentId":null,"timestamp":"<ts>","message":{"role":"user","content":"V1 U1.","timestamp": <ms>}}
+{"type":"message","id": "<id>","parentId": "<id>","timestamp":"<ts>","message":{"role":"assistant","content":[{"type":"text","text":"V1 A1."}],"api":"anthropic-messages","provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":10,"output":5,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"total":0.0}},"stopReason":"stop","timestamp": <ms>}}
+{"type":"message","id": "<id>","parentId": "<id>","timestamp":"<ts>","message":{"role":"user","content":"V1 U2.","timestamp": <ms>}}
+{"type":"message","id": "<id>","parentId": "<id>","timestamp":"<ts>","message":{"role":"assistant","content":[{"type":"text","text":"V1 A2."}],"api":"anthropic-messages","provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":10,"output":5,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"total":0.0}},"stopReason":"stop","timestamp": <ms>}}
+{"type":"message","id": "<id>","parentId": "<id>","timestamp":"<ts>","message":{"role":"user","content":"V1 U3 kept.","timestamp": <ms>}}
+{"type":"message","id": "<id>","parentId": "<id>","timestamp":"<ts>","message":{"role":"assistant","content":[{"type":"text","text":"V1 A3 kept."}],"api":"anthropic-messages","provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":10,"output":5,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"total":0.0}},"stopReason":"stop","timestamp": <ms>}}
 <!-- doc-c:fence=session-format.04 source=target/verification/docs-topics/harness/session-interop-v1-continued.jsonl -->
 ```
 
@@ -136,11 +136,11 @@ Rust-produced fork of the basic session:
 
 ```text
 {"type":"session","version":3,"id":"<uuid>","timestamp":"<ts>","cwd":"/target/verification/session-interop/v3/basic","parentSession":"/target/verification/session-interop/v3/basic/continued.jsonl"}
-{"id":"<id>","message":{"content":"What is 2+2?","role":"user","timestamp":<ms>},"parentId":null,"timestamp":"<ts>","type":"message"}
-{"id":"<id>","message":{"api":"anthropic-messages","content":[{"text":"2+2 = 4.","type":"text"}],"model":"claude-sonnet-4-5","provider":"anthropic","role":"assistant","stopReason":"stop","timestamp":<ms>,"usage":{"cacheRead":0,"cacheWrite":0,"input":10,"output":5}},"parentId":"<id>","timestamp":"<ts>","type":"message"}
-{"id":"<id>","message":{"content":"And 3+3?","role":"user","timestamp":<ms>},"parentId":"<id>","timestamp":"<ts>","type":"message"}
-{"id":"<id>","message":{"api":"anthropic-messages","content":[{"text":"3+3 = 6.","type":"text"}],"model":"claude-sonnet-4-5","provider":"anthropic","role":"assistant","stopReason":"stop","timestamp":<ms>,"usage":{"cacheRead":0,"cacheWrite":0,"input":10,"output":5}},"parentId":"<id>","timestamp":"<ts>","type":"message"}
-{"id":"<id>","message":{"api":"anthropic-messages","content":[{"text":"Rust interop continuation","type":"text"}],"model":"claude-test","provider":"anthropic","role":"assistant","stopReason":"stop","timestamp":42,"usage":{"cacheRead":0,"cacheWrite":0,"cost":{"cacheRead":0.0,"cacheWrite":0.0,"input":0.0,"output":0.0,"total":0.0},"input":1,"output":1,"totalTokens":2}},"parentId":"<id>","timestamp":"<ts>","type":"message"}
+{"id": "<id>","message":{"content":"What is 2+2?","role":"user","timestamp": <ms>},"parentId":null,"timestamp":"<ts>","type":"message"}
+{"id": "<id>","message":{"api":"anthropic-messages","content":[{"text":"2+2 = 4.","type":"text"}],"model":"claude-sonnet-4-5","provider":"anthropic","role":"assistant","stopReason":"stop","timestamp": <ms>,"usage":{"cacheRead":0,"cacheWrite":0,"input":10,"output":5}},"parentId": "<id>","timestamp":"<ts>","type":"message"}
+{"id": "<id>","message":{"content":"And 3+3?","role":"user","timestamp": <ms>},"parentId": "<id>","timestamp":"<ts>","type":"message"}
+{"id": "<id>","message":{"api":"anthropic-messages","content":[{"text":"3+3 = 6.","type":"text"}],"model":"claude-sonnet-4-5","provider":"anthropic","role":"assistant","stopReason":"stop","timestamp": <ms>,"usage":{"cacheRead":0,"cacheWrite":0,"input":10,"output":5}},"parentId": "<id>","timestamp":"<ts>","type":"message"}
+{"id": "<id>","message":{"api":"anthropic-messages","content":[{"text":"Rust interop continuation","type":"text"}],"model":"claude-test","provider":"anthropic","role":"assistant","stopReason":"stop","timestamp":42,"usage":{"cacheRead":0,"cacheWrite":0,"cost":{"cacheRead":0.0,"cacheWrite":0.0,"input":0.0,"output":0.0,"total":0.0},"input":1,"output":1,"totalTokens":2}},"parentId": "<id>","timestamp":"<ts>","type":"message"}
 <!-- doc-c:fence=session-format.07 source=target/verification/docs-topics/harness/session-interop-fork.jsonl -->
 ```
 
@@ -151,10 +151,10 @@ the same shape and chains onto the previous leaf:
 
 ```text
 {"type":"session","version":3,"id":"<uuid>","timestamp":"<ts>","cwd":"/tmp/pi-fixtures/cwd"}
-{"type":"message","id":"<id>","parentId":null,"timestamp":"<ts>","message":{"role":"user","content":"What is 2+2?","timestamp":<ms>}}
-{"type":"message","id":"<id>","parentId":"<id>","timestamp":"<ts>","message":{"role":"assistant","content":[{"type":"text","text":"2+2 = 4."}],"api":"anthropic-messages","provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":10,"output":5,"cacheRead":0,"cacheWrite":0},"stopReason":"stop","timestamp":<ms>}}
-{"type":"message","id":"<id>","parentId":"<id>","timestamp":"<ts>","message":{"role":"user","content":"And 3+3?","timestamp":<ms>}}
-{"type":"message","id":"<id>","parentId":"<id>","timestamp":"<ts>","message":{"role":"assistant","content":[{"type":"text","text":"3+3 = 6."}],"api":"anthropic-messages","provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":10,"output":5,"cacheRead":0,"cacheWrite":0},"stopReason":"stop","timestamp":<ms>}}
+{"type":"message","id": "<id>","parentId":null,"timestamp":"<ts>","message":{"role":"user","content":"What is 2+2?","timestamp": <ms>}}
+{"type":"message","id": "<id>","parentId": "<id>","timestamp":"<ts>","message":{"role":"assistant","content":[{"type":"text","text":"2+2 = 4."}],"api":"anthropic-messages","provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":10,"output":5,"cacheRead":0,"cacheWrite":0},"stopReason":"stop","timestamp": <ms>}}
+{"type":"message","id": "<id>","parentId": "<id>","timestamp":"<ts>","message":{"role":"user","content":"And 3+3?","timestamp": <ms>}}
+{"type":"message","id": "<id>","parentId": "<id>","timestamp":"<ts>","message":{"role":"assistant","content":[{"type":"text","text":"3+3 = 6."}],"api":"anthropic-messages","provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":10,"output":5,"cacheRead":0,"cacheWrite":0},"stopReason":"stop","timestamp": <ms>}}
 <!-- doc-c:fence=session-format.08 source=target/verification/docs-topics/harness/session-interop-v3-continued.jsonl -->
 ```
 
@@ -163,11 +163,11 @@ entry kept after the cut, and the token count before compaction:
 
 ```text
 {"type":"session","version":3,"id":"<uuid>","timestamp":"<ts>","cwd":"/tmp/pi-fixtures/cwd"}
-{"type":"message","id":"<id>","parentId":null,"timestamp":"<ts>","message":{"role":"user","content":"V1 U1.","timestamp":<ms>}}
-{"type":"message","id":"<id>","parentId":"<id>","timestamp":"<ts>","message":{"role":"assistant","content":[{"type":"text","text":"V1 A1."}],"api":"anthropic-messages","provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":10,"output":5,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"total":0.0}},"stopReason":"stop","timestamp":<ms>}}
-{"type":"message","id":"<id>","parentId":"<id>","timestamp":"<ts>","message":{"role":"user","content":"V1 U2.","timestamp":<ms>}}
-{"type":"message","id":"<id>","parentId":"<id>","timestamp":"<ts>","message":{"role":"assistant","content":[{"type":"text","text":"V1 A2."}],"api":"anthropic-messages","provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":10,"output":5,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"total":0.0}},"stopReason":"stop","timestamp":<ms>}}
-{"type":"message","id":"<id>","parentId":"<id>","timestamp":"<ts>","message":{"role":"user","content":"V1 U3 kept.","timestamp":<ms>}}
+{"type":"message","id": "<id>","parentId":null,"timestamp":"<ts>","message":{"role":"user","content":"V1 U1.","timestamp": <ms>}}
+{"type":"message","id": "<id>","parentId": "<id>","timestamp":"<ts>","message":{"role":"assistant","content":[{"type":"text","text":"V1 A1."}],"api":"anthropic-messages","provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":10,"output":5,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"total":0.0}},"stopReason":"stop","timestamp": <ms>}}
+{"type":"message","id": "<id>","parentId": "<id>","timestamp":"<ts>","message":{"role":"user","content":"V1 U2.","timestamp": <ms>}}
+{"type":"message","id": "<id>","parentId": "<id>","timestamp":"<ts>","message":{"role":"assistant","content":[{"type":"text","text":"V1 A2."}],"api":"anthropic-messages","provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":10,"output":5,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"total":0.0}},"stopReason":"stop","timestamp": <ms>}}
+{"type":"message","id": "<id>","parentId": "<id>","timestamp":"<ts>","message":{"role":"user","content":"V1 U3 kept.","timestamp": <ms>}}
 <!-- doc-c:fence=session-format.09 source=target/verification/docs-topics/harness/session-interop-v1-continued.jsonl -->
 ```
 

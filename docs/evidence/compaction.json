@@ -20,7 +20,7 @@
 		{
 			"rowId": "dc-claim-compaction-2",
 			"source": "target/verification/docs-topics/harness/e2e-session.jsonl",
-			"claim": "\"firstKeptEntryId\":\"<id>\""
+			"claim": "\"firstKeptEntryId\": \"<id>\""
 		},
 		{
 			"rowId": "dc-claim-compaction-3",
