@@ -111,7 +111,7 @@ jobs:
           ldd_status=$?
           set -e
           cat "$EVIDENCE/pi-ldd.txt"
-          grep -Fq 'not a dynamic executable' "$EVIDENCE/pi-ldd.txt"
+          grep -Eq 'not a dynamic executable|statically linked' "$EVIDENCE/pi-ldd.txt"
           printf 'ldd_exit=%s\n' "$ldd_status" >> "$EVIDENCE/pi-ldd.txt"
 
           fetch() {
@@ -144,6 +144,7 @@ jobs:
             local label="$2"
             local pinned_loader="/lib/$MUSL_LOADER"
             local allowed_prefix="$USERLAND_DIR/"
+            local re='^[[:space:]]*(/[^[:space:](]+)'
             local line path
             while IFS= read -r line || [[ -n "$line" ]]; do
               [[ -z "$line" ]] && continue
@@ -151,7 +152,7 @@ jobs:
                 path="${line#*=> }"
                 path="${path%% (*}"
                 path="${path%"${path##*[![:space:]]}"}"
-              elif [[ "$line" =~ ^[[:space:]]*(/[^[:space:](]+) ]]; then
+              elif [[ "$line" =~ $re ]]; then
                 path="${BASH_REMATCH[1]}"
               else
                 continue
@@ -207,9 +208,9 @@ jobs:
             rm -rf "$pkginfo_dir"
             mkdir -p "$pkginfo_dir"
             tar -xzf "$EVIDENCE/downloads/$apk_name" -C "$pkginfo_dir" .PKGINFO
-            grep -Fx "pkgname=$package" "$pkginfo_dir/.PKGINFO"
-            grep -Fx "pkgver=$ALPINE_GCC_RUNTIME_VERSION" "$pkginfo_dir/.PKGINFO"
-            grep -Fx "arch=$ALPINE_ARCH" "$pkginfo_dir/.PKGINFO"
+            grep -Fx "pkgname = $package" "$pkginfo_dir/.PKGINFO"
+            grep -Fx "pkgver = $ALPINE_GCC_RUNTIME_VERSION" "$pkginfo_dir/.PKGINFO"
+            grep -Fx "arch = $ALPINE_ARCH" "$pkginfo_dir/.PKGINFO"
             cp "$pkginfo_dir/.PKGINFO" "$EVIDENCE/downloads/$package.PKGINFO"
             tar -xzf "$EVIDENCE/downloads/$apk_name" -C "$USERLAND_DIR" usr/lib
           done
@@ -227,9 +228,9 @@ jobs:
             bun install --frozen-lockfile
             bun build ./src/main.ts --compile --minify \
               --compile-autoload-tsconfig --compile-autoload-package-json \
-              --target "$BUN_COMPILE_TARGET" --outfile "$GITHUB_WORKSPACE/$STAGE/pi-extension-host"
+              --target "$BUN_COMPILE_TARGET" --outfile "../../$STAGE/pi-extension-host"
             bun build ./src/main.ts --target bun --minify \
-              --outfile "$GITHUB_WORKSPACE/$STAGE/pi-extension-host.js"
+              --outfile "../../$STAGE/pi-extension-host.js"
           )
           bun_url="https://github.com/oven-sh/bun/releases/download/bun-v$BUN_VERSION/$BUN_ASSET"
           fetch "$bun_url" "$EVIDENCE/downloads/$BUN_ASSET" "$BUN_ASSET_SHA256" \
@@ -533,7 +534,7 @@ jobs:
           ldd_status=$?
           set -e
           cat "$EVIDENCE/pi-ldd.txt"
-          grep -Fq 'not a dynamic executable' "$EVIDENCE/pi-ldd.txt"
+          grep -Eq 'not a dynamic executable|statically linked' "$EVIDENCE/pi-ldd.txt"
           printf 'ldd_exit=%s\n' "$ldd_status" >> "$EVIDENCE/pi-ldd.txt"
 
           fetch() {
@@ -566,6 +567,7 @@ jobs:
             local label="$2"
             local pinned_loader="/lib/$MUSL_LOADER"
             local allowed_prefix="$USERLAND_DIR/"
+            local re='^[[:space:]]*(/[^[:space:](]+)'
             local line path
             while IFS= read -r line || [[ -n "$line" ]]; do
               [[ -z "$line" ]] && continue
@@ -573,7 +575,7 @@ jobs:
                 path="${line#*=> }"
                 path="${path%% (*}"
                 path="${path%"${path##*[![:space:]]}"}"
-              elif [[ "$line" =~ ^[[:space:]]*(/[^[:space:](]+) ]]; then
+              elif [[ "$line" =~ $re ]]; then
                 path="${BASH_REMATCH[1]}"
               else
                 continue
@@ -629,9 +631,9 @@ jobs:
             rm -rf "$pkginfo_dir"
             mkdir -p "$pkginfo_dir"
             tar -xzf "$EVIDENCE/downloads/$apk_name" -C "$pkginfo_dir" .PKGINFO
-            grep -Fx "pkgname=$package" "$pkginfo_dir/.PKGINFO"
-            grep -Fx "pkgver=$ALPINE_GCC_RUNTIME_VERSION" "$pkginfo_dir/.PKGINFO"
-            grep -Fx "arch=$ALPINE_ARCH" "$pkginfo_dir/.PKGINFO"
+            grep -Fx "pkgname = $package" "$pkginfo_dir/.PKGINFO"
+            grep -Fx "pkgver = $ALPINE_GCC_RUNTIME_VERSION" "$pkginfo_dir/.PKGINFO"
+            grep -Fx "arch = $ALPINE_ARCH" "$pkginfo_dir/.PKGINFO"
             cp "$pkginfo_dir/.PKGINFO" "$EVIDENCE/downloads/$package.PKGINFO"
             tar -xzf "$EVIDENCE/downloads/$apk_name" -C "$USERLAND_DIR" usr/lib
           done
@@ -649,9 +651,9 @@ jobs:
             bun install --frozen-lockfile
             bun build ./src/main.ts --compile --minify \
               --compile-autoload-tsconfig --compile-autoload-package-json \
-              --target "$BUN_COMPILE_TARGET" --outfile "$GITHUB_WORKSPACE/$STAGE/pi-extension-host"
+              --target "$BUN_COMPILE_TARGET" --outfile "../../$STAGE/pi-extension-host"
             bun build ./src/main.ts --target bun --minify \
-              --outfile "$GITHUB_WORKSPACE/$STAGE/pi-extension-host.js"
+              --outfile "../../$STAGE/pi-extension-host.js"
           )
           bun_url="https://github.com/oven-sh/bun/releases/download/bun-v$BUN_VERSION/$BUN_ASSET"
           fetch "$bun_url" "$EVIDENCE/downloads/$BUN_ASSET" "$BUN_ASSET_SHA256" \
