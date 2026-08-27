@@ -4,7 +4,7 @@
 |---|---|
 | Issue | [#63][issue-63] `TUI-G6` (routed decision: presentation and color policy) |
 | Decision type | Recorded decision, not implementation |
-| Status | RATIFIED (four pins settled; decision-only record) |
+| Status | RATIFIED (four pins settled; rulings 1-2 remediations landed; decision-only record) |
 | Deliverable | This document and the matching commit, and only these |
 | Remediation owners | [TUI-T2 #74][issue-74] (color depth), [TUI-T3 #73][issue-73] (hyperlinks) |
 | Verification | [TUI-P2 #58][issue-58], [TUI-V5 #79][issue-79] |
@@ -19,8 +19,8 @@
 
 | Ruling | Verdict | Parity status | Owner | Verification |
 |---|---|---|---|---|
-| 1. Color depth (`caps.true_color`) | Fix: capability-driven `ColorMode` selection is the pinned end state | Current hardcoded `ColorMode::Truecolor` sites recorded as a standing divergence | TUI-T2 #74 | TUI-P2 #58, TUI-V5 #79 |
-| 2. Hyperlinks (`caps.hyperlinks`) | Fix: honor the capability at markdown surfaces, URL-text fallback otherwise | Current hardcoded-off state recorded as a standing divergence | TUI-T3 #73 | TUI-V5 #79 |
+| 1. Color depth (`caps.true_color`) | Fix: capability-driven `ColorMode` selection is the pinned end state | Remediated by TUI-T2 (04f91de, dc9d412): runtime depth is capability-driven; `Truecolor` literals remain only at headless export | TUI-T2 #74 (landed) | TUI-P2 #58 (closed), TUI-V5 #79 |
+| 2. Hyperlinks (`caps.hyperlinks`) | Fix: honor the capability at markdown surfaces, URL-text fallback otherwise | Remediated by TUI-T3 (583b2f5, 701bdd3): markdown surfaces honor `caps.hyperlinks` with URL-text fallback | TUI-T3 #73 (landed) | TUI-V5 #79 |
 | 3. Extension `setTheme` guardrails | Accept unchecked palettes | Exact reference parity, not a divergence | None (no code change) | TUI-V5 #79 measures, never gates |
 | 4. ANSI-256 to RGB transform | Byte-lock the `55 + 40·v` closed form | Settled parity across all four converters | None; any change is a new recorded divergence | Byte equality of the four sites |
 
@@ -32,8 +32,10 @@ guardrails, and the ANSI-256 quantization rule used by HTML export and theme con
 
 Under the repository parity doctrine (issue #25), the TypeScript reference tree
 (`.references/pi/…`) is canonical and every deviation is an explicit, recorded decision. Two of
-the four rulings below fix a gap toward the reference and record the current Rust state as a
-standing divergence pending its remediation ticket. One ruling accepts current behavior as exact
+the four rulings below fixed a gap toward the reference and recorded the then-current Rust state
+as a standing divergence pending its remediation ticket; both remediations have since landed (TUI-T2
+commits 04f91de and dc9d412; TUI-T3 commits 583b2f5 and 701bdd3), and this record's Rust witness
+sections have been refreshed to the landed state. One ruling accepts current behavior as exact
 parity. One ruling locks an already-agreeing transform so it cannot drift. This record establishes
 policy only and makes no code changes.
 
@@ -43,8 +45,9 @@ policy only and makes no code changes.
 
 `caps.true_color`-driven `ColorMode` selection is the pinned end state. The Rust engine must
 derive the render depth from detected terminal capabilities exactly as the reference does. The
-current Rust constants (`ColorMode::Truecolor` at every resolution site) are recorded as a
-standing divergence until remediation lands.
+current Rust constants (`ColorMode::Truecolor` at every resolution site) were recorded as a
+standing divergence pending remediation. TUI-T2 landed the remediation (04f91de, dc9d412);
+the Rust witnesses below describe the post-remediation state.
 
 ### Reference witnesses
 
@@ -58,30 +61,36 @@ standing divergence until remediation lands.
 
 ### Rust witnesses
 
-- Engine tail hardcodes the depth. `crates/pi/src/modes/interactive/theme.rs:1676`, `:1679`, and
-  `:1683` (inside `resolve_active_theme`'s load path) pass `ColorMode::Truecolor` to
-  `load_or_dark` / `load_by_name` unconditionally.
-- Every runtime resolution site funnels there:
-  - `crates/pi/src/modes/interactive/runtime.rs:5083` (`startup_theme`) resolves the initial theme.
-  - `runtime.rs:3806-3810` (`apply_theme_from_settings`) resolves on `/reload` and
-    settings-driven changes, resolving at line 3809.
-  - `runtime.rs:3852-3854` (`handle_extension_theme_set`, non-persist fallback) calls
-    `load_or_dark(&name, ColorMode::Truecolor)` at line 3854.
-  - `runtime.rs:3895` resolves after storage-driven reapply.
-  - `runtime.rs:4018` resolves theme family selection.
-  - `runtime.rs:5184` builds the `theme.update` catalog via
-    `available_themes(ColorMode::Truecolor)`.
-- Headless export pins the same depth outside the runtime:
+- The engine resolves depth from a caller-supplied mode.
+  `crates/pi/src/modes/interactive/theme.rs:1687-1711` (`resolve_active_theme`) takes a
+  `color_mode: ColorMode` parameter and threads it into every load: `load_or_dark(&member,
+  color_mode)`, `load_by_name(&paired, color_mode)`, and `load_or_dark(base, color_mode)`.
+- The depth derives from the capability. `runtime.rs:3809-3815` (`color_mode`) maps
+  `self.true_color` to `ColorMode::Truecolor` or `ColorMode::Palette256`; the field is cached
+  from `options.caps.true_color` at `runtime.rs:1525`, and the startup entry passes the same
+  capability check inline at `runtime.rs:6659-6664`.
+- Every runtime resolution site passes it:
+  - `runtime.rs:3819-3823` (`apply_theme_from_settings`) resolves on `/reload` and
+    settings-driven changes with `self.color_mode()` at line 3822.
+  - `runtime.rs:3851-3875` (`handle_extension_theme_set`) resolves the persist branch at line
+    3865 and falls back to `load_or_dark(&name, self.color_mode())` at line 3867.
+  - `runtime.rs:3909` resolves after storage-driven reapply.
+  - `runtime.rs:4032` resolves theme family selection.
+  - `runtime.rs:5092-5099` (`startup_theme`) resolves the initial theme at line 5098.
+  - `runtime.rs:5195-5200` (`build_theme_update`) builds the `theme.update` catalog via
+    `available_themes(color_mode)`.
+- Headless export keeps a fixed depth outside the runtime:
   `crates/pi/src/core/export_html/mod.rs:258` (`built_in` uses
-  `load_or_dark(name, ColorMode::Truecolor)`) and `:301` (`resolve_export_theme` resolves through
-  `resolve_active_theme`). Export has no live terminal, so a fixed depth there is inherent to the
-  surface; the divergence being recorded is the interactive path, where a terminal exists and is
-  not asked.
-- Capabilities are detected and carried but never consulted for depth. `runtime.rs:743` runs
-  `TerminalCapabilities::detect()` inside `Options::detect`, and `runtime.rs:617-618` declares the
-  `caps` field, yet its live consumers are background polarity (`runtime.rs:747`, `:6594`), kitty
-  keyboard state (`runtime.rs:6595`), and the host capability push (`runtime.rs:6608`). No code
-  path reads `caps.true_color`.
+  `load_or_dark(name, ColorMode::Truecolor)`) and `:301` (`resolve_export_theme` passes
+  `ColorMode::Truecolor` explicitly). Export has no live terminal, so a fixed depth there is
+  inherent to the surface; TUI-T2's close review ratified these literals as the allowed
+  remaining sites.
+- Capabilities are detected, carried, and consulted for depth: `runtime.rs:743` runs
+  `TerminalCapabilities::detect()` inside `Options::detect`, `runtime.rs:617-618` declares the
+  `caps` field, and `caps.true_color` is read at `runtime.rs:1525` and `:6659`. Remaining
+  non-depth consumers are background polarity (`runtime.rs:747`), hyperlink seeding
+  (`runtime.rs:1592`), the host capability push (`runtime.rs:6628`), and kitty keyboard state
+  (`runtime.rs:6615`).
 
 ### Rationale
 
@@ -101,8 +110,9 @@ permanent compatibility regression on 256-color terminals.
 ### Owner
 
 TUI-T2 [#74][issue-74] (classifier: PASS; existing-token selection at existing render sites).
-Verification after implementation: TUI-P2 [#58][issue-58] and TUI-V5 [#79][issue-79]. This record
-verifies nothing by itself.
+Remediation landed in 04f91de and dc9d412; issue #74 is closed. Verification: TUI-P2
+[#58][issue-58] verified and closed; TUI-V5 [#79][issue-79] remains open. This record verifies
+nothing by itself.
 
 ## 3. Ruling 2: honor `caps.hyperlinks` at markdown surfaces
 
@@ -110,8 +120,9 @@ verifies nothing by itself.
 
 Markdown render surfaces honor the detected `caps.hyperlinks` capability: OSC 8 hyperlink
 encoding when the terminal advertises support, and the text-form fallback (URL printed in
-parentheses when it differs from the link text) otherwise. The current hardcoded-off state is
-recorded as a standing divergence until remediation lands.
+parentheses when it differs from the link text) otherwise. The hardcoded-off state was recorded
+as a standing divergence until TUI-T3 landed the remediation (583b2f5, 701bdd3); the Rust
+witnesses below describe the post-remediation state.
 
 ### Reference witnesses
 
@@ -126,17 +137,23 @@ recorded as a standing divergence until remediation lands.
 - The seam already exists and is caller-driven in `crates/pi-tui/src/components/markdown.rs`:
   - `:161-162` declares `pub hyperlinks: bool` under the documented contract "caller supplies
     capability".
-  - `:217-220` provides `set_hyperlinks` (option write plus cache invalidation).
-  - `:623-624` is the render-time gate mirroring `markdown.ts:692`, with the same URL-text
+  - `:217-218` provides `set_hyperlinks` (option write plus cache invalidation).
+  - `:623` is the render-time gate mirroring `markdown.ts:692`, with the same URL-text
     fallback shape.
-- The product hardcodes it off:
-  - `crates/pi/src/modes/interactive/theme.rs:992-998` (`user_markdown_options`) sets
-    `hyperlinks: false` at line 996.
-  - `MarkdownOptions::default()` (derived `Default`, `markdown.rs:154-163`) leaves the flag
-    `false`, and the product constructs it directly at `header.rs:38`,
-    `messages.rs:206`, `:268`, `:473`, `:500`, `:527`, `:554`, and `startup.rs:142`, `:302`
-    (all under `crates/pi/src/modes/interactive/`). `messages.rs:335` routes through
-    `user_markdown_options`, which is equally off.
+- The product wires the capability through:
+  - `runtime.rs:1592` (`seed_view`) seeds `view.hyperlinks = options.caps.hyperlinks` onto
+    `ViewState` (`state.rs:83-86` declares the field).
+  - `view.rs:60-64` (`compose`) wraps the whole view composition in
+    `theme::with_hyperlinks(state.hyperlinks, …)`, the thread-local declared at
+    `theme.rs:539` with its accessor at `:544-548`.
+  - `user_markdown_options` (`theme.rs:1012-1018`) reads that thread-local, mirroring the
+    reference's environmental `getCapabilities().hyperlinks` check; every markdown call site
+    routes through it (`messages.rs:206`, `:268`, `:335`, `:473`, `:500`, `:527`, `:554`). The
+    former direct `MarkdownOptions::default()` constructions in `header.rs` and `startup.rs`
+    are gone.
+  - TUI-T3's wire pass (701bdd3) carries OSC 8 hyperlink regions through the raw wire channel
+    to capable terminals, with a writer payload test pinning the exact bytes; incapable
+    terminals keep the URL-text fallback.
 
 ### Rationale
 
@@ -176,8 +193,8 @@ is exact reference parity, not a divergence, and requires no code change.
 
 ### Rust witnesses
 
-- `crates/pi/src/modes/interactive/runtime.rs:3838-3858` (`handle_extension_theme_set`): the
-  object form goes through `resolved_theme_from_wire` (`runtime.rs:5153-5174`), which ignores
+- `crates/pi/src/modes/interactive/runtime.rs:3851-3875` (`handle_extension_theme_set`): the
+  object form goes through `resolved_theme_from_wire` (`runtime.rs:5168-5189`), which ignores
   unknown slots, resets missing slots, and performs no contrast or hue checks; the name form
   resolves through the engine and optionally persists. This matches the unchecked reference
   behavior.
@@ -186,9 +203,9 @@ is exact reference parity, not a divergence, and requires no code change.
 
 ### The 4.5 threshold stays a test-scoped, built-in-only oracle
 
-`crates/pi/src/modes/interactive/theme.rs:2364-2411` (the `NATIVE_CONTRAST_PAIRS` admission
-oracle), `:2591` (`contrast_ratio`), `:2652-2654` (`ciede2000`), and the `measured >= 4.5`
-assertion at `:2824-2828` all live inside `mod tests` (`:1872`). The oracle constrains shipped
+`crates/pi/src/modes/interactive/theme.rs:2456-2500` (the `NATIVE_CONTRAST_PAIRS` admission
+oracle), `:2679` (`contrast_ratio`), `:2741-2747` (`ciede2000`), and the `measured >= 4.5`
+assertion at `:2912-2915` all live inside `mod tests` (`:1897`). The oracle constrains shipped
 built-in palettes only. It never runs against extension input and must not be promoted into a
 runtime gate.
 
@@ -257,20 +274,22 @@ ticket.
   change.
 - The extension protocol surface (`ThemeSet`, `crates/pi-ext/src/protocol.rs:1417`) is out of
   scope for both remediation tickets.
-- The two standing divergences (rulings 1 and 2) remain recorded as divergences in this document
-  until their owners land; closing either divergence requires the owning ticket, not an edit to
-  this record's verdicts.
+- The two standing divergences (rulings 1 and 2) were closed by their owners: TUI-T2 landed
+  capability-driven depth (04f91de, dc9d412) and TUI-T3 landed hyperlink wiring (583b2f5,
+  701bdd3). Their witness sections record the landed state; this record's verdicts are
+  unchanged by those landings and by this refresh.
 
 ## 7. Verification boundary
 
 - This record is decision-only: nothing here is verified by running code, and no test, build,
   formatter, or linter run accompanies it.
-- After TUI-T2 lands: TUI-P2 [#58][issue-58] (deterministic contrast measurement prototype) and
-  TUI-V5 [#79][issue-79] (theme and contrast matrix with numeric oracle) verify that depth
-  selection follows `caps.true_color` and that both depth modes render the built-in palette set
-  legibly.
-- After TUI-T3 lands: PTY-level transcript assertions verify that OSC 8 emission follows
-  `caps.hyperlinks` and that incapable terminals receive the URL-text fallback.
+- TUI-T2 landed (04f91de, dc9d412); TUI-P2 [#58][issue-58] verified and closed. TUI-V5
+  [#79][issue-79] (theme and contrast matrix with numeric oracle) remains the open
+  verification that depth selection follows `caps.true_color` and that both depth modes render
+  the built-in palette set legibly.
+- TUI-T3 landed (583b2f5, 701bdd3); its close evidence includes PTY-level transcript
+  assertions that OSC 8 emission follows `caps.hyperlinks` and that incapable terminals
+  receive the URL-text fallback.
 - Ruling 3 needs no verification ticket: TUI-V5 [#79][issue-79] measures contrast outcomes and
   never gates on them.
 - Ruling 4 is verified by byte equality of the four witness sites, which holds today; any future
