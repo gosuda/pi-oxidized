@@ -22,7 +22,8 @@ implicitly carries a crossterm major, and a crossterm major is executed only as
 the ratatui pairing bump. The unit moves as **exactly one atomic commit**
 `chore(deps)!: bump ratatui+crossterm <from>→<to> (<pairing feature>)` touching
 the three manifests (crates/pi/Cargo.toml, crates/pi-ext/Cargo.toml,
-crates/pi-tui/Cargo.toml), both lockfiles per the lockfile law, and the source
+crates/pi-tui/Cargo.toml), the `Cargo.lock` diff per the lockfile law
+(Cargo-only unit; the Bun lockfile is untouched), and the source
 callsites the API break forces — nothing else. The unit is Class S (every crate
 member links into the shipped `pi` binary on non-dev edges) and carries the full
 post-audit of §7.
@@ -64,18 +65,25 @@ drops the old one, the pin's feature string must move with it.
   `ratatui-crossterm 0.1.2`. There are no duplicate crossterm majors in the
   graph today; preserving that singleton is the invariant the rule protects.
 - Zero `ratatui::crossterm` re-export uses exist in the tree (census §3): every
-  crossterm call goes through the direct `=0.29.0` dep. Type unification between
-  our direct crossterm types and the backend's is therefore mediated *solely* by
-  the `crossterm_0_29` feature resolution — the coupling is invisible to the
-  compiler until it breaks.
+  crossterm call goes through the direct `=0.29.0` dep. The singleton is
+  therefore a *resolution* fact, not a source-level fact: the exact pins plus
+  the `crossterm_0_29` feature keep the backend and the direct terminal code on
+  one crate instance, and nothing in the source would stop a manifest edit from
+  splitting it (§2.3). The coupling is enforced by the commit law of §1, which
+  is exactly why it must be codified.
 
-### 2.3 Breakage modes of an independent move
+### 2.3 Consequences of an independent move
+
+The issue's wording is precise: moving crossterm alone **breaks the
+`crossterm_0_29` feature pairing** — the feature-selected configuration that
+describes which crossterm major the backend speaks — even where the tree still
+compiles. Verified mechanics per move:
 
 | Move | Consequence |
 | --- | --- |
-| crossterm alone → 0.30 | `ratatui-crossterm` still pairs 0.29 via `crossterm_0_29`; two crossterm majors resolve in the graph. `CrosstermBackend<FrameSink>` (crates/pi-tui/src/terminal/writer.rs:213,256) and the direct `EventStream` (crates/pi-tui/src/terminal/input.rs:5,142) become different crate instances: `crossterm::event::Event` from the input task is no longer the event type the backend pair speaks, raw-mode state duplicates (`enable_raw_mode` from two majors, guard.rs:15), and the sole-owner doctrine (T9) silently splits across two event loops. |
-| ratatui alone → next major | the new facade's pairing feature names a crossterm major we do not pin; either the feature no longer exists (build failure) or it resolves a second crossterm major into the lock, reproducing the same split as above with the roles reversed. |
-| Both, as two commits | the intermediate commit is a broken tree on the TUI surface even if `cargo build` passes feature resolution — exactly the state §6's PTY evidence exists to reject. |
+| crossterm alone → 0.30 | `ratatui-crossterm` keeps pairing 0.29 via `crossterm_0_29` while the three direct deps resolve 0.30: **two crossterm majors** land in the lock and the shipped binary (`cargo tree -d` shows the dup). No compile error and no immediate misbehavior — no crossterm type crosses the backend boundary in this tree (the sole `EventStream` maps `Event` → `UiEvent` before any TUI surface sees it, input.rs:5,142,225-245; `CrosstermBackend<FrameSink>` is a Write-backed renderer, writer.rs:213,256; raw mode has one owner, our guard, guard.rs:15). What is lost is the invariant: two decode stacks and two escape-sequence vocabularies in one binary, and a configuration outside the upstream pairing matrix (§4) — unsupported and uninspectable, which is why the rule is commit policy, not a type-system guarantee. |
+| ratatui alone → next major | two shapes. (a) The new major keeps an old pairing feature: a second crossterm major resolves, same duplicate-major state as above with the roles reversed. (b) The new major drops or renames the pairing feature — the expected major-break shape, as 0.30 itself dropped the pre-split direct-dependency model: `crossterm_0_29` becomes an unknown feature and **every one of the three manifests fails to build**. Only shape (b) is compiler-enforced. |
+| Both, as two commits | the intermediate commit is either the duplicate-major lock (§ row 1) or a tree where one manifest builds and another does not (§ row 2b) — no acceptable intermediate state exists for a shipped TUI surface, which is why the unit is one commit. |
 
 ## 3. Callsite census (2026-08-28, at =0.30.2 / =0.29.0)
 
