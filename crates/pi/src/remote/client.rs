@@ -2366,7 +2366,10 @@ mod tests {
     async fn shared_lease_detaches_only_after_final_release() {
         let (client, server) = connect_scripted().await;
         let first = attach(&client, &server, "session-1").await;
-        let second = attach(&client, &server, "session-1").await;
+        // A second shared lease on an already-attached session completes
+        // locally without a protocol round trip, so it must not script a
+        // server response (the script would wait forever).
+        let second = client.attach_session("session-1").await.expect("second shared attach");
         assert!(second.attached());
 
         // First release must NOT send a protocol detach.
@@ -2511,9 +2514,12 @@ mod tests {
         );
         assert_eq!(server.core.request_count(), sent_before, "no frame may be sent");
 
-        // Row 5: inbound garbage frame → Protocol and disconnected.
+        // Row 5: inbound undecodable frame → Protocol and disconnected.
+        // A complete frame whose payload is the CBOR break byte (invalid
+        // outside an indefinite-length item) fails decode immediately; a
+        // bare prefix would just wait for more bytes.
         let pending = client.list_sessions();
-        server.send_raw(vec![0, 0, 2, 1]).await;
+        server.send_raw(vec![0, 0, 0, 1, 0xff]).await;
         let error = pending.await.unwrap_err();
         assert!(
             matches!(error, PiClientError::Protocol(_)),
@@ -2600,10 +2606,12 @@ mod tests {
         let listing = client.list_sessions();
         let attaching = client.attach_session("session-1");
         let scripted = async {
-            let (attach_id, attach_command) = server.core.next_request().await;
+            // join! polls futures in creation order, so the list request
+            // (created first) is sent before the attach request.
             let (list_id, list_command) = server.core.next_request().await;
-            assert!(matches!(attach_command, Command::Attach { .. }));
+            let (attach_id, attach_command) = server.core.next_request().await;
             assert!(matches!(list_command, Command::List));
+            assert!(matches!(attach_command, Command::Attach { .. }));
             // Respond in reverse completion order inside one chunk.
         let attach_frame = encode_server_message(
             &ServerMessage::Response {
@@ -2667,14 +2675,16 @@ mod tests {
 
         let snapshots: Arc<StdMutex<Vec<u64>>> = Arc::new(StdMutex::new(Vec::new()));
         let events: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        // Subscriptions are RAII: the guard must outlive the events it
+        // should observe, so it is bound instead of dropped on the spot.
         let snapshot_sink = Arc::clone(&snapshots);
-        handle
+        let snapshot_guard = handle
             .subscribe(Arc::new(move |snapshot: &SessionSnapshot| {
                 lock(&snapshot_sink).push(snapshot.revision);
             }))
             .expect("subscribe");
         let event_sink = Arc::clone(&events);
-        handle
+        let event_guard = handle
             .on_event(Arc::new(move |_: &ServerEvent| {
                 event_sink.fetch_add(1, AtomicOrdering::SeqCst);
             }))

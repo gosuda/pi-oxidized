@@ -73,7 +73,7 @@ async fn read_loop(core: Arc<PairCore>, index: usize) {
     let seeded = *signal.borrow_and_update();
     match seeded {
         SideSignal::Open => {}
-        SideSignal::LocallyClosed => return,
+        SideSignal::LocallyClosed => { eprintln!("DBG rloop seed-close {index}"); return; },
         SideSignal::PeerFailed => {
             let error = side
                 .error
@@ -156,7 +156,9 @@ impl InMemoryTransport {
             return;
         }
         self.outbound.lock().expect("outbound lock").take();
-        let _ = side.signal.send(SideSignal::LocallyClosed);
+        // send_replace (not send): the terminal wake must be unconditional —
+        // watch::send may skip notification, which strands a parked reader.
+        side.signal.send_replace(SideSignal::LocallyClosed);
     }
 
     /// Injects a typed terminal failure into the peer's handlers (mirrors
