@@ -254,3 +254,63 @@ pre-existing in untouched files).
 `docs/TUI-CLOSE-*` (TUI-CLOSE), `packages/extension-host` (XC-CLOSE).
 `pi/src/modes/interactive/runtime.rs` untouched this iteration (its
 transcript path renders through the already-fixed `Text`/`Markdown` seam).
+
+## Iteration 4 — `render-churn-recomposition` (Design D: borrowed visible window)
+
+Commit: see `git log` (`perf(t11)`). Date 2026-08-28.
+
+**Blind derivation** (reserved at iteration 3 from the measured residual, per
+the ledger's allocation-reuse candidate direction): after Design C the
+static scenario still allocated 5.4 KiB/frame with zero content change; the
+residual sits in the bench root's window serve — `visible: Vec<String> =
+all_lines[start..].iter().cloned().collect()` per frame, a deep copy of ~25
+visible lines. The upstream window is a shallow `.slice()` of string
+references — copying pointers, never string bytes. Data layout: serve the
+window as a borrow (`&all_lines[start..]`); `paint_lines` already accepts a
+slice, and the `take(scroll_h)` bound is subsumed by the `start`
+computation (slice length is already `<= scroll_h`; `paint_lines` clips by
+area). This is workload-fidelity work as much as optimization: the deep copy
+was a port infidelity measured as if it were unit cost.
+
+**Boundary answers** (explicit, before touching): bench-local change — no
+production file touched; emitted bytes unchanged (written-bytes metric
+byte-identical 10500/11656); the window contents and order passed to
+`paint_lines` are identical; scenario parameters untouched (parameter-parity
+test green).
+
+**Branch classification**:
+
+| Original branch | Classification | Reason |
+|---|---|---|
+| per-frame `Vec<String>` window materialization (`.cloned().collect()`) | residue | upstream serves a shallow reference window; the deep copy re-materializes unchanged content every frame |
+| `start` computation (`len.saturating_sub(scroll_h)`) | essential | follow-end window selection; unchanged |
+| `paint_lines` over the window | essential | cell writes; now fed the borrowed window |
+
+**Measurements** (pinned workload, same protocol; baselines = the iteration-3
+tree measured fresh this session before the change; contended box disclosed
+— min-of-7 is the pre-declared paired estimator):
+
+| Scenario | Before (µs/frame) | After (µs/frame) | Win (min-of-7) | Allocated before -> after | Written before -> after |
+|---|---|---|---|---|---|
+| static | 8.2 (min) / 23.3 (median) | 6.5 (min) / 7.6 (median) | 1.25x | 5.4 -> 2.7 KiB/frame | 10500 -> 10500 B |
+| editor | 19.2 (min) / 35.7 (median) | 18.1 (min) / 21.3 (median) | 1.06x | 13.4 -> 10.6 KiB/frame | 11656 -> 11656 B |
+
+Median-of-7 wins (static 3.05x, editor 1.67x) are inflated by differing
+contention mix between the two measurement windows and are disclosed, not
+claimed; the honest paired estimate is min-of-7. Clean-cluster RSDs: static
+~6.3%, editor ~7.9% — < 20%. Win gate >=1.05x median: **passed on both
+scenarios under both estimators** (min-of-7 1.25x / 1.06x).
+
+**Recomputed multiple**: editor 18.1 us vs the ledger's 1.5 us floor ≈
+**12.1x — still OPEN** (>2x ⇒ the unit iterates again; handed to the next
+slot with Design E (measure-walk skip on the static residual) pre-derived
+and the E1-E4 exhaustion record pending, floor to be recomputed per G10
+Finding 5).
+
+**Verification**: render-churn verification suite 3/3 (parameter parity,
+non-zero results, editor>static allocation ordering — 10.6 > 2.7 KiB/frame
+still holds); full pi-tui suite green at iteration 3 on the identical
+library tree (this iteration touches no library code — bench binary only).
+
+**Not touched**: no production file; `scripts/`, `docs/TUI-CLOSE-*`,
+`packages/extension-host` (sibling lanes).

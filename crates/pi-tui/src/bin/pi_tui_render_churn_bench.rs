@@ -268,12 +268,8 @@ impl Component for BenchRoot {
             // ScrollView in follow-end mode shows the last N lines.
             let all_lines = self.transcript.lines_for_width(width);
             let start = all_lines.len().saturating_sub(usize::from(scroll_h));
-            let visible: Vec<String> = all_lines[start..]
-                .iter()
-                .take(usize::from(scroll_h))
-                .cloned()
-                .collect();
-            pi_tui::components::util::paint_lines(scroll_area, buf, &visible);
+            let visible = &all_lines[start..];
+            pi_tui::components::util::paint_lines(scroll_area, buf, visible);
         }
 
         // Render dock: status, editor, footer stacked vertically.
