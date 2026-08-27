@@ -2,7 +2,7 @@
 
 Owning R2 hot rows (lane 2): *Argument parsing + config construction*, *Model/provider
 construction (offline stub)*, *TUI construction + layout*. (The first synchronized
-paint row is owned by terminal-paint.md.) State: **OPEN**, ~122x floor.
+paint row is owned by terminal-paint.md.) State: **OPEN**, ~162.4x floor.
 
 ## Contract (from call sites, tests, signatures — never internals)
 

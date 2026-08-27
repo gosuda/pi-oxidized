@@ -2,7 +2,7 @@
 
 Owning R2 hot rows: *Terminal diff/encode/write (paint)* (lanes 3, 4), *Terminal
 diff/encode* + *NullTerminal write* (lane 7), *First terminal paint (synchronized
-output)* (lane 2). State: **OPEN**, ~41x floor on the stream workload.
+output)* (lane 2). State: **OPEN**, ~7.5x paint-only floor (~41x on the recompose+paint block).
 
 ## Contract (from call sites, tests, signatures — never internals)
 

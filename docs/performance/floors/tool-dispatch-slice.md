@@ -1,7 +1,7 @@
 # Floor ledger: tool dispatch slice (validation, events, result, append)
 
 Owning R2 hot rows (lane 8): *argument validation*, *tool start/update/end events*,
-*result construction + session append*. State: **OPEN**, 4.85x floor.
+*result construction + session append*. State: **OPEN**, 5.62x floor.
 
 ## Contract (from call sites, tests, signatures — never internals)
 
