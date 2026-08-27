@@ -492,13 +492,22 @@ impl AgentSession {
             }
             if let Some(replacement) = cancel.compaction {
                 // Extension provided the full result — persist + emit without
-                // invoking the pure summariser.
+                // invoking the pure summariser. The span stays open across
+                // finalize so persist/rebuild failures record Error status.
                 let mut replacement = replacement;
                 replacement.from_hook = Some(true);
-                drop(compaction_span);
                 return self
                     .finalize_compaction_result(replacement, true, reason, will_retry, &abort_token)
                     .await
+                    .map_err(|err| {
+                        contained(|| {
+                            compaction_span.set_status(SpanStatus::Error {
+                                name: None,
+                                message: Some(err.to_string()),
+                            });
+                        }, || ());
+                        err
+                    })
                     .map(Some);
             }
         }
@@ -515,7 +524,7 @@ impl AgentSession {
                 operation: AiOperation::Stream,
                 provider: model.provider.clone(),
                 model: model.id.clone(),
-                api: model.provider.clone(),
+                api: model.api.clone(),
                 streaming: true,
                 deferred: None,
             },
@@ -553,16 +562,36 @@ impl AgentSession {
                     },
                     || (),
                 );
+                // The engine failed, so the enclosing compaction operation
+                // failed too — record Error before the span settles on drop.
+                contained(
+                    || {
+                        compaction_span.set_status(SpanStatus::Error {
+                            name: None,
+                            message: Some(err.to_string()),
+                        });
+                    },
+                    || (),
+                );
             }
         }
         drop(ai_span);
-        drop(compaction_span);
 
         let result = result?;
 
-        // Persist + rebuild + extension session_compact.
+        // Persist + rebuild + extension session_compact. The span stays open
+        // across finalize so persist/rebuild failures record Error status.
         self.finalize_compaction_result(result, false, reason, will_retry, &abort_token)
             .await
+            .map_err(|err| {
+                contained(|| {
+                    compaction_span.set_status(SpanStatus::Error {
+                        name: None,
+                        message: Some(err.to_string()),
+                    });
+                }, || ());
+                err
+            })
             .map(Some)
     }
 
@@ -1108,6 +1137,7 @@ mod tests {
     use crate::core::agent_session::{AgentSession, AgentSessionConfig};
     use crate::core::sessions::SessionEntry;
     use futures::stream::{self, BoxStream};
+    use pi_agent::telemetry::{AttributeValue, InMemoryTelemetryContext, SpanStatus};
     use pi_agent::user_text;
     use pi_ai::{
         AssistantContent, AssistantMessageEvent, Context, DoneReason, Model, ModelCost, ModelInput,
@@ -1208,11 +1238,55 @@ mod tests {
         stream_fn: SummarizeStreamFn,
         messages: Vec<pi_agent::AgentMessage>,
     ) -> TestResult<Arc<AgentSession>> {
+        make_session_with_telemetry(
+            context_window,
+            stream_fn,
+            messages,
+            pi_agent::telemetry::noop_context(),
+        )
+    }
+
+    fn make_session_with_telemetry(
+        context_window: u64,
+        stream_fn: SummarizeStreamFn,
+        messages: Vec<pi_agent::AgentMessage>,
+        telemetry: Arc<dyn pi_agent::telemetry::TelemetryContext>,
+    ) -> TestResult<Arc<AgentSession>> {
         let provider = mock_provider();
         let mut config = AgentSessionConfig::test_config(provider, test_model(context_window))?;
         config.system_prompt = "sys".into();
         config.messages = messages;
         config.compaction_stream_override = Some(CompactionStreamHandle::new(stream_fn));
+        // Provide the base config explicitly so the session threads the given
+        // telemetry context (same Arc) instead of the C18-resolved no-op.
+        config.base_config = Some(pi_agent::AgentLoopConfig {
+            model: test_model(context_window),
+            reasoning: None,
+            temperature: None,
+            max_tokens: None,
+            session_id: None,
+            transport: None,
+            cache_retention: None,
+            thinking_budgets: None,
+            max_retry_delay_ms: None,
+            metadata: None,
+            headers: None,
+            env: None,
+            stream_extra: Map::new(),
+            tool_execution: pi_agent::ToolExecutionMode::Parallel,
+            convert_to_llm: pi_agent::default_convert_to_llm_hook(),
+            transform_context: None,
+            get_api_key: None,
+            should_stop_after_turn: None,
+            prepare_next_turn: None,
+            get_steering_messages: None,
+            get_follow_up_messages: None,
+            before_tool_call: None,
+            after_tool_call: None,
+            on_payload: None,
+            on_response: None,
+            telemetry,
+        });
         Ok(AgentSession::new(config)?)
     }
 
@@ -1244,6 +1318,15 @@ mod tests {
         context_window: u64,
         stream_fn: SummarizeStreamFn,
     ) -> TestResult<Arc<AgentSession>> {
+        session_with_history_with(context_window, stream_fn, pi_agent::telemetry::noop_context())
+            .await
+    }
+
+    async fn session_with_history_with(
+        context_window: u64,
+        stream_fn: SummarizeStreamFn,
+        telemetry: Arc<dyn pi_agent::telemetry::TelemetryContext>,
+    ) -> TestResult<Arc<AgentSession>> {
         // Create a long conversation that exceeds the keep-recent window.
         let mut messages = Vec::new();
         for i in 0..20 {
@@ -1268,7 +1351,7 @@ mod tests {
             ));
         }
 
-        let session = make_session(context_window, stream_fn, messages)?;
+        let session = make_session_with_telemetry(context_window, stream_fn, messages, telemetry)?;
 
         // Match TS agent-session-compaction fixtures: force a tiny keep-recent
         // budget so prepare_compaction has messages to summarize.
@@ -1590,6 +1673,89 @@ mod tests {
         );
         Ok(())
     }
+
+    #[tokio::test]
+    async fn compaction_emits_spans_through_session_telemetry_context() -> TestResult {
+        let telemetry = InMemoryTelemetryContext::new();
+        let session = session_with_history_with(
+            8_192,
+            summary_stream_fn("## Goal\nTelemetry summary"),
+            Arc::new(telemetry.clone()),
+        )
+        .await?;
+
+        session.compact(None).await?;
+        sleep(std::time::Duration::from_millis(50)).await;
+
+        // The spans must be visible through the SAME Arc injected via
+        // AgentLoopConfig.telemetry and threaded into the session.
+        let spans = telemetry.spans();
+        let compaction = spans
+            .iter()
+            .find(|span| span.name == "pi.harness.compaction")
+            .ok_or("missing pi.harness.compaction span")?;
+        assert_eq!(
+            compaction.attributes.get("pi.operation.kind"),
+            Some(&AttributeValue::Str("compaction".to_owned()))
+        );
+        assert_eq!(compaction.status, SpanStatus::Ok);
+
+        let ai = spans
+            .iter()
+            .find(|span| span.name == "pi.ai.request" && span.parent_id == Some(compaction.id))
+            .ok_or("missing child pi.ai.request span")?;
+        assert_eq!(
+            ai.attributes.get("pi.ai.provider"),
+            Some(&AttributeValue::Str("test-provider".to_owned()))
+        );
+        assert_eq!(
+            ai.attributes.get("pi.ai.model"),
+            Some(&AttributeValue::Str("m".to_owned()))
+        );
+        assert_eq!(
+            ai.attributes.get("pi.ai.api"),
+            Some(&AttributeValue::Str("test-api".to_owned()))
+        );
+        assert_eq!(ai.status, SpanStatus::Ok);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_compaction_records_error_status_on_both_spans() -> TestResult {
+        let telemetry = InMemoryTelemetryContext::new();
+        let session = session_with_history_with(
+            8_192,
+            error_stream_fn("summarization exploded"),
+            Arc::new(telemetry.clone()),
+        )
+        .await?;
+
+        let result = session.compact(None).await;
+        assert!(result.is_err());
+        sleep(std::time::Duration::from_millis(50)).await;
+
+        let spans = telemetry.spans();
+        let compaction = spans
+            .iter()
+            .find(|span| span.name == "pi.harness.compaction")
+            .ok_or("missing pi.harness.compaction span")?;
+        assert!(
+            matches!(compaction.status, SpanStatus::Error { .. }),
+            "failed compaction must record Error on pi.harness.compaction: {:?}",
+            compaction.status
+        );
+        let ai = spans
+            .iter()
+            .find(|span| span.name == "pi.ai.request")
+            .ok_or("missing pi.ai.request span")?;
+        assert!(
+            matches!(ai.status, SpanStatus::Error { .. }),
+            "failed summarization must record Error on pi.ai.request: {:?}",
+            ai.status
+        );
+        Ok(())
+    }
+
 
     #[tokio::test]
     async fn manual_compact_custom_instructions_passed_to_summary() -> TestResult {
