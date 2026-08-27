@@ -120,6 +120,15 @@ const OSC0_SET_TITLE_PREFIX: &[u8] = b"\x1b]0;";
 /// BEL terminates an OSC sequence.
 const OSC_BEL: u8 = 0x07;
 
+/// Minimum viewport width for readable rendering (TUI-G8 floor policy).
+///
+/// When a live resize reports `width < VIEWPORT_WIDTH_FLOOR`, the runtime
+/// accepts the event (updates the size cache and [`ViewState`]) but blanks
+/// the render area instead of wrapping content into an unreadable viewport.
+/// Rendering resumes immediately when width returns to ≥ floor. Matches the
+/// initial-size clamp in [`initial_terminal_size`].
+pub const VIEWPORT_WIDTH_FLOOR: u16 = 20;
+
 /// Sanitize extension-supplied terminal title text for OSC 0 emission.
 ///
 /// Drops every [`char::is_control`] scalar and stops before the sanitized
@@ -980,6 +989,20 @@ impl Component for InteractiveRoot {
     }
 
     fn render(&mut self, area: Rect, buf: &mut Buffer) {
+        // TUI-G8 floor policy: refuse to render below 20 columns. The resize
+        // event is still accepted (size cache and ViewState updated in
+        // `handle_resize`); only the render is suppressed so the viewport
+        // blanks instead of wrapping into an unreadable state. Explicitly
+        // clear the area so stale content from a previous wider frame does
+        // not persist for one frame.
+        if area.width < VIEWPORT_WIDTH_FLOOR {
+            for y in area.y..area.bottom() {
+                for x in area.x..area.right() {
+                    buf[(x, y)].reset();
+                }
+            }
+            return;
+        }
         let pre_heights = self
             .pre_editor
             .iter_mut()
@@ -6567,7 +6590,7 @@ fn tree_entry_label(entry: &crate::core::sessions::SessionEntry) -> String {
 /// Returns `(80, 24)` when the size cannot be queried (non-tty stdout).
 fn initial_terminal_size() -> (u16, u16) {
     match crossterm::terminal::size() {
-        Ok((width, height)) => (width.clamp(20, 1024), height.clamp(1, 256)),
+        Ok((width, height)) => (width.clamp(VIEWPORT_WIDTH_FLOOR, 1024), height.clamp(1, 256)),
         Err(_) => (80, 24),
     }
 }
@@ -11546,5 +11569,49 @@ mod tests {
             encode_osc0_set_title("safe\x07\x1b]1;evil\x07\u{009b}ok")
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn viewport_floor_blanks_render_below_20_columns() {
+        let (mut rt, _log) = make_runtime();
+        let editor = std::mem::replace(&mut rt.editor, Editor::with_defaults());
+        let selector = rt.active_selector.take();
+        let mut root = rt.build_root(editor, selector);
+
+        // Pre-populate the buffer with non-blank content to simulate stale
+        // cells from a previous wider frame — the floor gate must clear them.
+        let narrow = Rect::new(0, 0, 15, 24);
+        let mut buf = Buffer::empty(narrow);
+        for cell in buf.content.iter_mut() {
+            cell.set_symbol("X");
+        }
+        root.render(narrow, &mut buf);
+        let all_blank = buf
+            .content()
+            .iter()
+            .all(|cell| cell.symbol() == " ");
+        assert!(all_blank, "render at width 15 must clear all stale content");
+
+        // Width at the floor: render must produce visible content.
+        let editor = std::mem::replace(&mut rt.editor, Editor::with_defaults());
+        let selector = rt.active_selector.take();
+        let mut root = rt.build_root(editor, selector);
+        let floor = Rect::new(0, 0, VIEWPORT_WIDTH_FLOOR, 24);
+        let mut buf = Buffer::empty(floor);
+        root.render(floor, &mut buf);
+        let has_content = buf
+            .content()
+            .iter()
+            .any(|cell| cell.symbol() != " ");
+        assert!(
+            has_content,
+            "render at width {} must produce visible content",
+            VIEWPORT_WIDTH_FLOOR
+        );
+    }
+
+    #[tokio::test]
+    async fn viewport_floor_constant_matches_initial_clamp() {
+        assert_eq!(VIEWPORT_WIDTH_FLOOR, 20);
     }
 }
