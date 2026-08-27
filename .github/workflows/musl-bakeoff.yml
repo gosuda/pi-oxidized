@@ -135,7 +135,8 @@ jobs:
           alpine_url="https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/$ALPINE_ARCH/$ALPINE_ASSET"
           fetch "$alpine_url" "$EVIDENCE/downloads/$ALPINE_ASSET" "$ALPINE_ASSET_SHA256" \
             'matched Alpine vendor-published .sha256 value grounded 2026-08-26'
-          tar -tzf "$EVIDENCE/downloads/$ALPINE_ASSET" | grep -Fxq "./lib/$MUSL_LOADER"
+          tar -tzf "$EVIDENCE/downloads/$ALPINE_ASSET" > "$EVIDENCE/alpine-rootfs-members.txt"
+          grep -Fxq "./lib/$MUSL_LOADER" "$EVIDENCE/alpine-rootfs-members.txt"
           tar -xzf "$EVIDENCE/downloads/$ALPINE_ASSET" -C "$ROOTFS"
           sudo install -m 0755 "$ROOTFS/lib/$MUSL_LOADER" "/lib/$MUSL_LOADER"
 
@@ -505,7 +506,7 @@ jobs:
           mkdir -p "$crate_source"
           tar -xzf "$EVIDENCE/downloads/$crate" -C "$crate_source" --strip-components=1
           cargo install --locked --path "$crate_source"
-          cargo zigbuild --version | tee "$EVIDENCE/candidate-B/cargo-zigbuild-version.txt"
+          cargo-zigbuild --version | tee "$EVIDENCE/candidate-B/cargo-zigbuild-version.txt"
           env -u CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER \
               -u CC_aarch64_unknown_linux_musl \
               PATH="$RUNNER_TEMP/${ZIG_ASSET%.tar.xz}:$PATH" \
@@ -558,7 +559,8 @@ jobs:
           alpine_url="https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/$ALPINE_ARCH/$ALPINE_ASSET"
           fetch "$alpine_url" "$EVIDENCE/downloads/$ALPINE_ASSET" "$ALPINE_ASSET_SHA256" \
             'matched Alpine vendor-published .sha256 value grounded 2026-08-26'
-          tar -tzf "$EVIDENCE/downloads/$ALPINE_ASSET" | grep -Fxq "./lib/$MUSL_LOADER"
+          tar -tzf "$EVIDENCE/downloads/$ALPINE_ASSET" > "$EVIDENCE/alpine-rootfs-members.txt"
+          grep -Fxq "./lib/$MUSL_LOADER" "$EVIDENCE/alpine-rootfs-members.txt"
           tar -xzf "$EVIDENCE/downloads/$ALPINE_ASSET" -C "$ROOTFS"
           sudo install -m 0755 "$ROOTFS/lib/$MUSL_LOADER" "/lib/$MUSL_LOADER"
 
