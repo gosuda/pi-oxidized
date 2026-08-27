@@ -19,7 +19,7 @@
 
 | Ruling | Verdict | Parity status | Owner | Verification |
 |---|---|---|---|---|
-| 1. Color depth (`caps.true_color`) | Fix: capability-driven `ColorMode` selection is the pinned end state | Remediated by TUI-T2 (04f91de, dc9d412): runtime depth is capability-driven; `Truecolor` literals remain only at headless export | TUI-T2 #74 (landed) | TUI-P2 #58 (closed), TUI-V5 #79 |
+| 1. Color depth (`caps.true_color`) | Fix: capability-driven `ColorMode` selection is the pinned end state | Remediated by TUI-T2 (04f91de, dc9d412): runtime depth is capability-driven; remaining `Truecolor` literals sit at TUI-T2-ratified sites (built-in interning, name enumeration, wire mapping, defaults, headless export) | TUI-T2 #74 (landed) | TUI-P2 #58 (closed), TUI-V5 #79 |
 | 2. Hyperlinks (`caps.hyperlinks`) | Fix: honor the capability at markdown surfaces, URL-text fallback otherwise | Remediated by TUI-T3 (583b2f5, 701bdd3): markdown surfaces honor `caps.hyperlinks` with URL-text fallback | TUI-T3 #73 (landed) | TUI-V5 #79 |
 | 3. Extension `setTheme` guardrails | Accept unchecked palettes | Exact reference parity, not a divergence | None (no code change) | TUI-V5 #79 measures, never gates |
 | 4. ANSI-256 to RGB transform | Byte-lock the `55 + 40·v` closed form | Settled parity across all four converters | None; any change is a new recorded divergence | Byte equality of the four sites |
@@ -77,14 +77,25 @@ the Rust witnesses below describe the post-remediation state.
   - `runtime.rs:3909` resolves after storage-driven reapply.
   - `runtime.rs:4032` resolves theme family selection.
   - `runtime.rs:5092-5099` (`startup_theme`) resolves the initial theme at line 5098.
-  - `runtime.rs:5195-5200` (`build_theme_update`) builds the `theme.update` catalog via
+  - `runtime.rs:5193-5200` (`build_theme_update`) builds the `theme.update` catalog via
     `available_themes(color_mode)`.
-- Headless export keeps a fixed depth outside the runtime:
-  `crates/pi/src/core/export_html/mod.rs:258` (`built_in` uses
-  `load_or_dark(name, ColorMode::Truecolor)`) and `:301` (`resolve_export_theme` passes
-  `ColorMode::Truecolor` explicitly). Export has no live terminal, so a fixed depth there is
-  inherent to the surface; TUI-T2's close review ratified these literals as the allowed
-  remaining sites.
+- Remaining `ColorMode::Truecolor` literals sit at the sites TUI-T2's close review ratified,
+  not only headless export:
+  - Built-in interning fast path: `built_in_theme` (`theme.rs:1484-1497`) returns interned
+    statics and `load_by_name` (`:1542-1546`) returns them regardless of the requested `mode`;
+    the statics are resolved once at `ColorMode::Truecolor` (`dark()`/`light()` at
+    `theme.rs:1199`, the `built_in_theme!` macro's `.resolve(ColorMode::Truecolor)` at
+    `:1217`). Pinned as deliberate reference parity by
+    `resolve_active_theme_forced_256_accepts_palette_mode` (`theme.rs:2159-2172`);
+    capability-driven resolution still governs file-backed and custom themes, where
+    `Palette256` mode takes effect.
+  - Catalog name enumeration: `theme_selector_values` (`theme.rs:1625`) passes
+    `available_themes(ColorMode::Truecolor)` but discards the resolved themes (names only).
+  - Wire mode-string mapping: `resolved_theme_from_wire`'s else-arm (`runtime.rs:5172`).
+  - `Options::default` theme via `dark()` (`runtime.rs:721`).
+  - Headless HTML export: `crates/pi/src/core/export_html/mod.rs:258` (`built_in` uses
+    `load_or_dark(name, ColorMode::Truecolor)`) and `:301` (`resolve_export_theme` passes
+    `ColorMode::Truecolor` explicitly) — no live terminal, fixed depth inherent.
 - Capabilities are detected, carried, and consulted for depth: `runtime.rs:743` runs
   `TerminalCapabilities::detect()` inside `Options::detect`, `runtime.rs:617-618` declares the
   `caps` field, and `caps.true_color` is read at `runtime.rs:1525` and `:6659`. Remaining
@@ -137,7 +148,7 @@ witnesses below describe the post-remediation state.
 - The seam already exists and is caller-driven in `crates/pi-tui/src/components/markdown.rs`:
   - `:161-162` declares `pub hyperlinks: bool` under the documented contract "caller supplies
     capability".
-  - `:217-218` provides `set_hyperlinks` (option write plus cache invalidation).
+  - `:217-220` provides `set_hyperlinks` (option write plus cache invalidation).
   - `:623` is the render-time gate mirroring `markdown.ts:692`, with the same URL-text
     fallback shape.
 - The product wires the capability through:
