@@ -29,5 +29,5 @@ pub use probe::{
 pub use sink::FrameSink;
 pub use writer::{
     COALESCE_WINDOW, Coalescer, ReanchorCause, SettledBlock, SimulatedTxn, TransactionRecorder,
-    Tui, Txn,
+    Tui, Txn, paint_timer_read, paint_timer_reset, set_paint_timer,
 };

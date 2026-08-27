@@ -619,3 +619,146 @@ from base. Scenario-isolated callgrind attribution builds were one-off
 `.github/workflows/` (REL-T4 lane), `pi/src/modes/interactive/runtime.rs`,
 `docs/performance/floors/` (PERF-R9/G10 lane — the ledger keeps its
 authored pre-campaign numbers by the campaign-log header's own rule).
+
+## Iteration 8 — `terminal-paint` (Design A: span-fed, fused, pooled paint)
+
+**Blind derivation** (recorded before reading the replaced
+paint/encode/write body — `writer.rs`/`backend.rs` internals unread at
+this point — from `terminal-paint.md` Contract + Floor + decomposition
+and the campaign's public prior records only; data layout first).
+
+Honest cross-unit note first: the ledger's headline addressable item —
+"damage-scoped diff (skip the 3000-cell equality scan)" — is already
+shipped by render-churn Design B (row-scoped diff, iteration 2). The
+ledger's authored decomposition (BufferDiff 29.5 us, encode 13.8 us,
+write 0.7 us per painted frame) is pre-campaign arithmetic over the
+full-scan path; this iteration must first *re-measure* the paint-only
+share on the pinned workload post-B, then attack the residual.
+
+Data layout of the residual (derived blind): the paint path's per-frame
+data is (i) a change-detection input — post-B a per-row walk whose
+within-row detection is still full-width `Cell::eq` against the grid
+snapshot, (ii) an update-set materialization — an owned intermediate
+(iteration 2's record names `Vec<(u16,u16,Cell)>` updates, +2.6 KiB/frame
+allocation) — and (iii) a per-frame output byte buffer. Producers already
+travel row-granular damage to the committer via the claim machinery
+(Designs B/E); the claim lacks column granularity, so the committer
+re-detects changes cell-by-cell inside damaged rows.
+
+**Design A (chosen): span-fed, fused, pooled paint.** (1) Producers
+record changed column *spans* at write time into the row claim (the
+existing producer→commit channel); (2) commit-time change detection
+enumerates recorded spans instead of scanning full rows — `Cell::eq` is
+retained *inside* spans so the emitted update set stays byte-identical
+(cells outside a recorded span are provably equal to the last emitted
+state: either untouched since emit or rewritten with claim-validated
+identical content, which the span assertion covers); (3) the encoder
+fuses into the span walk — ANSI runs append directly into a pooled,
+writer-owned output buffer carried across frames — deleting both the
+updates materialization and the per-frame output allocation. Targets:
+within-row equality on partially damaged rows, the second encode pass,
+and per-frame allocation churn.
+
+**Candidates evaluated blind**:
+
+| Candidate | Verdict | Reason |
+|---|---|---|
+| P1 span-fed fused pooled paint (above) | **chosen** | only candidate attacking all three residual data layouts without touching the wire |
+| P2 direct region encoding from the ops record | fallback | subsumed by P1's fusion; kept if the encode body shows a separate dominant term |
+| P3 pre-encoded row-byte cache keyed by claim key | rejected blind | pinned editor workload appends a fresh line each frame (fresh 128-bit key) — cache never hits; static frames emit nothing; zero pinned-workload win |
+| P4 `audit_bytes` vectorization (memchr) | not chosen | synchronized-output safety guard classified boundary in iteration 7's record; consent-gated; ~0.3-0.4 us of ~13.9 us frame was 1.02x there — re-graded against paint-only below |
+
+**Measurement plan** (blind): paint-only per painted frame on the pinned
+shape (100x30, editor churn + static), isolated via the iteration-7
+probe seam (`--probe` instrumented counters) or a paint-scenario
+isolation; release, `taskset -c 20-40`, 20 warmup / 300 frames, fresh
+pre-change baselines, >=1.05x median win gate on the paint-only figure
+(whole-frame numbers disclosed alongside). Multiple recomputed against
+this unit's 0.64 us floor from the replacement's own measurement.
+
+**Branch classification** (divergence audit of the replaced paint
+machinery, answered after the blind record above was filed and the body
+read):
+
+| Original branch | Classification | Reason |
+|---|---|---|
+| post-walk full-row `grid.clone_from_slice` per damaged row | **replaced (fused)** | the walk's own equality results drive per-cell copies into the snapshot; equal head cells skip the copy; `Cell::eq`'s None≡`" "` symbol normalization keeps the un-copied snapshot observably identical (eq/symbol/cell_width all normalize) |
+| full-width per-cell walk inside damaged rows | **essential, windowed** | change detection is the diff's contract; `row_walk_span` narrows it to the union of prior+frame claim spans when every claim is spanned (Foreign/claim-less rows keep the full row); measured pinned spans are full-width (100 cols), so the window is correctness machinery, not a pinned-shape win — recorded honestly |
+| skip-cell handling (never emitted) | **essential** | skip cells keep never-emitted semantics; fused sync still compares+syncs them so a stale skip cell cannot later mis-trigger force-trailing |
+| continuation/VS16/force-trailing semantics | **essential** | exact port; trailing ranges run past the window end to completion (full-row semantics for boundary graphemes), pinned by the new unit test |
+| per-frame `Vec<(u16,u16,Cell)>` updates allocation | **replaced (pooled)** | taken from a writer-owned pool and returned after the backend encode |
+| per-frame `wrap_synchronized` allocation | **replaced (pooled)** | `wrap_synchronized_into` fills a pooled frame buffer that rotates through `last_payload` (test surface keeps exact bytes) |
+| per-frame composition `Vec` regrowth (`mem::take` leaves capacity 0) | **replaced (pooled)** | `take_composition_bytes` swaps the pooled buffer into the sink; the drained payload's buffer returns to the pool after the stage-3 write; straggler-drain discard semantics unchanged |
+| `blank_vanished_spans` per-column `covered()` closure | **replaced (fast path)** | a foreign current claim covers the row; a vanished span fully contained in one current span blanks nothing — the churn case (same-span line swap) leaves the per-column loop |
+| `audit_bytes` ×2, sync wrapper bytes, one `write_all`+`flush` | **essential (boundary)** | synchronized-output guard and wire framing — untouched |
+
+**Boundary answers** (explicit): emitted bytes are byte-identical — the
+pinned workload's written-bytes metric is identical before/after (35.0 B
+static, 44.0 B poke per frame), the encoder/cursor/wrapper sequence is
+unchanged, and the byte-level gauntlets pass (`transcript_state_matrix`
+k=3, `pty_no_flicker` 5, `static_frame_evidence`, a11y/ext/grill/theme).
+No wire-format, session-JSONL, or extension-RPC surface touched. The
+`audit_bytes` guard runs identically on the pooled buffers.
+
+**Measurement** (pinned workload protocol: release, `taskset -c 20-40`,
+20 warmup / 300 frames, 100x30, 150 lines; instrumented binaries built
+from the same tree — baseline = this session's instrumented pre-design
+writer, design = the landed writer; 7 interleaved probe pairs, medians;
+the paint-only figure is the pre-declared estimator, measured by the new
+paint-path instrument (emit_frame_diff → stage3_write) on production
+frames):
+
+| Scenario (paint-only, ns/frame) | Before | After | Win (median-of-7) |
+|---|---|---|---|
+| static 100x30 | 1155 | 900 | 1.28x |
+| poke (one changed transcript line) | 4550 | 3203 | 1.42x |
+| editor steady (rotated trailing chars) | 4396 | 2699 | 1.63x |
+
+Distributions are fully disjoint in all three scenarios (e.g. poke:
+baseline min 4498 > design max 3300). Win gate >=1.05x median: **passed
+on all three**. Whole-frame disclosure (same probe runs, quiet window):
+framePoke 14.50 → 11.73 us (1.24x), frameEditorSteady 15.19 → 12.42 us
+(1.22x), frameStatic30 2.19 → 2.18 us (static paint is a small share of
+an already-flat frame); the 9-pair bench-protocol run was bimodally
+contended (per-run 13-41 us editor) and is disclosed, not claimed — the
+paint-only instrument is the paired estimator. Allocation: static
+150 → 5 B/frame (pools), poke 7312 → 6916 B/frame, editor 9008 → 8863
+B/frame (residual is the workload-side derive/rebuild, out of unit
+scope). Written bytes identical both sides.
+
+**Recomputed multiple** (vs this unit's 0.64 us floor, recomputed from
+the replacement's own measurement): poke 3.20 us ≈ **5.0x**, editor
+steady 2.70 us ≈ **4.2x**, static 0.90 us ≈ 1.4x — **still OPEN**
+(>2x on the changed-line scenarios ⇒ logged as intermediate; the unit
+iterates again in a later slot per the issue's one-commit rule).
+
+**Named dominant residual**: the change-detection walk itself — `Cell::eq`
+over the (full-width) damaged rows, ~1.5 us of the 3.2 us poke paint; the
+floor prices change detection at zero ("damage information is available
+to the producer"), and the producer-side seam (memo ops record / derive
+write path) is owned by `render-churn-recomposition`. **Next design
+(reserved, materially distinct — Design B)**: producer-fed column damage
+— the line painters record the exact written column ranges into the row
+claim, so the paint walk skips provably-equal columns inside the span
+(today the pinned spans are full-width: measured walk window = 100 of
+100 columns). Secondary: the crossterm `draw` fixed cost (~0.3 us empty,
+~0.5 us with updates) and the boundary audit (~0.3 us, consent-gated).
+
+**Verification**: 398/398 pi-tui lib tests (396 + the fused-sync
+semantics and `row_walk_span` contract tests; the fused walk's
+`debug_assert` snapshot-exactness check runs on every damaged row in
+every debug test); full release integration suite green (render-churn
+verification — now pinning the paint-probe terms — 4/4 incl. 3 stability
+re-runs; no-flicker PTY 5; state matrix; static-frame-evidence 1; grill
+8; theme 5; a11y/ext); `cargo clippy --release -p pi-tui --all-targets
+--locked` on the changed files adds zero findings vs the base commit
+(one pre-existing `collapsible_if` in rewritten code disappeared —
+disclosed). The paint-probe instrument is env-free (atomic bool arm),
+costs one atomic load per frame when disarmed, and its contract is
+pinned by the verification suite.
+
+**Not touched (out of scope, file-disjoint)**: `scripts/` (DEPS lane),
+`docs/TUI-CLOSE-*` (TUI-CLOSE), `packages/extension-host` (XC-CLOSE),
+`.github/workflows/` (REL-T4 lane), `pi/src/modes/interactive/runtime.rs`,
+`docs/performance/floors/` (PERF-R9/G10 lane — ledgers keep authored
+numbers).

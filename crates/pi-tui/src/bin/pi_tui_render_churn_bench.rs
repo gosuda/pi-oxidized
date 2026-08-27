@@ -28,7 +28,9 @@ use pi_bench_alloc::CountingAllocator;
 use pi_tui::component::{Component, EventResult, UiEvent};
 use pi_tui::components::Text;
 use pi_tui::components::util::{KeyedLine, paint_lines_keyed};
-use pi_tui::terminal::{TerminalCapabilities, Tui, Txn};
+use pi_tui::terminal::{
+    TerminalCapabilities, Tui, Txn, paint_timer_read, paint_timer_reset, set_paint_timer,
+};
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect, Size};
@@ -496,6 +498,33 @@ fn run_probe_frames(
     }
 }
 
+/// Paint-path share of a production-frame loop (µs/frame), via the
+/// PERF-T11 paint-probe instrument: arms the writer's paint timer around
+/// the same production frames, so the paint-only figure is measured on
+/// the real path (diff + encode + framing + write) rather than derived.
+/// Returns `(total µs/frame, diff-phase µs/frame, frames)`.
+fn run_paint_probe(
+    tui: &mut Tui<NullWriter>,
+    root: &mut BenchRoot,
+    frames: usize,
+    frame: impl Fn(usize, &mut BenchRoot),
+) -> (f64, f64, f64) {
+    set_paint_timer(true);
+    paint_timer_reset();
+    for i in 0..frames {
+        frame(i, root);
+        let _ = tui.commit(Txn::Frame, root);
+    }
+    let (total, diff, count) = paint_timer_read();
+    set_paint_timer(false);
+    let n = f64::from(u32::try_from(count).unwrap_or(u32::MAX)).max(1.0);
+    (
+        f64::from(u32::try_from(total.min(u64::from(u32::MAX))).unwrap_or(u32::MAX)) / n,
+        f64::from(u32::try_from(diff.min(u64::from(u32::MAX))).unwrap_or(u32::MAX)) / n,
+        n,
+    )
+}
+
 fn median_of(vals: &mut [f64]) -> f64 {
     vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let mid = vals.len() / 2;
@@ -544,6 +573,65 @@ fn probe_static_shape(rows: u16) -> (f64, f64, f64) {
         median_of(&mut allocs),
         median_of(&mut written),
     )
+}
+
+/// Median paint-only share of a static frame loop at a viewport height
+/// (µs/frame, via the paint-probe instrument).
+fn probe_paint_static(rows: u16) -> f64 {
+    let mut times = Vec::with_capacity(PROBE_REPS);
+    for _ in 0..PROBE_REPS {
+        let mut tui = fresh_tui(rows);
+        let mut root = BenchRoot::new();
+        for _ in 0..PROBE_WARMUP {
+            let _ = tui.commit(Txn::Frame, &mut root);
+        }
+        let (total, _diff, _n) = run_paint_probe(&mut tui, &mut root, PROBE_FRAMES, |_i, _root| {});
+        times.push(total);
+    }
+    median_of(&mut times)
+}
+
+/// Median paint-only share of a poke (one changed transcript line) frame
+/// loop at the pinned shape: (total µs/frame, diff-phase µs/frame).
+fn probe_paint_poke() -> (f64, f64) {
+    let mut total_times = Vec::with_capacity(PROBE_REPS);
+    let mut diff_times = Vec::with_capacity(PROBE_REPS);
+    for _ in 0..PROBE_REPS {
+        let mut tui = fresh_tui(ROWS);
+        let mut root = BenchRoot::new();
+        for _ in 0..PROBE_WARMUP {
+            let _ = tui.commit(Txn::Frame, &mut root);
+        }
+        let (total, diff, _n) = run_paint_probe(&mut tui, &mut root, PROBE_FRAMES, |i, root| {
+            root.transcript.poke(i);
+        });
+        total_times.push(total);
+        diff_times.push(diff);
+    }
+    (median_of(&mut total_times), median_of(&mut diff_times))
+}
+
+/// Median paint-only share of an editor-steady (rotated trailing chars)
+/// frame loop at the pinned shape: (total µs/frame, diff-phase µs/frame).
+fn probe_paint_editor_steady() -> (f64, f64) {
+    let mut total_times = Vec::with_capacity(PROBE_REPS);
+    let mut diff_times = Vec::with_capacity(PROBE_REPS);
+    for _ in 0..PROBE_REPS {
+        let mut tui = fresh_tui(ROWS);
+        let mut root = BenchRoot::new();
+        for i in 0..150 {
+            root.editor.append(char::from(b'a' + u8::try_from(i % 26).unwrap_or(0)));
+        }
+        for _ in 0..PROBE_WARMUP {
+            let _ = tui.commit(Txn::Frame, &mut root);
+        }
+        let (total, diff, _n) = run_paint_probe(&mut tui, &mut root, PROBE_FRAMES, |i, root| {
+            root.editor.rotate_unique(i);
+        });
+        total_times.push(total);
+        diff_times.push(diff);
+    }
+    (median_of(&mut total_times), median_of(&mut diff_times))
 }
 
 /// Median one-changed-line frame cost at the pinned shape (µs/frame, bytes/frame, written bytes/frame).
@@ -661,6 +749,9 @@ fn run_probe() -> ExitCode {
     let (editor_steady, editor_steady_bytes) = probe_editor_steady();
     let wrap_key = probe_wrap_key();
     let editor_rebuild = probe_editor_rebuild();
+    let paint_static30 = probe_paint_static(30);
+    let (paint_poke, paint_poke_diff) = probe_paint_poke();
+    let (paint_editor, paint_editor_diff) = probe_paint_editor_steady();
 
     let mut root = BenchRoot::new();
     let dock = root.dock_height(COLUMNS);
@@ -679,6 +770,9 @@ fn run_probe() -> ExitCode {
     println!("  frameStatic60   {static60:8.3} µs/frame");
     println!("  framePoke       {poke:8.3} µs/frame  ({poke_bytes:6.0} B/frame, {poke_written:5.1} B written)");
     println!("  frameEditorSteady {editor_steady:6.3} µs/frame  ({editor_steady_bytes:6.0} B/frame)");
+    println!("  paintStatic30    {paint_static30:7.3} µs/frame  (paint-only, probe)");
+    println!("  paintPoke        {paint_poke:7.3} µs/frame  (paint-only; diff phase {paint_poke_diff:.3})");
+    println!("  paintEditorSteady {paint_editor:6.3} µs/frame  (paint-only; diff phase {paint_editor_diff:.3})");
     println!("  wrapKeyPerLine  {wrap_key:8.3} µs/line   (workload-side)");
     println!("  editorRebuild   {editor_rebuild:8.3} µs/frame (workload-side)");
     println!("  identitySlope   {slope_30_50:8.4} µs/visible-line (30↔50; 50↔60 {slope_50_60:.4})");
@@ -700,7 +794,12 @@ fn run_probe() -> ExitCode {
          \"frameStatic30WrittenPerFrame\": {static30_written:.1},\
          \"framePokeWrittenPerFrame\": {poke_written:.1},\
          \"wrapKeyUsPerLine\": {wrap_key:.4},\
-         \"editorRebuildUs\": {editor_rebuild:.4}\
+         \"editorRebuildUs\": {editor_rebuild:.4},\
+         \"paintStatic30Us\": {paint_static30:.4},\
+         \"paintPokeUs\": {paint_poke:.4},\
+         \"paintPokeDiffUs\": {paint_poke_diff:.4},\
+         \"paintEditorSteadyUs\": {paint_editor:.4},\
+         \"paintEditorSteadyDiffUs\": {paint_editor_diff:.4}\
          }},\
          \"derived\": {{\
          \"dockHeight\": {dock},\

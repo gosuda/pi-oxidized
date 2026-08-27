@@ -106,10 +106,6 @@ fn benchmark_produces_nonzero_results_for_both_scenarios() {
     for scenario in ["static", "editor"] {
         let s = &json["scenarios"][scenario];
         assert!(
-            s["allocatedBytes"].as_u64().is_some_and(|v| v > 0),
-            "{scenario} scenario must allocate non-zero bytes"
-        );
-        assert!(
             json_f64(&s["elapsedMs"]).is_some_and(|ms| ms > 0.0),
             "{scenario} scenario must have positive wall time"
         );
@@ -121,11 +117,20 @@ fn benchmark_produces_nonzero_results_for_both_scenarios() {
             json_f64(&s["msPerFrame"]).is_some_and(|ms| ms > 0.0),
             "{scenario} scenario must have positive ms/frame"
         );
-        assert!(
-            json_f64(&s["kiBPerFrame"]).is_some_and(|kib| kib > 0.0),
-            "{scenario} scenario must have positive KiB/frame"
-        );
     }
+    // PERF-T11 terminal-paint Design A pooled the paint transaction, so the
+    // static scenario's steady-state allocation is now zero bytes (it was
+    // 100 B/frame after Design F). Only the editor scenario — whose
+    // workload-side rebuild still allocates — pins a positive allocation.
+    let editor = &json["scenarios"]["editor"];
+    assert!(
+        editor["allocatedBytes"].as_u64().is_some_and(|v| v > 0),
+        "editor scenario must allocate non-zero bytes"
+    );
+    assert!(
+        json_f64(&editor["kiBPerFrame"]).is_some_and(|kib| kib > 0.0),
+        "editor scenario must have positive KiB/frame"
+    );
 }
 
 #[test]
@@ -193,7 +198,23 @@ fn floor_probe_reports_sane_constants() {
     term(&measured["editorRebuildUs"]);
     let slope = term(&derived["identitySlopeUsPerLine"]);
     term(&derived["changedLineCommitUs"]);
-    term(&derived["editorRowCommitUs"]);
+    // PERF-T11 terminal-paint probe terms (paint-only instrument). The
+    // relations compare paint terms with each other — cross-loop
+    // comparisons against the separately timed whole-frame loops flake
+    // under the box's bursty contention.
+    let paint_static = term(&measured["paintStatic30Us"]);
+    let paint_poke = term(&measured["paintPokeUs"]);
+    let paint_poke_diff = term(&measured["paintPokeDiffUs"]);
+    let paint_steady = term(&measured["paintEditorSteadyUs"]);
+    let paint_steady_diff = term(&measured["paintEditorSteadyDiffUs"]);
+    assert!(
+        paint_poke > paint_static,
+        "a changed-line frame's paint share must exceed the static paint share"
+    );
+    assert!(
+        paint_poke_diff <= paint_poke && paint_steady_diff <= paint_steady,
+        "the diff phase cannot exceed the paint transaction it sits inside"
+    );
 
     // Sanity relations pinning the exhaustion-record arithmetic.
     assert!(poke > static30, "a changed-line frame must cost more than static");

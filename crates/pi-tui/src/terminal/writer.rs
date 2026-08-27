@@ -3,9 +3,9 @@
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::buffer::{Buffer, Cell, CellDiffOption, CellWidth};
 use ratatui::layout::{Position, Rect, Size};
@@ -15,16 +15,57 @@ use ratatui::widgets::Widget;
 use ratatui::{Terminal, TerminalOptions, Viewport};
 
 use crate::component::Component;
-use crate::frame::{
-    FrameAnnotations, RowClaim, RowClaims, with_annotations,
-};
+use crate::frame::{FrameAnnotations, RawRegion, RowClaim, RowClaims, with_annotations};
 use crate::terminal::backend::{
-    GuardedBackend, audit_bytes, encode_full_row_prefix, wrap_synchronized,
+    GuardedBackend, audit_bytes, encode_full_row_prefix, wrap_synchronized, wrap_synchronized_into,
 };
 use crate::terminal::caps::{TerminalCapabilities, kitty_delete_id};
 use crate::terminal::sink::FrameSink;
 
 const SYNC_OUTPUT_END: &[u8] = b"\x1b[?2026l";
+// ── PERF-T11 paint-path probe (instrumented counter) ──────────────────────
+//
+// When armed by the churn-bench `--probe` (`set_paint_timer`), every
+// committed frame accumulates the paint transaction — `emit_frame_diff`
+// through `stage3_write`, i.e. the terminal-paint ledger unit (diff,
+// encode, framing, write) — into these counters. One atomic load per
+// frame when disarmed; zero timing work.
+
+static PAINT_TIMER: AtomicBool = AtomicBool::new(false);
+static PAINT_NANOS: AtomicU64 = AtomicU64::new(0);
+static PAINT_DIFF_NANOS: AtomicU64 = AtomicU64::new(0);
+static PAINT_FRAMES: AtomicU64 = AtomicU64::new(0);
+
+fn paint_timer_on() -> bool {
+    PAINT_TIMER.load(Ordering::Relaxed)
+}
+
+/// Arm/disarm the paint-path probe counter (churn-bench `--probe`).
+pub fn set_paint_timer(enabled: bool) {
+    PAINT_TIMER.store(enabled, Ordering::Relaxed);
+}
+
+/// Read the paint-path probe counters: `(total nanos, diff-phase nanos, frames)`.
+///
+/// The diff phase covers `emit_frame_diff` (damage diff + grid sync +
+/// backend encode issue); the total adds the cursor sequence, composition
+/// drain, framing audits, and the stage-3 write.
+#[must_use]
+pub fn paint_timer_read() -> (u64, u64, u64) {
+    (
+        PAINT_NANOS.load(Ordering::Relaxed),
+        PAINT_DIFF_NANOS.load(Ordering::Relaxed),
+        PAINT_FRAMES.load(Ordering::Relaxed),
+    )
+}
+
+/// Reset the paint-path probe counters.
+pub fn paint_timer_reset() {
+    PAINT_NANOS.store(0, Ordering::Relaxed);
+    PAINT_DIFF_NANOS.store(0, Ordering::Relaxed);
+    PAINT_FRAMES.store(0, Ordering::Relaxed);
+}
+
 
 /// Maximum background coalescing window.
 pub const COALESCE_WINDOW: Duration = Duration::from_millis(16);
@@ -144,7 +185,6 @@ struct ViewportState {
 
 impl ViewportState {
     fn new(size: Size, cursor: Position, viewport_height: u16) -> Self {
-        let viewport_height = viewport_height.min(size.height).max(1);
         let viewport_top = cursor.y.saturating_sub(viewport_height.saturating_sub(1));
         Self {
             size,
@@ -186,6 +226,15 @@ pub struct Tui<W: Write> {
     /// capacity across frames so steady-state claim recording does not
     /// allocate.
     scratch_claims: Vec<Vec<RowClaim>>,
+    /// Pooled frame update set (PERF-T11 terminal-paint Design A): the
+    /// `(x, y, Cell)` list is taken per frame and returned after the
+    /// backend encode, so steady-state paint allocates nothing for it.
+    updates_scratch: Vec<(u16, u16, Cell)>,
+    /// Pooled synchronized-output frame buffer; swaps with `last_payload`
+    /// per stage-3 write so framing allocates nothing steady-state.
+    frame_scratch: Vec<u8>,
+    /// Pooled composition buffer swapped into the sink on each take.
+    comp_scratch: Option<Vec<u8>>,
     hardware_cursor: bool,
 }
 
@@ -225,6 +274,9 @@ impl<W: Write> Tui<W> {
             coalescer: Coalescer::new(),
             write_count: 0,
             scratch_claims: Vec::new(),
+            updates_scratch: Vec::new(),
+            frame_scratch: Vec::new(),
+            comp_scratch: None,
             last_payload: Vec::new(),
             grid: Buffer::default(),
             prior_claims: Vec::new(),
@@ -369,6 +421,8 @@ impl<W: Write> Tui<W> {
         let row_claims = collected.take_row_claims();
         let (cursor, raw_regions) = collected.into_parts();
         let (mut prior_table, frame_table) = row_claims.into_tables();
+        let paint_timed = paint_timer_on();
+        let paint_t0 = paint_timed.then(Instant::now);
         self.emit_frame_diff(&prior_table, &frame_table, frame_area)?;
         self.prior_claims = frame_table;
         // Design F: the consumed prior table returns to the pool; its rows
@@ -377,6 +431,7 @@ impl<W: Write> Tui<W> {
             row.clear();
         }
         self.scratch_claims = prior_table;
+        let paint_t1 = paint_timed.then(Instant::now);
 
         // Cursor sequence mirrors ratatui's `apply_buffer_with_cursor`:
         // updates, then show/set or hide, then the backend flush. Full-row
@@ -395,9 +450,39 @@ impl<W: Write> Tui<W> {
         self.terminal.backend_mut().set_full_rows(false);
 
         let mut payload = self.take_composition_bytes();
+        self.append_frame_regions(&raw_regions, &mut payload);
 
+        if let Some(cursor) = cursor {
+            self.state.cursor = cursor;
+            self.terminal.backend_mut().set_cursor_cache(cursor);
+        }
+
+        let result = self.stage3_write(&payload);
+        // Return the drained payload's buffer to the composition pool for
+        // the next frame's sink swap.
+        payload.clear();
+        self.comp_scratch = Some(payload);
+        if let Some(t0) = paint_t0 {
+            let end = Instant::now();
+            PAINT_NANOS.fetch_add(
+                u64::try_from(end.duration_since(t0).as_nanos()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            if let Some(t1) = paint_t1 {
+                PAINT_DIFF_NANOS.fetch_add(
+                    u64::try_from(t1.duration_since(t0).as_nanos()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+            }
+            PAINT_FRAMES.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    /// Append raw regions and Kitty-image bookkeeping to the frame payload.
+    fn append_frame_regions(&mut self, raw_regions: &[RawRegion], payload: &mut Vec<u8>) {
         let mut next_ids = HashSet::new();
-        for region in &raw_regions {
+        for region in raw_regions {
             if let Some(id) = region.kitty_id {
                 next_ids.insert(id);
             }
@@ -414,13 +499,6 @@ impl<W: Write> Tui<W> {
             payload.extend_from_slice(b"\x1b8");
         }
         self.state.live_kitty_ids = next_ids;
-
-        if let Some(cursor) = cursor {
-            self.state.cursor = cursor;
-            self.terminal.backend_mut().set_cursor_cache(cursor);
-        }
-
-        self.stage3_write(&payload)
     }
 
     /// Emit the frame's cell updates, scoped to rows whose claim set changed.
@@ -441,7 +519,12 @@ impl<W: Write> Tui<W> {
         let width = usize::from(area.width);
         let rows = usize::from(area.height);
         let base = usize::from(area.y);
-        let mut updates: Vec<(u16, u16, Cell)> = Vec::new();
+        // PERF-T11 terminal-paint Design A: the update set is pooled and the
+        // emitted-state sync is fused into the diff walk (see
+        // `push_row_diff`) — steady-state paint allocates nothing and no
+        // full-row snapshot copy runs per damaged row.
+        let mut updates = std::mem::take(&mut self.updates_scratch);
+        updates.clear();
         if width > 0 {
             // Claim tables are indexed by absolute terminal row (painters
             // record absolute `y`); grid and buffer content slices are
@@ -460,20 +543,24 @@ impl<W: Write> Tui<W> {
                 let row_y = u16::try_from(y_abs).unwrap_or(u16::MAX);
                 let current = self.terminal.current_buffer_mut();
                 blank_vanished_spans(prior_row, frame_row, row_y, width, current);
+                let (from, to) = row_walk_span(prior_row, frame_row, width);
                 push_row_diff(
-                    &self.grid.content[start..end],
+                    &mut self.grid.content[start..end],
                     &current.content[start..end],
                     row_y,
                     area.x,
+                    from,
+                    to,
                     &mut updates,
                 );
-                self.grid.content[start..end]
-                    .clone_from_slice(&current.content[start..end]);
             }
         }
-        self.terminal
+        let result = self
+            .terminal
             .backend_mut()
-            .draw(updates.iter().map(|(x, y, cell)| (*x, *y, cell)))
+            .draw(updates.iter().map(|(x, y, cell)| (*x, *y, cell)));
+        self.updates_scratch = updates;
+        result
     }
 
     /// Drop all damage-scoping state; the next frame fully repaints and
@@ -648,10 +735,14 @@ impl<W: Write> Tui<W> {
         }
     }
 
-    fn take_composition_bytes(&self) -> Vec<u8> {
+    fn take_composition_bytes(&mut self) -> Vec<u8> {
+        // PERF-T11 terminal-paint Design A: swap the pooled buffer into the
+        // sink instead of leaving it a fresh empty Vec, so the composition
+        // growth per frame reuses retained capacity.
+        let scratch = self.comp_scratch.take().unwrap_or_default();
         self.composition
             .lock()
-            .map(|mut guard| std::mem::take(&mut *guard))
+            .map(|mut guard| std::mem::replace(&mut *guard, scratch))
             .unwrap_or_default()
     }
 
@@ -663,8 +754,9 @@ impl<W: Write> Tui<W> {
                 "banned clear sequence in transaction payload",
             ));
         }
-        let framed = wrap_synchronized(payload, self.caps.sync_output);
-        let framed_report = audit_bytes(&framed);
+        let framed = &mut self.frame_scratch;
+        wrap_synchronized_into(framed, payload, self.caps.sync_output);
+        let framed_report = audit_bytes(framed);
         if framed_report.sync_begin != framed_report.sync_end {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -673,12 +765,21 @@ impl<W: Write> Tui<W> {
         }
         write_stage3_frame(
             &mut self.outer,
-            &framed,
+            framed,
             self.caps.sync_output && !payload.is_empty(),
         )?;
         self.write_count = self.write_count.saturating_add(1);
-        self.last_payload = framed;
-        let _ = self.take_composition_bytes();
+        // Rotate the pooled frame buffer through `last_payload`: the test
+        // surface keeps the exact last stage-3 payload, and the buffer it
+        // displaced becomes the next frame's scratch (no steady-state
+        // framing allocation).
+        std::mem::swap(&mut self.last_payload, &mut self.frame_scratch);
+        // Straggler bytes flushed after the payload take keep their prior
+        // discard semantics; the pooled sink buffer stays installed with its
+        // capacity.
+        if let Ok(mut guard) = self.composition.lock() {
+            guard.clear();
+        }
         Ok(())
     }
 }
@@ -708,9 +809,38 @@ fn best_effort_sync_close<W: Write>(writer: &mut W) {
     let _ = writer.flush();
 }
 
-/// Set equality for two claim rows (claims dedupe, order is render order).
 fn claims_equal(a: &[RowClaim], b: &[RowClaim]) -> bool {
     a.len() == b.len() && a.iter().all(|claim| b.contains(claim))
+}
+
+/// Column window a damaged row's diff walk must cover.
+///
+/// PERF-T11 terminal-paint Design A (span feeding): when every claim on
+/// both sides is spanned, changed cells can only lie inside the union of
+/// the prior and frame claim spans — writers write inside their claims
+/// (the Design B writer contract), and vanished-claim blanking stays
+/// inside prior spans. Any foreign claim, or a row with no frame claims
+/// (unclaimed writers, suspended recording), keeps the full row.
+fn row_walk_span(prior: &[RowClaim], frame: &[RowClaim], width: usize) -> (usize, usize) {
+    if frame.is_empty() {
+        return (0, width);
+    }
+    let full = (0, width);
+    let mut lo = usize::from(u16::MAX);
+    let mut hi = 0usize;
+    for claim in prior.iter().chain(frame) {
+        match claim.span() {
+            Some((x, span_width)) => {
+                lo = lo.min(usize::from(x));
+                hi = hi.max(usize::from(x.saturating_add(span_width)));
+            }
+            None => return full,
+        }
+    }
+    if hi <= lo {
+        return full;
+    }
+    (lo.min(width), hi.min(width))
 }
 
 /// Blank the spans of vanished claimants on one row.
@@ -729,14 +859,10 @@ fn blank_vanished_spans(
     if prior.is_empty() {
         return;
     }
-    let covered = |col: u16| -> bool {
-        frame.iter().any(|claim| match claim.span() {
-            Some((x, span_width)) => {
-                col >= x && col < x.saturating_add(span_width)
-            }
-            None => true,
-        })
-    };
+    // A foreign current claim covers the whole row; nothing to blank.
+    if frame.iter().any(|claim| claim.span().is_none()) {
+        return;
+    }
     for claim in prior {
         if frame.contains(claim) {
             continue;
@@ -745,13 +871,27 @@ fn blank_vanished_spans(
             Some((x, span_width)) => (x, x.saturating_add(span_width)),
             None => (0, u16::try_from(width).unwrap_or(u16::MAX)),
         };
-        for col in from..to {
-            if !covered(col) {
-                if let Some(cell) =
-                    buf.cell_mut((col, y))
+        // Fast path (the churn case: one line claim replaced by another
+        // with the same span): a single current span containing the
+        // vanished span blanks nothing, without a per-column walk.
+        if frame.iter().any(|current| {
+            current.span().is_some_and(|(cx, cw)| {
+                cx <= from && to <= cx.saturating_add(cw) && cx < cw.saturating_add(cx)
+            })
+        }) {
+            continue;
+        }
+        'col: for col in from..to {
+            for current in frame {
+                if let Some((cx, cw)) = current.span()
+                    && col >= cx
+                    && col < cx.saturating_add(cw)
                 {
-                    cell.reset();
+                    continue 'col;
                 }
+            }
+            if let Some(cell) = buf.cell_mut((col, y)) {
+                cell.reset();
             }
         }
     }
@@ -765,11 +905,24 @@ fn blank_vanished_spans(
 /// and a replaced wide grapheme whose style was visible on blank trailing
 /// cells force-refreshes the trailing range. Painters never place a wide
 /// grapheme in a row's final column, so trailing state stays within the row.
+///
+/// PERF-T11 terminal-paint Design A: the walk is *fused* with the
+/// emitted-state sync — every cell the walk finds unequal is copied into
+/// `prev` (the snapshot slice) in place, replacing the previous full-row
+/// `clone_from_slice` per damaged row, and *windowed* to `[from, to)` (see
+/// [`row_walk_span`]); a grapheme starting inside the window still runs its
+/// continuation/trailing range to completion exactly as a full-row walk
+/// would. `Cell::eq` normalizes `None` and `" "` symbols, so a snapshot
+/// cell left un-copied because it compares equal stays observably identical
+/// (eq, `symbol()`, `cell_width()` all normalize).
+#[allow(clippy::too_many_arguments)]
 fn push_row_diff(
-    prev: &[Cell],
+    prev: &mut [Cell],
     next: &[Cell],
     y: u16,
     x0: u16,
+    from: usize,
+    to: usize,
     out: &mut Vec<(u16, u16, Cell)>,
 ) {
     /// Modifiers visually apparent on a blank (space) cell.
@@ -785,11 +938,19 @@ fn push_row_diff(
             || (cell.skip && matches!(cell.diff_option, CellDiffOption::None))
     };
 
+    // Fused sync: copy the buffer cell into the snapshot when they differ.
+    let sync = |j: usize, prev: &mut [Cell], next: &[Cell]| {
+        if prev[j] != next[j] {
+            prev[j] = next[j].clone();
+        }
+    };
+
     let len = prev.len().min(next.len());
-    let mut pos = 0usize;
+    let to = to.min(len);
+    let mut pos = from.min(to);
     // Pending trailing cells after a wide character: `(next index, end, force)`.
     let mut trailing: Option<(usize, usize, bool)> = None;
-    while pos < len || trailing.is_some() {
+    while pos < to || trailing.is_some() {
         if let Some((mut next_index, mut end, force)) = trailing.take() {
             while next_index < end {
                 let j = next_index;
@@ -799,57 +960,84 @@ fn push_row_diff(
                 if !is_skip(&next[j]) && (force || prev[j].symbol() != next[j].symbol()) {
                     let x = x0.saturating_add(u16::try_from(j).unwrap_or(u16::MAX));
                     out.push((x, y, next[j].clone()));
+                    sync(j, prev, next);
                     trailing = Some((next_index, end, force));
                     break;
                 }
+                sync(j, prev, next);
             }
             if trailing.is_none() {
                 pos = end.max(pos);
             }
             continue;
         }
-        if pos >= len {
+        if pos >= to {
             break;
         }
         let i = pos;
         pos += 1;
         let current = &next[i];
-        let previous = &prev[i];
         let x = x0.saturating_add(u16::try_from(i).unwrap_or(u16::MAX));
         match current.diff_option {
-            CellDiffOption::Skip => {}
-            _ if is_skip(current) => {}
+            CellDiffOption::Skip => {
+                sync(i, prev, next);
+            }
+            _ if is_skip(current) => {
+                sync(i, prev, next);
+            }
             CellDiffOption::ForcedWidth(width) => {
+                let emit = *current != prev[i];
                 pos = pos.saturating_add(width.get().saturating_sub(1) as usize);
-                if current != previous {
+                for j in i..pos.min(len) {
+                    sync(j, prev, next);
+                }
+                if emit {
                     out.push((x, y, current.clone()));
                 }
             }
             CellDiffOption::None | CellDiffOption::AlwaysUpdate => {
                 let cell_width = current.cell_width() as usize;
-                if matches!(current.diff_option, CellDiffOption::None) && current == previous {
+                if matches!(current.diff_option, CellDiffOption::None) && *current == prev[i] {
+                    // Head is equal (just compared) — sync only the wide
+                    // grapheme's continuation columns; the old bulk row copy
+                    // paid a full-cell move for every equal cell.
+                    for j in (i + 1)..(i + cell_width).min(len) {
+                        sync(j, prev, next);
+                    }
                     pos += cell_width.saturating_sub(1);
                     continue;
                 }
-                let previous_width = previous.cell_width() as usize;
+                // Prev-derived values are read branch-locally: `sync` takes
+                // `prev` mutably, and `cell_width()` is unicode-width work
+                // too expensive to pay per equal cell.
+                let prev_width = prev[i].cell_width() as usize;
+                let prev_visible = prev[i].bg != Color::Reset
+                    || prev[i].modifier.intersects(VISIBLE_ON_BLANK);
                 let contains_vs16 =
                     cell_width > 1 && current.symbol().chars().any(|c| c == '\u{FE0F}');
                 if contains_vs16 {
                     trailing = Some((i + 1, (i + cell_width).min(len), false));
                 } else if cell_width > 1 {
                     pos += cell_width.saturating_sub(1);
-                } else if previous_width > cell_width
-                    && (previous.bg != Color::Reset
-                        || previous.modifier.intersects(VISIBLE_ON_BLANK))
-                {
-                    trailing = Some((i + 1, i + previous_width, true));
+                    for j in (i + 1)..(i + cell_width).min(len) {
+                        sync(j, prev, next);
+                    }
+                } else if prev_width > cell_width && prev_visible {
+                    trailing = Some((i + 1, i + prev_width, true));
                 }
                 out.push((x, y, current.clone()));
+                sync(i, prev, next);
             }
         }
     }
+    #[cfg(debug_assertions)]
+    for j in from.min(len)..to {
+        debug_assert!(
+            prev[j] == next[j],
+            "fused diff sync left snapshot column {j} stale on row {y}"
+        );
+    }
 }
-
 fn render_lines(buf: &mut Buffer, lines: &[Line<'static>]) {
     let mut y = buf.area.y;
     for line in lines {
@@ -982,12 +1170,104 @@ pub enum SimulatedTxn {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::num::NonZeroU16;
     use crate::component::{EventResult, UiEvent};
     use crate::terminal::backend::audit_bytes;
     use crate::terminal::caps::TerminalCapabilities;
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
     use std::io::Cursor;
+
+    /// PERF-T11 terminal-paint Design A contract: the fused windowed diff
+    /// walk must (a) emit exactly the cells a full-row scan of the same
+    /// semantics would emit, and (b) leave the snapshot (`prev`) equal to
+    /// the buffer row (`next`) over the walked window — the property the
+    /// old post-walk full-row `clone_from_slice` provided.
+    #[test]
+    fn fused_diff_sync_matches_full_row_copy_semantics() {
+        let mk = |sym: &'static str| Cell::new(sym);
+        // Crafted row covering every walk branch.
+        let mut next = vec![mk("x"); 8];
+        let mut prev = next.clone();
+
+        // 0: equal plain cell (no emit, no copy needed).
+        // 1: changed symbol (emit + sync).
+        next[1] = mk("y");
+        // 2: skip cell differing from the snapshot: never emitted, but the
+        // old full-row copy synced it.
+        let mut skip_cell = mk("z");
+        skip_cell.set_diff_option(CellDiffOption::Skip);
+        next[2] = skip_cell;
+        // 3-4: equal wide grapheme: head not emitted, continuation synced.
+        next[3] = mk("瓦");
+        prev[3] = mk("瓦");
+        next[4] = mk("");
+        prev[4] = mk("");
+        // 5: narrow cell replacing a previous wide grapheme whose trailing
+        // cell carried a visible background: force-refreshes the trailing
+        // range (emits 5 and 6).
+        let mut old_wide = mk("骨");
+        old_wide.bg = Color::Red;
+        prev[5] = old_wide;
+        prev[6] = mk("");
+        next[5] = mk("n");
+        next[6] = mk("");
+        // 7: ForcedWidth cell equal to the snapshot: advances past its span,
+        // not emitted.
+        let mut forced = mk("f");
+        forced.set_diff_option(CellDiffOption::ForcedWidth(
+            NonZeroU16::MIN,
+        ));
+        next[7] = forced.clone();
+        prev[7] = forced;
+
+        let reference = next.clone();
+        let mut updates = Vec::new();
+        let mut snapshot = prev.clone();
+        push_row_diff(&mut snapshot, &next, 4, 10, 0, 8, &mut updates);
+
+        // (a) emission: the changed symbol (x=11), the narrow replacement
+        // (x=15), and its force-refreshed trailing cell (x=16).
+        let xs: Vec<u16> = updates.iter().map(|(x, _, _)| *x).collect();
+        assert_eq!(xs, vec![11, 15, 16]);
+        // (b) fused sync: snapshot equals the buffer row over the window.
+        assert_eq!(snapshot, reference);
+
+        // Windowed call over [2, 6): the narrow replacement inside the
+        // window is emitted, and its force-trailing range runs past the
+        // window end to completion (full-row semantics preserved for
+        // boundary-crossing graphemes).
+        let mut updates2 = Vec::new();
+        let mut snapshot2 = prev.clone();
+        push_row_diff(&mut snapshot2, &next, 4, 10, 2, 6, &mut updates2);
+        let xs2: Vec<u16> = updates2.iter().map(|(x, _, _)| *x).collect();
+        assert_eq!(xs2, vec![15, 16]);
+        for j in 2..7 {
+            assert_eq!(snapshot2[j], reference[j], "window column {j} synced");
+        }
+    }
+
+    /// `row_walk_span` unions prior and frame claim spans; foreign claims or
+    /// claim-less frames keep the full row.
+    #[test]
+    fn row_walk_span_unions_claims_and_falls_back_to_full_row() {
+        let line = |x: u16, w: u16| RowClaim::Line {
+            x,
+            width: w,
+            key: 7,
+            linked: false,
+        };
+        assert_eq!(row_walk_span(&[], &[line(4, 8)], 100), (4, 12));
+        assert_eq!(row_walk_span(&[line(60, 10)], &[line(4, 8)], 100), (4, 70));
+        assert_eq!(
+            row_walk_span(&[RowClaim::Foreign], &[line(4, 8)], 100),
+            (0, 100)
+        );
+        assert_eq!(row_walk_span(&[line(4, 8)], &[], 100), (0, 100));
+        // Spans clamp to the row width.
+        assert_eq!(row_walk_span(&[], &[line(90, 20)], 100), (90, 100));
+    }
+
     #[derive(Default)]
     struct FailOnceWriter {
         bytes: Vec<u8>,
