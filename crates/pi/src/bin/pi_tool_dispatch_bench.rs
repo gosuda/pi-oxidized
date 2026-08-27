@@ -287,7 +287,6 @@ fn sample_model() -> Model {
 fn bench_config() -> AgentLoopConfig {
     AgentLoopConfig::base(sample_model())
 }
-}
 
 fn valid_arguments() -> Map<String, Value> {
     let mut args = Map::new();
