@@ -215,7 +215,7 @@ mod tests {
     #[test]
     fn oversized_frame_rejected() {
         let mut prefix = [0u8; 4];
-        prefix[0] = 0x01;
+        prefix.copy_from_slice(&(16 * 1024 * 1024 + 1u32).to_be_bytes());
         let mut dec = FrameDecoder::default();
         let err = dec.push(&prefix).unwrap_err();
         assert_eq!(err, FrameError::Oversized { declared: 16 * 1024 * 1024 + 1, limit: 16 * 1024 * 1024 });
