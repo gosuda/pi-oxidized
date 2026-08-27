@@ -1259,34 +1259,11 @@ mod tests {
         config.compaction_stream_override = Some(CompactionStreamHandle::new(stream_fn));
         // Provide the base config explicitly so the session threads the given
         // telemetry context (same Arc) instead of the C18-resolved no-op.
-        config.base_config = Some(pi_agent::AgentLoopConfig {
-            model: test_model(context_window),
-            reasoning: None,
-            temperature: None,
-            max_tokens: None,
-            session_id: None,
-            transport: None,
-            cache_retention: None,
-            thinking_budgets: None,
-            max_retry_delay_ms: None,
-            metadata: None,
-            headers: None,
-            env: None,
-            stream_extra: Map::new(),
-            tool_execution: pi_agent::ToolExecutionMode::Parallel,
-            convert_to_llm: pi_agent::default_convert_to_llm_hook(),
-            transform_context: None,
-            get_api_key: None,
-            should_stop_after_turn: None,
-            prepare_next_turn: None,
-            get_steering_messages: None,
-            get_follow_up_messages: None,
-            before_tool_call: None,
-            after_tool_call: None,
-            on_payload: None,
-            on_response: None,
-            telemetry,
-        });
+        // Construction goes through the sanctioned `base` seam (no new
+        // AgentLoopConfig literal site; the parity oracle stays at five).
+        let mut base = pi_agent::AgentLoopConfig::base(test_model(context_window));
+        base.telemetry = telemetry;
+        config.base_config = Some(base);
         Ok(AgentSession::new(config)?)
     }
 

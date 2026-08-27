@@ -228,6 +228,17 @@ pub struct AgentLoopConfig {
 }
 
 impl AgentLoopConfig {
+    /// Base configuration for one model with every optional seam at its
+    /// default (no-op telemetry, parallel tools, default convert hook).
+    ///
+    /// This is the sanctioned construction path for callers outside the
+    /// five pinned `AgentLoopConfig` literal sites: mutate the returned
+    /// config instead of constructing the struct literal, so the parity
+    /// arbitration oracle stays at exactly five sites.
+    #[must_use]
+    pub fn base(model: Model) -> Self {
+        crate::agent::default_base_config(model)
+    }
     /// Builds provider stream options from this config, a resolved key, and cancel token.
     ///
     /// When `reasoning` is present and not [`ModelThinkingLevel::Off`], inserts

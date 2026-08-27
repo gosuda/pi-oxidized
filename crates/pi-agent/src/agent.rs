@@ -52,15 +52,18 @@ impl AgentOptions {
             thinking_level: pi_ai::ModelThinkingLevel::Off,
             tools: Vec::new(),
             messages: Vec::new(),
-            config: default_base_config(),
+            config: default_base_config(crate::state::default_model()),
             provider,
         }
     }
 }
 
-fn default_base_config() -> AgentLoopConfig {
+/// Single construction owner for a base [`AgentLoopConfig`] (pinned
+/// arbitration site). `AgentLoopConfig::base` in `config.rs` delegates here
+/// so callers outside the five pinned sites never construct the literal.
+pub(crate) fn default_base_config(model: Model) -> AgentLoopConfig {
     AgentLoopConfig {
-        model: crate::state::default_model(),
+        model,
         reasoning: None,
         temperature: None,
         max_tokens: None,

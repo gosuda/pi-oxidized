@@ -285,34 +285,8 @@ fn sample_model() -> Model {
 }
 
 fn bench_config() -> AgentLoopConfig {
-    AgentLoopConfig {
-        model: sample_model(),
-        reasoning: None,
-        temperature: None,
-        max_tokens: None,
-        session_id: None,
-        transport: None,
-        cache_retention: None,
-        thinking_budgets: None,
-        max_retry_delay_ms: None,
-        metadata: None,
-        headers: None,
-        env: None,
-        stream_extra: Map::new(),
-        tool_execution: ToolExecutionMode::Parallel,
-        convert_to_llm: default_convert_to_llm_hook(),
-        transform_context: None,
-        get_api_key: None,
-        should_stop_after_turn: None,
-        prepare_next_turn: None,
-        get_steering_messages: None,
-        get_follow_up_messages: None,
-        before_tool_call: None,
-        after_tool_call: None,
-        on_payload: None,
-        on_response: None,
-        telemetry: noop_context(),
-    }
+    AgentLoopConfig::base(sample_model())
+}
 }
 
 fn valid_arguments() -> Map<String, Value> {
