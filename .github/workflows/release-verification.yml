@@ -234,25 +234,36 @@ jobs:
           printf 'artifact\turl\tsha256\tacquired_utc\tvendor_verification\n' \
             > target/verification/rel-t4/musl/pins-ledger.tsv
 
-      - name: Musl toolchain candidate A (apt musl-tools)
+      - name: Musl toolchain candidate A (apt musl-tools) and build
         id: musl-candidate-a
         if: matrix.musl == 'true'
         # Candidate B is the sanctioned backup on aarch64 only (REL-R1 §2
         # rules); on x86_64 candidate A is the executed winner and hard-fails.
+        # selected-candidate.txt is written only after the A build succeeds,
+        # so an apt success whose musl-gcc build fails still falls through to
+        # candidate B on aarch64.
         continue-on-error: ${{ matrix.target == 'aarch64-unknown-linux-musl' }}
         shell: bash
         run: |
           set -Eeuo pipefail
+          EVIDENCE=target/verification/rel-t4/musl
+          triple='${{ matrix.target }}'
+          linker_var="CARGO_TARGET_$(printf '%s' "$triple" | tr '[:lower:]-' '[:upper:]_')_LINKER"
+          cc_var="CC_$(printf '%s' "$triple" | tr '[:upper:]-' '[:lower:]_')"
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             "musl-dev=$MUSL_APT_VERSION" "musl-tools=$MUSL_APT_VERSION"
           test "$(dpkg-query -W -f='${Version}' musl-dev)" = "$MUSL_APT_VERSION"
           test "$(dpkg-query -W -f='${Version}' musl-tools)" = "$MUSL_APT_VERSION"
           dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\n' musl-dev musl-tools \
-            | tee target/verification/rel-t4/musl/candidate-a-packages.tsv
+            | tee "$EVIDENCE/candidate-a-packages.tsv"
           printf '%s\n' 'integrity=distro-signed Ubuntu noble apt repository' \
-            > target/verification/rel-t4/musl/candidate-a-provenance.txt
-          printf 'A\n' > target/verification/rel-t4/musl/selected-candidate.txt
+            > "$EVIDENCE/candidate-a-provenance.txt"
+          env "$linker_var=musl-gcc" "$cc_var=musl-gcc" \
+            cargo build -p pi --release --locked --target "$triple" \
+            2>&1 | tee "$EVIDENCE/candidate-a-build.log"
+          test -x "target/$triple/release/pi"
+          printf 'A\n' > "$EVIDENCE/selected-candidate.txt"
 
       - name: Musl toolchain candidate B (pinned cargo-zigbuild)
         if: always() && matrix.target == 'aarch64-unknown-linux-musl' && steps.musl-candidate-a.outcome == 'failure'
@@ -296,9 +307,17 @@ jobs:
           tar -xzf "$EVIDENCE/downloads/$crate" -C "$crate_source" --strip-components=1
           cargo install --locked --path "$crate_source"
           cargo-zigbuild --version | tee "$EVIDENCE/candidate-b-cargo-zigbuild-version.txt"
+          triple='${{ matrix.target }}'
+          linker_var="CARGO_TARGET_$(printf '%s' "$triple" | tr '[:lower:]-' '[:upper:]_')_LINKER"
+          cc_var="CC_$(printf '%s' "$triple" | tr '[:upper:]-' '[:lower:]_')"
+          PATH="$RUNNER_TEMP/zig:$PATH" \
+            env -u "$linker_var" -u "$cc_var" \
+            cargo zigbuild -p pi --release --locked --target "$triple" \
+            2>&1 | tee "$EVIDENCE/candidate-b-build.log"
+          test -x "target/$triple/release/pi"
           printf 'B\n' > "$EVIDENCE/selected-candidate.txt"
 
-      - name: Build pi (musl target)
+      - name: Assert musl pi build
         if: matrix.musl == 'true'
         shell: bash
         run: |
@@ -308,19 +327,8 @@ jobs:
           candidate="$(tr -d '\n' < "$EVIDENCE/selected-candidate.txt")"
           triple='${{ matrix.target }}'
           linker_var="CARGO_TARGET_$(printf '%s' "$triple" | tr '[:lower:]-' '[:upper:]_')_LINKER"
-          cc_var="CC_$(printf '%s' "$triple" | tr '[:upper:]-' '[:lower:]_')"
           printf 'candidate=%s\ntriple=%s\nlinker_var=%s\n' "$candidate" "$triple" "$linker_var" \
             | tee "$EVIDENCE/build-selection.txt"
-          if test "$candidate" = "B"; then
-            PATH="$RUNNER_TEMP/zig:$PATH" \
-              env -u "$linker_var" -u "$cc_var" \
-              cargo zigbuild -p pi --release --locked --target "$triple" \
-              2>&1 | tee "$EVIDENCE/candidate-b-build.log"
-          else
-            env "$linker_var=musl-gcc" "$cc_var=musl-gcc" \
-              cargo build -p pi --release --locked --target "$triple" \
-              2>&1 | tee "$EVIDENCE/candidate-a-build.log"
-          fi
           test -x "target/$triple/release/pi"
 
       - name: Provision Alpine musl userland (loader + C++ runtime)
