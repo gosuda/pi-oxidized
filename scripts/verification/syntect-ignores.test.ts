@@ -46,7 +46,7 @@ function removeSyntectDependency(text: string, dependency: string): string {
 	if (match === null) throw new Error("Cargo.lock fixture has no syntect dependency block");
 	const dependencies = match[2];
 	if (dependencies === undefined) throw new Error("Cargo.lock fixture has no syntect dependency list");
-	const replacedDependencies = dependencies.replace(` "${dependency}",\n`, "");
+	const replacedDependencies = dependencies.replace(new RegExp(`\\s*"${dependency}",\\n?`), "");
 	expect(replacedDependencies).not.toBe(dependencies);
 	return text.replace(syntectBlock, `$1${replacedDependencies}$3`);
 }
@@ -117,6 +117,11 @@ describe("syntect-ignores watch (DEPS-R3)", () => {
 			const withoutDependency = removeSyntectDependency(lockText, "bincode");
 			const violations = violate(denyTomlText, withoutDependency);
 			expect(violations.join("\n")).toContain("syntect no longer depends on bincode");
+		});
+		test("dropping the yaml-rust transitive from syntect fails while the package remains locked", () => {
+			const withoutDependency = removeSyntectDependency(lockText, "yaml-rust");
+			const violations = violate(denyTomlText, withoutDependency);
+			expect(violations.join("\n")).toContain("syntect no longer depends on yaml-rust");
 		});
 	});
 
