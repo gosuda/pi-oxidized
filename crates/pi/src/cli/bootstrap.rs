@@ -2028,7 +2028,7 @@ mod tests {
         let pkg_out = CapturedOutput::default();
         let pkg = FakePackageHandler::default();
         let outcome = run_bootstrap(BootstrapInputs {
-            args: args_vec(&["--print", "hello"]),
+            args: args_vec(&["--no-session", "--print", "hello"]),
             io: &io,
             factory: &factory,
             package_handler: &pkg,
@@ -2276,7 +2276,7 @@ mod tests {
         let pkg_out = CapturedOutput::default();
         let pkg = FakePackageHandler::default();
         let outcome = run_bootstrap(BootstrapInputs {
-            args: args_vec(&["--print", "hello"]),
+            args: args_vec(&["--no-session", "--print", "hello"]),
             io: &io,
             factory: &factory,
             package_handler: &pkg,
