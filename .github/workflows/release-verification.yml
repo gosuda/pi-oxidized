@@ -101,6 +101,7 @@ jobs:
         shell: bash
         run: |
           cargo build -p pi --locked
+          cargo build --release -p pi --locked
           case "${RUNNER_OS}-${RUNNER_ARCH}" in
             Linux-X64) host_target=bun-linux-x64-baseline ;;
             macOS-X64) host_target=bun-darwin-x64-baseline ;;
@@ -113,6 +114,13 @@ jobs:
             mkdir -p dist
             bun build ./src/main.ts --compile --minify --compile-autoload-tsconfig --compile-autoload-package-json --target "$host_target" --outfile dist/pi-extension-host
           )
+
+      - name: Run DOC-C transcript harnesses (e2e-smoke, session-interop)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          bun run scripts/verification/e2e-smoke.ts
+          bun run scripts/verification/session-interop.ts
 
       # Bun's terminal spawn is POSIX-only. The Windows leg runs the portable
       # script tests; PTY driver, interactive smoke, and performance suites

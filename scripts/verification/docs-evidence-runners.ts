@@ -218,7 +218,7 @@ export function runFencedCompile(row: LedgerRow, root: string, runId: string): R
 	}
 	// Look for a fenced block annotated with the fenceMarker comment
 	const fenceRe = new RegExp(
-		"```[a-zA-Z]*\\s*[\\s\\S]*?" + escapeRegex(fenceMarker.value) + "[\\s\\S]*?```",
+		"(`{3,}|~{3,})[^\\n]*\\n[\\s\\S]*?" + escapeRegex(fenceMarker.value) + "[\\s\\S]*?\\n\\1[ \\t]*(?:\\n|$)",
 	);
 	if (!fenceRe.test(content)) {
 		return failResult(

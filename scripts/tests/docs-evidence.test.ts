@@ -97,8 +97,14 @@ function writePriorSidecar(dir: string, sidecar: Sidecar): void {
 	writeFileSync(join(dir, `${sidecar.rowId}.json`), JSON.stringify(sidecar, null, 2) + "\n");
 }
 
+/** DOC-C full-tree assertions need the release binary and harness transcripts. */
+const DOCC_PREREQS_READY =
+	existsSync(join(REPO_ROOT, "target/release/pi")) &&
+	existsSync(join(REPO_ROOT, "target/verification/e2e/latest-run.txt")) &&
+	existsSync(join(REPO_ROOT, "target/verification/session-interop/v3/basic"));
+
 describe("docs-evidence: green on current tree", () => {
-	test("checker exits 0 on the current tree", () => {
+	test.skipIf(!DOCC_PREREQS_READY)("checker exits 0 on the current tree", () => {
 		const dir = mkdtempSync(join(tmpdir(), "docs-ev-green-"));
 		const scDir = join(dir, "sidecars");
 		mkdirSync(scDir, { recursive: true });
@@ -108,7 +114,7 @@ describe("docs-evidence: green on current tree", () => {
 		expect(result.problems).toEqual([]);
 	});
 
-	test("CLI entrypoint produces the OK sentinel", () => {
+	test.skipIf(!DOCC_PREREQS_READY)("CLI entrypoint produces the OK sentinel", () => {
 		const proc = spawnSync(
 			"bun",
 			["run", "scripts/verification/docs-evidence.ts", "--sidecar-dir", join(tmpdir(), "docs-ev-cli")],

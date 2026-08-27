@@ -19,6 +19,8 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
+import { captureCliHelpSnapshots, captureReleaseFlagSnapshot, checkDocsTopics, mirrorHarnessArtifacts } from "./docs-topics.ts";
+
 import {
 	CANONICAL_REFERENCE_SHA,
 	STALE_REFERENCE_SHA,
@@ -251,6 +253,7 @@ export function runCheck(
 	root: string,
 	sidecarDir: string,
 	runId: string,
+	options: { readonly strict?: boolean } = {},
 ): CheckResult {
 	const problems: string[] = [];
 	const sidecars: Sidecar[] = [];
@@ -273,6 +276,33 @@ export function runCheck(
 	const importFindings = scanForExampleProductImports(root);
 	for (const finding of importFindings) {
 		problems.push(`[example-product-import] ${finding}`);
+	}
+
+	// 2c. DOC-C: capture fresh transcript snapshots before rows run so
+	// transcript-claim rows read artifacts produced in the current run, and
+	// mirror the latest harness outputs into stable paths. Skipped when the
+	// release binary is absent (leg without a build) so library consumers of
+	const doccActive =
+		options.strict === true || (existsSync(join(root, "docs/index.md")) && existsSync(join(root, "target/release/pi")));
+	if (doccActive) {
+		for (const snap of captureCliHelpSnapshots(root)) {
+			if (!snap.ok) {
+				problems.push(`[doc-c-capture] ${snap.name}: producer exited nonzero`);
+			}
+		}
+		const releaseFlags = captureReleaseFlagSnapshot(root);
+		if (!releaseFlags.ok) {
+			problems.push(`[doc-c-capture] ${releaseFlags.name}: producer exited nonzero`);
+		}
+		const mirrors = mirrorHarnessArtifacts(root);
+		if (mirrors.e2eResult === null) {
+			problems.push("[doc-c-capture] e2e-smoke transcript unavailable: run scripts/verification/e2e-smoke.ts first");
+		}
+		if (mirrors.sessionInteropFork === null) {
+			problems.push(
+				"[doc-c-capture] session-interop transcript unavailable: run scripts/verification/session-interop.ts first",
+			);
+		}
 	}
 
 	// 3. Run each row's evidence class runner
@@ -309,6 +339,21 @@ export function runCheck(
 		writeSidecar(sidecarDir, sc);
 	}
 
+	// 6. DOC-C: ported-topic corpus gates (index parity, manifests, fences,
+	// imports, terminal lock, fresh-sidecar binding).
+	if (doccActive) {
+		const freshRowIds = new Set(sidecars.filter((sc) => sc.runId === runId).map((sc) => sc.rowId));
+		for (const problem of checkDocsTopics({
+			root,
+			referencePin: ledger.referencePin,
+			ledgerRows: ledger.rows,
+			freshRowIds,
+			sidecarDir,
+		})) {
+			problems.push(problem);
+		}
+	}
+
 	return { ok: problems.length === 0, problems, sidecars };
 }
 
@@ -333,7 +378,7 @@ async function main(): Promise<void> {
 	}
 
 	const runId = new Date().toISOString();
-	const result = runCheck(ledger, inventory, root, sidecarDir, runId);
+	const result = runCheck(ledger, inventory, root, sidecarDir, runId, { strict: true });
 
 	if (result.ok) {
 		process.stdout.write(SENTINEL_OK + "\n");
