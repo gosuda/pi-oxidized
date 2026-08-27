@@ -1014,6 +1014,7 @@ pub fn user_markdown_options() -> MarkdownOptions {
         preserve_ordered_list_markers: true,
         preserve_backslash_escapes: true,
         hyperlinks: HYPERLINKS.with(|cell| cell.get()),
+        render_latex: true,
     }
 }
 

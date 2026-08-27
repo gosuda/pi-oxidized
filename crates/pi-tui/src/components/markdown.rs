@@ -10,7 +10,8 @@ use ratatui::layout::Rect;
 use crate::component::{Component, EventResult, UiEvent};
 use crate::link::hyperlink_capped;
 use crate::text::{
-    is_image_line, strip_trailing_partial_closing_fence, visible_width, wrap_text_with_ansi,
+    is_image_line, render_latex, strip_trailing_partial_closing_fence, visible_width,
+    wrap_text_with_ansi,
 };
 
 use super::util::{apply_background, empty_line, paint_lines};
@@ -152,7 +153,7 @@ impl Default for MarkdownTheme {
 }
 
 /// Markdown parse options.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct MarkdownOptions {
     /// Preserve source ordered-list markers (best-effort with pulldown-cmark).
     pub preserve_ordered_list_markers: bool,
@@ -160,6 +161,19 @@ pub struct MarkdownOptions {
     pub preserve_backslash_escapes: bool,
     /// Enable OSC 8 hyperlinks (caller supplies capability).
     pub hyperlinks: bool,
+    /// Render supported LaTeX math expressions as Unicode text (default: true).
+    pub render_latex: bool,
+}
+
+impl Default for MarkdownOptions {
+    fn default() -> Self {
+        Self {
+            preserve_ordered_list_markers: false,
+            preserve_backslash_escapes: false,
+            hyperlinks: false,
+            render_latex: true,
+        }
+    }
 }
 
 /// Markdown component with width-keyed render cache.
@@ -341,6 +355,444 @@ impl Component for Markdown {
     }
 }
 
+/// Preprocess LaTeX math delimiters in markdown source, rendering supported
+/// expressions to Unicode text. Implements the upstream marked-extension
+/// delimiter contract: block `$$…$$` and `\[…]` first, then inline `$$…$$`,
+/// `\(...\)`, `\[…]`, and single `$…$` with four rejection rules.
+///
+/// Code fences and inline code spans are excluded — math delimiters inside
+/// them stay literal. Escaped `\$` is consumed as a markdown escape before
+/// the math path sees it.
+fn preprocess_math(source: &str) -> String {
+    // Fast path: no math delimiters at all
+    if !source.contains('$') && !source.contains("\\[") && !source.contains("\\(") {
+        return source.to_owned();
+    }
+
+    let mut result = String::with_capacity(source.len());
+    let lines: Vec<&str> = source.split('\n').collect();
+    let mut i = 0;
+    while i < lines.len() {
+        // Check for block math: ^ {0,3}$$...$$ or ^ {0,3}\[...\]
+        if let Some((rendered, consumed)) = try_block_math(&lines[i..]) {
+            for line in rendered.split('\n') {
+                result.push_str(line);
+                result.push('\n');
+            }
+            i += consumed;
+            continue;
+        }
+
+        // Process inline math within the line
+        result.push_str(&process_inline_math(lines[i]));
+        if i + 1 < lines.len() {
+            result.push('\n');
+        }
+        i += 1;
+    }
+    result
+}
+
+/// Try to match block math starting at the given lines.
+/// Returns (rendered_text, lines_consumed) if matched, None otherwise.
+fn try_block_math(lines: &[&str]) -> Option<(String, usize)> {
+    let first = lines.first()?;
+
+    // $$...$$ block
+    if let Some(rest) = strip_leading_spaces(first, "$$") {
+        let after_open = rest.trim_start();
+
+        // Check if opener line has content after $$
+        if let Some(end_idx) = find_block_closer_dollar(after_open) {
+            let body = after_open[..end_idx].trim();
+            let rendered = render_latex(body, true).unwrap_or_else(|| {
+                format!("$${body}$$")
+            });
+            return Some((rendered, 1));
+        }
+
+        // Multi-line: collect until closing $$
+        let mut search_lines = vec![after_open.to_owned()];
+        for (idx, line) in lines.iter().enumerate().skip(1) {
+            if let Some(pos) = find_block_closer_dollar(line) {
+                let before = &line[..pos];
+                if !before.trim().is_empty() {
+                    search_lines.push(before.to_owned());
+                }
+                let body = search_lines.join("\n").trim().to_owned();
+                let rendered = render_latex(&body, true).unwrap_or_else(|| {
+                    format!("$${body}$$")
+                });
+                let after = &line[pos + 2..];
+                let mut result = rendered;
+                if !after.trim().is_empty() {
+                    result.push('\n');
+                    result.push_str(after.trim());
+                }
+                return Some((result, idx + 1));
+            }
+            search_lines.push(line.to_string());
+        }
+        // Pending (unclosed) $$ block — check if body looks like math
+        if looks_like_pending_dollar_math(&search_lines.join("\n")) {
+            return Some((format!("$${}", search_lines.join("\n")), lines.len()));
+        }
+        return None;
+    }
+
+    // \[...\] block
+    if let Some(rest) = strip_leading_spaces(first, "\\[") {
+        let after_open = rest.trim_start();
+        // Check if opener line has content after \[
+        if let Some(end_idx) = find_block_closer_bracket(after_open) {
+            let body = after_open[..end_idx].trim();
+            let rendered = render_latex(body, true).unwrap_or_else(|| {
+                format!("\\[{body}\\]")
+            });
+            return Some((rendered, 1));
+        }
+
+        // Multi-line: collect until closing \]
+        let mut search_lines = vec![after_open.to_owned()];
+        for (idx, line) in lines.iter().enumerate().skip(1) {
+            if let Some(pos) = line.find("\\]") {
+                let before = &line[..pos];
+                if !before.trim().is_empty() {
+                    search_lines.push(before.to_owned());
+                }
+                let body = search_lines.join("\n").trim().to_owned();
+                let rendered = render_latex(&body, true).unwrap_or_else(|| {
+                    format!("\\[{body}\\]")
+                });
+                let after = &line[pos + 2..];
+                let mut result = rendered;
+                if !after.trim().is_empty() {
+                    result.push('\n');
+                    result.push_str(after.trim());
+                }
+                return Some((result, idx + 1));
+            }
+            search_lines.push(line.to_string());
+        }
+        // Pending \[ block — always pending
+        let mut result = String::from("\\[\n");
+        result.push_str(&search_lines.join("\n"));
+        return Some((result, lines.len()));
+    }
+
+    None
+}
+
+/// Strip up to 3 leading spaces then match the prefix. Returns the rest after prefix.
+fn strip_leading_spaces<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
+    let mut chars = line.chars();
+    let mut spaces = 0;
+    while spaces < 3 {
+        match chars.clone().next() {
+            Some(' ') => {
+                chars.next();
+                spaces += 1;
+            }
+            _ => break,
+        }
+    }
+    let rest: &str = chars.as_str();
+    rest.starts_with(prefix).then(|| &rest[prefix.len()..])
+}
+
+/// Find the closing $$ in a string, respecting backslash escapes.
+fn find_block_closer_dollar(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'\\' {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'$' && bytes[i + 1] == b'$' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Find the closing \] in a string.
+fn find_block_closer_bracket(s: &str) -> Option<usize> {
+    s.find("\\]")
+}
+
+/// Check if pending dollar math body looks like math.
+fn looks_like_pending_dollar_math(source: &str) -> bool {
+    source.contains('\\')
+        || source.contains('_')
+        || source.contains('^')
+        || source.contains('=')
+        || source.contains('+')
+        || source.contains('*')
+        || source.contains('/')
+        || source.contains('<')
+        || source.contains('>')
+        || source.contains('(')
+        || source.contains(')')
+        || source.contains('[')
+        || source.contains(']')
+        || source.contains('|')
+        || source.contains("±")
+        || source.contains("≤")
+        || source.contains("≥")
+        || source.contains("≠")
+        || source.contains("≈")
+        || source.contains("∈")
+        || source.contains("→")
+        || source.contains("⇒")
+        || source.contains("∞")
+        || source.contains("∫")
+        || source.contains("∑")
+        || source.contains("√")
+        || source.contains('-')
+}
+
+/// Process inline math delimiters within a single line.
+fn process_inline_math(line: &str) -> String {
+    if !line.contains('$') && !line.contains("\\(") && !line.contains("\\[") {
+        return line.to_owned();
+    }
+
+    let mut result = String::with_capacity(line.len());
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        // Skip inline code spans (backtick-delimited)
+        if chars[i] == '`' {
+            // Find matching backtick
+            let mut j = i + 1;
+            while j < chars.len() && chars[j] != '`' {
+                j += 1;
+            }
+            if j < chars.len() {
+                // Include the code span verbatim
+                let span: String = chars[i..=j].iter().collect();
+                result.push_str(&span);
+                i = j + 1;
+                continue;
+            }
+        }
+
+        // Check for $$ inline
+        if i + 1 < chars.len() && chars[i] == '$' && chars[i + 1] == '$' {
+            if let Some((rendered, end)) = match_inline_dollar_dollar(&chars, i) {
+                result.push_str(&rendered);
+                i = end;
+                continue;
+            }
+        }
+
+        // Check for \( inline
+        if i + 1 < chars.len() && chars[i] == '\\' && chars[i + 1] == '(' {
+            if let Some((rendered, end)) = match_inline_paren(&chars, i) {
+                result.push_str(&rendered);
+                i = end;
+                continue;
+            }
+        }
+
+        // Check for \[ inline (single-line only)
+        if i + 1 < chars.len() && chars[i] == '\\' && chars[i + 1] == '[' {
+            if let Some((rendered, end)) = match_inline_bracket(&chars, i) {
+                result.push_str(&rendered);
+                i = end;
+                continue;
+            }
+        }
+
+        // Check for single $ inline
+        if chars[i] == '$' {
+            // Reject if followed by whitespace
+            if i + 1 < chars.len() && (chars[i + 1] == ' ' || chars[i + 1] == '\t') {
+                result.push(chars[i]);
+                i += 1;
+                continue;
+            }
+            if i + 1 >= chars.len() {
+                result.push(chars[i]);
+                i += 1;
+                continue;
+            }
+            if let Some((rendered, end)) = match_single_dollar(&chars, i) {
+                result.push_str(&rendered);
+                i = end;
+                continue;
+            }
+        }
+
+        // Escaped \$ — pass through as-is (pulldown-cmark will handle the escape)
+        if chars[i] == '\\' && i + 1 < chars.len() && chars[i + 1] == '$' {
+            result.push(chars[i]);
+            result.push(chars[i + 1]);
+            i += 2;
+            continue;
+        }
+
+        result.push(chars[i]);
+        i += 1;
+    }
+
+    result
+}
+
+/// Match $$...$$ inline math. Returns (rendered, end_index).
+fn match_inline_dollar_dollar(chars: &[char], start: usize) -> Option<(String, usize)> {
+    let mut i = start + 2;
+    while i + 1 < chars.len() {
+        if chars[i] == '\\' {
+            i += 2;
+            continue;
+        }
+        if chars[i] == '$' && chars[i + 1] == '$' {
+            let body: String = chars[start + 2..i].iter().collect();
+            if body.is_empty() || body.contains('\n') {
+                return None;
+            }
+            let rendered = render_latex(&body, false).unwrap_or_else(|| format!("$${body}$$"));
+            return Some((rendered, i + 2));
+        }
+        i += 1;
+    }
+    // Pending
+    let body: String = chars[start + 2..].iter().collect();
+    if looks_like_pending_dollar_math(&body) {
+        return Some((format!("$${body}"), chars.len()));
+    }
+    None
+}
+
+/// Match \(...\) inline math. Returns (rendered, end_index).
+fn match_inline_paren(chars: &[char], start: usize) -> Option<(String, usize)> {
+    let mut i = start + 2;
+    while i + 1 < chars.len() {
+        // Check for closing \) before generic backslash skip
+        if chars[i] == '\\' && chars[i + 1] == ')' {
+            let body: String = chars[start + 2..i].iter().collect();
+            if body.is_empty() || body.contains('\n') {
+                return None;
+            }
+            let rendered = render_latex(&body, false).unwrap_or_else(|| format!("\\({body}\\)"));
+            return Some((rendered, i + 2));
+        }
+        if chars[i] == '\\' {
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    // Pending — \(\ is always pending
+    let body: String = chars[start + 2..].iter().collect();
+    Some((format!("\\({body}"), chars.len()))
+}
+
+/// Match \[...\] inline math (single-line). Returns (rendered, end_index).
+fn match_inline_bracket(chars: &[char], start: usize) -> Option<(String, usize)> {
+    let mut i = start + 2;
+    while i + 1 < chars.len() {
+        // Check for closing \] before generic backslash skip
+        if chars[i] == '\\' && chars[i + 1] == ']' {
+            let body: String = chars[start + 2..i].iter().collect();
+            if body.is_empty() || body.contains('\n') {
+                return None;
+            }
+            let rendered = render_latex(&body, false).unwrap_or_else(|| format!("\\[{body}\\]"));
+            return Some((rendered, i + 2));
+        }
+        if chars[i] == '\\' {
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    // Pending
+    let body: String = chars[start + 2..].iter().collect();
+    Some((format!("\\[{body}"), chars.len()))
+}
+
+/// Match single $...$ inline math with four rejection rules.
+/// Returns (rendered, end_index).
+fn match_single_dollar(chars: &[char], start: usize) -> Option<(String, usize)> {
+    let mut i = start + 1;
+    while i < chars.len() {
+        if chars[i] == '\\' {
+            i += 2;
+            continue;
+        }
+        if chars[i] == '$' {
+            let body: String = chars[start + 1..i].iter().collect();
+            if body.is_empty() || body.contains('\n') {
+                return None;
+            }
+
+            // Rejection rule 1: inner text ends with whitespace
+            if body.ends_with(' ') || body.ends_with('\t') {
+                return None;
+            }
+            // Rejection rule 2: char after closing $ is a digit (currency)
+            if i + 1 < chars.len() && chars[i + 1].is_ascii_digit() {
+                return None;
+            }
+            // Rejection rule 3: ALL-CAPS identifier followed by identifier start (shell vars)
+            if is_all_caps_identifier(&body)
+                && i + 1 < chars.len()
+                && (chars[i + 1].is_alphabetic() || chars[i + 1] == '_')
+            {
+                return None;
+            }
+            // Rejection rule 4: inner text contains backtick (code span)
+            if body.contains('`') {
+                return None;
+            }
+
+            let rendered = render_latex(&body, false).unwrap_or_else(|| format!("${body}$"));
+            return Some((rendered, i + 1));
+        }
+        i += 1;
+    }
+    // Pending — only if body looks like math
+    let body: String = chars[start + 1..].iter().collect();
+    if looks_like_pending_dollar_math(&body) {
+        return Some((format!("${body}"), chars.len()));
+    }
+    None
+}
+
+/// Check if a string is an ALL-CAPS identifier (optionally one trailing punctuation)
+/// per the upstream regex: /^[A-Z_][A-Z0-9_]*(?:[^A-Za-z0-9_\s])?$/
+fn is_all_caps_identifier(s: &str) -> bool {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.is_empty() {
+        return false;
+    }
+    // First char must be [A-Z_]
+    if !chars[0].is_ascii_uppercase() && chars[0] != '_' {
+        return false;
+    }
+    // Rest must be [A-Z0-9_]* optionally followed by one non-alphanumeric-non-space
+    let mut i = 1;
+    while i < chars.len() && (chars[i].is_ascii_uppercase() || chars[i].is_ascii_digit() || chars[i] == '_') {
+        i += 1;
+    }
+    if i == chars.len() {
+        return true;
+    }
+    // One trailing non-alphanumeric-non-whitespace
+    if i + 1 == chars.len()
+        && !chars[i].is_alphanumeric()
+        && !chars[i].is_whitespace()
+    {
+        return true;
+    }
+    false
+}
+
 fn render_markdown(
     text: &str,
     width: usize,
@@ -348,13 +800,18 @@ fn render_markdown(
     options: &MarkdownOptions,
     apply_default: impl Fn(&str) -> String,
 ) -> Vec<String> {
+    let transformed = if options.render_latex {
+        preprocess_math(text)
+    } else {
+        text.to_owned()
+    };
     let mut parser_options = Options::empty();
     parser_options.insert(Options::ENABLE_TABLES);
     parser_options.insert(Options::ENABLE_STRIKETHROUGH);
     parser_options.insert(Options::ENABLE_TASKLISTS);
 
-    let mut renderer = MarkdownRenderer::new(text, width, theme, options, &apply_default);
-    for (event, range) in Parser::new_ext(text, parser_options).into_offset_iter() {
+    let mut renderer = MarkdownRenderer::new(&transformed, width, theme, options, &apply_default);
+    for (event, range) in Parser::new_ext(&transformed, parser_options).into_offset_iter() {
         renderer.consume(event, range);
     }
     renderer.finish()
@@ -2348,5 +2805,122 @@ mod tests {
         // Directly invoke finish_list with an empty list stack.
         renderer.finish_list(0..0);
         // Should have returned without panicking; nothing to assert on output.
+    }
+
+    // ----- LaTeX math integration tests -----
+
+    #[test]
+    fn inline_dollar_math_renders() {
+        let lines = plain_default("A map $\\mathbb{C}^3 \\to \\mathbb{C}^3$.", 80);
+        assert_eq!(lines, vec!["A map ℂ³ → ℂ³."]);
+    }
+
+    #[test]
+    fn inline_paren_math_renders() {
+        let lines = plain_default("Limit \\(s \\to \\infty\\).", 80);
+        assert_eq!(lines, vec!["Limit s → ∞."]);
+    }
+
+    #[test]
+    fn inline_dollar_dollar_math_renders() {
+        let lines = plain_default("Vector $$\\vec{x}$$ end.", 80);
+        assert_eq!(lines, vec!["Vector x⃗ end."]);
+    }
+
+    #[test]
+    fn block_dollar_math_renders() {
+        let lines = plain_default("$$\nx^2 + y^2 = r^2\n$$", 80);
+        assert_eq!(lines, vec!["x² + y² = r²"]);
+    }
+
+    #[test]
+    fn block_bracket_math_renders() {
+        let lines = plain_default("\\[\n\\frac{a}{b}\n\\]", 80);
+        // display mode: stacked fraction with bar width = max(numerator, denominator)
+        assert_eq!(lines, vec!["a", "─", "b"]);
+    }
+
+    #[test]
+    fn dollar_sign_currency_not_math() {
+        let lines = plain_default("Price: $100 total.", 80);
+        assert_eq!(lines, vec!["Price: $100 total."]);
+    }
+
+    #[test]
+    fn dollar_followed_by_space_not_math() {
+        let lines = plain_default("Cost: $ and benefit.", 80);
+        assert_eq!(lines, vec!["Cost: $ and benefit."]);
+    }
+
+    #[test]
+    fn all_caps_shell_var_not_math() {
+        let lines = plain_default("Use $HOME variable.", 80);
+        assert_eq!(lines, vec!["Use $HOME variable."]);
+    }
+
+    #[test]
+    fn unsupported_math_falls_back_to_raw() {
+        let lines = plain_default("Bad: $\\unknown{thing}$.", 80);
+        assert_eq!(lines, vec!["Bad: $\\unknown{thing}$."]);
+    }
+
+    #[test]
+    fn math_inside_code_span_not_rendered() {
+        let lines = plain_default("Code: `$x^2$` here.", 80);
+        // pulldown-cmark renders inline code without backticks
+        assert_eq!(lines, vec!["Code: $x^2$ here."]);
+    }
+
+    #[test]
+    fn multiple_inline_math_in_one_line() {
+        let lines = plain_default("$x^2$ and $y^2$ and $z^2$", 80);
+        assert_eq!(lines, vec!["x² and y² and z²"]);
+    }
+
+    #[test]
+    fn math_with_text_in_paragraph() {
+        let lines = plain_default("The formula $\\frac{1}{2}$ is simple.", 80);
+        assert_eq!(lines, vec!["The formula 1/2 is simple."]);
+    }
+
+    #[test]
+    fn escaped_dollar_not_math() {
+        let lines = plain_default("Price \\$5 dollars.", 80);
+        // pulldown-cmark processes \$ as escape → renders as $
+        assert_eq!(lines, vec!["Price $5 dollars."]);
+    }
+
+    #[test]
+    fn render_latex_disabled_passes_raw() {
+        let lines = plain(
+            "Math $x^2$ here.",
+            80,
+            MarkdownOptions {
+                render_latex: false,
+                ..Default::default()
+            },
+        );
+        assert_eq!(lines, vec!["Math $x^2$ here."]);
+    }
+
+    #[test]
+    fn block_math_with_surrounding_text() {
+        let lines = plain_default("Before\n$$\n\\sum_{i=1}^n x_i\n$$\nAfter", 80);
+        assert!(lines.iter().any(|l| l.contains("∑") || l.contains("xᵢ")), "expected math output in {lines:?}");
+        assert!(lines.iter().any(|l| l.contains("Before")), "expected 'Before' in {lines:?}");
+        assert!(lines.iter().any(|l| l.contains("After")), "expected 'After' in {lines:?}");
+    }
+
+    #[test]
+    fn inline_math_with_fraction_and_subscript() {
+        let lines = plain_default("Value $\\frac{1}{x_0}$ end.", 80);
+        // format_fraction wraps non-simple denominator (x₀ is not is_simple_num)
+        assert_eq!(lines, vec!["Value 1/(x₀) end."]);
+    }
+    #[test]
+    fn display_math_fraction_stacked() {
+        let lines = plain_default("$$\n\\frac{x+1}{x-1}\n$$", 80);
+        // display mode: bar width = max(numerator, denominator) = 3
+        assert_eq!(lines, vec!["x+1", "───", "x-1"]);
     }
 }
