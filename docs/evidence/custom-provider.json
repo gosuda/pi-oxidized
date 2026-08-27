@@ -1,0 +1,41 @@
+{
+	"schema": "pi.docs.topic-evidence.v1",
+	"topic": "custom-provider",
+	"doc": "docs/custom-provider.md",
+	"referenceSource": ".references/pi/packages/coding-agent/docs/custom-provider.md",
+	"referencePin": "8fa7eebd235355522c8104166b4f1f959b4e2f10",
+	"transcripts": [
+		{
+			"kind": "cli-help",
+			"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+			"producer": "target/release/pi --help"
+		},
+		{
+			"kind": "e2e-smoke",
+			"source": "target/verification/e2e/latest-run.txt",
+			"producer": "scripts/verification/e2e-smoke.ts"
+		}
+	],
+	"claims": [
+		{
+			"rowId": "dc-claim-custom-provider-1",
+			"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+			"claim": "--provider <name>              Provider name (default: google)"
+		},
+		{
+			"rowId": "dc-claim-custom-provider-2",
+			"source": "scripts/verification/extension.ts",
+			"claim": "export const VERIFICATION_PROVIDER = \"verification\";"
+		}
+	],
+	"pending": [
+		{
+			"item": "full custom-provider reference (auth, retry, attribution)",
+			"reason": "unported-feature"
+		},
+		{
+			"item": "catalog integration for registered providers",
+			"reason": "unported-feature"
+		}
+	]
+}

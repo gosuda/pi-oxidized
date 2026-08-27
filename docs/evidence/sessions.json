@@ -1,0 +1,59 @@
+{
+	"schema": "pi.docs.topic-evidence.v1",
+	"topic": "sessions",
+	"doc": "docs/sessions.md",
+	"referenceSource": ".references/pi/packages/coding-agent/docs/sessions.md",
+	"referencePin": "8fa7eebd235355522c8104166b4f1f959b4e2f10",
+	"transcripts": [
+		{
+			"kind": "cli-help",
+			"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+			"producer": "target/release/pi --help"
+		},
+		{
+			"kind": "session-interop",
+			"source": "target/verification/docs-topics/harness/session-interop-v3-continued.jsonl",
+			"producer": "scripts/verification/session-interop.ts"
+		},
+		{
+			"kind": "e2e-smoke",
+			"source": "target/verification/e2e/latest-run.txt",
+			"producer": "scripts/verification/e2e-smoke.ts"
+		}
+	],
+	"claims": [
+		{
+			"rowId": "dc-claim-sessions-1",
+			"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+			"claim": "--continue, -c"
+		},
+		{
+			"rowId": "dc-claim-sessions-2",
+			"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+			"claim": "--fork <path|id>"
+		},
+		{
+			"rowId": "dc-claim-sessions-3",
+			"source": "target/verification/docs-topics/harness/session-interop-v3-continued.jsonl",
+			"claim": "Rust interop continuation"
+		}
+	],
+	"pending": [
+		{
+			"item": "interactive /resume session picker (search, delete, trash CLI deletion)",
+			"reason": "unported-feature"
+		},
+		{
+			"item": "/tree tree navigation and in-place branching UI",
+			"reason": "unported-feature"
+		},
+		{
+			"item": "/fork, /clone, /new, /name, /session, /share, /export slash commands",
+			"reason": "unported-feature"
+		},
+		{
+			"item": "branch summaries generated when switching branches",
+			"reason": "unported-feature"
+		}
+	]
+}

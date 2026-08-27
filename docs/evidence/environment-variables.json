@@ -1,0 +1,45 @@
+{
+	"schema": "pi.docs.topic-evidence.v1",
+	"topic": "environment-variables",
+	"doc": "docs/environment-variables.md",
+	"referenceSource": ".references/pi/packages/coding-agent/docs/environment-variables.md",
+	"referencePin": "8fa7eebd235355522c8104166b4f1f959b4e2f10",
+	"transcripts": [
+		{
+			"kind": "cli-help",
+			"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+			"producer": "target/release/pi --help"
+		}
+	],
+	"claims": [
+		{
+			"rowId": "dc-claim-environment-variables-1",
+			"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+			"claim": "Config directory (default: ~/.pi/agent)"
+		},
+		{
+			"rowId": "dc-claim-environment-variables-2",
+			"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+			"claim": "Disable startup network operations when set to 1/true/yes"
+		},
+		{
+			"rowId": "dc-claim-environment-variables-3",
+			"source": "crates/pi/src/core/update/version_check.rs",
+			"claim": "PI_SKIP_VERSION_CHECK"
+		}
+	],
+	"pending": [
+		{
+			"item": "process markers AI_AGENT=pi and PI_CODING_AGENT=true for child processes",
+			"reason": "unported-feature"
+		},
+		{
+			"item": "shell-tool session environment (PI_SESSION_ID, PI_SESSION_FILE, PI_PROVIDER, PI_MODEL, PI_REASONING_LEVEL)",
+			"reason": "unported-feature"
+		},
+		{
+			"item": "PI_TUI_ESC_TIMEOUT lone-ESC/Alt-key disambiguation timeout",
+			"reason": "TUI-CLOSE"
+		}
+	]
+}

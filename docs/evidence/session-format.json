@@ -1,0 +1,53 @@
+{
+	"schema": "pi.docs.topic-evidence.v1",
+	"topic": "session-format",
+	"doc": "docs/session-format.md",
+	"referenceSource": ".references/pi/packages/coding-agent/docs/session-format.md",
+	"referencePin": "8fa7eebd235355522c8104166b4f1f959b4e2f10",
+	"transcripts": [
+		{
+			"kind": "session-interop",
+			"source": "target/verification/docs-topics/harness/session-interop-v3-continued.jsonl",
+			"producer": "scripts/verification/session-interop.ts"
+		}
+	],
+	"claims": [
+		{
+			"rowId": "dc-claim-session-format-1",
+			"source": "target/verification/docs-topics/harness/session-interop-v3-continued.jsonl",
+			"claim": "\"version\":3"
+		},
+		{
+			"rowId": "dc-claim-session-format-2",
+			"source": "target/verification/docs-topics/harness/session-interop-v1-continued.jsonl",
+			"claim": "\"type\":\"compaction\""
+		},
+		{
+			"rowId": "dc-claim-session-format-3",
+			"source": ".agent-tasks/pi-rust-rewrite/fixtures/sessions/v3/basic.jsonl",
+			"claim": "\"parentId\":null"
+		}
+	],
+	"pending": [
+		{
+			"item": "full entry-type and AgentMessage type reference for extension and SDK authors",
+			"reason": "PAR-CLOSE"
+		},
+		{
+			"item": "buildContextEntries/buildSessionContext context-building semantics and SessionManager API surface",
+			"reason": "PAR-CLOSE"
+		},
+		{
+			"item": "compaction entries embedding retained post-compaction context (retainedTail)",
+			"reason": "PAR-CLOSE"
+		},
+		{
+			"item": "interactive deletion from the session picker and trash CLI integration",
+			"reason": "unported-feature"
+		},
+		{
+			"item": "extension entry renderers (registerEntryRenderer) for custom entries",
+			"reason": "unported-feature"
+		}
+	]
+}

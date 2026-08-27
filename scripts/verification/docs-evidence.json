@@ -717,6 +717,1630 @@
 				"countMethod": "regex",
 				"countKey": "RUST_TARGETS"
 			}
+		},
+		{
+			"id": "dc-index",
+			"surface": "docs/index.md",
+			"owner": "DOC-C",
+			"class": "review-only-prose",
+			"params": {
+				"source": "docs/index.md"
+			}
+		},
+		{
+			"id": "dc-topic-quickstart",
+			"surface": "docs/quickstart.md",
+			"owner": "DOC-C",
+			"class": "review-only-prose",
+			"params": {
+				"source": "docs/quickstart.md"
+			}
+		},
+		{
+			"id": "dc-claim-quickstart-1",
+			"surface": "target/verification/docs-topics/cli-help/pi--version.txt#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/cli-help/pi--version.txt",
+				"claim": "0.1.0"
+			}
+		},
+		{
+			"id": "dc-claim-quickstart-2",
+			"surface": "target/verification/docs-topics/cli-help/pi--help.txt#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+				"claim": "--print, -p"
+			}
+		},
+		{
+			"id": "dc-fence-quickstart.01",
+			"surface": "docs/quickstart.md#fence/quickstart.01",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/quickstart.md",
+				"fenceMarker": "doc-c:fence=quickstart.01"
+			}
+		},
+		{
+			"id": "dc-fence-quickstart.02",
+			"surface": "docs/quickstart.md#fence/quickstart.02",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/quickstart.md",
+				"fenceMarker": "doc-c:fence=quickstart.02"
+			}
+		},
+		{
+			"id": "dc-fence-quickstart.03",
+			"surface": "docs/quickstart.md#fence/quickstart.03",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/quickstart.md",
+				"fenceMarker": "doc-c:fence=quickstart.03"
+			}
+		},
+		{
+			"id": "dc-fence-quickstart.04",
+			"surface": "docs/quickstart.md#fence/quickstart.04",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/quickstart.md",
+				"fenceMarker": "doc-c:fence=quickstart.04"
+			}
+		},
+		{
+			"id": "dc-fence-quickstart.05",
+			"surface": "docs/quickstart.md#fence/quickstart.05",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/quickstart.md",
+				"fenceMarker": "doc-c:fence=quickstart.05"
+			}
+		},
+		{
+			"id": "dc-topic-usage",
+			"surface": "docs/usage.md",
+			"owner": "DOC-C",
+			"class": "review-only-prose",
+			"params": {
+				"source": "docs/usage.md"
+			}
+		},
+		{
+			"id": "dc-claim-usage-1",
+			"surface": "target/verification/docs-topics/cli-help/pi--help.txt#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+				"claim": "--print, -p"
+			}
+		},
+		{
+			"id": "dc-claim-usage-2",
+			"surface": "target/verification/docs-topics/cli-help/pi--help.txt#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+				"claim": "--no-context-files, -nc"
+			}
+		},
+		{
+			"id": "dc-claim-usage-3",
+			"surface": "target/verification/docs-topics/cli-help/pi--help.txt#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+				"claim": "pi <command> --help"
+			}
+		},
+		{
+			"id": "dc-fence-usage.01",
+			"surface": "docs/usage.md#fence/usage.01",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/usage.md",
+				"fenceMarker": "doc-c:fence=usage.01"
+			}
+		},
+		{
+			"id": "dc-fence-usage.02",
+			"surface": "docs/usage.md#fence/usage.02",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/usage.md",
+				"fenceMarker": "doc-c:fence=usage.02"
+			}
+		},
+		{
+			"id": "dc-fence-usage.03",
+			"surface": "docs/usage.md#fence/usage.03",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/usage.md",
+				"fenceMarker": "doc-c:fence=usage.03"
+			}
+		},
+		{
+			"id": "dc-topic-providers",
+			"surface": "docs/providers.md",
+			"owner": "DOC-C",
+			"class": "review-only-prose",
+			"params": {
+				"source": "docs/providers.md"
+			}
+		},
+		{
+			"id": "dc-claim-providers-1",
+			"surface": "target/verification/docs-topics/cli-help/pi--help.txt#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+				"claim": "ANTHROPIC_API_KEY"
+			}
+		},
+		{
+			"id": "dc-claim-providers-2",
+			"surface": "target/verification/docs-topics/cli-help/pi--help.txt#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+				"claim": "API key (defaults to env vars)"
+			}
+		},
+		{
+			"id": "dc-claim-providers-3",
+			"surface": "target/verification/docs-topics/cli-help/pi--help.txt#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+				"claim": "Provider name (default: google)"
+			}
+		},
+		{
+			"id": "dc-fence-providers.01",
+			"surface": "docs/providers.md#fence/providers.01",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/providers.md",
+				"fenceMarker": "doc-c:fence=providers.01"
+			}
+		},
+		{
+			"id": "dc-fence-providers.02",
+			"surface": "docs/providers.md#fence/providers.02",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/providers.md",
+				"fenceMarker": "doc-c:fence=providers.02"
+			}
+		},
+		{
+			"id": "dc-topic-security",
+			"surface": "docs/security.md",
+			"owner": "DOC-C",
+			"class": "review-only-prose",
+			"params": {
+				"source": "docs/security.md"
+			}
+		},
+		{
+			"id": "dc-claim-security-1",
+			"surface": "target/verification/docs-topics/cli-help/pi--help.txt#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+				"claim": "--approve, -a"
+			}
+		},
+		{
+			"id": "dc-claim-security-2",
+			"surface": "scripts/verification/e2e-smoke.ts#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "scripts/verification/e2e-smoke.ts",
+				"claim": "\"--approve\","
+			}
+		},
+		{
+			"id": "dc-fence-security.01",
+			"surface": "docs/security.md#fence/security.01",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/security.md",
+				"fenceMarker": "doc-c:fence=security.01"
+			}
+		},
+		{
+			"id": "dc-fence-security.02",
+			"surface": "docs/security.md#fence/security.02",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/security.md",
+				"fenceMarker": "doc-c:fence=security.02"
+			}
+		},
+		{
+			"id": "dc-fence-security.03",
+			"surface": "docs/security.md#fence/security.03",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/security.md",
+				"fenceMarker": "doc-c:fence=security.03"
+			}
+		},
+		{
+			"id": "dc-topic-settings",
+			"surface": "docs/settings.md",
+			"owner": "DOC-C",
+			"class": "review-only-prose",
+			"params": {
+				"source": "docs/settings.md"
+			}
+		},
+		{
+			"id": "dc-claim-settings-1",
+			"surface": "target/verification/docs-topics/cli-help/pi--help.txt#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+				"claim": "Config directory (default: ~/.pi/agent)"
+			}
+		},
+		{
+			"id": "dc-claim-settings-2",
+			"surface": "target/verification/docs-topics/cli-help/pi-config--help.txt#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/cli-help/pi-config--help.txt",
+				"claim": "Without -l, starts in global settings (~/.pi/agent/settings.json)."
+			}
+		},
+		{
+			"id": "dc-claim-settings-3",
+			"surface": "target/verification/docs-topics/cli-help/pi-config--help.txt#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/cli-help/pi-config--help.txt",
+				"claim": "Edit project overrides (.pi/settings.json)"
+			}
+		},
+		{
+			"id": "dc-fence-settings.01",
+			"surface": "docs/settings.md#fence/settings.01",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/settings.md",
+				"fenceMarker": "doc-c:fence=settings.01"
+			}
+		},
+		{
+			"id": "dc-fence-settings.02",
+			"surface": "docs/settings.md#fence/settings.02",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/settings.md",
+				"fenceMarker": "doc-c:fence=settings.02"
+			}
+		},
+		{
+			"id": "dc-topic-keybindings",
+			"surface": "docs/keybindings.md",
+			"owner": "DOC-C",
+			"class": "review-only-prose",
+			"params": {
+				"source": "docs/keybindings.md"
+			}
+		},
+		{
+			"id": "dc-claim-keybindings-1",
+			"surface": "target/verification/docs-topics/cli-help/pi--help.txt#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+				"claim": "Comma-separated model patterns for Ctrl+P cycling"
+			}
+		},
+		{
+			"id": "dc-claim-keybindings-2",
+			"surface": "scripts/verification/e2e-smoke.ts#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "scripts/verification/e2e-smoke.ts",
+				"claim": "canonical Kitty ctrl+shift+x shortcut dispatch"
+			}
+		},
+		{
+			"id": "dc-claim-keybindings-3",
+			"surface": "target/verification/docs-topics/harness/e2e-result.json#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/harness/e2e-result.json",
+				"claim": "rust-extension-shortcut-dispatch"
+			}
+		},
+		{
+			"id": "dc-fence-keybindings.01",
+			"surface": "docs/keybindings.md#fence/keybindings.01",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/keybindings.md",
+				"fenceMarker": "doc-c:fence=keybindings.01"
+			}
+		},
+		{
+			"id": "dc-topic-sessions",
+			"surface": "docs/sessions.md",
+			"owner": "DOC-C",
+			"class": "review-only-prose",
+			"params": {
+				"source": "docs/sessions.md"
+			}
+		},
+		{
+			"id": "dc-claim-sessions-1",
+			"surface": "target/verification/docs-topics/cli-help/pi--help.txt#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+				"claim": "--continue, -c"
+			}
+		},
+		{
+			"id": "dc-claim-sessions-2",
+			"surface": "target/verification/docs-topics/cli-help/pi--help.txt#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+				"claim": "--fork <path|id>"
+			}
+		},
+		{
+			"id": "dc-claim-sessions-3",
+			"surface": "target/verification/docs-topics/harness/session-interop-v3-continued.jsonl#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/harness/session-interop-v3-continued.jsonl",
+				"claim": "Rust interop continuation"
+			}
+		},
+		{
+			"id": "dc-fence-sessions.01",
+			"surface": "docs/sessions.md#fence/sessions.01",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/sessions.md",
+				"fenceMarker": "doc-c:fence=sessions.01"
+			}
+		},
+		{
+			"id": "dc-fence-sessions.02",
+			"surface": "docs/sessions.md#fence/sessions.02",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/sessions.md",
+				"fenceMarker": "doc-c:fence=sessions.02"
+			}
+		},
+		{
+			"id": "dc-fence-sessions.03",
+			"surface": "docs/sessions.md#fence/sessions.03",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/sessions.md",
+				"fenceMarker": "doc-c:fence=sessions.03"
+			}
+		},
+		{
+			"id": "dc-fence-sessions.04",
+			"surface": "docs/sessions.md#fence/sessions.04",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/sessions.md",
+				"fenceMarker": "doc-c:fence=sessions.04"
+			}
+		},
+		{
+			"id": "dc-fence-sessions.05",
+			"surface": "docs/sessions.md#fence/sessions.05",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/sessions.md",
+				"fenceMarker": "doc-c:fence=sessions.05"
+			}
+		},
+		{
+			"id": "dc-fence-sessions.06",
+			"surface": "docs/sessions.md#fence/sessions.06",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/sessions.md",
+				"fenceMarker": "doc-c:fence=sessions.06"
+			}
+		},
+		{
+			"id": "dc-topic-compaction",
+			"surface": "docs/compaction.md",
+			"owner": "DOC-C",
+			"class": "review-only-prose",
+			"params": {
+				"source": "docs/compaction.md"
+			}
+		},
+		{
+			"id": "dc-claim-compaction-1",
+			"surface": "target/verification/docs-topics/harness/e2e-result.json#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/harness/e2e-result.json",
+				"claim": "\"name\": \"rust-interactive-tools-steering-compaction\""
+			}
+		},
+		{
+			"id": "dc-claim-compaction-2",
+			"surface": "target/verification/docs-topics/harness/e2e-session.jsonl#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/harness/e2e-session.jsonl",
+				"claim": "\"firstKeptEntryId\":\"<id>\""
+			}
+		},
+		{
+			"id": "dc-claim-compaction-3",
+			"surface": "target/verification/docs-topics/harness/e2e-result.json#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/harness/e2e-result.json",
+				"claim": "\"compaction\""
+			}
+		},
+		{
+			"id": "dc-fence-compaction.01",
+			"surface": "docs/compaction.md#fence/compaction.01",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/compaction.md",
+				"fenceMarker": "doc-c:fence=compaction.01"
+			}
+		},
+		{
+			"id": "dc-fence-compaction.02",
+			"surface": "docs/compaction.md#fence/compaction.02",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/compaction.md",
+				"fenceMarker": "doc-c:fence=compaction.02"
+			}
+		},
+		{
+			"id": "dc-fence-compaction.03",
+			"surface": "docs/compaction.md#fence/compaction.03",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/compaction.md",
+				"fenceMarker": "doc-c:fence=compaction.03"
+			}
+		},
+		{
+			"id": "dc-fence-compaction.04",
+			"surface": "docs/compaction.md#fence/compaction.04",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/compaction.md",
+				"fenceMarker": "doc-c:fence=compaction.04"
+			}
+		},
+		{
+			"id": "dc-topic-extensions",
+			"surface": "docs/extensions.md",
+			"owner": "DOC-C",
+			"class": "review-only-prose",
+			"params": {
+				"source": "docs/extensions.md"
+			}
+		},
+		{
+			"id": "dc-claim-extensions-1",
+			"surface": "target/verification/docs-topics/cli-help/pi--help.txt#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+				"claim": "--extension, -e <path>"
+			}
+		},
+		{
+			"id": "dc-claim-extensions-2",
+			"surface": "target/verification/docs-topics/cli-help/pi--help.txt#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+				"claim": "Disable extension discovery (explicit -e paths still work)"
+			}
+		},
+		{
+			"id": "dc-claim-extensions-3",
+			"surface": "target/verification/docs-topics/cli-help/pi--help.txt#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+				"claim": "Extensions can register additional flags (e.g., --plan from plan-mode extension)."
+			}
+		},
+		{
+			"id": "dc-fence-extensions.01",
+			"surface": "docs/extensions.md#fence/extensions.01",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/extensions.md",
+				"fenceMarker": "doc-c:fence=extensions.01"
+			}
+		},
+		{
+			"id": "dc-fence-extensions.02",
+			"surface": "docs/extensions.md#fence/extensions.02",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/extensions.md",
+				"fenceMarker": "doc-c:fence=extensions.02"
+			}
+		},
+		{
+			"id": "dc-fence-extensions.03",
+			"surface": "docs/extensions.md#fence/extensions.03",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/extensions.md",
+				"fenceMarker": "doc-c:fence=extensions.03"
+			}
+		},
+		{
+			"id": "dc-fence-extensions.04",
+			"surface": "docs/extensions.md#fence/extensions.04",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/extensions.md",
+				"fenceMarker": "doc-c:fence=extensions.04"
+			}
+		},
+		{
+			"id": "dc-fence-extensions.05",
+			"surface": "docs/extensions.md#fence/extensions.05",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/extensions.md",
+				"fenceMarker": "doc-c:fence=extensions.05"
+			}
+		},
+		{
+			"id": "dc-topic-skills",
+			"surface": "docs/skills.md",
+			"owner": "DOC-C",
+			"class": "review-only-prose",
+			"params": {
+				"source": "docs/skills.md"
+			}
+		},
+		{
+			"id": "dc-claim-skills-1",
+			"surface": "target/verification/docs-topics/cli-help/pi--help.txt#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+				"claim": "--skill <path>"
+			}
+		},
+		{
+			"id": "dc-claim-skills-2",
+			"surface": "target/verification/docs-topics/cli-help/pi--help.txt#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+				"claim": "--no-skills, -ns"
+			}
+		},
+		{
+			"id": "dc-fence-skills.01",
+			"surface": "docs/skills.md#fence/skills.01",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/skills.md",
+				"fenceMarker": "doc-c:fence=skills.01"
+			}
+		},
+		{
+			"id": "dc-topic-prompt-templates",
+			"surface": "docs/prompt-templates.md",
+			"owner": "DOC-C",
+			"class": "review-only-prose",
+			"params": {
+				"source": "docs/prompt-templates.md"
+			}
+		},
+		{
+			"id": "dc-claim-prompt-templates-1",
+			"surface": "target/verification/docs-topics/cli-help/pi--help.txt#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+				"claim": "--prompt-template <path>"
+			}
+		},
+		{
+			"id": "dc-claim-prompt-templates-2",
+			"surface": "target/verification/docs-topics/cli-help/pi--help.txt#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+				"claim": "--no-prompt-templates, -np"
+			}
+		},
+		{
+			"id": "dc-fence-prompt-templates.01",
+			"surface": "docs/prompt-templates.md#fence/prompt-templates.01",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/prompt-templates.md",
+				"fenceMarker": "doc-c:fence=prompt-templates.01"
+			}
+		},
+		{
+			"id": "dc-topic-themes",
+			"surface": "docs/themes.md",
+			"owner": "DOC-C",
+			"class": "review-only-prose",
+			"params": {
+				"source": "docs/themes.md"
+			}
+		},
+		{
+			"id": "dc-claim-themes-1",
+			"surface": "target/verification/docs-topics/cli-help/pi--help.txt#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+				"claim": "--theme <path>"
+			}
+		},
+		{
+			"id": "dc-claim-themes-2",
+			"surface": "target/verification/docs-topics/cli-help/pi--help.txt#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+				"claim": "--no-themes"
+			}
+		},
+		{
+			"id": "dc-fence-themes.01",
+			"surface": "docs/themes.md#fence/themes.01",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/themes.md",
+				"fenceMarker": "doc-c:fence=themes.01"
+			}
+		},
+		{
+			"id": "dc-topic-packages",
+			"surface": "docs/packages.md",
+			"owner": "DOC-C",
+			"class": "review-only-prose",
+			"params": {
+				"source": "docs/packages.md"
+			}
+		},
+		{
+			"id": "dc-claim-packages-1",
+			"surface": "target/verification/docs-topics/cli-help/pi--help.txt#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+				"claim": "pi install <source> [-l]"
+			}
+		},
+		{
+			"id": "dc-claim-packages-2",
+			"surface": "target/verification/docs-topics/cli-help/pi--help.txt#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+				"claim": "Open TUI to enable/disable package resources (Tab switches scope)"
+			}
+		},
+		{
+			"id": "dc-claim-packages-3",
+			"surface": "target/verification/docs-topics/cli-help/pi-config--help.txt#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/cli-help/pi-config--help.txt",
+				"claim": "Edit project overrides (.pi/settings.json)"
+			}
+		},
+		{
+			"id": "dc-fence-packages.01",
+			"surface": "docs/packages.md#fence/packages.01",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/packages.md",
+				"fenceMarker": "doc-c:fence=packages.01"
+			}
+		},
+		{
+			"id": "dc-fence-packages.02",
+			"surface": "docs/packages.md#fence/packages.02",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/packages.md",
+				"fenceMarker": "doc-c:fence=packages.02"
+			}
+		},
+		{
+			"id": "dc-fence-packages.03",
+			"surface": "docs/packages.md#fence/packages.03",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/packages.md",
+				"fenceMarker": "doc-c:fence=packages.03"
+			}
+		},
+		{
+			"id": "dc-topic-models",
+			"surface": "docs/models.md",
+			"owner": "DOC-C",
+			"class": "review-only-prose",
+			"params": {
+				"source": "docs/models.md"
+			}
+		},
+		{
+			"id": "dc-claim-models-1",
+			"surface": "target/verification/docs-topics/cli-help/pi--help.txt#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+				"claim": "off, minimal, low, medium, high, xhigh, max"
+			}
+		},
+		{
+			"id": "dc-claim-models-2",
+			"surface": "crates/pi-ai/src/catalog/mod.rs#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "crates/pi-ai/src/catalog/mod.rs",
+				"claim": "data/builtin-models.json"
+			}
+		},
+		{
+			"id": "dc-claim-models-3",
+			"surface": "crates/pi/src/core/model_runtime.rs#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "crates/pi/src/core/model_runtime.rs",
+				"claim": "agentDir/models.json"
+			}
+		},
+		{
+			"id": "dc-fence-models.01",
+			"surface": "docs/models.md#fence/models.01",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/models.md",
+				"fenceMarker": "doc-c:fence=models.01"
+			}
+		},
+		{
+			"id": "dc-fence-models.02",
+			"surface": "docs/models.md#fence/models.02",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/models.md",
+				"fenceMarker": "doc-c:fence=models.02"
+			}
+		},
+		{
+			"id": "dc-fence-models.03",
+			"surface": "docs/models.md#fence/models.03",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/models.md",
+				"fenceMarker": "doc-c:fence=models.03"
+			}
+		},
+		{
+			"id": "dc-fence-models.04",
+			"surface": "docs/models.md#fence/models.04",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/models.md",
+				"fenceMarker": "doc-c:fence=models.04"
+			}
+		},
+		{
+			"id": "dc-fence-models.05",
+			"surface": "docs/models.md#fence/models.05",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/models.md",
+				"fenceMarker": "doc-c:fence=models.05"
+			}
+		},
+		{
+			"id": "dc-topic-custom-provider",
+			"surface": "docs/custom-provider.md",
+			"owner": "DOC-C",
+			"class": "review-only-prose",
+			"params": {
+				"source": "docs/custom-provider.md"
+			}
+		},
+		{
+			"id": "dc-claim-custom-provider-1",
+			"surface": "target/verification/docs-topics/cli-help/pi--help.txt#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+				"claim": "--provider <name>              Provider name (default: google)"
+			}
+		},
+		{
+			"id": "dc-claim-custom-provider-2",
+			"surface": "scripts/verification/extension.ts#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "scripts/verification/extension.ts",
+				"claim": "export const VERIFICATION_PROVIDER = \"verification\";"
+			}
+		},
+		{
+			"id": "dc-fence-custom-provider.01",
+			"surface": "docs/custom-provider.md#fence/custom-provider.01",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/custom-provider.md",
+				"fenceMarker": "doc-c:fence=custom-provider.01"
+			}
+		},
+		{
+			"id": "dc-fence-custom-provider.02",
+			"surface": "docs/custom-provider.md#fence/custom-provider.02",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/custom-provider.md",
+				"fenceMarker": "doc-c:fence=custom-provider.02"
+			}
+		},
+		{
+			"id": "dc-topic-sdk",
+			"surface": "docs/sdk.md",
+			"owner": "DOC-C",
+			"class": "review-only-prose",
+			"params": {
+				"source": "docs/sdk.md"
+			}
+		},
+		{
+			"id": "dc-claim-sdk-1",
+			"surface": "crates/pi-ai/src/lib.rs#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "crates/pi-ai/src/lib.rs",
+				"claim": "pub use provider::{Provider, ProviderError, ProviderResponse, StreamOptions};"
+			}
+		},
+		{
+			"id": "dc-claim-sdk-2",
+			"surface": "crates/pi-agent/src/lib.rs#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "crates/pi-agent/src/lib.rs",
+				"claim": "pub mod run;"
+			}
+		},
+		{
+			"id": "dc-fence-sdk.01",
+			"surface": "docs/sdk.md#fence/sdk.01",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/sdk.md",
+				"fenceMarker": "doc-c:fence=sdk.01"
+			}
+		},
+		{
+			"id": "dc-fence-sdk.02",
+			"surface": "docs/sdk.md#fence/sdk.02",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/sdk.md",
+				"fenceMarker": "doc-c:fence=sdk.02"
+			}
+		},
+		{
+			"id": "dc-topic-rpc",
+			"surface": "docs/rpc.md",
+			"owner": "DOC-C",
+			"class": "review-only-prose",
+			"params": {
+				"source": "docs/rpc.md"
+			}
+		},
+		{
+			"id": "dc-claim-rpc-1",
+			"surface": "target/verification/docs-topics/cli-help/pi--help.txt#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+				"claim": "--mode <mode>                  Output mode: text (default), json, or rpc"
+			}
+		},
+		{
+			"id": "dc-fence-rpc.01",
+			"surface": "docs/rpc.md#fence/rpc.01",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/rpc.md",
+				"fenceMarker": "doc-c:fence=rpc.01"
+			}
+		},
+		{
+			"id": "dc-topic-json",
+			"surface": "docs/json.md",
+			"owner": "DOC-C",
+			"class": "review-only-prose",
+			"params": {
+				"source": "docs/json.md"
+			}
+		},
+		{
+			"id": "dc-claim-json-1",
+			"surface": "target/verification/docs-topics/cli-help/pi--help.txt#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+				"claim": "--mode <mode>                  Output mode: text (default), json, or rpc"
+			}
+		},
+		{
+			"id": "dc-fence-json.01",
+			"surface": "docs/json.md#fence/json.01",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/json.md",
+				"fenceMarker": "doc-c:fence=json.01"
+			}
+		},
+		{
+			"id": "dc-topic-environment-variables",
+			"surface": "docs/environment-variables.md",
+			"owner": "DOC-C",
+			"class": "review-only-prose",
+			"params": {
+				"source": "docs/environment-variables.md"
+			}
+		},
+		{
+			"id": "dc-claim-environment-variables-1",
+			"surface": "target/verification/docs-topics/cli-help/pi--help.txt#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+				"claim": "Config directory (default: ~/.pi/agent)"
+			}
+		},
+		{
+			"id": "dc-claim-environment-variables-2",
+			"surface": "target/verification/docs-topics/cli-help/pi--help.txt#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+				"claim": "Disable startup network operations when set to 1/true/yes"
+			}
+		},
+		{
+			"id": "dc-claim-environment-variables-3",
+			"surface": "crates/pi/src/core/update/version_check.rs#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "crates/pi/src/core/update/version_check.rs",
+				"claim": "PI_SKIP_VERSION_CHECK"
+			}
+		},
+		{
+			"id": "dc-fence-environment-variables.01",
+			"surface": "docs/environment-variables.md#fence/environment-variables.01",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/environment-variables.md",
+				"fenceMarker": "doc-c:fence=environment-variables.01"
+			}
+		},
+		{
+			"id": "dc-fence-environment-variables.02",
+			"surface": "docs/environment-variables.md#fence/environment-variables.02",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/environment-variables.md",
+				"fenceMarker": "doc-c:fence=environment-variables.02"
+			}
+		},
+		{
+			"id": "dc-topic-session-format",
+			"surface": "docs/session-format.md",
+			"owner": "DOC-C",
+			"class": "review-only-prose",
+			"params": {
+				"source": "docs/session-format.md"
+			}
+		},
+		{
+			"id": "dc-claim-session-format-1",
+			"surface": "target/verification/docs-topics/harness/session-interop-v3-continued.jsonl#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/harness/session-interop-v3-continued.jsonl",
+				"claim": "\"version\":3"
+			}
+		},
+		{
+			"id": "dc-claim-session-format-2",
+			"surface": "target/verification/docs-topics/harness/session-interop-v1-continued.jsonl#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/harness/session-interop-v1-continued.jsonl",
+				"claim": "\"type\":\"compaction\""
+			}
+		},
+		{
+			"id": "dc-claim-session-format-3",
+			"surface": ".agent-tasks/pi-rust-rewrite/fixtures/sessions/v3/basic.jsonl#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": ".agent-tasks/pi-rust-rewrite/fixtures/sessions/v3/basic.jsonl",
+				"claim": "\"parentId\":null"
+			}
+		},
+		{
+			"id": "dc-fence-session-format.01",
+			"surface": "docs/session-format.md#fence/session-format.01",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/session-format.md",
+				"fenceMarker": "doc-c:fence=session-format.01"
+			}
+		},
+		{
+			"id": "dc-fence-session-format.02",
+			"surface": "docs/session-format.md#fence/session-format.02",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/session-format.md",
+				"fenceMarker": "doc-c:fence=session-format.02"
+			}
+		},
+		{
+			"id": "dc-fence-session-format.03",
+			"surface": "docs/session-format.md#fence/session-format.03",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/session-format.md",
+				"fenceMarker": "doc-c:fence=session-format.03"
+			}
+		},
+		{
+			"id": "dc-fence-session-format.04",
+			"surface": "docs/session-format.md#fence/session-format.04",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/session-format.md",
+				"fenceMarker": "doc-c:fence=session-format.04"
+			}
+		},
+		{
+			"id": "dc-fence-session-format.05",
+			"surface": "docs/session-format.md#fence/session-format.05",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/session-format.md",
+				"fenceMarker": "doc-c:fence=session-format.05"
+			}
+		},
+		{
+			"id": "dc-fence-session-format.06",
+			"surface": "docs/session-format.md#fence/session-format.06",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/session-format.md",
+				"fenceMarker": "doc-c:fence=session-format.06"
+			}
+		},
+		{
+			"id": "dc-fence-session-format.07",
+			"surface": "docs/session-format.md#fence/session-format.07",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/session-format.md",
+				"fenceMarker": "doc-c:fence=session-format.07"
+			}
+		},
+		{
+			"id": "dc-fence-session-format.08",
+			"surface": "docs/session-format.md#fence/session-format.08",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/session-format.md",
+				"fenceMarker": "doc-c:fence=session-format.08"
+			}
+		},
+		{
+			"id": "dc-fence-session-format.09",
+			"surface": "docs/session-format.md#fence/session-format.09",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/session-format.md",
+				"fenceMarker": "doc-c:fence=session-format.09"
+			}
+		},
+		{
+			"id": "dc-fence-session-format.10",
+			"surface": "docs/session-format.md#fence/session-format.10",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/session-format.md",
+				"fenceMarker": "doc-c:fence=session-format.10"
+			}
+		},
+		{
+			"id": "dc-fence-session-format.11",
+			"surface": "docs/session-format.md#fence/session-format.11",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/session-format.md",
+				"fenceMarker": "doc-c:fence=session-format.11"
+			}
+		},
+		{
+			"id": "dc-fence-session-format.12",
+			"surface": "docs/session-format.md#fence/session-format.12",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/session-format.md",
+				"fenceMarker": "doc-c:fence=session-format.12"
+			}
+		},
+		{
+			"id": "dc-topic-shell-aliases",
+			"surface": "docs/shell-aliases.md",
+			"owner": "DOC-C",
+			"class": "review-only-prose",
+			"params": {
+				"source": "docs/shell-aliases.md"
+			}
+		},
+		{
+			"id": "dc-claim-shell-aliases-1",
+			"surface": "target/verification/docs-topics/cli-help/pi--help.txt#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+				"claim": "--session-dir <dir>"
+			}
+		},
+		{
+			"id": "dc-claim-shell-aliases-2",
+			"surface": "target/verification/docs-topics/cli-help/pi--help.txt#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+				"claim": "Don't save session (ephemeral)"
+			}
+		},
+		{
+			"id": "dc-claim-shell-aliases-3",
+			"surface": "target/verification/docs-topics/cli-help/pi--help.txt#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+				"claim": "pi --tools read,grep,find,ls -p \"Review the code in src/\""
+			}
+		},
+		{
+			"id": "dc-fence-shell-aliases.01",
+			"surface": "docs/shell-aliases.md#fence/shell-aliases.01",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/shell-aliases.md",
+				"fenceMarker": "doc-c:fence=shell-aliases.01"
+			}
+		},
+		{
+			"id": "dc-fence-shell-aliases.02",
+			"surface": "docs/shell-aliases.md#fence/shell-aliases.02",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/shell-aliases.md",
+				"fenceMarker": "doc-c:fence=shell-aliases.02"
+			}
+		},
+		{
+			"id": "dc-fence-shell-aliases.03",
+			"surface": "docs/shell-aliases.md#fence/shell-aliases.03",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/shell-aliases.md",
+				"fenceMarker": "doc-c:fence=shell-aliases.03"
+			}
+		},
+		{
+			"id": "dc-fence-shell-aliases.04",
+			"surface": "docs/shell-aliases.md#fence/shell-aliases.04",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/shell-aliases.md",
+				"fenceMarker": "doc-c:fence=shell-aliases.04"
+			}
+		},
+		{
+			"id": "dc-fence-shell-aliases.05",
+			"surface": "docs/shell-aliases.md#fence/shell-aliases.05",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/shell-aliases.md",
+				"fenceMarker": "doc-c:fence=shell-aliases.05"
+			}
+		},
+		{
+			"id": "dc-topic-development",
+			"surface": "docs/development.md",
+			"owner": "DOC-C",
+			"class": "review-only-prose",
+			"params": {
+				"source": "docs/development.md"
+			}
+		},
+		{
+			"id": "dc-claim-development-1",
+			"surface": "target/verification/docs-topics/release-flags.txt#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/release-flags.txt",
+				"claim": "--target accepted"
+			}
+		},
+		{
+			"id": "dc-claim-development-2",
+			"surface": "target/verification/docs-topics/release-flags.txt#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/release-flags.txt",
+				"claim": "--bogus rejected: UnknownArgError"
+			}
+		},
+		{
+			"id": "dc-fence-development.01",
+			"surface": "docs/development.md#fence/development.01",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/development.md",
+				"fenceMarker": "doc-c:fence=development.01"
+			}
+		},
+		{
+			"id": "dc-fence-development.02",
+			"surface": "docs/development.md#fence/development.02",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/development.md",
+				"fenceMarker": "doc-c:fence=development.02"
+			}
+		},
+		{
+			"id": "dc-fence-development.03",
+			"surface": "docs/development.md#fence/development.03",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/development.md",
+				"fenceMarker": "doc-c:fence=development.03"
+			}
+		},
+		{
+			"id": "dc-fence-development.04",
+			"surface": "docs/development.md#fence/development.04",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/development.md",
+				"fenceMarker": "doc-c:fence=development.04"
+			}
+		},
+		{
+			"id": "dc-topic-harness",
+			"surface": "docs/harness.md",
+			"owner": "DOC-C",
+			"class": "review-only-prose",
+			"params": {
+				"source": "docs/harness.md"
+			}
+		},
+		{
+			"id": "dc-claim-harness-1",
+			"surface": "crates/pi-agent/src/lib.rs#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "crates/pi-agent/src/lib.rs",
+				"claim": "pub mod run;"
+			}
+		},
+		{
+			"id": "dc-claim-harness-2",
+			"surface": "crates/pi-agent/src/lib.rs#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "crates/pi-agent/src/lib.rs",
+				"claim": "pub mod queue;"
+			}
+		},
+		{
+			"id": "dc-fence-harness.01",
+			"surface": "docs/harness.md#fence/harness.01",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/harness.md",
+				"fenceMarker": "doc-c:fence=harness.01"
+			}
+		},
+		{
+			"id": "dc-fence-harness.02",
+			"surface": "docs/harness.md#fence/harness.02",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/harness.md",
+				"fenceMarker": "doc-c:fence=harness.02"
+			}
+		},
+		{
+			"id": "dc-fence-harness.03",
+			"surface": "docs/harness.md#fence/harness.03",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/harness.md",
+				"fenceMarker": "doc-c:fence=harness.03"
+			}
+		},
+		{
+			"id": "dc-topic-search",
+			"surface": "docs/search.md",
+			"owner": "DOC-C",
+			"class": "review-only-prose",
+			"params": {
+				"source": "docs/search.md"
+			}
+		},
+		{
+			"id": "dc-claim-search-1",
+			"surface": "target/verification/docs-topics/cli-help/pi--help.txt#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+				"claim": "grep   - Search file contents (read-only, off by default)"
+			}
+		},
+		{
+			"id": "dc-claim-search-2",
+			"surface": "target/verification/docs-topics/cli-help/pi--help.txt#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+				"claim": "--tools, -t <tools>"
+			}
+		},
+		{
+			"id": "dc-fence-search.01",
+			"surface": "docs/search.md#fence/search.01",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/search.md",
+				"fenceMarker": "doc-c:fence=search.01"
+			}
+		},
+		{
+			"id": "dc-fence-search.02",
+			"surface": "docs/search.md#fence/search.02",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/search.md",
+				"fenceMarker": "doc-c:fence=search.02"
+			}
+		},
+		{
+			"id": "dc-fence-search.03",
+			"surface": "docs/search.md#fence/search.03",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/search.md",
+				"fenceMarker": "doc-c:fence=search.03"
+			}
+		},
+		{
+			"id": "dc-topic-telemetry-schema",
+			"surface": "docs/telemetry-schema.md",
+			"owner": "DOC-C",
+			"class": "review-only-prose",
+			"params": {
+				"source": "docs/telemetry-schema.md"
+			}
+		},
+		{
+			"id": "dc-claim-telemetry-schema-1",
+			"surface": "target/verification/docs-topics/cli-help/pi--help.txt#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+				"claim": "PI_TELEMETRY"
+			}
+		},
+		{
+			"id": "dc-claim-telemetry-schema-2",
+			"surface": "target/verification/docs-topics/cli-help/pi--help.txt#claim",
+			"owner": "DOC-C",
+			"class": "transcript-claim",
+			"params": {
+				"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+				"claim": "Override install telemetry when set to 1/true/yes or 0/false/no"
+			}
+		},
+		{
+			"id": "dc-fence-telemetry-schema.01",
+			"surface": "docs/telemetry-schema.md#fence/telemetry-schema.01",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/telemetry-schema.md",
+				"fenceMarker": "doc-c:fence=telemetry-schema.01"
+			}
+		},
+		{
+			"id": "dc-fence-telemetry-schema.02",
+			"surface": "docs/telemetry-schema.md#fence/telemetry-schema.02",
+			"owner": "DOC-C",
+			"class": "fenced-compile",
+			"params": {
+				"topic": "docs/telemetry-schema.md",
+				"fenceMarker": "doc-c:fence=telemetry-schema.02"
+			}
 		}
 	]
 }

@@ -1,0 +1,53 @@
+{
+	"schema": "pi.docs.topic-evidence.v1",
+	"topic": "themes",
+	"doc": "docs/themes.md",
+	"referenceSource": ".references/pi/packages/coding-agent/docs/themes.md",
+	"referencePin": "8fa7eebd235355522c8104166b4f1f959b4e2f10",
+	"transcripts": [
+		{
+			"kind": "cli-help",
+			"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+			"producer": "target/release/pi --help"
+		},
+		{
+			"kind": "e2e-smoke",
+			"source": "target/verification/e2e/latest-run.txt",
+			"producer": "scripts/verification/e2e-smoke.ts"
+		}
+	],
+	"claims": [
+		{
+			"rowId": "dc-claim-themes-1",
+			"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+			"claim": "--theme <path>"
+		},
+		{
+			"rowId": "dc-claim-themes-2",
+			"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+			"claim": "--no-themes"
+		}
+	],
+	"pending": [
+		{
+			"item": "theme JSON format and the 51-token color reference",
+			"reason": "unported-feature"
+		},
+		{
+			"item": "color value formats and terminal truecolor compatibility notes",
+			"reason": "unported-feature"
+		},
+		{
+			"item": "theme selection via /settings and terminal background detection",
+			"reason": "TUI-CLOSE"
+		},
+		{
+			"item": "hot reload of the active custom theme file",
+			"reason": "TUI-CLOSE"
+		},
+		{
+			"item": "--use-theme initial-theme flag (this build exposes --theme loading instead)",
+			"reason": "unported-feature"
+		}
+	]
+}

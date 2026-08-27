@@ -1,0 +1,36 @@
+{
+	"schema": "pi.docs.topic-evidence.v1",
+	"topic": "harness",
+	"doc": "docs/harness.md",
+	"referenceSource": ".references/pi/packages/agent/docs/harness.md",
+	"referencePin": "8fa7eebd235355522c8104166b4f1f959b4e2f10",
+	"transcripts": [
+		{
+			"kind": "e2e-smoke",
+			"source": "target/verification/e2e/latest-run.txt",
+			"producer": "scripts/verification/e2e-smoke.ts"
+		}
+	],
+	"claims": [
+		{
+			"rowId": "dc-claim-harness-1",
+			"source": "crates/pi-agent/src/lib.rs",
+			"claim": "pub mod run;"
+		},
+		{
+			"rowId": "dc-claim-harness-2",
+			"source": "crates/pi-agent/src/lib.rs",
+			"claim": "pub mod queue;"
+		}
+	],
+	"pending": [
+		{
+			"item": "TypeScript AgentHarness runtime specification",
+			"reason": "unported-feature"
+		},
+		{
+			"item": "harness telemetry span generation",
+			"reason": "unported-feature"
+		}
+	]
+}

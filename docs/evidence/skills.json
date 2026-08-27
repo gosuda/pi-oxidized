@@ -1,0 +1,53 @@
+{
+	"schema": "pi.docs.topic-evidence.v1",
+	"topic": "skills",
+	"doc": "docs/skills.md",
+	"referenceSource": ".references/pi/packages/coding-agent/docs/skills.md",
+	"referencePin": "8fa7eebd235355522c8104166b4f1f959b4e2f10",
+	"transcripts": [
+		{
+			"kind": "cli-help",
+			"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+			"producer": "target/release/pi --help"
+		},
+		{
+			"kind": "e2e-smoke",
+			"source": "target/verification/e2e/latest-run.txt",
+			"producer": "scripts/verification/e2e-smoke.ts"
+		}
+	],
+	"claims": [
+		{
+			"rowId": "dc-claim-skills-1",
+			"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+			"claim": "--skill <path>"
+		},
+		{
+			"rowId": "dc-claim-skills-2",
+			"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+			"claim": "--no-skills, -ns"
+		}
+	],
+	"pending": [
+		{
+			"item": "SKILL.md format, frontmatter field table, and name rules",
+			"reason": "unported-feature"
+		},
+		{
+			"item": "/skill:name command surface and argument append behavior",
+			"reason": "unported-feature"
+		},
+		{
+			"item": "progressive-disclosure loading mechanics",
+			"reason": "unported-feature"
+		},
+		{
+			"item": "validation and warning behavior (name length, invalid characters, missing descriptions, collisions)",
+			"reason": "unported-feature"
+		},
+		{
+			"item": "cross-harness sharing via the settings skills array and skill repository pointers",
+			"reason": "unported-feature"
+		}
+	]
+}

@@ -1,0 +1,57 @@
+{
+	"schema": "pi.docs.topic-evidence.v1",
+	"topic": "compaction",
+	"doc": "docs/compaction.md",
+	"referenceSource": ".references/pi/packages/coding-agent/docs/compaction.md",
+	"referencePin": "8fa7eebd235355522c8104166b4f1f959b4e2f10",
+	"transcripts": [
+		{
+			"kind": "e2e-smoke",
+			"source": "target/verification/e2e/latest-run.txt",
+			"producer": "scripts/verification/e2e-smoke.ts"
+		}
+	],
+	"claims": [
+		{
+			"rowId": "dc-claim-compaction-1",
+			"source": "target/verification/docs-topics/harness/e2e-result.json",
+			"claim": "\"name\": \"rust-interactive-tools-steering-compaction\""
+		},
+		{
+			"rowId": "dc-claim-compaction-2",
+			"source": "target/verification/docs-topics/harness/e2e-session.jsonl",
+			"claim": "\"firstKeptEntryId\":\"<id>\""
+		},
+		{
+			"rowId": "dc-claim-compaction-3",
+			"source": "target/verification/docs-topics/harness/e2e-result.json",
+			"claim": "\"compaction\""
+		}
+	],
+	"pending": [
+		{
+			"item": "auto-compaction trigger logic and reserveTokens/keepRecentTokens settings keys",
+			"reason": "unported-feature"
+		},
+		{
+			"item": "manual /compact [instructions] command",
+			"reason": "unported-feature"
+		},
+		{
+			"item": "branch summarization and branch_summary generation on tree switches",
+			"reason": "unported-feature"
+		},
+		{
+			"item": "split-turn cut handling and merged history/turn summaries",
+			"reason": "unported-feature"
+		},
+		{
+			"item": "extension hooks (session_before_compact, session_compact_failed, session_before_tree)",
+			"reason": "unported-feature"
+		},
+		{
+			"item": "retainedTail compaction embedding and full CompactionEntry field parity",
+			"reason": "PAR-CLOSE"
+		}
+	]
+}

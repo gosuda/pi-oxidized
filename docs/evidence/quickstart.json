@@ -1,0 +1,54 @@
+{
+	"schema": "pi.docs.topic-evidence.v1",
+	"topic": "quickstart",
+	"doc": "docs/quickstart.md",
+	"referenceSource": ".references/pi/packages/coding-agent/docs/quickstart.md",
+	"referencePin": "8fa7eebd235355522c8104166b4f1f959b4e2f10",
+	"transcripts": [
+		{
+			"kind": "cli-help",
+			"source": "target/verification/docs-topics/cli-help/pi--version.txt",
+			"producer": "target/release/pi --version"
+		},
+		{
+			"kind": "cli-help",
+			"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+			"producer": "target/release/pi --help"
+		},
+		{
+			"kind": "e2e-smoke",
+			"source": "target/verification/e2e/latest-run.txt",
+			"producer": "scripts/verification/e2e-smoke.ts"
+		}
+	],
+	"claims": [
+		{
+			"rowId": "dc-claim-quickstart-1",
+			"source": "target/verification/docs-topics/cli-help/pi--version.txt",
+			"claim": "0.1.0"
+		},
+		{
+			"rowId": "dc-claim-quickstart-2",
+			"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+			"claim": "--print, -p"
+		}
+	],
+	"pending": [
+		{
+			"item": "npm distribution and curl installer",
+			"reason": "unported-feature"
+		},
+		{
+			"item": "/login subscription flows",
+			"reason": "unported-feature"
+		},
+		{
+			"item": "image paste and drag-drop",
+			"reason": "TUI-CLOSE"
+		},
+		{
+			"item": "slash-command inventory (/reload, /model, /resume)",
+			"reason": "unported-feature"
+		}
+	]
+}

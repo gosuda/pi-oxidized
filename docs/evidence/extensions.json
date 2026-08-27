@@ -1,0 +1,67 @@
+{
+	"schema": "pi.docs.topic-evidence.v1",
+	"topic": "extensions",
+	"doc": "docs/extensions.md",
+	"referenceSource": ".references/pi/packages/coding-agent/docs/extensions.md",
+	"referencePin": "8fa7eebd235355522c8104166b4f1f959b4e2f10",
+	"transcripts": [
+		{
+			"kind": "cli-help",
+			"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+			"producer": "target/release/pi --help"
+		},
+		{
+			"kind": "e2e-smoke",
+			"source": "target/verification/e2e/latest-run.txt",
+			"producer": "scripts/verification/e2e-smoke.ts"
+		},
+		{
+			"kind": "e2e-smoke",
+			"source": "target/verification/docs-topics/harness/e2e-result.json",
+			"producer": "scripts/verification/e2e-smoke.ts"
+		}
+	],
+	"claims": [
+		{
+			"rowId": "dc-claim-extensions-1",
+			"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+			"claim": "--extension, -e <path>"
+		},
+		{
+			"rowId": "dc-claim-extensions-2",
+			"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+			"claim": "Disable extension discovery (explicit -e paths still work)"
+		},
+		{
+			"rowId": "dc-claim-extensions-3",
+			"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+			"claim": "Extensions can register additional flags (e.g., --plan from plan-mode extension)."
+		}
+	],
+	"pending": [
+		{
+			"item": "available-imports table (extension import packages and purposes)",
+			"reason": "DOC-D"
+		},
+		{
+			"item": "full event catalog (startup, resource, session, agent, model, tool, user-bash, input events)",
+			"reason": "unported-feature"
+		},
+		{
+			"item": "ExtensionContext, ExtensionCommandContext, and ExtensionAPI method reference",
+			"reason": "unported-feature"
+		},
+		{
+			"item": "custom UI chapter (dialogs, widgets, autocomplete providers, custom components, custom editor, renderers)",
+			"reason": "unported-feature"
+		},
+		{
+			"item": "state management, dynamic tool loading, output truncation, error handling, mode behavior tables",
+			"reason": "unported-feature"
+		},
+		{
+			"item": "extension styles, async factory and shutdown guidance, examples reference",
+			"reason": "unported-feature"
+		}
+	]
+}

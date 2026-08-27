@@ -1,0 +1,32 @@
+{
+	"schema": "pi.docs.topic-evidence.v1",
+	"topic": "search",
+	"doc": "docs/search.md",
+	"referenceSource": ".references/pi/packages/agent/docs/search.md",
+	"referencePin": "8fa7eebd235355522c8104166b4f1f959b4e2f10",
+	"transcripts": [
+		{
+			"kind": "cli-help",
+			"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+			"producer": "target/release/pi --help"
+		}
+	],
+	"claims": [
+		{
+			"rowId": "dc-claim-search-1",
+			"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+			"claim": "grep   - Search file contents (read-only, off by default)"
+		},
+		{
+			"rowId": "dc-claim-search-2",
+			"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+			"claim": "--tools, -t <tools>"
+		}
+	],
+	"pending": [
+		{
+			"item": "session-search query interface over committed session entries",
+			"reason": "unported-feature"
+		}
+	]
+}

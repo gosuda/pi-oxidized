@@ -1,0 +1,49 @@
+{
+	"schema": "pi.docs.topic-evidence.v1",
+	"topic": "models",
+	"doc": "docs/models.md",
+	"referenceSource": ".references/pi/packages/coding-agent/docs/models.md",
+	"referencePin": "8fa7eebd235355522c8104166b4f1f959b4e2f10",
+	"transcripts": [
+		{
+			"kind": "cli-help",
+			"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+			"producer": "target/release/pi --help"
+		}
+	],
+	"claims": [
+		{
+			"rowId": "dc-claim-models-1",
+			"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+			"claim": "off, minimal, low, medium, high, xhigh, max"
+		},
+		{
+			"rowId": "dc-claim-models-2",
+			"source": "crates/pi-ai/src/catalog/mod.rs",
+			"claim": "data/builtin-models.json"
+		},
+		{
+			"rowId": "dc-claim-models-3",
+			"source": "crates/pi/src/core/model_runtime.rs",
+			"claim": "agentDir/models.json"
+		}
+	],
+	"pending": [
+		{
+			"item": "samplingParams free-form merge into request bodies",
+			"reason": "unported-feature"
+		},
+		{
+			"item": "cost tiers (inputTokensAbove alternate rate sets)",
+			"reason": "unported-feature"
+		},
+		{
+			"item": "/model picker and /scoped-models slash commands",
+			"reason": "unported-feature"
+		},
+		{
+			"item": "executed models.json fixture walkthroughs",
+			"reason": "DOC-D"
+		}
+	]
+}

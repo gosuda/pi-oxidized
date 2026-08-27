@@ -1,0 +1,62 @@
+{
+	"schema": "pi.docs.topic-evidence.v1",
+	"topic": "usage",
+	"doc": "docs/usage.md",
+	"referenceSource": ".references/pi/packages/coding-agent/docs/usage.md",
+	"referencePin": "8fa7eebd235355522c8104166b4f1f959b4e2f10",
+	"transcripts": [
+		{
+			"kind": "cli-help",
+			"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+			"producer": "target/release/pi --help"
+		},
+		{
+			"kind": "e2e-smoke",
+			"source": "target/verification/e2e/latest-run.txt",
+			"producer": "scripts/verification/e2e-smoke.ts"
+		}
+	],
+	"claims": [
+		{
+			"rowId": "dc-claim-usage-1",
+			"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+			"claim": "--print, -p"
+		},
+		{
+			"rowId": "dc-claim-usage-2",
+			"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+			"claim": "--no-context-files, -nc"
+		},
+		{
+			"rowId": "dc-claim-usage-3",
+			"source": "target/verification/docs-topics/cli-help/pi--help.txt",
+			"claim": "pi <command> --help"
+		}
+	],
+	"pending": [
+		{
+			"item": "interactive slash-command inventory (/login, /model, /resume, /settings, /tree, /compact, /share, /reload, and the rest of the reference table)",
+			"reason": "unported-feature"
+		},
+		{
+			"item": "editor image paste, drag-drop, and inline images (Kitty graphics protocol)",
+			"reason": "TUI-CLOSE"
+		},
+		{
+			"item": "--tui-mode and --use-theme run flags",
+			"reason": "unported-feature"
+		},
+		{
+			"item": "/llama command and llama.cpp router integration",
+			"reason": "unported-feature"
+		},
+		{
+			"item": "Windows Terminal Alt+Enter fullscreen remapping guidance",
+			"reason": "TUI-CLOSE"
+		},
+		{
+			"item": "full --mode rpc surface parity (clear_queue boundary gap)",
+			"reason": "PAR-CLOSE"
+		}
+	]
+}
