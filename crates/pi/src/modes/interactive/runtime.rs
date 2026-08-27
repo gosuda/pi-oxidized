@@ -9113,6 +9113,119 @@ mod tests {
         );
     }
 
+    /// TUI-T8 presentation check: one real `ctrl+o` key through `step_ui`
+    /// (existing dispatch only) expands every tool and bash message
+    /// (per-message) and each block's rendered tail recovers in full
+    /// (per-block), with the collapse hint disappearing.
+    #[tokio::test]
+    async fn ctrl_o_expansion_recovers_full_content_per_block_and_per_message() -> TestResult {
+        use crate::modes::interactive::messages::BashMessageView;
+        use crate::modes::interactive::tool_renderer::{
+            ToolCallView, ToolPhase, ToolResultView, ToolState,
+        };
+        use crate::modes::interactive::view::{render_view, snapshot_buffer_plain};
+
+        fn tool_view(id: &str) -> MessageView {
+            MessageView::Tool(crate::modes::interactive::messages::ToolMessageView {
+                renderer: "read".to_owned(),
+                state: ToolState {
+                    call: ToolCallView {
+                        name: "read".to_owned(),
+                        id: id.to_owned(),
+                        args_summary: format!("path: {id}.rs"),
+                        raw_args: serde_json::json!({ "path": format!("{id}.rs") }),
+                    },
+                    result: Some(ToolResultView {
+                        text: (1..=15_usize)
+                            .map(|i| format!("{id} line {i}"))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                        truncated: false,
+                        full_output_path: None,
+                        images: Vec::new(),
+                        error: None,
+                    }),
+                    expanded: false,
+                    phase: ToolPhase::Success,
+                },
+            })
+        }
+
+        let (mut rt, _log) = try_make_runtime()?;
+        rt.view.messages.push(tool_view("alpha"));
+        rt.view.messages.push(MessageView::Bash(BashMessageView {
+            command: "printf probe".to_owned(),
+            output: (1..=15_usize)
+                .map(|i| format!("bash line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            expanded: false,
+            exit_code: Some(0),
+            cancelled: false,
+            truncated: false,
+            full_output_path: None,
+        }));
+        rt.view.messages.push(tool_view("beta"));
+
+        let plain = |rt: &InteractiveRuntime<SharedWriter, FakeHost>| {
+            let buf = render_view(&rt.view, 100, 200);
+            snapshot_buffer_plain(&buf, 100, 200).join("\n")
+        };
+
+        // Collapsed previews stop at TOOL_PREVIEW_LINES (12) with a hint.
+        let before = plain(&rt);
+        assert!(
+            before.matches("more lines").count() == 2,
+            "each tool block must mark its 3 hidden lines: {before}"
+        );
+        for tail in ["alpha line 13", "beta line 13", "bash line 13"] {
+            assert!(
+                !before.contains(tail),
+                "collapsed preview must stop before line 13: {tail}"
+            );
+        }
+
+        // Existing dispatch only: the real key event through the input path.
+        rt.step_ui(key(KeyCode::Char('o'), KeyModifiers::CONTROL))
+            .await
+            .map_err(|error| format!("ctrl+o step failed: {error}"))?;
+
+        // Per-message: every tool and bash view flipped.
+        for message in &rt.view.messages {
+            match message {
+                MessageView::Tool(view) => assert!(
+                    view.state.expanded,
+                    "every tool view must expand after ctrl+o"
+                ),
+                MessageView::Bash(view) => {
+                    assert!(view.expanded, "bash view must expand after ctrl+o")
+                }
+                _ => {}
+            }
+        }
+
+        // Per-block: hidden tails render in full and the hints are gone.
+        let after = plain(&rt);
+        for tail in [
+            "alpha line 13",
+            "alpha line 15",
+            "beta line 13",
+            "beta line 15",
+            "bash line 13",
+            "bash line 15",
+        ] {
+            assert!(
+                after.contains(tail),
+                "expanded block must recover its tail: {tail}"
+            );
+        }
+        assert!(
+            !after.contains("more lines"),
+            "collapse hint must disappear once expanded: {after}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn effective_extension_shortcuts_reject_invalid_reserved_and_use_last_registration() {
         use pi_ext::adapters::ShortcutRegistration;
