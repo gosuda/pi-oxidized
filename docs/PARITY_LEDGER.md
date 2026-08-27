@@ -64,7 +64,7 @@ Statuses are evidence-bearing: `landed` names an existing owner seam; `folded` r
 | R1 | Remote codec and framing | pi | remote/codec.rs, remote/framing.rs | transport-neutral bytes | planned | Portable neutral surface compiles on every target. |
 | R2 | Remote schemas | pi | remote/schemas.rs | transport-neutral schema | planned | Portable neutral surface compiles on every target. |
 | R3 | Remote client and ByteTransport | pi | remote/client.rs, remote/transport/ | ByteTransport | planned | Unix adapter is #[cfg(unix)]; the in-memory adapter and client are portable; Unix endpoints on non-Unix return typed EndpointSpecError::UnsupportedOnPlatform. |
-| R4 | Remote multi-session server | pi | remote/server.rs | portable server and listener preset | planned | Unix listener preset is #[cfg(unix)]; the transport-neutral server is portable; the merge-blocking Windows-target compile check covers the transport-neutral surface. |
+| R4 | Remote multi-session server | pi | remote/server.rs | portable server and listener preset | landed | Unix listener preset is #[cfg(unix)]; the transport-neutral server is portable; the merge-blocking Windows-target compile check covers the transport-neutral surface. |
 
 ## Pinned workspace contract
 
