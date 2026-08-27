@@ -121,7 +121,10 @@ pub fn build_first_time_setup_with_selection(
 ) -> Box<dyn Component> {
     let mut stack = super::messages::ColumnStack::new();
     stack.push(Box::new(Text::with_padding(
-        theme::bold(&th.fg(ThemeColor::Accent, "Welcome to pi")),
+        theme::bold(&th.fg(
+            ThemeColor::Accent,
+            "Welcome to pi, the minimal coding agent.",
+        )),
         CONTENT_INDENT,
         0,
     )));

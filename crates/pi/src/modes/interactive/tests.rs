@@ -874,6 +874,56 @@ fn selector_builders_render_named_empty_copy_and_exit_hint() {
     }
 }
 
+#[test]
+fn first_run_wizard_renders_canonical_consent_copy() {
+    use crate::modes::interactive::startup::{
+        FIRST_RUN_STEP_ANALYTICS, build_first_time_setup_with_selection,
+    };
+    use crate::modes::interactive::theme::{dark, markdown_theme};
+
+    let th = dark();
+    let mut comp = build_first_time_setup_with_selection(
+        FIRST_RUN_STEP_ANALYTICS,
+        0,
+        None,
+        None,
+        markdown_theme(),
+        &th,
+    );
+    let buf = render_component(comp.as_mut(), 80);
+    let plain = snapshot_buffer_plain(&buf, 80, buf.area().height).join("\n");
+    assert!(
+        plain.contains("Welcome to pi, the minimal coding agent."),
+        "first-run tagline must match the reference copy:\n{plain}"
+    );
+    assert!(
+        plain.contains("Opt-in to anonymous usage data sharing?"),
+        "consent question must match the reference copy:\n{plain}"
+    );
+    for fragment in [
+        "tracking identifier",
+        "usage analytics",
+        "/privacy",
+        "settings.json",
+    ] {
+        assert!(
+            plain.contains(fragment),
+            "disclosure fragment `{fragment}` missing:\n{plain}"
+        );
+    }
+    for label in ["Share anonymous usage data", "Don't share"] {
+        assert!(plain.contains(label), "option `{label}` missing:\n{plain}");
+    }
+    assert!(
+        !plain.contains("(you can change this in settings)"),
+        "stale lowercase parenthetical must not resurface:\n{plain}"
+    );
+    assert!(
+        !plain.contains("Enable anonymous usage analytics?"),
+        "stale consent wording must not resurface:\n{plain}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Resize + theme fallback
 // ---------------------------------------------------------------------------
