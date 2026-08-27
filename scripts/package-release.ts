@@ -31,11 +31,12 @@
  */
 
 import { mkdir, rm } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 import { checksumLine, extractZip, sha256Bytes, writeTarGz, writeZip } from "./release/archive.ts";
 import { parseReleaseArgs } from "./release/args.ts";
 import {
+	buildFallbackBundle,
 	buildHost,
 	helloRequestLine,
 	HOST_COMPATIBILITY_VERSION,
@@ -144,6 +145,59 @@ async function main(): Promise<void> {
 				});
 			}
 		}
+		// Musl rows ship both host execution paths: the compiled sidecar is
+		// the primary resolver path, and the pinned musl Bun runtime plus JS
+		// bundle ride along as the fallback (REL-T4 drives both `hello`
+		// protocols from the same unpacked archive).
+		let fallbackBundle:
+			| { readonly scriptPath: string; readonly bunRuntimePath: string }
+			| undefined;
+		if (args.plan.libc === "musl") {
+			if (host.kind !== "compiled") {
+				throw new Error(
+					`musl release for ${args.plan.rustTarget} requires a compiled sidecar; ` +
+						`host build produced ${host.kind}`,
+				);
+			}
+			const bunRuntimePath = join(
+				stagingRoot,
+				"host",
+				args.plan.rustTarget,
+				args.plan.bunRuntimeName,
+			);
+			let scriptPath: string;
+			await fs.mkdir(dirname(bunRuntimePath), { recursive: true });
+			if (args.dryRun) {
+				scriptPath = join(stagingRoot, args.plan.hostBundleName);
+				await fs.writeFile(
+					scriptPath,
+					`mock-host-bundle ${args.plan.bunTarget} source-date-epoch=${args.sourceDateEpoch}\n`,
+				);
+				await fs.writeFile(
+					bunRuntimePath,
+					`mock-bun-runtime ${args.plan.bunTarget} source-date-epoch=${args.sourceDateEpoch}\n`,
+				);
+			} else {
+				scriptPath = (
+					await buildFallbackBundle({
+						repoRoot,
+						stagingRoot,
+						plan: args.plan,
+						runner,
+					})
+				).scriptPath;
+				process.stdout.write(
+					`  Provisioning checksum-verified musl Bun runtime ${args.plan.bunTarget}...\n`,
+				);
+				await provisionBunRuntime({
+					plan: args.plan,
+					destination: bunRuntimePath,
+					cacheDir: args.runtimeCache,
+					fs,
+				});
+			}
+			fallbackBundle = { scriptPath, bunRuntimePath };
+		}
 
 		// 3. Assembly & verification.
 		process.stdout.write(`[3/6] Assembling artifacts and verifying invariants...\n`);
@@ -158,6 +212,7 @@ async function main(): Promise<void> {
 			repoRoot,
 			host,
 			bunRuntimePath,
+			fallbackBundle,
 			fs,
 			sourceDateEpoch: parseInt(args.sourceDateEpoch, 10),
 			compatibilityVersion: HOST_COMPATIBILITY_VERSION,

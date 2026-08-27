@@ -162,6 +162,49 @@ export async function buildHost(options: BuildHostOptions): Promise<HostArtifact
 	);
 }
 
+/** Inputs for building only the runtime-bundle fallback script. */
+export interface BuildFallbackBundleOptions {
+	/** Absolute path to the workspace root (contains `packages/extension-host`). */
+	readonly repoRoot: string;
+	/** Working directory under which artifacts are emitted (a `host/` subdir is created). */
+	readonly stagingRoot: string;
+	/** Resolved release target. */
+	readonly plan: TargetPlan;
+	/** Command runner. Defaults to {@link SpawnRunner}. */
+	readonly runner?: CommandRunner;
+}
+
+/**
+ * Build only the runtime-bundle fallback JavaScript (`pi-extension-host.js`)
+ * for archives that ship the compiled sidecar AND the fallback beside it
+ * (musl rows: the release smoke drives both `hello` protocols from one
+ * unpacked archive). Provisioning the pinned `bun` runtime stays the
+ * caller's job, exactly as for the runtime-bundle host kind.
+ */
+export async function buildFallbackBundle(
+	options: BuildFallbackBundleOptions,
+): Promise<{ readonly scriptPath: string }> {
+	const runner = options.runner ?? new SpawnRunner();
+	const hostDir = hostPackageDir(options.repoRoot);
+	const outDir = targetStagingDir(options.stagingRoot, options.plan);
+	await mkdir(outDir, { recursive: true });
+	const scriptPath = join(outDir, options.plan.hostBundleName);
+	if (existsSync(scriptPath)) await rm(scriptPath, { force: true });
+	const { runtimeBundle } = hostBundleCommands(options.plan, outDir);
+	const res = await runner.run("bun", [...runtimeBundle], {
+		cwd: hostDir,
+		rejectOnError: false,
+		timeoutMs: HOST_BUILD_TIMEOUT_MS,
+	});
+	if (res.exitCode !== 0 || !existsSync(scriptPath)) {
+		throw new HostBuildError(
+			options.plan.rustTarget,
+			`runtime-bundle fallback build failed (exit ${res.exitCode}). stderr=${res.stderr.slice(-500)}`,
+		);
+	}
+	return { scriptPath };
+}
+
 /** Install host dependencies with the locked file. */
 async function installHostDeps(hostDir: string, runner: CommandRunner): Promise<void> {
 	const res = await runner.run("bun", ["install", "--frozen-lockfile"], {

@@ -201,6 +201,89 @@ describe("assembleRelease", () => {
 		).toBe(false);
 	});
 
+	test("stages the compiled sidecar and the musl fallback beside it", () => {
+		const plan = planFor("x86_64-unknown-linux-musl");
+		const base = {
+			plan,
+			version: "1.0.0",
+			piBinaryPath: "/workspace/target/x86_64-unknown-linux-musl/release/pi",
+			repoRoot: "/workspace",
+			fs: new MemoryFs(),
+			sourceDateEpoch: 1000,
+			compatibilityVersion: "0.80.10",
+			protocolVersion: 1,
+			createdAt: "2024-01-01T00:00:00Z",
+			docsSource: "/workspace/docs",
+			examplesSource: "/workspace/examples",
+			assetsSource: "/workspace/assets",
+		};
+
+		expect(
+			stagedInputs({
+				...base,
+				host: { kind: "compiled", binaryPath: "/staging/pi-extension-host" },
+				fallbackBundle: {
+					scriptPath: "/staging/host/pi-extension-host.js",
+					bunRuntimePath: "/staging/host/bun",
+				},
+			}).map((entry) => [entry.kind, entry.source, entry.destRel, entry.optional]),
+		).toEqual([
+			["rust-binary", base.piBinaryPath, "pi", false],
+			["host-binary", "/staging/pi-extension-host", "pi-extension-host", false],
+			["host-bundle", "/staging/host/pi-extension-host.js", "pi-extension-host.js", false],
+			["bun-runtime", "/staging/host/bun", "bun", false],
+			["metadata-file", "/workspace/CHANGELOG.md", "CHANGELOG.md", true],
+			["metadata-file", "/workspace/README.md", "README.md", true],
+			["metadata-file", "/workspace/LICENSE", "LICENSE", true],
+			["metadata-file", "/workspace/LICENSE-MIT", "LICENSE-MIT", true],
+			["tree", "/workspace/docs", "docs", true],
+			["tree", "/workspace/examples", "examples", true],
+			["tree", "/workspace/assets", "assets", true],
+			["tree", "/workspace/crates/pi/assets/theme", "theme", true],
+			["manifest", "generated:release.json", "release.json", false],
+		]);
+	});
+	test("stages both musl host execution paths into one manifest", async () => {
+		const fs = new MemoryFs();
+		const plan = planFor("x86_64-unknown-linux-musl");
+		const piPath = "/workspace/target/x86_64-unknown-linux-musl/release/pi";
+		fs.files.set(piPath, new Uint8Array([1]));
+		fs.modes.set(piPath, 0o755);
+		fs.files.set("/staging/pi-extension-host", new Uint8Array([2]));
+		fs.modes.set("/staging/pi-extension-host", 0o755);
+		fs.files.set("/staging/host/pi-extension-host.js", new Uint8Array([3]));
+		fs.files.set("/staging/host/bun", new Uint8Array([4]));
+		fs.modes.set("/staging/host/bun", 0o755);
+
+		const assembly = await assembleRelease("/staging", {
+			plan,
+			version: "1.0.0",
+			piBinaryPath: piPath,
+			repoRoot: "/workspace",
+			host: { kind: "compiled" as const, binaryPath: "/staging/pi-extension-host" },
+			fallbackBundle: {
+				scriptPath: "/staging/host/pi-extension-host.js",
+				bunRuntimePath: "/staging/host/bun",
+			},
+			fs,
+			sourceDateEpoch: 1000,
+			compatibilityVersion: "0.80.10",
+			protocolVersion: 1,
+			createdAt: "2024-01-01T00:00:00Z",
+		});
+
+		expect(assembly.manifest.hostKind).toBe("compiled");
+		expect(assembly.manifest.files.map((file) => file.path)).toEqual([
+			"bun",
+			"pi",
+			"pi-extension-host",
+			"pi-extension-host.js",
+		]);
+		expect(assembly.manifest.files.find((file) => file.path === "bun")?.executable).toBe(
+			true,
+		);
+	});
+
 	test("rejects a runtime bundle without a provisioned Bun path", async () => {
 		const fs = new MemoryFs();
 		const plan = planFor("x86_64-unknown-linux-gnu");

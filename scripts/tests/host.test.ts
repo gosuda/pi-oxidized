@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-import { buildHost, hostBundleCommands, isHelloAckLine } from "../release/host.ts";
+import { buildFallbackBundle, buildHost, hostBundleCommands, isHelloAckLine } from "../release/host.ts";
 import { OK_RUN, RecordingRunner, type RunResult } from "../release/runner.ts";
 import { planFor } from "../release/targets.ts";
 
@@ -297,5 +297,47 @@ describe("isHelloAckLine", () => {
 				}),
 			),
 		).toBe(false);
+	});
+});
+
+describe("buildFallbackBundle", () => {
+	test("builds the fallback JavaScript beside the compiled sidecar path", async () => {
+		const plan = planFor("aarch64-unknown-linux-musl");
+		let bundleArgs: readonly string[] = [];
+		const runner = new RecordingRunner((call): RunResult => {
+			if (call.command === "bun" && call.args[0] === "build") {
+				bundleArgs = call.args;
+				const outIndex = call.args.indexOf("--outfile");
+				const scriptPath = call.args[outIndex + 1];
+				if (scriptPath !== undefined) writeFileSync(scriptPath, "bundled-host");
+				return OK_RUN;
+			}
+			return OK_RUN;
+		});
+
+		const { scriptPath } = await buildFallbackBundle({
+			repoRoot: "/workspace",
+			stagingRoot: work,
+			plan,
+			runner,
+		});
+
+		expect(scriptPath).toBe(join(work, "host", plan.rustTarget, plan.hostBundleName));
+		expect(bundleArgs).toContain("--target");
+		expect(bundleArgs).not.toContain("--compile");
+	});
+
+	test("fails loudly when the fallback bundle build fails", async () => {
+		const plan = planFor("x86_64-unknown-linux-musl");
+		const runner = new RecordingRunner((call): RunResult => {
+			if (call.command === "bun" && call.args[0] === "build") {
+				return { exitCode: 1, stdout: "", stderr: "bundle failed" };
+			}
+			return OK_RUN;
+		});
+
+		await expect(
+			buildFallbackBundle({ repoRoot: "/workspace", stagingRoot: work, plan, runner }),
+		).rejects.toThrow("runtime-bundle fallback build failed");
 	});
 });

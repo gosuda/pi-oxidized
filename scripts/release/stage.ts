@@ -63,6 +63,16 @@ export interface AssembleInputs {
 	 * supplies it from the official Bun release archive.
 	 */
 	readonly bunRuntimePath?: string;
+	/**
+	 * Optional runtime-bundle fallback staged beside a compiled host: the
+	 * host JavaScript bundle plus the provisioned Bun runtime. Musl rows
+	 * ship both host execution paths so the release smoke drives each
+	 * `hello` protocol from the same unpacked archive.
+	 */
+	readonly fallbackBundle?: {
+		readonly scriptPath: string;
+		readonly bunRuntimePath: string;
+	};
 	/** Filesystem seam. */
 	readonly fs: Fs;
 	/** Source-date-epoch stamp for the manifest + archive mtimes. */
@@ -137,6 +147,22 @@ export function stagedInputs(inputs: AssembleInputs): readonly StagedInput[] {
 			{
 				kind: "bun-runtime",
 				source: inputs.bunRuntimePath ?? "",
+				destRel: inputs.plan.bunRuntimeName,
+				optional: false,
+			},
+		);
+	}
+	if (inputs.fallbackBundle !== undefined) {
+		staged.push(
+			{
+				kind: "host-bundle",
+				source: inputs.fallbackBundle.scriptPath,
+				destRel: inputs.plan.hostBundleName,
+				optional: false,
+			},
+			{
+				kind: "bun-runtime",
+				source: inputs.fallbackBundle.bunRuntimePath,
 				destRel: inputs.plan.bunRuntimeName,
 				optional: false,
 			},
