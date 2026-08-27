@@ -78,6 +78,13 @@ pub enum Scenario {
     /// restore, and rebind reflection in rendered hints — within current
     /// dispatch semantics (no semantics changes; those belong to TUI-G7).
     KeyboardGauntlet,
+    /// Exercises the accessibility gauntlet (TUI-V6): transient-notice
+    /// persistence across a content tick, spinner-status frames carrying
+    /// kind + elapsed + cancel hint, and anti-chatter announcement
+    /// sequencing per settled stage — the three automated accessibility
+    /// invariants over canonical settled content, with the notice urgency
+    /// window quarantined as a tolerated measured field.
+    FixtureA11yGauntlet,
 }
 
 /// Evidence tier for the runner that produced an artifact.

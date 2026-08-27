@@ -61,6 +61,11 @@ path = "src/bin/pi_tui_ext_fixture.rs"
 name = "pi_tui_state_matrix_fixture"
 path = "src/bin/pi_tui_state_matrix_fixture.rs"
 
+
+[[bin]]
+name = "pi_tui_a11y_fixture"
+path = "src/bin/pi_tui_a11y_fixture.rs"
+
 [[bin]]
 name = "pi_tui_render_churn_bench"
 path = "src/bin/pi_tui_render_churn_bench.rs"
