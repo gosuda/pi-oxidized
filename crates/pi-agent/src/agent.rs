@@ -736,9 +736,7 @@ mod tests {
     }
 
     fn base_test_config() -> AgentLoopConfig {
-        let mut config = default_base_config();
-        config.model = test_model();
-        config
+        default_base_config(test_model())
     }
 
     fn agent_options(provider: Arc<dyn Provider>) -> AgentOptions {
