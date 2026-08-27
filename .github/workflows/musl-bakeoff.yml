@@ -130,7 +130,7 @@ jobs:
           # env: cannot interpolate RUNNER_TEMP, so pin an absolute writable path here.
           export USERLAND_DIR="$RUNNER_TEMP/pi-musl-userland/$ALPINE_ARCH"
           ROOTFS="$RUNNER_TEMP/alpine-rootfs"
-          rm -rf "$ROOTFS" "$USERLAND_DIR"
+          rm -rf -- "${ROOTFS:?}" "${USERLAND_DIR:?}"
           mkdir -p "$ROOTFS/tmp" "$USERLAND_DIR"
           alpine_url="https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/$ALPINE_ARCH/$ALPINE_ASSET"
           fetch "$alpine_url" "$EVIDENCE/downloads/$ALPINE_ASSET" "$ALPINE_ASSET_SHA256" \
@@ -205,7 +205,7 @@ jobs:
             apk_url="https://dl-cdn.alpinelinux.org/alpine/v3.24/main/$ALPINE_ARCH/$apk_name"
             fetch "$apk_url" "$EVIDENCE/downloads/$apk_name" "$expected_sha"               'content-addressed SHA256 pin + acquisition date; .PKGINFO pkgname/pkgver/arch asserted before extract; no signature verification'
             pkginfo_dir="$RUNNER_TEMP/pkginfo-$package"
-            rm -rf "$pkginfo_dir"
+            rm -rf -- "${pkginfo_dir:?}"
             mkdir -p "$pkginfo_dir"
             tar -xzf "$EVIDENCE/downloads/$apk_name" -C "$pkginfo_dir" .PKGINFO
             grep -Fx "pkgname = $package" "$pkginfo_dir/.PKGINFO"
@@ -237,7 +237,7 @@ jobs:
             'matched official Bun v1.3.14 SHASUMS256.txt value grounded 2026-08-26'
           unzip -Z1 "$EVIDENCE/downloads/$BUN_ASSET" | tee "$EVIDENCE/bun-archive-members.txt"
           bun_extract="$RUNNER_TEMP/bun-runtime"
-          rm -rf "$bun_extract"
+          rm -rf -- "${bun_extract:?}"
           unzip -q "$EVIDENCE/downloads/$BUN_ASSET" -d "$bun_extract"
           install -m 0755 "$bun_extract/${BUN_ASSET%.zip}/bun" "$STAGE/bun"
           install -m 0755 "$PI" "$STAGE/pi"
@@ -255,7 +255,7 @@ jobs:
           assert_musl_resolution "$EVIDENCE/runtime-loader-resolution.txt" staged-runtime
 
           tar -czf "$EVIDENCE/bakeoff.tar.gz" -C "$STAGE" .
-          rm -rf "$UNPACK"
+          rm -rf -- "${UNPACK:?}"
           mkdir -p "$UNPACK"
           tar -xzf "$EVIDENCE/bakeoff.tar.gz" -C "$UNPACK"
           tar -tzf "$EVIDENCE/bakeoff.tar.gz" | sort > "$EVIDENCE/archive-members.txt"
@@ -553,7 +553,7 @@ jobs:
           # env: cannot interpolate RUNNER_TEMP, so pin an absolute writable path here.
           export USERLAND_DIR="$RUNNER_TEMP/pi-musl-userland/$ALPINE_ARCH"
           ROOTFS="$RUNNER_TEMP/alpine-rootfs"
-          rm -rf "$ROOTFS" "$USERLAND_DIR"
+          rm -rf -- "${ROOTFS:?}" "${USERLAND_DIR:?}"
           mkdir -p "$ROOTFS/tmp" "$USERLAND_DIR"
           alpine_url="https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/$ALPINE_ARCH/$ALPINE_ASSET"
           fetch "$alpine_url" "$EVIDENCE/downloads/$ALPINE_ASSET" "$ALPINE_ASSET_SHA256" \
@@ -628,7 +628,7 @@ jobs:
             apk_url="https://dl-cdn.alpinelinux.org/alpine/v3.24/main/$ALPINE_ARCH/$apk_name"
             fetch "$apk_url" "$EVIDENCE/downloads/$apk_name" "$expected_sha"               'content-addressed SHA256 pin + acquisition date; .PKGINFO pkgname/pkgver/arch asserted before extract; no signature verification'
             pkginfo_dir="$RUNNER_TEMP/pkginfo-$package"
-            rm -rf "$pkginfo_dir"
+            rm -rf -- "${pkginfo_dir:?}"
             mkdir -p "$pkginfo_dir"
             tar -xzf "$EVIDENCE/downloads/$apk_name" -C "$pkginfo_dir" .PKGINFO
             grep -Fx "pkgname = $package" "$pkginfo_dir/.PKGINFO"
@@ -660,7 +660,7 @@ jobs:
             'matched official Bun v1.3.14 SHASUMS256.txt value grounded 2026-08-26'
           unzip -Z1 "$EVIDENCE/downloads/$BUN_ASSET" | tee "$EVIDENCE/bun-archive-members.txt"
           bun_extract="$RUNNER_TEMP/bun-runtime"
-          rm -rf "$bun_extract"
+          rm -rf -- "${bun_extract:?}"
           unzip -q "$EVIDENCE/downloads/$BUN_ASSET" -d "$bun_extract"
           install -m 0755 "$bun_extract/${BUN_ASSET%.zip}/bun" "$STAGE/bun"
           install -m 0755 "$PI" "$STAGE/pi"
@@ -678,7 +678,7 @@ jobs:
           assert_musl_resolution "$EVIDENCE/runtime-loader-resolution.txt" staged-runtime
 
           tar -czf "$EVIDENCE/bakeoff.tar.gz" -C "$STAGE" .
-          rm -rf "$UNPACK"
+          rm -rf -- "${UNPACK:?}"
           mkdir -p "$UNPACK"
           tar -xzf "$EVIDENCE/bakeoff.tar.gz" -C "$UNPACK"
           tar -tzf "$EVIDENCE/bakeoff.tar.gz" | sort > "$EVIDENCE/archive-members.txt"
