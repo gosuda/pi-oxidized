@@ -72,9 +72,9 @@ The PTY fixture does not exercise clipboard actions; OSC 52 is not emitted on th
 
 **Ruling**: verified. Generic OSC52 emission belongs to pi-tui terminal capabilities (C13 planned); the encoder is correct and bounded.
 
-### T4: LaTeX math rendering — UNVERIFIED (open parity gap)
+### T4: LaTeX math rendering — VERIFIED (re-adjudicated under PAR-CLOSE)
 
-**Evidence**: `grill_t4_math_rendering_unverified_gap`
+**Evidence**: `grill_t4_math_rendering_landed` (re-adjudicated; originally `grill_t4_math_rendering_unverified_gap`)
 
 The test confirms two gaps:
 1. `ENABLE_MATH` is not enabled in the pulldown-cmark parser options (markdown.rs:351-354), so `$...$` and `$$...$$` are treated as literal text, not as InlineMath/DisplayMath events
@@ -82,7 +82,9 @@ The test confirms two gaps:
 
 The raw-literal fallback path described in `docs/PAR-MATH-latex-strategy.md` is not implemented. Math markdown renders as literal text with visible dollar signs and LaTeX commands.
 
-**Ruling**: unverified. Re-scoped as an explicit open parity gap: T4 remains `planned` — the math rendering path (ENABLE_MATH + raw-literal fallback) is not implemented despite PAR-MATH (issue #37) being closed. The closure of #37 delivered the strategy document only; implementation was not landed.
+**Original ruling (2026-08-26)**: unverified. The math rendering path was not implemented despite PAR-MATH (issue #37) being closed with evidence that existed in no repository ref.
+
+**Re-adjudication (PAR-CLOSE, #39)**: verified. The engine re-landed as T4 stage 1 (`text/latex.rs`, commit 0c27a40) and the markdown math-path integration landed as stage 2 under PAR-CLOSE: the pre-parse `preprocess_math` pass implements the upstream marked-extension delimiter contract (block `$$…$$`/`\[…]`, inline `$$…$$`/`\(…\)`/single `$…$`, four rejection rules, code-span/fence exclusion, escaped-dollar handling, `MarkdownOptions.render_latex` gate). The original gap mechanism (no ENABLE_MATH; dropped InlineMath/DisplayMath events) is intentionally superseded by the preprocessing approach from the settled strategy — the events remain dropped because math never reaches pulldown-cmark. The witness now asserts math renders (no surviving delimiters, superscript and summation present) and unsupported input falls back to raw source.
 
 ## Summary
 
@@ -93,4 +95,4 @@ The raw-literal fallback path described in `docs/PAR-MATH-latex-strategy.md` is 
 | T3 Image rendering | verified | Unit: Kitty/iTerm2 encoders, fallback; PTY: no raw image bytes on wire |
 | T9 Terminal interfaces | verified | PTY: sole stdout owner, transaction markers, probe emission |
 | OSC52 Clipboard | verified | Unit: correct encoding, oversized rejection |
-| T4 Math rendering | unverified | Test: ENABLE_MATH not enabled, events silently dropped, no fallback |
+| T4 Math rendering | verified (re-adjudicated) | Test: `grill_t4_math_rendering_landed` — math renders to Unicode, unsupported falls back to raw |

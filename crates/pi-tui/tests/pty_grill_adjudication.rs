@@ -314,7 +314,7 @@ fn grill_t9_terminal_interfaces_sole_stdout_owner() {
 /// This test documents the gap: math markdown renders as literal text (dollar
 /// signs visible), confirming no math rendering or fallback exists.
 #[test]
-fn grill_t4_math_rendering_unverified_gap() {
+fn grill_t4_math_rendering_landed() {
     use pi_tui::components::{DefaultTextStyle, Markdown, MarkdownOptions, MarkdownTheme};
     use pi_tui::component::Component;
     use ratatui::buffer::Buffer;
@@ -339,16 +339,41 @@ fn grill_t4_math_rendering_unverified_gap() {
         .map(|cell| cell.symbol().to_string())
         .collect();
 
-    // ENABLE_MATH is not enabled, so dollar signs pass through as literal
-    // text — this confirms the math rendering gap is real and observable.
+    // Re-adjudicated under PAR-CLOSE (#39): the markdown math path landed
+    // (stage 1 engine 0c27a40 + stage 2 integration), so delimiters no longer
+    // survive as literal text and LaTeX commands render to Unicode.
     assert!(
-        rendered.contains('$'),
-        "T4 UNVERIFIED: math delimiters survive as literal text — ENABLE_MATH not enabled, no math rendering exists"
+        !rendered.contains('$'),
+        "T4 LANDED: math delimiters must not survive as literal text"
     );
-    // No LaTeX rendering occurs — \sum appears as literal text, not rendered.
     assert!(
-        rendered.contains("\\sum"),
-        "T4 UNVERIFIED: LaTeX commands survive as literal text — no math rendering or fallback exists"
+        !rendered.contains("\\sum"),
+        "T4 LANDED: LaTeX commands must render, not pass through literally"
+    );
+    assert!(
+        rendered.contains('²') && rendered.contains('∑'),
+        "T4 LANDED: expected rendered superscript and summation in {rendered:?}"
+    );
+
+    // The fallback contract: unsupported math falls back to raw source.
+    let mut md = Markdown::new(
+        "Bad $\\unknown{thing}$ end.\n",
+        0,
+        0,
+        MarkdownTheme::default(),
+        DefaultTextStyle::default(),
+        MarkdownOptions::default(),
+    );
+    let mut buf = Buffer::empty(area);
+    md.render(area, &mut buf);
+    let rendered: String = buf
+        .content
+        .iter()
+        .map(|cell| cell.symbol().to_string())
+        .collect();
+    assert!(
+        rendered.contains("$\\unknown{thing}$"),
+        "T4 LANDED: unsupported input must fall back to raw delimiters, got {rendered:?}"
     );
 }
 
