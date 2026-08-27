@@ -254,8 +254,8 @@ jobs:
         shell: bash
         env:
           ZIG_VERSION: "0.16.0"
-          ZIG_ASSET: ${{ matrix.zig-asset }}
-          ZIG_SHA256: ${{ matrix.zig-sha }}
+          ZIG_ASSET: ${{ matrix['zig-asset'] }}
+          ZIG_SHA256: ${{ matrix['zig-sha'] }}
         run: |
           set -Eeuo pipefail
           EVIDENCE=target/verification/rel-t4/musl
@@ -322,12 +322,12 @@ jobs:
         if: matrix.musl == 'true'
         shell: bash
         env:
-          ALPINE_ARCH: ${{ matrix.alpine-arch }}
-          ALPINE_ASSET: ${{ matrix.alpine-asset }}
-          ALPINE_ASSET_SHA256: ${{ matrix.alpine-sha }}
-          LIBSTDCXX_SHA256: ${{ matrix.libstdcxx-sha }}
-          LIBGCC_SHA256: ${{ matrix.libgcc-sha }}
-          MUSL_LOADER: ${{ matrix.musl-loader }}
+          ALPINE_ARCH: ${{ matrix['alpine-arch'] }}
+          ALPINE_ASSET: ${{ matrix['alpine-asset'] }}
+          ALPINE_ASSET_SHA256: ${{ matrix['alpine-sha'] }}
+          LIBSTDCXX_SHA256: ${{ matrix['libstdcxx-sha'] }}
+          LIBGCC_SHA256: ${{ matrix['libgcc-sha'] }}
+          MUSL_LOADER: ${{ matrix['musl-loader'] }}
         run: |
           set -Eeuo pipefail
           EVIDENCE=target/verification/rel-t4/musl
@@ -399,12 +399,12 @@ jobs:
         if: matrix.musl == 'true'
         shell: bash
         env:
-          MUSL_LOADER: ${{ matrix.musl-loader }}
+          MUSL_LOADER: ${{ matrix['musl-loader'] }}
         run: |
           set -Eeuo pipefail
           EVIDENCE=target/verification/rel-t4/musl
           UNPACK="$EVIDENCE/unpacked"
-          export USERLAND_DIR="$RUNNER_TEMP/pi-musl-userland/${{ matrix.alpine-arch }}"
+          export USERLAND_DIR="$RUNNER_TEMP/pi-musl-userland/${{ matrix['alpine-arch'] }}"
           shopt -s nullglob
           archives=(dist/pass1/*.tar.gz)
           test "${#archives[@]}" -eq 1
