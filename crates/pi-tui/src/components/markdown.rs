@@ -2160,6 +2160,68 @@ mod tests {
     }
 
     #[test]
+    fn link_hyperlink_emits_osc8_raw_region_on_wire_channel() {
+        use crate::frame::{FrameAnnotations, with_annotations};
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use std::cell::RefCell;
+
+        let mut m = Markdown::new(
+            "see [label](https://example.com) done",
+            0,
+            0,
+            MarkdownTheme::default(),
+            DefaultTextStyle::default(),
+            MarkdownOptions {
+                hyperlinks: true,
+                ..Default::default()
+            },
+        );
+        let height = m.measure(80).max(1);
+        let annotations = RefCell::new(FrameAnnotations::new());
+        with_annotations(&annotations, || {
+            let mut buf = Buffer::empty(Rect::new(0, 0, 80, height));
+            m.render(Rect::new(0, 0, 80, height), &mut buf);
+        });
+        let regions = annotations.into_inner().into_parts().1;
+        assert_eq!(regions.len(), 1, "exactly one region per rendered link");
+        let bytes = String::from_utf8_lossy(&regions[0].bytes).into_owned();
+        assert!(bytes.contains("\u{1b}]8;;https://example.com\u{1b}\\"));
+        assert!(bytes.contains("label"));
+        assert!(bytes.ends_with("\u{1b}]8;;\u{1b}\\\u{1b}[0m"));
+        assert_eq!(regions[0].area.height, 1);
+        assert_eq!(regions[0].area.width, "label".len() as u16);
+    }
+
+    #[test]
+    fn link_hyperlink_disabled_emits_no_region() {
+        use crate::frame::{FrameAnnotations, with_annotations};
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use std::cell::RefCell;
+
+        let mut m = Markdown::new(
+            "see [label](https://example.com) done",
+            0,
+            0,
+            MarkdownTheme::default(),
+            DefaultTextStyle::default(),
+            MarkdownOptions {
+                hyperlinks: false,
+                ..Default::default()
+            },
+        );
+        let height = m.measure(80).max(1);
+        let annotations = RefCell::new(FrameAnnotations::new());
+        with_annotations(&annotations, || {
+            let mut buf = Buffer::empty(Rect::new(0, 0, 80, height));
+            m.render(Rect::new(0, 0, 80, height), &mut buf);
+        });
+        let regions = annotations.into_inner().into_parts().1;
+        assert!(regions.is_empty(), "fallback path never touches the wire channel");
+    }
+
+    #[test]
     fn empty_measures_zero() {
         let mut m = md("   ");
         assert_eq!(m.measure(80), 0);

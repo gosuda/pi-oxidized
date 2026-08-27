@@ -5,7 +5,8 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::text::{extract_ansi_code, grapheme_width, visible_width};
+use crate::frame::{RawRegion, push_raw_region};
+use crate::text::{extract_ansi_code, grapheme_width, parse_osc8_hyperlink, visible_width};
 
 /// Active SGR attributes while painting a line.
 #[derive(Debug, Clone, Default)]
@@ -142,6 +143,80 @@ impl PaintStyle {
         }
         style.add_modifier(mods)
     }
+
+    /// Serialize the active style as one SGR sequence (empty when default).
+    ///
+    /// Used to prefix hyperlink region replays so the verbatim span re-
+    /// establishes the style context that was active when the link opened.
+    fn sgr_prefix(&self) -> String {
+        let mut params = String::new();
+        let mut push = |chunk: &str| {
+            if !params.is_empty() {
+                params.push(';');
+            }
+            params.push_str(chunk);
+        };
+        if let Some(fg) = self.fg {
+            push(&color_params(fg, 30));
+        }
+        if let Some(bg) = self.bg {
+            push(&color_params(bg, 40));
+        }
+        if self.has(Self::BOLD) {
+            push("1");
+        }
+        if self.has(Self::DIM) {
+            push("2");
+        }
+        if self.has(Self::ITALIC) {
+            push("3");
+        }
+        if self.has(Self::UNDERLINE) {
+            push("4");
+        }
+        if self.has(Self::REVERSE) {
+            push("7");
+        }
+        if self.has(Self::STRIKE) {
+            push("9");
+        }
+        if params.is_empty() {
+            String::new()
+        } else {
+            format!("\u{1b}[{params}m")
+        }
+    }
+}
+
+/// SGR parameters for one color against base code 30 (fg) or 40 (bg).
+fn color_params(color: Color, base: u32) -> String {
+    match color {
+        Color::Reset => {
+            if base == 30 {
+                "39".to_owned()
+            } else {
+                "49".to_owned()
+            }
+        }
+        Color::Black => format!("{base}"),
+        Color::Red => format!("{}", base + 1),
+        Color::Green => format!("{}", base + 2),
+        Color::Yellow => format!("{}", base + 3),
+        Color::Blue => format!("{}", base + 4),
+        Color::Magenta => format!("{}", base + 5),
+        Color::Cyan => format!("{}", base + 6),
+        Color::Gray => format!("{}", base + 7),
+        Color::DarkGray => format!("{}", base + 60),
+        Color::LightRed => format!("{}", base + 61),
+        Color::LightGreen => format!("{}", base + 62),
+        Color::LightYellow => format!("{}", base + 63),
+        Color::LightBlue => format!("{}", base + 64),
+        Color::LightMagenta => format!("{}", base + 65),
+        Color::LightCyan => format!("{}", base + 66),
+        Color::White => format!("{}", base + 67),
+        Color::Rgb(r, g, b) => format!("{base};2;{r};{g};{b}"),
+        Color::Indexed(n) => format!("{base};5;{n}"),
+    }
 }
 
 fn basic_fg(idx: u32) -> Color {
@@ -182,6 +257,13 @@ pub fn paint_lines(area: Rect, buf: &mut Buffer, lines: &[String]) {
 }
 
 /// Paint a single ANSI-capable line starting at `(x, y)`.
+///
+/// SGR sequences update the painted cell style. OSC 8 hyperlink sequences
+/// cannot live in a cell buffer, so each balanced open/close span around
+/// visible text is recorded as a [`RawRegion`] annotation; the writer replays
+/// the verbatim bytes to the terminal (see `commit_frame`). Outside a frame
+/// (`with_annotations` inactive, tests, settled-line painting) the push is a
+/// no-op and the styled label cells stand alone.
 pub fn paint_line(x: u16, y: u16, max_width: usize, buf: &mut Buffer, line: &str) {
     if max_width == 0 {
         return;
@@ -189,11 +271,47 @@ pub fn paint_line(x: u16, y: u16, max_width: usize, buf: &mut Buffer, line: &str
     let mut col = 0usize;
     let mut i = 0usize;
     let mut style = PaintStyle::default();
-    while i < line.len() && col < max_width {
+    // Open OSC 8 hyperlink: (byte offset of the open sequence, first painted
+    // column, SGR context active when the link opened).
+    let mut link: Option<(usize, usize, String)> = None;
+    // Visible graphemes are gated by `max_width`, but the trailing ANSI tail
+    // is always consumed: wrapped rows that fill the line exactly to the
+    // margin carry their OSC 8 close at `col == max_width` and must still
+    // close the region.
+    while i < line.len() {
         if let Some(ansi) = extract_ansi_code(line, i) {
-            style.process(ansi.code);
+            match parse_osc8_hyperlink(ansi.code) {
+                Some(Some(_)) => {
+                    let prefix = style.sgr_prefix();
+                    link = Some((i, col, prefix));
+                }
+                Some(None) => {
+                    if let Some((open_at, start_col, prefix)) = link.take()
+                        && col > start_col
+                    {
+                        let width = u16::try_from(col - start_col).unwrap_or(u16::MAX);
+                        let region_x =
+                            x.saturating_add(u16::try_from(start_col).unwrap_or(u16::MAX));
+                        let mut bytes = prefix.into_bytes();
+                        bytes.extend_from_slice(line[open_at..i + ansi.len].as_bytes());
+                        // Reset guard: the verbatim span may set SGR without
+                        // restoring it, and the replayed bytes must not leak
+                        // attributes into subsequent payload writes.
+                        bytes.extend_from_slice(b"\x1b[0m");
+                        push_raw_region(RawRegion {
+                            area: Rect::new(region_x, y, width, 1),
+                            bytes,
+                            kitty_id: None,
+                        });
+                    }
+                }
+                None => style.process(ansi.code),
+            }
             i += ansi.len;
             continue;
+        }
+        if col >= max_width {
+            break;
         }
         let rest = &line[i..];
         let Some(grapheme) = rest.graphemes(true).next() else {
@@ -321,4 +439,107 @@ pub fn render_snapshot<C: crate::component::Component + ?Sized>(
         "measure height must equal rendered row count at width {width}"
     );
     painted
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frame::{FrameAnnotations, with_annotations};
+    use crate::link::{format_link_close_bel, format_link_open_bel, hyperlink_capped};
+    use std::cell::RefCell;
+
+    fn paint_with_annotations(
+        x: u16,
+        y: u16,
+        max_width: usize,
+        line: &str,
+    ) -> (Buffer, Vec<crate::frame::RawRegion>) {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 80, 4));
+        let annotations = RefCell::new(FrameAnnotations::new());
+        with_annotations(&annotations, || {
+            paint_line(x, y, max_width, &mut buf, line);
+        });
+        let regions = annotations.into_inner().into_parts().1;
+        (buf, regions)
+    }
+
+    #[test]
+    fn paint_line_records_hyperlink_region() {
+        let styled_label = "\u{1b}[34mexample\u{1b}[0m";
+        let line = format!("see {}", hyperlink_capped(styled_label, "https://example.com", None));
+        let (buf, regions) = paint_with_annotations(5, 2, 80, &line);
+        assert_eq!(regions.len(), 1, "one region per balanced link span");
+        let region = &regions[0];
+        // "see " occupies columns 0..3; label starts at column 4 of the line,
+        // which is screen column 5 + 4 = 9 and spans 7 visible columns.
+        assert_eq!(region.area, Rect::new(9, 2, 7, 1));
+        assert!(region.bytes.starts_with(b"\x1b]8;;https://example.com\x1b\\"));
+        assert!(region.bytes.ends_with(b"\x1b]8;;\x1b\\\x1b[0m"));
+        let rendered = String::from_utf8_lossy(&region.bytes).into_owned();
+        assert!(rendered.contains("example"), "label text rides in the region");
+        // Label cells are still painted for non-raw consumers (tests, fallback).
+        assert_eq!(buf.cell((9, 2)).map(|c| c.symbol()), Some("e"));
+        assert_eq!(buf.cell((15, 2)).map(|c| c.symbol()), Some("e"));
+    }
+
+    #[test]
+    fn paint_line_records_hyperlink_region_bel_terminator() {
+        let line = format!(
+            "{}label{}",
+            format_link_open_bel("https://example.com", None).unwrap(),
+            format_link_close_bel()
+        );
+        let (_, regions) = paint_with_annotations(0, 0, 80, &line);
+        assert_eq!(regions.len(), 1);
+        assert!(regions[0].bytes.starts_with(b"\x1b]8;;https://example.com\x07"));
+        assert!(regions[0].bytes.ends_with(b"\x1b]8;;\x07\x1b[0m"));
+    }
+
+    #[test]
+    fn paint_line_drops_region_when_label_truncated() {
+        let line = hyperlink_capped("example", "https://example.com", None);
+        // max_width cuts inside the label: the close sequence is never seen.
+        let (_, regions) = paint_with_annotations(0, 0, 3, &line);
+        assert!(regions.is_empty(), "no dangling open on truncation");
+    }
+
+    #[test]
+    fn paint_line_plain_line_records_no_region() {
+        let (_, regions) = paint_with_annotations(0, 0, 80, "plain \u{1b}[1mbold\u{1b}[0m text");
+        assert!(regions.is_empty());
+    }
+
+    #[test]
+    fn paint_line_outside_frame_still_paints_label() {
+        // No with_annotations: push is a no-op, label cells must still paint.
+        let line = hyperlink_capped("example", "https://example.com", None);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 80, 1));
+        paint_line(0, 0, 80, &mut buf, &line);
+        assert_eq!(buf.cell((0, 0)).map(|c| c.symbol()), Some("e"));
+        assert_eq!(buf.cell((6, 0)).map(|c| c.symbol()), Some("e"));
+    }
+
+    #[test]
+    fn paint_line_records_region_when_label_fills_line_exactly() {
+        // Wrapped rows fill interior lines to exactly the margin and carry
+        // the close at col == max_width; the region must survive.
+        let line = hyperlink_capped("abcdef", "https://example.com", None);
+        let (_, regions) = paint_with_annotations(0, 0, 6, &line);
+        assert_eq!(regions.len(), 1, "close at the margin still closes the span");
+        assert_eq!(regions[0].area, Rect::new(0, 0, 6, 1));
+    }
+
+    #[test]
+    fn paint_line_region_carries_outer_style_context() {
+        // Italic set before the open: the replay must re-establish it so the
+        // overwritten label cells keep their painted style (blockquote case).
+        let line = format!("\u{1b}[3m{}", hyperlink_capped("label", "https://example.com", None));
+        let (_, regions) = paint_with_annotations(0, 0, 80, &line);
+        assert_eq!(regions.len(), 1);
+        assert!(
+            regions[0].bytes.starts_with(b"\x1b[3m\x1b]8;;https://example.com\x1b\\"),
+            "style context at open prefixes the region: {:?}",
+            String::from_utf8_lossy(&regions[0].bytes)
+        );
+    }
 }

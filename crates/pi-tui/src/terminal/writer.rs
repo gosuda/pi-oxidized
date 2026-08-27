@@ -984,6 +984,68 @@ mod tests {
     }
 
     #[test]
+    fn markdown_hyperlink_region_reaches_terminal_payload() -> io::Result<()> {
+        use crate::components::{DefaultTextStyle, Markdown, MarkdownOptions, MarkdownTheme};
+
+        struct MarkdownRoot;
+        impl Component for MarkdownRoot {
+            fn measure(&mut self, _width: u16) -> u16 {
+                1
+            }
+            fn render(&mut self, area: Rect, buf: &mut Buffer) {
+                let mut m = Markdown::new(
+                    "[label](https://example.com)",
+                    0,
+                    0,
+                    MarkdownTheme::default(),
+                    DefaultTextStyle::default(),
+                    MarkdownOptions {
+                        hyperlinks: true,
+                        ..Default::default()
+                    },
+                );
+                m.render(area, buf);
+            }
+            fn handle_event(&mut self, _event: &UiEvent) -> EventResult {
+                EventResult::Ignored
+            }
+            fn invalidate(&mut self) {}
+        }
+
+        let caps = TerminalCapabilities {
+            sync_output: true,
+            ..TerminalCapabilities::default()
+        };
+        let outer = Cursor::new(Vec::new());
+        let mut tui = Tui::new(outer, Size::new(40, 8), Position::ORIGIN, 3, caps)?;
+        tui.commit(Txn::Frame, &mut MarkdownRoot)?;
+        let payload = tui.last_payload();
+        let text = String::from_utf8_lossy(payload).into_owned();
+        // The hyperlink region replays as: save cursor, absolute position,
+        // verbatim OSC 8 open + styled label + close (+ reset guard), restore.
+        let open = "\u{1b}]8;;https://example.com\u{1b}\\";
+        let close = "\u{1b}]8;;\u{1b}\\";
+        assert!(
+            text.contains(&format!("\u{1b}7\u{1b}[1;1H{open}")),
+            "region replay must be cursor-saved, positioned, and open-first: {text:?}"
+        );
+        let open_at = text.find(open).expect("OSC 8 open reaches the payload");
+        let close_at = text[open_at..]
+            .find(close)
+            .expect("OSC 8 close reaches the payload")
+            + open_at;
+        assert!(
+            text[open_at..close_at].contains("label"),
+            "label rides the region: {text:?}"
+        );
+        assert!(
+            text.contains(&format!("{close}\u{1b}[0m\u{1b}8")),
+            "region ends with close + SGR reset + cursor restore: {text:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn tui_viewport_shrink_orders_abandoned_erases_before_new_rows() -> io::Result<()> {
         for sync_output in [true, false] {
             let caps = TerminalCapabilities {
