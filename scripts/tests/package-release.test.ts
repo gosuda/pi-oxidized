@@ -403,6 +403,38 @@ describe("pinned Bun runtime provisioning", () => {
 		}
 	});
 
+	test("installs from a checksum-valid offline cache for all seven targets without fetching", async () => {
+		for (const target of RUST_TARGETS) {
+			const plan = planFor(target);
+			const asset = bunRuntimeAsset(plan);
+			const work = mkdtempSync(join(tmpdir(), "pi-runtime-cache-7-"));
+			try {
+				const zipPath = join(work, asset.fileName);
+				const runtimeBytes = new TextEncoder().encode(`cached-bun-${target}\n`);
+				await writeZip(
+					[{ path: asset.runtimeMember, data: runtimeBytes, mode: 0o755 }],
+					zipPath,
+					{ sourceDateEpoch: 0 },
+				);
+				const fs = memoryFs({
+					[join("/cache", asset.fileName)]: new Uint8Array(readFileSync(zipPath)),
+				});
+				const destination = await provisionBunRuntime({
+					plan,
+					destination: "/out/bun",
+					cacheDir: "/cache",
+					fs,
+					fetcher: () => Promise.reject(new Error("network unavailable")),
+					digest: () => asset.sha256,
+				});
+				expect(destination).toBe("/out/bun");
+				expect(fs.files.get("/out/bun")).toEqual(runtimeBytes);
+			} finally {
+				rmSync(work, { recursive: true, force: true });
+			}
+		}
+	});
+
 	test("wraps non-OK and throwing fetch failures with cache path and filename", async () => {
 		const plan = planFor("x86_64-unknown-linux-gnu");
 		const asset = bunRuntimeAsset(plan);
