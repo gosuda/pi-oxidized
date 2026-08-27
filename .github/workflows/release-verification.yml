@@ -5,9 +5,14 @@ on:
     branches: ["main"]
   pull_request:
     branches: ["main"]
+  workflow_dispatch:
 
 env:
   SOURCE_DATE_EPOCH: "1735689600"
+  MUSL_APT_VERSION: "1.2.4-2"
+  ALPINE_GCC_RUNTIME_VERSION: "15.2.0-r5"
+  CARGO_ZIGBUILD_VERSION: "0.23.0"
+  CARGO_ZIGBUILD_SHA256: 68c7df45b9d9934aaed5987fbf422b31419f81827b13a52251a61e1e772c6ff7
 
 jobs:
   release-verification:
@@ -20,19 +25,42 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04-arm
           - target: x86_64-apple-darwin
             os: macos-15-intel
           - target: aarch64-apple-darwin
             os: macos-15
           - target: x86_64-pc-windows-msvc
             os: windows-latest
+          # REL-T4: the two musl legs carry the packaging/protocol step set
+          # alone — zero interaction steps (EXT-26 four-axis recipe).
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+            musl: "true"
+            musl-loader: ld-musl-x86_64.so.1
+            alpine-arch: x86_64
+            alpine-asset: alpine-minirootfs-3.24.1-x86_64.tar.gz
+            alpine-sha: 41f73e3cf5fa919b8aa5ca6b30dc48f0da2720776d7423e2a7748211456fe081
+            libstdcxx-sha: 14c987b556f5385a5db18376e788c75f37d85321b8dc1920d926ea7daac1d6f6
+            libgcc-sha: 393dcd32629f06d7d85409c272d142d0c082772d10b87ef55ee82f47de3be637
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            musl: "true"
+            musl-loader: ld-musl-aarch64.so.1
+            alpine-arch: aarch64
+            alpine-asset: alpine-minirootfs-3.24.1-aarch64.tar.gz
+            alpine-sha: f55a90f69052c5bd6f92cb09a8f47065970830b194c917a006fb94028e721259
+            libstdcxx-sha: 2302e766d4e4926038ec166ecb85837ee884576115236ddb565e3a5fca4a11d7
+            libgcc-sha: 369aaa6e9d099a737bad6dd3e6c2fe7bb1547ca26d22b94ee0411228f709b403
+            zig-asset: zig-aarch64-linux-0.16.0.tar.xz
+            zig-sha: ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
       - name: Checkout TypeScript reference (pinned)
+        if: matrix.musl != 'true'
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           repository: earendil-works/pi
@@ -41,35 +69,28 @@ jobs:
           persist-credentials: false
 
       - name: Verify reference pin
+        if: matrix.musl != 'true'
         shell: bash
         run: |
           test "$(git -C .references/pi rev-parse HEAD)" = "8fa7eebd235355522c8104166b4f1f959b4e2f10"
 
-      - name: Set up QEMU for aarch64 Linux
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        id: qemu
-        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130  # v3
-        with:
-          platforms: arm64
-
-      - name: Install cross-compiler for aarch64 Linux
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-
-      - name: Verify aarch64 smoke execution support
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+      # REL-T4: aarch64 legs run natively (ubuntu-24.04-arm) — no QEMU, no
+      # cross-compiler. The verification fails loudly if the runner is not a
+      # native arm64 image or if a qemu-aarch64 binfmt handler is registered.
+      - name: Verify native arm64 runner
+        if: startsWith(matrix.target, 'aarch64-')
         shell: bash
-        env:
-          QEMU_PLATFORMS: ${{ steps.qemu.outputs.platforms }}
         run: |
-          case ",${QEMU_PLATFORMS}," in
-            *,linux/arm64,*) ;;
-            *) echo "setup-qemu did not register linux/arm64: ${QEMU_PLATFORMS}" >&2; exit 1 ;;
-          esac
-          test -r /proc/sys/fs/binfmt_misc/qemu-aarch64
-          grep -q '^enabled' /proc/sys/fs/binfmt_misc/qemu-aarch64
+          set -Eeuo pipefail
+          mkdir -p target/verification/rel-t4
+          test "$(uname -m)" = "aarch64"
+          test "$RUNNER_ARCH" = "ARM64"
+          if grep -q '^enabled' /proc/sys/fs/binfmt_misc/qemu-aarch64 2>/dev/null; then
+            echo 'qemu-aarch64 binfmt registered on an arm64 leg — native-only topology violated' >&2
+            exit 1
+          fi
+          printf 'native-arm64-verified=%s@%s\n' "${ImageOS:-unknown}" "${ImageVersion:-unknown}" \
+            | tee -a target/verification/rel-t4/environment.txt
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
@@ -88,21 +109,25 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Install dependencies
+        if: matrix.musl != 'true'
         run: bun install --frozen-lockfile
 
       - name: Reconstruct reference provider data (offline)
+        if: matrix.musl != 'true'
         run: bun run scripts/reconstruct-provider-data.ts
 
       - name: Install reference dependencies
+        if: matrix.musl != 'true'
         run: npm ci --ignore-scripts --prefix .references/pi
 
       - name: Prepare interactive script test prerequisites
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && matrix.musl != 'true'
         shell: bash
         run: |
           cargo build -p pi --locked
           case "${RUNNER_OS}-${RUNNER_ARCH}" in
             Linux-X64) host_target=bun-linux-x64-baseline ;;
+            Linux-ARM64) host_target=bun-linux-arm64 ;;
             macOS-X64) host_target=bun-darwin-x64-baseline ;;
             macOS-ARM64) host_target=bun-darwin-arm64 ;;
             *) echo "unsupported test-host runner: ${RUNNER_OS}-${RUNNER_ARCH}" >&2; exit 1 ;;
@@ -118,6 +143,7 @@ jobs:
       # script tests; PTY driver, interactive smoke, and performance suites
       # self-skip via describe.skipIf(isWindows) where prerequisites are absent.
       - name: JS checks and scripts tests
+        if: matrix.musl != 'true'
         shell: bash
         run: |
           bun run check
@@ -178,28 +204,411 @@ jobs:
           if-no-files-found: warn
           overwrite: true
 
-      - name: Build and Package (First Pass)
+      # ─────────────────────────────────────────────────────────────────────
+      # REL-T4 musl legs: the packaging/protocol step set alone. Recipe from
+      # the landed REL-R1/REL-T3 bakeoff (docs/REL-R1-musl-toolchain-bakeoff.md
+      # §3): Candidate A (apt musl-tools) everywhere, Candidate B (pinned
+      # cargo-zigbuild) tried only on aarch64 and only if A fails; the Alpine
+      # userland is provisioned before packaging so the in-pipeline unpack
+      # smoke executes the musl artifacts natively.
+      # ─────────────────────────────────────────────────────────────────────
+
+      - name: Record musl leg environment evidence
+        if: matrix.musl == 'true'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p target/verification/rel-t4/musl/downloads
+          {
+            printf 'acquired_utc=%s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            printf 'runner_name=%s\nrunner_os=%s\nrunner_arch=%s\n' "$RUNNER_NAME" "$RUNNER_OS" "$RUNNER_ARCH"
+            printf 'image_os=%s\nimage_version=%s\n' "${ImageOS:-unknown}" "${ImageVersion:-unknown}"
+            rustc --version
+            bun --version
+          } | tee -a target/verification/rel-t4/environment.txt
+          printf 'artifact\turl\tsha256\tacquired_utc\tvendor_verification\n' \
+            > target/verification/rel-t4/musl/pins-ledger.tsv
+
+      - name: Musl toolchain candidate A (apt musl-tools)
+        id: musl-candidate-a
+        if: matrix.musl == 'true'
+        # Candidate B is the sanctioned backup on aarch64 only (REL-R1 §2
+        # rules); on x86_64 candidate A is the executed winner and hard-fails.
+        continue-on-error: ${{ matrix.target == 'aarch64-unknown-linux-musl' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            "musl-dev=$MUSL_APT_VERSION" "musl-tools=$MUSL_APT_VERSION"
+          test "$(dpkg-query -W -f='${Version}' musl-dev)" = "$MUSL_APT_VERSION"
+          test "$(dpkg-query -W -f='${Version}' musl-tools)" = "$MUSL_APT_VERSION"
+          dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\n' musl-dev musl-tools \
+            | tee target/verification/rel-t4/musl/candidate-a-packages.tsv
+          printf '%s\n' 'integrity=distro-signed Ubuntu noble apt repository' \
+            > target/verification/rel-t4/musl/candidate-a-provenance.txt
+          printf 'A\n' > target/verification/rel-t4/musl/selected-candidate.txt
+
+      - name: Musl toolchain candidate B (pinned cargo-zigbuild)
+        if: always() && matrix.target == 'aarch64-unknown-linux-musl' && steps.musl-candidate-a.outcome == 'failure'
+        shell: bash
         env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
-          QEMU_LD_PREFIX: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && '/usr/aarch64-linux-gnu' || '' }}
+          ZIG_VERSION: "0.16.0"
+          ZIG_ASSET: ${{ matrix.zig-asset }}
+          ZIG_SHA256: ${{ matrix.zig-sha }}
+        run: |
+          set -Eeuo pipefail
+          EVIDENCE=target/verification/rel-t4/musl
+          fetch() {
+            local url="$1" output="$2" expected="$3" verification="$4"
+            local acquired computed
+            acquired="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            curl --proto '=https' --tlsv1.2 --location --fail --show-error --silent \
+              --output "$output" "$url"
+            computed="$(sha256sum "$output" | cut -d ' ' -f 1)"
+            printf '%s  %s\n' "$expected" "$output" | sha256sum --check --strict
+            printf '%s\t%s\t%s\t%s\t%s\n' \
+              "$(basename "$output")" "$url" "$computed" "$acquired" "$verification" \
+              >> "$EVIDENCE/pins-ledger.tsv"
+          }
+          zig_url="https://ziglang.org/download/$ZIG_VERSION/$ZIG_ASSET"
+          fetch "$zig_url" "$EVIDENCE/downloads/$ZIG_ASSET" "$ZIG_SHA256" \
+            'matched ziglang.org 0.16.0 index.json shasum grounded 2026-08-26'
+          rm -rf -- "$RUNNER_TEMP/zig"
+          tar -xJf "$EVIDENCE/downloads/$ZIG_ASSET" -C "$RUNNER_TEMP"
+          mv "$RUNNER_TEMP/${ZIG_ASSET%.tar.xz}" "$RUNNER_TEMP/zig"
+          export PATH="$RUNNER_TEMP/zig:$PATH"
+          zig version | tee "$EVIDENCE/candidate-b-zig-version.txt"
+          test "$(zig version)" = "$ZIG_VERSION"
+
+          crate="cargo-zigbuild-$CARGO_ZIGBUILD_VERSION.crate"
+          crate_url="https://static.crates.io/crates/cargo-zigbuild/$crate"
+          fetch "$crate_url" "$EVIDENCE/downloads/$crate" "$CARGO_ZIGBUILD_SHA256" \
+            'matched crates.io registry checksum for cargo-zigbuild 0.23.0 grounded 2026-08-26'
+          crate_source="$RUNNER_TEMP/cargo-zigbuild-source"
+          rm -rf -- "${crate_source:?}"
+          mkdir -p "$crate_source"
+          tar -xzf "$EVIDENCE/downloads/$crate" -C "$crate_source" --strip-components=1
+          cargo install --locked --path "$crate_source"
+          cargo-zigbuild --version | tee "$EVIDENCE/candidate-b-cargo-zigbuild-version.txt"
+          printf 'B\n' > "$EVIDENCE/selected-candidate.txt"
+
+      - name: Build pi (musl target)
+        if: matrix.musl == 'true'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          EVIDENCE=target/verification/rel-t4/musl
+          test -f "$EVIDENCE/selected-candidate.txt"
+          candidate="$(tr -d '\n' < "$EVIDENCE/selected-candidate.txt")"
+          triple='${{ matrix.target }}'
+          linker_var="CARGO_TARGET_$(printf '%s' "$triple" | tr '[:lower:]-' '[:upper:]_')_LINKER"
+          cc_var="CC_$(printf '%s' "$triple" | tr '[:upper:]-' '[:lower:]_')"
+          printf 'candidate=%s\ntriple=%s\nlinker_var=%s\n' "$candidate" "$triple" "$linker_var" \
+            | tee "$EVIDENCE/build-selection.txt"
+          if test "$candidate" = "B"; then
+            PATH="$RUNNER_TEMP/zig:$PATH" \
+              env -u "$linker_var" -u "$cc_var" \
+              cargo zigbuild -p pi --release --locked --target "$triple" \
+              2>&1 | tee "$EVIDENCE/candidate-b-build.log"
+          else
+            env "$linker_var=musl-gcc" "$cc_var=musl-gcc" \
+              cargo build -p pi --release --locked --target "$triple" \
+              2>&1 | tee "$EVIDENCE/candidate-a-build.log"
+          fi
+          test -x "target/$triple/release/pi"
+
+      - name: Provision Alpine musl userland (loader + C++ runtime)
+        if: matrix.musl == 'true'
+        shell: bash
+        env:
+          ALPINE_ARCH: ${{ matrix.alpine-arch }}
+          ALPINE_ASSET: ${{ matrix.alpine-asset }}
+          ALPINE_ASSET_SHA256: ${{ matrix.alpine-sha }}
+          LIBSTDCXX_SHA256: ${{ matrix.libstdcxx-sha }}
+          LIBGCC_SHA256: ${{ matrix.libgcc-sha }}
+          MUSL_LOADER: ${{ matrix.musl-loader }}
+        run: |
+          set -Eeuo pipefail
+          EVIDENCE=target/verification/rel-t4/musl
+          fetch() {
+            local url="$1" output="$2" expected="$3" verification="$4"
+            local acquired computed
+            acquired="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            curl --proto '=https' --tlsv1.2 --location --fail --show-error --silent \
+              --output "$output" "$url"
+            computed="$(sha256sum "$output" | cut -d ' ' -f 1)"
+            printf '%s  %s\n' "$expected" "$output" | sha256sum --check --strict
+            printf '%s\t%s\t%s\t%s\t%s\n' \
+              "$(basename "$output")" "$url" "$computed" "$acquired" "$verification" \
+              >> "$EVIDENCE/pins-ledger.tsv"
+          }
+          export USERLAND_DIR="$RUNNER_TEMP/pi-musl-userland/$ALPINE_ARCH"
+          MUSL_PATH_FILE="/etc/ld-musl-${ALPINE_ARCH}.path"
+          ROOTFS="$RUNNER_TEMP/alpine-rootfs"
+          rm -rf -- "${ROOTFS:?}" "${USERLAND_DIR:?}"
+          mkdir -p "$ROOTFS/tmp" "$USERLAND_DIR"
+          alpine_url="https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/$ALPINE_ARCH/$ALPINE_ASSET"
+          fetch "$alpine_url" "$EVIDENCE/downloads/$ALPINE_ASSET" "$ALPINE_ASSET_SHA256" \
+            'matched Alpine vendor-published .sha256 value grounded 2026-08-26'
+          members="$EVIDENCE/alpine-rootfs-members.txt"
+          tar -tzf "$EVIDENCE/downloads/$ALPINE_ASSET" > "$members"
+          grep -Fxq "./lib/$MUSL_LOADER" "$members"
+          tar -xzf "$EVIDENCE/downloads/$ALPINE_ASSET" -C "$ROOTFS"
+          sudo install -m 0755 "$ROOTFS/lib/$MUSL_LOADER" "/lib/$MUSL_LOADER"
+
+          # Content-addressed APK pins only: minirootfs keys reject current
+          # v3.24 packages as UNTRUSTED; no index or apk-signature machinery.
+          for package in libstdc++ libgcc; do
+            case "$package" in
+              'libstdc++') expected_sha="$LIBSTDCXX_SHA256" ;;
+              libgcc) expected_sha="$LIBGCC_SHA256" ;;
+              *) echo "unexpected package: $package" >&2; exit 1 ;;
+            esac
+            apk_name="$package-$ALPINE_GCC_RUNTIME_VERSION.apk"
+            apk_url="https://dl-cdn.alpinelinux.org/alpine/v3.24/main/$ALPINE_ARCH/$apk_name"
+            fetch "$apk_url" "$EVIDENCE/downloads/$apk_name" "$expected_sha" \
+              'content-addressed SHA256 pin + acquisition date; .PKGINFO pkgname/pkgver/arch asserted before extract; no signature verification'
+            pkginfo_dir="$RUNNER_TEMP/pkginfo-$package"
+            rm -rf -- "${pkginfo_dir:?}"
+            mkdir -p "$pkginfo_dir"
+            tar -xzf "$EVIDENCE/downloads/$apk_name" -C "$pkginfo_dir" .PKGINFO
+            grep -Fx "pkgname = $package" "$pkginfo_dir/.PKGINFO"
+            grep -Fx "pkgver = $ALPINE_GCC_RUNTIME_VERSION" "$pkginfo_dir/.PKGINFO"
+            grep -Fx "arch = $ALPINE_ARCH" "$pkginfo_dir/.PKGINFO"
+            cp "$pkginfo_dir/.PKGINFO" "$EVIDENCE/downloads/$package.PKGINFO"
+            tar -xzf "$EVIDENCE/downloads/$apk_name" -C "$USERLAND_DIR" usr/lib
+          done
+
+          test -e "$USERLAND_DIR/usr/lib/libstdc++.so.6"
+          test -e "$USERLAND_DIR/usr/lib/libgcc_s.so.1"
+          # Path file replaces musl defaults; keep ONLY the isolated userland.
+          printf '%s\n' "$USERLAND_DIR/usr/lib" | sudo tee "$MUSL_PATH_FILE"
+          test "$(tr -d '\n' < "$MUSL_PATH_FILE")" = "$USERLAND_DIR/usr/lib"
+          cp "$MUSL_PATH_FILE" "$EVIDENCE/ld-musl.path"
+
+      - name: Build and Package (First Pass)
+        if: matrix.musl == 'true'
+        run: bun run scripts/package-release.ts --no-cargo --target ${{ matrix.target }} --out dist/pass1
+
+      - name: Build and Package (Second Pass)
+        if: matrix.musl == 'true'
+        run: bun run scripts/package-release.ts --no-cargo --target ${{ matrix.target }} --out dist/pass2
+
+      - name: Musl static-link, interpreter, and archive-integrity gates
+        if: matrix.musl == 'true'
+        shell: bash
+        env:
+          MUSL_LOADER: ${{ matrix.musl-loader }}
+        run: |
+          set -Eeuo pipefail
+          EVIDENCE=target/verification/rel-t4/musl
+          UNPACK="$EVIDENCE/unpacked"
+          export USERLAND_DIR="$RUNNER_TEMP/pi-musl-userland/${{ matrix.alpine-arch }}"
+          shopt -s nullglob
+          archives=(dist/pass1/*.tar.gz)
+          test "${#archives[@]}" -eq 1
+          archive="${archives[0]}"
+          printf 'archive=%s\n' "$(basename "$archive")" | tee "$EVIDENCE/archive-name.txt"
+          rm -rf -- "${UNPACK:?}"
+          mkdir -p "$UNPACK"
+          tar -xzf "$archive" -C "$UNPACK"
+          root="$(find "$UNPACK" -mindepth 1 -maxdepth 1 -type d)"
+          test -n "$root"
+
+          tar -tzf "$archive" | sort > "$EVIDENCE/archive-members.txt"
+
+          PI="$root/pi"
+          test -x "$PI"
+          readelf -d "$PI" | tee "$EVIDENCE/pi-readelf-dynamic.txt"
+          if readelf -d "$PI" | grep -q '(NEEDED)'; then
+            echo 'pi contains a dynamic NEEDED entry' >&2
+            exit 1
+          fi
+          file "$PI" | tee "$EVIDENCE/pi-file.txt"
+          set +e
+          ldd "$PI" > "$EVIDENCE/pi-ldd.txt" 2>&1
+          ldd_status=$?
+          set -e
+          cat "$EVIDENCE/pi-ldd.txt"
+          grep -Eq 'not a dynamic executable|statically linked' "$EVIDENCE/pi-ldd.txt"
+          printf 'ldd_exit=%s\n' "$ldd_status" >> "$EVIDENCE/pi-ldd.txt"
+
+          assert_program_interpreter() {
+            local binary="$1" evidence="$2" label="$3"
+            local expected="/lib/$MUSL_LOADER"
+            local -a interpreters
+            readelf -lW "$binary" | tee "$evidence"
+            mapfile -t interpreters < <(
+              sed -n 's/^[[:space:]]*\[Requesting program interpreter: \(\/[^]]*\)\]$/\1/p' "$evidence"
+            )
+            if (( ${#interpreters[@]} != 1 )); then
+              printf 'expected exactly one PT_INTERP (%s), found %s for %s\n' \
+                "$expected" "${#interpreters[@]}" "$label" >&2
+              exit 1
+            fi
+            if [[ "${interpreters[0]}" != "$expected" ]]; then
+              printf 'unexpected PT_INTERP for %s: expected %s, got %s\n' \
+                "$label" "$expected" "${interpreters[0]}" >&2
+              exit 1
+            fi
+          }
+          assert_musl_resolution() {
+            local listing="$1" label="$2"
+            local allowed_prefix="$USERLAND_DIR/"
+            local re='^[[:space:]]*(/[^[:space:](]+)'
+            local line path
+            while IFS= read -r line || [[ -n "$line" ]]; do
+              [[ -z "$line" ]] && continue
+              if [[ "$line" == *'=>'* ]]; then
+                path="${line#*=> }"
+                path="${path%% (*}"
+                path="${path%"${path##*[![:space:]]}"}"
+              elif [[ "$line" =~ $re ]]; then
+                path="${BASH_REMATCH[1]}"
+              else
+                continue
+              fi
+              if [[ "$path" == "/lib/$MUSL_LOADER" ]]; then
+                continue
+              fi
+              case "$path" in
+                "$allowed_prefix"*) ;;
+                *)
+                  printf 'resolved object outside isolated Alpine userland (%s): %s\n' "$label" "$path" >&2
+                  exit 1
+                  ;;
+              esac
+            done < "$listing"
+          }
+
+          assert_program_interpreter "$root/pi-extension-host" \
+            "$EVIDENCE/host-interpreter.txt" unpacked-host
+          assert_program_interpreter "$root/bun" \
+            "$EVIDENCE/runtime-interpreter.txt" unpacked-runtime
+          "/lib/$MUSL_LOADER" --list "$root/pi-extension-host" \
+            | tee "$EVIDENCE/host-loader-resolution.txt"
+          assert_musl_resolution "$EVIDENCE/host-loader-resolution.txt" unpacked-host
+          "/lib/$MUSL_LOADER" --list "$root/bun" \
+            | tee "$EVIDENCE/runtime-loader-resolution.txt"
+          assert_musl_resolution "$EVIDENCE/runtime-loader-resolution.txt" unpacked-runtime
+
+          # Archive-integrity gate: every release.json manifest member must be
+          # present in the unpacked archive with a matching sha256, and the
+          # archive member set must equal the manifest set exactly.
+          python3 - "$root" "$EVIDENCE/archive-members.txt" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          members_path = pathlib.Path(sys.argv[2])
+          manifest = json.loads((root / "release.json").read_text(encoding="utf-8"))
+          # release.json cannot contain its own digest: excluded from the
+          # set equality, but must be present as an archive member.
+          expected = {
+              str(p.relative_to(root))
+              for p in root.rglob("*")
+              if p.is_file() and p.name != "release.json"
+          }
+          listed = {
+              line.strip().lstrip("./").split("/", 1)[1]
+              for line in members_path.read_text(encoding="utf-8").splitlines()
+              if line.strip() and "/" in line.strip().lstrip("./")
+          }
+          listed.discard("release.json")
+          if "release.json" not in {
+              line.strip().lstrip("./").split("/", 1)[-1]
+              for line in members_path.read_text(encoding="utf-8").splitlines()
+          }:
+              raise SystemExit("release.json missing from archive members")
+          manifest_files = {entry["path"] for entry in manifest["files"]}
+          if expected != manifest_files:
+              raise SystemExit(
+                  f"unpacked file set != manifest: only-on-disk={sorted(expected - manifest_files)} "
+                  f"only-in-manifest={sorted(manifest_files - expected)}"
+              )
+          if listed != manifest_files:
+              raise SystemExit(
+                  f"archive member set != manifest: only-in-archive={sorted(listed - manifest_files)} "
+                  f"only-in-manifest={sorted(manifest_files - listed)}"
+              )
+          for entry in manifest["files"]:
+              data = (root / entry["path"]).read_bytes()
+              digest = hashlib.sha256(data).hexdigest()
+              if digest != entry["sha256"]:
+                  raise SystemExit(f"{entry['path']}: sha256 mismatch manifest vs unpacked bytes")
+              if len(data) != entry["size"]:
+                  raise SystemExit(f"{entry['path']}: size mismatch manifest vs unpacked bytes")
+          print(f"archive-integrity: {len(manifest_files)} members verified against release.json")
+          PY
+          printf 'PASS\n' > "$EVIDENCE/native-verdict.txt"
+
+      - name: Musl packaging/protocol lane (transcript_musl_smoke)
+        if: matrix.musl == 'true'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          EVIDENCE=target/verification/rel-t4/musl
+          shopt -s nullglob
+          archives=(dist/pass1/*.tar.gz)
+          test "${#archives[@]}" -eq 1
+          archive="${archives[0]}"
+          root="$(find "$EVIDENCE/unpacked" -mindepth 1 -maxdepth 1 -type d)"
+          test -n "$root"
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-musl) export PI_TUI_MUSL_ROW=musl-x64 ;;
+            *) export PI_TUI_MUSL_ROW=musl-arm64 ;;
+          esac
+          export PI_TUI_MUSL_ROOT="$root"
+          export PI_TUI_MUSL_ARCHIVE="$archive"
+          printf 'musl-lane row=%s root=%s archive=%s\n' \
+            "$PI_TUI_MUSL_ROW" "$PI_TUI_MUSL_ROOT" "$PI_TUI_MUSL_ARCHIVE"
+          cargo test -p pi-tui --features testkit --test transcript_musl_smoke
+
+      - name: Build and Package (First Pass)
+        if: matrix.musl != 'true'
         run: bun run scripts/package-release.ts --target ${{ matrix.target }} --out dist/pass1
 
       - name: Build and Package (Second Pass)
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
-          QEMU_LD_PREFIX: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && '/usr/aarch64-linux-gnu' || '' }}
+        if: matrix.musl != 'true'
         run: bun run scripts/package-release.ts --target ${{ matrix.target }} --out dist/pass2
 
       - name: Verify Determinism
         shell: bash
         run: diff -u dist/pass1/*.sha256 dist/pass2/*.sha256
 
+      # REL-T4: the five non-musl legs execute the Tier N interaction witness
+      # (portable-pty: posix_openpt on the unix rows, ConPTY on windows);
+      # x86_64-unknown-linux-gnu additionally anchors the host-pty stack it
+      # already runs above. The two musl legs execute no interaction steps.
+      - name: Tier N interaction witness (portable-pty)
+        if: matrix.musl != 'true'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p target/verification/rel-t4
+          {
+            printf 'runner_name=%s\nrunner_os=%s\nrunner_arch=%s\n' "$RUNNER_NAME" "$RUNNER_OS" "$RUNNER_ARCH"
+            printf 'image_os=%s\nimage_version=%s\n' "${ImageOS:-unknown}" "${ImageVersion:-unknown}"
+            printf 'witness=pty_no_flicker\ndriver=portable-pty-native\nrow=${{ matrix.target }}\n'
+          } | tee target/verification/rel-t4/witness-environment.txt
+          cargo test -p pi-tui --features testkit --test pty_no_flicker
+
       - name: Upload Artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: pi-${{ matrix.target }}
           path: dist/pass1/*
+
+      - name: Upload REL-T4 leg evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: rel-t4-evidence-${{ matrix.target }}
+          path: |
+            target/verification/rel-t4
+            target/verification/tui-transcripts
+          if-no-files-found: ignore
+          overwrite: true
