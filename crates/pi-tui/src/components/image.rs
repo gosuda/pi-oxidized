@@ -241,6 +241,13 @@ impl Component for ImageComponent {
                     }
                 }
             }
+            // Direct cell writer: claim the covered rows for damage scoping.
+            crate::frame::claim_opaque_span(Rect {
+                x: area.x,
+                y: area.y,
+                width: cols,
+                height: rows,
+            });
             push_raw_region(RawRegion {
                 area: region_area,
                 bytes,

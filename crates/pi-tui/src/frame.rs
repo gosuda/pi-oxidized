@@ -16,6 +16,131 @@ pub struct RawRegion {
     pub kitty_id: Option<u32>,
 }
 
+/// Claim on one render-buffer row: the row's painter within a frame.
+///
+/// Damage scoping (PERF-T11 Design B) treats the render buffer as in-place:
+/// rows whose claim set is unchanged between frames are provably equal to the
+/// last emitted grid and skip both repaint and diff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowClaim {
+    /// A `paint_line` line owns `[x, x + width)` (memo key folded with width).
+    Line {
+        /// Column where the claimed span starts.
+        x: u16,
+        /// Paint width of the claimed span.
+        width: u16,
+        /// Memo key of the claimed line.
+        key: u64,
+    },
+    /// A direct cell writer (editor body, image cells, clipped copies) owns
+    /// `[x, x + width)`; its content is not key-derivable, so the row always
+    /// diffs but the span is accounted for.
+    Opaque {
+        /// Column where the claimed span starts.
+        x: u16,
+        /// Width of the claimed span.
+        width: u16,
+    },
+    /// A foreign writer (overlay compositing) painted over the row; base
+    /// claims never match while overlaid, so the row repaints on overlay
+    /// close.
+    Foreign,
+}
+
+impl RowClaim {
+    /// Column span `(x, width)` this claim accounts for (`None` for foreign
+    /// claims, which cover the whole row).
+    #[must_use]
+    pub const fn span(&self) -> Option<(u16, u16)> {
+        match *self {
+            Self::Line { x, width, .. } | Self::Opaque { x, width } => Some((x, width)),
+            Self::Foreign => None,
+        }
+    }
+
+    /// Whether the claim describes a keyed, repaintable line.
+    #[must_use]
+    pub const fn is_line(&self) -> bool {
+        matches!(self, Self::Line { .. })
+    }
+}
+
+/// Per-row claim bookkeeping for one frame render.
+///
+/// `prior` holds the previous frame's claims (installed by the writer before
+/// composition); `frame` collects this frame's claims row by row.
+#[derive(Debug, Default, Clone)]
+pub struct RowClaims {
+    /// Claims carried over from the previous frame, indexed by row.
+    prior: Vec<Vec<RowClaim>>,
+    /// Claims recorded during this frame, indexed by row.
+    frame: Vec<Vec<RowClaim>>,
+}
+
+impl RowClaims {
+    /// Create empty bookkeeping sized for `rows` rows.
+    #[must_use]
+    pub fn with_rows(rows: usize) -> Self {
+        Self {
+            prior: vec![Vec::new(); rows],
+            frame: vec![Vec::new(); rows],
+        }
+    }
+
+    /// Record a line claim on row `y`; returns whether the row span may
+    /// skip repainting.
+    ///
+    /// The skip license requires the identical claim in the prior frame AND
+    /// that every prior claim on the row is a line claim: a foreign or
+    /// opaque writer owned part of the row, so the row's prior final content
+    /// is not what this line paints (overlay close must repaint).
+    #[must_use]
+    pub fn claim_line(&mut self, y: u16, x: u16, width: u16, key: u64) -> bool {
+        let claim = RowClaim::Line { x, width, key };
+        let matched = self
+            .prior
+            .get(usize::from(y))
+            .is_some_and(|row| row.iter().all(RowClaim::is_line) && row.contains(&claim));
+        self.record(y, claim);
+        matched
+    }
+
+    /// Record an opaque claim on row `y` (direct cell writer).
+    pub fn claim_opaque(&mut self, y: u16, x: u16, width: u16) {
+        self.record(y, RowClaim::Opaque { x, width });
+    }
+
+    /// Record a foreign claim on row `y` (overlay compositing).
+    pub fn claim_foreign(&mut self, y: u16) {
+        self.record(y, RowClaim::Foreign);
+    }
+    fn record(&mut self, y: u16, claim: RowClaim) {
+        if let Some(row) = self.frame.get_mut(usize::from(y))
+            && !row.contains(&claim)
+        {
+            row.push(claim);
+        }
+    }
+
+    /// Take the prior-frame claims, leaving this frame's recorded claims.
+    #[must_use]
+    pub fn take_prior(&mut self) -> Vec<Vec<RowClaim>> {
+        std::mem::take(&mut self.prior)
+    }
+
+    /// Take this frame's recorded claims, leaving empty rows.
+    #[must_use]
+    pub fn take_frame(&mut self) -> Vec<Vec<RowClaim>> {
+        std::mem::take(&mut self.frame)
+    }
+
+    /// Install `prior` as the prior-frame claims, resetting frame state.
+    pub fn install_prior(&mut self, prior: Vec<Vec<RowClaim>>) {
+        self.prior = prior;
+        self.frame = vec![Vec::new(); self.prior.len()];
+    }
+}
+
 /// Annotations collected while composing one frame.
 #[derive(Debug, Default, Clone)]
 pub struct FrameAnnotations {
@@ -23,6 +148,8 @@ pub struct FrameAnnotations {
     cursor: Option<Position>,
     /// Raw regions to emit after the cell draw in the same write.
     raw_regions: Vec<RawRegion>,
+    /// Row-claim bookkeeping for damage-scoped frame rendering.
+    row_claims: RowClaims,
 }
 
 impl FrameAnnotations {
@@ -52,6 +179,22 @@ impl FrameAnnotations {
     #[must_use]
     pub fn raw_regions(&self) -> &[RawRegion] {
         &self.raw_regions
+    }
+
+    /// Install prior-frame row claims (writer, before composition).
+    pub fn install_row_claims(&mut self, claims: RowClaims) {
+        self.row_claims = claims;
+    }
+
+    /// Take the row-claim bookkeeping (writer, after composition).
+    #[must_use]
+    pub fn take_row_claims(&mut self) -> RowClaims {
+        std::mem::take(&mut self.row_claims)
+    }
+
+    /// Borrow the row-claim bookkeeping mutably.
+    pub fn row_claims_mut(&mut self) -> &mut RowClaims {
+        &mut self.row_claims
     }
 
     /// Consume annotations after composition.
@@ -92,7 +235,10 @@ impl Drop for AnnotationsGuard<'_> {
 /// Restores the previous thread-local slot and commits collected annotations
 /// even if `f` panics.
 pub fn with_annotations<R>(annotations: &RefCell<FrameAnnotations>, f: impl FnOnce() -> R) -> R {
-    let previous = annotations_slot().with(|slot| slot.replace(Some(FrameAnnotations::new())));
+    // Seed the thread-local from the target so the writer can pre-install
+    // prior-frame row claims before composition.
+    let seeded = std::mem::take(&mut *annotations.borrow_mut());
+    let previous = annotations_slot().with(|slot| slot.replace(Some(seeded)));
     let mut guard = AnnotationsGuard {
         target: annotations,
         previous,
@@ -125,14 +271,68 @@ pub fn push_raw_region(region: RawRegion) {
     let _ = with_current_annotations(|annotations| annotations.push_raw_region(region));
 }
 
+/// Record a line claim for the current frame.
+///
+/// Returns `None` outside a frame; inside, returns whether the identical
+/// claim existed in the prior frame, which licenses skipping the repaint for
+/// that row span.
+pub fn claim_line(y: u16, x: u16, width: u16, key: u64) -> Option<bool> {
+    with_current_annotations(|annotations| {
+        annotations.row_claims_mut().claim_line(y, x, width, key)
+    })
+}
+
+/// Record opaque row-span claims for the current frame (no-op outside).
+pub fn claim_opaque_span(area: Rect) {
+    let _ = with_current_annotations(|annotations| {
+        for row in 0..area.height {
+            annotations
+                .row_claims_mut()
+                .claim_opaque(area.y.saturating_add(row), area.x, area.width);
+        }
+    });
+}
+
+/// Record foreign claims for rows composited over (no-op outside).
+pub fn claim_foreign_span(area: Rect) {
+    let _ = with_current_annotations(|annotations| {
+        for row in 0..area.height {
+            annotations
+                .row_claims_mut()
+                .claim_foreign(area.y.saturating_add(row));
+        }
+    });
+}
+
+/// Suspend row-claim recording for the duration of `f`.
+///
+/// Off-screen scratch renders (bottom-clipped copies) must not record claims
+/// at scratch coordinates.
+pub fn suspend_row_claims<R>(f: impl FnOnce() -> R) -> R {
+    let suspended = with_current_annotations(|annotations| {
+        let mut empty = RowClaims::default();
+        empty.install_prior(Vec::new());
+        std::mem::swap(&mut empty, annotations.row_claims_mut());
+        empty
+    });
+    let result = f();
+    if let Some(claims) = suspended {
+        let _ = with_current_annotations(|annotations| {
+            *annotations.row_claims_mut() = claims;
+        });
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         FrameAnnotations, RawRegion, push_raw_region, set_cursor, with_annotations,
         with_current_annotations,
     };
-    use ratatui::layout::{Position, Rect};
+
     use std::cell::RefCell;
+    use ratatui::layout::{Position, Rect};
 
     #[test]
     fn annotations_collect_cursor_and_raw_regions() {

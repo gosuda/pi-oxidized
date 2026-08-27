@@ -29,6 +29,9 @@ enum PaintedOp {
 #[derive(Debug, Default)]
 struct DerivedLine {
     width: usize,
+    /// Visible columns painted (ops cover `[0, visible)`; the span tail is
+    /// blanked to reproduce reset-buffer semantics in the in-place buffer).
+    visible: u16,
     /// `(column offset, op)` in paint order.
     ops: Vec<(u16, PaintedOp)>,
     /// Hyperlink region templates: `(start column, span columns, bytes)`.
@@ -323,6 +326,30 @@ pub fn paint_line(x: u16, y: u16, max_width: usize, buf: &mut Buffer, line: &str
         return;
     }
     let key = paint_cache_key(line, max_width);
+    let width = u16::try_from(max_width).unwrap_or(u16::MAX);
+    // Damage scoping (PERF-T11 Design B): record the row claim; when the
+    // identical (line, geometry) claim existed in the prior frame and the
+    // memo still holds the derivation, the in-place render buffer already
+    // contains exactly these cells — re-push the hyperlink regions only and
+    // skip the cell writes. Outside a frame (`with_annotations` inactive)
+    // the claim is a no-op and the row always paints.
+    let claim_matched = crate::frame::claim_line(y, x, width, key).unwrap_or(false);
+    if claim_matched {
+        let skipped = PAINT_CACHE.with(|cache| {
+            let cache = cache.borrow();
+            let Some((hit_line, derived)) = cache.get(&key) else {
+                return false;
+            };
+            if &**hit_line != line || derived.width != max_width {
+                return false;
+            }
+            replay_regions(derived, x, y);
+            true
+        });
+        if skipped {
+            return;
+        }
+    }
     let hit = PAINT_CACHE.with(|cache| {
         let cache = cache.borrow();
         let Some((hit_line, derived)) = cache.get(&key) else {
@@ -373,6 +400,17 @@ fn replay_derived(derived: &DerivedLine, line: &str, x: u16, y: u16, buf: &mut B
             }
         }
     }
+    blank_span(
+        x.saturating_add(derived.visible),
+        x.saturating_add(u16::try_from(derived.width).unwrap_or(u16::MAX)),
+        y,
+        buf,
+    );
+    replay_regions(derived, x, y);
+}
+
+/// Re-push hyperlink region templates translated to `(x, y)` (skip path).
+fn replay_regions(derived: &DerivedLine, x: u16, y: u16) {
     for &(start_col, span, ref bytes) in &derived.regions {
         let rx = x.saturating_add(start_col);
         push_raw_region(RawRegion {
@@ -383,10 +421,21 @@ fn replay_derived(derived: &DerivedLine, line: &str, x: u16, y: u16, buf: &mut B
     }
 }
 
+/// Reset `[from, to)` on row `y` to default cells, reproducing the
+/// reset-buffer semantics the in-place render buffer no longer provides.
+fn blank_span(from: u16, to: u16, y: u16, buf: &mut Buffer) {
+    for col in from..to {
+        if let Some(cell) = buf.cell_mut((col, y)) {
+            cell.reset();
+        }
+    }
+}
+
 /// Derive (and paint) one line at `(x, y)`, recording the ops for replay.
 fn derive_line(x: u16, y: u16, max_width: usize, buf: &mut Buffer, line: &str) -> DerivedLine {
     let mut derived = DerivedLine {
         width: max_width,
+        visible: 0,
         ops: Vec::with_capacity(32),
         regions: Vec::new(),
     };
@@ -483,6 +532,13 @@ fn derive_line(x: u16, y: u16, max_width: usize, buf: &mut Buffer, line: &str) -
         col = col.saturating_add(gw);
         i = i.saturating_add(grapheme.len());
     }
+    derived.visible = u16::try_from(col).unwrap_or(u16::MAX);
+    blank_span(
+        x.saturating_add(derived.visible),
+        x.saturating_add(u16::try_from(max_width).unwrap_or(u16::MAX)),
+        y,
+        buf,
+    );
     derived
 }
 

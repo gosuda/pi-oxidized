@@ -71,3 +71,101 @@ out of unit scope — they mirror upstream and are not the commit path).
 
 **Not touched (out of scope, file-disjoint)**: `scripts/` (DEPS-R1),
 `pi/src/modes/interactive/runtime.rs` (TUI-V4), `remote/` (PAR-SERVER).
+
+## Iteration 2 — `render-churn-recomposition` (Design B: claimed-row damage scoping)
+
+Commit: see `git log` (`perf(t11)`). Date 2026-08-28.
+
+**Blind derivation** (recorded before implementation, from the ledger's
+Contract + Floor + decomposition; data layout first). After Design A the
+remaining per-frame cost sits in three branches that exist only because
+`Terminal::draw` discards the previous grid every frame: (1) re-writing
+every cell of every unchanged row into a buffer that `swap_buffers`
+reset, (2) the whole-grid `Cell::eq` walk in the diff, (3) the
+dead-buffer reset. Data layout: render **in place** — the current buffer
+is never reset or swapped, so it *is* the previous grid and seeding is
+free; keep a separate `grid` snapshot of the last *emitted* cell state;
+keep a per-row **claim table** naming each row's painters. A row skips
+repaint and diff when this frame's claim set equals the prior frame's
+and every claim is a keyed line claim (paint_line records
+`(x, width, line-key)`; a skip requires the prior row to contain the
+identical claim and no foreign/opaque claim). The diff is scoped to
+dirty rows by an exact port of ratatui's `BufferDiff` per-cell semantics
+(skip cells, ForcedWidth, VS16 trailing, visible-on-blank force).
+Vanished claimants' spans are blanked (minus current claim coverage) —
+this reproduces reset-buffer blanking for shrunken content, vanished
+painters, and rows below the rendered height. Overlays claim their rows
+as foreign so base rows repaint on overlay close (`dismiss_overlay`
+returns a plain `Repaint`, no reanchor). Direct cell writers (editor
+body, input, image, bottom-clipped copies, fixture `put_line`s) now
+blank their row spans and claim them — under in-place rendering that is
+the Component-writer contract that reset-buffer semantics used to
+provide for free.
+
+**Boundary answers** (explicit, before touching): synchronized-output
+framing untouched (`stage3_write` unchanged); per-frame emitted bytes
+unchanged — same update stream, order, and cursor sequence (draw, then
+show/hide + set, then backend flush); the bench's written-bytes metric
+is byte-identical (35/39 B/frame) and `transcript_state_matrix` k=3,
+`pty_no_flicker`, `static_frame_evidence`, the unicode/a11y/ext
+gauntlets, and all 377 pi-tui lib tests pass. One interior divergence,
+answered: ratatui's `last_known_cursor_pos` is fed by `Terminal::flush`,
+which frames no longer call; its only consumer is `Terminal::resize`'s
+inline-offset arithmetic in the cold reanchor path, where the system
+already exercises the offset-0 constructor path
+(`commit_set_viewport_height` rebuilds via `Terminal::with_options`);
+reanchor lands inside today's tested envelope (resize-storm/ladder
+predicates cover it).
+
+**Branch classification** (divergence audit of the replaced machinery):
+
+| Original branch | Classification | Reason |
+|---|---|---|
+| per-cell replay stores for unchanged rows | residue | buffer never resets; claim-validated skip leaves correct cells |
+| whole-grid diff walk (`Cell::eq` × grid) | residue on cleanly-skipped rows | provably equal to the emitted snapshot |
+| `swap_buffers` dead-buffer reset | residue | the reset buffer is never read |
+| diff walk on damaged rows | essential | changed content must reach the wire |
+| paint/replay on damaged rows | essential | changed lines must repaint |
+| hyperlink region pushes | essential | wire surface; skip re-pushes recorded templates |
+| multi-width continuation + `CellDiffOption::Skip` handling | essential | preserved verbatim in the row-diff port |
+| reanchor/settle/resize full repaint | essential | cold paths; claims cleared, full walk |
+
+**Measurements** (pinned workload, `pi_tui_render_churn_bench`,
+release, `taskset -c 20-40`, 20 warmup / 300 frames, 100x30, 150 lines;
+medians of 3 runs; baselines re-measured this session on 19b1561 — the
+iter1 result tree — before the change):
+
+| Scenario | Before (ms/frame) | After (ms/frame) | Win | Allocated before -> after | Written before -> after |
+|---|---|---|---|---|---|
+| static | 0.136 (0.143/0.136/0.116) | 0.016 (0.016/0.016/0.042) | **8.5x** | 22.1 -> 24.7 KiB/frame | 35 -> 35 B/frame |
+| editor | 0.129 (0.125/0.129/0.135) | 0.027 (0.027/0.029/0.044) | **4.8x** | 30.4 -> 33.1 KiB/frame | 39 -> 39 B/frame |
+
+Win gate ≥1.05x median: **passed on both scenarios**. Written bytes are
+identical per frame — the wire surface is unchanged, which is the
+strongest available byte-parity evidence short of golden transcripts.
+Allocation rose ~2.6 KiB/frame (updates `Vec<(u16,u16,Cell)>` + claim
+vectors; the editor scenario's dominant allocation remains the bench's
+own workload-side `Vec<String>` clone of 150 lines per frame, out of
+unit scope per iteration 1).
+
+**Recomputed multiple**: editor 27 us vs the ledger's 1.5 us floor ≈
+**18x — still OPEN** (>2x ⇒ logged as intermediate; the unit iterates
+again). Honest note for the terminal record: the residual 27 us/frame
+is dominated by the out-of-scope workload-side clone; the commit path
+itself (measure + render with skips + scoped diff + encode) is now
+within a few microseconds of the changed-line floor, and per G10
+Finding 5 the floor term must be recomputed from the replacement's own
+per-line measurement at the exhaustion record, not cited.
+
+**Verification**: 377/377 pi-tui lib; testkit release suites green
+(state matrix k=3 determinism, no-flicker PTY 5, grill 9, theme 5,
+unicode/a11y/ext gauntlets, render-churn verification 3,
+static-frame-evidence 1); crates/pi lib failures at this tree
+(extension_host ×4, sessions cross-version ×1) are pre-existing at the
+base commit and unrelated (verified by stash-and-rerun at base).
+
+**Not touched (out of scope, file-disjoint)**: `scripts/` (DEPS-R1),
+`docs/PARITY_LEDGER.md` + `markdown.rs` (PAR-CLOSE), `docs/TUI-CLOSE-*`
+(TUI-CLOSE). `pi/src/modes/interactive/runtime.rs` touched only in
+`render_bottom_clipped` (claim suspension + opaque claims) — TUI-V4 has
+landed and no sibling owns it.

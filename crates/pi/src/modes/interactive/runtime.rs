@@ -942,7 +942,9 @@ fn render_bottom_clipped(
 
     let source_area = Rect::new(0, 0, area.width, measured_height);
     let mut source = Buffer::empty(source_area);
-    component.render(source_area, &mut source);
+    // Scratch render: claims made at scratch coordinates would poison the
+    // frame's damage table, so recording is suspended.
+    pi_tui::frame::suspend_row_claims(|| component.render(source_area, &mut source));
     for row in 0..area.height {
         for column in 0..area.width {
             let source_position = (column, skipped_rows + row);
@@ -953,7 +955,10 @@ fn render_bottom_clipped(
                 *target_cell = source_cell.clone();
             }
         }
+        // Direct cell writer (scratch-buffer copy): claim the copied rows so
+        // damage scoping accounts for them (PERF-T11 Design B).
     }
+    pi_tui::frame::claim_opaque_span(area);
 }
 
 impl Component for InteractiveRoot {

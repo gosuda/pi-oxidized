@@ -216,13 +216,29 @@ impl Component for A11yRoot {
             if *row >= bottom {
                 return;
             }
-            for (col, ch) in line.chars().take(width).enumerate() {
+            let mut col = 0usize;
+            for ch in line.chars().take(width) {
                 let x = area
                     .x
                     .saturating_add(u16::try_from(col).unwrap_or(u16::MAX));
                 let ch = if ch.is_control() { ' ' } else { ch };
                 buf[(x, *row)].set_char(ch);
+                col += 1;
             }
+            // Direct cell writer under in-place rendering: blank the rest of
+            // the row span (reset-buffer parity) and claim it.
+            for tail in col..width {
+                let x = area
+                    .x
+                    .saturating_add(u16::try_from(tail).unwrap_or(u16::MAX));
+                buf[(x, *row)].reset();
+            }
+            pi_tui::frame::claim_opaque_span(ratatui::layout::Rect {
+                x: area.x,
+                y: *row,
+                width: u16::try_from(width).unwrap_or(u16::MAX),
+                height: 1,
+            });
             *row = row.saturating_add(1);
         };
 

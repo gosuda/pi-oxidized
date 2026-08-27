@@ -1891,6 +1891,19 @@ impl Editor {
                     );
                 }
             }
+            // Direct cell writer: blank the unpainted tail (reset-buffer
+            // parity) and claim the row span for damage scoping.
+            for tail in col_x..right {
+                if let Some(cell) = buf.cell_mut((tail, y)) {
+                    cell.reset();
+                }
+            }
+            crate::frame::claim_opaque_span(Rect {
+                x: area.x,
+                y,
+                width,
+                height: 1,
+            });
             y = y.saturating_add(1);
         }
         self.last_cursor_screen = cursor_screen;
@@ -1949,6 +1962,14 @@ impl Editor {
                     }
                     col = col.saturating_add(1);
                 }
+                // Selection styling overpaints a keyed line: the row's
+                // content is no longer line-derivable.
+                crate::frame::claim_foreign_span(Rect {
+                    x: x0,
+                    y,
+                    width: content_width,
+                    height: 1,
+                });
             }
             y = y.saturating_add(1);
         }

@@ -6,15 +6,18 @@ use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use ratatui::backend::CrosstermBackend;
-use ratatui::buffer::Buffer;
+use ratatui::backend::{Backend, CrosstermBackend};
+use ratatui::buffer::{Buffer, Cell, CellDiffOption, CellWidth};
 use ratatui::layout::{Position, Rect, Size};
+use ratatui::style::{Color, Modifier};
 use ratatui::text::Line;
 use ratatui::widgets::Widget;
 use ratatui::{Terminal, TerminalOptions, Viewport};
 
 use crate::component::Component;
-use crate::frame::{FrameAnnotations, with_annotations, with_current_annotations};
+use crate::frame::{
+    FrameAnnotations, RowClaim, RowClaims, with_annotations,
+};
 use crate::terminal::backend::{
     GuardedBackend, audit_bytes, encode_full_row_prefix, wrap_synchronized,
 };
@@ -175,6 +178,10 @@ pub struct Tui<W: Write> {
     coalescer: Coalescer,
     write_count: u64,
     last_payload: Vec<u8>,
+    /// Emitted-state snapshot: the cell grid as last flushed to the wire.
+    /// The in-place render buffer is diffed against this per damaged row.
+    grid: Buffer,
+    prior_claims: Vec<Vec<RowClaim>>,
     hardware_cursor: bool,
 }
 
@@ -214,6 +221,8 @@ impl<W: Write> Tui<W> {
             coalescer: Coalescer::new(),
             write_count: 0,
             last_payload: Vec::new(),
+            grid: Buffer::default(),
+            prior_claims: Vec::new(),
             hardware_cursor: std::env::var_os("PI_HARDWARE_CURSOR").is_some(),
         })
     }
@@ -301,27 +310,68 @@ impl<W: Write> Tui<W> {
         } else {
             self.terminal.backend_mut().set_full_rows(false);
         }
+
+        // Manual draw pipeline (PERF-T11 Design B). `Terminal::draw` resets
+        // the render buffer every frame (swap_buffers) and diffs the whole
+        // grid; instead, render in place — the current buffer is never reset
+        // or swapped, so unchanged rows' cells survive — then diff only the
+        // rows whose claim set changed against the emitted-state snapshot.
+        // Emitted bytes match the whole-grid diff: cleanly skipped rows are
+        // byte-equal to the snapshot by construction.
+        self.terminal.autoresize()?;
+        let frame_area = self.terminal.get_frame().area();
+        if self.grid.area != frame_area {
+            // Viewport geometry moved (first frame, resize, settle scroll,
+            // viewport-height rebuild): realign the emitted snapshot to the
+            // live buffer and drop every row claim.
+            let current = std::mem::take(self.terminal.current_buffer_mut());
+            self.grid = current.clone();
+            *self.terminal.current_buffer_mut() = current;
+            // The claim table covers absolute terminal rows
+            // `area.y .. area.y + height`.
+            self.prior_claims = vec![Vec::new(); usize::from(frame_area.bottom())];
+        }
+
+        let mut row_claims = RowClaims::default();
+        row_claims.install_prior(std::mem::take(&mut self.prior_claims));
+        annotations.borrow_mut().install_row_claims(row_claims);
         {
             let terminal = &mut self.terminal;
-            let draw_result = with_annotations(&annotations, || {
-                terminal.draw(|frame| {
-                    let frame_area = frame.area();
-                    let height = root.measure(frame_area.width).min(frame_area.height);
-                    let render_area =
-                        Rect::new(frame_area.x, frame_area.y, frame_area.width, height);
-                    root.render(render_area, frame.buffer_mut());
-                    if hardware_cursor {
-                        if let Some(pos) = with_current_annotations(|a| a.cursor()).flatten() {
-                            frame.set_cursor_position(pos);
-                        }
-                    }
-                })
+            with_annotations(&annotations, || {
+                let mut frame = terminal.get_frame();
+                let frame_area = frame.area();
+                let height = root.measure(frame_area.width).min(frame_area.height);
+                let render_area =
+                    Rect::new(frame_area.x, frame_area.y, frame_area.width, height);
+                root.render(render_area, frame.buffer_mut());
             });
-            draw_result?;
         }
+
+        let mut collected = annotations.into_inner();
+        let mut row_claims = collected.take_row_claims();
+        let (cursor, raw_regions) = collected.into_parts();
+
+        let frame_claims = row_claims.take_frame();
+        let prior_claims = row_claims.take_prior();
+        self.emit_frame_diff(&prior_claims, &frame_claims, frame_area)?;
+        self.prior_claims = frame_claims;
+
+        // Cursor sequence mirrors ratatui's `apply_buffer_with_cursor`:
+        // updates, then show/set or hide, then the backend flush. Full-row
+        // mode stays armed through the draw and clears after it.
+        let cursor_position = hardware_cursor.then_some(cursor).flatten();
+        match cursor_position {
+            Some(position) => {
+                self.terminal.show_cursor()?;
+                self.terminal.set_cursor_position(position)?;
+            }
+            None => {
+                self.terminal.hide_cursor()?;
+            }
+        }
+        self.terminal.backend_mut().flush()?;
         self.terminal.backend_mut().set_full_rows(false);
 
-        let (cursor, raw_regions) = annotations.into_inner().into_parts();
         let mut payload = self.take_composition_bytes();
 
         let mut next_ids = HashSet::new();
@@ -351,6 +401,65 @@ impl<W: Write> Tui<W> {
         self.stage3_write(&payload)
     }
 
+    /// Emit the frame's cell updates, scoped to rows whose claim set changed.
+    ///
+    /// A row is provably unchanged when this frame's claim set equals the
+    /// prior frame's and every claim is a keyed line claim: each claimant
+    /// either repainted deterministically or skipped against an identical
+    /// prior claim, and nothing else owns cells there. Dirty rows blank the
+    /// spans of vanished claimants (not covered by a current claim), diff
+    /// against the emitted snapshot with ratatui's own per-cell semantics,
+    /// and sync the snapshot.
+    fn emit_frame_diff(
+        &mut self,
+        prior: &[Vec<RowClaim>],
+        frame: &[Vec<RowClaim>],
+        area: Rect,
+    ) -> io::Result<()> {
+        let width = usize::from(area.width);
+        let rows = usize::from(area.height);
+        let base = usize::from(area.y);
+        let mut updates: Vec<(u16, u16, Cell)> = Vec::new();
+        if width > 0 {
+            // Claim tables are indexed by absolute terminal row (painters
+            // record absolute `y`); grid and buffer content slices are
+            // row-relative.
+            for y_abs in base..base + rows {
+                let prior_row = prior.get(y_abs).map_or([].as_slice(), Vec::as_slice);
+                let frame_row = frame.get(y_abs).map_or([].as_slice(), Vec::as_slice);
+                if !frame_row.is_empty()
+                    && claims_equal(prior_row, frame_row)
+                    && frame_row.iter().all(RowClaim::is_line)
+                {
+                    continue;
+                }
+                let rel = y_abs - base;
+                let (start, end) = (rel * width, rel * width + width);
+                let row_y = u16::try_from(y_abs).unwrap_or(u16::MAX);
+                let current = self.terminal.current_buffer_mut();
+                blank_vanished_spans(prior_row, frame_row, row_y, width, current);
+                push_row_diff(
+                    &self.grid.content[start..end],
+                    &current.content[start..end],
+                    row_y,
+                    area.x,
+                    &mut updates,
+                );
+                self.grid.content[start..end]
+                    .clone_from_slice(&current.content[start..end]);
+            }
+        }
+        self.terminal
+            .backend_mut()
+            .draw(updates.iter().map(|(x, y, cell)| (*x, *y, cell)))
+    }
+
+    /// Drop all damage-scoping state; the next frame fully repaints and
+    /// realigns the emitted snapshot to the live buffer.
+    fn invalidate_damage(&mut self) {
+        self.grid = Buffer::default();
+        self.prior_claims.clear();
+    }
     fn commit_settle(
         &mut self,
         blocks: Vec<SettledBlock>,
@@ -408,7 +517,9 @@ impl<W: Write> Tui<W> {
             }
         }
 
-        // insert_before + redraw are inseparable in one stage-3 write.
+        // insert_before scrolled the viewport: the emitted snapshot must
+        // realign to the shifted buffer before the redraw diffs against it.
+        self.invalidate_damage();
         self.commit_frame(root, false)
     }
 
@@ -444,7 +555,8 @@ impl<W: Write> Tui<W> {
         if !payload_prefix.is_empty() {
             self.push_composition_bytes(&payload_prefix);
         }
-
+        // Full-row reanchor: drop claims so every row reaches the wire.
+        self.invalidate_damage();
         self.commit_frame(root, true)
     }
 
@@ -503,6 +615,8 @@ impl<W: Write> Tui<W> {
         let initialization = self.take_composition_bytes();
         self.push_composition_bytes(&pending);
         self.push_composition_bytes(&initialization);
+        // Terminal rebuilt with fresh buffers: emitted snapshot restarts.
+        self.invalidate_damage();
         self.commit_frame(root, true)
     }
 
@@ -570,6 +684,148 @@ fn write_stage3_frame<W: Write>(
 fn best_effort_sync_close<W: Write>(writer: &mut W) {
     let _ = writer.write_all(SYNC_OUTPUT_END);
     let _ = writer.flush();
+}
+
+/// Set equality for two claim rows (claims dedupe, order is render order).
+fn claims_equal(a: &[RowClaim], b: &[RowClaim]) -> bool {
+    a.len() == b.len() && a.iter().all(|claim| b.contains(claim))
+}
+
+/// Blank the spans of vanished claimants on one row.
+///
+/// A prior claim absent from this frame means its painter went away; the
+/// cells it covered must return to default (reset-buffer semantics) unless a
+/// current claim's span already accounts for them. Foreign claims cover the
+/// whole row.
+fn blank_vanished_spans(
+    prior: &[RowClaim],
+    frame: &[RowClaim],
+    y: u16,
+    width: usize,
+    buf: &mut Buffer,
+) {
+    if prior.is_empty() {
+        return;
+    }
+    let covered = |col: u16| -> bool {
+        frame.iter().any(|claim| match claim.span() {
+            Some((x, span_width)) => {
+                col >= x && col < x.saturating_add(span_width)
+            }
+            None => true,
+        })
+    };
+    for claim in prior {
+        if frame.contains(claim) {
+            continue;
+        }
+        let (from, to) = match claim.span() {
+            Some((x, span_width)) => (x, x.saturating_add(span_width)),
+            None => (0, u16::try_from(width).unwrap_or(u16::MAX)),
+        };
+        for col in from..to {
+            if !covered(col) {
+                if let Some(cell) =
+                    buf.cell_mut((col, y))
+                {
+                    cell.reset();
+                }
+            }
+        }
+    }
+}
+
+/// Row-scoped port of ratatui's `BufferDiff` iterator (`ratatui-core` 0.1.2).
+///
+/// Emits the same `(x, y, cell)` update stream the whole-grid diff produces
+/// for this row: skip cells are never emitted, wide graphemes advance past
+/// their continuation columns, VS16 sequences get trailing columns checked,
+/// and a replaced wide grapheme whose style was visible on blank trailing
+/// cells force-refreshes the trailing range. Painters never place a wide
+/// grapheme in a row's final column, so trailing state stays within the row.
+fn push_row_diff(
+    prev: &[Cell],
+    next: &[Cell],
+    y: u16,
+    x0: u16,
+    out: &mut Vec<(u16, u16, Cell)>,
+) {
+    /// Modifiers visually apparent on a blank (space) cell.
+    const VISIBLE_ON_BLANK: Modifier = Modifier::REVERSED
+        .union(Modifier::UNDERLINED)
+        .union(Modifier::SLOW_BLINK)
+        .union(Modifier::RAPID_BLINK)
+        .union(Modifier::CROSSED_OUT);
+
+    #[allow(deprecated)]
+    let is_skip = |cell: &Cell| {
+        matches!(cell.diff_option, CellDiffOption::Skip)
+            || (cell.skip && matches!(cell.diff_option, CellDiffOption::None))
+    };
+
+    let len = prev.len().min(next.len());
+    let mut pos = 0usize;
+    // Pending trailing cells after a wide character: `(next index, end, force)`.
+    let mut trailing: Option<(usize, usize, bool)> = None;
+    while pos < len || trailing.is_some() {
+        if let Some((mut next_index, mut end, force)) = trailing.take() {
+            while next_index < end {
+                let j = next_index;
+                let cell_width = next[j].cell_width().max(1) as usize;
+                next_index += cell_width;
+                end = end.max(next_index).min(len);
+                if !is_skip(&next[j]) && (force || prev[j].symbol() != next[j].symbol()) {
+                    let x = x0.saturating_add(u16::try_from(j).unwrap_or(u16::MAX));
+                    out.push((x, y, next[j].clone()));
+                    trailing = Some((next_index, end, force));
+                    break;
+                }
+            }
+            if trailing.is_none() {
+                pos = end.max(pos);
+            }
+            continue;
+        }
+        if pos >= len {
+            break;
+        }
+        let i = pos;
+        pos += 1;
+        let current = &next[i];
+        let previous = &prev[i];
+        let x = x0.saturating_add(u16::try_from(i).unwrap_or(u16::MAX));
+        match current.diff_option {
+            CellDiffOption::Skip => {}
+            _ if is_skip(current) => {}
+            CellDiffOption::ForcedWidth(width) => {
+                pos = pos.saturating_add(width.get().saturating_sub(1) as usize);
+                if current != previous {
+                    out.push((x, y, current.clone()));
+                }
+            }
+            CellDiffOption::None | CellDiffOption::AlwaysUpdate => {
+                let cell_width = current.cell_width() as usize;
+                if matches!(current.diff_option, CellDiffOption::None) && current == previous {
+                    pos += cell_width.saturating_sub(1);
+                    continue;
+                }
+                let previous_width = previous.cell_width() as usize;
+                let contains_vs16 =
+                    cell_width > 1 && current.symbol().chars().any(|c| c == '\u{FE0F}');
+                if contains_vs16 {
+                    trailing = Some((i + 1, (i + cell_width).min(len), false));
+                } else if cell_width > 1 {
+                    pos += cell_width.saturating_sub(1);
+                } else if previous_width > cell_width
+                    && (previous.bg != Color::Reset
+                        || previous.modifier.intersects(VISIBLE_ON_BLANK))
+                {
+                    trailing = Some((i + 1, i + previous_width, true));
+                }
+                out.push((x, y, current.clone()));
+            }
+        }
+    }
 }
 
 fn render_lines(buf: &mut Buffer, lines: &[Line<'static>]) {

@@ -45,6 +45,7 @@ use pi_tui::terminal::{
     install_panic_emergency_hook, probe_query_batch, write_emergency_restore_bytes,
 };
 use pi_tui::text::{normalize_terminal_output, visible_width};
+use ratatui::buffer::Cell;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect, Size};
 
@@ -455,6 +456,18 @@ fn put_line(line: &str, buf: &mut Buffer, row: &mut u16, width: usize, bottom: u
         }
         col += gw;
     }
+    // Direct cell writer under in-place rendering: blank the rest of the
+    // row span (reset-buffer parity) and claim it.
+    for tail in col..width {
+        let x = u16::try_from(tail).unwrap_or(u16::MAX);
+        buf.cell_mut((x, *row)).map_or((), Cell::reset);
+    }
+    pi_tui::frame::claim_opaque_span(ratatui::layout::Rect {
+        x: 0,
+        y: *row,
+        width: u16::try_from(width).unwrap_or(u16::MAX),
+        height: 1,
+    });
     *row = row.saturating_add(1);
 }
 
