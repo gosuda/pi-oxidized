@@ -1,8 +1,8 @@
 {
 	"schema": "pi.deps.sbom.v1",
 	"capturedAt": "2026-08-27",
-	"captureHead": "20be789e19ace467a857f4cfb77e021ef43523d7",
-	"contentSha256": "7a54b9d2bfe22372567cf36527102153d61d027c5d6f922618f69c8fdc104f98",
+	"captureHead": "acdade463b1bed77304a3debccb3697df48fb2f5",
+	"contentSha256": "051773d15249f76d83d135e8a9668eaba3d343286b3df582d1a4196b3f515fd9",
 	"content": {
 		"rust": {
 			"toolchainChannel": "1.97.1",
@@ -1082,7 +1082,7 @@
 				},
 				{
 					"name": "futures",
-					"version": "0.3.32",
+					"version": "0.3.34",
 					"license": "MIT OR Apache-2.0",
 					"source": "registry",
 					"direct": true,
@@ -1090,7 +1090,7 @@
 				},
 				{
 					"name": "futures-channel",
-					"version": "0.3.32",
+					"version": "0.3.34",
 					"license": "MIT OR Apache-2.0",
 					"source": "registry",
 					"direct": false,
@@ -1098,7 +1098,7 @@
 				},
 				{
 					"name": "futures-core",
-					"version": "0.3.32",
+					"version": "0.3.34",
 					"license": "MIT OR Apache-2.0",
 					"source": "registry",
 					"direct": false,
@@ -1106,7 +1106,7 @@
 				},
 				{
 					"name": "futures-io",
-					"version": "0.3.32",
+					"version": "0.3.34",
 					"license": "MIT OR Apache-2.0",
 					"source": "registry",
 					"direct": false,
@@ -1114,7 +1114,7 @@
 				},
 				{
 					"name": "futures-macro",
-					"version": "0.3.32",
+					"version": "0.3.34",
 					"license": "MIT OR Apache-2.0",
 					"source": "registry",
 					"direct": false,
@@ -1122,7 +1122,7 @@
 				},
 				{
 					"name": "futures-sink",
-					"version": "0.3.32",
+					"version": "0.3.34",
 					"license": "MIT OR Apache-2.0",
 					"source": "registry",
 					"direct": false,
@@ -1130,7 +1130,7 @@
 				},
 				{
 					"name": "futures-task",
-					"version": "0.3.32",
+					"version": "0.3.34",
 					"license": "MIT OR Apache-2.0",
 					"source": "registry",
 					"direct": false,
@@ -1138,7 +1138,7 @@
 				},
 				{
 					"name": "futures-util",
-					"version": "0.3.32",
+					"version": "0.3.34",
 					"license": "MIT OR Apache-2.0",
 					"source": "registry",
 					"direct": false,
@@ -1186,7 +1186,7 @@
 				},
 				{
 					"name": "globset",
-					"version": "0.4.19",
+					"version": "0.4.20",
 					"license": "Unlicense OR MIT",
 					"source": "registry",
 					"direct": true,
@@ -1474,7 +1474,7 @@
 				},
 				{
 					"name": "ignore",
-					"version": "0.4.30",
+					"version": "0.4.33",
 					"license": "Unlicense OR MIT",
 					"source": "registry",
 					"direct": true,
@@ -1562,15 +1562,23 @@
 				},
 				{
 					"name": "jiff",
-					"version": "0.2.32",
+					"version": "0.2.35",
 					"license": "Unlicense OR MIT",
 					"source": "registry",
 					"direct": true,
 					"devOnly": false
 				},
 				{
+					"name": "jiff-core",
+					"version": "0.1.0",
+					"license": "Unlicense OR MIT",
+					"source": "registry",
+					"direct": false,
+					"devOnly": false
+				},
+				{
 					"name": "jiff-static",
-					"version": "0.2.32",
+					"version": "0.2.35",
 					"license": "Unlicense OR MIT",
 					"source": "registry",
 					"direct": false,
@@ -2490,7 +2498,7 @@
 				},
 				{
 					"name": "regex-automata",
-					"version": "0.4.16",
+					"version": "0.4.18",
 					"license": "MIT OR Apache-2.0",
 					"source": "registry",
 					"direct": false,
@@ -2658,7 +2666,7 @@
 				},
 				{
 					"name": "schemars",
-					"version": "1.2.1",
+					"version": "1.2.2",
 					"license": "MIT",
 					"source": "registry",
 					"direct": true,
@@ -2666,7 +2674,7 @@
 				},
 				{
 					"name": "schemars_derive",
-					"version": "1.2.1",
+					"version": "1.2.2",
 					"license": "MIT",
 					"source": "registry",
 					"direct": false,
@@ -2706,7 +2714,7 @@
 				},
 				{
 					"name": "serde",
-					"version": "1.0.228",
+					"version": "1.0.229",
 					"license": "MIT OR Apache-2.0",
 					"source": "registry",
 					"direct": true,
@@ -2722,7 +2730,7 @@
 				},
 				{
 					"name": "serde_core",
-					"version": "1.0.228",
+					"version": "1.0.229",
 					"license": "MIT OR Apache-2.0",
 					"source": "registry",
 					"direct": false,
@@ -2730,7 +2738,7 @@
 				},
 				{
 					"name": "serde_derive",
-					"version": "1.0.228",
+					"version": "1.0.229",
 					"license": "MIT OR Apache-2.0",
 					"source": "registry",
 					"direct": false,
@@ -2738,7 +2746,7 @@
 				},
 				{
 					"name": "serde_derive_internals",
-					"version": "0.29.1",
+					"version": "0.30.0",
 					"license": "MIT OR Apache-2.0",
 					"source": "registry",
 					"direct": false,
@@ -2746,7 +2754,7 @@
 				},
 				{
 					"name": "serde_json",
-					"version": "1.0.150",
+					"version": "1.0.151",
 					"license": "MIT OR Apache-2.0",
 					"source": "registry",
 					"direct": true,
@@ -3017,6 +3025,14 @@
 					"devOnly": false
 				},
 				{
+					"name": "syn",
+					"version": "3.0.4",
+					"license": "MIT OR Apache-2.0",
+					"source": "registry",
+					"direct": false,
+					"devOnly": false
+				},
+				{
 					"name": "sync_wrapper",
 					"version": "1.0.2",
 					"license": "Apache-2.0",
@@ -3114,7 +3130,7 @@
 				},
 				{
 					"name": "thiserror",
-					"version": "2.0.18",
+					"version": "2.0.20",
 					"license": "MIT OR Apache-2.0",
 					"source": "registry",
 					"direct": true,
@@ -3130,7 +3146,7 @@
 				},
 				{
 					"name": "thiserror-impl",
-					"version": "2.0.18",
+					"version": "2.0.20",
 					"license": "MIT OR Apache-2.0",
 					"source": "registry",
 					"direct": false,
@@ -3218,7 +3234,7 @@
 				},
 				{
 					"name": "tokio-util",
-					"version": "0.7.18",
+					"version": "0.7.19",
 					"license": "MIT",
 					"source": "registry",
 					"direct": true,
@@ -4007,7 +4023,7 @@
 				{
 					"path": "package.json",
 					"dependencies": {
-						"ignore": "7.0.5"
+						"ignore": "7.0.6"
 					},
 					"devDependencies": {
 						"@types/bun": "1.3.9",
@@ -4822,6 +4838,14 @@
 						{
 							"name": "ignore",
 							"version": "7.0.5"
+						},
+						{
+							"name": "ignore",
+							"version": "7.0.5"
+						},
+						{
+							"name": "ignore",
+							"version": "7.0.6"
 						},
 						{
 							"name": "inherits",
