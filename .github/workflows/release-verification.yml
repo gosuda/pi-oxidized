@@ -85,8 +85,8 @@ jobs:
           mkdir -p target/verification/rel-t4
           test "$(uname -m)" = "aarch64"
           test "$RUNNER_ARCH" = "ARM64"
-          if grep -q '^enabled' /proc/sys/fs/binfmt_misc/qemu-aarch64 2>/dev/null; then
-            echo 'qemu-aarch64 binfmt registered on an arm64 leg — native-only topology violated' >&2
+          if test -e /proc/sys/fs/binfmt_misc/qemu-aarch64; then
+            echo 'qemu-aarch64 binfmt handler registered on an arm64 leg — native-only topology violated' >&2
             exit 1
           fi
           printf 'native-arm64-verified=%s@%s\n' "${ImageOS:-unknown}" "${ImageVersion:-unknown}" \
