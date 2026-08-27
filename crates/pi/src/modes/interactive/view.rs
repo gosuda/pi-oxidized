@@ -202,7 +202,7 @@ fn build_message(
 /// Build the status section (active indicator or idle).
 fn build_status_section(state: &ViewState) -> Box<dyn Component> {
     if let Some(status) = state.status.as_ref() {
-        status::build_status(status, &state.theme)
+        status::build_status(status, &state.theme, state.indicator_frames.as_deref())
     } else {
         status::build_idle(state.width)
     }

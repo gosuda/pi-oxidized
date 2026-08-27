@@ -84,6 +84,10 @@ pub struct ViewState {
     /// view composition via [`super::theme::with_hyperlinks`] so every
     /// markdown surface honors the same capability.
     pub hyperlinks: bool,
+    /// Override spinner indicator frames. `None` uses the default 10-frame
+    /// braille animation; `Some` with a single frame renders a static
+    /// indicator (TUI-T11 reduced-motion mechanism per TUI-G1 decision).
+    pub indicator_frames: Option<Vec<String>>,
 }
 
 /// Header view-model data.
@@ -583,6 +587,7 @@ impl ViewState {
             working_message: None,
             working_visible: true,
             hyperlinks: false,
+            indicator_frames: None,
         }
     }
 

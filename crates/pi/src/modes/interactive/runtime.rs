@@ -628,6 +628,11 @@ pub struct InteractiveRuntimeOptions {
     pub double_escape: DoubleEscapeAction,
     /// Show hardware cursor (debug / accessibility).
     pub hardware_cursor: bool,
+    /// Override spinner indicator frames for reduced-motion (TUI-T11).
+    /// `None` uses the default 10-frame braille animation; `Some` with a
+    /// single frame renders a static indicator. No env/setting gate —
+    /// callers supply this programmatically per TUI-G1 decision (option b).
+    pub indicator_frames: Option<Vec<String>>,
     pending_ui_events: Vec<UiEvent>,
 }
 
@@ -726,6 +731,7 @@ impl Default for InteractiveRuntimeOptions {
             quiet: false,
             double_escape: DoubleEscapeAction::None,
             hardware_cursor: false,
+            indicator_frames: None,
             pending_ui_events: Vec::new(),
         }
     }
@@ -1196,6 +1202,10 @@ pub struct InteractiveRuntime<W: Write, S: SessionHost> {
     spinner_started: Option<tokio::time::Instant>,
     /// Braille spinner frame counter, advanced every [`SPINNER_TICK`].
     spinner_frame: usize,
+    /// Number of frames in the current indicator (1 for static, 10 for
+    /// default braille). Drives tick repaint-suppression: when ≤ 1, only
+    /// elapsed-second boundary crossings trigger a repaint (TUI-T11).
+    spinner_frame_count: usize,
     /// Persisted next-tick deadline for the spinner `select!` arm.
     ///
     /// WHY: `tokio::select!` drops the losing future each loop turn, so a
@@ -1513,6 +1523,10 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             spinner_started: None,
             pending_reanchor: None,
             spinner_frame: 0,
+            spinner_frame_count: options
+                .indicator_frames
+                .as_ref()
+                .map_or(pi_tui::components::DEFAULT_LOADER_FRAMES.len(), Vec::len),
             spinner_deadline: None,
             spinner_kind: None,
             pending_settle: None,
@@ -1590,6 +1604,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         view.height = options.size.1;
         view.quiet = options.quiet;
         view.hyperlinks = options.caps.hyperlinks;
+        view.indicator_frames = options.indicator_frames.clone();
         view.resize(options.size.0, options.size.1);
         view
     }
@@ -4428,8 +4443,13 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             .spinner_started
             .get_or_insert_with(tokio::time::Instant::now);
         let elapsed_secs = started.elapsed().as_secs();
-        self.spinner_frame =
-            (self.spinner_frame + 1) % pi_tui::components::DEFAULT_LOADER_FRAMES.len();
+        // TUI-T11: cycle the frame counter only for multi-frame indicators.
+        // When frame_count ≤ 1 (static/reduced-motion), the frame never
+        // changes, so repaints fire only on elapsed-second boundary crossings
+        // — tick repaint-suppression per TUI-P4 evidence.
+        if self.spinner_frame_count > 1 {
+            self.spinner_frame = (self.spinner_frame + 1) % self.spinner_frame_count;
+        }
         if status.frame == self.spinner_frame && status.elapsed_secs == elapsed_secs {
             return false;
         }
@@ -8968,6 +8988,74 @@ mod tests {
             "clock must restart from 0 after A→B→A"
         );
         assert_eq!(status.frame, 1, "frame must restart at 1 after A→B→A");
+        Ok(())
+    }
+
+    /// TUI-T11: with a single-frame (static/reduced-motion) indicator,
+    /// `tick_status_indicator` must not cycle the frame counter and must
+    /// suppress repaints on sub-second ticks — only elapsed-second boundary
+    /// crossings trigger a repaint. This is the tick repaint-suppression
+    /// invariant proven by TUI-P4, implemented here via `spinner_frame_count`.
+    #[tokio::test(start_paused = true)]
+    async fn static_indicator_suppresses_subsecond_repaints() -> Result<(), String> {
+        let writer = SharedWriter::new();
+        let caps = TerminalCapabilities::default();
+        let tui = Tui::new(writer, Size::new(80, 24), Position::ORIGIN, 8, caps)
+            .map_err(|e| format!("tui: {e}"))?;
+        let (_tx, rx) = mpsc::unbounded_channel::<UiEvent>();
+        let input = TerminalInput::mock(rx);
+        let (host, _log) = FakeHost::new();
+        let options = InteractiveRuntimeOptions {
+            size: (80, 24),
+            indicator_frames: Some(vec!["●".to_owned()]),
+            ..InteractiveRuntimeOptions::default()
+        };
+        let mut rt = InteractiveRuntime::new(tui, input, Arc::new(host), &options);
+        let _ = rt.paint_now();
+
+        assert_eq!(
+            rt.spinner_frame_count, 1,
+            "static indicator must set frame_count to 1"
+        );
+
+        rt.view.status = Some(SessionStatus {
+            kind: StatusKind::Working,
+            frame: 0,
+            elapsed_secs: 0,
+            message: "Working…".to_owned(),
+        });
+        // 13 sub-second ticks (13 × 80 ms = 1.04 s, but started is set on
+        // the first tick at t=80ms, so elapsed at tick 13 = 12 × 80 = 0.96s).
+        for i in 1..=13_usize {
+            tokio::time::advance(SPINNER_TICK).await;
+            assert!(
+                !rt.tick_status_indicator(),
+                "sub-second tick {i} must not repaint for static indicator"
+            );
+        }
+        assert_eq!(
+            rt.spinner_frame, 0,
+            "frame counter must not advance for static indicator"
+        );
+
+        // 14th tick crosses the 1-second boundary (elapsed = 13 × 80 = 1.04s).
+        tokio::time::advance(SPINNER_TICK).await;
+        assert!(
+            rt.tick_status_indicator(),
+            "elapsed-second boundary must trigger a repaint"
+        );
+        let status = rt.view.status.as_ref().ok_or("status vanished")?;
+        assert_eq!(status.elapsed_secs, 1);
+        assert_eq!(status.frame, 0, "frame stays at 0 for static indicator");
+        // Next 11 ticks are again sub-second — no repaints (11 × 80 = 0.88s,
+        // total elapsed = 1.04 + 0.88 = 1.92s, still within second 1).
+        for i in 1..=11_usize {
+            tokio::time::advance(SPINNER_TICK).await;
+            assert!(
+                !rt.tick_status_indicator(),
+                "sub-second tick after boundary {i} must not repaint"
+            );
+        }
         Ok(())
     }
 
