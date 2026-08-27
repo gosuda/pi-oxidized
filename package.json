@@ -24,6 +24,7 @@
 		"verify:replacement": "bun run scripts/verification/e2e-smoke.ts --replacement-only",
 		"verify:parity": "bun run scripts/verification/parity.ts",
 		"verify:performance": "bun run scripts/verification/performance.ts",
+		"verify:footprint": "bun run scripts/verification/footprint.ts",
 		"gen:par-wire-corpus": "bun run scripts/verification/gen-par-wire-corpus.ts",
 		"verify:style-ledger": "bun run scripts/verification/style-ledger.ts",
 		"verify:syntect-ignores": "bun run scripts/verification/syntect-ignores.ts",

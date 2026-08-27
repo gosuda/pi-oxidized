@@ -356,7 +356,7 @@ Ranked time share: N/A (artifact size, not a time-share metric). Ranked 11/11 (n
 
 Hot/cold unit split: N/A (static artifact property).
 
-Claim class: paired comparative, carefully named. The comparison supports "Rust launcher is smaller" (27.4 MB vs 93.4 MB, 3.41x). It does not support "installed package size" or "distribution size" claims: the current record does not sum reference `dist`/assets/dependencies or Rust external runtime assets.
+Claim class: paired comparative, carefully named. The comparison supports "Rust launcher is smaller" (27.4 MB vs 93.4 MB, 3.41x). It does not by itself support "installed package size" or "distribution size" claims: launcher bytes are one accounting class, not an installed footprint. The D8 registry entry for **total installed/distribution footprint** is no longer blocked: PERF-T7 (#91) landed the symmetric install-footprint accounting ([docs/PERF-T7-install-footprint-accounting.md](PERF-T7-install-footprint-accounting.md); runner `verify:footprint`, artifact `target/bench/install-footprint.json`) — launcher, runtime payload, shipped dependencies, and external interpreter prerequisite measured side by side under one contract, with no size threshold applied. Trusted baseline: recorded per run by that lane's artifact; numbers are quotable only under that contract's naming.
 
 ## Ranked time-share summary
 
