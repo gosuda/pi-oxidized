@@ -1,5 +1,8 @@
 //! Shared helpers for component measure/render against Ratatui buffers.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -7,6 +10,57 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::frame::{RawRegion, push_raw_region};
 use crate::text::{extract_ansi_code, grapheme_width, parse_osc8_hyperlink, visible_width};
+
+/// One recorded paint operation at a column offset, replayable at any buffer
+/// position.
+#[derive(Debug, Clone)]
+enum PaintedOp {
+    /// Grapheme cell: byte range into the source line plus reduced style.
+    Sym {
+        start: u32,
+        end: u32,
+        style: Style,
+    },
+    /// Continuation cell of a wider-than-one-column grapheme.
+    Cont,
+}
+
+/// Derived paint result for one `(line, max_width)` pair.
+#[derive(Debug, Default)]
+struct DerivedLine {
+    width: usize,
+    /// `(column offset, op)` in paint order.
+    ops: Vec<(u16, PaintedOp)>,
+    /// Hyperlink region templates: `(start column, span columns, bytes)`.
+    regions: Vec<(u16, u16, Vec<u8>)>,
+}
+
+// Painted-line memo. Derivation (ANSI scan + grapheme segmentation + width
+// computation + SGR reduction) is a pure function of `(line, max_width)`,
+// so unchanged lines — the overwhelming majority of every frame's rows —
+// replay their recorded ops instead of re-deriving. Hit validation
+// compares the full line, so a hash collision only costs a re-derivation.
+thread_local! {
+    static PAINT_CACHE: RefCell<HashMap<u64, (Box<str>, DerivedLine)>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Entry cap. The whole cache clears on overflow: one full re-derivation
+/// frame amortized over `PAINT_CACHE_CAP` inserts, bounding the memo to a
+/// few MB regardless of session length.
+const PAINT_CACHE_CAP: usize = 1024;
+
+/// FNV-1a over the line bytes with `max_width` folded into the final state.
+fn paint_cache_key(line: &str, max_width: usize) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in line.as_bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash ^ u64::try_from(max_width)
+        .unwrap_or(u64::MAX)
+        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+}
 
 /// Active SGR attributes while painting a line.
 #[derive(Debug, Clone, Default)]
@@ -268,6 +322,74 @@ pub fn paint_line(x: u16, y: u16, max_width: usize, buf: &mut Buffer, line: &str
     if max_width == 0 {
         return;
     }
+    let key = paint_cache_key(line, max_width);
+    let hit = PAINT_CACHE.with(|cache| {
+        let cache = cache.borrow();
+        let Some((hit_line, derived)) = cache.get(&key) else {
+            return false;
+        };
+        if &**hit_line != line || derived.width != max_width {
+            return false;
+        }
+        replay_derived(derived, line, x, y, buf);
+        true
+    });
+    if hit {
+        return;
+    }
+    let derived = derive_line(x, y, max_width, buf, line);
+    // Byte ranges index into the validated line; lines beyond `u32::MAX`
+    // bytes cannot carry faithful records and stay uncached.
+    if line.len() <= u32::MAX as usize {
+        PAINT_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if cache.len() >= PAINT_CACHE_CAP {
+                cache.clear();
+            }
+            cache.insert(key, (line.into(), derived));
+        });
+    }
+}
+
+/// Replay recorded ops at `(x, y)`: cell writes and region pushes identical
+/// to a fresh derivation, translated to the target position.
+fn replay_derived(derived: &DerivedLine, line: &str, x: u16, y: u16, buf: &mut Buffer) {
+    for &(col, ref op) in &derived.ops {
+        let cx = x.saturating_add(col);
+        let Some(cell) = buf.cell_mut((cx, y)) else {
+            continue;
+        };
+        match *op {
+            PaintedOp::Sym { start, end, style } => {
+                let (start, end) = (start as usize, end as usize);
+                if end > start && end <= line.len() {
+                    cell.set_symbol(&line[start..end]);
+                    cell.set_style(style);
+                }
+            }
+            PaintedOp::Cont => {
+                cell.reset();
+                cell.set_diff_option(CellDiffOption::Skip);
+            }
+        }
+    }
+    for &(start_col, span, ref bytes) in &derived.regions {
+        let rx = x.saturating_add(start_col);
+        push_raw_region(RawRegion {
+            area: Rect::new(rx, y, span, 1),
+            bytes: bytes.clone(),
+            kitty_id: None,
+        });
+    }
+}
+
+/// Derive (and paint) one line at `(x, y)`, recording the ops for replay.
+fn derive_line(x: u16, y: u16, max_width: usize, buf: &mut Buffer, line: &str) -> DerivedLine {
+    let mut derived = DerivedLine {
+        width: max_width,
+        ops: Vec::with_capacity(32),
+        regions: Vec::new(),
+    };
     let mut col = 0usize;
     let mut i = 0usize;
     let mut style = PaintStyle::default();
@@ -300,9 +422,14 @@ pub fn paint_line(x: u16, y: u16, max_width: usize, buf: &mut Buffer, line: &str
                         bytes.extend_from_slice(b"\x1b[0m");
                         push_raw_region(RawRegion {
                             area: Rect::new(region_x, y, width, 1),
-                            bytes,
+                            bytes: bytes.clone(),
                             kitty_id: None,
                         });
+                        derived.regions.push((
+                            u16::try_from(start_col).unwrap_or(u16::MAX),
+                            width,
+                            bytes,
+                        ));
                     }
                 }
                 None => style.process(ansi.code),
@@ -328,21 +455,35 @@ pub fn paint_line(x: u16, y: u16, max_width: usize, buf: &mut Buffer, line: &str
         if col + gw > max_width {
             break;
         }
+        let cell_style = style.to_style();
         let cell_x = x.saturating_add(u16::try_from(col).unwrap_or(u16::MAX));
         if let Some(cell) = buf.cell_mut((cell_x, y)) {
             cell.set_symbol(grapheme);
-            cell.set_style(style.to_style());
+            cell.set_style(cell_style);
         }
+        derived.ops.push((
+            u16::try_from(col).unwrap_or(u16::MAX),
+            PaintedOp::Sym {
+                start: u32::try_from(i).unwrap_or(u32::MAX),
+                end: u32::try_from(i + grapheme.len()).unwrap_or(u32::MAX),
+                style: cell_style,
+            },
+        ));
         for extra in 1..gw {
             let cx = x.saturating_add(u16::try_from(col + extra).unwrap_or(u16::MAX));
             if let Some(cell) = buf.cell_mut((cx, y)) {
                 cell.reset();
                 cell.set_diff_option(CellDiffOption::Skip);
             }
+            derived.ops.push((
+                u16::try_from(col + extra).unwrap_or(u16::MAX),
+                PaintedOp::Cont,
+            ));
         }
         col = col.saturating_add(gw);
         i = i.saturating_add(grapheme.len());
     }
+    derived
 }
 
 /// Pad a line to exactly `width` visible columns with trailing spaces.
@@ -541,5 +682,67 @@ mod tests {
             "style context at open prefixes the region: {:?}",
             String::from_utf8_lossy(&regions[0].bytes)
         );
+    }
+
+    #[test]
+    fn paint_line_replay_is_identical_to_first_paint() {
+        // Second paint of unchanged content takes the memo replay path; it
+        // must reproduce the derived buffer and regions exactly, including
+        // wide-grapheme skip flags and hyperlink region bytes.
+        let line = format!(
+            "\u{1b}[1mbold\u{1b}[0m 日本語 {} tail",
+            hyperlink_capped("label", "https://example.com", None)
+        );
+        let (first, first_regions) = paint_with_annotations(0, 0, 40, &line);
+        let (second, second_regions) = paint_with_annotations(0, 0, 40, &line);
+        assert_eq!(first, second, "replayed cells must equal derived cells");
+        assert_eq!(
+            first_regions, second_regions,
+            "replayed regions must equal derived regions"
+        );
+        // "bold" spans cols 0..4, space at 4, 日 at 5, continuation at 6.
+        assert_eq!(
+            first.cell((6, 0)).map(|c| c.diff_option),
+            Some(CellDiffOption::Skip)
+        );
+    }
+
+    #[test]
+    fn paint_line_replay_translates_position() {
+        let line = format!(
+            "pad {}",
+            hyperlink_capped("label", "https://example.com", None)
+        );
+        let (base, base_regions) = paint_with_annotations(0, 0, 40, &line);
+        let (shifted, shifted_regions) = paint_with_annotations(2, 3, 40, &line);
+        // Same painted row content, offset by (+2, +3).
+        for x in 0..38u16 {
+            assert_eq!(
+                base.cell((x, 0)).map(|c| (c.symbol(), c.diff_option)),
+                shifted.cell((x + 2, 3)).map(|c| (c.symbol(), c.diff_option)),
+                "column {x} must replay identically when translated"
+            );
+        }
+        assert_eq!(shifted_regions.len(), 1);
+        let base_area = base_regions[0].area;
+        assert_eq!(
+            shifted_regions[0].area,
+            Rect::new(base_area.x + 2, base_area.y + 3, base_area.width, 1),
+            "replayed region area must translate with the paint origin"
+        );
+        assert_eq!(base_regions[0].bytes, shifted_regions[0].bytes);
+    }
+
+    #[test]
+    fn paint_line_cache_keys_on_width() {
+        // The same line at a different max_width derives (and replays)
+        // independently: truncation at the narrower width must hold.
+        let line = "abcdefghij".to_owned();
+        let (wide, _) = paint_with_annotations(0, 0, 10, &line);
+        let (narrow, _) = paint_with_annotations(0, 0, 4, &line);
+        let (narrow_again, _) = paint_with_annotations(0, 0, 4, &line);
+        assert_eq!(wide.cell((9, 0)).map(|c| c.symbol()), Some("j"));
+        assert_eq!(narrow.cell((4, 0)).map(|c| c.symbol()), Some(" "), "cut at width 4");
+        assert_eq!(narrow, narrow_again, "narrow replay stays self-consistent");
     }
 }
