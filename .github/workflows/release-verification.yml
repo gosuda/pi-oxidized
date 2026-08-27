@@ -83,9 +83,14 @@ jobs:
         run: |
           set -Eeuo pipefail
           mkdir -p target/verification/rel-t4
-          test "$(uname -m)" = "aarch64"
+          case "$RUNNER_OS" in
+            Linux) test "$(uname -m)" = "aarch64" ;;
+            # Darwin reports the arm64 architecture as `arm64`, not `aarch64`.
+            macOS) test "$(uname -m)" = "arm64" ;;
+            *) echo "aarch64 leg on unsupported runner OS: $RUNNER_OS" >&2; exit 1 ;;
+          esac
           test "$RUNNER_ARCH" = "ARM64"
-          if test -e /proc/sys/fs/binfmt_misc/qemu-aarch64; then
+          if test "$RUNNER_OS" = "Linux" && test -e /proc/sys/fs/binfmt_misc/qemu-aarch64; then
             echo 'qemu-aarch64 binfmt handler registered on an arm64 leg — native-only topology violated' >&2
             exit 1
           fi
