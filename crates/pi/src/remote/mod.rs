@@ -13,6 +13,12 @@
 //! built off that tier fails with a typed
 //! [`transport::EndpointSpecError::UnsupportedOnPlatform`].
 //!
+//! R4 adds the multi-session [`server`] (portable core, zero `cfg`
+//! branches) with its AgentSession hosting seam and the
+//! `#[cfg(unix)]` Unix listener preset, which shares the same typed
+//! [`transport::EndpointSpecError`] owner for platform-gated listen
+//! specs.
+//!
 //! See `docs/PAR-WIRE-remote-session-wire-format.md` for the binding
 //! decision.
 
@@ -23,4 +29,5 @@ pub mod client;
 pub mod codec;
 pub mod framing;
 pub mod schemas;
+pub mod server;
 pub mod transport;

@@ -229,7 +229,7 @@ impl InMemoryEndpoint {
 
 /// Accepts dialed in-memory connections.
 pub struct InMemoryListener {
-    dial_rx: StdMutex<mpsc::Receiver<InMemoryTransport>>,
+    dial_rx: tokio::sync::Mutex<mpsc::Receiver<InMemoryTransport>>,
     endpoint: InMemoryEndpoint,
 }
 
@@ -246,7 +246,7 @@ impl InMemoryListener {
         let (dial_tx, dial_rx) = mpsc::channel(1);
         let endpoint = InMemoryEndpoint { dial_tx };
         let listener = Self {
-            dial_rx: StdMutex::new(dial_rx),
+            dial_rx: tokio::sync::Mutex::new(dial_rx),
             endpoint: endpoint.clone(),
         };
         (listener, endpoint)
@@ -266,7 +266,7 @@ impl InMemoryListener {
         handlers: Arc<dyn ByteTransportHandlers>,
     ) -> Result<InMemoryTransport, TransportError> {
         let server = {
-            let mut dial_rx = self.dial_rx.lock().expect("listener lock");
+            let mut dial_rx = self.dial_rx.lock().await;
             dial_rx
                 .recv()
                 .await

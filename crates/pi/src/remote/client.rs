@@ -1833,6 +1833,7 @@ async fn release_inner(core: &Arc<ClientCore>, lease: &Arc<LeaseEntry>) -> Resul
 /// A lease on one attached remote session (port of upstream
 /// `SessionHandle`). Dropping the handle does **not** release the lease —
 /// call [`PiSessionHandle::detach`] or [`PiSessionHandle::dispose`].
+#[derive(Clone)]
 pub struct PiSessionHandle {
     core: Arc<ClientCore>,
     lease: Arc<LeaseEntry>,
