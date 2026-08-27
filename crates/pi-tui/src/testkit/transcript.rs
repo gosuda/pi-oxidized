@@ -33,10 +33,21 @@ pub enum Scenario {
     /// Exercises paste and cursor reporting against the deterministic fixture.
     FixturePasteCursor,
     /// Exercises the extension-UI gauntlet: railed messages, widget slots,
-    /// stacked overlays with focus restore, HostUiRequest dialogs, extension
+    /// stacked overlays with focus restore, `HostUiRequest` dialogs, extension
     /// footer shortcuts, hostile setTheme sanitization, and OSC 0 title
     /// injection with C0/C1 and >256 UTF-8 bytes.
     FixtureExtGauntlet,
+    /// Exercises the two-tier state-matrix corpus (TUI-V1): empty, loading,
+    /// retry, queue, streaming, error, focus-marked, and extension-UI states
+    /// rendered through the deterministic fixture with per-state quality-bar
+    /// checkpoints.
+    FixtureStateMatrix,
+    /// Records the musl release-row packaging/protocol lane (TUI-V1):
+    /// host-native artifact execution, static-link/unpack/integrity, and the
+    /// compiled-host plus bundled-Bun-fallback JSONL hello handshakes. Never
+    /// carries a PTY, render, synchronized-output, no-clear, or snapshot
+    /// claim (validator-enforced via `DriverKind::QemuUserSmoke`).
+    MuslPackagingSmoke,
     /// Captures product startup before interactive input.
     ColdStart,
     /// Captures the first-run configuration flow.
