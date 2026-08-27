@@ -66,6 +66,11 @@ pub enum Scenario {
     ProductResizeLadder,
     /// Captures product behavior while resizes are coalesced.
     ProductResizeStorm,
+    /// Exercises the Unicode/width gauntlet (TUI-V3): the 13-probe corpus
+    /// across rails, assistant markdown tables, editor cursor, overlay
+    /// compositing, and paste-atomic segments; asserts column alignment of
+    /// rails and table borders and drift-free cursor placement.
+    FixtureUnicodeGauntlet,
 }
 
 /// Evidence tier for the runner that produced an artifact.
