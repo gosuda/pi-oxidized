@@ -329,6 +329,12 @@ pub fn render_view(state: &ViewState, width: u16, height: u16) -> Buffer {
 /// height cap). Useful for golden snapshots that want the full content.
 #[must_use]
 pub fn render_view_with_height(state: &ViewState, width: u16, height: u16) -> Buffer {
+    // TUI-G8 floor policy: below 20 columns the render is blanked.
+    // The buffer is allocated at the reported size so callers see the
+    // correct geometry, but no content cells are written.
+    if width < super::runtime::VIEWPORT_WIDTH_FLOOR {
+        return Buffer::empty(Rect::new(0, 0, width.max(1), height.max(1)));
+    }
     let composed = compose(state);
     let area = Rect::new(0, 0, width.max(1), height.max(1));
     let mut buf = Buffer::empty(area);

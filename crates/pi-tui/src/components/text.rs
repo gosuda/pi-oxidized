@@ -6,7 +6,7 @@ use ratatui::layout::Rect;
 use crate::component::{Component, EventResult, UiEvent};
 use crate::text::{visible_width, wrap_text_with_ansi};
 
-use super::util::{apply_background, empty_line, paint_lines};
+use super::util::{KeyedLine, apply_background, empty_line, paint_lines_keyed};
 
 /// Background applicator for a full-width line.
 type TextBgFn = Box<dyn Fn(&str) -> String + Send>;
@@ -24,7 +24,7 @@ pub struct Text {
 struct RenderCache {
     content: String,
     width: u16,
-    lines: Vec<String>,
+    lines: Vec<KeyedLine>,
 }
 
 impl Text {
@@ -85,13 +85,19 @@ impl Text {
         self.cache = None;
     }
 
-    fn lines_for_width(&mut self, width: u16) -> &[String] {
+    fn lines_for_width(&mut self, width: u16) -> &[KeyedLine] {
         let cache_hit = match &self.cache {
             Some(cache) => cache.width == width && cache.content == self.content,
             None => false,
         };
         if !cache_hit {
-            let lines = self.render_lines(width);
+            // Key each line once at cache fill (Design E): the paint walk
+            // then reuses the key every frame instead of re-hashing.
+            let lines = self
+                .render_lines(width)
+                .into_iter()
+                .map(|line| KeyedLine::new(line, width))
+                .collect();
             self.cache = Some(RenderCache {
                 content: self.content.clone(),
                 width,
@@ -164,7 +170,7 @@ impl Component for Text {
 
     fn render(&mut self, area: Rect, buf: &mut Buffer) {
         let lines = self.lines_for_width(area.width);
-        paint_lines(area, buf, lines);
+        paint_lines_keyed(area, buf, lines);
     }
 
     fn handle_event(&mut self, _event: &UiEvent) -> EventResult {
