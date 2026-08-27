@@ -73,7 +73,7 @@ async fn read_loop(core: Arc<PairCore>, index: usize) {
     let seeded = *signal.borrow_and_update();
     match seeded {
         SideSignal::Open => {}
-        SideSignal::LocallyClosed => { eprintln!("DBG rloop seed-close {index}"); return; },
+        SideSignal::LocallyClosed => return,
         SideSignal::PeerFailed => {
             let error = side
                 .error

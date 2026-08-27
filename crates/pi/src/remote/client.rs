@@ -953,7 +953,7 @@ impl PiClient {
     /// Opens a connection and completes the protocol handshake, returning
     /// the server snapshot.
     pub async fn connect(&self) -> Result<ServerSnapshot, PiClientError> {
-        let receiver = {
+        let (receiver, id) = {
             let mut inner = lock(&self.core.inner);
             if inner.disposed {
                 return Err(PiClientError::Disposed(PiClientDisposedError));
@@ -976,11 +976,7 @@ impl PiClient {
                 handshake: Some(sender),
                 decoder,
             };
-            inner.notify_connection_state(
-                ConnectionStateChange { state: ConnectionState::Connecting, error: None },
-                &mut Notifications::default(),
-            );
-            receiver
+            (receiver, id)
         };
         {
             let mut notifications = Notifications::default();
@@ -998,7 +994,6 @@ impl PiClient {
             core: Arc::clone(&self.core),
         });
         let factory = Arc::clone(&self.core.factory);
-        let id = lock(&self.core.inner).conn_sequence;
         tokio::spawn(async move {
             open_transport(core, id, handlers, factory).await;
         });
@@ -1259,7 +1254,6 @@ impl ByteTransportHandlers for ConnHandlers {
                 }
             };
             for message in messages {
-                let kind = match &message { ServerMessage::Hello{..} => "hello", ServerMessage::HelloError{..} => "hello_error", ServerMessage::Response{..} => "response", ServerMessage::Event{..} => "event" };
                 if matches!(inner.conn, ConnState::Disconnected) {
                     break;
                 }
@@ -2613,26 +2607,26 @@ mod tests {
             assert!(matches!(list_command, Command::List));
             assert!(matches!(attach_command, Command::Attach { .. }));
             // Respond in reverse completion order inside one chunk.
-        let attach_frame = encode_server_message(
-            &ServerMessage::Response {
-                id: attach_id,
-                ok: true,
-                result: Some(attach_result("session-1", 1)),
-                error: None,
-            },
-            None,
-        )
-        .expect("encode attach");
-        let list_frame = encode_server_message(
-            &ServerMessage::Response {
-                id: list_id,
-                ok: true,
-                result: Some(CommandResult::List { sessions: vec![] }),
-                error: None,
-            },
-            None,
-        )
-        .expect("encode list");
+            let attach_frame = encode_server_message(
+                &ServerMessage::Response {
+                    id: attach_id,
+                    ok: true,
+                    result: Some(attach_result("session-1", 1)),
+                    error: None,
+                },
+                None,
+            )
+            .expect("encode attach");
+            let list_frame = encode_server_message(
+                &ServerMessage::Response {
+                    id: list_id,
+                    ok: true,
+                    result: Some(CommandResult::List { sessions: vec![] }),
+                    error: None,
+                },
+                None,
+            )
+            .expect("encode list");
             let mut chunk = attach_frame;
             chunk.extend_from_slice(&list_frame);
             server.send_raw(chunk).await;
@@ -2678,13 +2672,13 @@ mod tests {
         // Subscriptions are RAII: the guard must outlive the events it
         // should observe, so it is bound instead of dropped on the spot.
         let snapshot_sink = Arc::clone(&snapshots);
-        let snapshot_guard = handle
+        let _snapshot_guard = handle
             .subscribe(Arc::new(move |snapshot: &SessionSnapshot| {
                 lock(&snapshot_sink).push(snapshot.revision);
             }))
             .expect("subscribe");
         let event_sink = Arc::clone(&events);
-        let event_guard = handle
+        let _event_guard = handle
             .on_event(Arc::new(move |_: &ServerEvent| {
                 event_sink.fetch_add(1, AtomicOrdering::SeqCst);
             }))

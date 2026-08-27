@@ -34,6 +34,9 @@ pub use in_memory::{InMemoryEndpoint, InMemoryListener, InMemoryTransport};
 
 #[cfg(unix)]
 pub use unix::{UnixByteTransport, UnixTransportOptions};
+/// Failure reported by a byte transport adapter: underlying stream I/O
+/// failure, closure before or during the operation, pending-byte budget
+/// exhaustion, or adapter-specific failure text.
 #[derive(Debug)]
 pub enum TransportError {
     /// Underlying stream I/O failure.
@@ -202,7 +205,10 @@ impl std::error::Error for EndpointSpecError {}
 /// Maximum Unix socket path length in bytes: Linux allocates 108 bytes for
 /// `sun_path` (107 usable plus NUL); every other Unix leaves 104 (103 plus
 /// NUL). Mirrors upstream `unix.ts`.
-#[cfg(unix)]
+///
+/// Defined on every tier: the eager Unix-spec validation in
+/// [`build_transport`] runs on non-Unix builds too, so the limit must be
+/// nameable there.
 const MAX_UNIX_SOCKET_PATH_BYTES: usize = if cfg!(target_os = "linux") { 107 } else { 103 };
 
 /// The single fallible surface turning an [`EndpointSpec`] into a
