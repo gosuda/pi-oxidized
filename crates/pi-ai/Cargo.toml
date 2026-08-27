@@ -35,3 +35,7 @@ zstd = { version = "=0.13.3", default-features = false }
 nix = { version = "=0.31.3", default-features = false, features = ["signal"] }
 [dev-dependencies]
 tokio = { version = "=1.52.4", default-features = false, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+
+[[bin]]
+name = "pi-ai"
+path = "src/cli.rs"
