@@ -363,6 +363,14 @@ impl Component for Markdown {
 /// Code fences and inline code spans are excluded — math delimiters inside
 /// them stay literal. Escaped `\$` is consumed as a markdown escape before
 /// the math path sees it.
+/// A CommonMark fence line: up to three leading spaces then ``` or ~~~
+/// (at least three markers, optionally followed by an info string).
+fn is_fence_line(line: &str) -> bool {
+    let stripped = line.strip_prefix("   ").or_else(|| line.strip_prefix("  "));
+    let rest = stripped.unwrap_or(line.trim_start_matches(' '));
+    rest.starts_with("```") || rest.starts_with("~~~")
+}
+
 fn preprocess_math(source: &str) -> String {
     // Fast path: no math delimiters at all
     if !source.contains('$') && !source.contains("\\[") && !source.contains("\\(") {
@@ -372,7 +380,27 @@ fn preprocess_math(source: &str) -> String {
     let mut result = String::with_capacity(source.len());
     let lines: Vec<&str> = source.split('\n').collect();
     let mut i = 0;
+    let mut in_fence = false;
     while i < lines.len() {
+        // Fenced code blocks pass through verbatim: math delimiters inside
+        // them stay literal (the code-fence exclusion contract).
+        if is_fence_line(lines[i]) {
+            in_fence = !in_fence;
+            result.push_str(lines[i]);
+            if i + 1 < lines.len() {
+                result.push('\n');
+            }
+            i += 1;
+            continue;
+        }
+        if in_fence {
+            result.push_str(lines[i]);
+            if i + 1 < lines.len() {
+                result.push('\n');
+            }
+            i += 1;
+            continue;
+        }
         // Check for block math: ^ {0,3}$$...$$ or ^ {0,3}\[...\]
         if let Some((rendered, consumed)) = try_block_math(&lines[i..]) {
             for line in rendered.split('\n') {
@@ -2869,6 +2897,30 @@ mod tests {
         let lines = plain_default("Code: `$x^2$` here.", 80);
         // pulldown-cmark renders inline code without backticks
         assert_eq!(lines, vec!["Code: $x^2$ here."]);
+    }
+
+    #[test]
+    fn math_inside_fenced_code_block_not_rendered() {
+        let lines = plain_default(
+            "Example:\n```\n$$\nx^2 + y^2 = r^2\n$$\ninline $x^2$ too\n```\nDone $z^2$.",
+            80,
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("$$")),
+            "fenced block math must stay literal in {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("x^2 + y^2")),
+            "fenced LaTeX must stay literal in {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("inline $x^2$ too")),
+            "inline math inside a fence must stay literal in {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("z²")),
+            "math after the fence must still render in {lines:?}"
+        );
     }
 
     #[test]

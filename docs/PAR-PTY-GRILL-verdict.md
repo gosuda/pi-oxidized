@@ -76,11 +76,11 @@ The PTY fixture does not exercise clipboard actions; OSC 52 is not emitted on th
 
 **Evidence**: `grill_t4_math_rendering_landed` (re-adjudicated; originally `grill_t4_math_rendering_unverified_gap`)
 
-The test confirms two gaps:
-1. `ENABLE_MATH` is not enabled in the pulldown-cmark parser options (markdown.rs:351-354), so `$...$` and `$$...$$` are treated as literal text, not as InlineMath/DisplayMath events
-2. Even if `ENABLE_MATH` were enabled, `InlineMath` and `DisplayMath` events are silently dropped (`=> {}`) in the consume method (markdown.rs:458-459)
+Original findings (2026-08-26, superseded):
+1. `ENABLE_MATH` was not enabled in the pulldown-cmark parser options, so `$...$` and `$$...$$` were treated as literal text, not as InlineMath/DisplayMath events
+2. `InlineMath` and `DisplayMath` events were silently dropped (`=> {}`) in the consume method
 
-The raw-literal fallback path described in `docs/PAR-MATH-latex-strategy.md` is not implemented. Math markdown renders as literal text with visible dollar signs and LaTeX commands.
+The raw-literal fallback path described in `docs/PAR-MATH-latex-strategy.md` was not implemented; math markdown rendered as literal text with visible dollar signs and LaTeX commands.
 
 **Original ruling (2026-08-26)**: unverified. The math rendering path was not implemented despite PAR-MATH (issue #37) being closed with evidence that existed in no repository ref.
 
