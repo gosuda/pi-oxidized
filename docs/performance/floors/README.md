@@ -101,5 +101,6 @@ append-5k 116.42 ms warm (R8; fresh re-run above used for per-entry arithmetic).
 
 - `target/bench/performance-comparison.json`, `session-timing.json`, `tool-dispatch.json` (committed artifacts cited by R2/R8).
 - Callgrind profiles (this run, attribution build with symbols at `target/attrib/`, worktree 48696b5): churn, append, reopen, dispatch, version, first-frame, stream.
+- Citation provenance: contract line anchors were written against worktree 48696b5 and re-anchored to the integration tree by PERF-G10 (drift table in [PERF-G10-floor-ledger-audit.md](../PERF-G10-floor-ledger-audit.md)); measurement provenance above still refers to 48696b5.
 - `strace -c/-T` censuses: version, append, first-frame waits.
 - floorkit + sonic-rs micro-benches (throwaway, /tmp, not committed; commands recorded in the ledger that uses each constant).

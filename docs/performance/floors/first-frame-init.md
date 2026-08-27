@@ -6,7 +6,7 @@ paint row is owned by terminal-paint.md.) State: **OPEN**, ~162.4x floor.
 
 ## Contract (from call sites, tests, signatures — never internals)
 
-- `run_interactive_mode` (crates/pi/src/modes/interactive/runtime.rs:6589-6660) owes, before the first frame: terminal guard + raw mode (:6602-6608), a blocking terminal probe (:6610, probe batch without sync wrapper, probe.rs:27-86), theme resolution from probed polarity, `Tui::new` (:6623), `InteractiveRuntime::new` (:6656), then the first `Tui::commit` (Txn::Frame/Settle) through stage3 (writer.rs:522, backend.rs:275-284).
+- `run_interactive_mode` (crates/pi/src/modes/interactive/runtime.rs:6610-6690) owes, before the first frame: terminal guard + raw mode (:6622-6626), a blocking terminal probe (:6630, probe batch without sync wrapper, probe.rs:27-86), theme resolution from probed polarity, `Tui::new` (:6643), `InteractiveRuntime::new` (:6685), then the first `Tui::commit` (Txn::Frame/Settle) through stage3 (writer.rs:522, backend.rs:275-284).
 - Provider/model construction on the offline path: `ModelRuntime::create` (crates/pi/src/core/model_runtime.rs:359) builds the compiled-in builtin catalog (:360) plus a 10-adapter reqwest ProviderRegistry (:1641-1668), `rebuild_providers` (:435, compose_models_static :1380-1419) and `refresh(allow_network: false)` (:436-438); the verification api key installs without network (set_runtime_api_key :592-621). PI_OFFLINE=1 becomes bootstrap offline mode (bootstrap.rs:446-454).
 - The lane's observable boundary: first complete DEC synchronized-output transaction after spawn (performance.ts :1026-1044); sync-balance and probe-before-sync are test-pinned (pty_no_flicker.rs:54-66, 236-290).
 

@@ -7,7 +7,7 @@ State: **OPEN**, ~141x floor — the largest sustained multiple on the hot list.
 
 - One frame of the churn workload (crates/pi-tui/src/bin/pi_tui_render_churn_bench.rs:327-344) = `frame(i, root)` + `tui.commit(Txn::Frame, root)` through the production `Tui::commit` -> `commit_frame` path (crates/pi-tui/src/terminal/writer.rs:283-343): the root is measured, rendered into the cell buffer, differenced, encoded, and written. The bench's NullWriter discards bytes and counts them (bench.rs:49-73).
 - Editor scenario: exactly one character is appended per frame (bench.rs:397-399); static scenario: no mutation (bench.rs:395). Viewport 100x30, transcript 150 styled ANSI lines, 20 warmups, 300 frames (bench.rs:40-45) — mirrors the upstream parameters (`.references/pi/packages/tui/test/render-churn-bench.ts`).
-- Production consumers of the same path: `paint_frame` (crates/pi/src/modes/interactive/runtime.rs:4527-4528) -> `build_root` (runtime.rs:4599) on every repaint; the interactive runtime owes a correct grid for the current view state and only-changed-cells bytes on the wire.
+- Production consumers of the same path: `paint_frame` (crates/pi/src/modes/interactive/runtime.rs:4548-4549) -> `build_root` (runtime.rs:4551) on every repaint; the interactive runtime owes a correct grid for the current view state and only-changed-cells bytes on the wire.
 - Behavior tests pinning the render path: pi-tui transcript/state-matrix fixtures (crates/pi-tui/tests/transcript_state_matrix.rs, static_frame_evidence.rs) assert grid-level output correctness, not frame cost.
 
 Boundary classification: the emitted escape-byte stream is the terminal wire surface

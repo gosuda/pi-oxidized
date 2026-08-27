@@ -5,10 +5,10 @@ Owning R2 hot rows (lane 3): *Provider frame decode*, *Assistant state reduction
 
 ## Contract (from call sites, tests, signatures — never internals)
 
-- Provider leg: the verification provider emits pre-typed `text_delta` events (scripts/verification/extension.ts `streamVerification` :225-306, push at :292-299; chunk count from `PI_VERIFICATION_CHUNK_COUNT`); on real providers the same funnel is `Provider::stream` -> `AssistantState::text_delta` producing `AssistantMessageEvent::TextDelta` (crates/pi-ai/src/providers/stream_state.rs:187-198). The event consumer set is fixed by the drain contract.
+- Provider leg: the verification provider emits pre-typed `text_delta` events (scripts/verification/extension.ts `streamVerification` :178, push at :210; chunk count from `PI_VERIFICATION_CHUNK_COUNT`); on real providers the same funnel is `Provider::stream` -> `AssistantState::text_delta` producing `AssistantMessageEvent::TextDelta` (crates/pi-ai/src/providers/stream_state.rs:187-198). The event consumer set is fixed by the drain contract.
 - `ProviderDrain::spawn` (crates/pi-agent/src/drain.rs:105-118) owes: every non-terminal event's partial snapshot published to a lossy watch (:220-229) AND every event forwarded losslessly to the capacity-64 mpsc (:146) — state fidelity for the loop, latest-wins for presentation.
 - Reduce: `consume_drain_items` folds each item and emits one `AgentEvent::MessageUpdate` per frame (crates/pi-agent/src/run.rs:260-363, emit at :344-347); the session pump republishes `AgentSessionEvent::MessageUpdate` (crates/pi/src/core/agent_session/subscribe.rs:180-260).
-- Visible update: `handle_partial_update` replaces the streaming assistant view per partial (crates/pi/src/modes/interactive/runtime.rs:2181-2209) behind a <=16 ms coalescer (runtime.rs:104 BACKGROUND_COALESCE_WINDOW, armed :4523-4524); the terminal write is coalesced, the event loop keeps every frame.
+- Visible update: `handle_partial_update` replaces the streaming assistant view per partial (crates/pi/src/modes/interactive/runtime.rs:2196-2224) behind a <=16 ms coalescer (runtime.rs:104 BACKGROUND_COALESCE_WINDOW, armed :2193); the terminal write is coalesced, the event loop keeps every frame.
 - Persistence is per message end (agent_session/persistence.rs `persist_message_end`), not per frame — the lane-3 "Session JSONL append" row amortizes to ~0.07 us/frame (18.34 us / 256) and is owned by session-append.md.
 
 Boundary classification: the provider event funnel signature and the AgentEvent/

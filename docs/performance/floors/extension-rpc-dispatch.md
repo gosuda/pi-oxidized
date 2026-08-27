@@ -9,7 +9,7 @@ matching)*, *Host loop dispatch*, *Widget callback + UI-slot traffic*. State: **
 - `serve_io(reader, writer, extension, config) -> Result<(), ServerError>` (crates/pi-ext/src/server.rs:966) drives the whole server: per outbound frame the writer task owes `write_all` + `flush` after `encode_frame` (server.rs:983-1108); per inbound frame the drive loop (:1308) decodes via `FrameDecoder` and routes exactly one allowlisted method, returning exactly one terminal res/error frame (:1550-1691, res_frame :2365 / error_frame :2375 / fault_frame :2394).
 - Wire contract: one JSONL line per frame; `encode_frame` = validate + serialize + newline, cap MAX_FRAME_BYTES 8 MiB (protocol.rs:1904-1910, :263); Req/Res require nonzero ids (`requires_nonzero_id` protocol.rs:356); PROTOCOL_VERSION handshake asserted, compatibility version deliberately ignored (validate_hello server.rs:1370, tests hello_answers_with_compiled_constants :4044, hello_rejects_protocol_mismatch :4085).
 - Terminal-input budget: 4 ms handler budget mirrored TS/Rust (EXTENSION_INPUT_TIMEOUT_MS host.ts:116; NATIVE_TERMINAL_INPUT_BUDGET server.rs:66) with a correlated non-retryable timeout error — a real-time obligation on the dispatch path.
-- The TS host loop owes the same per-event shape (bench-extension-scaling.ts measureTerminalInput :161-185, measureFrameCpu :205-220; host.ts terminalInput dispatch :778, 4 ms race :1456).
+- The TS host loop owes the same per-event shape (bench-extension-scaling.ts measureTerminalInput :181-205, measureFrameCpu :209-224; host.ts terminalInput dispatch :778, 4 ms race :1449).
 
 Boundary classification: the frame format, id-correlation discipline, and version
 handshake are **boundary** (external extensions speak them; XC track owns the
