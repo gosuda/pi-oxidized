@@ -1,8 +1,8 @@
 {
 	"schema": "pi.deps.sbom.v1",
 	"capturedAt": "2026-08-27",
-	"captureHead": "9f4aafa6b12fc0613c0eaaa99c896d58472bb142",
-	"contentSha256": "8ed27395970d030d53e161c352a6ce4e79ba70ceede57d8a7c6b1b796addc6ba",
+	"captureHead": "a06d3526aed0763fcc77c537fa7f8597ed83951a",
+	"contentSha256": "f301a8061c4972d98c149250a1d8b238fc2c36c7ca66c63ddfc466bb3beb06d0",
 	"content": {
 		"rust": {
 			"toolchainChannel": "1.97.1",
@@ -4621,7 +4621,7 @@
 						},
 						{
 							"name": "brace-expansion",
-							"version": "5.0.7"
+							"version": "5.0.9"
 						},
 						{
 							"name": "braces",
@@ -5025,7 +5025,7 @@
 						},
 						{
 							"name": "nanoid",
-							"version": "3.3.16"
+							"version": "3.3.18"
 						},
 						{
 							"name": "napi-build-utils",
@@ -5117,7 +5117,7 @@
 						},
 						{
 							"name": "postcss",
-							"version": "8.5.19"
+							"version": "8.5.26"
 						},
 						{
 							"name": "prebuild-install",
