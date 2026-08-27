@@ -1,8 +1,8 @@
 {
 	"schema": "pi.deps.sbom.v1",
 	"capturedAt": "2026-08-27",
-	"captureHead": "acdade463b1bed77304a3debccb3697df48fb2f5",
-	"contentSha256": "051773d15249f76d83d135e8a9668eaba3d343286b3df582d1a4196b3f515fd9",
+	"captureHead": "9f4aafa6b12fc0613c0eaaa99c896d58472bb142",
+	"contentSha256": "8ed27395970d030d53e161c352a6ce4e79ba70ceede57d8a7c6b1b796addc6ba",
 	"content": {
 		"rust": {
 			"toolchainChannel": "1.97.1",
@@ -546,7 +546,7 @@
 				},
 				{
 					"name": "chacha20",
-					"version": "0.10.1",
+					"version": "0.10.2",
 					"license": "MIT OR Apache-2.0",
 					"source": "registry",
 					"direct": false,
@@ -1234,7 +1234,7 @@
 				},
 				{
 					"name": "h2",
-					"version": "0.4.15",
+					"version": "0.4.19",
 					"license": "MIT",
 					"source": "registry",
 					"direct": false,
