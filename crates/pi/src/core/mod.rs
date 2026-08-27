@@ -5,7 +5,6 @@ pub mod agent_session_runtime;
 pub mod agent_session_services;
 pub mod compaction;
 pub mod config;
-pub mod config_value;
 pub mod experimental;
 pub mod export_html;
 pub mod extension_host;

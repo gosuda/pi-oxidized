@@ -12,6 +12,12 @@ use std::time::Duration;
 
 use futures::future::FutureExt;
 use futures::stream::{self, BoxStream};
+// Config-value resolution has exactly one owner: `pi_ai::auth::config_value`
+// (one parser, one process-wide command cache). The historical
+// `pi::core::config_value` HashMap-shaped wrapper had zero internal callers
+// and was deleted by PAR-COMPAT-DISPO executing PAR-COMPAT-AUDIT's
+// delete-not-port ruling; the scripts/verification/compat-audit.ts
+// config-value-single-owner witness enforces that no second wrapper returns.
 use pi_ai::auth::config_value::{
     is_config_value_configured, resolve_config_value, resolve_headers,
 };
