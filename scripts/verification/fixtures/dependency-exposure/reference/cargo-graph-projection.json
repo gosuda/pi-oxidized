@@ -12,6 +12,7 @@
 		"pi",
 		"pi-agent",
 		"pi-ai",
+		"pi-bench-alloc",
 		"pi-ext",
 		"pi-tui"
 	],
@@ -6170,6 +6171,13 @@
 		{
 			"from": "pi-tui",
 			"to": "nix",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-tui",
+			"to": "pi-bench-alloc",
 			"kinds": [
 				"normal"
 			]
