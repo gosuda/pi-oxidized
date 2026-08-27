@@ -81,13 +81,15 @@ compiles. Verified mechanics per move:
 
 | Move | Consequence |
 | --- | --- |
-| crossterm alone → 0.30 | `ratatui-crossterm` keeps pairing 0.29 via `crossterm_0_29` while the three direct deps resolve 0.30: **two crossterm majors** land in the lock and the shipped binary (`cargo tree -d` shows the dup). No compile error and no immediate misbehavior — no crossterm type crosses the backend boundary in this tree (the sole `EventStream` maps `Event` → `UiEvent` before any TUI surface sees it, input.rs:5,142,225-245; `CrosstermBackend<FrameSink>` is a Write-backed renderer, writer.rs:213,256; raw mode has one owner, our guard, guard.rs:15). What is lost is the invariant: two decode stacks and two escape-sequence vocabularies in one binary, and a configuration outside the upstream pairing matrix (§4) — unsupported and uninspectable, which is why the rule is commit policy, not a type-system guarantee. |
-| ratatui alone → next major | two shapes. (a) The new major keeps an old pairing feature: a second crossterm major resolves, same duplicate-major state as above with the roles reversed. (b) The new major drops or renames the pairing feature — the expected major-break shape, as 0.30 itself dropped the pre-split direct-dependency model: `crossterm_0_29` becomes an unknown feature and **every one of the three manifests fails to build**. Only shape (b) is compiler-enforced. |
-| Both, as two commits | the intermediate commit is either the duplicate-major lock (§ row 1) or a tree where one manifest builds and another does not (§ row 2b) — no acceptable intermediate state exists for a shipped TUI surface, which is why the unit is one commit. |
+| crossterm alone → 0.30 | the backend edge keeps resolving crossterm 0.29 through `crossterm_0_29` while the three direct edges resolve 0.30: **two crossterm majors** land in the lock and the shipped binary (`cargo tree -d` shows the dup). It compiles and it runs — the tree's only input decoder stays the direct dep's `EventStream` (input.rs:5,142,225-245), the backend is an output encoder over `Write` (writer.rs:213,256), raw mode keeps its single owner (guard.rs:15). What breaks is the pairing invariant: input and output terminal handling run on two different crossterm majors with no compiler signal, duplicate terminal-stack code ships in the binary, and the resolved configuration matches nothing in the upstream pairing matrix (§4) — unsupported and uninspectable. |
+| ratatui alone → next major | three shapes. (a) Adopting the new major while its pairing feature targets a crossterm major ≠ the pinned 0.29 and the direct pins stay: the same two-major resolution as row 1, roles reversed. (b) The new major drops or renames the pairing feature — the expected major-break shape, as 0.30 itself dropped the pre-split direct-dependency model: `crossterm_0_29` becomes an unknown feature and **every one of the three manifests fails to build**. (c) The new major retains a 0.29-targeting feature: both edges still resolve 0.29, no second major appears — the coupling is not yet in play, and the unit moves only when the pairing must. Only shape (b) is compiler-enforced. |
+| Both, as two commits | the intermediate commit is either the two-major lock (row 1 / row 2a) or a tree where one manifest builds and another does not (row 2b) — no acceptable intermediate state exists for a shipped TUI surface, which is why the unit is one commit. |
 
 ## 3. Callsite census (2026-08-28, at =0.30.2 / =0.29.0)
 
-`grep -rn "use ratatui|use crossterm"` use-site lines per crate and surface:
+`grep -Ern "use ratatui|use crossterm" crates/<crate>/{src,tests}` use-site
+lines per crate and surface (src includes the `src/bin` fixture binaries,
+split out below):
 
 | Crate | src | tests | fixture bins | Total | Files |
 | --- | --- | --- | --- | --- | --- |
