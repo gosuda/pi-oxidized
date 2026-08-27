@@ -443,7 +443,7 @@ describe("extension endpoint conformance", () => {
 	});
 
 	test("tool_call block with terminate forwards through both modes", async () => {
-		const run = async (mode: "mode1" | "mode2") => {
+	const run = async (mode: "mode1" | "mode2"): Promise<Record<string, unknown>> => {
 			(globalThis as Record<string, unknown>)[OBSERVATIONS] = [];
 			const link = await openEndpoint(mode, true);
 			try {
@@ -452,7 +452,7 @@ describe("extension endpoint conformance", () => {
 					toolCallId: "terminate-call",
 					input: { text: "hi" },
 				});
-				return res.payload;
+				return res.payload as Record<string, unknown>;
 			} finally {
 				await link.finish();
 			}
