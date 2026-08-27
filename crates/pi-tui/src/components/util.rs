@@ -2,6 +2,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 
 use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::layout::Rect;
@@ -41,11 +42,35 @@ struct DerivedLine {
 // Painted-line memo. Derivation (ANSI scan + grapheme segmentation + width
 // computation + SGR reduction) is a pure function of `(line, max_width)`,
 // so unchanged lines — the overwhelming majority of every frame's rows —
-// replay their recorded ops instead of re-deriving. Hit validation
-// compares the full line, so a hash collision only costs a re-derivation.
+// replay their recorded ops instead of re-deriving. The 128-bit composite
+// key makes a content collision (two lines, same key) a ~2^-128 accident,
+// so a hit validates without re-comparing the full line.
 thread_local! {
-    static PAINT_CACHE: RefCell<HashMap<u64, (Box<str>, DerivedLine)>> =
-        RefCell::new(HashMap::new());
+    static PAINT_CACHE: RefCell<HashMap<u128, (Box<str>, DerivedLine), BuildHasherDefault<IdHasher>>> =
+        RefCell::new(HashMap::default());
+}
+
+/// Identity hasher for the memo's `u128` keys: the composite key is already
+/// a well-mixed digest of the line content, so re-hashing it with SipHash
+/// only costs time (PERF-T11 Design E). The map only ever hashes `u128`s;
+/// the truncated `finish` value merely picks a bucket — full keys are
+/// compared for equality on lookup.
+#[derive(Default)]
+struct IdHasher(u64);
+
+impl Hasher for IdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, _bytes: &[u8]) {
+        // u128 keys go through `write_u128`; byte writes are never issued.
+    }
+    fn write_u64(&mut self, key: u64) {
+        self.0 = key;
+    }
+    fn write_u128(&mut self, key: u128) {
+        self.0 = key as u64;
+    }
 }
 
 /// Entry cap. The whole cache clears on overflow: one full re-derivation
@@ -53,16 +78,62 @@ thread_local! {
 /// few MB regardless of session length.
 const PAINT_CACHE_CAP: usize = 1024;
 
-/// FNV-1a over the line bytes with `max_width` folded into the final state.
-fn paint_cache_key(line: &str, max_width: usize) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+/// Composite 128-bit paint key for `(line, max_width)`: FNV-1a 64 crossed
+/// with an independent rotate-multiply 64 mix in the same byte loop.
+///
+/// Two independently mixed 64-bit digests make an accidental or practical
+/// crafted collision of the composite infeasible (~2^128 work), which
+/// licenses the claim-skip fast path (Design E) to trust the key alone:
+/// the pre-E design paid a full-line validation compare on every unchanged
+/// line, every frame, to guard a 2^-64 event.
+fn paint_cache_key(line: &str, max_width: usize) -> u128 {
+    let mut fnv: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix: u64 = 0x9e37_79b9_7f4a_7c15;
     for &byte in line.as_bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        fnv ^= u64::from(byte);
+        fnv = fnv.wrapping_mul(0x0000_0100_0000_01b3);
+        mix = (mix ^ u64::from(byte)).rotate_left(31);
+        mix = mix.wrapping_mul(0xd6e8_feb8_6659_fd93);
     }
-    hash ^ u64::try_from(max_width)
+    let width = u64::try_from(max_width)
         .unwrap_or(u64::MAX)
-        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        .wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    (u128::from(fnv ^ width) << 64) | u128::from(mix.rotate_left(19) ^ width)
+}
+/// A display line carrying its paint-memo key, precomputed when the line
+/// entered the serving cache (PERF-T11 Design E).
+///
+/// Wrap caches serve the same lines frame after frame; keying once at
+/// cache-fill time removes the per-frame content hash from the paint walk.
+/// The key must be computed for the exact width the line is painted at.
+#[derive(Debug, Clone)]
+pub struct KeyedLine {
+    line: String,
+    key: u128,
+}
+
+impl KeyedLine {
+    /// Key `line` for painting at `width` columns. The key is frozen at
+    /// construction and the fields are private, so a `KeyedLine` can never
+    /// carry a stale key for mutated content — the claim-skip fast path
+    /// relies on that inseparability.
+    #[must_use]
+    pub fn new(line: String, width: u16) -> Self {
+        let key = paint_cache_key(&line, usize::from(width));
+        Self { line, key }
+    }
+
+    /// The display line content.
+    #[must_use]
+    pub fn line(&self) -> &str {
+        &self.line
+    }
+
+    /// The frozen paint key.
+    #[must_use]
+    pub const fn key(&self) -> u128 {
+        self.key
+    }
 }
 
 /// Active SGR attributes while painting a line.
@@ -313,6 +384,30 @@ pub fn paint_lines(area: Rect, buf: &mut Buffer, lines: &[String]) {
     }
 }
 
+/// Paint pre-keyed display lines into `area` — [`paint_lines`] for caches
+/// that serve the same lines every frame (PERF-T11 Design E).
+///
+/// Keys must have been computed with the line's build width, which must
+/// equal `area.width`; a stale key degrades to a wrong memo probe (guarded
+/// by the full-line validation compare) and re-derivation, never to wrong
+/// cells.
+pub fn paint_lines_keyed(area: Rect, buf: &mut Buffer, lines: &[KeyedLine]) {
+    let height = area.height as usize;
+    let width = area.width as usize;
+    for row in 0..height {
+        let y = area
+            .y
+            .saturating_add(u16::try_from(row).unwrap_or(u16::MAX));
+        let Some(keyed) = lines.get(row) else {
+            // Absent rows still claim and paint the empty line, exactly
+            // like `paint_lines`.
+            paint_line(area.x, y, width, buf, "");
+            continue;
+        };
+        paint_line_with_key(area.x, y, width, buf, &keyed.line, keyed.key);
+    }
+}
+
 /// Paint a single ANSI-capable line starting at `(x, y)`.
 ///
 /// SGR sequences update the painted cell style. OSC 8 hyperlink sequences
@@ -326,45 +421,58 @@ pub fn paint_line(x: u16, y: u16, max_width: usize, buf: &mut Buffer, line: &str
         return;
     }
     let key = paint_cache_key(line, max_width);
-    let width = u16::try_from(max_width).unwrap_or(u16::MAX);
-    // Damage scoping (PERF-T11 Design B): record the row claim; when the
-    // identical (line, geometry) claim existed in the prior frame and the
-    // memo still holds the derivation, the in-place render buffer already
-    // contains exactly these cells — re-push the hyperlink regions only and
-    // skip the cell writes. Outside a frame (`with_annotations` inactive)
-    // the claim is a no-op and the row always paints.
-    let claim_matched = crate::frame::claim_line(y, x, width, key).unwrap_or(false);
-    if claim_matched {
-        let skipped = PAINT_CACHE.with(|cache| {
-            let cache = cache.borrow();
-            let Some((hit_line, derived)) = cache.get(&key) else {
-                return false;
-            };
-            if &**hit_line != line || derived.width != max_width {
-                return false;
-            }
-            replay_regions(derived, x, y);
-            true
-        });
-        if skipped {
-            return;
-        }
+    paint_line_with_key(x, y, max_width, buf, line, key);
+}
+
+/// [`paint_line`] with a precomputed memo key (Design E).
+fn paint_line_with_key(
+    x: u16,
+    y: u16,
+    max_width: usize,
+    buf: &mut Buffer,
+    line: &str,
+    key: u128,
+) {
+    if max_width == 0 {
+        return;
     }
-    let hit = PAINT_CACHE.with(|cache| {
+    let width = u16::try_from(max_width).unwrap_or(u16::MAX);
+    // Damage scoping (PERF-T11 Design B + E): probe the prior claim first.
+    // A regionless line whose identical (x, width, key) claim already
+    // painted this row needs nothing at all — the in-place render buffer
+    // still holds exactly these cells and there are no hyperlink regions
+    // to re-push — so it skips the memo probe and validation compare.
+    // Outside a frame (`with_annotations` inactive) the probe is `None`
+    // and the row always paints.
+    let prior = crate::frame::probe_line(y, x, width, key);
+    if prior.is_some_and(|prior| prior.matched && !prior.linked) {
+        crate::frame::record_line(y, x, width, key, false);
+        return;
+    }
+    let claim_matched = prior.map_or(false, |prior| prior.matched);
+    let (hit, linked) = PAINT_CACHE.with(|cache| {
         let cache = cache.borrow();
         let Some((hit_line, derived)) = cache.get(&key) else {
-            return false;
+            return (false, false);
         };
         if &**hit_line != line || derived.width != max_width {
-            return false;
+            return (false, false);
         }
-        replay_derived(derived, line, x, y, buf);
-        true
+        if claim_matched {
+            // The cells are already in place (claim licensed the skip);
+            // only the hyperlink regions must reach the wire again.
+            replay_regions(derived, x, y);
+        } else {
+            replay_derived(derived, line, x, y, buf);
+        }
+        (true, !derived.regions.is_empty())
     });
     if hit {
+        crate::frame::record_line(y, x, width, key, linked);
         return;
     }
     let derived = derive_line(x, y, max_width, buf, line);
+    let linked = !derived.regions.is_empty();
     // Byte ranges index into the validated line; lines beyond `u32::MAX`
     // bytes cannot carry faithful records and stay uncached.
     if line.len() <= u32::MAX as usize {
@@ -376,6 +484,7 @@ pub fn paint_line(x: u16, y: u16, max_width: usize, buf: &mut Buffer, line: &str
             cache.insert(key, (line.into(), derived));
         });
     }
+    crate::frame::record_line(y, x, width, key, linked);
 }
 
 /// Replay recorded ops at `(x, y)`: cell writes and region pushes identical

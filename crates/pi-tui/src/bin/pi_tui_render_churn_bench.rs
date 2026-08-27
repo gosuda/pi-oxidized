@@ -27,6 +27,7 @@ use std::time::Instant;
 use pi_bench_alloc::CountingAllocator;
 use pi_tui::component::{Component, EventResult, UiEvent};
 use pi_tui::components::Text;
+use pi_tui::components::util::{KeyedLine, paint_lines_keyed};
 use pi_tui::terminal::{TerminalCapabilities, Tui, Txn};
 
 use ratatui::buffer::Buffer;
@@ -77,7 +78,7 @@ struct EditorSim {
     text: String,
     cached_text: Option<String>,
     cached_width: Option<u16>,
-    cached_lines: Option<Vec<String>>,
+    cached_lines: Option<Vec<KeyedLine>>,
 }
 
 impl EditorSim {
@@ -103,7 +104,7 @@ impl Component for EditorSim {
 
     fn render(&mut self, area: Rect, buf: &mut Buffer) {
         let lines = self.lines_for_width(area.width);
-        pi_tui::components::util::paint_lines(area, buf, lines);
+        paint_lines_keyed(area, buf, lines);
     }
 
     fn handle_event(&mut self, _event: &UiEvent) -> EventResult {
@@ -118,7 +119,7 @@ impl Component for EditorSim {
 }
 
 impl EditorSim {
-    fn lines_for_width(&mut self, width: u16) -> &[String] {
+    fn lines_for_width(&mut self, width: u16) -> &[KeyedLine] {
         let cache_hit = self.cached_width == Some(width)
             && self.cached_text.as_deref() == Some(self.text.as_str());
         if !cache_hit {
@@ -127,9 +128,9 @@ impl EditorSim {
                 "─".repeat(usize::from(width.max(2).saturating_sub(2)))
             );
             let lines = vec![
-                border.clone(),
-                format!(" > {}▌", self.text),
-                border,
+                KeyedLine::new(border.clone(), width),
+                KeyedLine::new(format!(" > {}▌", self.text), width),
+                KeyedLine::new(border, width),
             ];
             self.cached_text = Some(self.text.clone());
             self.cached_width = Some(width);
@@ -145,7 +146,7 @@ impl EditorSim {
 struct Transcript {
     lines: Vec<String>,
     cached_width: Option<u16>,
-    cached_wrapped: Option<Vec<String>>,
+    cached_wrapped: Option<Vec<KeyedLine>>,
 }
 
 impl Transcript {
@@ -179,7 +180,7 @@ impl Component for Transcript {
 
     fn render(&mut self, area: Rect, buf: &mut Buffer) {
         let lines = self.lines_for_width(area.width);
-        pi_tui::components::util::paint_lines(area, buf, lines);
+        paint_lines_keyed(area, buf, lines);
     }
 
     fn handle_event(&mut self, _event: &UiEvent) -> EventResult {
@@ -193,14 +194,19 @@ impl Component for Transcript {
 }
 
 impl Transcript {
-    fn lines_for_width(&mut self, width: u16) -> &[String] {
+    fn lines_for_width(&mut self, width: u16) -> &[KeyedLine] {
         if self.cached_width != Some(width) {
-            // Wrap each transcript line to width using the same text wrapper.
+            // Wrap each transcript line to width using the same text wrapper;
+            // key each wrapped line once at build (Design E).
             let content_width = usize::from(width.max(1));
             let mut wrapped = Vec::with_capacity(self.lines.len() * 2);
             for line in &self.lines {
                 let wrapped_lines = pi_tui::text::wrap_text_with_ansi(line, content_width);
-                wrapped.extend(wrapped_lines);
+                wrapped.extend(
+                    wrapped_lines
+                        .into_iter()
+                        .map(|line| KeyedLine::new(line, width)),
+                );
             }
             self.cached_width = Some(width);
             self.cached_wrapped = Some(wrapped);
@@ -269,7 +275,7 @@ impl Component for BenchRoot {
             let all_lines = self.transcript.lines_for_width(width);
             let start = all_lines.len().saturating_sub(usize::from(scroll_h));
             let visible = &all_lines[start..];
-            pi_tui::components::util::paint_lines(scroll_area, buf, visible);
+            paint_lines_keyed(scroll_area, buf, visible);
         }
 
         // Render dock: status, editor, footer stacked vertically.

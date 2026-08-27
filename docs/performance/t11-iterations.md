@@ -314,3 +314,91 @@ library tree (this iteration touches no library code — bench binary only).
 
 **Not touched**: no production file; `scripts/`, `docs/TUI-CLOSE-*`,
 `packages/extension-host` (sibling lanes).
+
+## Iteration 5 — `render-churn-recomposition` (Design E: keyed identity, probe-free skips)
+
+Commit: see `git log` (`perf(t11)`). Date 2026-08-28.
+
+**Blind derivation** (recorded at 5be1884 before reading post-iter3/4 code,
+from the ledger's Contract + Floor + decomposition sections; reserved in the
+handoff): after Designs A (painted-line memo), B (claimed-row damage
+scoping), C (reference-served line cache), and D (borrowed visible window),
+the static scenario still paid 7.0 us/frame with zero content change — none
+of A–D touched the per-frame *identity revalidation* of unchanged lines:
+every painted line re-hashed its content (FNV-1a), re-probed the memo
+(HashMap<u64> under SipHash), and re-compared the full line bytes as a
+collision guard, every frame. Data layout: move identity to where content
+is finalized — caches that serve wrapped lines (`Text`, `Markdown`, the
+bench's `Transcript`/`EditorSim`) key each line once at cache fill
+(`KeyedLine { line, key }`), the memo map hashes its already-mixed keys with
+an identity hasher instead of SipHash, and the row claim carries a `linked`
+flag (recorded from the derivation's own region set, a pure function of the
+key) so a claim-matched regionless line skips the memo probe and validation
+compare entirely: its cells are provably in the in-place buffer and there
+are no hyperlink regions to re-push. Because the skip path now trusts the
+key alone, the key widens to a 128-bit composite (FNV-1a 64 crossed with an
+independent rotate-multiply 64 in the same byte loop): an accidental or
+practical crafted collision needs to defeat two independent 64-bit mixes
+simultaneously (~2^128), which re-classifies the per-frame full-line
+validation compare as residue.
+
+**Boundary answers** (explicit, before touching): emitted bytes unchanged —
+bench written-bytes metric byte-identical (10500/11656 B); `paint_lines`
+plain path preserved verbatim for uncached callers (rail, loader, editor
+body, lists, image fallback); claim set-equality semantics unchanged
+(`linked` is a pure function of the key, so it never differentiates two
+paints of the same key); memo eviction behavior on the skip path is now
+irrelevant for regionless lines (cells live in the in-place buffer, not the
+memo) and unchanged for linked lines (probe miss falls through to
+re-derivation, re-pushing regions); no wire/format surface touched.
+
+**Branch classification** (divergence audit of the replaced machinery):
+
+| Original branch | Classification | Reason |
+|---|---|---|
+| per-frame FNV-1a hash of every served line | residue | identity is a pure function of content finalized at cache fill; owners compute it once per rebuild |
+| per-frame SipHash of the u64 memo key (HashMap RandomState) | residue | the key is already a well-mixed digest; identity hasher |
+| per-frame memo probe + full-line compare for claim-matched regionless rows | residue | cells provably in the in-place buffer (Design B); no regions to re-push; 128-bit composite key makes the collision the compare guarded a ~2^-128 accident |
+| memo probe + full-line compare for repainting rows (claim miss) | essential | replay validation stays; changed content must repaint |
+| `derive_line` on memo miss | essential | derivation on genuine change; unchanged |
+| hyperlink region re-push on claim-matched linked rows | essential | wire surface; probe retained for `linked` claims |
+| claim record/probe set bookkeeping | essential | Design B's skip license; now carries `linked` |
+
+**Measurements** (pinned workload, `pi_tui_render_churn_bench`, release,
+`taskset -c 20-40`, 20 warmup / 300 frames, 100x30, 150 lines; 7 runs per
+side, fresh baselines measured this session on 0748236 before the change;
+box contended (load ~10) — min-of-7 is the pre-declared paired estimator,
+medians disclosed):
+
+| Scenario | Before (µs/frame) | After (µs/frame) | Win (min-of-7) | Win (median-of-7) | Allocated before -> after | Written before -> after |
+|---|---|---|---|---|---|---|
+| static | 7.0 (min) / 7.0 (median) | 3.0 (min) / 3.0 (median) | **2.33x** | **2.33x** | 2.7 -> 4.6 KiB/frame | 10500 -> 10500 B |
+| editor | 17.0 (min) / 22.0 (median) | 15.0 (min) / 16.0 (median) | **1.13x** | **1.38x** | 10.6 -> 12.6 KiB/frame | 11656 -> 11656 B |
+
+Win gate >=1.05x median: **passed on both scenarios under both estimators**
+(min 2.33x/1.13x, median 2.33x/1.38x). Written bytes byte-identical — the
+wire surface is unchanged. Allocation rose ~1.9-2.0 KiB/frame: `RowClaim::Line`
+grew 16 -> 32 bytes with the u128 key (claim table rebuild dominates the
+static frame's remaining allocation); time cost is negative net — disclosed,
+not hidden. Editor>static allocation ordering still holds (12.6 > 4.6).
+
+**Recomputed multiple**: editor 15.0 us vs the ledger's 1.5 us floor ≈
+**10x — still OPEN** (>2x ⇒ logged as intermediate). The residual is
+dominated by the bench-side `EditorSim` per-frame rebuild (borders + text
+row re-materialized on every text miss — upstream-faithful workload cost,
+out of unit scope per iteration 1/3 precedent) plus the per-frame claim
+table rebuild in `commit_frame` (a candidate Design F: pooled/reused claim
+vectors) and the changed-line derive + 3-row damage diff. The terminal
+exhaustion record (E1–E4 with the G10-Finding-5 floor revalidation from the
+replacement's own per-line measurement) remains the unit's closing work.
+
+**Verification**: 395/395 pi-tui lib tests; full release integration suite
+green (render-churn verification 3 — parameter parity, non-zero results,
+editor>static allocation ordering; no-flicker PTY 5; grill adjudication 8;
+theme 5; static-frame-evidence 1; state-matrix / unicode / a11y / ext /
+musl gauntlet harnesses green); `cargo clippy --release -p pi-tui
+--all-targets --locked` reports no findings on the changed files.
+
+**Not touched (out of scope, file-disjoint)**: `scripts/` (DEPS lane),
+`docs/TUI-CLOSE-*` (TUI-CLOSE), `packages/extension-host` (XC-CLOSE),
+`.github/workflows/` (REL-T4 lane), `pi/src/modes/interactive/runtime.rs`.

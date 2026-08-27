@@ -30,7 +30,12 @@ pub enum RowClaim {
         /// Paint width of the claimed span.
         width: u16,
         /// Memo key of the claimed line.
-        key: u64,
+        key: u128,
+        /// Whether the line's derivation carries hyperlink regions (OSC 8
+        /// spans re-pushed every frame). Pure function of `(key, width)`,
+        /// so the flag is stable per key; regionless lines can skip the
+        /// memo probe entirely on a claim match (PERF-T11 Design E).
+        linked: bool,
     },
     /// A direct cell writer (editor body, image cells, clipped copies) owns
     /// `[x, x + width)`; its content is not key-derivable, so the row always
@@ -65,6 +70,23 @@ impl RowClaim {
     }
 }
 
+/// Prior-frame probe result for a line about to paint (see [`RowClaims::probe_line`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PriorLine {
+    /// The identical `(x, width, key)` claim existed and the row was all-line.
+    pub matched: bool,
+    /// The matched prior claim carried hyperlink regions.
+    pub linked: bool,
+}
+
+impl PriorLine {
+    /// Probe result for an unclaimed row (no prior claims to match).
+    pub const UNCLAIMED: Self = Self {
+        matched: false,
+        linked: false,
+    };
+}
+
 /// Per-row claim bookkeeping for one frame render.
 ///
 /// `prior` holds the previous frame's claims (installed by the writer before
@@ -87,24 +109,49 @@ impl RowClaims {
         }
     }
 
-    /// Record a line claim on row `y`; returns whether the row span may
-    /// skip repainting.
+    /// Probe the prior-frame claim for a line about to paint on row `y`.
     ///
-    /// The skip license requires the identical claim in the prior frame AND
+    /// The match license requires the identical claim in the prior frame AND
     /// that every prior claim on the row is a line claim: a foreign or
     /// opaque writer owned part of the row, so the row's prior final content
     /// is not what this line paints (overlay close must repaint).
+    /// `linked` reports the prior claim's region flag so a regionless
+    /// matched line can skip the paint-memo probe (Design E). The match
+    /// itself ignores `linked`: the flag is a pure function of the key, so
+    /// an identical `(x, width, key)` claim always carries the same flag.
     #[must_use]
-    pub fn claim_line(&mut self, y: u16, x: u16, width: u16, key: u64) -> bool {
-        let claim = RowClaim::Line { x, width, key };
-        let matched = self
-            .prior
-            .get(usize::from(y))
-            .is_some_and(|row| row.iter().all(RowClaim::is_line) && row.contains(&claim));
-        self.record(y, claim);
-        matched
+    pub fn probe_line(&self, y: u16, x: u16, width: u16, key: u128) -> PriorLine {
+        let Some(row) = self.prior.get(usize::from(y)) else {
+            return PriorLine::UNCLAIMED;
+        };
+        let mut matched = false;
+        let mut linked = false;
+        for claim in row {
+            let RowClaim::Line {
+                x: claim_x,
+                width: claim_width,
+                key: claim_key,
+                linked: claim_linked,
+            } = claim
+            else {
+                // A foreign or opaque claimant owned part of the row.
+                return PriorLine {
+                    matched: false,
+                    linked: false,
+                };
+            };
+            if *claim_x == x && *claim_width == width && *claim_key == key {
+                matched = true;
+                linked = *claim_linked;
+            }
+        }
+        PriorLine { matched, linked }
     }
 
+    /// Record this frame's line claim on row `y` with its region flag.
+    pub fn record_line(&mut self, y: u16, x: u16, width: u16, key: u128, linked: bool) {
+        self.record(y, RowClaim::Line { x, width, key, linked });
+    }
     /// Record an opaque claim on row `y` (direct cell writer).
     pub fn claim_opaque(&mut self, y: u16, x: u16, width: u16) {
         self.record(y, RowClaim::Opaque { x, width });
@@ -271,15 +318,24 @@ pub fn push_raw_region(region: RawRegion) {
     let _ = with_current_annotations(|annotations| annotations.push_raw_region(region));
 }
 
-/// Record a line claim for the current frame.
+/// Probe the prior-frame claim for a line about to paint (Design E).
 ///
-/// Returns `None` outside a frame; inside, returns whether the identical
-/// claim existed in the prior frame, which licenses skipping the repaint for
-/// that row span.
-pub fn claim_line(y: u16, x: u16, width: u16, key: u64) -> Option<bool> {
+/// Returns `None` outside a frame; inside, `Some(PriorLine { matched, linked })`
+/// where `matched` licenses skipping the repaint for that row span and
+/// `linked` reports whether the prior claim carried hyperlink regions.
+pub fn probe_line(y: u16, x: u16, width: u16, key: u128) -> Option<PriorLine> {
     with_current_annotations(|annotations| {
-        annotations.row_claims_mut().claim_line(y, x, width, key)
+        annotations.row_claims_mut().probe_line(y, x, width, key)
     })
+}
+
+/// Record this frame's line claim (no-op outside a frame).
+pub fn record_line(y: u16, x: u16, width: u16, key: u128, linked: bool) {
+    let _ = with_current_annotations(|annotations| {
+        annotations
+            .row_claims_mut()
+            .record_line(y, x, width, key, linked)
+    });
 }
 
 /// Record opaque row-span claims for the current frame (no-op outside).

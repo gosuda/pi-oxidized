@@ -14,7 +14,7 @@ use crate::text::{
     wrap_text_with_ansi,
 };
 
-use super::util::{apply_background, empty_line, paint_lines};
+use super::util::{KeyedLine, apply_background, empty_line, paint_lines_keyed};
 
 /// Default text styling applied to body content (not backgrounds).
 #[derive(Clone, Default)]
@@ -190,7 +190,7 @@ pub struct Markdown {
 struct Cache {
     text: String,
     width: u16,
-    lines: Vec<String>,
+    lines: Vec<KeyedLine>,
 }
 
 impl Markdown {
@@ -318,13 +318,19 @@ impl Markdown {
         }
     }
 
-    fn lines_for_width(&mut self, width: u16) -> &[String] {
+    fn lines_for_width(&mut self, width: u16) -> &[KeyedLine] {
         let cache_hit = match &self.cache {
             Some(cache) => cache.width == width && cache.text == self.text,
             None => false,
         };
         if !cache_hit {
-            let lines = self.render_lines(width);
+            // Key each line once at cache fill (Design E): the paint walk
+            // then reuses the key every frame instead of re-hashing.
+            let lines = self
+                .render_lines(width)
+                .into_iter()
+                .map(|line| KeyedLine::new(line, width))
+                .collect();
             self.cache = Some(Cache {
                 text: self.text.clone(),
                 width,
@@ -346,7 +352,7 @@ impl Component for Markdown {
 
     fn render(&mut self, area: Rect, buf: &mut Buffer) {
         let lines = self.lines_for_width(area.width);
-        paint_lines(area, buf, lines);
+        paint_lines_keyed(area, buf, lines);
     }
 
     fn handle_event(&mut self, _event: &UiEvent) -> EventResult {
