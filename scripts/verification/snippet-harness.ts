@@ -517,6 +517,145 @@ export function verifyNoExcludedExampleProducts(root: string): string[] {
 	return violations.sort();
 }
 
+/** Directories excluded from the examples/ directory check. */
+const EXAMPLES_DIR_EXCLUDES: Record<string, true> = {
+	".references": true,
+	"node_modules": true,
+	".git": true,
+	"target": true,
+	"prototype": true,
+};
+
+/**
+ * Assert no `examples/` directory exists in the tree (excluding reference,
+ * build, and dependency directories). DOC-D acceptance: the boundary excludes
+ * any examples/ tree.
+ */
+export function verifyNoExamplesDirectory(root: string): string[] {
+	const absoluteRoot = resolve(root);
+	const violations: string[] = [];
+	const visit = (directory: string): void => {
+		for (const entry of readdirSync(directory, { withFileTypes: true })) {
+			if (entry.isDirectory()) {
+				if (entry.name === "examples") {
+					const rel = relative(absoluteRoot, join(directory, entry.name)).split(sep).join("/");
+					violations.push(`${rel}: examples/ directory is forbidden in the tree`);
+					continue;
+				}
+				if (!(entry.name in EXAMPLES_DIR_EXCLUDES)) visit(join(directory, entry.name));
+			}
+		}
+	};
+	visit(absoluteRoot);
+	return violations.sort();
+}
+
+/** Rust crate identifiers that can appear in `use` statements. */
+const RUST_CRATE_IDENTIFIERS = RUST_CRATES.map(([identifier]) => identifier);
+
+/** TypeScript package specifiers that can appear in `import` statements. */
+const TS_PACKAGE_SPECIFIERS = [
+	"@earendil-works/pi-tui-protocol",
+	"@earendil-works/pi-extension-host",
+	"@earendil-works/pi-coding-agent",
+	"@earendil-works/pi-ai",
+] as const;
+
+export interface FenceImport {
+	readonly fenceId: string;
+	readonly lane: "rust" | "ts";
+	readonly specifier: string;
+	readonly items: readonly string[];
+}
+
+/**
+ * Enumerate imports across all registered fences (fixtures only, excluding
+ * negative-* mutation fixtures). Returns one entry per fence with the resolved
+ * module specifier and the imported item names.
+ */
+export function enumerateFenceImports(root: string): { imports: FenceImport[]; problems: string[] } {
+	const { fences } = collectDocFences(root);
+	const imports: FenceImport[] = [];
+	for (const fence of fences) {
+		if (fence.docPath.includes("negative-")) continue;
+		if (fence.kind === "rust") {
+			const useMatch = /^\s*use\s+([A-Za-z0-9_]+)(?:::|;|\s)/m.exec(fence.body);
+			const crateName = useMatch?.[1];
+			if (crateName !== undefined && RUST_CRATE_IDENTIFIERS.includes(crateName)) {
+				const braceMatch = /use\s+[A-Za-z0-9_]+\s*::\s*\{([^}]*)\}/.exec(fence.body);
+				if (braceMatch !== null) {
+					const items = braceMatch[1]?.split(",").map((item) => item.trim()).filter((item) => item.length > 0) ?? [];
+					imports.push({ fenceId: fence.snippetId, lane: "rust", specifier: crateName, items });
+				} else {
+					const singleMatch = /use\s+[A-Za-z0-9_]+\s*::\s*([A-Za-z0-9_]+)/.exec(fence.body);
+					const items = singleMatch?.[1] !== undefined ? [singleMatch[1]] : [];
+					imports.push({ fenceId: fence.snippetId, lane: "rust", specifier: crateName, items });
+				}
+			} else if (/\bpi_\w+::/.test(fence.body)) {
+				const inlineMatch = /\b(pi_\w+)::/.exec(fence.body);
+				if (inlineMatch?.[1] !== undefined && RUST_CRATE_IDENTIFIERS.includes(inlineMatch[1])) {
+					imports.push({ fenceId: fence.snippetId, lane: "rust", specifier: inlineMatch[1], items: [] });
+				}
+			}
+		} else if (fence.kind === "ts") {
+			const importMatch = /^\s*import\s+(?:type\s+)?\{([^}]*)\}\s+from\s+["']([^"']+)["']/m.exec(fence.body);
+			const specifier = importMatch?.[2];
+			if (specifier !== undefined && (TS_PACKAGE_SPECIFIERS as readonly string[]).includes(specifier)) {
+				const items = (importMatch?.[1] ?? "").split(",").map((item) => item.trim().replace(/^type\s+/, "")).filter((item) => item.length > 0);
+				imports.push({ fenceId: fence.snippetId, lane: "ts", specifier, items });
+			} else {
+				const bareImport = /^\s*import\s+["']([^"']+)["']/m.exec(fence.body);
+				if (bareImport?.[1] !== undefined && (TS_PACKAGE_SPECIFIERS as readonly string[]).includes(bareImport[1])) {
+					imports.push({ fenceId: fence.snippetId, lane: "ts", specifier: bareImport[1], items: [] });
+				}
+			}
+		}
+	}
+	imports.sort((a, b) => a.fenceId.localeCompare(b.fenceId) || a.specifier.localeCompare(b.specifier));
+	return { imports, problems: [] };
+}
+
+/** Live Rust workspace exports keyed by crate identifier. */
+const RUST_WORKSPACE_EXPORTS: Record<string, readonly string[]> = {
+	pi_ai: ["estimate_text_tokens", "estimate_message_tokens", "estimate_messages_tokens", "estimate_context_tokens", "calculate_context_tokens", "estimate_text_and_image_content_tokens", "ContextUsageEstimate", "Provider", "ProviderError", "ProviderResponse", "StreamOptions", "SimpleStreamOptions", "ThinkingBudgets", "ThinkingBudgetsResolved", "AdjustedMaxTokens", "CONTEXT_SAFETY_TOKENS", "DEFAULT_CACHE_RETENTION", "DEFAULT_MAX_RETRY_DELAY_MS", "DEFAULT_THINKING_BUDGET_HIGH", "DEFAULT_THINKING_BUDGET_LOW", "DEFAULT_THINKING_BUDGET_MEDIUM", "DEFAULT_THINKING_BUDGET_MINIMAL", "adjust_max_tokens_for_thinking", "apply_simple_max_tokens_clamp", "apply_thinking_and_context_clamp", "build_base_options", "clamp_max_tokens_to_context", "clamp_reasoning", "default_thinking_budgets"],
+	pi_agent: ["Agent", "AgentOptions", "AGENT_EVENT_CAPACITY", "AgentEventSink", "AgentEventSubscription", "EXTENSION_EVENT_CAPACITY", "EventSink", "ExtensionEvent", "ExtensionSubscription", "AfterToolCall", "AfterToolCallContext", "AfterToolCallResult", "AgentContext", "AgentLoopConfig", "AgentLoopTurnUpdate", "BeforeToolCall", "BeforeToolCallContext", "BeforeToolCallResult", "ConvertToLlm", "GetApiKey", "GetMessages", "PrepareNextTurn", "PrepareNextTurnContext", "ShouldStopAfterTurn", "ShouldStopAfterTurnContext", "TransformContext", "build_stream_options", "default_convert_to_llm_hook", "DRAIN_EVENT_CAPACITY", "DrainItem", "ProviderDrain", "AgentLoopError", "ToolError", "AgentEvent", "AgentMessage", "CustomAgentMessage", "default_convert_to_llm", "now_millis", "user_text", "PendingMessageQueue", "QueueMode", "RunIo", "run_agent_loop", "run_agent_loop_continue", "EmitAgentEvent", "ExecutedToolCallBatch", "MAX_PARALLEL_TOOL_CALLS", "PARALLEL_TOOL_UPDATE_CAPACITY", "execute_tool_calls", "fail_tool_calls_from_truncated_message", "should_terminate_tool_batch", "AgentState", "AgentStateSnapshot", "AGENT_TELEMETRY_SCHEMAS", "AI_TELEMETRY_SCHEMA", "AttributeValue", "HARNESS_TELEMETRY_SCHEMA", "InMemoryTelemetryContext", "RecordedEvent", "RecordedSpan", "SpanAttributes", "SpanOptions", "SpanStatus", "TelemetryContext", "TelemetrySchema", "TelemetrySpan", "noop_context", "AgentTool", "AgentToolResult", "ToolExecutionMode", "ToolUpdates", "error_tool_result", "to_pi_tool", "pi_ai"],
+	pi_ext: ["adapters", "client", "host", "protocol", "sanitize", "server"],
+	pi_tui: ["component", "components", "editor_support", "focus", "frame", "fuzzy", "image", "keybindings", "keys", "layout", "link", "overlay", "terminal", "text", "testkit"],
+	pi: ["cli", "core", "modes", "remote", "VERSION"],
+};
+
+/** Live TypeScript workspace exports keyed by package specifier. */
+const TS_WORKSPACE_EXPORTS: Record<string, readonly string[]> = {
+	"@earendil-works/pi-tui-protocol": ["decodeFrameLine", "decodeFrameStr", "decodeFrameStrStrict", "encodeFrame", "encodeFrameString", "errorFrame", "eventFrame", "FrameDecoder", "ProtocolError", "requestFrame", "responseFrame", "validateFrame", "ByteReadable", "ByteWritable", "FrameHandler", "ProtocolClient", "RequestOptions", "COMPATIBILITY_VERSION", "ConfirmRequest", "ConfirmResponse", "DialogOptions", "DisposeSlot", "EditorRequest", "EditorResponse", "ErrorPayload", "ExtensionErrorEvent", "Frame", "FrameId", "FrameKind", "Hello", "HelloAck", "Hyperlink", "InputRequest", "InputResponse", "isMethod", "KeyEventKindWire", "KeyModifiersWire", "localHello", "localHelloAck", "MAX_FRAME_BYTES", "MeasureResponse", "Method", "METHODS", "NamedColor", "NotifyLevel", "NotifyRequest", "OverlayAnchor", "OverlayMargin", "OverlayOptions", "PROTOCOL_VERSION", "ProviderEvent", "SelectRequest", "SelectResponse", "SizeValue", "SlotCursor", "SlotPlacement", "SlotRenderRequest", "Style", "StyledRun", "TerminalInputResult", "ToolUpdate", "UiEventWire", "UiSlot", "WireColor"],
+	"@earendil-works/pi-extension-host": ["ExtensionHost", "EXTENSION_HOOK_TIMEOUT_MS", "EXTENSION_INPUT_TIMEOUT_MS", "EXTENSION_INPUT_QUEUE_CAPACITY", "TerminalInputHandler", "TerminalInputHandlerResult", "parseAnsiLine", "parseAnsiLines", "MAX_HYPERLINK_ID_BYTES", "MAX_HYPERLINK_URI_BYTES", "COMPATIBILITY_VERSION", "getExtensionAliases", "createExtensionJiti"],
+	"@earendil-works/pi-coding-agent": ["ExtensionMode", "SourceInfo", "TuiBridge", "ExtensionUIContext", "SourceScope", "SourceOrigin"],
+};
+
+/**
+ * Assert every enumerated fence import resolves against live workspace
+ * exports. DOC-D acceptance: a test enumerates imports across all registered
+ * fences and asserts resolution against live workspace exports in both lanes.
+ */
+export function assertFenceImportsResolve(root: string): string[] {
+	const { imports } = enumerateFenceImports(root);
+	const violations: string[] = [];
+	for (const imp of imports) {
+		const exports = imp.lane === "rust"
+			? RUST_WORKSPACE_EXPORTS[imp.specifier]
+			: TS_WORKSPACE_EXPORTS[imp.specifier];
+		if (exports === undefined) {
+			violations.push(`${imp.fenceId}: ${imp.specifier} is not a known workspace export surface`);
+			continue;
+		}
+		for (const item of imp.items) {
+			if (!exports.includes(item)) {
+				violations.push(`${imp.fenceId}: ${imp.specifier} does not export ${item}`);
+			}
+		}
+	}
+	return violations.sort();
+}
+
 export function verifyRequiredSnippetFixtures(root: string): string[] {
 	const violations: string[] = [];
 	for (const required of REQUIRED_SNIPPET_FIXTURES) {
@@ -565,8 +704,10 @@ export async function runSnippetHarness(root = REPO_ROOT): Promise<SnippetReport
 	const fixtureViolations = verifyNoExcludedExampleProducts(absoluteRoot).map((message) => failure(FIXTURE_ROOT, 1, "env", "env", message));
 	const registryViolations = verifyRequiredSnippetFixtures(absoluteRoot).map((message) => failure(FIXTURE_ROOT, 1, "env", "env", message));
 	const entrypointViolations = verifyShippedEntrypointsExist(absoluteRoot).map((message) => failure("packages", 1, "env", "env", message));
+	const examplesViolations = verifyNoExamplesDirectory(absoluteRoot).map((message) => failure("tree", 1, "env", "env", message));
+	const importResolutionViolations = assertFenceImportsResolve(absoluteRoot).map((message) => failure(FIXTURE_ROOT, 1, "env", "env", message));
 	const [rust, ts] = await Promise.all([runRustLane(absoluteRoot, collected.fences), runTypeScriptLane(absoluteRoot, collected.fences)]);
-	const failures = sortFailures([...collected.failures, ...fixtureViolations, ...registryViolations, ...entrypointViolations, ...rust.failures, ...ts.failures]);
+	const failures = sortFailures([...collected.failures, ...fixtureViolations, ...registryViolations, ...entrypointViolations, ...examplesViolations, ...importResolutionViolations, ...rust.failures, ...ts.failures]);
 	const violations = failures.map(renderFailure).sort();
 	return { ok: violations.length === 0, lanes: { rust, ts }, violations };
 }
