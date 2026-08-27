@@ -54,6 +54,16 @@ The allowlisted bridge and host-control method set is fixed and ordered.
   `::emitProvidersUpdate` as
   `{ method: "providers.update", payload: { providers } }`).
 
+`witness: packages/pi-tui-protocol/tests/codec.test.ts::witness manifest
+lockstep` — the single `(method, kind)` lockstep surface: total `frames.jsonl`
+line count, every manifest pair witnessed in the corpus (and no untracked
+pair), and the modifier-combo key-event kinds. Both language sides consume
+`packages/pi-tui-protocol/tests/fixtures/witness-manifest.json` by name; the
+Rust mirror is exercised by the `shared_fixtures_*` consumers in
+`crates/pi-ext/src/protocol.rs` (lines 2124, 2676). `mutation:` removing any
+fixture line or mutating a modifier-combo key event kind fails the lockstep
+test (XC-2, issue #41).
+
 Lifecycle event discriminants reuse the exact `type` strings from the reference
 extension API and are carried as open method strings on a `Frame`
 (`crates/pi-ext/src/protocol.rs` module doc, lines 367-369).
@@ -331,6 +341,16 @@ Both arrays are identical and both end at `input`. Any boundary that adds or
 removes a discriminant MUST update both arrays in lockstep and re-verify parity
 (see [Ownership](#ownership)).
 
+`witness: packages/extension-host/tests/acceptance.test.ts::acceptance: all 33
+lifecycle events` — asserts the canonical list carries exactly 33
+discriminants and that handlers for each are recognized by the runner;
+`scripts/verification/xc-dispatch.ts::DISCRIMINANT_LATTICE` (verified by
+`xc-dispatch.test.ts`) classifies exactly 33 discriminants matching
+`ALL_EVENT_TYPES`; the serialized corpus is held to the same set by the
+witness-manifest lockstep (§2). `mutation:` dropping a discriminant from the
+canonical list fails the acceptance suite and the lattice classification
+check.
+
 ### 7.1 Dispatch-semantics lattice (XC-6, issue #55)
 
 Each of the 33 discriminants belongs to one or more dispatch-semantics
@@ -380,6 +400,13 @@ The full registry snapshot (`RegistrySnapshotWire` consumed by Rust
   open-method sections at lines 1339, 1429).
 - `handlers`: the canonical 33 discriminants with at least one registered handler.
 - `terminalInput`: boolean, whether an active terminal-input handler exists.
+
+`witness: packages/extension-host/tests/acceptance.test.ts::acceptance:
+registry snapshot and tool/provider bridges::extensions.load returns full
+RegistrySnapshotWire` — asserts the emitted snapshot end-to-end through the
+host; the Rust decode side is exercised by
+`crates/pi/src/core/extension_host/tests.rs::real_host_lifecycle_and_dispatch`.
+`mutation:` dropping or reshaping a snapshot field fails the wire witness.
 
 ## 9. UI slots and sanitization clamps
 
