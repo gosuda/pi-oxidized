@@ -118,6 +118,15 @@ impl DriverSession for PosixPtySession {
 
     fn close(mut self) -> Result<ExitStatus, DriverError> {
         self.ensure_open()?;
+        // Emit portable-pty's master-EOF stand-in (`\n` + VEOT; see its
+        // `UnixMasterWriter::drop`) explicitly before dropping the writer: the
+        // DSR auto-responder's shared handle keeps the inner master writer
+        // alive past `close_writer`, so its Drop-time stand-in cannot fire
+        // until the reader pump is joined — which happens only after
+        // `child.wait()`. Serve-mode children wait for the Ctrl+D terminator,
+        // so without this a live child deadlocks the wait. Errors (child
+        // already exited) are ignored, matching the Drop-time behavior.
+        let _ = self.io.write_all(b"\n\x04");
         self.io.closed = true;
         // Writer EOF first, then wait for the child, then join the reader.
         self.io.close_writer();
