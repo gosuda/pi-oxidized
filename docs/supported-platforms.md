@@ -67,18 +67,21 @@ statement byte-identically:
 > protocol smokes, `no PTY/render/synchronized-output/no-clear claims`.
 
 Carrier map for the byte-identity contract (`scripts/tests/supported-platforms.test.ts`
-pins each fragment against its owning source): the census sentence lives in the compat
-matrix's tier census (`scripts/tests/compat-matrix.test.ts:400`), the per-row
-`Tier N terminal-conformance row` claim lives in the compat matrix's five release rows
-(`scripts/verification/compat-matrix.json:466,476,487,498,509`), and the absence line
-lives in the transcript-lane constant, both musl rows, and the transcript matrix's musl
-smoke-lane row (`crates/pi-tui/tests/transcript_musl_smoke.rs:57`;
-`scripts/verification/compat-matrix.json:525,535`; `docs/tui-transcript-schema-v1.md:149`).
-This document repeats each fragment byte-identically as quoted above.
+pins each fragment against every carrier): the census sentence
+`exactly five release rows carry the Tier N terminal-conformance claim` is carried
+byte-identically by the compat matrix's `tierCensus` field
+(`scripts/verification/compat-matrix.json:3`), by the transcript matrix's runner-matrix
+section (`docs/tui-transcript-schema-v1.md:120`), by the compat matrix's own tier census
+(`scripts/tests/compat-matrix.test.ts:400`), and by this document (quoted above); the
+per-row `Tier N terminal-conformance row` claim lives in the compat matrix's five release
+rows (`scripts/verification/compat-matrix.json:467,477,488,499,510`); and the absence
+line lives in the transcript-lane constant, both musl rows, and the transcript matrix's
+musl smoke-lane row (`crates/pi-tui/tests/transcript_musl_smoke.rs:57`;
+`scripts/verification/compat-matrix.json:526,536`; `docs/tui-transcript-schema-v1.md:150`).
 
 - Each of the five rows carries the phrase `Tier N terminal-conformance row` with its
   interaction witness — `pty_no_flicker` under portable-pty `posix_openpt` on the unix
-  rows, ConPTY on windows (`scripts/verification/compat-matrix.json:466,476,487,498,509`).
+  rows, ConPTY on windows (`scripts/verification/compat-matrix.json:467,477,488,499,510`).
 - The five-row runner topology mirrors the transcript matrix's five `RowId` rows
   `gnu-x64`, `gnu-arm64`, `darwin-x64`, `darwin-arm64`, `windows-x64`
   (`docs/tui-transcript-schema-v1.md:34,106-119`; `RowId` at
@@ -97,25 +100,25 @@ This document repeats each fragment byte-identically as quoted above.
 - Two-mode JSONL protocol smokes: the compiled-sidecar `hello` handshake and the
   bundled `pi-extension-host.js`-under-`bun` `hello` handshake both run from the same
   unpacked archive (`scripts/package-release.ts:202-254,429-456`; the musl smoke-lane
-  row in `docs/tui-transcript-schema-v1.md:149`).
+  row in `docs/tui-transcript-schema-v1.md:150`).
 - The absence line `no PTY/render/synchronized-output/no-clear claims` is owned by the
   musl transcript lane's `ABSENCE_LINE` constant
   (`crates/pi-tui/tests/transcript_musl_smoke.rs:57`), carried byte-identically by both
-  musl rows' evidence (`scripts/verification/compat-matrix.json:525,535`) and by the
-  transcript matrix's musl smoke-lane row (`docs/tui-transcript-schema-v1.md:149`).
+  musl rows' evidence (`scripts/verification/compat-matrix.json:526,536`) and by the
+  transcript matrix's musl smoke-lane row (`docs/tui-transcript-schema-v1.md:150`).
 
 ## 3. QEMU contingency label
 
 - The musl lanes run under `DriverKind::QemuUserSmoke` in `TranscriptMode::Contingency`,
   labeled packaging/protocol-only: claims must stay inside `{execution, protocol}`,
   render-class events and claims are rejected, and `RowTier::TierN` is prohibited
-  (`docs/tui-transcript-schema-v1.md:121-125` "QEMU contingency rules";
+  (`docs/tui-transcript-schema-v1.md:122-126` "QEMU contingency rules";
   `crates/pi-tui/src/testkit/validate.rs:86-92,118,296-309`).
 - QEMU is never native evidence: the bakeoff deleted the QEMU substitution and the
   aarch64 native-image gate fails any registered binfmt handler
   (`docs/REL-R1-musl-toolchain-bakeoff.md` §4 "QEMU"; `workflow:103-106`).
 - Both musl rows therefore scope every claim as "packaging/protocol scope only" with the
-  absence line attached (`scripts/verification/compat-matrix.json:525,535`).
+  absence line attached (`scripts/verification/compat-matrix.json:526,536`).
 
 ## 4. Archive, checksum, release.json, and provenance contract
 
@@ -281,7 +284,7 @@ This document repeats each fragment byte-identically as quoted above.
    its Runtime and Release Constants table (`docs/compatibility.md:39`).
 7. Re-prove the pins end to end: `bun run verify:compatibility` runs the compat matrix
    including both musl rows (`workflow:199-201`;
-   `scripts/verification/compat-matrix.json:512-537`), and the release-verification
+   `scripts/verification/compat-matrix.json:513-538`), and the release-verification
    workflow's musl gates re-execute the static-link, interpreter, isolation, integrity,
    and two-mode protocol smokes against the new runtime
    (`workflow:421-591`).

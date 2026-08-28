@@ -117,6 +117,7 @@ The validator decodes `rawBytesB64` and `context`, runs `normalize_raw_bytes`, a
 | `windows-x64` | Windows x86-64 | `DriverKind::ConPty` | `ConPty` only (enforced on `TierN` and local) |
 
 The TierN column is validator-enforced; on the local tier only `windows-x64` hard-requires `ConPty` — the remaining local "typical" pairings are guidance, not asserted.
+The release-tier census is normative across carriers: `exactly five release rows carry the Tier N terminal-conformance claim` (`scripts/tests/compat-matrix.test.ts:400`; `scripts/verification/compat-matrix.json` `tierCensus`).
 
 ### QEMU contingency rules
 `QemuUserSmokeDriver` (`crates/pi-tui/src/testkit/qemu.rs`) executes binaries via piped stdio (`DriverSession` only, never `RenderSession`).

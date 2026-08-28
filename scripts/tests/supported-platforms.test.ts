@@ -56,7 +56,11 @@ describe("supported-platforms document (REL-T9)", () => {
 		expect(census).toBe(
 			"exactly five release rows carry the Tier N terminal-conformance claim",
 		);
-		// The census sentence, verbatim, in this document.
+		// The same census sentence is carried byte-identically by all three:
+		// the compat matrix's tierCensus field, the transcript matrix's
+		// runner-matrix section, and this document.
+		expect(compatRaw.includes(census)).toBe(true);
+		expect(transcriptMatrix.includes(census)).toBe(true);
 		expect(doc.includes(census)).toBe(true);
 		// The compat-matrix row phrase survives byte-identically here: six
 		// occurrences in the JSON — five positive row claims plus the one

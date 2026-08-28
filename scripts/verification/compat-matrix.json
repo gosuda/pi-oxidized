@@ -1,5 +1,6 @@
 {
 	"version": "0.2.0",
+	"tierCensus": "exactly five release rows carry the Tier N terminal-conformance claim",
 	"rows": [
 		{
 			"id": "tui-protocol-check",
