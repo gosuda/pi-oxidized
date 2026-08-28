@@ -66,6 +66,16 @@ statement byte-identically:
 > only host-native execution, static-link/unpack/integrity, and the two-mode JSONL
 > protocol smokes, `no PTY/render/synchronized-output/no-clear claims`.
 
+Carrier map for the byte-identity contract (`scripts/tests/supported-platforms.test.ts`
+pins each fragment against its owning source): the census sentence lives in the compat
+matrix's tier census (`scripts/tests/compat-matrix.test.ts:400`), the per-row
+`Tier N terminal-conformance row` claim lives in the compat matrix's five release rows
+(`scripts/verification/compat-matrix.json:466,476,487,498,509`), and the absence line
+lives in the transcript-lane constant, both musl rows, and the transcript matrix's musl
+smoke-lane row (`crates/pi-tui/tests/transcript_musl_smoke.rs:57`;
+`scripts/verification/compat-matrix.json:525,535`; `docs/tui-transcript-schema-v1.md:149`).
+This document repeats each fragment byte-identically as quoted above.
+
 - Each of the five rows carries the phrase `Tier N terminal-conformance row` with its
   interaction witness — `pty_no_flicker` under portable-pty `posix_openpt` on the unix
   rows, ConPTY on windows (`scripts/verification/compat-matrix.json:466,476,487,498,509`).
