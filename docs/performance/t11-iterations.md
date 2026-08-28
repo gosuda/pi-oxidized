@@ -2257,3 +2257,124 @@ Fresh adversarial review: **CLEAN**.
 Out of scope, file-disjoint: `.github/workflows/`, `scripts/`, production
 `serve_io` logic (only `#[cfg(feature = "bench-seam")]` seam calls added),
 `Cargo.lock`, `rust-toolchain.toml`, other floor ledgers.
+
+## Iteration 23 — `extension-rpc-dispatch` (same-protocol single-CPU re-run — still NOISY, no classification)
+
+Commit: see `git log` (`docs(t11)`). Date 2026-08-28.
+
+**Unit**: `extension-rpc-dispatch` (unchanged from iteration 22). Floor:
+750-1000 ns/request (server-only, computed from contract).
+
+**Goal**: test whether the iteration-22 noise-gate failure (rs ≤ 0.20 failed
+at 45.24%) is stable across sessions by repeating the identical recorded
+retry protocol on a fresh session: same one-CPU pin (`taskset -c 20`), same
+3 warmup + 27 measured rounds. Iteration 22's recorded 27-round run already
+used this pin (only its earlier 9-round attempt ran `taskset -c 20-40`), so
+this is a same-protocol re-run, not a new remediation. Contract for this
+iteration: no production or test code edits, no `yield_now` (it would bias
+the real server path with an extra scheduler hop), no protocol changes.
+
+### Protocol (unchanged lane, one CPU)
+
+```
+taskset -c 20 env BENCH_MEASURED_ROUNDS=27 cargo test -p pi-ext --features bench-seam --test serve_io_scaling --release -- --ignored --exact --nocapture timed_serve_io_perf_t11_extension_rpc_dispatch
+```
+
+3 warmup + 27 measured rounds; identical 300-request `terminalInput` corpus
+(ids 300-599, x/a/b cycling); fresh current-thread runtime per round. The
+pre-iteration source scout (agent://ScoutExtensionRpcTiming) confirmed the
+lane already builds `Builder::new_current_thread()` per round on a plain
+`#[test]` (pi-ext has no `rt-multi-thread`), and that the seam Mutex cannot
+contend (single thread, lock never held across an await) — the
+multi-thread-runtime and Mutex-contention hypotheses from iteration 22's
+bimodality discussion are false and were not pursued. Warmup S_medians
+(1,922 / 2,300 / 4,023 ns) are excluded from statistics per the lane.
+
+### Measurements (27 measured rounds, `taskset -c 20`, release)
+
+| Round | RTT (ns/req) | S_median (ns) |
+|---|---|---|
+| 1 | 3,726 | 1,100 |
+| 2 | 13,329 | 4,001 |
+| 3 | 13,554 | 4,009 |
+| 4 | 13,340 | 4,010 |
+| 5 | 13,147 | 3,989 |
+| 6 | 20,293 | 7,422 |
+| 7 | 9,813 | 2,889 |
+| 8 | 13,425 | 4,098 |
+| 9 | 21,739 | 5,062 |
+| 10 | 10,616 | 3,248 |
+| 11 | 13,319 | 3,978 |
+| 12 | 13,133 | 3,994 |
+| 13 | 8,226 | 2,498 |
+| 14 | 13,403 | 4,111 |
+| 15 | 23,415 | 4,000 |
+| 16 | 13,368 | 4,034 |
+| 17 | 13,337 | 4,051 |
+| 18 | 13,358 | 4,068 |
+| 19 | 21,464 | 5,892 |
+| 20 | 13,127 | 3,975 |
+| 21 | 13,414 | 4,048 |
+| 22 | 13,346 | 4,001 |
+| 23 | 8,213 | 2,446 |
+| 24 | 13,573 | 4,111 |
+| 25 | 5,329 | 1,573 |
+| 26 | 5,744 | 1,733 |
+| 27 | 17,590 | 5,180 |
+
+Median S = 4,001 ns (population sd 1,262 ns), inclusive RTT median =
+13,340 ns/req, rs = 31.55% — **NOISY** (gate ≤ 20% fails).
+
+### Analysis
+
+Under the identical protocol, rs came in at 31.55% against iteration 22's
+recorded 45.24%: the noise level itself drifts between sessions, and the
+gate fails in both runs. No spread improvement can be attributed to a
+pinning change — the recorded retry used the same pin.
+
+Both recorded 27-round runs are one-CPU-pinned and both distributions are
+multi-modal, so cross-CPU migration — which a one-CPU affinity set already
+excludes — is not the dominant source of the modality (single-CPU
+frequency/cache state is not controlled by this protocol). The shape:
+dominant cluster ~3,975-4,111 ns (16 rounds), one mid-round at 3,248 ns
+(round 10), low cluster ~1,100-2,889 ns (6 rounds: 1, 7, 13, 23, 25, 26),
+high tail ~5,062-7,422 ns (4 rounds: 6, 9, 19, 27). The per-round medians
+carry the spread — each round's S_median lands in one region of the
+distribution (a round-level location shift into the noise-gate input) —
+which is consistent with the scout's read of a per-round sticky scheduler
+shape (whether the spawned request task rides the decode→encode seam in one
+cooperative hop or yields back through the runtime).
+
+### Classification
+
+**NOISY — no classification allowed.** The noise gate (rs ≤ 0.20) failed at
+31.55%. No cluster may be picked from the distribution; the unit stays
+**OPEN (fail-closed)**.
+
+### Next evidence requirement (named, not attempted)
+
+This iteration's contract forbade measurement-affecting code changes, so the
+seam still spans drive-decode → spawned-task encode and includes the
+per-request JoinSet spawn + cooperative hop. Before any classification
+attempt, the campaign needs attribution that separates that spawn + hop cost
+from handler cost — a bench-seam-gated seam refinement (e.g., start the S
+interval inside the spawned task) or an equivalent hop-determinism probe —
+validated by a passing noise gate over the full 27-round protocol. The
+optimization candidate (inline `terminalInput` handler on the drive loop to
+eliminate spawn + scheduler round-trip) remains gated behind a trusted lane
+and is untouched.
+
+### Verification
+
+Lane exited non-zero (101) with `NOISY: no classification allowed` — the
+expected fail-closed path. `Cargo.lock`: byte-identical (sha256
+`9eef233d...`). Diff docs-only: `docs/performance/floors/extension-rpc-dispatch.md`
+and `docs/performance/t11-iterations.md`. Fresh adversarial docs review:
+**CLEAN**.
+
+### Not touched
+
+Out of scope, file-disjoint: production `serve_io` logic, `server.rs`
+(including `bench-seam` seams), `serve_io_scaling.rs`, `Cargo.toml`,
+`Cargo.lock`, `.github/workflows/`, `scripts/`, other floor ledgers,
+`rust-toolchain.toml`.

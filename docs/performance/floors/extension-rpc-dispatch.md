@@ -30,7 +30,7 @@ encode one res line                                                    ~0.3 us
 floor                                                                ~0.75-1 us/request
 ```
 
-## Measured cost — iteration 22 (PERF-T11 #97, 2026-08-28)
+## Measured cost — iterations 22-23 (PERF-T11 #97, 2026-08-28)
 
 A timed `serve_io` lane was added to `crates/pi-ext/tests/serve_io_scaling.rs`
 (ignored, release-only, gated by the `bench-seam` Cargo feature). The lane
@@ -46,7 +46,7 @@ inclusive RTT = batch wall time / 300. Instrumentation overhead: two
 `std::sync::Mutex` lock/unlock pairs per request (~40-100 ns total), present
 in both warmup and measured rounds, disclosed but not subtracted.
 
-### Results (27 measured rounds, `taskset -c 20`, release)
+### Iteration 22 results (27 measured rounds, `taskset -c 20`, release)
 
 | Metric | Value |
 |---|---|
@@ -64,6 +64,37 @@ drive loop before completing the response). The dominant cluster (~4,000 ns)
 exceeds the 2,000 ns OPEN threshold (2× floor_max); the secondary cluster
 (~1,100-2,000 ns) straddles the AT-FLOOR/BOUNDARY/OPEN thresholds. No
 classification is possible because the noise gate failed.
+
+### Iteration 23 — same-protocol single-CPU re-run (2026-08-28)
+
+Iteration 23 repeated the identical recorded retry protocol (`taskset -c 20`,
+3 warmup + 27 measured rounds via `BENCH_MEASURED_ROUNDS=27`) on a fresh
+session, to test whether the iteration-22 noise-gate failure is stable across
+sessions. Iteration 22's recorded 27-round run already used this one-CPU pin
+(only its earlier 9-round attempt ran `taskset -c 20-40`), so this run is a
+same-protocol re-run, not a new remediation. Measurement-only: no production
+or test code changed.
+
+| Metric | Value |
+|---|---|
+| Inclusive RTT (median) | 13,340 ns/request |
+| Attributed server S (median) | 4,001 ns/request |
+| Relative spread (server) | 31.55% |
+| Noise gate (rs ≤ 0.20) | **FAILED** |
+| Classification | **NOISY — no classification allowed** |
+
+Under the identical protocol, rs came in at 31.55% against iteration 22's
+recorded 45.24%: the noise level itself drifts between sessions, and the gate
+fails in both runs. The distribution is again multi-modal: a dominant cluster
+at ~3,975-4,111 ns (16 rounds), one mid-round at 3,248 ns (round 10), a low
+cluster at ~1,100-2,889 ns (6 rounds), and a high tail at ~5,062-7,422 ns
+(4 rounds). The per-round medians carry the spread: each round's S_median
+lands in one region of the distribution (a round-level location shift into
+the noise-gate input). Both recorded 27-round runs are one-CPU-pinned and
+both are multi-modal, so cross-CPU migration — which a one-CPU affinity set
+already excludes — is not the dominant source of the modality (single-CPU
+frequency/cache state is not controlled by this protocol). State remains
+**OPEN (fail-closed)**.
 
 ### Prior unproven state (superseded by this measurement)
 
@@ -83,9 +114,17 @@ per-request work or widen samples per the R2 ladder).
 No trusted lane total exists to decompose (noise gate failed); no attributed
 categories are asserted. The 4 ms terminal-input budget is a *constraint* on
 any rebuild (a slower dispatch fails the budget contract), recorded here
-because Phase-5 candidates must respect it. The bimodal S distribution
+because Phase-5 candidates must respect it. The multi-modal S distribution
 suggests the dominant cost is async task scheduling overhead (spawn →
 semaphore acquire → handler → out_tx.send → writer task wake), not the
-decode/correlate/encode floor terms. A next blind candidate would target the
-task-spawn-per-request overhead, but no optimization is attempted in this
-iteration per the campaign contract.
+decode/correlate/encode floor terms. Iteration 23 is consistent with this: a
+same-protocol re-run on the same one-CPU pin (`taskset -c 20`) failed the
+gate again (rs 31.55% vs the recorded 45.24%) with the modality intact, so
+cross-CPU migration is ruled out as the dominant source of the modality
+(single-CPU frequency/cache state not controlled) and the noise level itself
+drifts between sessions. The next evidence
+requirement is attribution that separates the per-request spawn + cooperative
+hop cost from handler cost (a bench-seam-gated seam refinement or an
+equivalent hop-determinism probe), validated by a passing noise gate; only a
+protocol that passes the gate can classify this unit, and no cluster may be
+picked from the current distributions.
