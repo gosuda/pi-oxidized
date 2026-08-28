@@ -88,7 +88,7 @@ describe("SBOM content structure", () => {
 		const rustIds = new Set(content.rust.packages.map((p) => `${p.name}@${p.version}`));
 		const fromVersions = [
 			// Re-anchored by the Bin P patch sweep (4e10a0a) and the Bin M
-			// minor sweep (e331816): these are the from-versions every later
+			// minor sweep (e331816) and the Bin X1 major bump: these are the from-versions every later
 			// epoch diffs against.
 			"futures@0.3.34",
 			"globset@0.4.20",
@@ -104,7 +104,7 @@ describe("SBOM content structure", () => {
 			"google-cloud-auth@1.16.0",
 			"tokio@1.53.1",
 			"uuid@1.26.0",
-			"base64@0.22.1",
+			"base64@0.23.1",
 			"serde-saphyr@0.0.29",
 		];
 		for (const id of fromVersions) {

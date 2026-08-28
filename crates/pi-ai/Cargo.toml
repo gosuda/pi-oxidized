@@ -12,7 +12,7 @@ workspace = true
 aws-config = "=1.11.0"
 aws-sdk-bedrockruntime = { version = "=1.142.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "query", "tokio"] }
-base64 = "=0.22.1"
+base64 = "=0.23.1"
 filetime = "=0.2.29"
 futures = { version = "=0.3.34", default-features = false, features = ["alloc", "std"] }
 getrandom = { version = "=0.4.3", default-features = false, features = ["std"] }
