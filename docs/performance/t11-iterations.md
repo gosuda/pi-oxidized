@@ -3275,3 +3275,86 @@ so two short arms cannot pass on their combined duration. The trusted-baseline
 numbers above were captured with the pre-hardening collector on a production
 tree identical to `6318fa3`; the hardened collector re-confirms the baseline in
 iteration 31 after a production correctness fix on this unit's surface.
+
+## Iteration 31 — `keypress-dispatch` (first-frame stdin fix — production correctness defect, baseline re-confirmed)
+
+Date 2026-08-29. Base `6318fa3` + iteration 30. Two landings in one iteration:
+(a) a **production correctness fix** on this unit's surface (startup input
+path), found because it deterministically corrupted burst input in the harness
+and invalidated early-lane measurements; (b) the **trusted-baseline
+re-confirmation** on the fixed tree, which became the operative lane.
+
+### The defect
+
+The startup capability probe owns stdin until its collector joins. Since
+`2e4c087` (speculative first paint with deferred probe join), the first frame
+painted while the collector still ran: input written at first-paint time —
+which is exactly when the measurement harness writes — landed in the
+byte-level collector and was re-injected through the lossy startup mapper
+(`reinject_bytes_as_events`), violating the "EventStream owns full parsing"
+boundary. A bracketed paste `\x1b[200~text\x1b[201~` became `Esc` + literal
+`[200~` cells; the marker's `Esc` then cleared the editor, erasing the pasted
+text. Screen output showed ~5 cells painted and then (apparently) a stall,
+while input processing stayed alive. Single keys written later were unaffected
+(the collector had exited by then), which is why the iteration-30 keypress
+lane itself never tripped it. The mid-session `probe_background` re-injection
+path shares the same lossy mapper and remains a recorded residual.
+
+### The fix (`9ead528`)
+
+Reorder the startup sequence in `run_interactive_mode`: arm the collector's
+yield flag right before the runtime needs stdin, join it (the collector
+honors the arm within a 3 ms poll slice once replies have started; a silent
+terminal still ends at its 25 ms first-byte window), adopt final capabilities,
+start the EventStream reader, then paint the first frame. The first-frame
+overlap win is preserved — the collector still runs concurrently with host
+binding, the startup long pole; in every measured environment the join has
+long completed before the paint. From the first frame onward, input always
+reaches the production crossterm parser.
+
+### Evidence
+
+- Reproduction (pre-fix, canonical `6318fa3` binary): paste
+  `check 9 rust-warmup-1` right after the first frame → literal `[200~`
+  cells painted one synchronized frame each, label erased by the marker's
+  `Esc`, `hasLabel=false` for 40 s+ (also independently bisected to
+  {`021a00c`, `2e4c087`} by the memory lane on binary `a007540^`).
+- Post-fix, same repro: **one** balanced DEC 2026 transaction paints the
+  label whole (`hasLabel=true`), 3/3 runs.
+- Regression test `crates/pi/tests/startup_paste_echo.rs` drives the real
+  binary through a PTY and asserts the paste renders the label as
+  synchronized editor text with no marker cells: **red on the pre-fix tree,
+  green after the fix** (mutation-verified both directions).
+- Scoped verification: pi-tui probe tests 15/15, terminal-input tests 3/3,
+  runtime scoped tests (step_ui paste/resize/selector, coalescer, editor
+  repaint) 7/7, harness suites 42/42, script typecheck clean.
+
+### Baseline re-confirmation (trusted; the operative lane)
+
+The iteration-30 trusted capture (median 467.59 us pooled, rs 2.69%) was
+measured while the collector still owned stdin into the first ~30 samples of
+each round: those keys were re-injected late through the synthetic mapper,
+inflating the operating point in a perfectly repeatable way. On the fixed
+tree, same pinned protocol (`taskset -c 20`, 3+27 process rounds × 20+200
+key-clear pairs, hardened collector):
+
+| Metric | Iteration 30 (pre-fix) | Iteration 31 (operative) |
+|---|---|---|
+| Round-median rs | 2.69% | **13.95%** (<= 20% PASS) |
+| Round medians median | 467.27 us | **288.26 us** |
+| Pooled raw median / p95 / p99 | 467.59 / 548.75 / 888.09 us | **291.90 / 437.23 / 532.32 us** |
+| Collection wall | 16.52 s | 11.34 s (>= 1 s PASS) |
+| Valid synchronized + key-correlated samples | 5,400/5,400 | 5,400/5,400, 0 invalid frames |
+| Binary | sha256 `58592a9d…` (production = `6318fa3`) | sha256 `8af89dd1…` (this iteration) |
+
+The lane moved −37.6% because the measurement no longer includes the
+collector-interference plateau on early samples; this is measurement
+correction, not a performance claim. **No classification yet** — the trusted
+operative lane (T = 291.9 us median) proceeds to attribution (S0–S3 probes +
+raw-vs-EventStream fixture differential), floor revalidation, and the
+zeroing-ceiling test in iteration 32+.
+
+Not touched by the fix: `Cargo.lock`, `rust-toolchain.toml`,
+`.github/workflows/`, `scripts/release/`, other units' floor ledgers, the
+keypress measurement boundary (this iteration changes the production startup
+path only).

@@ -2,7 +2,7 @@
 
 Owning R2 hot rows (lane 4): *PTY key write*, *Input dispatch to state mutation*.
 (The paint row is owned by terminal-paint.md.)
-State: **OPEN — measurement trusted (iteration 30 repaired protocol, 2026-08-29);
+State: **OPEN — measurement trusted (iteration 30 repaired protocol, operative iteration 31, 2026-08-29);
 attribution and floor revalidation pending.**
 
 ## Contract (from call sites, tests, signatures — never internals)
@@ -50,33 +50,42 @@ Working observation (not a claim): if the noisy median holds after remediation, 
 unit sits ~100x over the ~13-25 us floor, consistent with a full-root rebuild per
 keypress (render-churn ledger shows a full frame at ~212 us) plus wait shapes.
 
-## Measured cost — trusted (iteration 30 repaired protocol, 2026-08-29)
+## Measured cost — trusted (repaired protocol; operative: iteration 31, 2026-08-29)
 
 Protocol: 3 discarded process warmup rounds, then 27 fresh measured process
 rounds; each round = one idle extension-free editor child under `taskset -c 20`
-(governor `powersave`, recorded; binary sha256 `58592a9d…`, production sources
-identical to `6318fa3`) with 20 discarded warmup key-clear pairs and 200 measured
-key-clear pairs on a fixed empty editor (`Ctrl+U` clear outside timing). Interval
-= write receipt (elapsed captured immediately before the first `FileSink.write`)
+(governor `powersave`, recorded) with 20 discarded warmup key-clear pairs and
+200 measured key-clear pairs on a fixed empty editor (`Ctrl+U` clear outside
+timing, verified to restore the empty editor: the previous key must be absent
+from the next paint and from the clear repaint's printable cells). Interval =
+write receipt (elapsed captured immediately before the first `FileSink.write`)
 to the arrival of the chunk completing the first balanced DEC 2026 transaction
 containing the typed key; a row-local fallback, extra/missing markers, or a
 payload mismatch fails the whole round (no sample filtering, no concurrent 1 ms
 sampler). Trust estimator: population stddev / median over the 27 round medians;
 pooled raw spread disclosed, not gating.
 
-Result: **trusted — round-median rs 2.69%** (27 round medians: median 467.27 us,
-min 438.01 us, max 506.47 us); collection wall 16.52 s (>= 1 s PASS); 5,400/5,400
-samples synchronized and key-correlated, 0 invalid frames; pooled raw median
-467.59 us, p95 548.75 us, p99 888.09 us (< 5 ms behavior gate PASS), pooled raw
-spread 55.99% (disclosed; per-key tails include a 15.88 ms scheduler hiccup).
-**The former 1.935 ms median was an artifact of the old protocol (200-key editor
-growth across the round, snapshot-start boundary, accepted fallback frames,
-concurrent 1 ms sampler), not an operating point of the lane.** Multiple vs
-floor: unproven until attribution and floor revalidation.
+**Operative result (iteration 31, post first-frame stdin fix): trusted —
+round-median rs 13.95%** (27 round medians: median 288.26 us, min 273.30 us,
+max 445.85 us); collection wall 11.34 s (>= 1 s PASS); 5,400/5,400 samples
+synchronized and key-correlated, 0 invalid frames; pooled raw median 291.90
+us, p95 437.23 us, p99 532.32 us (behavior gate < 5 ms PASS; pooled raw
+spread 64.6% disclosed — one 11.13 ms scheduler hiccup in the tail); binary
+sha256 `8af89dd1…` (measurement collector + first-frame stdin fix).
+
+History: the iteration-30 initial capture on a production tree identical to
+`6318fa3` (binary `58592a9d…`) measured median 467.59 us pooled / 467.27 us
+round-median, rs 2.69% — trusted by the gates but inflated: the startup probe
+collector still owned stdin into the first ~30 samples of each round, so early
+keys were re-injected late through the synthetic mapper. The iteration-31
+first-frame stdin fix removed that interference; the numbers above are the
+operative lane. Multiple vs floor: unproven until attribution and floor
+revalidation.
 
 ## Decomposition status
 
-Trusted inclusive lane total T = 467.6 us median (above). Attribution into
-T = X + Q + D + R + P with ownership separation (R once to render-churn, P once
-to terminal-paint, charged once) plus the raw-vs-EventStream fixture differential
-is the iteration-28 prerequisite. No verdict asserted yet.
+Trusted inclusive lane total T = 291.9 us median (operative, above).
+Attribution into T = X + Q + D + R + P with ownership separation (R once to
+render-churn, P once to terminal-paint, charged once) plus the raw-vs-
+EventStream fixture differential is the iteration-32 prerequisite. No verdict
+asserted yet.
