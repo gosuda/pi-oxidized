@@ -1,8 +1,9 @@
 # Floor ledger: extension RPC dispatch (frame path, correlation, host loop)
 
 Owning R2 hot rows (lanes 5/6): *JSONL frame encode/decode*, *Request correlation (id
-matching)*, *Host loop dispatch*, *Widget callback + UI-slot traffic*. State: **OPEN >2x
-(trusted — S = 4399 ns, rs_S = 9.93%, noise gate passed; Q = 2923 ns, H = 1462 ns).**
+matching)*, *Host loop dispatch*, *Widget callback + UI-slot traffic*. State:
+**CONSTRAINED-ABOVE-FLOOR (terminal — E1-E4 exhaustion at iteration 26; trusted
+S = 3058 ns, rs_S = 16.37%, noise gate passed; Q = 1708 ns, H = 1306 ns).**
 
 ## Contract (from call sites, tests, signatures — never internals)
 
@@ -29,7 +30,7 @@ encode one res line                                                    ~0.3 us
                                                                      ---------
 floor                                                                ~0.75-1 us/request
 ```
-## Measured cost — iterations 22-25 (PERF-T11 #97, 2026-08-28/29)
+## Measured cost — iterations 22-26 (PERF-T11 #97, 2026-08-28/29)
 
 A timed `serve_io` lane was added to `crates/pi-ext/tests/serve_io_scaling.rs`
 (ignored, release-only, gated by the `bench-seam` Cargo feature). The lane
@@ -194,3 +195,109 @@ dispatch fails the budget contract). The current total server cost (3058
 ns) is ~1300× under the 4 ms budget. The remaining Q (~1708 ns) is
 channel handoff + worker wake; the next candidate would attack that or H
 (handler + encode ~1306 ns).
+
+### Iteration 26 — E1-E4 exhaustion (CONSTRAINED-ABOVE-FLOOR) (2026-08-29)
+
+Terminal docs-only record: no candidate was executed this iteration. The
+safe design space was executed and accepted in iteration 25 (1.44x); every
+remaining in-unit mechanism is boundary-infeasible on the recorded advocate
+proofs, not a performance miss. Provenance:
+`agent://RpcInlineDesignAdvocate` (0.99 confidence — block-must-fix on the
+inline terminalInput fast path) and `agent://RpcFusedLoopAdvocate` (0.98
+confidence — block-must-fix on the fused reader+FuturesUnordered loop).
+
+#### E1 — decomposition reconciliation (trusted iteration-25 medians)
+
+| Term | ns/request | Share of S | Status |
+|---|---|---|---|
+| Q — channel handoff (`try_send` + `recv` + worker wake) + `FuturesUnordered::push` | 1,708 | 55.9% | required isolation handoff (E4) |
+| H — handler + response construction + encode | 1,306 | 42.7% | AT-FLOOR (E3) |
+| **S — total server (encode_complete − decode_start)** | **3,058** | — | rs_S = 16.37%, gate passed |
+
+Reconciliation: Q and H are medians of independently accumulated
+distributions, so they need not sum exactly to the S median: 1708 + 1306 =
+3014 ns vs S_median = 3058 ns (44 ns, 1.4% of S — the round-level location
+shifts recorded in iterations 22-25 correlate Q and H within a round, so
+the median of the sum exceeds the sum of the medians). The identity
+Q + H = S is exact per request: asserted for all 300×27 = 8100 samples in
+the iteration-25 run. Inclusive RTT (median 12,387 ns/request) remains
+reference only — it spans reader/writer and transport wait, not server
+work. Distributions are the iteration-25 measurements; no new measurement
+was taken this iteration.
+
+#### E2 — candidate history and evidence
+
+1. **Executed safe design — one supervised request worker over
+   `FuturesUnordered` (iteration 25)**: per-request `JoinSet::spawn`
+   replaced by one long-lived worker fed by a bounded mpsc (capacity =
+   `max_in_flight`), `select!` over `job_rx.recv()` and `pending.next()`.
+   Measured **1.44x** (S 4399 → 3058 ns; Q 2923 → 1708 ns, −41.5%; H
+   equivalent within noise), PASSED the ≥1.05x gate, accepted. This is the
+   safe-design endpoint: what remains of Q is the handoff itself.
+2. **Inline `terminalInput` handler on the drive loop** — REJECTED on
+   `agent://RpcInlineDesignAdvocate` (block-must-fix): awaiting the inline
+   future **suspends the one `drive` future**, so the transport reader
+   cannot advance and cancel/request frames behind a terminal callback —
+   in the same batch or a later read — are **delayed**; awaiting each
+   inline request inside the single drive loop **serializes previously
+   concurrent terminal callbacks** (up to `max_in_flight` (default 64)
+   overlap today → 1) and reorders responses from callback-completion
+   order to request order; and the cooperative `tokio::time::timeout`
+   **cannot preempt a non-yielding callback** (spin, blocking I/O, or an
+   indefinite lock defeats the 4 ms budget without bound — the trait
+   documents no nonblocking/cooperative/bounded-poll contract).
+   Boundary-infeasible, not a performance miss.
+3. **Fused reader + `FuturesUnordered` completions loop** — REJECTED on
+   `agent://RpcFusedLoopAdvocate` (block-must-fix): polling arbitrary
+   extension futures inside `drive` **loses task isolation** — one
+   non-yielding extension poll blocks the transport reader (the separate
+   worker task is what lets cancellation/EOF proceed on another runtime
+   worker); the proposed `reader_eof` state **changes clean-EOF abortive
+   teardown into an unbounded drain** unless corrected (a never-resolving
+   callback holds shutdown); and **fairness becomes load-bearing** — the
+   proposed `biased;` reader-first select starves admitted requests under
+   sustained readable input (permits never release; every later request
+   falsely rejected as overloaded), and completion-first bias is equally
+   wrong. Boundary-infeasible, not a performance miss.
+
+#### E3 — floor and multiple revalidation
+
+Floor **~0.75-1.0 us/request** (revalidated — no input, dependency, or
+protocol change since the R9 computation; the lane replays the identical
+300-request corpus over an in-memory duplex).
+
+- Interior H = **1.306 us ≤ 1.5 us** = 2× the conservative floor lower
+  bound (0.75 us): the interior handler/response-construction/encode work
+  is **AT-FLOOR** — no ≥1.05x candidate exists inside H.
+- Total S = **3.058 us is 3.06×-4.08× the floor** (3058/1000 to 3058/750).
+  This is a constraint statement, NOT a claim that 3.058 us is a physical
+  floor: the gap over the floor is held open by Q (E4), not by interior
+  work.
+
+#### E4 — dominant residual and reopen conditions
+
+Dominant residual: **Q = 1.708 us** — the required **cross-task isolation
+handoff** that keeps arbitrary extension callbacks off the transport reader
+while preserving cancellation (registration-before-enqueue, abortive
+teardown on EOF/error), bounded concurrency (`max_in_flight` permits), and
+one-response-per-id. Every mechanism that would remove the handoff
+collapses one of those contract properties (E2 items 2-3). Reopen only on:
+
+1. **Cooperative/nonblocking extension-callback contract** — a trait-level
+   bounded-poll or blocking-disclosure guarantee enforced at the adapter
+   seam: the callback becomes safe to poll on the drive loop; inline/fused
+   execution becomes feasible and Q collapses toward zero.
+2. **Serialized terminal callbacks + delayed cancel/EOF accepted** as an
+   explicit re-contracting of observable extension behavior: inline await
+   becomes feasible; same Q collapse.
+3. **A different runtime primitive proven (measured, not projected) to
+   preserve task isolation and clear ≥1.05x** — e.g. a preemptible
+   callback executor or a dedicated-thread worker with a cheaper handoff.
+   Micro-tuning the existing handoff (unbounded channel, capacity bumps,
+   allocator tweaks) is NOT a materially distinct design: it does not
+   remove the handoff, and unbounded channels sacrifice the
+   bounded-memory/backpressure contract.
+
+**Verdict: CONSTRAINED-ABOVE-FLOOR.** Unit terminal in the campaign
+records; issue #97 stays OPEN. Next ordered unit: **`keypress-dispatch`**
+(measurement prerequisite — measurement remediation first).
