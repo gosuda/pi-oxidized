@@ -2558,3 +2558,204 @@ Out of scope, file-disjoint: production `serve_io` logic (only
 `#[cfg(feature = "bench-seam")]` seam calls added/modified), `Cargo.toml`,
 `Cargo.lock`, `.github/workflows/`, `scripts/`, other floor ledgers,
 `rust-toolchain.toml`.
+
+## Iteration 25 — `extension-rpc-dispatch` (FuturesUnordered request worker — S gate PASSED, OPEN >2x, win 1.44x)
+
+Commit: see `git log` (`perf(t11)` + `docs(t11)`). Date 2026-08-29.
+
+**Unit**: `extension-rpc-dispatch` (unchanged from iterations 22-24). Floor:
+750-1000 ns/request (server-only, computed from contract).
+
+**Goal**: replace per-request `JoinSet::spawn` with one long-lived
+supervised request worker owning a `FuturesUnordered` of request futures,
+eliminating the per-request spawn allocation and JoinSet bookkeeping that
+dominates Q (spawn + cooperative scheduler hop = 2923 ns, 66.5% of S in
+iteration 24). Preserve drive-loop responsiveness to cancel frames,
+bounded concurrency, exact teardown, and one-response-per-id.
+
+### Implementation
+
+Added a `RequestJob` struct owning the frame, `OwnedSemaphorePermit`,
+optional `ShortcutClaim`, and optional `CancellationToken`. Added a
+`run_request_worker` async function: one long-lived task that owns a
+`FuturesUnordered<Pin<Box<dyn Future<Output = ()> + Send>>>` and uses
+`tokio::select!` over `job_rx.recv()` and `pending.next()` (guarded by
+`if !pending.is_empty()`). Each admitted job is pushed as the existing
+panic-guarded `handle_request` future — no callback serialization, max
+overlap remains `max_in_flight`.
+
+`dispatch_request` retains the exact synchronous admission order
+(semaphore permit, shortcut claim, cancellation token registration) then
+`try_send`s an owned `RequestJob` to the bounded channel instead of
+`tasks.spawn`. On `Full`: undoes in-flight registration, drops permit/claim,
+emits one correlated `overloaded` error via `rejection_tx`. On `Closed`:
+undoes registration, drops permit/claim, returns `ServerError::Io` (fatal).
+
+`serve_io_inner` creates the bounded channel (capacity = `max_in_flight`)
+and spawns the worker before `drive`. Teardown: `drop(job_tx)`, cancel
+in-flight tokens, `worker_handle.abort()` + `await` (dropping pending
+futures, releasing permits/claims via RAII), then `tasks.abort_all()` +
+join (theme tasks), then `drop(rejection_tx)` + `drop(runtime)` +
+`writer_shutdown.cancel()` + reap writer/rejection flusher — preserving
+the existing writer/rejection teardown ordering. The current code aborts
+requests (no graceful drain), so the worker is aborted, not drained.
+
+`drive` and `dispatch_ready` signatures gain a `&mpsc::Sender<RequestJob>`
+parameter. Cancel events (`tool.cancel` / `provider.cancel`) remain
+processed synchronously in `drive` → `dispatch_ready` while worker
+futures are pending — the drive loop never awaits request futures.
+
+Added `max_in_flight: usize` field to `ServerRuntime` (stored from
+`config.max_in_flight.max(1)`) for the channel capacity. Added imports:
+`FuturesUnordered`, `StreamExt` from `futures`, `OwnedSemaphorePermit`
+from `tokio::sync`. No new dependencies; `futures` 0.3.34 (already in
+`Cargo.toml` with `alloc` feature) provides `FuturesUnordered` and
+`StreamExt`.
+
+### Protocol
+
+```
+taskset -c 20 env BENCH_MEASURED_ROUNDS=27 cargo test -p pi-ext --features bench-seam --test serve_io_scaling --release -- --ignored --exact --nocapture timed_serve_io_perf_t11_extension_rpc_dispatch
+```
+
+3 warmup + 27 measured rounds; identical 300-request `terminalInput`
+corpus (ids 300-599, x/a/b cycling); fresh current-thread runtime per
+round; CPU pinned to core 20. Canonical baseline binary built from
+e426e73; design binary built from the perf commit. Alternating A/B
+protocol (9 pairs, 9 measured rounds each) run first, then 27-round
+trusted run for the design binary.
+
+### A/B protocol (9 alternating pairs, `taskset -c 20`, 9 measured rounds)
+
+| Pair | Baseline S (ns) | Design S (ns) | Baseline rs_S | Design rs_S |
+|---|---|---|---|---|
+| 1 | 4,634 | 3,306 | 29.05% | 29.29% |
+| 2 | 4,443 | 3,054 | 44.26% | 27.03% |
+| 3 | 4,312 | 2,030 | 24.03% | 7.22% |
+| 4 | 2,754 | 1,892 | 9.61% | 10.43% |
+| 5 | 2,682 | 1,850 | 23.97% | 9.33% |
+| 6 | 1,555 | 1,874 | 40.18% | 20.42% |
+| 7 | 2,642 | 1,822 | 19.41% | 41.23% |
+| 8 | 2,906 | 1,976 | 44.09% | 31.67% |
+| 9 | 2,597 | 2,480 | 42.30% | 27.31% |
+
+Design S is lower than baseline in 8/9 pairs (pair 6 is the exception:
+baseline hit a low-noise cluster at 1555 ns). Design Q is consistently
+lower: median Q drops from ~2900 ns to ~1000 ns across pairs.
+
+### Trusted measurement (27 measured rounds, `taskset -c 20`, release)
+
+| Round | RTT (ns/req) | Q_median (ns) | H_median (ns) | S_median (ns) |
+|---|---|---|---|---|
+| 1 | 12,531 | 1,788 | 1,328 | 3,141 |
+| 2 | 12,471 | 1,733 | 1,315 | 3,093 |
+| 3 | 12,386 | 1,704 | 1,311 | 3,039 |
+| 4 | 12,335 | 1,712 | 1,298 | 3,039 |
+| 5 | 12,403 | 1,721 | 1,297 | 3,057 |
+| 6 | 12,387 | 1,700 | 1,292 | 3,018 |
+| 7 | 12,523 | 1,719 | 1,313 | 3,070 |
+| 8 | 11,138 | 1,456 | 1,114 | 2,586 |
+| 9 | 12,574 | 1,754 | 1,348 | 3,127 |
+| 10 | 12,366 | 1,708 | 1,276 | 3,019 |
+| 11 | 12,484 | 1,693 | 1,321 | 3,058 |
+| 12 | 12,527 | 1,753 | 1,324 | 3,080 |
+| 13 | 12,264 | 1,712 | 1,314 | 3,067 |
+| 14 | 12,373 | 1,694 | 1,297 | 3,023 |
+| 15 | 12,391 | 1,706 | 1,337 | 3,067 |
+| 16 | 12,258 | 1,670 | 1,296 | 2,982 |
+| 17 | 5,937 | 805 | 635 | 1,443 |
+| 18 | 5,196 | 719 | 548 | 1,284 |
+| 19 | 12,480 | 1,674 | 1,284 | 3,015 |
+| 20 | 22,411 | 1,706 | 1,381 | 3,097 |
+| 21 | 14,309 | 1,887 | 1,714 | 3,603 |
+| 22 | 12,333 | 1,671 | 1,306 | 3,001 |
+| 23 | 12,214 | 1,728 | 1,294 | 3,062 |
+| 24 | 12,420 | 1,731 | 1,311 | 3,075 |
+| 25 | 12,695 | 1,762 | 1,310 | 3,101 |
+| 26 | 8,011 | 1,154 | 827 | 1,980 |
+| 27 | 12,384 | 1,746 | 1,292 | 3,070 |
+
+Aggregate (median of round medians):
+
+| Metric | Value |
+|---|---|
+| Inclusive RTT (median) | 12,387 ns/request |
+| Q (spawn + cooperative hop) | 1,708 ns/request |
+| H (handler + encode) | 1,306 ns/request |
+| S (total server) | 3,058 ns/request |
+| rs_Q | 16.02% |
+| rs_H | 17.30% |
+| rs_S | 16.37% |
+| Noise gate (rs_S ≤ 0.20) | **PASSED** |
+| Win vs iteration-24 baseline (S) | 4399 / 3058 = **1.44x** (≥1.05 gate) |
+| Q reduction | 2923 → 1708 ns (−41.5%, material) |
+| H equivalence | 1462 → 1306 ns (within noise) |
+
+Q_median samples (ns): [1788, 1733, 1704, 1712, 1721, 1700, 1719, 1456, 1754, 1708, 1693, 1753, 1712, 1694, 1706, 1670, 805, 719, 1674, 1706, 1887, 1671, 1728, 1731, 1762, 1154, 1746]
+
+H_median samples (ns): [1328, 1315, 1311, 1298, 1297, 1292, 1313, 1114, 1348, 1276, 1321, 1324, 1314, 1297, 1337, 1296, 635, 548, 1284, 1381, 1714, 1306, 1294, 1311, 1310, 827, 1292]
+
+S_median samples (ns): [3141, 3093, 3039, 3039, 3057, 3018, 3070, 2586, 3127, 3019, 3058, 3080, 3067, 3023, 3067, 2982, 1443, 1284, 3015, 3097, 3603, 3001, 3062, 3075, 3101, 1980, 3070]
+
+RTT samples (ns/req): [12531, 12471, 12386, 12335, 12403, 12387, 12523, 11138, 12574, 12366, 12484, 12527, 12264, 12373, 12391, 12258, 5937, 5196, 12480, 22411, 14309, 12333, 12214, 12420, 12695, 8011, 12384]
+
+### Attribution analysis
+
+Q dropped from 2923 ns (iteration 24) to 1708 ns (−41.5%). The remaining
+Q (~1708 ns) is the channel handoff (`try_send` + `recv` + scheduler wake
+of the worker task) plus the `FuturesUnordered::push` overhead. The
+per-request `JoinSet::spawn` allocation and task registration are
+eliminated. The worker task is spawned once and reused for all requests.
+
+H remained equivalent: 1462 ns → 1306 ns (within noise — rs_H = 17.30%
+vs iteration 24's 10.65%). The handler, response construction, and encode
+costs are unchanged.
+
+S dropped from 4399 ns to 3058 ns (win 1.44x). The noise gate passed at
+rs_S = 16.37% (≤ 20%). The dominant cluster is ~3000-3100 ns (20 of 27
+rounds), with low outliers at 1284/1443/1980/2586 ns (rounds 17, 18, 26,
+8) and one high outlier at 3603 ns (round  21). The low outliers
+correspond to rounds where both Q and H dropped together (same per-round
+sticky scheduler shape as iteration 24), not one component oscillating
+independently.
+
+### Classification
+
+**OPEN >2x** — S = 3058 ns > 2000 ns = 2× floor_max (1000 ns). The noise
+gate passed (rs_S = 16.37% ≤ 20%), so this classification is trusted.
+
+### Gate verdict
+
+| Gate | Criterion | Result |
+|---|---|---|
+| Win | S_baseline / S_design ≥ 1.05 | 4399 / 3058 = 1.44x **PASS** |
+| Q decrease | Q_design < Q_baseline (material) | 1708 < 2923 (−41.5%) **PASS** |
+| H equivalence | H_design ≈ H_baseline | 1306 ≈ 1462 (within noise) **PASS** |
+| Noise | rs_S ≤ 0.20 | 16.37% **PASS** |
+| Cargo.lock | unchanged | sha256 `9eef233d...` **PASS** |
+| Correctness | scaling + server tests | 10/10 + 55/55 **PASS** |
+| Review | fresh adversarial | **CLEAN** |
+
+**Accepted**: perf commit + docs/ledger record.
+
+### Verification
+
+- `cargo test -p pi-ext --test serve_io_scaling` (no feature): 10/10 pass
+- `cargo test -p pi-ext --features bench-seam --test serve_io_scaling` (debug): 10/10 pass, 1 ignored
+- `cargo test -p pi-ext --lib -- server::tests`: 55/55 pass
+- `cargo test -p pi-ext --features bench-seam --test serve_io_scaling --release --no-run`: compiles clean
+- `taskset -c 20 env BENCH_MEASURED_ROUNDS=27 /tmp/bench_design_iter25 --test timed_serve_io_perf_t11_extension_rpc_dispatch --ignored --exact --nocapture`: 1 passed, noise gate passed, classification OPEN >2x
+- Q+H==S asserted per-request for all 300×27 = 8100 samples
+- All 300 complete triplets per round (no missing timestamps)
+- `Cargo.lock`: byte-identical (sha256 `9eef233d...`)
+
+### Review
+
+Fresh adversarial review: **CLEAN** (0 findings, confidence 0.96).
+
+### Not touched
+
+Out of scope, file-disjoint: `Cargo.toml`, `Cargo.lock`,
+`.github/workflows/`, `scripts/`, other floor ledgers,
+`rust-toolchain.toml`, `serve_io_scaling.rs` (test lane unchanged from
+iteration 24).

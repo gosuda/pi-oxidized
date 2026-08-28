@@ -29,7 +29,7 @@ encode one res line                                                    ~0.3 us
                                                                      ---------
 floor                                                                ~0.75-1 us/request
 ```
-## Measured cost — iterations 22-24 (PERF-T11 #97, 2026-08-28)
+## Measured cost — iterations 22-25 (PERF-T11 #97, 2026-08-28/29)
 
 A timed `serve_io` lane was added to `crates/pi-ext/tests/serve_io_scaling.rs`
 (ignored, release-only, gated by the `bench-seam` Cargo feature). The lane
@@ -138,6 +138,35 @@ the `terminalInput` handler on the drive loop (skip `tasks.spawn` for
 non-cancellable methods), collapsing Q toward zero and leaving H (~1462 ns)
 as the server cost.
 
+### Iteration 25 — FuturesUnordered request worker (2026-08-29)
+
+Replaced per-request `JoinSet::spawn` with one long-lived supervised
+request worker owning a `FuturesUnordered` of request futures, connected
+to `dispatch_request` via a bounded mpsc channel (capacity =
+`max_in_flight`). The worker polls jobs concurrently using `select!`
+over `job_rx.recv()` and `pending.next()`. This eliminates the
+per-request spawn allocation and JoinSet bookkeeping while preserving
+drive-loop cancel responsiveness, bounded concurrency, exact teardown,
+and one-response-per-id.
+
+| Metric | Iteration 24 (baseline) | Iteration 25 (design) |
+|---|---|---|
+| Q (spawn + hop) | 2,923 ns | 1,708 ns (−41.5%) |
+| H (handler + encode) | 1,462 ns | 1,306 ns (equivalent) |
+| S (total server) | 4,399 ns | 3,058 ns (win 1.44x) |
+| rs_S | 9.93% | 16.37% |
+| Noise gate | PASSED | PASSED |
+| Classification | OPEN >2x | OPEN >2x |
+
+The remaining Q (~1708 ns) is the channel handoff (`try_send` + `recv` +
+worker wake) plus `FuturesUnordered::push`. The per-request `JoinSet`
+spawn allocation and task registration are eliminated. H is unchanged.
+S = 3058 ns is still >2× floor_max (2000 ns), so the unit remains
+**OPEN >2x (trusted)**. The 4 ms budget is ~1300× under (3058 ns vs 4 ms).
+The next candidate would attack the remaining Q (channel handoff +
+worker wake) or H (handler + encode), but the win (1.44x) clears the
+≥1.05 gate and the change is accepted.
+
 ### Prior unproven state (superseded by this measurement)
 
 Rust: the serve_io scaling suite was correctness-only (no timed distributions;
@@ -150,20 +179,18 @@ PERF-T6 correctness suite already replays the identical corpus — adding
 distributions is the named unblock; D8 registry entry "Rust-vs-upstream
 extension-host scaling"), and/or (b) TS-side noise remediation (enlarge
 per-request work or widen samples per the R2 ladder).
-
-## Decomposition status
-
-Trusted lane total: S = 4399 ns (rs_S = 9.93%, noise gate passed).
-Attributed categories:
-  Q (spawn + cooperative scheduler hop) = 2923 ns (66.5% of S)
-  H (handler + response construction + encode) = 1462 ns (33.2% of S)
+Trusted lane total (iteration 25): S = 3058 ns (rs_S = 16.37%, noise gate
+passed). Attributed categories:
+  Q (channel handoff + worker wake) = 1708 ns (55.9% of S)
+  H (handler + response construction + encode) = 1306 ns (42.7% of S)
   Q + H = S verified per-request for all 300×27 = 8100 samples.
 
+Prior trusted total (iteration 24): S = 4399 ns, Q = 2923 ns, H = 1462 ns.
+Iteration 25 reduced Q by 41.5% (2923 → 1708 ns) by eliminating
+per-request JoinSet::spawn. H is equivalent (within noise). Win = 1.44x.
+
 The 4 ms terminal-input budget is a *constraint* on any rebuild (a slower
-dispatch fails the budget contract), recorded here because Phase-5 candidates
-must respect it. The current total server cost (4399 ns) is ~900× under the
-4 ms budget. The dominant cost is Q (spawn + cooperative hop), confirmed by
-hop attribution. The named iteration-25 candidate (inline `terminalInput`
-handler on the drive loop, skip `tasks.spawn` for non-cancellable methods)
-would collapse Q toward zero and leave H (~1462 ns) as the server cost —
-potentially classifiable as BOUNDARY or AT-FLOOR after re-measurement.
+dispatch fails the budget contract). The current total server cost (3058
+ns) is ~1300× under the 4 ms budget. The remaining Q (~1708 ns) is
+channel handoff + worker wake; the next candidate would attack that or H
+(handler + encode ~1306 ns).
