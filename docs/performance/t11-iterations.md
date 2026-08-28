@@ -2879,3 +2879,108 @@ OPEN for the remaining units. Next ordered unit: **`keypress-dispatch`**
 (`server.rs`, `protocol.rs`), `serve_io_scaling.rs` (test lane unchanged
 from iteration 24), `Cargo.lock`, `rust-toolchain.toml`,
 `.github/workflows/`, `scripts/`, other floor ledgers.
+
+---
+
+## Iteration 27 — `startup-version-path` (sync arg dispatch before runtime construction — OPEN >2x, win 1.59x wall / 3.99x Ir)
+
+Date 2026-08-29. Base `6318fa3` (canonical origin/feat/ver-align-canonical-pin,
+iteration 26). Perf commit + this docs record.
+
+### Blind derivation (ledger only, before any replaced body was read)
+
+Contract: `--version` sets a flag in a hand-rolled single-pass parser and the
+process prints the compile-time `VERSION` constant and exits 0. Floor: one
+write(2) of ~9 B plus an argv scan ≈ 0.15 us. Decomposition: ~35% of
+in-process Ir in tokio worker machinery; the wall layer is 80 clone3 + a
+futex/munmap teardown storm. The ledger's addressable-overhead note names
+the lever: runtime construction precedes argument dispatch, so the flag-exit
+path pays for a runtime it never uses. Candidate, fixed before reading
+`entry.rs` / `bootstrap.rs` bodies: make argument dispatch synchronous and
+runtime-free; construct the multi-thread runtime only when the pipeline
+continues past dispatch.
+
+### Design (single home preserved, no duplicated dispatch)
+
+- `initialize_bootstrap` (parse → package/config subcommand dispatch →
+  diagnostics → `--version` / export exits) is fully synchronous and already
+  ran before the first `await` of `run_bootstrap`. It is hoisted above runtime
+  construction into `entry::run`.
+- `run_bootstrap` composes init + a new `run_bootstrap_parsed` continuation
+  (everything after init, byte-unchanged); `run()` calls init synchronously,
+  then builds the runtime and blocks on the continuation. The outcome →
+  exit-code / mode-runner tail moved into `dispatch_outcome`, shared by
+  `run()` and `run_pipeline`. The test seam is unchanged (init still inside
+  `run_bootstrap`); `run_pipeline_version_exits_zero` passes.
+- The one runtime-dependent init leaf, `RealPackageHandler::open_config_selector`
+  (interactive `pi config`), drove its future on the ambient multi-thread
+  runtime via `block_in_place` + `Handle::current`; with init hoisted above
+  runtime construction that would panic. It now runs `select_config` on a
+  dedicated OS thread with its own current-thread runtime (the
+  `refresh_models` worker shape; `spawn_blocking` inside works there). Two
+  review rounds were needed: in-runtime `Builder::build` panics, so a plain
+  nested runtime was not enough; the thread is. Found by this iteration's
+  adversarial review, fixed before push; off the pinned workload path
+  (non-tty runs early-error in `select_config`), so measurements are
+  unaffected.
+
+### Replaced-branch classification
+
+- essential: argv parse, diagnostics print, package/config dispatch, version
+  write + exit-code mapping (the contract rows; same code, same order, one
+  home);
+- residue: multi-thread runtime build + 80-thread teardown on every flag-exit
+  path (paid for nothing on those paths; eliminated for them by construction,
+  not suppressed);
+- essential, unchanged: the runtime-build-failure branch, now only reachable
+  when the pipeline continues past dispatch.
+
+### Boundary answers (explicit, before touch)
+
+1. Version text byte-identical: same `io.write_stdout(VERSION)` call;
+   diffed base vs after binaries: identical bytes, exit 0 both.
+2. Exit code 0: same `stop(0, false)` → `ExitCode::from(code)` mapping.
+3. `--help` and all other flags unchanged: init's branch order (package →
+   config → diagnostics-error → version → export) untouched, so combined-arg
+   behavior (e.g. `pi package list --version`, `pi --version -Z`) is
+   unchanged; `--help` and `--no-session --print hello` diffed base vs after:
+   byte-identical output and equal exit codes in the same sandbox.
+4. stdout/stderr routing unchanged: same `BootstrapIo` handles, same write
+   order; `output_guard::take_over_stdout` still runs later, in
+   `prepare_session`, in both shapes.
+5. Noted, contract-conformant: `--version` no longer surfaces runtime
+   construction failure. The ledger contract is "prints VERSION and exits
+   0", and the version short-circuit already never reached the runtime in
+   tests (`run_pipeline_version_exits_zero`).
+
+### Measurements (same machine, release lto=fat/cgu=1/strip; wall pinned
+`taskset -c 20-40`, hyperfine `-N`, ≥50 runs, 5 warmup)
+
+| instrument | before (6318fa3) | after | win |
+|---|---|---|---|
+| hyperfine wall, paired run | 5.9 ms ± 0.9 | 3.7 ms ± 0.6 | **1.59x** |
+| hyperfine wall, quiet-window pair (same shapes) | 6.3 ms ± 0.8 | 3.2 ms ± 0.8 | 1.97x |
+| callgrind in-process Ir | 3,767,328 | 945,385 | **3.99x** |
+| strace -f -c syscalls | 2788 | 84 | 33x |
+| sub: clone3 (worker threads) | 80 | 0 | — |
+| sub: futex | 705 | 0 | — |
+| User+Sys per run (hyperfine) | 11.0 ms | 3.5 ms | 3.1x |
+
+Gate: ≥1.05x median, PASS (1.59x paired; 1.97x quiet window). Scoped
+verification: `cargo check -p pi` green; `cargo test -p pi cli` 164 passed /
+0 failed (one environmental failure, a gitignored prebuilt
+`pi-extension-host` artifact missing in a fresh worktree, reproduced at base
+with the artifact absent and cleared by providing the artifact; unrelated to
+the diff); live smoke: `--version` → `0.1.0` exit 0, `--help` and a normal
+flag path parity-diffed base vs after.
+
+### Multiple recompute
+
+Ledger convention (3.95 M Ir ≈ 0.37 ms → 93.7 ns per 1000 Ir): 945,385 Ir ≈
+88.6 us → 88.6 / 0.15 us ≈ **591x**. Still ≫ 2x → the win is logged as
+intermediate and the unit stays OPEN pending a materially distinct
+in-boundary design or the E1-E4 exhaustion record (iteration 28).
+
+**Not touched** (out of scope, file-disjoint): `crates/pi-tui/`,
+`crates/pi-ext/`, `.github/workflows/`, `scripts/`, `Cargo.lock`,
+`rust-toolchain.toml`, other units' floor ledgers, `packages/`.

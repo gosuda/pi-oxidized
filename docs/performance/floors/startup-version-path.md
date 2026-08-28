@@ -52,3 +52,24 @@ The fast-exit path pays for a runtime it never uses: deferring runtime construct
 past argument dispatch (or lazily on first async need) removes the thread-spawn/futex
 storm and most of the 15 ms direct wall. The hot rows themselves are effectively at
 floor. Boundary: CLI observable (version text, exit 0) unchanged.
+
+## Measured cost — iteration 27 (PERF-T11 #97, 2026-08-29)
+
+Sync arg dispatch before runtime construction (perf commit on `6318fa3`,
+iteration 27): argument dispatch (parse, package/config subcommands,
+diagnostics, `--version`) now runs before any tokio machinery exists; the
+multi-thread runtime is constructed only when the pipeline continues past
+dispatch. Pinned instruments, same machine, release lto=fat: hyperfine wall
+(paired run, `taskset -c 20-40`, `-N`, ≥50 runs) 5.9 ms ± 0.9 → 3.7 ms ± 0.6
+(1.59x; quiet window 6.3 → 3.2 ms, 1.97x); callgrind in-process Ir
+3,767,328 → 945,385 (3.99x); strace census 2788 → 84 syscalls, clone3 80 → 0,
+futex 705 → 0. Contract observable verified byte-identical (`--version` →
+`0.1.0`, exit 0; `--help` and a normal flag path parity-diffed base vs after).
+
+Multiple recompute (93.7 ns per 1000 Ir): 945,385 Ir ≈ 88.6 us → ≈ 591x the
+0.15 us floor. **OPEN** (intermediate win logged; >2x).
+
+Remaining decomposition (callgrind attribution, 945,385 Ir): dynamic loader
+(relocation, symbol lookup, version check, tunables) ≈ 751 kIr ≈ 79%; libc
+startup, stdio and env parsing ≈ 89 kIr ≈ 9%; product remainder (static
+init, arg scan, version write) ≈ 106 kIr ≈ 11%.
