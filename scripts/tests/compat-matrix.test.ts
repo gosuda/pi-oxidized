@@ -432,7 +432,9 @@ describe("release tier matrix 0.2.0 (REL-T5)", () => {
 		};
 		for (const row of excludedReleaseRows) {
 			const text = `${row.evidence} ${row.rationale ?? ""} ${row.citation ?? ""}`;
-			expect(text).toContain(witnesses[row.id]);
+			const witness = witnesses[row.id];
+			if (witness === undefined) throw new Error(`no CI witness pinned for ${row.id}`);
+			expect(text).toContain(witness);
 		}
 	});
 
