@@ -654,23 +654,35 @@ jobs:
           printf 'archive=%s\nroot=%s\n' "$(basename "$archive")" "$root" \
             | tee "$EVIDENCE/archive.txt"
 
-          # REL-R3 §5.2 condition 5: no sideloaded ConPTY shim next to the
-          # packed pi.exe — portable-pty 0.9.0 prefers a sideloaded
-          # conpty.dll over the OS conhost, which would silently change the
-          # driver under test.
-          if compgen -G "$root/conpty.dll" >/dev/null || \
-             compgen -G "$root/openconsole.exe" >/dev/null; then
-            echo 'sideloaded conpty.dll/openconsole.exe in the deploy dir (REL-R3 §5.2 condition 5)' >&2
-            exit 1
-          fi
+          # Build the harness first so its DLL-search locations are concrete:
+          # portable-pty 0.9.0 prefers a sideloaded conpty.dll over the OS
+          # conhost and resolves the bare name through the loading process's
+          # search order (vendored psuedocon.rs load_conpty, sideload
+          # preference 52-58) — the harness's application directory and this
+          # step's CWD, plus pi.exe's own directory inside the archive. Guard
+          # all three: REL-R3 §5.2 condition 5 forbids a sideloaded shim
+          # anywhere it would silently replace the driver under test.
+          cargo build --release --locked --manifest-path prototype/rel-r3-conpty/Cargo.toml
+          harness=prototype/rel-r3-conpty/target/release/rel-r3-conpty-witness.exe
+          test -x "$harness"
+          for guard_dir in "$(dirname "$harness")" . "$root"; do
+            if compgen -G "$guard_dir/conpty.dll" >/dev/null || \
+               compgen -G "$guard_dir/openconsole.exe" >/dev/null; then
+              echo "sideloaded conpty.dll/openconsole.exe in $guard_dir (REL-R3 §5.2 condition 5)" >&2
+              exit 1
+            fi
+          done
 
-          # Harness exit codes gate the row: 0 all hard assertions pass, 1
-          # hard failures (named in the verdict event), 3 harness/PTY error.
-          # --expect-ready pins the archive's TUI boot header ("type a
-          # message to begin") — the §4 host-hello observable.
-          cargo run --release --locked --manifest-path prototype/rel-r3-conpty/Cargo.toml -- \
-            --pi "$root/pi.exe" \
-            --out "$EVIDENCE" \
+          # Execute the built artifact directly (the §2 recipe's cargo run,
+          # split so the guarded binary is the one that runs). Harness exit
+          # codes gate the row: 0 all hard assertions pass, 1 hard failures
+          # (named in the verdict event), 3 harness/PTY error. --expect-ready
+          # pins the archive's TUI boot header ("type a message to begin") —
+          # the §4 host-hello observable. cygpath pins mixed absolute paths so
+          # no MSYS conversion heuristic decides where the harness looks.
+          "$harness" \
+            --pi "$(cygpath -m "$PWD/$root/pi.exe")" \
+            --out "$(cygpath -m "$PWD/$EVIDENCE")" \
             --expect-ready 'type a message'
 
       - name: Upload Artifacts
