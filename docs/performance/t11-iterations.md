@@ -2102,3 +2102,158 @@ Out of scope, file-disjoint: `.github/workflows/`, `scripts/release/`,
 `scripts/verification/compat-matrix.json`, `docs/supported-platforms.md`,
 DEPS ledger docs, floor ledgers, `Cargo.lock`, `rust-toolchain.toml`,
 bench scripts (`session-timing.rs`).
+
+## Iteration 22 — `extension-rpc-dispatch` (timed serve_io lane — NOISY, no classification)
+
+Commit: see `git log` (`perf(t11)`). Date 2026-08-28.
+
+**Unit**: `extension-rpc-dispatch` — JSONL frame encode/decode, request
+correlation (id matching), host loop dispatch, widget callback + UI-slot
+traffic. Floor: 750-1000 ns/request (server-only, computed from contract).
+
+**Goal**: land a trusted timed real-`serve_io` lane for extension RPC
+dispatch, measure it, and classify against the server-only floor. No
+production optimization in this iteration.
+
+### Implementation
+
+Added a `bench-seam` Cargo feature to `pi-ext` (zero production overhead;
+disabled by default). When enabled, `server.rs` exposes a `bench_seam` module
+with `record_decode(id)` / `record_encode(id)` / `take_completed()` / `clear()`
+using a `LazyLock<Mutex<HashMap<u64, (Instant, Option<Instant>)>>>`. Seam
+calls are inserted at:
+
+1. **Decode seam**: after `FrameDecoder::push` returns frames, before
+   `dispatch_ready` — `bench_seam::record_decode(frame.id)` in the `Ready`
+   branch of `drive()`.
+2. **Encode seam**: after `handle_request_dispatch` constructs the terminal
+   frame, before `out_tx.send` — `bench_seam::record_encode(id)`.
+
+Both are `#[cfg(feature = "bench-seam")]` gated — no code in production builds.
+
+Added `#[ignore] #[test] fn timed_serve_io_perf_t11_extension_rpc_dispatch`
+to `serve_io_scaling.rs`. It factors the PERF-T6 300-request corpus into
+shared `corpus_setup` / `corpus_data` helpers (single source of truth — no
+fixture fork). Each round: fresh `current_thread` runtime, setup/hello/load/
+session_start/uiSlot drain outside timing, 300 sequential `terminalInput`
+(ids 300-599, x/a/b cycling) inside timing. Measures:
+
+- **Inclusive RTT**: batch wall time / 300 (client encode → duplex → server
+  → response decode).
+- **Attributed server S**: per-request `encode_complete − decode_start` from
+  seam timestamps, median of 300 per round.
+
+3 warmup + 9 measured rounds (env `BENCH_MEASURED_ROUNDS` for retry). Noise
+gate: population stddev / median ≤ 0.20. Classification: S ≤ 1500 ns →
+AT-FLOOR; S > 2000 ns → OPEN >2x; 1500 < S ≤ 2000 → BOUNDARY fail-closed.
+
+### Measurements
+
+First run (9 measured rounds, `taskset -c 20-40`):
+
+| Round | RTT (ns/req) | S_median (ns) |
+|---|---|---|
+| 1 | 13,216 | 3,930 |
+| 2 | 10,406 | 2,526 |
+| 3 | 14,132 | 3,451 |
+| 4 | 6,090 | 1,748 |
+| 5 | 13,457 | 4,099 |
+| 6 | 13,322 | 3,981 |
+| 7 | 13,200 | 3,982 |
+| 8 | 4,051 | 1,168 |
+| 9 | 8,866 | 2,692 |
+
+Median S = 3,451 ns, rs = 29.63% — **NOISY**.
+
+Retry (27 measured rounds, `taskset -c 20`):
+
+| Round | RTT (ns/req) | S_median (ns) |
+|---|---|---|
+| 1 | 6,692 | 2,032 |
+| 2 | 13,458 | 3,994 |
+| 3 | 13,343 | 4,027 |
+| 4 | 3,548 | 1,076 |
+| 5 | 6,805 | 2,054 |
+| 6 | 13,323 | 4,110 |
+| 7 | 4,134 | 1,114 |
+| 8 | 14,334 | 4,053 |
+| 9 | 13,308 | 4,044 |
+| 10 | 9,110 | 2,842 |
+| 11 | 4,190 | 1,229 |
+| 12 | 3,939 | 1,194 |
+| 13 | 33,255 | 2,914 |
+| 14 | 13,324 | 4,116 |
+| 15 | 13,287 | 4,015 |
+| 16 | 13,164 | 4,012 |
+| 17 | 15,849 | 4,886 |
+| 18 | 5,570 | 1,682 |
+| 19 | 7,294 | 2,257 |
+| 20 | 8,751 | 2,627 |
+| 21 | 13,317 | 3,988 |
+| 22 | 13,562 | 4,118 |
+| 23 | 24,362 | 8,035 |
+| 24 | 23,002 | 7,934 |
+| 25 | 6,644 | 1,982 |
+| 26 | 13,404 | 4,074 |
+| 27 | 19,800 | 6,266 |
+
+Median S = 3,994 ns, rs = 45.24% — **NOISY**.
+
+### Classification
+
+**NOISY — no classification allowed.** The noise gate (rs ≤ 0.20) failed at
+both 9 and 27 measured rounds. The S_median distribution is bimodal: a
+dominant cluster at ~4,000 ns and a secondary cluster at ~1,100-2,000 ns.
+The dominant cluster (~4,000 ns) exceeds the 2,000 ns OPEN threshold
+(2× floor_max = 2× 1,000 ns); the secondary cluster (~1,100-2,000 ns)
+straddles the AT-FLOOR/BOUNDARY/OPEN thresholds. The noise gate prevents
+any classification.
+
+### Instrumentation overhead
+
+Two `std::sync::Mutex` lock/unlock pairs per request (~40-100 ns total),
+present in both warmup and measured rounds. Disclosed but not subtracted.
+The overhead is small relative to the measured ~4,000 ns S and does not
+explain the bimodality.
+
+### Bimodality analysis
+
+The bimodal pattern is consistent across runs and likely originates from
+tokio current-thread runtime scheduling: `dispatch_ready` spawns a task per
+request (`tasks.spawn`), and the attributed S interval spans the task spawn →
+semaphore acquire → handler → `out_tx.send` → writer task wake path.
+Sometimes the spawned task runs to completion before the drive loop yields
+(lower cluster), sometimes it yields back through the scheduler (upper
+cluster). The floor terms (decode ~400 ns, correlate ~50 ns, encode ~300 ns
+= ~750 ns) are dwarfed by the scheduling overhead.
+
+### Next blind candidate (named, not attempted)
+
+If the noise gate can be passed (e.g., by reducing scheduling variability or
+measuring a narrower seam that excludes task-spawn overhead), the dominant
+cost is the per-request `tasks.spawn` + semaphore acquire + `out_tx.send`
+round-trip through the tokio scheduler. A blind candidate would inline the
+terminalInput handler on the drive loop (skip `tasks.spawn` for
+non-cancellable methods), eliminating the spawn + wake overhead. But this
+is an optimization for a future iteration, not this one.
+
+### Verification
+
+- `cargo test -p pi-ext --test serve_io_scaling` (no feature): 10/10 pass,
+  zero warnings
+- `cargo test -p pi-ext --features bench-seam --test serve_io_scaling --release
+  --no-run`: compiles clean
+- `cargo test -p pi-ext --features bench-seam --test serve_io_scaling --release
+  -- --ignored --exact --nocapture timed_serve_io_perf_t11_extension_rpc_dispatch`:
+  runs, produces distributions, fails on noise gate (expected)
+- `Cargo.lock`: byte-identical (sha256 `9eef233d...`)
+
+### Review
+
+Fresh adversarial review: **CLEAN**.
+
+### Not touched
+
+Out of scope, file-disjoint: `.github/workflows/`, `scripts/`, production
+`serve_io` logic (only `#[cfg(feature = "bench-seam")]` seam calls added),
+`Cargo.lock`, `rust-toolchain.toml`, other floor ledgers.
