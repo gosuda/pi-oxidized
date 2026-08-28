@@ -87,12 +87,12 @@ export interface AssembleInputs {
 	 */
 	readonly createdAt: string;
 	/**
-	 * Absolute source paths for the docs/examples/assets trees that get
-	 * copied verbatim into the archive root. Missing paths are skipped
-	 * silently so a workspace can ship a subset.
+	 * Absolute path to the docs tree copied verbatim into `<archiveDir>/docs/`
+	 * of every archive. Required: a release without the shipped documentation
+	 * fails staging rather than silently shipping a doc-less archive.
 	 */
-	readonly docsSource?: string;
-	readonly examplesSource?: string;
+	readonly docsSource: string;
+	/** Absolute path to the assets tree copied into `<archiveDir>/assets/`; skipped when absent. */
 	readonly assetsSource?: string;
 	/**
 	 * Optional set of additional `(src, archiveRelPath)` pairs to copy in,
@@ -168,25 +168,34 @@ export function stagedInputs(inputs: AssembleInputs): readonly StagedInput[] {
 			},
 		);
 	}
-	for (const name of ["CHANGELOG.md", "README.md", "LICENSE", "LICENSE-MIT"]) {
+	// CHANGELOG.md and the docs tree are mandatory release members: the
+	// CHANGELOG gate refuses builds without release notes, and every archive
+	// must ship the documentation. README.md and the license files stay
+	// optional so a workspace can ship a subset (the root README lands with
+	// the documentation track).
+	for (const [name, optional] of [
+		["CHANGELOG.md", false],
+		["README.md", true],
+		["LICENSE", true],
+		["LICENSE-MIT", true],
+	] as const) {
 		staged.push({
 			kind: "metadata-file",
 			source: `${inputs.repoRoot}/${name}`,
 			destRel: name,
-			optional: true,
+			optional,
 		});
 	}
-	for (const [source, destRel] of [
-		[inputs.docsSource, "docs"],
-		[inputs.examplesSource, "examples"],
-		[inputs.assetsSource, "assets"],
-		[`${inputs.repoRoot}/crates/pi/assets/theme`, "theme"],
+	for (const [source, destRel, optional] of [
+		[inputs.docsSource, "docs", false],
+		[inputs.assetsSource, "assets", true],
+		[`${inputs.repoRoot}/crates/pi/assets/theme`, "theme", true],
 	] as const) {
 		staged.push({
 			kind: "tree",
 			source: source ?? "",
 			destRel,
-			optional: true,
+			optional,
 		});
 	}
 	for (const extra of inputs.extraFiles ?? []) {
@@ -254,7 +263,7 @@ class UsedPaths {
 	assertNotReserved(relPath: string): void {
 		const norm = normalizeArchiveRel(relPath);
 		const top = norm.split("/")[0] ?? "";
-		if (RESERVED_TOP_LEVEL[top] && !norm.startsWith("docs/") && !norm.startsWith("examples/") && !norm.startsWith("assets/")) {
+		if (RESERVED_TOP_LEVEL[top] && !norm.startsWith("docs/") && !norm.startsWith("assets/")) {
 			throw new ReleaseVerifyError(
 				`extraFile destination collides with reserved slot: ${norm}`,
 			);
@@ -269,9 +278,8 @@ class UsedPaths {
  *     pi[.exe]
  *     pi-extension-host[.exe]            (compiled path)
  *     bun[.exe], pi-extension-host.js    (fallback path)
- *     CHANGELOG.md, README.md, LICENSE
- *     docs/...                           (recursive)
- *     examples/...                       (recursive)
+ *     CHANGELOG.md (required), README.md, LICENSE
+ *     docs/...                           (recursive, required)
  *     assets/...                         (recursive)
  *     release.json
  *
@@ -438,7 +446,14 @@ async function copyStagedFile(
 	optional: boolean,
 	used: UsedPaths,
 ): Promise<ManifestFile | null> {
-	const data = await readStagedFile(fs, src, optional);
+	let data: Uint8Array | null;
+	try {
+		data = await readStagedFile(fs, src, optional);
+	} catch (error) {
+		throw new ReleaseVerifyError(
+			`required staged file is missing: ${src} (${errMessage(error)})`,
+		);
+	}
 	if (!data) return null;
 	used.claim(destRel);
 	const dest = safeJoinPath(archiveDir, destRel);
@@ -470,7 +485,9 @@ async function copyTreeOptional(
 		}
 	} catch (error) {
 		if (optional) return [];
-		throw error;
+		throw new ReleaseVerifyError(
+			`required staged tree is missing or unreadable: ${src} (${errMessage(error)})`,
+		);
 	}
 
 	const destRoot = safeJoinPath(archiveDir, destSubdir);

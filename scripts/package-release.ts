@@ -53,6 +53,56 @@ const CARGO_BUILD_TIMEOUT_MS = 30 * 60_000;
 const ARCHIVE_TOOL_TIMEOUT_MS = 2 * 60_000;
 const SMOKE_TIMEOUT_MS = 30_000;
 
+/** The section a releasable CHANGELOG must carry with at least one entry. */
+const UNRELEASED_SECTION = "## [Unreleased]";
+
+/**
+ * Release-path gate: return the failure reason when the root CHANGELOG.md is
+ * missing or its `## [Unreleased]` section carries no entries, else `null`.
+ * Enforced for every build mode (dry-run, no-cargo, full) before any build
+ * work starts, so no release is cut without release notes.
+ */
+export async function changelogGateFailure(fs: Fs, repoRoot: string): Promise<string | null> {
+	const path = join(repoRoot, "CHANGELOG.md");
+	let text: string;
+	try {
+		text = new TextDecoder().decode(await fs.readFile(path));
+	} catch {
+		return (
+			`release CHANGELOG gate: ${path} is missing; every release build ` +
+			`(dry-run and full) requires a CHANGELOG.md with a non-empty ${UNRELEASED_SECTION} section`
+		);
+	}
+	const lines = text.split(/\r?\n/);
+	const start = lines.findIndex((line) => line.trim() === UNRELEASED_SECTION);
+	if (start === -1) {
+		return (
+			`release CHANGELOG gate: ${path} has no ${UNRELEASED_SECTION} section; ` +
+			`add release notes before building a release`
+		);
+	}
+	const section = lines.slice(start + 1);
+	const end = section.findIndex((line) => line.startsWith("## "));
+	const body = end === -1 ? section : section.slice(0, end);
+	const hasEntries = body.some((line) => {
+		const trimmed = line.trim();
+		return trimmed.length > 0 && !trimmed.startsWith("#");
+	});
+	if (!hasEntries) {
+		return (
+			`release CHANGELOG gate: ${path} has an empty ${UNRELEASED_SECTION} section; ` +
+			`add release notes before building a release`
+		);
+	}
+	return null;
+}
+
+/** Fail the build when the root CHANGELOG gate trips. */
+export async function enforceChangelogGate(fs: Fs, repoRoot: string): Promise<void> {
+	const failure = await changelogGateFailure(fs, repoRoot);
+	if (failure !== null) throw new Error(failure);
+}
+
 
 async function main(): Promise<void> {
 	const args = parseReleaseArgs(process.argv.slice(2));
@@ -67,6 +117,10 @@ async function main(): Promise<void> {
 	process.stdout.write(
 		`Mode:            ${args.dryRun ? "dry-run" : args.noCargo ? "no-cargo" : "full"}\n\n`,
 	);
+
+	// Release CHANGELOG gate: fails every build mode (dry-run and full)
+	// before any build work when release notes are missing or empty.
+	await enforceChangelogGate(fs, repoRoot);
 
 	const stagingRoot = join(args.outDir, `.staging-release-${args.plan.rustTarget}`);
 	await fs.mkdir(stagingRoot, { recursive: true });
@@ -218,15 +272,7 @@ async function main(): Promise<void> {
 			compatibilityVersion: HOST_COMPATIBILITY_VERSION,
 			protocolVersion: HOST_PROTOCOL_VERSION,
 			createdAt: new Date(parseInt(args.sourceDateEpoch, 10) * 1000).toISOString(),
-			docsSource: join(repoRoot, "crates", "pi", "docs"),
-			examplesSource: join(
-				repoRoot,
-				".references",
-				"pi",
-				"packages",
-				"coding-agent",
-				"examples",
-			),
+			docsSource: join(repoRoot, "docs"),
 			assetsSource: join(repoRoot, "crates", "pi", "assets"),
 		});
 

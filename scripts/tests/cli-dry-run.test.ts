@@ -53,6 +53,8 @@ describe("package-release dry-run", () => {
 				expect(members).toContain(`${prefix}${plan.piBinaryName}`);
 				expect(members).toContain(`${prefix}${plan.hostBinaryName}`);
 				expect(members).toContain(`${prefix}release.json`);
+				expect(members).toContain(`${prefix}CHANGELOG.md`);
+				expect(members.some((member) => member.startsWith(`${prefix}docs/`))).toBe(true);
 			} finally {
 				rmSync(work, { recursive: true, force: true });
 			}

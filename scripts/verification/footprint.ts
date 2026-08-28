@@ -782,8 +782,7 @@ async function measureRustSide(): Promise<SideMeasurement> {
 		compatibilityVersion: HOST_COMPATIBILITY_VERSION,
 		protocolVersion: HOST_PROTOCOL_VERSION,
 		createdAt: new Date(sourceDateEpoch * 1000).toISOString(),
-		docsSource: join(REPOSITORY_ROOT, "crates", "pi", "docs"),
-		examplesSource: join(CODING_AGENT_DIR, "examples"),
+		docsSource: join(REPOSITORY_ROOT, "docs"),
 		assetsSource: join(REPOSITORY_ROOT, "crates", "pi", "assets"),
 	});
 	const manifestPath = join(assembly.stagingDir, "release.json");

@@ -1,16 +1,23 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { decodeZipArchive, sha256Bytes, writeZip } from "../release/archive.ts";
-import { smokeUnpacked } from "../package-release.ts";
+import {
+	decodeZipArchive,
+	extractZip,
+	sha256Bytes,
+	writeTarGz,
+	writeZip,
+} from "../release/archive.ts";
+import { changelogGateFailure, enforceChangelogGate, smokeUnpacked } from "../package-release.ts";
 import {
 	helloRequestLine,
 	HOST_COMPATIBILITY_VERSION,
 	HOST_PROTOCOL_VERSION,
 } from "../release/host.ts";
-import { RecordingRunner, type Fs, type RunResult } from "../release/runner.ts";
+import { RecordingRunner, realFs, SpawnRunner, type Fs, type RunResult } from "../release/runner.ts";
+import { assembleRelease } from "../release/stage.ts";
 import {
 	BUN_RUNTIME_VERSION,
 	BunRuntimeProvisionError,
@@ -18,7 +25,7 @@ import {
 	provisionBunRuntime,
 	type RuntimeFetcher,
 } from "../release/runtime.ts";
-import { planFor, RUST_TARGETS } from "../release/targets.ts";
+import { planFor, RUST_TARGETS, type TargetPlan } from "../release/targets.ts";
 
 const FILE_STAT = { isFile: true, isDir: false, size: 1, mode: 0o755 } as const;
 
@@ -534,4 +541,215 @@ describe("portable ZIP validation", () => {
 			rmSync(work, { recursive: true, force: true });
 		}
 	});
+});
+
+describe("release CHANGELOG gate", () => {
+	const bytes = (text: string) => new TextEncoder().encode(text);
+
+	test("fails when the root CHANGELOG.md is missing", async () => {
+		const failure = await changelogGateFailure(memoryFs({}), "/workspace");
+		expect(failure).toContain("CHANGELOG.md");
+		expect(failure).toContain("missing");
+	});
+
+	test("fails when the Unreleased section is absent", async () => {
+		const fs = memoryFs({
+			"/workspace/CHANGELOG.md": bytes(
+				"# Changelog\n\n## [0.1.0] - 2026-01-01\n\n- Shipped something.\n",
+			),
+		});
+		expect(await changelogGateFailure(fs, "/workspace")).toContain(
+			"no ## [Unreleased] section",
+		);
+	});
+
+	test("fails when the Unreleased section carries no entries", async () => {
+		const fs = memoryFs({
+			"/workspace/CHANGELOG.md": bytes(
+				"# Changelog\n\n## [Unreleased]\n\n### Added\n\n## [0.1.0] - 2026-01-01\n\n- Shipped something.\n",
+			),
+		});
+		expect(await changelogGateFailure(fs, "/workspace")).toContain(
+			"empty ## [Unreleased] section",
+		);
+	});
+
+	test("passes when the Unreleased section carries entries", async () => {
+		const fs = memoryFs({
+			"/workspace/CHANGELOG.md": bytes(
+				"# Changelog\n\n## [Unreleased]\n\n### Added\n\n- Docs staged into release archives [#111]\n\n## [0.1.0] - 2026-01-01\n\n- Shipped something.\n",
+			),
+		});
+		expect(await changelogGateFailure(fs, "/workspace")).toBeNull();
+	});
+
+	test("enforceChangelogGate throws the gate reason on failure", async () => {
+		const error = await rejectionOf(enforceChangelogGate(memoryFs({}), "/workspace"));
+		expect(error.message).toContain("release CHANGELOG gate");
+	});
+
+	test("gate transitions fail-empty-pass against a real filesystem", async () => {
+		const root = mkdtempSync(join(tmpdir(), "pi-changelog-gate-"));
+		try {
+			expect(await changelogGateFailure(realFs, root)).toContain("missing");
+			writeFileSync(join(root, "CHANGELOG.md"), "# Changelog\n\n## [Unreleased]\n");
+			expect(await changelogGateFailure(realFs, root)).toContain("empty");
+			writeFileSync(
+				join(root, "CHANGELOG.md"),
+				"# Changelog\n\n## [Unreleased]\n\n- Release notes [#111]\n",
+			);
+			expect(await changelogGateFailure(realFs, root)).toBeNull();
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("seven-archive release path", () => {
+	const EPOCH = 1_700_000_000;
+
+	/** Fixture repo root with every member a release archive must ship. */
+	function writeDocsFixtureRepo(root: string, stagingRoot: string, plan: TargetPlan): void {
+		mkdirSync(join(root, "target", plan.rustTarget, "release"), { recursive: true });
+		writeFileSync(
+			join(root, "target", plan.rustTarget, "release", plan.piBinaryName),
+			`mock-pi ${plan.rustTarget}\n`,
+		);
+		mkdirSync(join(stagingRoot, "host"), { recursive: true });
+		writeFileSync(join(stagingRoot, "pi-extension-host"), "mock-extension-host\n");
+		mkdirSync(join(root, "docs", "guide"), { recursive: true });
+		writeFileSync(join(root, "docs", "intro.md"), "# Introduction\n\nShipped docs member.\n");
+		writeFileSync(join(root, "docs", "guide", "deep.md"), "# Deep guide\n\nNested docs member.\n");
+		writeFileSync(
+			join(root, "CHANGELOG.md"),
+			"# Changelog\n\n## [Unreleased]\n\n- Docs staged into release archives [#111]\n",
+		);
+		writeFileSync(join(root, "README.md"), "# pi\n\nRust port of the pi coding agent.\n");
+	}
+
+	async function assembleFixture(root: string, stagingRoot: string, plan: TargetPlan) {
+		return assembleRelease(stagingRoot, {
+			plan,
+			version: "0.0.0-gate",
+			piBinaryPath: join(root, "target", plan.rustTarget, "release", plan.piBinaryName),
+			repoRoot: root,
+			host: { kind: "compiled", binaryPath: join(stagingRoot, "pi-extension-host") },
+			fs: realFs,
+			sourceDateEpoch: EPOCH,
+			compatibilityVersion: HOST_COMPATIBILITY_VERSION,
+			protocolVersion: HOST_PROTOCOL_VERSION,
+			createdAt: new Date(EPOCH * 1000).toISOString(),
+			docsSource: join(root, "docs"),
+		});
+	}
+
+	/** Pack the assembled tree exactly like package-release main() and extract it. */
+	async function packAndExtract(
+		root: string,
+		stagingRoot: string,
+		plan: TargetPlan,
+	): Promise<string> {
+		const assembly = await assembleFixture(root, stagingRoot, plan);
+		const entries: { path: string; data: Uint8Array; mode: number }[] = [];
+		for (const file of assembly.manifest.files) {
+			entries.push({
+				path: `${plan.archiveDir}/${file.path}`,
+				data: new Uint8Array(await realFs.readFile(join(assembly.stagingDir, file.path))),
+				mode: file.executable ? 0o755 : 0o644,
+			});
+		}
+		entries.push({
+			path: `${plan.archiveDir}/release.json`,
+			data: new Uint8Array(await realFs.readFile(join(assembly.stagingDir, "release.json"))),
+			mode: 0o644,
+		});
+		const archivePath = join(stagingRoot, plan.archive === "zip" ? "out.zip" : "out.tar.gz");
+		const archiveOpts = { sourceDateEpoch: EPOCH };
+		if (plan.archive === "zip") {
+			await writeZip(entries, archivePath, archiveOpts);
+		} else {
+			await writeTarGz(entries, archivePath, archiveOpts);
+		}
+		const extractDir = join(stagingRoot, "extracted");
+		await realFs.mkdir(extractDir, { recursive: true });
+		if (plan.archive === "zip") {
+			await extractZip(archivePath, extractDir);
+		} else {
+			const tar = await new SpawnRunner().run(
+				"tar",
+				["-xzf", archivePath, "-C", extractDir],
+				{ rejectOnError: false, timeoutMs: 30_000 },
+			);
+			if (tar.exitCode !== 0) {
+				throw new Error(`tar exited ${tar.exitCode}: ${tar.stderr.slice(0, 500)}`);
+			}
+		}
+		return extractDir;
+	}
+
+	const readExtracted = (dir: string, rel: string): Uint8Array =>
+		new Uint8Array(readFileSync(join(dir, rel)));
+
+	test("every archive ships docs, README, CHANGELOG, and a digest-matching release.json", async () => {
+		for (const target of RUST_TARGETS) {
+			const plan = planFor(target);
+			const root = mkdtempSync(join(tmpdir(), `pi-rel-docs-${target}-`));
+			const stagingRoot = join(root, "staging");
+			writeDocsFixtureRepo(root, stagingRoot, plan);
+			try {
+				const archiveRoot = join(await packAndExtract(root, stagingRoot, plan), plan.archiveDir);
+				const releaseJson = JSON.parse(
+					new TextDecoder().decode(readExtracted(archiveRoot, "release.json")),
+				) as { files: { path: string; size: number; sha256: string; executable: boolean }[] };
+				const byPath = new Map(releaseJson.files.map((file) => [file.path, file]));
+				for (const member of [
+					"CHANGELOG.md",
+					"README.md",
+					"docs/intro.md",
+					"docs/guide/deep.md",
+				]) {
+					const entry = byPath.get(member);
+					if (entry === undefined) {
+						throw new Error(`${target}: release.json digest table omits ${member}`);
+					}
+					const memberBytes = readExtracted(archiveRoot, member);
+					expect(sha256Bytes(memberBytes)).toBe(entry.sha256);
+					expect(memberBytes.length).toBe(entry.size);
+					expect(entry.executable).toBe(false);
+				}
+			} finally {
+				rmSync(root, { recursive: true, force: true });
+			}
+		}
+	}, 60_000);
+
+	test("deleting one docs source file drops exactly that member from archive and digest table", async () => {
+		const plan = planFor("x86_64-unknown-linux-gnu");
+		const root = mkdtempSync(join(tmpdir(), "pi-rel-docs-mutation-"));
+		const stagingRoot = join(root, "staging");
+		writeDocsFixtureRepo(root, stagingRoot, plan);
+		try {
+			const before = await assembleFixture(root, stagingRoot, plan);
+			expect(before.manifest.files.find((file) => file.path === "docs/guide/deep.md")).toBeDefined();
+			unlinkSync(join(root, "docs", "guide", "deep.md"));
+			// package-release main() always stages into a fresh staging root;
+			// mirror that guarantee before re-assembling the mutated tree.
+			rmSync(stagingRoot, { recursive: true, force: true });
+			mkdirSync(join(stagingRoot, "host"), { recursive: true });
+			writeFileSync(join(stagingRoot, "pi-extension-host"), "mock-extension-host\n");
+
+			const archiveRoot = join(await packAndExtract(root, stagingRoot, plan), plan.archiveDir);
+			const releaseJson = JSON.parse(
+				new TextDecoder().decode(readExtracted(archiveRoot, "release.json")),
+			) as { files: { path: string; sha256: string }[] };
+			const paths = releaseJson.files.map((file) => file.path);
+			expect(paths).not.toContain("docs/guide/deep.md");
+			expect(paths).toContain("docs/intro.md");
+			const intro = releaseJson.files.find((file) => file.path === "docs/intro.md");
+			if (intro === undefined) throw new Error("digest table lost docs/intro.md");
+			expect(sha256Bytes(readExtracted(archiveRoot, "docs/intro.md"))).toBe(intro.sha256);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	}, 30_000);
 });

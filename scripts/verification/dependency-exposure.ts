@@ -1252,6 +1252,7 @@ export async function enumerateStagedInputs(
 			piBinaryPath: "/check/target/pi",
 			repoRoot: root,
 			bunRuntimePath: "/check/staging/bun",
+			docsSource: "/check/docs",
 			sourceDateEpoch: 0,
 			compatibilityVersion: "0.0.0",
 			protocolVersion: 1,

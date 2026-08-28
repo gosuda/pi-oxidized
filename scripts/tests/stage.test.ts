@@ -74,9 +74,11 @@ describe("assembleRelease", () => {
 		fs.files.set("/staging/pi-extension-host", new Uint8Array([2]));
 		fs.modes.set("/staging/pi-extension-host", 0o755);
 
-		// Optional metadata.
+		// Required metadata + optional files.
+		fs.files.set("/workspace/CHANGELOG.md", new Uint8Array([5]));
 		fs.files.set("/workspace/LICENSE", new Uint8Array([3]));
 		fs.files.set("/workspace/README.md", new Uint8Array([4]));
+		fs.files.set("/workspace/docs/intro.md", new Uint8Array([6]));
 
 		const inputs = {
 			plan,
@@ -91,7 +93,6 @@ describe("assembleRelease", () => {
 			protocolVersion: 1,
 			createdAt: "2024-01-01T00:00:00Z",
 			docsSource: "/workspace/docs",
-			examplesSource: "/workspace/examples",
 			assetsSource: "/workspace/assets",
 		};
 
@@ -120,9 +121,9 @@ describe("assembleRelease", () => {
 		// Includes the expected files.
 		expect(paths).toContain("pi");
 		expect(paths).toContain("pi-extension-host");
+		expect(paths).toContain("CHANGELOG.md");
 		expect(paths).toContain("LICENSE");
 		expect(paths).toContain("README.md");
-
 		// Executable bits.
 		const piEntry = m1.files.find((f) => f.path === "pi");
 		expect(piEntry?.executable).toBe(true);
@@ -136,6 +137,7 @@ describe("assembleRelease", () => {
 
 		fs.files.set("/workspace/target/x86_64-pc-windows-msvc/release/pi.exe", new Uint8Array([1]));
 		fs.files.set("/staging/pi-extension-host.exe", new Uint8Array([2]));
+		fs.files.set("/workspace/CHANGELOG.md", new Uint8Array([5]));
 
 		const inputs = {
 			plan,
@@ -150,7 +152,6 @@ describe("assembleRelease", () => {
 			protocolVersion: 1,
 			createdAt: "2024-01-01T00:00:00Z",
 			docsSource: "/workspace/docs",
-			examplesSource: "/workspace/examples",
 			assetsSource: "/workspace/assets",
 		};
 
@@ -170,6 +171,7 @@ describe("assembleRelease", () => {
 		fs.files.set(scriptPath, new Uint8Array([2]));
 		fs.files.set(runtimePath, new Uint8Array([3]));
 		fs.modes.set(piPath, 0o755);
+		fs.files.set("/workspace/CHANGELOG.md", new Uint8Array([5]));
 		fs.modes.set(runtimePath, 0o755);
 
 		const assembly = await assembleRelease("/staging", {
@@ -184,10 +186,12 @@ describe("assembleRelease", () => {
 			compatibilityVersion: "0.80.10",
 			protocolVersion: 1,
 			createdAt: "2024-01-01T00:00:00Z",
+			docsSource: "/workspace/docs",
 		});
 
 		expect(assembly.manifest.hostKind).toBe("runtime-bundle");
 		expect(assembly.manifest.files.map((file) => file.path)).toEqual([
+			"CHANGELOG.md",
 			"bun",
 			"pi",
 			"pi-extension-host.js",
@@ -214,7 +218,6 @@ describe("assembleRelease", () => {
 			protocolVersion: 1,
 			createdAt: "2024-01-01T00:00:00Z",
 			docsSource: "/workspace/docs",
-			examplesSource: "/workspace/examples",
 			assetsSource: "/workspace/assets",
 		};
 
@@ -232,12 +235,11 @@ describe("assembleRelease", () => {
 			["host-binary", "/staging/pi-extension-host", "pi-extension-host", false],
 			["host-bundle", "/staging/host/pi-extension-host.js", "pi-extension-host.js", false],
 			["bun-runtime", "/staging/host/bun", "bun", false],
-			["metadata-file", "/workspace/CHANGELOG.md", "CHANGELOG.md", true],
+			["metadata-file", "/workspace/CHANGELOG.md", "CHANGELOG.md", false],
 			["metadata-file", "/workspace/README.md", "README.md", true],
 			["metadata-file", "/workspace/LICENSE", "LICENSE", true],
 			["metadata-file", "/workspace/LICENSE-MIT", "LICENSE-MIT", true],
-			["tree", "/workspace/docs", "docs", true],
-			["tree", "/workspace/examples", "examples", true],
+			["tree", "/workspace/docs", "docs", false],
 			["tree", "/workspace/assets", "assets", true],
 			["tree", "/workspace/crates/pi/assets/theme", "theme", true],
 			["manifest", "generated:release.json", "release.json", false],
@@ -253,6 +255,7 @@ describe("assembleRelease", () => {
 		fs.modes.set("/staging/pi-extension-host", 0o755);
 		fs.files.set("/staging/host/pi-extension-host.js", new Uint8Array([3]));
 		fs.files.set("/staging/host/bun", new Uint8Array([4]));
+		fs.files.set("/workspace/CHANGELOG.md", new Uint8Array([5]));
 		fs.modes.set("/staging/host/bun", 0o755);
 
 		const assembly = await assembleRelease("/staging", {
@@ -270,10 +273,12 @@ describe("assembleRelease", () => {
 			compatibilityVersion: "0.80.10",
 			protocolVersion: 1,
 			createdAt: "2024-01-01T00:00:00Z",
+			docsSource: "/workspace/docs",
 		});
 
 		expect(assembly.manifest.hostKind).toBe("compiled");
 		expect(assembly.manifest.files.map((file) => file.path)).toEqual([
+			"CHANGELOG.md",
 			"bun",
 			"pi",
 			"pi-extension-host",
@@ -304,6 +309,7 @@ describe("assembleRelease", () => {
 			compatibilityVersion: "0.80.10",
 			protocolVersion: 1,
 			createdAt: "2024-01-01T00:00:00Z",
+			docsSource: "/workspace/docs",
 		};
 		await expect(
 			assembleRelease("/staging", { ...inputs, bunRuntimePath: undefined }),
@@ -328,7 +334,6 @@ describe("stagedInputs", () => {
 			protocolVersion: 1,
 			createdAt: "2024-01-01T00:00:00Z",
 			docsSource: "/workspace/docs",
-			examplesSource: "/workspace/examples",
 			assetsSource: "/workspace/assets",
 			extraFiles: [{ src: "/tmp/extra.txt", dest: "notes/extra.txt" }],
 		};
@@ -341,12 +346,11 @@ describe("stagedInputs", () => {
 		).toEqual([
 			["rust-binary", base.piBinaryPath, "pi", false],
 			["host-binary", "/staging/pi-extension-host", "pi-extension-host", false],
-			["metadata-file", "/workspace/CHANGELOG.md", "CHANGELOG.md", true],
+			["metadata-file", "/workspace/CHANGELOG.md", "CHANGELOG.md", false],
 			["metadata-file", "/workspace/README.md", "README.md", true],
 			["metadata-file", "/workspace/LICENSE", "LICENSE", true],
 			["metadata-file", "/workspace/LICENSE-MIT", "LICENSE-MIT", true],
-			["tree", "/workspace/docs", "docs", true],
-			["tree", "/workspace/examples", "examples", true],
+			["tree", "/workspace/docs", "docs", false],
 			["tree", "/workspace/assets", "assets", true],
 			["tree", "/workspace/crates/pi/assets/theme", "theme", true],
 			["extra", "/tmp/extra.txt", "notes/extra.txt", false],
@@ -367,12 +371,11 @@ describe("stagedInputs", () => {
 			["rust-binary", base.piBinaryPath, "pi", false],
 			["host-bundle", "/staging/pi-extension-host.js", "pi-extension-host.js", false],
 			["bun-runtime", "/official/bun", "bun", false],
-			["metadata-file", "/workspace/CHANGELOG.md", "CHANGELOG.md", true],
+			["metadata-file", "/workspace/CHANGELOG.md", "CHANGELOG.md", false],
 			["metadata-file", "/workspace/README.md", "README.md", true],
 			["metadata-file", "/workspace/LICENSE", "LICENSE", true],
 			["metadata-file", "/workspace/LICENSE-MIT", "LICENSE-MIT", true],
-			["tree", "/workspace/docs", "docs", true],
-			["tree", "/workspace/examples", "examples", true],
+			["tree", "/workspace/docs", "docs", false],
 			["tree", "/workspace/assets", "assets", true],
 			["tree", "/workspace/crates/pi/assets/theme", "theme", true],
 			["extra", "/tmp/extra.txt", "notes/extra.txt", false],
