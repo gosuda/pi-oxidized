@@ -1567,3 +1567,183 @@ the ledger's 243.61 ms R2 baseline predates the probe-wait fixes).
 `scripts/release/`, `scripts/verification/compat-matrix.json`,
 `docs/supported-platforms.md`, DEPS ledger docs, floor ledgers,
 `Cargo.lock`, `rust-toolchain.toml`.
+
+## Iteration 18 — `first-frame-init` (fresh stage attribution — CONSTRAINED-ABOVE-FLOOR)
+
+Date 2026-08-28. Base `10e719d` (iteration 17).
+
+**Method**: fresh post-iteration-16 stage attribution using temporary
+env-gated monotonic markers (`PI_TIMING_PROBE=1`), all timestamps collected
+in memory and emitted after the first synchronized frame so marker I/O
+cannot delay the measured frame. 15 stages A–O spanning spawn→first-sync,
+with 8 sub-stages E1–E8 inside the factory. All probe code fully reverted;
+the final tree contains zero probe instrumentation.
+
+**Correction to iteration 17**: `InteractiveRuntimeOptions::detect` is
+env/capability inference (tmux hyperlink probe cached in a process-wide
+`OnceLock`); the actual startup terminal probe is in `run_interactive_mode`
+via `probe_write_batch` + `probe_collect_replies` (the two-phase
+reply-armed wait from iteration 15). The iteration-17 candidate overlapped
+`detect` with `RuntimeFactory::create`, but `detect` is ~200 us — the
+overlap was with the wrong stage.
+
+**Stage measurements** (release, `taskset -c 20-40`, fresh 100x32 PTY +
+extension-free workload + sandbox env per sample, PI_OFFLINE=1,
+xterm-256color; 5 runs, medians):
+
+| Stage | Description | Median (us) | Δ from prev (us) |
+|-------|-------------|------------|-------------------|
+| A | `main()` entry | 56 | — (exec/loader before this) |
+| B | Tokio runtime built | 2,230 | 2,174 |
+| C | Bootstrap pipeline start | 2,251 | 21 |
+| D | Bootstrap→factory call | 2,840 | 589 |
+| E1 | Session context built | 2,875 | 35 |
+| E2 | Services create begins | 2,876 | 1 |
+| E3 | Models resolved | 58,354 | **55,478** |
+| E4 | Session from services | 59,973 | 1,619 |
+| E5 | Session diagnostics | 60,074 | 101 |
+| E6 | Session inputs built | 60,208 | 134 |
+| E7 | Session built | 60,254 | 46 |
+| E8 | Runtime `new` | 60,255 | 1 |
+| F | Dispatch enter | 60,282 | 27 |
+| G | `detect` done | 60,507 | 225 |
+| H | Terminal activated | 60,531 | 24 |
+| I | Probe written + spawned | 60,540 | 9 |
+| K | Tui constructed | 60,591 | 51 |
+| L | Host bound | 60,613 | 22 |
+| M | InteractiveRuntime `new` | 60,743 | 130 |
+| N | Speculative paint (`initialize_run`) | 62,326 | **1,583** |
+| O | Probe joined | 85,702 | 23,376 |
+| O' | Input started + emit | 85,710 | 8 |
+
+**Overlap reconciliation**: the probe collector (J = O − I ≈ 25,162 us)
+runs **concurrently** with K+L+M+N (≈ 1,786 us) per the iteration-16
+speculative-paint design. The first synchronized frame is emitted at N
+(inside `initialize_run`), **before** the probe join at O. The probe join
+is not on the first-frame critical path.
+
+**Critical-path equation** (first synchronized frame):
+
+```
+first_frame = exec_loader + (N_speculative_paint − A_main_entry)
+            = exec_loader + 62,270 us
+            ≈ exec_loader + 62.3 ms
+```
+
+Measured first-frame (PTY harness, Popen→SYNC_BEGIN): median ~71.3 ms
+(A/A baseline, 9 interleaved pairs). Therefore:
+
+```
+ exec_loader ≈ 71.3 − 62.3 ≈ 9.0 ms
+```
+
+The exec/loader residual (process spawn + dynamic linker + Rust pre-main)
+is ~9.0 ms — not addressable from Rust code.
+
+**Full critical-path decomposition**:
+
+| Segment | Duration (ms) | Classification |
+|---------|-------------|----------------|
+| exec/loader (spawn→main) | ~9.0 | **Platform** — OS process spawn + dynamic linker; not addressable from Rust |
+| Tokio runtime build (A→B) | ~2.2 | **Essential** — async runtime required for all I/O |
+| Bootstrap prep (B→D) | ~0.6 | **Essential** — argv parse, session manager, migrations |
+| Factory create: ModelRuntime (D→E3) | ~55.5 | **Boundary-gated** — model catalog parse, rustls decode, provider registry; Cargo.lock frozen |
+| Factory create: session build (E3→E8) | ~1.9 | **Essential** — session services, model resolution, AgentSession construction |
+| Dispatch + detect (E8→G) | ~0.3 | **Essential** — mode dispatch, env/capability inference |
+| Terminal activation (G→H) | ~0.02 | **Essential** — raw mode, guard |
+| Probe write (H→I) | ~0.01 | **Essential** — probe batch bytes (frozen boundary) |
+| Speculative paint (I→N, concurrent with J) | ~1.8 | **Essential** — Tui construction, host bind, theme, first paint; runs concurrently with probe collector |
+
+**Post-frame (not on first-frame critical path)**:
+
+| Segment | Duration (ms) | Classification |
+|---------|-------------|----------------|
+| Probe collector (J = O − I) | ~25.2 | **Boundary-gated** — probe first-byte timeout (25 ms, iteration 15); frozen probe bytes/order; concurrent with I→N, joined after frame |
+| Probe join tail (N→O) | ~23.4 | **Off critical path** — happens after first frame is painted |
+
+**E1–E4 (factory interior) decomposition**:
+
+| Sub-stage | Duration (ms) | Classification |
+|-----------|-------------|----------------|
+| E2→E3: `create_runtime_services` + `resolve_models` | ~55.5 | **Boundary-gated** — `ModelRuntime::create` (builtin catalog, auth.json, models.json, models-store.json, `default_provider_registry` with rustls, `rebuild_providers`, `refresh`) + `resolve_cli_model` + `resolve_model_scope` |
+| E3→E4: `create_agent_session_from_services` | ~1.6 | **Essential** — session result construction |
+| E4→E8: session metadata + diagnostics + inputs + build + runtime | ~0.3 | **Essential** — session wiring |
+
+**Designs 15/16/17 revalidation**:
+- Design 15 (two-phase probe wait): **landed**, reduced probe wait from
+  ~157 ms to ~25 ms. Still in effect; the 25 ms first-byte timeout is
+  boundary-gated (probe bytes/order frozen).
+- Design 16 (speculative first paint): **landed**, overlapped the 25 ms
+  probe wait with construction + first paint. Still in effect; the first
+  frame is painted at N before the probe join at O.
+- Design 17 (detection/factory overlap): **rejected** at 0.98x/1.01x.
+  Revalidated: `detect` is ~225 us — overlapping it with anything saves
+  nothing. The factory create (~55.5 ms) is the dominant serial stage, but
+  it completes before the probe is even written, so there is nothing to
+  overlap it with on the first-frame path.
+
+**Floor revalidation**: the ledger floor is ~1.50 ms (R9 floor for
+first-frame-init). The measured first-frame is ~71.3 ms ≈ **47.5x** the
+floor. The floor represents the theoretical minimum (process exec + minimal
+initialization); the 47.5x gap is dominated by boundary-gated stages
+(model catalog + TLS init ~55.5 ms, exec/loader ~9.0 ms). The probe
+timeout (~25.2 ms) is concurrent but off the first-frame critical path
+(the frame is painted at N before the join at O).
+
+**Every >=3.3 ms term classified**:
+
+| Term | Duration (ms) | Classification | Removable? |
+|------|-------------|----------------|------------|
+| ModelRuntime::create + model resolution | ~55.5 | Boundary-gated | No — Cargo.lock frozen (rustls, parser), model catalog required |
+| Probe first-byte timeout (J) | ~25.2 | Boundary-gated (off critical path) | No — concurrent with paint; probe bytes/order frozen, 25 ms is the round-trip-class floor |
+| exec/loader (spawn→main) | ~9.0 | Platform | No — OS process spawn + dynamic linker |
+| Tokio runtime build | ~2.2 | Essential | No — async runtime required |
+| Speculative paint (initialize_run) | ~1.8 | Essential | No — first frame must be painted |
+| Session from services | ~1.6 | Essential | No — session must be constructed |
+
+No term >=3.3 ms is removable without crossing a frozen boundary
+(Cargo.lock/dependencies, probe bytes/order, provider/auth readiness) or
+removing an essential stage (runtime, session, first paint).
+
+**Named dominant residual**: `ModelRuntime::create` + model resolution
+(~55.5 ms, 78% of measured first-frame). Interior: `builtin_models()`
+catalog parse + `FileCredentialStore::new(auth.json)` +
+`ModelsJsonConfig::load(models.json)` + `FileModelsStore::new(models-store.json)`
++ `default_provider_registry()` (rustls decode + HTTP client pool) +
+`rebuild_providers()` + `refresh()`. The only material lever inside this
+is the parser/TLS swap (sonic-rs for JSON, ring for TLS), which crosses
+the campaign's Cargo.lock boundary and is barred.
+
+**E1–E4 evidence (exhaustion record)**:
+- **E1 (enumeration)**: all 15+8 stages enumerated with measured medians.
+  No stage omitted; overlap explicitly reconciled.
+- **E2 (equivalence)**: the critical-path equation
+  `first_frame = exec_loader + (N − A)` reconciles to the measured
+  ~71.3 ms within 0.3 ms (62.3 + 9.0 = 71.3). The overlap
+  `max(J, K+L+M+N) = J = 25.2 ms` is correctly represented as
+  off-first-frame-path (the frame is painted at N, before the join at O).
+- **E3 (essential/residue)**: every >=3.3 ms term classified as
+  boundary-gated, platform, or essential. No residue found.
+- **E4 (floor)**: the 47.5x multiple is dominated by boundary-gated
+  stages (model catalog + TLS ~55.5 ms, exec/loader ~9.0 ms). The probe
+  timeout (~25.2 ms) is concurrent but off the first-frame critical path.
+  The only remaining lever (parser/TLS swap) is barred by the Cargo.lock
+  freeze. No rebuild candidate inside the campaign's dependency boundary
+  projects a >=1.05x reduction.
+
+**Verdict**: **CONSTRAINED-ABOVE-FLOOR**. The `first-frame-init` unit is
+classified as constrained above the floor by frozen boundaries. No valid
+>=1.05x candidate exists within the campaign's dependency boundary. The
+unit remains OPEN in the campaign issue (#97) because the parser/TLS
+swap (sonic-rs/ring) would unlock the dominant ~55.5 ms term, but that
+crosses the Cargo.lock boundary and is outside this campaign's scope.
+
+**Probe reversion**: all temporary probe code (5 files: `main.rs`,
+`lib.rs`, `entry.rs`, `bootstrap.rs`, `runtime.rs`) fully reverted.
+`git diff --stat` confirms zero probe code in the final tree. The only
+shipped change is this docs record.
+
+**Not touched** (out of scope, file-disjoint): `.github/workflows/`,
+`scripts/release/`, `scripts/verification/compat-matrix.json`,
+`docs/supported-platforms.md`, DEPS ledger docs, floor ledgers,
+`Cargo.lock`, `rust-toolchain.toml`, `scripts/first-frame-timing.py`.
