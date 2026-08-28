@@ -1840,3 +1840,123 @@ calls), same error-result behavior.
 `scripts/release/`, `scripts/verification/compat-matrix.json`,
 `docs/supported-platforms.md`, DEPS ledger docs, floor ledgers,
 `Cargo.lock`, `rust-toolchain.toml`.
+
+## Iteration 20 — `tool-dispatch-slice` (E1-E4 exhaustion — CONSTRAINED-ABOVE-FLOOR)
+
+Date 2026-08-28. Base `3ee5d7b` (canonical origin/feat/ver-align-canonical-pin,
+iteration 19). Docs-only terminal record: no candidate was executed this
+iteration; every remaining in-unit mechanism is already measured below the
+gate (iteration 19) or infeasible under the ownership contracts. Provenance:
+`agent://ToolDispatchNextOracle` (0.97 confidence — recommend
+CONSTRAINED-ABOVE-FLOOR closure: no materially distinct >=1.05x design
+within tool-dispatch ownership that preserves the contracts) and
+`agent://ToolDispatchDesignAdvocate` (block-must-fix on the combined
+move+Arc+result-consumption plan, on three-owner/public-boundary proof).
+
+### E1 — decomposition reconciliation (24.12 us/call)
+
+| Term | us/call | Share | Ownership |
+|---|---|---|---|
+| Session append syscalls (open+close+write per entry) | 5.43 | 22.5% | `session-append` unit (next unit) |
+| Allocation (event/message/JSONL value shapes) | 8.10 | 33.6% | boundary (double serialization) |
+| Value pipeline (serde traversal) | 3.55 | 14.7% | boundary (double serialization) |
+| Payload copies (ToolCall/result/message clones) | 2.22 | 9.2% | in-unit — measured below gate |
+| Tokio spawn + validation + residual | 4.82 | 20.0% | essential (spawn contract + argument validation) |
+| **Total** | **24.12** | **100%** | |
+
+Reconciliation is exact: 5.43 + 8.10 + 3.55 + 2.22 + 4.82 = 24.12 us/call.
+The oracle's grouped view — append syscalls 22.5%, "allocator + Value
+pipeline" 11.7 us (48.5%), spawn + validation + residual 20% — maps onto
+the same terms with the payload-copy term stated separately (8.10 + 3.55 =
+11.65 us = 48.3% exactly). The only in-unit slice is the 2.22 us
+payload-copy term (~9.2%), whose largest single component (the ToolCall
+clone, ~0.9 us ≈ 3.7%) iteration 19 measured at 0.95x/1.02x — below the
+run-to-run noise floor.
+
+### E2 — candidate history and evidence
+
+1. **Global `Arc<ToolCall>` + result-consumption (iteration-19 plan v1)** —
+   rejected before execution on the advocate's three-owner/public-boundary
+   proof: consuming `ToolResultMessage` cannot satisfy the three
+   simultaneous owners (`MessageStart`, `MessageEnd`, returned
+   `ExecutedToolCallBatch.messages`) without reinstating the clone the plan
+   claimed to remove; the current shape (return message + one clone into
+   `AgentMessage` + one clone for start + move into end) is already the
+   minimum compatible ownership. A global Arc additionally taxes every
+   single-owner path (sequential, immediate-validation, missing-tool,
+   hook-blocked, truncated) with one heap allocation + refcount traffic;
+   `Arc` is justified only at the parallel pending-slot/worker seam, which
+   is not the sequential hot path the bench measures. Verdict:
+   block-must-fix.
+2. **ToolCall move-only (iteration 19)** — executed at base `a30d013`,
+   measured **0.95x / 1.02x** on two independent 9-pair interleaved runs,
+   FAILED the >=1.05x gate, fully reverted (no production change). The
+   eliminated clone (~0.9 us/call, ~3.7% of the budget) is below the
+   measurement noise floor of the session-append-dominated per-call cost.
+3. **Scoped borrow / update-emission clone elimination** — infeasible. The
+   remaining ToolCall clone (update emission, `schedule.rs` line 672)
+   cannot be removed by borrowing `tool_call` from `PreparedToolCall`
+   across the worker lifetime: the worker is an owned, abortable task
+   (lines 680-703) that must own its inputs for `Send` so cancellation can
+   force-abort non-cooperative tools, and a scoped borrow cannot cross the
+   spawn boundary. Deferring update emission until after the worker joins
+   changes observable event ordering (update-before-completion), a
+   contract violation.
+4. **Sequential-path spawn removal (inline the worker)** — projected
+   **<1.01x**: `tokio::spawn` with task reuse costs ~50-200 ns, <1% of the
+   24 us/call budget — below the gate by construction. It also violates
+   cancellation symmetry: the bounded-parallelism contract
+   (`MAX_PARALLEL_TOOL_CALLS = 8`) and non-cooperative-tool force-abort
+   semantics justify the owned task even on the sequential path, and a
+   separate sequential/parallel execution shape for a sub-1% projected win
+   is complexity without a measurable return.
+
+### E3 — floor and multiple revalidation
+
+Floor **4.29 us/call** (ledger R9; revalidated — no input, dependency, or
+protocol input changed it, and both iteration-19 runs reproduce the same
+~24 us operating point). Multiple: 24.12 / 4.29 = **5.62x**. This multiple
+is a constraint statement, NOT a claim that 24 us/call is at its physical
+floor: the gap is held open by (a) boundary-owned double serialization —
+events and the session entry are built through separate serde pipelines
+(~11.65 us/call), unifiable only by redesigning the event-emission /
+session-write boundary or deferring live events; and (b) cross-unit
+session-append cost (5.43 us/call, including a 2.06 us open+close per
+entry) owned by the `session-append` unit. Both levers are outside
+tool-dispatch ownership; inside the unit nothing measurable remains.
+
+### E4 — dominant residual and reopen conditions
+
+Dominant residual: boundary-owned event/message/session serialization
+(~11.65 us/call) plus next-unit session append (5.43 us/call). Every
+in-unit removable candidate is measured below the gate (ToolCall move,
+0.95x/1.02x) or infeasible (scoped borrow across an owned abortable worker;
+result consumption vs three owners; spawn removal vs cancellation
+symmetry). Exact boundary consents that would reopen the unit:
+
+1. **Relax the two-append contract** (batch-append N calls in one session
+   write): session term 5.43 → ~0.5 us/call, oracle-projected **~1.26x**.
+   Requires changing `ExecutedToolCallBatch` persistence semantics and the
+   append call site in `run.rs` — a protocol/test contract change.
+2. **Unify event emission with session serialization** (one serialization
+   pass shared by `AgentEvent` and the JSONL entry, or events deferred to
+   the session write): double-serialization term ~11.65 → ~6 us/call,
+   oracle-projected **~1.31x**. Requires redesigning the event-emission
+   boundary (live-update timing change).
+3. **`session-append` lands its held-open-fd optimization** (closes the
+   2.06 us open+close, 5.43 → 3.37 us/entry): tool-dispatch inherits
+   **~1.09x** passively — the only lever that does not cross
+   tool-dispatch's own boundary, and it belongs entirely to the next unit.
+
+**Verdict**: **CONSTRAINED-ABOVE-FLOOR**. The `tool-dispatch-slice` unit is
+terminal in the campaign records: no >=1.05x candidate exists inside the
+unit without crossing the event/session boundary or taking ownership of
+next-unit work. This closure is unit-scoped and does not close the
+campaign: issue #97 remains OPEN for the remaining units. Next unit:
+**`session-append`** (4.91x ledger multiple).
+
+**Not touched** (out of scope, file-disjoint): production code,
+`.github/workflows/`, `scripts/release/`,
+`scripts/verification/compat-matrix.json`, `docs/supported-platforms.md`,
+DEPS ledger docs, floor ledgers, `Cargo.lock`, `rust-toolchain.toml`,
+`scripts/session-timing.ts`, `session-timing.rs`.
