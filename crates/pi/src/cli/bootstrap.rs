@@ -380,6 +380,18 @@ pub async fn run_bootstrap(inputs: BootstrapInputs<'_>) -> BootstrapOutcome {
         Ok(parsed) => parsed,
         Err(exit) => return exit.into_outcome(),
     };
+    run_bootstrap_parsed(inputs, parsed).await
+}
+
+/// Bootstrap continuation with argument dispatch already resolved by
+/// [`initialize_bootstrap`]. The production entry (`entry::run`) runs the
+/// synchronous dispatch before constructing the tokio runtime — `--version`
+/// and the other sync exits never pay runtime construction — and continues
+/// here; [`run_bootstrap`] composes both halves for direct callers.
+pub(crate) async fn run_bootstrap_parsed(
+    inputs: BootstrapInputs<'_>,
+    parsed: Args,
+) -> BootstrapOutcome {
     let prepared = match prepare_session(&inputs, parsed).await {
         Ok(prepared) => prepared,
         Err(exit) => return exit.into_outcome(),
@@ -394,7 +406,7 @@ pub async fn run_bootstrap(inputs: BootstrapInputs<'_>) -> BootstrapOutcome {
     finish_bootstrap(inputs.io, state, handle).await
 }
 
-type BootstrapStep<T> = Result<T, BootstrapExit>;
+pub(crate) type BootstrapStep<T> = Result<T, BootstrapExit>;
 
 struct PreparedSession {
     parsed: Args,
@@ -415,8 +427,8 @@ struct BootstrapState {
 }
 
 #[derive(Clone, Copy)]
-struct BootstrapExit {
-    code: u8,
+pub(crate) struct BootstrapExit {
+    pub(crate) code: u8,
     drain_quirk: bool,
 }
 
@@ -442,7 +454,7 @@ fn fail(io: &dyn BootstrapIo, restore_stdout: bool, message: &str) -> BootstrapE
     stop(1, false)
 }
 
-fn initialize_bootstrap(inputs: &BootstrapInputs<'_>) -> BootstrapStep<Args> {
+pub(crate) fn initialize_bootstrap(inputs: &BootstrapInputs<'_>) -> BootstrapStep<Args> {
     let mut parsed = crate::cli::args::parse_args(&inputs.args);
     let offline_mode = parsed.offline || is_truthy_env_flag(inputs.io.env("PI_OFFLINE").as_deref());
     parsed.offline = offline_mode;
