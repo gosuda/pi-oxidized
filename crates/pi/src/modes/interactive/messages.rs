@@ -12,9 +12,7 @@ use pi_ai::{AssistantContent, AssistantMessage, StopReason};
 use pi_tui::component::Component;
 use pi_tui::components::{Markdown, Rail, Spacer, Text};
 
-use super::theme::{
-    self, MarkdownTheme, ResolvedTheme, ThemeColor, user_markdown_options,
-};
+use super::theme::{self, MarkdownTheme, ResolvedTheme, ThemeColor, user_markdown_options};
 use super::tool_renderer::{ToolPhase, ToolState};
 /// Shared left-edge indent for unrailed content (column 2; D3).
 pub const CONTENT_INDENT: u16 = 2;

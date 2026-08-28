@@ -194,7 +194,10 @@ impl fmt::Display for EndpointSpecError {
                 "unix transport path is too long; maximum is {max} UTF-8 bytes"
             ),
             Self::InvalidMaxPendingBytes => {
-                write!(f, "unix transport maxPendingBytes must be a positive integer")
+                write!(
+                    f,
+                    "unix transport maxPendingBytes must be a positive integer"
+                )
             }
         }
     }
@@ -223,7 +226,10 @@ const MAX_UNIX_SOCKET_PATH_BYTES: usize = if cfg!(target_os = "linux") { 107 } e
 pub fn build_transport(spec: &EndpointSpec) -> Result<ByteTransportFactory, EndpointSpecError> {
     match spec {
         EndpointSpec::InMemory { endpoint } => Ok(endpoint.factory()),
-        EndpointSpec::Unix { path, max_pending_bytes } => {
+        EndpointSpec::Unix {
+            path,
+            max_pending_bytes,
+        } => {
             let path = path.clone();
             if path.as_os_str().is_empty() {
                 return Err(EndpointSpecError::EmptyPath);
@@ -264,7 +270,7 @@ mod tests {
             max_pending_bytes: None,
         })
         .map(|_| ())
-        .unwrap_err();
+        .expect_err("expected error");
         assert_eq!(error, EndpointSpecError::EmptyPath);
     }
 
@@ -277,7 +283,7 @@ mod tests {
             max_pending_bytes: None,
         })
         .map(|_| ())
-        .unwrap_err();
+        .expect_err("expected error");
         assert_eq!(error, EndpointSpecError::PathTooLong { max });
     }
 
@@ -288,7 +294,7 @@ mod tests {
             max_pending_bytes: Some(0),
         })
         .map(|_| ())
-        .unwrap_err();
+        .expect_err("expected error");
         assert_eq!(error, EndpointSpecError::InvalidMaxPendingBytes);
     }
 
@@ -320,7 +326,7 @@ mod tests {
             max_pending_bytes: None,
         })
         .map(|_| ())
-        .unwrap_err();
+        .expect_err("expected error");
         assert_eq!(
             error,
             EndpointSpecError::UnsupportedOnPlatform {
@@ -328,7 +334,10 @@ mod tests {
                 os: std::env::consts::OS,
             }
         );
-        assert_eq!(error.to_string(), "unix endpoint is unsupported on platform windows");
+        assert_eq!(
+            error.to_string(),
+            "unix endpoint is unsupported on platform windows"
+        );
     }
 
     #[test]
@@ -338,9 +347,6 @@ mod tests {
             TransportError::PendingBytesExceeded.to_string(),
             "transport exceeded its pending byte limit"
         );
-        assert_eq!(
-            TransportError::Message("boom".into()).to_string(),
-            "boom"
-        );
+        assert_eq!(TransportError::Message("boom".into()).to_string(), "boom");
     }
 }

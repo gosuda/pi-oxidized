@@ -26,6 +26,7 @@
 //!   the failure is treated as best-effort (upstream destroys the
 //!   socket with a timer).
 
+use futures::future::{BoxFuture, FutureExt};
 use std::collections::HashSet;
 use std::io;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
@@ -33,15 +34,14 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard, PoisonError};
 use std::time::Duration;
-use futures::future::{BoxFuture, FutureExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener as TokioUnixListener, UnixStream};
 use tokio::sync::mpsc;
 
 use crate::remote::framing::DEFAULT_MAX_FRAME_LENGTH;
 use crate::remote::server::{
-    build_listener, ByteConnection, ConnectionAcceptor, ConnectionHandler, ListenSpec,
-    ListenerError, PiServer, PiServerOptions, ServerErrorHandler, ServerListener, ServerService,
+    ByteConnection, ConnectionAcceptor, ConnectionHandler, ListenSpec, ListenerError, PiServer,
+    PiServerOptions, ServerErrorHandler, ServerListener, ServerService, build_listener,
 };
 use crate::remote::transport::TransportError;
 
@@ -106,7 +106,10 @@ impl std::fmt::Display for UnixListenerOptionsError {
         match self {
             Self::EmptyPath => write!(f, "unix listener path must not be empty"),
             Self::PathTooLong { max } => {
-                write!(f, "unix listener path is too long; maximum is {max} UTF-8 bytes")
+                write!(
+                    f,
+                    "unix listener path is too long; maximum is {max} UTF-8 bytes"
+                )
             }
             Self::InvalidMode => write!(f, "unix listener mode must be between 0o000 and 0o777"),
             Self::InvalidGracefulTimeout => {
@@ -361,9 +364,8 @@ impl ServerListener for UnixServerListener {
         async move {
             // Dial the socket to wake up `listener.accept()` from its park
             let _ = UnixStream::connect(&path).await;
-            let deadline = tokio::time::timeout(
-                Duration::from_millis(CLOSE_SETTLE_TIMEOUT_MS),
-                async {
+            let deadline =
+                tokio::time::timeout(Duration::from_millis(CLOSE_SETTLE_TIMEOUT_MS), async {
                     let mut interval = tokio::time::interval(Duration::from_millis(5));
                     loop {
                         interval.tick().await;
@@ -371,9 +373,8 @@ impl ServerListener for UnixServerListener {
                             break;
                         }
                     }
-                },
-            )
-            .await;
+                })
+                .await;
             let _ = deadline;
         }
         .boxed()
@@ -627,7 +628,9 @@ impl ByteConnection for UnixServerConnection {
         let max_pending_bytes = self.max_pending_bytes;
         Box::pin(async move {
             let bytes = chunk.len();
-            let budget = pending_bytes.fetch_add(bytes, Ordering::SeqCst).saturating_add(bytes);
+            let budget = pending_bytes
+                .fetch_add(bytes, Ordering::SeqCst)
+                .saturating_add(bytes);
             if budget > max_pending_bytes {
                 pending_bytes.fetch_sub(bytes, Ordering::SeqCst);
                 return Err(TransportError::PendingBytesExceeded);
@@ -640,7 +643,10 @@ impl ByteConnection for UnixServerConnection {
         })
     }
 
-    fn close(&self, final_chunk: Option<Vec<u8>>) -> BoxFuture<'static, Result<(), TransportError>> {
+    fn close(
+        &self,
+        final_chunk: Option<Vec<u8>>,
+    ) -> BoxFuture<'static, Result<(), TransportError>> {
         if self.closed.swap(true, Ordering::SeqCst) {
             return futures::future::ready(Ok(())).boxed();
         }
@@ -683,9 +689,9 @@ impl std::hash::Hash for UnixServerConnection {
 mod tests {
     use super::*;
     use crate::remote::client::{PiClient, PiClientOptions};
-    use crate::remote::server::test_support::ScriptedService;
     use crate::remote::server::SessionRuntime;
-    use crate::remote::transport::{build_transport, EndpointSpec};
+    use crate::remote::server::test_support::ScriptedService;
+    use crate::remote::transport::{EndpointSpec, build_transport};
     #[test]
     fn validate_options_rejects_bad_modes() {
         assert_eq!(
@@ -705,7 +711,10 @@ mod tests {
             validate_options(Path::new("/tmp/x.sock"), None, Some(0)),
             Err(UnixListenerOptionsError::InvalidGracefulTimeout)
         );
-        assert_eq!(validate_options(Path::new("/tmp/x.sock"), None, None), Ok(()));
+        assert_eq!(
+            validate_options(Path::new("/tmp/x.sock"), None, None),
+            Ok(())
+        );
     }
 
     #[tokio::test]
@@ -741,8 +750,14 @@ mod tests {
         })
         .expect("client options valid");
 
-        let snapshot = client.connect().await.expect("client connects over unix socket");
-        assert_eq!(snapshot.protocol_version, crate::remote::schemas::PROTOCOL_VERSION);
+        let snapshot = client
+            .connect()
+            .await
+            .expect("client connects over unix socket");
+        assert_eq!(
+            snapshot.protocol_version,
+            crate::remote::schemas::PROTOCOL_VERSION
+        );
 
         // List sessions over unix socket
         let sessions = client.list_sessions().await.expect("list sessions");
@@ -776,14 +791,11 @@ mod tests {
         finisher.await.expect("finisher task completes");
 
         assert!(
-            prompt_snapshot
-                .transcript
-                .iter()
-                .any(|item| match item {
-                    crate::remote::schemas::TranscriptItem::User(u) => u.type_field == "assistant",
-                    crate::remote::schemas::TranscriptItem::Assistant(a) => a.type_field == "assistant",
-                    _ => false,
-                }),
+            prompt_snapshot.transcript.iter().any(|item| match item {
+                crate::remote::schemas::TranscriptItem::User(u) => u.type_field == "assistant",
+                crate::remote::schemas::TranscriptItem::Assistant(a) => a.type_field == "assistant",
+                _ => false,
+            }),
             "should have assistant reply in returned prompt snapshot, got: {:?}",
             prompt_snapshot.transcript
         );

@@ -55,7 +55,8 @@ fn run_bench() -> Value {
 /// Extract a floating-point value from a JSON field that may be a number or
 /// string.
 fn json_f64(v: &Value) -> Option<f64> {
-    v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+    v.as_f64()
+        .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
 }
 
 #[test]
@@ -76,11 +77,7 @@ fn benchmark_parameters_match_upstream() {
     );
 
     // Frames: 300 (matches FRAMES=300)
-    assert_eq!(
-        json["frames"].as_u64(),
-        Some(300),
-        "frames must be 300"
-    );
+    assert_eq!(json["frames"].as_u64(), Some(300), "frames must be 300");
 
     // Warmup frames: 20 (matches WARMUP_FRAMES=20)
     assert_eq!(
@@ -225,8 +222,14 @@ fn floor_probe_reports_sane_constants() {
     );
 
     // Sanity relations pinning the exhaustion-record arithmetic.
-    assert!(poke > static30, "a changed-line frame must cost more than static");
-    assert!(steady > static30, "editor steady frame must cost more than static");
+    assert!(
+        poke > static30,
+        "a changed-line frame must cost more than static"
+    );
+    assert!(
+        steady > static30,
+        "editor steady frame must cost more than static"
+    );
     assert!(
         slope < 1.0,
         "identity slope must be far below the pre-campaign 1.3 µs/line derive term"

@@ -193,7 +193,10 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
                     "peakRssBytes": peak_rss_bytes(),
                 }
             });
-            println!("{}", serde_json::to_string(&summary).unwrap());
+            println!(
+                "{}",
+                serde_json::to_string(&summary).expect("serialize summary")
+            );
         } else {
             eprintln!(
                 "lane={label} n={count} median={median:.3}ms stddev={stddev:.3}ms \
@@ -259,7 +262,10 @@ fn measure_append(config: &Config) -> Result<Vec<f64>, String> {
                     "peakRssBytes": peak_rss_bytes(),
                 }
             });
-            println!("{}", serde_json::to_string(&record).unwrap());
+            println!(
+                "{}",
+                serde_json::to_string(&record).expect("serialize record")
+            );
         }
 
         timings.push(elapsed);
@@ -304,7 +310,10 @@ fn measure_reopen(config: &Config, session_path: &PathBuf) -> Result<Vec<f64>, S
                     "peakRssBytes": peak_rss_bytes(),
                 }
             });
-            println!("{}", serde_json::to_string(&record).unwrap());
+            println!(
+                "{}",
+                serde_json::to_string(&record).expect("serialize record")
+            );
         }
 
         timings.push(elapsed);

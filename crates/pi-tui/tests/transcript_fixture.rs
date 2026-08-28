@@ -210,9 +210,8 @@ impl FixtureRun {
             |bytes| predicate(bytes) || predicate(&merge_acc(&prior, bytes)),
             &self.context,
         )?;
-        self.settle_windows_ms.push(
-            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-        );
+        self.settle_windows_ms
+            .push(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
         self.raw_acc.extend_from_slice(&batch.bytes);
         Ok(batch.bytes)
     }
@@ -231,9 +230,8 @@ impl FixtureRun {
             |bytes| predicate(bytes) || predicate(&merge_acc(&prior, bytes)),
             &self.context,
         )?;
-        self.settle_windows_ms.push(
-            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-        );
+        self.settle_windows_ms
+            .push(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
         self.raw_acc.extend_from_slice(&frame.batch.bytes);
         Ok(frame)
     }
@@ -337,8 +335,8 @@ fn fixture_binary() -> Result<PathBuf, CorpusError> {
             "fixture build failed; hard-failing transcript corpus prerequisites".to_owned(),
         ));
     }
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/debug/pi_tui_pty_fixture");
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/pi_tui_pty_fixture");
     if path.exists() {
         Ok(path)
     } else {
@@ -559,9 +557,8 @@ fn run_resize_ladder(
         last_snapshot = Some(frame.snapshot);
     }
 
-    let final_snapshot = last_snapshot.ok_or_else(|| {
-        CorpusError::Assert("resize-ladder: missing final snapshot".to_owned())
-    })?;
+    let final_snapshot = last_snapshot
+        .ok_or_else(|| CorpusError::Assert("resize-ladder: missing final snapshot".to_owned()))?;
     if final_snapshot.geometry.cols != 1 || final_snapshot.geometry.rows != 1 {
         return Err(CorpusError::Assert(format!(
             "resize-ladder: final geometry must be settled 1x1, got {}x{}",
@@ -629,7 +626,12 @@ fn run_paste_cursor(
     let frame = run.settle_frame(|bytes| {
         contains_bytes(bytes, b"cursor=") || contains_bytes(bytes, b"STATUS")
     })?;
-    if !frame.snapshot.lines.iter().any(|line| line.contains("EDIT")) {
+    if !frame
+        .snapshot
+        .lines
+        .iter()
+        .any(|line| line.contains("EDIT"))
+    {
         return Err(CorpusError::Assert(
             "paste-cursor: EDIT line missing after paste/cursor".to_owned(),
         ));

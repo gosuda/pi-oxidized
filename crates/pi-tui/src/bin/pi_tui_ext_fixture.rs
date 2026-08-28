@@ -26,12 +26,10 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyModifiers};
 use pi_tui::component::{Component, EventResult, UiEvent};
-use pi_tui::keys::{
-    KeyId, MODIFY_OTHER_KEYS_OMISSION, key_matches, set_kitty_protocol_active,
-};
+use pi_tui::keys::{KeyId, MODIFY_OTHER_KEYS_OMISSION, key_matches, set_kitty_protocol_active};
 use pi_tui::terminal::{
-    ProbeSession, TerminalCapabilities, TerminalGuard, TerminalInput,
-    Tui, Txn, install_panic_emergency_hook, probe_query_batch, write_emergency_restore_bytes,
+    ProbeSession, TerminalCapabilities, TerminalGuard, TerminalInput, Tui, Txn,
+    install_panic_emergency_hook, probe_query_batch, write_emergency_restore_bytes,
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect, Size};
@@ -406,10 +404,7 @@ fn run() -> io::Result<ExitCode> {
         if arg == "--serve" {
             serve = true;
         } else if arg == "--help" {
-            writeln!(
-                io::stdout(),
-                "pi_tui_ext_fixture [--serve]"
-            )?;
+            writeln!(io::stdout(), "pi_tui_ext_fixture [--serve]")?;
             return Ok(ExitCode::SUCCESS);
         } else {
             return Err(io::Error::new(
@@ -512,7 +507,8 @@ async fn run_gauntlet(serve: bool, started: Instant) -> io::Result<ExitCode> {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     if !probe.is_complete() {
-        let _ = probe.feed(b"\x1b[?0u\x1b[?1;2c\x1b[6;10;20t\x1b]11;rgb:0000/0000/0000\x07\x1b[1;1R");
+        let _ =
+            probe.feed(b"\x1b[?0u\x1b[?1;2c\x1b[6;10;20t\x1b]11;rgb:0000/0000/0000\x07\x1b[1;1R");
     }
 
     let mut caps = tokio::task::spawn_blocking(TerminalCapabilities::detect)

@@ -43,8 +43,7 @@ use pi_tui::testkit::qemu::QemuUserSmokeDriver;
 use pi_tui::testkit::repeat::{RepeatError, run_k};
 use pi_tui::testkit::transcript::{
     CapabilityProfile, ClaimClass, DriverKind, Geometry, NormalizationContext, RowId, RowTier,
-    RunnerRow, Scenario, TimingEnvelope, TranscriptArtifact, TranscriptMode,
-    TranscriptSpec,
+    RunnerRow, Scenario, TimingEnvelope, TranscriptArtifact, TranscriptMode, TranscriptSpec,
 };
 use pi_tui::testkit::validate::validate_artifact;
 use pi_tui::testkit::{RecordingError, RecordingSession};
@@ -219,8 +218,9 @@ impl SmokeRun {
         claims: Vec<ClaimClass>,
         mode: TranscriptMode,
     ) -> Result<Self, LaneError> {
-        let cwd = std::env::current_dir()
-            .map_err(|error| LaneError::Prerequisite(format!("current_dir unavailable: {error}")))?;
+        let cwd = std::env::current_dir().map_err(|error| {
+            LaneError::Prerequisite(format!("current_dir unavailable: {error}"))
+        })?;
         let context = NormalizationContext {
             home: std::env::var_os("HOME").map(|v| v.as_encoded_bytes().to_vec()),
             cwd: Some(cwd.as_os_str().as_encoded_bytes().to_vec()),
@@ -289,8 +289,9 @@ impl SmokeRun {
         let mut artifact = self.recording.finish()?;
         artifact.timing.wall_ms =
             u64::try_from(self.wall_started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        validate_artifact(&artifact)
-            .map_err(|error| LaneError::Assert(format!("validator rejected smoke artifact: {error}")))?;
+        validate_artifact(&artifact).map_err(|error| {
+            LaneError::Assert(format!("validator rejected smoke artifact: {error}"))
+        })?;
         Ok(artifact)
     }
 }
@@ -341,11 +342,7 @@ struct AxisSpec {
     ack_check: Option<fn(&str) -> bool>,
 }
 
-fn run_axis_k(
-    row_label: &str,
-    row: &RunnerRow,
-    spec: &AxisSpec,
-) -> Result<String, LaneError> {
+fn run_axis_k(row_label: &str, row: &RunnerRow, spec: &AxisSpec) -> Result<String, LaneError> {
     match run_k(K, |iteration| {
         let mut run = SmokeRun::open(
             spec.argv.clone(),
@@ -358,7 +355,9 @@ fn run_axis_k(
             run.write(bytes)?;
         }
         run.settle_output(|bytes| {
-            bytes.windows(spec.settle_needle.len()).any(|w| w == spec.settle_needle)
+            bytes
+                .windows(spec.settle_needle.len())
+                .any(|w| w == spec.settle_needle)
         })?;
         if let Some(check) = spec.ack_check {
             let text = String::from_utf8_lossy(run.output()).into_owned();
@@ -432,7 +431,8 @@ fn unpack_integrity_axis(root: &Path, archive: Option<&str>) -> Result<String, L
                 stack.push(path);
             } else if path.file_name().is_some_and(|n| n == "pi") {
                 let unpacked = fs::read(&path).map_err(|e| LaneError::Io(e.to_string()))?;
-                let executed = fs::read(root.join("pi")).map_err(|e| LaneError::Io(e.to_string()))?;
+                let executed =
+                    fs::read(root.join("pi")).map_err(|e| LaneError::Io(e.to_string()))?;
                 if unpacked != executed {
                     return Err(LaneError::Assert(
                         "integrity mismatch: unpacked pi differs from executed pi".to_owned(),
@@ -442,7 +442,9 @@ fn unpack_integrity_axis(root: &Path, archive: Option<&str>) -> Result<String, L
             }
         }
     }
-    Err(LaneError::Assert("archive contains no pi member".to_owned()))
+    Err(LaneError::Assert(
+        "archive contains no pi member".to_owned(),
+    ))
 }
 
 #[expect(
@@ -451,13 +453,16 @@ fn unpack_integrity_axis(root: &Path, archive: Option<&str>) -> Result<String, L
 )]
 #[test]
 fn musl_packaging_protocol_lane() -> Result<(), LaneError> {
-    let row_env = std::env::var("PI_TUI_MUSL_ROW").ok().filter(|v| !v.trim().is_empty());
+    let row_env = std::env::var("PI_TUI_MUSL_ROW")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
     let Some(row_label) = row_env else {
         // Self-check mode (no lane inputs on this host): the lane still
         // proves its own fixtures — the ELF detector flags a dynamically
         // linked host binary as non-static, and the hello ack shape check
         // rejects malformed acknowledgments.
-        let host = std::env::current_exe().map_err(|e| LaneError::Io(format!("current_exe: {e}")))?;
+        let host =
+            std::env::current_exe().map_err(|e| LaneError::Io(format!("current_exe: {e}")))?;
         let bytes = fs::read(&host)?;
         assert_eq!(
             elf64_is_static(&bytes),
@@ -471,11 +476,19 @@ fn musl_packaging_protocol_lane() -> Result<(), LaneError> {
         // Malformed program headers must return None, never panic.
         let mut truncated = bytes[..64].to_vec();
         truncated[54..56].copy_from_slice(&4u16.to_le_bytes());
-        assert_eq!(elf64_is_static(&truncated), None, "short phentsize rejected");
+        assert_eq!(
+            elf64_is_static(&truncated),
+            None,
+            "short phentsize rejected"
+        );
         assert_eq!(elf64_interp(&truncated), None, "short phentsize rejected");
         let mut huge_offset = bytes[..64].to_vec();
         huge_offset[32..40].copy_from_slice(&u64::MAX.to_le_bytes());
-        assert_eq!(elf64_is_static(&huge_offset), None, "overflowing phoff rejected");
+        assert_eq!(
+            elf64_is_static(&huge_offset),
+            None,
+            "overflowing phoff rejected"
+        );
         return Ok(());
     };
 

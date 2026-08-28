@@ -1,11 +1,5 @@
 //! `UiWriter` / `Tui` transaction pipeline and background coalescer.
 
-use std::cell::RefCell;
-use std::collections::HashSet;
-use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::buffer::{Buffer, Cell, CellDiffOption, CellWidth};
 use ratatui::layout::{Position, Rect, Size};
@@ -13,6 +7,12 @@ use ratatui::style::{Color, Modifier};
 use ratatui::text::Line;
 use ratatui::widgets::Widget;
 use ratatui::{Terminal, TerminalOptions, Viewport};
+use std::cell::RefCell;
+use std::collections::HashSet;
+use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::component::Component;
 use crate::frame::{FrameAnnotations, RawRegion, RowClaim, RowClaims, with_annotations};
@@ -65,7 +65,6 @@ pub fn paint_timer_reset() {
     PAINT_DIFF_NANOS.store(0, Ordering::Relaxed);
     PAINT_FRAMES.store(0, Ordering::Relaxed);
 }
-
 
 /// Maximum background coalescing window.
 pub const COALESCE_WINDOW: Duration = Duration::from_millis(16);
@@ -430,8 +429,7 @@ impl<W: Write> Tui<W> {
                 let mut frame = terminal.get_frame();
                 let frame_area = frame.area();
                 let height = root.measure(frame_area.width).min(frame_area.height);
-                let render_area =
-                    Rect::new(frame_area.x, frame_area.y, frame_area.width, height);
+                let render_area = Rect::new(frame_area.x, frame_area.y, frame_area.width, height);
                 root.render(render_area, frame.buffer_mut());
             });
         }
@@ -1111,8 +1109,8 @@ fn push_row_diff(
                 // `prev` mutably, and `cell_width()` is unicode-width work
                 // too expensive to pay per equal cell.
                 let prev_width = prev[i].cell_width() as usize;
-                let prev_visible = prev[i].bg != Color::Reset
-                    || prev[i].modifier.intersects(VISIBLE_ON_BLANK);
+                let prev_visible =
+                    prev[i].bg != Color::Reset || prev[i].modifier.intersects(VISIBLE_ON_BLANK);
                 let contains_vs16 =
                     cell_width > 1 && current.symbol().chars().any(|c| c == '\u{FE0F}');
                 if contains_vs16 {
@@ -1270,13 +1268,13 @@ pub enum SimulatedTxn {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::num::NonZeroU16;
     use crate::component::{EventResult, UiEvent};
     use crate::terminal::backend::audit_bytes;
     use crate::terminal::caps::TerminalCapabilities;
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
     use std::io::Cursor;
+    use std::num::NonZeroU16;
 
     /// PERF-T11 terminal-paint Design A contract: the fused windowed diff
     /// walk must (a) emit exactly the cells a full-row scan of the same
@@ -1315,9 +1313,7 @@ mod tests {
         // 7: ForcedWidth cell equal to the snapshot: advances past its span,
         // not emitted.
         let mut forced = mk("f");
-        forced.set_diff_option(CellDiffOption::ForcedWidth(
-            NonZeroU16::MIN,
-        ));
+        forced.set_diff_option(CellDiffOption::ForcedWidth(NonZeroU16::MIN));
         next[7] = forced.clone();
         prev[7] = forced;
 
@@ -1414,7 +1410,12 @@ mod tests {
         );
         // A vanished foreign prior claim keeps the outer span.
         assert_eq!(
-            narrowed_walk_span(&[RowClaim::Foreign], &[line(0, 100)], Some((1, 2)), (0, 100)),
+            narrowed_walk_span(
+                &[RowClaim::Foreign],
+                &[line(0, 100)],
+                Some((1, 2)),
+                (0, 100)
+            ),
             (0, 100)
         );
         // Claim-less frames (suspended recording) keep the outer span.

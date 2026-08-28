@@ -28,7 +28,12 @@ pub fn build_status(
         frames: Some(frames.to_vec()),
         interval_ms: None,
     });
-    let mut loader = Loader::new(spinner_fn, message_fn, status_message(status, th), indicator);
+    let mut loader = Loader::new(
+        spinner_fn,
+        message_fn,
+        status_message(status, th),
+        indicator,
+    );
     loader.set_frame_index(status.frame);
     // Loader self-indents one column inside pi-tui; the product adds the
     // missing column so the status line shares the column-2 left edge.

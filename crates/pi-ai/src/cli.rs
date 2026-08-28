@@ -13,20 +13,13 @@ use std::path::Path;
 
 use futures::future::BoxFuture;
 use pi_ai::auth::error::AuthError;
+use pi_ai::auth::oauth::radius::RadiusOAuthOptions;
 use pi_ai::auth::oauth::{
-    anthropic::AnthropicOAuth,
-    github_copilot::GitHubCopilotOAuth,
-    kimi_coding::KimiCodingOAuth,
-    openai_codex::OpenAiCodexOAuth,
-    openrouter::OpenRouterOAuth,
-    radius::RadiusOAuth,
+    anthropic::AnthropicOAuth, github_copilot::GitHubCopilotOAuth, kimi_coding::KimiCodingOAuth,
+    openai_codex::OpenAiCodexOAuth, openrouter::OpenRouterOAuth, radius::RadiusOAuth,
     xai::XaiOAuth,
 };
-use pi_ai::auth::oauth::radius::RadiusOAuthOptions;
-use pi_ai::auth::types::{
-    AuthEvent, AuthInteraction, AuthPrompt, Credential,
-    OAuthAuth,
-};
+use pi_ai::auth::types::{AuthEvent, AuthInteraction, AuthPrompt, Credential, OAuthAuth};
 use tokio_util::sync::CancellationToken;
 
 const AUTH_FILE: &str = "auth.json";
@@ -48,8 +41,7 @@ const PROVIDERS: &[OAuthProvider] = &[
             AnthropicOAuth::new()
                 .map(|auth| std::sync::Arc::new(auth) as std::sync::Arc<dyn OAuthAuth>)
                 .unwrap_or_else(|_| {
-                    std::sync::Arc::new(AnthropicOAuth::default())
-                        as std::sync::Arc<dyn OAuthAuth>
+                    std::sync::Arc::new(AnthropicOAuth::default()) as std::sync::Arc<dyn OAuthAuth>
                 })
         },
     },
@@ -69,8 +61,7 @@ const PROVIDERS: &[OAuthProvider] = &[
         name: "Kimi For Coding",
         build: || {
             KimiCodingOAuth::shared().unwrap_or_else(|_| {
-                std::sync::Arc::new(KimiCodingOAuth::default())
-                    as std::sync::Arc<dyn OAuthAuth>
+                std::sync::Arc::new(KimiCodingOAuth::default()) as std::sync::Arc<dyn OAuthAuth>
             })
         },
     },
@@ -90,8 +81,7 @@ const PROVIDERS: &[OAuthProvider] = &[
         name: "OpenRouter",
         build: || {
             OpenRouterOAuth::shared().unwrap_or_else(|_| {
-                std::sync::Arc::new(OpenRouterOAuth::default())
-                    as std::sync::Arc<dyn OAuthAuth>
+                std::sync::Arc::new(OpenRouterOAuth::default()) as std::sync::Arc<dyn OAuthAuth>
             })
         },
     },
@@ -121,8 +111,7 @@ const PROVIDERS: &[OAuthProvider] = &[
         name: "xAI",
         build: || {
             XaiOAuth::shared().unwrap_or_else(|_| {
-                std::sync::Arc::new(XaiOAuth::default())
-                    as std::sync::Arc<dyn OAuthAuth>
+                std::sync::Arc::new(XaiOAuth::default()) as std::sync::Arc<dyn OAuthAuth>
             })
         },
     },
@@ -167,19 +156,20 @@ impl AuthInteraction for StdinInteraction {
         Box::pin(async move {
             match auth_prompt {
                 AuthPrompt::Select {
-                    message,
-                    options,
-                    ..
+                    message, options, ..
                 } => {
                     println!("\n{message}");
                     for (index, option) in options.iter().enumerate() {
                         println!("  {}. {}", index + 1, option.label);
                     }
                     let count = options.len();
-                    let answer = prompt_line(&format!(
-                        "Enter number (1-{count}): "
-                    ));
-                    let choice: usize = answer.parse::<usize>().ok().filter(|n| *n >= 1 && *n <= count).map(|n| n - 1).unwrap_or(usize::MAX);
+                    let answer = prompt_line(&format!("Enter number (1-{count}): "));
+                    let choice: usize = answer
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|n| *n >= 1 && *n <= count)
+                        .map(|n| n - 1)
+                        .unwrap_or(usize::MAX);
                     let selected = options.get(choice);
                     match selected {
                         Some(option) => Ok(option.id.clone()),
@@ -228,10 +218,7 @@ impl AuthInteraction for StdinInteraction {
 
     fn notify(&self, event: AuthEvent) {
         match event {
-            AuthEvent::AuthUrl {
-                url,
-                instructions,
-            } => {
+            AuthEvent::AuthUrl { url, instructions } => {
                 println!("\nOpen this URL in your browser:\n{url}");
                 if let Some(instructions) = instructions {
                     println!("{instructions}");
@@ -260,18 +247,15 @@ impl AuthInteraction for StdinInteraction {
 }
 
 async fn login(provider_id: &str) -> Result<(), String> {
-    let provider = find_provider(provider_id)
-        .ok_or_else(|| format!("Unknown provider: {provider_id}"))?;
+    let provider =
+        find_provider(provider_id).ok_or_else(|| format!("Unknown provider: {provider_id}"))?;
 
     let oauth = (provider.build)();
     let interaction = StdinInteraction {
         signal: CancellationToken::new(),
     };
 
-    let credential = oauth
-        .login(&interaction)
-        .await
-        .map_err(|e| e.to_string())?;
+    let credential = oauth.login(&interaction).await.map_err(|e| e.to_string())?;
 
     let auth_path = std::path::PathBuf::from(AUTH_FILE);
     let mut auth = load_auth(&auth_path);

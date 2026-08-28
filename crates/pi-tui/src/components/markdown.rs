@@ -442,9 +442,7 @@ fn try_block_math(lines: &[&str]) -> Option<(String, usize)> {
         // Check if opener line has content after $$
         if let Some(end_idx) = find_block_closer_dollar(after_open) {
             let body = after_open[..end_idx].trim();
-            let rendered = render_latex(body, true).unwrap_or_else(|| {
-                format!("$${body}$$")
-            });
+            let rendered = render_latex(body, true).unwrap_or_else(|| format!("$${body}$$"));
             return Some((rendered, 1));
         }
 
@@ -457,9 +455,7 @@ fn try_block_math(lines: &[&str]) -> Option<(String, usize)> {
                     search_lines.push(before.to_owned());
                 }
                 let body = search_lines.join("\n").trim().to_owned();
-                let rendered = render_latex(&body, true).unwrap_or_else(|| {
-                    format!("$${body}$$")
-                });
+                let rendered = render_latex(&body, true).unwrap_or_else(|| format!("$${body}$$"));
                 let after = &line[pos + 2..];
                 let mut result = rendered;
                 if !after.trim().is_empty() {
@@ -483,9 +479,7 @@ fn try_block_math(lines: &[&str]) -> Option<(String, usize)> {
         // Check if opener line has content after \[
         if let Some(end_idx) = find_block_closer_bracket(after_open) {
             let body = after_open[..end_idx].trim();
-            let rendered = render_latex(body, true).unwrap_or_else(|| {
-                format!("\\[{body}\\]")
-            });
+            let rendered = render_latex(body, true).unwrap_or_else(|| format!("\\[{body}\\]"));
             return Some((rendered, 1));
         }
 
@@ -498,9 +492,7 @@ fn try_block_math(lines: &[&str]) -> Option<(String, usize)> {
                     search_lines.push(before.to_owned());
                 }
                 let body = search_lines.join("\n").trim().to_owned();
-                let rendered = render_latex(&body, true).unwrap_or_else(|| {
-                    format!("\\[{body}\\]")
-                });
+                let rendered = render_latex(&body, true).unwrap_or_else(|| format!("\\[{body}\\]"));
                 let after = &line[pos + 2..];
                 let mut result = rendered;
                 if !after.trim().is_empty() {
@@ -814,17 +806,16 @@ fn is_all_caps_identifier(s: &str) -> bool {
     }
     // Rest must be [A-Z0-9_]* optionally followed by one non-alphanumeric-non-space
     let mut i = 1;
-    while i < chars.len() && (chars[i].is_ascii_uppercase() || chars[i].is_ascii_digit() || chars[i] == '_') {
+    while i < chars.len()
+        && (chars[i].is_ascii_uppercase() || chars[i].is_ascii_digit() || chars[i] == '_')
+    {
         i += 1;
     }
     if i == chars.len() {
         return true;
     }
     // One trailing non-alphanumeric-non-whitespace
-    if i + 1 == chars.len()
-        && !chars[i].is_alphanumeric()
-        && !chars[i].is_whitespace()
-    {
+    if i + 1 == chars.len() && !chars[i].is_alphanumeric() && !chars[i].is_whitespace() {
         return true;
     }
     false
@@ -2609,7 +2600,11 @@ mod tests {
             },
         );
         let snap = render_snapshot(&mut m, 80);
-        let plain_text: String = snap.iter().map(|s| strip_ansi(s)).collect::<Vec<_>>().join("\n");
+        let plain_text: String = snap
+            .iter()
+            .map(|s| strip_ansi(s))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(plain_text.contains("label"));
         assert!(!plain_text.contains("(https://example.com)"));
     }
@@ -2628,7 +2623,11 @@ mod tests {
             },
         );
         let snap = render_snapshot(&mut m, 80);
-        let plain_text: String = snap.iter().map(|s| strip_ansi(s)).collect::<Vec<_>>().join("\n");
+        let plain_text: String = snap
+            .iter()
+            .map(|s| strip_ansi(s))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(plain_text.contains("label"));
         assert!(plain_text.contains("(https://example.com)"));
     }
@@ -2648,7 +2647,11 @@ mod tests {
             },
         );
         let snap = render_snapshot(&mut m, 80);
-        let plain_text: String = snap.iter().map(|s| strip_ansi(s)).collect::<Vec<_>>().join("\n");
+        let plain_text: String = snap
+            .iter()
+            .map(|s| strip_ansi(s))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(plain_text.contains("label"));
         assert!(!plain_text.contains(&long_uri));
     }
@@ -2712,7 +2715,10 @@ mod tests {
             m.render(Rect::new(0, 0, 80, height), &mut buf);
         });
         let regions = annotations.into_inner().into_parts().1;
-        assert!(regions.is_empty(), "fallback path never touches the wire channel");
+        assert!(
+            regions.is_empty(),
+            "fallback path never touches the wire channel"
+        );
     }
 
     #[test]
@@ -2967,9 +2973,18 @@ mod tests {
     #[test]
     fn block_math_with_surrounding_text() {
         let lines = plain_default("Before\n$$\n\\sum_{i=1}^n x_i\n$$\nAfter", 80);
-        assert!(lines.iter().any(|l| l.contains("∑") || l.contains("xᵢ")), "expected math output in {lines:?}");
-        assert!(lines.iter().any(|l| l.contains("Before")), "expected 'Before' in {lines:?}");
-        assert!(lines.iter().any(|l| l.contains("After")), "expected 'After' in {lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("∑") || l.contains("xᵢ")),
+            "expected math output in {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("Before")),
+            "expected 'Before' in {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("After")),
+            "expected 'After' in {lines:?}"
+        );
     }
 
     #[test]

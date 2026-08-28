@@ -52,7 +52,9 @@ impl FrameDecoderOptions {
     /// Default options (16 MiB max).
     #[must_use]
     pub const fn default() -> Self {
-        Self { max_frame_length: DEFAULT_MAX_FRAME_LENGTH }
+        Self {
+            max_frame_length: DEFAULT_MAX_FRAME_LENGTH,
+        }
     }
     /// Create options with a custom max frame length.
     pub fn with_max(max_frame_length: usize) -> Result<Self, FrameError> {
@@ -65,12 +67,18 @@ impl FrameDecoderOptions {
 }
 
 impl Default for FrameDecoderOptions {
-    fn default() -> Self { Self::default() }
+    fn default() -> Self {
+        Self::default()
+    }
 }
 
 fn resolve_max(options: Option<FrameDecoderOptions>) -> Result<usize, FrameError> {
     let max = options.map_or(DEFAULT_MAX_FRAME_LENGTH, |o| o.max_frame_length);
-    if u64::try_from(max).is_ok_and(|v| v <= MAX_UINT32) { Ok(max) } else { Err(FrameError::InvalidLimit(max as u64)) }
+    if u64::try_from(max).is_ok_and(|v| v <= MAX_UINT32) {
+        Ok(max)
+    } else {
+        Err(FrameError::InvalidLimit(max as u64))
+    }
 }
 
 /// Prefixes a payload with its unsigned 32-bit big-endian byte length.
@@ -83,17 +91,33 @@ pub fn encode_frame(payload: &[u8]) -> Vec<u8> {
 }
 
 /// Validates that `frame` contains exactly one complete frame within the configured limit.
-pub fn assert_complete_frame(frame: &[u8], options: Option<FrameDecoderOptions>) -> Result<(), FrameError> {
-    if frame.len() < FRAME_HEADER_LENGTH { return Err(FrameError::IncompleteHeader); }
+pub fn assert_complete_frame(
+    frame: &[u8],
+    options: Option<FrameDecoderOptions>,
+) -> Result<(), FrameError> {
+    if frame.len() < FRAME_HEADER_LENGTH {
+        return Err(FrameError::IncompleteHeader);
+    }
     let length = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]) as u64;
     let max = resolve_max(options)? as u64;
-    if length > max { return Err(FrameError::Oversized { declared: length, limit: max }); }
-    if frame.len() != FRAME_HEADER_LENGTH + length as usize { return Err(FrameError::NotOneCompletePayload); }
+    if length > max {
+        return Err(FrameError::Oversized {
+            declared: length,
+            limit: max,
+        });
+    }
+    if frame.len() != FRAME_HEADER_LENGTH + length as usize {
+        return Err(FrameError::NotOneCompletePayload);
+    }
     Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DecoderState { Open, Ended, Failed }
+enum DecoderState {
+    Open,
+    Ended,
+    Failed,
+}
 
 /// Incrementally splits arbitrary byte chunks into length-prefixed payloads.
 #[derive(Debug)]
@@ -109,16 +133,34 @@ pub struct FrameDecoder {
 impl FrameDecoder {
     /// Create a decoder with the given options.
     pub fn new(options: Option<FrameDecoderOptions>) -> Result<Self, FrameError> {
-        Ok(Self { header: [0; FRAME_HEADER_LENGTH], header_len: 0, max_frame_length: resolve_max(options)?, payload: Vec::new(), expected_payload_len: None, state: DecoderState::Open })
+        Ok(Self {
+            header: [0; FRAME_HEADER_LENGTH],
+            header_len: 0,
+            max_frame_length: resolve_max(options)?,
+            payload: Vec::new(),
+            expected_payload_len: None,
+            state: DecoderState::Open,
+        })
     }
     /// Create a decoder with default options (16 MiB max).
     #[must_use]
     pub fn default() -> Self {
-        Self::new(None).unwrap_or_else(|_| Self { header: [0; FRAME_HEADER_LENGTH], header_len: 0, max_frame_length: DEFAULT_MAX_FRAME_LENGTH, payload: Vec::new(), expected_payload_len: None, state: DecoderState::Open })
+        Self::new(None).unwrap_or_else(|_| Self {
+            header: [0; FRAME_HEADER_LENGTH],
+            header_len: 0,
+            max_frame_length: DEFAULT_MAX_FRAME_LENGTH,
+            payload: Vec::new(),
+            expected_payload_len: None,
+            state: DecoderState::Open,
+        })
     }
     /// Feed a chunk; returns all complete payloads decoded from it.
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<Vec<u8>>, FrameError> {
-        match self.state { DecoderState::Ended => return Err(FrameError::Ended), DecoderState::Failed => return Err(FrameError::Failed), DecoderState::Open => {} }
+        match self.state {
+            DecoderState::Ended => return Err(FrameError::Ended),
+            DecoderState::Failed => return Err(FrameError::Failed),
+            DecoderState::Open => {}
+        }
         let mut frames = Vec::new();
         let mut offset = 0;
         while offset < chunk.len() {
@@ -126,14 +168,26 @@ impl FrameDecoder {
                 let needed = FRAME_HEADER_LENGTH - self.header_len;
                 let avail = chunk.len() - offset;
                 let take = needed.min(avail);
-                self.header[self.header_len..self.header_len + take].copy_from_slice(&chunk[offset..offset + take]);
+                self.header[self.header_len..self.header_len + take]
+                    .copy_from_slice(&chunk[offset..offset + take]);
                 self.header_len += take;
                 offset += take;
-                if self.header_len < FRAME_HEADER_LENGTH { continue; }
+                if self.header_len < FRAME_HEADER_LENGTH {
+                    continue;
+                }
                 let frame_length = u32::from_be_bytes(self.header) as u64;
                 self.header_len = 0;
-                if frame_length > self.max_frame_length as u64 { self.fail(); return Err(FrameError::Oversized { declared: frame_length, limit: self.max_frame_length as u64 }); }
-                if frame_length == 0 { frames.push(Vec::new()); continue; }
+                if frame_length > self.max_frame_length as u64 {
+                    self.fail();
+                    return Err(FrameError::Oversized {
+                        declared: frame_length,
+                        limit: self.max_frame_length as u64,
+                    });
+                }
+                if frame_length == 0 {
+                    frames.push(Vec::new());
+                    continue;
+                }
                 let len = frame_length as usize;
                 self.expected_payload_len = Some(len);
                 self.payload.clear();
@@ -143,7 +197,8 @@ impl FrameDecoder {
             let avail = chunk.len() - offset;
             let remaining = expected - self.payload.len();
             let take = avail.min(remaining);
-            self.payload.extend_from_slice(&chunk[offset..offset + take]);
+            self.payload
+                .extend_from_slice(&chunk[offset..offset + take]);
             offset += take;
             if self.payload.len() == expected {
                 frames.push(std::mem::take(&mut self.payload));
@@ -154,8 +209,15 @@ impl FrameDecoder {
     }
     /// Assert no partial frame remains; transitions to the ended state.
     pub fn end(&mut self) -> Result<(), FrameError> {
-        match self.state { DecoderState::Ended => return Err(FrameError::Ended), DecoderState::Failed => return Err(FrameError::Failed), DecoderState::Open => {} }
-        if self.header_len != 0 || self.expected_payload_len.is_some() { self.fail(); return Err(FrameError::Truncated); }
+        match self.state {
+            DecoderState::Ended => return Err(FrameError::Ended),
+            DecoderState::Failed => return Err(FrameError::Failed),
+            DecoderState::Open => {}
+        }
+        if self.header_len != 0 || self.expected_payload_len.is_some() {
+            self.fail();
+            return Err(FrameError::Truncated);
+        }
         self.state = DecoderState::Ended;
         Ok(())
     }
@@ -188,7 +250,9 @@ mod tests {
         let frame = encode_frame(payload);
         let mut dec = FrameDecoder::default();
         let mut got = Vec::new();
-        for byte in &frame { got.extend(dec.push(std::slice::from_ref(byte)).expect("decode")); }
+        for byte in &frame {
+            got.extend(dec.push(std::slice::from_ref(byte)).expect("decode"));
+        }
         assert_eq!(got.len(), 1);
         assert_eq!(got[0], payload);
         dec.end().expect("end");
@@ -217,8 +281,14 @@ mod tests {
         let mut prefix = [0u8; 4];
         prefix.copy_from_slice(&(16 * 1024 * 1024 + 1u32).to_be_bytes());
         let mut dec = FrameDecoder::default();
-        let err = dec.push(&prefix).unwrap_err();
-        assert_eq!(err, FrameError::Oversized { declared: 16 * 1024 * 1024 + 1, limit: 16 * 1024 * 1024 });
+        let err = dec.push(&prefix).expect_err("expected error");
+        assert_eq!(
+            err,
+            FrameError::Oversized {
+                declared: 16 * 1024 * 1024 + 1,
+                limit: 16 * 1024 * 1024
+            }
+        );
     }
 
     #[test]
@@ -227,7 +297,7 @@ mod tests {
         let frame = encode_frame(payload);
         let mut dec = FrameDecoder::default();
         let _ = dec.push(&frame[..FRAME_HEADER_LENGTH]).expect("header");
-        let err = dec.end().unwrap_err();
+        let err = dec.end().expect_err("expected error");
         assert_eq!(err, FrameError::Truncated);
     }
 
@@ -246,7 +316,7 @@ mod tests {
         let payload = b"test";
         let frame = encode_frame(payload);
         assert_complete_frame(&frame, None).expect("valid");
-        let err = assert_complete_frame(&frame[..3], None).unwrap_err();
+        let err = assert_complete_frame(&frame[..3], None).expect_err("expected error");
         assert_eq!(err, FrameError::IncompleteHeader);
     }
 }

@@ -34,14 +34,13 @@ use std::time::{Duration, Instant};
 use avt::Vt;
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 
-use pi_tui::image::{encode_iterm2, encode_kitty, image_fallback, KittyEncodeOptions};
+use pi_tui::image::{KittyEncodeOptions, encode_iterm2, encode_kitty, image_fallback};
 use pi_tui::keys::{
-    is_kitty_protocol_active, key_matches, key_press, set_kitty_protocol_active,
-    MODIFY_OTHER_KEYS_OMISSION,
+    MODIFY_OTHER_KEYS_OMISSION, is_kitty_protocol_active, key_matches, key_press,
+    set_kitty_protocol_active,
 };
 use pi_tui::terminal::guard::EMERGENCY_RESTORE_BYTES;
 use pi_tui::terminal::{audit_bytes, probe_query_batch};
-
 
 const HARD_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_IDLE: Duration = Duration::from_millis(300);
@@ -113,8 +112,8 @@ fn grill_t2_terminal_state_probes_before_sync_kitty_flag_emergency_restore() {
         .expect("T2: probe query batch must be present on the wire");
 
     // Probes must precede synchronized output.
-    let first_sync = find_subslice(&report.raw, b"\x1b[?2026h")
-        .expect("T2: sync branch must emit CSI ? 2026 h");
+    let first_sync =
+        find_subslice(&report.raw, b"\x1b[?2026h").expect("T2: sync branch must emit CSI ? 2026 h");
     assert!(
         probe_pos < first_sync,
         "T2: probes must precede synchronized output (probe={probe_pos}, sync={first_sync})"
@@ -296,7 +295,6 @@ fn grill_t9_terminal_interfaces_sole_stdout_owner() {
     );
 }
 
-
 // ---------------------------------------------------------------------------
 // T4: Math rendering — VERIFIED (re-adjudicated under PAR-CLOSE, #39)
 // ---------------------------------------------------------------------------
@@ -310,8 +308,8 @@ fn grill_t9_terminal_interfaces_sole_stdout_owner() {
 /// docs/PAR-PTY-GRILL-verdict.md for the full re-adjudication record.
 
 fn grill_t4_math_rendering_landed() {
-    use pi_tui::components::{DefaultTextStyle, Markdown, MarkdownOptions, MarkdownTheme};
     use pi_tui::component::Component;
+    use pi_tui::components::{DefaultTextStyle, Markdown, MarkdownOptions, MarkdownTheme};
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
 
@@ -389,7 +387,10 @@ struct GrillReport {
     txn_count: u32,
 }
 
-#[expect(clippy::too_many_lines, reason = "PTY harness requires sequential setup, resize, and drain")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "PTY harness requires sequential setup, resize, and drain"
+)]
 fn drive_fixture(exit: &str, sync: bool) -> GrillReport {
     let binary = fixture_binary();
     let pty_system = NativePtySystem::default();
@@ -673,11 +674,8 @@ fn detect_row_erase_immediate_reflow(raw: &[u8], txns: &[Vec<u8>]) -> bool {
                 continue;
             }
             let b0 = window[0];
-            let ok = b0.is_ascii_graphic()
-                || b0 == b' '
-                || b0 == b'\n'
-                || b0 == b'\r'
-                || b0 == 0x1b;
+            let ok =
+                b0.is_ascii_graphic() || b0 == b' ' || b0 == b'\n' || b0 == b'\r' || b0 == 0x1b;
             if !ok {
                 return false;
             }

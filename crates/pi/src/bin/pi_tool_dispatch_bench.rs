@@ -189,10 +189,7 @@ impl Sink {
     }
 
     fn session_file(&self) -> Option<String> {
-        self.session
-            .borrow()
-            .get_session_file()
-            .map(str::to_owned)
+        self.session.borrow().get_session_file().map(str::to_owned)
     }
 }
 
@@ -222,7 +219,9 @@ impl EmitAgentEvent for Sink {
                     }
                     self.appends.set(self.appends.get() + 1);
                     if let Some(t0) = self.t0.take() {
-                        self.slices.borrow_mut().push(t0.elapsed().as_nanos() as u64);
+                        self.slices
+                            .borrow_mut()
+                            .push(t0.elapsed().as_nanos() as u64);
                     }
                 }
             }
@@ -348,12 +347,8 @@ fn parse_args() -> Result<Args, String> {
                 args.clk_tck = value()?.parse().map_err(|e| format!("--clk-tck: {e}"))?
             }
             "--calls" => args.calls = value()?.parse().map_err(|e| format!("--calls: {e}"))?,
-            "--warmup" => {
-                args.warmup = value()?.parse().map_err(|e| format!("--warmup: {e}"))?
-            }
-            "--blocks" => {
-                args.blocks = value()?.parse().map_err(|e| format!("--blocks: {e}"))?
-            }
+            "--warmup" => args.warmup = value()?.parse().map_err(|e| format!("--warmup: {e}"))?,
+            "--blocks" => args.blocks = value()?.parse().map_err(|e| format!("--blocks: {e}"))?,
             "--session-dir" => args.session_dir = value()?,
             "--arguments" => {
                 let mode = value()?;

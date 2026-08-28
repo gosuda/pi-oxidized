@@ -7856,7 +7856,10 @@ pub(crate) mod tests {
             args: vec!["/bundle/pi-extension-host.js".to_owned()],
         });
         let spec = endpoint_host_spec(&plans[0], Some(&resolved))?;
-        assert!(!spec.args.contains(&"--no-builtins".to_owned()), "builtin compat must not get --no-builtins");
+        assert!(
+            !spec.args.contains(&"--no-builtins".to_owned()),
+            "builtin compat must not get --no-builtins"
+        );
         Ok(())
     }
 
@@ -7874,9 +7877,15 @@ pub(crate) mod tests {
         let mjs = temp.path().join("prebundled.mjs");
         std::fs::write(&mjs, "export default {}")?;
         let (classified, diagnostics) = classify_paths(&[mjs.to_string_lossy().into_owned()]);
-        assert!(classified.is_empty(), ".mjs must not produce a classified extension");
+        assert!(
+            classified.is_empty(),
+            ".mjs must not produce a classified extension"
+        );
         assert_eq!(diagnostics.len(), 1);
-        assert!(diagnostics[0].message.contains("lean runner"), "diagnostic must mention lean runner");
+        assert!(
+            diagnostics[0].message.contains("lean runner"),
+            "diagnostic must mention lean runner"
+        );
         Ok(())
     }
 
@@ -7894,5 +7903,4 @@ pub(crate) mod tests {
         assert_eq!(plans[0].kind, EndpointKind::TsCompat);
         Ok(())
     }
-
 }

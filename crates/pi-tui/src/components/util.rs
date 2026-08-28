@@ -17,11 +17,7 @@ use crate::text::{extract_ansi_code, grapheme_width, parse_osc8_hyperlink, visib
 #[derive(Debug, Clone)]
 enum PaintedOp {
     /// Grapheme cell: byte range into the source line plus reduced style.
-    Sym {
-        start: u32,
-        end: u32,
-        style: Style,
-    },
+    Sym { start: u32, end: u32, style: Style },
     /// Continuation cell of a wider-than-one-column grapheme.
     Cont,
 }
@@ -425,14 +421,7 @@ pub fn paint_line(x: u16, y: u16, max_width: usize, buf: &mut Buffer, line: &str
 }
 
 /// [`paint_line`] with a precomputed memo key (Design E).
-fn paint_line_with_key(
-    x: u16,
-    y: u16,
-    max_width: usize,
-    buf: &mut Buffer,
-    line: &str,
-    key: u128,
-) {
+fn paint_line_with_key(x: u16, y: u16, max_width: usize, buf: &mut Buffer, line: &str, key: u128) {
     if max_width == 0 {
         return;
     }
@@ -526,7 +515,9 @@ fn apply_sym(cell: &mut Cell, y: u16, cx: u16, symbol: &str, style: Style) {
     let mut changed = cell.symbol() != symbol;
     changed |= style.fg.is_some_and(|c| cell.fg != c);
     changed |= style.bg.is_some_and(|c| cell.bg != c);
-    changed |= style.underline_color.is_some_and(|c| cell.underline_color != c);
+    changed |= style
+        .underline_color
+        .is_some_and(|c| cell.underline_color != c);
     changed |= cell.modifier & style.add_modifier != style.add_modifier;
     changed |= cell.modifier & style.sub_modifier != Modifier::empty();
     if changed {
@@ -821,17 +812,27 @@ mod tests {
     #[test]
     fn paint_line_records_hyperlink_region() {
         let styled_label = "\u{1b}[34mexample\u{1b}[0m";
-        let line = format!("see {}", hyperlink_capped(styled_label, "https://example.com", None));
+        let line = format!(
+            "see {}",
+            hyperlink_capped(styled_label, "https://example.com", None)
+        );
         let (buf, regions) = paint_with_annotations(5, 2, 80, &line);
         assert_eq!(regions.len(), 1, "one region per balanced link span");
         let region = &regions[0];
         // "see " occupies columns 0..3; label starts at column 4 of the line,
         // which is screen column 5 + 4 = 9 and spans 7 visible columns.
         assert_eq!(region.area, Rect::new(9, 2, 7, 1));
-        assert!(region.bytes.starts_with(b"\x1b]8;;https://example.com\x1b\\"));
+        assert!(
+            region
+                .bytes
+                .starts_with(b"\x1b]8;;https://example.com\x1b\\")
+        );
         assert!(region.bytes.ends_with(b"\x1b]8;;\x1b\\\x1b[0m"));
         let rendered = String::from_utf8_lossy(&region.bytes).into_owned();
-        assert!(rendered.contains("example"), "label text rides in the region");
+        assert!(
+            rendered.contains("example"),
+            "label text rides in the region"
+        );
         // Label cells are still painted for non-raw consumers (tests, fallback).
         assert_eq!(buf.cell((9, 2)).map(|c| c.symbol()), Some("e"));
         assert_eq!(buf.cell((15, 2)).map(|c| c.symbol()), Some("e"));
@@ -841,12 +842,16 @@ mod tests {
     fn paint_line_records_hyperlink_region_bel_terminator() {
         let line = format!(
             "{}label{}",
-            format_link_open_bel("https://example.com", None).unwrap(),
+            format_link_open_bel("https://example.com", None).expect("link open"),
             format_link_close_bel()
         );
         let (_, regions) = paint_with_annotations(0, 0, 80, &line);
         assert_eq!(regions.len(), 1);
-        assert!(regions[0].bytes.starts_with(b"\x1b]8;;https://example.com\x07"));
+        assert!(
+            regions[0]
+                .bytes
+                .starts_with(b"\x1b]8;;https://example.com\x07")
+        );
         assert!(regions[0].bytes.ends_with(b"\x1b]8;;\x07\x1b[0m"));
     }
 
@@ -880,7 +885,11 @@ mod tests {
         // the close at col == max_width; the region must survive.
         let line = hyperlink_capped("abcdef", "https://example.com", None);
         let (_, regions) = paint_with_annotations(0, 0, 6, &line);
-        assert_eq!(regions.len(), 1, "close at the margin still closes the span");
+        assert_eq!(
+            regions.len(),
+            1,
+            "close at the margin still closes the span"
+        );
         assert_eq!(regions[0].area, Rect::new(0, 0, 6, 1));
     }
 
@@ -888,11 +897,16 @@ mod tests {
     fn paint_line_region_carries_outer_style_context() {
         // Italic set before the open: the replay must re-establish it so the
         // overwritten label cells keep their painted style (blockquote case).
-        let line = format!("\u{1b}[3m{}", hyperlink_capped("label", "https://example.com", None));
+        let line = format!(
+            "\u{1b}[3m{}",
+            hyperlink_capped("label", "https://example.com", None)
+        );
         let (_, regions) = paint_with_annotations(0, 0, 80, &line);
         assert_eq!(regions.len(), 1);
         assert!(
-            regions[0].bytes.starts_with(b"\x1b[3m\x1b]8;;https://example.com\x1b\\"),
+            regions[0]
+                .bytes
+                .starts_with(b"\x1b[3m\x1b]8;;https://example.com\x1b\\"),
             "style context at open prefixes the region: {:?}",
             String::from_utf8_lossy(&regions[0].bytes)
         );
@@ -933,7 +947,9 @@ mod tests {
         for x in 0..38u16 {
             assert_eq!(
                 base.cell((x, 0)).map(|c| (c.symbol(), c.diff_option)),
-                shifted.cell((x + 2, 3)).map(|c| (c.symbol(), c.diff_option)),
+                shifted
+                    .cell((x + 2, 3))
+                    .map(|c| (c.symbol(), c.diff_option)),
                 "column {x} must replay identically when translated"
             );
         }
@@ -956,7 +972,11 @@ mod tests {
         let (narrow, _) = paint_with_annotations(0, 0, 4, &line);
         let (narrow_again, _) = paint_with_annotations(0, 0, 4, &line);
         assert_eq!(wide.cell((9, 0)).map(|c| c.symbol()), Some("j"));
-        assert_eq!(narrow.cell((4, 0)).map(|c| c.symbol()), Some(" "), "cut at width 4");
+        assert_eq!(
+            narrow.cell((4, 0)).map(|c| c.symbol()),
+            Some(" "),
+            "cut at width 4"
+        );
         assert_eq!(narrow, narrow_again, "narrow replay stays self-consistent");
     }
 }

@@ -149,7 +149,7 @@ fn main() -> ExitCode {
         // The static path cycles through 1 frame, so the frame never changes.
         // This uses the indicator's actual frame count (1), not the shipped
         // hardcoded mod-10 — see module docs for the qualification.
-        let new_static_frame = (status_static_frame + 1) % 1; // always 0
+        let new_static_frame = 0; // single-frame spinner: frame never changes
         let static_status_changed =
             new_static_frame != status_static_frame || new_elapsed != prev_elapsed;
         if static_status_changed {
@@ -190,19 +190,28 @@ fn main() -> ExitCode {
     // Emit evidence markers to stdout.
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
-    let emit = |lock: &mut std::io::StdoutLock<'_>, key: &str, value: &str| -> std::io::Result<()> {
-        writeln!(lock, "EVIDENCE:{key}={value}")
-    };
+    let emit = |lock: &mut std::io::StdoutLock<'_>,
+                key: &str,
+                value: &str|
+     -> std::io::Result<()> { writeln!(lock, "EVIDENCE:{key}={value}") };
 
     let _ = emit(&mut lock, "static_ticks", &TICK_COUNT.to_string());
-    let _ = emit(&mut lock, "static_advance_true", &static_advance_true.to_string());
+    let _ = emit(
+        &mut lock,
+        "static_advance_true",
+        &static_advance_true.to_string(),
+    );
     let _ = emit(
         &mut lock,
         "static_frame_index",
         &static_loader.frame_index().to_string(),
     );
     let _ = emit(&mut lock, "animated_ticks", &TICK_COUNT.to_string());
-    let _ = emit(&mut lock, "animated_advance_true", &animated_advance_true.to_string());
+    let _ = emit(
+        &mut lock,
+        "animated_advance_true",
+        &animated_advance_true.to_string(),
+    );
     let _ = emit(
         &mut lock,
         "animated_frame_index",
@@ -219,7 +228,11 @@ fn main() -> ExitCode {
         &status_animated_repaints.to_string(),
     );
     let _ = emit(&mut lock, "kind_label", KIND_LABEL);
-    let _ = emit(&mut lock, "total_elapsed_secs", &total_elapsed_secs.to_string());
+    let _ = emit(
+        &mut lock,
+        "total_elapsed_secs",
+        &total_elapsed_secs.to_string(),
+    );
     let _ = emit(&mut lock, "static_frame_count", "1");
     let _ = emit(&mut lock, "animated_frame_count", &frames_len.to_string());
 

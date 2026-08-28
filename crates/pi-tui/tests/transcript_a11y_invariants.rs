@@ -975,7 +975,8 @@ fn static_sufficiency_fails_on_missing_elapsed_or_kind() -> Result<(), String> {
         "a corpus with zero spinner-status frames must fail as unexercised"
     );
     // The canonical corpus shape passes with all seven spinner frames.
-    let spinner = check_static_sufficiency(&spinner_frames()).map_err(|violations| violations.join("; "))?;
+    let spinner =
+        check_static_sufficiency(&spinner_frames()).map_err(|violations| violations.join("; "))?;
     assert_eq!(spinner, 7);
     Ok(())
 }

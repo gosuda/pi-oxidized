@@ -28,9 +28,9 @@ use pi_ext::protocol::{
     TerminalInputResult, decode_frame_str, encode_frame, from_payload,
 };
 use pi_ext::server::{
-    ExtensionFault, NativeExtension, NativeExtensionContext, NativeEventSink, NativeFuture,
-    RegistrySnapshot, ServerConfig, ServerError, ToolCall, ToolSnapshotEntry, ToolUpdateSink,
-    EXTENSIONS_LOAD_METHOD, NATIVE_TERMINAL_INPUT_BUDGET,
+    EXTENSIONS_LOAD_METHOD, ExtensionFault, NATIVE_TERMINAL_INPUT_BUDGET, NativeEventSink,
+    NativeExtension, NativeExtensionContext, NativeFuture, RegistrySnapshot, ServerConfig,
+    ServerError, ToolCall, ToolSnapshotEntry, ToolUpdateSink,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -138,22 +138,12 @@ impl ScalingAdapter {
 
 impl NativeExtension for ScalingAdapter {
     fn snapshot(&self) -> RegistrySnapshot {
-        self.handles
-            .snapshot_calls
-            .fetch_add(1, Ordering::SeqCst);
+        self.handles.snapshot_calls.fetch_add(1, Ordering::SeqCst);
 
         let (tool_count, handlers, terminal_input) = match self.profile {
             LoadProfile::Zero => (0, Vec::new(), false),
-            LoadProfile::Idle100 => (
-                100,
-                vec!["session_start".to_owned()],
-                false,
-            ),
-            LoadProfile::Active20 => (
-                20,
-                vec!["session_start".to_owned()],
-                true,
-            ),
+            LoadProfile::Idle100 => (100, vec!["session_start".to_owned()], false),
+            LoadProfile::Active20 => (20, vec!["session_start".to_owned()], true),
         };
 
         RegistrySnapshot {
@@ -250,9 +240,7 @@ impl NativeExtension for ScalingAdapter {
 
             let is_slow = match mode {
                 TerminalInputMode::Fast => false,
-                TerminalInputMode::SlowThenFast => {
-                    call_count.fetch_add(1, Ordering::SeqCst) == 0
-                }
+                TerminalInputMode::SlowThenFast => call_count.fetch_add(1, Ordering::SeqCst) == 0,
             };
 
             if is_slow {
@@ -413,8 +401,12 @@ impl RawPeer {
     }
 
     async fn session_start(&mut self, id: u64) -> Result<Frame, Box<dyn Error + Send + Sync>> {
-        self.request(id, "session_start", json!({ "type": "session_start", "reason": "startup" }))
-            .await
+        self.request(
+            id,
+            "session_start",
+            json!({ "type": "session_start", "reason": "startup" }),
+        )
+        .await
     }
 
     async fn terminal_input(
@@ -432,10 +424,7 @@ impl RawPeer {
 /// Uses only the production `serve_io` entry point — no custom server loop.
 type ServerHandle = tokio::task::JoinHandle<Result<(), ServerError>>;
 
-fn spawn_server<E: NativeExtension>(
-    ext: E,
-    config: ServerConfig,
-) -> (RawPeer, ServerHandle) {
+fn spawn_server<E: NativeExtension>(ext: E, config: ServerConfig) -> (RawPeer, ServerHandle) {
     let (client_tx, server_rx) = tokio::io::duplex(64 * 1024);
     let (server_tx, client_rx) = tokio::io::duplex(64 * 1024);
     let handle = tokio::spawn(async move { serve_io(server_rx, server_tx, ext, config).await });
@@ -542,7 +531,11 @@ async fn extensions_load_zero_idle_active_id_correlation() -> R {
         let response = peer.load(id).await?;
 
         assert_eq!(response.id, id, "{label}: load response must correlate");
-        assert_eq!(response.kind, FrameKind::Res, "{label}: load must be a response");
+        assert_eq!(
+            response.kind,
+            FrameKind::Res,
+            "{label}: load must be a response"
+        );
         assert_eq!(
             response.method, EXTENSIONS_LOAD_METHOD,
             "{label}: load response method must match"
@@ -611,7 +604,10 @@ async fn session_start_active20_emits_widget_slots() -> R {
     sorted.dedup();
     assert_eq!(sorted.len(), 20, "widget keys must be unique");
 
-    let events = handles.lifecycle_events.lock().unwrap_or_else(|e| e.into_inner());
+    let events = handles
+        .lifecycle_events
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     assert!(
         events.contains(&"session_start".to_owned()),
         "session_start lifecycle must be recorded"
@@ -649,7 +645,11 @@ async fn fast_terminal_input_stream_300_requests_id_correlation() -> R {
         let response = peer.terminal_input(id, data).await?;
 
         assert_eq!(response.id, id, "request {i}: id must correlate");
-        assert_eq!(response.kind, FrameKind::Res, "request {i}: must be a response");
+        assert_eq!(
+            response.kind,
+            FrameKind::Res,
+            "request {i}: must be a response"
+        );
         assert_eq!(
             response.method,
             Method::TerminalInput.as_str(),
@@ -680,7 +680,10 @@ async fn fast_terminal_input_stream_300_requests_id_correlation() -> R {
         }
     }
 
-    let inputs = handles.terminal_inputs.lock().unwrap_or_else(|e| e.into_inner());
+    let inputs = handles
+        .terminal_inputs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     assert_eq!(
         inputs.len(),
         REQUESTS as usize,
@@ -765,7 +768,8 @@ async fn fast_after_slow_stays_local() -> R {
     let slow_elapsed = t0.elapsed();
     assert_eq!(slow_response.id, 10, "slow timeout must correlate by id");
     assert_eq!(
-        slow_response.kind, FrameKind::Error,
+        slow_response.kind,
+        FrameKind::Error,
         "slow terminalInput must be an error frame"
     );
     let slow_error: ErrorPayload = from_payload(&slow_response.payload)?;
@@ -853,10 +857,7 @@ async fn cooperative_cancellation_tool_execute() -> R {
         error.code, "cancelled",
         "cancelled tool error code must be 'cancelled'"
     );
-    assert!(
-        !error.retryable,
-        "cancelled error must be non-retryable"
-    );
+    assert!(!error.retryable, "cancelled error must be non-retryable");
 
     assert!(
         handles.tool_cancelled.load(Ordering::SeqCst),
@@ -920,7 +921,10 @@ async fn full_corpus_replay_id_correlation() -> R {
         assert_eq!(response.kind, FrameKind::Res);
     }
 
-    let inputs = handles.terminal_inputs.lock().unwrap_or_else(|e| e.into_inner());
+    let inputs = handles
+        .terminal_inputs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     assert_eq!(inputs.len(), FAST_REQUESTS as usize);
 
     drop(peer);
@@ -944,10 +948,16 @@ async fn prepare_validate_fixed_results_id_correlation() -> R {
     let _ = collect_ui_slot_keys(&mut peer, Duration::from_millis(500)).await;
 
     // tool.prepare
-    let prep_res = peer.request(200, methods::TOOL_PREPARE, json!({
-        "name": "tool.0",
-        "args": { "input": "hello" },
-    })).await?;
+    let prep_res = peer
+        .request(
+            200,
+            methods::TOOL_PREPARE,
+            json!({
+                "name": "tool.0",
+                "args": { "input": "hello" },
+            }),
+        )
+        .await?;
     assert_eq!(prep_res.id, 200, "prepare response must correlate");
     assert_eq!(prep_res.kind, FrameKind::Res);
     assert_eq!(
@@ -960,10 +970,16 @@ async fn prepare_validate_fixed_results_id_correlation() -> R {
     );
 
     // tool.validate
-    let val_res = peer.request(201, methods::TOOL_VALIDATE, json!({
-        "name": "tool.0",
-        "args": { "input": "hello", "prepared": true },
-    })).await?;
+    let val_res = peer
+        .request(
+            201,
+            methods::TOOL_VALIDATE,
+            json!({
+                "name": "tool.0",
+                "args": { "input": "hello", "prepared": true },
+            }),
+        )
+        .await?;
     assert_eq!(val_res.id, 201, "validate response must correlate");
     assert_eq!(val_res.kind, FrameKind::Res);
     assert_eq!(
@@ -972,11 +988,13 @@ async fn prepare_validate_fixed_results_id_correlation() -> R {
     );
 
     assert_eq!(
-        handles.prepare_calls.load(Ordering::SeqCst), 1,
+        handles.prepare_calls.load(Ordering::SeqCst),
+        1,
         "prepare must be called once"
     );
     assert_eq!(
-        handles.validate_calls.load(Ordering::SeqCst), 1,
+        handles.validate_calls.load(Ordering::SeqCst),
+        1,
         "validate must be called once"
     );
 

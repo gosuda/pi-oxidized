@@ -44,8 +44,8 @@ pub use schedule::{
 pub use state::{AgentState, AgentStateSnapshot};
 pub use telemetry::{
     AGENT_TELEMETRY_SCHEMAS, AI_TELEMETRY_SCHEMA, AttributeValue, HARNESS_TELEMETRY_SCHEMA,
-    InMemoryTelemetryContext, RecordedEvent, RecordedSpan, SpanAttributes, SpanOptions,
-    SpanStatus, TelemetryContext, TelemetrySchema, TelemetrySpan, noop_context,
+    InMemoryTelemetryContext, RecordedEvent, RecordedSpan, SpanAttributes, SpanOptions, SpanStatus,
+    TelemetryContext, TelemetrySchema, TelemetrySpan, noop_context,
 };
 pub use tool::{
     AgentTool, AgentToolResult, ToolExecutionMode, ToolUpdates, error_tool_result, to_pi_tool,

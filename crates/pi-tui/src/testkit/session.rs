@@ -2,8 +2,8 @@
 
 use std::io::{Read, Write};
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::Mutex;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -219,16 +219,12 @@ impl<S: RenderSession> RecordingSession<S> {
     {
         let session = self.session.as_mut().ok_or(DriverError::Closed)?;
         let frame = session.read_settled_frame(policy, predicate)?;
-        Geometry::new(
-            frame.snapshot.geometry.cols,
-            frame.snapshot.geometry.rows,
-        )?;
+        Geometry::new(frame.snapshot.geometry.cols, frame.snapshot.geometry.rows)?;
         let cursor_col = u16::try_from(frame.snapshot.cursor_col).map_err(|_| {
             DriverError::InvalidSpec("snapshot cursor column exceeds u16".to_owned())
         })?;
-        let cursor_row = u16::try_from(frame.snapshot.cursor_row).map_err(|_| {
-            DriverError::InvalidSpec("snapshot cursor row exceeds u16".to_owned())
-        })?;
+        let cursor_row = u16::try_from(frame.snapshot.cursor_row)
+            .map_err(|_| DriverError::InvalidSpec("snapshot cursor row exceeds u16".to_owned()))?;
         self.recorder.output_and_snapshot(
             &[frame.batch.bytes.as_slice()],
             frame.snapshot.geometry.cols,
@@ -240,7 +236,6 @@ impl<S: RenderSession> RecordingSession<S> {
         Ok(frame)
     }
 }
-
 
 /// Shared writer that allows multiple owners to write to the same underlying
 /// PTY master. Used to give the DSR auto-responder thread its own write handle
@@ -266,10 +261,13 @@ impl SharedWriter {
 
 impl Write for SharedWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.inner.lock().unwrap().write(buf)
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .write(buf)
     }
     fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.lock().unwrap().flush()
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).flush()
     }
 }
 /// One chunk, or a terminal reader failure that must not validate as settle.
@@ -323,14 +321,13 @@ impl ReaderPump {
 
                         // Auto-respond to any DSR cursor-position queries.
                         if let Some(w) = &mut responder {
-                            let scan: Vec<u8> = residual
-                                .iter()
-                                .chain(chunk.iter())
-                                .copied()
-                                .collect();
+                            let scan: Vec<u8> =
+                                residual.iter().chain(chunk.iter()).copied().collect();
                             let needle = b"\x1b[6n";
                             let mut idx = 0;
-                            while let Some(pos) = scan[idx..].windows(needle.len()).position(|w| w == needle) {
+                            while let Some(pos) =
+                                scan[idx..].windows(needle.len()).position(|w| w == needle)
+                            {
                                 let abs = idx + pos;
                                 // Only respond to matches that start at or after
                                 // the residual boundary so we don't double-respond.
@@ -628,11 +625,11 @@ pub(crate) fn apply_std_env(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::CapabilityProfile;
     use crate::testkit::transcript::{
-        CanonicalEvent, EventKind, RunnerRow, RowId, RowTier, Scenario, TimingEnvelope,
+        CanonicalEvent, EventKind, RowId, RowTier, RunnerRow, Scenario, TimingEnvelope,
         TranscriptMode,
     };
-    use crate::testkit::CapabilityProfile;
 
     #[derive(Default)]
     struct FakeDriver {
@@ -1073,7 +1070,9 @@ mod tests {
                     |bytes| bytes == b"visible",
                     &context,
                 ),
-                Err(RecordingError::Transcript(TranscriptError::SequenceOverflow))
+                Err(RecordingError::Transcript(
+                    TranscriptError::SequenceOverflow
+                ))
             ));
             // Overflow leaves the post-spawn sequence unused; restore it so close
             // can record exit without inventing events from the rejected settle.
@@ -1114,7 +1113,7 @@ mod tests {
         assert_eq!(&collected[..], &input[..]);
 
         // Two DSR replies were written.
-        let replies = received.lock().unwrap();
+        let replies = received.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             &replies[..],
             b"\x1b[1;1R\x1b[1;1R",
@@ -1145,9 +1144,9 @@ mod tests {
 
         let reader = SplitReader {
             chunks: vec![
-                b"abc\x1b".to_vec(),  // partial: ESC at end
-                b"[6n".to_vec(),      // rest of DSR query
-                b"def".to_vec(),      // normal text
+                b"abc\x1b".to_vec(), // partial: ESC at end
+                b"[6n".to_vec(),     // rest of DSR query
+                b"def".to_vec(),     // normal text
             ],
             idx: 0,
         };
@@ -1165,15 +1164,22 @@ mod tests {
 
         assert_eq!(&collected[..], b"abc\x1b[6ndef");
 
-        let replies = received.lock().unwrap();
-        assert_eq!(&replies[..], b"\x1b[1;1R", "expected one DSR reply for split query");
+        let replies = received.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            &replies[..],
+            b"\x1b[1;1R",
+            "expected one DSR reply for split query"
+        );
     }
 
     /// Writer sink that captures bytes for DSR reply verification.
     struct DsrSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
     impl Write for DsrSink {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend_from_slice(buf);
             Ok(buf.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {

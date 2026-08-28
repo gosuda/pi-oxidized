@@ -148,9 +148,9 @@ impl StateMatrixRoot {
                 "STREAM chunk verification-stream-0002".to_owned(),
                 "STREAM chunk verification-stream-0003".to_owned(),
             ],
-            Phase::Error => vec![
-                "Error: request failed after 3 attempts (verification-provider)".to_owned(),
-            ],
+            Phase::Error => {
+                vec!["Error: request failed after 3 attempts (verification-provider)".to_owned()]
+            }
             Phase::Loading | Phase::FocusMarked => Vec::new(),
             Phase::ExtUi => vec![
                 "│ EXT: verification ext-state-message".to_owned(),
@@ -209,7 +209,9 @@ impl Component for StateMatrixRoot {
             }
             let mut col = 0usize;
             for ch in line.chars().take(width) {
-                let x = area.x.saturating_add(u16::try_from(col).unwrap_or(u16::MAX));
+                let x = area
+                    .x
+                    .saturating_add(u16::try_from(col).unwrap_or(u16::MAX));
                 let ch = if ch.is_control() { ' ' } else { ch };
                 buf[(x, *row)].set_char(ch);
                 col += 1;
@@ -217,7 +219,9 @@ impl Component for StateMatrixRoot {
             // Direct cell writer under in-place rendering: blank the rest of
             // the row span (reset-buffer parity) and claim it.
             for tail in col..width {
-                let x = area.x.saturating_add(u16::try_from(tail).unwrap_or(u16::MAX));
+                let x = area
+                    .x
+                    .saturating_add(u16::try_from(tail).unwrap_or(u16::MAX));
                 buf[(x, *row)].reset();
             }
             pi_tui::frame::claim_opaque_span(ratatui::layout::Rect {
@@ -335,7 +339,10 @@ fn run() -> io::Result<ExitCode> {
         }
     }
     if args.iter().any(|arg| arg == "--help") {
-        writeln!(io::stdout(), "pi_tui_state_matrix_fixture (stepped; no arguments)")?;
+        writeln!(
+            io::stdout(),
+            "pi_tui_state_matrix_fixture (stepped; no arguments)"
+        )?;
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -435,7 +442,8 @@ async fn run_matrix(started: Instant) -> io::Result<ExitCode> {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     if !probe.is_complete() {
-        let _ = probe.feed(b"\x1b[?0u\x1b[?1;2c\x1b[6;10;20t\x1b]11;rgb:0000/0000/0000\x07\x1b[1;1R");
+        let _ =
+            probe.feed(b"\x1b[?0u\x1b[?1;2c\x1b[6;10;20t\x1b]11;rgb:0000/0000/0000\x07\x1b[1;1R");
     }
 
     let mut caps = tokio::task::spawn_blocking(TerminalCapabilities::detect)

@@ -1857,7 +1857,10 @@ mod tests {
         }
         assert_eq!(literals.len(), 5);
         for (i, literal) in literals.iter().enumerate() {
-            if !literal.contains("telemetry:") {
+            if !literal.contains("telemetry:")
+                && !literal.contains("telemetry,")
+                && !literal.contains("telemetry }")
+            {
                 panic!("literal {i} missing telemetry:\n{literal}");
             }
         }

@@ -258,8 +258,7 @@ impl Transcript {
             *line = String::from_utf8(bytes).unwrap_or_default();
         }
         if let (Some(wrapped), Some(width)) = (&mut self.cached_wrapped, self.cached_width) {
-            let rewrapped =
-                pi_tui::text::wrap_text_with_ansi(&self.lines[idx], usize::from(width));
+            let rewrapped = pi_tui::text::wrap_text_with_ansi(&self.lines[idx], usize::from(width));
             // The poked line is ~85 chars at width 100 — always one wrapped
             // line; the guard keeps the probe total if that ever changes.
             if rewrapped.len() == 1 {
@@ -292,11 +291,7 @@ impl BenchRoot {
             transcript: Transcript::new(),
             editor: EditorSim::new(),
             status: Text::with_padding("\x1b[2mstatus: idle\x1b[22m", 1, 0),
-            footer: Text::with_padding(
-                "\x1b[2m~/workspaces/pi  main  100k tokens\x1b[22m",
-                1,
-                0,
-            ),
+            footer: Text::with_padding("\x1b[2m~/workspaces/pi  main  100k tokens\x1b[22m", 1, 0),
         }
     }
 
@@ -345,21 +340,36 @@ impl Component for BenchRoot {
         // Render dock: status, editor, footer stacked vertically.
         let mut y = area.y.saturating_add(scroll_h);
 
-        let status_h = self.status.measure(width).max(1).min(area.height.saturating_sub(scroll_h));
+        let status_h = self
+            .status
+            .measure(width)
+            .max(1)
+            .min(area.height.saturating_sub(scroll_h));
         if status_h > 0 {
-            self.status.render(Rect::new(area.x, y, width, status_h), buf);
+            self.status
+                .render(Rect::new(area.x, y, width, status_h), buf);
             y = y.saturating_add(status_h);
         }
         let remaining_after_status = area.height.saturating_sub(y.saturating_sub(area.y));
-        let editor_h = self.editor.measure(width).max(3).min(remaining_after_status);
+        let editor_h = self
+            .editor
+            .measure(width)
+            .max(3)
+            .min(remaining_after_status);
         if editor_h > 0 {
-            self.editor.render(Rect::new(area.x, y, width, editor_h), buf);
+            self.editor
+                .render(Rect::new(area.x, y, width, editor_h), buf);
             y = y.saturating_add(editor_h);
         }
         let remaining_after_editor = area.height.saturating_sub(y.saturating_sub(area.y));
-        let footer_h = self.footer.measure(width).max(1).min(remaining_after_editor);
+        let footer_h = self
+            .footer
+            .measure(width)
+            .max(1)
+            .min(remaining_after_editor);
         if footer_h > 0 {
-            self.footer.render(Rect::new(area.x, y, width, footer_h), buf);
+            self.footer
+                .render(Rect::new(area.x, y, width, footer_h), buf);
         }
     }
 
@@ -485,7 +495,8 @@ fn run_probe_frames(
     for i in 0..frames {
         frame(i, root);
         if tui.commit(Txn::Frame, root).is_ok() {
-            written = written.saturating_add(u64::try_from(tui.last_payload().len()).unwrap_or(u64::MAX));
+            written =
+                written.saturating_add(u64::try_from(tui.last_payload().len()).unwrap_or(u64::MAX));
         }
     }
     let us = start.elapsed().as_secs_f64() * 1e6;
@@ -620,7 +631,8 @@ fn probe_paint_editor_steady() -> (f64, f64) {
         let mut tui = fresh_tui(ROWS);
         let mut root = BenchRoot::new();
         for i in 0..150 {
-            root.editor.append(char::from(b'a' + u8::try_from(i % 26).unwrap_or(0)));
+            root.editor
+                .append(char::from(b'a' + u8::try_from(i % 26).unwrap_or(0)));
         }
         for _ in 0..PROBE_WARMUP {
             let _ = tui.commit(Txn::Frame, &mut root);
@@ -764,20 +776,36 @@ fn run_probe() -> ExitCode {
     // workload-side rebuild.
     let editor_row_commit = editor_steady - static30 - editor_rebuild;
 
-    println!("floor probe (reps={PROBE_REPS} × {PROBE_FRAMES} frames; tight {PROBE_TIGHT_ITERS} ops)");
-    println!("  frameStatic30   {static30:8.3} µs/frame  ({static30_bytes:6.0} B/frame, {static30_written:5.1} B written)");
+    println!(
+        "floor probe (reps={PROBE_REPS} × {PROBE_FRAMES} frames; tight {PROBE_TIGHT_ITERS} ops)"
+    );
+    println!(
+        "  frameStatic30   {static30:8.3} µs/frame  ({static30_bytes:6.0} B/frame, {static30_written:5.1} B written)"
+    );
     println!("  frameStatic50   {static50:8.3} µs/frame");
     println!("  frameStatic60   {static60:8.3} µs/frame");
-    println!("  framePoke       {poke:8.3} µs/frame  ({poke_bytes:6.0} B/frame, {poke_written:5.1} B written)");
-    println!("  frameEditorSteady {editor_steady:6.3} µs/frame  ({editor_steady_bytes:6.0} B/frame)");
+    println!(
+        "  framePoke       {poke:8.3} µs/frame  ({poke_bytes:6.0} B/frame, {poke_written:5.1} B written)"
+    );
+    println!(
+        "  frameEditorSteady {editor_steady:6.3} µs/frame  ({editor_steady_bytes:6.0} B/frame)"
+    );
     println!("  paintStatic30    {paint_static30:7.3} µs/frame  (paint-only, probe)");
-    println!("  paintPoke        {paint_poke:7.3} µs/frame  (paint-only; diff phase {paint_poke_diff:.3})");
-    println!("  paintEditorSteady {paint_editor:6.3} µs/frame  (paint-only; diff phase {paint_editor_diff:.3})");
+    println!(
+        "  paintPoke        {paint_poke:7.3} µs/frame  (paint-only; diff phase {paint_poke_diff:.3})"
+    );
+    println!(
+        "  paintEditorSteady {paint_editor:6.3} µs/frame  (paint-only; diff phase {paint_editor_diff:.3})"
+    );
     println!("  wrapKeyPerLine  {wrap_key:8.3} µs/line   (workload-side)");
     println!("  editorRebuild   {editor_rebuild:8.3} µs/frame (workload-side)");
     println!("  identitySlope   {slope_30_50:8.4} µs/visible-line (30↔50; 50↔60 {slope_50_60:.4})");
-    println!("  changedLineCommit {changed_line_commit:6.3} µs/changed-line (poke − static − wrapKey)");
-    println!("  editorRowCommit {editor_row_commit:6.3} µs/changed-line (steady − static − rebuild)");
+    println!(
+        "  changedLineCommit {changed_line_commit:6.3} µs/changed-line (poke − static − wrapKey)"
+    );
+    println!(
+        "  editorRowCommit {editor_row_commit:6.3} µs/changed-line (steady − static − rebuild)"
+    );
 
     let json = format!(
         "\n__PROBE_JSON__\n{{\
@@ -859,9 +887,7 @@ fn main() -> ExitCode {
 
     // Report
     let transcript_lines = root.transcript.lines_for_width(COLUMNS).len();
-    println!(
-        "frames={FRAMES} viewport={COLUMNS}x{ROWS} transcript={transcript_lines} lines"
-    );
+    println!("frames={FRAMES} viewport={COLUMNS}x{ROWS} transcript={transcript_lines} lines");
     report("static", &static_result);
     report("editor", &editor_result);
 

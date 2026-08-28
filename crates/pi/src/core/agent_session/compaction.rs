@@ -44,8 +44,8 @@ use super::events::{AgentSessionEvent, CompactionReason, SummarizationRetrySourc
 use super::extension_runner::ExtensionRunner;
 use super::tree::SummarizationAuth;
 use pi_agent::telemetry::{
-    AiOperation, AiRequestStart, HarnessCompactionStart, SpanStatus,
-    contained, start_ai_request_span, start_harness_compaction_span,
+    AiOperation, AiRequestStart, HarnessCompactionStart, SpanStatus, contained,
+    start_ai_request_span, start_harness_compaction_span,
 };
 
 // ---------------------------------------------------------------------------
@@ -449,12 +449,15 @@ impl AgentSession {
 
         let path_refs: Vec<&SessionEntry> = path_entries.iter().collect();
         let preparation = prepare_compaction(&path_refs, pure_settings).map_err(|err| {
-            contained(|| {
-                compaction_span.set_status(SpanStatus::Error {
-                    name: None,
-                    message: Some(err.to_string()),
-                });
-            }, || ());
+            contained(
+                || {
+                    compaction_span.set_status(SpanStatus::Error {
+                        name: None,
+                        message: Some(err.to_string()),
+                    });
+                },
+                || (),
+            );
             err
         })?;
         let Some(preparation) = preparation else {
@@ -464,12 +467,15 @@ impl AgentSession {
 
         // Resolve auth + stream inputs.
         let inputs = self.resolve_compaction_inputs().await.map_err(|err| {
-            contained(|| {
-                compaction_span.set_status(SpanStatus::Error {
-                    name: None,
-                    message: Some(err.to_string()),
-                });
-            }, || ());
+            contained(
+                || {
+                    compaction_span.set_status(SpanStatus::Error {
+                        name: None,
+                        message: Some(err.to_string()),
+                    });
+                },
+                || (),
+            );
             err
         })?;
 
@@ -477,15 +483,21 @@ impl AgentSession {
         let runner = self.hooks.runner();
         if runner.has_handlers("session_before_compact") {
             let event = AgentSessionEvent::CompactionStart { reason };
-            let cancel = self.extension_before_compact(&runner, event).await.map_err(|err| {
-                contained(|| {
-                    compaction_span.set_status(SpanStatus::Error {
-                        name: None,
-                        message: Some(err.to_string()),
-                    });
-                }, || ());
-                err
-            })?;
+            let cancel = self
+                .extension_before_compact(&runner, event)
+                .await
+                .map_err(|err| {
+                    contained(
+                        || {
+                            compaction_span.set_status(SpanStatus::Error {
+                                name: None,
+                                message: Some(err.to_string()),
+                            });
+                        },
+                        || (),
+                    );
+                    err
+                })?;
             if cancel.cancel {
                 drop(compaction_span);
                 return Err(CompactionError::Cancelled);
@@ -500,12 +512,15 @@ impl AgentSession {
                     .finalize_compaction_result(replacement, true, reason, will_retry, &abort_token)
                     .await
                     .map_err(|err| {
-                        contained(|| {
-                            compaction_span.set_status(SpanStatus::Error {
-                                name: None,
-                                message: Some(err.to_string()),
-                            });
-                        }, || ());
+                        contained(
+                            || {
+                                compaction_span.set_status(SpanStatus::Error {
+                                    name: None,
+                                    message: Some(err.to_string()),
+                                });
+                            },
+                            || (),
+                        );
                         err
                     })
                     .map(Some);
@@ -584,12 +599,15 @@ impl AgentSession {
         self.finalize_compaction_result(result, false, reason, will_retry, &abort_token)
             .await
             .map_err(|err| {
-                contained(|| {
-                    compaction_span.set_status(SpanStatus::Error {
-                        name: None,
-                        message: Some(err.to_string()),
-                    });
-                }, || ());
+                contained(
+                    || {
+                        compaction_span.set_status(SpanStatus::Error {
+                            name: None,
+                            message: Some(err.to_string()),
+                        });
+                    },
+                    || (),
+                );
                 err
             })
             .map(Some)
@@ -1295,8 +1313,12 @@ mod tests {
         context_window: u64,
         stream_fn: SummarizeStreamFn,
     ) -> TestResult<Arc<AgentSession>> {
-        session_with_history_with(context_window, stream_fn, pi_agent::telemetry::noop_context())
-            .await
+        session_with_history_with(
+            context_window,
+            stream_fn,
+            pi_agent::telemetry::noop_context(),
+        )
+        .await
     }
 
     async fn session_with_history_with(
@@ -1732,7 +1754,6 @@ mod tests {
         );
         Ok(())
     }
-
 
     #[tokio::test]
     async fn manual_compact_custom_instructions_passed_to_summary() -> TestResult {

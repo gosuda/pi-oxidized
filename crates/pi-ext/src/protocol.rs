@@ -3083,9 +3083,8 @@ mod bridge_tests {
     /// create a second check.  Deleting any fixture line or mutating a
     /// modifier-combo key event kind breaks this test on the Rust side,
     /// mirroring the TypeScript `witness manifest lockstep` describe block.
-    const WITNESS_MANIFEST: &str = include_str!(
-        "../../../packages/pi-tui-protocol/tests/fixtures/witness-manifest.json"
-    );
+    const WITNESS_MANIFEST: &str =
+        include_str!("../../../packages/pi-tui-protocol/tests/fixtures/witness-manifest.json");
 
     #[test]
     fn witness_manifest_lockstep() -> TestResult {
@@ -3117,10 +3116,7 @@ mod bridge_tests {
             if frame.method == Method::UiEvent.as_str() && frame.kind == FrameKind::Req {
                 if let Some(event) = frame.payload.get("event") {
                     if event.get("type").and_then(|v| v.as_str()) == Some("key") {
-                        let code = event
-                            .get("code")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
+                        let code = event.get("code").and_then(|v| v.as_str()).unwrap_or("");
                         let modifiers = event
                             .get("modifiers")
                             .cloned()
@@ -3146,12 +3142,8 @@ mod bridge_tests {
 
         // 2. Every manifest (method, kind) pair must be witnessed.
         for pair in expected_pairs {
-            let method = pair[0]
-                .as_str()
-                .ok_or("manifest pair missing method")?;
-            let kind_str = pair[1]
-                .as_str()
-                .ok_or("manifest pair missing kind")?;
+            let method = pair[0].as_str().ok_or("manifest pair missing method")?;
+            let kind_str = pair[1].as_str().ok_or("manifest pair missing kind")?;
             let kind = match kind_str {
                 "req" => FrameKind::Req,
                 "res" => FrameKind::Res,
@@ -3173,10 +3165,9 @@ mod bridge_tests {
                 FrameKind::Event => "event",
                 FrameKind::Error => "error",
             };
-            let found = expected_pairs.iter().any(|p| {
-                p[0].as_str() == Some(method.as_str())
-                    && p[1].as_str() == Some(kind_str)
-            });
+            let found = expected_pairs
+                .iter()
+                .any(|p| p[0].as_str() == Some(method.as_str()) && p[1].as_str() == Some(kind_str));
             assert!(
                 found,
                 "fixture contains untracked {method} {kind_str} pair not in manifest"
@@ -3189,13 +3180,12 @@ mod bridge_tests {
             expected_key_events.len(),
             "key event count drifted from manifest"
         );
-        for (i, (actual, expected)) in
-            key_events.iter().zip(expected_key_events.iter()).enumerate()
+        for (i, (actual, expected)) in key_events
+            .iter()
+            .zip(expected_key_events.iter())
+            .enumerate()
         {
-            assert_eq!(
-                actual, expected,
-                "key event {i} drifted from manifest"
-            );
+            assert_eq!(actual, expected, "key event {i} drifted from manifest");
         }
 
         Ok(())

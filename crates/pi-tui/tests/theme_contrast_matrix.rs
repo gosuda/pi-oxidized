@@ -145,7 +145,13 @@ fn polarity_detection_reports_numbers_not_inferences() {
         .expect("polarityTotal");
     assert_eq!(
         classified,
-        u64::try_from(verdicts.iter().filter(|v| v.get("detectedDark").and_then(|d| d.as_bool()).is_some()).count()).unwrap(),
+        u64::try_from(
+            verdicts
+                .iter()
+                .filter(|v| v.get("detectedDark").and_then(|d| d.as_bool()).is_some())
+                .count()
+        )
+        .unwrap(),
         "polarityClassified must match actual classified count"
     );
     // 10 of 11 classified (only the fallback case is unclassified).
@@ -168,21 +174,18 @@ fn thinking_ramp_verdicts_report_numbers_against_thresholds() {
         .and_then(|v| v.as_f64())
         .expect("de2000Ratio threshold");
 
-    assert!((de_threshold - 2.3).abs() < 1e-9, "ΔE2000 threshold pinned at 2.3");
+    assert!(
+        (de_threshold - 2.3).abs() < 1e-9,
+        "ΔE2000 threshold pinned at 2.3"
+    );
     assert!(
         (ratio_threshold - 1.25).abs() < 1e-9,
         "ratio threshold pinned at 1.25"
     );
 
     for v in verdicts {
-        let lower = v
-            .get("lower")
-            .and_then(|s| s.as_str())
-            .unwrap_or("unknown");
-        let upper = v
-            .get("upper")
-            .and_then(|s| s.as_str())
-            .unwrap_or("unknown");
+        let lower = v.get("lower").and_then(|s| s.as_str()).unwrap_or("unknown");
+        let upper = v.get("upper").and_then(|s| s.as_str()).unwrap_or("unknown");
         let polarity = v
             .get("polarity")
             .and_then(|s| s.as_str())
@@ -195,11 +198,15 @@ fn thinking_ramp_verdicts_report_numbers_against_thresholds() {
         let de = v
             .get("deltaE2000")
             .and_then(|d| d.as_f64())
-            .unwrap_or_else(|| panic!("{lower}→{upper} {polarity}/{color_mode}: deltaE2000 must be a number"));
+            .unwrap_or_else(|| {
+                panic!("{lower}→{upper} {polarity}/{color_mode}: deltaE2000 must be a number")
+            });
         let ratio = v
             .get("wcagRatio")
             .and_then(|r| r.as_f64())
-            .unwrap_or_else(|| panic!("{lower}→{upper} {polarity}/{color_mode}: wcagRatio must be a number"));
+            .unwrap_or_else(|| {
+                panic!("{lower}→{upper} {polarity}/{color_mode}: wcagRatio must be a number")
+            });
 
         // Verify the pass/fail flags match the numeric thresholds.
         let passes_de = de >= de_threshold;
@@ -273,7 +280,9 @@ fn rail_hue_collisions_report_wcag_ratios_against_minimum() {
         let ratio = v
             .get("wcagRatio")
             .and_then(|r| r.as_f64())
-            .unwrap_or_else(|| panic!("{fg} vs {rail} {polarity}/{color_mode}: wcagRatio must be a number"));
+            .unwrap_or_else(|| {
+                panic!("{fg} vs {rail} {polarity}/{color_mode}: wcagRatio must be a number")
+            });
 
         let passes = ratio >= min_threshold;
         let actual_passes = v
@@ -297,10 +306,7 @@ fn sgr_inspection_reports_both_modes_with_delta_e() {
     let verdicts = report.sgr_verdicts();
 
     for v in verdicts {
-        let slot = v
-            .get("slot")
-            .and_then(|s| s.as_str())
-            .unwrap_or("unknown");
+        let slot = v.get("slot").and_then(|s| s.as_str()).unwrap_or("unknown");
         let polarity = v
             .get("polarity")
             .and_then(|s| s.as_str())
@@ -330,7 +336,10 @@ fn sgr_inspection_reports_both_modes_with_delta_e() {
             "{slot} {polarity}: forced-256 SGR must be palette, got {f256_sgr:?}"
         );
         // ΔE2000 must be non-negative.
-        assert!(de >= 0.0, "{slot} {polarity}: deltaE2000 must be non-negative, got {de}");
+        assert!(
+            de >= 0.0,
+            "{slot} {polarity}: deltaE2000 must be non-negative, got {de}"
+        );
     }
 
     // 2 themes × 12 slots = 24 verdicts.
@@ -374,10 +383,7 @@ fn slash_pair_fallback_resolves_every_case() {
             );
         } else {
             // Known names must not trigger fallback.
-            assert!(
-                !fallback,
-                "known setting {raw:?} must not trigger fallback"
-            );
+            assert!(!fallback, "known setting {raw:?} must not trigger fallback");
         }
     }
 
@@ -388,5 +394,8 @@ fn slash_pair_fallback_resolves_every_case() {
         .get("pairFallbackCount")
         .and_then(|v| v.as_u64())
         .expect("pairFallbackCount");
-    assert_eq!(fallback_count, 2, "expected 2 fallbacks, got {fallback_count}");
+    assert_eq!(
+        fallback_count, 2,
+        "expected 2 fallbacks, got {fallback_count}"
+    );
 }

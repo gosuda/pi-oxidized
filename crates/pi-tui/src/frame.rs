@@ -89,8 +89,11 @@ impl PriorLine {
 
 /// Writer-side pooling tables: prior-frame claims, frame claims, and the
 /// frame-side changed-column ranges (PERF-T11 terminal-paint Design B).
-pub type ClaimTables = (Vec<Vec<RowClaim>>, Vec<Vec<RowClaim>>, Vec<Option<(u16, u16)>>);
-
+pub type ClaimTables = (
+    Vec<Vec<RowClaim>>,
+    Vec<Vec<RowClaim>>,
+    Vec<Option<(u16, u16)>>,
+);
 
 /// Per-row claim bookkeeping for one frame render.
 ///
@@ -187,7 +190,15 @@ impl RowClaims {
 
     /// Record this frame's line claim on row `y` with its region flag.
     pub fn record_line(&mut self, y: u16, x: u16, width: u16, key: u128, linked: bool) {
-        self.record(y, RowClaim::Line { x, width, key, linked });
+        self.record(
+            y,
+            RowClaim::Line {
+                x,
+                width,
+                key,
+                linked,
+            },
+        );
     }
     /// Record an opaque claim on row `y` (direct cell writer).
     pub fn claim_opaque(&mut self, y: u16, x: u16, width: u16) {
@@ -400,18 +411,19 @@ pub fn record_line(y: u16, x: u16, width: u16, key: u128, linked: bool) {
 /// still record: their rows carry no frame claims, so the writer never
 /// narrows them.
 pub fn record_change(y: u16, col: u16) {
-    let _ = with_current_annotations(|annotations| {
-        annotations.row_claims_mut().record_change(y, col)
-    });
+    let _ =
+        with_current_annotations(|annotations| annotations.row_claims_mut().record_change(y, col));
 }
 
 /// Record opaque row-span claims for the current frame (no-op outside).
 pub fn claim_opaque_span(area: Rect) {
     let _ = with_current_annotations(|annotations| {
         for row in 0..area.height {
-            annotations
-                .row_claims_mut()
-                .claim_opaque(area.y.saturating_add(row), area.x, area.width);
+            annotations.row_claims_mut().claim_opaque(
+                area.y.saturating_add(row),
+                area.x,
+                area.width,
+            );
         }
     });
 }
@@ -450,12 +462,12 @@ pub fn suspend_row_claims<R>(f: impl FnOnce() -> R) -> R {
 #[cfg(test)]
 mod tests {
     use super::{
-        FrameAnnotations, RawRegion, RowClaims, push_raw_region, set_cursor,
-        with_annotations, with_current_annotations,
+        FrameAnnotations, RawRegion, RowClaims, push_raw_region, set_cursor, with_annotations,
+        with_current_annotations,
     };
 
-    use std::cell::RefCell;
     use ratatui::layout::{Position, Rect};
+    use std::cell::RefCell;
 
     #[test]
     fn annotations_collect_cursor_and_raw_regions() {

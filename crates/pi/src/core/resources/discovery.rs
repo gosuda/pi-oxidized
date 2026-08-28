@@ -2701,11 +2701,21 @@ mod tests {
         let root = temp_root("m20-manifest-vs-pkg")?;
         let ext = root.join("precedence-ext");
         fs::create_dir_all(&ext)?;
-        fs::write(ext.join("pi-extension.json"), r#"{"runtime":"native","entry":"native-entry"}"#)?;
+        fs::write(
+            ext.join("pi-extension.json"),
+            r#"{"runtime":"native","entry":"native-entry"}"#,
+        )?;
         fs::write(ext.join("legacy.ts"), "export default {}")?;
-        fs::write(ext.join("package.json"), r#"{"pi":{"extensions":["legacy.ts"]}}"#)?;
+        fs::write(
+            ext.join("package.json"),
+            r#"{"pi":{"extensions":["legacy.ts"]}}"#,
+        )?;
         let entries = collect_auto_extension_entries(&root);
-        assert_eq!(entries, vec![path_to_string(&ext)], "pi-extension.json must take precedence over package.json");
+        assert_eq!(
+            entries,
+            vec![path_to_string(&ext)],
+            "pi-extension.json must take precedence over package.json"
+        );
         let _ = fs::remove_dir_all(root);
         Ok(())
     }
@@ -2717,9 +2727,16 @@ mod tests {
         fs::create_dir_all(&ext)?;
         fs::write(ext.join("index.ts"), "export default {}")?;
         fs::write(ext.join("custom.ts"), "export default {}")?;
-        fs::write(ext.join("package.json"), r#"{"pi":{"extensions":["custom.ts"]}}"#)?;
+        fs::write(
+            ext.join("package.json"),
+            r#"{"pi":{"extensions":["custom.ts"]}}"#,
+        )?;
         let entries = collect_auto_extension_entries(&root);
-        assert_eq!(entries, vec![path_to_string(&ext.join("custom.ts"))], "package.json extensions must take precedence over index.ts");
+        assert_eq!(
+            entries,
+            vec![path_to_string(&ext.join("custom.ts"))],
+            "package.json extensions must take precedence over index.ts"
+        );
         let _ = fs::remove_dir_all(root);
         Ok(())
     }
@@ -2732,9 +2749,12 @@ mod tests {
         fs::write(ext.join("index.ts"), "export default {}")?;
         fs::write(ext.join("index.js"), "export default {}")?;
         let entries = collect_auto_extension_entries(&root);
-        assert_eq!(entries, vec![path_to_string(&ext.join("index.ts"))], "index.ts must take precedence over index.js");
+        assert_eq!(
+            entries,
+            vec![path_to_string(&ext.join("index.ts"))],
+            "index.ts must take precedence over index.js"
+        );
         let _ = fs::remove_dir_all(root);
         Ok(())
     }
-
 }

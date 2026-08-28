@@ -902,7 +902,13 @@ mod tests {
     #[test]
     fn m21_multiple_e_flags_accumulate_in_order() {
         let result = parse_args(&args(&["-e", "./a.ts", "-e", "./b.ts", "-e", "./c.ts"]));
-        assert_eq!(result.extensions, vec!["./a.ts".to_owned(), "./b.ts".to_owned(), "./c.ts".to_owned()]);
+        assert_eq!(
+            result.extensions,
+            vec![
+                "./a.ts".to_owned(),
+                "./b.ts".to_owned(),
+                "./c.ts".to_owned()
+            ]
+        );
     }
-
 }

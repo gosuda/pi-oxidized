@@ -34,10 +34,8 @@ use std::time::{Duration, Instant};
 
 use pi_tui::component::{Component, EventResult, UiEvent};
 use pi_tui::components::editor::Editor;
-use pi_tui::components::{
-    DefaultTextStyle, Input, Markdown, MarkdownOptions, MarkdownTheme, Rail,
-};
 use pi_tui::components::util::paint_lines;
+use pi_tui::components::{DefaultTextStyle, Input, Markdown, MarkdownOptions, MarkdownTheme, Rail};
 use pi_tui::keys::set_kitty_protocol_active;
 use pi_tui::overlay::write_overlay_cells;
 use pi_tui::terminal::{
@@ -45,8 +43,8 @@ use pi_tui::terminal::{
     install_panic_emergency_hook, probe_query_batch, write_emergency_restore_bytes,
 };
 use pi_tui::text::{normalize_terminal_output, visible_width};
-use ratatui::buffer::Cell;
 use ratatui::buffer::Buffer;
+use ratatui::buffer::Cell;
 use ratatui::layout::{Position, Rect, Size};
 
 const DRAW_DEADLINE: Duration = Duration::from_secs(8);
@@ -226,7 +224,11 @@ impl GauntletRoot {
         );
         for index in selected {
             let (label, _probe) = CORPUS[index];
-            doc.push_str(&format!("| {label} {} | {} |\n", normalized_probe(index), index + 1));
+            doc.push_str(&format!(
+                "| {label} {} | {} |\n",
+                normalized_probe(index),
+                index + 1
+            ));
         }
         doc
     }
@@ -373,12 +375,7 @@ impl Component for GauntletRoot {
                         let y = row;
                         put_line(base, buf, &mut row, width, bottom);
                         let overlay_line = gauntlet_row(index);
-                        let overlay_area = Rect::new(
-                            OVERLAY_COL,
-                            y,
-                            OVERLAY_WIDTH,
-                            1,
-                        );
+                        let overlay_area = Rect::new(OVERLAY_COL, y, OVERLAY_WIDTH, 1);
                         write_overlay_cells(buf, overlay_area, &overlay_line);
                     }
                 }
@@ -416,7 +413,13 @@ impl Component for GauntletRoot {
             width,
             bottom,
         );
-        put_line("FOOTER pi-tui-unicode-gauntlet", buf, &mut row, width, bottom);
+        put_line(
+            "FOOTER pi-tui-unicode-gauntlet",
+            buf,
+            &mut row,
+            width,
+            bottom,
+        );
         if self.phase == Phase::Done {
             put_line("UNICODE GAUNTLET COMPLETE", buf, &mut row, width, bottom);
         }
@@ -530,7 +533,10 @@ fn run() -> io::Result<ExitCode> {
         }
     }
     if args.iter().any(|arg| arg == "--help") {
-        writeln!(io::stdout(), "pi_tui_unicode_gauntlet_fixture (stepped; no arguments)")?;
+        writeln!(
+            io::stdout(),
+            "pi_tui_unicode_gauntlet_fixture (stepped; no arguments)"
+        )?;
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -626,7 +632,8 @@ async fn run_gauntlet(started: Instant) -> io::Result<ExitCode> {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     if !probe.is_complete() {
-        let _ = probe.feed(b"\x1b[?0u\x1b[?1;2c\x1b[6;10;20t\x1b]11;rgb:0000/0000/0000\x07\x1b[1;1R");
+        let _ =
+            probe.feed(b"\x1b[?0u\x1b[?1;2c\x1b[6;10;20t\x1b]11;rgb:0000/0000/0000\x07\x1b[1;1R");
     }
 
     let mut caps = tokio::task::spawn_blocking(TerminalCapabilities::detect)
@@ -672,14 +679,8 @@ async fn run_gauntlet(started: Instant) -> io::Result<ExitCode> {
     }
     steps.push((Phase::Overlay, Vec::new()));
     // Paste-verbatim: paste-1 builds the editor (enter), paste-2 appends.
-    steps.push((
-        Phase::PasteVerbatim(0),
-        vec![EditorStep::Paste(0)],
-    ));
-    steps.push((
-        Phase::PasteVerbatim(1),
-        vec![EditorStep::Paste(1)],
-    ));
+    steps.push((Phase::PasteVerbatim(0), vec![EditorStep::Paste(0)]));
+    steps.push((Phase::PasteVerbatim(1), vec![EditorStep::Paste(1)]));
     // Atomicity: two undos remove both verbatim pastes in one step each,
     // then the self-check stamps the verdict; a fresh large paste renders
     // the marker row.

@@ -688,12 +688,7 @@ async fn serve_live_events(
             }
         }
         tui.note_resize(latest.0.max(1), latest.1.max(1));
-        commit_with_deadline(
-            tui,
-            Txn::Reanchor(ReanchorCause::Resize),
-            root,
-            started,
-        )?;
+        commit_with_deadline(tui, Txn::Reanchor(ReanchorCause::Resize), root, started)?;
     }
 }
 

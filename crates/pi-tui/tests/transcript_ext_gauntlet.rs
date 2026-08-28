@@ -163,7 +163,6 @@ impl FixtureRun {
         })
     }
 
-
     fn settle_frame<F>(
         &mut self,
         mut predicate: F,
@@ -178,9 +177,8 @@ impl FixtureRun {
             |bytes| predicate(bytes) || predicate(&merge_acc(&prior, bytes)),
             &self.context,
         )?;
-        self.settle_windows_ms.push(
-            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-        );
+        self.settle_windows_ms
+            .push(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
         self.raw_acc.extend_from_slice(&frame.batch.bytes);
         Ok(frame)
     }
@@ -279,8 +277,8 @@ fn fixture_binary() -> Result<PathBuf, CorpusError> {
             "fixture build failed; hard-failing transcript corpus prerequisites".to_owned(),
         ));
     }
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/debug/pi_tui_ext_fixture");
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/pi_tui_ext_fixture");
     if path.exists() {
         Ok(path)
     } else {

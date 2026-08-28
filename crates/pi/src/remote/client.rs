@@ -42,10 +42,10 @@ use futures::future::{BoxFuture, FutureExt, Shared};
 use tokio::sync::oneshot;
 
 use crate::remote::codec::{CodecError, ServerMessageDecoder, encode_client_message};
-use crate::remote::framing::{FrameDecoderOptions, FrameError, DEFAULT_MAX_FRAME_LENGTH};
+use crate::remote::framing::{DEFAULT_MAX_FRAME_LENGTH, FrameDecoderOptions, FrameError};
 use crate::remote::schemas::{
-    ClientMessage, Command, CommandResult, JsonValue, ModelRef, ProtocolError, ProtocolErrorCode,
-    PROTOCOL_VERSION, ServerEvent, ServerMessage, ServerSnapshot, SessionMetadata,
+    ClientMessage, Command, CommandResult, JsonValue, ModelRef, PROTOCOL_VERSION, ProtocolError,
+    ProtocolErrorCode, ServerEvent, ServerMessage, ServerSnapshot, SessionMetadata,
     SessionSnapshot, ThinkingLevel,
 };
 use crate::remote::transport::{
@@ -103,7 +103,9 @@ pub struct PiDisconnectedError {
 
 impl PiDisconnectedError {
     fn new(message: impl Into<String>) -> Self {
-        Self { message: message.into() }
+        Self {
+            message: message.into(),
+        }
     }
 }
 
@@ -160,7 +162,9 @@ pub struct PiSessionDetachedError {
 
 impl PiSessionDetachedError {
     fn new(session_id: impl Into<String>) -> Self {
-        Self { session_id: session_id.into() }
+        Self {
+            session_id: session_id.into(),
+        }
     }
 }
 
@@ -182,7 +186,9 @@ pub struct ProtocolViolationError {
 
 impl ProtocolViolationError {
     fn new(message: impl Into<String>) -> Self {
-        Self { message: message.into() }
+        Self {
+            message: message.into(),
+        }
     }
 }
 
@@ -270,7 +276,10 @@ impl fmt::Display for PiClientOptionsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidMaxFrameLength { value, max } => {
-                write!(f, "PiClient maxFrameLength must be an integer between 1 and {max}, got {value}")
+                write!(
+                    f,
+                    "PiClient maxFrameLength must be an integer between 1 and {max}, got {value}"
+                )
             }
         }
     }
@@ -302,7 +311,9 @@ pub struct Subscription {
 
 impl Subscription {
     fn new(remove: impl FnOnce() + Send + Sync + 'static) -> Self {
-        Self { remove: Some(Box::new(remove)) }
+        Self {
+            remove: Some(Box::new(remove)),
+        }
     }
 }
 
@@ -369,7 +380,11 @@ struct Notifications {
 
 impl Notifications {
     fn deliver(&self, on_listener_error: &Option<ListenerErrorHandler>) {
-        for (listener, value) in self.snapshot_listeners.iter().zip(self.snapshot_values.iter()) {
+        for (listener, value) in self
+            .snapshot_listeners
+            .iter()
+            .zip(self.snapshot_values.iter())
+        {
             invoke_isolated(listener, value, on_listener_error);
         }
         for (listener, value) in self.event_listeners.iter().zip(self.event_values.iter()) {
@@ -505,7 +520,11 @@ impl ClientState {
         }
     }
 
-    fn apply_server_snapshot(&mut self, snapshot: &ServerSnapshot, notifications: &mut Notifications) {
+    fn apply_server_snapshot(
+        &mut self,
+        snapshot: &ServerSnapshot,
+        notifications: &mut Notifications,
+    ) {
         if let Some(current) = &self.snapshot {
             if snapshot.revision < current.revision {
                 return;
@@ -545,7 +564,8 @@ impl ClientState {
             notifications.session_snapshot_listeners.extend(listeners);
             notifications.session_snapshot_values.push(snapshot.clone());
         }
-        self.session_snapshots.insert(snapshot.session_id.clone(), snapshot);
+        self.session_snapshots
+            .insert(snapshot.session_id.clone(), snapshot);
     }
 }
 
@@ -565,9 +585,8 @@ fn result_session(result: &CommandResult) -> Option<&SessionSnapshot> {
 fn event_session_id(event: &ServerEvent) -> Option<&str> {
     match event {
         ServerEvent::SessionSnapshot { snapshot } => Some(&snapshot.session_id),
-        ServerEvent::SessionProgress { session_id, .. } | ServerEvent::SessionRemoved { session_id } => {
-            Some(session_id)
-        }
+        ServerEvent::SessionProgress { session_id, .. }
+        | ServerEvent::SessionRemoved { session_id } => Some(session_id),
         ServerEvent::ServerSnapshot { .. } => None,
     }
 }
@@ -764,7 +783,11 @@ impl Inner {
         matches!(self.conn, ConnState::Connected { .. })
     }
 
-    fn notify_connection_state(&self, change: ConnectionStateChange, notifications: &mut Notifications) {
+    fn notify_connection_state(
+        &self,
+        change: ConnectionStateChange,
+        notifications: &mut Notifications,
+    ) {
         notifications.connection_state.push(change);
     }
 
@@ -938,7 +961,10 @@ impl PiClient {
         let max_frame_length = options.max_frame_length.unwrap_or(DEFAULT_MAX_FRAME_LENGTH);
         let value = u64::try_from(max_frame_length).unwrap_or(u64::MAX);
         if value == 0 || value > MAX_UINT32 {
-            return Err(PiClientOptionsError::InvalidMaxFrameLength { value, max: MAX_UINT32 });
+            return Err(PiClientOptionsError::InvalidMaxFrameLength {
+                value,
+                max: MAX_UINT32,
+            });
         }
         let core = Arc::new(ClientCore {
             factory: options.transport_factory,
@@ -983,7 +1009,10 @@ impl PiClient {
             {
                 let inner = lock(&self.core.inner);
                 inner.notify_connection_state(
-                    ConnectionStateChange { state: ConnectionState::Connecting, error: None },
+                    ConnectionStateChange {
+                        state: ConnectionState::Connecting,
+                        error: None,
+                    },
                     &mut notifications,
                 );
             }
@@ -997,9 +1026,9 @@ impl PiClient {
         tokio::spawn(async move {
             open_transport(core, id, handlers, factory).await;
         });
-        receiver.await.unwrap_or_else(|_| {
-            Err(PiClientError::disconnected("connection attempt aborted"))
-        })
+        receiver
+            .await
+            .unwrap_or_else(|_| Err(PiClientError::disconnected("connection attempt aborted")))
     }
 
     /// Reconnects after a disconnection.
@@ -1027,7 +1056,10 @@ impl PiClient {
     }
 
     /// Subscribes to server snapshots.
-    pub fn subscribe(&self, listener: ServerSnapshotListener) -> Result<Subscription, PiClientError> {
+    pub fn subscribe(
+        &self,
+        listener: ServerSnapshotListener,
+    ) -> Result<Subscription, PiClientError> {
         let mut inner = lock(&self.core.inner);
         if inner.disposed {
             return Err(PiClientError::Disposed(PiClientDisposedError));
@@ -1036,7 +1068,10 @@ impl PiClient {
         inner.state.snapshot_listeners.push((id, listener));
         let core = Arc::clone(&self.core);
         Ok(Subscription::new(move || {
-            lock(&core.inner).state.snapshot_listeners.retain(|(listener_id, _)| *listener_id != id);
+            lock(&core.inner)
+                .state
+                .snapshot_listeners
+                .retain(|(listener_id, _)| *listener_id != id);
         }))
     }
 
@@ -1050,7 +1085,10 @@ impl PiClient {
         inner.state.event_listeners.push((id, listener));
         let core = Arc::clone(&self.core);
         Ok(Subscription::new(move || {
-            lock(&core.inner).state.event_listeners.retain(|(listener_id, _)| *listener_id != id);
+            lock(&core.inner)
+                .state
+                .event_listeners
+                .retain(|(listener_id, _)| *listener_id != id);
         }))
     }
 
@@ -1107,7 +1145,8 @@ impl PiClient {
 
     /// Attaches to a session with a shared lease.
     pub async fn attach_session(&self, session_id: &str) -> Result<PiSessionHandle, PiClientError> {
-        self.acquire_session(session_id, SessionLeaseMode::Shared).await
+        self.acquire_session(session_id, SessionLeaseMode::Shared)
+            .await
     }
 
     /// Attaches to a session under the requested lease mode.
@@ -1181,7 +1220,11 @@ async fn open_transport(
     let stored = {
         let mut inner = lock(&core.inner);
         match &mut inner.conn {
-            ConnState::Connecting { id, transport: slot, .. } if *id == connect_id => {
+            ConnState::Connecting {
+                id,
+                transport: slot,
+                ..
+            } if *id == connect_id => {
                 *slot = Some(Arc::clone(&transport));
                 true
             }
@@ -1192,7 +1235,9 @@ async fn open_transport(
         transport.close();
         return;
     }
-    let hello = ClientMessage::Hello { version: PROTOCOL_VERSION };
+    let hello = ClientMessage::Hello {
+        version: PROTOCOL_VERSION,
+    };
     let frame = match encode_client_message(&hello, Some(core.frame_options)) {
         Ok(frame) => frame,
         Err(error) => {
@@ -1230,7 +1275,13 @@ impl ByteTransportHandlers for ConnHandlers {
             if inner.conn.current_id().is_none() {
                 return;
             }
-            if matches!(&inner.conn, ConnState::Connecting { transport: None, .. }) {
+            if matches!(
+                &inner.conn,
+                ConnState::Connecting {
+                    transport: None,
+                    ..
+                }
+            ) {
                 let error = PiClientError::protocol(
                     "Received server data before the client hello was sent",
                 );
@@ -1239,9 +1290,8 @@ impl ByteTransportHandlers for ConnHandlers {
             }
             let messages = {
                 match &mut inner.conn {
-                    ConnState::Connecting { decoder, .. } | ConnState::Connected { decoder, .. } => {
-                        decoder.push(&chunk)
-                    }
+                    ConnState::Connecting { decoder, .. }
+                    | ConnState::Connected { decoder, .. } => decoder.push(&chunk),
                     ConnState::Disconnected => return,
                 }
             };
@@ -1321,7 +1371,11 @@ fn handle_server_message(
                         handshake,
                         decoder,
                     } => {
-                        inner.conn = ConnState::Connected { id, transport, decoder };
+                        inner.conn = ConnState::Connected {
+                            id,
+                            transport,
+                            decoder,
+                        };
                         handshake
                     }
                     other => {
@@ -1335,7 +1389,10 @@ fn handle_server_message(
                 };
                 inner.state.apply_server_snapshot(&snapshot, notifications);
                 inner.notify_connection_state(
-                    ConnectionStateChange { state: ConnectionState::Connected, error: None },
+                    ConnectionStateChange {
+                        state: ConnectionState::Connected,
+                        error: None,
+                    },
                     notifications,
                 );
                 if let Some(sender) = handshake {
@@ -1354,7 +1411,12 @@ fn handle_server_message(
                 let error = PiClientError::protocol("Unexpected handshake message");
                 inner.fail_and_close(error, notifications);
             }
-            ServerMessage::Response { id, ok, result, error } => {
+            ServerMessage::Response {
+                id,
+                ok,
+                result,
+                error,
+            } => {
                 handle_response(inner, id, ok, result, error, notifications);
             }
             ServerMessage::Event { event } => {
@@ -1443,8 +1505,13 @@ async fn fail_if_current_by_transport(
     {
         let mut inner = lock(&core.inner);
         let current = match &inner.conn {
-            ConnState::Connected { transport: current, .. } => Arc::ptr_eq(current, transport),
-            ConnState::Connecting { transport: Some(current), .. } => Arc::ptr_eq(current, transport),
+            ConnState::Connected {
+                transport: current, ..
+            } => Arc::ptr_eq(current, transport),
+            ConnState::Connecting {
+                transport: Some(current),
+                ..
+            } => Arc::ptr_eq(current, transport),
             _ => false,
         };
         if current {
@@ -1477,12 +1544,18 @@ async fn request(core: &Arc<ClientCore>, command: Command) -> Result<CommandResu
         );
         (id, receiver)
     };
-    let message = ClientMessage::Request { id, request: command.clone() };
+    let message = ClientMessage::Request {
+        id,
+        request: command.clone(),
+    };
     let frame = match encode_client_message(&message, Some(core.frame_options)) {
         Ok(frame) => frame,
         Err(error) => {
             let error = PiClientError::Protocol(ProtocolViolationError::from(error));
-            if let Some(pending) = lock(&core.inner).pending_requests.remove(&message_id(&message)) {
+            if let Some(pending) = lock(&core.inner)
+                .pending_requests
+                .remove(&message_id(&message))
+            {
                 let _ = pending.resolve.send(Err(error.clone()));
             }
             return Err(error);
@@ -1494,7 +1567,9 @@ async fn request(core: &Arc<ClientCore>, command: Command) -> Result<CommandResu
             Err(_) => Err(error),
         };
     }
-    receiver.await.unwrap_or_else(|_| Err(PiClientError::disconnected("request dropped")))
+    receiver
+        .await
+        .unwrap_or_else(|_| Err(PiClientError::disconnected("request dropped")))
 }
 
 fn message_id(message: &ClientMessage) -> String {
@@ -1535,7 +1610,11 @@ fn reserve_lease(
     mode: SessionLeaseMode,
 ) -> Result<u64, PiClientError> {
     let mut inner = lock(&core.inner);
-    let count = inner.session_lease_counts.get(session_id).copied().unwrap_or(0);
+    let count = inner
+        .session_lease_counts
+        .get(session_id)
+        .copied()
+        .unwrap_or(0);
     if mode == SessionLeaseMode::Exclusive && count > 0 {
         return Err(PiClientError::Ownership(PiSessionOwnershipError {
             session_id: Some(session_id.to_string()),
@@ -1549,27 +1628,41 @@ fn reserve_lease(
         }));
     }
     let token = core.next_lease_token.fetch_add(1, Ordering::SeqCst);
-    inner.session_lease_counts.insert(session_id.to_string(), count + 1);
+    inner
+        .session_lease_counts
+        .insert(session_id.to_string(), count + 1);
     if mode == SessionLeaseMode::Exclusive {
-        inner.exclusive_session_leases.insert(session_id.to_string(), token);
+        inner
+            .exclusive_session_leases
+            .insert(session_id.to_string(), token);
     }
     Ok(token)
 }
 
 fn release_lease_by_token(core: &Arc<ClientCore>, session_id: &str, token: u64) {
     let mut inner = lock(&core.inner);
-    let count = inner.session_lease_counts.get(session_id).copied().unwrap_or(0);
+    let count = inner
+        .session_lease_counts
+        .get(session_id)
+        .copied()
+        .unwrap_or(0);
     if count <= 1 {
         inner.session_lease_counts.remove(session_id);
     } else {
-        inner.session_lease_counts.insert(session_id.to_string(), count - 1);
+        inner
+            .session_lease_counts
+            .insert(session_id.to_string(), count - 1);
     }
     if inner.exclusive_session_leases.get(session_id) == Some(&token) {
         inner.exclusive_session_leases.remove(session_id);
     }
 }
 
-fn create_session_handle(core: &Arc<ClientCore>, session_id: String, token: u64) -> PiSessionHandle {
+fn create_session_handle(
+    core: &Arc<ClientCore>,
+    session_id: String,
+    token: u64,
+) -> PiSessionHandle {
     let generation = lock(&core.inner)
         .session_lease_generations
         .get(&session_id)
@@ -1604,10 +1697,15 @@ fn refresh_lease_state(core: &Arc<ClientCore>, lease: &Arc<LeaseEntry>) {
 fn lease_is_active(core: &Arc<ClientCore>, lease: &Arc<LeaseEntry>) -> bool {
     refresh_lease_state(core, lease);
     *lock(&lease.state) == LeaseState::Active
-        && lock(&core.inner).state.is_session_attached(&lease.session_id)
+        && lock(&core.inner)
+            .state
+            .is_session_attached(&lease.session_id)
 }
 
-fn assert_lease_active(core: &Arc<ClientCore>, lease: &Arc<LeaseEntry>) -> Result<(), PiClientError> {
+fn assert_lease_active(
+    core: &Arc<ClientCore>,
+    lease: &Arc<LeaseEntry>,
+) -> Result<(), PiClientError> {
     {
         let inner = lock(&core.inner);
         if inner.disposed {
@@ -1651,11 +1749,16 @@ async fn acquire_after_reserve(
     session_id: &str,
     token: u64,
 ) -> Result<PiSessionHandle, PiClientError> {
-    let detachment = lock(&core.inner).session_detachments.get(session_id).cloned();
+    let detachment = lock(&core.inner)
+        .session_detachments
+        .get(session_id)
+        .cloned();
     if let Some(detachment) = detachment {
         let _ = detachment.await;
     }
-    let needs_reconcile = lock(&core.inner).session_cleanup_required.contains(session_id);
+    let needs_reconcile = lock(&core.inner)
+        .session_cleanup_required
+        .contains(session_id);
     if needs_reconcile {
         reconcile_cleanup(core, session_id).await?;
     }
@@ -1667,7 +1770,9 @@ async fn acquire_after_reserve(
                 existing.clone()
             } else {
                 let future: SharedOutcome = attach_session_shared(core, session_id).shared();
-                inner.session_attachments.insert(session_id.to_string(), future.clone());
+                inner
+                    .session_attachments
+                    .insert(session_id.to_string(), future.clone());
                 future
             }
         };
@@ -1686,7 +1791,13 @@ fn attach_session_shared(
     let session_id = session_id.to_string();
     Box::pin(async move {
         let previous = lock(&core.inner).state.forget_session_snapshot(&session_id);
-        let outcome = request(&core, Command::Attach { session_id: session_id.clone() }).await;
+        let outcome = request(
+            &core,
+            Command::Attach {
+                session_id: session_id.clone(),
+            },
+        )
+        .await;
         match outcome {
             Ok(_) => Ok(()),
             Err(error) => {
@@ -1706,7 +1817,10 @@ fn reconcile_cleanup(
     let core = Arc::clone(core);
     let session_id = session_id.to_string();
     Box::pin(async move {
-        if !lock(&core.inner).session_cleanup_required.contains(&session_id) {
+        if !lock(&core.inner)
+            .session_cleanup_required
+            .contains(&session_id)
+        {
             return Ok(());
         }
         let future = {
@@ -1717,7 +1831,13 @@ fn reconcile_cleanup(
                 let core = Arc::clone(&core);
                 let sid = session_id.clone();
                 let future: SharedOutcome = async move {
-                    let outcome = request(&core, Command::Detach { session_id: sid.clone() }).await;
+                    let outcome = request(
+                        &core,
+                        Command::Detach {
+                            session_id: sid.clone(),
+                        },
+                    )
+                    .await;
                     let result = outcome.map(|_| ());
                     if result.is_ok() {
                         lock(&core.inner).session_cleanup_required.remove(&sid);
@@ -1726,12 +1846,16 @@ fn reconcile_cleanup(
                 }
                 .boxed()
                 .shared();
-                inner.session_reconciliations.insert(session_id.clone(), future.clone());
+                inner
+                    .session_reconciliations
+                    .insert(session_id.clone(), future.clone());
                 future
             }
         };
         let outcome = future.await;
-        lock(&core.inner).session_reconciliations.remove(&session_id);
+        lock(&core.inner)
+            .session_reconciliations
+            .remove(&session_id);
         outcome
     })
 }
@@ -1757,13 +1881,10 @@ fn release_lease(
         }
         assert_lease_active(&core, &lease)?;
         *lock(&lease.state) = LeaseState::Releasing;
-        let shared: SharedOutcome = release_outer(
-            Arc::clone(&core),
-            Arc::clone(&lease),
-            relinquish_on_failure,
-        )
-        .boxed()
-        .shared();
+        let shared: SharedOutcome =
+            release_outer(Arc::clone(&core), Arc::clone(&lease), relinquish_on_failure)
+                .boxed()
+                .shared();
         *lock(&lease.release_future) = Some(shared.clone());
         shared.await
     })
@@ -1796,7 +1917,10 @@ async fn release_outer(
     }
 }
 
-async fn release_inner(core: &Arc<ClientCore>, lease: &Arc<LeaseEntry>) -> Result<(), PiClientError> {
+async fn release_inner(
+    core: &Arc<ClientCore>,
+    lease: &Arc<LeaseEntry>,
+) -> Result<(), PiClientError> {
     let session_id = lease.session_id.clone();
     let count = lock(&core.inner)
         .session_lease_counts
@@ -1877,7 +2001,10 @@ impl PiSessionHandle {
     }
 
     /// Subscribes to snapshots for this session while the lease is active.
-    pub fn subscribe(&self, listener: SessionSnapshotListener) -> Result<Subscription, PiClientError> {
+    pub fn subscribe(
+        &self,
+        listener: SessionSnapshotListener,
+    ) -> Result<Subscription, PiClientError> {
         assert_lease_active(&self.core, &self.lease)?;
         let core = Arc::clone(&self.core);
         let lease = Arc::clone(&self.lease);
@@ -1932,7 +2059,9 @@ impl PiSessionHandle {
             let core = Arc::clone(&self.core);
             Subscription::new(move || {
                 let mut inner = lock(&core.inner);
-                inner.state.unregister_session_event_listener(&session_id, id);
+                inner
+                    .state
+                    .unregister_session_event_listener(&session_id, id);
             })
         };
         Ok(subscription)
@@ -2007,7 +2136,10 @@ impl PiSessionHandle {
     }
 
     /// Switches the session thinking level.
-    pub async fn set_thinking(&self, thinking_level: ThinkingLevel) -> Result<SessionSnapshot, PiClientError> {
+    pub async fn set_thinking(
+        &self,
+        thinking_level: ThinkingLevel,
+    ) -> Result<SessionSnapshot, PiClientError> {
         let result = self
             .session_request(Command::SetThinking {
                 session_id: self.lease.session_id.clone(),
@@ -2183,7 +2315,8 @@ mod tests {
         }
 
         fn fail(&self, message: &str) {
-            self.transport.fail_peer(TransportError::Message(message.to_string()));
+            self.transport
+                .fail_peer(TransportError::Message(message.to_string()));
         }
     }
 
@@ -2200,7 +2333,10 @@ mod tests {
     fn session_snapshot(session_id: &str, revision: u64) -> SessionSnapshot {
         SessionMetadata {
             session_id: session_id.to_string(),
-            model: ModelRef { provider: "faux".to_string(), id: "model".to_string() },
+            model: ModelRef {
+                provider: "faux".to_string(),
+                id: "model".to_string(),
+            },
             thinking_level: ThinkingLevel::Off,
             locked: true,
             revision,
@@ -2211,11 +2347,15 @@ mod tests {
     }
 
     fn attach_result(session_id: &str, revision: u64) -> CommandResult {
-        CommandResult::Attach { session: session_snapshot(session_id, revision) }
+        CommandResult::Attach {
+            session: session_snapshot(session_id, revision),
+        }
     }
 
     fn detach_result(session_id: &str) -> CommandResult {
-        CommandResult::Detach { session_id: session_id.to_string() }
+        CommandResult::Detach {
+            session_id: session_id.to_string(),
+        }
     }
 
     fn make_client(factory: ByteTransportFactory) -> PiClient {
@@ -2292,7 +2432,10 @@ mod tests {
         let attaching = client.attach_session(session_id);
         let scripted = async {
             let (id, command) = server.core.next_request().await;
-            assert!(matches!(command, Command::Attach { .. }), "expected attach request");
+            assert!(
+                matches!(command, Command::Attach { .. }),
+                "expected attach request"
+            );
             server.respond(&id, attach_result(session_id, 1)).await;
         };
         let (handle, ()) = tokio::join!(attaching, scripted);
@@ -2313,11 +2456,14 @@ mod tests {
         let exclusive_conflict = client
             .acquire_session("session-1", SessionLeaseMode::Exclusive)
             .await
-            .unwrap_err();
+            .expect_err("expected error");
         match &exclusive_conflict {
             PiClientError::Ownership(error) => {
                 assert_eq!(error.session_id.as_deref(), Some("session-1"));
-                assert_eq!(error.message, "Session session-1 already has an active lease");
+                assert_eq!(
+                    error.message,
+                    "Session session-1 already has an active lease"
+                );
             }
             other => panic!("expected ownership error, got {other:?}"),
         }
@@ -2328,12 +2474,17 @@ mod tests {
         let scripted = async {
             let (attach_id, attach_command) = server.core.next_request().await;
             assert!(matches!(attach_command, Command::Attach { .. }));
-            server.respond(&attach_id, attach_result("session-1", 2)).await;
+            server
+                .respond(&attach_id, attach_result("session-1", 2))
+                .await;
         };
         let (exclusive, ()) = tokio::join!(acquiring, scripted);
         let exclusive = exclusive.expect("exclusive acquire");
 
-        let shared_conflict = client.attach_session("session-1").await.unwrap_err();
+        let shared_conflict = client
+            .attach_session("session-1")
+            .await
+            .expect_err("expected error");
         match &shared_conflict {
             PiClientError::Ownership(error) => {
                 assert_eq!(error.message, "Session session-1 has an exclusive lease");
@@ -2344,13 +2495,23 @@ mod tests {
     }
 
     /// Detaches every handle, answering each protocol detach request.
-    async fn detach_leases(handles: &[PiSessionHandle], server: &TestServer, labels: &[(&str, &str)]) {
+    async fn detach_leases(
+        handles: &[PiSessionHandle],
+        server: &TestServer,
+        labels: &[(&str, &str)],
+    ) {
         for (index, handle) in handles.iter().enumerate() {
             let detaching = handle.detach();
             let scripted = async {
                 let (id, command) = server.core.next_request().await;
-                assert!(matches!(command, Command::Detach { .. }), "expected detach for {}", labels[index].1);
-                server.respond(&id, detach_result(handles[index].id())).await;
+                assert!(
+                    matches!(command, Command::Detach { .. }),
+                    "expected detach for {}",
+                    labels[index].1
+                );
+                server
+                    .respond(&id, detach_result(handles[index].id()))
+                    .await;
             };
             let (outcome, ()) = tokio::join!(detaching, scripted);
             outcome.expect("detach");
@@ -2364,7 +2525,10 @@ mod tests {
         // A second shared lease on an already-attached session completes
         // locally without a protocol round trip, so it must not script a
         // server response (the script would wait forever).
-        let second = client.attach_session("session-1").await.expect("second shared attach");
+        let second = client
+            .attach_session("session-1")
+            .await
+            .expect("second shared attach");
         assert!(second.attached());
 
         // First release must NOT send a protocol detach.
@@ -2374,7 +2538,11 @@ mod tests {
         outcome.expect("first detach");
         assert!(!first.attached());
         assert!(second.attached());
-        assert_eq!(server.core.request_count(), 0, "no protocol detach before the final lease");
+        assert_eq!(
+            server.core.request_count(),
+            0,
+            "no protocol detach before the final lease"
+        );
 
         let detaching = second.detach();
         let scripted = async {
@@ -2403,7 +2571,7 @@ mod tests {
 
         assert_eq!(client.connection_state(), ConnectionState::Connected);
         assert!(!handle.attached());
-        let error = handle.abort().await.unwrap_err();
+        let error = handle.abort().await.expect_err("expected error");
         match &error {
             PiClientError::SessionDetached(e) => assert_eq!(e.session_id, "session-1"),
             other => panic!("expected session detached, got {other:?}"),
@@ -2418,7 +2586,7 @@ mod tests {
         let (client, server) = connect_scripted().await;
         let pending = client.list_sessions();
         server.close();
-        let error = pending.await.unwrap_err();
+        let error = pending.await.expect_err("expected error");
         match &error {
             PiClientError::Disconnected(e) => assert_eq!(e.message, "Byte transport closed"),
             other => panic!("expected disconnected error, got {other:?}"),
@@ -2431,7 +2599,7 @@ mod tests {
         let (client, server) = connect_scripted().await;
         let pending = client.list_sessions();
         server.fail("read failed");
-        let error = pending.await.unwrap_err();
+        let error = pending.await.expect_err("expected error");
         match &error {
             PiClientError::Disconnected(e) => assert_eq!(e.message, "read failed"),
             other => panic!("expected disconnected error, got {other:?}"),
@@ -2447,9 +2615,10 @@ mod tests {
     async fn transport_failure_table_maps_to_exactly_one_variant() {
         // Row 1: transport open failure → Disconnected.
         let (listener, endpoint) = InMemoryListener::new();
-        let client = make_client(build_transport(&EndpointSpec::InMemory { endpoint }).expect("factory"));
+        let client =
+            make_client(build_transport(&EndpointSpec::InMemory { endpoint }).expect("factory"));
         drop(listener);
-        let error = client.connect().await.unwrap_err();
+        let error = client.connect().await.expect_err("expected error");
         assert!(
             matches!(error, PiClientError::Disconnected(_)),
             "open failure must map to Disconnected, got {error:?}"
@@ -2468,7 +2637,7 @@ mod tests {
                 .await;
         };
         let (attaching, ()) = tokio::join!(attaching, scripted);
-        let error = attaching.unwrap_err();
+        let error = attaching.expect_err("expected error");
         match &error {
             PiClientError::Ownership(e) => {
                 assert_eq!(e.session_id.as_deref(), Some("locked-session"));
@@ -2487,7 +2656,7 @@ mod tests {
                 .await;
         };
         let (listing, ()) = tokio::join!(listing, scripted);
-        let error = listing.unwrap_err();
+        let error = listing.expect_err("expected error");
         match &error {
             PiClientError::Server(e) => {
                 assert_eq!(e.code, ProtocolErrorCode::InvalidRequest);
@@ -2502,12 +2671,16 @@ mod tests {
         let oversized = handle
             .prompt("x".repeat(DEFAULT_MAX_FRAME_LENGTH + 1))
             .await
-            .unwrap_err();
+            .expect_err("expected error");
         assert!(
             matches!(oversized, PiClientError::Protocol(_)),
             "encode failure must map to Protocol, got {oversized:?}"
         );
-        assert_eq!(server.core.request_count(), sent_before, "no frame may be sent");
+        assert_eq!(
+            server.core.request_count(),
+            sent_before,
+            "no frame may be sent"
+        );
 
         // Row 5: inbound undecodable frame → Protocol and disconnected.
         // A complete frame whose payload is the CBOR break byte (invalid
@@ -2515,7 +2688,7 @@ mod tests {
         // bare prefix would just wait for more bytes.
         let pending = client.list_sessions();
         server.send_raw(vec![0, 0, 0, 1, 0xff]).await;
-        let error = pending.await.unwrap_err();
+        let error = pending.await.expect_err("expected error");
         assert!(
             matches!(error, PiClientError::Protocol(_)),
             "decode failure must map to Protocol, got {error:?}"
@@ -2527,7 +2700,8 @@ mod tests {
     async fn hello_error_maps_to_server_class() {
         let (listener, endpoint) = InMemoryListener::new();
         let core = Arc::new(ServerCore::new());
-        let client = make_client(build_transport(&EndpointSpec::InMemory { endpoint }).expect("factory"));
+        let client =
+            make_client(build_transport(&EndpointSpec::InMemory { endpoint }).expect("factory"));
         let connect = client.connect();
         let accept_core = Arc::clone(&core);
         let setup = async move {
@@ -2549,7 +2723,7 @@ mod tests {
             server
         };
         let (connected, _server) = tokio::join!(connect, setup);
-        let error = connected.unwrap_err();
+        let error = connected.expect_err("expected error");
         match &error {
             PiClientError::Server(e) => {
                 assert_eq!(e.code, ProtocolErrorCode::Version);
@@ -2564,7 +2738,7 @@ mod tests {
         let (client, server) = connect_scripted().await;
         server.close();
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        let error = client.list_sessions().await.unwrap_err();
+        let error = client.list_sessions().await.expect_err("expected error");
         assert!(
             matches!(error, PiClientError::Disconnected(_)),
             "request on a closed transport must map to Disconnected, got {error:?}"
@@ -2587,8 +2761,12 @@ mod tests {
             assert!(matches!(second_command, Command::Attach { .. }));
             assert_eq!(first_id, "request-1");
             assert_eq!(second_id, "request-2");
-            server.respond(&first_id, CommandResult::List { sessions: vec![] }).await;
-            server.respond(&second_id, attach_result("session-1", 1)).await;
+            server
+                .respond(&first_id, CommandResult::List { sessions: vec![] })
+                .await;
+            server
+                .respond(&second_id, attach_result("session-1", 1))
+                .await;
         };
         let (listed, attached, ()) = futures::join!(listing, attaching, scripted);
         assert!(listed.expect("list").is_empty());
@@ -2649,7 +2827,7 @@ mod tests {
             server.respond(&id, attach_result("session-1", 1)).await;
         };
         let (listed, ()) = tokio::join!(listing, scripted);
-        let error = listed.unwrap_err();
+        let error = listed.expect_err("expected error");
         match &error {
             PiClientError::Protocol(e) => {
                 assert_eq!(e.message, "Response command attach does not match list");
@@ -2711,7 +2889,11 @@ mod tests {
             })
             .await;
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        assert_eq!(*lock(&snapshots), vec![2u64], "snapshots must stop after detach");
+        assert_eq!(
+            *lock(&snapshots),
+            vec![2u64],
+            "snapshots must stop after detach"
+        );
         assert_eq!(events.load(AtomicOrdering::SeqCst), 1);
 
         // session_removed is delivered even to a detached lease.
@@ -2740,7 +2922,10 @@ mod tests {
             .await;
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         assert!(!handle.attached());
-        handle.dispose().await.expect("invalidated dispose needs no protocol cleanup");
+        handle
+            .dispose()
+            .await
+            .expect("invalidated dispose needs no protocol cleanup");
     }
 
     // -----------------------------------------------------------------------
@@ -2756,9 +2941,12 @@ mod tests {
         client.dispose();
         client.dispose();
 
-        let error = pending.await.unwrap_err();
+        let error = pending.await.expect_err("expected error");
         assert!(matches!(error, PiClientError::Disposed(_)));
-        let error = handle.prompt("after disposal".to_string()).await.unwrap_err();
+        let error = handle
+            .prompt("after disposal".to_string())
+            .await
+            .expect_err("expected error");
         assert!(matches!(error, PiClientError::Disposed(_)));
         handle.dispose().await.expect("dispose after invalidation");
         assert!(!client.connected());
@@ -2781,7 +2969,9 @@ mod tests {
         let scripted = async {
             let (attach_id, attach_command) = server.core.next_request().await;
             assert!(matches!(attach_command, Command::Attach { .. }));
-            server.respond(&attach_id, attach_result("session-1", 1)).await;
+            server
+                .respond(&attach_id, attach_result("session-1", 1))
+                .await;
         };
         let (acquired, ()) = tokio::join!(acquiring, scripted);
         let handle = acquired.expect("exclusive acquire");
@@ -2792,14 +2982,14 @@ mod tests {
             let (detach_id, detach_command) = server.core.next_request().await;
             assert!(matches!(detach_command, Command::Detach { .. }));
             // While releasing, session-scoped commands are detached-typed.
-            let mid = handle.abort().await.unwrap_err();
+            let mid = handle.abort().await.expect_err("expected error");
             assert!(matches!(mid, PiClientError::SessionDetached(_)));
             server
                 .respond_error(&detach_id, ProtocolErrorCode::InvalidRequest, "retry")
                 .await;
         };
         let (first_detach, ()) = tokio::join!(detaching, scripted);
-        let error = first_detach.unwrap_err();
+        let error = first_detach.expect_err("expected error");
         match &error {
             PiClientError::Server(e) => assert_eq!(e.message, "retry"),
             other => panic!("expected server error, got {other:?}"),
@@ -2841,7 +3031,9 @@ mod tests {
         let scripted = async {
             let (second_attach_id, second_attach_command) = server.core.next_request().await;
             assert!(matches!(second_attach_command, Command::Attach { .. }));
-            server.respond(&second_attach_id, attach_result("session-1", 2)).await;
+            server
+                .respond(&second_attach_id, attach_result("session-1", 2))
+                .await;
         };
         let (second, ()) = tokio::join!(reacquiring, scripted);
         let second = second.expect("reacquire");
@@ -2857,13 +3049,21 @@ mod tests {
             let (id, command) = server.core.next_request().await;
             assert!(matches!(command, Command::Create { .. }));
             server
-                .respond(&id, CommandResult::Create { session: session_snapshot("fresh", 1) })
+                .respond(
+                    &id,
+                    CommandResult::Create {
+                        session: session_snapshot("fresh", 1),
+                    },
+                )
                 .await;
         };
         let (creating, ()) = tokio::join!(creating, scripted);
         let handle = creating.expect("create");
         assert_eq!(handle.id(), "fresh");
-        let conflict = client.attach_session("fresh").await.unwrap_err();
+        let conflict = client
+            .attach_session("fresh")
+            .await
+            .expect_err("expected error");
         assert!(matches!(conflict, PiClientError::Ownership(_)));
         detach_leases(&[handle], &server, &[("fresh", "created")]).await;
     }
@@ -2888,7 +3088,9 @@ mod tests {
         let scripted = async {
             let (attach_id, attach_command) = server.core.next_request().await;
             assert!(matches!(attach_command, Command::Attach { .. }));
-            server.respond(&attach_id, attach_result("session-1", 0)).await;
+            server
+                .respond(&attach_id, attach_result("session-1", 0))
+                .await;
         };
         let (reacquiring, ()) = tokio::join!(reacquiring, scripted);
         let reopened = reacquiring.expect("reacquire");
@@ -2906,7 +3108,7 @@ mod tests {
                 on_listener_error: None,
             })
             .map(|_| ())
-            .unwrap_err();
+            .expect_err("expected error");
             match error {
                 PiClientOptionsError::InvalidMaxFrameLength { value, max } => {
                     assert_eq!(max, MAX_UINT32);

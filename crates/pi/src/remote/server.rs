@@ -55,21 +55,23 @@ use futures::future::{BoxFuture, FutureExt, Shared};
 use uuid::Uuid;
 
 use crate::core::agent_session::AgentSession;
-use crate::remote::codec::{encode_server_message, is_supported_protocol_version, ClientMessageDecoder};
-use crate::remote::framing::{FrameDecoderOptions, DEFAULT_MAX_FRAME_LENGTH};
-use crate::remote::schemas::{
-    AssistantContent, ClientMessage, Command, CommandResult, ImageContent,
-    JsonValue, ModelMetadata, ModelRef, ProtocolError, ProtocolErrorCode, ServerEvent,
-    ServerMessage, ServerSnapshot, SessionMetadata, SessionPhase, SessionSnapshot, TextContent,
-    ThinkingContent, ThinkingLevel, ToolCallContent,
-    TranscriptItem, TranscriptProgress, UserContent, UserTranscriptItem, PROTOCOL_VERSION,
+use crate::remote::codec::{
+    ClientMessageDecoder, encode_server_message, is_supported_protocol_version,
 };
-use crate::remote::transport::{
-    build_transport, ByteTransport, ByteTransportHandlers, EndpointSpec, EndpointSpecError,
-    InMemoryListener, TransportError,
+use crate::remote::framing::{DEFAULT_MAX_FRAME_LENGTH, FrameDecoderOptions};
+use crate::remote::schemas::{
+    AssistantContent, ClientMessage, Command, CommandResult, ImageContent, JsonValue,
+    ModelMetadata, ModelRef, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, ServerEvent,
+    ServerMessage, ServerSnapshot, SessionMetadata, SessionPhase, SessionSnapshot, TextContent,
+    ThinkingContent, ThinkingLevel, ToolCallContent, TranscriptItem, TranscriptProgress,
+    UserContent, UserTranscriptItem,
 };
 #[cfg(not(unix))]
 use crate::remote::transport::EndpointKind;
+use crate::remote::transport::{
+    ByteTransport, ByteTransportHandlers, EndpointSpec, EndpointSpecError, InMemoryListener,
+    TransportError, build_transport,
+};
 use pi_agent::AgentMessage;
 
 #[cfg(unix)]
@@ -150,7 +152,11 @@ impl ServerError {
     /// Builds an operation error without details.
     #[must_use]
     pub fn new(code: ServerOperationCode, message: impl Into<String>) -> Self {
-        Self { code, message: message.into(), details: None }
+        Self {
+            code,
+            message: message.into(),
+            details: None,
+        }
     }
 
     fn to_protocol_error(&self) -> ProtocolError {
@@ -272,7 +278,8 @@ pub trait ByteConnection: Send + Sync + 'static {
     fn send(&self, chunk: Vec<u8>) -> BoxFuture<'static, Result<(), TransportError>>;
     /// Closes the connection, optionally delivering one final chunk
     /// first.
-    fn close(&self, final_chunk: Option<Vec<u8>>) -> BoxFuture<'static, Result<(), TransportError>>;
+    fn close(&self, final_chunk: Option<Vec<u8>>)
+    -> BoxFuture<'static, Result<(), TransportError>>;
 }
 
 /// Receives connection events for one accepted connection.
@@ -477,7 +484,9 @@ pub struct PiServer {
 
 impl fmt::Debug for PiServer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PiServer").field("id", &self.core.id).finish()
+        f.debug_struct("PiServer")
+            .field("id", &self.core.id)
+            .finish()
     }
 }
 
@@ -500,8 +509,9 @@ impl PiServer {
                 max: MAX_UINT32,
             });
         }
-        let handshake_timeout_ms =
-            options.handshake_timeout_ms.unwrap_or(DEFAULT_HANDSHAKE_TIMEOUT_MS);
+        let handshake_timeout_ms = options
+            .handshake_timeout_ms
+            .unwrap_or(DEFAULT_HANDSHAKE_TIMEOUT_MS);
         if handshake_timeout_ms == 0 || handshake_timeout_ms > MAX_TIMER_DELAY_MS {
             return Err(PiServerOptionsError::InvalidHandshakeTimeout {
                 value: handshake_timeout_ms,
@@ -509,7 +519,9 @@ impl PiServer {
             });
         }
         let core = ServerCore {
-            id: options.server_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+            id: options
+                .server_id
+                .unwrap_or_else(|| Uuid::new_v4().to_string()),
             service,
             max_frame_length,
             handshake_timeout_ms,
@@ -524,7 +536,9 @@ impl PiServer {
                 broadcast_tail: futures::future::ready(()).boxed().shared(),
             }),
         };
-        Ok(Self { core: Arc::new(core) })
+        Ok(Self {
+            core: Arc::new(core),
+        })
     }
 
     /// Stable server id.
@@ -612,7 +626,9 @@ impl ServerHandler {
         let decoder = ClientMessageDecoder::new(Some(FrameDecoderOptions {
             max_frame_length: core.max_frame_length,
         }))
-        .unwrap_or_else(|_| ClientMessageDecoder::new(None).expect("default decoder options are valid"));
+        .unwrap_or_else(|_| {
+            ClientMessageDecoder::new(None).expect("default decoder options are valid")
+        });
         let conn = Arc::new(ServerConnection {
             id: id.clone(),
             connection,
@@ -628,7 +644,10 @@ impl ServerHandler {
         });
         install_handshake_watchdog(core, &conn);
         lock(&core.shared).connections.insert(id, conn.clone());
-        Self { core: Arc::clone(core), conn }
+        Self {
+            core: Arc::clone(core),
+            conn,
+        }
     }
 }
 
@@ -806,7 +825,10 @@ async fn finish_handshake(core: &Arc<ServerCore>, conn: &Arc<ServerConnection>, 
     {
         let (disconnected, handshaking) = {
             let inner = lock(&conn.inner);
-            (inner.disconnected, matches!(inner.stage, Stage::Handshaking))
+            (
+                inner.disconnected,
+                matches!(inner.stage, Stage::Handshaking),
+            )
         };
         let closing = lock(&core.shared).closing;
         if closing || disconnected || !handshaking || conn.connection.closed() {
@@ -866,7 +888,12 @@ async fn handle_request(
     };
     let result = execute_command(core, conn, request).await;
     let response = match result {
-        Ok(result) => ServerMessage::Response { id, ok: true, result: Some(result), error: None },
+        Ok(result) => ServerMessage::Response {
+            id,
+            ok: true,
+            result: Some(result),
+            error: None,
+        },
         Err(failure) => ServerMessage::Response {
             id,
             ok: false,
@@ -983,7 +1010,9 @@ async fn send_message(
     }
     let frame = encode_server_message(
         &message,
-        Some(FrameDecoderOptions { max_frame_length: core.max_frame_length }),
+        Some(FrameDecoderOptions {
+            max_frame_length: core.max_frame_length,
+        }),
     );
     let frame = match frame {
         Ok(frame) => frame,
@@ -1029,7 +1058,9 @@ async fn fail_protocol(core: &Arc<ServerCore>, conn: &Arc<ServerConnection>, fai
     let error = to_protocol_error(core, failure);
     let final_frame = encode_server_message(
         &ServerMessage::HelloError { error },
-        Some(FrameDecoderOptions { max_frame_length: core.max_frame_length }),
+        Some(FrameDecoderOptions {
+            max_frame_length: core.max_frame_length,
+        }),
     )
     .ok();
     conn.connection.close(final_frame).await.ok();
@@ -1122,7 +1153,10 @@ async fn sessions_disconnect(core: &Arc<ServerCore>, conn: &Arc<ServerConnection
     };
     let lives: Vec<Arc<LiveSession>> = {
         let shared = lock(&core.shared);
-        session_ids.iter().filter_map(|id| shared.live.get(id).cloned()).collect()
+        session_ids
+            .iter()
+            .filter_map(|id| shared.live.get(id).cloned())
+            .collect()
     };
     for live in &lives {
         lock(&live.connections).remove(&conn.id);
@@ -1146,7 +1180,12 @@ async fn execute_command(
             let sessions = list_metadata(core).await;
             Ok(CommandResult::List { sessions })
         }
-        Command::Create { cwd, name, model, thinking_level } => {
+        Command::Create {
+            cwd,
+            name,
+            model,
+            thinking_level,
+        } => {
             let id = Uuid::new_v4().to_string();
             let options = CreateSessionOptions {
                 id: id.clone(),
@@ -1199,40 +1238,34 @@ async fn execute_command(
         Command::Prompt { session_id, text } => {
             let live = require_attached(core, conn, &session_id)?;
             let live_op = Arc::clone(&live);
-            let session = run_operation(core, conn, &live, move || {
-                live_op.runtime.prompt(text)
-            })
-            .await?;
+            let session =
+                run_operation(core, conn, &live, move || live_op.runtime.prompt(text)).await?;
             Ok(CommandResult::Prompt { session })
         }
         Command::Steer { session_id, text } => {
             let live = require_attached(core, conn, &session_id)?;
             let live_op = Arc::clone(&live);
-            let session = run_operation(core, conn, &live, move || {
-                live_op.runtime.steer(text)
-            })
-            .await?;
+            let session =
+                run_operation(core, conn, &live, move || live_op.runtime.steer(text)).await?;
             Ok(CommandResult::Steer { session })
         }
         Command::Abort { session_id } => {
             let live = require_attached(core, conn, &session_id)?;
             let live_op = Arc::clone(&live);
-            let session = run_operation(core, conn, &live, move || {
-                live_op.runtime.abort()
-            })
-            .await?;
+            let session = run_operation(core, conn, &live, move || live_op.runtime.abort()).await?;
             Ok(CommandResult::Abort { session })
         }
         Command::SetModel { session_id, model } => {
             let live = require_attached(core, conn, &session_id)?;
             let live_op = Arc::clone(&live);
-            let session = run_operation(core, conn, &live, move || {
-                live_op.runtime.set_model(model)
-            })
-            .await?;
+            let session =
+                run_operation(core, conn, &live, move || live_op.runtime.set_model(model)).await?;
             Ok(CommandResult::SetModel { session })
         }
-        Command::SetThinking { session_id, thinking_level } => {
+        Command::SetThinking {
+            session_id,
+            thinking_level,
+        } => {
             let live = require_attached(core, conn, &session_id)?;
             let live_op = Arc::clone(&live);
             let session = run_operation(core, conn, &live, move || {
@@ -1268,7 +1301,11 @@ where
 
 /// Acquires (or joins the opening of) the live session for `id` (port
 /// of `acquire`).
-async fn acquire<F>(core: &Arc<ServerCore>, id: String, open: F) -> Result<Arc<LiveSession>, ServerError>
+async fn acquire<F>(
+    core: &Arc<ServerCore>,
+    id: String,
+    open: F,
+) -> Result<Arc<LiveSession>, ServerError>
 where
     F: FnOnce(String) -> BoxFuture<'static, Result<Box<dyn SessionRuntime>, ServerError>>,
 {
@@ -1401,7 +1438,11 @@ async fn create_live_session(
 }
 
 /// Delivers one runtime event (port of `handleRuntimeEvent`).
-fn handle_runtime_event(core: &Arc<ServerCore>, live: &Arc<LiveSession>, event: &SessionRuntimeEvent) {
+fn handle_runtime_event(
+    core: &Arc<ServerCore>,
+    live: &Arc<LiveSession>,
+    event: &SessionRuntimeEvent,
+) {
     match event {
         SessionRuntimeEvent::Error(error) => {
             let error = error.clone();
@@ -1463,7 +1504,10 @@ async fn terminate(
     let conn_ids: Vec<String> = lock(&live.connections).iter().cloned().collect();
     let conns: Vec<Arc<ServerConnection>> = {
         let shared = lock(&core.shared);
-        conn_ids.iter().filter_map(|id| shared.connections.get(id).cloned()).collect()
+        conn_ids
+            .iter()
+            .filter_map(|id| shared.connections.get(id).cloned())
+            .collect()
     };
     for conn in &conns {
         conn.connection.close(None).await.ok();
@@ -1516,9 +1560,7 @@ fn require_attached(
     let shared = lock(&core.shared);
     let live = shared.live.get(session_id);
     match live {
-        Some(live)
-            if !live.terminal.load(Ordering::SeqCst) && lock(&live.disposing).is_none() =>
-        {
+        Some(live) if !live.terminal.load(Ordering::SeqCst) && lock(&live.disposing).is_none() => {
             Ok(Arc::clone(live))
         }
         _ => Err(ServerError::new(
@@ -1543,12 +1585,17 @@ async fn broadcast_session_snapshot(
 ) -> Result<SessionSnapshot, ServerError> {
     let snapshot = normalized_snapshot(live).await?;
     let envelope = ServerMessage::Event {
-        event: ServerEvent::SessionSnapshot { snapshot: snapshot.clone() },
+        event: ServerEvent::SessionSnapshot {
+            snapshot: snapshot.clone(),
+        },
     };
     let conn_ids: Vec<String> = lock(&live.connections).iter().cloned().collect();
     let conns: Vec<Arc<ServerConnection>> = {
         let shared = lock(&core.shared);
-        conn_ids.iter().filter_map(|id| shared.connections.get(id).cloned()).collect()
+        conn_ids
+            .iter()
+            .filter_map(|id| shared.connections.get(id).cloned())
+            .collect()
     };
     for conn in conns {
         send_message(core, &conn, envelope.clone()).await;
@@ -1727,10 +1774,13 @@ pub enum ListenSpec {
 /// unsupported on this platform.
 pub fn build_listener(spec: &ListenSpec) -> Result<Arc<dyn ServerListener>, EndpointSpecError> {
     match spec {
-        ListenSpec::InMemory { listener } => Ok(Arc::new(InMemoryServerListener::new(Arc::clone(
-            listener,
-        )))),
-        ListenSpec::Unix { path, max_pending_bytes } => {
+        ListenSpec::InMemory { listener } => {
+            Ok(Arc::new(InMemoryServerListener::new(Arc::clone(listener))))
+        }
+        ListenSpec::Unix {
+            path,
+            max_pending_bytes,
+        } => {
             // Shared eager validation (empty/over-long path, invalid
             // budget) and the typed platform gate.
             let client_spec = EndpointSpec::Unix {
@@ -1795,7 +1845,6 @@ impl InMemoryServerListener {
     }
 }
 
-
 /// Bridges one accepted in-memory transport into a [`ByteConnection`].
 ///
 /// The accepted end is installed only after
@@ -1858,7 +1907,10 @@ impl ByteConnection for InMemoryConnection {
         })
     }
 
-    fn close(&self, final_chunk: Option<Vec<u8>>) -> BoxFuture<'static, Result<(), TransportError>> {
+    fn close(
+        &self,
+        final_chunk: Option<Vec<u8>>,
+    ) -> BoxFuture<'static, Result<(), TransportError>> {
         if self.closed.swap(true, Ordering::SeqCst) {
             return Box::pin(futures::future::ready(Ok(())));
         }
@@ -1956,8 +2008,7 @@ impl ServerListener for InMemoryServerListener {
 /// Resolves a wire [`ModelRef`] to a concrete model for
 /// [`AgentSession::set_model`]. Hosting sessions without a resolver
 /// rejects `set_model` with `not_found`.
-pub type ModelResolver =
-    Arc<dyn Fn(&ModelRef) -> Option<pi_ai::Model> + Send + Sync>;
+pub type ModelResolver = Arc<dyn Fn(&ModelRef) -> Option<pi_ai::Model> + Send + Sync>;
 
 /// Builds one [`AgentSession`] for a create command. The factory owns
 /// session construction (the G8 surface); it must return a session
@@ -2081,8 +2132,10 @@ impl ServerService for AgentSessionService {
             let id = session.session_id().await;
             lock(&sessions).insert(id.clone(), Arc::clone(&session));
             lock(&locked).insert(id.clone());
-            Ok(Box::new(AgentSessionRuntime::new(session, id, locked, resolver))
-                as Box<dyn SessionRuntime>)
+            Ok(
+                Box::new(AgentSessionRuntime::new(session, id, locked, resolver))
+                    as Box<dyn SessionRuntime>,
+            )
         })
     }
 
@@ -2107,8 +2160,9 @@ impl ServerService for AgentSessionService {
                 ));
             }
             lock(&locked).insert(session_id.clone());
-            Ok(Box::new(AgentSessionRuntime::new(session, session_id, locked, resolver))
-                as Box<dyn SessionRuntime>)
+            Ok(Box::new(AgentSessionRuntime::new(
+                session, session_id, locked, resolver,
+            )) as Box<dyn SessionRuntime>)
         })
     }
 }
@@ -2203,7 +2257,9 @@ impl SessionRuntime for AgentSessionRuntime {
     fn set_thinking(&self, level: ThinkingLevel) -> BoxFuture<'static, Result<(), ServerError>> {
         let session = Arc::clone(&self.session);
         Box::pin(async move {
-            let _ = session.set_thinking_level(wire_thinking_to_model(level)).await;
+            let _ = session
+                .set_thinking_level(wire_thinking_to_model(level))
+                .await;
             Ok(())
         })
     }
@@ -2214,11 +2270,13 @@ impl SessionRuntime for AgentSessionRuntime {
         let id = self.next_listener_id.fetch_add(1, Ordering::SeqCst);
         lock(&listeners).push((id, listener));
         let agent_listeners = Arc::clone(&listeners);
-        let unsubscribe = session.subscribe(move |_event: &crate::core::agent_session::AgentSessionEvent| {
-            for (_, listener) in lock(&agent_listeners).iter() {
-                listener(&SessionRuntimeEvent::Snapshot);
-            }
-        });
+        let unsubscribe = session.subscribe(
+            move |_event: &crate::core::agent_session::AgentSessionEvent| {
+                for (_, listener) in lock(&agent_listeners).iter() {
+                    listener(&SessionRuntimeEvent::Snapshot);
+                }
+            },
+        );
         let remove = Arc::clone(&listeners);
         Box::new(move || {
             lock(&remove).retain(|(listener_id, _)| *listener_id != id);
@@ -2264,7 +2322,10 @@ async fn agent_session_snapshot(session: &Arc<AgentSession>) -> SessionSnapshot 
     let revision = u64::try_from(transcript.len()).unwrap_or(u64::MAX);
     SessionSnapshot {
         session_id,
-        model: ModelRef { provider: model.provider, id: model.id },
+        model: ModelRef {
+            provider: model.provider,
+            id: model.id,
+        },
         thinking_level,
         locked: false,
         revision,
@@ -2342,10 +2403,12 @@ fn map_agent_message(message: &AgentMessage) -> Option<TranscriptItem> {
                         }
                     })
                     .collect::<Vec<_>>();
-                Some(TranscriptItem::Assistant(crate::remote::schemas::AssistantTranscriptItem {
-                    type_field: "assistant".to_string(),
-                    content,
-                }))
+                Some(TranscriptItem::Assistant(
+                    crate::remote::schemas::AssistantTranscriptItem {
+                        type_field: "assistant".to_string(),
+                        content,
+                    },
+                ))
             }
             pi_ai::Message::ToolResult(result) => {
                 let content = result
@@ -2362,11 +2425,13 @@ fn map_agent_message(message: &AgentMessage) -> Option<TranscriptItem> {
                         }
                     })
                     .collect::<Vec<_>>();
-                Some(TranscriptItem::Tool(crate::remote::schemas::ToolTranscriptItem {
-                    type_field: "tool".to_string(),
-                    tool_call_id: result.tool_call_id.clone(),
-                    content,
-                }))
+                Some(TranscriptItem::Tool(
+                    crate::remote::schemas::ToolTranscriptItem {
+                        type_field: "tool".to_string(),
+                        tool_call_id: result.tool_call_id.clone(),
+                        content,
+                    },
+                ))
             }
         },
         AgentMessage::Custom(_) => None,
@@ -2374,17 +2439,21 @@ fn map_agent_message(message: &AgentMessage) -> Option<TranscriptItem> {
 }
 
 fn wire_text(text: String) -> UserContent {
-    UserContent::Text(TextContent { type_field: "text".to_string(), text })
+    UserContent::Text(TextContent {
+        type_field: "text".to_string(),
+        text,
+    })
 }
 
 fn wire_tool_text(text: String) -> crate::remote::schemas::ToolContent {
-    crate::remote::schemas::ToolContent::Text(TextContent { type_field: "text".to_string(), text })
+    crate::remote::schemas::ToolContent::Text(TextContent {
+        type_field: "text".to_string(),
+        text,
+    })
 }
 
 /// Converts a JSON object into the wire value model.
-fn serde_json_to_wire(
-    value: &serde_json::Map<String, serde_json::Value>,
-) -> JsonValue {
+fn serde_json_to_wire(value: &serde_json::Map<String, serde_json::Value>) -> JsonValue {
     use crate::remote::schemas::JsonValue as Wire;
     let mut map = indexmap::IndexMap::new();
     for (key, item) in value {
@@ -2395,9 +2464,9 @@ fn serde_json_to_wire(
                 serde_json::Value::Bool(value) => Wire::Bool(*value),
                 serde_json::Value::Number(number) => json_number_to_wire(number),
                 serde_json::Value::String(text) => Wire::String(text.clone()),
-                serde_json::Value::Array(items) => Wire::Array(
-                    items.iter().map(json_leaf_to_wire).collect::<Vec<_>>(),
-                ),
+                serde_json::Value::Array(items) => {
+                    Wire::Array(items.iter().map(json_leaf_to_wire).collect::<Vec<_>>())
+                }
                 serde_json::Value::Object(object) => {
                     let mut inner = indexmap::IndexMap::new();
                     for (inner_key, inner_item) in object {
@@ -2537,16 +2606,20 @@ pub(crate) mod test_support {
         }
 
         pub(crate) fn emit_snapshot(&self) {
-            let listeners: Vec<SessionRuntimeListener> =
-                lock(&self.listeners).iter().map(|(_, l)| Arc::clone(l)).collect();
+            let listeners: Vec<SessionRuntimeListener> = lock(&self.listeners)
+                .iter()
+                .map(|(_, l)| Arc::clone(l))
+                .collect();
             for listener in listeners {
                 listener(&SessionRuntimeEvent::Snapshot);
             }
         }
 
         pub(crate) fn emit_progress(&self, progress: TranscriptProgress) {
-            let listeners: Vec<SessionRuntimeListener> =
-                lock(&self.listeners).iter().map(|(_, l)| Arc::clone(l)).collect();
+            let listeners: Vec<SessionRuntimeListener> = lock(&self.listeners)
+                .iter()
+                .map(|(_, l)| Arc::clone(l))
+                .collect();
             for listener in listeners {
                 listener(&SessionRuntimeEvent::Progress(progress.clone()));
             }
@@ -2589,8 +2662,10 @@ pub(crate) mod test_support {
                     })],
                 }));
             }
-            let listeners: Vec<SessionRuntimeListener> =
-                lock(&listeners_arc).iter().map(|(_, l)| Arc::clone(l)).collect();
+            let listeners: Vec<SessionRuntimeListener> = lock(&listeners_arc)
+                .iter()
+                .map(|(_, l)| Arc::clone(l))
+                .collect();
             for l in &listeners {
                 l(&SessionRuntimeEvent::Snapshot);
             }
@@ -2605,17 +2680,20 @@ pub(crate) mod test_support {
                     } else {
                         String::new()
                     };
-                    s.transcript
-                        .push(TranscriptItem::Assistant(crate::remote::schemas::AssistantTranscriptItem {
+                    s.transcript.push(TranscriptItem::Assistant(
+                        crate::remote::schemas::AssistantTranscriptItem {
                             type_field: "assistant".to_string(),
                             content: vec![AssistantContent::Text(TextContent {
                                 type_field: "text".to_string(),
                                 text: reply,
                             })],
-                        }));
+                        },
+                    ));
                 }
-                let listeners: Vec<SessionRuntimeListener> =
-                    lock(&listeners_arc).iter().map(|(_, l)| Arc::clone(l)).collect();
+                let listeners: Vec<SessionRuntimeListener> = lock(&listeners_arc)
+                    .iter()
+                    .map(|(_, l)| Arc::clone(l))
+                    .collect();
                 for l in &listeners {
                     l(&SessionRuntimeEvent::Snapshot);
                 }
@@ -2678,7 +2756,10 @@ pub(crate) mod test_support {
             Box::pin(futures::future::ready(Ok(())))
         }
 
-        fn set_thinking(&self, level: ThinkingLevel) -> BoxFuture<'static, Result<(), ServerError>> {
+        fn set_thinking(
+            &self,
+            level: ThinkingLevel,
+        ) -> BoxFuture<'static, Result<(), ServerError>> {
             if *lock(&self.phase) != SessionPhase::Idle {
                 return Box::pin(futures::future::ready(Err(ServerError::new(
                     ServerOperationCode::Busy,
@@ -2799,8 +2880,11 @@ pub(crate) mod test_support {
                 }));
                 lock(&sessions).insert(options.id.clone(), Arc::clone(&snapshot));
                 lock(&locked).insert(options.id.clone());
-                let runtime =
-                    Arc::new(ScriptedSession::new(options.id.clone(), snapshot, Arc::clone(&locked)));
+                let runtime = Arc::new(ScriptedSession::new(
+                    options.id.clone(),
+                    snapshot,
+                    Arc::clone(&locked),
+                ));
                 lock(&runtimes)
                     .entry(options.id)
                     .or_default()
@@ -2817,15 +2901,12 @@ pub(crate) mod test_support {
             let locked = Arc::clone(&self.locked);
             let runtimes = Arc::clone(&self.runtimes);
             Box::pin(async move {
-                let snapshot = lock(&sessions)
-                    .get(&session_id)
-                    .cloned()
-                    .ok_or_else(|| {
-                        ServerError::new(
-                            ServerOperationCode::NotFound,
-                            format!("Unknown session: {session_id}"),
-                        )
-                    })?;
+                let snapshot = lock(&sessions).get(&session_id).cloned().ok_or_else(|| {
+                    ServerError::new(
+                        ServerOperationCode::NotFound,
+                        format!("Unknown session: {session_id}"),
+                    )
+                })?;
                 if lock(&locked).contains(&session_id) {
                     return Err(ServerError::new(
                         ServerOperationCode::SessionLocked,
@@ -2874,7 +2955,10 @@ pub(crate) mod test_support {
         fn set_model(&self, model: ModelRef) -> BoxFuture<'static, Result<(), ServerError>> {
             self.inner.set_model(model)
         }
-        fn set_thinking(&self, level: ThinkingLevel) -> BoxFuture<'static, Result<(), ServerError>> {
+        fn set_thinking(
+            &self,
+            level: ThinkingLevel,
+        ) -> BoxFuture<'static, Result<(), ServerError>> {
             self.inner.set_thinking(level)
         }
         fn subscribe(&self, listener: SessionRuntimeListener) -> Box<dyn Fn() + Send + Sync> {
@@ -2944,11 +3028,12 @@ mod tests {
 
         // Same client attempting a second lease while exclusive is held
         // is rejected locally by lease tracking as Ownership.
-        let err_a = client_a
-            .attach_session("session-exclusive")
-            .await;
+        let err_a = client_a.attach_session("session-exclusive").await;
         assert!(
-            matches!(err_a, Err(crate::remote::client::PiClientError::Ownership(_))),
+            matches!(
+                err_a,
+                Err(crate::remote::client::PiClientError::Ownership(_))
+            ),
             "expected Ownership error on conflicting lease, got {err_a:?}"
         );
         // Cleanup
@@ -3094,7 +3179,10 @@ mod tests {
         client_a.disconnect("client dropped");
         let prompt_err = prompt_task.await.expect("prompt task finished");
         assert!(
-            matches!(prompt_err, Err(crate::remote::client::PiClientError::Disconnected(_))),
+            matches!(
+                prompt_err,
+                Err(crate::remote::client::PiClientError::Disconnected(_))
+            ),
             "in-flight prompt should fail with disconnected, got {prompt_err:?}"
         );
         // Finish the in-flight prompt on the runtime side (disconnect survival)
@@ -3128,11 +3216,9 @@ mod tests {
             Ok(start_event_helper()),
             Ok(done_event_helper("agent reply")),
         ]);
-        let mut config = crate::core::agent_session::AgentSessionConfig::test_config(
-            provider,
-            test_model_val(),
-        )
-        .expect("test config valid");
+        let mut config =
+            crate::core::agent_session::AgentSessionConfig::test_config(provider, test_model_val())
+                .expect("test config valid");
         config.system_prompt = "system prompt".into();
         let session = AgentSession::new(config).expect("AgentSession created");
 
@@ -3162,7 +3248,10 @@ mod tests {
             .await
             .expect("prompt roundtrip");
         assert!(
-            snapshot.transcript.iter().any(|item| matches!(item, TranscriptItem::User(_))),
+            snapshot
+                .transcript
+                .iter()
+                .any(|item| matches!(item, TranscriptItem::User(_))),
             "transcript should contain the prompt"
         );
 
@@ -3197,7 +3286,10 @@ mod tests {
             ("schemas.rs", include_str!("schemas.rs")),
             ("serde_cbor.rs", include_str!("serde_cbor.rs")),
             ("transport.rs", include_str!("transport.rs")),
-            ("transport/in_memory.rs", include_str!("transport/in_memory.rs")),
+            (
+                "transport/in_memory.rs",
+                include_str!("transport/in_memory.rs"),
+            ),
             #[cfg(unix)]
             ("transport/unix.rs", include_str!("transport/unix.rs")),
             ("server.rs", include_str!("server.rs")),
@@ -3291,7 +3383,9 @@ pub(crate) mod mod_tests_helper {
         }
     }
 
-    pub(crate) fn test_mock_provider(events: Vec<Result<AssistantMessageEvent, ProviderError>>) -> Arc<dyn Provider> {
+    pub(crate) fn test_mock_provider(
+        events: Vec<Result<AssistantMessageEvent, ProviderError>>,
+    ) -> Arc<dyn Provider> {
         Arc::new(MockProvider(events))
     }
 
@@ -3303,7 +3397,9 @@ pub(crate) mod mod_tests_helper {
 
     pub(crate) fn done_event_helper(text: &str) -> AssistantMessageEvent {
         let mut message = AssistantMessage::new("test-api", "test-provider", "m", 1);
-        message.content.push(pi_ai::AssistantContent::Text(pi_ai::TextContent::new(text)));
+        message
+            .content
+            .push(pi_ai::AssistantContent::Text(pi_ai::TextContent::new(text)));
         AssistantMessageEvent::Done {
             reason: DoneReason::Stop,
             message,

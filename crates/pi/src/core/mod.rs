@@ -25,7 +25,7 @@ pub mod sessions;
 pub mod settings;
 pub mod share;
 pub mod system_prompt;
+pub mod telemetry;
 pub mod tools;
 pub mod trust;
-pub mod telemetry;
 pub mod update;

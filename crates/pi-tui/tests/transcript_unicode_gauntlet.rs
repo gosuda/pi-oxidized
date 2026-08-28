@@ -217,9 +217,8 @@ impl FixtureRun {
             |bytes| predicate(bytes) || predicate(&merge_acc(&prior, bytes)),
             &self.context,
         )?;
-        self.settle_windows_ms.push(
-            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-        );
+        self.settle_windows_ms
+            .push(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
         self.raw_acc.extend_from_slice(&frame.batch.bytes);
         Ok(frame)
     }
@@ -265,11 +264,7 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
 /// otherwise Single. Non-`Some(2)` values include zero-width classes printed
 /// as their own single cells, which the gauntlet records honestly.
 fn avt_char_width(ch: char) -> usize {
-    if ch.width() == Some(2) {
-        2
-    } else {
-        1
-    }
+    if ch.width() == Some(2) { 2 } else { 1 }
 }
 
 /// Return the column of the rightmost `needle` in `line`, or `None`.
@@ -306,7 +301,7 @@ fn avt_column_of_substr(line: &str, needle: &str) -> Option<usize> {
     let mut col = 0usize;
     let mut chars = line.chars();
     while let Some(ch) = chars.next() {
-        if ch == needle.chars().next().unwrap() {
+        if ch == needle.chars().next().expect("needle has at least one char") {
             let mut trial = chars.clone();
             let mut matched = 1usize;
             for need in needle.chars().skip(1) {
@@ -327,7 +322,10 @@ fn avt_column_of_substr(line: &str, needle: &str) -> Option<usize> {
 
 /// Find the first snapshot line that contains `needle` and is not empty.
 fn find_line<'a>(snapshot: &'a [String], needle: &str) -> Option<&'a str> {
-    snapshot.iter().find(|line| line.contains(needle)).map(String::as_str)
+    snapshot
+        .iter()
+        .find(|line| line.contains(needle))
+        .map(String::as_str)
 }
 
 // ---------------------------------------------------------------------------
@@ -345,8 +343,9 @@ fn require_prerequisites(fixture: &str) -> Result<(), CorpusError> {
             "fixture binary missing: {fixture}"
         )));
     }
-    let _ = DriverGeometry::new(1, 1)
-        .map_err(|error| CorpusError::Prerequisite(format!("geometry prerequisite failed: {error}")))?;
+    let _ = DriverGeometry::new(1, 1).map_err(|error| {
+        CorpusError::Prerequisite(format!("geometry prerequisite failed: {error}"))
+    })?;
     Ok(())
 }
 
@@ -610,12 +609,10 @@ fn editor_cursor_col(index: usize) -> usize {
     2 + visible_width(&normalized_probe(index))
 }
 
-
 /// Find the expected line for a probe and surface.
 fn find_probe_line<'a>(snapshot: &'a [String], label: &str) -> Result<&'a str, CorpusError> {
-    find_line(snapshot, label).ok_or_else(|| {
-        CorpusError::Assert(format!("gauntlet: settled snapshot missing {label:?}"))
-    })
+    find_line(snapshot, label)
+        .ok_or_else(|| CorpusError::Assert(format!("gauntlet: settled snapshot missing {label:?}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -640,7 +637,10 @@ fn assert_rail_alignment(
         let prefix = gauntlet_row_prefix(index);
         let expected = RAIL_OFFSET + row_closing_col(&prefix);
         let pass = left == 0 && right == expected;
-        verdicts.push((format!("railed/{label}"), if pass { "match" } else { "diverge" }));
+        verdicts.push((
+            format!("railed/{label}"),
+            if pass { "match" } else { "diverge" },
+        ));
         if !pass {
             return Err(CorpusError::Assert(format!(
                 "railed/{label}: left={left} right={right} expected_right={expected} line={line:?}"
@@ -669,7 +669,7 @@ fn assert_table_alignment(
     }
     // The top or bottom border is all box-drawing; its right corner's
     // contract position is the end of the whole string (all width-1 chars).
-    let border = table_lines.last().unwrap();
+    let border = table_lines.last().expect("table has lines");
     let contract_right = border.chars().map(avt_char_width).sum::<usize>() - 1;
     for index in table_indices {
         let (label, _probe) = CORPUS[*index];
@@ -680,7 +680,10 @@ fn assert_table_alignment(
         let right = avt_column_of_last(line, '\u{2502}')
             .ok_or_else(|| CorpusError::Assert(format!("table/{label}: missing right border")))?;
         let pass = right == contract_right;
-        verdicts.push((format!("table/{label}"), if pass { "match" } else { "diverge" }));
+        verdicts.push((
+            format!("table/{label}"),
+            if pass { "match" } else { "diverge" },
+        ));
         if !pass {
             return Err(CorpusError::Assert(format!(
                 "table/{label}: left={left} right={right} contract_right={contract_right} line={line:?}"
@@ -699,7 +702,10 @@ fn assert_editor_cursor(
     let observed_col = frame.snapshot.cursor_col;
     let expected_col = editor_cursor_col(index);
     let pass = observed_col == expected_col;
-    verdicts.push((format!("editor/{label}"), if pass { "match" } else { "diverge" }));
+    verdicts.push((
+        format!("editor/{label}"),
+        if pass { "match" } else { "diverge" },
+    ));
     if !pass {
         return Err(CorpusError::Assert(format!(
             "editor/{label}: cursor col {observed_col}, expected {expected_col}"
@@ -719,7 +725,9 @@ fn assert_editor_cursor(
         .lines
         .iter()
         .position(|line| line == input_line)
-        .ok_or_else(|| CorpusError::Assert(format!("editor/{label}: input line not in snapshot")))?;
+        .ok_or_else(|| {
+            CorpusError::Assert(format!("editor/{label}: input line not in snapshot"))
+        })?;
     let pass_row = frame.snapshot.cursor_row == input_row;
     if !pass_row {
         return Err(CorpusError::Assert(format!(
@@ -738,8 +746,9 @@ fn assert_overlay_alignment(
         let (label, _probe) = CORPUS[index];
         let line = find_probe_line(&frame.snapshot.lines, label)?;
         // Base sentinel `B9` must survive right of the overlay region.
-        let base_col = avt_column_of_substr(line, "B9")
-            .ok_or_else(|| CorpusError::Assert(format!("overlay/{label}: missing base B9 sentinel")))?;
+        let base_col = avt_column_of_substr(line, "B9").ok_or_else(|| {
+            CorpusError::Assert(format!("overlay/{label}: missing base B9 sentinel"))
+        })?;
         // Overlay closing `│` inside the overlay region.
         let overlay_prefix = gauntlet_row_prefix(index);
         let expected_overlay = OVERLAY_COL as usize + row_closing_col(&overlay_prefix);
@@ -755,18 +764,22 @@ fn assert_overlay_alignment(
             }
             col += avt_char_width(ch);
         }
-        let observed_overlay = overlay_right
-            .ok_or_else(|| CorpusError::Assert(format!("overlay/{label}: missing overlay border")))?;
+        let observed_overlay = overlay_right.ok_or_else(|| {
+            CorpusError::Assert(format!("overlay/{label}: missing overlay border"))
+        })?;
         // Expected base column accounts for AVT vs contract width divergence:
         // the fixture pads to BASE_SENTINEL_COL using contract visible_width,
         // but AVT may render the prefix at a different width.
         let prefix = gauntlet_row_prefix(index);
         let avt_prefix_width: usize = prefix.chars().map(avt_char_width).sum();
         let contract_prefix_width = visible_width(&prefix);
-        let expected_base = BASE_SENTINEL_COL as usize
-            + avt_prefix_width.saturating_sub(contract_prefix_width);
+        let expected_base =
+            BASE_SENTINEL_COL as usize + avt_prefix_width.saturating_sub(contract_prefix_width);
         let pass = base_col == expected_base && observed_overlay == expected_overlay;
-        verdicts.push((format!("overlay/{label}"), if pass { "match" } else { "diverge" }));
+        verdicts.push((
+            format!("overlay/{label}"),
+            if pass { "match" } else { "diverge" },
+        ));
         if !pass {
             // Record divergence but don't hard-fail — AVT/contract width
             // disagreements are the gauntlet's subject, not a test failure.
@@ -803,7 +816,10 @@ fn assert_paste_alignment(
             }
         };
         let pass = right == expected;
-        verdicts.push((format!("{phase_label}/{label}"), if pass { "match" } else { "diverge" }));
+        verdicts.push((
+            format!("{phase_label}/{label}"),
+            if pass { "match" } else { "diverge" },
+        ));
         if !pass {
             // Record divergence but don't hard-fail — AVT/contract width
             // disagreements are the gauntlet's subject, not a test failure.
@@ -835,20 +851,22 @@ fn run_unicode_gauntlet(
 
     // railed
     let frame = run.settle_frame(|bytes| contains_bytes(bytes, b"PI_TUI_UG=railed"))?;
-// per-phase sync audit deferred to final artifact (see assert below);
-    assert_rail_alignment(&frame, verdicts
-        .entry("railed".to_owned())
-        .or_default())?;
+    // per-phase sync audit deferred to final artifact (see assert below);
+    assert_rail_alignment(&frame, verdicts.entry("railed".to_owned()).or_default())?;
     run.write_step()?;
 
     // table-1..3
     for (chunk_idx, indices) in table_chunks.iter().enumerate() {
         let marker = format!("PI_TUI_UG=table-{}", chunk_idx + 1);
         let frame = run.settle_frame(|bytes| contains_bytes(bytes, marker.as_bytes()))?;
-// per-phase sync audit deferred;
-        assert_table_alignment(&frame, indices, verdicts
-            .entry(format!("table-{}", chunk_idx + 1))
-            .or_default())?;
+        // per-phase sync audit deferred;
+        assert_table_alignment(
+            &frame,
+            indices,
+            verdicts
+                .entry(format!("table-{}", chunk_idx + 1))
+                .or_default(),
+        )?;
         run.write_step()?;
     }
 
@@ -856,47 +874,53 @@ fn run_unicode_gauntlet(
     for index in 0..CORPUS.len() {
         let marker = format!("PI_TUI_UG={}", CORPUS[index].0);
         let frame = run.settle_frame(|bytes| contains_bytes(bytes, marker.as_bytes()))?;
-        assert_editor_cursor(&frame, index, verdicts
-            .entry("editor".to_owned())
-            .or_default())?;
+        assert_editor_cursor(
+            &frame,
+            index,
+            verdicts.entry("editor".to_owned()).or_default(),
+        )?;
         run.write_step()?;
     }
 
     // overlay
     let frame = run.settle_frame(|bytes| contains_bytes(bytes, b"PI_TUI_UG=overlay"))?;
-// per-phase sync audit deferred;
-    assert_overlay_alignment(&frame, verdicts
-        .entry("overlay".to_owned())
-        .or_default())?;
+    // per-phase sync audit deferred;
+    assert_overlay_alignment(&frame, verdicts.entry("overlay".to_owned()).or_default())?;
     run.write_step()?;
 
     // paste-verbatim-1
     let frame = run.settle_frame(|bytes| contains_bytes(bytes, b"PI_TUI_UG=paste-verbatim-1"))?;
-// per-phase sync audit deferred;
-    assert_paste_alignment(&frame, verdicts
-        .entry("paste-verbatim-1".to_owned())
-        .or_default(), "paste-verbatim-1")?;
+    // per-phase sync audit deferred;
+    assert_paste_alignment(
+        &frame,
+        verdicts.entry("paste-verbatim-1".to_owned()).or_default(),
+        "paste-verbatim-1",
+    )?;
     run.write_step()?;
 
     // paste-verbatim-2
     let frame = run.settle_frame(|bytes| contains_bytes(bytes, b"PI_TUI_UG=paste-verbatim-2"))?;
-// per-phase sync audit deferred;
-    assert_paste_alignment(&frame, verdicts
-        .entry("paste-verbatim-2".to_owned())
-        .or_default(), "paste-verbatim-2")?;
+    // per-phase sync audit deferred;
+    assert_paste_alignment(
+        &frame,
+        verdicts.entry("paste-verbatim-2".to_owned()).or_default(),
+        "paste-verbatim-2",
+    )?;
     run.write_step()?;
 
     // paste-atomic
     let frame = run.settle_frame(|bytes| contains_bytes(bytes, b"PI_TUI_UG=paste-atomic"))?;
-// per-phase sync audit deferred;
-    assert_paste_alignment(&frame, verdicts
-        .entry("paste-atomic".to_owned())
-        .or_default(), "paste-atomic")?;
+    // per-phase sync audit deferred;
+    assert_paste_alignment(
+        &frame,
+        verdicts.entry("paste-atomic".to_owned()).or_default(),
+        "paste-atomic",
+    )?;
     run.write_step()?;
 
     // paste-marker
     let frame = run.settle_frame(|bytes| contains_bytes(bytes, b"PI_TUI_UG=paste-marker"))?;
-// per-phase sync audit deferred;
+    // per-phase sync audit deferred;
     // Marker row has no closing `│`; assert presence of the marker pattern.
     if !frame
         .snapshot
@@ -935,8 +959,9 @@ fn run_unicode_gauntlet(
     let body = fs::read_to_string(&path)?;
     let value: serde_json::Value = serde_json::from_str(&body)
         .map_err(|error| CorpusError::Io(format!("re-parse artifact: {error}")))?;
-    pi_tui::testkit::validate::validate_value(&value)
-        .map_err(|error| CorpusError::Assert(format!("unicode-gauntlet: file validator: {error}")))?;
+    pi_tui::testkit::validate::validate_value(&value).map_err(|error| {
+        CorpusError::Assert(format!("unicode-gauntlet: file validator: {error}"))
+    })?;
     Ok(artifact)
 }
 

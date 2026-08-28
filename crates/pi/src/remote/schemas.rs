@@ -53,7 +53,9 @@ pub enum JsonValue {
 
 impl JsonValue {
     #[must_use]
-    pub fn null() -> Self { Self::Null }
+    pub fn null() -> Self {
+        Self::Null
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -444,10 +446,7 @@ pub enum ServerEvent {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
     Hello { version: u32 },
-    Request {
-        id: String,
-        request: Command,
-    },
+    Request { id: String, request: Command },
 }
 
 /// A message from the server to the client.
@@ -460,7 +459,9 @@ pub enum ServerMessage {
         connection_id: String,
         snapshot: ServerSnapshot,
     },
-    HelloError { error: ProtocolError },
+    HelloError {
+        error: ProtocolError,
+    },
     Response {
         id: String,
         ok: bool,
@@ -469,5 +470,7 @@ pub enum ServerMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<ProtocolError>,
     },
-    Event { event: ServerEvent },
+    Event {
+        event: ServerEvent,
+    },
 }

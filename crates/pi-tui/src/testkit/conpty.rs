@@ -45,11 +45,20 @@ impl TerminalDriver for ConPtyDriver {
         cmd.cwd(&spec.cwd);
         apply_env(&mut cmd, spec);
 
-        let child = pair.slave.spawn_command(cmd).map_err(|err| DriverError::pty(&err))?;
+        let child = pair
+            .slave
+            .spawn_command(cmd)
+            .map_err(|err| DriverError::pty(&err))?;
         drop(pair.slave);
 
-        let raw_writer = pair.master.take_writer().map_err(|err| DriverError::pty(&err))?;
-        let reader = pair.master.try_clone_reader().map_err(|err| DriverError::pty(&err))?;
+        let raw_writer = pair
+            .master
+            .take_writer()
+            .map_err(|err| DriverError::pty(&err))?;
+        let reader = pair
+            .master
+            .try_clone_reader()
+            .map_err(|err| DriverError::pty(&err))?;
 
         // Wrap in SharedWriter so the DSR auto-responder can share the single
         // PTY master writer (portable-pty allows only one take_writer call).
@@ -64,10 +73,8 @@ impl TerminalDriver for ConPtyDriver {
             w.flush()?;
         }
 
-        let pump = crate::testkit::session::ReaderPump::from_reader_with_dsr_responder(
-            reader,
-            dsr_writer,
-        );
+        let pump =
+            crate::testkit::session::ReaderPump::from_reader_with_dsr_responder(reader, dsr_writer);
         Ok(ConPtySession {
             master: pair.master,
             child: Some(child),

@@ -871,10 +871,10 @@ impl TranscriptRecorder {
         self.raw_log.extend_from_slice(&raw);
         self.applied.extend(applied);
         self.output_audits.push(audit);
-        self.artifact.canonical.events.push(CanonicalEvent::Output {
-            seq,
-            bytes_b64,
-        });
+        self.artifact
+            .canonical
+            .events
+            .push(CanonicalEvent::Output { seq, bytes_b64 });
         Ok(())
     }
 
@@ -1407,8 +1407,7 @@ mod tests {
     }
 
     #[test]
-    fn output_and_snapshot_rejects_max_minus_one_without_mutation()
-    -> Result<(), TranscriptError> {
+    fn output_and_snapshot_rejects_max_minus_one_without_mutation() -> Result<(), TranscriptError> {
         let mut value = recorder(DriverKind::PosixPty);
         value.spawn(vec!["pi".to_owned()], &NormalizationContext::default())?;
         let events_before = value.artifact.canonical.events.clone();
@@ -1552,10 +1551,12 @@ mod tests {
             .expect_err("expected sequence overflow");
         assert!(matches!(error, TranscriptError::SequenceOverflow));
         assert_recorder_state_unchanged(&value, &before);
-        assert!(!value
-            .applied
-            .iter()
-            .any(|entry| entry.kind == NormalizationKind::ResizeCollapse));
+        assert!(
+            !value
+                .applied
+                .iter()
+                .any(|entry| entry.kind == NormalizationKind::ResizeCollapse)
+        );
         Ok(())
     }
 

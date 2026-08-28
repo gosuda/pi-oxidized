@@ -33,10 +33,10 @@ use pi_tui::testkit::transcript::{
 use pi_tui::testkit::{RecordingError, RecordingSession};
 use tempfile::TempDir;
 
-#[cfg(unix)]
-use pi_tui::testkit::posix::PosixPtyDriver;
 #[cfg(windows)]
 use pi_tui::testkit::conpty::ConPtyDriver;
+#[cfg(unix)]
+use pi_tui::testkit::posix::PosixPtyDriver;
 
 const INITIAL_COLS: u16 = 80;
 const INITIAL_ROWS: u16 = 24;
@@ -46,7 +46,11 @@ const VERIFICATION_PROVIDER: &str = "verification";
 const VERIFICATION_MODEL: &str = "model";
 const VERIFICATION_PROFILE_FLAG: &str = "verification-profile";
 const VERIFICATION_PROFILE: &str = "tui-transcript-profile";
-const READY_MARKERS: &[&[u8]] = &[b"type a message", b"type a message to begin", b"No messages"];
+const READY_MARKERS: &[&[u8]] = &[
+    b"type a message",
+    b"type a message to begin",
+    b"No messages",
+];
 const KEY_ENTER: &[u8] = b"\r";
 const KEY_ESCAPE: &[u8] = b"\x1b";
 const KEY_DOWN: &[u8] = b"\x1b[B";
@@ -156,12 +160,16 @@ struct ProductRun {
 
 fn workspace_root() -> Result<PathBuf, CorpusError> {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest.parent().and_then(Path::parent).map(Path::to_path_buf).ok_or_else(|| {
-        CorpusError::Prerequisite(format!(
-            "workspace root not found above {}",
-            manifest.display()
-        ))
-    })
+    manifest
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .ok_or_else(|| {
+            CorpusError::Prerequisite(format!(
+                "workspace root not found above {}",
+                manifest.display()
+            ))
+        })
 }
 
 fn extension_path() -> Result<PathBuf, CorpusError> {
@@ -264,7 +272,10 @@ fn common_argv(include_extension: bool) -> Result<Vec<String>, CorpusError> {
 fn launch_env(sandbox: &Sandbox, opts: &LaunchOpts) -> Result<LaunchEnv, CorpusError> {
     require_prerequisites()?;
     let mut env = BTreeMap::new();
-    env.insert("HOME".to_owned(), sandbox.home_dir.to_string_lossy().into_owned());
+    env.insert(
+        "HOME".to_owned(),
+        sandbox.home_dir.to_string_lossy().into_owned(),
+    );
     env.insert("PI_OFFLINE".to_owned(), "1".to_owned());
     env.insert(
         "PI_EXTENSION_HOST".to_owned(),
@@ -569,9 +580,8 @@ impl ProductRun {
             |bytes| predicate(bytes) || predicate(&merge_acc(&self.raw_acc, bytes)),
             &self.context,
         )?;
-        self.settle_windows_ms.push(
-            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-        );
+        self.settle_windows_ms
+            .push(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
         self.raw_acc.extend_from_slice(&batch.bytes);
         Ok(batch.bytes)
     }
@@ -589,9 +599,8 @@ impl ProductRun {
             |bytes| predicate(bytes) || predicate(&merge_acc(&self.raw_acc, bytes)),
             &self.context,
         )?;
-        self.settle_windows_ms.push(
-            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-        );
+        self.settle_windows_ms
+            .push(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
         self.raw_acc.extend_from_slice(&frame.batch.bytes);
         self.saw_snapshot = true;
         Ok(frame)
@@ -668,10 +677,13 @@ fn frame_lines_contain(
     )))
 }
 
-
 /// Type a sentinel into the editor and prove focus restored: the screen model
 /// must show the editor marker followed by the sentinel, then clear it.
-fn prove_editor_focus(run: &mut ProductRun, scenario: &str, sentinel: &str) -> Result<(), CorpusError> {
+fn prove_editor_focus(
+    run: &mut ProductRun,
+    scenario: &str,
+    sentinel: &str,
+) -> Result<(), CorpusError> {
     for byte in sentinel.bytes() {
         run.write_input(&[byte])?;
     }
@@ -695,11 +707,14 @@ fn run_keyboard_wizard(
     row: &RunnerRow,
 ) -> Result<TranscriptArtifact, CorpusError> {
     let sandbox = create_sandbox()?;
-    let launch = launch_env(&sandbox, &LaunchOpts {
-        wizard: true,
-        include_extension: false,
-        ..LaunchOpts::default()
-    })?;
+    let launch = launch_env(
+        &sandbox,
+        &LaunchOpts {
+            wizard: true,
+            include_extension: false,
+            ..LaunchOpts::default()
+        },
+    )?;
     let mut run = ProductRun::open(launch, row.clone(), vec![ClaimClass::Execution])?;
 
     let frame = run.settle_frame(|bytes| contains_bytes(bytes, b"Choose a theme family"))?;
@@ -721,8 +736,9 @@ fn run_keyboard_wizard(
 
     run.write_input(KEY_DOWN)?;
     run.write_input(KEY_ENTER)?;
-    let frame =
-        run.settle_frame(|bytes| contains_bytes(bytes, b"anonymous usage") || ready_predicate(bytes))?;
+    let frame = run.settle_frame(|bytes| {
+        contains_bytes(bytes, b"anonymous usage") || ready_predicate(bytes)
+    })?;
     frame_lines_contain("keyboard-wizard", &frame, "anonymous usage")?;
 
     // Down selects "Don't share" → analytics must persist false.
@@ -749,15 +765,20 @@ fn run_keyboard_wizard(
     }
 
     // Persisted settings prove the keyboard-only flow completed on disk.
-    let settings_path = sandbox.home_dir.join(".pi").join("agent").join("settings.json");
+    let settings_path = sandbox
+        .home_dir
+        .join(".pi")
+        .join("agent")
+        .join("settings.json");
     let raw = fs::read_to_string(&settings_path).map_err(|error| {
         CorpusError::Assert(format!(
             "keyboard-wizard: settings not persisted at {}: {error}",
             settings_path.display()
         ))
     })?;
-    let value: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|error| CorpusError::Assert(format!("keyboard-wizard: settings parse: {error}")))?;
+    let value: serde_json::Value = serde_json::from_str(&raw).map_err(|error| {
+        CorpusError::Assert(format!("keyboard-wizard: settings parse: {error}"))
+    })?;
     let theme = value
         .get("theme")
         .and_then(serde_json::Value::as_str)
@@ -838,9 +859,8 @@ fn run_keyboard_slash_flows(
 
     // /logout with nothing stored: explicit no-op notice.
     run.send_line("/logout")?;
-    let frame = run.settle_frame(|bytes| {
-        contains_bytes(bytes, b"No stored credentials to remove")
-    })?;
+    let frame =
+        run.settle_frame(|bytes| contains_bytes(bytes, b"No stored credentials to remove"))?;
     frame_lines_contain(scenario, &frame, "No stored credentials to remove")?;
     prove_editor_focus(&mut run, scenario, "logoutfocus")?;
 
@@ -914,8 +934,7 @@ fn run_keyboard_ctrl_d_order(
         if *command == "/tree" {
             // Deterministic seeded turn so /resume has the active session.
             run.send_line("verification seeded turn")?;
-            let _ =
-                run.settle_frame(|bytes| contains_bytes(bytes, FINAL_MARKER.as_bytes()))?;
+            let _ = run.settle_frame(|bytes| contains_bytes(bytes, FINAL_MARKER.as_bytes()))?;
         }
     }
 
@@ -949,11 +968,14 @@ fn run_keyboard_streaming_interrupt(
     row: &RunnerRow,
 ) -> Result<TranscriptArtifact, CorpusError> {
     let sandbox = create_sandbox()?;
-    let launch = launch_env(&sandbox, &LaunchOpts {
-        chunk_count: 12,
-        chunk_delay_ms: 300,
-        ..LaunchOpts::default()
-    })?;
+    let launch = launch_env(
+        &sandbox,
+        &LaunchOpts {
+            chunk_count: 12,
+            chunk_delay_ms: 300,
+            ..LaunchOpts::default()
+        },
+    )?;
     let mut run = ProductRun::open(launch, row.clone(), vec![ClaimClass::Execution])?;
     let _ = run.settle_frame(ready_predicate)?;
     let scenario = "keyboard-streaming-interrupt";
@@ -978,9 +1000,9 @@ fn run_keyboard_streaming_interrupt(
         )));
     }
     if !contains_bytes(run.raw_so_far(), b"Aborting") {
-        return Err(CorpusError::Assert(
-            format!("{scenario}: Aborting… status marker missing after Esc"),
-        ));
+        return Err(CorpusError::Assert(format!(
+            "{scenario}: Aborting… status marker missing after Esc"
+        )));
     }
     prove_editor_focus(&mut run, scenario, "abortfocus")?;
 
@@ -1121,17 +1143,24 @@ fn run_keyboard_rebind_hints(
     row: &RunnerRow,
 ) -> Result<TranscriptArtifact, CorpusError> {
     let sandbox = create_sandbox()?;
-    let launch = launch_env(&sandbox, &LaunchOpts {
-        include_extension: false,
-        rebind_keybindings: true,
-        ..LaunchOpts::default()
-    })?;
+    let launch = launch_env(
+        &sandbox,
+        &LaunchOpts {
+            include_extension: false,
+            rebind_keybindings: true,
+            ..LaunchOpts::default()
+        },
+    )?;
     let mut run = ProductRun::open(launch, row.clone(), vec![ClaimClass::Execution])?;
     let scenario = "keyboard-rebind-hints";
 
     // Empty-state hint must render the rebound chords, never the defaults.
     let frame = run.settle_frame(ready_predicate)?;
-    frame_lines_contain(scenario, &frame, "/hotkeys shortcuts · ctrl+m expand tools · f9 thinking")?;
+    frame_lines_contain(
+        scenario,
+        &frame,
+        "/hotkeys shortcuts · ctrl+m expand tools · f9 thinking",
+    )?;
     for line in &frame.snapshot.lines {
         if line.contains("expand tools") && line.contains("ctrl+o") {
             return Err(CorpusError::Assert(format!(
@@ -1236,7 +1265,11 @@ fn tui_keyboard_gauntlet_wizard_slash_ctrl_d_streaming_overlay_rebind() {
         Err(error) => hard_fail(error),
     };
     if row_label == "local" {
-        assert_eq!(row.tier, RowTier::Local, "local runs must never claim Tier N");
+        assert_eq!(
+            row.tier,
+            RowTier::Local,
+            "local runs must never claim Tier N"
+        );
     }
 
     let scenarios: [(

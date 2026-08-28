@@ -2834,7 +2834,8 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             .enqueue_bash(command.to_owned(), exclude_from_context)
             .await
         {
-            self.last_error = Some("A bash command is already running. Press Esc to cancel it first.".to_owned());
+            self.last_error =
+                Some("A bash command is already running. Press Esc to cancel it first.".to_owned());
             return ActionOutcome::Repaint;
         }
         self.view.editor.border = EditorBorder::Bash;
@@ -3859,8 +3860,12 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     /// and apply it. Called on `/reload` and after settings-driven changes.
     pub(crate) fn apply_theme_from_settings(&mut self) {
         let (raw, mode) = self.session.theme_settings();
-        let resolved =
-            super::theme::resolve_active_theme(raw.as_deref(), mode, self.terminal_theme, self.color_mode());
+        let resolved = super::theme::resolve_active_theme(
+            raw.as_deref(),
+            mode,
+            self.terminal_theme,
+            self.color_mode(),
+        );
         self.apply_theme(resolved);
     }
 
@@ -3903,7 +3908,12 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             if let Err(error) = self.session.persist_theme(&name, mode) {
                 self.last_error = Some(error);
             }
-            super::theme::resolve_active_theme(Some(&name), mode, self.terminal_theme, self.color_mode())
+            super::theme::resolve_active_theme(
+                Some(&name),
+                mode,
+                self.terminal_theme,
+                self.color_mode(),
+            )
         } else {
             super::theme::load_or_dark(&name, self.color_mode())
         };
@@ -3946,8 +3956,12 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     fn preview_theme_selection(&mut self, selection: &str) {
         let storage = super::theme::theme_selection_to_storage(selection);
         let (_, mode) = self.session.theme_settings();
-        let resolved =
-            super::theme::resolve_active_theme(Some(&storage), mode, self.terminal_theme, self.color_mode());
+        let resolved = super::theme::resolve_active_theme(
+            Some(&storage),
+            mode,
+            self.terminal_theme,
+            self.color_mode(),
+        );
         self.apply_theme(resolved);
     }
 
@@ -4069,8 +4083,12 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             return;
         };
         let storage = super::theme::theme_selection_to_storage(&family);
-        let resolved =
-            super::theme::resolve_active_theme(Some(&storage), mode, self.terminal_theme, self.color_mode());
+        let resolved = super::theme::resolve_active_theme(
+            Some(&storage),
+            mode,
+            self.terminal_theme,
+            self.color_mode(),
+        );
         self.apply_theme(resolved);
     }
 
@@ -6539,11 +6557,7 @@ fn session_entry_matches_tree_filter(
 fn session_entry_is_bookkeeping(entry: &crate::core::sessions::SessionEntry) -> bool {
     matches!(
         entry.discriminant(),
-        "label"
-            | "model_change"
-            | "thinking_level_change"
-            | "session_info"
-            | "custom"
+        "label" | "model_change" | "thinking_level_change" | "session_info" | "custom"
     )
 }
 
@@ -6593,7 +6607,10 @@ fn tree_entry_label(entry: &crate::core::sessions::SessionEntry) -> String {
 /// Returns `(80, 24)` when the size cannot be queried (non-tty stdout).
 fn initial_terminal_size() -> (u16, u16) {
     match crossterm::terminal::size() {
-        Ok((width, height)) => (width.clamp(VIEWPORT_WIDTH_FLOOR, 1024), height.clamp(1, 256)),
+        Ok((width, height)) => (
+            width.clamp(VIEWPORT_WIDTH_FLOOR, 1024),
+            height.clamp(1, 256),
+        ),
         Err(_) => (80, 24),
     }
 }
@@ -11592,10 +11609,7 @@ mod tests {
         let (mut rt, _log) = try_make_runtime()?;
         // Normal render at 80 has content.
         let buf = render_view(&rt.view, 80, 24);
-        assert!(
-            !buffer_is_blank(&buf),
-            "80-column render must have content"
-        );
+        assert!(!buffer_is_blank(&buf), "80-column render must have content");
         // Resize below floor.
         rt.step_ui(UiEvent::Resize {
             width: 10,
@@ -11801,8 +11815,15 @@ mod tests {
 
     /// Build a runtime with a live input sender so tests can pre-load
     /// events into the channel before calling `step_ui`.
-    fn try_make_runtime_with_channel()
-    -> Result<(InteractiveRuntime<SharedWriter, FakeHost>, Arc<ActionLog>, mpsc::UnboundedSender<UiEvent>, SharedWriter), String> {
+    fn try_make_runtime_with_channel() -> Result<
+        (
+            InteractiveRuntime<SharedWriter, FakeHost>,
+            Arc<ActionLog>,
+            mpsc::UnboundedSender<UiEvent>,
+            SharedWriter,
+        ),
+        String,
+    > {
         let writer = SharedWriter::new();
         let sink = writer.clone();
         let caps = TerminalCapabilities::default();
@@ -11832,14 +11853,23 @@ mod tests {
         // Pre-load the storm: 20→160→30. The first step_ui enters
         // handle_resize which drains the channel and coalesces all three
         // into one reanchor.
-        tx.send(UiEvent::Resize { width: 160, height: 24 })
-            .map_err(|e| format!("send failed: {e}"))?;
-        tx.send(UiEvent::Resize { width: 30, height: 24 })
-            .map_err(|e| format!("send failed: {e}"))?;
+        tx.send(UiEvent::Resize {
+            width: 160,
+            height: 24,
+        })
+        .map_err(|e| format!("send failed: {e}"))?;
+        tx.send(UiEvent::Resize {
+            width: 30,
+            height: 24,
+        })
+        .map_err(|e| format!("send failed: {e}"))?;
 
-        rt.step_ui(UiEvent::Resize { width: 20, height: 24 })
-            .await
-            .map_err(|e| format!("resize step failed: {e}"))?;
+        rt.step_ui(UiEvent::Resize {
+            width: 20,
+            height: 24,
+        })
+        .await
+        .map_err(|e| format!("resize step failed: {e}"))?;
 
         // Final size must be the last event (30×24), not the first.
         assert_eq!(rt.tui.size(), Size::new(30, 24));
@@ -11871,16 +11901,28 @@ mod tests {
         let (mut rt, _log, tx, sink) = try_make_runtime_with_channel()?;
         let baseline = sink.snapshot().len();
 
-        tx.send(UiEvent::Resize { width: 15, height: 24 })
-            .map_err(|e| format!("send failed: {e}"))?;
-        tx.send(UiEvent::Resize { width: 10, height: 24 })
-            .map_err(|e| format!("send failed: {e}"))?;
-        tx.send(UiEvent::Resize { width: 8, height: 24 })
-            .map_err(|e| format!("send failed: {e}"))?;
+        tx.send(UiEvent::Resize {
+            width: 15,
+            height: 24,
+        })
+        .map_err(|e| format!("send failed: {e}"))?;
+        tx.send(UiEvent::Resize {
+            width: 10,
+            height: 24,
+        })
+        .map_err(|e| format!("send failed: {e}"))?;
+        tx.send(UiEvent::Resize {
+            width: 8,
+            height: 24,
+        })
+        .map_err(|e| format!("send failed: {e}"))?;
 
-        rt.step_ui(UiEvent::Resize { width: 20, height: 24 })
-            .await
-            .map_err(|e| format!("resize step failed: {e}"))?;
+        rt.step_ui(UiEvent::Resize {
+            width: 20,
+            height: 24,
+        })
+        .await
+        .map_err(|e| format!("resize step failed: {e}"))?;
 
         assert_eq!(rt.tui.size(), Size::new(8, 24));
         let written = &sink.snapshot()[baseline..];
@@ -12006,9 +12048,12 @@ mod tests {
         let (mut rt, _log, _tx, sink) = try_make_runtime_with_channel()?;
         let baseline = sink.snapshot().len();
 
-        rt.step_ui(UiEvent::Resize { width: 80, height: 24 })
-            .await
-            .map_err(|e| format!("resize step failed: {e}"))?;
+        rt.step_ui(UiEvent::Resize {
+            width: 80,
+            height: 24,
+        })
+        .await
+        .map_err(|e| format!("resize step failed: {e}"))?;
 
         let written = &sink.snapshot()[baseline..];
         assert!(
@@ -12028,14 +12073,23 @@ mod tests {
     async fn resize_storm_settles_with_bottom_anchored_viewport() -> TestResult {
         let (mut rt, _log, tx, _sink) = try_make_runtime_with_channel()?;
 
-        tx.send(UiEvent::Resize { width: 30, height: 24 })
-            .map_err(|e| format!("send failed: {e}"))?;
-        tx.send(UiEvent::Resize { width: 160, height: 24 })
-            .map_err(|e| format!("send failed: {e}"))?;
+        tx.send(UiEvent::Resize {
+            width: 30,
+            height: 24,
+        })
+        .map_err(|e| format!("send failed: {e}"))?;
+        tx.send(UiEvent::Resize {
+            width: 160,
+            height: 24,
+        })
+        .map_err(|e| format!("send failed: {e}"))?;
 
-        rt.step_ui(UiEvent::Resize { width: 160, height: 24 })
-            .await
-            .map_err(|e| format!("resize step failed: {e}"))?;
+        rt.step_ui(UiEvent::Resize {
+            width: 160,
+            height: 24,
+        })
+        .await
+        .map_err(|e| format!("resize step failed: {e}"))?;
 
         assert_eq!(rt.tui.size(), Size::new(160, 24));
         // Viewport height is preserved from the initial 8-row inline

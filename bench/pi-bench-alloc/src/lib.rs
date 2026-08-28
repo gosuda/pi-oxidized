@@ -53,20 +53,29 @@ unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let ptr = unsafe { System.alloc(layout) };
         if !ptr.is_null() {
-            ALLOCATED.fetch_add(u64::try_from(layout.size()).unwrap_or(u64::MAX), Ordering::Relaxed);
+            ALLOCATED.fetch_add(
+                u64::try_from(layout.size()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
         }
         ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        DEALLOCATED.fetch_add(u64::try_from(layout.size()).unwrap_or(u64::MAX), Ordering::Relaxed);
+        DEALLOCATED.fetch_add(
+            u64::try_from(layout.size()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
         unsafe { System.dealloc(ptr, layout) };
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         let ptr = unsafe { System.alloc_zeroed(layout) };
         if !ptr.is_null() {
-            ALLOCATED.fetch_add(u64::try_from(layout.size()).unwrap_or(u64::MAX), Ordering::Relaxed);
+            ALLOCATED.fetch_add(
+                u64::try_from(layout.size()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
         }
         ptr
     }
@@ -74,8 +83,14 @@ unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
         if !new_ptr.is_null() {
-            DEALLOCATED.fetch_add(u64::try_from(layout.size()).unwrap_or(u64::MAX), Ordering::Relaxed);
-            ALLOCATED.fetch_add(u64::try_from(new_size).unwrap_or(u64::MAX), Ordering::Relaxed);
+            DEALLOCATED.fetch_add(
+                u64::try_from(layout.size()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            ALLOCATED.fetch_add(
+                u64::try_from(new_size).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
         }
         new_ptr
     }

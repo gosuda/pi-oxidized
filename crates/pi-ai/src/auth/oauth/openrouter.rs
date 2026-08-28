@@ -20,7 +20,9 @@ use uuid::Uuid;
 
 use super::super::error::AuthError;
 use super::super::http::{AuthHttpClient, AuthHttpError};
-use super::super::types::{AuthEvent, AuthInteraction, AuthPrompt, ModelAuth, OAuthAuth, OAuthCredential};
+use super::super::types::{
+    AuthEvent, AuthInteraction, AuthPrompt, ModelAuth, OAuthAuth, OAuthCredential,
+};
 use super::callback_server::callback_host_from_env;
 use super::page::{oauth_error_html, oauth_success_html};
 use super::pkce::generate_pkce;
@@ -67,7 +69,11 @@ impl OpenRouterOAuth {
 
     /// Build with explicit endpoints (tests / mocks).
     #[must_use]
-    pub fn with_endpoints(http: AuthHttpClient, authorize_url: impl Into<String>, token_url: impl Into<String>) -> Self {
+    pub fn with_endpoints(
+        http: AuthHttpClient,
+        authorize_url: impl Into<String>,
+        token_url: impl Into<String>,
+    ) -> Self {
         Self {
             http,
             authorize_url: authorize_url.into(),
@@ -149,7 +155,9 @@ impl OAuthAuth for OpenRouterOAuth {
 
             let listener = TcpListener::bind(SocketAddr::new(callback_host, 0))
                 .await
-                .map_err(|e| AuthError::message(format!("Failed to bind OpenRouter callback: {e}")))?;
+                .map_err(|e| {
+                    AuthError::message(format!("Failed to bind OpenRouter callback: {e}"))
+                })?;
             let port = listener
                 .local_addr()
                 .map_err(|e| AuthError::message(format!("Failed to get callback port: {e}")))?
@@ -178,11 +186,11 @@ impl OAuthAuth for OpenRouterOAuth {
             let callback_shutdown = shutdown.clone();
 
             let server_handle = tokio::spawn(async move {
+                use axum::Router;
                 use axum::extract::{Query, State};
+                use axum::http::StatusCode;
                 use axum::response::{Html, IntoResponse, Response};
                 use axum::routing::any;
-                use axum::Router;
-                use axum::http::StatusCode;
 
                 #[derive(Deserialize)]
                 struct CallbackQuery {
@@ -223,7 +231,10 @@ impl OAuthAuth for OpenRouterOAuth {
                     let Some(code) = query.code.filter(|value| !value.is_empty()) else {
                         return (
                             StatusCode::BAD_REQUEST,
-                            Html(oauth_error_html("OpenRouter returned no authorization code.", None)),
+                            Html(oauth_error_html(
+                                "OpenRouter returned no authorization code.",
+                                None,
+                            )),
                         )
                             .into_response();
                     };
@@ -232,7 +243,10 @@ impl OAuthAuth for OpenRouterOAuth {
                     if *claimed {
                         return (
                             StatusCode::CONFLICT,
-                            Html(oauth_error_html("This OAuth callback has already been used.", None)),
+                            Html(oauth_error_html(
+                                "This OAuth callback has already been used.",
+                                None,
+                            )),
                         )
                             .into_response();
                     }
@@ -388,14 +402,22 @@ fn parse_authorization_input(input: &str) -> String {
     }
 
     if let Ok(url) = reqwest::Url::parse(value) {
-        if let Some(code) = url.query_pairs().find(|(key, _)| key == "code").map(|(_, v)| v.to_string()) {
+        if let Some(code) = url
+            .query_pairs()
+            .find(|(key, _)| key == "code")
+            .map(|(_, v)| v.to_string())
+        {
             return code;
         }
     }
 
     if value.contains("code=") {
         if let Ok(url) = reqwest::Url::parse(&format!("http://localhost/?{value}")) {
-            if let Some(code) = url.query_pairs().find(|(key, _)| key == "code").map(|(_, v)| v.to_string()) {
+            if let Some(code) = url
+                .query_pairs()
+                .find(|(key, _)| key == "code")
+                .map(|(_, v)| v.to_string())
+            {
                 return code;
             }
         }

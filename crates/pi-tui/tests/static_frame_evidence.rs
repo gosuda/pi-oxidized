@@ -66,7 +66,12 @@ fn static_frame_preserves_three_invariants_under_load() {
     // at 0s, so tick 0 should show only the kind label.
     let static_samples: Vec<(&str, &str)> = evidence
         .iter()
-        .filter(|(k, _)| k.starts_with("static_render_sample_") && k["static_render_sample_".len()..].chars().all(|c| c.is_ascii_digit()))
+        .filter(|(k, _)| {
+            k.starts_with("static_render_sample_")
+                && k["static_render_sample_".len()..]
+                    .chars()
+                    .all(|c| c.is_ascii_digit())
+        })
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
     assert!(
@@ -142,15 +147,13 @@ fn static_frame_preserves_three_invariants_under_load() {
     // The static repaints should equal the total elapsed seconds (each
     // second boundary triggers one repaint).
     assert_eq!(
-        status_static_repaints,
-        total_elapsed as usize,
+        status_static_repaints, total_elapsed as usize,
         "tick repaint-suppression: static repaints ({status_static_repaints}) must equal elapsed-second boundaries ({total_elapsed})"
     );
     // The animated path should have repaints on every tick (frame changes
     // every tick).
     assert_eq!(
-        status_animated_repaints,
-        static_ticks,
+        status_animated_repaints, static_ticks,
         "tick repaint-suppression: animated repaints ({status_animated_repaints}) must equal ticks ({static_ticks}) — every tick changes the frame"
     );
 

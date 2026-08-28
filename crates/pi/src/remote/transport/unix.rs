@@ -192,7 +192,6 @@ fn mark_failed(shared: &Shared, error: Option<TransportError>) {
     shared.signal.send_replace(ReaderSignal::Failed);
 }
 
-
 impl ByteTransport for UnixByteTransport {
     fn send(&self, chunk: Vec<u8>) -> SendFuture {
         let outbound = self.outbound.lock().expect("outbound lock").clone();
@@ -212,7 +211,10 @@ impl ByteTransport for UnixByteTransport {
             }
             let (done_tx, done_rx) = oneshot::channel();
             outbound
-                .send(WriteItem::Bytes { bytes: chunk, done: done_tx })
+                .send(WriteItem::Bytes {
+                    bytes: chunk,
+                    done: done_tx,
+                })
                 .await
                 .map_err(|_| {
                     shared.pending_bytes.fetch_sub(len, Ordering::SeqCst);
@@ -253,18 +255,18 @@ pub async fn connect(
     options: &UnixTransportOptions,
     handlers: Arc<dyn ByteTransportHandlers>,
 ) -> Result<Arc<dyn ByteTransport>, TransportError> {
-    let stream = UnixStream::connect(&options.path).await.map_err(TransportError::Io)?;
-    let max_pending_bytes =
-        options.max_pending_bytes.unwrap_or(DEFAULT_MAX_FRAME_LENGTH * 4);
+    let stream = UnixStream::connect(&options.path)
+        .await
+        .map_err(TransportError::Io)?;
+    let max_pending_bytes = options
+        .max_pending_bytes
+        .unwrap_or(DEFAULT_MAX_FRAME_LENGTH * 4);
     Ok(UnixByteTransport::new(stream, max_pending_bytes, handlers))
 }
 
 /// Builds the factory used by [`crate::remote::transport::build_transport`]
 /// on the Unix tier.
-pub fn factory(
-    path: std::path::PathBuf,
-    max_pending_bytes: Option<usize>,
-) -> ByteTransportFactory {
+pub fn factory(path: std::path::PathBuf, max_pending_bytes: Option<usize>) -> ByteTransportFactory {
     Arc::new(move |handlers| {
         let options = UnixTransportOptions {
             path: path.clone(),
@@ -337,7 +339,10 @@ mod tests {
         await_condition(|| client_handlers.closes.load(Ordering::SeqCst) == 1).await;
         assert_eq!(client_handlers.closes.load(Ordering::SeqCst), 1);
         assert!(client_handlers.errors.lock().expect("errors").is_empty());
-        let err = transport.send(b"x".to_vec()).await.unwrap_err();
+        let err = transport
+            .send(b"x".to_vec())
+            .await
+            .expect_err("expected error");
         assert!(matches!(err, TransportError::Closed));
     }
 
@@ -359,7 +364,7 @@ mod tests {
         let error = factory(handlers as Arc<dyn ByteTransportHandlers>)
             .await
             .map(|_| ())
-            .unwrap_err();
+            .expect_err("expected error");
         assert!(matches!(error, TransportError::Io(_)));
     }
 
@@ -377,7 +382,10 @@ mod tests {
         let (server_stream, _addr) = accepted.expect("accept");
         let _server_held = server_stream;
 
-        let error = transport.send(vec![0u8; 9]).await.unwrap_err();
+        let error = transport
+            .send(vec![0u8; 9])
+            .await
+            .expect_err("expected error");
         assert!(
             matches!(error, TransportError::PendingBytesExceeded),
             "a single write above the budget must be rejected, got {error:?}"

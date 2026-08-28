@@ -538,7 +538,6 @@ pub fn write_overlay_cells(buf: &mut Buffer, area: Rect, text: &str) {
     // cells survive an overlay close (PERF-T11 Design B).
     crate::frame::claim_foreign_span(area);
 
-
     // If the first cell of the overlay region is the trailing half of a wide
     // grapheme, blank the leading cell so the pair is not left half-stale.
     if area.x > 0 {

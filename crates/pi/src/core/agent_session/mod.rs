@@ -490,7 +490,7 @@ impl AgentSession {
                 after_tool_call: None,
                 on_payload: None,
                 on_response: None,
-                telemetry: telemetry,
+                telemetry,
             });
             base.before_tool_call = Some(hooks.before_tool_call_hook());
             base.after_tool_call = Some(hooks.after_tool_call_hook());
@@ -1212,18 +1212,18 @@ mod tests {
     use std::time::Duration;
 
     use futures::stream::{self, BoxStream, StreamExt};
+    use pi_agent::{AgentEvent, AgentToolResult, ToolError, ToolUpdates, user_text};
     use pi_ai::{
         AssistantContent, AssistantMessage, AssistantMessageEvent, Context, DoneReason, Model,
         ModelCost, ModelInput, Provider, ProviderError, StopReason, StreamOptions, TextContent,
         ToolCall,
     };
-    use pi_agent::{AgentEvent, AgentToolResult, ToolError, ToolUpdates, user_text};
     use serde_json::Map;
     use serde_json::Value;
     use serde_json::json;
     use tokio::sync::{Mutex as TokioMutex, mpsc};
-    use tokio_util::sync::CancellationToken;
     use tokio::time::{sleep, timeout};
+    use tokio_util::sync::CancellationToken;
 
     fn test_model() -> Model {
         Model {
@@ -1899,9 +1899,8 @@ mod tests {
         }
     }
 
-    static EMPTY_PARAMS: std::sync::LazyLock<Value> = std::sync::LazyLock::new(|| {
-        json!({"type":"object","properties":{}})
-    });
+    static EMPTY_PARAMS: std::sync::LazyLock<Value> =
+        std::sync::LazyLock::new(|| json!({"type":"object","properties":{}}));
 
     /// Provider that emits a start event then a done event with one tool call
     /// to the named tool, then hangs. On subsequent stream calls it hangs
@@ -1922,11 +1921,13 @@ mod tests {
             if count == 0 {
                 let mut message =
                     AssistantMessage::new("test-api", "test-provider", "m", pi_agent::now_millis());
-                message.content.push(AssistantContent::ToolCall(ToolCall::new(
-                    "tc-1",
-                    &self.tool_name,
-                    Map::new(),
-                )));
+                message
+                    .content
+                    .push(AssistantContent::ToolCall(ToolCall::new(
+                        "tc-1",
+                        &self.tool_name,
+                        Map::new(),
+                    )));
                 message.stop_reason = StopReason::ToolUse;
                 let done = AssistantMessageEvent::Done {
                     reason: DoneReason::ToolUse,
@@ -1942,11 +1943,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_determinism_through_concrete_pi_tools() -> Result<(), Box<dyn std::error::Error>> {
+    async fn cancellation_determinism_through_concrete_pi_tools()
+    -> Result<(), Box<dyn std::error::Error>> {
         // PAR-FOLD witness: cancellation aborts drain/queue exactly once
         // through concrete pi tools — no duplicate agent_end, no task leak,
         let blocking_tool = Arc::new(CancelSensitiveTool::new("blocking"));
-
 
         // Also install a concrete pi read tool to prove the registry carries
         // real product tools alongside the test tool.
@@ -1996,7 +1997,10 @@ mod tests {
         })
         .await;
 
-        assert!(tool_started, "tool_execution_start never fired within 5s; events so far: {events:?}");
+        assert!(
+            tool_started,
+            "tool_execution_start never fired within 5s; events so far: {events:?}"
+        );
 
         // Cancel the run.
         session.agent.abort();

@@ -709,9 +709,12 @@ mod tests {
             let file = temp.path().join(ext);
             fs::write(&file, "export default {}")?;
             let discovered = file.to_str().ok_or("non-UTF-8 temp path")?;
-            assert_eq!(classify(discovered)?.runtime, ExtensionRuntime::TsCompat, "{ext} must be TsCompat");
+            assert_eq!(
+                classify(discovered)?.runtime,
+                ExtensionRuntime::TsCompat,
+                "{ext} must be TsCompat"
+            );
         }
         Ok(())
     }
-
 }

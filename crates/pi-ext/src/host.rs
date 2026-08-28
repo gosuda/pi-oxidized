@@ -338,7 +338,10 @@ mod tests {
         let mode = env::var(M19_CHILD_MODE).unwrap_or_default();
         let ok = match mode.as_str() {
             "notconfigured" => {
-                matches!(resolve_with_fallback(None, None, None, None), Err(HostError::NotConfigured { .. }))
+                matches!(
+                    resolve_with_fallback(None, None, None, None),
+                    Err(HostError::NotConfigured { .. })
+                )
             }
             "envwins" => match env::var(M19_ENV_HOST) {
                 Ok(host) => match resolve_with_fallback(Some(host.as_str()), None, None, None) {
@@ -354,7 +357,12 @@ mod tests {
 
     /// Re-runs only `test_name` in a child process with `dir` prepended to
     /// `PATH`. Returns whether the child exited successfully.
-    fn m19_rerun_with_path(dir: &Path, test_name: &str, mode: &str, extra_env: &[(&str, &str)]) -> bool {
+    fn m19_rerun_with_path(
+        dir: &Path,
+        test_name: &str,
+        mode: &str,
+        extra_env: &[(&str, &str)],
+    ) -> bool {
         let Ok(exe) = env::current_exe() else {
             return false;
         };
@@ -377,7 +385,10 @@ mod tests {
         for (key, value) in extra_env {
             command.env(key, value);
         }
-        command.status().map(|status| status.success()).unwrap_or(false)
+        command
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
     }
 
     /// Writes `bytes` and marks the file executable so a PATH-search
@@ -402,10 +413,17 @@ mod tests {
     fn m19_no_path_fallback_when_file_exists_on_disk() -> R {
         m19_guard();
         let dir = tempdir()?;
-        let stray = dir.path().join(format!("{DEFAULT_HOST_NAME}{HOST_EXE_SUFFIX}"));
+        let stray = dir
+            .path()
+            .join(format!("{DEFAULT_HOST_NAME}{HOST_EXE_SUFFIX}"));
         write_exec(&stray, b"#!bin\n")?;
         assert!(
-            m19_rerun_with_path(dir.path(), "m19_no_path_fallback_when_file_exists_on_disk", "notconfigured", &[]),
+            m19_rerun_with_path(
+                dir.path(),
+                "m19_no_path_fallback_when_file_exists_on_disk",
+                "notconfigured",
+                &[]
+            ),
             "resolver must stay NotConfigured even with a stray host binary on PATH"
         );
         Ok(())
@@ -415,11 +433,18 @@ mod tests {
     fn m19_explicit_none_params_never_discover_stray_executable() -> R {
         m19_guard();
         let dir = tempdir()?;
-        let stray = dir.path().join(format!("{DEFAULT_HOST_NAME}{HOST_EXE_SUFFIX}"));
+        let stray = dir
+            .path()
+            .join(format!("{DEFAULT_HOST_NAME}{HOST_EXE_SUFFIX}"));
         write_exec(&stray, b"#!bin\n")?;
         fs::write(dir.path().join(DEFAULT_HOST_BUNDLE_NAME), b"bundle")?;
         assert!(
-            m19_rerun_with_path(dir.path(), "m19_explicit_none_params_never_discover_stray_executable", "notconfigured", &[]),
+            m19_rerun_with_path(
+                dir.path(),
+                "m19_explicit_none_params_never_discover_stray_executable",
+                "notconfigured",
+                &[]
+            ),
             "resolver must stay NotConfigured even with stray host + bundle on PATH"
         );
         Ok(())
@@ -431,7 +456,9 @@ mod tests {
         let dir = tempdir()?;
         let env_host = dir.path().join("explicit-host");
         write_exec(&env_host, b"#!bin\n")?;
-        let stray = dir.path().join(format!("{DEFAULT_HOST_NAME}{HOST_EXE_SUFFIX}"));
+        let stray = dir
+            .path()
+            .join(format!("{DEFAULT_HOST_NAME}{HOST_EXE_SUFFIX}"));
         write_exec(&stray, b"#!bin\n")?;
         let host_str = env_host.to_string_lossy().into_owned();
         assert!(

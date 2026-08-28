@@ -52,9 +52,17 @@ const STATE_MATRIX: [(&str, &[u8], &str); 8] = [
     ("loading", b"PI_TUI_STATE=loading", "working"),
     ("retry", b"PI_TUI_STATE=retry", "Retrying (1/3) in 5s"),
     ("queue", b"PI_TUI_STATE=queue", "queued follow-up"),
-    ("streaming", b"PI_TUI_STATE=streaming", "verification-stream-0001"),
+    (
+        "streaming",
+        b"PI_TUI_STATE=streaming",
+        "verification-stream-0001",
+    ),
     ("error", b"PI_TUI_STATE=error", "Error: request failed"),
-    ("focus-marked", b"PI_TUI_STATE=focus-marked", "verification focus probe"),
+    (
+        "focus-marked",
+        b"PI_TUI_STATE=focus-marked",
+        "verification focus probe",
+    ),
     ("ext-ui", b"PI_TUI_STATE=ext-ui", "verification-ext-widget"),
 ];
 
@@ -192,9 +200,8 @@ impl FixtureRun {
             |bytes| predicate(bytes) || predicate(&merge_acc(&prior, bytes)),
             &self.context,
         )?;
-        self.settle_windows_ms.push(
-            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-        );
+        self.settle_windows_ms
+            .push(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
         self.raw_acc.extend_from_slice(&frame.batch.bytes);
         Ok(frame)
     }
@@ -245,8 +252,9 @@ fn require_prerequisites(fixture: &str) -> Result<(), CorpusError> {
             "fixture binary missing: {fixture}"
         )));
     }
-    let _ = DriverGeometry::new(1, 1)
-        .map_err(|error| CorpusError::Prerequisite(format!("geometry prerequisite failed: {error}")))?;
+    let _ = DriverGeometry::new(1, 1).map_err(|error| {
+        CorpusError::Prerequisite(format!("geometry prerequisite failed: {error}"))
+    })?;
     Ok(())
 }
 

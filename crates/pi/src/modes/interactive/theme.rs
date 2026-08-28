@@ -2094,7 +2094,13 @@ mod tests {
             );
             // Unknown pair members fall back per-member to built-in dark.
             assert_eq!(
-                resolve_active_theme(Some("solarized-light/gruvbox-dark"), mode, terminal, ColorMode::Truecolor).name,
+                resolve_active_theme(
+                    Some("solarized-light/gruvbox-dark"),
+                    mode,
+                    terminal,
+                    ColorMode::Truecolor
+                )
+                .name,
                 "dark",
                 "unknown pair members, {mode:?}/{terminal:?}"
             );
@@ -2105,23 +2111,47 @@ mod tests {
     fn resolve_active_theme_member_failure_falls_back_per_member() {
         // Dark member loads; light member is unknown and falls back to dark.
         assert_eq!(
-            resolve_active_theme(Some("nope/m3-dark"), ThemeMode::Dark, TerminalTheme::Dark, ColorMode::Truecolor).name,
+            resolve_active_theme(
+                Some("nope/m3-dark"),
+                ThemeMode::Dark,
+                TerminalTheme::Dark,
+                ColorMode::Truecolor
+            )
+            .name,
             "m3-dark"
         );
         assert_eq!(
-            resolve_active_theme(Some("nope/m3-dark"), ThemeMode::Light, TerminalTheme::Dark, ColorMode::Truecolor).name,
+            resolve_active_theme(
+                Some("nope/m3-dark"),
+                ThemeMode::Light,
+                TerminalTheme::Dark,
+                ColorMode::Truecolor
+            )
+            .name,
             "dark"
         );
         // Unpaired custom name that does not exist: load_or_dark fallback.
         assert_eq!(
-            resolve_active_theme(Some("mytheme"), ThemeMode::Auto, TerminalTheme::Light, ColorMode::Truecolor).name,
+            resolve_active_theme(
+                Some("mytheme"),
+                ThemeMode::Auto,
+                TerminalTheme::Light,
+                ColorMode::Truecolor
+            )
+            .name,
             "dark"
         );
         // Paired name whose counterpart does not exist keeps the base.
         // ("classic-light" pairs to "classic-dark", both exist; use a fake
         // family to hit the fallback.)
         assert_eq!(
-            resolve_active_theme(Some("ghost-light"), ThemeMode::Dark, TerminalTheme::Dark, ColorMode::Truecolor).name,
+            resolve_active_theme(
+                Some("ghost-light"),
+                ThemeMode::Dark,
+                TerminalTheme::Dark,
+                ColorMode::Truecolor
+            )
+            .name,
             "dark",
             "ghost-dark fails to load, ghost-light fails to load, dark fallback"
         );

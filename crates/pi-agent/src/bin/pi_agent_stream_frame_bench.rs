@@ -40,12 +40,12 @@ use pi_agent::config::{
 };
 use pi_agent::tool::ToolExecutionMode;
 use pi_agent::{EventSink, ProviderDrain, RunIo, run_agent_loop};
-use serde_json::Map;
-use std::collections::BTreeMap;
 use pi_ai::{
     AssistantContent, AssistantMessage, AssistantMessageEvent, Context, DoneReason, Model,
     ModelCost, ModelInput, Provider, ProviderError, StopReason, StreamOptions, TextContent,
 };
+use serde_json::Map;
+use std::collections::BTreeMap;
 use tokio::runtime::Builder;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -334,7 +334,10 @@ fn bench_funnel(script: &Arc<Vec<FrameTemplate>>) -> (u64, u64) {
     });
     let elapsed = start.elapsed();
     drop(result);
-    (u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX), sink.updates.load(Ordering::Relaxed))
+    (
+        u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX),
+        sink.updates.load(Ordering::Relaxed),
+    )
 }
 
 /// One measured drain round: the two channel legs alone (lossy watch +
@@ -372,7 +375,10 @@ fn bench_drain(script: &Arc<Vec<FrameTemplate>>) -> (u64, u64) {
         count
     });
     let elapsed = start.elapsed();
-    (u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX), delivered)
+    (
+        u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX),
+        delivered,
+    )
 }
 
 fn median(values: &mut [u64]) -> u64 {
@@ -385,15 +391,15 @@ fn main() {
     let final_len = script
         .last()
         .map_or(0, |frame| match &frame.kind {
-            FrameKind::Done { .. } => frame
-                .inner
-                .as_ref()
-                .content
-                .first()
-                .map_or(0, |c| match c {
+            FrameKind::Done { .. } => {
+                frame
+                    .inner
+                    .as_ref()
+                    .content.first().map_or(0, |c| match c {
                     AssistantContent::Text(block) => block.text.len(),
                     _ => 0,
-                }),
+                })
+            }
             _ => 0,
         });
 
@@ -427,8 +433,12 @@ fn main() {
     let drain_ns = median(&mut drain_ns);
     let reduce_ns = funnel_ns.saturating_sub(drain_ns);
 
-    println!("stream-frame-pipeline bench (pinned: {FRAMES} x verification-chunk frames, final text {final_len} B)");
-    println!("protocol: release, medians of {MEASURED_ROUNDS} interleaved rounds after {WARMUP_ROUNDS} warmups");
+    println!(
+        "stream-frame-pipeline bench (pinned: {FRAMES} x verification-chunk frames, final text {final_len} B)"
+    );
+    println!(
+        "protocol: release, medians of {MEASURED_ROUNDS} interleaved rounds after {WARMUP_ROUNDS} warmups"
+    );
     println!();
     println!("scenario | ns/frame");
     println!("funnel (decode+forward+reduce) | {funnel_ns}");

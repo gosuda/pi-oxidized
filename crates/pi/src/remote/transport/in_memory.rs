@@ -12,7 +12,9 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use tokio::sync::{mpsc, watch};
 
-use super::{ByteTransport, ByteTransportFactory, ByteTransportHandlers, SendFuture, TransportError};
+use super::{
+    ByteTransport, ByteTransportFactory, ByteTransportHandlers, SendFuture, TransportError,
+};
 
 /// Pending chunks buffered per direction before writers feel backpressure.
 /// Chunks are whole frames (bounded by the frame limit in real use).
@@ -182,7 +184,10 @@ impl ByteTransport for InMemoryTransport {
             let Some(outbound) = outbound else {
                 return Err(TransportError::Closed);
             };
-            outbound.send(chunk).await.map_err(|_| TransportError::Closed)
+            outbound
+                .send(chunk)
+                .await
+                .map_err(|_| TransportError::Closed)
         })
     }
 
@@ -205,12 +210,15 @@ impl std::fmt::Debug for InMemoryEndpoint {
 }
 
 impl InMemoryEndpoint {
-    fn dial(&self, handlers: Arc<dyn ByteTransportHandlers>) -> Result<InMemoryTransport, TransportError> {
+    fn dial(
+        &self,
+        handlers: Arc<dyn ByteTransportHandlers>,
+    ) -> Result<InMemoryTransport, TransportError> {
         let (client, server) = pair();
         start_reader(&client.core, client.index, handlers);
-        self.dial_tx
-            .try_send(server)
-            .map_err(|_| TransportError::Message("in-memory listener is closed or saturated".into()))?;
+        self.dial_tx.try_send(server).map_err(|_| {
+            TransportError::Message("in-memory listener is closed or saturated".into())
+        })?;
         Ok(client)
     }
 
@@ -219,9 +227,9 @@ impl InMemoryEndpoint {
         Arc::new(move |handlers| {
             let endpoint = endpoint.clone();
             Box::pin(async move {
-                endpoint.dial(handlers).map(|transport| {
-                    Arc::new(transport) as Arc<dyn ByteTransport>
-                })
+                endpoint
+                    .dial(handlers)
+                    .map(|transport| Arc::new(transport) as Arc<dyn ByteTransport>)
             })
         })
     }
@@ -281,10 +289,7 @@ fn pair() -> (InMemoryTransport, InMemoryTransport) {
     let (a_to_b, b_inbound) = mpsc::channel(CHANNEL_CAPACITY);
     let (b_to_a, a_inbound) = mpsc::channel(CHANNEL_CAPACITY);
     let core = Arc::new(PairCore {
-        sides: [
-            SideCell::new(a_inbound),
-            SideCell::new(b_inbound),
-        ],
+        sides: [SideCell::new(a_inbound), SideCell::new(b_inbound)],
     });
     let a = InMemoryTransport {
         core: Arc::clone(&core),

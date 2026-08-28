@@ -34,10 +34,10 @@ use pi_tui::testkit::transcript::{
 use pi_tui::testkit::{RecordingError, RecordingSession};
 use tempfile::TempDir;
 
-#[cfg(unix)]
-use pi_tui::testkit::posix::PosixPtyDriver;
 #[cfg(windows)]
 use pi_tui::testkit::conpty::ConPtyDriver;
+#[cfg(unix)]
+use pi_tui::testkit::posix::PosixPtyDriver;
 
 const INITIAL_COLS: u16 = 80;
 const INITIAL_ROWS: u16 = 24;
@@ -47,7 +47,11 @@ const VERIFICATION_PROVIDER: &str = "verification";
 const VERIFICATION_MODEL: &str = "model";
 const VERIFICATION_PROFILE_FLAG: &str = "verification-profile";
 const VERIFICATION_PROFILE: &str = "tui-transcript-profile";
-const READY_MARKERS: &[&[u8]] = &[b"type a message", b"type a message to begin", b"No messages"];
+const READY_MARKERS: &[&[u8]] = &[
+    b"type a message",
+    b"type a message to begin",
+    b"No messages",
+];
 const KEY_ENTER: &[u8] = b"\r";
 const KEY_ESCAPE: &[u8] = b"\x1b";
 
@@ -170,12 +174,16 @@ struct ProductRun {
 
 fn workspace_root() -> Result<PathBuf, CorpusError> {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest.parent().and_then(Path::parent).map(Path::to_path_buf).ok_or_else(|| {
-        CorpusError::Prerequisite(format!(
-            "workspace root not found above {}",
-            manifest.display()
-        ))
-    })
+    manifest
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .ok_or_else(|| {
+            CorpusError::Prerequisite(format!(
+                "workspace root not found above {}",
+                manifest.display()
+            ))
+        })
 }
 
 fn extension_path() -> Result<PathBuf, CorpusError> {
@@ -292,7 +300,10 @@ fn launch_env(
 ) -> Result<LaunchEnv, CorpusError> {
     require_prerequisites()?;
     let mut env = BTreeMap::new();
-    env.insert("HOME".to_owned(), sandbox.home_dir.to_string_lossy().into_owned());
+    env.insert(
+        "HOME".to_owned(),
+        sandbox.home_dir.to_string_lossy().into_owned(),
+    );
     env.insert("PI_OFFLINE".to_owned(), "1".to_owned());
     env.insert(
         "PI_EXTENSION_HOST".to_owned(),
@@ -586,9 +597,8 @@ impl ProductRun {
             |bytes| predicate(bytes) || predicate(&merge_acc(&self.raw_acc, bytes)),
             &self.context,
         )?;
-        self.settle_windows_ms.push(
-            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-        );
+        self.settle_windows_ms
+            .push(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
         self.raw_acc.extend_from_slice(&batch.bytes);
         Ok(batch.bytes)
     }
@@ -606,9 +616,8 @@ impl ProductRun {
             |bytes| predicate(bytes) || predicate(&merge_acc(&self.raw_acc, bytes)),
             &self.context,
         )?;
-        self.settle_windows_ms.push(
-            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-        );
+        self.settle_windows_ms
+            .push(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
         self.raw_acc.extend_from_slice(&frame.batch.bytes);
         self.saw_snapshot = true;
         Ok(frame)
@@ -975,7 +984,11 @@ fn run_product_resize_storm(
     run.resize_storm(&RESIZE_STORM)?;
     let frame = run.settle_frame(ready_predicate)?;
     // Survival observation: process still rendering after the storm.
-    if frame.snapshot.lines.iter().all(|line| line.trim().is_empty())
+    if frame
+        .snapshot
+        .lines
+        .iter()
+        .all(|line| line.trim().is_empty())
         && run.raw_so_far().is_empty()
     {
         return Err(CorpusError::Assert(
@@ -1002,10 +1015,17 @@ fn tui_product_transcript_corpus_cold_wizard_trust_stream_selectors_overlays_res
         Err(error) => hard_fail(error),
     };
     if row_label == "local" {
-        assert_eq!(row.tier, RowTier::Local, "local runs must never claim Tier N");
+        assert_eq!(
+            row.tier,
+            RowTier::Local,
+            "local runs must never claim Tier N"
+        );
     }
 
-    let scenarios: [(&str, fn(usize, &str, &RunnerRow) -> Result<TranscriptArtifact, CorpusError>); 8] = [
+    let scenarios: [(
+        &str,
+        fn(usize, &str, &RunnerRow) -> Result<TranscriptArtifact, CorpusError>,
+    ); 8] = [
         ("cold-start", run_cold_start),
         ("wizard", run_wizard),
         ("trust-selector", run_trust_selector),

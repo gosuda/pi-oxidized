@@ -14,7 +14,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use super::super::error::AuthError;
-use super::super::http::{AuthHttpClient, AuthHttpResponse, AuthHttpError};
+use super::super::http::{AuthHttpClient, AuthHttpError, AuthHttpResponse};
 use super::super::types::{AuthEvent, AuthInteraction, ModelAuth, OAuthAuth, OAuthCredential};
 use super::device_code::{
     OAuthDeviceCodePollOptions, OAuthDeviceCodePollResult, poll_oauth_device_code_flow,
@@ -229,7 +229,11 @@ impl KimiCodingOAuth {
             };
 
             if response.ok {
-                return credentials_from_token_response(&response.body, Some(refresh_token), now_ms());
+                return credentials_from_token_response(
+                    &response.body,
+                    Some(refresh_token),
+                    now_ms(),
+                );
             }
 
             let status = response.status;
@@ -358,7 +362,9 @@ fn positive_number(body: &Value, field: &str) -> Result<u64, AuthError> {
     body.get(field)
         .and_then(json_number_as_u64)
         .filter(|value| *value > 0)
-        .ok_or_else(|| AuthError::message(format!("Invalid Kimi Code OAuth response field: {field}")))
+        .ok_or_else(|| {
+            AuthError::message(format!("Invalid Kimi Code OAuth response field: {field}"))
+        })
 }
 
 fn json_number_as_u64(value: &Value) -> Option<u64> {
@@ -382,8 +388,9 @@ fn json_number_as_u64(value: &Value) -> Option<u64> {
 }
 
 fn validate_http_url(raw: &str) -> Result<String, AuthError> {
-    let url = reqwest::Url::parse(raw)
-        .map_err(|_| AuthError::message("Untrusted verification URI in Kimi Code OAuth response"))?;
+    let url = reqwest::Url::parse(raw).map_err(|_| {
+        AuthError::message("Untrusted verification URI in Kimi Code OAuth response")
+    })?;
     if url.scheme() != "https" && url.scheme() != "http" {
         return Err(AuthError::message(
             "Untrusted verification URI in Kimi Code OAuth response",
