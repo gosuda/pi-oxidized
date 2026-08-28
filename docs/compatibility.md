@@ -45,7 +45,7 @@ A disagreement fails generation.
 |--------|-------|--------|
 | Node | `>=22.19.0` | `packages/pi-tui-protocol/package.json` engines.node |
 | Bun | `>=1.3.0` | `package.json` engines.bun |
-| Rust | `>=1.97.1` | `Cargo.toml` [workspace.package] rust-version |
+| Rust | `>=1.98.0` | `Cargo.toml` [workspace.package] rust-version |
 
 ## Settled Reference Pin
 
