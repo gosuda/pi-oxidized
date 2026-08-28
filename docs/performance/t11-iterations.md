@@ -916,3 +916,96 @@ artifact present — pre-existing, outside this unit's owned files
 (wizard/composer runtime), left for the owning lane. Clippy delta on the
 changed files: zero new findings.
 multiple recomputed against the unit's 0.64 us floor.
+
+
+## Iteration 10 — `stream-frame-pipeline` (measurement prerequisite landed; Design A recorded for the rebuild)
+
+Commit: see `git log` (`perf(t11)`). Date 2026-08-28.
+
+**Measurement prerequisite landed** (the R9 ledger held this unit OPEN
+fail-closed — multiple unproven; the named prerequisite was an in-process
+instrument on the drain entry points). New `pi_agent_stream_frame_bench`
+(pi-agent bin, existing dependencies only — Cargo.lock untouched) drives
+the real funnel on the pinned verification stream shape
+(`streamVerification`, `PI_VERIFICATION_CHUNK_COUNT=256`: 24-byte
+`verification-chunk-NNNN\n` chunks, full snapshot per event, 6,144 B final
+text):
+
+- `funnel` — `run_agent_loop` (provider -> drain -> reduce), the loop's
+  own event path, counting sink.
+- `drain` — `ProviderDrain::spawn` alone (lossy watch + lossless mpsc).
+- `reduce` — disclosed as funnel − drain (`consume_drain_items` is
+  private; the delta isolates its per-frame share).
+
+Source-side event production is replayed by per-yield clone, mirroring
+`AssistantState::snapshot`'s cost class; the extension-host share of the
+R2 1.133 ms/frame process-tree figure stays a named residual in E1 (the
+instrument proves the in-process multiple, which is what this unit's Rust
+legs own).
+
+**Baseline** (release, `taskset -c 20-40`, medians of 9 interleaved
+rounds after 3 warmups; run-to-run spread on this box is wide —
+before/after binaries must be interleaved in pairs at the landing
+measurement, iteration-9 protocol): funnel ~2.1 us/frame, drain
+~1.8 us/frame, reduce ~0.4 us/frame, against the ledger floor
+~0.2 us decode/forward + ~0.15 us reduce. In-process multiple
+~= 6x floor — **>2x: proven rebuild candidate**; the fail-closed OPEN is
+resolved and the unit enters the rebuild loop.
+
+**Blind derivation** (recorded before reading any replaced body beyond the
+contract points the instrument itself had to open — funnel signatures, not
+internals; from `stream-frame-pipeline.md` Contract + Floor, the measured
+decomposition, and data layout): the canonical streaming state is one
+`AssistantMessage` whose text block grows by an append per frame; between
+frames the only mutation is that append. The snapshot-per-event shape
+forces one materialization per frame at the source — but every downstream
+stage re-materializes the whole message again: the drain clones the partial
+to Arc it for the watch; the reduce leg clones it into the emitted update;
+the agent-state reduce clones the update's message; the bus unwrap clones
+the event out of its queue Arc; the interactive view clones twice per frame
+(session event + watch). That is 5-7 O(message-length) copies per frame
+for data whose only change is one append — the ~1.8 us drain leg is
+exactly two full-message copies (~6 KiB memcpy + child allocs) plus
+channel/scheduler cost, and it grows linearly with message length.
+
+**Design A (chosen, for the next slot to implement): Arc-at-birth snapshot
+sharing.** The funnel's snapshot becomes `Arc<AssistantMessage>` where it
+is born — adapter `AssistantState::snapshot()`, or the extension-host
+deserialize boundary (serde `rc`, wire JSON byte-identical) — and every
+per-frame consumer holds a clone of that Arc: watch publish, the emitted
+`MessageUpdate`, the state reduce, the bus queue, the view's streaming
+tail. One materialization per frame is the minimum the funnel contract
+forces (extensions consume the serialized partial; the watch leg needs a
+complete latest-wins snapshot). Terminal messages and once-per-message
+events stay owned.
+
+**Candidates evaluated blind**:
+
+| Candidate | Verdict | Reason |
+|---|---|---|
+| A: Arc-at-birth, shared per frame end-to-end | **chosen** | kills every redundant copy without shape change on the wire |
+| B: pi-agent-only fix (reduce reads the watch Arc, event stays owned) | rejected blind | leaves the drain, state, bus, and both view clones — at most one of five redundant copies removed |
+| C: delta-carrying funnel (drop snapshots from events) | rejected blind | extensions consume `assistantMessageEvent` WITH its partial — crosses the extension-RPC boundary owned by `extension-rpc-dispatch` |
+| D: move the partial out of the forwarded event in the drain | rejected blind | the lossless leg must forward every event intact (drain.rs:105-118 fidelity contract) |
+| E: coalesce watch publishes | rejected blind | drops the per-frame publish the contract states; watch semantics already coalesce lag |
+
+**Boundary answers** (explicit, before touching): extension-RPC event JSON
+byte-identical; both drain fidelity legs unchanged; loop
+cancellation/finalization semantics untouched; session JSONL persistence
+per message end (untouched lane). Cutover map (compiler-enforced): pi-ai
+event `partial` fields + `AssistantState::snapshot` + adapter construction
+sites (anthropic 10, mistral 9, pi_messages 11, stream_state 12,
+openai_completions/refresh_partial, shared/responses) + conformance
+suites; pi-agent drain publish (Arc::clone), reduce (`MessageUpdate`
+message), `AgentState::streaming_message`, event serde; pi
+`AgentSessionEvent::MessageUpdate`, subscribe passthrough, view streaming
+tail (both the session-event and watch paths). Adapter
+`snapshot()->mutate->rewrap` round trips become `message_mut()` in-place
+edits (removes another per-delta clone). Not touched: Cargo.lock,
+workflows, compat-matrix, scripts/release, floor ledgers.
+
+**State**: measurement instrument landed this commit; the Design A cutover
+is recorded and started (pi-ai event-shape work reverted unlanded at the
+session's budget wall — re-derive from this record, implement, and
+measure with interleaved before/after binary pairs). `stream-frame-pipeline`
+stays OPEN on the R9 list; no other unit touched.
