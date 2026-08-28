@@ -243,6 +243,23 @@ impl SessionManager {
         persist: bool,
         options: Option<NewSessionOptions>,
     ) -> Result<Self, SessionError> {
+        let mut sm = Self::construct_empty(cwd, session_dir, persist)?;
+        if let Some(file) = session_file {
+            sm.set_session_file(&file)?;
+        } else {
+            sm.new_session(options)?;
+        }
+        Ok(sm)
+    }
+
+    /// Shared constructor body: resolved cwd/dir, session-dir creation, and
+    /// the empty manager that the file-loading entry points
+    /// ([`Self::set_session_file`], [`Self::open`]) then populate.
+    fn construct_empty(
+        cwd: &str,
+        session_dir: &str,
+        persist: bool,
+    ) -> Result<Self, SessionError> {
         let cwd = path_to_string(&resolve_path(cwd));
         let session_dir = path_to_string(&normalize_path(session_dir, PathInputOptions::new()));
         if persist && !session_dir.is_empty() && !path_exists(Path::new(&session_dir)) {
@@ -251,8 +268,7 @@ impl SessionManager {
                 source,
             })?;
         }
-
-        let mut sm = Self {
+        Ok(Self {
             session_id: String::new(),
             session_file: None,
             session_dir,
@@ -263,14 +279,7 @@ impl SessionManager {
             by_id: HashMap::new(),
             labels: LabelMap::default(),
             leaf: Leaf::Null,
-        };
-
-        if let Some(file) = session_file {
-            sm.set_session_file(&file)?;
-        } else {
-            sm.new_session(options)?;
-        }
-        Ok(sm)
+        })
     }
 
     /// Switch to a different session file (resume / open).
@@ -291,75 +300,90 @@ impl SessionManager {
                         source,
                     }
                 })?;
-            if entries.is_empty() {
-                let size = fs::metadata(&resolved)
-                    .map_err(|source| SessionError::Io {
+            self.apply_session_file_entries(resolved, entries)
+        } else {
+            self.new_session(None)?;
+            self.session_file = Some(resolved);
+            Ok(())
+        }
+    }
+
+    /// Bind the manager state to an already-loaded session file's entries.
+    ///
+    /// Shared by [`Self::set_session_file`] and [`Self::open`] so a reopen
+    /// parses the file exactly once. The branches mirror the historical
+    /// post-load behavior exactly: empty-file init + rewrite, header id
+    /// extraction, the version gate with the legacy Value + migration lane,
+    /// and the index rebuild.
+    fn apply_session_file_entries(
+        &mut self,
+        resolved: String,
+        entries: Vec<FileEntry>,
+    ) -> Result<(), SessionError> {
+        if entries.is_empty() {
+            let size = fs::metadata(&resolved)
+                .map_err(|source| SessionError::Io {
+                    path: resolved.clone(),
+                    source,
+                })?
+                .len();
+            if size > 0 {
+                return Err(SessionError::InvalidSessionFile(resolved));
+            }
+            // Empty file: init header and rewrite.
+            self.new_session(None)?;
+            self.session_file = Some(resolved);
+            self.rewrite_file()?;
+            self.flushed = true;
+            return Ok(());
+        }
+
+        let header_id = entries
+            .iter()
+            .find(|entry| entry.is_session_header())
+            .and_then(|entry| match entry {
+                FileEntry::Header(header) => header.id.clone(),
+                FileEntry::RawHeader(raw) => {
+                    raw.get("id").and_then(Value::as_str).map(str::to_owned)
+                }
+                FileEntry::Entry(_) => None,
+            });
+        self.session_id = header_id.unwrap_or_else(create_session_id);
+
+        // Migration gate: v3+ files keep the directly parsed entries;
+        // legacy files reload through the exact Value + migration path.
+        let version = entries
+            .iter()
+            .find(|entry| entry.is_session_header())
+            .map_or(1, |entry| match entry {
+                FileEntry::Header(header) => header.version.unwrap_or(1),
+                FileEntry::RawHeader(raw) => raw
+                    .get("version")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(1),
+                FileEntry::Entry(_) => 1,
+            });
+        if version < CURRENT_SESSION_VERSION {
+            let mut values =
+                load_values_from_file(Path::new(&resolved)).map_err(|source| {
+                    SessionError::Io {
                         path: resolved.clone(),
                         source,
-                    })?
-                    .len();
-                if size > 0 {
-                    return Err(SessionError::InvalidSessionFile(resolved));
-                }
-                // Empty file: init header and rewrite.
-                self.new_session(None)?;
-                self.session_file = Some(resolved);
-                self.rewrite_file()?;
-                self.flushed = true;
-                return Ok(());
-            }
-
-            let header_id = entries
-                .iter()
-                .find(|entry| entry.is_session_header())
-                .and_then(|entry| match entry {
-                    FileEntry::Header(header) => header.id.clone(),
-                    FileEntry::RawHeader(raw) => {
-                        raw.get("id").and_then(Value::as_str).map(str::to_owned)
                     }
-                    FileEntry::Entry(_) => None,
-                });
-            self.session_id = header_id.unwrap_or_else(create_session_id);
-
-            // Migration gate: v3+ files keep the directly parsed entries;
-            // legacy files reload through the exact Value + migration path.
-            let version = entries
-                .iter()
-                .find(|entry| entry.is_session_header())
-                .map_or(1, |entry| match entry {
-                    FileEntry::Header(header) => header.version.unwrap_or(1),
-                    FileEntry::RawHeader(raw) => raw
-                        .get("version")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(1),
-                    FileEntry::Entry(_) => 1,
-                });
-            if version < CURRENT_SESSION_VERSION {
-                let mut values =
-                    load_values_from_file(Path::new(&resolved)).map_err(|source| {
-                        SessionError::Io {
-                            path: resolved.clone(),
-                            source,
-                        }
-                    })?;
-                let migrated = migrate_values_to_current(&mut values);
-                self.file_entries = values
-                    .into_iter()
-                    .map(entries::file_entry_from_value)
-                    .collect();
-                if migrated {
-                    self.rewrite_file()?;
-                }
-            } else {
-                self.file_entries = entries;
+                })?;
+            let migrated = migrate_values_to_current(&mut values);
+            self.file_entries = values
+                .into_iter()
+                .map(entries::file_entry_from_value)
+                .collect();
+            if migrated {
+                self.rewrite_file()?;
             }
-            self.build_index();
-            self.flushed = true;
         } else {
-            let explicit = resolved;
-            self.new_session(None)?;
-            self.session_file = Some(explicit);
+            self.file_entries = entries;
         }
+        self.build_index();
+        self.flushed = true;
         Ok(())
     }
 
@@ -1247,7 +1271,22 @@ impl SessionManager {
         cwd_override: Option<&str>,
     ) -> Result<Self, SessionError> {
         let resolved = path_to_string(&resolve_path(path));
-        let entries = load_entries_from_file(Path::new(&resolved));
+        // Single-pass open: the one parse below feeds both the header-cwd
+        // probe and the manager state (the file was previously parsed twice —
+        // a full `load_entries_from_file` probe, then `set_session_file`'s
+        // reload). Loader and error semantics match `set_session_file`:
+        // missing file → new session targeting the path; read failure → `Io`.
+        let exists = path_exists(Path::new(&resolved));
+        let entries = if exists {
+            load_file_entries_from_file(Path::new(&resolved)).map_err(|source| {
+                SessionError::Io {
+                    path: resolved.clone(),
+                    source,
+                }
+            })?
+        } else {
+            Vec::new()
+        };
         let header_cwd = entries
             .iter()
             .find_map(FileEntry::header)
@@ -1267,7 +1306,15 @@ impl SessionManager {
                 .parent()
                 .map_or_else(|| ".".to_owned(), |p| p.to_string_lossy().into_owned()),
         };
-        Self::construct(&cwd, &dir, Some(resolved), true, None)
+        let mut sm = Self::construct_empty(&cwd, &dir, true)?;
+        sm.session_file = Some(resolved.clone());
+        if exists {
+            sm.apply_session_file_entries(resolved, entries)?;
+        } else {
+            sm.new_session(None)?;
+            sm.session_file = Some(resolved);
+        }
+        Ok(sm)
     }
 
     /// Continue the most recent session, or create new if none.
