@@ -144,3 +144,10 @@ historical record and is not rewritten. All other PERF-G15 checks passed
 (no cold fix landed — 0 FIXED corroborated by a commit-by-commit sweep of
 the campaign's code commits against the cold rows; part (b) holds vacuously;
 no CONSTRAINED residual term touched outside Phase-5 discipline).
+
+Supersession (PERF-G13, iteration 33): the terminal classification named
+above was subsequently re-derived as **CONSTRAINED-ABOVE-FLOOR** (fresh
+trusted drain 1382 ns/frame, rs 8.91%, ~6.9x, complete E1-E4;
+`floors/stream-frame-pipeline.md`, `floors/README.md`, t11-iterations.md
+iteration 33). The erratum's substance is unchanged — the T14 enumeration's
+AT-FLOOR grouping is incorrect under either terminal name.
