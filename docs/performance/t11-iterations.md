@@ -1391,3 +1391,125 @@ nothing. Re-reviewed: **CLEAN** (0.97 confidence).
 `docs/supported-platforms.md`, DEPS ledger docs, floor ledgers,
 `scripts/session-timing.ts`, `session-timing.rs`, `runtime.rs` (the
 `run_interactive_mode` owed sequence is unchanged), `input.rs`.
+
+## Iteration 16 — `first-frame-init` (speculative first paint with deferred probe join)
+
+Commit: see `git log` (`perf(t11)`). Date 2026-08-28.
+
+**Blind derivation** (from the iteration-15 residual decomposition): the
+residual after the two-phase probe wait is ~116–126 ms, of which ~25 ms is
+the no-responder first-byte window (now event-driven but still serial with
+construction), ~19 ms is construction CPU (Tui + AgentSessionHost +
+InteractiveRuntime + bind_extensions + startup_theme + initialize_run), and
+~9 ms is spawn/loader. The 25 ms probe wait and the ~8–14 ms construction +
+first paint are independent and currently serial — the probe collector reads
+stdin while the main task builds the UI. Overlapping them cuts the serial
+chain: paint the first frame speculatively with DEFAULT capabilities while
+the probe collector runs on a blocking thread, then join and reconcile.
+
+**Design**: split `probe_terminal` into `probe_write_batch` (write the query
+batch, return whether stdin is a terminal) and `probe_collect_replies`
+(blocking collector under the two-phase budget, merging replies into caps
+and returning early keystrokes). In `run_interactive_mode`: (1) TerminalGuard
++ raw mode, (2) `probe_write_batch` + flush, (3) spawn a
+`tokio::task::spawn_blocking` running `probe_collect_replies` (owns stdin
+until joined), (4) construct Tui + AgentSessionHost + bind_extensions +
+startup_theme + InteractiveRuntime with DEFAULT caps and a
+`TerminalInput::deferred()` handle (no stdin reader), (5) `initialize_run`
+then `paint_frame` produces the FIRST FRAME with default caps, (6) join the
+probe collector, (7) `adopt_probe_caps`: if caps/theme changed, update +
+re-paint, (8) `set_kitty_protocol_active` with final caps, queue early
+keystrokes, (9) `TerminalInput::start` spawns the reader (now safe to take
+stdin), (10) enter the event loop via `run_with_startup(false)` on the first
+pass (the speculative paint already ran the startup sequence); later passes
+(Suspend, external editor) pass `true` to re-run it.
+
+**Boundary answers** (explicit, before touching): the probe batch bytes and
+their position before the first synchronized frame are unchanged
+(`pty_no_flicker` probe-before-sync predicate holds — the batch is written
+before any frame); first frame uses default caps (`sync_output` defaults to
+true, so the frame is a DEC 2026 synchronized transaction — the bench
+detection predicate holds); non-responding terminals (the bench workload)
+need no re-paint (`adopt_probe_caps` returns false when caps are unchanged);
+real terminals may flash one extra frame when the probe refines caps/theme;
+the probe collector owns stdin until joined; the `TerminalInput` reader is
+deferred until after the probe join — never two stdin readers; early
+keystrokes are queued via `queue_pending_events` (reversed into the
+pop-from-end `pending_ui_reinject` queue, preserving ordering); Suspend and
+external-editor paths re-run `initialize_run` on their loop re-entry
+(`run_with_startup(true)`), restoring the frame as before; non-TTY stdin
+writes no batch, spawns no task, and produces empty pending events (parity
+with the old `probe_terminal` early return).
+
+**Cutover surface** (3 files):
+- `crates/pi-tui/src/terminal/probe.rs` — `probe_terminal` replaced by
+  `probe_write_batch` (phase 1) + `probe_collect_replies` (phase 2); the
+  shared `collect_probe_replies` and `read_stdin_within` are unchanged.
+- `crates/pi-tui/src/terminal/input.rs` — `TerminalInput` gains `deferred()`
+  (channels without the reader task), `start()` (spawns the reader later),
+  and a `control_rx: Option<…>` field holding the receiver back until
+  `start`; `spawn()` is now `deferred()` + `start()`; `mock()` updated for
+  the new field; two test struct literals updated.
+- `crates/pi/src/modes/interactive/runtime.rs` — `run_interactive_mode`
+  restructured as above; `InteractiveRuntime` gains `run_with_startup`,
+  `adopt_probe_caps`, `queue_pending_events`; `run()` delegates to
+  `run_with_startup(true)`.
+`crates/pi-tui/src/terminal/mod.rs` — re-exports updated
+(`probe_terminal` → `probe_collect_replies` + `probe_write_batch`).
+Cargo.lock untouched (lock-neutral, no new deps).
+
+**Divergence audit** (branch classification of the replaced startup sequence):
+
+| Original branch | Classification | Reason |
+|---|---|---|
+| `probe_terminal` (write + collect serially before construction) | residue | the 25 ms no-responder wait and the ~8–14 ms construction + first paint are independent and overlapped by the split |
+| `TerminalInput::spawn` before construction | residue | the reader must not start until the probe collector joins — replaced by `deferred()` + `start()` after the join |
+| `set_kitty_protocol_active` before construction | residue | moved after the probe join so the final probed kitty capability is installed before the reader decodes keys |
+| probe batch bytes, two-phase reply budget, fragment arming, `ProbeSession` feed/apply, reinjection, EOF break | essential | unchanged |
+| Suspend / external-editor repaint-on-resume | essential | preserved via `run_with_startup(true)` on later loop passes |
+
+**Measurements** (release, `taskset -c 20-40`, 9 interleaved pairs per run,
+order alternating per pair, 1 warmup per arm; `scripts/first-frame-timing.py`,
+fresh 100x32 PTY + extension-free workload + sandbox env per sample,
+PI_OFFLINE=1, xterm-256color; baseline = d7f5e4a clean-worktree binary,
+design = cutover binary; every sample first-frame via synchronized-output
+detection, no row-local fallbacks). Two complete runs:
+
+| Run | Before median (ms) | After median (ms) | Win |
+|---|---|---|---|
+| 1 | 95.0 (85.5–127.6) | 76.9 (58.6–105.0) | 1.24x |
+| 2 | 92.5 (76.1–125.4) | 72.9 (58.6–95.5) | 1.27x |
+
+Win gate >=1.05x median: **PASSED** (1.24x / 1.27x on two independent
+complete interleaved runs).
+
+**Recomputed multiple**: ~73–77 ms vs the ledger floor ~1.50 ms ≈
+**~49–51x — still OPEN** (>2x). The residual is construction CPU (~19 ms,
+incl. rustls decode on the offline path) + spawn/loader (~9 ms) + the
+un-overlappable tail of the probe wait (the join latency after the
+speculative paint completes); the next material levers are the
+construction CPU itself (parser/TLS) and the spawn/loader, which sit
+outside this iteration.
+
+**Verification**: `cargo check --workspace --all-targets` green (warnings
+pre-existing, none new in the touched files); `pi-tui --lib` 400/400 pass
+(probe subset 15/15); `pi --lib` 1660 pass / 5 fail, every failure in the
+four disclosed environmental classes (manifest-utf8, trust-gating,
+NFD-on-filesystem ×3 — the same classes iterations 13–15 recorded,
+identical-to-base: the same 5 tests fail at d7f5e4a); all 18 bench samples
+detected via synchronized-output (the default-caps first frame emits the
+DEC 2026 transaction, exercising the probe-before-sync wire predicate
+end-to-end).
+
+**Review**: fresh adversarial review — **CLEAN** (0.92 confidence). The
+split preserves the old probe bytes and parser/timeout semantics, keeps the
+blocking collector as the sole stdin reader until its JoinHandle is
+resolved, starts `TerminalInput` only after kitty capability state is
+installed, and reverses probe events correctly for the runtime's
+pop-from-end queue.
+
+**Not touched** (out of scope, file-disjoint): `.github/workflows/`,
+`scripts/release/`, `scripts/verification/compat-matrix.json`,
+`docs/supported-platforms.md`, DEPS ledger docs, floor ledgers,
+`scripts/session-timing.ts`, `session-timing.rs`, `Cargo.lock`,
+`rust-toolchain.toml`.
