@@ -35,6 +35,11 @@ delta proves the lane is wait-bound, not cache-bound).
 
 **Multiple = 243.61 / 1.50 ~= 162.4x => OPEN.**
 
+*Superseded by PERF-T11: terminal CONSTRAINED-ABOVE-FLOOR at ≈47.5x (fresh stage
+attribution, iteration 18; measured ~71.3 ms vs the ~1.50 ms floor, dominated by
+boundary-gated model-catalog/TLS ~55.5 ms and exec/loader ~9.0 ms). See
+[t11-iterations.md](../t11-iterations.md), iteration 18.*
+
 ## Cost decomposition (sums to 243.6 ms)
 
 | Category | Cost | Method |

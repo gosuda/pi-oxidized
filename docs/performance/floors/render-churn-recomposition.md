@@ -43,6 +43,10 @@ baseline: editor 0.212 ms/frame Rust vs 0.243 ms TS (paired, PASS).
 changed-line floor — the full-tree recompute is a shared design property, and the
 ledger records it as the campaign's largest sustained target.
 
+*Superseded by PERF-T11: terminal AT-FLOOR at ≈1.25–1.35x (E1–E4 exhaustion,
+iteration 7; revalidated floor 10.4–10.6 µs/editor-frame, pinned editor medians
+13.5–13.9 µs). See [t11-iterations.md](../t11-iterations.md), iteration 7.*
+
 ## Cost decomposition (sums to 212 us/frame; callgrind Ir shares, 1.348 G Ir / 640 frames)
 
 | Category | Cost | Method |

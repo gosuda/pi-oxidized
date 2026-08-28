@@ -40,6 +40,10 @@ unmapped; no unit carries a third state.
 
 ## Ordered OPEN list (rebuild targets, descending time share)
 
+> Historical R9 output (2026-08-27), consumed by the PERF-T11 campaign (#97): all
+> eleven targets reached terminal verdicts. Current states live in the index State
+> column above and in [t11-iterations.md](../t11-iterations.md).
+
 1. `render-churn-recomposition` — rank-3 lane, per-frame during all rendering, ~141x floor; the single largest sustained multiple.
 2. `terminal-paint` — component of the rank-1 stream lane, ~7.5x paint-only (its recompose+paint block ~41x over the write floor).
 3. `stream-frame-pipeline` (decode / reduce / visible-update) — rank-1 lane components; multiples unproven, measurement prerequisite first (per-process CPU split pi vs extension host, turn-phase attribution).
@@ -58,6 +62,10 @@ unmapped; no unit carries a third state.
 on 2026-08-27. Units whose measurement is missing or noise-rejected are recorded OPEN
 by the fail-closed rule (an untrusted measurement can never prove AT-FLOOR), each with
 its named measurement prerequisite.
+
+> Historical as of 2026-08-27 (pre-campaign). Terminal AT-FLOOR units after
+> PERF-T11: render-churn-recomposition, terminal-paint, session-append,
+> session-reopen, keypress-dispatch (see the index State column).
 
 ## Blind-derivation contract (binding Phase 5)
 

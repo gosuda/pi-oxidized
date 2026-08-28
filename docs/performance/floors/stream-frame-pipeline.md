@@ -50,6 +50,13 @@ three units hold **OPEN by the fail-closed rule**: an unproven multiple can neve
 declare AT-FLOOR, and each unit's ceiling share of the rank-1 lane keeps it a rebuild
 candidate.
 
+*Superseded by PERF-T11: terminal architecture-floor (residual classification
+recorded at iteration 13: drain 2,426 ns ≈ 12.1x the ~200 ns decode/forward floor;
+channel/scheduler cost plus one contract-forced source-side materialization per
+frame; no materially distinct design inside the unit boundary). See
+[t11-iterations.md](../t11-iterations.md), stream-frame-pipeline residual
+classification.*
+
 ## Blind-derivation classification for Phase 5
 
 Consumers interior; nothing published. The watch/mpsc topology is itself contract

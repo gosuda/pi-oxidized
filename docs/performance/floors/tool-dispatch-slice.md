@@ -37,6 +37,11 @@ fresh callgrind corroborates 251.1 kIr/call ~= 23.7 us at the 10.6 kIr/us calibr
 
 **Multiple = 24.12 / 4.29 ~= 5.62x => OPEN.**
 
+*Superseded by PERF-T11: terminal CONSTRAINED-ABOVE-FLOOR at 5.62x (E1–E4
+exhaustion, iteration 20; gap held by boundary-owned double serialization and
+cross-unit session-append cost). See [t11-iterations.md](../t11-iterations.md),
+iteration 20.*
+
 ## Cost decomposition (sums to 24.12 us/call)
 
 | Category | Cost | Method |

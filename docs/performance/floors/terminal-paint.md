@@ -48,6 +48,10 @@ Amortized paint-only ~= 0.18 x 26.5 us + per-frame write share ~= 4.8-5.5 us/fra
 
 **Multiple (paint-only, amortized) = 4.8 / 0.64 ~= 7.5x => OPEN.**
 
+*Superseded by PERF-T11: terminal AT-FLOOR (poke ≈1.97x, editor steady ≈1.50x,
+static ≈1.38x, all ≤2x on every pinned shape; E1–E4 exhaustion, iteration 9).
+See [t11-iterations.md](../t11-iterations.md), iteration 9.*
+
 The amortized recompose+paint block it sits in is 26.5 / 0.64 ~= 41x its write floor
 (the block's own dominant term is recomposition, owned and decomposed in
 render-churn-recomposition.md).

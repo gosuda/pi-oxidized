@@ -40,6 +40,10 @@ paired claim.
 
 **Multiple = 5.952 / 0.764 = 7.79x => OPEN.**
 
+*Superseded by PERF-T11: terminal AT-FLOOR at 1.97x (iteration 14; 1.506 µs/entry
+vs 0.764 µs floor, single-pass open). See [t11-iterations.md](../t11-iterations.md),
+iteration 14.*
+
 ## Cost decomposition (sums to 5.95 us/entry)
 
 | Category | Cost | Method |

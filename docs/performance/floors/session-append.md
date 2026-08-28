@@ -47,6 +47,10 @@ the fresh number is the decomposition anchor.
 
 **Multiple = 18.337 / 3.735 = 4.91x => OPEN.**
 
+*Superseded by PERF-T11: terminal AT-FLOOR at 1.41x (iteration 21; 5.275 µs/entry
+vs 3.735 µs floor, maintained assistant-present state). See
+[t11-iterations.md](../t11-iterations.md), iteration 21.*
+
 ## Cost decomposition (sums to 18.34 us/entry)
 
 | Category | Cost | Method |
