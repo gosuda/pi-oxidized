@@ -2878,8 +2878,7 @@ OPEN for the remaining units. Next ordered unit: **`keypress-dispatch`**
 **Not touched** (out of scope, file-disjoint): production code
 (`server.rs`, `protocol.rs`), `serve_io_scaling.rs` (test lane unchanged
 from iteration 24), `Cargo.lock`, `rust-toolchain.toml`,
-`.github/workflows/`, `scripts/`, other floor ledgers.<<<<<<< ours
-
+`.github/workflows/`, `scripts/`, other floor ledgers.
 ---
 
 ## Iteration 27 — `startup-version-path` (sync arg dispatch before runtime construction — OPEN >2x, win 1.59x wall / 3.99x Ir)
@@ -3088,9 +3087,7 @@ remaining units.
 `crates/pi-tui/`, `crates/pi-ext/`, `.github/workflows/`, `scripts/`,
 `Cargo.lock`, `rust-toolchain.toml`, other units' floor ledgers, `packages/`.
 
-||||||| original
 
-=======
 ## Iteration 29 — `memory-resource-units` (prerequisite run — distribution recorded; Phase-6 transfer)
 
 Date 2026-08-29. Base `6318fa3` (canonical origin/feat/ver-align-canonical-pin,
@@ -3188,4 +3185,93 @@ no-stream) belong to the `.references/pi` pin owners.
 `rust-toolchain.toml`, `crates/pi-tui/src/terminal/*`, other units' floor
 ledgers.
 
->>>>>>> theirs
+## Iteration 30 — `keypress-dispatch` (measurement boundary repair — protocol trusted, rs 2.69%)
+
+Date 2026-08-29. Base `6318fa3` (canonical origin/feat/ver-align-canonical-pin,
+iteration 26). Measurement iteration only — no production Rust optimization; the
+keypress/input/runtime/writer sources measured are identical to `6318fa3`
+(post-extension-RPC terminal classification, confirmed ancestor before the run).
+The R2-era keypress lane could not feed a verdict (rs 26.98%, wall 0.44 s), and
+inspection found the measurement boundary itself wrong in four independent ways,
+so this iteration repairs the instrument before attributing anything.
+
+### What was wrong with the R2-era protocol
+
+1. **Start boundary was not the write.** The old collector took
+   `snapshot().elapsedMs` *before* `writeKeys`, so the timed interval included
+   `snapshot()`'s echo scan and chunk copy plus the poll-loop scheduling gap up
+   to the write, and missed the true write instant.
+2. **The editor grew across the round.** One process, 20 warmup keys and 200
+   measured keys, no clear: sample *k* painted a *k*-character editor. The
+   per-round trend (growing render/paint cost) is a variance source and makes
+   the "median keypress" an average over 200 different workloads.
+3. **Fallback frames were accepted as paints.** `frameObservation` returns the
+   first synchronized transaction *or* a row-local printable CSI transaction;
+   the old lane recorded latency from whichever came first.
+4. **A concurrent 1 ms `ProcTreeSampler`** polled `/proc` on the same host core
+   territory during latency collection.
+
+### The repaired protocol (committed this iteration)
+
+- `PtyProcess.writeKeys` pre-encodes and returns a **receipt**
+  (`outputOffset`, `startedElapsedMs`) captured immediately before the first
+  `FileSink.write`; `#consume` timestamps chunk **arrival** before copy/decode.
+  Transport unchanged (`setsid script --quiet --flush --echo always`).
+- `keySyncTransaction`: strict synchronized-only observer — first balanced
+  `ESC[?2026h … ESC[?2026l` transaction at/after the receipt offset, returning
+  payload, begin/end counts through the completing chunk, and the completing
+  chunk's arrival elapsed. Row-local printable output before any synchronized
+  begin is reported as fallback, never as a frame. Split markers accumulate.
+- One measured sample = `writeKeys(key)` → first balanced transaction whose
+  payload contains the typed key, exactly one begin/end pair → `Ctrl+U` clear
+  → its complete synchronized paint (outside timing). Fixed empty editor for
+  every measured key. Any violation fails the whole round (no filtering).
+- Outer aggregation: 3 discarded process warmup rounds, then 27 fresh measured
+  process rounds × (20 warmup + 200 measured) pairs. Trust estimator:
+  population stddev / median over the 27 round medians (repository rule,
+  `0.20` passes); pooled raw spread disclosed only; collection wall >= 1 s;
+  pooled raw p99 < 5 ms stays the separate behavior gate.
+- `scripts/bench-keypress-dispatch.ts`: dedicated thin CLI (single-arm
+  `--binary/--rounds/--output`; paired `--baseline/--design/--pairs` with arm
+  order alternated per pair) over the same exported collector.
+- Focused tests: receipt boundary pins (offset excludes prior chunks, starts
+  before the write, precedes output, hostile bytes in order), observer pins
+  (split markers, fallback rejection, extra-marker counts, payload
+  correlation, pre-offset transactions ignored), aggregation pins (all rounds
+  and samples summarized, partial round rejected, rs = 0.20 boundary quiet).
+  `bun test scripts/verification/pty.test.ts scripts/verification/performance.test.ts`:
+  42/42 PASS. Script typecheck clean. Run under `taskset -c 20`.
+
+### Trusted baseline (27 measured rounds, pinned)
+
+| Metric | Value | Gate |
+|---|---|---|
+| Round-median rs | **2.69%** | <= 20% **PASS** (was 26.98% FAIL) |
+| Round medians (n=27) | median 467.27 us, min 438.01, max 506.47 | — |
+| Collection wall | **16.52 s** | >= 1 s **PASS** (was 0.44 s) |
+| Synchronized + key-correlated samples | 5,400 / 5,400, 0 invalid frames | all-frames **PASS** |
+| Pooled raw median / p95 / p99 | 467.59 / 548.75 / 888.09 us | p99 < 5 ms **PASS** |
+| Pooled raw spread | 55.99% | disclosed, not gating (one 15.88 ms scheduler hiccup in the tail) |
+| Affinity / governor | CPU 20 / `powersave` (recorded) | — |
+| Binary | sha256 `58592a9d…`, built from this commit; production sources = `6318fa3` | — |
+
+**Classification: none yet — measurement iteration.** The lane is now trusted;
+the unit stays **OPEN** pending attribution (temporary S0–S3 probes +
+raw-vs-EventStream fixture differential), floor revalidation, and the
+zeroing-ceiling test before any candidate is named. The former 1.935 ms
+"operating point" was an artifact of the broken instrument (editor growth,
+snapshot-start boundary, accepted fallbacks, concurrent sampler), not a fact
+about the lane.
+
+Not touched: production Rust (`crates/**`), `Cargo.lock`, `rust-toolchain.toml`,
+`.github/workflows/`, `scripts/release/`, other units' floor ledgers.
+
+Adversarial-review hardening before landing (0 blocking findings remaining):
+the collector now verifies that the Ctrl+U clear actually restores the empty
+editor — the previous key must be absent from the next paint and from the
+clear repaint's printable cells (escape-sequence bytes stripped before
+matching) — and the paired runner gates each arm on its own collection wall
+so two short arms cannot pass on their combined duration. The trusted-baseline
+numbers above were captured with the pre-hardening collector on a production
+tree identical to `6318fa3`; the hardened collector re-confirms the baseline in
+iteration 31 after a production correctness fix on this unit's surface.
