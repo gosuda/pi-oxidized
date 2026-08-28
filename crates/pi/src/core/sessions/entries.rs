@@ -689,10 +689,126 @@ pub fn parse_session_entries(content: &str) -> Vec<FileEntry> {
 /// a string `id`). Malformed mid-file lines are skipped.
 #[must_use]
 pub fn load_entries_from_file(file_path: &Path) -> Vec<FileEntry> {
-    match load_values_from_file(file_path) {
-        Ok(values) => values.into_iter().map(file_entry_from_value).collect(),
+    match load_file_entries_from_file(file_path) {
+        Ok(entries) => entries,
         Err(_) => Vec::new(),
     }
+}
+
+/// Load file entries from a session file via the direct typed parse fast path.
+///
+/// Same contract as [`load_values_from_file`] + [`file_entry_from_value`]
+/// (header-validated; missing or invalid file → empty vec; malformed mid-file
+/// lines skipped), without materializing a `serde_json::Value` tree per line:
+/// each line is parsed straight into its typed variant. Lines the direct parse
+/// rejects (legacy shapes, content patches, unknown variants) fall back to the
+/// exact Value path, so acceptance is identical for every file the append path
+/// and the upstream TS implementation produce.
+pub(crate) fn load_file_entries_from_file(file_path: &Path) -> io::Result<Vec<FileEntry>> {
+    let normalized = normalize_path(&file_path.to_string_lossy(), PathInputOptions::new());
+    if !path_exists(&normalized) {
+        return Ok(Vec::new());
+    }
+
+    let file = File::open(&normalized)?;
+    let mut entries = Vec::new();
+    for chunk in BufReader::new(file).split(b'\n') {
+        let bytes = chunk?;
+        let line = String::from_utf8_lossy(&bytes);
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Some(entry) = parse_line(line.as_ref()) {
+            entries.push(entry);
+        }
+    }
+
+    if entries.is_empty() {
+        return Ok(entries);
+    }
+
+    // Header validation identical to `load_values_from_file`: the first
+    // parseable line must be a session header whose `id` is a JSON string.
+    let valid = match &entries[0] {
+        FileEntry::Header(header) => header.id.is_some(),
+        FileEntry::RawHeader(raw) => raw.get("id").is_some_and(Value::is_string),
+        FileEntry::Entry(_) => false,
+    };
+    if !valid {
+        return Ok(Vec::new());
+    }
+
+    Ok(entries)
+}
+
+/// Wire discriminant peek for the direct typed parse fast path.
+///
+/// Borrows the `type` string from the line when it carries no escapes; any
+/// peek failure (malformed JSON, escaped string, non-object line) returns
+/// `None` and the caller takes the Value fallback.
+#[derive(Deserialize)]
+struct TagPeek<'a> {
+    #[serde(rename = "type")]
+    ty: Option<&'a str>,
+}
+
+/// Direct typed parse of one JSONL line, or `None` for the Value fallback.
+///
+/// The fallback ([`parse_line_via_value`]) is the exact pre-fast-path parse,
+/// so `parse_line` accepts a line iff the fallback does; the fast path only
+/// skips the `Value` round-trip for lines that need no patch/migration
+/// handling.
+fn parse_line(line: &str) -> Option<FileEntry> {
+    // Peek failures (malformed JSON, escaped or non-string tag, tagless
+    // lines) route to the Value fallback so acceptance matches the old path
+    // exactly — notably tagless valid JSON lines are preserved as
+    // `Unknown`, never dropped.
+    let ty = match serde_json::from_str::<TagPeek>(line) {
+        Ok(peeked) => peeked.ty,
+        Err(_) => return parse_line_via_value(line),
+    };
+    let Some(ty) = ty else {
+        return parse_line_via_value(line);
+    };
+    let direct = match ty {
+        "session" => serde_json::from_str::<SessionHeader>(line)
+            .ok()
+            .map(FileEntry::Header),
+        "message" => serde_json::from_str::<SessionMessageEntry>(line)
+            .ok()
+            .map(|e| FileEntry::Entry(SessionEntry::Message(e))),
+        "thinking_level_change" => serde_json::from_str::<ThinkingLevelChangeEntry>(line)
+            .ok()
+            .map(|e| FileEntry::Entry(SessionEntry::ThinkingLevelChange(e))),
+        "model_change" => serde_json::from_str::<ModelChangeEntry>(line)
+            .ok()
+            .map(|e| FileEntry::Entry(SessionEntry::ModelChange(e))),
+        "compaction" => serde_json::from_str::<CompactionEntry>(line)
+            .ok()
+            .map(|e| FileEntry::Entry(SessionEntry::Compaction(e))),
+        "branch_summary" => serde_json::from_str::<BranchSummaryEntry>(line)
+            .ok()
+            .map(|e| FileEntry::Entry(SessionEntry::BranchSummary(e))),
+        "custom" => serde_json::from_str::<CustomEntry>(line)
+            .ok()
+            .map(|e| FileEntry::Entry(SessionEntry::Custom(e))),
+        "custom_message" => serde_json::from_str::<CustomMessageEntry>(line)
+            .ok()
+            .map(|e| FileEntry::Entry(SessionEntry::CustomMessage(e))),
+        "label" => serde_json::from_str::<LabelEntry>(line)
+            .ok()
+            .map(|e| FileEntry::Entry(SessionEntry::Label(e))),
+        "session_info" => serde_json::from_str::<SessionInfoEntry>(line)
+            .ok()
+            .map(|e| FileEntry::Entry(SessionEntry::SessionInfo(e))),
+        _ => None,
+    };
+    direct.or_else(|| parse_line_via_value(line))
+}
+
+/// Value-path parse of one line (the exact pre-fast-path behavior).
+fn parse_line_via_value(line: &str) -> Option<FileEntry> {
+    Some(file_entry_from_value(serde_json::from_str(line).ok()?))
 }
 
 /// Load raw JSON values from a session file (header-validated).
@@ -1367,4 +1483,61 @@ not valid json
             load_entries_from_file(Path::new("/tmp/pi-oxidized-no-such-session-file.jsonl"));
         assert!(entries.is_empty());
     }
+
+    #[test]
+    fn parse_line_matches_value_path_on_peek_failures() {
+        let lines = [
+            // Escaped tag: the borrowed peek cannot match, the Value path
+            // unescapes and recognizes the header.
+            r#"{"type":"sess\u0069on","version":3,"id":"x","timestamp":"t","cwd":"/tmp"}"#
+                .to_owned(),
+            // Tagless valid JSON line: preserved as Unknown, never dropped.
+            r#"{"foo":1,"bar":{"baz":[1,2]}}"#.to_owned(),
+            // Non-string tag: Unknown, not dropped.
+            r#"{"type":123,"id":"n1"}"#.to_owned(),
+            // Malformed JSON: skipped, same as the old path.
+            "not json".to_owned(),
+        ];
+        for line in &lines {
+            assert_eq!(
+                parse_line(line),
+                parse_line_via_value(line),
+                "fast path diverged from the Value path for {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn escaped_tag_header_and_tagless_lines_load() {
+        let content = concat!(
+            r#"{"type":"sess"#,
+            "\\u0069",
+            r#"on","version":3,"id":"x","timestamp":"2025-01-01T00:00:00.000Z","cwd":"/tmp"}"#,
+            "\n",
+            r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2025-01-01T00:00:01.000Z","message":{"role":"user","content":"hi","timestamp":1}}"#,
+            "\n",
+            r#"{"foo":"untagged"}"#,
+        );
+        let dir = std::env::temp_dir().join("pi-entries-escaped-tag-test");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let file = dir.join("escaped-tag.jsonl");
+        std::fs::write(&file, content).expect("write session");
+        let entries = load_entries_from_file(&file);
+        std::fs::remove_file(&file).ok();
+        assert_eq!(entries.len(), 3, "all three lines must load");
+        assert!(
+            entries[0].header().is_some_and(|h| h.id.as_deref() == Some("x")),
+            "escaped-tag header must be recognized, got {:?}",
+            entries[0]
+        );
+        assert!(matches!(
+            entries[1],
+            FileEntry::Entry(SessionEntry::Message(_))
+        ));
+        assert!(matches!(
+            entries[2],
+            FileEntry::Entry(SessionEntry::Unknown(_))
+        ));
+    }
+
 }

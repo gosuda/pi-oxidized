@@ -49,8 +49,8 @@ pub use list::{
 };
 
 use entries::{
-    file_entry_to_line, iso_to_millis, load_values_from_file, migrate_values_to_current,
-    path_exists, session_entry_to_line,
+    file_entry_to_line, iso_to_millis, load_file_entries_from_file, load_values_from_file,
+    migrate_values_to_current, path_exists, session_entry_to_line,
 };
 
 // ---------------------------------------------------------------------------
@@ -284,13 +284,14 @@ impl SessionManager {
         self.session_file = Some(resolved.clone());
 
         if path_exists(Path::new(&resolved)) {
-            let mut values =
-                load_values_from_file(Path::new(&resolved)).map_err(|source| SessionError::Io {
-                    path: resolved.clone(),
-                    source,
+            let entries =
+                load_file_entries_from_file(Path::new(&resolved)).map_err(|source| {
+                    SessionError::Io {
+                        path: resolved.clone(),
+                        source,
+                    }
                 })?;
-
-            if values.is_empty() {
+            if entries.is_empty() {
                 let size = fs::metadata(&resolved)
                     .map_err(|source| SessionError::Io {
                         path: resolved.clone(),
@@ -308,20 +309,49 @@ impl SessionManager {
                 return Ok(());
             }
 
-            let header_id = values
+            let header_id = entries
                 .iter()
-                .find(|v| v.get("type").and_then(Value::as_str) == Some("session"))
-                .and_then(|h| h.get("id").and_then(Value::as_str))
-                .map(str::to_owned);
+                .find(|entry| entry.is_session_header())
+                .and_then(|entry| match entry {
+                    FileEntry::Header(header) => header.id.clone(),
+                    FileEntry::RawHeader(raw) => {
+                        raw.get("id").and_then(Value::as_str).map(str::to_owned)
+                    }
+                    FileEntry::Entry(_) => None,
+                });
             self.session_id = header_id.unwrap_or_else(create_session_id);
 
-            let migrated = migrate_values_to_current(&mut values);
-            self.file_entries = values
-                .into_iter()
-                .map(entries::file_entry_from_value)
-                .collect();
-            if migrated {
-                self.rewrite_file()?;
+            // Migration gate: v3+ files keep the directly parsed entries;
+            // legacy files reload through the exact Value + migration path.
+            let version = entries
+                .iter()
+                .find(|entry| entry.is_session_header())
+                .map_or(1, |entry| match entry {
+                    FileEntry::Header(header) => header.version.unwrap_or(1),
+                    FileEntry::RawHeader(raw) => raw
+                        .get("version")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(1),
+                    FileEntry::Entry(_) => 1,
+                });
+            if version < CURRENT_SESSION_VERSION {
+                let mut values =
+                    load_values_from_file(Path::new(&resolved)).map_err(|source| {
+                        SessionError::Io {
+                            path: resolved.clone(),
+                            source,
+                        }
+                    })?;
+                let migrated = migrate_values_to_current(&mut values);
+                self.file_entries = values
+                    .into_iter()
+                    .map(entries::file_entry_from_value)
+                    .collect();
+                if migrated {
+                    self.rewrite_file()?;
+                }
+            } else {
+                self.file_entries = entries;
             }
             self.build_index();
             self.flushed = true;
