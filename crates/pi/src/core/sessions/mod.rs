@@ -203,6 +203,9 @@ pub struct SessionManager {
     cwd: String,
     persist: bool,
     flushed: bool,
+    /// Cached: true iff any entry in `file_entries` is an assistant message.
+    /// Maintained in O(1) on append; recomputed in `build_index` on load/branch.
+    has_assistant: bool,
     file_entries: Vec<FileEntry>,
     /// id → index into `file_entries` (Entry variants only).
     by_id: HashMap<String, usize>,
@@ -275,6 +278,7 @@ impl SessionManager {
             cwd,
             persist,
             flushed: false,
+            has_assistant: false,
             file_entries: Vec::new(),
             by_id: HashMap::new(),
             labels: LabelMap::default(),
@@ -430,6 +434,7 @@ impl SessionManager {
         self.labels.clear();
         self.leaf = Leaf::Null;
         self.flushed = false;
+        self.has_assistant = false;
 
         if self.persist {
             let file_name = session_file_name(&timestamp, &self.session_id);
@@ -449,6 +454,7 @@ impl SessionManager {
         self.by_id.clear();
         self.labels.clear();
         self.leaf = Leaf::Null;
+        self.has_assistant = false;
         for (idx, fe) in self.file_entries.iter().enumerate() {
             if fe.is_session_header() {
                 continue;
@@ -456,6 +462,9 @@ impl SessionManager {
             let Some(entry) = fe.entry() else {
                 continue;
             };
+            if entry.is_assistant_message() {
+                self.has_assistant = true;
+            }
             if let Some(id) = entry.id() {
                 self.by_id.insert(id.to_owned(), idx);
                 self.leaf = Leaf::Id(id.to_owned());
@@ -504,11 +513,16 @@ impl SessionManager {
             return Ok(());
         };
 
-        let has_assistant = self
-            .file_entries
-            .iter()
-            .filter_map(FileEntry::entry)
-            .any(SessionEntry::is_assistant_message);
+        // O(1): cached pre-append state OR'd with the entry being appended.
+        // The entry at `idx` was already pushed to `file_entries` by `append_entry`;
+        // checking it directly accounts for the first-assistant transition without
+        // scanning the full vector.
+        let has_assistant = self.has_assistant
+            || self
+                .file_entries
+                .get(idx)
+                .and_then(FileEntry::entry)
+                .is_some_and(SessionEntry::is_assistant_message);
 
         if !has_assistant {
             if self.flushed
@@ -587,6 +601,17 @@ impl SessionManager {
             self.leaf = previous_leaf;
             self.flushed = previous_flushed;
             return Err(err);
+        }
+        // Update cached assistant state only after persist succeeds.
+        // On rollback, has_assistant retains its prior value.
+        if !self.has_assistant
+            && self
+                .file_entries
+                .get(idx)
+                .and_then(FileEntry::entry)
+                .is_some_and(SessionEntry::is_assistant_message)
+        {
+            self.has_assistant = true;
         }
         Ok(id)
     }
@@ -1222,11 +1247,7 @@ impl SessionManager {
 
         if self.persist {
             self.session_file = Some(new_session_file.clone());
-            let has_assistant = self
-                .file_entries
-                .iter()
-                .filter_map(FileEntry::entry)
-                .any(SessionEntry::is_assistant_message);
+            let has_assistant = self.has_assistant;
             if has_assistant {
                 self.rewrite_file()?;
                 self.flushed = true;
