@@ -147,7 +147,7 @@ describe("SBOM drift detection", () => {
 		expect(verifySnapshot(snapshot, live).some((d) => d.includes("serde"))).toBe(true);
 
 		const toolchainMoved = mutable();
-		toolchainMoved.rust.toolchainChannel = "1.98.0";
+		toolchainMoved.rust.toolchainChannel = "1.99.0";
 		expect(
 			verifySnapshot(snapshot, toolchainMoved).some((d) => d.includes("toolchain")),
 		).toBe(true);
