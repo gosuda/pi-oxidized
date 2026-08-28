@@ -1193,3 +1193,87 @@ been dropped instead of preserved as `Unknown`). Fixed by routing both to
 `scripts/release/`, `scripts/verification/compat-matrix.json`,
 `docs/supported-platforms.md`, DEPS ledger docs, floor ledgers,
 `scripts/session-timing.ts`, `session-timing.rs`.
+
+
+## Iteration 14 — `session-reopen` (single-pass open)
+
+Commit: see `git log` (`perf(t11)`). Date 2026-08-28.
+
+**Blind derivation** (from the ledger's Contract + Floor sections and the
+iteration-13 residual record): the repeated reopen input is one file parsed
+twice — `SessionManager::open` pre-parses the full entry list solely to
+extract the header cwd, then `construct` → `set_session_file` reloads the
+same file; the first pass is residue (its entries vec is discarded after a
+header scan — a second full parse of every line). Data layout: fuse the two
+passes into one — `open` performs the single propagating load, derives the
+header cwd from that parse, and binds the already-loaded entries through a
+shared post-load path (`apply_session_file_entries`) that `set_session_file`
+also delegates to; the manager's session file binding is preserved on every
+branch (the pre-set `Some(resolved)` mirrors the old top-of-function
+assignment, so append can never silently no-op).
+
+**Boundary answers** (explicit, before touching): reopen acceptance is
+unchanged by construction — the single parse IS `set_session_file`'s own
+loader, so empty file → header init + rewrite, invalid header (size > 0) →
+`InvalidSessionFile`, legacy v1/v2 → the untouched `load_values_from_file` +
+`migrate_values_to_current` + rewrite lane (byte-identical to base), v3 →
+adopted entries; header-id and version scans (Header id/version or
+RawHeader raw fields, `Entry(_) => 1`) preserved verbatim; header-cwd
+extraction still `find_map(FileEntry::header)` (typed headers only, as
+before); missing file → new session targeting the path; read failure → the
+same `SessionError::Io` with the same path (now from the single parse; the
+only side-effect delta is that the session dir is no longer created before
+that error path). The v3 wire format is untouched (no write on the reopen
+path — sha-prefix stability asserted per bench sample); `fork_from`
+untouched (raw `Value`s); append/persist paths untouched.
+
+**Cutover surface** (1 file): `crates/pi/src/core/sessions/mod.rs` —
+`construct` split into `construct` + `construct_empty` (shared body),
+`set_session_file`'s exists-branch post-load logic extracted into
+`apply_session_file_entries` (shared by both entry points), `open` rewritten
+single-pass. Cargo.lock untouched (lock-neutral, no new deps).
+
+**Measurements** (release, `taskset -c 20-40`, 9 interleaved pairs, medians
+of per-run 20-sample medians; `session-timing --mode reopen --entries 5000`,
+815,149-byte shared session file, sha-prefix `660557e2b670b944` stable across
+every run; baseline = 7011ac5 clean worktree binary, design = cutover
+binary):
+
+| Scenario | Before (ms/reopen) | After (ms/reopen) | Win (median-of-9) |
+|---|---|---|---|
+| reopen 5000 entries | 14.452 (14.040–15.308) | 7.529 (7.351–7.744) | 1.92x |
+
+Win gate >=1.05x median: **PASSED** (1.92x). Per-entry: 2.89 → 1.51 us.
+
+**Recomputed multiple**: 1.506 us/entry vs the ledger floor 0.764 us ≈
+**1.97x — AT-FLOOR** (at/under the 2x rebuild threshold), with dual
+disclosure of boundary proximity: pair-level multiples span 1.88–2.07x, and
+the floor's 683.8 ns parse constant is sonic-rs-derived while the
+implementation parses with serde_json, so a like-for-like floor is higher
+and 1.97x is the conservative upper bound. The only remaining halving lever
+is the parser swap itself (sonic-rs), which crosses the campaign's
+Cargo.lock boundary and is barred. Residual composition: the typed-parse
+constant (nested `AgentMessage` serde + per-field String allocations) and
+the by-id/labels/leaf index rebuild; no rebuild candidate inside the
+campaign's dependency boundary projects a >2x reduction.
+
+**Verification**: `cargo check --workspace --all-targets` green (warnings
+pre-existing; none in the touched file); `pi --lib` 1659 pass / 6 fail —
+failure classes identical to the iteration-13 disclosure (extension-host
+artifact, manifest utf8, trust-gating env, NFD-on-filesystem ×3 — the NFD
+set rotates per run and worsens on tmpfs TMPDIR: 8 fails on tmpfs vs 3 on
+zfs, independent of this diff, which touches only
+`core::sessions::mod.rs`); `core::sessions` subset 63/64 with only the
+disclosed `list_sessions_sorted_by_modified` flake (fails ~1/3 of probes on
+this tree, `list.rs` has zero references to the changed loader).
+
+**Review**: fresh adversarial review verified acceptance-equivalence
+branch-by-branch (valid v3, v1/v2 legacy, empty file, invalid header,
+RawHeader shapes, escaped-tag/tagless lines, unknown variants, missing
+file, cwd precedence, session-file binding on every success path): **CLEAN**
+(0.97 confidence).
+
+**Not touched** (out of scope, file-disjoint): `.github/workflows/`,
+`scripts/release/`, `scripts/verification/compat-matrix.json`,
+`docs/supported-platforms.md`, DEPS ledger docs, floor ledgers,
+`scripts/session-timing.ts`, `session-timing.rs`.
