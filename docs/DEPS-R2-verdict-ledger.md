@@ -33,11 +33,20 @@ entry is an audit failure at DEPS-D1.
 
 | head | date | subject | class | checks |
 |---|---|---|---|---|
-| b90362dc | 2026-08-26 | npm:typebox | S | E1:fail E2:fail E3:pass E4:pass |
-| b90362dc | 2026-08-26 | npm:@types/bun | E | E1:pass E2:pass E3:pass E4:pass |
-| b90362dc | 2026-08-26 | tool:bun-runtime | S | E1:pass E2:fail E3:fail E4:fail |
+| 849122647411 | 2026-08-28 | npm:typebox | S | E1:fail E2:fail E3:pass E4:pass |
+| 849122647411 | 2026-08-28 | npm:@types/bun | E | E1:pass E2:pass E3:pass E4:pass |
+| 849122647411 | 2026-08-28 | tool:bun-runtime | S | E1:pass E2:fail E3:fail E4:fail |
 
 ## Records
+
+- **849122647411 / DEPS-D1 closing re-ground (2026-08-28) — sanity rows re-decided, not new verdicts.** The
+  DEPS-D1 closing git-log audit found the checked-in reference (last captured at `7f325058`) trailing the
+  post-Bin-M shipped-input commits (`4ee9916` serde-rc, `75996e1` toolchain 1.98.0): the fail-closed checker
+  classified every npm subject Class S on rust-input drift and the checked-in self-check went red — the
+  reference-refresh-law state (`DEPS-R2-remediation-runbook.md` §5), resolved by mechanical regeneration
+  (`16d2ad9`), never by widening the gate. The three anchor rows above were re-emitted by the checker at
+  capture head 8491226 (2491 metafile inputs); classes are identical to the b90362dc-era rows. SBOM baseline
+  re-anchored in the same closing pass (`80ac57f`; delta = exactly the toolchain channel re-pin).
 
 - **b90362dc / npm:typebox — sanity, not a remediation.** Known-member anchor from the
   checker `self-check` at DEPS-R2 landing: production-field position
