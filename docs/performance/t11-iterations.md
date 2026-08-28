@@ -3358,3 +3358,118 @@ Not touched by the fix: `Cargo.lock`, `rust-toolchain.toml`,
 `.github/workflows/`, `scripts/release/`, other units' floor ledgers, the
 keypress measurement boundary (this iteration changes the production startup
 path only).
+
+## Iteration 32 — `keypress-dispatch` (S0–S3 attribution + floor revalidation — AT-FLOOR, terminal)
+
+Date 2026-08-29. Base `911a85d` (iteration 31). Docs-only terminal record: every
+temporary probe and fixture mode was reverted before this commit — the working
+tree is byte-identical to `911a85d` (`git diff` empty), which landed green
+(harness suites 42/42, pi-tui terminal:: 83 passed / 0 failed,
+`startup_paste_echo` 1/1, script typecheck clean).
+
+### Attribution method (temporary, env-gated, reverted)
+
+- Five stage marks per keypress cycle at the plan's exact seams: input send
+  (`input.rs` decoded-key publish), runtime handler entry (`handle_ui_event`
+  `UiEvent::Key` entry), immediate-paint call (immediately before the
+  `needs_immediate_repaint` `paint_frame`), writer paint start (after
+  `measure`/`render`, before diff/encode), stage-3 write end (after
+  `write_all` + `flush`). Marks were buffered in memory and appended to a
+  sidecar once at run-loop exit, so probe file I/O never entered the measured
+  interval. Strict per-cycle ordering dropped marks not driven by a keypress
+  cycle (first paint, coalescer paints).
+- Instrumented run: same pinned protocol (`taskset -c 20`, 3+27 process rounds
+  x 20+200 key-clear pairs). **Perturbation gate PASS**: pooled median 301.70
+  us instrumented vs 298.30 us uninstrumented re-run on the same tree
+  (+1.14% < 5%); round-median rs 5.60% vs 7.04% (no noise regression); pooled
+  p99 594 us < 5 ms.
+- Correlation integrity: 30 children (3 process warmups + 27 measured
+  rounds); one startup artifact cycle identified per child; 25/27 measured
+  children fully correlated (two children lost 1-2 marks mid-run — 3 of
+  11,880 cycles, 0.025% — and are excluded from per-key decomposition).
+  5,000 correlated measured keys; 4,990 (99.80%) have all components
+  nonnegative; 10 (0.20%) violated nonnegativity by up to 1.46 ms and are
+  excluded as correlation failures (never clamped).
+- Raw-vs-EventStream differential: two temporary `pi_tui_pty_fixture` modes —
+  raw (same terminal mode, read one byte directly, emit one fixed non-empty
+  balanced synchronized transaction) and input (the identical byte through
+  production `EventStream -> map_event -> mpsc -> recv`). 27 interleaved
+  paired rounds, arm order alternated per pair, 20 discarded + 200 measured
+  samples per round-child, same `PtyProcess` transport, `taskset -c 20`.
+  raw **81.2 us** median, rs 11.32% PASS; input **100.3 us**, rs 7.15% PASS;
+  paired delta median **18.3 us** (input/raw 1.23x, 1/27 sign flips —
+  stable, above the 1.05x resolution gate).
+
+### E1 — reconciled decomposition (5,000 correlated keys; 4,990 clean)
+
+| Stage | Median | p5–p95 | Share of T | Round-median rs | Ownership |
+|---|---|---|---|---|---|
+| T (inclusive) | 301.7 us | 274.5–359.1 | 100% | 4.22% | — |
+| Q (channel/scheduler handoff) | 10.6 us | 6.9–31.4 | 3.50% | 5.57% | keypress |
+| D (dispatch/state mutation) | 91.3 us | 81.6–113.6 | 30.27% | 3.94% | keypress |
+| R (build_root/measure/render) | 69.0 us | 60.8–88.0 | 22.88% | 4.23% | render-churn-recomposition (booked once) |
+| P (diff/encode/sync/write/flush) | 31.0 us | 28.1–38.7 | 10.29% | 5.35% | terminal-paint (booked once) |
+| X (PTY ingress + script(1)/kernel/observer) | 96.6 us | 69.2–131.0 | 31.99% | 2.95% | boundary/platform |
+| **T_owned = T − R − P = Q + D + X** | **201.2 us** | 178.3–244.0 | 66.70% | 3.79% | keypress |
+
+Reconciliation: per-key identity `T − (Q+D+R+P+X) = 0` holds by construction;
+`median(T) − Σ median(component) = +3.2 us` (medians are not additive,
+disclosed); `median(Q)+median(D)+median(X) = 198.4 us` against
+`median(T_owned) = 201.2 us`. No component clamped; negatives excluded, not
+forced positive.
+
+### E2 — candidate disposition
+
+The unit terminates at sequence 6 (multiple <= 2.0); the conditional candidate
+ladder of sequence 7 is not reached and no production candidate was executed —
+nothing to revert and no rejection record required. The pre-declared zeroing
+ceiling per stage (share of T; inclusive speedup if zeroed): Q 3.50% -> 1.036x
+(rejected by construction, < 1.05x; Q also sits inside the 10–20 us scheduler
+floor, so the input-handoff candidate is infeasible); D 30.27% -> 1.434x;
+R 22.88% -> 1.297x (render-churn owner); P 10.29% -> 1.115x (terminal-paint
+owner); X 31.99% -> 1.470x (not product-addressable). D's ceiling is recorded
+as the residual inside the owned envelope, bounded by the AT-FLOOR verdict
+below.
+
+### E3 — floor revalidation
+
+Owned floor = same-harness raw PTY/observer arm 81.2 us + production
+EventStream decode/wakeup/channel 18.3 us (paired fixture differential) +
+measured minimal dispatch term:
+
+| Dispatch term | Owned floor | multiple = median(T_owned)/floor |
+|---|---|---|
+| D median 91.3 us | 190.8 us | **1.055x** |
+| D p5 81.6 us | 181.1 us | **1.111x** |
+| D min 75.2 us | 174.7 us | **1.152x** |
+
+Full semantic floor (adds the already-terminal same-key R + P once):
+290.8 us; inclusive multiple 301.7/290.8 = 1.04x. The historical 13–25 us
+class estimate is superseded: it priced a pipe write and two context switches
+with no observation transport; the same-harness raw arm alone measures
+81.2 us.
+
+### Verdict: AT-FLOOR (terminal)
+
+Trusted `median(T_owned) / revalidated owned floor = 1.05–1.15x <= 2.0` under
+every dispatch-floor interpretation. `keypress-dispatch` is terminal in
+PERF-T11; issue #97 remains OPEN for the remaining units.
+
+**E4 — dominant residual and reopen conditions.** Inside the owned lane the
+largest single term is X (96.6 us: PTY ingress, `script(1)` egress, kernel
+scheduling, Bun observer) — boundary/platform, not unit-addressable; Q is at
+the scheduler floor. The owned envelope Q+D (101.9 us) is bounded below by the
+scheduler hop plus the measured production dispatch path. Reopen only on:
+(a) an observation-transport boundary consent (replacing the `script(1)`/PTY
+observation stack — barred as a new lane by this campaign's rules);
+(b) fresh trusted evidence that D's interior contains a materially cheaper
+semantically-equivalent path (would need a new attribution pass and a
+>= 1.05x paired win to matter, and cannot move the unit below its floor);
+(c) render-churn/terminal-paint re-openings would move R/P terms that this
+unit no longer owns.
+
+Not touched: production Rust (`crates/**`), `Cargo.lock`,
+`rust-toolchain.toml`, `.github/workflows/`, `scripts/release/`, other units'
+floor ledgers. All temporary stage marks, the stage-probe module, the env
+gate, and both fixture modes are reverted (`git restore`; working tree ==
+`911a85d`).
