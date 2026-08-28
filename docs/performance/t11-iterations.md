@@ -1960,3 +1960,145 @@ campaign: issue #97 remains OPEN for the remaining units. Next unit:
 `scripts/verification/compat-matrix.json`, `docs/supported-platforms.md`,
 DEPS ledger docs, floor ledgers, `Cargo.lock`, `rust-toolchain.toml`,
 `scripts/session-timing.ts`, `session-timing.rs`.
+
+---
+
+## Iteration 21 — `session-append` (maintained assistant-present state — AT-FLOOR at 1.41x)
+
+**Commit**: perf commit on `feat/ver-align-canonical-pin` (linear on `f4ae3ae`).
+Docs record in the same commit.
+
+### Blind derivation (from the ledger's Contract + Floor + decomposition)
+
+The ledger's cost decomposition names the `has_assistant` scan as 1.28 us/entry
+(9.9% of unit Ir, growing quadratically with entry count). The scan is
+`self.file_entries.iter().filter_map(FileEntry::entry).any(SessionEntry::is_assistant_message)`
+in `persist_entry_at`, called on every append. For 5000 entries the average
+scan length is 2500, and each iteration does an enum match + string comparison
+(`role() == "assistant"`), making the real per-append cost far higher than the
+profiler's flat attribution suggests.
+
+**Design**: replace the O(entries) per-append scan with a maintained `has_assistant: bool`
+field on `SessionManager`. The field is:
+
+- Initialized `false` in `construct_empty` and `new_session` (header-only state).
+- Recomputed in `build_index` (folded into the existing index pass — no second scan).
+- Updated in O(1) after successful persist in `append_entry`:
+  `has_assistant || entry_at_idx.is_assistant_message()`.
+- Read in `persist_entry_at` as the effective post-append state:
+  `self.has_assistant || file_entries[idx].is_assistant_message()` — this O(1)
+  calculation corrects the plan's ordering bug (using the stale pre-append cached
+  boolean would miss the first-assistant flush trigger).
+- Read in `create_branched_session` (after `build_index` recomputes it from the
+  branched entry set).
+
+**Plan ordering-bug correction**: the plan proposed replacing the scan with
+`self.has_assistant` directly. But at the time `persist_entry_at` runs, the
+entry has already been pushed to `file_entries` and `has_assistant` has not yet
+been updated — so the first assistant message would see `has_assistant == false`
+and skip the exclusive-create flush, breaking `deferred_write_until_first_assistant`.
+The fix: compute `has_assistant_after_append = self.has_assistant ||
+entry_at_idx.is_assistant_message()` in O(1) and use that for the persist decision.
+The cached field is assigned only after `persist_entry_at` returns Ok, so failed
+appends leave it untouched and retries correctly flush.
+
+### Branch classification
+
+| Replaced branch | Classification | Reason |
+|---|---|---|
+| `persist_entry_at` O(n) scan → O(1) cached read | Residue | The scan recomputes a monotonically non-decreasing boolean on every append; the result is cacheable in O(1) |
+| `create_branched_session` O(n) scan → cached read | Residue | `build_index` already iterates all entries; folding the assistant check into that pass eliminates the second scan |
+| `build_index` adds `has_assistant` tracking | Essential | Index rebuild must reflect loaded entry state; folded into existing loop (zero additional iterations) |
+
+### Boundary answers
+
+- **JSONL v3 wire format**: untouched. `has_assistant` is interior state; the
+  persist decision logic (deferred write, exclusive-create flush, append-line)
+  is unchanged — only the *source* of the `has_assistant` boolean changes from
+  O(n) scan to O(1) cache.
+- **First-assistant deferred flush**: preserved. The effective post-append
+  calculation ensures the first assistant triggers the exclusive-create flush
+  exactly as before.
+- **Failed-append rollback**: preserved. `has_assistant` is updated only after
+  `persist_entry_at` succeeds; rollback pops the entry and restores
+  leaf/by_id/flushed without touching `has_assistant`.
+- **Retry after failure**: preserved. A failed first-assistant append leaves
+  `has_assistant == false`; the retry correctly computes the effective state
+  and flushes.
+- **Migration/load**: preserved. `build_index` recomputes `has_assistant` from
+  loaded/migrated entries in the existing index pass.
+- **Branch**: preserved. `build_index` on the branched entry set recomputes
+  `has_assistant`; the branch persist decision uses the cached value.
+- **New session / empty file**: preserved. Both set `has_assistant = false`.
+
+### Cutover surface
+
+1 file: `crates/pi/src/core/sessions/mod.rs`. No new dependencies, no serializer
+change, no held-open fd, no Cargo.lock change.
+
+### Measurements
+
+Release, `taskset -c 20-40`, 9 interleaved baseline/design pairs, per-run
+20-sample medians; `session-timing --mode append --entries 5000`.
+Baseline = clean `f4ae3ae` binary; design = cutover binary.
+
+| Pair | Baseline (us/entry) | Design (us/entry) | Speedup |
+|---|---|---|---|
+| 1 | 15.260 | 5.524 | 2.76x |
+| 2 | 16.120 | 5.196 | 3.10x |
+| 3 | 15.748 | 5.463 | 2.88x |
+| 4 | 16.069 | 5.610 | 2.86x |
+| 5 | 15.042 | 5.338 | 2.82x |
+| 6 | 15.554 | 5.275 | 2.95x |
+| 7 | 15.180 | 5.082 | 2.99x |
+| 8 | 15.432 | 5.183 | 2.98x |
+| 9 | 15.006 | 5.130 | 2.93x |
+
+**Overall median (pair 5 sorted)**: baseline 15.432 us, design 5.275 us,
+**speedup 2.93x**. All relative spreads < 20% (noise gate passed).
+
+SHA-256 prefixes: 180 unique per arm (20 samples x 9 pairs), all 16-char
+hex valid — each sample creates a fresh session with random IDs, so prefixes
+differ across runs by design. Wire-byte stability validated by the
+`append_prefix_stability` test (unchanged, passes).
+
+### Recomputed multiple
+
+Design 5.275 us/entry vs ledger floor 3.735 us/entry = **1.41x — AT-FLOOR**
+(<=2x). The O(n^2) scan was the dominant overhead: at 5000 entries the average
+scan cost was ~10 us/append (2500 iterations x ~4 ns/iter for enum match +
+string compare), far exceeding the ledger's flat 1.28 us profiler attribution.
+Removing it drops per-entry cost from ~15.4 us to ~5.3 us, within 1.41x of the
+theoretical floor.
+
+Residual composition (5.275 us vs 3.735 us floor = 1.54 us gap):
+- openat+close per append: ~2.06 us (held-open fd design rejected by advocate:
+  external rename/delete, partial-write rollback, lifecycle transition hazards)
+- entry serialization Value pipeline: the remaining gap is the serialization
+  + write + bookkeeping floor terms
+- The only remaining halving lever (held-open fd) was rejected by the design
+  advocate for correctness reasons (partial-write atomicity, external rename
+  safety, lifecycle transition exhaustiveness)
+
+### Verification
+
+- `cargo check -p pi`: green (warnings pre-existing, none in touched file)
+- `core::sessions` tests: 64/64 pass (deferred_write_until_first_assistant,
+  failed_append_does_not_advance_tree_and_can_retry,
+  create_branched_session_defers_without_assistant,
+  create_branched_session_writes_with_assistant, append_prefix_stability,
+  empty_file_gets_header, generated_cross_version_session_interoperability,
+  and all others)
+- `pi check` on touched file: compilation succeeded; runtime check blocked by
+  worktree environment (auth/session storage permission denied — not a code issue)
+
+### Review
+
+Fresh adversarial review: **CLEAN**.
+
+### Not touched
+
+Out of scope, file-disjoint: `.github/workflows/`, `scripts/release/`,
+`scripts/verification/compat-matrix.json`, `docs/supported-platforms.md`,
+DEPS ledger docs, floor ledgers, `Cargo.lock`, `rust-toolchain.toml`,
+bench scripts (`session-timing.rs`).
