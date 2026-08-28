@@ -47,6 +47,65 @@ use crate::protocol::{
     TerminalInputResult, ThemeUpdate, ToolUpdate, encode_frame, from_payload, to_payload,
 };
 
+/// Test-only timing instrumentation for the extension RPC dispatch bench
+/// lane. Compiled only when the `bench-seam` Cargo feature is enabled;
+/// zero overhead in production builds. Stores per-frame-id decode-start
+/// and encode-complete timestamps in a global map, drained by the
+/// ignored release test after each measurement round.
+#[cfg(feature = "bench-seam")]
+pub mod bench_seam {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+    use std::time::Instant;
+
+    /// Per-request timing pair: when the decoded frame entered dispatch,
+    /// and when the terminal response frame was about to be sent.
+    static TIMESTAMPS: LazyLock<Mutex<HashMap<u64, (Instant, Option<Instant>)>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// Record the decode-start timestamp for `id` (frame just decoded,
+    /// about to enter `dispatch_ready`).
+    pub fn record_decode(id: u64) {
+        let mut map = TIMESTAMPS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.insert(id, (Instant::now(), None));
+    }
+
+    /// Record the encode-complete timestamp for `id` (terminal frame
+    /// constructed, about to be sent via `out_tx`).
+    pub fn record_encode(id: u64) {
+        let mut map = TIMESTAMPS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = map.get_mut(&id) {
+            entry.1 = Some(Instant::now());
+        }
+    }
+
+    /// Drain all completed timing entries. Returns `(id, decode_start,
+    /// encode_complete)` for entries where both timestamps were captured.
+    /// Incomplete entries (decode without matching encode) are dropped.
+    pub fn take_completed() -> Vec<(u64, Instant, Instant)> {
+        let mut map = TIMESTAMPS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.drain()
+            .filter_map(|(id, (decode_start, encode_complete))| {
+                encode_complete.map(|ec| (id, decode_start, ec))
+            })
+            .collect()
+    }
+
+    /// Clear all stored timestamps.
+    pub fn clear() {
+        let mut map = TIMESTAMPS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.clear();
+    }
+}
+
 /// Wire method for the registry snapshot request.
 pub const EXTENSIONS_LOAD_METHOD: &str = "extensions.load";
 /// Wire method for slash-command execution.
@@ -1356,6 +1415,8 @@ where
                     state = ServerState::Ready;
                 }
                 ServerState::Ready => {
+                    #[cfg(feature = "bench-seam")]
+                    bench_seam::record_decode(frame.id);
                     dispatch_ready(frame, runtime, rejection_tx, tasks)?;
                 }
             }
@@ -1744,6 +1805,8 @@ async fn handle_request_dispatch<E: NativeExtension>(
             }
         }
     };
+    #[cfg(feature = "bench-seam")]
+    bench_seam::record_encode(id);
     let _ = runtime.out_tx.send(terminal.into()).await;
 }
 

@@ -476,6 +476,32 @@ async fn collect_ui_slot_keys(peer: &mut RawPeer, deadline: Duration) -> Vec<Str
 }
 
 // ---------------------------------------------------------------------------
+// Shared corpus helpers (single source of truth for the 300-request stream)
+// ---------------------------------------------------------------------------
+
+/// Shared setup for the 300-request terminal-input corpus: hello handshake,
+/// `extensions.load` (20-active), `session_start`, and uiSlot drain.
+/// Excluded from all timing regions.
+async fn corpus_setup(peer: &mut RawPeer) -> R {
+    peer.hello().await?;
+    let _ack = peer.recv().await?;
+    let _load_res = peer.load(2).await?;
+    let _ss_res = peer.session_start(3).await?;
+    let _ = collect_ui_slot_keys(peer, Duration::from_millis(500)).await;
+    Ok(())
+}
+
+/// Deterministic terminal-input data for request `i` in the 300-request
+/// corpus: `i%3` cycles `x` (consume), `a` (rewrite→A), `b` (rewrite→B).
+fn corpus_data(i: u64) -> &'static str {
+    match i % 3 {
+        0 => "x",
+        1 => "a",
+        _ => "b",
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests: frame corpus replay through production serve_io
 // ---------------------------------------------------------------------------
 
@@ -628,20 +654,12 @@ async fn fast_terminal_input_stream_300_requests_id_correlation() -> R {
     let (ext, handles) = ScalingAdapter::new(LoadProfile::Active20, TerminalInputMode::Fast);
     let (mut peer, server) = spawn_server(ext, ServerConfig::default());
 
-    peer.hello().await?;
-    let _ack = peer.recv().await?;
-    let _load_res = peer.load(2).await?;
-    let _ss_res = peer.session_start(3).await?;
-    let _ = collect_ui_slot_keys(&mut peer, Duration::from_millis(500)).await;
+    corpus_setup(&mut peer).await?;
 
     let start_id: u64 = 300;
     for i in 0..REQUESTS {
         let id = start_id + i;
-        let data = match i % 3 {
-            0 => "x",
-            1 => "a",
-            _ => "b",
-        };
+        let data = corpus_data(i);
         let response = peer.terminal_input(id, data).await?;
 
         assert_eq!(response.id, id, "request {i}: id must correlate");
@@ -1046,6 +1064,249 @@ async fn no_benchmark_specific_code_audit() -> R {
     // 3. No custom method registry: the production server routes methods
     //    internally. This test sends frames by method string and relies
     //    on the production dispatch — it does not construct a method table.
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// PERF-T11 iteration 22: timed serve_io extension RPC dispatch bench lane
+// ---------------------------------------------------------------------------
+
+/// Run one measurement round: fresh current-thread runtime, corpus setup
+/// outside timing, 300 sequential terminalInput requests inside timing.
+/// Returns `(rtt_ns, server_samples)` where `rtt_ns` is the inclusive
+/// batch round-trip time and `server_samples` is per-request attributed
+/// server cost `S_i = encode_complete - decode_start` in nanoseconds.
+#[cfg(feature = "bench-seam")]
+fn run_timed_round() -> (u64, Vec<u64>) {
+    use pi_ext::server::bench_seam;
+
+    bench_seam::clear();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build current-thread runtime");
+
+    let (rtt_ns, server_samples) = rt.block_on(async {
+        let (ext, handles) =
+            ScalingAdapter::new(LoadProfile::Active20, TerminalInputMode::Fast);
+        let (mut peer, server) = spawn_server(ext, ServerConfig::default());
+
+        // Setup outside timing
+        corpus_setup(&mut peer).await.expect("corpus setup");
+
+        const REQUESTS: u64 = 300;
+        const START_ID: u64 = 300;
+
+        // Timed region: 300 sequential terminalInput round-trips
+        let rtt_start = Instant::now();
+        for i in 0..REQUESTS {
+            let id = START_ID + i;
+            let data = corpus_data(i);
+            let response = peer.terminal_input(id, data).await.expect("terminal_input");
+            assert_eq!(response.id, id, "request {i}: id must correlate");
+            assert_eq!(response.kind, FrameKind::Res);
+        }
+        let rtt_end = Instant::now();
+        let rtt_ns = rtt_end.duration_since(rtt_start).as_nanos() as u64;
+
+        // Collect attributed server timestamps
+        let completed = bench_seam::take_completed();
+
+        // Verify adapter received all 300 inputs
+        let inputs = handles
+            .terminal_inputs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            inputs.len(),
+            REQUESTS as usize,
+            "adapter must receive all 300 terminal inputs"
+        );
+
+        drop(peer);
+        let result = tokio::time::timeout(TIMEOUT, server)
+            .await
+            .expect("server join timeout")
+            .expect("server task panicked")
+            .expect("serve_io error");
+        assert_eq!(result, (), "clean EOF expected");
+
+        // Compute per-request server cost S_i
+        let server_samples: Vec<u64> = completed
+            .into_iter()
+            .filter(|(id, _, _)| *id >= START_ID && *id < START_ID + REQUESTS)
+            .map(|(_, decode_start, encode_complete)| {
+                encode_complete.duration_since(decode_start).as_nanos() as u64
+            })
+            .collect();
+
+        assert_eq!(
+            server_samples.len(),
+            REQUESTS as usize,
+            "must capture all 300 server timing pairs, got {}",
+            server_samples.len()
+        );
+
+        (rtt_ns, server_samples)
+    });
+
+    drop(rt);
+    (rtt_ns, server_samples)
+}
+
+/// Population standard deviation.
+#[cfg(feature = "bench-seam")]
+fn population_stddev(values: &[f64], mean: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let variance: f64 =
+        values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64;
+    variance.sqrt()
+}
+
+/// Median of a sorted slice.
+#[cfg(feature = "bench-seam")]
+fn median_sorted(sorted: &[f64]) -> f64 {
+    let n = sorted.len();
+    if n == 0 {
+        return 0.0;
+    }
+    if n % 2 == 1 {
+        sorted[n / 2]
+    } else {
+        (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+    }
+}
+
+/// PERF-T11 iteration 22: timed serve_io extension RPC dispatch bench lane.
+///
+/// Measures 300 sequential terminalInput round-trips through production
+/// `serve_io` over an in-memory duplex, with 3 warmup + 9 measured rounds.
+/// Reports inclusive RTT and attributed server cost S (decode start to
+/// encode complete), classified against the 750-1000 ns server-only floor.
+///
+/// Run with:
+/// `cargo test -p pi-ext --features bench-seam timed_serve_io_perf_t11_extension_rpc_dispatch --release --ignored --exact --nocapture`
+#[cfg(feature = "bench-seam")]
+#[test]
+#[ignore]
+fn timed_serve_io_perf_t11_extension_rpc_dispatch() -> R {
+    const WARMUP_ROUNDS: usize = 3;
+    let measured_rounds: usize = std::env::var("BENCH_MEASURED_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(9);
+    let total_rounds: usize = WARMUP_ROUNDS + measured_rounds;
+    const REQUESTS: u64 = 300;
+    const NOISE_LIMIT: f64 = 0.20;
+    const FLOOR_MIN_NS: f64 = 750.0;
+    const FLOOR_MAX_NS: f64 = 1000.0;
+    const AT_FLOOR_THRESHOLD: f64 = 2.0 * FLOOR_MIN_NS; // 1500 ns
+    const OPEN_THRESHOLD: f64 = 2.0 * FLOOR_MAX_NS; // 2000 ns
+
+    let mut rtt_samples: Vec<f64> = Vec::with_capacity(measured_rounds);
+    let mut s_median_samples: Vec<f64> = Vec::with_capacity(measured_rounds);
+
+    for round in 0..total_rounds {
+        let (rtt_ns, server_samples) = run_timed_round();
+
+        if round < WARMUP_ROUNDS {
+            eprintln!(
+                "warmup round {}: RTT={} ns, S_median={} ns (n={})",
+                round + 1,
+                rtt_ns,
+                {
+                    let mut sorted: Vec<f64> =
+                        server_samples.iter().map(|&v| v as f64).collect();
+                    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    median_sorted(&sorted) as u64
+                },
+                server_samples.len()
+            );
+            continue;
+        }
+
+        // Per-request server cost for this round
+        let mut s_values: Vec<f64> = server_samples.iter().map(|&v| v as f64).collect();
+        s_values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let s_median = median_sorted(&s_values);
+        let rtt_per_req = rtt_ns as f64 / REQUESTS as f64;
+
+        rtt_samples.push(rtt_per_req);
+        s_median_samples.push(s_median);
+
+        eprintln!(
+            "measured round {}: RTT={:.0} ns/req, S_median={:.0} ns/req (n={})",
+            round + 1 - WARMUP_ROUNDS,
+            rtt_per_req,
+            s_median,
+            server_samples.len()
+        );
+    }
+
+    // Aggregate: median of round medians
+    let mut s_sorted = s_median_samples.clone();
+    s_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let s_aggregate_median = median_sorted(&s_sorted);
+
+    let mut rtt_sorted = rtt_samples.clone();
+    rtt_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let rtt_aggregate_median = median_sorted(&rtt_sorted);
+
+    // Noise gate: population stddev / median on server S_median distribution
+    let s_mean: f64 = s_median_samples.iter().sum::<f64>() / s_median_samples.len() as f64;
+    let s_stddev = population_stddev(&s_median_samples, s_mean);
+    let s_relative_spread = if s_aggregate_median > 0.0 {
+        s_stddev / s_aggregate_median
+    } else {
+        f64::INFINITY
+    };
+
+    eprintln!();
+    eprintln!("extension-rpc-dispatch bench (pinned: 300 x terminalInput round-trips, Active20 + Fast)");
+    eprintln!("protocol: release, median of {} rounds after {} warmups", measured_rounds, WARMUP_ROUNDS);
+    eprintln!("inclusive RTT | {:.0} ns/request", rtt_aggregate_median);
+    eprintln!("attributed server cost | {:.0} ns/request", s_aggregate_median);
+    eprintln!("relative spread (server) | {:.2}%", s_relative_spread * 100.0);
+    eprintln!("ledger floor | 750-1000 ns (server-only)");
+    eprintln!();
+    eprintln!("server S_median samples (ns): {:?}", s_median_samples);
+    eprintln!("RTT samples (ns/req): {:?}", rtt_samples);
+
+    // Noise gate
+    if s_relative_spread > NOISE_LIMIT {
+        eprintln!();
+        eprintln!(
+            "NOISY: relative spread {:.2}% exceeds limit {:.0}%",
+            s_relative_spread * 100.0,
+            NOISE_LIMIT * 100.0
+        );
+        eprintln!("Remediation: 1. pin CPU governor (taskset -c 20-40), 2. isolate process, 3. retry with 27 measured rounds, 4. check box load");
+        // Fail-closed: no classification
+        return Err("NOISY: no classification allowed".into());
+    }
+
+    // Classification
+    eprintln!();
+    if s_aggregate_median <= AT_FLOOR_THRESHOLD {
+        eprintln!(
+            "classification: AT-FLOOR (S={:.0} ns <= {:.0} ns = 2x floor_min)",
+            s_aggregate_median, AT_FLOOR_THRESHOLD
+        );
+    } else if s_aggregate_median > OPEN_THRESHOLD {
+        eprintln!(
+            "classification: OPEN >2x (S={:.0} ns > {:.0} ns = 2x floor_max)",
+            s_aggregate_median, OPEN_THRESHOLD
+        );
+    } else {
+        eprintln!(
+            "classification: BOUNDARY fail-closed ({:.0} ns < S={:.0} ns <= {:.0} ns) — floor refinement needed",
+            AT_FLOOR_THRESHOLD, s_aggregate_median, OPEN_THRESHOLD
+        );
+    }
 
     Ok(())
 }

@@ -8,6 +8,12 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+## Test-only timing seam for the extension RPC dispatch bench lane.
+## Zero overhead in production; enables per-request Instant capture
+## at the decode and encode seams in `serve_io`.
+bench-seam = []
+
 [dependencies]
 anstyle-parse = "=1.0.0"
 crossterm = { version = "=0.29.0", default-features = false, features = ["events"] }
