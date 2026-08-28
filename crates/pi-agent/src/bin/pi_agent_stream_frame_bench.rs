@@ -14,6 +14,16 @@
 //!   + reduce (fold + one `MessageUpdate` per frame).
 //! - `drain` — `ProviderDrain::spawn` over the same rematerialized stream:
 //!   the two channel legs without the reduce leg.
+//! - `source` — stream poll + per-frame rematerialization in the drain
+//!   loop's shape; both channel legs disabled (E1 materialization term).
+//! - `source-watch` — source + lossy watch leg only (mpsc disabled).
+//! - `source-forward` — source + lossless mpsc leg only (watch disabled).
+//!
+//! E1 stage attribution derives each term by stage disabling: watch leg =
+//! `source-watch − source`; mpsc leg = `source-forward − source`; cross-task
+//! interaction = `drain − source-watch − (source-forward − source)`. The
+//! four terms sum to the measured drain median by construction (remainder
+//! form); interaction absorbs task-placement and contention effects.
 //!
 //! `reduce` is disclosed as `funnel - drain` (arithmetic, not separately
 //! timed): `consume_drain_items` is private and the funnel-minus-drain delta
@@ -29,6 +39,10 @@
 //!
 //! Run:
 //!   cargo run -p pi-agent --release --bin `pi_agent_stream_frame_bench`
+//!
+//! `STREAM_BENCH_MEASURED_ROUNDS` raises the measured-round count (default 9)
+//! for the trusted-distribution protocol; per-round samples and rs (sample
+//! stddev / mean) are printed for the noise gate.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -381,6 +395,182 @@ fn bench_drain(script: &Arc<Vec<FrameTemplate>>) -> (u64, u64) {
     )
 }
 
+/// `AssistantMessageEvent` partial accessor, identical to the private
+/// `drain.rs::event_partial` (copied because it is private; the pinned
+/// workload exercises the Start/TextStart/TextDelta/TextEnd/Done subset).
+fn event_partial(event: &AssistantMessageEvent) -> Option<&Arc<AssistantMessage>> {
+    match event {
+        AssistantMessageEvent::Start { partial }
+        | AssistantMessageEvent::TextStart { partial, .. }
+        | AssistantMessageEvent::TextDelta { partial, .. }
+        | AssistantMessageEvent::TextEnd { partial, .. }
+        | AssistantMessageEvent::ThinkingStart { partial, .. }
+        | AssistantMessageEvent::ThinkingDelta { partial, .. }
+        | AssistantMessageEvent::ThinkingEnd { partial, .. }
+        | AssistantMessageEvent::ToolCallStart { partial, .. }
+        | AssistantMessageEvent::ToolCallDelta { partial, .. }
+        | AssistantMessageEvent::ToolCallEnd { partial, .. } => Some(partial),
+        AssistantMessageEvent::Done { .. } | AssistantMessageEvent::Error { .. } => None,
+    }
+}
+
+/// One measured source round: the drain loop's stream poll + per-frame
+/// rematerialization (`Arc::new(inner.clone())`) with both channel legs
+/// disabled. Returns `(elapsed_ns, events_pulled)`.
+fn bench_source(script: &Arc<Vec<FrameTemplate>>) -> (u64, u64) {
+    let rt = Builder::new_current_thread().enable_all().build().unwrap_or_else(|error| {
+        panic!("bench runtime: {error}")
+    });
+    let start = Instant::now();
+    let count = rt.block_on(async {
+        let cancel = CancellationToken::new();
+        let mut stream = rematerialize(Arc::clone(script));
+        let mut count = 0u64;
+        loop {
+            let next = tokio::select! {
+                () = cancel.cancelled() => break,
+                item = stream.next() => item,
+            };
+            let Some(Ok(event)) = next else { break };
+            std::hint::black_box(&event);
+            count += 1;
+        }
+        count
+    });
+    let elapsed = start.elapsed();
+    (u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX), count)
+}
+
+/// One measured source+watch round: the source leg plus the lossy watch leg
+/// (refcount-only publish identical to `drain.rs::publish_partial`, watcher
+/// task identical to `bench_drain`'s) with the mpsc forward disabled.
+/// Returns `(elapsed_ns, events_pulled)`.
+fn bench_source_watch(script: &Arc<Vec<FrameTemplate>>) -> (u64, u64) {
+    let rt = Builder::new_current_thread().enable_all().build().unwrap_or_else(|error| {
+        panic!("bench runtime: {error}")
+    });
+    let start = Instant::now();
+    let count = rt.block_on(async {
+        let (partial_tx, mut partial_rx) = watch::channel(None);
+        let watcher = tokio::spawn(async move {
+            loop {
+                if partial_rx.changed().await.is_err() {
+                    break;
+                }
+                std::hint::black_box(partial_rx.borrow_and_update());
+            }
+        });
+        let cancel = CancellationToken::new();
+        let mut stream = rematerialize(Arc::clone(script));
+        let mut count = 0u64;
+        loop {
+            let next = tokio::select! {
+                () = cancel.cancelled() => break,
+                item = stream.next() => item,
+            };
+            let Some(Ok(event)) = next else { break };
+            if let Some(partial) = event_partial(&event) {
+                let _ = partial_tx.send(Some(Arc::clone(partial)));
+            }
+            std::hint::black_box(&event);
+            count += 1;
+        }
+        watcher.abort();
+        count
+    });
+    let elapsed = start.elapsed();
+    (u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX), count)
+}
+
+/// One measured source+forward round: the source leg inside a spawned task
+/// (as `ProviderDrain::spawn` positions it) plus the lossless mpsc leg
+/// (boxed `DrainItem` forward under the `send_item`-shaped cancellation
+/// select, receiver loop identical to `bench_drain`'s) with the watch leg
+/// disabled. Returns `(elapsed_ns, delivered_items)`.
+fn bench_source_forward(script: &Arc<Vec<FrameTemplate>>) -> (u64, u64) {
+    let rt = Builder::new_current_thread().enable_all().build().unwrap_or_else(|error| {
+        panic!("bench runtime: {error}")
+    });
+    let start = Instant::now();
+    let delivered = rt.block_on(async {
+        let (event_tx, mut event_rx) =
+            mpsc::channel::<pi_agent::DrainItem>(pi_agent::DRAIN_EVENT_CAPACITY);
+        let cancel = CancellationToken::new();
+        let stream = rematerialize(Arc::clone(script));
+        let forwarder = tokio::spawn(async move {
+            let mut stream = stream;
+            loop {
+                let next = tokio::select! {
+                    () = cancel.cancelled() => return,
+                    item = stream.next() => item,
+                };
+                let Some(Ok(event)) = next else { return; };
+                tokio::select! {
+                    () = cancel.cancelled() => return,
+                    result = event_tx
+                        .send(pi_agent::DrainItem::Event(Box::new(event))) =>
+                    {
+                        if result.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        let mut count = 0u64;
+        while let Some(item) = event_rx.recv().await {
+            std::hint::black_box(&item);
+            count += 1;
+        }
+        let _ = forwarder.await;
+        count
+    });
+    let elapsed = start.elapsed();
+    (
+        u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX),
+        delivered,
+    )
+}
+
+/// Measured-round count: `STREAM_BENCH_MEASURED_ROUNDS` override (>= 9),
+/// else the 9-round default.
+fn measured_rounds() -> usize {
+    std::env::var("STREAM_BENCH_MEASURED_ROUNDS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&rounds| rounds >= MEASURED_ROUNDS)
+        .unwrap_or(MEASURED_ROUNDS)
+}
+
+/// Warmup-round count: `STREAM_BENCH_WARMUP_ROUNDS` override, else 3.
+fn warmup_rounds() -> usize {
+    std::env::var("STREAM_BENCH_WARMUP_ROUNDS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(WARMUP_ROUNDS)
+}
+
+/// rs: sample standard deviation / mean, in percent (noise-gate input).
+fn rs_pct(values: &[u64]) -> f64 {
+    let n = values.len();
+    if n < 2 {
+        return 0.0;
+    }
+    let mean = values.iter().map(|&v| v as f64).sum::<f64>() / n as f64;
+    if mean == 0.0 {
+        return 0.0;
+    }
+    let variance = values
+        .iter()
+        .map(|&v| {
+            let delta = v as f64 - mean;
+            delta * delta
+        })
+        .sum::<f64>()
+        / (n - 1) as f64;
+    (variance.sqrt() / mean) * 100.0
+}
+
 fn median(values: &mut [u64]) -> u64 {
     values.sort_unstable();
     values[values.len() / 2]
@@ -402,12 +592,18 @@ fn main() {
             }
             _ => 0,
         });
+    let rounds = measured_rounds();
+    let warmups = warmup_rounds();
 
-    let mut funnel_ns = Vec::with_capacity(MEASURED_ROUNDS);
-    let mut drain_ns = Vec::with_capacity(MEASURED_ROUNDS);
+    let mut funnel_ns = Vec::with_capacity(rounds);
+    let mut drain_ns = Vec::with_capacity(rounds);
+    let mut source_ns = Vec::with_capacity(rounds);
+    let mut source_watch_ns = Vec::with_capacity(rounds);
+    let mut source_forward_ns = Vec::with_capacity(rounds);
 
-    for round in 0..WARMUP_ROUNDS + MEASURED_ROUNDS {
-        let measured = round >= WARMUP_ROUNDS;
+    for round in 0..warmups + rounds {
+        let measured = round >= warmups;
+
         let (ns, updates) = bench_funnel(&script);
         assert_eq!(
             updates,
@@ -427,23 +623,85 @@ fn main() {
         if measured {
             drain_ns.push(ns / FRAMES as u64);
         }
+
+        let (ns, events) = bench_source(&script);
+        assert_eq!(
+            events,
+            (FRAMES + 4) as u64,
+            "source must pull every scripted event"
+        );
+        if measured {
+            source_ns.push(ns / FRAMES as u64);
+        }
+
+        let (ns, events) = bench_source_watch(&script);
+        assert_eq!(
+            events,
+            (FRAMES + 4) as u64,
+            "source-watch must pull every scripted event"
+        );
+        if measured {
+            source_watch_ns.push(ns / FRAMES as u64);
+        }
+
+        let (ns, items) = bench_source_forward(&script);
+        assert_eq!(
+            items,
+            (FRAMES + 4) as u64,
+            "source-forward must deliver every scripted event"
+        );
+        if measured {
+            source_forward_ns.push(ns / FRAMES as u64);
+        }
     }
+
+    let funnel_rs = rs_pct(&funnel_ns);
+    let drain_rs = rs_pct(&drain_ns);
+    let source_rs = rs_pct(&source_ns);
+    let source_watch_rs = rs_pct(&source_watch_ns);
+    let source_forward_rs = rs_pct(&source_forward_ns);
+    let drain_samples: Vec<u64> = drain_ns.clone();
+    let source_samples: Vec<u64> = source_ns.clone();
+    let source_watch_samples: Vec<u64> = source_watch_ns.clone();
+    let source_forward_samples: Vec<u64> = source_forward_ns.clone();
 
     let funnel_ns = median(&mut funnel_ns);
     let drain_ns = median(&mut drain_ns);
+    let source_ns = median(&mut source_ns);
+    let source_watch_ns = median(&mut source_watch_ns);
+    let source_forward_ns = median(&mut source_forward_ns);
     let reduce_ns = funnel_ns.saturating_sub(drain_ns);
+    let watch_leg = source_watch_ns as i64 - source_ns as i64;
+    let forward_leg = source_forward_ns as i64 - source_ns as i64;
+    let interaction = drain_ns as i64 - source_watch_ns as i64 - forward_leg;
+    let attributed_sum = source_ns as i64 + watch_leg + forward_leg + interaction;
 
     println!(
         "stream-frame-pipeline bench (pinned: {FRAMES} x verification-chunk frames, final text {final_len} B)"
     );
     println!(
-        "protocol: release, medians of {MEASURED_ROUNDS} interleaved rounds after {WARMUP_ROUNDS} warmups"
+        "protocol: release, medians of {rounds} interleaved rounds after {warmups} warmups"
     );
     println!();
-    println!("scenario | ns/frame");
-    println!("funnel (decode+forward+reduce) | {funnel_ns}");
-    println!("drain (decode+forward only)    | {drain_ns}");
-    println!("reduce (funnel - drain)        | {reduce_ns}");
+    println!("scenario | median ns/frame | rs");
+    println!("funnel (decode+forward+reduce)   | {funnel_ns} | {funnel_rs:.2}%");
+    println!("drain (decode+forward only)      | {drain_ns} | {drain_rs:.2}%");
+    println!("source (materialization+poll)    | {source_ns} | {source_rs:.2}%");
+    println!("source-watch (source+lossy leg)  | {source_watch_ns} | {source_watch_rs:.2}%");
+    println!("source-forward (source+lossless) | {source_forward_ns} | {source_forward_rs:.2}%");
+    println!("reduce (funnel - drain)          | {reduce_ns}");
+    println!();
+    println!("E1 stage attribution (stage disabling; sums to the drain median by construction):");
+    println!("source materialization+poll      = {source_ns} ns/frame");
+    println!("watch leg (refcount publish)     = {watch_leg} ns/frame  = source-watch - source");
+    println!("mpsc leg (boxed fwd + handoff)   = {forward_leg} ns/frame  = source-forward - source");
+    println!("cross-task interaction           = {interaction} ns/frame  = drain - source-watch - (source-forward - source)");
+    println!("attributed sum                   = {attributed_sum} ns/frame (drain median {drain_ns})");
+    println!();
+    println!("drain samples (ns/frame): {drain_samples:?}");
+    println!("source samples (ns/frame): {source_samples:?}");
+    println!("source-watch samples (ns/frame): {source_watch_samples:?}");
+    println!("source-forward samples (ns/frame): {source_forward_samples:?}");
     println!();
     println!("ledger floor: decode/forward ~200 ns + reduce ~150 ns (per frame)");
 }
