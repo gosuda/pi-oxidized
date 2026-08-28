@@ -289,6 +289,36 @@ describe("runMatrix", () => {
 		expect(result.rowResults[0]?.error).toMatch(/launch\/read error/);
 		expect(result.summary.requiredFailed).toEqual(["r1"]);
 	});
+
+	test("fails a required row with a named prerequisite error when requires is missing", async () => {
+		const matrix: Matrix = {
+			version: "0.2.0",
+			rows: [
+				{
+					id: "r1",
+					surface: "a",
+					tier: "unit",
+					required: true,
+					requires: ["/nonexistent-musl-prerequisite-path"],
+					commands: [validCommand()],
+					evidence: "e",
+				},
+			],
+		};
+		const result = await runMatrix({
+			matrix,
+			matrixPath: "scripts/verification/compat-matrix.json",
+			repoRoot,
+			request: {},
+			dryRun: false,
+		});
+		expect(result.rowResults[0]?.status).toBe("failed");
+		expect(result.rowResults[0]?.error).toBe(
+			"missing prerequisite: /nonexistent-musl-prerequisite-path not found under " + repoRoot,
+		);
+		expect(result.summary.requiredFailed).toEqual(["r1"]);
+		expect(result.commandResults).toHaveLength(0);
+	});
 });
 
 describe("runCommand", () => {

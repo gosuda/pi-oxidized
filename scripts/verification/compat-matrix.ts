@@ -639,6 +639,12 @@ async function main(): Promise<void> {
 	writeFileSync(outPath, JSON.stringify(result, null, "\t"), "utf8");
 
 	if (result.summary.requiredFailed.length > 0) {
+		for (const rowId of result.summary.requiredFailed) {
+			const failed = result.rowResults.find((row) => row.rowId === rowId);
+			if (failed?.error !== undefined) {
+				console.error(`[${rowId}] ${failed.error}`);
+			}
+		}
 		console.error(
 			`Compatibility matrix failed required rows: ${result.summary.requiredFailed.join(", ")}`,
 		);
