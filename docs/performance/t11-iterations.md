@@ -1570,7 +1570,7 @@ the ledger's 243.61 ms R2 baseline predates the probe-wait fixes).
 
 ## Iteration 18 — `first-frame-init` (fresh stage attribution — CONSTRAINED-ABOVE-FLOOR)
 
-Date 2026-08-28. Base `10e719d` (iteration 17).
+Date 2026-08-28. Base `13a458c` (iteration 17).
 
 **Method**: fresh post-iteration-16 stage attribution using temporary
 env-gated monotonic markers (`PI_TIMING_PROBE=1`), all timestamps collected
