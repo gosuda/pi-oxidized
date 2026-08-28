@@ -1747,3 +1747,96 @@ shipped change is this docs record.
 `scripts/release/`, `scripts/verification/compat-matrix.json`,
 `docs/supported-platforms.md`, DEPS ledger docs, floor ledgers,
 `Cargo.lock`, `rust-toolchain.toml`, `scripts/first-frame-timing.py`.
+
+## Iteration 19 — `tool-dispatch-slice` (ToolCall move-only — REJECTED)
+
+Date 2026-08-28. Base `a30d013` (canonical origin/feat/ver-align-canonical-pin).
+
+**Candidate**: move `ToolCall` by value through the sequential and truncated
+dispatch paths instead of cloning at `PreparedToolCall` construction (line 660)
+and `FinalizedOutcome` construction (line 157/224). `prepare_tool_call` takes
+`ToolCall` by value and moves it into `PreparedToolCall` or `ImmediateOutcome`;
+`execute_prepared_tool_call` consumes `PreparedToolCall`, clones `tool_call`
+only for update emission, and moves `tool_call`/`args` into `ExecutedOutcome`;
+`finalize_executed_tool_call` receives `ExecutedOutcome` (with `tool_call` and
+`args`) instead of `PreparedToolCall`, clones only for `AfterToolCallContext`
+when a hook is present, and moves into `FinalizedOutcome`. The truncated path
+moves each extracted `ToolCall` directly into `FinalizedOutcome`. Parallel path
+clones `tool_call` before calling `prepare_tool_call` (same clone count as
+before) and destructures `prepared` to move `tool_call`/`args` into
+`ExecutedOutcome` for the new `finalize` signature. No global Arc; no
+parallel-path Arc; no result-finalization/message changes.
+
+**Design provenance**: tightened by `agent://ToolDispatchDesignAdvocate`
+(block-must-fix → revised: pure move pipeline for sequential/truncated, Arc
+restricted to parallel seam, result consumption separated) and
+`agent://PerfT11ToolDispatchPlan2` (code-ready-revised, projected 1.05x,
+eliminates 1 of 3 per-call ToolCall clones on the sequential hot path).
+
+**Clone count attribution** (sequential prepared path, benchmark workload):
+
+| Site | Before | After |
+|---|---|---|
+| `tool_calls_from_message` extraction | 1 clone | 1 clone |
+| `prepare_tool_call` → `PreparedToolCall` | 1 clone (line 660) | 0 (move) |
+| `execute_prepared_tool_call` update emission | 1 clone (line 672) | 1 clone |
+| **Total** | **3** | **2** |
+
+Truncated path: 2 clones → 1 clone (move into `FinalizedOutcome`). Parallel
+path: unchanged clone count (clone before `prepare_tool_call`, clone for slot).
+
+**Implementation** (reverted): `crates/pi-agent/src/schedule.rs` —
+`ImmediateOutcome` gained `tool_call: ToolCall`; `ExecutedOutcome` gained
+`tool_call: ToolCall` and `args: Map<String, Value>`; `prepare_tool_call`
+parameter changed from `&ToolCall` to `ToolCall`; `execute_prepared_tool_call`
+consumed `PreparedToolCall` (worker returned `(AgentToolResult, bool)` tuple,
+outer scope wrapped into `ExecutedOutcome`); `finalize_executed_tool_call`
+received `ExecutedOutcome` instead of `PreparedToolCall`; sequential function
+took `Vec<ToolCall>` by value; truncated function iterated by value. ~80 LOC.
+
+**Measurements** (`pi_tool_dispatch_bench`, release, `taskset -c 20-40`,
+3000 calls, 300 warmup, 1 block, 9 interleaved baseline/design pairs per run,
+order alternating per pair; baseline = `a30d013` clean binary, design =
+cutover binary). Two complete runs:
+
+| Run | Before median (us) | After median (us) | Win |
+|---|---|---|---|
+| 1 | 23.47 | 24.72 | 0.95x |
+| 2 | 24.93 | 24.45 | 1.02x |
+
+Run 1 pair data (before/after us): 23.08/23.42, 23.17/23.90, 23.74/25.05,
+25.33/24.61, 23.47/24.72, 23.29/24.91, 23.47/23.26, 28.49/27.55, 25.04/24.79.
+Run 2 pair data: 25.28/33.08, 26.24/24.07, 24.65/29.05, 27.02/26.74,
+30.93/27.41, 23.95/23.17, 24.10/23.29, 24.93/24.06, 23.51/24.45.
+
+Win gate >=1.05x median: **FAILED** (0.95x / 1.02x on two independent
+complete interleaved runs). The eliminated clone (ToolCall is 3 Strings +
+1 Map — `id`, `name`, `thought_signature`, `arguments`) saves ~0.9 us per
+call per the plan's cost model, but the measurement shows no consistent
+win: the effect is below the run-to-run noise floor. The 24 us/call median
+vs the 4.29 us floor (5.6x) is dominated by session append I/O and event
+emission, not by ToolCall cloning — the clone cost is ~3.7% of the per-call
+budget, below the measurement noise floor on this workload.
+
+**Verdict**: REJECTED. All Rust edits fully reverted; no production change
+landed. The `tool-dispatch-slice` unit remains OPEN at ~5.6x the floor
+(24 us/call vs 4.29 us floor). The ToolCall move-only mechanism eliminates
+one clone but the saving is below the noise floor of the benchmark's
+session-append-dominated per-call cost. A materially distinct design is
+needed: either (a) eliminate the update-emission clone (the remaining
+ToolCall clone, e.g., by passing `&tool_call` into the worker via scoped
+borrow or by deferring update emission to after the worker joins), or
+(b) target the dominant session-append/event-emission terms that are ~96%
+of the per-call budget, not the ~3.7% clone term.
+
+**Verification** (pre-revert): `cargo check -p pi-agent` clean (0 errors,
+0 warnings after style fix); `cargo test -p pi --test tool_dispatch_bench`
+2/2 pass (valid_dispatch_satisfies_the_shared_protocol,
+invalid_payload_is_rejected_by_argument_validation). Protocol invariants
+preserved: same event counts (start/update/end), same append count (2x
+calls), same error-result behavior.
+
+**Not touched** (out of scope, file-disjoint): `.github/workflows/`,
+`scripts/release/`, `scripts/verification/compat-matrix.json`,
+`docs/supported-platforms.md`, DEPS ledger docs, floor ledgers,
+`Cargo.lock`, `rust-toolchain.toml`.
