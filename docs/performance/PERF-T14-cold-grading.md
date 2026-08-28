@@ -127,3 +127,20 @@ measured-cost/multiple cells) to the terminal verdicts.
 - Grading discipline: one verdict per row; cold rules binding; no wall-clock claim on
   bytes-currency rows; historical records unedited; corrections as F1 and F3 (README,
   this commit) and F2 (erratum here).
+
+## Audit erratum (PERF-G15, #101)
+
+The "Fixed verdicts" enumeration above lists `stream-frame-pipeline` in the
+AT-FLOOR group. Its terminal classification is **architecture-floor**
+(terminal, iteration 13 — residual classified, multiples unproven): the
+floors-README ledger index ("architecture-floor (terminal, iteration 13)"),
+the `stream-frame-pipeline.md` header, and the #97 campaign terminal table
+all record that state, and the ledger's own verdict predates this document.
+The enumeration's substance — every campaign win is a hot-unit cost booked
+to its timing ledger — is unaffected: the iteration-10/12 Arc-at-birth wins
+are booked to `stream-frame-pipeline.md` and the unit's terminal record is
+iteration 13. Recorded here as an addendum; the original sentence is
+historical record and is not rewritten. All other PERF-G15 checks passed
+(no cold fix landed — 0 FIXED corroborated by a commit-by-commit sweep of
+the campaign's code commits against the cold rows; part (b) holds vacuously;
+no CONSTRAINED residual term touched outside Phase-5 discipline).
