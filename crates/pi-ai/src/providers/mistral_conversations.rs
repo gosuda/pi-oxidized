@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
 
 use futures::{StreamExt, stream::BoxStream};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
@@ -60,7 +61,7 @@ impl Provider for MistralConversations {
                 model.id.clone(),
                 unix_millis(),
             );
-            if sender.start(output.clone()).await.is_err() {
+            if sender.start(Arc::new(output.clone())).await.is_err() {
                 return;
             }
             if let Err(failure) =
@@ -740,7 +741,7 @@ async fn finish_open_block(
             AssistantMessageEvent::TextEnd {
                 content_index: index,
                 content,
-                partial: output.clone(),
+                partial: Arc::new(output.clone()),
             }
         }
         OpenBlock::Thinking(index) => {
@@ -751,7 +752,7 @@ async fn finish_open_block(
             AssistantMessageEvent::ThinkingEnd {
                 content_index: index,
                 content,
-                partial: output.clone(),
+                partial: Arc::new(output.clone()),
             }
         }
     };
@@ -777,7 +778,7 @@ async fn append_text(
         sender
             .event(AssistantMessageEvent::TextStart {
                 content_index: index,
-                partial: output.clone(),
+                partial: Arc::new(output.clone()),
             })
             .await
             .map_err(|error| StreamFailure::error(error.to_string()))?;
@@ -792,7 +793,7 @@ async fn append_text(
         .event(AssistantMessageEvent::TextDelta {
             content_index: index,
             delta: delta.to_owned(),
-            partial: output.clone(),
+            partial: Arc::new(output.clone()),
         })
         .await
         .map_err(|error| StreamFailure::error(error.to_string()))
@@ -814,7 +815,7 @@ async fn append_thinking(
         sender
             .event(AssistantMessageEvent::ThinkingStart {
                 content_index: index,
-                partial: output.clone(),
+                partial: Arc::new(output.clone()),
             })
             .await
             .map_err(|error| StreamFailure::error(error.to_string()))?;
@@ -829,7 +830,7 @@ async fn append_thinking(
         .event(AssistantMessageEvent::ThinkingDelta {
             content_index: index,
             delta: delta.to_owned(),
-            partial: output.clone(),
+            partial: Arc::new(output.clone()),
         })
         .await
         .map_err(|error| StreamFailure::error(error.to_string()))
@@ -871,7 +872,7 @@ async fn append_tool_call(
         sender
             .event(AssistantMessageEvent::ToolCallStart {
                 content_index: index,
-                partial: output.clone(),
+                partial: Arc::new(output.clone()),
             })
             .await
             .map_err(|error| StreamFailure::error(error.to_string()))?;
@@ -899,7 +900,7 @@ async fn append_tool_call(
         .event(AssistantMessageEvent::ToolCallDelta {
             content_index,
             delta: args_delta,
-            partial: output.clone(),
+            partial: Arc::new(output.clone()),
         })
         .await
         .map_err(|error| StreamFailure::error(error.to_string()))
@@ -924,7 +925,7 @@ async fn finish_tool_calls(
             .event(AssistantMessageEvent::ToolCallEnd {
                 content_index: index,
                 tool_call: tool,
-                partial: output.clone(),
+                partial: Arc::new(output.clone()),
             })
             .await
             .map_err(|error| StreamFailure::error(error.to_string()))?;
@@ -1150,7 +1151,7 @@ mod tests {
         let (sender, mut stream) =
             ProviderEventSender::channel(NonZeroUsize::new(8).unwrap_or(NonZeroUsize::MIN));
         let mut output = AssistantMessage::new("mistral-conversations", "mistral", "x", 1);
-        let _ = sender.start(output.clone()).await;
+        let _ = sender.start(Arc::new(output.clone())).await;
         let mut chunks = ChunkState::default();
         let first = append_tool_call(
             &sender,
@@ -1200,7 +1201,7 @@ mod tests {
         let (sender, mut stream) =
             ProviderEventSender::channel(NonZeroUsize::new(2).unwrap_or(NonZeroUsize::MIN));
         let output = AssistantMessage::new("mistral-conversations", "mistral", "x", 1);
-        let _ = sender.start(output.clone()).await;
+        let _ = sender.start(Arc::new(output.clone())).await;
         let Err(missing) = require_terminal(false) else {
             unreachable!("EOF must be rejected");
         };

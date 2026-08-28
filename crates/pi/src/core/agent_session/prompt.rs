@@ -911,12 +911,12 @@ mod tests {
 
     fn start_event() -> AssistantMessageEvent {
         AssistantMessageEvent::Start {
-            partial: AssistantMessage::new(
+            partial: Arc::new(AssistantMessage::new(
                 "test-api",
                 "test-provider",
                 "m",
                 pi_agent::now_millis(),
-            ),
+            )),
         }
     }
 

@@ -52,7 +52,7 @@ impl ProviderEventSender {
     }
 
     /// Emit the sole start event.
-    pub(crate) async fn start(&self, partial: AssistantMessage) -> Result<(), EventSendError> {
+    pub(crate) async fn start(&self, partial: Arc<AssistantMessage>) -> Result<(), EventSendError> {
         let mut phase = self.phase.lock().await;
         match *phase {
             Phase::New => {
@@ -166,9 +166,14 @@ impl AssistantState {
         &self.message
     }
 
-    /// Clone the current canonical message for an immutable event snapshot.
-    pub(crate) fn snapshot(&self) -> AssistantMessage {
-        self.message.clone()
+    /// Mutate the canonical message in place and return the closure's result.
+    pub(crate) fn message_mut<R>(&mut self, update: impl FnOnce(&mut AssistantMessage) -> R) -> R {
+        update(&mut self.message)
+    }
+
+    /// Materialize a fresh shared snapshot of the canonical message for one event frame.
+    pub(crate) fn snapshot(&self) -> Arc<AssistantMessage> {
+        Arc::new(self.message.clone())
     }
 
     /// Append an empty text block and return its start event.
@@ -308,7 +313,7 @@ impl AssistantState {
             DoneReason::ToolUse => StopReason::ToolUse,
         };
         self.message.error_message = None;
-        self.snapshot()
+        Arc::unwrap_or_clone(self.snapshot())
     }
 
     /// Set failed terminal state and return the final message.
@@ -322,7 +327,7 @@ impl AssistantState {
             ErrorReason::Error => StopReason::Error,
         };
         self.message.error_message = Some(message.into());
-        self.snapshot()
+        Arc::unwrap_or_clone(self.snapshot())
     }
 
     fn last_index(&self) -> Result<u64, AssistantStateError> {
@@ -416,7 +421,7 @@ mod tests {
             sender.done(DoneReason::Stop, assistant.clone()).await,
             Err(EventSendError::NotStarted)
         );
-        sender.start(assistant.clone()).await?;
+        sender.start(Arc::new(assistant.clone())).await?;
         let clone = sender.clone();
         sender.done(DoneReason::Stop, assistant.clone()).await?;
         assert_eq!(
@@ -445,13 +450,13 @@ mod tests {
         let capacity = NonZeroUsize::new(4).ok_or("non-zero capacity")?;
         let (sender, mut stream) = ProviderEventSender::channel(capacity);
         let assistant = AssistantMessage::new("api", "provider", "model", 1);
-        sender.start(assistant.clone()).await?;
+        sender.start(Arc::new(assistant.clone())).await?;
 
         let event_sender = sender.clone();
         let terminal_sender = sender.clone();
         let event = AssistantMessageEvent::TextStart {
             content_index: 0,
-            partial: assistant.clone(),
+            partial: Arc::new(assistant.clone()),
         };
         let (event_result, terminal_result) = tokio::join!(
             event_sender.event(event),
@@ -488,7 +493,7 @@ mod tests {
         let starters: Vec<_> = (0..8).map(|_| sender.clone()).collect();
         let mut start_handles = Vec::new();
         for starter in starters {
-            let message = assistant.clone();
+            let message = Arc::new(assistant.clone());
             start_handles.push(tokio::spawn(async move { starter.start(message).await }));
         }
         let mut start_ok = 0;
@@ -502,7 +507,7 @@ mod tests {
         let event_senders: Vec<_> = (0..8).map(|_| sender.clone()).collect();
         let mut event_handles = Vec::new();
         for (index, event_sender) in event_senders.into_iter().enumerate() {
-            let message = assistant.clone();
+            let message = Arc::new(assistant.clone());
             event_handles.push(tokio::spawn(async move {
                 event_sender
                     .event(AssistantMessageEvent::TextStart {

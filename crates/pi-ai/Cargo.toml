@@ -17,7 +17,7 @@ filetime = "=0.2.29"
 futures = { version = "=0.3.34", default-features = false, features = ["alloc", "std"] }
 getrandom = { version = "=0.4.3", default-features = false, features = ["std"] }
 reqwest = { version = "=0.13.4", default-features = false, features = ["json", "stream", "rustls", "system-proxy"] }
-serde = { version = "=1.0.229", features = ["derive"] }
+serde = { version = "=1.0.229", features = ["derive", "rc"] }
 google-cloud-auth = "=1.16.0"
 same-file = "=1.0.6"
 serde_json = "=1.0.151"

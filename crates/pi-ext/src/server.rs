@@ -2678,7 +2678,7 @@ mod tests {
         AssistantMessageEvent::TextDelta {
             content_index: 0,
             delta: delta.to_owned(),
-            partial: AssistantMessage::new("test-api", "test-provider", "m", 0),
+            partial: Arc::new(AssistantMessage::new("test-api", "test-provider", "m", 0)),
         }
     }
 

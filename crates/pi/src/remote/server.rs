@@ -3297,7 +3297,7 @@ pub(crate) mod mod_tests_helper {
 
     pub(crate) fn start_event_helper() -> AssistantMessageEvent {
         AssistantMessageEvent::Start {
-            partial: AssistantMessage::new("test-api", "test-provider", "m", 1),
+            partial: Arc::new(AssistantMessage::new("test-api", "test-provider", "m", 1)),
         }
     }
 

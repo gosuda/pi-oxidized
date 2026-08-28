@@ -245,8 +245,9 @@ pub enum AgentSessionEvent {
     },
     /// An assistant message was updated during streaming.
     MessageUpdate {
-        /// Latest assistant message snapshot.
-        message: AgentMessage,
+        /// Latest assistant message snapshot (shared via `Arc` to avoid
+        /// cloning on every streaming delta; wire JSON is unchanged).
+        message: Arc<AgentMessage>,
         /// Underlying provider stream event.
         #[serde(rename = "assistantMessageEvent")]
         assistant_message_event: Box<AssistantMessageEvent>,

@@ -61,7 +61,7 @@ impl Provider for GoogleGenerativeAi {
                 model.id.clone(),
                 unix_millis(),
             );
-            if sender.start(output.clone()).await.is_err() {
+            if sender.start(Arc::new(output.clone())).await.is_err() {
                 return;
             }
             if let Err(failure) = run_request(

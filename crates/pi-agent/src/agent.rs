@@ -761,7 +761,12 @@ mod tests {
 
     fn start_event() -> AssistantMessageEvent {
         AssistantMessageEvent::Start {
-            partial: AssistantMessage::new("test-api", "test-provider", "m", now_millis()),
+            partial: Arc::new(AssistantMessage::new(
+                "test-api",
+                "test-provider",
+                "m",
+                now_millis(),
+            )),
         }
     }
 
@@ -769,7 +774,7 @@ mod tests {
         AssistantMessageEvent::TextDelta {
             content_index: 0,
             delta: text.to_owned(),
-            partial: assistant(text),
+            partial: Arc::new(assistant(text)),
         }
     }
 
@@ -777,7 +782,7 @@ mod tests {
         AssistantMessageEvent::TextEnd {
             content_index: 0,
             content: text.to_owned(),
-            partial: assistant(text),
+            partial: Arc::new(assistant(text)),
         }
     }
 

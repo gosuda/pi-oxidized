@@ -1389,11 +1389,12 @@ fn compact_message_updates_omit_growing_snapshot_content() {
     partial
         .content
         .push(AssistantContent::Text(TextContent::new("hello")));
+    let partial = Arc::new(partial);
 
     let delta = compact_message_update_event(&AssistantMessageEvent::TextDelta {
         content_index: 0,
         delta: "lo".to_owned(),
-        partial: partial.clone(),
+        partial: Arc::clone(&partial),
     });
     assert_eq!(delta["type"], "text_delta");
     assert_eq!(delta["delta"], "lo");
@@ -1404,7 +1405,7 @@ fn compact_message_updates_omit_growing_snapshot_content() {
     let end = compact_message_update_event(&AssistantMessageEvent::TextEnd {
         content_index: 0,
         content: "hello".to_owned(),
-        partial,
+        partial: Arc::clone(&partial),
     });
     assert_eq!(end["block"]["type"], "text");
     assert_eq!(end["block"]["text"], "hello");

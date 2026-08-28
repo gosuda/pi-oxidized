@@ -2149,7 +2149,7 @@ mod tests {
         // Build a minimal valid AssistantMessageEvent payload. The adapter
         // decodes `providerEvent` frames via `decode_provider_stream_event`,
         // which tries `AssistantMessageEvent` first.
-        let partial = AssistantMessage::new("custom", "custom", "m", 0);
+        let partial = Arc::new(AssistantMessage::new("custom", "custom", "m", 0));
         let event = AssistantMessageEvent::TextDelta {
             content_index: 0,
             delta: "x".to_owned(),
@@ -2240,7 +2240,7 @@ mod tests {
         let req = host.require_frame("provider.stream").await?;
 
         // Build a minimal valid AssistantMessageEvent payload.
-        let partial = AssistantMessage::new("custom", "custom", "m", 0);
+        let partial = Arc::new(AssistantMessage::new("custom", "custom", "m", 0));
         let event = AssistantMessageEvent::TextDelta {
             content_index: 0,
             delta: "x".to_owned(),

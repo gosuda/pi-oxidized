@@ -29,7 +29,7 @@ ratatui = { version = "=0.30.2", default-features = false, features = ["crosster
 semver = "=1.0.28"
 reqwest = { version = "=0.13.4", default-features = false, features = ["json", "rustls", "system-proxy"] }
 regex = "=1.13.1"
-serde = { version = "=1.0.229", features = ["derive"] }
+serde = { version = "=1.0.229", features = ["derive", "rc"] }
 schemars = "=1.2.2"
 same-file = "=1.0.6"
 serde-saphyr = { version = "=1.1.0", default-features = false, features = ["deserialize"] }

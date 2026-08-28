@@ -9,15 +9,18 @@
 //!
 //! Scenarios (in-process, current-thread runtime, counting event sink):
 //!
-//! - `funnel` — `run_agent_loop`: provider decode (source snapshot clone) +
-//!   drain (lossy watch + lossless mpsc forward) + reduce (fold + one
-//!   `MessageUpdate` per frame).
-//! - `drain` — `ProviderDrain::spawn` alone over the same script: the two
-//!   channel legs without the reduce leg.
+//! - `funnel` — `run_agent_loop`: provider decode (source snapshot clone,
+//!   wrapped in a fresh `Arc`) + drain (lossy watch + lossless mpsc forward)
+//!   + reduce (fold + one `MessageUpdate` per frame).
+//! - `drain` — `ProviderDrain::spawn` over the same rematerialized stream:
+//!   the two channel legs without the reduce leg.
 //!
 //! `reduce` is disclosed as `funnel - drain` (arithmetic, not separately
 //! timed): `consume_drain_items` is private and the funnel-minus-drain delta
-//! isolates its per-frame fold/emit share.
+//! isolates its per-frame fold/emit share. Because both `funnel` and `drain`
+//! use the same `rematerialize` map, the provider's per-frame source cost
+//! (one `AssistantMessage` clone wrapped in `Arc::new`) is present in both
+//! scenarios and cancels out of the `funnel - drain` difference.
 //!
 //! Rounds are interleaved (funnel then drain per round) to decorrelate box
 //! noise; medians are reported in ns/frame. Allocation counting needs the
@@ -62,22 +65,49 @@ fn base_message() -> AssistantMessage {
     AssistantMessage::new("openai-completions", "openai", "m", 1)
 }
 
-/// Builds the verification stream script: snapshots grow per frame exactly as
-/// `AssistantState` produces them (full message snapshot per event).
-fn frame_script() -> Vec<Result<AssistantMessageEvent, ProviderError>> {
-    let mut script = Vec::with_capacity(FRAMES + 4);
-    script.push(Ok(AssistantMessageEvent::Start {
-        partial: base_message(),
-    }));
+/// Event-kind payload for one scripted frame, decoupled from the event object
+/// so the same source can be rematerialized for every round.
+#[derive(Clone)]
+enum FrameKind {
+    Start,
+    TextStart,
+    TextDelta { delta: String },
+    TextEnd { content: String },
+    Done { reason: DoneReason },
+}
 
-    let mut partial = base_message();
+/// Canonical snapshot template for one scripted frame. `inner` is a shared
+/// `Arc<AssistantMessage>`; the consumer (`FrameProvider` or the drain stream)
+/// rematerializes the `AssistantMessageEvent` by cloning the inner message and
+/// wrapping it in a fresh `Arc`, mirroring `AssistantState::snapshot`'s cost.
+#[derive(Clone)]
+struct FrameTemplate {
+    content_index: u64,
+    inner: Arc<AssistantMessage>,
+    kind: FrameKind,
+}
+
+/// Builds the verification stream script: shared canonical `Arc<AssistantMessage>`
+/// snapshots grow per frame exactly as `AssistantState` materializes them.
+fn frame_script() -> Vec<FrameTemplate> {
+    let mut script = Vec::with_capacity(FRAMES + 4);
+
+    let base = base_message();
+    script.push(FrameTemplate {
+        content_index: 0,
+        inner: Arc::new(base.clone()),
+        kind: FrameKind::Start,
+    });
+
+    let mut partial = base;
     partial
         .content
         .push(AssistantContent::Text(TextContent::new("")));
-    script.push(Ok(AssistantMessageEvent::TextStart {
+    script.push(FrameTemplate {
         content_index: 0,
-        partial: partial.clone(),
-    }));
+        inner: Arc::new(partial.clone()),
+        kind: FrameKind::TextStart,
+    });
 
     let mut text = String::new();
     for index in 0..FRAMES {
@@ -86,33 +116,79 @@ fn frame_script() -> Vec<Result<AssistantMessageEvent, ProviderError>> {
         if let AssistantContent::Text(block) = &mut partial.content[0] {
             block.text.push_str(&delta);
         }
-        script.push(Ok(AssistantMessageEvent::TextDelta {
+        script.push(FrameTemplate {
             content_index: 0,
-            delta,
-            partial: partial.clone(),
-        }));
+            inner: Arc::new(partial.clone()),
+            kind: FrameKind::TextDelta { delta },
+        });
     }
 
-    script.push(Ok(AssistantMessageEvent::TextEnd {
+    script.push(FrameTemplate {
         content_index: 0,
-        content: text.clone(),
-        partial: partial.clone(),
-    }));
+        inner: Arc::new(partial.clone()),
+        kind: FrameKind::TextEnd {
+            content: text.clone(),
+        },
+    });
+
     let mut final_message = partial;
     final_message.stop_reason = StopReason::Stop;
-    script.push(Ok(AssistantMessageEvent::Done {
-        reason: DoneReason::Stop,
-        message: final_message,
-    }));
+    script.push(FrameTemplate {
+        content_index: 0,
+        inner: Arc::new(final_message),
+        kind: FrameKind::Done {
+            reason: DoneReason::Stop,
+        },
+    });
+
     script
 }
 
-/// Replays the script as a provider stream. The per-yield clone mirrors the
-/// real source cost class: `AssistantState::snapshot()` clones the canonical
-/// message once per frame at event production.
+/// Rematerialize a provider stream from the shared script. Each per-frame
+/// `partial` is produced by `Arc::new(inner.clone())`, preserving the source
+/// cost class of `AssistantState::snapshot()`.
+fn rematerialize(
+    script: Arc<Vec<FrameTemplate>>,
+) -> BoxStream<'static, Result<AssistantMessageEvent, ProviderError>> {
+    let len = script.len();
+    stream::iter(
+        (0..len)
+            .map(move |i| script[i].clone())
+            .map(|frame| {
+                let inner = frame.inner.as_ref();
+                let partial = Arc::new(inner.clone());
+                Ok(match frame.kind {
+                    FrameKind::Start => AssistantMessageEvent::Start { partial },
+                    FrameKind::TextStart => AssistantMessageEvent::TextStart {
+                        content_index: frame.content_index,
+                        partial,
+                    },
+                    FrameKind::TextDelta { delta } => AssistantMessageEvent::TextDelta {
+                        content_index: frame.content_index,
+                        delta,
+                        partial,
+                    },
+                    FrameKind::TextEnd { content } => AssistantMessageEvent::TextEnd {
+                        content_index: frame.content_index,
+                        content,
+                        partial,
+                    },
+                    FrameKind::Done { reason } => AssistantMessageEvent::Done {
+                        reason,
+                        message: frame.inner.as_ref().clone(),
+                    },
+                })
+            }),
+    )
+    .boxed()
+}
+
+/// Replays the script as a provider stream. Each yield rematerializes the event
+/// with `Arc::new(inner.clone())`, mirroring `AssistantState::snapshot`'s
+/// source cost: one canonical message clone wrapped in a fresh `Arc` per frame.
 #[derive(Clone)]
 struct FrameProvider {
-    script: Arc<Vec<Result<AssistantMessageEvent, ProviderError>>>,
+    script: Arc<Vec<FrameTemplate>>,
 }
 
 impl Provider for FrameProvider {
@@ -122,7 +198,7 @@ impl Provider for FrameProvider {
         _context: Context,
         _options: StreamOptions,
     ) -> BoxStream<'static, Result<AssistantMessageEvent, ProviderError>> {
-        stream::iter(self.script.as_ref().clone()).boxed()
+        rematerialize(Arc::clone(&self.script))
     }
 }
 
@@ -210,10 +286,9 @@ fn bench_config() -> AgentLoopConfig {
 
 /// One measured funnel round: provider -> drain -> reduce, end to end.
 /// Returns `(elapsed_ns, message_update_count)`.
-fn bench_funnel(script: &Arc<Vec<Result<AssistantMessageEvent, ProviderError>>>) -> (u64, u64) {
+fn bench_funnel(script: &Arc<Vec<FrameTemplate>>) -> (u64, u64) {
     let rt = Builder::new_current_thread().enable_all().build().unwrap_or_else(|error| {
-        eprintln!("bench runtime: {error}");
-        std::process::exit(1);
+        panic!("bench runtime: {error}")
     });
     let provider = FrameProvider {
         script: Arc::clone(script),
@@ -263,11 +338,12 @@ fn bench_funnel(script: &Arc<Vec<Result<AssistantMessageEvent, ProviderError>>>)
 }
 
 /// One measured drain round: the two channel legs alone (lossy watch +
-/// lossless mpsc), no reduce leg. Returns `(elapsed_ns, delivered_items)`.
-fn bench_drain(script: &Arc<Vec<Result<AssistantMessageEvent, ProviderError>>>) -> (u64, u64) {
+/// lossless mpsc), no reduce leg. Uses the same `rematerialize` map as
+/// `FrameProvider` so the `funnel - drain` delta is exactly the reduce leg.
+/// Returns `(elapsed_ns, delivered_items)`.
+fn bench_drain(script: &Arc<Vec<FrameTemplate>>) -> (u64, u64) {
     let rt = Builder::new_current_thread().enable_all().build().unwrap_or_else(|error| {
-        eprintln!("bench runtime: {error}");
-        std::process::exit(1);
+        panic!("bench runtime: {error}")
     });
     let start = Instant::now();
     let delivered = rt.block_on(async {
@@ -283,7 +359,7 @@ fn bench_drain(script: &Arc<Vec<Result<AssistantMessageEvent, ProviderError>>>) 
             }
         });
         let cancel = CancellationToken::new();
-        let stream = stream::iter(script.as_ref().clone()).boxed();
+        let stream = rematerialize(Arc::clone(script));
         let drain = ProviderDrain::spawn(stream, partial_tx, event_tx, cancel);
 
         let mut count = 0u64;
@@ -306,16 +382,20 @@ fn median(values: &mut [u64]) -> u64 {
 
 fn main() {
     let script = Arc::new(frame_script());
-    let final_len = match script.last() {
-        Some(Ok(AssistantMessageEvent::Done { message, .. })) => message
-            .content
-            .first()
-            .map_or(0, |c| match c {
-                AssistantContent::Text(block) => block.text.len(),
-                _ => 0,
-            }),
-        _ => 0,
-    };
+    let final_len = script
+        .last()
+        .map_or(0, |frame| match &frame.kind {
+            FrameKind::Done { .. } => frame
+                .inner
+                .as_ref()
+                .content
+                .first()
+                .map_or(0, |c| match c {
+                    AssistantContent::Text(block) => block.text.len(),
+                    _ => 0,
+                }),
+            _ => 0,
+        });
 
     let mut funnel_ns = Vec::with_capacity(MEASURED_ROUNDS);
     let mut drain_ns = Vec::with_capacity(MEASURED_ROUNDS);
