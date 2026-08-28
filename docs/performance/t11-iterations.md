@@ -1009,3 +1009,77 @@ is recorded and started (pi-ai event-shape work reverted unlanded at the
 session's budget wall — re-derive from this record, implement, and
 measure with interleaved before/after binary pairs). `stream-frame-pipeline`
 stays OPEN on the R9 list; no other unit touched.
+
+## Iteration 12 — `stream-frame-pipeline` (Design A: Arc-at-birth snapshot sharing)
+
+Commit: see `git log` (`perf(t11)`). Date 2026-08-28.
+
+**Implementation**: the Design A cutover recorded at iteration 10 is
+landed. The streaming partial `AssistantMessage` in all 10
+`AssistantMessageEvent` variants becomes `Arc<AssistantMessage>` at birth
+(adapter `AssistantState::snapshot() -> Arc<AssistantMessage>`, serde `rc`
+on pi-ai, pi-agent, and pi — wire JSON byte-identical). Every per-frame
+consumer holds a clone of that Arc: watch publish (`publish_partial` =
+`Arc::clone`, refcount-only — the ~1.8 us per-frame full-message clone is
+gone), the emitted `MessageUpdate` (`Arc<AgentMessage>`), the state reduce
+(`Arc::clone`), the bus queue, the subscribe passthrough (pure Arc move).
+Terminal messages and once-per-message events stay owned
+(`Arc::unwrap_or_clone` at `finish`/`fail`). Adapter
+`snapshot()->mutate->rewrap` round trips become `message_mut()` in-place
+edits (openai_completions `update_message`/`update_content`).
+
+**Cutover surface** (30 files, compiler-enforced): pi-ai types.rs (10
+variant partial fields), stream_state.rs (snapshot/message_mut/start),
+anthropic_messages.rs (10 sites), shared/google.rs (9+1 sites),
+bedrock_converse_stream.rs, google_generative_ai.rs, google_vertex.rs,
+mistral_conversations.rs, pi_messages.rs, shared/responses.rs,
+openai_completions.rs (message_mut); pi-agent event.rs, drain.rs
+(publish_partial/publish_terminal split), run.rs, state.rs, bus.rs,
+agent.rs; pi events.rs, subscribe.rs, text.rs, extension_host/tests.rs,
+prompt.rs, mod.rs, remote/server.rs; pi-ext adapters.rs, server.rs;
+bench binary updated. Cargo.lock untouched (lock-neutral).
+
+**Boundary answers**: extension-RPC event JSON byte-identical (serde `rc`
+serializes `Arc<T>` as `T`); both drain fidelity legs unchanged
+(publish_partial forwards the Arc, publish_terminal materializes once at
+terminal); loop cancellation/finalization semantics untouched; session
+JSONL persistence per message end (untouched). Conformance suites pass
+(2 pre-existing env failures: missing `.references/pi/` checkout, identical
+on base).
+
+**Measurements** (release, `taskset -c 20-40`, 9 interleaved pairs, medians;
+baseline = 6a31935 clean worktree binary, design = cutover binary):
+
+| Scenario | Before (ns/frame) | After (ns/frame) | Win (median-of-9) |
+|---|---|---|---|
+| funnel (decode+forward+reduce) | 3639 | 3281 | 1.10x |
+| drain (decode+forward only) | 2886 | 2426 | 1.18x |
+| reduce (funnel - drain) | 763 | 871 | 0.87x |
+
+Win gate >=1.05x median on drain (the named target): **PASSED** (1.18x).
+Funnel also passed (1.10x). Reduce (funnel - drain) appears to regress
+(0.87x) — this is the subtraction artifact: drain improved more than
+funnel, so the residual difference widens. The reduce leg still does one
+materialization per frame (`Arc::new(assistant_agent_message(
+partial.as_ref().clone()))`), which is the minimum the contract forces;
+the cutover's cost saving is in the drain leg, not the reduce leg. Pair 8
+and 9 show high variance (contended box); the median is the honest paired
+estimator.
+
+**Recomputed multiple**: drain 2426 ns vs the ledger floor ~200 ns
+decode/forward ≈ **12.1x — still OPEN** (>2x; the unit iterates again).
+The residual is channel/scheduler cost + the one source-side
+materialization per frame; the redundant downstream clones are eliminated.
+
+**Verification**: `cargo check --workspace --all-targets` green; pi-ai
+7+2 pass (2 conformance failures pre-existing — missing `.references/pi/`
+checkout, identical on base 6a31935); pi-agent 118/118 green; pi-ext
+176+1 pass (1 failure pre-existing — missing extension-host artifact,
+identical on base); pi --lib 1658 pass, 5 fail (all pre-existing
+environmental — missing extension-host artifact + session fixtures;
+failure set byte-identical to base 6a31935 on tmpfs). Fresh adversarial
+review: CLEAN (0.97 confidence).
+
+**Not touched** (out of scope, file-disjoint): `.github/workflows/`,
+`scripts/release/`, `scripts/verification/compat-matrix.json`,
+`docs/supported-platforms.md`, DEPS ledger docs, floor ledgers.
