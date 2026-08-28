@@ -7,6 +7,13 @@ on:
     branches: ["main"]
   workflow_dispatch:
 
+# REL-T8 (#109): SLSA build-provenance attestation needs OIDC (id-token)
+# and the attestation API write; everything else in this workflow is
+# read-only.
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
 env:
   SOURCE_DATE_EPOCH: "1735689600"
   MUSL_APT_VERSION: "1.2.4-2"
@@ -684,6 +691,61 @@ jobs:
             --pi "$(cygpath -m "$PWD/$root/pi.exe")" \
             --out "$(cygpath -m "$PWD/$EVIDENCE")" \
             --expect-ready 'type a message'
+
+      # ─────────────────────────────────────────────────────────────────────
+      # REL-T8 (#109): SLSA build-provenance attestation for the release
+      # archive. dist/pass1 holds exactly the two files this leg produced —
+      # the docs-staged archive (REL-DOCS tree baked in by
+      # scripts/package-release.ts) plus its .sha256 sidecar — so one
+      # attestation over both yields the per-archive bundle: seven bundles
+      # across the seven-leg matrix, each subject-bound to its archive and
+      # its sidecar. The action is pinned to the commit SHA of the current
+      # release-channel version (v4.2.2, re-grounded from
+      # actions/attest-build-provenance releases before landing); the bundle
+      # also lands in the repository's attestation store. The fork guard
+      # keeps the OIDC-gated steps off fork pull requests, where GitHub
+      # mints no id-token; in-repo runs attest on push, PR, and dispatch.
+      # ─────────────────────────────────────────────────────────────────────
+      - name: Attest archive build provenance (REL-T8)
+        id: attest
+        if: github.event.pull_request.head.repo.fork != true
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-path: |
+            dist/pass1/*.tar.gz
+            dist/pass1/*.zip
+            dist/pass1/*.sha256
+
+      # Verify the bundle over every artifact it covers: gh re-derives each
+      # subject's digest and checks it against the DSSE signature chain to
+      # GitHub's Sigstore root, pinning the signer identity to this
+      # repository's workflow issuer. The bundle is copied next to the
+      # archive so the uploaded artifact carries archive + sidecar +
+      # provenance together.
+      - name: Verify attestation bundles (REL-T8)
+        if: github.event.pull_request.head.repo.fork != true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          bundle='${{ steps.attest.outputs.bundle-path }}'
+          # The action reports bundle-path in runner-native form — a
+          # backslash Windows path on the windows leg — so normalize to a
+          # Git Bash path the same way the REL-T7 witness normalizes its
+          # harness invocation (cygpath exists only on the Windows image).
+          if command -v cygpath >/dev/null 2>&1; then
+            bundle="$(cygpath -u "$bundle")"
+          fi
+          test -n "$bundle" && test -f "$bundle"
+          cp "$bundle" dist/pass1/attestation.json
+          shopt -s nullglob
+          artifacts=(dist/pass1/*.tar.gz dist/pass1/*.zip dist/pass1/*.sha256)
+          test "${#artifacts[@]}" -eq 2
+          for artifact in "${artifacts[@]}"; do
+            gh attestation verify "$artifact" --bundle "$bundle" \
+              --signer-repo "$GITHUB_REPOSITORY"
+          done
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
