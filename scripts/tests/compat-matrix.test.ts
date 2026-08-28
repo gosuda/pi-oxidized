@@ -428,7 +428,7 @@ describe("release tier matrix 0.2.0 (REL-T5)", () => {
 			"release-aarch64-linux-musl": "ubuntu-24.04-arm",
 			"release-aarch64-darwin": "macos-15",
 			"release-x86_64-darwin": "macos-15-intel",
-			"release-x86_64-windows": "windows-latest",
+			"release-x86_64-windows": "windows-2025",
 		};
 		for (const row of excludedReleaseRows) {
 			const text = `${row.evidence} ${row.rationale ?? ""} ${row.citation ?? ""}`;

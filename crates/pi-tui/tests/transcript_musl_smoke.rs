@@ -585,7 +585,7 @@ fn musl_packaging_protocol_lane() -> Result<(), LaneError> {
             "static-link": "pass",
             "unpack-integrity": integrity,
             "compiled-host-protocol": compiled_verdict,
-            "bundled-bun-fallback-protocol": {"verdict": "pass", "digest": fallback_digest, "limitation": "fallback-runtime:glibc-host-bun-standin-until-REL-T2-pins-musl-bun"},
+            "bundled-bun-fallback-protocol": {"verdict": "pass", "digest": fallback_digest},
         },
         "limitations": [
             "limitation:release-archive-unpack-integrity-requires-PI_TUI_MUSL_ARCHIVE",

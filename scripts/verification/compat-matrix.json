@@ -506,9 +506,9 @@
 			"required": false,
 			"excluded": true,
 			"commands": [],
-			"evidence": "x86_64-windows release unpack smoke is not run on the linux dev host; CI witness is the native leg on windows-latest",
-			"rationale": "Windows PE binaries cannot be executed or fully validated on the linux development host; the target is built and smoke-tested natively on the windows-latest runner; Tier N terminal-conformance row — the interaction witness (pty_no_flicker under portable-pty ConPTY) runs on the windows-latest runner.",
-			"citation": "scripts/release/targets.ts RUST_TARGETS includes x86_64-pc-windows-msvc; release-verification.yml maps x86_64-pc-windows-msvc to windows-latest"
+			"evidence": "x86_64-windows release unpack smoke is not run on the linux dev host; CI witness is the native leg on windows-2025",
+			"rationale": "Windows PE binaries cannot be executed or fully validated on the linux development host; the target is built and smoke-tested natively on the windows-2025 runner (image-pinned per REL-R3 §5.2 condition 5 — the floating windows-latest alias is rejected so conhost-derivation changes are image changes, not silent ones); Tier N terminal-conformance row — the interaction witness (pty_no_flicker under portable-pty ConPTY) runs on the windows-2025 runner.",
+			"citation": "scripts/release/targets.ts RUST_TARGETS includes x86_64-pc-windows-msvc; release-verification.yml maps x86_64-pc-windows-msvc to windows-2025 (image-pinned, release-verification.yml:40-44)"
 		},
 		{
 			"id": "release-x86_64-linux-musl",
