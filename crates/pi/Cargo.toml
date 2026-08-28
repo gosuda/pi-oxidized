@@ -37,11 +37,11 @@ sha2 = { version = "=0.11.0", default-features = false }
 serde_json = "=1.0.151"
 syntect = { version = "=5.3.0", default-features = false, features = ["parsing", "regex-fancy", "yaml-load"] }
 thiserror = "=2.0.20"
-tokio = { version = "=1.52.4", default-features = false, features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "=1.53.1", default-features = false, features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "=0.7.19", default-features = false, features = ["rt"] }
 unicode-normalization = "=0.1.25"
 url = "=2.5.8"
-uuid = { version = "=1.24.0", features = ["v4", "v7"] }
+uuid = { version = "=1.26.0", features = ["v4", "v7"] }
 wait-timeout = "=0.2.1"
 
 [target.'cfg(unix)'.dependencies]
@@ -55,7 +55,7 @@ pi-tui = { version = "=0.1.0", path = "../pi-tui", features = ["testkit"] }
 insta = { version = "=1.48.0", features = ["filters"] }
 proptest = { version = "=1.11.0", default-features = false, features = ["std"] }
 # test-util enables tokio::time::pause/advance for the spinner runtime test.
-tokio = { version = "=1.52.4", default-features = false, features = ["test-util"] }
+tokio = { version = "=1.53.1", default-features = false, features = ["test-util"] }
 tempfile = "=3.27.0"
 
 [[bin]]

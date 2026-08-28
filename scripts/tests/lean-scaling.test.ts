@@ -4,6 +4,7 @@
  * children through hello -> extensions.load and the lean 3-RPC round-trip.
  */
 import { describe, expect, test } from "bun:test";
+import { EventEmitter } from "node:events";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -22,6 +23,15 @@ import {
 	summarize,
 } from "../lean-scaling.ts";
 
+/**
+ * bun-types 1.4.0 declares `process.off` only for its new "memoryPressure"
+ * event, which shadows the EventEmitter `off` inherited by NodeJS.Process.
+ * Dispatch through the EventEmitter prototype so node process events keep
+ * their documented `(event, listener)` removal signature.
+ */
+function processOff(event: string, listener: (...args: unknown[]) => void): void {
+	EventEmitter.prototype.off.call(process, event, listener);
+}
 /** Track timer handles created/cleared while this helper is active. */
 function interceptTimers() {
 	const handles = new Set<TimerHandle>();
@@ -264,7 +274,7 @@ describe("ChildHost request write failure", () => {
 			expect(unhandled).toEqual([]);
 		} finally {
 			Reflect.set(stdin, "write", originalWrite);
-			process.off("unhandledRejection", trackUnhandled);
+			processOff("unhandledRejection", trackUnhandled);
 			await host.close();
 			rmSync(tempDir, { recursive: true, force: true });
 		}
@@ -341,8 +351,8 @@ describe("ChildHost async stdin EPIPE", () => {
 			expect(uncaught).toEqual([]);
 		} finally {
 			Reflect.set(stdin, "write", originalWrite);
-			process.off("unhandledRejection", trackUnhandled);
-			process.off("uncaughtException", trackUncaught);
+			processOff("unhandledRejection", trackUnhandled);
+			processOff("uncaughtException", trackUncaught);
 			await host.close();
 			rmSync(tempDir, { recursive: true, force: true });
 		}
@@ -450,8 +460,8 @@ describe("ChildHost malformed stdout", () => {
 			expect(existsSync(sentinelPath)).toBe(false);
 			expect(host.frames).toEqual([]);
 		} finally {
-			process.off("uncaughtException", trackUnhandled);
-			process.off("unhandledRejection", trackUnhandled);
+			processOff("uncaughtException", trackUnhandled);
+			processOff("unhandledRejection", trackUnhandled);
 			await host.close();
 			rmSync(tempDir, { recursive: true, force: true });
 		}

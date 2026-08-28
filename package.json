@@ -35,7 +35,7 @@
 		"verify:compat-docs": "bun run scripts/verification/generate-compat-docs.ts"
 	},
 	"devDependencies": {
-		"@types/bun": "1.3.9",
+		"@types/bun": "1.4.0",
 		"typescript": "5.9.3"
 	},
 	"engines": {
