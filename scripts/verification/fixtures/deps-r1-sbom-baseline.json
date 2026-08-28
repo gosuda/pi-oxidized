@@ -1,8 +1,8 @@
 {
 	"schema": "pi.deps.sbom.v1",
-	"capturedAt": "2026-08-27",
-	"captureHead": "a06d3526aed0763fcc77c537fa7f8597ed83951a",
-	"contentSha256": "f301a8061c4972d98c149250a1d8b238fc2c36c7ca66c63ddfc466bb3beb06d0",
+	"capturedAt": "2026-08-28",
+	"captureHead": "e3318167746aa033daa94e64c24c89da60669320",
+	"contentSha256": "9e016543b916d6e981113a46d8cd162c659d1d64881acf691bb8d2c23eb3b043",
 	"content": {
 		"rust": {
 			"toolchainChannel": "1.97.1",
@@ -146,7 +146,7 @@
 				},
 				{
 					"name": "aws-config",
-					"version": "1.9.0",
+					"version": "1.11.0",
 					"license": "Apache-2.0",
 					"source": "registry",
 					"direct": true,
@@ -178,7 +178,7 @@
 				},
 				{
 					"name": "aws-runtime",
-					"version": "1.8.1",
+					"version": "1.9.1",
 					"license": "Apache-2.0",
 					"source": "registry",
 					"direct": false,
@@ -186,7 +186,7 @@
 				},
 				{
 					"name": "aws-sdk-bedrockruntime",
-					"version": "1.136.0",
+					"version": "1.142.0",
 					"license": "Apache-2.0",
 					"source": "registry",
 					"direct": true,
@@ -194,7 +194,7 @@
 				},
 				{
 					"name": "aws-sdk-sso",
-					"version": "1.103.0",
+					"version": "1.108.0",
 					"license": "Apache-2.0",
 					"source": "registry",
 					"direct": false,
@@ -202,7 +202,7 @@
 				},
 				{
 					"name": "aws-sdk-ssooidc",
-					"version": "1.105.0",
+					"version": "1.110.0",
 					"license": "Apache-2.0",
 					"source": "registry",
 					"direct": false,
@@ -210,7 +210,7 @@
 				},
 				{
 					"name": "aws-sdk-sts",
-					"version": "1.108.0",
+					"version": "1.113.0",
 					"license": "Apache-2.0",
 					"source": "registry",
 					"direct": false,
@@ -234,7 +234,7 @@
 				},
 				{
 					"name": "aws-smithy-eventstream",
-					"version": "0.61.1",
+					"version": "0.61.2",
 					"license": "Apache-2.0",
 					"source": "registry",
 					"direct": false,
@@ -250,7 +250,7 @@
 				},
 				{
 					"name": "aws-smithy-http-client",
-					"version": "1.2.0",
+					"version": "1.4.0",
 					"license": "Apache-2.0",
 					"source": "registry",
 					"direct": false,
@@ -274,7 +274,7 @@
 				},
 				{
 					"name": "aws-smithy-query",
-					"version": "0.61.1",
+					"version": "0.62.0",
 					"license": "Apache-2.0",
 					"source": "registry",
 					"direct": false,
@@ -282,7 +282,7 @@
 				},
 				{
 					"name": "aws-smithy-runtime",
-					"version": "1.12.0",
+					"version": "1.14.0",
 					"license": "Apache-2.0",
 					"source": "registry",
 					"direct": false,
@@ -290,7 +290,7 @@
 				},
 				{
 					"name": "aws-smithy-runtime-api",
-					"version": "1.13.0",
+					"version": "1.15.0",
 					"license": "Apache-2.0",
 					"source": "registry",
 					"direct": false,
@@ -314,7 +314,7 @@
 				},
 				{
 					"name": "aws-smithy-types",
-					"version": "1.6.1",
+					"version": "1.6.2",
 					"license": "Apache-2.0",
 					"source": "registry",
 					"direct": false,
@@ -322,7 +322,7 @@
 				},
 				{
 					"name": "aws-smithy-xml",
-					"version": "0.61.1",
+					"version": "0.62.0",
 					"license": "Apache-2.0",
 					"source": "registry",
 					"direct": false,
@@ -330,7 +330,7 @@
 				},
 				{
 					"name": "aws-types",
-					"version": "1.4.0",
+					"version": "1.5.0",
 					"license": "Apache-2.0",
 					"source": "registry",
 					"direct": false,
@@ -358,6 +358,14 @@
 					"license": "MIT OR Apache-2.0",
 					"source": "registry",
 					"direct": true,
+					"devOnly": false
+				},
+				{
+					"name": "base64",
+					"version": "0.23.1",
+					"license": "MIT OR Apache-2.0",
+					"source": "registry",
+					"direct": false,
 					"devOnly": false
 				},
 				{
@@ -1194,7 +1202,7 @@
 				},
 				{
 					"name": "google-cloud-auth",
-					"version": "1.14.0",
+					"version": "1.16.0",
 					"license": "Apache-2.0",
 					"source": "registry",
 					"direct": true,
@@ -1202,7 +1210,7 @@
 				},
 				{
 					"name": "google-cloud-gax",
-					"version": "1.12.0",
+					"version": "1.14.0",
 					"license": "Apache-2.0",
 					"source": "registry",
 					"direct": false,
@@ -1218,7 +1226,7 @@
 				},
 				{
 					"name": "google-cloud-wkt",
-					"version": "1.6.0",
+					"version": "1.7.0",
 					"license": "Apache-2.0",
 					"source": "registry",
 					"direct": false,
@@ -1650,7 +1658,7 @@
 				},
 				{
 					"name": "jsonwebtoken",
-					"version": "10.4.0",
+					"version": "11.0.0",
 					"license": "MIT",
 					"source": "registry",
 					"direct": false,
@@ -3202,7 +3210,7 @@
 				},
 				{
 					"name": "tokio",
-					"version": "1.52.4",
+					"version": "1.53.1",
 					"license": "MIT",
 					"source": "registry",
 					"direct": true,
@@ -3220,6 +3228,14 @@
 					"name": "tokio-rustls",
 					"version": "0.26.4",
 					"license": "MIT OR Apache-2.0",
+					"source": "registry",
+					"direct": false,
+					"devOnly": false
+				},
+				{
+					"name": "tokio-stream",
+					"version": "0.1.19",
+					"license": "MIT",
 					"source": "registry",
 					"direct": false,
 					"devOnly": false
@@ -3442,7 +3458,7 @@
 				},
 				{
 					"name": "uuid",
-					"version": "1.24.0",
+					"version": "1.26.0",
 					"license": "Apache-2.0 OR MIT",
 					"source": "registry",
 					"direct": true,
@@ -4026,7 +4042,7 @@
 						"ignore": "7.0.6"
 					},
 					"devDependencies": {
-						"@types/bun": "1.3.9",
+						"@types/bun": "1.4.0",
 						"typescript": "5.9.3"
 					},
 					"optionalDependencies": {},
@@ -4037,15 +4053,15 @@
 					"dependencies": {
 						"@earendil-works/pi-tui-protocol": "file:../pi-tui-protocol",
 						"jiti": "2.7.0",
-						"typebox": "1.1.38"
+						"typebox": "1.3.19"
 					},
 					"devDependencies": {
 						"@earendil-works/pi-agent-core": "file:../../.references/pi/packages/agent",
 						"@earendil-works/pi-ai": "file:../../.references/pi/packages/ai",
 						"@earendil-works/pi-coding-agent": "file:../../.references/pi/packages/coding-agent",
 						"@earendil-works/pi-tui": "file:../../.references/pi/packages/tui",
-						"@types/bun": "1.3.9",
-						"typebox": "1.1.38",
+						"@types/bun": "1.4.0",
+						"typebox": "1.3.19",
 						"typescript": "5.9.3"
 					},
 					"optionalDependencies": {},
@@ -4055,7 +4071,7 @@
 					"path": "packages/pi-tui-protocol/package.json",
 					"dependencies": {},
 					"devDependencies": {
-						"@types/bun": "1.3.9",
+						"@types/bun": "1.4.0",
 						"typescript": "5.9.3"
 					},
 					"optionalDependencies": {},
@@ -4501,7 +4517,7 @@
 						},
 						{
 							"name": "@types/bun",
-							"version": "1.3.9"
+							"version": "1.4.0"
 						},
 						{
 							"name": "@types/chai",
@@ -4637,7 +4653,7 @@
 						},
 						{
 							"name": "bun-types",
-							"version": "1.3.9"
+							"version": "1.4.0"
 						},
 						{
 							"name": "canvas",
@@ -5301,7 +5317,7 @@
 						},
 						{
 							"name": "typebox",
-							"version": "1.1.38"
+							"version": "1.3.19"
 						},
 						{
 							"name": "typescript",
@@ -5795,7 +5811,7 @@
 						},
 						{
 							"name": "@types/bun",
-							"version": "1.3.9"
+							"version": "1.4.0"
 						},
 						{
 							"name": "@types/chai",
@@ -5931,7 +5947,7 @@
 						},
 						{
 							"name": "bun-types",
-							"version": "1.3.9"
+							"version": "1.4.0"
 						},
 						{
 							"name": "canvas",
@@ -6587,7 +6603,7 @@
 						},
 						{
 							"name": "typebox",
-							"version": "1.1.38"
+							"version": "1.3.19"
 						},
 						{
 							"name": "typescript",

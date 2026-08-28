@@ -87,8 +87,9 @@ describe("SBOM content structure", () => {
 		const { content } = baselineSnapshot();
 		const rustIds = new Set(content.rust.packages.map((p) => `${p.name}@${p.version}`));
 		const fromVersions = [
-			// Re-anchored by the Bin P patch sweep (4e10a0a): these are the
-			// from-versions every later epoch diffs against.
+			// Re-anchored by the Bin P patch sweep (4e10a0a) and the Bin M
+			// minor sweep (e331816): these are the from-versions every later
+			// epoch diffs against.
 			"futures@0.3.34",
 			"globset@0.4.20",
 			"ignore@0.4.33",
@@ -98,11 +99,11 @@ describe("SBOM content structure", () => {
 			"serde_json@1.0.151",
 			"thiserror@2.0.20",
 			"tokio-util@0.7.19",
-			"aws-config@1.9.0",
-			"aws-sdk-bedrockruntime@1.136.0",
-			"google-cloud-auth@1.14.0",
-			"tokio@1.52.4",
-			"uuid@1.24.0",
+			"aws-config@1.11.0",
+			"aws-sdk-bedrockruntime@1.142.0",
+			"google-cloud-auth@1.16.0",
+			"tokio@1.53.1",
+			"uuid@1.26.0",
 			"base64@0.22.1",
 			"serde-saphyr@0.0.29",
 		];
@@ -114,11 +115,11 @@ describe("SBOM content structure", () => {
 		);
 		expect(rootLock.has("ignore@7.0.6")).toBe(true);
 		expect(rootLock.has("typescript@5.9.3")).toBe(true);
-		expect(rootLock.has("@types/bun@1.3.9")).toBe(true);
+		expect(rootLock.has("@types/bun@1.4.0")).toBe(true);
 		const hostLock = new Set(
 			(content.npm.lockfiles[1]?.packages ?? []).map((p) => `${p.name}@${p.version}`),
 		);
-		expect(hostLock.has("typebox@1.1.38")).toBe(true);
+		expect(hostLock.has("typebox@1.3.19")).toBe(true);
 	});
 
 	test("direct registry pins carry licenses and the toolchain/bun pins agree", () => {
