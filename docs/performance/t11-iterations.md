@@ -2984,3 +2984,106 @@ in-boundary design or the E1-E4 exhaustion record (iteration 28).
 **Not touched** (out of scope, file-disjoint): `crates/pi-tui/`,
 `crates/pi-ext/`, `.github/workflows/`, `scripts/`, `Cargo.lock`,
 `rust-toolchain.toml`, other units' floor ledgers, `packages/`.
+
+---
+
+## Iteration 28 — `startup-version-path` (E1-E4 exhaustion — CONSTRAINED-ABOVE-FLOOR)
+
+Date 2026-08-29. Base for the record: iteration 27 (perf `3b4e53c` + docs
+`465091f` on canonical origin/feat/ver-align-canonical-pin, itself on
+`6318fa3`); the closed after-state was produced by the perf commit. Docs-only
+terminal record: no candidate
+was executed this iteration; after the iteration-27 win (1.59x wall, 3.99x Ir,
+2788 → 84 syscalls) no materially distinct in-boundary design reaches the
+>=1.05x gate or the 2x multiple.
+
+### E1 — decomposition reconciliation (945,385 Ir in-process, iteration-27 after-state)
+
+| Term | Ir | Share | Ownership |
+|---|---|---|---|
+| Dynamic loader: relocation (`_dl_relocate_object_no_relro` 339,909 + do-rel 123,193 + dl-reloc 29,972) | 493,074 | 52.2% | artifact shape (27.7 MB dynamically linked binary) |
+| Dynamic loader: symbol binding (do_lookup_x 114,982, strcmp 40,873, `_dl_lookup_symbol_x` 31,796, dl-new-hash 28,236, check_match 21,663) | 237,550 | 25.1% | artifact shape + ld.so |
+| Dynamic loader: version check + tunables (14,036 + 26,691) | 40,727 | 4.3% | artifact shape + ld.so |
+| libc startup, stdio and env parsing (vfscanf 53,972, strtoul 26,550, _IO_sputbackc 4,784, getdelim 3,905) | 89,211 | 9.4% | libc pre-main |
+| Product remainder (Rust std init, panic machinery, argv scan, version write) | 84,823 | 9.0% | unit (contract rows < 4 kIr) |
+| **Total** | **945,385** | **100%** | |
+
+Reconciliation exact: 493,074 + 237,550 + 40,727 + 89,211 + 84,823 = 945,385
+(callgrind annotate of `/tmp` profile from the iteration-27 after-binary). The
+contract rows themselves (argv scan, constant read, one write) are < 4 kIr
+(base ledger, strace-confirmed 2 write-class calls); the other ~81 kIr of the
+product term is std/libc-adjacent init the process cannot skip. Wall side
+(3.7 ms direct median, 1.6 ms min): kernel execve + page-in of the binary and
+libc dominate; syscall time is 0.95 ms and in-process Ir is ~0.24 ms at 2 GHz,
+so most of the wall is process creation, outside any in-process lever.
+
+### E2 — candidate history and evidence
+
+1. **Sync arg dispatch before runtime construction (iteration 27)** —
+   executed, **1.59x** paired hyperfine / **3.99x** Ir / 33x syscalls, kept
+   (gate >=1.05x PASS). Removed the entire tokio runtime term the ledger
+   attributed (~35% of the old 3.77 M Ir) and the 80-thread storm.
+2. **Static linking (musl/static-pie)** — infeasible in-boundary: it is a
+   release-build/toolchain consent (`rust-toolchain.toml`, `Cargo.lock`, and
+   `scripts/release/` are frozen for this campaign; glibc-specific dynamic
+   dependencies span the workspace). Even if consented: removes the ~771 kIr
+   loader terms, projecting ~174 kIr ≈ 16.3 us ≈ **109x floor**, still >2x.
+3. **RELR (link-time relocation representation)** — a linker/artifact
+   consent, not program code: it compacts the relative-relocation term
+   (493,074 Ir, 52.2%) at link time and requires the frozen release/link
+   surface. **Prelink / ld.so cache warming** — deployment-environment
+   consent, outside program control; addresses at most the ~237 kIr binding
+   term (~25%). Both leave the kernel exec cost.
+4. **Raw-syscall version write (bypass std::io wiring)** — the whole product
+   remainder is 84.8 kIr (~9%); the contract rows are < 4 kIr of it. Best
+   case removes tens of kIr (~ a few us in-process) and nothing from the
+   wall the lane gates (exec/page-in dominated); below the >=1.05x gate on
+   the pinned workload by construction, and it trades the ProductOutput
+   stdout-routing contract for an unmeasurable win.
+5. **Tiny `--version` helper binary or lazy-loaded monolith** — changes the
+   shipped artifact shape (single-binary distribution contract, packaging and
+   release scripts frozen); a reopen consent, not an in-boundary design.
+6. **current_thread ambient runtime for non-version invocations** — no effect
+   on this unit (the version path now builds no runtime at all) and out of
+   the unit's rows; belongs to whichever unit owns general startup.
+
+### E3 — floor and multiple revalidation
+
+Floor **~0.15 us** (argv scan ~20 ns + constant read ~1 ns + one write(2)
+122.7 ns, floorkit): revalidated, no input changed it; the iteration-27
+after-state reproduces the same contract observable (byte-identical version
+text, exit 0, 2 write-class calls). Multiple: 945,385 Ir ≈ 88.6 us → 88.6 /
+0.15 ≈ **591x**. This is a constraint statement, not an at-floor claim: the
+gap is held by the loader (81.6%), libc pre-main (9.4%), and kernel process
+creation on the wall side, none of which is unit-addressable. Note the
+multiple is bounded below by process existence itself: any dynamically linked
+Rust binary pays >100 us before `main`, so the 2x criterion (0.3 us) is
+unreachable for a real process start regardless of in-unit code.
+
+### E4 — dominant residual and reopen conditions
+
+Dominant residual: **ELF dynamic relocation and symbol binding of the 27.7 MB
+dynamically linked binary (~771 kIr, 81.6%) plus kernel process creation and
+page-in on the wall side (min 1.6 ms direct vs ~0.24 ms in-process)**. Exact
+boundary consents that would reopen the unit:
+
+1. **Static-linking release consent** (musl/static-pie target; toolchain,
+   lockfile, and release scripts unfrozen): removes the relocation/lookup
+   terms, projected ~109x, still CONSTRAINED-ABOVE-FLOOR; would need a fresh
+   E1-E3 pass.
+2. **RELR link-time consent** (release/link surface unfrozen): compacts the
+   493,074 Ir relative-relocation term. **Prelink / ld.so cache deployment
+   consent**: up to ~25% binding-term reduction, environment-side.
+3. **Artifact-shape consent** (version helper binary or lazy loading):
+   removes most of the exec/page-in wall; changes the distribution contract.
+
+**Verdict**: **CONSTRAINED-ABOVE-FLOOR**. The `startup-version-path` unit is
+terminal in the campaign records: the addressable runtime term is fully
+removed (iteration 27), every remaining in-unit mechanism is measured or
+projected below the gate, and the dominant residual requires boundary
+consents. This closure is unit-scoped: issue #97 remains OPEN for the
+remaining units.
+
+**Not touched** (out of scope, file-disjoint): production code,
+`crates/pi-tui/`, `crates/pi-ext/`, `.github/workflows/`, `scripts/`,
+`Cargo.lock`, `rust-toolchain.toml`, other units' floor ledgers, `packages/`.

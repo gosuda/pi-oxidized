@@ -1,7 +1,10 @@
 # Floor ledger: startup fast path (arg parse, version lookup, output write)
 
 Owning R2 hot rows (lane 1): *CLI argument parsing*, *Version lookup*, *One output
-write + clean exit*. State: **OPEN**, ~2480x on in-process CPU (de-minimis absolute).
+write + clean exit*. State: **CONSTRAINED-ABOVE-FLOOR (terminal — E1-E4
+exhaustion at iteration 28; iteration-27 win banked 1.59x wall / 3.99x Ir /
+2788 → 84 syscalls; residual ~591x held by ELF dynamic loading + libc
+pre-main, de-minimis absolute).**
 
 ## Contract (from call sites, tests, signatures — never internals)
 
@@ -67,9 +70,31 @@ futex 705 → 0. Contract observable verified byte-identical (`--version` →
 `0.1.0`, exit 0; `--help` and a normal flag path parity-diffed base vs after).
 
 Multiple recompute (93.7 ns per 1000 Ir): 945,385 Ir ≈ 88.6 us → ≈ 591x the
-0.15 us floor. **OPEN** (intermediate win logged; >2x).
+0.15 us floor. Intermediate win logged at >2x; terminal state in the
+iteration-28 section below.
 
-Remaining decomposition (callgrind attribution, 945,385 Ir): dynamic loader
-(relocation, symbol lookup, version check, tunables) ≈ 751 kIr ≈ 79%; libc
-startup, stdio and env parsing ≈ 89 kIr ≈ 9%; product remainder (static
-init, arg scan, version write) ≈ 106 kIr ≈ 11%.
+Remaining decomposition (exact reconciliation in the iteration-28 E1 record;
+callgrind attribution, 945,385 Ir): dynamic loader (relocation, symbol binding,
+version check, tunables) 771,351 Ir ≈ 81.6%; libc startup, stdio and env parsing
+89,211 Ir ≈ 9.4%; product remainder (std init, arg scan, version write) 84,823 Ir
+≈ 9.0%.
+
+### Iteration 28 — E1-E4 exhaustion (CONSTRAINED-ABOVE-FLOOR) (2026-08-29)
+
+Docs-only terminal record (campaign log iteration 28). No in-boundary candidate
+reaches the >=1.05x gate or the 2x multiple after iteration 27. E1: the 945,385 Ir
+after-state reconciles exactly into loader 771,351 (81.6%) + libc pre-main 89,211
+(9.4%) + product remainder 84,823 (9.0%, of which the contract rows are < 4 kIr);
+wall 3.7 ms direct is dominated by kernel execve + page-in, outside in-process
+levers. E2: static linking (release/toolchain consent) projects ~109x; RELR is a
+link-time artifact consent compacting the 493,074 Ir relative-relocation term;
+prelink/ld.so cache warming is a deployment consent worth up to ~25% of the
+~237 kIr binding term; a raw-syscall version write is below the gate by
+construction, and a version helper binary or lazy loading changes the
+shipped-artifact contract. E3: floor ~0.15 us revalidated
+(same argv + constant + one write(2) observable); multiple 591x. E4: dominant
+residual is ELF dynamic relocation and symbol binding plus kernel process
+creation; reopen consents are static linking, RELR (link-time), prelink/ld.so
+cache (deployment), or an artifact-shape change. Any real process start pays
+>100 us before `main`, so
+the 2x criterion is unreachable in this artifact shape.
