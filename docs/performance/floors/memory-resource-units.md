@@ -1,8 +1,9 @@
 # Floor ledger: memory resource units (terminal state, stream-load growth)
 
 Owning R2 hot rows (lane 10): *Terminal state*, *Stream-load memory growth* — hot by
-input-scaling, graded in the resource currency. State: **RECORDED — distribution captured
-(PERF-T11 iteration 29); graduation transfers to Phase-6 cold grading (PERF-T14).**
+input-scaling, graded in the resource currency. State: **GRADED — PERF-T14 cold grading
+in the bytes currency (docs/performance/PERF-T14-cold-grading.md); distribution
+recorded at PERF-T11 iteration 29; no wall-clock claim.**
 
 ## Contract (from call sites, tests, signatures — never internals)
 

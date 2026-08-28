@@ -15,25 +15,28 @@
 
 | Ledger | Owning R2/R8 hot rows | Lane | Measured cost (trust) | Floor | Multiple | State |
 |---|---|---|---|---|---|---|
-| [session-append.md](session-append.md) | JSONL entry serialization; file append | 9 | 18.34 us/entry (fresh, rs 5.3%) | 3.73 us | 4.91x | OPEN |
-| [session-reopen.md](session-reopen.md) | JSONL scan/parse on reopen; state reconstruction | 9 | 5.95 us/entry (fresh, rs 5.7%) | 0.76 us | 7.79x | OPEN |
-| [render-churn-recomposition.md](render-churn-recomposition.md) | Component tree recomposition; layout calculation | 7 | 212 us/frame editor (R8 + fresh) | ~1.5 us | ~141x | OPEN |
-| [terminal-paint.md](terminal-paint.md) | Terminal diff/encode/write (paint); NullTerminal write; first synchronized paint | 2, 3, 4, 7 | 26.5 us/frame amortized (subtraction) | 0.64 us | ~7.5x paint-only (block 41x) | OPEN |
-| [stream-frame-pipeline.md](stream-frame-pipeline.md) | Provider frame decode; assistant state reduction; incremental visible content update | 3 | not separable (see ledger) | 0.15-0.2 us/frame each | unproven | OPEN (fail-closed) |
-| [tool-dispatch-slice.md](tool-dispatch-slice.md) | Argument validation; tool start/update/end events; result construction + append | 8 | 24.12 us/call wall (R8 artifact) | 4.29 us | 5.62x | OPEN |
-| [startup-version-path.md](startup-version-path.md) | CLI argument parsing; version lookup; one output write + clean exit | 1 | 0.37 ms in-process CPU (callgrind) | 0.15 us | ~2480x (CPU) | OPEN |
-| [first-frame-init.md](first-frame-init.md) | Argument parsing + config construction; model/provider construction; TUI construction + layout | 2 | 243.61 ms lane (R2, trusted) | ~1.50 ms | ~162.4x | OPEN |
-| [extension-rpc-dispatch.md](extension-rpc-dispatch.md) | JSONL frame encode/decode; request correlation; host loop dispatch; widget callback + UI-slot traffic | 5, 6 | none trusted (Rust untimed; TS noisy) | ~1 us/req | unproven | OPEN (fail-closed) |
-| [keypress-dispatch.md](keypress-dispatch.md) | PTY key write; input dispatch to state mutation | 4 | 1.935 ms median (NOISE FAIL, rs 27%) | ~13 us | unproven | OPEN (fail-closed) |
-| [memory-resource-units.md](memory-resource-units.md) | Terminal state; stream-load memory growth | 10 | none (artifact incomplete, R8) | bytes-class | unproven | OPEN (fail-closed) |
+| [session-append.md](session-append.md) | JSONL entry serialization; file append | 9 | 18.34 us/entry (fresh, rs 5.3%) | 3.73 us | 4.91x | AT-FLOOR (terminal, 1.41x) |
+| [session-reopen.md](session-reopen.md) | JSONL scan/parse on reopen; state reconstruction | 9 | 5.95 us/entry (fresh, rs 5.7%) | 0.76 us | 7.79x | AT-FLOOR (terminal, 1.97x) |
+| [render-churn-recomposition.md](render-churn-recomposition.md) | Component tree recomposition; layout calculation | 7 | 212 us/frame editor (R8 + fresh) | ~1.5 us (revalidated 10.4-10.6 us) | ~141x | AT-FLOOR (terminal, ~1.25-1.35x) |
+| [terminal-paint.md](terminal-paint.md) | Terminal diff/encode/write (paint); NullTerminal write; first synchronized paint | 2, 3, 4, 7 | 26.5 us/frame amortized (subtraction) | 0.64 us | ~7.5x paint-only (block 41x) | AT-FLOOR (terminal, 1.97x/1.50x/1.38x) |
+| [stream-frame-pipeline.md](stream-frame-pipeline.md) | Provider frame decode; assistant state reduction; incremental visible content update | 3 | not separable (see ledger) | 0.15-0.2 us/frame each | unproven | architecture-floor (terminal, iteration 13) |
+| [tool-dispatch-slice.md](tool-dispatch-slice.md) | Argument validation; tool start/update/end events; result construction + append | 8 | 24.12 us/call wall (R8 artifact) | 4.29 us | 5.62x | CONSTRAINED-ABOVE-FLOOR (terminal, 5.62x) |
+| [startup-version-path.md](startup-version-path.md) | CLI argument parsing; version lookup; one output write + clean exit | 1 | 0.37 ms in-process CPU (callgrind) | 0.15 us | ~2480x (CPU) | CONSTRAINED-ABOVE-FLOOR (terminal; iteration-27 win banked 1.59x wall / 3.99x Ir; residual ~591x de-minimis) |
+| [first-frame-init.md](first-frame-init.md) | Argument parsing + config construction; model/provider construction; TUI construction + layout | 2 | 243.61 ms lane (R2, trusted) | ~1.50 ms | ~162.4x | CONSTRAINED-ABOVE-FLOOR (terminal, ~47.5x at ~71.3 ms) |
+| [extension-rpc-dispatch.md](extension-rpc-dispatch.md) | JSONL frame encode/decode; request correlation; host loop dispatch; widget callback + UI-slot traffic | 5, 6 | none trusted (Rust untimed; TS noisy) | ~1 us/req | unproven | CONSTRAINED-ABOVE-FLOOR (terminal, S 3,058 ns trusted) |
+| [keypress-dispatch.md](keypress-dispatch.md) | PTY key write; input dispatch to state mutation | 4 | 291.9 us pooled median (trusted, iteration 31) | owned floor revalidated | 1.05-1.15x owned | AT-FLOOR (terminal, 1.05-1.15x owned) |
+| [memory-resource-units.md](memory-resource-units.md) | Terminal state; stream-load memory growth | 10 | recorded (iteration 29, bytes) | bytes-class | ~352x / ~1,737x (bytes) | GRADED (PERF-T14, bytes currency) |
 
 ## Coverage — no residue
 
 Every hot row of the PERF-R2 lane tables (as amended by PERF-R8) maps to exactly one
-ledger above. Cold rows (process creation, runtime loading, page-cache effects,
-extension registration, V8 profiler setup) are excluded by the R2 split and are graded
-in the Phase-6 cold pass, not here. No hot row is unmapped; no unit carries a third
-state.
+ledger above. Cold rows are excluded by the R2 split and are graded in the Phase-6
+cold pass (PERF-T14): process creation, executable/runtime loading, process startup,
+extension fan-out/registration, timeout/locality correctness, V8 heap profiler
+sampling, page-cache warm/cold, and the four lane-10 memory rows (resident
+executable/runtime pages, allocator baseline, model/config state, task/event-loop
+stacks); see [PERF-T14-cold-grading.md](../PERF-T14-cold-grading.md). No hot row is
+unmapped; no unit carries a third state.
 
 ## Ordered OPEN list (rebuild targets, descending time share)
 
