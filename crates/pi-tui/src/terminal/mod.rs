@@ -23,8 +23,8 @@ pub use input::{TerminalInput, map_event};
 pub use probe::{
     PROBE_FRAGMENT_TIMEOUT, ProbeFeed, ProbeReply, ProbeSession, TerminalTheme,
     background_from_replies, classify_background, detect_terminal_theme, osc_11_query,
-    probe_background, probe_background_from_chunks, probe_query_batch, probe_terminal,
-    reinject_bytes_as_events,
+    probe_background, probe_background_from_chunks, probe_collect_replies, probe_query_batch,
+    probe_write_batch, reinject_bytes_as_events,
 };
 pub use sink::FrameSink;
 pub use writer::{

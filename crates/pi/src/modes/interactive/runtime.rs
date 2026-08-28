@@ -53,7 +53,9 @@ use pi_tui::keys::{
 };
 use pi_tui::terminal::caps::TerminalCapabilities;
 use pi_tui::terminal::input::TerminalInput;
-use pi_tui::terminal::probe::{TerminalTheme, detect_terminal_theme, probe_terminal};
+use pi_tui::terminal::probe::{
+    TerminalTheme, detect_terminal_theme, probe_collect_replies, probe_write_batch,
+};
 use pi_tui::terminal::writer::{ReanchorCause, SettledBlock, Tui, Txn};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -1686,6 +1688,27 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         );
     }
 
+    /// Merge late startup-probe capability refinements: replace the Tui
+    /// capability set, refresh the cached true-color flag, re-detect the
+    /// polarity, and re-resolve the theme (no-op when it did not change).
+    /// Returns whether the capability set changed; the caller repaints.
+    fn adopt_probe_caps(&mut self, caps: TerminalCapabilities) -> bool {
+        if *self.tui.capabilities() == caps {
+            return false;
+        }
+        *self.tui.capabilities_mut() = caps;
+        self.true_color = self.tui.capabilities().true_color;
+        self.requery_terminal_theme();
+        self.apply_theme_from_settings();
+        true
+    }
+
+    /// Queue events preserved by the startup probe for re-injection ahead of
+    /// live input (the reader starts after the probe join).
+    fn queue_pending_events(&mut self, events: Vec<UiEvent>) {
+        self.pending_ui_reinject.extend(events.into_iter().rev());
+    }
+
     /// Signal the runtime to exit at the next loop turn (signal handler hook).
     pub fn request_shutdown(&self) {
         self.shutdown_flag
@@ -1770,7 +1793,14 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     // into methods would hide the loop's shape without removing any behaviour.
     #[allow(clippy::too_many_lines)]
     pub async fn run(&mut self) -> io::Result<InteractiveExit> {
-        if !self.initialize_run().await {
+        self.run_with_startup(true).await
+    }
+
+    /// [`InteractiveRuntime::run`] with the startup sequence (theme push +
+    /// first paint) conditional: the speculative-first-paint startup paints
+    /// that frame itself, inside the probe window.
+    async fn run_with_startup(&mut self, startup: bool) -> io::Result<InteractiveExit> {
+        if startup && !self.initialize_run().await {
             return Ok(self.exit_kind);
         }
 
@@ -6637,10 +6667,16 @@ where
 /// Wires (in order):
 /// 1. `io::stdout()` handle + initial ioctl size.
 /// 2. Panic emergency-restore hook and [`TerminalGuard`] viewport/activation.
-/// 3. [`Tui<Stdout>`] construction with the cached capabilities + size.
-/// 4. [`TerminalInput::spawn`] (sole `EventStream` owner).
-/// 5. [`AgentSessionHost`] wrapping the runtime.
-/// 6. [`InteractiveRuntime::run`] to completion.
+/// 3. Startup probe batch write; reply collection offloaded to a blocking
+///    task that owns stdin during first-frame construction.
+/// 4. [`Tui<Stdout>`] construction with the default capabilities + size, and
+///    a deferred [`TerminalInput`] (no stdin reader yet).
+/// 5. [`AgentSessionHost`] wrapping the runtime, then the speculative first
+///    frame painted inside the probe window.
+/// 6. Probe replies joined; capability/theme refinements merged with a
+///    repaint when they changed the first frame's basis; the input reader
+///    starts (sole `EventStream` owner from here on).
+/// 7. [`InteractiveRuntime::run`] to completion.
 ///
 /// On exit the runtime is dropped, then the guard (which writes the restore
 /// bytes via its `Drop` impl). Returns the process exit code.
@@ -6670,12 +6706,22 @@ pub async fn run_interactive_mode(
         .activate(enable_kitty)
         .map_err(|e| format!("terminal activation failed: {e}"))?;
 
-    options.pending_ui_events = probe_terminal(guard.writer_mut(), &mut options.caps)
+    // Speculative startup probe: write the batch, then collect replies on a
+    // blocking task while this task constructs the UI and paints the first
+    // frame with the default capabilities. The collector owns stdin until it
+    // is joined; the TerminalInput reader starts only after the join, so
+    // there is never more than one stdin reader.
+    let probe_written = probe_write_batch(guard.writer_mut())
         .map_err(|error| format!("terminal probe failed: {error}"))?;
+    let probe_task = probe_written.then(|| {
+        let mut probe_caps = options.caps.clone();
+        tokio::task::spawn_blocking(move || {
+            probe_collect_replies(&mut probe_caps).map(|pending| (probe_caps, pending))
+        })
+    });
     let colorfgbg = std::env::var("COLORFGBG").ok();
     options.terminal_theme =
         detect_terminal_theme(options.caps.dark_background, colorfgbg.as_deref());
-    set_kitty_protocol_active(options.caps.kitty_keyboard());
 
     // 2. Tui takes a separate stdout handle (Stdout is a cheap cloneable
     //    handle to the same underlying stream). No stdout clone of the
@@ -6692,8 +6738,9 @@ pub async fn run_interactive_mode(
     )
     .map_err(|e| format!("tui initialization failed: {e}"))?;
 
-    // 3. Spawn the sole TerminalInput task.
-    let input = TerminalInput::spawn();
+    // 3. Deferred input handle: no stdin reader yet — the probe collector
+    //    still owns stdin. The reader starts after the join.
+    let input = TerminalInput::deferred();
 
     // 4. Wire the host and runtime. Session replacement rebinds the host's
     //    cached session Arc; InteractiveRuntime also rebinds events/partial
@@ -6712,10 +6759,10 @@ pub async fn run_interactive_mode(
         })
         .await;
 
-    // Resolve the startup theme from settings + the just-probed terminal
-    // polarity (replaces the static dark default); the render depth follows
-    // the probed truecolor capability (256-color-only terminals get
-    // downsampled SGR).
+    // Resolve the startup theme from settings + the current polarity guess
+    // (replaces the static dark default; refined after the probe join); the
+    // render depth follows the truecolor capability (256-color-only
+    // terminals get downsampled SGR).
     options.theme = startup_theme(
         host_arc.as_ref(),
         options.terminal_theme,
@@ -6766,10 +6813,38 @@ pub async fn run_interactive_mode(
         })));
     }
 
-    // 5. Drive the loop. Suspend restores the terminal, raises SIGTSTP on
+    // 5. Speculative first frame: run the startup sequence (theme push +
+    //    first paint) inside the probe window with the default capabilities.
+    let mut startup_already_painted = rt.initialize_run().await;
+
+    // Join the probe collector. Merge capability/theme refinements and
+    // repaint when they changed the first frame's basis (a silent terminal —
+    // the common case — skips the repaint), preserve early keystrokes for
+    // re-injection, then hand stdin to the input reader.
+    let (probe_caps, pending_events) = match probe_task {
+        Some(handle) => match handle.await {
+            Ok(Ok(joined)) => joined,
+            Ok(Err(error)) => return Err(format!("terminal probe failed: {error}")),
+            Err(error) => return Err(format!("terminal probe task failed: {error}")),
+        },
+        None => (options.caps.clone(), Vec::new()),
+    };
+    if rt.adopt_probe_caps(probe_caps) {
+        rt.paint_frame()
+            .map_err(|error| format!("startup repaint failed: {error}"))?;
+    }
+    set_kitty_protocol_active(rt.tui.capabilities().kitty_keyboard());
+    rt.queue_pending_events(pending_events);
+    rt.input_mut().start();
+
+    // 6. Drive the loop. Suspend restores the terminal, raises SIGTSTP on
     //    Unix, then resumes/resizes and re-enters run() without exiting.
     let exit = loop {
-        let exit = rt.run().await;
+        // The first pass skips the startup sequence when the speculative
+        // paint above already ran it; later entries (Suspend, external
+        // editor) re-run it to restore the frame, as before.
+        let exit = rt.run_with_startup(!startup_already_painted).await;
+        startup_already_painted = true;
         // Resize events update the runtime view while the guard remains owned
         // here. Synchronize before every path that can restore terminal modes.
         guard.set_viewport_bottom_row(rt.viewport_bottom_row());
@@ -6809,12 +6884,12 @@ pub async fn run_interactive_mode(
         }
     };
 
-    // 6. Drop runtime first so any final paint commits before guard restore.
+    // 7. Drop runtime first so any final paint commits before guard restore.
     drop(rt);
     runtime.set_rebind_session(None);
     runtime.set_before_session_invalidate(None);
     runtime.set_before_session_replacement(None);
-    // 7. Guard restores on Drop. Convert exit kind to a process exit code.
+    // 8. Guard restores on Drop. Convert exit kind to a process exit code.
     let code = match exit {
         InteractiveExit::Clean
         | InteractiveExit::SessionEnded

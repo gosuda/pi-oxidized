@@ -87,25 +87,39 @@ pub fn detect_terminal_theme(osc_dark: Option<bool>, colorfgbg: Option<&str>) ->
         })
 }
 
-/// Write the startup probe batch and merge bounded replies into `caps`.
+/// Write the startup probe batch (phase 1 of the startup probe).
 ///
-/// This runs before [`crate::terminal::TerminalInput`] takes ownership of
-/// stdin, preserving early keystrokes as UI events for its caller to re-inject.
+/// Returns `false` when stdin is not a terminal — no batch is written and
+/// the matching [`probe_collect_replies`] call completes immediately.
+/// Written outside synchronized output, before
+/// [`crate::terminal::TerminalInput`] takes ownership of stdin.
 ///
 /// # Errors
 ///
 /// Returns [`io::Error`] when writing or flushing the probe batch fails.
-pub fn probe_terminal<W: Write>(
-    output: &mut W,
-    caps: &mut TerminalCapabilities,
-) -> io::Result<Vec<UiEvent>> {
+pub fn probe_write_batch<W: Write>(output: &mut W) -> io::Result<bool> {
     if !io::stdin().is_terminal() {
-        return Ok(Vec::new());
+        return Ok(false);
     }
 
     output.write_all(&probe_query_batch(true))?;
     output.flush()?;
+    Ok(true)
+}
 
+/// Collect the startup probe replies written by [`probe_write_batch`]
+/// (phase 2), merging recognized replies into `caps` and returning early
+/// keystrokes as UI events for re-injection.
+///
+/// Blocks for the two-phase reply budget (see [`collect_probe_replies`]) —
+/// at most [`PROBE_FIRST_BYTE_TIMEOUT`] on a silent terminal — so callers
+/// that painted a first frame speculatively during this window re-derive
+/// theme and capability state afterwards and repaint when it changed.
+///
+/// # Errors
+///
+/// Returns [`io::Error`] when reading stdin fails.
+pub fn probe_collect_replies(caps: &mut TerminalCapabilities) -> io::Result<Vec<UiEvent>> {
     let mut session = ProbeSession::new();
     let mut pending = Vec::new();
     collect_probe_replies(&mut session, &mut pending, ProbeSession::is_complete)?;

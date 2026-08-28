@@ -12,8 +12,12 @@ use crate::terminal::probe::probe_background;
 /// Handle used by the UI loop to receive mapped terminal events.
 #[derive(Debug)]
 pub struct TerminalInput {
+    tx: mpsc::UnboundedSender<UiEvent>,
     rx: mpsc::UnboundedReceiver<UiEvent>,
     control_tx: mpsc::UnboundedSender<InputControl>,
+    /// Held back by [`TerminalInput::deferred`] until [`TerminalInput::start`]
+    /// spawns the reader task.
+    control_rx: Option<mpsc::UnboundedReceiver<InputControl>>,
 }
 
 /// Control messages for pausing the `EventStream` around probes.
@@ -39,17 +43,52 @@ impl TerminalInput {
     /// Only one instance should exist for the process while interactive.
     #[must_use]
     pub fn spawn() -> Self {
+        let mut input = Self::deferred();
+        input.start();
+        input
+    }
+
+    /// Create the input handle WITHOUT spawning the `EventStream` reader.
+    ///
+    /// Startup calls this while the capability probe still owns stdin (its
+    /// collector may run on a blocking thread during first-frame painting);
+    /// [`TerminalInput::start`] spawns the reader once stdin ownership is
+    /// back with this handle. [`Self::pause`] and [`Self::resume`] must not
+    /// be called before `start`.
+    #[must_use]
+    pub fn deferred() -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let (control_tx, control_rx) = mpsc::unbounded_channel();
-        tokio::spawn(input_task(tx, control_rx));
-        Self { rx, control_tx }
+        Self {
+            tx,
+            rx,
+            control_tx,
+            control_rx: Some(control_rx),
+        }
+    }
+
+    /// Spawn the reader task for a [`TerminalInput::deferred`] handle.
+    ///
+    /// No-op when the reader is already running. Only one reader may exist
+    /// for the process while interactive; call only once nothing else reads
+    /// stdin (after the probe collector joined).
+    pub fn start(&mut self) {
+        if let Some(control_rx) = self.control_rx.take() {
+            tokio::spawn(input_task(self.tx.clone(), control_rx));
+        }
     }
 
     /// Create an input handle backed by a pre-built channel (tests / mocks).
     #[must_use]
     pub fn mock(rx: mpsc::UnboundedReceiver<UiEvent>) -> Self {
+        let (tx, _tx_rx) = mpsc::unbounded_channel();
         let (control_tx, _control_rx) = mpsc::unbounded_channel();
-        Self { rx, control_tx }
+        Self {
+            tx,
+            rx,
+            control_tx,
+            control_rx: None,
+        }
     }
 
     /// Receive the next UI event.
@@ -278,9 +317,12 @@ mod tests {
         tokio::spawn(input_task_with_factory(events_tx, control_rx, || {
             futures::stream::pending::<io::Result<Event>>()
         }));
+        let (unused_tx, _unused_rx) = mpsc::unbounded_channel();
         let mut input = TerminalInput {
+            tx: unused_tx,
             rx: events_rx,
             control_tx,
+            control_rx: None,
         };
 
         input.pause().await?;
@@ -299,9 +341,12 @@ mod tests {
         tokio::spawn(input_task_with_factory(events_tx, control_rx, || {
             futures::stream::pending::<io::Result<Event>>()
         }));
+        let (unused_tx, _unused_rx) = mpsc::unbounded_channel();
         let mut input = TerminalInput {
+            tx: unused_tx,
             rx: events_rx,
             control_tx,
+            control_rx: None,
         };
 
         input.pause().await?;
