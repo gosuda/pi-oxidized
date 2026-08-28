@@ -1440,7 +1440,28 @@
 		},
 		{
 			"from": "aws-smithy-query",
+			"to": "aws-smithy-runtime-api",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-query",
+			"to": "aws-smithy-schema",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-query",
 			"to": "aws-smithy-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-query",
+			"to": "aws-smithy-xml",
 			"kinds": [
 				"normal"
 			]
@@ -3344,13 +3365,6 @@
 		},
 		{
 			"from": "google-cloud-auth",
-			"to": "chrono",
-			"kinds": [
-				"normal"
-			]
-		},
-		{
-			"from": "google-cloud-auth",
 			"to": "google-cloud-gax",
 			"kinds": [
 				"normal"
@@ -3373,6 +3387,13 @@
 		{
 			"from": "google-cloud-auth",
 			"to": "http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-auth",
+			"to": "jiff",
 			"kinds": [
 				"normal"
 			]
@@ -3534,6 +3555,13 @@
 		{
 			"from": "google-cloud-gax",
 			"to": "tokio",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-gax",
+			"to": "tokio-stream",
 			"kinds": [
 				"normal"
 			]
@@ -4744,6 +4772,13 @@
 		},
 		{
 			"from": "jiff",
+			"to": "jiff-core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "jiff",
 			"to": "jiff-static",
 			"kinds": [
 				"normal"
@@ -4787,6 +4822,20 @@
 		{
 			"from": "jiff",
 			"to": "windows-link",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "jiff-core",
+			"to": "defmt",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "jiff-static",
+			"to": "jiff-core",
 			"kinds": [
 				"normal"
 			]
@@ -8614,6 +8663,27 @@
 			]
 		},
 		{
+			"from": "syn",
+			"to": "proc-macro2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "syn",
+			"to": "quote",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "syn",
+			"to": "unicode-ident",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
 			"from": "sync_wrapper",
 			"to": "futures-core",
 			"kinds": [
@@ -9349,6 +9419,34 @@
 			]
 		},
 		{
+			"from": "tokio-stream",
+			"to": "futures-core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tokio-stream",
+			"to": "pin-project-lite",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tokio-stream",
+			"to": "tokio",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tokio-stream",
+			"to": "tokio-util",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
 			"from": "tokio-tungstenite",
 			"to": "futures-util",
 			"kinds": [
@@ -9428,6 +9526,13 @@
 		{
 			"from": "tokio-util",
 			"to": "futures-util",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tokio-util",
+			"to": "libc",
 			"kinds": [
 				"normal"
 			]
