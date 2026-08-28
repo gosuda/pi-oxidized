@@ -114,7 +114,7 @@ describe("SBOM content structure", () => {
 			(content.npm.lockfiles[0]?.packages ?? []).map((p) => `${p.name}@${p.version}`),
 		);
 		expect(rootLock.has("ignore@7.0.6")).toBe(true);
-		expect(rootLock.has("typescript@5.9.3")).toBe(true);
+		expect(rootLock.has("typescript@7.0.2")).toBe(true);
 		expect(rootLock.has("@types/bun@1.4.0")).toBe(true);
 		const hostLock = new Set(
 			(content.npm.lockfiles[1]?.packages ?? []).map((p) => `${p.name}@${p.version}`),

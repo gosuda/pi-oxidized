@@ -476,7 +476,7 @@ export async function runTypeScriptLane(root: string, allFences: readonly Regist
 			"@earendil-works/pi-ai": [join(resolve(root), "packages/extension-host/src/refs.d.ts")],
 			"@earendil-works/pi-ai/*": [join(resolve(root), "packages/extension-host/src/refs.d.ts")],
 		};
-		writeFileSync(join(laneRoot, "tsconfig.json"), `${JSON.stringify({ compilerOptions: { target: "ESNext", module: "ESNext", moduleResolution: "bundler", lib: ["ESNext"], types: ["bun"], typeRoots: [join(resolve(root), "node_modules/@types")], strict: true, noUncheckedIndexedAccess: true, exactOptionalPropertyTypes: false, noEmit: true, skipLibCheck: true, allowImportingTsExtensions: true, baseUrl: ".", paths }, include: ["snippet_*.ts"] }, null, 2)}\n`);
+		writeFileSync(join(laneRoot, "tsconfig.json"), `${JSON.stringify({ compilerOptions: { target: "ESNext", module: "ESNext", moduleResolution: "bundler", lib: ["ESNext"], types: ["bun"], typeRoots: [join(resolve(root), "node_modules/@types")], strict: true, noUncheckedIndexedAccess: true, exactOptionalPropertyTypes: false, noEmit: true, skipLibCheck: true, allowImportingTsExtensions: true, paths }, include: ["snippet_*.ts"] }, null, 2)}\n`);
 		let result: RunResult;
 		try {
 			result = await new SpawnRunner().run(join(resolve(root), "node_modules/.bin/tsc"), ["--noEmit", "-p", laneRoot, "--pretty", "false"], { cwd: resolve(root), timeoutMs: TS_TIMEOUT_MS });
