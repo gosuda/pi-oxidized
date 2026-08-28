@@ -138,6 +138,7 @@ describe("assembleRelease", () => {
 		fs.files.set("/workspace/target/x86_64-pc-windows-msvc/release/pi.exe", new Uint8Array([1]));
 		fs.files.set("/staging/pi-extension-host.exe", new Uint8Array([2]));
 		fs.files.set("/workspace/CHANGELOG.md", new Uint8Array([5]));
+		fs.files.set("/workspace/README.md", new Uint8Array([4]));
 
 		const inputs = {
 			plan,
@@ -172,6 +173,7 @@ describe("assembleRelease", () => {
 		fs.files.set(runtimePath, new Uint8Array([3]));
 		fs.modes.set(piPath, 0o755);
 		fs.files.set("/workspace/CHANGELOG.md", new Uint8Array([5]));
+		fs.files.set("/workspace/README.md", new Uint8Array([4]));
 		fs.modes.set(runtimePath, 0o755);
 
 		const assembly = await assembleRelease("/staging", {
@@ -192,6 +194,7 @@ describe("assembleRelease", () => {
 		expect(assembly.manifest.hostKind).toBe("runtime-bundle");
 		expect(assembly.manifest.files.map((file) => file.path)).toEqual([
 			"CHANGELOG.md",
+			"README.md",
 			"bun",
 			"pi",
 			"pi-extension-host.js",
@@ -236,7 +239,7 @@ describe("assembleRelease", () => {
 			["host-bundle", "/staging/host/pi-extension-host.js", "pi-extension-host.js", false],
 			["bun-runtime", "/staging/host/bun", "bun", false],
 			["metadata-file", "/workspace/CHANGELOG.md", "CHANGELOG.md", false],
-			["metadata-file", "/workspace/README.md", "README.md", true],
+			["metadata-file", "/workspace/README.md", "README.md", false],
 			["metadata-file", "/workspace/LICENSE", "LICENSE", true],
 			["metadata-file", "/workspace/LICENSE-MIT", "LICENSE-MIT", true],
 			["tree", "/workspace/docs", "docs", false],
@@ -256,6 +259,7 @@ describe("assembleRelease", () => {
 		fs.files.set("/staging/host/pi-extension-host.js", new Uint8Array([3]));
 		fs.files.set("/staging/host/bun", new Uint8Array([4]));
 		fs.files.set("/workspace/CHANGELOG.md", new Uint8Array([5]));
+		fs.files.set("/workspace/README.md", new Uint8Array([4]));
 		fs.modes.set("/staging/host/bun", 0o755);
 
 		const assembly = await assembleRelease("/staging", {
@@ -279,6 +283,7 @@ describe("assembleRelease", () => {
 		expect(assembly.manifest.hostKind).toBe("compiled");
 		expect(assembly.manifest.files.map((file) => file.path)).toEqual([
 			"CHANGELOG.md",
+			"README.md",
 			"bun",
 			"pi",
 			"pi-extension-host",
@@ -347,7 +352,7 @@ describe("stagedInputs", () => {
 			["rust-binary", base.piBinaryPath, "pi", false],
 			["host-binary", "/staging/pi-extension-host", "pi-extension-host", false],
 			["metadata-file", "/workspace/CHANGELOG.md", "CHANGELOG.md", false],
-			["metadata-file", "/workspace/README.md", "README.md", true],
+			["metadata-file", "/workspace/README.md", "README.md", false],
 			["metadata-file", "/workspace/LICENSE", "LICENSE", true],
 			["metadata-file", "/workspace/LICENSE-MIT", "LICENSE-MIT", true],
 			["tree", "/workspace/docs", "docs", false],
@@ -372,7 +377,7 @@ describe("stagedInputs", () => {
 			["host-bundle", "/staging/pi-extension-host.js", "pi-extension-host.js", false],
 			["bun-runtime", "/official/bun", "bun", false],
 			["metadata-file", "/workspace/CHANGELOG.md", "CHANGELOG.md", false],
-			["metadata-file", "/workspace/README.md", "README.md", true],
+			["metadata-file", "/workspace/README.md", "README.md", false],
 			["metadata-file", "/workspace/LICENSE", "LICENSE", true],
 			["metadata-file", "/workspace/LICENSE-MIT", "LICENSE-MIT", true],
 			["tree", "/workspace/docs", "docs", false],

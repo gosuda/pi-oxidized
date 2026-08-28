@@ -168,14 +168,13 @@ export function stagedInputs(inputs: AssembleInputs): readonly StagedInput[] {
 			},
 		);
 	}
-	// CHANGELOG.md and the docs tree are mandatory release members: the
-	// CHANGELOG gate refuses builds without release notes, and every archive
-	// must ship the documentation. README.md and the license files stay
-	// optional so a workspace can ship a subset (the root README lands with
-	// the documentation track).
+	// CHANGELOG.md, README.md, and the docs tree are mandatory release
+	// members: the CHANGELOG gate refuses builds without release notes, and
+	// no archive may ship without the README or the documentation. Only the
+	// license files stay optional.
 	for (const [name, optional] of [
 		["CHANGELOG.md", false],
-		["README.md", true],
+		["README.md", false],
 		["LICENSE", true],
 		["LICENSE-MIT", true],
 	] as const) {
