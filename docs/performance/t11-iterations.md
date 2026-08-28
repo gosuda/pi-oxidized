@@ -1513,3 +1513,57 @@ pop-from-end queue.
 `docs/supported-platforms.md`, DEPS ledger docs, floor ledgers,
 `scripts/session-timing.ts`, `session-timing.rs`, `Cargo.lock`,
 `rust-toolchain.toml`.
+
+## Iteration 17 — `first-frame-init` (detection/factory overlap — REJECTED)
+
+Date 2026-08-28. Base `ea3516b` (iteration 16).
+
+**Candidate**: overlap the single `spawn_blocking(
+InteractiveRuntimeOptions::detect)` with independent
+`RuntimeFactory::create`. The blocking terminal probe (~25 ms after
+iteration 15's two-phase wait) runs concurrently with runtime construction
+(model registry, provider adapters, session services). The `JoinHandle` is
+carried through `Dispatched` to the interactive dispatcher seam, which
+awaits it instead of spawning a fresh detection. Non-interactive and
+early-exit paths abort the handle to avoid detached tasks.
+
+**Implementation** (reverted): `bootstrap.rs` — `run_bootstrap` spawns
+`spawn_blocking(InteractiveRuntimeOptions::detect)` after
+`prepare_session` when `app_mode.is_interactive()`, before
+`create_runtime`; the `JoinHandle` is threaded through `finish_bootstrap`
+into `Dispatched.detect_handle` (new `Option<JoinHandle<...>>` field).
+`entry.rs` — the interactive closure in `Io::real()` awaits
+`dispatched.detect_handle` when `Some`, falling back to a fresh
+`spawn_blocking` when `None`. Every non-interactive path (factory error,
+help/list-models, stdin demotion, no-models) aborts the handle.
+
+**Measurements** (`scripts/first-frame-timing.py`, release,
+`taskset -c 20-40`, 9 interleaved pairs, fresh 100x32 PTY per sample,
+PI_OFFLINE extension-free workload; baseline = `ea3516b` clean binary,
+design = cutover binary):
+
+| Run | Before median (ms) | After median (ms) | Win |
+|---|---|---|---|
+| 1 | 70.1 (65.9–93.6) | 71.3 (70.3–85.0) | 0.98x |
+| 2 | 72.4 (65.1–84.1) | 71.8 (68.4–86.4) | 1.01x |
+
+All 18 samples per run detected via synchronized-output. Win gate
+>=1.05x median: **FAILED** (0.98x / 1.01x). The overlap does not yield a
+measurable win because after iterations 15–16 the probe wait is already
+~25 ms (two-phase reply-armed wait) and `RuntimeFactory::create` on the
+offline extension-free path completes in a comparable or shorter window —
+the two tasks are roughly co-terminus, so overlapping them saves little
+to nothing. The baseline first-frame lane is now ~70 ms (down from
+~276 ms at iteration 14), and the residual is dominated by process
+spawn + loader + construction, not by serialized probe-then-factory
+ordering.
+
+**Verdict**: REJECTED. All Rust edits fully reverted; no production
+change landed. The `first-frame-init` unit remains OPEN at ~162.4x
+(ledger floor ~1.50 ms vs measured ~70 ms ≈ 47x after iterations 15–16;
+the ledger's 243.61 ms R2 baseline predates the probe-wait fixes).
+
+**Not touched** (out of scope, file-disjoint): `.github/workflows/`,
+`scripts/release/`, `scripts/verification/compat-matrix.json`,
+`docs/supported-platforms.md`, DEPS ledger docs, floor ledgers,
+`Cargo.lock`, `rust-toolchain.toml`.
