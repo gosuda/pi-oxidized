@@ -54,7 +54,7 @@ use pi_tui::keys::{
 use pi_tui::terminal::caps::TerminalCapabilities;
 use pi_tui::terminal::input::TerminalInput;
 use pi_tui::terminal::probe::{
-    TerminalTheme, detect_terminal_theme, probe_collect_replies, probe_write_batch,
+    TerminalTheme, detect_terminal_theme, probe_collect_replies_with_yield, probe_write_batch,
 };
 use pi_tui::terminal::writer::{ReanchorCause, SettledBlock, Tui, Txn};
 use ratatui::buffer::Buffer;
@@ -6706,17 +6706,21 @@ pub async fn run_interactive_mode(
         .activate(enable_kitty)
         .map_err(|e| format!("terminal activation failed: {e}"))?;
 
-    // Speculative startup probe: write the batch, then collect replies on a
-    // blocking task while this task constructs the UI and paints the first
-    // frame with the default capabilities. The collector owns stdin until it
-    // is joined; the TerminalInput reader starts only after the join, so
-    // there is never more than one stdin reader.
+    // Startup probe: write the query batch, then collect replies on a
+    // blocking task while this task constructs the UI. The collector owns
+    // stdin until it is joined; the TerminalInput reader starts only after
+    // the join, so there is never more than one stdin reader. The collector
+    // honors the yield flag (polled on its wait loop) so the runtime can
+    // take stdin back promptly when the first frame is due.
     let probe_written = probe_write_batch(guard.writer_mut())
         .map_err(|error| format!("terminal probe failed: {error}"))?;
+    let probe_yield = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let probe_task = probe_written.then(|| {
         let mut probe_caps = options.caps.clone();
+        let yield_now = Arc::clone(&probe_yield);
         tokio::task::spawn_blocking(move || {
-            probe_collect_replies(&mut probe_caps).map(|pending| (probe_caps, pending))
+            probe_collect_replies_with_yield(&mut probe_caps, &yield_now)
+                .map(|pending| (probe_caps, pending))
         })
     });
     let colorfgbg = std::env::var("COLORFGBG").ok();
@@ -6813,14 +6817,19 @@ pub async fn run_interactive_mode(
         })));
     }
 
-    // 5. Speculative first frame: run the startup sequence (theme push +
-    //    first paint) inside the probe window with the default capabilities.
-    let mut startup_already_painted = rt.initialize_run().await;
-
-    // Join the probe collector. Merge capability/theme refinements and
-    // repaint when they changed the first frame's basis (a silent terminal —
-    // the common case — skips the repaint), preserve early keystrokes for
-    // re-injection, then hand stdin to the input reader.
+    // Arm the collector yield and take stdin back BEFORE the first frame
+    // paints. The collector is the sole stdin reader until it joins; painting
+    // the frame while it still owned stdin made input written at first-paint
+    // time land in the byte-level collector and get re-injected through the
+    // lossy startup mapper — bracketed pastes and escape sequences were
+    // corrupted (an early paste could even clear the editor via the ESC in
+    // its 201~ marker). The collector honors the arm within its poll slice
+    // (only after replies started flowing; a silent terminal still ends at
+    // its 25 ms first-byte window), so the join adds at most a few
+    // milliseconds over host binding, which dominates startup. Input
+    // observed from the first frame onward always reaches the production
+    // EventStream parser.
+    probe_yield.store(true, std::sync::atomic::Ordering::Relaxed);
     let (probe_caps, pending_events) = match probe_task {
         Some(handle) => match handle.await {
             Ok(Ok(joined)) => joined,
@@ -6829,13 +6838,19 @@ pub async fn run_interactive_mode(
         },
         None => (options.caps.clone(), Vec::new()),
     };
-    if rt.adopt_probe_caps(probe_caps) {
-        rt.paint_frame()
-            .map_err(|error| format!("startup repaint failed: {error}"))?;
-    }
+    // Merge capability/theme refinements before painting: the first frame
+    // already uses the final capabilities, so no post-paint repaint is
+    // needed. Then queue probe-window keystrokes and hand stdin to the
+    // EventStream reader; from here on crossterm owns input parsing.
+    rt.adopt_probe_caps(probe_caps);
     set_kitty_protocol_active(rt.tui.capabilities().kitty_keyboard());
     rt.queue_pending_events(pending_events);
     rt.input_mut().start();
+
+    // 5. First frame: run the startup sequence (theme push + first paint)
+    //    with the final capabilities, after stdin ownership returned to the
+    //    EventStream reader.
+    let mut startup_already_painted = rt.initialize_run().await;
 
     // 6. Drive the loop. Suspend restores the terminal, raises SIGTSTP on
     //    Unix, then resumes/resizes and re-enters run() without exiting.
