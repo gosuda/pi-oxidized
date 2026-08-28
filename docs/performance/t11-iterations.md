@@ -1277,3 +1277,117 @@ file, cwd precedence, session-file binding on every success path): **CLEAN**
 `scripts/release/`, `scripts/verification/compat-matrix.json`,
 `docs/supported-platforms.md`, DEPS ledger docs, floor ledgers,
 `scripts/session-timing.ts`, `session-timing.rs`.
+
+## Iteration 15 — `first-frame-init` (reply-armed two-phase probe wait)
+
+Commit: see `git log` (`perf(t11)`). Date 2026-08-28.
+
+**Blind derivation** (recorded before reading the replaced body, from the
+ledger's Contract + Floor + decomposition): the lane is wait-bound — ~215 ms
+of 243.6 ms is two wait shapes, and the ledger names the entry: event-driven
+readiness instead of fixed ticks, eliminating the long pre-output block. The
+first-frame wire (probe batch + first synchronized frame) is boundary; only
+the waits are addressable. Data layout: make the pre-output probe wait
+event-driven and reply-armed — the wait blocks on stdin readiness with the
+remaining budget (no fixed tick), and the fragment budget attaches to the
+reply stream: once the first reply byte arrives the full TS-parity 150 ms
+fragment window applies (measured from the query write, exactly today's
+acceptance), but a terminal that has sent nothing cannot hold a fragment in
+flight, so silence ends the wait at a round-trip-class window (~1 ms floor
+class + scheduler headroom = 25 ms) instead of billing the full budget on
+every non-responding terminal. The compute side (18.9 ms construction, incl.
+1.9 ms rustls decode on the offline path) is secondary and untouched this
+iteration.
+
+**Boundary answers** (explicit, before touching): the probe batch bytes and
+their position before the first synchronized frame are unchanged
+(`pty_no_flicker` probe-before-sync predicate covers both scenarios); first
+DEC synchronized-output transaction composition unchanged; raw-mode enter/
+exit and guard ordering unchanged; probe acceptance for SPLIT replies is
+unchanged by construction — the 150 ms fragment budget still starts at the
+query write once bytes flow; early-keystroke preservation flows through the
+same `ProbeSession::feed` -> `PendingInput` -> reinject path; mid-session
+`probe_background` (paused-stream OSC 11 requery) gets the identical loop
+and returns `None` on silence exactly as its timeout path did, keeping the
+prior classification.
+
+**Cutover surface** (1 file + instrument): `crates/pi-tui/src/terminal/
+probe.rs` — `PROBE_FIRST_BYTE_TIMEOUT` (25 ms) constant, shared
+`collect_probe_replies` (two-phase budget, both probe loops converge on it),
+`read_stdin_nonblocking` replaced by `read_stdin_within(remaining)`
+(nix `poll` with computed ceiling-rounded timeout; readiness wakes are
+immediate, tick quantization gone; non-unix keeps a bounded sleep);
+`probe_terminal`/`probe_background` bodies reduce to the shared collector.
+`scripts/first-frame-timing.py` — committed interleaved A/B first-frame
+driver (fresh 100x32 PTY + extension-free workload per sample, sandbox env
+matching the verification harness, order alternating per pair, medians).
+Cargo.lock untouched (lock-neutral, no new deps).
+
+**Divergence audit** (branch classification of the replaced wait machinery):
+
+| Original branch | Classification | Reason |
+|---|---|---|
+| `poll(0)` + `sleep(5 ms)` tick cadence (28–30 zero-event iterations) | residue | tick quantization adds up to 5 ms of reply latency and the strace census shows the iteration count, not the deadline, set by the 5 ms sleep — replaced by one readiness poll with the remaining budget |
+| full 150 ms fragment budget burned while stdin is silent | residue | no contract term forces a wait beyond the probe round trip when no reply stream exists (floor: ~1 ms pipe-RT class); fragments require a first byte |
+| fragment budget after first byte, absolute from query write | essential | TS-parity split-reply acceptance — preserved verbatim |
+| `ProbeSession` feed/apply, `flush_timeout`, reinjection, EOF break | essential | unchanged |
+
+**Ground truth before design** (strace -f -TT census of the pinned workload
+on this box, baseline binary): the ledger's 157.2 ms "5 ms-cadence epoll
+loop" is the probe fragment wait itself — 28 × (`poll(fd0, 0)` +
+`clock_nanosleep(5 ms) ≈ 5.2 ms`) from the probe write to the first frame;
+the ledger's 58.3 ms blocking `epoll_wait` did not reproduce on this box/run
+(no critical-path block outside the probe loop; the observed `epoll_wait(-1)`
+waits belong to the concurrent tokio/crossterm input threads, not the main
+thread). Design trace: one `poll(fd0, POLLIN, 25) = 0 (Timeout) <25.2 ms>`,
+zero tick sleeps.
+
+**Measurements** (release, `taskset -c 20-40`, 9 interleaved pairs per run,
+order alternating per pair, 1 warmup per arm; `scripts/first-frame-timing.py`,
+fresh 100x32 PTY + extension-free workload + sandbox env per sample,
+PI_OFFLINE=1, xterm-256color; baseline = a007540 clean-worktree binary,
+design = cutover binary after the review fix; every sample first-frame via
+synchronized-output detection, no row-local fallbacks). Two complete
+post-fix runs on a box under external compile load (disclosed — one
+~0.8–1.2 s contention outlier per arm):
+
+| Run | Before median (ms) | After median (ms) | Win |
+|---|---|---|---|
+| 1 | 276.0 (244.6–1242.3) | 126.4 (110.9–351.1) | 2.18x |
+| 2 | 250.6 (245.5–1076.3) | 116.0 (111.9–145.3) | 2.16x |
+
+Win gate >=1.05x median: **PASSED** (2.18x / 2.16x on two independent
+complete interleaved runs). Contention-free pairs run ~245–276 ms (before)
+vs ~111–149 ms (after).
+
+**Recomputed multiple**: ~116–126 ms vs the ledger floor ~1.50 ms ≈
+**~77–84x — still OPEN** (>2x). The residual is the no-responder first-byte
+window (25 ms) + construction CPU (~19 ms, incl. rustls decode on the
+offline path) + spawn/loader (~9 ms); the next material lever is overlapping
+the startup construction with the probe window (a distinct design, not
+attempted in this slot), and the parser/TLS levers sit outside this
+iteration.
+
+**Verification**: `cargo check --workspace --all-targets` green (warnings
+pre-existing, none new in the touched file); `pi-tui --lib` 400/400 pass
+(probe subset 15/15 after the review fix); `pi --lib` 1659 pass / 6 fail,
+every failure in the four disclosed environmental classes (extension-host
+artifact, manifest utf8, trust-gating env, NFD-on-filesystem ×3 — the same
+classes iterations 13–14 recorded, independent of this diff); strace shape
+deltas recorded above; `pty_no_flicker` sync and sync-ignored scenarios pin
+the probe-before-sync wire predicate (the fixture drives its own probe loop,
+so the end-to-end probe-wait change is exercised by the first-frame driver
+and the live bench, which all observed synchronized-output first frames).
+
+**Review**: the first fresh adversarial review found one blocking defect —
+the fragment phase armed on ANY stdin bytes, so an early keystroke at a
+non-responding terminal still bought the full 150 ms wait. Fixed by arming
+the fragment phase only on probe-reply evidence (a recognized reply or a
+buffered partial sequence in `ProbeSession`); classified keystrokes arm
+nothing. Re-reviewed: **CLEAN** (0.97 confidence).
+
+**Not touched** (out of scope, file-disjoint): `.github/workflows/`,
+`scripts/release/`, `scripts/verification/compat-matrix.json`,
+`docs/supported-platforms.md`, DEPS ledger docs, floor ledgers,
+`scripts/session-timing.ts`, `session-timing.rs`, `runtime.rs` (the
+`run_interactive_mode` owed sequence is unchanged), `input.rs`.
