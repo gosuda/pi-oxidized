@@ -54,7 +54,7 @@ empty-transcript state is <=~100 KiB of the measured total.
 | typescript | not captured (n=0) | — | — |
 
 Growth over the idle lane (rust): ~119.7 MB RSS. Floor: 6,144 B + ~170 B/entry -> 6,314 B
-(single message entry) to 49,664 B (256-frame sensitivity); retained/floor ~18,962x to
+(single message entry) to 49,664 B (256-frame sensitivity); retained/floor ~18,959x to
 ~2,410x. Caveat named: the stream-load lane's process tree differs from the idle lane's by
 construction (verification extension + extension host join the tree), so this multiple
 bounds the whole-tree footprint under load, not transcript retention alone — retained

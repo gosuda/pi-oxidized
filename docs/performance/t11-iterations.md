@@ -3164,7 +3164,7 @@ load-window max tree RSS, 5 rust samples; TS n=0 per degradation 2):
 | rust | 145,068,032 B | 142,938,112-146,386,944 (2.4%) | 133,730,304 B |
 
 Growth over idle (rust): ~119.7 MB RSS. Floor 6,314 B (one entry) to
-49,664 B (256-entry sensitivity) -> retained/floor ~18,962x to ~2,410x.
+49,664 B (256-entry sensitivity) -> retained/floor ~18,959x to ~2,410x.
 Caveat: the stream lane's tree adds the verification extension + extension
 host, so the multiple bounds whole-tree footprint under load; retained
 transcript bytes are <=~0.005% of it. Churn above retained state belongs to
