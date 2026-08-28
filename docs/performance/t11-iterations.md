@@ -3473,3 +3473,41 @@ Not touched: production Rust (`crates/**`), `Cargo.lock`,
 floor ledgers. All temporary stage marks, the stage-probe module, the env
 gate, and both fixture modes are reverted (`git restore`; working tree ==
 `911a85d`).
+
+## PERF-G12 errata (2026-08-29 — divergence/boundary audit, issue #96)
+
+Two record defects found by the PERF-G12 audit of the rebuilt units. Both are
+docs-only corrections derivable from existing repository evidence; no
+historical iteration text is edited, and neither requires new measurement.
+
+1. **Iteration 5 blind-derivation anchor is dangling.** The iteration-5 record
+   states the Design E derivation was "recorded at 5be1884 before reading
+   post-iter3/4 code". Commit `5be1884` (`docs(xc-close): M1-M22 mutation
+   log...`) touches only `docs/extension-compatibility-contract.md` and
+   `docs/xc-mutation-log.md`, and no file in its tree mentions Design E, keyed
+   identity, or probe-free skips — the derivation is not in that commit. The
+   earliest in-repo trace is the iteration-4 record's one-line reservation
+   (landed in `0748236`: "handed to the next slot with Design E (measure-walk
+   skip on the static residual) pre-derived"); the full derivation text first
+   appears in the iteration-5 perf commit itself (`dee3103`). The
+   blind-ordering claim for iteration 5 therefore rests on the committed
+   one-line pre-reservation plus self-attestation, not on a verifiable
+   committed derivation. Anchor corrected by this erratum; the derivation
+   content itself is unchanged.
+
+2. **Iteration 8 divergence audit omits one replaced guard.** `d3fa790`
+   (terminal-paint iteration 1) deletes the clamp in `ViewportState::new`
+   (`let viewport_height = viewport_height.min(size.height).max(1);`) and
+   passes the raw argument through from `Tui::new`, which still clamps only
+   the `Viewport::Inline` construction. No classification row covers this
+   removal. Verified behavior-neutral at every in-repo call site: the sole
+   production caller pre-clamps (`crates/pi/src/modes/interactive/runtime.rs`
+   `let viewport_height = options.viewport_height.max(1).min(size.1);`,
+   present before `d3fa790` and still present), the churn bench passes
+   `Size::new(COLUMNS, ROWS)` with viewport `ROWS` (clamp is identity), and
+   the fixtures pass constants (20, 10) against >= 8-row terminal sizes. The
+   latent divergence is confined to a hypothetical caller passing
+   viewport_height > size.height or 0, where the state's viewport
+   top/area would disagree with the clamped Terminal viewport. Recorded as an
+   audit erratum; no code change — the guard is redundant at all real call
+   sites.
