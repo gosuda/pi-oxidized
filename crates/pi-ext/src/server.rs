@@ -49,18 +49,19 @@ use crate::protocol::{
 
 /// Test-only timing instrumentation for the extension RPC dispatch bench
 /// lane. Compiled only when the `bench-seam` Cargo feature is enabled;
-/// zero overhead in production builds. Stores per-frame-id decode-start
-/// and encode-complete timestamps in a global map, drained by the
-/// ignored release test after each measurement round.
+/// zero overhead in production builds. Stores per-frame-id decode-start,
+/// task-start, and encode-complete timestamps in a global map, drained by
+/// the ignored release test after each measurement round.
 #[cfg(feature = "bench-seam")]
 pub mod bench_seam {
     use std::collections::HashMap;
     use std::sync::{LazyLock, Mutex};
     use std::time::Instant;
 
-    /// Per-request timing pair: when the decoded frame entered dispatch,
-    /// and when the terminal response frame was about to be sent.
-    static TIMESTAMPS: LazyLock<Mutex<HashMap<u64, (Instant, Option<Instant>)>>> =
+    /// Per-request timing triple: when the decoded frame entered dispatch,
+    /// when the spawned task first executed, and when the terminal response
+    /// frame was about to be sent.
+    static TIMESTAMPS: LazyLock<Mutex<HashMap<u64, (Instant, Option<Instant>, Option<Instant>)>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
 
     /// Record the decode-start timestamp for `id` (frame just decoded,
@@ -69,7 +70,18 @@ pub mod bench_seam {
         let mut map = TIMESTAMPS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.insert(id, (Instant::now(), None));
+        map.insert(id, (Instant::now(), None, None));
+    }
+
+    /// Record the task-start timestamp for `id` (spawned task first
+    /// executing, before panic guard / handler dispatch).
+    pub fn record_task_start(id: u64) {
+        let mut map = TIMESTAMPS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = map.get_mut(&id) {
+            entry.1 = Some(Instant::now());
+        }
     }
 
     /// Record the encode-complete timestamp for `id` (terminal frame
@@ -79,20 +91,23 @@ pub mod bench_seam {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(entry) = map.get_mut(&id) {
-            entry.1 = Some(Instant::now());
+            entry.2 = Some(Instant::now());
         }
     }
 
     /// Drain all completed timing entries. Returns `(id, decode_start,
-    /// encode_complete)` for entries where both timestamps were captured.
-    /// Incomplete entries (decode without matching encode) are dropped.
-    pub fn take_completed() -> Vec<(u64, Instant, Instant)> {
+    /// task_start, encode_complete)` for entries where all three timestamps
+    /// were captured. Incomplete entries are dropped.
+    pub fn take_completed() -> Vec<(u64, Instant, Instant, Instant)> {
         let mut map = TIMESTAMPS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.drain()
-            .filter_map(|(id, (decode_start, encode_complete))| {
-                encode_complete.map(|ec| (id, decode_start, ec))
+            .filter_map(|(id, (decode_start, task_start, encode_complete))| {
+                match (task_start, encode_complete) {
+                    (Some(ts), Some(ec)) => Some((id, decode_start, ts, ec)),
+                    _ => None,
+                }
             })
             .collect()
     }
@@ -1725,6 +1740,8 @@ async fn handle_request<E: NativeExtension>(
     token: Option<CancellationToken>,
 ) {
     let id = frame.id;
+    #[cfg(feature = "bench-seam")]
+    bench_seam::record_task_start(id);
     let method = frame.method.clone();
     let result =
         std::panic::AssertUnwindSafe(handle_request_dispatch(Arc::clone(&runtime), frame, token))

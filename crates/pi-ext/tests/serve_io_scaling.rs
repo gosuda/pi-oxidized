@@ -1074,11 +1074,14 @@ async fn no_benchmark_specific_code_audit() -> R {
 
 /// Run one measurement round: fresh current-thread runtime, corpus setup
 /// outside timing, 300 sequential terminalInput requests inside timing.
-/// Returns `(rtt_ns, server_samples)` where `rtt_ns` is the inclusive
-/// batch round-trip time and `server_samples` is per-request attributed
-/// server cost `S_i = encode_complete - decode_start` in nanoseconds.
+/// Returns `(rtt_ns, q_samples, h_samples, s_samples)` where `rtt_ns` is
+/// the inclusive batch round-trip time and the three vectors are per-request
+/// attributed costs in nanoseconds:
+///   Q_i = task_start - decode_start   (spawn + cooperative scheduler hop)
+///   H_i = encode_complete - task_start (handler + response construction + encode)
+///   S_i = encode_complete - decode_start (total server cost, Q + H)
 #[cfg(feature = "bench-seam")]
-fn run_timed_round() -> (u64, Vec<u64>) {
+fn run_timed_round() -> (u64, Vec<u64>, Vec<u64>, Vec<u64>) {
     use pi_ext::server::bench_seam;
 
     bench_seam::clear();
@@ -1088,7 +1091,7 @@ fn run_timed_round() -> (u64, Vec<u64>) {
         .build()
         .expect("build current-thread runtime");
 
-    let (rtt_ns, server_samples) = rt.block_on(async {
+    let (rtt_ns, q_samples, h_samples, s_samples) = rt.block_on(async {
         let (ext, handles) =
             ScalingAdapter::new(LoadProfile::Active20, TerminalInputMode::Fast);
         let (mut peer, server) = spawn_server(ext, ServerConfig::default());
@@ -1133,27 +1136,38 @@ fn run_timed_round() -> (u64, Vec<u64>) {
             .expect("serve_io error");
         assert_eq!(result, (), "clean EOF expected");
 
-        // Compute per-request server cost S_i
-        let server_samples: Vec<u64> = completed
-            .into_iter()
-            .filter(|(id, _, _)| *id >= START_ID && *id < START_ID + REQUESTS)
-            .map(|(_, decode_start, encode_complete)| {
-                encode_complete.duration_since(decode_start).as_nanos() as u64
-            })
-            .collect();
+        // Compute per-request attributed costs Q, H, S
+        let mut q_samples: Vec<u64> = Vec::with_capacity(REQUESTS as usize);
+        let mut h_samples: Vec<u64> = Vec::with_capacity(REQUESTS as usize);
+        let mut s_samples: Vec<u64> = Vec::with_capacity(REQUESTS as usize);
+        for (id, decode_start, task_start, encode_complete) in completed {
+            if id < START_ID || id >= START_ID + REQUESTS {
+                continue;
+            }
+            let q = task_start.duration_since(decode_start).as_nanos() as u64;
+            let h = encode_complete.duration_since(task_start).as_nanos() as u64;
+            let s = encode_complete.duration_since(decode_start).as_nanos() as u64;
+            assert_eq!(
+                q + h, s,
+                "id {id}: Q+H must equal S (Q={q}, H={h}, S={s})"
+            );
+            q_samples.push(q);
+            h_samples.push(h);
+            s_samples.push(s);
+        }
 
         assert_eq!(
-            server_samples.len(),
+            q_samples.len(),
             REQUESTS as usize,
-            "must capture all 300 server timing pairs, got {}",
-            server_samples.len()
+            "must capture all 300 complete triplets (decode/task_start/encode), got {}",
+            q_samples.len()
         );
 
-        (rtt_ns, server_samples)
+        (rtt_ns, q_samples, h_samples, s_samples)
     });
 
     drop(rt);
-    (rtt_ns, server_samples)
+    (rtt_ns, q_samples, h_samples, s_samples)
 }
 
 /// Population standard deviation.
@@ -1181,15 +1195,19 @@ fn median_sorted(sorted: &[f64]) -> f64 {
     }
 }
 
-/// PERF-T11 iteration 22: timed serve_io extension RPC dispatch bench lane.
+/// PERF-T11 iteration 24: timed serve_io extension RPC dispatch bench lane
+/// with hop attribution.
 ///
 /// Measures 300 sequential terminalInput round-trips through production
-/// `serve_io` over an in-memory duplex, with 3 warmup + 9 measured rounds.
-/// Reports inclusive RTT and attributed server cost S (decode start to
-/// encode complete), classified against the 750-1000 ns server-only floor.
+/// `serve_io` over an in-memory duplex, with 3 warmup + 27 measured rounds.
+/// Reports inclusive RTT and attributed server costs decomposed into:
+///   Q = task_start - decode_start   (spawn + cooperative scheduler hop)
+///   H = encode_complete - task_start (handler + response construction + encode)
+///   S = Q + H = encode_complete - decode_start (total server cost, unchanged)
+/// Classification remains fail-closed whenever rs_S > 0.20.
 ///
 /// Run with:
-/// `cargo test -p pi-ext --features bench-seam timed_serve_io_perf_t11_extension_rpc_dispatch --release --ignored --exact --nocapture`
+/// `taskset -c 20 env BENCH_MEASURED_ROUNDS=27 cargo test -p pi-ext --features bench-seam timed_serve_io_perf_t11_extension_rpc_dispatch --release --ignored --exact --nocapture`
 #[cfg(feature = "bench-seam")]
 #[test]
 #[ignore]
@@ -1198,7 +1216,7 @@ fn timed_serve_io_perf_t11_extension_rpc_dispatch() -> R {
     let measured_rounds: usize = std::env::var("BENCH_MEASURED_ROUNDS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(9);
+        .unwrap_or(27);
     let total_rounds: usize = WARMUP_ROUNDS + measured_rounds;
     const REQUESTS: u64 = 300;
     const NOISE_LIMIT: f64 = 0.20;
@@ -1208,46 +1226,76 @@ fn timed_serve_io_perf_t11_extension_rpc_dispatch() -> R {
     const OPEN_THRESHOLD: f64 = 2.0 * FLOOR_MAX_NS; // 2000 ns
 
     let mut rtt_samples: Vec<f64> = Vec::with_capacity(measured_rounds);
+    let mut q_median_samples: Vec<f64> = Vec::with_capacity(measured_rounds);
+    let mut h_median_samples: Vec<f64> = Vec::with_capacity(measured_rounds);
     let mut s_median_samples: Vec<f64> = Vec::with_capacity(measured_rounds);
 
     for round in 0..total_rounds {
-        let (rtt_ns, server_samples) = run_timed_round();
+        let (rtt_ns, q_samples, h_samples, s_samples) = run_timed_round();
 
         if round < WARMUP_ROUNDS {
+            let mut s_sorted: Vec<f64> = s_samples.iter().map(|&v| v as f64).collect();
+            s_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
             eprintln!(
-                "warmup round {}: RTT={} ns, S_median={} ns (n={})",
+                "warmup round {}: RTT={} ns, Q_median={} ns, H_median={} ns, S_median={} ns (n={})",
                 round + 1,
                 rtt_ns,
                 {
-                    let mut sorted: Vec<f64> =
-                        server_samples.iter().map(|&v| v as f64).collect();
-                    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                    median_sorted(&sorted) as u64
+                    let mut q_sorted: Vec<f64> = q_samples.iter().map(|&v| v as f64).collect();
+                    q_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    median_sorted(&q_sorted) as u64
                 },
-                server_samples.len()
+                {
+                    let mut h_sorted: Vec<f64> = h_samples.iter().map(|&v| v as f64).collect();
+                    h_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    median_sorted(&h_sorted) as u64
+                },
+                median_sorted(&s_sorted) as u64,
+                s_samples.len()
             );
             continue;
         }
 
-        // Per-request server cost for this round
-        let mut s_values: Vec<f64> = server_samples.iter().map(|&v| v as f64).collect();
+        // Per-request costs for this round
+        let mut q_values: Vec<f64> = q_samples.iter().map(|&v| v as f64).collect();
+        q_values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let q_median = median_sorted(&q_values);
+
+        let mut h_values: Vec<f64> = h_samples.iter().map(|&v| v as f64).collect();
+        h_values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let h_median = median_sorted(&h_values);
+
+        let mut s_values: Vec<f64> = s_samples.iter().map(|&v| v as f64).collect();
         s_values.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let s_median = median_sorted(&s_values);
+
         let rtt_per_req = rtt_ns as f64 / REQUESTS as f64;
 
         rtt_samples.push(rtt_per_req);
+        q_median_samples.push(q_median);
+        h_median_samples.push(h_median);
         s_median_samples.push(s_median);
 
         eprintln!(
-            "measured round {}: RTT={:.0} ns/req, S_median={:.0} ns/req (n={})",
+            "measured round {}: RTT={:.0} ns/req, Q_median={:.0} ns, H_median={:.0} ns, S_median={:.0} ns (n={})",
             round + 1 - WARMUP_ROUNDS,
             rtt_per_req,
+            q_median,
+            h_median,
             s_median,
-            server_samples.len()
+            s_samples.len()
         );
     }
 
     // Aggregate: median of round medians
+    let mut q_sorted = q_median_samples.clone();
+    q_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let q_aggregate_median = median_sorted(&q_sorted);
+
+    let mut h_sorted = h_median_samples.clone();
+    h_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let h_aggregate_median = median_sorted(&h_sorted);
+
     let mut s_sorted = s_median_samples.clone();
     s_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let s_aggregate_median = median_sorted(&s_sorted);
@@ -1256,7 +1304,23 @@ fn timed_serve_io_perf_t11_extension_rpc_dispatch() -> R {
     rtt_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let rtt_aggregate_median = median_sorted(&rtt_sorted);
 
-    // Noise gate: population stddev / median on server S_median distribution
+    // Noise gate: population stddev / median on each distribution
+    let q_mean: f64 = q_median_samples.iter().sum::<f64>() / q_median_samples.len() as f64;
+    let q_stddev = population_stddev(&q_median_samples, q_mean);
+    let q_relative_spread = if q_aggregate_median > 0.0 {
+        q_stddev / q_aggregate_median
+    } else {
+        f64::INFINITY
+    };
+
+    let h_mean: f64 = h_median_samples.iter().sum::<f64>() / h_median_samples.len() as f64;
+    let h_stddev = population_stddev(&h_median_samples, h_mean);
+    let h_relative_spread = if h_aggregate_median > 0.0 {
+        h_stddev / h_aggregate_median
+    } else {
+        f64::INFINITY
+    };
+
     let s_mean: f64 = s_median_samples.iter().sum::<f64>() / s_median_samples.len() as f64;
     let s_stddev = population_stddev(&s_median_samples, s_mean);
     let s_relative_spread = if s_aggregate_median > 0.0 {
@@ -1269,27 +1333,59 @@ fn timed_serve_io_perf_t11_extension_rpc_dispatch() -> R {
     eprintln!("extension-rpc-dispatch bench (pinned: 300 x terminalInput round-trips, Active20 + Fast)");
     eprintln!("protocol: release, median of {} rounds after {} warmups", measured_rounds, WARMUP_ROUNDS);
     eprintln!("inclusive RTT | {:.0} ns/request", rtt_aggregate_median);
-    eprintln!("attributed server cost | {:.0} ns/request", s_aggregate_median);
-    eprintln!("relative spread (server) | {:.2}%", s_relative_spread * 100.0);
+    eprintln!("Q (spawn+hop) | {:.0} ns/request", q_aggregate_median);
+    eprintln!("H (handler+encode) | {:.0} ns/request", h_aggregate_median);
+    eprintln!("S (total server) | {:.0} ns/request", s_aggregate_median);
+    eprintln!("relative spread Q | {:.2}%", q_relative_spread * 100.0);
+    eprintln!("relative spread H | {:.2}%", h_relative_spread * 100.0);
+    eprintln!("relative spread S | {:.2}%", s_relative_spread * 100.0);
     eprintln!("ledger floor | 750-1000 ns (server-only)");
     eprintln!();
-    eprintln!("server S_median samples (ns): {:?}", s_median_samples);
+    eprintln!("Q_median samples (ns): {:?}", q_median_samples);
+    eprintln!("H_median samples (ns): {:?}", h_median_samples);
+    eprintln!("S_median samples (ns): {:?}", s_median_samples);
     eprintln!("RTT samples (ns/req): {:?}", rtt_samples);
 
-    // Noise gate
+    // S noise gate — fail-closed, not waived
     if s_relative_spread > NOISE_LIMIT {
         eprintln!();
         eprintln!(
-            "NOISY: relative spread {:.2}% exceeds limit {:.0}%",
+            "S NOISY: relative spread {:.2}% exceeds limit {:.0}%",
             s_relative_spread * 100.0,
             NOISE_LIMIT * 100.0
         );
-        eprintln!("Remediation: 1. pin CPU governor (taskset -c 20-40), 2. isolate process, 3. retry with 27 measured rounds, 4. check box load");
+
+        // Attribution analysis even when S is noisy
+        let h_trusted = h_relative_spread <= NOISE_LIMIT;
+        let q_is_noise_source = q_relative_spread > NOISE_LIMIT && h_trusted;
+
+        eprintln!();
+        eprintln!("attribution analysis (S gate failed, examining Q and H):");
+        eprintln!("  H trusted: {} (rs_H={:.2}%, limit {:.0}%)", h_trusted, h_relative_spread * 100.0, NOISE_LIMIT * 100.0);
+        eprintln!("  Q noisy: {} (rs_Q={:.2}%, limit {:.0}%)", q_relative_spread > NOISE_LIMIT, q_relative_spread * 100.0, NOISE_LIMIT * 100.0);
+
+        if h_trusted && q_is_noise_source {
+            eprintln!("  verdict: Q (spawn + cooperative scheduler hop) is the noise source");
+            eprintln!("  H is tight at {:.0} ns — handler + encode cost is stable", h_aggregate_median);
+            eprintln!("  Q carries the multi-modal distribution matching S noise");
+            eprintln!("  iteration-25 candidate (NAMED, NOT IMPLEMENTED):");
+            eprintln!("    inline terminalInput handler on drive loop (skip tasks.spawn)");
+            eprintln!("    to eliminate spawn + cooperative hop, then re-measure S");
+        } else if !h_trusted {
+            eprintln!("  verdict: H is also noisy — handler/encode seam needs further refinement");
+            eprintln!("  next seam candidate (NAMED, NOT IMPLEMENTED):");
+            eprintln!("    split H into handler-execution and encode-construction sub-seams");
+            eprintln!("    to separate handler work from response construction + encode");
+        } else {
+            eprintln!("  verdict: neither Q nor H is individually noisy — S noise may be");
+            eprintln!("  from cross-round covariance; further seam refinement needed");
+        }
+
         // Fail-closed: no classification
-        return Err("NOISY: no classification allowed".into());
+        return Err("S NOISY: no classification allowed (attribution recorded)".into());
     }
 
-    // Classification
+    // Classification (S gate passed)
     eprintln!();
     if s_aggregate_median <= AT_FLOOR_THRESHOLD {
         eprintln!(
