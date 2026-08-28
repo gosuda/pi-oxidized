@@ -59,8 +59,8 @@ A disagreement fails generation.
 ```json
 {
 	"schema": "pi.compatibility.matrix.v1",
-	"matrixVersion": "0.1.0",
-	"rowCount": 38,
+	"matrixVersion": "0.2.0",
+	"rowCount": 40,
 	"rows": [
 		{
 			"id": "tui-protocol-check",
@@ -280,6 +280,18 @@ A disagreement fails generation.
 		},
 		{
 			"id": "release-x86_64-windows",
+			"tier": "release",
+			"surface": "release",
+			"required": false
+		},
+		{
+			"id": "release-x86_64-linux-musl",
+			"tier": "release",
+			"surface": "release",
+			"required": true
+		},
+		{
+			"id": "release-aarch64-linux-musl",
 			"tier": "release",
 			"surface": "release",
 			"required": false

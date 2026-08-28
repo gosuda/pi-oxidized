@@ -632,7 +632,7 @@
 			"class": "matrix-count",
 			"params": {
 				"source": "scripts/verification/compat-matrix.json",
-				"expectedCount": 38,
+				"expectedCount": 40,
 				"countMethod": "json-array",
 				"countKey": "rows"
 			}

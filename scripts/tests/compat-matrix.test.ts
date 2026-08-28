@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
 import { describe, expect, test } from "bun:test";
 
 import {
@@ -314,5 +317,127 @@ describe("runCommand", () => {
 		);
 		expect(result.exitCode).toBe(3);
 		expect(result.stderr).toContain("err");
+	});
+});
+
+describe("release tier matrix 0.2.0 (REL-T5)", () => {
+	const repoRoot = join(import.meta.dir, "../..");
+	const matrixPath = join(repoRoot, "scripts/verification/compat-matrix.json");
+	const raw = readFileSync(matrixPath, "utf8");
+	const matrix = validateMatrix(JSON.parse(raw));
+	const releaseRows = selectRows(matrix, { tier: "release" });
+	const muslRows = releaseRows.filter((row) => row.id.endsWith("-musl"));
+	const tierNRows = releaseRows.filter(
+		(row) =>
+			/(?<!Not a )Tier N terminal-conformance row/.test(row.evidence) ||
+			(row.rationale !== undefined &&
+				/(?<!Not a )Tier N terminal-conformance row/.test(row.rationale)),
+	);
+	const excludedReleaseRows = releaseRows.filter((row) => row.excluded === true);
+	const locallyRequiredReleaseRows = releaseRows.filter(
+		(row) => row.required && row.excluded !== true,
+	);
+
+	/** Verbatim absence line owned by the musl transcript lane. */
+	function canonicalAbsenceLine(): string {
+		const source = readFileSync(
+			join(repoRoot, "crates/pi-tui/tests/transcript_musl_smoke.rs"),
+			"utf8",
+		);
+		const match = source.match(/const ABSENCE_LINE: &str = "([^"]+)";/);
+		if (match === null || match[1] === undefined) {
+			throw new Error("ABSENCE_LINE not found in transcript_musl_smoke.rs");
+		}
+		return match[1];
+	}
+
+	test("validateMatrix passes on the committed matrix at version 0.2.0", () => {
+		expect(matrix.version).toBe("0.2.0");
+	});
+
+	test("selectRows tier:release returns exactly the seven release target rows", () => {
+		expect(releaseRows.map((row) => row.id)).toEqual([
+			"release-x86_64-linux",
+			"release-aarch64-linux",
+			"release-x86_64-darwin",
+			"release-aarch64-darwin",
+			"release-x86_64-windows",
+			"release-x86_64-linux-musl",
+			"release-aarch64-linux-musl",
+		]);
+	});
+
+	test("exactly five release rows carry the Tier N terminal-conformance claim", () => {
+		expect(tierNRows).toHaveLength(5);
+		expect(tierNRows.map((row) => row.id).sort()).toEqual([
+			"release-aarch64-darwin",
+			"release-aarch64-linux",
+			"release-x86_64-darwin",
+			"release-x86_64-linux",
+			"release-x86_64-windows",
+		]);
+	});
+
+	test("exactly two release rows are locally required and five are excluded", () => {
+		expect(locallyRequiredReleaseRows.map((row) => row.id)).toEqual([
+			"release-x86_64-linux",
+			"release-x86_64-linux-musl",
+		]);
+		expect(excludedReleaseRows.map((row) => row.id).sort()).toEqual([
+			"release-aarch64-darwin",
+			"release-aarch64-linux",
+			"release-aarch64-linux-musl",
+			"release-x86_64-darwin",
+			"release-x86_64-windows",
+		]);
+	});
+
+	test("every excluded release row names its actual CI witness runner", () => {
+		const witnesses: Record<string, string> = {
+			"release-aarch64-linux": "ubuntu-24.04-arm",
+			"release-aarch64-linux-musl": "ubuntu-24.04-arm",
+			"release-aarch64-darwin": "macos-15",
+			"release-x86_64-darwin": "macos-15-intel",
+			"release-x86_64-windows": "windows-latest",
+		};
+		for (const row of excludedReleaseRows) {
+			const text = `${row.evidence} ${row.rationale ?? ""} ${row.citation ?? ""}`;
+			expect(text).toContain(witnesses[row.id]);
+		}
+	});
+
+	test("both musl rows carry the absence line byte-identically to the transcript lane constant", () => {
+		expect(muslRows.map((row) => row.id).sort()).toEqual([
+			"release-aarch64-linux-musl",
+			"release-x86_64-linux-musl",
+		]);
+		const absence = canonicalAbsenceLine();
+		for (const row of muslRows) {
+			expect(row.evidence.includes(absence)).toBe(true);
+		}
+		// The absence line appears exactly twice in the whole matrix — once per
+		// musl row — and never on a Tier N row.
+		expect(raw.split(absence).length - 1).toBe(2);
+		for (const row of tierNRows) {
+			expect(
+				row.evidence.includes(absence) || (row.rationale?.includes(absence) ?? false),
+			).toBe(false);
+		}
+	});
+
+	test("local musl row names the musl userland prerequisite paths", () => {
+		const row = releaseRows.find((r) => r.id === "release-x86_64-linux-musl");
+		expect(row?.requires).toEqual(["/lib/ld-musl-x86_64.so.1", "/etc/ld-musl-x86_64.path"]);
+		expect(row?.rationale).toContain("musl-gcc");
+	});
+
+	test("aarch64 rationales claim native ubuntu-24.04-arm execution, never the cross-compile fallback", () => {
+		for (const id of ["release-aarch64-linux", "release-aarch64-linux-musl"]) {
+			const row = matrix.rows.find((r) => r.id === id);
+			expect(row?.rationale).toContain("ubuntu-24.04-arm");
+			expect(row?.rationale).toContain("no cross-compilation");
+			expect(row?.rationale).toContain("no QEMU");
+			expect(row?.rationale ?? "").not.toContain("Cross-compiling aarch64");
+		}
 	});
 });

@@ -1,5 +1,5 @@
 {
-	"version": "0.1.0",
+	"version": "0.2.0",
 	"rows": [
 		{
 			"id": "tui-protocol-check",
@@ -463,7 +463,7 @@
 					"timeoutMs": 1800000
 				}
 			],
-			"evidence": "package-release assembles x86_64-unknown-linux-gnu archive and unpack smoke verifies pi --version + host hello handshake"
+			"evidence": "package-release assembles x86_64-unknown-linux-gnu archive and unpack smoke verifies pi --version + host hello handshake; Tier N terminal-conformance row — the interaction witness (pty_no_flicker under portable-pty posix_openpt) runs on the ubuntu-latest runner"
 		},
 		{
 			"id": "release-aarch64-linux",
@@ -472,9 +472,9 @@
 			"required": false,
 			"excluded": true,
 			"commands": [],
-			"evidence": "aarch64-linux release unpack smoke is not run on the x86_64 linux dev host",
-			"rationale": "Cross-compiling aarch64 binaries and running them on an x86_64 host is not supported by the local toolchain; CI uses a native runner.",
-			"citation": "scripts/release/targets.ts RUST_TARGETS includes aarch64-unknown-linux-gnu; package-release requires a matching native host for unpack smoke"
+			"evidence": "aarch64-linux release unpack smoke is not run on the x86_64 linux dev host; CI witness is the native arm64 leg on ubuntu-24.04-arm",
+			"rationale": "Executed natively on the ubuntu-24.04-arm runner (arm64 kernel and toolchain; no cross-compilation, no QEMU — the native-image gate verifies uname -m and RUNNER_ARCH and rejects any registered qemu-aarch64 binfmt handler). The x86_64 dev host provides no arm64 execution environment, so the leg is excluded locally; Tier N terminal-conformance row — the interaction witness (pty_no_flicker under portable-pty posix_openpt) runs on the ubuntu-24.04-arm runner.",
+			"citation": "scripts/release/targets.ts RUST_TARGETS includes aarch64-unknown-linux-gnu; package-release requires a matching native host for unpack smoke; release-verification.yml maps aarch64-unknown-linux-gnu to ubuntu-24.04-arm"
 		},
 		{
 			"id": "release-x86_64-darwin",
@@ -483,9 +483,9 @@
 			"required": false,
 			"excluded": true,
 			"commands": [],
-			"evidence": "x86_64-darwin release unpack smoke is not run on the linux dev host",
-			"rationale": "macOS binaries cannot be executed or fully validated on the linux development host; the target is built and smoke-tested on darwin CI runners.",
-			"citation": "scripts/release/targets.ts RUST_TARGETS includes x86_64-apple-darwin"
+			"evidence": "x86_64-darwin release unpack smoke is not run on the linux dev host; CI witness is the native intel leg on macos-15-intel",
+			"rationale": "macOS binaries cannot be executed or fully validated on the linux development host; the target is built and smoke-tested natively on the macos-15-intel runner; Tier N terminal-conformance row — the interaction witness (pty_no_flicker under portable-pty posix_openpt) runs on the macos-15-intel runner.",
+			"citation": "scripts/release/targets.ts RUST_TARGETS includes x86_64-apple-darwin; release-verification.yml maps x86_64-apple-darwin to macos-15-intel"
 		},
 		{
 			"id": "release-aarch64-darwin",
@@ -494,9 +494,9 @@
 			"required": false,
 			"excluded": true,
 			"commands": [],
-			"evidence": "aarch64-darwin release unpack smoke is not run on the linux dev host",
-			"rationale": "macOS ARM binaries cannot be executed or fully validated on the linux development host; the target is built and smoke-tested on darwin CI runners.",
-			"citation": "scripts/release/targets.ts RUST_TARGETS includes aarch64-apple-darwin"
+			"evidence": "aarch64-darwin release unpack smoke is not run on the linux dev host; CI witness is the native arm64 leg on macos-15",
+			"rationale": "macOS ARM binaries cannot be executed or fully validated on the linux development host; the target is built and smoke-tested natively on the macos-15 arm64 runner; Tier N terminal-conformance row — the interaction witness (pty_no_flicker under portable-pty posix_openpt) runs on the macos-15 runner.",
+			"citation": "scripts/release/targets.ts RUST_TARGETS includes aarch64-apple-darwin; release-verification.yml maps aarch64-apple-darwin to macos-15 (native arm64 image)"
 		},
 		{
 			"id": "release-x86_64-windows",
@@ -505,9 +505,36 @@
 			"required": false,
 			"excluded": true,
 			"commands": [],
-			"evidence": "x86_64-windows release unpack smoke is not run on the linux dev host",
-			"rationale": "Windows PE binaries cannot be executed or fully validated on the linux development host; the target is built and smoke-tested on windows CI runners.",
-			"citation": "scripts/release/targets.ts RUST_TARGETS includes x86_64-pc-windows-msvc"
+			"evidence": "x86_64-windows release unpack smoke is not run on the linux dev host; CI witness is the native leg on windows-latest",
+			"rationale": "Windows PE binaries cannot be executed or fully validated on the linux development host; the target is built and smoke-tested natively on the windows-latest runner; Tier N terminal-conformance row — the interaction witness (pty_no_flicker under portable-pty ConPTY) runs on the windows-latest runner.",
+			"citation": "scripts/release/targets.ts RUST_TARGETS includes x86_64-pc-windows-msvc; release-verification.yml maps x86_64-pc-windows-msvc to windows-latest"
+		},
+		{
+			"id": "release-x86_64-linux-musl",
+			"surface": "release",
+			"tier": "release",
+			"required": true,
+			"requires": ["/lib/ld-musl-x86_64.so.1", "/etc/ld-musl-x86_64.path"],
+			"commands": [
+				{
+					"cwd": ".",
+					"argv": ["bun", "run", "scripts/package-release.ts", "--target", "x86_64-unknown-linux-musl"],
+					"timeoutMs": 1800000
+				}
+			],
+			"evidence": "package-release assembles x86_64-unknown-linux-musl archive (compiled sidecar plus pinned musl Bun runtime + pi-extension-host.js fallback staged beside pi) and unpack smoke verifies pi --version + compiled-sidecar hello handshake; packaging/protocol scope only — no PTY/render/synchronized-output/no-clear claims",
+			"rationale": "Musl packaging/protocol witness required on the local x86_64 host. Prerequisites: the musl C toolchain (musl-gcc, apt musl-tools/musl-dev or the REL-R1 relocated prefix) for the cargo build, and the Alpine musl userland for the smoke — Alpine minirootfs loader installed at /lib/ld-musl-x86_64.so.1 with /etc/ld-musl-x86_64.path pinned to the isolated libstdc++/libgcc userland; missing either fails the row on the named prerequisite. Not a Tier N terminal-conformance row — zero interaction steps."
+		},
+		{
+			"id": "release-aarch64-linux-musl",
+			"surface": "release",
+			"tier": "release",
+			"required": false,
+			"excluded": true,
+			"commands": [],
+			"evidence": "aarch64-linux-musl packaging/protocol lane is not run on the x86_64 linux dev host; CI witness is the native musl leg on ubuntu-24.04-arm (musl-gcc build, static-link/interpreter/archive-integrity gates, transcript_musl_smoke packaging/protocol lane) — no PTY/render/synchronized-output/no-clear claims",
+			"rationale": "Executed natively on the ubuntu-24.04-arm runner: the arm64 kernel runs the aarch64 musl artifacts under the provisioned Alpine arm64 userland (ld-musl-aarch64.so.1), with no cross-compilation and no QEMU — the native-image gate verifies uname -m and RUNNER_ARCH and rejects any registered qemu-aarch64 binfmt handler. The x86_64 dev host provides neither arm64 execution nor an aarch64 musl userland, so the leg is excluded locally.",
+			"citation": "scripts/release/targets.ts RUST_TARGETS includes aarch64-unknown-linux-musl; release-verification.yml maps aarch64-unknown-linux-musl to ubuntu-24.04-arm with the Alpine minirootfs arm64 userland (ld-musl-aarch64.so.1)"
 		},
 		{
 			"id": "compat-audit-witness",
