@@ -1,8 +1,8 @@
 # Floor ledger: memory resource units (terminal state, stream-load growth)
 
 Owning R2 hot rows (lane 10): *Terminal state*, *Stream-load memory growth* — hot by
-input-scaling, graded in the resource currency. State: **OPEN (fail-closed — no
-recorded distribution).**
+input-scaling, graded in the resource currency. State: **RECORDED — distribution captured
+(PERF-T11 iteration 29); graduation transfers to Phase-6 cold grading (PERF-T14).**
 
 ## Contract (from call sites, tests, signatures — never internals)
 
@@ -24,15 +24,49 @@ stream growth floor:   the turn's text retained once (view + session entry)
 Allocated churn above the retained floor is owned by the timing ledgers (render churn
 measures 28.3 KiB allocated per frame — allocation reuse is booked there, not here).
 
-## Measured cost — none recorded
+## Measured cost — distribution recorded (PERF-T11 iteration 29, 2026-08-29)
 
-R8: the memory collectors exist (PERF-T1) but the current performance-comparison
-artifact predates their completion (`idleProcessTreeMemory`/`streamProcessTreeMemory`
-keys absent); the lane re-run was blocked by concurrent pi-tui compile breakage at R8
-time. Session-timing records peak RSS per sample as a paired counter (Rust 2-16 MB vs
-TS 52-105 MB across cells, R8) but no time-series distribution.
+Prerequisite satisfied: one full `verify:performance` run on the canonical tree
+(`6318fa3` + measurement-harness resilience commit) captured the PERF-T1 memory keys
+(`idleProcessTreeMemory`, `streamProcessTreeMemory`; process-tree RSS/PSS, 5 samples per
+implementation, 50 ms cadence, 1 s steady/load windows; artifact
+`target/bench/performance-comparison.json`). Full-run context: the wall-clock gates ran
+first and their verdict (noise rejection on the keypress wall lane, rs 29.49% — owned by
+the keypress-dispatch unit) completed before memory collection, so the keys remain
+non-gating and post-verdict.
 
-**Multiple unproven; OPEN by the fail-closed rule.** Prerequisite: one full
-`verify:performance` run capturing the memory keys (non-gating, post-verdict), then
-retained-vs-floor comparison per unit. These units may only graduate at Phase-6 cold
-grading in the resource currency; they can never carry a wall-clock claim.
+**Terminal state** (extension-free idle after first frame, steady-window max tree RSS):
+
+| impl | RSS median | RSS min-max | PSS median | floor | retained/floor (RSS) |
+|---|---|---|---|---|---|
+| rust | 25,362,432 B | 25,255,936-25,489,408 | 16,147,456 B | 72,000 B | ~352x |
+| typescript | 125,042,688 B | 124,301,312-125,812,736 | 118,487,040 B | 72,000 B | ~1,737x |
+
+Floor: 100x30x24 B = 72,000 B; transcript empty at idle. Dominant retained term: the
+process baseline (binary text/data, runtime heaps, allocator arenas) — the grid plus
+empty-transcript state is <=~100 KiB of the measured total.
+
+**Stream-load growth** (one streamed turn, 256 x 24 B = 6,144 B transcript):
+
+| impl | load-window max tree RSS median | min-max | PSS median |
+|---|---|---|---|
+| rust | 145,068,032 B | 142,938,112-146,386,944 | 133,730,304 B |
+| typescript | not captured (n=0) | — | — |
+
+Growth over the idle lane (rust): ~119.7 MB RSS. Floor: 6,144 B + ~170 B/entry -> 6,314 B
+(single message entry) to 49,664 B (256-frame sensitivity); retained/floor ~18,962x to
+~2,410x. Caveat named: the stream-load lane's process tree differs from the idle lane's by
+construction (verification extension + extension host join the tree), so this multiple
+bounds the whole-tree footprint under load, not transcript retention alone — retained
+transcript bytes are <=~0.005% of the measured growth, and churn above retained state is
+owned by the timing ledgers.
+
+TypeScript stream-load is disclosed as a lane degradation in the artifact
+(`harness.laneDegradations`): the reference build (.references/pi `4e4949299`) accepts the
+submitted prompt but never streams offline — an upstream reference regression, not a
+pi-oxidized measurement.
+
+**Disposition: OPEN (fail-closed) resolved by this recorded distribution; both hot rows
+sit far above 2x floor in bytes with the dominant term named; per this ledger's Phase-6
+rule, graduation transfers to PERF-T14 (#100) cold grading in the resource currency. This
+unit carries no wall-clock claim.**

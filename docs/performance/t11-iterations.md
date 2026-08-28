@@ -2878,7 +2878,7 @@ OPEN for the remaining units. Next ordered unit: **`keypress-dispatch`**
 **Not touched** (out of scope, file-disjoint): production code
 (`server.rs`, `protocol.rs`), `serve_io_scaling.rs` (test lane unchanged
 from iteration 24), `Cargo.lock`, `rust-toolchain.toml`,
-`.github/workflows/`, `scripts/`, other floor ledgers.
+`.github/workflows/`, `scripts/`, other floor ledgers.<<<<<<< ours
 
 ---
 
@@ -3087,3 +3087,105 @@ remaining units.
 **Not touched** (out of scope, file-disjoint): production code,
 `crates/pi-tui/`, `crates/pi-ext/`, `.github/workflows/`, `scripts/`,
 `Cargo.lock`, `rust-toolchain.toml`, other units' floor ledgers, `packages/`.
+
+||||||| original
+
+=======
+## Iteration 29 — `memory-resource-units` (prerequisite run — distribution recorded; Phase-6 transfer)
+
+Date 2026-08-29. Base `6318fa3` (canonical origin/feat/ver-align-canonical-pin,
+iteration 26) + measurement-harness resilience commit. Measurement-only
+iteration: no production code changed, no wall-clock claim made or
+rebutted. This unit's floor ledger required one full `verify:performance`
+run capturing the PERF-T1 memory keys (`idleProcessTreeMemory`,
+`streamProcessTreeMemory`; non-gating, post-verdict), then a
+retained-vs-floor comparison per hot row. The keys are now recorded and the
+unit's fail-closed OPEN is resolved; per the ledger's own Phase-6 rule,
+graduation transfers to PERF-T14 (#100) cold grading.
+
+### Harness work required to reach the memory lanes (measurement-only)
+
+The memory keys sit behind every wall lane in `scripts/verification/
+performance.ts`, and four defects — none in the memory collectors — aborted
+every full run before them (six full-run attempts, R8-era artifact showed the
+same first-frame abort two days prior):
+
+1. **TypeScript reference never exits on /quit** (upstream `.references/pi`
+   `4e4949299`; deterministic, reproduced standalone). `terminateAndRequireCleanExit`
+   now escalates to tree termination on quit-timeout, keeps the captured
+   sample, and discloses per-sample escalations in `harness.quitTimeouts`
+   (50 first-frame escalations this run). Teardown is not measurement.
+2. **TypeScript reference accepts a prompt but never streams offline**
+   (same reference checkout; prompt painted, extensions loaded, no provider
+   frames within 30 s). The stream CPU lane fast-fails the implementation
+   after its first failed sample; stream-load memory TS samples fail
+   individually. Both disclosed in `harness.laneDegradations`; TS stream-load
+   memory is therefore n=0 in this run's distribution.
+3. **Rust burst-write paint stall (production, OPEN, owned by
+   keypress-dispatch)**: a multi-character burst written after the first
+   frame (paste markers or plain text) paints ~5 cells then stops emitting
+   frames while input processing continues (later Enter still submits;
+   streaming paints still work). Bisected by binary: pre-T11 `a007540`
+   (= `021a00c^`) paints the whole burst in one synchronized frame; the
+   window is the first-frame-init pair `021a00c`/`2e4c087`. Single-key paints
+   are healthy (keypress lane below, median 0.67 ms). The stream CPU lane's
+   pre-Enter submission wait was relaxed from "prompt label painted" to
+   sync-marker presence — a measurement-protocol note, not a fix; the CPU
+   bracket (Enter -> final marker) and the post-stream validity assertions
+   are unchanged.
+4. **Lane isolation**: a failed lane previously aborted the whole run and
+   discarded every other lane's data. Collectors now catch per-sample and
+   per-implementation failures, record them in `harness.laneDegradations`,
+   and turn an empty per-implementation sample set into an explicit verdict
+   blocker. A noise rejection (below) now completes the verdict first and
+   still collects the non-gating memory lanes before exiting — preserving
+   their post-verdict, non-gating contract.
+
+Verification for the harness change: `bun run check` clean;
+`bun test scripts/verification/performance.test.ts` 30/30 (the ignore-quit
+test now pins the terminate-and-disclose contract via
+`recordedQuitTimeouts()`).
+
+### Measurements (full run, `taskset -c 20-40`, artifact on the cutover tree)
+
+**Terminal state** (idle lane, extension-free, steady-window max tree RSS,
+5 samples/implementation; floor 100x30x24 B = 72,000 B, transcript empty):
+
+| impl | RSS median | min-max | PSS median | retained/floor |
+|---|---|---|---|---|
+| rust | 25,362,432 B | 25,255,936-25,489,408 (0.9%) | 16,147,456 B | ~352x |
+| typescript | 125,042,688 B | 124,301,312-125,812,736 (1.2%) | 118,487,040 B | ~1,737x |
+
+**Stream-load growth** (one turn: 256 x 24 B = 6,144 B transcript;
+load-window max tree RSS, 5 rust samples; TS n=0 per degradation 2):
+
+| impl | RSS median | min-max | PSS median |
+|---|---|---|---|
+| rust | 145,068,032 B | 142,938,112-146,386,944 (2.4%) | 133,730,304 B |
+
+Growth over idle (rust): ~119.7 MB RSS. Floor 6,314 B (one entry) to
+49,664 B (256-entry sensitivity) -> retained/floor ~18,962x to ~2,410x.
+Caveat: the stream lane's tree adds the verification extension + extension
+host, so the multiple bounds whole-tree footprint under load; retained
+transcript bytes are <=~0.005% of it. Churn above retained state belongs to
+the timing ledgers (ledger's own R8 note).
+
+**Disposition**: both hot rows sit far above 2x floor in bytes with the
+dominant retained term named (process/runtime baseline, not TUI retained
+state). Per the floor ledger's Phase-6 rule these units graduate only at
+cold grading in the resource currency: **graduation transfers to PERF-T14
+(#100)**. No wall-clock claim is made; AT-FLOOR/CONSTRAINED-ABOVE-FLOOR do
+not apply to this measurement unit. The fail-closed OPEN is resolved by the
+recorded distribution.
+
+**Handoffs**: keypress-dispatch owns the burst-write paint stall
+(defect + window above; its own wall lane remains noisy, rs 29.49% this run,
+67-69% in two prior runs); upstream-reference defects (/quit hang, offline
+no-stream) belong to the `.references/pi` pin owners.
+
+**Not touched** (out of scope, file-disjoint): production code
+(`crates/*`), `.github/workflows/`, `scripts/release/`, `Cargo.lock`,
+`rust-toolchain.toml`, `crates/pi-tui/src/terminal/*`, other units' floor
+ledgers.
+
+>>>>>>> theirs
