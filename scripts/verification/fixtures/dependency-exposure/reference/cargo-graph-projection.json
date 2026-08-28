@@ -18,41 +18,6 @@
 	],
 	"edges": [
 		{
-			"from": "ahash",
-			"to": "cfg-if",
-			"kinds": [
-				"normal"
-			]
-		},
-		{
-			"from": "ahash",
-			"to": "getrandom",
-			"kinds": [
-				"normal"
-			]
-		},
-		{
-			"from": "ahash",
-			"to": "once_cell",
-			"kinds": [
-				"normal"
-			]
-		},
-		{
-			"from": "ahash",
-			"to": "version_check",
-			"kinds": [
-				"build"
-			]
-		},
-		{
-			"from": "ahash",
-			"to": "zerocopy",
-			"kinds": [
-				"normal"
-			]
-		},
-		{
 			"from": "aho-corasick",
 			"to": "memchr",
 			"kinds": [
@@ -3211,13 +3176,6 @@
 		},
 		{
 			"from": "getrandom",
-			"to": "js-sys",
-			"kinds": [
-				"normal"
-			]
-		},
-		{
-			"from": "getrandom",
 			"to": "libc",
 			"kinds": [
 				"normal"
@@ -3233,13 +3191,6 @@
 		{
 			"from": "getrandom",
 			"to": "wasip2",
-			"kinds": [
-				"normal"
-			]
-		},
-		{
-			"from": "getrandom",
-			"to": "wasm-bindgen",
 			"kinds": [
 				"normal"
 			]
@@ -8076,13 +8027,6 @@
 		},
 		{
 			"from": "serde-saphyr",
-			"to": "ahash",
-			"kinds": [
-				"normal"
-			]
-		},
-		{
-			"from": "serde-saphyr",
 			"to": "annotate-snippets",
 			"kinds": [
 				"normal"
@@ -8091,13 +8035,6 @@
 		{
 			"from": "serde-saphyr",
 			"to": "encoding_rs_io",
-			"kinds": [
-				"normal"
-			]
-		},
-		{
-			"from": "serde-saphyr",
-			"to": "getrandom",
 			"kinds": [
 				"normal"
 			]
