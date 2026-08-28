@@ -1,7 +1,7 @@
 # Floor ledger: tool dispatch slice (validation, events, result, append)
 
 Owning R2 hot rows (lane 8): *argument validation*, *tool start/update/end events*,
-*result construction + session append*. State: **OPEN**, 5.62x floor.
+*result construction + session append*. State: **CONSTRAINED-ABOVE-FLOOR (terminal — E1–E4 exhaustion at iteration 20; 24.12 µs/call vs 4.29 µs floor ⇒ 5.62x, gap held by boundary-owned double serialization and cross-unit session-append cost).**
 
 ## Contract (from call sites, tests, signatures — never internals)
 

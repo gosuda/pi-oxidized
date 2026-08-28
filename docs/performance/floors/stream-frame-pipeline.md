@@ -1,7 +1,7 @@
 # Floor ledger: stream frame pipeline (decode / state reduction / visible update)
 
 Owning R2 hot rows (lane 3): *Provider frame decode*, *Assistant state reduction*,
-*Incremental visible content update*. State: **OPEN (fail-closed — multiple unproven)**.
+*Incremental visible content update*. State: **architecture-floor (terminal — residual classification recorded at iteration 13; drain 2426 ns vs ~200 ns decode/forward floor, channel/scheduler cost + one contract-forced source-side materialization per frame, no materially distinct design inside the unit boundary).**
 
 ## Contract (from call sites, tests, signatures — never internals)
 

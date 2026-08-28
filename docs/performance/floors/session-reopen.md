@@ -1,7 +1,7 @@
 # Floor ledger: session JSONL reopen (scan/parse + state reconstruction)
 
 Owning R2 hot rows (lane 9): *JSONL scan/parse on reopen*, *Session/tree state
-reconstruction*. State: **OPEN**, 7.79x floor.
+reconstruction*. State: **AT-FLOOR (terminal — single-pass open at iteration 14; 1.506 µs/entry vs 0.764 µs floor ⇒ 1.97x).**
 
 ## Contract (from call sites, tests, signatures — never internals)
 

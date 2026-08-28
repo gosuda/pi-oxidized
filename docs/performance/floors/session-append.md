@@ -1,7 +1,7 @@
 # Floor ledger: session JSONL append (serialization + file append)
 
 Owning R2 hot rows (lane 9): *JSONL entry serialization*, *File append (bytes written)*;
-also carries the *session append* leg of lanes 3 and 8. State: **OPEN**, 4.91x floor.
+also carries the *session append* leg of lanes 3 and 8. State: **AT-FLOOR (terminal — maintained assistant-present state at iteration 21; 5.275 µs/entry vs 3.735 µs floor ⇒ 1.41x).**
 
 ## Contract (from call sites, tests, signatures — never internals)
 

@@ -1,7 +1,7 @@
 # Floor ledger: render-churn recomposition + layout (per-frame view rebuild)
 
 Owning R2 hot rows (lane 7): *Component tree recomposition*, *Layout calculation*.
-State: **OPEN**, ~141x floor — the largest sustained multiple on the hot list.
+State: **AT-FLOOR (terminal — E1–E4 exhaustion at iteration 7; revalidated floor 10.4–10.6 µs/editor-frame, pinned editor medians 13.5–13.9 µs ⇒ multiple ≈ 1.25–1.35x).**
 
 ## Contract (from call sites, tests, signatures — never internals)
 

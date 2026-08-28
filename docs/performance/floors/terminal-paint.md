@@ -2,7 +2,7 @@
 
 Owning R2 hot rows: *Terminal diff/encode/write (paint)* (lanes 3, 4), *Terminal
 diff/encode* + *NullTerminal write* (lane 7), *First terminal paint (synchronized
-output)* (lane 2). State: **OPEN**, ~7.5x paint-only floor (~41x on the recompose+paint block).
+output)* (lane 2). State: **AT-FLOOR (terminal — E1–E4 exhaustion at iteration 9; poke 1.263 µs ≈ 1.97x, editor steady 0.963 µs ≈ 1.50x, static 0.882 µs ≈ 1.38x, all ≤2x on every pinned shape).**
 
 ## Contract (from call sites, tests, signatures — never internals)
 
