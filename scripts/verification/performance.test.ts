@@ -2,14 +2,16 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { spawnPty } from "./pty.ts";
+import { spawnPty, type PtySnapshot } from "./pty.ts";
 import {
+	aggregateKeypressRounds,
 	HarnessFailure,
 	ProcTreeSampler,
 	assembleProcessMemoryReading,
 	distribution,
 	exitCodeForFailure,
 	frameObservation,
+	keySyncTransaction,
 	observeProcessTreeMemory,
 	parseProcStatusPeakRssText,
 	parseSmapsRollupText,
@@ -20,6 +22,7 @@ import {
 	sampleProcessTreeMemoryWindow,
 	terminateAndRequireCleanExit,
 	validateMemoryCoverage,
+	type KeypressRoundRecord,
 } from "./performance.ts";
 import {
 	NOISE_EXIT_CODE,
@@ -669,5 +672,109 @@ describe("entrypoint harness failure preserves threshold blockers", () => {
 		const catchBody = source.slice(catchStart);
 		expect(catchBody).toContain("recordEntrypointHarnessFailure(artifact, failure)");
 		expect(catchBody).not.toMatch(/artifact\.blockers = \[`\$\{stage\}: \$\{failure\.message\}`\]/);
+	});
+});
+describe("strict keypress synchronized observer", () => {
+	const encoder = new TextEncoder();
+
+	function snapshotOf(...texts: readonly string[]): PtySnapshot {
+		const chunks = texts.map((text, index) => ({
+			stream: "pty" as const,
+			text,
+			bytes: encoder.encode(text),
+			elapsedMs: (index + 1) * 5,
+			unixMs: index + 1,
+		}));
+		const rawText = texts.join("");
+		return {
+			rawText,
+			applicationText: rawText,
+			echoText: "",
+			chunks,
+			elapsedMs: chunks.length * 5,
+			exited: false,
+			exitCode: null,
+		};
+	}
+
+	test("returns the first balanced transaction with payload and completing-chunk timestamp across split markers", () => {
+		expect(keySyncTransaction(snapshotOf(`junk${SYNC_BEGIN}`, "a\x1b[0mkey", `${SYNC_END}tail`), 0)).toEqual({
+			kind: "transaction",
+			payload: "a\x1b[0mkey",
+			beginCount: 1,
+			endCount: 1,
+			elapsedMs: 15,
+		});
+	});
+
+	test("ignores complete transactions before the receipt offset and scans only post-write bytes", () => {
+		expect(
+			keySyncTransaction(snapshotOf(`${SYNC_BEGIN}old${SYNC_END}`, `${SYNC_BEGIN}new${SYNC_END}`), 15),
+		).toEqual({ kind: "transaction", payload: "new", beginCount: 1, endCount: 1, elapsedMs: 10 });
+	});
+
+	test("reports row-local printable output before any synchronized begin as a fallback, not a frame", () => {
+		expect(keySyncTransaction(snapshotOf("\x1b[3;1Hcursor moved"), 0)).toEqual({ kind: "fallback", elapsedMs: 5 });
+	});
+
+	test("returns undefined while the markers are incomplete or absent", () => {
+		expect(keySyncTransaction(snapshotOf(SYNC_BEGIN, "partial"), 0)).toBeUndefined();
+		expect(keySyncTransaction(snapshotOf("plain text without control sequences"), 0)).toBeUndefined();
+	});
+
+	test("counts extra markers through the completing chunk so an extra completed frame can be rejected", () => {
+		expect(
+			keySyncTransaction(snapshotOf(`${SYNC_BEGIN}q${SYNC_END}${SYNC_BEGIN}extra${SYNC_END}`), 0),
+		).toEqual({ kind: "transaction", payload: "q", beginCount: 2, endCount: 2, elapsedMs: 5 });
+	});
+
+	test("exposes the payload so the collector can require the typed key", () => {
+		const observation = keySyncTransaction(snapshotOf(`${SYNC_BEGIN}editor [q] ready${SYNC_END}`), 0);
+		expect(observation?.kind === "transaction" && observation.payload.includes("q")).toBe(true);
+	});
+});
+
+describe("keypress round aggregation", () => {
+	function syntheticRound(round: number, latencies: readonly number[]): KeypressRoundRecord {
+		return {
+			round,
+			medianMs: distribution(latencies).median,
+			samples: latencies.map((latencyMs, index) => ({
+				latencyMs,
+				key: String.fromCharCode(97 + (index % 26)),
+				synchronizedFramesObserved: 1,
+			})),
+		};
+	}
+
+	test("summarizes all 27-style rounds without filtering any sample", () => {
+		const rounds = [0, 1, 2].map((round) =>
+			syntheticRound(
+				round,
+				Array.from({ length: 200 }, (_, index) => (index === 0 && round === 1 ? 999 : round + 1)),
+			),
+		);
+		const aggregated = aggregateKeypressRounds(rounds);
+		expect(aggregated.roundMedians).toEqual([1, 2, 3]);
+		expect(aggregated.roundSummary.median).toBe(2);
+		expect(aggregated.pooled.count).toBe(600);
+		expect(aggregated.pooled.max).toBe(999);
+	});
+
+	test("rejects a partial round instead of summarizing missing samples", () => {
+		const short = syntheticRound(0, Array.from({ length: 199 }, () => 1));
+		expect(() => aggregateKeypressRounds([short])).toThrow(HarnessFailure);
+	});
+
+	test("round-median spread exactly at the 0.20 trust boundary stays quiet", () => {
+		const spread = distribution([8, 12]);
+		expect(spread.median).toBe(10);
+		expect(spread.stddev).toBe(2);
+		expect(spread.relativeSpread).toBe(0.2);
+		expect(() =>
+			requireQuiet([
+				{ label: "boundary", count: spread.count, median: spread.median, stddev: spread.stddev, relativeSpread: spread.relativeSpread },
+			]),
+		).not.toThrow();
 	});
 });

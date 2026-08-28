@@ -81,6 +81,8 @@ const STREAM_CHUNKS = 256;
 const STREAM_CHUNK_DELAY_MS = 2;
 const KEY_WARMUPS = 20;
 const KEY_SAMPLES = 200;
+const KEYPRESS_PROCESS_WARMUPS = 3;
+export const KEYPRESS_MEASURED_ROUNDS = 27;
 const PROC_SAMPLE_INTERVAL_MS = 1;
 const VERSION_SPEEDUP_TARGET = 3;
 const FIRST_FRAME_SPEEDUP_TARGET = 3;
@@ -98,7 +100,7 @@ const implementationNames = ["rust", "typescript"] as const;
 type Implementation = (typeof implementationNames)[number];
 type SampleKind = "cold" | "warm";
 
-interface Distribution {
+export interface Distribution {
 	readonly count: number;
 	readonly median: number;
 	readonly p95: number;
@@ -176,8 +178,9 @@ type StreamTurnMeasurement = Omit<
 	"persistedProviderFrames" | "sessionJsonlFiles" | "sessionSha256"
 >;
 
-interface KeypressSample {
+export interface KeypressSample {
 	readonly latencyMs: number;
+	readonly key: string;
 	readonly synchronizedFramesObserved: number;
 }
 
@@ -187,7 +190,7 @@ interface CommandRecord {
 	readonly argv: readonly string[];
 }
 
-interface FileRecord {
+export interface FileRecord {
 	readonly path: string;
 	readonly sha256: string;
 	readonly bytes: number;
@@ -1039,9 +1042,64 @@ export function frameObservation(snapshot: PtySnapshot, chunkOffset = 0): FrameO
 			}
 			continue;
 		}
-		if (/\x1b\[[0-?]*[ -/]*[@-~]/.test(raw) && stripTerminalSequences(raw).trim().length > 0) {
+		if (hasRowLocalFallback(raw)) {
 			return { elapsedMs: chunk.elapsedMs, bytes, detection: "row-local-fallback" };
 		}
+	}
+	return undefined;
+}
+
+export type KeySyncObservation =
+	| {
+			readonly kind: "transaction";
+			/** Frame text between SYNC_BEGIN and SYNC_END. */
+			readonly payload: string;
+			readonly beginCount: number;
+			readonly endCount: number;
+			/** Arrival elapsed of the chunk that completed the transaction. */
+			readonly elapsedMs: number;
+	  }
+	| { readonly kind: "fallback"; readonly elapsedMs: number };
+
+function hasRowLocalFallback(text: string): boolean {
+	return /\x1b\[[0-?]*[ -/]*[@-~]/.test(text) && stripTerminalSequences(text).trim().length > 0;
+}
+
+/**
+ * Strict synchronized-only observer for keypress samples: returns the first
+ * balanced DEC 2026 transaction at or after the write receipt's character
+ * offset, its payload, marker counts through the completing chunk, and the
+ * completing chunk's arrival timestamp. Row-local printable output before any
+ * synchronized begin is reported as a fallback, never as a frame. Split
+ * begin/end markers accumulate across chunks until balanced.
+ */
+export function keySyncTransaction(snapshot: PtySnapshot, startOffset: number): KeySyncObservation | undefined {
+	if (!(startOffset >= 0)) throw new HarnessFailure("keypress-observer", "sync scan offset must be non-negative");
+	let raw = "";
+	let consumed = 0;
+	let elapsedMs = 0;
+	for (const chunk of snapshot.chunks) {
+		if (chunk.stream !== "pty") continue;
+		const chunkStart = consumed;
+		consumed = chunkStart + chunk.text.length;
+		if (consumed <= startOffset) continue;
+		raw += chunk.text.slice(Math.max(0, startOffset - chunkStart));
+		elapsedMs = chunk.elapsedMs;
+		const begin = raw.indexOf(SYNC_BEGIN);
+		if (begin < 0) {
+			if (hasRowLocalFallback(raw)) return { kind: "fallback", elapsedMs };
+			continue;
+		}
+		if (hasRowLocalFallback(raw.slice(0, begin))) return { kind: "fallback", elapsedMs };
+		const end = raw.indexOf(SYNC_END, begin + SYNC_BEGIN.length);
+		if (end < 0) continue;
+		return {
+			kind: "transaction",
+			payload: raw.slice(begin + SYNC_BEGIN.length, end),
+			beginCount: countOccurrences(raw, SYNC_BEGIN),
+			endCount: countOccurrences(raw, SYNC_END),
+			elapsedMs,
+		};
 	}
 	return undefined;
 }
@@ -1543,77 +1601,189 @@ async function runStreamProcess(
 	}
 }
 
-async function runKeypressBenchmark(ticksPerSecond: number): Promise<{
+export interface KeypressRoundRecord {
+	readonly round: number;
 	readonly samples: readonly KeypressSample[];
-	readonly warmupCount: number;
-	readonly ptyRootPid: number;
-	readonly procSamples: number;
-	readonly observedProcesses: number;
-	readonly processTreeCpuMs: number;
-}> {
-	const sandbox = temporaryDirectory("keypress-rust");
+	readonly medianMs: number;
+}
+
+/**
+ * One fresh PTY process running the fixed keypress protocol: after the first
+ * settled frame, 20 discarded warmup key-clear pairs then 200 measured
+ * key-clear pairs. Every measured interval is receipt-to-completing-chunk on
+ * a fixed-state editor (one printable key, painted synchronously, cleared
+ * outside the timed window). Any behavioral violation fails the whole round.
+ */
+export async function runKeypressRound(binaryPath: string, round: number): Promise<KeypressRoundRecord> {
+	const sandbox = temporaryDirectory(`keypress-r2-round-${round < 0 ? "warmup" : round}`);
+	const binary = resolve(binaryPath);
 	mkdirSync(join(sandbox, "home"), { recursive: true });
 	const pty = spawnPty({
-		argv: [RUST_BINARY, ...extensionFreeArgs],
+		argv: [binary, ...extensionFreeArgs],
 		cwd: sandbox,
 		env: benchmarkEnvironment(sandbox),
 		size: { columns: 100, rows: 32 },
 	});
-	const sampler = new ProcTreeSampler(pty.pid, PROC_SAMPLE_INTERVAL_MS);
 	try {
 		await pty.waitFor((snapshot) => frameObservation(snapshot) !== undefined, { deadlineMs: 20_000, source: "raw" });
 		await Bun.sleep(30);
-		const measured: KeypressSample[] = [];
+		const samples: KeypressSample[] = [];
 		for (let index = 0; index < KEY_WARMUPS + KEY_SAMPLES; index += 1) {
-			const before = pty.snapshot();
-			const chunkOffset = before.chunks.length;
 			const key = String.fromCharCode(97 + (index % 26));
-			pty.writeKeys(key);
-			const painted = await pty.waitFor((snapshot) => frameObservation(snapshot, chunkOffset) !== undefined, {
-				deadlineMs: 1_000,
-				source: "raw",
-			});
-			const frame = frameObservation(painted, chunkOffset);
-			if (!frame) throw new HarnessFailure("keypress:rust", "keypress paint predicate returned without a frame");
-			const latencyMs = frame.elapsedMs - before.elapsedMs;
-			if (latencyMs < 0) throw new HarnessFailure("keypress:rust", `negative keypress latency ${latencyMs}`);
+			const receipt = pty.writeKeys(key);
+			const observed = await pty.waitFor(
+				(candidate) => keySyncTransaction(candidate, receipt.outputOffset) !== undefined,
+				{ deadlineMs: 1_000, source: "raw" },
+			);
+			const transaction = keySyncTransaction(observed, receipt.outputOffset);
+			if (!transaction) throw new HarnessFailure("keypress:round", `key ${key} paint never synchronized`);
+			if (transaction.kind === "fallback") {
+				throw new HarnessFailure("keypress:round", `row-local fallback frame arrived before the synchronized key ${key} paint`);
+			}
+			if (transaction.beginCount !== 1 || transaction.endCount !== 1) {
+				throw new HarnessFailure(
+					"keypress:round",
+					`key ${key} window contained ${transaction.beginCount} begins / ${transaction.endCount} ends; ` +
+						"expected exactly one balanced synchronized transaction",
+				);
+			}
+			if (!transaction.payload.includes(key)) {
+				throw new HarnessFailure("keypress:round", `first synchronized transaction after key ${key} did not contain the typed key payload`);
+			}
+			// Fixed-state check: the previous key must be gone. An ignored or
+			// remapped Ctrl+U leaves it in the editor and the next paint would
+			// render it (escape-sequence bytes are stripped before matching).
+			if (index > 0) {
+				const previousKey = String.fromCharCode(97 + ((index - 1) % 26));
+				if (stripTerminalSequences(transaction.payload).includes(previousKey)) {
+					throw new HarnessFailure(
+						"keypress:round",
+						`key ${key} paint still shows previous key ${previousKey}; the Ctrl+U clear did not restore the empty editor`,
+					);
+				}
+			}
+			const latencyMs = transaction.elapsedMs - receipt.startedElapsedMs;
+			if (latencyMs < 0) throw new HarnessFailure("keypress:round", `negative keypress latency ${latencyMs}`);
+			// Ctrl+U clear: outside the timed interval, must fully complete so the
+			// next measured key starts from the same empty editor state.
+			const clearReceipt = pty.writeKeys("\x15");
+			const cleared = await pty.waitFor(
+				(candidate) => keySyncTransaction(candidate, clearReceipt.outputOffset) !== undefined,
+				{ deadlineMs: 1_000, source: "raw" },
+			);
+			const clearTransaction = keySyncTransaction(cleared, clearReceipt.outputOffset);
+			if (
+				!clearTransaction ||
+				clearTransaction.kind !== "transaction" ||
+				clearTransaction.beginCount !== 1 ||
+				clearTransaction.endCount !== 1
+			) {
+				throw new HarnessFailure("keypress:round", `Ctrl+U clear paint after key ${key} did not complete as exactly one synchronized transaction`);
+			}
+			// The clear repaint erases the key; its printable cells must not
+			// still contain it, or the next sample would run on a grown editor.
+			if (stripTerminalSequences(clearTransaction.payload).includes(key)) {
+				throw new HarnessFailure(
+					"keypress:round",
+					`Ctrl+U clear paint after key ${key} still renders the key; editor state is not empty`,
+				);
+			}
 			if (index >= KEY_WARMUPS) {
-				const frameText = painted.chunks
-					.slice(chunkOffset)
-					.filter((chunk) => chunk.stream === "pty")
-					.map((chunk) => chunk.text)
-					.join("");
-				measured.push({
-					latencyMs,
-					synchronizedFramesObserved: countOccurrences(frameText, SYNC_BEGIN),
-				});
+				samples.push({ latencyMs, key, synchronizedFramesObserved: transaction.beginCount });
 			}
 		}
-		const clearChunkOffset = pty.snapshot().chunks.length;
-		pty.writeKeys("\x15");
-		await pty.waitFor((snapshot) => frameObservation(snapshot, clearChunkOffset) !== undefined, {
-			deadlineMs: 1_000,
-			source: "raw",
-		});
-		await terminateAndRequireCleanExit(pty, "keypress:rust");
-		const finalCpu = await sampler.stop();
-		return {
-			samples: measured,
-			warmupCount: KEY_WARMUPS,
-			ptyRootPid: pty.pid,
-			procSamples: finalCpu.procSamples,
-			observedProcesses: finalCpu.observedProcesses,
-			processTreeCpuMs: cpuMilliseconds(finalCpu, ticksPerSecond),
-		};
+		await terminateAndRequireCleanExit(pty, "keypress:round");
+		return { round, samples, medianMs: distribution(samples.map((sample) => sample.latencyMs)).median };
 	} catch (error) {
 		throw new HarnessFailure(
-			"keypress:rust",
+			`keypress:round-${round}`,
 			`${errorMessage(error instanceof Error ? error : String(error))}\nPTY tail:\n${tail(pty.snapshot().rawText, 6_000)}`,
 		);
 	} finally {
-		await sampler.stop();
 		await pty.terminate();
 	}
+}
+
+/** Pure outer-round aggregation: every sample from every round enters pooled; no filtering. */
+export function aggregateKeypressRounds(rounds: readonly KeypressRoundRecord[]): {
+	readonly roundMedians: readonly number[];
+	readonly roundSummary: Distribution;
+	readonly pooled: Distribution;
+} {
+	if (rounds.length === 0) throw new HarnessFailure("statistics", "keypress aggregation requires at least one measured round");
+	for (const round of rounds) {
+		if (round.samples.length !== KEY_SAMPLES) {
+			throw new HarnessFailure("statistics", `keypress round ${round.round} recorded ${round.samples.length}/${KEY_SAMPLES} samples`);
+		}
+	}
+	const pooled = rounds.flatMap((round) => round.samples.map((sample) => sample.latencyMs));
+	return {
+		roundMedians: rounds.map((round) => round.medianMs),
+		roundSummary: distribution(rounds.map((round) => round.medianMs)),
+		pooled: distribution(pooled),
+	};
+}
+
+function keypressSchedulingMetadata(): { cpuAffinity: string | null; governor: string | null } {
+	let cpuAffinity: string | null = null;
+	try {
+		cpuAffinity = /Cpus_allowed_list:\s*(\S+)/.exec(readFileSync("/proc/self/status", "utf8"))?.[1] ?? null;
+	} catch {
+		// Affinity metadata is descriptive only.
+	}
+	let governor: string | null = null;
+	try {
+		governor = readFileSync("/sys/devices/system/cpu/cpufreq/policy0/scaling_governor", "utf8").trim() || null;
+	} catch {
+		// Governor metadata is descriptive only.
+	}
+	return { cpuAffinity, governor };
+}
+
+export interface KeypressBenchmarkOptions {
+	readonly processWarmups?: number;
+	readonly rounds?: number;
+}
+
+export interface KeypressBenchmarkResult {
+	readonly binary: FileRecord;
+	readonly processWarmups: number;
+	readonly rounds: readonly KeypressRoundRecord[];
+	readonly roundMedians: readonly number[];
+	readonly roundSummary: Distribution;
+	readonly pooled: Distribution;
+	readonly collectionWallMs: number;
+	readonly synchronizedSampleCount: number;
+	/** Structural invariant: any invalid frame fails its round, so a completed run has zero. */
+	readonly invalidFrameCount: number;
+	readonly scheduling: { cpuAffinity: string | null; governor: string | null };
+}
+
+export async function runKeypressBenchmark(
+	binaryPath: string,
+	options: KeypressBenchmarkOptions = {},
+): Promise<KeypressBenchmarkResult> {
+	const processWarmups = options.processWarmups ?? KEYPRESS_PROCESS_WARMUPS;
+	const measuredRounds = options.rounds ?? KEYPRESS_MEASURED_ROUNDS;
+	const collectionStart = performance.now();
+	for (let warmup = 1; warmup <= processWarmups; warmup += 1) {
+		await runKeypressRound(binaryPath, -warmup);
+	}
+	const rounds: KeypressRoundRecord[] = [];
+	for (let round = 0; round < measuredRounds; round += 1) {
+		rounds.push(await runKeypressRound(binaryPath, round));
+	}
+	const collectionWallMs = performance.now() - collectionStart;
+	return {
+		binary: fileRecord(binaryPath),
+		processWarmups,
+		rounds,
+		...aggregateKeypressRounds(rounds),
+		collectionWallMs,
+		synchronizedSampleCount: rounds.reduce((sum, round) => sum + round.samples.length, 0),
+		invalidFrameCount: 0,
+		scheduling: keypressSchedulingMetadata(),
+	};
 }
 
 function runCacheDrop(python: string, path: string): void {
@@ -2010,13 +2180,13 @@ async function main(): Promise<void> {
 		coldCacheMethod: "sync once per cold group, then posix_fadvise(POSIX_FADV_DONTNEED) on the implementation executable before every cold sample",
 		firstFrameDefinition: "first complete DEC synchronized-output transaction; row-local printable CSI transaction is the recorded fallback",
 		streamCpuDefinition: "whole-process-tree CPU immediately before submit Enter through final marker, divided by the fixed 256 deterministic provider text-delta frames; painted frame/coalescing counts recorded separately",
-		keypressDefinition: "PTY key write to first complete synchronized output paint, sequential with no artificial/background-coalescer delay",
+		keypressDefinition: "per-key PTY write receipt to the completing chunk of the first balanced DEC 2026 transaction containing the typed key, empty editor per key, Ctrl+U clear paint outside timing, evaluated over fresh process rounds",
 		ptyTerm: PTY_TERM,
 		inputPaintBypassesBackgroundCoalescer: true,
 		versionSamples: { cold: VERSION_COLD_SAMPLES, warmups: VERSION_WARMUPS, warm: VERSION_WARM_SAMPLES },
 		firstFrameSamples: { cold: FIRST_FRAME_COLD_SAMPLES, warmups: FIRST_FRAME_WARMUPS, warm: FIRST_FRAME_WARM_SAMPLES },
 		streamSamples: { processWarmups: STREAM_PROCESS_WARMUPS, measuredPerImplementation: STREAM_PROCESS_SAMPLES },
-		keypressSamples: { warmups: KEY_WARMUPS, warm: KEY_SAMPLES },
+		keypressSamples: { warmups: KEY_WARMUPS, warm: KEY_SAMPLES, processWarmups: KEYPRESS_PROCESS_WARMUPS, measuredRounds: KEYPRESS_MEASURED_ROUNDS },
 		streamChunks: STREAM_CHUNKS,
 		streamChunkDelayMs: STREAM_CHUNK_DELAY_MS,
 	};
@@ -2125,28 +2295,41 @@ async function main(): Promise<void> {
 	// loses the whole lane. Record the degradation and continue so the
 	// non-gating memory lanes still collect; the explicit blocker below keeps
 	// the verdict honest.
-	const keypress = await runKeypressBenchmark(ticksPerSecond).catch((error: unknown) => {
+	const keypress = await runKeypressBenchmark(RUST_BINARY).catch((error: unknown) => {
 		laneDegradations.push(`rust native keypress-to-paint: lane failed: ${firstLine(error)}`);
 		return {
-			samples: [] as KeypressSample[],
-			warmupCount: KEY_WARMUPS,
-			ptyRootPid: 0,
-			procSamples: 0,
-			observedProcesses: 0,
-			processTreeCpuMs: 0,
-		};
+			binary: fileRecord(RUST_BINARY),
+			processWarmups: 0,
+			rounds: [] as KeypressRoundRecord[],
+			roundMedians: [] as number[],
+			roundSummary: laneDistribution([]),
+			pooled: laneDistribution([]),
+			collectionWallMs: 0,
+			synchronizedSampleCount: 0,
+			invalidFrameCount: 0,
+			scheduling: { cpuAffinity: null, governor: null },
+		} satisfies KeypressBenchmarkResult;
 	});
-	const keypressSummary = laneDistribution(keypress.samples.map((sample) => sample.latencyMs));
+	const keypressSummary = keypress.pooled;
 	artifact.measurements.rustNativeKeypressToPaint = {
 		unit: "milliseconds wall time",
-		summary: keypressSummary,
+		definition:
+			"per-key: PTY write receipt (elapsed captured immediately before the first sink write) to the arrival of the chunk completing the first balanced DEC 2026 transaction correlated to the typed key; each key is painted from an empty editor and cleared with Ctrl+U outside the timed window",
+		noiseEstimator: "population stddev / median over the 27 fresh process-round medians after 3 discarded process warmup rounds; pooled raw spread disclosed but not gating",
+		summary: keypress.pooled,
+		roundMedians: keypress.roundMedians,
+		roundSummary: keypress.roundSummary,
+		processWarmups: keypress.processWarmups,
+		measuredRounds: keypress.rounds.length,
+		collectionWallMs: keypress.collectionWallMs,
+		invalidFrameCount: keypress.invalidFrameCount,
+		synchronizedSampleCount: keypress.synchronizedSampleCount,
+		binary: keypress.binary,
+		scheduling: keypress.scheduling,
 		thresholdMs: KEYPRESS_P99_TARGET_MS,
-		warmupCount: keypress.warmupCount,
-		ptyRootPid: keypress.ptyRootPid,
-		procSamples: keypress.procSamples,
-		observedProcesses: keypress.observedProcesses,
-		processTreeCpuMs: keypress.processTreeCpuMs,
-		rawSamples: keypress.samples,
+		rawSamples: keypress.rounds.flatMap((round) =>
+			round.samples.map((sample) => ({ round: round.round, ...sample })),
+		),
 	};
 
 	const sourceAfter = {
@@ -2245,11 +2428,11 @@ async function main(): Promise<void> {
 			relativeSpread: streamSummary.typescript.relativeSpread,
 		},
 		{
-			label: "rust native keypress-to-paint",
-			count: keypressSummary.count,
-			median: keypressSummary.median,
-			stddev: keypressSummary.stddev,
-			relativeSpread: keypressSummary.relativeSpread,
+			label: "keypress process-round medians",
+			count: keypress.roundSummary.count,
+			median: keypress.roundSummary.median,
+			stddev: keypress.roundSummary.stddev,
+			relativeSpread: keypress.roundSummary.relativeSpread,
 		},
 		]);
 	} catch (error) {
@@ -2275,7 +2458,7 @@ async function main(): Promise<void> {
 	if (streamSamples.typescript.length === 0) {
 		blockers.push("streaming-tail provider-frame CPU (typescript): no samples collected (lane degraded; see harness.laneDegradations)");
 	}
-	if (keypress.samples.length === 0) {
+	if (keypress.synchronizedSampleCount === 0) {
 		blockers.push("Rust native keypress-to-paint: no samples collected (lane degraded; see harness.laneDegradations)");
 	}
 	if (artifact.build.sourceFingerprints.buildRegenerated?.rust) {
@@ -2350,6 +2533,11 @@ async function main(): Promise<void> {
 		blockers.push(
 			`Rust native keypress-to-paint p99: ${keypressSummary.p99.toFixed(3)} ms >= required ${KEYPRESS_P99_TARGET_MS.toFixed(3)} ms ` +
 				`(median ${keypressSummary.median.toFixed(3)} ms, p95 ${keypressSummary.p95.toFixed(3)} ms, ${keypressSummary.count} samples)`,
+		);
+	}
+	if (keypress.collectionWallMs < 1_000) {
+		blockers.push(
+			`keypress collection wall ${keypress.collectionWallMs.toFixed(0)} ms < required 1000 ms for a trusted baseline`,
 		);
 	}
 
