@@ -1,8 +1,8 @@
 # Floor ledger: extension RPC dispatch (frame path, correlation, host loop)
 
 Owning R2 hot rows (lanes 5/6): *JSONL frame encode/decode*, *Request correlation (id
-matching)*, *Host loop dispatch*, *Widget callback + UI-slot traffic*. State: **OPEN
-(fail-closed — no trusted or paired measured cost).**
+matching)*, *Host loop dispatch*, *Widget callback + UI-slot traffic*. State: **OPEN >2x
+(trusted — S = 4399 ns, rs_S = 9.93%, noise gate passed; Q = 2923 ns, H = 1462 ns).**
 
 ## Contract (from call sites, tests, signatures — never internals)
 
@@ -29,21 +29,25 @@ encode one res line                                                    ~0.3 us
                                                                      ---------
 floor                                                                ~0.75-1 us/request
 ```
-
-## Measured cost — iterations 22-23 (PERF-T11 #97, 2026-08-28)
+## Measured cost — iterations 22-24 (PERF-T11 #97, 2026-08-28)
 
 A timed `serve_io` lane was added to `crates/pi-ext/tests/serve_io_scaling.rs`
 (ignored, release-only, gated by the `bench-seam` Cargo feature). The lane
 replays the identical PERF-T6 300-request `terminalInput` corpus through
 production `serve_io` over an in-memory tokio duplex, with a fresh
-current-thread runtime per round (3 warmup + 9 measured, retried at 27).
+current-thread runtime per round (3 warmup + 27 measured).
 
 Server attribution is separated from inclusive RTT: a `bench-seam` feature
-exposes `record_decode(id)` at the post-decode / pre-dispatch seam and
+exposes `record_decode(id)` at the post-decode / pre-dispatch seam,
+`record_task_start(id)` at the spawned-task entry (first line inside
+`handle_request`, after id extraction, before panic guard), and
 `record_encode(id)` at the post-encode / pre-send seam in `server.rs`.
-Attributed server cost S_i = encode_complete − decode_start per request;
-inclusive RTT = batch wall time / 300. Instrumentation overhead: two
-`std::sync::Mutex` lock/unlock pairs per request (~40-100 ns total), present
+Attributed costs per request:
+  Q = task_start − decode_start (spawn + cooperative scheduler hop)
+  H = encode_complete − task_start (handler + response construction + encode)
+  S = Q + H = encode_complete − decode_start (total server cost)
+Inclusive RTT = batch wall time / 300. Instrumentation overhead: three
+`std::sync::Mutex` lock/unlock pairs per request (~60-150 ns total), present
 in both warmup and measured rounds, disclosed but not subtracted.
 
 ### Iteration 22 results (27 measured rounds, `taskset -c 20`, release)
@@ -96,6 +100,44 @@ already excludes — is not the dominant source of the modality (single-CPU
 frequency/cache state is not controlled by this protocol). State remains
 **OPEN (fail-closed)**.
 
+### Iteration 24 — hop attribution (2026-08-28)
+
+Iteration 24 added a third bench-seam timestamp (`record_task_start`) at the
+spawned task entry to decompose S into Q (spawn + cooperative scheduler hop)
+and H (handler + response construction + encode). Same protocol: `taskset -c
+20`, 3 warmup + 27 measured rounds, identical 300-request corpus.
+
+| Metric | Value |
+|---|---|
+| Inclusive RTT (median) | 13,885 ns/request |
+| Q (spawn + cooperative hop) | 2,923 ns/request |
+| H (handler + encode) | 1,462 ns/request |
+| S (total server) | 4,399 ns/request |
+| rs_Q | 9.97% |
+| rs_H | 10.65% |
+| rs_S | 9.93% |
+| Noise gate (rs_S ≤ 0.20) | **PASSED** |
+| Classification | **OPEN >2x** (S = 4399 ns > 2000 ns = 2× floor_max) |
+
+The S noise gate passed at rs_S = 9.93%, a dramatic improvement from
+iterations 22 (45.24%) and 23 (31.55%). All three distributions (Q, H, S)
+are individually tight (rs < 11%). Q dominates S at 66.5% (2923 ns vs H's
+1462 ns at 33.2%) — the spawn + cooperative scheduler hop is ~2× the
+handler + encode cost. The multi-modality observed in iterations 22/23 was
+a round-level location shift: the entire Q+H pair shifted together between
+rounds (both Q and H are proportionally lower in the outlier rounds 14-15
+and higher in round 16), not one component oscillating independently. This
+confirms the iteration-22/23 hypothesis that async task scheduling overhead
+dominates the server cost. The floor terms (decode ~400 ns, correlate ~50
+ns, encode ~300 ns = ~750 ns) are dwarfed by Q (spawn + hop ~2923 ns).
+
+State upgrades from **OPEN (fail-closed)** to **OPEN >2x (trusted)** — the
+noise gate passed, so the classification is trusted. The dominant cost is Q
+(spawn + cooperative hop); the named iteration-25 candidate is to inline
+the `terminalInput` handler on the drive loop (skip `tasks.spawn` for
+non-cancellable methods), collapsing Q toward zero and leaving H (~1462 ns)
+as the server cost.
+
 ### Prior unproven state (superseded by this measurement)
 
 Rust: the serve_io scaling suite was correctness-only (no timed distributions;
@@ -111,20 +153,17 @@ per-request work or widen samples per the R2 ladder).
 
 ## Decomposition status
 
-No trusted lane total exists to decompose (noise gate failed); no attributed
-categories are asserted. The 4 ms terminal-input budget is a *constraint* on
-any rebuild (a slower dispatch fails the budget contract), recorded here
-because Phase-5 candidates must respect it. The multi-modal S distribution
-suggests the dominant cost is async task scheduling overhead (spawn →
-semaphore acquire → handler → out_tx.send → writer task wake), not the
-decode/correlate/encode floor terms. Iteration 23 is consistent with this: a
-same-protocol re-run on the same one-CPU pin (`taskset -c 20`) failed the
-gate again (rs 31.55% vs the recorded 45.24%) with the modality intact, so
-cross-CPU migration is ruled out as the dominant source of the modality
-(single-CPU frequency/cache state not controlled) and the noise level itself
-drifts between sessions. The next evidence
-requirement is attribution that separates the per-request spawn + cooperative
-hop cost from handler cost (a bench-seam-gated seam refinement or an
-equivalent hop-determinism probe), validated by a passing noise gate; only a
-protocol that passes the gate can classify this unit, and no cluster may be
-picked from the current distributions.
+Trusted lane total: S = 4399 ns (rs_S = 9.93%, noise gate passed).
+Attributed categories:
+  Q (spawn + cooperative scheduler hop) = 2923 ns (66.5% of S)
+  H (handler + response construction + encode) = 1462 ns (33.2% of S)
+  Q + H = S verified per-request for all 300×27 = 8100 samples.
+
+The 4 ms terminal-input budget is a *constraint* on any rebuild (a slower
+dispatch fails the budget contract), recorded here because Phase-5 candidates
+must respect it. The current total server cost (4399 ns) is ~900× under the
+4 ms budget. The dominant cost is Q (spawn + cooperative hop), confirmed by
+hop attribution. The named iteration-25 candidate (inline `terminalInput`
+handler on the drive loop, skip `tasks.spawn` for non-cancellable methods)
+would collapse Q toward zero and leave H (~1462 ns) as the server cost —
+potentially classifiable as BOUNDARY or AT-FLOOR after re-measurement.

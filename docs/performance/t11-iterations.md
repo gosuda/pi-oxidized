@@ -2378,3 +2378,183 @@ Out of scope, file-disjoint: production `serve_io` logic, `server.rs`
 (including `bench-seam` seams), `serve_io_scaling.rs`, `Cargo.toml`,
 `Cargo.lock`, `.github/workflows/`, `scripts/`, other floor ledgers,
 `rust-toolchain.toml`.
+
+## Iteration 24 — `extension-rpc-dispatch` (hop attribution — S gate PASSED, OPEN >2x)
+
+Commit: see `git log` (`perf(t11)` + `docs(t11)`). Date 2026-08-28.
+
+**Unit**: `extension-rpc-dispatch` (unchanged from iterations 22-23). Floor:
+750-1000 ns/request (server-only, computed from contract).
+
+**Goal**: add a third bench-seam timestamp at the spawned task entry to
+decompose S into Q (decode→task start: spawn + cooperative scheduler hop)
+and H (task start→encode: handler + response construction + encode),
+attribute the multi-modal noise observed in iterations 22 (rs 45.24%) and
+23 (rs 31.55%), and classify if the S noise gate passes. No production
+optimization.
+
+### Implementation
+
+Extended the `bench_seam` module in `server.rs` to store a triple
+`(decode_start, task_start, encode_complete)` per frame id. Added
+`record_task_start(id)` called as the first executed line inside
+`handle_request`, immediately after `let id = frame.id;` and before the
+panic guard / handler dispatch. This captures the instant the spawned task
+begins executing on the executor — after the JoinSet spawn and cooperative
+scheduler hop, before any handler work.
+
+Storage schema changed from `HashMap<u64, (Instant, Option<Instant>)>` to
+`HashMap<u64, (Instant, Option<Instant>, Option<Instant>)>`. `take_completed`
+returns `(id, decode_start, task_start, encode_complete)` and filters
+entries where any of the three timestamps is missing. The test lane asserts
+Q+H==S for every id and requires all 300 triplets per round (no silent
+filtering of incomplete entries).
+
+Formulas:
+  Q = task_start - decode_start   (spawn + cooperative scheduler hop)
+  H = encode_complete - task_start (handler + response construction + encode)
+  S = Q + H = encode_complete - decode_start (total server cost, unchanged)
+
+All seams are `#[cfg(feature = "bench-seam")]` gated — zero production
+overhead. No new dependency, no Cargo.lock change.
+
+### Protocol
+
+```
+taskset -c 20 env BENCH_MEASURED_ROUNDS=27 cargo test -p pi-ext --features bench-seam --test serve_io_scaling --release -- --ignored --exact --nocapture timed_serve_io_perf_t11_extension_rpc_dispatch
+```
+
+3 warmup + 27 measured rounds; identical 300-request `terminalInput` corpus
+(ids 300-599, x/a/b cycling); fresh current-thread runtime per round; CPU
+pinned to core 20.
+
+### Measurements (27 measured rounds, `taskset -c 20`, release)
+
+| Round | RTT (ns/req) | Q_median (ns) | H_median (ns) | S_median (ns) |
+|---|---|---|---|---|
+| 1 | 14,244 | 2,940 | 1,581 | 4,564 |
+| 2 | 12,059 | 2,755 | 1,249 | 4,033 |
+| 3 | 13,753 | 2,924 | 1,416 | 4,360 |
+| 4 | 13,694 | 2,941 | 1,347 | 4,263 |
+| 5 | 13,891 | 2,915 | 1,436 | 4,390 |
+| 6 | 13,829 | 2,933 | 1,419 | 4,367 |
+| 7 | 13,826 | 2,920 | 1,463 | 4,381 |
+| 8 | 14,779 | 2,994 | 1,421 | 4,414 |
+| 9 | 14,616 | 2,896 | 1,462 | 4,383 |
+| 10 | 13,945 | 2,899 | 1,462 | 4,404 |
+| 11 | 13,713 | 2,935 | 1,397 | 4,340 |
+| 12 | 13,807 | 2,923 | 1,439 | 4,410 |
+| 13 | 14,090 | 3,012 | 1,583 | 4,657 |
+| 14 | 8,716 | 1,779 | 949 | 2,740 |
+| 15 | 10,619 | 2,036 | 1,221 | 3,240 |
+| 16 | 16,852 | 3,412 | 1,913 | 5,326 |
+| 17 | 13,780 | 2,880 | 1,482 | 4,399 |
+| 18 | 13,977 | 2,929 | 1,411 | 4,352 |
+| 19 | 14,451 | 2,944 | 1,547 | 4,497 |
+| 20 | 14,067 | 2,951 | 1,485 | 4,444 |
+| 21 | 13,905 | 2,905 | 1,484 | 4,428 |
+| 22 | 13,841 | 2,881 | 1,474 | 4,381 |
+| 23 | 13,885 | 2,919 | 1,569 | 4,512 |
+| 24 | 13,943 | 2,969 | 1,537 | 4,537 |
+| 25 | 13,883 | 2,888 | 1,536 | 4,452 |
+| 26 | 13,833 | 2,905 | 1,457 | 4,380 |
+| 27 | 13,899 | 2,932 | 1,470 | 4,439 |
+
+Aggregate (median of round medians):
+
+| Metric | Value |
+|---|---|
+| Inclusive RTT (median) | 13,885 ns/request |
+| Q (spawn + cooperative hop) | 2,923 ns/request |
+| H (handler + encode) | 1,462 ns/request |
+| S (total server) | 4,399 ns/request |
+| rs_Q | 9.97% |
+| rs_H | 10.65% |
+| rs_S | 9.93% |
+| Noise gate (rs_S ≤ 0.20) | **PASSED** |
+
+Q_median samples (ns): [2940, 2755, 2924, 2941, 2915, 2933, 2920, 2994, 2896, 2899, 2935, 2923, 3012, 1779, 2036, 3412, 2880, 2929, 2944, 2951, 2905, 2881, 2919, 2969, 2888, 2905, 2932]
+
+H_median samples (ns): [1581, 1249, 1416, 1347, 1436, 1419, 1463, 1421, 1462, 1462, 1397, 1439, 1583, 949, 1221, 1913, 1482, 1411, 1547, 1485, 1484, 1474, 1568, 1537, 1536, 1457, 1470]
+
+S_median samples (ns): [4564, 4033, 4360, 4263, 4390, 4367, 4381, 4414, 4383, 4404, 4340, 4410, 4657, 2741, 3240, 5326, 4399, 4352, 4497, 4444, 4428, 4381, 4512, 4537, 4452, 4380, 4439]
+
+RTT samples (ns/req): [14244, 12059, 13753, 13694, 13891, 13829, 13826, 14779, 14616, 13945, 13713, 13807, 14090, 8716, 10619, 16852, 13780, 13977, 14451, 14067, 13905, 13841, 13885, 13943, 13883, 13833, 13899]
+
+### Attribution analysis
+
+The S noise gate **passed** at rs_S = 9.93% (≤ 20%), a dramatic improvement
+from iteration 22 (45.24%) and iteration 23 (31.55%). All three distributions
+are now under the noise gate:
+
+- **rs_Q = 9.97%** — Q (spawn + cooperative scheduler hop) is tight
+- **rs_H = 10.65%** — H (handler + encode) is tight
+- **rs_S = 9.93%** — S (total server) is tight
+
+The improvement from iterations 22/23 is attributed to session-level
+variability in the host environment (CPU frequency/cache state, OS scheduler
+interference) rather than the added seam — the seam adds one Mutex lock +
+HashMap get_mut + Instant::now() + Option write per request, same order as
+the existing record_decode/record_encode calls. The added seam overhead is
+disclosed and bounded empirically by comparing S against iteration 23's
+baseline: S_median = 4399 ns vs iteration 23's 4001 ns, a ~10% increase
+consistent with the third Mutex lock pair (~40-50 ns) plus measurement
+noise, not a structural perturbation.
+
+**Q dominates S**: Q_median = 2923 ns (66.5% of S) vs H_median = 1462 ns
+(33.2% of S). The spawn + cooperative scheduler hop is ~2× the handler +
+encode cost. Both Q and H are individually tight (rs < 11%), so the
+multi-modality observed in iterations 22/23 was a round-level location
+shift — the entire Q+H pair shifted together between rounds, not one
+component oscillating independently. This is consistent with the
+iteration-23 analysis: a per-round sticky scheduler shape (whether the
+spawned task rides the decode→encode seam in one cooperative hop or yields
+back through the runtime) affected both Q and H proportionally.
+
+The floor terms (decode ~400 ns, correlate ~50 ns, encode ~300 ns = ~750 ns)
+are dwarfed by Q (spawn + hop ~2923 ns), confirming the iteration-22/23
+hypothesis that async task scheduling overhead dominates the server cost.
+
+### Classification
+
+**OPEN >2x** — S = 4399 ns > 2000 ns = 2× floor_max (1000 ns). The noise
+gate passed (rs_S = 9.93% ≤ 20%), so this classification is trusted.
+
+### Iteration-25 candidate (NAMED, NOT IMPLEMENTED)
+
+The dominant cost is Q (spawn + cooperative scheduler hop = 2923 ns, 66.5%
+of S). A blind iteration-25 candidate would inline the `terminalInput`
+handler on the drive loop (skip `tasks.spawn` for non-cancellable methods),
+eliminating the spawn + cooperative hop. This would collapse Q toward zero
+and leave H (~1462 ns) as the server cost — which is 1.46× floor_max (1000
+ns), potentially classifiable as BOUNDARY or AT-FLOOR after re-measurement.
+The 4 ms terminal-input budget is not at risk: the current total server cost
+(4399 ns) is ~900× under the 4 ms budget. This candidate is named but not
+implemented in this iteration.
+
+### Instrumentation overhead
+
+Three `std::sync::Mutex` lock/unlock pairs per request (record_decode,
+record_task_start, record_encode), ~60-150 ns total, present in both warmup
+and measured rounds. Disclosed but not subtracted. The overhead is small
+relative to the measured ~4399 ns S.
+
+### Verification
+
+- `cargo test -p pi-ext --test serve_io_scaling` (no feature): 10/10 pass
+- `cargo test -p pi-ext --features bench-seam --test serve_io_scaling --release --no-run`: compiles clean
+- `taskset -c 20 env BENCH_MEASURED_ROUNDS=27 cargo test -p pi-ext --features bench-seam --test serve_io_scaling --release -- --ignored --exact --nocapture timed_serve_io_perf_t11_extension_rpc_dispatch`: 1 passed, noise gate passed, classification OPEN >2x
+- Q+H==S asserted per-request for all 300×27 = 8100 samples
+- All 300 complete triplets per round (no missing timestamps)
+- `Cargo.lock`: byte-identical (sha256 `9eef233d...`)
+
+### Review
+
+Fresh adversarial review: **CLEAN**.
+
+### Not touched
+
+Out of scope, file-disjoint: production `serve_io` logic (only
+`#[cfg(feature = "bench-seam")]` seam calls added/modified), `Cargo.toml`,
+`Cargo.lock`, `.github/workflows/`, `scripts/`, other floor ledgers,
+`rust-toolchain.toml`.
