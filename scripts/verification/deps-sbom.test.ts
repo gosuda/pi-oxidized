@@ -105,7 +105,7 @@ describe("SBOM content structure", () => {
 			"tokio@1.53.1",
 			"uuid@1.26.0",
 			"base64@0.23.1",
-			"serde-saphyr@0.0.29",
+			"serde-saphyr@1.1.0",
 		];
 		for (const id of fromVersions) {
 			expect(rustIds.has(id)).toBe(true);

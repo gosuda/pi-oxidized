@@ -195,7 +195,7 @@ Per-change verdicts; rows below are the seed, not permanent labels.
 | 0348ecf0 | 2026-08-28 | npm:typebox | S | E1:fail E2:fail E3:pass E4:pass |
 | 0348ecf0 | 2026-08-28 | npm:@types/bun | E | E1:pass E2:pass E3:pass E4:pass |
 | 5e28ac5d | 2026-08-28 | crate:base64 | S | E1:fail E2:pass E3:fail E4:pass |
-| 358b15e0c92e | 2026-08-28 | npm:typescript | E | E1:pass E2:pass E3:pass E4:pass |
+| 7f325058 | 2026-08-28 | crate:serde-saphyr | S | E1:fail E2:pass E3:fail E4:pass |
 
 Reading: every crate member links into the shipped `pi` binary on non-dev
 edges (E3 fail) → Class S. `npm:ignore` sits in the root `dependencies`

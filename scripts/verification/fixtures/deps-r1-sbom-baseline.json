@@ -1,8 +1,8 @@
 {
 	"schema": "pi.deps.sbom.v1",
 	"capturedAt": "2026-08-28",
-	"captureHead": "358b15e0c92e41c7b165b3e05aec43947dce8743",
-	"contentSha256": "8aec9befc84819667c34a7c4ae278e27e0cbb7b29dba273831673509ce9e6ec1",
+	"captureHead": "7f32505847d436f399d3c2d5b60805277c75ae5d",
+	"contentSha256": "b04763c4c3474e2f769aa6ba201e13767f649f0e02c4810e82a18872b46d4d61",
 	"content": {
 		"rust": {
 			"toolchainChannel": "1.97.1",
@@ -12,14 +12,6 @@
 					"name": "adler2",
 					"version": "2.0.1",
 					"license": "0BSD OR MIT OR Apache-2.0",
-					"source": "registry",
-					"direct": false,
-					"devOnly": false
-				},
-				{
-					"name": "ahash",
-					"version": "0.8.12",
-					"license": "MIT OR Apache-2.0",
 					"source": "registry",
 					"direct": false,
 					"devOnly": false
@@ -1234,7 +1226,7 @@
 				},
 				{
 					"name": "granit-parser",
-					"version": "0.0.7",
+					"version": "1.1.0",
 					"license": "MIT OR Apache-2.0",
 					"source": "registry",
 					"direct": false,
@@ -2730,7 +2722,7 @@
 				},
 				{
 					"name": "serde-saphyr",
-					"version": "0.0.29",
+					"version": "1.1.0",
 					"license": "MIT OR Apache-2.0",
 					"source": "registry",
 					"direct": true,
