@@ -2,7 +2,7 @@
 
 Owning R2 hot rows (lane 2): *Argument parsing + config construction*, *Model/provider
 construction (offline stub)*, *TUI construction + layout*. (The first synchronized
-paint row is owned by terminal-paint.md.) State: **CONSTRAINED-ABOVE-FLOOR (terminal — fresh stage attribution at iteration 18; measured first-frame ~71.3 ms ≈ 47.5x the ~1.50 ms floor, dominated by boundary-gated model-catalog/TLS ~55.5 ms and exec/loader ~9.0 ms).**
+paint row is owned by terminal-paint.md.) State: **CONSTRAINED-ABOVE-FLOOR (terminal — fresh stage attribution at iteration 18; post-`9ead528` re-attestation at iteration 34: paired lane regressed ~92.1 → ~118.6 ms (+28.8%, silent-terminal 25 ms probe window serialized before first paint) but the >=3x release minimum still holds at 4.66x cold / 5.06x warm vs the recorded TS references; ~118.6 ms ≈ 79x the ~1.50 ms floor on the re-attestation box).**
 
 ## Contract (from call sites, tests, signatures — never internals)
 
@@ -32,6 +32,12 @@ the probe round trip on this path.
 
 Trusted lane baseline (R2): **243.61 ms cold / 248.36 ms warm** (the 4.75 ms cold-warm
 delta proves the lane is wait-bound, not cache-bound).
+
+Post-campaign re-attestation (iteration 34, post-`9ead528` tree, loaded box):
+**92.07 ms** at `9ead528^` → **118.57 ms** at the tip (paired interleaved
+lane, rs 10.92%/9.55%); release-minimum predicate 4.66x cold / 5.06x warm
+(>= 3x PASS). Regression mechanism and disposition: t11-iterations.md,
+iteration 34.
 
 **Multiple = 243.61 / 1.50 ~= 162.4x => OPEN.**
 

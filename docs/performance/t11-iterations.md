@@ -3685,3 +3685,107 @@ asserts are the executed correctness proof.
 (`crates/pi-agent/src/drain.rs`, `run.rs`, pi-ai, pi), `Cargo.lock`,
 `rust-toolchain.toml`, `.github/workflows/`, `scripts/release/`,
 `scripts/verification/`, other units' floor ledgers.
+
+## Iteration 34 — `first-frame-init` (post-`9ead528` re-attestation — REGRESSED beyond noise, release minimum preserved)
+
+Date 2026-08-29. Docs-only re-attestation record (PERF-G13 finding F2, issue
+#92): paired first-frame measurement of the iteration-31 startup reorder
+(`9ead528` — yield-armed probe collector, join moved before first paint)
+against its pre-fix parent. No production change; the regression below is
+reported for an owner decision, not patched.
+
+### Why
+
+Finding F2: the unit's terminal figure (~71.3 ms median, 47.5x, iteration 18)
+predates the last production change to the first-frame path, and the record's
+assertion "in every measured environment the join has long completed before
+the paint" carried no post-fix first-frame numbers. The first-frame >=3x
+release minimum (`FIRST_FRAME_SPEEDUP_TARGET = 3`, performance.ts:88; blocker
+predicate performance.ts:2495-2513) was never re-attested after `9ead528`.
+
+### Protocol
+
+The iteration 15-18 lane, verbatim: `scripts/first-frame-timing.py`,
+release binaries, `taskset -c 20-40`, interleaved A/B pairs with per-pair
+order alternation, 1 warmup per arm, fresh 100x32 PTY + extension-free
+workload + sandbox env per sample, PI_OFFLINE=1, xterm-256color, first frame
+by synchronized-output detection (all 72 samples synchronized-output, zero
+row-local fallbacks). Three independent complete runs of 12 pairs each
+(36 pairs per arm). Arms built from the same lineage with identical flags in
+one session: base = `9ead528^` = `e7da7bc` (sha256 `e36b06ed…`), current =
+origin tip `ce427eb` (sha256 `55594376…`); `git diff e7da7bc ce427eb --
+crates/ scripts/` is exactly `9ead528` (probe.rs, runtime.rs,
+startup_paste_echo.rs test), everything else docs-only. Disclosures: the box
+carried external load (1-min load average 13.8-16.4, 80 CPUs), which inflates
+both arms' absolutes equally — the recorded ~71.3 ms was taken on a quieter
+box, so absolutes here are conservative for the minimum predicate; sandboxes
+were created on the home filesystem instead of /tmp because the shared /tmp
+quota was exhausted by concurrent builds (both arms identical; session
+writes are KB-scale, and the paired deltas are unaffected).
+
+### Measurements (pooled medians; per-run agreement below)
+
+| Arm | Median | stddev | rs (<= 20% gate) | Range |
+|---|---|---|---|---|
+| base `9ead528^` (`e7da7bc`) | **92.07 ms** | 10.05 | **10.92% PASS** | 77.6-116.6 |
+| current `ce427eb` (post-`9ead528`) | **118.57 ms** | 11.33 | **9.55% PASS** | 105.2-156.8 |
+
+Current / base = **1.288x slower** (+26.5 ms, +28.8% wall). Per-run
+slowdowns: 1.303x / 1.249x / 1.306x — three independent complete runs agree
+outside the 1.05x noise band, with the noise gate passed on both arms in
+every run (run rs: A 13.96/9.03/9.46%, B 13.15/7.67/5.71%).
+
+### Finding: the iteration-31 reorder regressed the first-frame lane beyond noise
+
+Mechanism (from the `9ead528` diff, consistent with the measured +26.5 ms ~
+the 25 ms probe first-byte window): the fix moved the collector join BEFORE
+`initialize_run` (the first paint). The yield arm added by the fix shortens
+the collector's wait **only after replies started flowing** — on a silent
+terminal the collector still ends at its full 25 ms first-byte window
+(`PROBE_FIRST_BYTE_TIMEOUT`, probe.rs:24), and the bench/verification
+workload is a silent terminal. Iteration 16's design overlapped that window
+with host binding and the first paint; `9ead528` serializes it ahead of the
+first paint, so the window re-enters the critical path. The record's
+precondition "the join has long completed before the paint" does not hold on
+silent terminals. The lane remains far above the release minimum, so this is
+a regression of the lane's operating point, not a minimum violation.
+
+### Release-minimum predicate (evaluated with recorded reference values)
+
+Predicate: TypeScript median / Rust median >= 3.0 for both cold and warm
+extension-free first frame (`FIRST_FRAME_SPEEDUP_TARGET`,
+performance.ts:88; blockers at performance.ts:2495-2513). TypeScript
+reference figures are the recorded trusted R2 paired-lane values
+(`docs/PERF-R2-workload-surface-ranking.md:385-386` — the same run as the
+ledger's 243.61/248.36 ms baseline): TS 552.65 ms cold, 600.24 ms warm.
+
+| Lane | Speedup vs recorded TS reference | Target | Result |
+|---|---|---|---|
+| cold (TS 552.65 ms) | 552.65 / 118.57 = **4.66x** | >= 3x | **PASS** |
+| warm (TS 600.24 ms) | 600.24 / 118.57 = **5.06x** | >= 3x | **PASS** |
+
+For reference, the pre-fix arm scores 6.00x cold / 6.52x warm; the fix
+consumed roughly a quarter of the lane's margin over the minimum.
+
+### Disposition (owner decision — deliberately not patched)
+
+Per campaign discipline the regression is reported, not fixed here: the
+`9ead528` ordering buys a mutation-verified correctness property (EventStream
+owns stdin from the first frame; bracketed pastes no longer corrupt), and any
+latency recovery (yielding the silent-terminal window to the paint, or
+paint-then-repaint on late probe refinements) trades against the property the
+fix exists to guarantee. The owner chooses between: (a) accept the ~26 ms
+regression as the cost of the correctness fix (minimum still passed 4.66x),
+(b) authorize a campaign-legal candidate that overlaps the silent-terminal
+first-byte window with the paint while keeping first-frame stdin ownership
+with the EventStream (must pass the >=1.05x paired gate AND
+`startup_paste_echo`), or (c) revert the ordering. Until decided, the
+ledger's post-fix operating point is ~118.6 ms on this box (see floor
+ledger update), and the unit's terminal classification (CONSTRAINED-ABOVE-
+FLOOR) is unaffected — the minimum holds with margin.
+
+**Not touched** (out of scope, file-disjoint): production code (all of
+`crates/`), `scripts/first-frame-timing.py` (lane unchanged),
+`Cargo.lock`, `rust-toolchain.toml`, `.github/workflows/`,
+`scripts/release/`, other floor ledgers.
+
