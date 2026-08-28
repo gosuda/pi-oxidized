@@ -1,7 +1,11 @@
 # Floor ledger: stream frame pipeline (decode / state reduction / visible update)
 
 Owning R2 hot rows (lane 3): *Provider frame decode*, *Assistant state reduction*,
-*Incremental visible content update*. State: **architecture-floor (terminal — residual classification recorded at iteration 13; drain 2426 ns vs ~200 ns decode/forward floor, channel/scheduler cost + one contract-forced source-side materialization per frame, no materially distinct design inside the unit boundary).**
+*Incremental visible content update*. State: **CONSTRAINED-ABOVE-FLOOR (terminal —
+E1-E4 exhaustion recorded at iteration 33; fresh trusted drain 1,382 ns/frame,
+rs 8.91%, vs the ~200 ns decode/forward floor ≈ 6.9x; dominant residual the
+contract-forced lossless mpsc leg (boxed forward + cross-task handoff); no
+in-boundary candidate projects >=1.05x).**
 
 ## Contract (from call sites, tests, signatures — never internals)
 
@@ -19,46 +23,57 @@ verification lane (typed events). Unresolved channels: none on the measured path
 ## Floors (computed)
 
 ```
-decode/forward per frame: one mpsc send + watch store          ~0.2 us
-   (channel send ~100-200 ns class; no syscall forced)
+decode/forward per frame (drain leg), computed from the contract ops
+(uncontended, current-thread):
+   Box::new(event) heap alloc                     ~20-30 ns
+ + tokio bounded mpsc send (capacity 64)          ~50-100 ns
+ + Arc::clone (refcount, Arc-at-birth)            ~1-2 ns
+ + watch::send (store + watcher notify)           ~30-50 ns
+ = ~101-182 ns  ->  the ~0.2 us class stands
 state reduction per frame: fold + one event emission           ~0.15 us
 visible update per frame: append delta to view buffer          ~0.1 us
 ```
 
 No per-frame syscall is forced on any of the three legs (paint is coalesced and owned
-by terminal-paint.md; persistence is per message end).
+by terminal-paint.md; persistence is per message end). Arc-at-birth (iteration 12)
+lowered the watch term from a full-snapshot clone to a refcount store; the ~0.2 us
+class remains the conservative bound.
 
-## Measured cost — and why the multiple is unproven
+## Measured cost (terminal — iteration 33)
 
-The trusted lane-3 baseline (R2: 1.133 ms CPU per provider frame, process-tree) cannot
-currently be decomposed onto these units: (a) the process tree includes the Bun
-extension-host subprocess (the verification provider runs inside it) and the artifact
-records no per-process CPU split; (b) a whole-process callgrind run of one stream turn
-(166.6 M Ir) is dominated by startup (~first-frame scale, see first-frame-init.md) —
-the turn-phase delta sits below the run-to-run startup variance, so per-function
-attribution of the turn is not separable from the evidence in hand.
+The in-process instrument (`pi_agent_stream_frame_bench`, landed at iteration 10)
+drives the real funnel on the pinned verification stream shape
+(`PI_VERIFICATION_CHUNK_COUNT=256`, full snapshot per event, 6,144 B final text).
+Fresh trusted distribution (release, `taskset -c 20-40`, 6 warmup + 27 measured
+interleaved rounds; noise gate rs <= 20% on the predeclared median estimator):
+drain **1,382 ns/frame** (rs 8.91%, PASS); funnel 1,848; reduce (funnel − drain)
+466. Absolute levels drift with box state (the 2026-08-28 iteration-12 protocol
+measured 2,426 ns on a contended box; repeat runs this session ranged
+1,256-1,469 ns) — every observed level is far above 2x the floor.
 
-Decomposition status: attributed categories — amortized paint block <=26.5 us/frame
-(subtraction, terminal-paint.md), amortized persistence ~0.07 us/frame
-(session-append.md); **unattributed residual** ~= 1.133 ms - 26.5 us - 0.07 us - host
-share, with the host share unmeasured. The residual is named, not estimated.
+E1 stage attribution (reversible stage disabling on the pinned workload):
+source materialization + poll 441 ns (the contract-forced one-snapshot-per-frame),
+lossy watch leg 272 ns (refcount publish + watcher wake), lossless mpsc leg
+697 ns (boxed forward + drain-task→consumer handoff; **dominant**), cross-task
+interaction −28 ns at medians (the per-round identity is exact; median
+non-additivity disclosed, not clamped). Sum = 1,382 ns = the measured drain
+median. Multiple vs the ~0.2 us decode/forward floor ≈ **6.9x**.
 
-Measurement prerequisites (recorded for Phase-5 entry): per-process CPU sampling of
-the pi child vs the extension host in the runner artifact, or a turn-phase-triggered
-callgrind toggle (`--toggle-collect` on the drain entry points). Until one lands, the
-three units hold **OPEN by the fail-closed rule**: an unproven multiple can never
-declare AT-FLOOR, and each unit's ceiling share of the rank-1 lane keeps it a rebuild
-candidate.
+## Terminal classification (iteration 33)
 
-*Superseded by PERF-T11: terminal architecture-floor (residual classification
-recorded at iteration 13: drain 2,426 ns ≈ 12.1x the ~200 ns decode/forward floor;
-channel/scheduler cost plus one contract-forced source-side materialization per
-frame; no materially distinct design inside the unit boundary). See
-[t11-iterations.md](../t11-iterations.md), stream-frame-pipeline residual
-classification.*
+**CONSTRAINED-ABOVE-FLOOR.** The watch/mpsc two-leg topology and the
+one-snapshot-per-frame source materialization are contract, not slack: the
+lossless loop leg forwards every event intact with cancellation at channel
+capacity and an abortable lifecycle (drain.rs:90-107, :148, :171-180), the
+lossy presentation leg is a per-frame latest-wins refcount publish
+(drain.rs:226-232), and extensions consume the serialized partial. The
+iteration-12 rebuild (Arc-at-birth snapshot sharing, 1.18x paired win) removed
+every redundant O(message-length) copy. The iteration-10 blind candidates
+(B pi-agent-only, C delta-carrying funnel, D partial-stripping drain,
+E coalesced publish) remain boundary-rejected; the remaining in-boundary
+designs miss the gate (unboxed `DrainItem` forward projects ~1.02x < 1.05x;
+handoff micro-tuning is not materially distinct; fused single-task drain
+crosses the cancellation/lifecycle contract). Full E1-E4 record with exact
+reopen consents: t11-iterations.md iteration 33.
 
-## Blind-derivation classification for Phase 5
 
-Consumers interior; nothing published. The watch/mpsc topology is itself contract
-(lossless loop leg + lossy presentation leg) — a rebuild must preserve both legs'
-fidelity guarantees, sourced from drain.rs:105-118 and the coalescer bound.

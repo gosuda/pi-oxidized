@@ -3511,3 +3511,177 @@ historical iteration text is edited, and neither requires new measurement.
    top/area would disagree with the clamped Terminal viewport. Recorded as an
    audit erratum; no code change — the guard is redundant at all real call
    sites.
+
+## Iteration 33 — `stream-frame-pipeline` (E1-E4 exhaustion — CONSTRAINED-ABOVE-FLOOR, terminal)
+
+Date 2026-08-29. Base `51c9f85` (canonical `origin/feat/ver-align-canonical-pin`;
+measurement lane built at content-identical `ce427eb` — commits in between are
+docs-only). Resolves audit finding **F1** (issue #92, PERF-G13): the
+iteration-13 residual classification used the unsanctioned class
+`architecture-floor` and carried no numeric E1 reconciliation, no E3 floor
+revalidation, and no exact E4 reopen consents. This record replaces it with a
+sanctioned verdict on a fresh trusted distribution. Expected outcome was
+measurement + record, not a new optimization; the only code change is the
+measurement instrument itself (stage-attribution scenarios added to
+`pi_agent_stream_frame_bench`; the timing paths of the existing `funnel`/
+`drain` scenarios are byte-identical).
+
+### Fresh trusted measurement
+
+Protocol: release, `taskset -c 20-40` (the iteration-10/12 stream lane), 6
+warmup + 27 measured interleaved rounds (each round runs funnel, drain,
+source, source-watch, source-forward in fixed order), per-frame per-round
+values, predeclared estimator = median of the 27-round drain distribution,
+noise gate rs <= 20% (sample stddev / mean). Pinned workload unchanged
+(iteration 10): the `streamVerification` stream shape, 256 full-snapshot
+frames, 6,144 B final text, current-thread runtime.
+
+| Scenario | Median ns/frame | rs |
+|---|---|---|
+| funnel (decode+forward+reduce) | 1,848 | 9.46% |
+| **drain (decode+forward only)** | **1,382** | **8.91% — PASS** |
+| source (materialization+poll) | 441 | 8.78% |
+| source-watch (source + lossy watch leg) | 713 | 10.84% |
+| source-forward (source + lossless mpsc leg) | 1,138 | 7.60% |
+| reduce (funnel − drain) | 466 | — |
+
+drain samples (ns/frame): [1715, 1707, 1669, 1449, 1373, 1342, 1372, 1386,
+1308, 1383, 1366, 1383, 1387, 1263, 1410, 1325, 1278, 1261, 1397, 1248, 1269,
+1377, 1382, 1436, 1272, 1396, 1405].
+
+Level note: absolute levels on this shared box drift with box state and
+protocol (the 2026-08-28 iteration-12 protocol measured 2,426 ns on a
+contended box with 9 rounds/3 warmups; repeat 27-round runs this session
+ranged 1,256-1,469 ns on identical drain code). The verdict uses the fresh
+trusted distribution; under every observed level the multiple stays far above
+2x, so the classification is invariant to the drift.
+
+### E1 — decomposition reconciliation (1,382 ns/frame trusted)
+
+Terms derived by reversible stage disabling on the pinned workload (the new
+scenarios are the drain loop with stages removed):
+
+| Term | ns/frame | Share | Derivation | Ownership |
+|---|---|---|---|---|
+| source materialization + stream poll | 441 | 31.9% | `source` scenario | contract-forced: one full-snapshot materialization per frame (extensions consume the serialized partial; the watch leg needs a complete latest-wins snapshot) |
+| lossy watch leg | 272 | 19.7% | `source-watch − source` (refcount-only publish + watcher wake/borrow) | contract-forced: per-frame latest-wins publish (drain.rs:226-232) |
+| lossless mpsc leg | 697 | 50.4% | `source-forward − source` (`Box::new` + bounded send + recv handoff + drop, drain.rs:148) | contract-forced: every event forwarded intact (drain.rs:90-107) |
+| cross-task interaction | −28 | −2.0% | remainder: `drain − source-watch − (source-forward − source)` | median non-additivity of the disabled variants |
+| **drain (total)** | **1,382** | — | measured, rs 8.91% | — |
+
+Reconciliation: the identity `drain_r − source-watch_r − (source-forward_r −
+source_r) = interaction_r` holds exactly per round by construction; at
+medians, 441 + 272 + 697 − 28 = 1,382 = median(drain) (exact). The −28 ns
+interaction term is disclosed, not clamped (iteration-32 convention: no
+component forced positive). Dominant term: the lossless mpsc leg (697 ns,
+50.4%), a boxed per-frame forward plus a cross-task handoff, the same tokio
+wake class that dominates `extension-rpc-dispatch`'s Q.
+
+### E2 — candidate history and evidence
+
+1. **Arc-at-birth snapshot sharing (iteration 12, executed)** — measured
+   **1.18x** on drain (median of 9 interleaved binary pairs, >=1.05x gate
+   PASSED), landed; the drain-side full-message clone is gone
+   (`publish_partial` is refcount-only, drain.rs:226-232). In-tree at the
+   audited tip.
+2. **B: pi-agent-only fix** (reduce reads the watch Arc) — REJECTED blind
+   (iteration 10): left the drain/state/bus/view clones in place pre-Arc;
+   subsumed by the executed Design A.
+3. **C: delta-carrying funnel** — REJECTED blind: extensions consume
+   `assistantMessageEvent` WITH its partial, crossing the extension-RPC
+   boundary owned by `extension-rpc-dispatch`. Boundary-infeasible.
+4. **D: partial-stripping drain** — REJECTED blind: the lossless leg must
+   forward every event intact (drain.rs:90-107). Boundary-infeasible.
+5. **E: coalesced watch publishes** — REJECTED blind: drops the per-frame
+   publish the contract states; watch semantics already coalesce lag only.
+   Boundary-infeasible.
+6. **Remaining distinct in-boundary designs (this iteration's sweep)**:
+   - **Unboxed `DrainItem::Event` forward** (carry `AssistantMessageEvent`
+     inline): removes the per-frame `Box` alloc+drop, projected ~25-30 ns of
+     1,382 ≈ **1.02x < 1.05x**; it fails the projection bar, and the Box is
+     deliberate (`AssistantMessageEvent` is large relative to
+     `ProviderError`, drain.rs:38-40). Not executed; recorded.
+   - **Handoff micro-tuning** (capacity bumps, `try_send`, unbounded
+     channel): does not remove the handoff; unbounded sacrifices the
+     bounded-memory/backpressure property. Not materially distinct
+     (iteration-26 convention).
+   - **Fused single-task drain** (stream driven inline in the receiver loop):
+     would remove the cross-task handoff (the dominant residual) but crosses
+     the drain contract: cancellation while awaiting channel capacity
+     (drain.rs:90), the abortable `JoinHandle` lifecycle, and the
+     decode/reduce pipeline overlap the loop consumes. Boundary-infeasible.
+
+No candidate both projects >=1.05x and stays in-boundary: nothing was
+executed this iteration (the expected outcome: measurement + record).
+
+### E3 — floor and multiple revalidation
+
+Ledger floor (decode/forward per frame): ~200 ns. Recomputed from the
+current contract's per-non-terminal-frame ops (uncontended, current-thread):
+
+| Contract op | Evidence | Cost class |
+|---|---|---|
+| 1 lossless forward: `Box::new(event)` + bounded mpsc send (capacity 64) | drain.rs:148, :30 | ~20-30 ns alloc + ~50-100 ns tokio send |
+| 1 lossy publish: `Arc::clone` + `watch::send` | drain.rs:226-232 | ~1-2 ns refcount + ~30-50 ns store+notify |
+| **floor sum** | | **~101-182 ns, so the ~0.2 us class stands** |
+
+No contract input changed the floor since iteration 10; Arc-at-birth lowered
+the watch term from a full-snapshot clone to a refcount store, so ~200 ns
+remains the conservative bound. Fresh multiple: **1,382 / 200 ≈ 6.9x**
+(drain p5-p95 ≈ 1,261-1,410 ns, i.e. 6.3-7.1x): **>2x under every
+interpretation**. Constraint statement, not a physical-floor claim: the gap
+over the floor is held open by the three contract-forced terms (E1), not by
+removable interior slack. The interior legs are not individually AT-FLOOR:
+the watch leg's 272 ns against its ~31-52 ns ops bound is the same
+scheduler-wake class as the handoff, owned by the two-leg topology and priced
+into E4.
+
+### E4 — dominant residual and reopen conditions
+
+Dominant residual: the **lossless mpsc leg, 697 ns/frame (50.4%)**, the boxed
+per-frame forward plus the drain-task-to-consumer cross-task handoff, required
+by the lossless-leg fidelity contract (every event forwarded intact,
+cancellation at channel capacity, abortable lifecycle; drain.rs:90-107). The
+watch leg's 272 ns is the same wake class on the presentation side. Every
+mechanism that removes these costs crosses a contract (E2 items 3-6). Exact
+boundary consents that would reopen the unit:
+
+1. **Delta-carrying events consented at the extension-RPC boundary** (partial
+   dropped from `assistantMessageEvent`): the contract-forced source
+   materialization term (441 ns) collapses; the unit reopens.
+2. **Lossless-leg delivery cadence re-contracted** (batched forwards or an
+   explicit relaxation of the per-frame forward): the boxed per-frame forward
+   + handoff (697 ns) collapses; requires the drain.rs fidelity contract
+   rewrite and the `run.rs` consumer re-contract.
+3. **Drain-task fusion consented** (inline stream drive replacing the
+   cancel-at-capacity + abortable-task semantics): the cross-task handoff
+   collapses into the source/watch legs.
+4. **A cheaper runtime primitive with identical semantics proven >=1.05x on
+   this lane under the same gates** (interleaved pairs, rs <= 20%).
+
+Micro-tuning inside the existing handoff is not a reopen (not materially
+distinct, E2 item 6).
+
+### Verdict: CONSTRAINED-ABOVE-FLOOR (terminal)
+
+Fresh multiple ~6.9x > 2x with complete E1-E4; the AT-FLOOR path (multiple
+<= 2x) is excluded by measurement, and the residual is the contract-forced
+handoff and materialization structure, not implementation slack. The
+iteration-13 `architecture-floor` classification is superseded by this
+sanctioned record. `stream-frame-pipeline` is terminal in PERF-T11; issue #97
+remains OPEN for the remaining units.
+
+**Verification** (scoped): release build green (pi-agent lib + bench bin);
+instrument asserts every round, with the funnel emitting exactly 258
+`MessageUpdate`s and the drain forwarding exactly 260/260 scripted events
+losslessly across all 33x5 scenario rounds; `Cargo.lock` byte-identical to
+the base (sha256 `9eef233da7aa9b08…`). Production Rust untouched: the diff is
+the bench bin plus docs. The scoped `pi-agent` drain unit tests could not be
+re-run this session: the shared `/tmp` cargo cache is quota-exhausted by
+concurrent auditors (os error 122); the instrument's per-round contract
+asserts are the executed correctness proof.
+
+**Not touched** (out of scope, file-disjoint): production code
+(`crates/pi-agent/src/drain.rs`, `run.rs`, pi-ai, pi), `Cargo.lock`,
+`rust-toolchain.toml`, `.github/workflows/`, `scripts/release/`,
+`scripts/verification/`, other units' floor ledgers.
