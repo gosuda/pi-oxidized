@@ -13,6 +13,16 @@ use crate::terminal::caps::{CellDimensions, TerminalCapabilities};
 /// Fragment timeout for split capability replies (TS: 150 ms).
 pub const PROBE_FRAGMENT_TIMEOUT: Duration = Duration::from_millis(150);
 
+/// Wait bounding the FIRST reply byte after a probe query write.
+///
+/// [`PROBE_FRAGMENT_TIMEOUT`] protects replies split across reads and stays
+/// the budget once a reply stream exists; a terminal that has sent nothing
+/// cannot hold a fragment in flight, so a silent terminal ends the probe wait
+/// here instead of billing the full fragment budget (the first-frame lane is
+/// otherwise charged 150 ms on every non-responding terminal). Round-trip
+/// class per the R9 floor (~1 ms pipe RT) with scheduler-jitter headroom.
+pub const PROBE_FIRST_BYTE_TIMEOUT: Duration = Duration::from_millis(25);
+
 /// Terminal background polarity used by automatic theme selection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TerminalTheme {
@@ -98,22 +108,60 @@ pub fn probe_terminal<W: Write>(
 
     let mut session = ProbeSession::new();
     let mut pending = Vec::new();
-    let deadline = Instant::now() + PROBE_FRAGMENT_TIMEOUT;
-    while Instant::now() < deadline && !session.is_complete() {
-        if let Some(bytes) = read_stdin_nonblocking()? {
-            if bytes.is_empty() {
-                break;
-            }
-            if let ProbeFeed::PendingInput(bytes) = session.feed(&bytes) {
-                pending.extend(bytes);
-            }
-        } else {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    }
+    collect_probe_replies(&mut session, &mut pending, ProbeSession::is_complete)?;
     pending.extend(session.flush_timeout());
     session.apply_to(caps);
     Ok(reinject_bytes_as_events(&pending))
+}
+
+/// Shared probe wait: merge stdin bytes into `session` under the two-phase
+/// reply budget, returning interleaved non-probe input through `pending`.
+///
+/// Before the first reply byte the wait is bounded by
+/// [`PROBE_FIRST_BYTE_TIMEOUT`]; after bytes start flowing the full
+/// [`PROBE_FRAGMENT_TIMEOUT`] window applies (measured from the query write),
+/// so fragmented replies keep today's acceptance budget. Readiness is
+/// event-driven: the wait blocks in `poll` until bytes arrive or the active
+/// budget expires, with no fixed tick.
+///
+/// `complete` is the caller's collected-enough predicate (full probe set or
+/// a classified background).
+fn collect_probe_replies(
+    session: &mut ProbeSession,
+    pending: &mut Vec<u8>,
+    complete: impl Fn(&ProbeSession) -> bool,
+) -> io::Result<()> {
+    let fragment_deadline = Instant::now() + PROBE_FRAGMENT_TIMEOUT;
+    let first_byte_deadline = Instant::now() + PROBE_FIRST_BYTE_TIMEOUT;
+    let mut reply_seen = false;
+    loop {
+        if complete(session) {
+            return Ok(());
+        }
+        let active_deadline = if reply_seen {
+            fragment_deadline
+        } else {
+            first_byte_deadline
+        };
+        let Some(remaining) = active_deadline.checked_duration_since(Instant::now()) else {
+            return Ok(());
+        };
+        match read_stdin_within(remaining)? {
+            // EOF: stdin closed, no reply can arrive.
+            Some(bytes) if bytes.is_empty() => return Ok(()),
+            Some(bytes) => {
+                if let ProbeFeed::PendingInput(bytes) = session.feed(&bytes) {
+                    pending.extend(bytes);
+                }
+                // Arm the fragment phase only on probe-reply evidence: a
+                // recognized reply or a buffered partial sequence. Ordinary
+                // early keystrokes must not extend the wait.
+                reply_seen = !session.replies().is_empty() || !session.buffer.is_empty();
+            }
+            // Readiness timeout: the active budget expired.
+            None => return Ok(()),
+        }
+    }
 }
 
 /// Mid-session OSC 11 re-probe: emit only the background query and parse a
@@ -136,19 +184,9 @@ pub fn probe_background<W: Write>(output: &mut W) -> io::Result<(Option<bool>, V
 
     let mut session = ProbeSession::new();
     let mut pending = Vec::new();
-    let deadline = Instant::now() + PROBE_FRAGMENT_TIMEOUT;
-    while Instant::now() < deadline && background_from_replies(session.replies()).is_none() {
-        if let Some(bytes) = read_stdin_nonblocking()? {
-            if bytes.is_empty() {
-                break;
-            }
-            if let ProbeFeed::PendingInput(bytes) = session.feed(&bytes) {
-                pending.extend(bytes);
-            }
-        } else {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    }
+    collect_probe_replies(&mut session, &mut pending, |session| {
+        background_from_replies(session.replies()).is_some()
+    })?;
     pending.extend(session.flush_timeout());
     let dark = background_from_replies(session.replies());
     Ok((dark, reinject_bytes_as_events(&pending)))
@@ -625,8 +663,12 @@ pub fn reinject_bytes_as_events(bytes: &[u8]) -> Vec<UiEvent> {
     events
 }
 
-/// Read pending probe bytes without waiting for terminal input.
-fn read_stdin_nonblocking() -> io::Result<Option<Vec<u8>>> {
+/// Read pending probe bytes, blocking at most `timeout` for readiness.
+///
+/// `Ok(None)` means the readiness window expired without bytes; `Ok(Some)`
+/// carries one read (empty on EOF). Zero timeout keeps the old
+/// non-blocking semantics.
+fn read_stdin_within(timeout: Duration) -> io::Result<Option<Vec<u8>>> {
     #[cfg(unix)]
     {
         use std::os::fd::AsFd;
@@ -634,7 +676,13 @@ fn read_stdin_nonblocking() -> io::Result<Option<Vec<u8>>> {
         let stdin = io::stdin();
         let fd = stdin.as_fd();
         let mut fds = [nix::poll::PollFd::new(fd, nix::poll::PollFlags::POLLIN)];
-        if nix::poll::poll(&mut fds, 0u8)
+        // Round sub-millisecond remainders up: the wait must not expire early.
+        let timeout_ms = if timeout.is_zero() {
+            0_u16
+        } else {
+            u16::try_from(timeout.as_millis() + 1).unwrap_or(u16::MAX)
+        };
+        if nix::poll::poll(&mut fds, timeout_ms)
             .map_err(|error| io::Error::other(format!("poll stdin: {error}")))?
             == 0
         {
@@ -650,6 +698,11 @@ fn read_stdin_nonblocking() -> io::Result<Option<Vec<u8>>> {
     }
     #[cfg(not(unix))]
     {
+        // No readiness primitive here: honor the budget with a bounded sleep
+        // so the caller's deadline logic stays identical on this path.
+        if !timeout.is_zero() {
+            std::thread::sleep(timeout);
+        }
         Ok(None)
     }
 }
