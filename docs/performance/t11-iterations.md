@@ -1083,3 +1083,113 @@ review: CLEAN (0.97 confidence).
 **Not touched** (out of scope, file-disjoint): `.github/workflows/`,
 `scripts/release/`, `scripts/verification/compat-matrix.json`,
 `docs/supported-platforms.md`, DEPS ledger docs, floor ledgers.
+
+
+## stream-frame-pipeline residual classification (recorded at iteration 13)
+
+Classification of the iteration-12 residual (drain 2426 ns vs the ~200 ns
+decode/forward floor ≈ 12.1x): **channel/scheduler cost + the one
+contract-forced source-side materialization per frame — architecture floor,
+not a rebuild candidate.** Both terms are pinned by the unit's contract, not
+by implementation slack: the watch/mpsc two-leg topology is itself contract
+(lossless loop leg + lossy presentation leg, floors/stream-frame-pipeline.md),
+and one full-snapshot materialization per frame is the minimum the funnel
+forces (extensions consume the serialized partial; the watch leg needs a
+complete latest-wins snapshot). After Arc-at-birth the drain performs, per
+non-terminal frame: one snapshot materialization at the source, one
+refcount-only watch publish, one boxed lossless forward — every redundant
+copy is already gone, and the iteration-10 blind candidates that would cross
+the contract legs (B pi-agent-only, C delta-carrying funnel, D
+partial-stripping drain, E coalesced publish) remain rejected. No materially
+distinct design exists inside this unit's boundary; the unit's eventual
+terminal record cites this classification. Next hottest rebuild unit with a
+known design: `session-reopen` (7.79x, direct typed parse named in
+floors/session-reopen.md).
+
+## Iteration 13 — `session-reopen` (direct typed parse fast path)
+
+Commit: see `git log` (`perf(t11)`). Date 2026-08-28.
+
+**Blind derivation** (from the ledger's Contract + Floor sections; the design
+is the one named in the ledger's Addressable-overhead note — direct typed
+parse): the repeated reopen input is JSONL lines whose typed shape is decided
+by the `type` discriminant; the serde_json `Value` round-trip (parse to Value,
+migrate scan, per-line `Value` clone, `from_value` conversion, Value drop
+glue — ~5.3 us/entry of the 5.95 us decomposition) is residue for every line
+that already matches the current typed schema. Data layout: parse each line
+straight into the typed variant with `serde_json::from_str`, preceded by a
+borrowed zero-copy `type` peek; any line the direct parse rejects falls back
+to the exact pre-existing Value path (`file_entry_from_value`), so content
+patches (message/custom_message null content), v1→v3 migration shapes, and
+`Unknown(Value)` preservation are unchanged by construction.
+
+**Boundary answers** (explicit, before touching): reopen must accept every
+file the append path and the upstream TS implementation produce — acceptance
+is preserved because the fallback IS the old path and any fast-path success is
+equivalent to the old path's own success (same serde structs, `from_str` ≡
+`from_value` under stock serde_json number semantics); the v3 wire format is
+untouched (no write on the fast path — sha-prefix stability bench-asserted);
+migration semantics unchanged (files whose header version is absent or < 3
+reload through the untouched `load_values_from_file` +
+`migrate_values_to_current` + `rewrite_file` lane, byte-identical to base);
+`fork_from` untouched (it needs raw `Value`s for the as-is copy);
+`parse_session_entry_line`/`parse_session_entries` (import lane) untouched;
+append/persist paths untouched.
+
+**Cutover surface** (2 files): `entries.rs` — `load_entries_from_file`
+rewired to the new `load_file_entries_from_file` (direct typed parse +
+per-line Value fallback, header validation identical), `TagPeek` borrowed
+discriminant peek, `parse_line`/`parse_line_via_value`;
+`sessions/mod.rs` — `set_session_file` consumes the typed entries, derives
+session id from the first session-typed entry (Header id or RawHeader raw
+scan, matching the old Value scan), gates on header version (< v3 → exact
+legacy reload), keeps `build_index` + `flushed = true`. Cargo.lock untouched
+(lock-neutral, no new deps).
+
+**Measurements** (release, `taskset -c 20-40`, 9 interleaved pairs, medians
+of per-run 20-sample medians; `session-timing --mode reopen --entries 5000`,
+815 KB shared session file, sha-prefix `a0f5fe60…` stable across every run;
+baseline = 8491226 clean worktree binary, design = cutover binary):
+
+| Scenario | Before (ms/reopen) | After (ms/reopen) | Win (median-of-9) |
+|---|---|---|---|
+| reopen 5000 entries | 20.64 (20.19–22.99) | 15.10 (14.80–17.44) | 1.37x |
+
+Win gate >=1.05x median: **PASSED** (1.37x). Per-entry: 4.13 → 3.02 us.
+Pairs 8–9 show box contention in both arms; the median is the honest paired
+estimator (iteration-12 precedent).
+
+**Recomputed multiple**: 3.02 us/entry vs the ledger floor 0.764 us ≈
+**4.0x — still OPEN** (>2x; the unit iterates again). Remaining residual:
+the double parse in `SessionManager::open` (header-cwd pre-parse +
+`set_session_file` reload — both now fast but still two passes), by-id index
++ tree rebuild (~0.46 us), and the typed-parse constant itself (nested
+`AgentMessage` serde + per-field String allocations; the ledger's arena
+allocation lever remains unlanded).
+
+**Verification**: `cargo check --workspace --all-targets` green (warnings
+pre-existing, none in touched crates); `pi --lib` 1660 pass / 5 fail (all
+pre-existing environmental: extension-host artifact, manifest utf8,
+trust-gating env, NFD-on-tmpfs — a base-tree run at 8491226 shows 10 fails in
+the same env classes, rotating per run; `core::sessions` subset green
+including v1/v2/v3 fixture interoperability, migration round-trips, reopen
+append prefix stability). Two regression tests pin the fallback contract:
+`parse_line_matches_value_path_on_peek_failures` (fast path ≡ Value path on
+escaped tag, tagless line, non-string tag, malformed line) and
+`escaped_tag_header_and_tagless_lines_load` (end-to-end: escaped-tag header
+recognized, message entry typed, tagless line preserved as Unknown). One
+pre-existing flake disclosed: `list_sessions_sorted_by_modified` fails
+intermittently on BOTH trees at the same rate (2/5 probes each), independent
+of this diff (its scan path does not use the changed loader).
+
+**Review**: the first fresh adversarial review found one blocking acceptance
+defect in the initial fast path — `?` on the tag peek routed peek failures
+and tagless lines to "skip" instead of the Value fallback (an escaped-tag v3
+header would have invalidated the file; tagless valid JSON lines would have
+been dropped instead of preserved as `Unknown`). Fixed by routing both to
+`parse_line_via_value`; re-reviewed: **CLEAN** (0.99 confidence).
+
+**Not touched** (out of scope, file-disjoint): `.github/workflows/`,
+`scripts/release/`, `scripts/verification/compat-matrix.json`,
+`docs/supported-platforms.md`, DEPS ledger docs, floor ledgers,
+`scripts/session-timing.ts`, `session-timing.rs`.
