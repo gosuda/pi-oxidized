@@ -31,7 +31,10 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-15
           - target: x86_64-pc-windows-msvc
-            os: windows-latest
+            # REL-T7 / REL-R3 §5.2 condition 5: the ConPTY witness row pins its
+            # runner image so conhost-derivation changes are image changes,
+            # not silent ones. windows-latest is a floating alias.
+            os: windows-2025
           # REL-T4: the two musl legs carry the packaging/protocol step set
           # alone — zero interaction steps (EXT-26 four-axis recipe).
           - target: x86_64-unknown-linux-musl
@@ -609,6 +612,67 @@ jobs:
           } | tee target/verification/rel-t4/witness-environment.txt
           cargo test -p pi-tui --features testkit --test pty_no_flicker
 
+      # ─────────────────────────────────────────────────────────────────────
+      # REL-T7 (#114): the fifth Tier N row — the archive-level ConPTY
+      # witness that converts REL-R3's provisional GO (§5.1 of
+      # docs/REL-R3-conpty-witness-prototype.md) into a final one by
+      # executing the packed pi.exe under ConPTY with the R3-recorded hard
+      # assertions: pi.exe --version, the archive's TUI-ready marker, render
+      # /echo/resize on the avt-decoded frame, the DEC2026-fallback sync
+      # discipline, and taskkill /PID <pid> /T /F tree teardown with the
+      # conhost-reap EOF; console-mode cleanup is recorded as advisory (§4).
+      # A hard failure on this pinned leg is the §5.3 no-go path: the
+      # prototype findings are recorded verbatim and the topology reopen
+      # becomes a blocking release objection — the row is never weakened in
+      # place.
+      # ─────────────────────────────────────────────────────────────────────
+      - name: ConPTY witness on the packed archive (REL-T7 fifth row)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          EVIDENCE=target/verification/rel-t7
+          mkdir -p "$EVIDENCE/unpacked"
+          {
+            printf 'runner_name=%s\nrunner_os=%s\nrunner_arch=%s\n' "$RUNNER_NAME" "$RUNNER_OS" "$RUNNER_ARCH"
+            printf 'image_os=%s\nimage_version=%s\n' "${ImageOS:-unknown}" "${ImageVersion:-unknown}"
+            printf 'runner_image_pin=windows-2025\n'
+            printf 'witness=rel-r3-conpty\ndriver=portable-pty-0.9.0-ConPtySystem\nrow=${{ matrix.target }}\n'
+            cmd //c ver
+          } | tee "$EVIDENCE/witness-environment.txt"
+
+          # The witness runs the exact published bytes: sidecar gate, unpack.
+          shopt -s nullglob
+          archives=(dist/pass1/*.zip)
+          test "${#archives[@]}" -eq 1
+          archive="${archives[0]}"
+          (cd dist/pass1 && sha256sum --check --strict "$(basename "$archive").sha256")
+          /c/Windows/System32/tar.exe -xf "$archive" -C "$EVIDENCE/unpacked"
+          root="$(find "$EVIDENCE/unpacked" -mindepth 1 -maxdepth 1 -type d)"
+          test -n "$root"
+          printf 'archive=%s\nroot=%s\n' "$(basename "$archive")" "$root" \
+            | tee "$EVIDENCE/archive.txt"
+
+          # REL-R3 §5.2 condition 5: no sideloaded ConPTY shim next to the
+          # packed pi.exe — portable-pty 0.9.0 prefers a sideloaded
+          # conpty.dll over the OS conhost, which would silently change the
+          # driver under test.
+          if compgen -G "$root/conpty.dll" >/dev/null || \
+             compgen -G "$root/openconsole.exe" >/dev/null; then
+            echo 'sideloaded conpty.dll/openconsole.exe in the deploy dir (REL-R3 §5.2 condition 5)' >&2
+            exit 1
+          fi
+
+          # Harness exit codes gate the row: 0 all hard assertions pass, 1
+          # hard failures (named in the verdict event), 3 harness/PTY error.
+          # --expect-ready pins the archive's TUI boot header ("type a
+          # message to begin") — the §4 host-hello observable.
+          cargo run --release --locked --manifest-path prototype/rel-r3-conpty/Cargo.toml -- \
+            --pi "$root/pi.exe" \
+            --out "$EVIDENCE" \
+            --expect-ready 'type a message'
+
       - name: Upload Artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
@@ -623,5 +687,14 @@ jobs:
           path: |
             target/verification/rel-t4
             target/verification/tui-transcripts
+          if-no-files-found: ignore
+          overwrite: true
+
+      - name: Upload REL-T7 ConPTY witness evidence
+        if: always() && matrix.target == 'x86_64-pc-windows-msvc'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: rel-t7-conpty-witness-${{ matrix.target }}
+          path: target/verification/rel-t7
           if-no-files-found: ignore
           overwrite: true
