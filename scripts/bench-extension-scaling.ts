@@ -303,22 +303,11 @@ export interface RustScenarioReport {
 	localitySamplesMs?: number[];
 }
 
-export interface RustCorrectness {
-	helloAckObserved: boolean;
-	idCorrelation: boolean;
-	deterministicPayloads: boolean;
-	activeWidgetKeys: number;
-	slowTimeoutCode: string;
-	slowTimeoutRetryable: boolean;
-}
 
 export interface RustSamplerReport {
 	schemaVersion: number;
 	provenance: RustProvenance;
 	scenarios: RustScenarioReport[];
-	correctness: RustCorrectness;
-	pass: boolean;
-	failures: string[];
 }
 
 function requireFiniteSamples(values: unknown, field: string): number[] {
@@ -363,11 +352,6 @@ export function validateRustSamplerReport(report: RustSamplerReport): void {
 	if (report.schemaVersion !== EXPECTED_RUST_SCHEMA_VERSION) {
 		throw new RustSamplerError(
 			`Rust sampler schemaVersion ${String(report.schemaVersion)} != ${EXPECTED_RUST_SCHEMA_VERSION}`,
-		);
-	}
-	if (report.pass !== true || !Array.isArray(report.failures) || report.failures.length !== 0) {
-		throw new RustSamplerError(
-			`Rust sampler reported failure: ${JSON.stringify(report.failures ?? "missing failures")}`,
 		);
 	}
 	const provenance = report.provenance;
@@ -477,18 +461,6 @@ export function validateRustSamplerReport(report: RustSamplerReport): void {
 	if (seen.size !== EXPECTED_SCENARIOS.length) {
 		const missing = EXPECTED_SCENARIOS.filter((name) => !seen.has(name));
 		throw new RustSamplerError(`Rust sampler is missing scenarios: ${missing.join(", ")}`);
-	}
-	const correctness = report.correctness;
-	if (
-		typeof correctness !== "object" || correctness === null ||
-		correctness.helloAckObserved !== true ||
-		correctness.idCorrelation !== true ||
-		correctness.deterministicPayloads !== true ||
-		correctness.activeWidgetKeys !== 20 ||
-		correctness.slowTimeoutCode !== "timeout" ||
-		correctness.slowTimeoutRetryable !== false
-	) {
-		throw new RustSamplerError(`Rust sampler correctness attestation mismatch: ${JSON.stringify(correctness)}`);
 	}
 }
 
@@ -927,7 +899,6 @@ async function main(): Promise<void> {
 		rustSection = {
 			schemaVersion: rust.schemaVersion,
 			provenance: rust.provenance,
-			correctness: rust.correctness,
 			scenarios: Object.fromEntries(
 				rust.scenarios.map((scenario) => [
 					scenario.scenario,
@@ -945,7 +916,6 @@ async function main(): Promise<void> {
 					},
 				]),
 			),
-			pass: true,
 		};
 		rustQuietLanes = rust.scenarios.map((scenario) => {
 			const median = percentile([...scenario.normalizedSamplesMs].sort((a, b) => a - b), 50);

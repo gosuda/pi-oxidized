@@ -336,24 +336,10 @@ struct ScenarioReport {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct Correctness {
-    hello_ack_observed: bool,
-    id_correlation: bool,
-    deterministic_payloads: bool,
-    active_widget_keys: usize,
-    slow_timeout_code: &'static str,
-    slow_timeout_retryable: bool,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct SamplerReport {
     schema_version: u32,
     provenance: Provenance,
     scenarios: Vec<ScenarioReport>,
-    correctness: Correctness,
-    pass: bool,
-    failures: Vec<String>,
 }
 
 fn io_error(message: impl Into<String>) -> std::io::Error {
@@ -839,16 +825,6 @@ async fn sample() -> Result<SamplerReport> {
             },
         },
         scenarios: vec![zero, idle, active, fast, slow],
-        correctness: Correctness {
-            hello_ack_observed: true,
-            id_correlation: true,
-            deterministic_payloads: true,
-            active_widget_keys: 20,
-            slow_timeout_code: "timeout",
-            slow_timeout_retryable: false,
-        },
-        pass: true,
-        failures: Vec::new(),
     })
 }
 

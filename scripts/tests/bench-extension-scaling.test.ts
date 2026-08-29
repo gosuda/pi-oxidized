@@ -172,16 +172,6 @@ function validSamplerReport() {
 				localitySamplesMs: measuredSamples(0.1),
 			},
 		],
-		correctness: {
-			helloAckObserved: true,
-			idCorrelation: true,
-			deterministicPayloads: true,
-			activeWidgetKeys: 20,
-			slowTimeoutCode: "timeout",
-			slowTimeoutRetryable: false,
-		},
-		pass: true,
-		failures: [],
 	};
 }
 
@@ -273,26 +263,6 @@ describe("bench-extension-scaling rust sampler contract", () => {
 		Reflect.deleteProperty(slow, "timeoutSamplesMs");
 		expect(() => validateRustSamplerReport(missingSlowEvidence)).toThrow(/timeoutSamplesMs/);
 		expect(() => validateRustSamplerReport(badSamples)).toThrow(/finite non-negative/);
-	});
-
-	test("rejects failed or incomplete correctness attestations", () => {
-		const failed = { ...validSamplerReport(), pass: false };
-		expect(() => validateRustSamplerReport(failed)).toThrow(/reported failure/);
-
-		const failuresListed = { ...validSamplerReport(), failures: ["boom"] };
-		expect(() => validateRustSamplerReport(failuresListed)).toThrow(/reported failure/);
-
-		const missingFailures = validSamplerReport();
-		Reflect.deleteProperty(missingFailures, "failures");
-		expect(() => validateRustSamplerReport(missingFailures)).toThrow(/reported failure/);
-
-		const wrongTimeout = validSamplerReport();
-		wrongTimeout.correctness.slowTimeoutRetryable = true;
-		expect(() => validateRustSamplerReport(wrongTimeout)).toThrow(/correctness attestation/);
-
-		const missingWidgets = validSamplerReport();
-		missingWidgets.correctness.activeWidgetKeys = 0;
-		expect(() => validateRustSamplerReport(missingWidgets)).toThrow(/correctness attestation/);
 	});
 
 	test("missing or bypassed sampler binary prevents the artifact pass", () => {
