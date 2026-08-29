@@ -694,12 +694,13 @@ async function assertDialogCompatibility(state: WorkflowState, rust: PtyProcess)
 async function assertCustomUiCompatibility(state: WorkflowState, rust: PtyProcess): Promise<void> {
 	const step = beginStep(state, "rust-extension-custom-ui");
 	const startIndex = readCompatibilityMarkers(state).length;
+	const initialOutputOffset = rust.snapshot().rawText.length;
 	sendLine(rust, `/${VERIFICATION_CUSTOM_UI_COMMAND}`);
 	await waitForCompatibilityMarker(state, "custom initial render marker", rust, startIndex, "custom.render.initial");
 	// Raw PTY text contains differential writes, not a reconstructed screen.
 	// The deterministic suffix proves that the native terminal emitted the
 	// slot even when unchanged cells split the logical line.
-	await waitForScreen(rust, "custom UI initial render", "initial");
+	await waitForScreen(rust, "custom UI initial render", "initial", initialOutputOffset);
 	// Apply the same rule to the post-input suffix.
 	const updateOutputOffset = rust.snapshot().rawText.length;
 	rust.writeKeys("x");
