@@ -236,8 +236,8 @@ later-override-unless-reserved rules?
    resolveRegisteredCommands` (lines 603-636) *before* the snapshot is
    serialized. The Rust side receives already-disambiguated invocation names
    as `CommandWire.name` (`crates/pi/src/core/extension_host.rs::CommandWire`,
-   line 299; consumed by the command loop at lines 516-520). The Rust
-   `Registry::register_command` (adapters.rs:1137-1143) applies first-wins on
+   line 299; consumed by the command loop at lines 509-516). The Rust
+   `Registry::register_command` (adapters.rs:1146-1152) applies first-wins on
    the *invocation name*, which is correct: two extensions registering
    `cmd` produce `cmd:1` and `cmd:2` in the wire, so both are stored. If the
    host dropped disambiguation and sent `cmd` twice, first-wins would
@@ -254,7 +254,7 @@ later-override-unless-reserved rules?
    getShortcuts` (lines 494-536): shortcuts with `restrictOverride === true`
    are skipped (line 511), and later extension registrations replace earlier
    ones (line 533). The Rust product layer does **not** rely on
-   `Registry::register_shortcut` (which is first-wins, adapters.rs:1146-1152)
+   `Registry::register_shortcut` (which is first-wins, adapters.rs:1155-1161)
    for dispatch. Instead, `crates/pi/src/core/extension_host.rs::
    RegistrySnapshot.raw_shortcuts` (line 466) preserves *every* shortcut
    registration in order, and dispatch iterates endpoints last-first and
@@ -271,7 +271,7 @@ later-override-unless-reserved rules?
    fails.
 
 3. **Tool first-wins (Rule 1, both modes):** The Rust
-   `Registry::register_tool` (adapters.rs:1128-1134) implements first-wins.
+   `Registry::register_tool` (adapters.rs:1137-1143) implements first-wins.
    The host already deduplicates (`getAllRegisteredTools`, runner.ts:451-461);
    the Rust side is the trust boundary for a duplicated name.
 
@@ -382,7 +382,7 @@ Mutations M7–M10 prove the load-bearing dispatch semantics:
 
 The full registry snapshot (`RegistrySnapshotWire` consumed by Rust
 `HostExtensionRunner::load`) is produced by
-`packages/extension-host/src/host.ts::buildRegistrySnapshot` (lines 2078-2171):
+`packages/extension-host/src/host.ts::buildRegistrySnapshot` (lines 2088-2178):
 
 - `tools`: `{ name, label, description, parameters, executionMode? }` from
   `runner.getAllRegisteredTools()` definitions.
@@ -487,7 +487,7 @@ Each rule below carries a `witness:` to the implementing source and a
   extracts `requestId` from the payload, guards against `undefined`, and calls
   `.abort()` only on the matching `inFlightTools`/`inFlightProviders` entry.
   `witness: packages/extension-host/src/host.ts::handleControlEvent`
-  (lines 2191-2198), `lean-runner.ts::handleControlEvent` (lines 1926-1943).
+  (lines 2200-2207), `lean-runner.ts::handleControlEvent` (lines 1926-1943).
   `mutation: M18 — verifyCancelRouting` (tool.cancel tests in
   `tests/lean.test.ts` lines 924-1044).
 
@@ -495,7 +495,7 @@ Each rule below carries a `witness:` to the implementing source and a
 
 | Exemption | Intent | Witness |
 | --- | --- | --- |
-| `navigateTree` `summarize: true` omits the 30 s hook deadline | A provider-backed branch summary can legitimately exceed 30 s; only non-summarizing navigation stays under the generic timeout | `host.ts::navigateTree` conditional timeout `summarize ? {} : { timeoutMs: EXTENSION_HOOK_TIMEOUT_MS }` (lines 2927-2930); intent comment at lines 2927-2929; witnessed by `verifyNavigateTreeSummarizeExemption` in `scripts/verification/xc-deadline.ts` |
+| `navigateTree` `summarize: true` omits the 30 s hook deadline | A provider-backed branch summary can legitimately exceed 30 s; only non-summarizing navigation stays under the generic timeout | `host.ts::navigateTree` conditional timeout and intent comment (lines 2936-2939); witnessed by `verifyNavigateTreeSummarizeExemption` in `scripts/verification/xc-deadline.ts` |
 
 No unwitnessed timing contract rows remain.
 

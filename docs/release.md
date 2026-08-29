@@ -95,7 +95,7 @@ and their archive directories (`buildPlan`, `scripts/release/targets.ts:89-119`)
 | `aarch64-unknown-linux-gnu` | `pi-linux-arm64` | `tar.gz` | `bun-linux-arm64` |
 | `aarch64-unknown-linux-musl` | `pi-linux-arm64-musl` | `tar.gz` | `bun-linux-arm64-musl` |
 | `x86_64-apple-darwin` | `pi-darwin-x64-base` | `tar.gz` | `bun-darwin-x64-baseline` |
-| `aarch64-apple-darwin` | `pi-darwin-arm64` | `tar.gz` | `bun-darwin-aarch64` |
+| `aarch64-apple-darwin` | `pi-darwin-arm64` | `tar.gz` | `bun-darwin-arm64` |
 | `x86_64-pc-windows-msvc` | `pi-windows-x64-base` | `zip` | `bun-windows-x64-baseline` |
 
 Each target's dry-run command:

@@ -64,7 +64,7 @@ removes any prior manifest before evaluation.
 | Field | Value |
 |---|---|
 | Schema | `pi.docs.evidence.run.v1` |
-| Local run ID | `2026-08-29T14:25:57.921Z` |
+| Local run ID | `2026-08-29T14:32:01.743Z` |
 | Rows | 77 |
 | `present` rows | 77 |
 | Canonical ledger hash | `1c1d5479cecca4568888b3929b7e0648ea653493f595f4890c8d8aa125e11ac3` |

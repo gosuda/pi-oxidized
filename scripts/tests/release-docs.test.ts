@@ -488,6 +488,14 @@ describe("DOC-E: platform matrix matches RUST_TARGETS and CI matrix", () => {
 		expect(new Set<string>(RUST_TARGETS)).toEqual(new Set<string>(ciTargets));
 	});
 
+	test("docs/release.md target rows equal the resolved release plans", () => {
+		for (const plan of TARGET_PLANS) {
+			expect(RELEASE_DOC).toContain(
+				`| \`${plan.rustTarget}\` | \`${plan.archiveDir}\` | \`${plan.archive}\` | \`${plan.bunTarget}\` |`,
+			);
+		}
+	});
+
 	test("every TargetPlan has the expected fields derived from its triple", () => {
 		for (const plan of TARGET_PLANS) {
 			expect(plan.rustTarget).toBeDefined();
