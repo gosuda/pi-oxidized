@@ -79,6 +79,7 @@ const STREAM_PROCESS_WARMUPS = 3;
 const STREAM_PROCESS_SAMPLES = 20;
 const STREAM_CHUNKS = 256;
 const STREAM_CHUNK_DELAY_MS = 2;
+export const STREAM_PTY_SIZE = { columns: 80, rows: 24 } as const;
 const KEY_WARMUPS = 20;
 const KEY_SAMPLES = 200;
 const KEYPRESS_PROCESS_WARMUPS = 3;
@@ -1441,6 +1442,7 @@ async function runFirstFrameSample(
 		cwd: sandbox,
 		env: benchmarkEnvironment(sandbox),
 		size: { columns: 100, rows: 32 },
+		cursorPosition: false,
 	});
 	const sampler = new ProcTreeSampler(pty.pid, PROC_SAMPLE_INTERVAL_MS);
 	try {
@@ -1566,7 +1568,7 @@ async function runStreamProcess(
 			PI_VERIFICATION_CHUNK_DELAY_MS: String(STREAM_CHUNK_DELAY_MS),
 			PI_VERIFICATION_FINAL_MARKER: finalMarker,
 		},
-		size: { columns: 100, rows: 40 },
+		size: STREAM_PTY_SIZE,
 	});
 	const sampler = new ProcTreeSampler(pty.pid, PROC_SAMPLE_INTERVAL_MS);
 	try {
@@ -1989,7 +1991,7 @@ async function runStreamLoadMemorySample(
 			PI_VERIFICATION_CHUNK_DELAY_MS: String(STREAM_CHUNK_DELAY_MS),
 			PI_VERIFICATION_FINAL_MARKER: finalMarker,
 		},
-		size: { columns: 100, rows: 40 },
+		size: STREAM_PTY_SIZE,
 	});
 	try {
 		await pty.waitFor((snapshot) => frameObservation(snapshot) !== undefined, {
@@ -2179,6 +2181,8 @@ async function main(): Promise<void> {
 		quantileMethod: "R-7 linear interpolation",
 		coldCacheMethod: "sync once per cold group, then posix_fadvise(POSIX_FADV_DONTNEED) on the implementation executable before every cold sample",
 		firstFrameDefinition: "first complete DEC synchronized-output transaction; row-local printable CSI transaction is the recorded fallback",
+		firstFrameTerminalProfile:
+			"silent terminal during first-frame collection only: cursor-position replies disabled; elapsed time remains the completed-frame boundary",
 		streamCpuDefinition: "whole-process-tree CPU immediately before submit Enter through final marker, divided by the fixed 256 deterministic provider text-delta frames; painted frame/coalescing counts recorded separately",
 		keypressDefinition: "per-key PTY write receipt to the completing chunk of the first balanced DEC 2026 transaction containing the typed key, empty editor per key, Ctrl+U clear paint outside timing, evaluated over fresh process rounds",
 		ptyTerm: PTY_TERM,

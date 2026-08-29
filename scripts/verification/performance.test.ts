@@ -21,6 +21,7 @@ import {
 	recordEntrypointHarnessFailure,
 	sampleProcessTreeMemoryWindow,
 	terminateAndRequireCleanExit,
+	STREAM_PTY_SIZE,
 	validateMemoryCoverage,
 	type KeypressRoundRecord,
 } from "./performance.ts";
@@ -352,6 +353,37 @@ describe("timed CPU sampler purity", () => {
 			await child.exited;
 		}
 	}, 15_000);
+});
+
+describe("first-frame PTY profile", () => {
+	test("uses a silent terminal instead of answering one probe from the startup batch", () => {
+		const source = readFileSync(PERFORMANCE_MODULE, "utf8");
+		const functionStart = source.indexOf("async function runFirstFrameSample(");
+		const spawnStart = source.indexOf("const pty = spawnPty({", functionStart);
+		const spawnEnd = source.indexOf("const sampler = new ProcTreeSampler", spawnStart);
+		const firstFrameSpawn = source.slice(spawnStart, spawnEnd);
+		expect(firstFrameSpawn).toContain("cursorPosition: false");
+		expect(source.match(/cursorPosition:\s*false/g)).toHaveLength(1);
+		expect(source).toContain("firstFrameTerminalProfile:");
+		expect(source).toContain('"silent terminal during first-frame collection only:');
+	});
+});
+
+describe("stream PTY geometry", () => {
+	test("both stream samplers use the shared 80x24 geometry", () => {
+		expect(STREAM_PTY_SIZE).toEqual({ columns: 80, rows: 24 });
+		const source = readFileSync(PERFORMANCE_MODULE, "utf8");
+		const streamProcess = source.slice(
+			source.indexOf("async function runStreamProcess("),
+			source.indexOf("export interface KeypressRoundRecord"),
+		);
+		const streamMemory = source.slice(
+			source.indexOf("async function runStreamLoadMemorySample("),
+			source.indexOf("async function collectStreamLoadMemorySamples("),
+		);
+		expect(streamProcess).toContain("size: STREAM_PTY_SIZE");
+		expect(streamMemory).toContain("size: STREAM_PTY_SIZE");
+	});
 });
 
 describe("startup versus idle memory labels", () => {
