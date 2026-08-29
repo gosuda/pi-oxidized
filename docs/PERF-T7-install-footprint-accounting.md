@@ -3,7 +3,7 @@
 > Resolves [issue #91](https://github.com/metaphorics/pi-oxidized/issues/91).
 > Runner: `bun run scripts/verification/footprint.ts` (`verify:footprint`).
 > Artifact: `target/bench/install-footprint.json` (generated per run; not committed).
-> Upstream baseline: `.references/pi` at `8fa7eebd235355522c8104166b4f1f959b4e2f10`.
+> Upstream baseline: the [settled reference pin](compatibility.md#settled-reference-pin).
 
 ## Why an accounting contract is needed
 
@@ -18,7 +18,7 @@ semantically equal:
   whose launcher (`dist/bundle/cli.js`) is JavaScript: the bytes on disk after
   `npm install` are the package payload plus a 136-entry production dependency
   closure (per the upstream installer's own `install-lock` lockfile), and an
-  external Node.js (>= 22.19.0 per the install lock's `engines`) or Bun
+  external Node.js (Node engine floor in [docs/compatibility.md#engine-floors](compatibility.md#engine-floors)) or Bun
   interpreter that the package does not ship.
 - The upstream tree also carries a second launcher shape, the `dist/pi`
   compiled binary (produced only by upstream's `build:binary` script, never by
@@ -43,7 +43,7 @@ C1 + C2 + C3.
 | C1 launcher | The entrypoint artifact the user executes | `pi` binary in the assembled release tree (`release.json` manifest, produced by `assembleRelease` from `scripts/release/stage.ts`) | `dist/bundle/cli.js` from the `npm pack --dry-run --json` file list of the pinned reference package |
 | C2 runtime payload | Every non-launcher byte the distribution itself ships | Everything else in the assembled release tree (extension-host sidecar, `theme/`, `assets/`, `docs/`, `examples/`, `CHANGELOG.md`, `README.md`, `LICENSE*`, `release.json`) | All remaining `npm pack` file-list bytes except the compiled-launcher file `dist/pi` (see exclusions) |
 | C3 shipped dependencies | Bytes installed to satisfy declared runtime dependencies | None — statically linked into the launcher; recorded as empty with reason, never silently omitted | Production closure of `install-lock/package-lock.json`: third-party packages measured as installed `node_modules/<pkg>` directories, first-party `@earendil-works/pi-*` workspace packages measured as their own `npm pack --dry-run --json` file lists |
-| C4 external interpreter | Runtime prerequisite the distribution does not ship | None — launcher and sidecar are self-contained | Node.js >= 22.19.0 (or Bun) — recorded as name, version constraint, and on-machine binary size for context, **excluded from every total** |
+| C4 external interpreter | Runtime prerequisite the distribution does not ship | None — launcher and sidecar are self-contained | Node.js or Bun (engine floors in [docs/compatibility.md#engine-floors](compatibility.md#engine-floors)) — recorded as name, version constraint, and on-machine binary size for context, **excluded from every total** |
 
 ## Measurement invariants (both sides)
 

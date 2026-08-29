@@ -467,26 +467,44 @@ function scanDirForRegisteredPins(
 		const stat = statSync(fullPath);
 		if (stat.isDirectory()) {
 			scanDirForRegisteredPins(fullPath, registered, findings, root);
-		} else if (entry.endsWith(".md") && entry !== "compatibility.md") {
-			const content = readFileSync(fullPath, "utf8");
-			const lines = content.split("\n");
-			let inFence = false;
-			for (let i = 0; i < lines.length; i++) {
-				const line = lines[i];
-				if (line === undefined) continue;
-				// Toggle fence state on ``` lines (skip transcript evidence inside code blocks)
-				if (line.startsWith("```")) {
-					inFence = !inFence;
-					continue;
+			continue;
+		}
+		if (!entry.endsWith(".md") || entry === "compatibility.md") continue;
+
+		const content = readFileSync(fullPath, "utf8");
+		const lines = content.split("\n");
+		const relPath = fullPath.slice(root.length + 1);
+		let inExecutionMapRegistry = false;
+		let inFence = false;
+		for (let i = 0; i < lines.length; i++) {
+			const line = lines[i];
+			if (line === undefined) continue;
+			if (relPath === "EXECUTION_MAP.md") {
+				if (line === "## Registry") {
+					inExecutionMapRegistry = true;
+				} else if (line.startsWith("## ")) {
+					inExecutionMapRegistry = false;
 				}
-				if (inFence) continue;
-				// Skip HTML comment lines
-				if (line.startsWith("<!--")) continue;
-				for (const pin of registered) {
-					if (line.includes(pin)) {
-						const relPath = fullPath.slice(root.length + 1);
-						findings.push(`${relPath}:${i + 1} — registered pin value found outside compatibility.md: ${pin}`);
-					}
+			}
+			if (line.startsWith("```")) {
+				inFence = !inFence;
+				continue;
+			}
+			if (inFence || line.startsWith("<!--")) continue;
+
+			// Registry title cells mirror canonical issue titles byte-for-byte.
+			const searchableLine =
+				inExecutionMapRegistry && line.startsWith("|")
+					? line
+							.split("|")
+							.map((cell, index) => (index === 4 ? "" : cell))
+							.join("|")
+					: line;
+			for (const pin of registered) {
+				if (searchableLine.includes(pin)) {
+					findings.push(
+						`${relPath}:${i + 1} — registered pin value found outside compatibility.md: ${pin}`,
+					);
 				}
 			}
 		}

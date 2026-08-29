@@ -2970,8 +2970,10 @@ verification: `cargo check -p pi` green; `cargo test -p pi cli` 164 passed /
 0 failed (one environmental failure, a gitignored prebuilt
 `pi-extension-host` artifact missing in a fresh worktree, reproduced at base
 with the artifact absent and cleared by providing the artifact; unrelated to
-the diff); live smoke: `--version` → `0.1.0` exit 0, `--help` and a normal
-flag path parity-diffed base vs after.
+the diff); live smoke: `--version` → the registered workspace version (see
+[Workspace Version](../compatibility.md#workspace-version) in
+docs/compatibility.md), exit 0; `--help` and a normal flag path parity-diffed
+base vs after.
 
 ### Multiple recompute
 

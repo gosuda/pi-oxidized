@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { spawnSync } from "node:child_process";
 
 import {
@@ -12,23 +12,31 @@ import {
 	DEFAULT_REPROOF_INTERVAL_MS,
 	EVIDENCE_CLASSES,
 	FORBIDDEN_FIELDS,
+	RUN_MANIFEST_SCHEMA,
 	TOOL_VERSION,
 	checkStaleness,
 	isEvidenceClass,
+	isEvidenceStatus,
 	runEvidence,
+	sha256,
 	type LedgerRow,
+	type RunManifest,
 	type Sidecar,
 } from "../verification/docs-evidence-runners.ts";
 import {
 	DEFAULT_INVENTORY_PATH,
 	DEFAULT_LEDGER_PATH,
+	EXPECTED_LEDGER_ROW_COUNT,
 	REPO_ROOT,
+	RUN_MANIFEST_FILENAME,
 	SENTINEL_OK,
+	canonicalJson,
 	inventorySurfaceCount,
 	loadInventory,
 	loadLedger,
 	runCheck,
 	validateLedger,
+	type CheckResult,
 } from "../verification/docs-evidence.ts";
 
 const LEDGER = loadLedger(REPO_ROOT, DEFAULT_LEDGER_PATH);
@@ -36,7 +44,14 @@ const INVENTORY = loadInventory(REPO_ROOT, DEFAULT_INVENTORY_PATH);
 
 /** A minimal valid row for each evidence class. */
 function sampleRow(evidenceClass: string, id: string): LedgerRow {
-	const base = { id, surface: `test-${id}`, owner: "DOC-A", class: evidenceClass as LedgerRow["class"] };
+	const base = {
+		id,
+		surface: `test-${id}`,
+		owner: "DOC-A",
+		status: "present" as const,
+		target: `test-${id}`,
+		class: evidenceClass as LedgerRow["class"],
+	};
 	switch (evidenceClass) {
 		case "version-pin":
 			return { ...base, params: { label: "PROTOCOL_VERSION", expected: "1", source: "packages/pi-tui-protocol/src/types.ts" } };
@@ -62,7 +77,7 @@ function runScratchCheck(
 	rows: readonly LedgerRow[],
 	referencePin: string = CANONICAL_REFERENCE_SHA,
 	sidecarDir?: string,
-): { ok: boolean; problems: readonly string[] } {
+): CheckResult & { sidecarDir: string } {
 	const dir = mkdtempSync(join(tmpdir(), "docs-ev-"));
 	const ledgerPath = join(dir, "ledger.json");
 	const inventoryPath = join(dir, "inventory.json");
@@ -86,9 +101,12 @@ function runScratchCheck(
 		REPO_ROOT,
 		scDir,
 		new Date().toISOString(),
+		rows.length,
 	);
+	// We always own the scratch dir; a caller-supplied sidecar dir survives
+	// so the caller can inspect artifacts in it (e.g. the run manifest).
 	rmSync(dir, { recursive: true, force: true });
-	return result;
+	return { ...result, sidecarDir: scDir };
 }
 
 /** Write a prior sidecar to a dir so the checker can detect staleness. */
@@ -108,21 +126,137 @@ describe("docs-evidence: green on current tree", () => {
 		expect(result.problems).toEqual([]);
 	});
 
-	test("CLI entrypoint produces the OK sentinel", () => {
-		const proc = spawnSync(
-			"bun",
-			["run", "scripts/verification/docs-evidence.ts", "--sidecar-dir", join(tmpdir(), "docs-ev-cli")],
-			{ cwd: REPO_ROOT, encoding: "utf8", timeout: 30000 },
-		);
-		expect(proc.status).toBe(0);
-		expect(proc.stdout.trim()).toBe(SENTINEL_OK);
+	test("CLI entrypoint prints sentinel + runId + rows + manifest and emits the manifest", () => {
+		const dir = mkdtempSync(join(tmpdir(), "docs-ev-cli-"));
+		try {
+			const scDir = join(dir, "sidecars");
+			const proc = spawnSync(
+				"bun",
+				[
+					"run",
+					"scripts/verification/docs-evidence.ts",
+					"--sidecar-dir",
+					scDir,
+				],
+				{ cwd: REPO_ROOT, encoding: "utf8", timeout: 30000 },
+			);
+			expect(proc.status).toBe(0);
+
+			const manifestPath = join(scDir, RUN_MANIFEST_FILENAME);
+			expect(existsSync(manifestPath)).toBe(true);
+			const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as RunManifest;
+			expect(manifest.schema).toBe(RUN_MANIFEST_SCHEMA);
+			expect(manifest.referencePin).toBe(CANONICAL_REFERENCE_SHA);
+			expect(manifest.ledgerHash).toBe(sha256(canonicalJson(LEDGER)));
+			expect(manifest.rowCount).toBe(LEDGER.rows.length);
+			expect(manifest.presentCount).toBe(LEDGER.rows.length);
+			const entryIds = manifest.entries.map((e) => e.rowId);
+			expect([...entryIds].sort()).toEqual(entryIds); // sorted by rowId
+			expect(new Set(entryIds)).toEqual(new Set(LEDGER.rows.map((r) => r.id)));
+			for (const entry of manifest.entries) {
+				expect(entry.status).toBe("present");
+				expect(entry.contentHash).toMatch(/^[0-9a-f]{64}$/);
+			}
+
+			const out = proc.stdout.trim();
+			expect(out.startsWith(`${SENTINEL_OK} `)).toBe(true);
+			expect(out).toContain(`runId=${manifest.runId}`);
+			expect(out).toContain(`rows=${LEDGER.rows.length}`);
+			expect(out).toContain(`manifest=${manifestPath}`);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("CLI removes a stale manifest when input loading fails", () => {
+		const dir = mkdtempSync(join(tmpdir(), "docs-ev-load-fail-"));
+		try {
+			const ledgerPath = join(dir, "broken-ledger.json");
+			const scDir = join(dir, "sidecars");
+			mkdirSync(scDir, { recursive: true });
+			writeFileSync(ledgerPath, "{");
+			const manifestPath = join(scDir, RUN_MANIFEST_FILENAME);
+			writeFileSync(manifestPath, '{"schema":"pi.docs.evidence.run.v1"}\n');
+
+			const proc = spawnSync(
+				"bun",
+				[
+					"run",
+					"scripts/verification/docs-evidence.ts",
+					"--ledger",
+					relative(REPO_ROOT, ledgerPath),
+					"--sidecar-dir",
+					scDir,
+				],
+				{ cwd: REPO_ROOT, encoding: "utf8", timeout: 30000 },
+			);
+
+			expect(proc.status).toBe(1);
+			expect(proc.stderr).toContain("failed to load inputs");
+			expect(existsSync(manifestPath)).toBe(false);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("CLI rejects a coordinated ledger and inventory omission", () => {
+		const dir = mkdtempSync(join(tmpdir(), "docs-ev-row-contract-"));
+		try {
+			const omittedSurface = LEDGER.rows.at(-1)?.surface;
+			expect(omittedSurface).toBeTruthy();
+			const ledgerPath = join(dir, "ledger.json");
+			const inventoryPath = join(dir, "inventory.json");
+			const scDir = join(dir, "sidecars");
+			writeFileSync(
+				ledgerPath,
+				JSON.stringify({ ...LEDGER, rows: LEDGER.rows.slice(0, -1) }, null, 2),
+			);
+			writeFileSync(
+				inventoryPath,
+				JSON.stringify(
+					{
+						...INVENTORY,
+						categories: INVENTORY.categories.map((category) => ({
+							...category,
+							surfaces: category.surfaces.filter((surface) => surface !== omittedSurface),
+						})),
+					},
+					null,
+					2,
+				),
+			);
+
+			const proc = spawnSync(
+				"bun",
+				[
+					"run",
+					"scripts/verification/docs-evidence.ts",
+					"--ledger",
+					relative(REPO_ROOT, ledgerPath),
+					"--inventory",
+					relative(REPO_ROOT, inventoryPath),
+					"--sidecar-dir",
+					scDir,
+				],
+				{ cwd: REPO_ROOT, encoding: "utf8", timeout: 30000 },
+			);
+
+			expect(proc.status).toBe(1);
+			expect(proc.stderr).toContain(
+				`ledger has ${EXPECTED_LEDGER_ROW_COUNT - 1} rows, contract requires ${EXPECTED_LEDGER_ROW_COUNT}`,
+			);
+			expect(existsSync(join(scDir, RUN_MANIFEST_FILENAME))).toBe(false);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });
 
 describe("docs-evidence: ledger structure", () => {
-	test("ledger row count equals inventory surface count", () => {
-		const expected = inventorySurfaceCount(INVENTORY);
-		expect(LEDGER.rows.length).toBe(expected);
+	test("ledger row count equals the fixed contract and inventory surface count", () => {
+		const inventoryCount = inventorySurfaceCount(INVENTORY);
+		expect(LEDGER.rows.length).toBe(EXPECTED_LEDGER_ROW_COUNT);
+		expect(LEDGER.rows.length).toBe(inventoryCount);
 	});
 
 	test("every row carries an owner and a closed class", () => {
@@ -130,6 +264,21 @@ describe("docs-evidence: ledger structure", () => {
 			expect(row.owner).toBeTruthy();
 			expect(isEvidenceClass(row.class)).toBe(true);
 		}
+	});
+
+	test("every row carries a known status and a nonempty target equal to its surface", () => {
+		for (const row of LEDGER.rows) {
+			expect(isEvidenceStatus(row.status)).toBe(true);
+			expect(row.status).toBe("present");
+			expect(row.target.length).toBeGreaterThan(0);
+			expect(row.target).toBe(row.surface);
+		}
+	});
+
+	test("canonicalJson is key-order independent (stable ledger hashing)", () => {
+		const a = { schema: "s", referencePin: "r", rows: [{ id: "x", surface: "y" }] };
+		const b = { rows: [{ surface: "y", id: "x" }], referencePin: "r", schema: "s" };
+		expect(canonicalJson(a)).toBe(canonicalJson(b));
 	});
 
 	test("exactly one reference-pin literal is recorded", () => {
@@ -176,6 +325,8 @@ describe("docs-evidence: mutation suite (per class)", () => {
 			id: "mut-vp-missing",
 			surface: "test",
 			owner: "DOC-A",
+			status: "present",
+			target: "test",
 			class: "version-pin",
 			params: { label: "PROTOCOL_VERSION", source: "packages/pi-tui-protocol/src/types.ts" },
 		};
@@ -189,6 +340,8 @@ describe("docs-evidence: mutation suite (per class)", () => {
 			id: "mut-unknown-class",
 			surface: "test",
 			owner: "DOC-A",
+			status: "present",
+			target: "test",
 			class: "nonexistent-class",
 			params: {},
 		};
@@ -281,6 +434,8 @@ describe("docs-evidence: mutation suite (per class)", () => {
 			id: "mut-command-field",
 			surface: "test",
 			owner: "DOC-A",
+			status: "present",
+			target: "test",
 			class: "review-only-prose",
 			params: { source: ".references/pi/README.md" },
 			command: "bun run something",
@@ -312,6 +467,114 @@ describe("docs-evidence: mutation suite (per class)", () => {
 		rmSync(dir, { recursive: true, force: true });
 		expect(result.ok).toBe(false);
 		expect(result.problems.some((p) => p.includes("contentHash mismatch"))).toBe(true);
+	});
+
+	test("missing status fails", () => {
+		const { status: _status, ...row } = sampleRow("review-only-prose", "mut-status-missing");
+		const result = runScratchCheck([row as LedgerRow]);
+		expect(result.ok).toBe(false);
+		expect(result.problems.some((p) => p.includes("unknown or missing status"))).toBe(true);
+	});
+
+	test("unknown status fails", () => {
+		const row = { ...sampleRow("review-only-prose", "mut-status-bogus"), status: "proven" };
+		const result = runScratchCheck([row as LedgerRow]);
+		expect(result.ok).toBe(false);
+		expect(result.problems.some((p) => p.includes("unknown or missing status: proven"))).toBe(true);
+	});
+
+	for (const pendingStatus of ["pending-port", "pending-evidence"] as const) {
+		test(`${pendingStatus} blocks a successful run manifest`, () => {
+			const outer = mkdtempSync(join(tmpdir(), `docs-ev-${pendingStatus}-`));
+			const scDir = join(outer, "sidecars");
+			const row = {
+				...sampleRow("review-only-prose", `mut-${pendingStatus}`),
+				status: pendingStatus,
+			};
+			const result = runScratchCheck([row], CANONICAL_REFERENCE_SHA, scDir);
+			try {
+				expect(result.ok).toBe(false);
+				expect(result.problems.some((p) => p.includes(`status ${pendingStatus} is not final`))).toBe(true);
+				expect(result.manifestPath).toBeNull();
+				expect(existsSync(join(scDir, RUN_MANIFEST_FILENAME))).toBe(false);
+			} finally {
+				rmSync(outer, { recursive: true, force: true });
+			}
+		});
+	}
+
+	test("missing target fails", () => {
+		const { target: _target, ...row } = sampleRow("review-only-prose", "mut-target-missing");
+		const result = runScratchCheck([row as LedgerRow]);
+		expect(result.ok).toBe(false);
+		expect(result.problems.some((p) => p.includes("missing target"))).toBe(true);
+	});
+
+	test("empty target fails", () => {
+		const row = { ...sampleRow("review-only-prose", "mut-target-empty"), target: "" };
+		const result = runScratchCheck([row as LedgerRow]);
+		expect(result.ok).toBe(false);
+		expect(result.problems.some((p) => p.includes("missing target"))).toBe(true);
+	});
+
+	test("target that differs from its surface fails", () => {
+		const row = {
+			...sampleRow("review-only-prose", "mut-target-mismatch"),
+			target: "different-surface",
+		};
+		const result = runScratchCheck([row]);
+		expect(result.ok).toBe(false);
+		expect(result.problems.some((p) => p.includes("does not match surface"))).toBe(true);
+	});
+
+	test("clean run writes a run manifest with sorted present entries", () => {
+		const outer = mkdtempSync(join(tmpdir(), "docs-ev-manifest-ok-"));
+		const scDir = join(outer, "sidecars");
+		const rows = [
+			sampleRow("review-only-prose", "zz-manifest-prose"),
+			sampleRow("changelog-unreleased", "aa-manifest-changelog"),
+		];
+		const result = runScratchCheck(rows, CANONICAL_REFERENCE_SHA, scDir);
+		const manifestPath = join(scDir, RUN_MANIFEST_FILENAME);
+		try {
+			expect(result.ok).toBe(true);
+			expect(result.manifestPath).toBe(manifestPath);
+			const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as RunManifest;
+			expect(manifest.schema).toBe(RUN_MANIFEST_SCHEMA);
+			expect(manifest.referencePin).toBe(CANONICAL_REFERENCE_SHA);
+			expect(manifest.ledgerHash).toBe(
+				sha256(canonicalJson({ schema: "pi.docs.evidence.v1", referencePin: CANONICAL_REFERENCE_SHA, rows })),
+			);
+			expect(manifest.rowCount).toBe(2);
+			expect(manifest.presentCount).toBe(2);
+			expect(manifest.entries.map((e) => e.rowId)).toEqual([
+				"aa-manifest-changelog",
+				"zz-manifest-prose",
+			]);
+			for (const entry of manifest.entries) {
+				expect(entry.status).toBe("present");
+				expect(entry.contentHash).toMatch(/^[0-9a-f]{64}$/);
+			}
+		} finally {
+			rmSync(outer, { recursive: true, force: true });
+		}
+	});
+
+	test("failed run removes a stale manifest and writes none", () => {
+		const outer = mkdtempSync(join(tmpdir(), "docs-ev-manifest-fail-"));
+		const scDir = join(outer, "sidecars");
+		mkdirSync(scDir, { recursive: true });
+		const manifestPath = join(scDir, RUN_MANIFEST_FILENAME);
+		writeFileSync(manifestPath, '{"schema":"pi.docs.evidence.run.v1"}\n');
+		const row = { ...sampleRow("review-only-prose", "mut-manifest-fail"), status: "bogus" };
+		const result = runScratchCheck([row as LedgerRow], CANONICAL_REFERENCE_SHA, scDir);
+		try {
+			expect(result.ok).toBe(false);
+			expect(result.manifestPath).toBeNull();
+			expect(existsSync(manifestPath)).toBe(false);
+		} finally {
+			rmSync(outer, { recursive: true, force: true });
+		}
 	});
 });
 
@@ -352,7 +615,7 @@ describe("docs-evidence: reference-pin literal", () => {
 
 describe("docs-evidence: staleness logic", () => {
 	const now = new Date().toISOString();
-	const row: LedgerRow = { id: "stale-unit", surface: "s", owner: "DOC-A", class: "review-only-prose", params: { source: "x" } };
+	const row: LedgerRow = { id: "stale-unit", surface: "s", owner: "DOC-A", status: "present", target: "s", class: "review-only-prose", params: { source: "x" } };
 
 	test("matching sidecar is not stale", () => {
 		const sc: Sidecar = { rowId: row.id, contentHash: "abc", toolVersion: TOOL_VERSION, runId: now };

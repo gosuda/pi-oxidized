@@ -10,7 +10,10 @@
  *    without UnknownArgError, so instructions cannot name a flag the parser
  *    rejects.
  * 2. Every fenced dry-run command succeeds as a real dry-run execution for
- *    all seven targets.
+ *    all seven targets: the produced archive and `.sha256` sidecar are
+ *    verified against the current repo docs tree, README.md, CHANGELOG.md,
+ *    and the release.json digest table (zip lane via the library extractor,
+ *    tar.gz lanes via the SpawnRunner tar pattern).
  * 3. The release-path CHANGELOG gate is present in both dry-run and full-build
  *    modes (the gate runs before any build work, so the mode does not matter,
  *    but the test exercises both code paths through changelogGateFailure).
@@ -23,20 +26,27 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 
+import { checksumLine, extractZip, sha256Bytes } from "../release/archive.ts";
 import { parseReleaseArgs, UnknownArgError } from "../release/args.ts";
 import { changelogGateFailure } from "../package-release.ts";
-import { realFs, type Fs } from "../release/runner.ts";
+import { realFs, SpawnRunner, type Fs } from "../release/runner.ts";
 import {
 	RELEASE_MANIFEST_SCHEMA,
 	type ReleaseManifest,
-	type ManifestFile,
 } from "../release/stage.ts";
-import { RUST_TARGETS, TARGET_PLANS, type TargetPlan } from "../release/targets.ts";
+import {
+	archiveName,
+	checksumName,
+	planFor,
+	RUST_TARGETS,
+	TARGET_PLANS,
+	type TargetPlan,
+} from "../release/targets.ts";
 
 const REPO_ROOT = resolve(import.meta.dirname, "../..");
 const RELEASE_DOC = readFileSync(join(REPO_ROOT, "docs/release.md"), "utf8");
@@ -149,6 +159,136 @@ function extractCiMatrixTargets(workflow: string): string[] {
 
 const bytes = (text: string) => new TextEncoder().encode(text);
 
+/** Recursively collect POSIX-style relative file paths under `root`, sorted. */
+function walkFiles(root: string): string[] {
+	const files: string[] = [];
+	const visit = (absDir: string, relDir: string): void => {
+		for (const dirent of readdirSync(absDir, { withFileTypes: true })) {
+			const childRel = relDir === "" ? dirent.name : `${relDir}/${dirent.name}`;
+			if (dirent.isDirectory()) {
+				visit(join(absDir, dirent.name), childRel);
+			} else if (dirent.isFile()) {
+				files.push(childRel);
+			}
+		}
+	};
+	visit(root, "");
+	return files.sort();
+}
+
+/**
+ * Extract a produced release archive: the library zip helper on the Windows
+ * lane, `tar -xzf` through the SpawnRunner pattern everywhere else (mirrors
+ * unpackArchive in scripts/package-release.ts).
+ */
+async function extractArchive(
+	archivePath: string,
+	plan: TargetPlan,
+	outDir: string,
+): Promise<void> {
+	if (plan.archive === "zip") {
+		await extractZip(archivePath, outDir);
+		return;
+	}
+	const result = await new SpawnRunner().run("tar", ["-xzf", archivePath, "-C", outDir], {
+		rejectOnError: false,
+		timeoutMs: 60_000,
+	});
+	if (result.exitCode !== 0) {
+		throw new Error(`tar exited ${result.exitCode}: ${result.stderr.slice(0, 500)}`);
+	}
+}
+
+/** Read the workspace version from package.json with runtime narrowing. */
+function workspaceVersion(): string {
+	const parsed: unknown = JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8"));
+	if (typeof parsed !== "object" || parsed === null || !("version" in parsed)) {
+		throw new Error("package.json carries no version field");
+	}
+	const { version } = parsed;
+	if (typeof version !== "string") {
+		throw new Error("package.json version is not a string");
+	}
+	return version;
+}
+
+/** Runtime narrowing for release.json bytes produced by a real dry-run. */
+function isReleaseManifest(value: unknown): value is ReleaseManifest {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		"schema" in value &&
+		typeof value.schema === "string" &&
+		"files" in value &&
+		Array.isArray(value.files)
+	);
+}
+
+async function verifyReleaseArchiveBundle(
+	bundleDir: string,
+	extractDir: string,
+	plan: TargetPlan,
+	pkgVersion: string,
+	repoDocMembers: readonly string[],
+): Promise<void> {
+	const archiveBase = archiveName(pkgVersion, plan);
+	const archivePath = join(bundleDir, archiveBase);
+	const checksumPath = join(bundleDir, checksumName(archiveBase));
+	expect(existsSync(archivePath)).toBe(true);
+	expect(existsSync(checksumPath)).toBe(true);
+
+	const digest = sha256Bytes(readFileSync(archivePath));
+	expect(readFileSync(checksumPath, "utf8")).toBe(checksumLine(digest, archiveBase));
+
+	mkdirSync(extractDir, { recursive: true });
+	await extractArchive(archivePath, plan, extractDir);
+	const archiveDirPath = join(extractDir, plan.archiveDir);
+	const releaseJsonPath = join(archiveDirPath, "release.json");
+	expect(existsSync(releaseJsonPath)).toBe(true);
+	const parsedManifest: unknown = JSON.parse(readFileSync(releaseJsonPath, "utf8"));
+	if (!isReleaseManifest(parsedManifest)) {
+		throw new Error(`${plan.archiveDir}/release.json is not a ReleaseManifest`);
+	}
+	const manifest: ReleaseManifest = parsedManifest;
+	expect(manifest.schema).toBe(RELEASE_MANIFEST_SCHEMA);
+	expect(manifest.version).toBe(pkgVersion);
+	expect(manifest.rustTarget).toBe(plan.rustTarget);
+	expect(manifest.bunTarget).toBe(plan.bunTarget);
+
+	const drift: string[] = [];
+	for (const rel of repoDocMembers) {
+		const entry = manifest.files.find((file) => file.path === rel);
+		if (entry === undefined) {
+			drift.push(`${rel}: missing from release.json`);
+			continue;
+		}
+		const repoBuf = readFileSync(join(REPO_ROOT, rel));
+		if (entry.size !== repoBuf.length) {
+			drift.push(`${rel}: size ${entry.size} != repo ${repoBuf.length}`);
+		}
+		if (entry.sha256 !== sha256Bytes(repoBuf)) {
+			drift.push(`${rel}: sha256 ${entry.sha256} != repo digest`);
+		}
+		const extractedPath = join(archiveDirPath, rel);
+		if (!existsSync(extractedPath)) {
+			drift.push(`${rel}: missing from archive`);
+		} else if (!repoBuf.equals(readFileSync(extractedPath))) {
+			drift.push(`${rel}: archived bytes differ from repo bytes`);
+		}
+	}
+	expect(drift).toEqual([]);
+
+	for (const file of manifest.files) {
+		if (file.path.startsWith("docs/")) expect(repoDocMembers).toContain(file.path);
+	}
+	const walked = walkFiles(extractDir);
+	const expectedMembers = [
+		...manifest.files.map((file) => `${plan.archiveDir}/${file.path}`),
+		`${plan.archiveDir}/release.json`,
+	].sort();
+	expect(walked).toEqual(expectedMembers);
+}
+
 // ---------------------------------------------------------------------------
 // 1. Fenced command extraction test
 // ---------------------------------------------------------------------------
@@ -190,26 +330,85 @@ describe("DOC-E: docs/release.md fenced commands parse through parseReleaseArgs"
 });
 
 // ---------------------------------------------------------------------------
-// 2. Dry-run execution for all seven targets
+// 2. Real dry-run archives verified against the repo docs tree
 // ---------------------------------------------------------------------------
 
 describe("DOC-E: dry-run succeeds for every seven targets", () => {
+	const pkgVersion = workspaceVersion();
+
+	/** Repo members every archive must ship: the whole docs tree + root metadata. */
+	const repoDocMembers = [
+		...walkFiles(join(REPO_ROOT, "docs")).map((rel) => `docs/${rel}`),
+		"README.md",
+		"CHANGELOG.md",
+	].sort();
+
+	test("the repo docs tree enumerates real members for every archive", () => {
+		expect(repoDocMembers.length).toBeGreaterThan(0);
+		expect(repoDocMembers).toContain("README.md");
+		expect(repoDocMembers).toContain("CHANGELOG.md");
+	});
+
 	for (const triple of RUST_TARGETS) {
-		test(`dry-run ${triple}`, () => {
+		test(`dry-run ${triple}: .sha256 sidecar, archive members, release.json digests`, async () => {
+			const plan = planFor(triple);
 			const outDir = mkdtempSync(join(tmpdir(), `doc-e-dry-${triple}-`));
+			const extractDir = join(outDir, "extracted");
 			try {
 				const proc = spawnSync(
 					"bun",
 					["run", "scripts/package-release.ts", "--target", triple, "--dry-run", "--out", outDir],
 					{ cwd: REPO_ROOT, encoding: "utf8", timeout: 60_000 },
 				);
-				expect(proc.status).toBe(0);
+				if (proc.status !== 0) {
+					throw new Error(
+						`package-release --dry-run exited ${proc.status}: ${proc.stderr.slice(-2000)}`,
+					);
+				}
+
+				// Final-tree archive + checksum under the deterministic target names.
+				await verifyReleaseArchiveBundle(
+					outDir,
+					extractDir,
+					plan,
+					pkgVersion,
+					repoDocMembers,
+				);
 			} finally {
 				rmSync(outDir, { recursive: true, force: true });
 			}
 		}, 60_000);
 	}
 });
+
+const relCloseArtifactRoot = process.env["PI_RELCLOSE_ARTIFACT_DIR"];
+if (relCloseArtifactRoot !== undefined) {
+	describe("DOC-F: consumed REL-CLOSE archive artifacts", () => {
+		const pkgVersion = workspaceVersion();
+		const repoDocMembers = [
+			...walkFiles(join(REPO_ROOT, "docs")).map((rel) => `docs/${rel}`),
+			"README.md",
+			"CHANGELOG.md",
+		].sort();
+
+		for (const triple of RUST_TARGETS) {
+			test(`consume pi-${triple}`, async () => {
+				const extractDir = mkdtempSync(join(tmpdir(), `doc-f-rel-close-${triple}-`));
+				try {
+					await verifyReleaseArchiveBundle(
+						join(relCloseArtifactRoot, `pi-${triple}`),
+						extractDir,
+						planFor(triple),
+						pkgVersion,
+						repoDocMembers,
+					);
+				} finally {
+					rmSync(extractDir, { recursive: true, force: true });
+				}
+			}, 60_000);
+		}
+	});
+}
 
 // ---------------------------------------------------------------------------
 // 3. CHANGELOG gate in both dry-run and full-build modes
@@ -342,6 +541,24 @@ describe("DOC-E: platform matrix matches RUST_TARGETS and CI matrix", () => {
 			.split(/\r?\n/)
 			.filter((line) => line.startsWith("|") && !line.includes("---") && !line.includes("Rust target"));
 		expect(tableRows.length).toBe(7);
+	});
+});
+
+describe("DOC-F: root README crate catalog", () => {
+	test("catalog rows equal Cargo workspace members", () => {
+		const cargo = readFileSync(join(REPO_ROOT, "Cargo.toml"), "utf8");
+		const workspace = cargo.match(/\[workspace\]([\s\S]*?)\n\[/)?.[1] ?? "";
+		const members = [...workspace.matchAll(/^\s*"([^"]+)",?\s*$/gm)]
+			.map((match) => match[1])
+			.filter((member): member is string => member !== undefined);
+		const readme = readFileSync(join(REPO_ROOT, "README.md"), "utf8");
+		const catalog = readme.match(/## Workspace crates\n([\s\S]*?)\n## /)?.[1] ?? "";
+		const catalogPaths = [...catalog.matchAll(/\]\((crates\/[^)]+)\)/g)]
+			.map((match) => match[1])
+			.filter((path): path is string => path !== undefined);
+
+		expect(catalogPaths).toEqual(members);
+		expect(new Set(catalogPaths).size).toBe(5);
 	});
 });
 

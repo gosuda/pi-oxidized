@@ -43,23 +43,23 @@ The following dispositions are ratified; any structural change executes only und
 | userMessageText | theme.rs `ThemeColor::UserMessageText` line 76; `ALL_FG` line 179; `ALL_FG_SLOTS` line 1824; `REQUIRED_COLORS` line 1772; `make_fg` line 586 | Registered and resolved, but **no render path consumes it** — user blocks color via `BorderAccent` | **KEEP** — `REQUIRED_COLORS` member; HTML export emits `--userMessageText` via `from_resolved` | TUI-T7 #69 |
 | customMessageText | theme.rs `ThemeColor::CustomMessageText` line 78; `ALL_FG` line 180; `ALL_FG_SLOTS` line 1825; `REQUIRED_COLORS` line 1774; `make_fg` line 587 | Registered and resolved, but **no render path consumes it** — custom blocks color via `CustomMessageLabel` | **KEEP** — `REQUIRED_COLORS` member; HTML export emits `--customMessageText` via `from_resolved` | TUI-T7 #69 |
 | TruncatedText | was `crates/pi-tui/src/components/truncated_text.rs`; re-export was `components/mod.rs` | **Zero callsites** outside its own module | **DELETED** — module and public re-export removed under TUI-T7 #69; no alias/shim | TUI-T7 #69 |
-| EditorBorder::Muted | written in runtime.rs line 4481 (thinking-level off ⊢ Muted); asserted in tests line 7413 | Written into `view.editor.border`; **no paint path reads the editor border** | **WIRE** — editor must consume EditorBorder via EditorTheme so Muted renders | TUI-T4 #65 |
-| EditorBorder::Bash | written in runtime.rs `dispatch_bash` line 2620 and sync line 4479; asserted in tests line 7397 | Write-only state; **no paint path reads it** | **WIRE** — editor must consume EditorBorder via EditorTheme so Bash renders | TUI-T4 #65 |
-| EditorBorder::Thinking | written in runtime.rs sync line 4483; asserted in tests line 7702 | Write-only state; **no paint path reads it** | **WIRE** — editor must consume EditorBorder via EditorTheme so Thinking renders | TUI-T4 #65 |
-| EditorTheme.border_color | `crates/pi-tui/src/components/editor/mod.rs` `EditorTheme` line 56, field line 56; stored into `Editor.border_color` line 177; constructed with `EditorTheme::default()` (identity, lines 59-66) at `runtime.rs` line 1358 | Stored but **never read in any paint fn**; `default()` supplies the identity closure, so today nothing changes | **WIRE** — the live editor consumes EditorBorder via EditorTheme instead of `EditorTheme::default()` at runtime.rs:1358 | TUI-T4 #65 |
+| EditorBorder::Muted | `runtime.rs` constructs `EditorTheme` from `EditorBorder::Muted` and synchronizes the live editor border as state changes | Painted by the live editor through `EditorTheme.border_color` | **WIRED** — the editor consumes the current border color | TUI-T4 #65 |
+| EditorBorder::Bash | `dispatch_bash` and runtime synchronization select the Bash border state | Painted by the live editor through `EditorTheme.border_color` | **WIRED** — bash mode reaches the editor glyphs | TUI-T4 #65 |
+| EditorBorder::Thinking | runtime synchronization selects the Thinking border state | Painted by the live editor through `EditorTheme.border_color` | **WIRED** — thinking state reaches the editor glyphs | TUI-T4 #65 |
+| EditorTheme.border_color | `crates/pi-tui/src/components/editor/mod.rs` stores the resolved editor border color; interactive runtime constructs the theme from `EditorBorder` | Read by the editor paint path | **WIRED** — `live_editor_border_painter_tracks_footer_and_bash_transitions` pins the state-to-paint contract | TUI-T4 #65 |
 
 ### Notes
 
 The eight required inert slots (`SelectedBg`, `UserMessageBg`, `CustomMessageBg`, `ToolPendingBg`, `ToolSuccessBg`, `ToolErrorBg`, `userMessageText`, `customMessageText`) are members of `REQUIRED_COLORS` (theme.rs line 1758). `ThemeJson::from_value` hard-fails a theme that omits any required slot (`ThemeError::MissingColor`, line 1315). HTML export consumes all nine slots (those eight plus `ScrollbarThumb`) through `ExportTheme::from_resolved`, which walks `fg_slot_names`/`bg_slot_names` into CSS variables (`export_html/mod.rs` lines 219-240); `generate_html` also reads `userMessageBg` to derive page/card/info backgrounds (lines 572-577). TUI-T7 #69 therefore ratifies **KEEP** for all nine live theme slots.
 - `scrollbarThumb` is the one background slot not in `REQUIRED_COLORS`; the parser synthesizes it from `selectedBg` when absent (theme.rs lines 1338-1341). It remains a schema/wire token exported to HTML; its only plausible terminal renderer (an alt-screen scroll thumb) lives in TUI-G4's domain.
-The EditorBorder family and `EditorTheme.border_color` form the single genuinely write-only surface: the runtime maintains the border state faithfully (and its tests pin it), but the `Editor` is constructed with the identity theme, so the state never reaches a glyph. Wiring is TUI-T4's job, not TUI-G3's.
+The EditorBorder family and `EditorTheme.border_color` now form one live paint path. The runtime resolves the current border state, synchronizes the editor theme, and the editor reads that color while painting. The runtime regression test pins footer and bash transitions.
 
 ## 4. Deferred execution owners
 
 Everything that would change a `.rs` file is out of scope for TUI-G3 and is routed to exactly one follow-on decision track:
 
 - **TUI-T7 (#69)** — executed: **KEEP** the nine theme slots (eight `REQUIRED_COLORS` members plus `ScrollbarThumb`) because schema parse and HTML export consume them; **DELETED** zero-caller `TruncatedText` (module + re-export, no shim).
-- **TUI-T4 (#65)** — owns: making the live editor consume `EditorBorder` state via `EditorTheme` instead of `EditorTheme::default()` at `runtime.rs:1358`.
+- **TUI-T4 (#65)** — executed: the live editor consumes `EditorBorder` state through `EditorTheme`; the runtime regression test covers state transitions.
 - **TUI-G4 (#35)** — owns: the alt-screen / scroll-view surface, the only domain where a `scrollbarThumb` renderer would ever exist.
 
 ## 5. Scope

@@ -4,8 +4,9 @@ Product-agnostic terminal components and lifecycle.
 
 ## Workspace topology
 
-`pi-tui` is a **dependency-free** leaf crate — it has no workspace dependencies.
-It is depended on by `pi-ext` and `pi`.
+`pi-tui` is a product-workspace leaf crate: it has no dependency on the other four
+product crates. Its render-churn benchmark alone uses `bench/pi-bench-alloc`.
+`pi-ext` and `pi` depend on `pi-tui`.
 
 ```
 pi-ai  (no workspace deps)

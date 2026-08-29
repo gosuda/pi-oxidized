@@ -24,7 +24,7 @@ The full topology is owned by the root `AGENTS.md` and generated from workspace
 |---|---|
 | `cli` | CLI entry point and argument parsing |
 | `core` | Core product services |
-| `modes` | Operating modes (TUI, RPC, JSON, print) |
+| `modes` | Operating modes (interactive, print including JSON, RPC, and run) |
 | `remote` | Remote session server and transport |
 
 ## Public re-exports

@@ -27,7 +27,7 @@ Statuses are evidence-bearing: `landed` names an existing owner seam; `folded` r
 | G6 | Execution environment | pi-agent | tool.rs plus pi concrete tools | tool execution contract | folded | One native environment exists; no shallow ExecutionEnv wrapper is introduced. |
 | G7 | Agent-harness built-in tool copies | pi | core/tools/ | product tool registry | folded | Duplicated harness tools fold into C5. |
 | G8 | Session persistence including sqlite-node | pi | core/sessions/, core/agent_session/persistence.rs, core/migrations.rs | session store | folded | JSONL, memory, and SQLite persistence have one product consumer and owner. |
-| G9 | Vendor-neutral telemetry schema and span context | pi-agent | telemetry.rs | TelemetryContext | landed | PAR-TEL (#71) landed pi-agent::telemetry with one injected no-fail TelemetryContext (e91ee94); all five AgentLoopConfig literal sites carry telemetry (enumeration witness every_agent_loop_config_literal_carries_telemetry, count = 5); compaction spans emit through the same injected context. Exporter adapters remain in pi; install-telemetry gating remains C18. |
+| G9 | Vendor-neutral telemetry schema and span context | pi-agent | telemetry.rs | TelemetryContext | landed | PAR-TEL (#71) landed pi-agent::telemetry with one injected no-fail TelemetryContext (e91ee94); all six AgentLoopConfig literal sites carry telemetry (enumeration witness every_agent_loop_config_literal_carries_telemetry, count = 6); compaction spans emit through the same injected context. Exporter adapters remain in pi; install-telemetry gating remains C18. |
 | G10 | Session-testing utilities | pi-agent | test support | dev-only support | dev-only | This surface never ships as product code. |
 | G11 | Message, event, and state model | pi-agent | message.rs, event.rs, state.rs, bus.rs | lifecycle event bus | landed | Agent lifecycle events remain distinct from provider stream events. |
 | T1 | Differential rendering engine | pi-tui | frame.rs, terminal/ | frame buffer | landed | Rendering remains product-agnostic. PAR-PTY-GRILL verified: host-tier PTY evidence proves zero full-screen clears, row-local erase with immediate reflow, and continuous content across resizes (crates/pi-tui/tests/pty_grill_adjudication.rs). |
@@ -79,7 +79,7 @@ Finalized by PAR-CLOSE (#39). Each entry names the deleted surface, the ruling, 
 
 The workspace contains exactly `pi`, `pi-agent`, `pi-ai`, `pi-ext`, and `pi-tui`. Its complete internal edge set is `pi-agent -> pi-ai`, `pi-ext -> pi-ai`, `pi-ext -> pi-agent`, `pi-ext -> pi-tui`, and `pi -> pi-ai`, `pi -> pi-agent`, `pi -> pi-ext`, `pi -> pi-tui`. `pi-ai` and `pi-tui` have no workspace dependencies. `pi-agent` must not import `pi_ext` or `pi_tui`; `pi-ext` must not import `pi`.
 
-The shared arbitration oracle is exactly five `AgentLoopConfig` literal sites: `crates/pi-agent/src/agent.rs:62-88`, `crates/pi-agent/src/config.rs:360-389`, `crates/pi-agent/src/run.rs:835-861`, `crates/pi-agent/src/schedule.rs:902-928`, and `crates/pi/src/core/agent_session/mod.rs:463-489`.
+The shared arbitration oracle is exactly six `AgentLoopConfig` literal sites: `crates/pi-agent/src/agent.rs:62-88`, `crates/pi-agent/src/config.rs:360-389`, `crates/pi-agent/src/run.rs:835-861`, `crates/pi-agent/src/schedule.rs:902-928`, `crates/pi/src/core/agent_session/mod.rs:463-489`, and `crates/pi-agent/src/bin/pi_agent_stream_frame_bench.rs:267-294`.
 
 ## Graduated parity-ticket DAG
 

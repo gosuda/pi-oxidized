@@ -60,9 +60,9 @@ any 0.x minor step, any major step, toolchain channel → **X**.
 
 | Member | Pinned | Policy floor | **2026-08-27 stable channel** |
 |---|---|---|---|
-| rust-toolchain | 1.97.1 | ≥1.98.0 | **1.98.0** (`88d9e12ae 2026-08-18`, channel date 2026-08-20) |
+| rust-toolchain | 1.97.1 | [compatibility.md § Engine Floors, Rust row](compatibility.md#engine-floors) | **stable channel at that row's floor version** (`88d9e12ae 2026-08-18`, channel date 2026-08-20) |
 
-`rust-std` publishes both musl triples on the 1.98.0 channel
+`rust-std` publishes both musl triples on the channel version matching the Rust floor registered in [compatibility.md § Engine Floors](compatibility.md#engine-floors)
 (`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`: `available = true`),
 so the EXT-26 musl legs stay provisionable on the re-grounded toolchain.
 
@@ -105,7 +105,9 @@ consumed read-only here — never re-implemented:
   execution from the unpacked archive; static-link/unpack/integrity gates
   (zero `readelf -d` NEEDED, `ldd` "not a dynamic executable", ELF whitelist,
   pass1/pass2 checksum diff); compiled-host JSONL handshake smoke (protocol
-  v1 / compatibility 0.80.10); bundled-Bun-fallback JSONL smoke. Musl legs
+  v1 / compatibility version per the `COMPATIBILITY_VERSION` row of
+  [compatibility.md § Protocol and Compatibility Versions](compatibility.md#protocol-and-compatibility-versions));
+  bundled-Bun-fallback JSONL smoke. Musl legs
   carry zero interaction claims; QEMU is a labeled contingency only.
 - **Runner topology and evidence rules:** EXT-26's binding five-Tier-N table
   with resolved-image-version evidence fields.
@@ -114,23 +116,26 @@ consumed read-only here — never re-implemented:
   change; scheduled epoch members always run the full lane (no pre-approved
   exemptions, EXT-23).
 
-**Epoch-start gate status (honest, at re-grounding date):** EXT-26 has landed
-and the target/asset-pin model is in the tree, but the seven-leg CI wiring
-itself is REL-T4 (#108, open) — the workflow matrix currently holds the five
-build/test triples. Per EXT-23 Phase 1 ("EXT-26 lanes usable or epochs do not
-start"), **no epoch (DEPS-B1 onward) may start until REL-T4 wires the seven
-legs**; this re-grounding does not downgrade the musl requirement.
+**Epoch-start gate status:** REL-T4 (#108) landed the seven-leg workflow matrix.
+All five build/test triples and both musl artifact-proof legs now run in
+`.github/workflows/release-verification.yml`; the EXT-23 Phase 1 prerequisite
+is satisfied.
 
 ## 4. SBOM baseline (the per-epoch diff anchor)
 
 - Fixture: `scripts/verification/fixtures/deps-r1-sbom-baseline.json`
   (schema `pi.deps.sbom.v1`, captured 2026-08-27 against the clean tree at
   `20be789`, content sha256 `7a54b9d2bfe2…`).
+  This is the historical seed capture. The current baseline re-anchor is
+  `849122647411` (2026-08-28), with content sha256 `c62a6c51aeb2…`; DEPS-R2
+  owns the successor ledger.
 - Tooling: `scripts/verification/deps-sbom.ts` (`verify:sbom`). Content =
   499 locked Rust packages (48 direct pins, license + direct/dev-only edge
   position each), toolchain channel + CI pin, three package.json surfaces,
-  both bun.lock files of record (322 + 320 resolutions), bundled Bun runtime
-  1.3.14 + its seven sha256 asset pins, seven release targets.
+  both bun.lock files of record (322 + 320 resolutions), the bundled Bun
+  runtime pinned by the `BUN_RUNTIME_VERSION` row of
+  [compatibility.md § Runtime and Release Constants](compatibility.md#runtime-and-release-constants)
+  plus its seven sha256 asset pins, seven release targets.
 - Every epoch post-audit regenerates (`capture`) and diffs against this
   baseline; `verify` fails closed on drift (license/provenance/version
   movement). 8-test suite `deps-sbom.test.ts` pins the digest chain,
@@ -156,9 +161,10 @@ live registries:
   jiff/globset/ignore/memchr `Unlicense OR MIT`, aws-* / google-cloud-auth
   `Apache-2.0`, schemars/tokio-util `MIT`; npm: ignore/typebox/@types/bun
   `MIT`, typescript `Apache-2.0`. Zero license drift among scheduled pairs.
-- **npm direct pins:** ignore 7.0.5, @types/bun 1.3.9, typescript 5.9.3,
-  typebox 1.1.38, jiti 2.7.0 (latest, MIT) — all allowlisted. `file:`
-  workspace deps are local MIT sources, not registry pins.
+- **npm direct from-version pins at this re-verification date:** ignore 7.0.5,
+  @types/bun 1.3.9, typescript 5.9.3, typebox 1.1.38, jiti 2.7.0 (latest, MIT)
+  — all allowlisted. `file:` workspace deps are local MIT sources, not
+  registry pins. DEPS-R2 records the successor target versions.
 
 ## 6. Exposure-record seed (invariant ledger)
 
@@ -168,6 +174,9 @@ run on the **refreshed** canonical reference (capture head `20be789`, see §7);
 following the verdict-ledger convention for sanity rows, the `head` column cites
 the reference capture head. The refreshed reference landed as commit `0d65c6a`.
 Per-change verdicts; rows below are the seed, not permanent labels.
+The current exposure reference is the DOC-F final-tree re-anchor at
+`eb91d6b1d4fa` (2026-08-29); its metafile projection contains 2,491 inputs.
+The rows below remain the dated seed ledger.
 
 | head | date | subject | class | checks |
 |---|---|---|---|---|

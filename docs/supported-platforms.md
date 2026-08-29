@@ -12,10 +12,10 @@ pinned against their owning sources by `scripts/tests/supported-platforms.test.t
 ## 1. Seven release targets and their native runners
 
 The release surface is exactly seven Rust triples (`RUST_TARGETS`,
-`scripts/release/targets.ts:18-26`); `buildPlan` (`scripts/release/targets.ts:89-119`)
-derives each plan's archive format, libc class, Bun target, and archive directory from
-the triple alone so every packaging phase reads one source of truth
-(`scripts/release/targets.ts:48-52`).
+`scripts/release/targets.ts:18-26`). `buildPlan`
+(`scripts/release/targets.ts:89-119`) derives each plan's archive format,
+libc class, Bun target, and archive directory from the triple alone so every
+packaging phase reads one source of truth.
 
 | Rust target | Runner (workflow matrix) | Archive | Archive dir | Bun runtime asset |
 |---|---|---|---|---|
@@ -46,11 +46,13 @@ the triple alone so every packaging phase reads one source of truth
   `image_os`/`image_version` into `witness-environment.txt` (`workflow:609-620`), and
   every musl leg records the same image fields plus `rustc`/`bun` versions into its
   environment evidence (`workflow:231-243`).
-- Toolchains are pinned, not image-sourced: Rust `1.97.1` via SHA-pinned
-  `dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4` (`workflow:110-114`)
-  and Bun `1.3.14` via SHA-pinned
-  `oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6` (`workflow:116-119`); the
-  workspace floors are Rust `>=1.97.1` and Bun `>=1.3.0`
+- Every release leg installs the Rust version registered in [docs/compatibility.md#engine-floors](compatibility.md#engine-floors) through the SHA-pinned
+  `dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4` action (`workflow:110-114`).
+- Every release leg installs the Bun runtime registered in [docs/compatibility.md#runtime-and-release-constants](compatibility.md#runtime-and-release-constants)
+  through the SHA-pinned `oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6`
+  action (`workflow:116-119`).
+- The workspace Rust and Bun floors are registered in
+  [docs/compatibility.md#engine-floors](compatibility.md#engine-floors)
   (`Cargo.toml` `[workspace.package]` `rust-version`; `package.json` `engines.bun`).
 
 ## 2. Verbatim tier statement — five Tier N rows, two musl rows
@@ -128,7 +130,7 @@ musl smoke-lane row (`crates/pi-tui/tests/transcript_musl_smoke.rs:57`;
   packages twice and `diff -u dist/pass1/*.sha256 dist/pass2/*.sha256` must be empty
   (`workflow:593-603`); the musl legs repackage from the prebuilt `pi` with `--no-cargo`
   (`workflow:413-419`).
-- `release.json` carries schema `pi.release.v1` (`RELEASE_MANIFEST_SCHEMA`,
+- `release.json` carries the release schema constant (see [docs/compatibility.md#runtime-and-release-constants](compatibility.md#runtime-and-release-constants); `RELEASE_MANIFEST_SCHEMA`,
   `scripts/release/stage.ts:19`) with fields `schema`, `version`, `rustTarget`,
   `bunTarget`, `hostKind`, `compatibilityVersion`, `protocolVersion`,
   `sourceDateEpoch`, `createdAt`, `files` (`scripts/release/stage.ts:34-46`); each
@@ -258,7 +260,7 @@ musl smoke-lane row (`crates/pi-tui/tests/transcript_musl_smoke.rs:57`;
 
 1. Pick the new Bun version from the release channel and record the grounding date; the
    version constant is `BUN_RUNTIME_VERSION` in `scripts/release/runtime.ts:8`
-   (currently `1.3.14`).
+   (see [docs/compatibility.md#runtime-and-release-constants](compatibility.md#runtime-and-release-constants)).
 2. Re-pin all seven `ASSET_PINS` entries (`scripts/release/runtime.ts:25-61`) from the
    new release's official `SHASUMS256.txt` — the vendor-verification channel used for
    the current pins (REL-T2 #104; `docs/REL-R1-musl-toolchain-bakeoff.md` §5 Bun rows,

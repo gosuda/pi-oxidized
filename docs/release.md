@@ -13,12 +13,15 @@ The parser's accepted flag set is defined in `scripts/release/args.ts`
 
 ## 1. Prerequisites
 
-- Rust toolchain `>=1.97.1` (`Cargo.toml` `[workspace.package]` `rust-version`).
-- Bun `>=1.3.0` (`package.json` `engines.bun`); release-verification CI pins `1.3.14`
-  (`workflow:116-119`).
+- Rust toolchain at the registered `rust-version` floor (`Cargo.toml`
+  `[workspace.package]`; value in [compatibility.md](compatibility.md) → Engine Floors).
+- Bun at the registered `engines.bun` floor (`package.json`); release-verification CI
+  pins the Bun runtime recorded as `BUN_RUNTIME_VERSION`
+  ([compatibility.md](compatibility.md) → Runtime and Release Constants,
+  `workflow:116-119`).
 - The root `CHANGELOG.md` must carry a non-empty `## [Unreleased]` section.
   The release-path CHANGELOG gate (`scripts/package-release.ts:121-123`,
-  `changelogGateFailure` at lines 66-95) fails every build mode — dry-run,
+  `changelogGateFailure` at lines 65–98) fails every build mode — dry-run,
   no-cargo, and full — before any build work starts when the file is missing
   or the section is empty.
 
@@ -89,8 +92,8 @@ and their archive directories (`buildPlan`, `scripts/release/targets.ts:89-119`)
 |---|---|---|---|
 | `x86_64-unknown-linux-gnu` | `pi-linux-x64-base` | `tar.gz` | `bun-linux-x64-baseline` |
 | `x86_64-unknown-linux-musl` | `pi-linux-x64-musl-base` | `tar.gz` | `bun-linux-x64-musl-baseline` |
-| `aarch64-unknown-linux-gnu` | `pi-linux-arm64` | `tar.gz` | `bun-linux-aarch64` |
-| `aarch64-unknown-linux-musl` | `pi-linux-arm64-musl` | `tar.gz` | `bun-linux-aarch64-musl` |
+| `aarch64-unknown-linux-gnu` | `pi-linux-arm64` | `tar.gz` | `bun-linux-arm64` |
+| `aarch64-unknown-linux-musl` | `pi-linux-arm64-musl` | `tar.gz` | `bun-linux-arm64-musl` |
 | `x86_64-apple-darwin` | `pi-darwin-x64-base` | `tar.gz` | `bun-darwin-x64-baseline` |
 | `aarch64-apple-darwin` | `pi-darwin-arm64` | `tar.gz` | `bun-darwin-aarch64` |
 | `x86_64-pc-windows-msvc` | `pi-windows-x64-base` | `zip` | `bun-windows-x64-baseline` |
@@ -142,12 +145,15 @@ Then compare: `diff -u dist/pass1/*.sha256 dist/pass2/*.sha256`.
 
 ## 9. release.json schema
 
-`release.json` is shipped inside every archive with schema `pi.release.v1`
-(`RELEASE_MANIFEST_SCHEMA`, `scripts/release/stage.ts:19`). The `ReleaseManifest`
-interface (`scripts/release/stage.ts:34-46`) defines the fields:
+`release.json` is shipped inside every archive with the schema registered as
+`RELEASE_MANIFEST_SCHEMA` (`scripts/release/stage.ts:19`; value in
+[compatibility.md](compatibility.md) → Runtime and Release Constants). The
+`ReleaseManifest` interface (`scripts/release/stage.ts:34-46`) defines the fields:
 
-- `schema`: `"pi.release.v1"` (the `RELEASE_MANIFEST_SCHEMA` constant).
-- `version`: workspace version (e.g. `0.1.0`).
+- `schema`: the `RELEASE_MANIFEST_SCHEMA` constant (value in
+  [compatibility.md](compatibility.md) → Runtime and Release Constants).
+- `version`: the workspace version ([compatibility.md](compatibility.md) →
+  Workspace Version).
 - `rustTarget`: the Rust target triple.
 - `bunTarget`: the Bun compile target (incl. `-baseline` for x86_64, `-musl` for musl).
 - `hostKind`: `"compiled"` sidecar or `"runtime-bundle"` fallback.

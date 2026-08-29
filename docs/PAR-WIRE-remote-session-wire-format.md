@@ -15,7 +15,7 @@ C4 (`modes/rpc`, JSONL over stdio) is a different, already-landed surface. This 
 - Upstream `schemas.ts:260-450`: full message universe pinned — `ClientMessage` (hello + request envelope), `ServerMessage` (hello, hello_error, response envelope ok/error, event envelope), `Command`/`CommandResult` union, `ServerEvent` (server_snapshot, session_snapshot, session_progress, session_removed), `ServerSnapshot` (`protocolVersion: 1`, `revision`, sessions, models), `ProtocolErrorCode` ∈ {version, busy, session_locked, not_found, invalid_request, not_implemented, internal_error}.
 - Upstream consumer `packages/client/src/client.ts:1-13` imports `encodeClientMessage`, `Command`, `CommandResult`, `ResponseEnvelope`, `ServerEvent`, `ServerSnapshot` from `@earendil-works/pi-protocol` over `ByteTransport` (`transport.ts:1-18`): the TS client interop requirement binds to the CBOR+frame stack, not JSONL.
 - Upstream `packages/coding-agent/src/modes/rpc/` (rpc-mode, rpc-client, rpc-types, jsonl; 1,785 lines) is the JSONL surface and it does **not** import `pi-protocol`; JSONL and the CBOR remote stack are disjoint upstream surfaces.
-- Landed C4 port `crates/pi/src/modes/rpc/jsonl.rs:1-29` and the six-file `modes/rpc/` tree (8,096 lines, `types.rs` is 3,025) mirror `modes/rpc` exactly; the landed tree has no `pi::remote` yet (ledger rows R1–R4 `planned`).
+- Landed C4 port `crates/pi/src/modes/rpc/jsonl.rs:1-29` and the six-file `modes/rpc/` tree (8,096 lines, `types.rs` is 3,025) mirror `modes/rpc` exactly. The distinct `pi::remote` CBOR stack is now implemented under `crates/pi/src/remote/`; ledger rows R1–R4 record its codec, schemas, client transport, and server endpoint.
 
 ## Rejected option: JSONL for R1–R4
 

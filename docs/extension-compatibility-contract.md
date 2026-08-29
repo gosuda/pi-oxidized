@@ -236,7 +236,7 @@ later-override-unless-reserved rules?
    resolveRegisteredCommands` (lines 603-636) *before* the snapshot is
    serialized. The Rust side receives already-disambiguated invocation names
    as `CommandWire.name` (`crates/pi/src/core/extension_host.rs::CommandWire`,
-   line 299; consumed at `build_snapshot`, lines 509-516). The Rust
+   line 299; consumed by the command loop at lines 516-520). The Rust
    `Registry::register_command` (adapters.rs:1137-1143) applies first-wins on
    the *invocation name*, which is correct: two extensions registering
    `cmd` produce `cmd:1` and `cmd:2` in the wire, so both are stored. If the
@@ -276,7 +276,7 @@ later-override-unless-reserved rules?
    the Rust side is the trust boundary for a duplicated name.
 
    `witness (M4): crates/pi-ext/src/adapters.rs::tests::
-   registry_first_registration_wins` (line 1999) and
+   registry_first_registration_wins` (line 2154) and
    `crates/pi/src/core/extension_host/tests.rs::
    registry_first_registration_wins_for_duplicates` (line 697). Mutation:
    change `register_tool` to last-wins → duplicate returns `true` and
@@ -392,7 +392,7 @@ The full registry snapshot (`RegistrySnapshotWire` consumed by Rust
 - `flags`: `{ name, description, type, extensionPath, default?, value? }` from
   `runner.getFlags()` plus effective values from `runner.getFlagValues()`.
 - `renderers`: `{ type: "message" | "widget", name }`, deduplicated.
-- `providers`: entries from `::buildProviderSnapshot` (lines 2059-2077):
+- `providers`: entries from `::buildProviderSnapshot` (lines 2068-2085):
   `{ name, streamSimple (boolean), baseUrl?, api?, displayName?, apiKey?, headers?,
   authHeader?, models? }` — matching `SessionToolWire` / `SessionCommandInfoWire`
   / `ProvidersUpdate` mirror fields on the Rust side
@@ -478,8 +478,8 @@ Each rule below carries a `witness:` to the implementing source and a
   throws `STALE_COMMAND_CONTEXT_MESSAGE` when the stale flag is set or the
   runner has been replaced.
   `witness: packages/extension-host/src/host.ts::STALE_COMMAND_CONTEXT_MESSAGE`
-  (line 112), `::captureReplacementToken` markStale call (line 2817),
-  `::createCommandContext` guard (lines 2968-2971).
+  (line 112), `::captureReplacementToken` markStale call (line 2826),
+  `::createCommandContext` guard (lines 2975-2979).
   `mutation: M17 — verifyStaleReplacementTokenGuard` (per-command replacement
   staleness suite in `tests/host.test.ts` lines 1277-1525).
 - **Cancel routing:** `tool.cancel` and `provider.cancel` events route the
@@ -487,7 +487,7 @@ Each rule below carries a `witness:` to the implementing source and a
   extracts `requestId` from the payload, guards against `undefined`, and calls
   `.abort()` only on the matching `inFlightTools`/`inFlightProviders` entry.
   `witness: packages/extension-host/src/host.ts::handleControlEvent`
-  (lines 2191-2198), `lean-runner.ts::handleControlEvent` (lines 1916-1924).
+  (lines 2191-2198), `lean-runner.ts::handleControlEvent` (lines 1926-1943).
   `mutation: M18 — verifyCancelRouting` (tool.cancel tests in
   `tests/lean.test.ts` lines 924-1044).
 

@@ -67,7 +67,9 @@ dispatch. Pinned instruments, same machine, release lto=fat: hyperfine wall
 (1.59x; quiet window 6.3 → 3.2 ms, 1.97x); callgrind in-process Ir
 3,767,328 → 945,385 (3.99x); strace census 2788 → 84 syscalls, clone3 80 → 0,
 futex 705 → 0. Contract observable verified byte-identical (`--version` →
-`0.1.0`, exit 0; `--help` and a normal flag path parity-diffed base vs after).
+the registered workspace version, exit 0; see [Workspace
+Version](../../compatibility.md#workspace-version) in docs/compatibility.md;
+`--help` and a normal flag path parity-diffed base vs after).
 
 Multiple recompute (93.7 ns per 1000 Ir): 945,385 Ir ≈ 88.6 us → ≈ 591x the
 0.15 us floor. Intermediate win logged at >2x; terminal state in the

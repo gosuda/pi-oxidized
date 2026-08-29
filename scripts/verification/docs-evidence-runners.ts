@@ -40,6 +40,23 @@ export const EVIDENCE_CLASSES = [
 
 export type EvidenceClass = (typeof EVIDENCE_CLASSES)[number];
 
+/**
+ * Row evidence lifecycle: the row's documentation surface is verified today
+ * (`present`), not yet ported (`pending-port`), or exists but lacks fresh
+ * evidence (`pending-evidence`).
+ */
+export const EVIDENCE_STATUSES = [
+	"present",
+	"pending-port",
+	"pending-evidence",
+] as const;
+
+export type EvidenceStatus = (typeof EVIDENCE_STATUSES)[number];
+
+export function isEvidenceStatus(value: unknown): value is EvidenceStatus {
+	return typeof value === "string" && (EVIDENCE_STATUSES as readonly string[]).includes(value);
+}
+
 /** Field names that no ledger row may carry (no command/argv strings). */
 export const FORBIDDEN_FIELDS = [
 	"command",
@@ -57,6 +74,8 @@ export interface LedgerRow {
 	readonly id: string;
 	readonly surface: string;
 	readonly owner: string;
+	readonly status: EvidenceStatus;
+	readonly target: string;
 	readonly class: EvidenceClass;
 	readonly params: Readonly<Record<string, unknown>>;
 }
@@ -72,6 +91,35 @@ export interface RunnerResult {
 	readonly ok: boolean;
 	readonly sidecar: Sidecar;
 	readonly problems: readonly string[];
+}
+
+// ---------------------------------------------------------------------------
+// Run manifest (pi.docs.evidence.run.v1)
+// ---------------------------------------------------------------------------
+
+export const RUN_MANIFEST_SCHEMA = "pi.docs.evidence.run.v1" as const;
+
+/** One ledger row's fresh evidence, as recorded in the run manifest. */
+export interface RunManifestEntry {
+	readonly rowId: string;
+	readonly status: EvidenceStatus;
+	readonly contentHash: string;
+}
+
+/**
+ * Emitted as run-manifest.json beside the sidecars after a clean run. Binds
+ * one runId to the ledger (referencePin + SHA-256 of its canonical JSON) and
+ * the per-row evidence collected during the run. Individual sidecars carry no
+ * status; the manifest is the only status-bearing artifact.
+ */
+export interface RunManifest {
+	readonly schema: typeof RUN_MANIFEST_SCHEMA;
+	readonly runId: string;
+	readonly referencePin: string;
+	readonly ledgerHash: string;
+	readonly rowCount: number;
+	readonly presentCount: number;
+	readonly entries: readonly RunManifestEntry[];
 }
 
 // ---------------------------------------------------------------------------

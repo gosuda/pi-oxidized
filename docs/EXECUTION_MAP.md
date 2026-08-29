@@ -21,7 +21,7 @@ The canonical stable-ID DAG registry for the port program (MAP-1, issue #134). O
 | DEPS-R1 | research | #117 | [DEPS-R1] Re-ground dependency bins against live registries before any upgrade executes | EXT-23, PAR-CLOSE, EXT-26 |
 | DEPS-R2 | task | #128 | [DEPS-R2] Stand up the out-of-band CVE/yanked-version remediation runbook with the shipped-exposure predicate checker | EXT-23 |
 | DEPS-R3 | task | #126 | [DEPS-R3] Watch: retire syntect-transitive deny.toml ignores on the qualifying syntect release | — |
-| DEPS-T1 | task | #124 | [DEPS-T1] Toolchain: Rust (see [compatibility.md](compatibility.md)) → re-grounded stable (≥1.98.0) as its own atomic unit | DEPS-X1, DEPS-X2, DEPS-X3 |
+| DEPS-T1 | task | #124 | [DEPS-T1] Toolchain: Rust 1.97.1 → re-grounded stable (≥1.98.0) as its own atomic unit | DEPS-X1, DEPS-X2, DEPS-X3 |
 | DEPS-X1 | task | #120 | [DEPS-X1] Major: base64 0.22.1 → 0.23.x with Engine-API migration evidence | DEPS-B2 |
 | DEPS-X2 | task | #122 | [DEPS-X2] Major: serde-saphyr 0.0.29 → 1.1.x with frontmatter fixture parity | DEPS-B2 |
 | DEPS-X3 | task | #125 | [DEPS-X3] Major: typescript 5.9.3 → 7.0.x across all three manifests | DEPS-B2 |
@@ -86,7 +86,7 @@ The canonical stable-ID DAG registry for the port program (MAP-1, issue #134). O
 | REL-R2 | research | #118 | [REL-R2] Research the signed and notarized macOS release channel | — |
 | REL-R3 | prototype | #115 | [REL-R3] Prototype the Windows ConPTY interaction witness | — |
 | REL-T1 | task | #106 | [REL-T1] Extend the release target model to seven triples | VER-ALIGN |
-| REL-T2 | task | #104 | [REL-T2] Pin Bun (see [compatibility.md](compatibility.md)) musl fallback-runtime assets | REL-T1 |
+| REL-T2 | task | #104 | [REL-T2] Pin Bun 1.3.14 musl fallback-runtime assets | REL-T1 |
 | REL-T3 | task | #112 | [REL-T3] Provision musl toolchains and userland in CI recipes | REL-R1, REL-T2 |
 | REL-T4 | task | #108 | [REL-T4] Wire seven legs, native runners, musl gates, and the five Tier N witnesses into release-verification.yml | REL-T3, TUI-CLOSE |
 | REL-T5 | task | #113 | [REL-T5] Land compat-matrix 0.2.0 with seven release target rows and tier-accurate terminology | REL-T4 |
@@ -140,10 +140,11 @@ The canonical stable-ID DAG registry for the port program (MAP-1, issue #134). O
 
 ## Pinned telemetry migration surface
 
-Exactly five AgentLoopConfig struct-literal sites — the shared arbitration oracle, imported from `PINNED_AGENT_LOOP_CONFIG_SITES` in scripts/verification/parity.ts:
+Exactly six AgentLoopConfig struct-literal sites — the shared arbitration oracle, imported from `PINNED_AGENT_LOOP_CONFIG_SITES` in scripts/verification/parity.ts:
 
 - crates/pi-agent/src/agent.rs:62-88
 - crates/pi-agent/src/config.rs:360-389
 - crates/pi-agent/src/run.rs:835-861
 - crates/pi-agent/src/schedule.rs:902-928
 - crates/pi/src/core/agent_session/mod.rs:463-489
+- crates/pi-agent/src/bin/pi_agent_stream_frame_bench.rs:267-294

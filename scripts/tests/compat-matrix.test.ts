@@ -1,9 +1,11 @@
-import { readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { describe, expect, test } from "bun:test";
 
 import {
+	captureDocsEvidence,
 	runCommand,
 	runMatrix,
 	selectRows,
@@ -11,6 +13,12 @@ import {
 	validateMatrix,
 	type Matrix,
 } from "../verification/compat-matrix.ts";
+import {
+	EXPECTED_LEDGER_ROW_COUNT,
+	canonicalJson,
+} from "../verification/docs-evidence.ts";
+import { RUN_MANIFEST_SCHEMA, sha256 } from "../verification/docs-evidence-runners.ts";
+import { CANONICAL_REFERENCE_SHA } from "../verification/alignment.ts";
 
 function validCommand() {
 	return {
@@ -318,6 +326,117 @@ describe("runMatrix", () => {
 		);
 		expect(result.summary.requiredFailed).toEqual(["r1"]);
 		expect(result.commandResults).toHaveLength(0);
+	});
+});
+
+describe("captureDocsEvidence", () => {
+	const runId = "2026-08-29T14:09:47.447Z";
+	const entries = Array.from({ length: EXPECTED_LEDGER_ROW_COUNT }, (_, index) => ({
+		rowId: `row-${index}`,
+		status: "present" as const,
+		contentHash: index.toString(16).padStart(64, "0"),
+	}));
+	const ledger = {
+		schema: "pi.docs.evidence.v1",
+		referencePin: CANONICAL_REFERENCE_SHA,
+		rows: entries.map(({ rowId }) => ({ id: rowId })),
+	};
+
+	function writeEvidenceFixture(root: string, rowCount = EXPECTED_LEDGER_ROW_COUNT) {
+		const ledgerDir = join(root, "scripts/verification");
+		const manifestDir = join(root, "target/verification/docs-evidence");
+		mkdirSync(ledgerDir, { recursive: true });
+		mkdirSync(manifestDir, { recursive: true });
+		writeFileSync(join(ledgerDir, "docs-evidence.json"), JSON.stringify(ledger));
+		const manifest = {
+			schema: RUN_MANIFEST_SCHEMA,
+			runId,
+			referencePin: CANONICAL_REFERENCE_SHA,
+			ledgerHash: sha256(canonicalJson(ledger)),
+			rowCount,
+			presentCount: rowCount,
+			entries,
+		};
+		const manifestPath = join(manifestDir, "run-manifest.json");
+		writeFileSync(manifestPath, JSON.stringify(manifest));
+		return { manifest, manifestPath };
+	}
+
+	function passingResult(manifestPath: string, emittedRunId = runId) {
+		return {
+			key: "docs-evidence",
+			cwd: ".",
+			argv: ["bun", "run", "scripts/verification/docs-evidence.ts"],
+			exitCode: 0,
+			durationMs: 1,
+			timedOut: false,
+			stdoutTail: `DOCS_EVIDENCE_OK runId=${emittedRunId} rows=77 manifest=${manifestPath}\n`,
+			stderrTail: "",
+			rowIds: ["docs-evidence"],
+		};
+	}
+
+	test("captures the full manifest from the canonical passing command", () => {
+		const root = mkdtempSync(join(tmpdir(), "compat-docs-evidence-"));
+		try {
+			const { manifest, manifestPath } = writeEvidenceFixture(root);
+			const captured = captureDocsEvidence(
+				{ cwd: ".", argv: ["bun", "run", "scripts/verification/docs-evidence.ts"], timeoutMs: 120_000 },
+				passingResult(manifestPath),
+				root,
+			);
+			expect(captured).toEqual(manifest);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("rejects a different command using the reserved row ID", () => {
+		const root = mkdtempSync(join(tmpdir(), "compat-docs-command-"));
+		try {
+			const { manifestPath } = writeEvidenceFixture(root);
+			expect(() =>
+				captureDocsEvidence(
+					{ cwd: ".", argv: ["bun", "-e", "process.exit(0)"], timeoutMs: 120_000 },
+					passingResult(manifestPath),
+					root,
+				),
+			).toThrow("did not run the canonical checker");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("rejects a manifest from a different run ID", () => {
+		const root = mkdtempSync(join(tmpdir(), "compat-docs-run-id-"));
+		try {
+			const { manifestPath } = writeEvidenceFixture(root);
+			expect(() =>
+				captureDocsEvidence(
+					{ cwd: ".", argv: ["bun", "run", "scripts/verification/docs-evidence.ts"], timeoutMs: 120_000 },
+					passingResult(manifestPath, "2026-08-29T14:10:00.000Z"),
+					root,
+				),
+			).toThrow("does not match the command or current ledger");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("rejects an incomplete manifest", () => {
+		const root = mkdtempSync(join(tmpdir(), "compat-docs-incomplete-"));
+		try {
+			const { manifestPath } = writeEvidenceFixture(root, EXPECTED_LEDGER_ROW_COUNT - 1);
+			expect(() =>
+				captureDocsEvidence(
+					{ cwd: ".", argv: ["bun", "run", "scripts/verification/docs-evidence.ts"], timeoutMs: 120_000 },
+					passingResult(manifestPath),
+					root,
+				),
+			).toThrow("invalid docs-evidence run manifest");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
 	});
 });
 

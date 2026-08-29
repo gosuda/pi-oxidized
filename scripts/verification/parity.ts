@@ -13,7 +13,7 @@
  *                                 the A8/A9/E1/R1-R4 special contracts.
  * 4. verifyGraduatedTicketDag   - stable IDs, every blocked_by resolvable, no
  *                                 cycles, no missing nodes.
- * 5. verifyAgentLoopConfigSites - exactly five AgentLoopConfig literal sites
+ * 5. verifyAgentLoopConfigSites - exactly six AgentLoopConfig literal sites
  *                                 at the pinned files and line ranges.
  *
  * Each operation is a pure check over text or collected inputs so the test
@@ -54,6 +54,7 @@ export const PINNED_AGENT_LOOP_CONFIG_SITES: readonly AgentLoopConfigPin[] = [
 	{ path: "crates/pi-agent/src/run.rs", start: 835, end: 861 },
 	{ path: "crates/pi-agent/src/schedule.rs", start: 902, end: 928 },
 	{ path: "crates/pi/src/core/agent_session/mod.rs", start: 463, end: 489 },
+	{ path: "crates/pi-agent/src/bin/pi_agent_stream_frame_bench.rs", start: 267, end: 294 },
 ];
 
 // ============================================================================
@@ -729,7 +730,7 @@ const ORACLE_BACKTICK_RE = /`([^`]+)`/g;
 const ORACLE_SITE_RE = /^([-\w./]+):(\d+)-(\d+)$/;
 
 /**
- * The oracle sentence in docs/PARITY_LEDGER.md states the same five sites as
+ * The oracle sentence in docs/PARITY_LEDGER.md states the same six sites as
  * PINNED_AGENT_LOOP_CONFIG_SITES; a re-pin that moves one authority and not
  * the other must fail the witness instead of drifting silently.
  */

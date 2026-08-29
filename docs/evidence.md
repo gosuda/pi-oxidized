@@ -13,7 +13,7 @@ docs-evidence.json (ledger)  ──►  docs-evidence.ts (checker)
          │                              │
          │                              ├──► docs-evidence-runners.ts (7 closed classes)
          │                              ├──► docs-inventory.json (surface count assertion)
-         │                              └──► target/verification/docs-evidence/ (sidecars)
+         │                              └──► target/verification/docs-evidence/ (sidecars + run-manifest.json)
          │
          └── referencePin: 8fa7eebd235355522c8104166b4f1f959b4e2f10
 ```
@@ -22,8 +22,8 @@ docs-evidence.json (ledger)  ──►  docs-evidence.ts (checker)
 
 | File | Role |
 |------|------|
-| `scripts/verification/docs-evidence.json` | Ledger — one row per surface, each with owner + closed class |
-| `scripts/verification/docs-evidence.ts` | Checker entrypoint — validates, runs, writes sidecars |
+| `scripts/verification/docs-evidence.json` | Ledger — one row per surface, each with owner + status + target + closed class |
+| `scripts/verification/docs-evidence.ts` | Checker entrypoint — validates, runs, writes sidecars + run manifest |
 | `scripts/verification/docs-evidence-runners.ts` | Seven closed evidence-class runner implementations |
 | `scripts/verification/fixtures/docs-inventory.json` | Inventory artifact — EXT-24 surface enumeration |
 | `scripts/tests/docs-evidence.test.ts` | Mutation suite + structural assertions |
@@ -44,6 +44,17 @@ shape; the checker rejects unknown classes and missing params.
 | `review-only-prose` | `source` | A prose surface file exists; sync-docs may not auto-edit it |
 | `changelog-unreleased` | `source` | A CHANGELOG has a `## [Unreleased]` append slot |
 
+Every row also carries two more required fields:
+
+- **status** — the row's evidence lifecycle: `present` (surface verified
+  today), `pending-port` (not yet ported), or `pending-evidence` (exists but
+  lacks fresh evidence). The committed ledger pins all 77 rows to `present`.
+- **target** — the registered surface the row verifies. The ledger sets it
+  equal to `surface` on every row: this ledger attests the exact registered
+  surface.
+
+The checker rejects unknown statuses and empty targets.
+
 ## Sidecar Binding
 
 Each run produces a sidecar artifact under
@@ -57,6 +68,32 @@ Staleness fails the run:
 - contentHash mismatch → surface content changed since the prior sidecar
 - toolVersion mismatch → checker version changed
 - runId older than the 7-day re-proof interval → evidence is stale
+
+## Run Manifest
+
+A clean run also emits `run-manifest.json` beside the sidecars (schema
+`pi.docs.evidence.run.v1`), binding one run to the whole ledger:
+
+| Field | Meaning |
+|-------|---------|
+| `runId` | ISO timestamp of the run (same value printed on success) |
+| `referencePin` | The ledger's pinned commit |
+| `ledgerHash` | SHA-256 of the ledger's canonical JSON (object keys sorted recursively) |
+| `rowCount` | Ledger rows total |
+| `presentCount` | Rows with status `present` |
+| `entries` | One `{rowId, status, contentHash}` per ledger row, sorted by `rowId` |
+
+The manifest is written only when the run finishes with zero problems, and
+any prior manifest is removed at run start — a failing run can never leave a
+manifest that falsely claims a current, clean state. Individual sidecars
+carry no status; the manifest is the only status-bearing artifact.
+
+When the required `docs-evidence` compatibility row passes,
+`target/verification/compat-matrix/result.json` embeds this validated manifest
+as `docsEvidence`. The release workflow retains that file in the
+`compatibility-performance-x86_64-unknown-linux-gnu` artifact. The artifact
+therefore binds its Git commit to the run ID and all 77 row hashes without a
+second CI upload path.
 
 ## sync-docs Policy
 
@@ -88,3 +125,6 @@ bun run scripts/verification/docs-evidence.ts
 # Run the mutation suite
 bun test scripts/tests/docs-evidence.test.ts
 ```
+
+On success the checker prints one line: the `DOCS_EVIDENCE_OK` sentinel, the
+runId, the ledger row count, and the path of the emitted run manifest.

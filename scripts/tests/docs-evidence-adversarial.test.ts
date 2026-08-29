@@ -85,6 +85,8 @@ describe("DOC-G2: stale-sidecar-reuse after code change", () => {
 			id: "g2-stale-sidecar",
 			surface: "test-stale",
 			owner: "DOC-A",
+			status: "present",
+			target: "test-stale",
 			class: "review-only-prose",
 			params: { source: ".references/pi/README.md" },
 		};
@@ -219,6 +221,8 @@ describe("DOC-G2: out-of-band-deps-doc-edit", () => {
 			id: "g2-oob-edit",
 			surface: "test-oob",
 			owner: "DOC-A",
+			status: "present",
+			target: "test-oob",
 			class: "review-only-prose",
 			params: { source: "fake-doc.md" },
 		};
@@ -308,6 +312,8 @@ describe("DOC-G2: disguised-example-product-import", () => {
 			id: "g2-wiring-row",
 			surface: "test-wiring",
 			owner: "DOC-A",
+			status: "present",
+			target: "test-wiring",
 			class: "review-only-prose",
 			params: { source: "scripts/tests/injected-fixture.ts" },
 		};
@@ -430,6 +436,8 @@ describe("DOC-G2: evidence-free-unreleased-entry", () => {
 			id: "g2-cl-evidence-free",
 			surface: "test-cl",
 			owner: "DOC-A",
+			status: "present",
+			target: "test-cl",
 			class: "changelog-unreleased",
 			params: { source: "CHANGELOG.md" },
 		};

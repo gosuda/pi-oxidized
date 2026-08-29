@@ -3,10 +3,10 @@
 | Field | Value |
 |---|---|
 | Issue | [#56][issue-56] `TUI-G8` (routed decision: viewport policy) |
-| Decision type | recorded policy decision, not implementation |
-| Status | RATIFIED |
-| Implementation | [#83][issue-83] (`TUI-T9`), not executed here |
-| Measurement | [#87][issue-87] (`TUI-V4`) measures current viewport semantics under this policy |
+| Decision type | recorded and implemented policy decision |
+| Status | IMPLEMENTED |
+| Implementation | [#83][issue-83] (`TUI-T9`), executed |
+| Measurement | [#87][issue-87] (`TUI-V4`) verifies the implemented viewport semantics |
 [issue-56]: https://github.com/metaphorics/pi-oxidized/issues/56
 [issue-83]: https://github.com/metaphorics/pi-oxidized/issues/83
 [issue-87]: https://github.com/metaphorics/pi-oxidized/issues/87
@@ -19,9 +19,9 @@ This document is the single authority for the supported viewport width floor bel
 initial 20-column clamp during live terminal resizes. Under the repository parity doctrine
 (issue #25), the TypeScript reference tree (`.references/pi/…`) is canonical and every
 deviation is an explicit recorded decision. The reference imposes no explicit live-resize
-width floor — it reads `terminal.columns` directly and renders at whatever width the
-kernel reports — so any floor the Rust port adopts is a new product policy, not a parity
-restoration. This record establishes that policy and makes no code changes.
+width floor: it reads `terminal.columns` directly and renders at whatever width the
+kernel reports. The Rust port therefore records its 20-column floor as an intentional
+product-policy deviation. This record defines the policy and records its implementation.
 
 ## 2. Decision
 
@@ -81,48 +81,37 @@ Best-effort wrap below 20 is rejected because:
   component tree. It is the minimal policy that prevents degraded output without
   inventing a new layout mode.
 
-## 3. Current-state divergence
+## 3. Implemented state
 
-The current Rust code has **no live-resize floor**. `handle_resize` (`runtime.rs:3243`)
-calls `self.tui.note_resize(width, height)` and `self.view.resize(width, height)` with
-the raw reported dimensions — no clamping. `ViewState::resize` (`state.rs:600`) stores
-them directly. The render path's defensive `.max(1)` guards prevent panics but produce
-degraded output at sub-20 widths.
+The Rust runtime tracks raw resize dimensions while enforcing the floor at the render
+boundary. `VIEWPORT_WIDTH_FLOOR` is 20. Both the runtime commit path and
+`ViewState::compose` blank frames below that width. A later resize to 20 columns or more
+resumes normal rendering from the current dimensions.
 
-This is a **recorded divergence from this policy**, to be remediated by TUI-T9 (#83).
-TUI-V4 (#87) measures the current behavior (no floor) as a standing invariance baseline;
-it does not gate on the floor being implemented.
+| Surface | Landed behavior | Status |
+|---|---|---|
+| `initial_terminal_size` | Clamps startup width to `[20, 1024]` | Compliant |
+| resize handling | Stores the raw width and height | Compliant |
+| runtime commit path | Skips content below `VIEWPORT_WIDTH_FLOOR` | Compliant |
+| `ViewState::compose` | Returns a blank frame below the floor | Compliant |
+| PTY fixture ladder | Exercises sub-20-column widths without panic | Compliant |
 
-| Surface | Current behavior | Policy target | Owner |
-|---|---|---|---|
-| `initial_terminal_size` (`runtime.rs:6528`) | Clamps to `[20, 1024]` | Already compliant | — |
-| `handle_resize` (`runtime.rs:3243`) | No width floor; raw dimensions | Blank render below 20 | TUI-T9 #83 |
-| `ViewState::resize` (`state.rs:600`) | Stores raw width/height | Store raw; render gate is at compose | TUI-T9 #83 |
-| `render_view` / `compose` (`view.rs`) | Renders at any width ≥ 1 | Skip content cells when width < 20 | TUI-T9 #83 |
-| PTY fixture ladder (`pi_tui_pty_fixture.rs:433`) | Exercises 8..18 column widths | Continues to exercise; fixture proves no-crash | — |
-
-## 4. Implementation specification: TUI-T9
-
-Implementation is assigned to standalone execution ticket [#83][issue-83] (`TUI-T9`).
+## 4. Implemented mechanism: TUI-T9
 
 ### Owned files
 - `crates/pi/src/modes/interactive/runtime.rs` — render gate in the commit/reanchor path
 - `crates/pi/src/modes/interactive/view.rs` — compose-time blank when width < 20
 
 ### Mechanism
-1. **Render gate:** when `view.width < 20`, the compose path emits an empty frame (zero
-   content cells) or a single-line "terminal too narrow" notice, and the commit path
-   writes it without clearing (Reanchor, not a full repaint). The Tui size cache and
-   ViewState dimensions still reflect the raw reported size so the next resize ≥ 20
-   resumes correctly.
-2. **No clamp on stored dimensions:** `ViewState::resize` and `Tui::note_resize` continue
-   to store the raw reported width/height. The floor is a render-time gate, not a stored
-   clamp. This preserves the invariant that a resize back to ≥ 20 columns immediately
-   renders correctly without a stale clamped value.
-3. **No new component branches:** the floor is enforced at the compose boundary, not
-   inside individual components. Components are never called with width < 20.
+1. **Render gate:** when the viewport width is below 20, the compose and commit paths
+   emit no content cells. The Tui size cache and ViewState dimensions still reflect the
+   raw reported size, so the next resize to at least 20 columns resumes correctly.
+2. **No clamp on stored dimensions:** `ViewState::resize` and `Tui::note_resize` store
+   the raw reported width and height. The floor remains a render-time gate.
+3. **No component branches:** the compose boundary enforces the floor. Components do
+   not receive sub-20-column widths.
 
-### Acceptance criteria for implementation
+### Acceptance criteria
 - A live resize to width < 20 blanks the render area (no content cells, no crash).
 - A subsequent resize to width ≥ 20 resumes normal rendering immediately.
 - The Tui size cache and ViewState dimensions track the raw reported size at all times.
@@ -132,16 +121,14 @@ Implementation is assigned to standalone execution ticket [#83][issue-83] (`TUI-
 
 ## 5. Verification boundary (TUI-V4)
 
-TUI-V4 (#87) measures current resize-storm, settle, and progressive-disclosure behavior
-under this policy. It measures the **current** state (no live-resize floor) as a standing
-invariance baseline and records the divergence. It does not gate on the floor being
-implemented. After TUI-T9 lands, TUI-V4 extends to verify the blank-and-resume contract.
+TUI-V4 (#87) measures resize storms, settling, and progressive disclosure under the
+implemented policy. The runtime regression test `floor_blanks_render_below_20` pins the
+blank-and-resume contract.
 
 ## 6. Ownership boundary
 
-- This record changes no Rust source, no protocol type, no verification script, no
-  settings surface, and no keybinding.
-- The floor policy is a render-time decision owned by TUI-T9 (#83).
+- This record changes no Rust source, protocol type, settings surface, or keybinding.
+- TUI-T9 (#83) executed the render-time floor policy.
 - The alt-screen / scroll-view surface (TUI-G4, #35) is out of scope: the floor applies
   to the main-screen interactive view only. Alt-screen scope is classified separately.
 - The width oracle (`width.rs`) is out of scope: the floor is a viewport policy, not a

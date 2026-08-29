@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -84,7 +84,7 @@ describe("generate-compat-docs: extraction helpers", () => {
 
 	test("extractRustVersion pulls rust-version from Cargo.toml", () => {
 		const content = readFileSync(join(REPO_ROOT, "Cargo.toml"), "utf8");
-		expect(extractRustVersion(content)).toBe("1.97.1");
+		expect(extractRustVersion(content)).toBe("1.98.0");
 	});
 
 	test("extractJsonField pulls version from root package.json", () => {
@@ -116,7 +116,7 @@ describe("generate-compat-docs: pin collection", () => {
 		expect(pins.rustCompatibilityVersion).toBe("0.80.10");
 		expect(pins.bunRuntimeVersion).toBe("1.3.14");
 		expect(pins.releaseManifestSchema).toBe("pi.release.v1");
-		expect(pins.rustVersion).toBe("1.97.1");
+		expect(pins.rustVersion).toBe("1.98.0");
 		expect(pins.nodeFloor).toBe(">=22.19.0");
 		expect(pins.bunFloor).toBe(">=1.3.0");
 		expect(pins.matrixRowCount).toBeGreaterThan(0);
@@ -147,16 +147,19 @@ describe("generate-compat-docs: pin collection", () => {
 });
 
 describe("generate-compat-docs: byte-stability", () => {
-	test("two consecutive runs produce a byte-identical docs/compatibility.md", () => {
+	test("committed bytes equal the first generation, and the first equals the second", () => {
+		const committed = readFileSync(DOC_PATH);
+
 		const first = runGenerator();
 		expect(first.status).toBe(0);
-		const firstContent = readFileSync(DOC_PATH, "utf8");
+		const firstContent = readFileSync(DOC_PATH);
 
 		const second = runGenerator();
 		expect(second.status).toBe(0);
-		const secondContent = readFileSync(DOC_PATH, "utf8");
+		const secondContent = readFileSync(DOC_PATH);
 
-		expect(secondContent).toBe(firstContent);
+		expect(firstContent.equals(committed)).toBe(true);
+		expect(secondContent.equals(firstContent)).toBe(true);
 	});
 
 	test("CLI entrypoint produces the OK sentinel", () => {
@@ -192,6 +195,36 @@ describe("generate-compat-docs: no hand-edited version numbers in other docs", (
 		const pins = collectPins();
 		const drift = findRegisteredPinsInOtherDocs(pins, REPO_ROOT);
 		expect(drift).toEqual([]);
+	});
+
+	test("execution-map title pins are opaque but prose pins still fail", () => {
+		const root = mkdtempSync(join(tmpdir(), "compat-map-pin-scan-"));
+		const docs = join(root, "docs");
+		mkdirSync(docs);
+		const pins = collectPins();
+		writeFileSync(
+			join(docs, "EXECUTION_MAP.md"),
+			[
+				"# Execution map",
+				"",
+				"## Registry",
+				"",
+				"| Stable ID | Kind | Issue | Title | blocked_by |",
+				"| --- | --- | --- | --- | --- |",
+				"| REL-T5 | task | #113 | Pin compat-matrix 0.2.0 | REL-T4 |",
+				"",
+				"## Evidence",
+				"",
+				"Hand-edited 0.2.0 claim.",
+			].join("\n"),
+		);
+		try {
+			expect(findRegisteredPinsInOtherDocs(pins, root)).toEqual([
+				"EXECUTION_MAP.md:11 — registered pin value found outside compatibility.md: 0.2.0",
+			]);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
 	});
 });
 

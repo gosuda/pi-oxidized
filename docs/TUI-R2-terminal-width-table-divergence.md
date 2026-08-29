@@ -96,7 +96,7 @@ Derivations: P3/P4/P5/P6 follow `east_asian_width` per code point; P7/P8 are zer
 
 ### 4.6 alacritty — v0.17.0 (stable, 2026-04-06)
 
-- Width is per-code-point `UnicodeWidthChar::width` on `unicode-width` 0.2.0 — no grapheme-cluster summation.
+- Width is per-code-point `UnicodeWidthChar::width` from the `unicode-width` release resolved in `Cargo.lock`; there is no grapheme-cluster summation.
 - Ambiguous = 1 and wide/fullwidth = 2 come from the same East-Asian data family as this crate's contract → axes A/B match. Thai (U+0E33) and Lao (U+0EB3) are East-Asian Neutral = 1 per code point, so a P13 cluster allocates 1 + 1 = 2 → axis D matches.
 - **Axis C diverges on three sub-probes**: P10 family = 4 × 2 = **8 columns** (D-3); P9 VS16 = base 1 + FE0F 0 = **1 column** (D-4); P12 singleton RI = **1 column** (D-5). The RI pair (P11) does sum to 2 and matches.
 - **Axes A/B/D MATCH; axis C DIVERGES (D-3, D-4, D-5).**

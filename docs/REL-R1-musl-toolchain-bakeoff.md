@@ -533,7 +533,9 @@ blocker REL-R1 recorded (run 32986086665). Re-dispatch after unlock.
 The fixed workflow's x86_64 run blocks (init evidence / candidate A /
 acceptance) were extracted verbatim from `daeb68d` and executed in
 `docker run ubuntu:24.04`. Only adaptations: Actions → sha256-verified
-rustup-init + Bun 1.3.14 SHASUMS256.txt toolchain provisioning (ledgered),
+rustup-init + Bun SHASUMS256.txt toolchain provisioning at the registered
+`BUN_RUNTIME_VERSION` pin ([compatibility.md](compatibility.md) → Runtime and
+Release Constants; ledgered),
 `sudo` dropped (container root), `RUNNER_TEMP→/tmp/runner`,
 `GITHUB_WORKSPACE→/work`, `CARGO_BUILD_JOBS=8` (4-vCPU runner shape).
 
@@ -551,9 +553,11 @@ rustup-init + Bun 1.3.14 SHASUMS256.txt toolchain provisioning (ledgered),
   `/lib/ld-musl-x86_64.so.1` for sidecar and Bun runtime; loader `--list`
   isolation gates passed (defect-2 fix exercised).
 - Hello protocol smokes (unpacked): the compiled sidecar and `./bun
-  pi-extension-host.js` both acked
-  `{"id":1,"kind":"res","method":"hello","payload":{"protocolVersion":1,"compatibilityVersion":"0.80.10"}}`.
-- `./pi --version` → `0.1.0`.
+  pi-extension-host.js` both acked the hello response with
+  `payload.compatibilityVersion` field-exact to the pinned `COMPATIBILITY_VERSION`
+  ([compatibility.md](compatibility.md) → Protocol and Compatibility Versions).
+- `./pi --version` → the registered workspace version
+  ([compatibility.md](compatibility.md) → Workspace Version).
 - Ledger gate: 4/4 direct downloads (minirootfs, 2 APKs, Bun zip), each
   sha256 + `acquired_utc` recorded; toolchain ledger (rustup-init,
   bun-linux-x64.zip) sha256-verified against vendor sidecars.

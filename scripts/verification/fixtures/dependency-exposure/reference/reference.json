@@ -1,10 +1,10 @@
 {
 	"schema": "pi.deps.exposure-reference.v1",
-	"capturedAt": "2026-08-28T04:44:08.900Z",
-	"captureHead": "84912264741194c584e4c2527f1bebf38dcad0b2",
+	"capturedAt": "2026-08-29T14:00:48.769Z",
+	"captureHead": "eb91d6b1d4fa26d229a6090b8ec8c0bbbecf4e68",
 	"metafile": {
 		"projectionPath": "metafile-projection.json",
-		"sha256": "c48cdfdc209a490a780182d7022ad507af9788c8340881a10d949ba916f981e3",
+		"sha256": "4bc05de4422fff466c9778fa54ff14f81bc9cf2e03973f65728b3aa753d4fff6",
 		"entry": "./src/main.ts",
 		"hostDirRel": "packages/extension-host",
 		"argv": [
@@ -17,10 +17,10 @@
 			"--target",
 			"bun-linux-x64-baseline",
 			"--outfile",
-			"/home/alpha/.omp/wt/t4c3b839e9/m/.tmp-audit/exposure-ref/.capture-staging/pi-extension-host/pi-extension-host",
-			"--metafile=/home/alpha/.omp/wt/t4c3b839e9/m/.tmp-audit/exposure-ref/.capture-staging/metafile.json"
+			"/home/alpha/harness/pi-oxidized/scripts/verification/fixtures/dependency-exposure/reference/.capture-staging/pi-extension-host/pi-extension-host",
+			"--metafile=/home/alpha/harness/pi-oxidized/scripts/verification/fixtures/dependency-exposure/reference/.capture-staging/metafile.json"
 		],
-		"metafileSha256": "76709f4502f850b5554f49127f64011f3545edb404181362c734fef33dc94d09"
+		"metafileSha256": "9a0eaa5a701e94602ae516d79e22cb28f96b2d72625b56f5ed3bf3ffa80dad94"
 	},
 	"cargo": {
 		"projectionPath": "cargo-graph-projection.json",
@@ -108,7 +108,7 @@
 		},
 		{
 			"path": "crates/pi-ext/Cargo.toml",
-			"sha256": "4695c25bbe5533806b32aa4a9e7a4921b75e0aa6afa8b0c3320467faff2e5be2"
+			"sha256": "ba0b28bffb456d4fa631c1f41df594c1afc3082b1833f335cf4013002a93e271"
 		},
 		{
 			"path": "crates/pi-tui/Cargo.toml",
